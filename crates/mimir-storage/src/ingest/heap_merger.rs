@@ -83,12 +83,12 @@ impl HeapMergerMetrics {
     pub fn new(registry: Option<&Registry>) -> Self {
         let pushed_records = Counter::with_opts(Opts::new(
             "cortex_ingest_storage_ordered_consumption_records_total",
-            "Total number of records pushed by ordered consumption.",
+            "Total number of records pushed by ordered consumption. The baseline against which the out-of-order records fraction can be computed.",
         ))
         .expect("valid metric");
         let out_of_order_emits = Counter::with_opts(Opts::new(
             "cortex_ingest_storage_ordered_consumption_out_of_order_records_total",
-            "Total number of records pushed with a timestamp older than the most recently pushed record.",
+            "Total number of records pushed with a timestamp older than the most recently pushed record. This is the residual cross-cluster out-of-order that ordered consumption could not absorb.",
         ))
         .expect("valid metric");
         let batch_flush_latency = Histogram::with_opts(HistogramOpts::new(
@@ -146,6 +146,7 @@ pub fn merge_records_in_timestamp_order(
 /// min-heap by `(timestamp_ms, kafka_cluster_id, offset)`, and flushing batches downstream.
 pub struct HeapMerger {
     input_tx: mpsc::Sender<HeapItem>,
+    stop_tx: tokio::sync::watch::Sender<bool>,
     handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -165,6 +166,7 @@ impl HeapMerger {
         };
 
         let (input_tx, mut input_rx) = mpsc::channel::<HeapItem>(buf_size);
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
 
         let handle = tokio::spawn(async move {
             let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(max_batch_records);
@@ -176,6 +178,13 @@ impl HeapMerger {
 
             loop {
                 tokio::select! {
+                    biased;
+                    _ = stop_rx.changed() => {
+                        if *stop_rx.borrow() {
+                            Self::drain_heap(&mut heap, &mut input_rx, "heap merger stopped");
+                            break;
+                        }
+                    }
                     maybe_item = input_rx.recv() => {
                         match maybe_item {
                             Some(item) => {
@@ -226,7 +235,21 @@ impl HeapMerger {
 
         Self {
             input_tx,
+            stop_tx,
             handle: tokio::sync::Mutex::new(Some(handle)),
+        }
+    }
+
+    fn drain_heap(
+        heap: &mut BinaryHeap<HeapItem>,
+        input_rx: &mut mpsc::Receiver<HeapItem>,
+        err_msg: &str,
+    ) {
+        while let Some(item) = heap.pop() {
+            let _ = item.ack.send(Err(err_msg.to_string()));
+        }
+        while let Ok(item) = input_rx.try_recv() {
+            let _ = item.ack.send(Err(err_msg.to_string()));
         }
     }
 
@@ -321,6 +344,15 @@ impl HeapMerger {
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// Immediately stops the merger and drains any pending records in the heap with an error
+    /// without forwarding them downstream (matching `HeapMerger.drain` in Go).
+    pub async fn shutdown_and_drain(&self) {
+        let _ = self.stop_tx.send(true);
+        if let Some(handle) = self.handle.lock().await.take() {
+            let _ = handle.await;
         }
     }
 
