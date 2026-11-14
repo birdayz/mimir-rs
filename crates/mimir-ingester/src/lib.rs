@@ -3,6 +3,7 @@
 //! Ported from:
 //! - github.com/grafana/mimir/pkg/ingester/*
 //! - github.com/grafana/mimir/pkg/ingester/activeseries/*
+//! - github.com/grafana/mimir/pkg/ingester/lookupplan/*
 
 pub mod active_series;
 pub mod circuit_breaker;
@@ -14,6 +15,7 @@ pub mod ingest_storage;
 pub mod ingester;
 pub mod label_churn;
 pub mod limiter;
+pub mod lookupplan;
 pub mod metric_counter;
 pub mod metrics;
 pub mod owned_series;
