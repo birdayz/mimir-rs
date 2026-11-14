@@ -182,7 +182,9 @@ impl Histogram {
             check_histogram_int_buckets(&self.negative_buckets, &mut n_count)
                 .map_err(|e| format!("negative side: {e}"))?;
             if !self.custom_values.is_empty() {
-                return Err("histogram with exponential schema must not have custom bounds".to_string());
+                return Err(
+                    "histogram with exponential schema must not have custom bounds".to_string(),
+                );
             }
         } else {
             return Err(format!(
@@ -194,7 +196,9 @@ impl Histogram {
         check_histogram_int_buckets(&self.positive_buckets, &mut p_count)
             .map_err(|e| format!("positive side: {e}"))?;
 
-        let sum_of_buckets = n_count.saturating_add(p_count).saturating_add(self.zero_count);
+        let sum_of_buckets = n_count
+            .saturating_add(p_count)
+            .saturating_add(self.zero_count);
         if self.sum.is_nan() {
             if sum_of_buckets > self.count {
                 return Err(format!(
@@ -329,7 +333,9 @@ impl FloatHistogram {
                 ));
             }
             if !self.custom_values.is_empty() {
-                return Err("histogram with exponential schema must not have custom bounds".to_string());
+                return Err(
+                    "histogram with exponential schema must not have custom bounds".to_string(),
+                );
             }
         } else {
             return Err(format!(

@@ -591,6 +591,23 @@ impl Ingester {
         user_id: &str,
         req: &cortexpb::WriteRequest,
     ) -> Result<(), IngesterError> {
+        if !req.timeseries_rw2.is_empty() || !req.symbols_rw2.is_empty() {
+            let mut buf = Vec::with_capacity(req.encoded_len());
+            req.encode(&mut buf).map_err(|e| IngesterError::Internal {
+                message: format!("failed to encode RW2 request: {e}"),
+            })?;
+            let mut scratch = mimir_proto::zerocopy::WriteRequestScratch::new();
+            let borrowed = mimir_proto::zerocopy::decode_write_request(
+                &buf,
+                mimir_proto::zerocopy::DecodeOptions::rw2(),
+                &mut scratch,
+            )
+            .map_err(|e| IngesterError::BadRequest {
+                message: e.to_string(),
+            })?;
+            return self.push_borrowed_inner(user_id, &borrowed);
+        }
+
         let meta_count = self.push_metadata_owned(user_id, &req.metadata);
         if meta_count > 0 {
             self.ingestion_rate.add(meta_count as i64);
@@ -921,6 +938,7 @@ impl Ingester {
             let prev_succeeded = stats.succeeded_samples;
             let mut created_ts = ts.created_timestamp();
             let mut ingest_created_ts = created_ts > 0;
+            let first_hist_ts = (hist_count > 0).then(|| ts.histogram_timestamp(0));
 
             for s in samples {
                 if s.timestamp_ms > max_timestamp_ms {
@@ -948,7 +966,7 @@ impl Ingester {
                     && created_ts < s.timestamp_ms
                     && (!native_histograms_enabled
                         || hist_count == 0
-                        || ts.histogram_timestamp(0) >= s.timestamp_ms)
+                        || first_hist_ts.is_none_or(|ht| ht >= s.timestamp_ms))
                 {
                     match app.append_float_reject_ooo(series_ref, &pairs, created_ts, 0.0) {
                         Ok(r) => {
@@ -1282,7 +1300,6 @@ impl Ingester {
         self.metrics
             .ingested_exemplars_fail
             .inc_by(stats.failed_exemplars as f64);
-
         self.appended_samples
             .fetch_add(stats.succeeded_samples as i64, Ordering::Relaxed);
         self.appended_exemplars

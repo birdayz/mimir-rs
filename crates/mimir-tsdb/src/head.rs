@@ -207,7 +207,7 @@ fn format_go_g(v: f64) -> String {
         return if v.is_sign_positive() { "+Inf" } else { "-Inf" }.to_string();
     }
     let abs = v.abs();
-    if abs >= 1e6 || abs < 1e-4 {
+    if !(1e-4..1e6).contains(&abs) {
         format!("{v:e}")
     } else {
         format!("{v}")
@@ -1230,6 +1230,7 @@ struct HeadMetrics {
     ooo_samples_appended: CounterVec,
     ooo_histogram: PromHistogram,
     wal_fsync_duration: WalFsyncSummary,
+    active_appenders: prometheus::Gauge,
 }
 
 impl HeadMetrics {
@@ -1262,15 +1263,23 @@ impl HeadMetrics {
         )
         .expect("valid ooo histogram");
 
+        let active_appenders = prometheus::Gauge::new(
+            "prometheus_tsdb_head_active_appenders",
+            "Number of currently active appender transactions.",
+        )
+        .expect("valid active appenders gauge");
+
         if let Some(r) = reg {
             let _ = r.register(Box::new(ooo_samples_appended.clone()));
             let _ = r.register(Box::new(ooo_histogram.clone()));
+            let _ = r.register(Box::new(active_appenders.clone()));
         }
         let wal_fsync_duration = WalFsyncSummary::new(reg);
         Self {
             ooo_samples_appended,
             ooo_histogram,
             wal_fsync_duration,
+            active_appenders,
         }
     }
 }
@@ -2364,6 +2373,7 @@ impl Head {
 
     /// Creates a new [`HeadAppender`] for transactional batched writes.
     pub fn appender(&self) -> HeadAppender<'_> {
+        self.metrics.active_appenders.inc();
         let min_valid = self.appendable_min_valid_time();
         let head_maxt = self.max_time();
         HeadAppender {
@@ -3707,6 +3717,7 @@ impl<'a> HeadAppender<'a> {
             return Err(HeadError::AppenderClosed);
         }
         self.closed = true;
+        self.head.metrics.active_appenders.dec();
 
         // 1. Log to WAL.
         self.log_wal()?;
@@ -4114,6 +4125,7 @@ impl<'a> HeadAppender<'a> {
             return Err(HeadError::AppenderClosed);
         }
         self.closed = true;
+        self.head.metrics.active_appenders.dec();
         for pf in self.floats.drain(..) {
             let mut st = pf.entry.inner.lock();
             st.pending_commits = st.pending_commits.saturating_sub(1);
@@ -4239,6 +4251,7 @@ impl<'a> HeadAppender<'a> {
 impl Drop for HeadAppender<'_> {
     fn drop(&mut self) {
         if !self.closed {
+            self.head.metrics.active_appenders.dec();
             for pf in self.floats.drain(..) {
                 let mut st = pf.entry.inner.lock();
                 st.pending_commits = st.pending_commits.saturating_sub(1);
