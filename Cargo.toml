@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mimir-proto",
+    "crates/mimir-common",
+    "crates/mimir-config",
+    "crates/mimir-tsdb",
+    "crates/mimir-ring",
+    "crates/mimir-storage",
+    "crates/mimir-ingester",
+    "crates/mimir-cmd",
+    "crates/mimir-conformance",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+debug = true
+
+[workspace.dependencies]
+bytes = "1"
+prost = "0.13"
+prost-types = "0.13"
+tonic = { version = "0.12", features = ["gzip", "zstd", "tls"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+axum = "0.7"
+hyper = { version = "1", features = ["full"] }
+tower = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+parking_lot = "0.12"
+dashmap = "6"
+hashbrown = "0.15"
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
+crc32c = "0.6"
+snap = "1"
+flate2 = "1"
+lz4_flex = "0.11"
+zstd = "0.13"
+memmap2 = "0.9"
+smallvec = { version = "1", features = ["union", "const_generics"] }
+regex = "1"
+regex-syntax = "0.8"
+prometheus = "0.13"
+ulid = "1"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
+tikv-jemallocator = "0.6"
+criterion = "0.5"
+tempfile = "3"
+proptest = "1"
+base64 = "0.22"
+hex = "0.4"

@@ -1,0 +1,29 @@
+[package]
+name = "mimir-cmd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mimir"
+path = "src/main.rs"
+
+[dependencies]
+mimir-common = { path = "../mimir-common" }
+mimir-config = { path = "../mimir-config" }
+mimir-ingester = { path = "../mimir-ingester" }
+mimir-proto = { path = "../mimir-proto" }
+mimir-ring = { path = "../mimir-ring" }
+mimir-storage = { path = "../mimir-storage" }
+mimir-tsdb = { path = "../mimir-tsdb" }
+anyhow = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+prometheus = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { workspace = true }

@@ -1,0 +1,24 @@
+[package]
+name = "mimir-tsdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimir-common = { path = "../mimir-common" }
+mimir-proto = { path = "../mimir-proto" }
+bytes = { workspace = true }
+crc32c = { workspace = true }
+hashbrown = { workspace = true }
+memmap2 = { workspace = true }
+parking_lot = { workspace = true }
+prometheus = { workspace = true }
+regex = { workspace = true }
+regex-syntax = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+smallvec = { workspace = true }
+snap = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+xxhash-rust = { workspace = true }

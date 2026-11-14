@@ -1,0 +1,25 @@
+[package]
+name = "mimir-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimir-common = { path = "../mimir-common" }
+mimir-config = { path = "../mimir-config" }
+mimir-proto = { path = "../mimir-proto" }
+mimir-tsdb = { path = "../mimir-tsdb" }
+bytes = { workspace = true }
+flate2 = { workspace = true }
+lz4_flex = { workspace = true }
+object_store = { workspace = true }
+parking_lot = { workspace = true }
+prometheus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snap = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+zstd = { workspace = true }

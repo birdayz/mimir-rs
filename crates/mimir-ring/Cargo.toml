@@ -1,0 +1,20 @@
+[package]
+name = "mimir-ring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimir-common = { path = "../mimir-common" }
+mimir-config = { path = "../mimir-config" }
+mimir-proto = { path = "../mimir-proto" }
+axum = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+prometheus = { workspace = true }
+prost = { workspace = true }
+rand = { workspace = true }
+snap = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
