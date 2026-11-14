@@ -31,6 +31,13 @@ func main() {
 		fatalf("usage: go-oracle <subcommand> [json-arg]")
 	}
 	cmd := os.Args[1]
+	if cmd == "kfake-broker" {
+		if err := cmdKfakeBroker(); err != nil {
+			fatalf("kfake-broker: %v", err)
+		}
+		return
+	}
+
 	var input []byte
 	var err error
 	if len(os.Args) >= 3 {
@@ -58,6 +65,14 @@ func main() {
 		out, err = cmdVerifyTSDBDir(input)
 	case "write-tsdb-fixture":
 		out, err = cmdWriteTSDBFixture(input)
+	case "partition-tokens":
+		out, err = cmdPartitionTokens(input)
+	case "ring-lookup":
+		out, err = cmdRingLookup(input)
+	case "ring-merge":
+		out, err = cmdRingMerge(input)
+	case "partition-ring-lookup":
+		out, err = cmdPartitionRingLookup(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}
@@ -358,11 +373,7 @@ func fromHistogramPB(h mimirpb.Histogram) HistogramJSON {
 	return out
 }
 
-func cmdEncodeWriteRequest(input []byte) (*bytesB64Out, error) {
-	var in WriteRequestJSON
-	if err := json.Unmarshal(input, &in); err != nil {
-		return nil, err
-	}
+func buildWriteRequest(in WriteRequestJSON) (*mimirpb.WriteRequest, error) {
 	src, err := parseSource(in.Source)
 	if err != nil {
 		return nil, err
@@ -407,6 +418,18 @@ func cmdEncodeWriteRequest(input []byte) (*bytesB64Out, error) {
 			pbTS.Histograms = append(pbTS.Histograms, toHistogramPB(h))
 		}
 		req.Timeseries = append(req.Timeseries, mimirpb.PreallocTimeseries{TimeSeries: pbTS})
+	}
+	return req, nil
+}
+
+func cmdEncodeWriteRequest(input []byte) (*bytesB64Out, error) {
+	var in WriteRequestJSON
+	if err := json.Unmarshal(input, &in); err != nil {
+		return nil, err
+	}
+	req, err := buildWriteRequest(in)
+	if err != nil {
+		return nil, err
 	}
 
 	var wire []byte

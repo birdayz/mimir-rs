@@ -1,9 +1,21 @@
+use std::collections::HashMap;
+use std::net::TcpStream;
+
+use base64::Engine;
 use mimir_conformance::oracle::{
     ensure_go_oracle_built, invoke_oracle, run_go_mimir, BytesB64Response, ChunkResponse,
     ChunkSampleJson, DecodeChunkRequest, DecodeWriteRequest, EncodeChunkRequest, ExemplarJson,
-    HashSeriesRequest, HashSeriesResponse, HistogramJson, LabelJson, MetadataJson, SampleJson,
-    SpanJson, TimeSeriesJson, TsdbSeriesFixtureJson, VerifyTsdbDirRequest, VerifyTsdbDirResponse,
-    WriteRequestJson, WriteTsdbFixtureRequest, WriteTsdbFixtureResponse,
+    HashSeriesRequest, HashSeriesResponse, HistogramJson, KfakeBrokerRequest, KfakePartitionOffset,
+    KfakeRecordInput, LabelJson, MetadataJson, PartitionRingLookupRequest,
+    PartitionRingLookupResponse, PartitionTokensRequest, PartitionTokensResponse, RingLookupRequest,
+    RingLookupResponse, RingMergeRequest, RingMergeResponse, SampleJson, SpanJson,
+    SpawnedKfakeBroker, TimeSeriesJson, TsdbSeriesFixtureJson, VerifyTsdbDirRequest,
+    VerifyTsdbDirResponse, WriteRequestJson, WriteTsdbFixtureRequest, WriteTsdbFixtureResponse,
+};
+use mimir_proto::prost::Message;
+use mimir_proto::ringpb::{
+    Desc, InstanceDesc, InstanceState, OwnerDesc, OwnerState, PartitionDesc, PartitionRingDesc,
+    PartitionState, PartitionTokenScheme,
 };
 
 #[test]
@@ -275,4 +287,267 @@ fn go_oracle_smoke_roundtrip() {
     assert_eq!(verify_resp.series.len(), 2);
     assert_eq!(verify_resp.series[0].histograms.len(), 1);
     assert_eq!(verify_resp.series[1].samples.len(), 2);
+}
+
+#[test]
+fn wave2_oracle_smoke() {
+    ensure_go_oracle_built().expect("go-oracle must build");
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // 1. partition-tokens
+    let pt_resp: PartitionTokensResponse = invoke_oracle(
+        "partition-tokens",
+        &PartitionTokensRequest { partitions: 3 },
+    )
+    .expect("partition-tokens");
+    assert_eq!(pt_resp.tokens_by_partition.len(), 3);
+    for toks in &pt_resp.tokens_by_partition {
+        assert_eq!(toks.len(), 512);
+        assert!(toks.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    // 2. ring-lookup
+    let now_sec = 1_700_000_000_i64;
+    let mut ingesters = HashMap::new();
+    ingesters.insert(
+        "ing-0".to_string(),
+        InstanceDesc {
+            id: "ing-0".to_string(),
+            addr: "10.0.0.1:9095".to_string(),
+            timestamp: now_sec - 5,
+            state: InstanceState::Active as i32,
+            tokens: vec![100, 1000],
+            zone: "zone-a".to_string(),
+            ..Default::default()
+        },
+    );
+    ingesters.insert(
+        "ing-1".to_string(),
+        InstanceDesc {
+            id: "ing-1".to_string(),
+            addr: "10.0.0.2:9095".to_string(),
+            timestamp: now_sec - 5,
+            state: InstanceState::Active as i32,
+            tokens: vec![500, 2000],
+            zone: "zone-b".to_string(),
+            ..Default::default()
+        },
+    );
+    ingesters.insert(
+        "ing-2".to_string(),
+        InstanceDesc {
+            id: "ing-2".to_string(),
+            addr: "10.0.0.3:9095".to_string(),
+            timestamp: now_sec - 5,
+            state: InstanceState::Active as i32,
+            tokens: vec![800, 3000],
+            zone: "zone-c".to_string(),
+            ..Default::default()
+        },
+    );
+    let desc = Desc { ingesters };
+    let desc_b64 = b64.encode(desc.encode_to_vec());
+
+    let lookup_resp: RingLookupResponse = invoke_oracle(
+        "ring-lookup",
+        &RingLookupRequest {
+            desc_b64: desc_b64.clone(),
+            replication_factor: 3,
+            heartbeat_timeout_ms: 60_000,
+            zone_awareness_enabled: true,
+            op: "Write".to_string(),
+            token: 150,
+            now_unix_sec: now_sec,
+        },
+    )
+    .expect("ring-lookup");
+    assert!(lookup_resp.error.is_none(), "{:?}", lookup_resp.error);
+    assert_eq!(lookup_resp.instance_ids, vec!["ing-1", "ing-2", "ing-0"]);
+    assert_eq!(lookup_resp.max_errors, 1);
+
+    // Deterministic unhealthy check via now_unix_sec far in future
+    let unhealthy_resp: RingLookupResponse = invoke_oracle(
+        "ring-lookup",
+        &RingLookupRequest {
+            desc_b64: desc_b64.clone(),
+            replication_factor: 3,
+            heartbeat_timeout_ms: 60_000,
+            zone_awareness_enabled: false,
+            op: "Write".to_string(),
+            token: 150,
+            now_unix_sec: now_sec + 3600,
+        },
+    )
+    .expect("ring-lookup unhealthy");
+    assert!(unhealthy_resp.error.is_some());
+    assert!(unhealthy_resp.instance_ids.is_empty());
+
+    // 3. ring-merge
+    let local_desc = Desc {
+        ingesters: HashMap::from([(
+            "ing-0".to_string(),
+            InstanceDesc {
+                id: "ing-0".to_string(),
+                addr: "10.0.0.1:9095".to_string(),
+                timestamp: 100,
+                state: InstanceState::Active as i32,
+                tokens: vec![10, 20],
+                ..Default::default()
+            },
+        )]),
+    };
+    let remote_desc = Desc {
+        ingesters: HashMap::from([(
+            "ing-1".to_string(),
+            InstanceDesc {
+                id: "ing-1".to_string(),
+                addr: "10.0.0.2:9095".to_string(),
+                timestamp: 200,
+                state: InstanceState::Active as i32,
+                tokens: vec![30, 40],
+                ..Default::default()
+            },
+        )]),
+    };
+    let merge_resp: RingMergeResponse = invoke_oracle(
+        "ring-merge",
+        &RingMergeRequest {
+            local_b64: b64.encode(local_desc.encode_to_vec()),
+            remote_b64: b64.encode(remote_desc.encode_to_vec()),
+            cas: false,
+        },
+    )
+    .expect("ring-merge");
+    let merged = Desc::decode(
+        b64.decode(&merge_resp.merged_b64)
+            .expect("decode merged_b64")
+            .as_slice(),
+    )
+    .expect("decode merged proto");
+    assert_eq!(merged.ingesters.len(), 2);
+    assert!(merge_resp.change_b64.is_some());
+
+    // 4. partition-ring-lookup
+    let mut pr_desc = PartitionRingDesc::default();
+    for pid in 0..3_i32 {
+        pr_desc.partitions.insert(
+            pid,
+            PartitionDesc {
+                id: pid,
+                tokens: vec![],
+                state: PartitionState::PartitionActive as i32,
+                state_timestamp: 100,
+                state_change_locked: false,
+                state_change_locked_timestamp: 0,
+                token_scheme: PartitionTokenScheme::PartitionTokensSmt512 as i32,
+            },
+        );
+        pr_desc.owners.insert(
+            format!("ingester-{pid}"),
+            OwnerDesc {
+                owned_partition: pid,
+                state: OwnerState::OwnerActive as i32,
+                updated_timestamp: 100,
+            },
+        );
+    }
+    let pr_resp: PartitionRingLookupResponse = invoke_oracle(
+        "partition-ring-lookup",
+        &PartitionRingLookupRequest {
+            desc_b64: b64.encode(pr_desc.encode_to_vec()),
+            max_derived_token_partitions: 4,
+            token: 123_456_789,
+            op: "Write".to_string(),
+        },
+    )
+    .expect("partition-ring-lookup");
+    assert!(pr_resp.error.is_none(), "{:?}", pr_resp.error);
+    let pid = pr_resp.partition_id.expect("partition_id");
+    assert!((0..3).contains(&pid));
+    assert_eq!(pr_resp.owners, vec![format!("ingester-{pid}")]);
+
+    // 5. SpawnedKfakeBroker (v2 + snappy + zstd)
+    let broker = SpawnedKfakeBroker::spawn(&KfakeBrokerRequest {
+        topic: "ingest".to_string(),
+        partitions: 4,
+        compression: Some("snappy".to_string()),
+        records: vec![
+            KfakeRecordInput {
+                partition: 0,
+                tenant: "user-1".to_string(),
+                version: 2,
+                compression: None,
+                write_request: WriteRequestJson {
+                    source: "API".to_string(),
+                    timeseries: vec![TimeSeriesJson {
+                        labels: vec![LabelJson {
+                            name: "__name__".to_string(),
+                            value: "up".to_string(),
+                        }],
+                        samples: vec![SampleJson {
+                            timestamp_ms: 1_700_000_000_000,
+                            value: 1.0,
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            },
+            KfakeRecordInput {
+                partition: 2,
+                tenant: "user-2".to_string(),
+                version: 2,
+                compression: Some("zstd".to_string()),
+                write_request: WriteRequestJson {
+                    source: "API".to_string(),
+                    timeseries: vec![TimeSeriesJson {
+                        labels: vec![LabelJson {
+                            name: "__name__".to_string(),
+                            value: "http_requests_total".to_string(),
+                        }],
+                        samples: vec![SampleJson {
+                            timestamp_ms: 1_700_000_001_000,
+                            value: 5.0,
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            },
+        ],
+    })
+    .expect("SpawnedKfakeBroker::spawn");
+
+    assert_eq!(broker.topic(), "ingest");
+    assert!(broker.broker_addr().starts_with("127.0.0.1:"));
+    assert_eq!(
+        broker.offsets(),
+        &[
+            KfakePartitionOffset {
+                partition: 0,
+                start_offset: 0,
+                end_offset: 1
+            },
+            KfakePartitionOffset {
+                partition: 1,
+                start_offset: 0,
+                end_offset: 0
+            },
+            KfakePartitionOffset {
+                partition: 2,
+                start_offset: 0,
+                end_offset: 1
+            },
+            KfakePartitionOffset {
+                partition: 3,
+                start_offset: 0,
+                end_offset: 0
+            },
+        ]
+    );
+
+    // Verify broker TCP listener is live while guard is held.
+    let conn = TcpStream::connect(broker.broker_addr()).expect("connect to kfake broker");
+    drop(conn);
+    drop(broker);
 }

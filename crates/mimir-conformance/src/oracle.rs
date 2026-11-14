@@ -1,8 +1,8 @@
 //! Helpers to locate, build, and invoke `target/go-oracle` and `target/go-mimir`.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -295,4 +295,193 @@ pub struct VerifyTsdbDirResponse {
     pub block_ulids: Vec<String>,
     pub head_series: u64,
     pub series: Vec<TsdbSeriesFixtureJson>,
+}
+
+// --- Wave 2 oracle types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionTokensRequest {
+    pub partitions: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionTokensResponse {
+    pub tokens_by_partition: Vec<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RingLookupRequest {
+    pub desc_b64: String,
+    pub replication_factor: i32,
+    pub heartbeat_timeout_ms: i64,
+    pub zone_awareness_enabled: bool,
+    pub op: String,
+    pub token: u32,
+    pub now_unix_sec: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RingLookupResponse {
+    #[serde(default)]
+    pub instance_ids: Vec<String>,
+    #[serde(default)]
+    pub max_errors: i32,
+    #[serde(default)]
+    pub max_unavailable_zones: i32,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RingMergeRequest {
+    pub local_b64: String,
+    pub remote_b64: String,
+    pub cas: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RingMergeResponse {
+    pub merged_b64: String,
+    #[serde(default)]
+    pub change_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionRingLookupRequest {
+    pub desc_b64: String,
+    pub max_derived_token_partitions: i32,
+    pub token: u32,
+    pub op: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionRingLookupResponse {
+    #[serde(default)]
+    pub partition_id: Option<i32>,
+    #[serde(default)]
+    pub owners: Vec<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KfakeRecordInput {
+    pub partition: i32,
+    pub tenant: String,
+    pub version: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<String>,
+    pub write_request: WriteRequestJson,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KfakeBrokerRequest {
+    pub topic: String,
+    pub partitions: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<String>,
+    #[serde(default)]
+    pub records: Vec<KfakeRecordInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KfakePartitionOffset {
+    pub partition: i32,
+    pub start_offset: i64,
+    pub end_offset: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KfakeBrokerReady {
+    pub broker_addr: String,
+    pub topic: String,
+    #[serde(default)]
+    pub offsets: Vec<KfakePartitionOffset>,
+}
+
+/// RAII guard for a live `go-oracle kfake-broker` daemon.
+///
+/// Spawns `go-oracle kfake-broker`, sends the seed configuration line, waits for the
+/// ready JSON line containing `broker_addr` and `offsets`, and keeps stdin open until
+/// dropped. Dropping closes stdin so the Go process shuts down `kfake` cleanly.
+pub struct SpawnedKfakeBroker {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    pub ready: KfakeBrokerReady,
+}
+
+impl SpawnedKfakeBroker {
+    pub fn spawn(req: &KfakeBrokerRequest) -> Result<Self> {
+        let bin = ensure_go_oracle_built()?;
+        let mut payload = serde_json::to_vec(req).context("serialize kfake-broker request")?;
+        payload.push(b'\n');
+
+        let mut child = Command::new(&bin)
+            .arg("kfake-broker")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to spawn {} kfake-broker", bin.display()))?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("kfake-broker child missing stdin")?;
+        stdin
+            .write_all(&payload)
+            .context("write kfake-broker config line")?;
+        stdin.flush().context("flush kfake-broker stdin")?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .context("kfake-broker child missing stdout")?;
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .context("read kfake-broker ready line")?;
+        if n == 0 {
+            drop(stdin);
+            let mut stderr_buf = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut stderr_buf);
+            }
+            let status = child.wait().context("wait for failed kfake-broker")?;
+            bail!(
+                "go-oracle kfake-broker exited before ready ({}): {}",
+                status,
+                stderr_buf.trim()
+            );
+        }
+
+        let ready: KfakeBrokerReady = serde_json::from_str(&line)
+            .with_context(|| format!("decode kfake-broker ready line: {}", line.trim()))?;
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            ready,
+        })
+    }
+
+    pub fn broker_addr(&self) -> &str {
+        &self.ready.broker_addr
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.ready.topic
+    }
+
+    pub fn offsets(&self) -> &[KfakePartitionOffset] {
+        &self.ready.offsets
+    }
+}
+
+impl Drop for SpawnedKfakeBroker {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.wait();
+    }
 }
