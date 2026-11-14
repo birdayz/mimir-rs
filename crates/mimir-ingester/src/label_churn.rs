@@ -61,20 +61,20 @@ impl SeriesRefHistory {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LabelChurnResponse {
     pub since: String,
     pub scores: Vec<LabelChurnScore>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LabelChurnScore {
     pub label_name: String,
     pub score: u64,
     pub metric_names: Vec<LabelChurnMetricName>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LabelChurnMetricName {
     pub metric_name: String,
     pub sampled_series: u64,

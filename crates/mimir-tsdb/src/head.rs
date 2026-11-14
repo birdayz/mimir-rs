@@ -2128,10 +2128,62 @@ impl Head {
     pub fn collect_ooo_compaction_series(
         &self,
     ) -> Result<(Vec<CompactionSeries>, i64, i64), HeadError> {
+        let mut writer_guard = self.chunk_writer.lock();
+        let mut mmapped_any = false;
+        let mut ooo_markers: Vec<RefMmapMarker> = Vec::new();
+        let entries = self.series.all_entries();
+        if let Some(ref mut writer) = *writer_guard {
+            for entry in &entries {
+                let mut st = entry.inner.lock();
+                if let Some(ref mut ooo) = st.ooo {
+                    if let Some(ohc) = ooo.ooo_head_chunk.take() {
+                        let cut_chunks = ohc.chunk.to_encoded_chunks(i64::MIN, i64::MAX)?;
+                        for cc in cut_chunks {
+                            let r = writer.write_chunk(
+                                entry.ref_id,
+                                cc.min_time,
+                                cc.max_time,
+                                &cc.chunk,
+                                true,
+                            )?;
+                            ooo.ooo_mmapped_chunks.push(MmappedChunk {
+                                ref_id: r,
+                                min_time: cc.min_time,
+                                max_time: cc.max_time,
+                                num_samples: cc.chunk.num_samples() as u16,
+                                encoding: cc.chunk.encoding(),
+                            });
+                            ooo_markers.push(RefMmapMarker {
+                                ref_id: entry.ref_id,
+                                mmap_ref: r.as_u64(),
+                            });
+                            mmapped_any = true;
+                        }
+                    }
+                }
+            }
+            if mmapped_any {
+                writer.flush()?;
+            }
+        }
+        drop(writer_guard);
+
+        if !ooo_markers.is_empty() {
+            if let Some(ref mut wbl) = *self.wbl.lock() {
+                let enc = RecordEncoder::new(self.opts.enable_st_storage);
+                let rec = enc.mmap_markers(&ooo_markers, Vec::new());
+                wbl.log(&[&rec])?;
+            }
+        }
+
+        if mmapped_any {
+            let reader = HeadChunksReader::open(self.dir.join("chunks_head"))?;
+            *self.chunk_reader.write() = Some(reader);
+        }
+
         let chunk_reader_guard = self.chunk_reader.read();
         let chunk_reader = chunk_reader_guard.as_ref();
 
-        let entries = self.series.all_entries();
         let mut out = Vec::new();
         let mut mint = i64::MAX;
         let mut maxt = i64::MIN;
@@ -2186,6 +2238,7 @@ impl Head {
     pub fn clear_ooo_data(&self) -> Result<(), HeadError> {
         let entries = self.series.all_entries();
         let mut to_delete = Vec::new();
+        let mut min_mmap_seq = usize::MAX;
         for entry in entries {
             let mut st = entry.inner.lock();
             if st.pending_commits > 0 {
@@ -2194,6 +2247,11 @@ impl Head {
             st.ooo = None;
             if st.mmapped_chunks.is_empty() && st.head_chunks.is_empty() {
                 to_delete.push(Arc::clone(&entry));
+            } else {
+                for mc in &st.mmapped_chunks {
+                    let (seq, _) = mc.ref_id.unpack();
+                    min_mmap_seq = min_mmap_seq.min(seq as usize);
+                }
             }
         }
         self.min_ooo_time.store(i64::MAX, Ordering::Release);
@@ -2201,6 +2259,24 @@ impl Head {
         self.wbl_pinned_refs.lock().clear();
         if !to_delete.is_empty() {
             self.delete_series_entries(&to_delete);
+        }
+
+        let (has_active, active_seq) = {
+            let w = self.chunk_writer.lock();
+            w.as_ref()
+                .map_or((false, 0usize), |wr| (wr.has_active_file(), wr.current_seq()))
+        };
+        let cut_before = if has_active {
+            min_mmap_seq.min(active_seq)
+        } else {
+            min_mmap_seq
+        };
+        if cut_before > 1 {
+            let reader_opt = self.chunk_reader.write().take();
+            if let Some(reader) = reader_opt {
+                let truncated = reader.truncate(cut_before)?;
+                *self.chunk_reader.write() = Some(truncated);
+            }
         }
         Ok(())
     }
@@ -3467,6 +3543,14 @@ impl<'a> HeadAppender<'a> {
                     wbl.log(&slices)?;
                 }
             }
+        }
+
+        if wbl_markers.iter().any(|m| m.mmap_ref != 0) {
+            if let Some(ref mut cw) = *self.head.chunk_writer.lock() {
+                cw.flush()?;
+            }
+            let reader = HeadChunksReader::open(self.head.dir.join("chunks_head"))?;
+            *self.head.chunk_reader.write() = Some(reader);
         }
 
         Ok(())

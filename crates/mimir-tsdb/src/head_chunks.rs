@@ -255,6 +255,14 @@ impl HeadChunksWriter {
         Ok(())
     }
 
+    pub fn has_active_file(&self) -> bool {
+        self.cur_writer.is_some()
+    }
+
+    pub fn current_seq(&self) -> usize {
+        self.seq
+    }
+
     pub fn close(mut self) -> Result<(), HeadChunksError> {
         self.close_inner()
     }

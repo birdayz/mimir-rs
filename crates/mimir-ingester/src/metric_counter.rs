@@ -35,7 +35,7 @@ impl MetricCounter {
     }
 
     fn shard(&self, metric_name: &str) -> &Mutex<MetricCounterShard> {
-        let fp = fnv64a(metric_name.as_bytes());
+        let fp = hash_metric_name(metric_name);
         let h = hash_fp(fp) as usize;
         &self.shards[h % NUM_METRIC_COUNTER_SHARDS]
     }
@@ -64,6 +64,12 @@ impl MetricCounter {
             }
         }
     }
+}
+
+/// FNV-1a 64-bit hash matching `pkg/ingester/metric_counter.go:hashMetricName`.
+#[inline]
+pub fn hash_metric_name(metric: &str) -> u64 {
+    fnv64a(metric.as_bytes())
 }
 
 #[inline]

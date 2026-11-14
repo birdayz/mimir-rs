@@ -182,7 +182,7 @@ struct LifecycleCallbackAdapter {
     max_in_memory_series_fn: Arc<dyn Fn() -> i64 + Send + Sync>,
     rejected_counter: CounterVec,
     owned_state: Arc<Mutex<OwnedSeriesState>>,
-    use_owned_series_for_limits: bool,
+    use_owned_series_for_limits: AtomicBool,
     num_series_fn: RwLock<Option<Arc<dyn Fn() -> u64 + Send + Sync>>>,
     pending_series_removals: Arc<AtomicI64>,
 }
@@ -202,17 +202,18 @@ impl SeriesLifecycleCallback for LifecycleCallbackAdapter {
             return Err(HeadError::MaxInMemorySeriesReached);
         }
 
-        let (series_count, min_local_limit) = if self.use_owned_series_for_limits {
-            let os = self.owned_state.lock();
-            (os.owned_series_count, os.local_series_limit)
-        } else {
-            let head_series = self
-                .num_series_fn
-                .read()
-                .as_ref()
-                .map_or(0, |f| f() as usize);
-            (head_series, 0)
-        };
+        let (series_count, min_local_limit) =
+            if self.use_owned_series_for_limits.load(Ordering::Acquire) {
+                let os = self.owned_state.lock();
+                (os.owned_series_count, os.local_series_limit)
+            } else {
+                let head_series = self
+                    .num_series_fn
+                    .read()
+                    .as_ref()
+                    .map_or(0, |f| f() as usize);
+                (head_series, 0)
+            };
 
         if !limiter.is_within_max_series_per_user(&self.user_id, series_count, min_local_limit) {
             return Err(HeadError::MaxSeriesPerUser);
@@ -305,7 +306,7 @@ pub struct UserTsdb {
     owned_token_ranges: Mutex<Vec<u32>>,
     requires_owned_series_update: Mutex<Option<String>>,
     pending_non_owned_refs: Mutex<HashMap<u64, Instant>>,
-    early_compaction_non_owned_enabled: bool,
+    early_compaction_non_owned_enabled: AtomicBool,
 
     lifecycle_adapter: Arc<LifecycleCallbackAdapter>,
 }
@@ -363,7 +364,9 @@ impl UserTsdb {
             max_in_memory_series_fn,
             rejected_counter,
             owned_state: Arc::clone(&owned_state),
-            use_owned_series_for_limits: ingester_cfg.use_ingester_owned_series_for_limits,
+            use_owned_series_for_limits: AtomicBool::new(
+                ingester_cfg.use_ingester_owned_series_for_limits,
+            ),
             num_series_fn: RwLock::new(None),
             pending_series_removals: Arc::clone(&pending_series_removals),
         });
@@ -507,8 +510,9 @@ impl UserTsdb {
                 RECOMPUTE_OWNED_SERIES_REASON_NEW_USER.to_string(),
             )),
             pending_non_owned_refs: Mutex::new(HashMap::new()),
-            early_compaction_non_owned_enabled: ingester_cfg
-                .early_compaction_non_owned_series_enabled,
+            early_compaction_non_owned_enabled: AtomicBool::new(
+                ingester_cfg.early_compaction_non_owned_series_enabled,
+            ),
             lifecycle_adapter,
         });
 
@@ -825,6 +829,46 @@ impl UserTsdb {
         }
     }
 
+    pub fn peek_reason_for_recompute_owned_series(&self) -> Option<String> {
+        self.requires_owned_series_update.lock().clone()
+    }
+
+    pub fn set_owned_series_state(&self, state: OwnedSeriesState) {
+        *self.owned_state.lock() = state;
+    }
+
+    pub fn add_owned_series_count(&self, delta: usize) {
+        self.owned_state.lock().owned_series_count += delta;
+    }
+
+    pub fn get_series_count_and_min_local_limit(&self) -> (usize, usize) {
+        if self
+            .lifecycle_adapter
+            .use_owned_series_for_limits
+            .load(Ordering::Acquire)
+        {
+            let os = self.owned_state.lock();
+            (os.owned_series_count, os.local_series_limit)
+        } else {
+            (self.db.head().num_series() as usize, 0)
+        }
+    }
+
+    pub fn set_use_owned_series_for_limits(&self, v: bool) {
+        self.lifecycle_adapter
+            .use_owned_series_for_limits
+            .store(v, Ordering::Release);
+    }
+
+    pub fn set_early_compaction_non_owned_enabled(&self, v: bool) {
+        self.early_compaction_non_owned_enabled
+            .store(v, Ordering::Release);
+    }
+
+    pub fn pending_non_owned_refs_snapshot(&self) -> HashMap<u64, Instant> {
+        self.pending_non_owned_refs.lock().clone()
+    }
+
     pub fn take_reason_for_recompute_owned_series(&self) -> Option<String> {
         self.requires_owned_series_update.lock().take()
     }
@@ -874,7 +918,9 @@ impl UserTsdb {
         }
         let mut count = 0usize;
         let mut non_owned_refs = HashSet::new();
-        let track_non_owned = self.early_compaction_non_owned_enabled;
+        let track_non_owned = self
+            .early_compaction_non_owned_enabled
+            .load(Ordering::Acquire);
         let user_id = &self.user_id;
 
         self.db.head().for_each_series(|ref_id, labels| {
@@ -901,14 +947,28 @@ impl UserTsdb {
         count
     }
 
-    pub fn recompute_owned_series(&self, shard_size: usize, _reason: &str) -> bool {
-        const MAX_ATTEMPTS: usize = 3;
-        const MAX_DIFF: isize = 1000;
+    pub fn recompute_owned_series(&self, shard_size: usize, reason: &str) -> bool {
+        self.recompute_owned_series_with_compute_fn(shard_size, reason, || {
+            self.compute_owned_series()
+        })
+        .0
+    }
 
+    pub fn recompute_owned_series_with_compute_fn(
+        &self,
+        shard_size: usize,
+        _reason: &str,
+        mut compute_fn: impl FnMut() -> usize,
+    ) -> (bool, usize) {
+        pub const MAX_ATTEMPTS: usize = 3;
+        pub const MAX_DIFF: isize = 1000;
+
+        let mut attempts = 0usize;
         for _ in 0..MAX_ATTEMPTS {
+            attempts += 1;
             let owned_before = self.owned_series_state().owned_series_count as isize;
             let local_limit_new = self.limiter.max_series_per_user(&self.user_id, 0);
-            let owned_new = self.compute_owned_series();
+            let owned_new = compute_fn();
 
             let mut os = self.owned_state.lock();
             let diff = (os.owned_series_count as isize) - owned_before;
@@ -916,10 +976,10 @@ impl UserTsdb {
             os.shard_size = shard_size;
             os.local_series_limit = local_limit_new;
             if (0..=MAX_DIFF).contains(&diff) {
-                return true;
+                return (true, attempts);
             }
         }
-        false
+        (false, attempts)
     }
 
     pub fn update_owned_series_if_needed(

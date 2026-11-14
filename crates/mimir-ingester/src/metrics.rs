@@ -203,6 +203,7 @@ pub struct IngesterMetrics {
     pub shutdown_marker: Gauge,
     pub utilization_limited_requests: CounterVec,
     pub index_lookup_comparison_outcomes: CounterVec,
+    label_value_bytes_labels: Mutex<HashMap<String, std::collections::HashSet<String>>>,
 }
 
 fn reg_counter(reg: Option<&Registry>, name: &str, help: &str) -> Counter {
@@ -687,6 +688,7 @@ impl IngesterMetrics {
                 "Total number of index lookup planning comparison outcomes when using mirrored chunk querier.",
                 &["outcome", "user"],
             ),
+            label_value_bytes_labels: Mutex::new(HashMap::new()),
         }
     }
 
@@ -740,6 +742,32 @@ impl IngesterMetrics {
             .attributed_active_series_failures_per_user
             .remove_label_values(&[user_id]);
         self.delete_per_user_custom_tracker_metrics(user_id, custom_tracker_names);
+    }
+
+    pub fn record_label_value_bytes_over_threshold(&self, user_id: &str, label_name: &str) {
+        self.label_value_bytes_over_threshold
+            .with_label_values(&[user_id, label_name])
+            .set(1.0);
+        self.label_value_bytes_labels
+            .lock()
+            .entry(user_id.to_string())
+            .or_default()
+            .insert(label_name.to_string());
+    }
+
+    pub fn delete_user_label_value_bytes_metrics(&self, user_id: &str, label_names: &[String]) {
+        for lbl in label_names {
+            let _ = self
+                .label_value_bytes_over_threshold
+                .remove_label_values(&[user_id, lbl]);
+        }
+        if let Some(tracked) = self.label_value_bytes_labels.lock().remove(user_id) {
+            for lbl in tracked {
+                let _ = self
+                    .label_value_bytes_over_threshold
+                    .remove_label_values(&[user_id, &lbl]);
+            }
+        }
     }
 
     pub fn delete_per_user_custom_tracker_metrics(

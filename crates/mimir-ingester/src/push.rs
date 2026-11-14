@@ -45,8 +45,12 @@ pub struct PushPermit<'a> {
 }
 
 impl PushPermit<'_> {
-    pub fn finish(mut self, err: Option<&IngesterError>) {
+    pub fn finish(self, err: Option<&IngesterError>) {
         let dur = self.started_at.elapsed();
+        self.finish_with_duration(dur, err);
+    }
+
+    pub fn finish_with_duration(mut self, dur: Duration, err: Option<&IngesterError>) {
         self.ingester
             .inflight_push_requests
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -57,10 +61,10 @@ impl PushPermit<'_> {
         }
         drop(self.inflight_permit.take());
         if let Some(bp) = self.breaker_permit.take() {
-            bp.finish(dur, false);
+            let be = err.map(|e| crate::circuit_breaker::BreakerError::Ingester(e.clone()));
+            bp.finish_with_err(dur, be.as_ref());
         }
         if let Some(rp) = self.reactive_permit.take() {
-            let _ = err;
             rp.record();
         }
     }
@@ -805,7 +809,7 @@ impl Ingester {
         db: &UserTsdb,
         source: cortexpb::write_request::SourceEnum,
         skip_label_validation: bool,
-        skip_label_count_validation: bool,
+        _skip_label_count_validation: bool,
         timeseries: I,
     ) -> Result<(), IngesterError>
     where
@@ -916,23 +920,6 @@ impl Ingester {
 
             // Additional validation when not skipped
             if series_ref.is_none() {
-                if !skip_label_count_validation
-                    && limits.max_label_names_per_series > 0
-                    && pairs.len() > limits.max_label_names_per_series as usize
-                {
-                    let s_str = make_series_str(&pairs);
-                    let total_bad =
-                        samples.len() + if native_histograms_enabled { hist_count } else { 0 };
-                    stats.failed_samples += total_bad;
-                    stats.failed_exemplars += ts.exemplar_count();
-                    record_partial(IngesterError::max_label_names_per_series(
-                        pairs.len(),
-                        limits.max_label_names_per_series as usize,
-                        s_str,
-                    ));
-                    continue;
-                }
-
                 if !skip_label_validation {
                     if let Some(err) = validate_label_pairs(&pairs, &limits, &mut make_series_str) {
                         let total_bad = samples.len()
@@ -1431,11 +1418,9 @@ fn handle_head_append_error<'a>(
 
 fn validate_label_pairs<'a>(
     pairs: &[(&'a str, &'a str)],
-    limits: &LimitsConfig,
+    _limits: &LimitsConfig,
     make_series_str: SeriesFormatter<'_, 'a>,
 ) -> Option<IngesterError> {
-    let max_name_len = limits.max_label_name_length.max(0) as usize;
-    let max_val_len = limits.max_label_value_length.max(0) as usize;
     let mut has_metric_name = false;
 
     for &(name, value) in pairs {
@@ -1445,20 +1430,6 @@ fn validate_label_pairs<'a>(
         if name.is_empty() {
             return Some(IngesterError::invalid_label_name(
                 name,
-                make_series_str(pairs),
-            ));
-        }
-        if max_name_len > 0 && name.len() > max_name_len {
-            return Some(IngesterError::label_name_too_long(
-                name,
-                max_name_len,
-                make_series_str(pairs),
-            ));
-        }
-        if max_val_len > 0 && value.len() > max_val_len {
-            return Some(IngesterError::label_value_too_long(
-                value,
-                max_val_len,
                 make_series_str(pairs),
             ));
         }

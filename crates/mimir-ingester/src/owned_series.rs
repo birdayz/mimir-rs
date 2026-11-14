@@ -1,8 +1,13 @@
 //! Owned-series tracking & ring strategies matching `pkg/ingester/owned_series.go`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use mimir_common::services::{
+    basic_service, start_and_await_running, stop_and_await_terminated, ManagedBasicService,
+    Service, ServiceContext, ServiceError, State,
+};
 use mimir_config::Overrides;
 use mimir_proto::ringpb::InstanceState;
 use mimir_proto::sharding::shard_by_all_labels;
@@ -12,6 +17,9 @@ use mimir_ring::ring::{Ring, RingError};
 use mimir_tsdb::labels::Labels;
 use parking_lot::Mutex;
 use prometheus::{Histogram, HistogramOpts, Registry};
+use tracing::{debug, info, warn};
+
+use crate::user_tsdb::UserTsdb;
 
 pub const RECOMPUTE_OWNED_SERIES_REASON_EARLY_COMPACTION: &str = "early compaction";
 pub const RECOMPUTE_OWNED_SERIES_REASON_COMPACTION: &str = "compaction";
@@ -222,6 +230,173 @@ impl OwnedSeriesMetrics {
 }
 
 pub const DEFAULT_OWNED_SERIES_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+type GetUsersFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+type GetTsdbFn = Arc<dyn Fn(&str) -> Option<Arc<UserTsdb>> + Send + Sync>;
+
+/// Service periodically recomputing owned series per tenant (`pkg/ingester/owned_series.go:ownedSeriesService`).
+pub struct OwnedSeriesService {
+    ring_strategy: Arc<dyn OwnedSeriesRingStrategy>,
+    get_tsdb_users: GetUsersFn,
+    get_tsdb: GetTsdbFn,
+    metrics: OwnedSeriesMetrics,
+    interval: Duration,
+    initial_ring_check_succeeded: AtomicBool,
+    last_reasons: Mutex<Vec<String>>,
+    service: Mutex<Option<Arc<ManagedBasicService>>>,
+}
+
+impl OwnedSeriesService {
+    pub fn new(
+        interval: Duration,
+        ring_strategy: Arc<dyn OwnedSeriesRingStrategy>,
+        reg: Option<&Registry>,
+        get_tsdb_users: GetUsersFn,
+        get_tsdb: GetTsdbFn,
+    ) -> Arc<Self> {
+        let this = Arc::new(Self {
+            ring_strategy,
+            get_tsdb_users,
+            get_tsdb,
+            metrics: OwnedSeriesMetrics::new(reg),
+            interval,
+            initial_ring_check_succeeded: AtomicBool::new(false),
+            last_reasons: Mutex::new(Vec::new()),
+            service: Mutex::new(None),
+        });
+
+        let s_start = Arc::clone(&this);
+        let s_run = Arc::clone(&this);
+        let basic = basic_service(
+            Some(Box::new(move |_ctx: ServiceContext| {
+                let s = Arc::clone(&s_start);
+                Box::pin(async move {
+                    match s.ring_strategy.check_ring_for_changes() {
+                        Ok(_) => {
+                            s.initial_ring_check_succeeded.store(true, Ordering::Release);
+                            let _ = s.update_all_tenants(true);
+                        }
+                        Err(e) => {
+                            if e.contains("empty") {
+                                warn!("skipped initial owned series computation, ring is empty");
+                                s.initial_ring_check_succeeded
+                                    .store(false, Ordering::Release);
+                            } else {
+                                return Err(ServiceError::failure(format!("can't read ring: {e}")));
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+            })),
+            Some(Box::new(move |ctx: ServiceContext| {
+                let s = Arc::clone(&s_run);
+                Box::pin(async move {
+                    let mut ticker_interval = if s.initial_ring_check_succeeded.load(Ordering::Acquire) {
+                        s.interval
+                    } else {
+                        DEFAULT_OWNED_SERIES_INITIAL_RETRY_INTERVAL
+                    };
+                    loop {
+                        tokio::select! {
+                            _ = ctx.canceled() => return Ok(()),
+                            _ = tokio::time::sleep(ticker_interval) => {
+                                match s.ring_strategy.check_ring_for_changes() {
+                                    Ok(ring_changed) => {
+                                        if ticker_interval != s.interval {
+                                            ticker_interval = s.interval;
+                                        }
+                                        s.update_all_tenants(ring_changed);
+                                    }
+                                    Err(e) => {
+                                        debug!(error = %e, "can't check ring for updates");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+            })),
+            None,
+        );
+        *this.service.lock() = Some(basic);
+        this
+    }
+
+    pub async fn start_and_await_running(&self) -> Result<(), String> {
+        let svc = self.service.lock().clone().expect("service initialized");
+        let ctx = ServiceContext::background();
+        start_and_await_running(ctx, svc.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn stop_and_await_terminated(&self) -> Result<(), String> {
+        let svc = self.service.lock().clone().expect("service initialized");
+        let ctx = ServiceContext::background();
+        stop_and_await_terminated(ctx, svc.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn state(&self) -> State {
+        self.service
+            .lock()
+            .as_ref()
+            .map_or(State::New, |s| s.state())
+    }
+
+    pub fn update_all_tenants(&self, ring_changed: bool) -> usize {
+        let mut updated = 0usize;
+        let mut reasons = Vec::new();
+        let start = Instant::now();
+        for user_id in (self.get_tsdb_users)() {
+            let Some(db) = (self.get_tsdb)(&user_id) else {
+                continue;
+            };
+            let shard_size = self.ring_strategy.shard_size_for_user(&user_id);
+            let local_limit = db.limiter.max_series_per_user(&user_id, 0);
+            let reason_preview = db.peek_reason_for_recompute_owned_series().or_else(|| {
+                let os = db.owned_series_state();
+                if shard_size != os.shard_size {
+                    Some(RECOMPUTE_OWNED_SERIES_REASON_SHARD_SIZE_CHANGED.to_string())
+                } else if local_limit != os.local_series_limit {
+                    Some(RECOMPUTE_OWNED_SERIES_REASON_LOCAL_LIMIT_CHANGED.to_string())
+                } else {
+                    None
+                }
+            });
+            if db.update_owned_series_if_needed(self.ring_strategy.as_ref(), ring_changed) {
+                updated += 1;
+                if let Some(r) = reason_preview {
+                    reasons.push(r);
+                } else {
+                    reasons.push(RECOMPUTE_OWNED_SERIES_REASON_RING_CHANGED.to_string());
+                }
+            } else if let Some(r) = db.peek_reason_for_recompute_owned_series() {
+                if r == RECOMPUTE_OWNED_SERIES_REASON_GET_TOKEN_RANGES_FAILED {
+                    reasons.push(r);
+                }
+            }
+        }
+        *self.last_reasons.lock() = reasons;
+        let elapsed = start.elapsed();
+        self.metrics.check_duration.observe(elapsed.as_secs_f64());
+        if updated > 0 {
+            info!(
+                updated_users = updated,
+                ring_changed,
+                duration_ms = elapsed.as_millis(),
+                "updated owned series for users"
+            );
+        }
+        updated
+    }
+
+    pub fn last_update_reasons(&self) -> Vec<String> {
+        self.last_reasons.lock().clone()
+    }
+}
 
 #[cfg(test)]
 mod tests {

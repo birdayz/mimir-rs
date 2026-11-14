@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use mimir_common::limiter::InflightLimiter;
-use mimir_common::services::{Service, ServiceContext, State};
+use mimir_common::services::{ManagedBasicService, Service, ServiceContext, State};
 use mimir_common::shutdownmarker;
 use mimir_config::{
     BlocksStorageConfig, IngestStorageConfig, IngesterConfig, InstanceLimits, Overrides,
@@ -101,6 +101,7 @@ pub struct Ingester {
 
     state: RwLock<State>,
     service_ctx: RwLock<Option<ServiceContext>>,
+    lifecycler_service: Mutex<Option<Arc<ManagedBasicService>>>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
 
     pub force_compact_tx: RwLock<Option<mpsc::Sender<TriggerRequest>>>,
@@ -304,6 +305,7 @@ impl Ingester {
             ignored_series_limit_metrics,
             state: RwLock::new(State::New),
             service_ctx: RwLock::new(None),
+            lifecycler_service: Mutex::new(None),
             background_tasks: Mutex::new(Vec::new()),
             force_compact_tx: RwLock::new(None),
             ship_tx: RwLock::new(None),
@@ -318,6 +320,10 @@ impl Ingester {
     #[inline]
     pub fn state(&self) -> State {
         *self.state.read()
+    }
+
+    pub fn set_state_for_test(&self, state: State) {
+        *self.state.write() = state;
     }
 
     pub fn service_context(&self) -> Option<ServiceContext> {
@@ -708,6 +714,7 @@ impl Ingester {
 
         if let Some(ref lc) = self.lifecycler {
             let svc = Arc::clone(lc).into_service();
+            *self.lifecycler_service.lock() = Some(Arc::clone(&svc));
             let lc_ctx = ctx.child();
             svc.start_async(lc_ctx)
                 .await
@@ -825,7 +832,11 @@ impl Ingester {
         }
 
         // 4. Stop partition lifecycler & classic lifecycler
-        if let Some(ref lc) = self.lifecycler {
+        let lc_svc = self.lifecycler_service.lock().take();
+        if let Some(svc) = lc_svc {
+            svc.stop_async();
+            let _ = svc.await_terminated().await;
+        } else if let Some(ref lc) = self.lifecycler {
             let svc = Arc::clone(lc).into_service();
             svc.stop_async();
             let _ = svc.await_terminated().await;

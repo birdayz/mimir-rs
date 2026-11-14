@@ -9,6 +9,8 @@
 //! - github.com/grafana/mimir/pkg/querier/api/consistency.go
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -19,15 +21,24 @@ use mimir_proto::ingesterpb;
 use mimir_proto::prost::Message;
 use mimir_storage::ingest::PartitionOffsets;
 use mimir_tsdb::chunkenc::Encoding;
+use mimir_tsdb::chunks_block::ChunkMeta;
+use mimir_tsdb::db::Tsdb;
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::matcher::{LabelMatcher, MatchType};
+use mimir_tsdb::querier::QueryChunkSeries;
 use mimir_tsdb::search::{FuzzAlg, SearchHints, SearchOrdering};
+use parking_lot::Mutex;
+use tokio::sync::mpsc;
 use tonic::metadata::MetadataMap;
 
 use crate::circuit_breaker::BreakerPermit;
 use crate::errors::IngesterError;
 use crate::ingester::{Ingester, INGEST_STORAGE_DEFAULT_READ_CONSISTENCY_TIMEOUT};
+use crate::lookupplan::{self, BasicLookupPlan, LookupPlanner, NoopPlanner, SelectHints};
 use crate::metrics::REASON_MAX_INFLIGHT_READ_REQUESTS;
+use crate::mirror_querier::{
+    ChunkBlockMeta, ChunkQuerier, ChunkSeries, ChunkSeriesSet, MirroredChunkQuerier, QuerierError,
+};
 use crate::user_tsdb::UserTsdb;
 
 pub const QUERY_STREAM_BATCH_SIZE: usize = 128;
@@ -393,14 +404,82 @@ impl Ingester {
             return Ok(Vec::new());
         };
 
-        let cq = db
-            .db
-            .chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms);
-        let mut chunk_series = cq
-            .select(true, &matchers)
-            .map_err(|e| IngesterError::Internal {
-                message: format!("selecting series from ChunkQuerier: {e}"),
-            })?;
+        let mut chunk_series = if self
+            .blocks_cfg
+            .tsdb
+            .index_lookup_planning
+            .index_lookup_planning_enabled
+        {
+            let planner: Arc<dyn LookupPlanner> = Arc::new(NoopPlanner);
+            let mut planned_cq = PlannedTsdbChunkQuerier::new(
+                Arc::clone(&db.db),
+                req.start_timestamp_ms,
+                req.end_timestamp_ms,
+                planner,
+            );
+            let select_hints = shard.map(|(shard_index, shard_count)| SelectHints {
+                shard_index,
+                shard_count,
+            });
+            let portion = self
+                .blocks_cfg
+                .tsdb
+                .index_lookup_planning
+                .index_lookup_planning_comparison_portion;
+            if portion > 0.0 && rand::random::<f64>() <= portion {
+                let mut mq = MirroredChunkQuerier::new_with_meta(
+                    user_id,
+                    self.metrics.index_lookup_comparison_outcomes.clone(),
+                    req.start_timestamp_ms,
+                    req.end_timestamp_ms,
+                    ChunkBlockMeta::default(),
+                    Box::new(planned_cq),
+                );
+                let mut ss = mq.select(true, select_hints.as_ref(), &matchers);
+                let mut out = Vec::new();
+                while ss.next() {
+                    if let Some(s) = ss.at() {
+                        out.push(QueryChunkSeries {
+                            labels: s.labels(),
+                            chunks: s.chunks(),
+                        });
+                    }
+                }
+                if let Some(e) = ss.err() {
+                    return Err(IngesterError::Internal {
+                        message: format!("selecting series from MirroredChunkQuerier: {e}"),
+                    });
+                }
+                drop(ss);
+                let _ = mq.close();
+                out
+            } else {
+                let mut ss = planned_cq.select(true, select_hints.as_ref(), &matchers);
+                let mut out = Vec::new();
+                while ss.next() {
+                    if let Some(s) = ss.at() {
+                        out.push(QueryChunkSeries {
+                            labels: s.labels(),
+                            chunks: s.chunks(),
+                        });
+                    }
+                }
+                if let Some(e) = ss.err() {
+                    return Err(IngesterError::Internal {
+                        message: format!("selecting series from PlannedChunkQuerier: {e}"),
+                    });
+                }
+                out
+            }
+        } else {
+            let cq = db
+                .db
+                .chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms);
+            cq.select(true, &matchers)
+                .map_err(|e| IngesterError::Internal {
+                    message: format!("selecting series from ChunkQuerier: {e}"),
+                })?
+        };
 
         if let Some((shard_idx, shard_count)) = shard {
             chunk_series.retain(|cs| {
@@ -1177,6 +1256,543 @@ fn labels_stable_hash(lbls: &Labels) -> u64 {
 
 #[allow(dead_code)]
 fn _unused_btreemap_check(_: BTreeMap<String, Vec<String>>) {}
+
+// ---------------------------------------------------------------------------
+// Lookupplan + MirroredChunkQuerier TSDB Adapter
+// ---------------------------------------------------------------------------
+
+struct TsdbChunkSeriesItem {
+    labels: Labels,
+    chunks: Vec<ChunkMeta>,
+}
+
+impl ChunkSeries for TsdbChunkSeriesItem {
+    fn labels(&self) -> Labels {
+        self.labels.clone()
+    }
+
+    fn chunks(&self) -> Vec<ChunkMeta> {
+        self.chunks.clone()
+    }
+}
+
+struct VecChunkSeriesSet {
+    items: Vec<Arc<dyn ChunkSeries>>,
+    pos: usize,
+    err: Option<QuerierError>,
+}
+
+impl ChunkSeriesSet for VecChunkSeriesSet {
+    fn next(&mut self) -> bool {
+        if self.err.is_some() || self.pos >= self.items.len() {
+            return false;
+        }
+        self.pos += 1;
+        true
+    }
+
+    fn at(&mut self) -> Option<Arc<dyn ChunkSeries>> {
+        if self.pos == 0 || self.pos > self.items.len() {
+            return None;
+        }
+        Some(Arc::clone(&self.items[self.pos - 1]))
+    }
+
+    fn err(&self) -> Option<QuerierError> {
+        self.err.clone()
+    }
+}
+
+pub struct PlannedTsdbChunkQuerier {
+    db: Arc<Tsdb>,
+    mint: i64,
+    maxt: i64,
+    planner: Arc<dyn LookupPlanner>,
+}
+
+impl PlannedTsdbChunkQuerier {
+    pub fn new(db: Arc<Tsdb>, mint: i64, maxt: i64, planner: Arc<dyn LookupPlanner>) -> Self {
+        Self {
+            db,
+            mint,
+            maxt,
+            planner,
+        }
+    }
+}
+
+impl ChunkQuerier for PlannedTsdbChunkQuerier {
+    fn select(
+        &mut self,
+        sort_series: bool,
+        hints: Option<&SelectHints>,
+        matchers: &[LabelMatcher],
+    ) -> Box<dyn ChunkSeriesSet> {
+        let plan = if lookupplan::is_planning_disabled_in_context() {
+            BasicLookupPlan::new(matchers.to_vec(), Vec::new())
+        } else {
+            let in_plan = BasicLookupPlan::new(matchers.to_vec(), Vec::new());
+            match self.planner.plan_index_lookup(&in_plan, hints) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Box::new(VecChunkSeriesSet {
+                        items: Vec::new(),
+                        pos: 0,
+                        err: Some(QuerierError::Other(e)),
+                    });
+                }
+            }
+        };
+
+        let cq = self.db.chunk_querier(self.mint, self.maxt);
+        match cq.select(sort_series, &plan.index_matchers) {
+            Ok(series) => {
+                let items = series
+                    .into_iter()
+                    .filter(|cs| {
+                        plan.scan_matchers
+                            .iter()
+                            .all(|m| m.matches(cs.labels.get(&m.name)))
+                    })
+                    .map(|cs| {
+                        Arc::new(TsdbChunkSeriesItem {
+                            labels: cs.labels,
+                            chunks: cs.chunks,
+                        }) as Arc<dyn ChunkSeries>
+                    })
+                    .collect();
+                Box::new(VecChunkSeriesSet {
+                    items,
+                    pos: 0,
+                    err: None,
+                })
+            }
+            Err(e) => Box::new(VecChunkSeriesSet {
+                items: Vec::new(),
+                pos: 0,
+                err: Some(QuerierError::Other(e.to_string())),
+            }),
+        }
+    }
+
+    fn label_values(
+        &mut self,
+        name: &str,
+        matchers: &[LabelMatcher],
+    ) -> Result<(Vec<String>, Vec<String>), QuerierError> {
+        let cq = self.db.chunk_querier(self.mint, self.maxt);
+        let vals = cq
+            .label_values(name, None, matchers)
+            .map_err(|e| QuerierError::Other(e.to_string()))?;
+        Ok((vals, Vec::new()))
+    }
+
+    fn label_names(
+        &mut self,
+        matchers: &[LabelMatcher],
+    ) -> Result<(Vec<String>, Vec<String>), QuerierError> {
+        let cq = self.db.chunk_querier(self.mint, self.maxt);
+        let names = cq
+            .label_names(matchers)
+            .map_err(|e| QuerierError::Other(e.to_string()))?;
+        Ok((names, Vec::new()))
+    }
+
+    fn close(&mut self) -> Result<(), QuerierError> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// list_series (`pkg/ingester/list_series_test.go`)
+// ---------------------------------------------------------------------------
+
+pub trait SeriesPostings {
+    fn next(&mut self) -> bool;
+    fn at(&self) -> u64;
+    fn err(&self) -> Option<String>;
+}
+
+pub trait SeriesIndexReader {
+    fn series(&mut self, ref_id: u64) -> Result<Labels, String>;
+}
+
+pub struct ListPostings {
+    refs: Vec<u64>,
+    pos: usize,
+}
+
+impl ListPostings {
+    pub fn new(refs: Vec<u64>) -> Self {
+        Self { refs, pos: 0 }
+    }
+}
+
+impl SeriesPostings for ListPostings {
+    fn next(&mut self) -> bool {
+        if self.pos >= self.refs.len() {
+            return false;
+        }
+        self.pos += 1;
+        true
+    }
+
+    fn at(&self) -> u64 {
+        self.refs[self.pos - 1]
+    }
+
+    fn err(&self) -> Option<String> {
+        None
+    }
+}
+
+pub struct Series<P: SeriesPostings, I: SeriesIndexReader> {
+    postings: P,
+    idx: I,
+    err: Option<String>,
+}
+
+impl<P: SeriesPostings, I: SeriesIndexReader> Series<P, I> {
+    pub fn new(postings: P, idx: I) -> Self {
+        Self {
+            postings,
+            idx,
+            err: None,
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> bool {
+        self.postings.next()
+    }
+
+    pub fn at(&mut self) -> Labels {
+        match self.idx.series(self.postings.at()) {
+            Ok(lbls) => lbls,
+            Err(e) => {
+                self.err = Some(format!("error getting series: {e}"));
+                Labels::empty()
+            }
+        }
+    }
+
+    pub fn err(&self) -> Option<String> {
+        if let Some(ref e) = self.err {
+            if let Some(pe) = self.postings.err() {
+                return Some(format!("error listing series: {e}; {pe}"));
+            }
+            return Some(format!("error listing series: {e}"));
+        }
+        self.postings.err()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// label_names_and_values (`pkg/ingester/label_names_and_values.go`)
+// ---------------------------------------------------------------------------
+
+pub const CHECK_CONTEXT_ERROR_SERIES_COUNT: u64 = 1000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabelNamesAndValuesError {
+    Canceled,
+    PoolStopped,
+    Other(String),
+}
+
+impl std::fmt::Display for LabelNamesAndValuesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Canceled => f.write_str("context canceled"),
+            Self::PoolStopped => f.write_str("worker pool is stopped"),
+            Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for LabelNamesAndValuesError {}
+
+pub trait LabelIndexReader: Send + Sync {
+    fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, LabelNamesAndValuesError>;
+    fn label_values(
+        &self,
+        name: &str,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<String>, LabelNamesAndValuesError>;
+}
+
+pub fn label_names_and_values_with_index<I, F, C>(
+    index: &I,
+    matchers: &[LabelMatcher],
+    message_size_threshold: usize,
+    is_canceled: C,
+    mut filter: F,
+) -> Result<Vec<ingesterpb::LabelNamesAndValuesResponse>, LabelNamesAndValuesError>
+where
+    I: LabelIndexReader,
+    F: FnMut(&str, &str) -> Result<bool, LabelNamesAndValuesError>,
+    C: Fn() -> bool,
+{
+    if is_canceled() {
+        return Err(LabelNamesAndValuesError::Canceled);
+    }
+    let label_names = index.label_names(matchers)?;
+    let mut batches = Vec::new();
+    let mut response = ingesterpb::LabelNamesAndValuesResponse::default();
+    let mut response_size_bytes = 0usize;
+
+    for label_name in label_names {
+        if is_canceled() {
+            return Err(LabelNamesAndValuesError::Canceled);
+        }
+        let mut label_item = ingesterpb::LabelValues {
+            label_name: label_name.clone(),
+            values: Vec::new(),
+        };
+        response_size_bytes += label_name.len();
+        if response_size_bytes >= message_size_threshold && !response.items.is_empty() {
+            batches.push(std::mem::take(&mut response));
+            response_size_bytes = label_name.len();
+        }
+        let raw_values = index.label_values(&label_name, matchers)?;
+        let mut values = Vec::with_capacity(raw_values.len());
+        for val in raw_values {
+            if filter(&label_name, &val)? {
+                values.push(val);
+            }
+        }
+
+        let mut last_added_idx: isize = -1;
+        for (i, val) in values.iter().enumerate() {
+            response_size_bytes += val.len();
+            if response_size_bytes >= message_size_threshold {
+                let start = (last_added_idx + 1) as usize;
+                label_item.values = values[start..=i].to_vec();
+                last_added_idx = i as isize;
+                response.items.push(ingesterpb::LabelValues {
+                    label_name: label_item.label_name.clone(),
+                    values: std::mem::take(&mut label_item.values),
+                });
+                batches.push(std::mem::take(&mut response));
+                if i + 1 == values.len() {
+                    response_size_bytes = 0;
+                } else {
+                    response_size_bytes = label_name.len();
+                }
+            } else if i + 1 == values.len() {
+                let start = (last_added_idx + 1) as usize;
+                label_item.values = values[start..=i].to_vec();
+                response.items.push(ingesterpb::LabelValues {
+                    label_name: label_item.label_name.clone(),
+                    values: std::mem::take(&mut label_item.values),
+                });
+            }
+        }
+    }
+
+    if !response.items.is_empty() {
+        batches.push(response);
+    }
+    Ok(batches)
+}
+
+pub trait PostingsCursor: Send {
+    fn next(&mut self) -> bool;
+    fn at(&self) -> u64;
+    fn err(&self) -> Option<LabelNamesAndValuesError>;
+}
+
+pub type PostingsForMatchersFn = Arc<
+    dyn Fn(&[LabelMatcher]) -> Result<Box<dyn PostingsCursor>, LabelNamesAndValuesError>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone, Debug)]
+pub struct LabelValueCountResult {
+    pub val: String,
+    pub count: u64,
+    pub err: Option<LabelNamesAndValuesError>,
+}
+
+pub fn count_label_value_series(
+    is_canceled: &(dyn Fn() -> bool + Send + Sync),
+    lbl_name: &str,
+    lbl_value: &str,
+    matchers: &[LabelMatcher],
+    postings_for_matchers_fn: &PostingsForMatchersFn,
+) -> Result<u64, LabelNamesAndValuesError> {
+    if is_canceled() {
+        return Err(LabelNamesAndValuesError::Canceled);
+    }
+    let mut lbl_val_matchers = Vec::with_capacity(matchers.len() + 1);
+    lbl_val_matchers.extend_from_slice(matchers);
+    lbl_val_matchers.push(
+        LabelMatcher::new(MatchType::Equal, lbl_name, lbl_value)
+            .map_err(|e| LabelNamesAndValuesError::Other(e.to_string()))?,
+    );
+
+    let mut p = postings_for_matchers_fn(&lbl_val_matchers)?;
+    let mut count = 0u64;
+    while p.next() {
+        count += 1;
+        if count.is_multiple_of(CHECK_CONTEXT_ERROR_SERIES_COUNT) && is_canceled() {
+            return Err(LabelNamesAndValuesError::Canceled);
+        }
+    }
+    if let Some(e) = p.err() {
+        return Err(e);
+    }
+    Ok(count)
+}
+
+type WorkerJob = Box<dyn FnOnce() + Send>;
+
+/// Simple bounded compute worker pool matching `pkg/util/workerpool`.
+pub struct ComputeWorkerPool {
+    stopped: Arc<AtomicBool>,
+    tx: Mutex<Option<mpsc::UnboundedSender<WorkerJob>>>,
+    handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl ComputeWorkerPool {
+    pub fn new(size: usize) -> Arc<Self> {
+        let (tx, rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let mut handles = Vec::with_capacity(size.max(1));
+        for _ in 0..size.max(1) {
+            let rx_c = Arc::clone(&rx);
+            handles.push(tokio::spawn(async move {
+                loop {
+                    let job = {
+                        let mut guard = rx_c.lock().await;
+                        guard.recv().await
+                    };
+                    let Some(job) = job else {
+                        break;
+                    };
+                    let _ = tokio::task::spawn_blocking(job).await;
+                }
+            }));
+        }
+        Arc::new(Self {
+            stopped: Arc::new(AtomicBool::new(false)),
+            tx: Mutex::new(Some(tx)),
+            handles: Mutex::new(handles),
+        })
+    }
+
+    pub fn submit(
+        &self,
+        job: impl FnOnce() + Send + 'static,
+    ) -> Result<(), LabelNamesAndValuesError> {
+        if self.stopped.load(AtomicOrdering::Acquire) {
+            return Err(LabelNamesAndValuesError::PoolStopped);
+        }
+        let guard = self.tx.lock();
+        let Some(ref tx) = *guard else {
+            return Err(LabelNamesAndValuesError::PoolStopped);
+        };
+        tx.send(Box::new(job))
+            .map_err(|_| LabelNamesAndValuesError::PoolStopped)
+    }
+
+    pub async fn stop(&self) {
+        self.stopped.store(true, AtomicOrdering::Release);
+        self.tx.lock().take();
+        let handles = std::mem::take(&mut *self.handles.lock());
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compute_label_values_series_count(
+    is_canceled: Arc<dyn Fn() -> bool + Send + Sync>,
+    pool: Arc<ComputeWorkerPool>,
+    chunk_size: usize,
+    lbl_name: String,
+    lbl_values: Vec<String>,
+    matchers: Vec<LabelMatcher>,
+    postings_for_matchers_fn: PostingsForMatchersFn,
+) -> mpsc::Receiver<LabelValueCountResult> {
+    let cap = lbl_values.len().max(1);
+    let (tx, rx) = mpsc::channel(cap);
+    if lbl_values.is_empty() {
+        return rx;
+    }
+
+    tokio::spawn(async move {
+        let mut wg_handles = Vec::new();
+        let chunk_sz = chunk_size.max(1);
+        let mut start = 0usize;
+        while start < lbl_values.len() {
+            if is_canceled() {
+                let _ = tx
+                    .send(LabelValueCountResult {
+                        val: String::new(),
+                        count: 0,
+                        err: Some(LabelNamesAndValuesError::Canceled),
+                    })
+                    .await;
+                break;
+            }
+            let end = (start + chunk_sz).min(lbl_values.len());
+            let chunk_vals = lbl_values[start..end].to_vec();
+            let cancel_c = Arc::clone(&is_canceled);
+            let lbl_c = lbl_name.clone();
+            let matchers_c = matchers.clone();
+            let fn_c = Arc::clone(&postings_for_matchers_fn);
+            let tx_c = tx.clone();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+            if let Err(e) = pool.submit(move || {
+                for v in chunk_vals {
+                    match count_label_value_series(
+                        cancel_c.as_ref(),
+                        &lbl_c,
+                        &v,
+                        &matchers_c,
+                        &fn_c,
+                    ) {
+                        Ok(count) => {
+                            let _ = tx_c.try_send(LabelValueCountResult {
+                                val: v,
+                                count,
+                                err: None,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx_c.try_send(LabelValueCountResult {
+                                val: v,
+                                count: 0,
+                                err: Some(err),
+                            });
+                        }
+                    }
+                }
+                let _ = done_tx.send(());
+            }) {
+                let _ = tx
+                    .send(LabelValueCountResult {
+                        val: String::new(),
+                        count: 0,
+                        err: Some(e),
+                    })
+                    .await;
+                break;
+            }
+            wg_handles.push(done_rx);
+            start = end;
+        }
+        for h in wg_handles {
+            let _ = h.await;
+        }
+    });
+
+    rx
+}
 
 #[cfg(test)]
 mod tests {

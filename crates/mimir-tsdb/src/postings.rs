@@ -17,6 +17,9 @@ use crate::symbols::{SymbolId, SymbolTable};
 /// Canonical key `(SymbolId::EMPTY, SymbolId::EMPTY)` storing all series refs in `MemPostings`.
 pub const ALL_POSTINGS_KEY: (SymbolId, SymbolId) = (SymbolId::EMPTY, SymbolId::EMPTY);
 
+/// Minimum label value byte length required before counting towards per-label-name byte accounting.
+pub const LABEL_VALUE_BYTES_MIN_LENGTH: usize = 128;
+
 #[derive(Debug, Error)]
 pub enum PostingsError {
     #[error("unexpected all-postings matcher among other matchers")]
@@ -189,17 +192,19 @@ impl MemPostings {
         let Some(list) = inner.m.get(&name_id).and_then(|vm| vm.get(&value_id)) else {
             return;
         };
-        if list.len() <= limit {
-            out.extend_from_slice(list);
-        } else {
-            let step = (list.len() / limit).max(1);
-            for idx in (0..list.len()).step_by(step).take(limit) {
-                out.push(list[idx]);
-            }
+        if list.is_empty() {
+            return;
+        }
+        // Sample `limit` entries independently with replacement (matching Go MemPostings.AppendRandomPostingsRefs).
+        let mut seed = (list.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (list[0]);
+        for _ in 0..limit {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let idx = ((seed >> 33) as usize) % list.len();
+            out.push(list[idx]);
         }
     }
 
-    /// Returns total byte length of distinct label values per label name.
+    /// Returns total byte length of distinct label values (longer than `LABEL_VALUE_BYTES_MIN_LENGTH`) per label name.
     pub fn label_values_bytes(&self, symbols: &SymbolTable) -> std::collections::HashMap<String, u64> {
         let inner = self.inner.read();
         let mut out = std::collections::HashMap::with_capacity(inner.lvs.len());
@@ -210,8 +215,11 @@ impl MemPostings {
             let total: u64 = val_ids
                 .iter()
                 .map(|&vid| symbols.resolve(vid).len() as u64)
+                .filter(|&len| len > LABEL_VALUE_BYTES_MIN_LENGTH as u64)
                 .sum();
-            out.insert(symbols.resolve(name_id).to_string(), total);
+            if total > 0 {
+                out.insert(symbols.resolve(name_id).to_string(), total);
+            }
         }
         out
     }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use mimir_config::Overrides;
-use mimir_ring::partition_ring::PartitionRingWatcher;
+use mimir_ring::partition_ring::{PartitionRing, PartitionRingWatcher};
 use mimir_ring::prng::shuffle_shard_expected_instances_per_zone;
 use mimir_ring::ring::Ring;
 
@@ -12,9 +12,41 @@ pub trait LimiterRingStrategy: Send + Sync {
     fn get_shard_size(&self, user_id: &str) -> usize;
 }
 
+/// Interface exposed by a ring implementation allowing instance/zone counting (`ingesterRingLimiterRingCount`).
+pub trait IngesterRingLimiterRingCount: Send + Sync {
+    fn writable_instances_with_tokens_count(&self) -> usize;
+    fn writable_instances_with_tokens_in_zone_count(&self, zone: &str) -> usize;
+    fn zones_count(&self) -> usize;
+}
+
+impl IngesterRingLimiterRingCount for Ring {
+    fn writable_instances_with_tokens_count(&self) -> usize {
+        Ring::writable_instances_with_tokens_count(self)
+    }
+
+    fn writable_instances_with_tokens_in_zone_count(&self, zone: &str) -> usize {
+        Ring::writable_instances_with_tokens_in_zone_count(self, zone)
+    }
+
+    fn zones_count(&self) -> usize {
+        Ring::zones_count(self)
+    }
+}
+
+/// Interface for accessing a `PartitionRing` (`partitionRingWatcher` in `limiter.go`).
+pub trait PartitionRingProvider: Send + Sync {
+    fn partition_ring(&self) -> Arc<PartitionRing>;
+}
+
+impl PartitionRingProvider for PartitionRingWatcher {
+    fn partition_ring(&self) -> Arc<PartitionRing> {
+        PartitionRingWatcher::partition_ring(self)
+    }
+}
+
 /// Classic ingester ring strategy scaling global limits across active instances/zones.
 pub struct IngesterRingLimiterStrategy {
-    ring: Arc<Ring>,
+    ring: Option<Arc<dyn IngesterRingLimiterRingCount>>,
     replication_factor: usize,
     zone_awareness_enabled: bool,
     ingester_zone: String,
@@ -22,8 +54,24 @@ pub struct IngesterRingLimiterStrategy {
 }
 
 impl IngesterRingLimiterStrategy {
-    pub fn new(
-        ring: Arc<Ring>,
+    pub fn new<R: IngesterRingLimiterRingCount + 'static>(
+        ring: Arc<R>,
+        replication_factor: usize,
+        zone_awareness_enabled: bool,
+        ingester_zone: impl Into<String>,
+        overrides: Overrides,
+    ) -> Self {
+        Self::new_opt(
+            Some(ring),
+            replication_factor,
+            zone_awareness_enabled,
+            ingester_zone,
+            overrides,
+        )
+    }
+
+    pub fn new_opt(
+        ring: Option<Arc<dyn IngesterRingLimiterRingCount>>,
         replication_factor: usize,
         zone_awareness_enabled: bool,
         ingester_zone: impl Into<String>,
@@ -40,7 +88,7 @@ impl IngesterRingLimiterStrategy {
 
     fn zones_count(&self) -> usize {
         if self.zone_awareness_enabled {
-            self.ring.zones_count().max(1)
+            self.ring.as_ref().map_or(1, |r| r.zones_count().max(1))
         } else {
             1
         }
@@ -52,14 +100,16 @@ impl LimiterRingStrategy for IngesterRingLimiterStrategy {
         if global_limit == 0 {
             return 0;
         }
+        let Some(ref ring) = self.ring else {
+            return 0;
+        };
         let zones_count = self.zones_count();
         let user_shard_size = self.get_shard_size(user_id);
 
         let mut ingesters_in_zone_count = if zones_count > 1 {
-            self.ring
-                .writable_instances_with_tokens_in_zone_count(&self.ingester_zone)
+            ring.writable_instances_with_tokens_in_zone_count(&self.ingester_zone)
         } else {
-            self.ring.writable_instances_with_tokens_count()
+            ring.writable_instances_with_tokens_count()
         };
 
         if user_shard_size > 0 {
@@ -83,12 +133,15 @@ impl LimiterRingStrategy for IngesterRingLimiterStrategy {
 
 /// Partition ring strategy scaling global limits across active partitions.
 pub struct PartitionRingLimiterStrategy {
-    watcher: Arc<PartitionRingWatcher>,
+    watcher: Arc<dyn PartitionRingProvider>,
     overrides: Overrides,
 }
 
 impl PartitionRingLimiterStrategy {
-    pub fn new(watcher: Arc<PartitionRingWatcher>, overrides: Overrides) -> Self {
+    pub fn new<P: PartitionRingProvider + 'static>(
+        watcher: Arc<P>,
+        overrides: Overrides,
+    ) -> Self {
         Self { watcher, overrides }
     }
 }

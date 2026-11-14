@@ -6,6 +6,7 @@
 //! - github.com/grafana/mimir/pkg/ingester/lookupplan/*
 
 pub mod active_series;
+pub mod activity;
 pub mod circuit_breaker;
 pub mod compaction;
 pub mod errors;
@@ -18,6 +19,7 @@ pub mod limiter;
 pub mod lookupplan;
 pub mod metric_counter;
 pub mod metrics;
+pub mod mirror_querier;
 pub mod owned_series;
 pub mod push;
 pub mod query;

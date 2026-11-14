@@ -325,7 +325,7 @@ impl Ingester {
         }
     }
 
-    async fn close_and_delete_user_tsdb_if_idle(
+    pub async fn close_and_delete_user_tsdb_if_idle(
         &self,
         user_id: &str,
         idle_timeout: Duration,
@@ -364,6 +364,12 @@ impl Ingester {
         self.series_count.fetch_sub(num_series, Ordering::Relaxed);
         let dir = user_db.db.dir().to_path_buf();
         let tracker_names = user_db.active_series.current_matcher_names();
+        let label_value_bytes_names: Vec<String> = user_db
+            .db
+            .head()
+            .label_values_bytes()
+            .into_keys()
+            .collect();
 
         if let Err(e) = user_db.close() {
             warn!(user = %user_id, error = %e, "failed to close idle TSDB");
@@ -375,8 +381,9 @@ impl Ingester {
         self.tsdbs.remove(user_id);
         self.metrics.mem_users.dec();
         self.delete_user_metadata(user_id);
+        self.metrics.delete_per_user_metrics(user_id, &tracker_names);
         self.metrics
-            .delete_per_user_metrics(user_id, &tracker_names);
+            .delete_user_label_value_bytes_metrics(user_id, &label_value_bytes_names);
 
         if let Err(e) = std::fs::remove_dir_all(&dir) {
             warn!(user = %user_id, dir = %dir.display(), error = %e, "failed to remove closed idle TSDB directory");
@@ -534,9 +541,7 @@ impl Ingester {
                             .is_over_label_value_bytes_metric_threshold(&user_id, bytes)
                     {
                         self.metrics
-                            .label_value_bytes_over_threshold
-                            .with_label_values(&[&user_id, &lbl_name])
-                            .set(1.0);
+                            .record_label_value_bytes_over_threshold(&user_id, &lbl_name);
                     }
                 }
             }
@@ -695,6 +700,13 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
         active_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         limit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         churn_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Consume immediate first ticks so tickers fire after their configured period (matching Go time.NewTicker).
+        ingest_rate_tick.tick().await;
+        rate_tick.tick().await;
+        active_tick.tick().await;
+        limit_tick.tick().await;
+        churn_tick.tick().await;
 
         loop {
             tokio::select! {

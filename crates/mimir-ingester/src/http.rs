@@ -28,7 +28,7 @@ use mimir_common::logging::format_rfc3339_utc;
 use mimir_common::services::State;
 use mimir_common::shutdownmarker;
 use mimir_common::tenant::extract_tenant_id_from_http_headers;
-use mimir_config::parse_go_duration;
+use mimir_config::{parse_go_duration, GoDuration};
 use mimir_proto::ringpb::PartitionState;
 use mimir_ring::partition_ring::http::partition_ring_router;
 use mimir_ring::partition_ring::{PartitionRingEditor, PartitionRingReader};
@@ -462,14 +462,24 @@ async fn tenants_handler(
         return Json(rows).into_response();
     }
 
-    let mut html = String::from("<html><head><title>Ingester Tenants</title></head><body><h1>Tenants</h1><table border=\"1\"><tr><th>Tenant</th><th>Series</th><th>Blocks</th><th>MinTime</th><th>MaxTime</th></tr>");
+    let now_str = format_rfc3339_utc(SystemTime::now());
+    let mut html = format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"UTF-8\">\n<title>Ingester tenants</title>\n</head>\n<body>\n\
+         <h1>Ingester tenants</h1>\n<p>Current time: {now_str}</p>\n\
+         <table border=\"1\" cellpadding=\"5\" style=\"border-collapse: collapse\">\n\
+         <thead><tr><th>Tenant</th><th>Head series</th><th>Blocks</th><th>Head MinT</th><th>Head MaxT</th><th>Grace interval</th><th>Warning</th></tr></thead>\n\
+         <tbody style=\"font-family: monospace;\">"
+    );
     for r in rows {
+        let lim = st.ingester.overrides.for_tenant(&r.tenant);
+        let past_grace = GoDuration(lim.past_grace_period.0 + lim.out_of_order_time_window.0);
+        let future_grace = GoDuration(lim.creation_grace_period.0);
         html.push_str(&format!(
-            "<tr><td><a href=\"/ingester/tsdb/{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            r.tenant, r.tenant, r.series, r.blocks, r.min_time, r.max_time
+            "<tr><td><a href=\"tsdb/{0}\">{0}</a></td><td>{1}</td><td>{2}</td><td>{3}</td><td>{4}</td><td>(-{5}, +{6})</td><td></td></tr>",
+            r.tenant, r.series, r.blocks, r.min_time, r.max_time, past_grace, future_grace
         ));
     }
-    html.push_str("</table></body></html>");
+    html.push_str("</tbody></table></body></html>");
     Html(html).into_response()
 }
 
@@ -519,12 +529,28 @@ async fn tenant_tsdb_handler(
     }
 
     let now_str = format_rfc3339_utc(SystemTime::now());
+    let label_churn_link = if st.ingester.cfg.label_churn_enabled {
+        format!("<p><a href=\"../label_churn/{tenant}\">Label churn</a></p>")
+    } else {
+        String::new()
+    };
     let html = format!(
-        "<html><head><title>Tenant {tenant}</title></head><body><h1>Tenant {tenant} ({now_str})</h1>\
-         <p>NumSeries: {}</p><p>MinTime: {}</p><p>MaxTime: {}</p><p>Blocks: {:?}</p></body></html>",
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"UTF-8\">\n<title>Ingester: TSDB for tenant {tenant}</title>\n</head>\n<body>\n\
+         <h1>Ingester: TSDB for tenant {tenant}</h1>\n<p>Current time: {now_str}</p>\n\
+         <h2>TSDB Head</h2>\n<ul>\n\
+         <li>Number of series: {}</li>\n\
+         <li>Min Time: {}</li>\n\
+         <li>Max Time: {}</li>\n\
+         <li>Min OOO Time: {}</li>\n\
+         <li>Max OOO Time: {}</li>\n\
+         </ul>\n{}\n\
+         <h2>Blocks</h2>\n<p>Blocks: {:?}</p></body></html>",
         head.num_series(),
         head.min_time(),
         head.max_time(),
+        head.min_ooo_time(),
+        head.max_ooo_time(),
+        label_churn_link,
         block_ids
     );
     Html(html).into_response()

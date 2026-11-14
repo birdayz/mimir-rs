@@ -53,15 +53,30 @@ pub const MAX_LENGTH_LABEL_NAME_FLAG: &str = "validation.max-length-label-name";
 pub const MAX_LENGTH_LABEL_VALUE_FLAG: &str = "validation.max-length-label-value";
 pub const MAX_NATIVE_HISTOGRAM_BUCKETS_FLAG: &str = "validation.max-native-histogram-buckets";
 
-/// Formats `(&str, &str)` pairs as Prometheus `{k1="v1", k2="v2"}` string matching `FromLabelAdaptersToString`.
+/// Formats `(&str, &str)` pairs matching Go `mimirpb.FromLabelAdaptersToString`:
+/// prints `__name__` unquoted first, then `{k1="v1", k2="v2"}` only if additional labels exist.
 pub fn format_labels_string<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
-    let mut out = String::from("{");
-    let mut first = true;
-    for (k, v) in pairs {
-        if !first {
+    let collected: Vec<(&'a str, &'a str)> = pairs.into_iter().collect();
+    let mut out = String::new();
+    let mut metric_name_idx = None;
+    for (i, &(k, v)) in collected.iter().enumerate() {
+        if k == "__name__" {
+            out.push_str(v);
+            metric_name_idx = Some(i);
+            break;
+        }
+    }
+
+    let mut count = 0usize;
+    for (i, &(k, v)) in collected.iter().enumerate() {
+        if Some(i) == metric_name_idx {
+            continue;
+        }
+        if count == 0 {
+            out.push('{');
+        } else {
             out.push_str(", ");
         }
-        first = false;
         out.push_str(k);
         out.push('=');
         out.push('"');
@@ -76,8 +91,11 @@ pub fn format_labels_string<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a st
             }
         }
         out.push('"');
+        count += 1;
     }
-    out.push('}');
+    if count > 0 {
+        out.push('}');
+    }
     out
 }
 
@@ -195,11 +213,12 @@ impl IngesterError {
         series: String,
         ooo_window: Duration,
     ) -> Self {
+        let dur_str = mimir_config::ModelDuration::from_nanos(ooo_window.as_nanos() as i64).to_string();
         Self::Sample {
             err_id: SAMPLE_TIMESTAMP_TOO_OLD,
             err_msg: format!(
-                "the sample has been rejected because another sample with a more recent timestamp has already been ingested and this sample is beyond the out-of-order time window of {:?}",
-                ooo_window
+                "the sample has been rejected because another sample with a more recent timestamp has already been ingested and this sample is beyond the out-of-order time window of {}",
+                dur_str
             ),
             timestamp_ms,
             series,
@@ -510,6 +529,14 @@ impl IngesterError {
         }
     }
 
+    pub fn is_do_not_log(&self) -> bool {
+        match self {
+            Self::InstanceLimitReached { .. } => true,
+            Self::WrappedUser { inner, .. } => inner.is_do_not_log(),
+            _ => false,
+        }
+    }
+
     pub fn rejected_samples(&self) -> i64 {
         match self {
             Self::WrappedUser {
@@ -710,8 +737,8 @@ impl fmt::Display for IngesterError {
                 remaining_delay,
             } => write!(
                 f,
-                "circuit breaker open on {request_type} request type with remaining delay {:?}",
-                remaining_delay
+                "circuit breaker open on {request_type} request type with remaining delay {}",
+                mimir_config::GoDuration::from_nanos(remaining_delay.as_nanos() as i64)
             ),
             Self::ReactiveLimiterExceeded { message } => f.write_str(message),
             Self::BadRequest { message } => f.write_str(message),
