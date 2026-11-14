@@ -11,9 +11,9 @@ use std::time::Duration;
 use mimir_proto::ringpb::PartitionRingDesc;
 use mimir_ring::partition_ring::PartitionRingWatcherDelegate;
 use mimir_storage::ingest::{
-    DecodedKafkaRecord, MultiClusterPartitionReader, PartitionOffsets, ReaderError,
-    RecordBatchConsumer, SingleClusterPartitionReader, ZeroCopyBatchConsumer,
-    ZeroCopyRecordHandler,
+    write_compartment_configs, DecodedKafkaRecord, MultiClusterPartitionReader, PartitionOffsets,
+    ReaderError, RecordBatchConsumer, SingleClusterPartitionReader, ZeroCopyBatchConsumer,
+    ZeroCopyRecordHandler, READ_COMPARTMENT_ID_PLACEHOLDER,
 };
 use tracing::{error, info};
 
@@ -97,6 +97,13 @@ impl IngestReaderHandle {
         }
     }
 
+    pub async fn start(&self) -> Result<(), ReaderError> {
+        match self {
+            Self::Single(r) => r.start().await,
+            Self::Multi(r) => r.start().await,
+        }
+    }
+
     pub async fn stop(&self) {
         match self {
             Self::Single(r) => r.stop().await,
@@ -146,29 +153,64 @@ impl ZeroCopyRecordHandler for IngesterZeroCopyHandler {
 }
 
 pub async fn start_ingest_reader(ingester: Arc<Ingester>) -> Result<Arc<IngestReaderHandle>, ReaderError> {
-    let offset_file_path =
-        PathBuf::from(&ingester.blocks_cfg.tsdb.dir).join("kafka-offset.json");
+    let tsdb_dir = PathBuf::from(&ingester.blocks_cfg.tsdb.dir);
     let consumer: Arc<dyn RecordBatchConsumer> =
         Arc::new(ZeroCopyBatchConsumer::new(IngesterZeroCopyHandler {
             ingester: Arc::clone(&ingester),
         }));
 
-    let reader = Arc::new(SingleClusterPartitionReader::new(
-        ingester.ingest_cfg.kafka.clone(),
-        ingester.ingest_partition_id,
-        &ingester.cfg.ring.instance_id,
-        Some(offset_file_path),
-        consumer,
-        ingester.registry.as_ref(),
-    )?);
+    let compartments = ingester.compartments_config();
+    let reader = if compartments.enabled {
+        let rc_id = ingester.cfg.read_compartment_id.max(0) as usize;
+        let topic = ingester
+            .ingest_cfg
+            .kafka
+            .topic
+            .replace(READ_COMPARTMENT_ID_PLACEHOLDER, &rc_id.to_string());
+        let num_wc = compartments.write.num_compartments.max(1) as usize;
+        let cluster_configs =
+            write_compartment_configs(&ingester.ingest_cfg.kafka, num_wc, &topic);
+        let offset_paths = (0..cluster_configs.len())
+            .map(|w| Some(tsdb_dir.join(format!("kafka-offset-wc-{w}.json"))))
+            .collect();
+        let multi = MultiClusterPartitionReader::new(
+            &cluster_configs,
+            &ingester.ingest_cfg.ordered_consumption,
+            ingester.ingest_partition_id,
+            &ingester.cfg.ring.instance_id,
+            offset_paths,
+            consumer,
+            ingester.registry.as_ref(),
+        )?;
+        Arc::new(IngestReaderHandle::Multi(Arc::new(multi)))
+    } else {
+        let offset_file_path = tsdb_dir.join("kafka-offset.json");
+        let single = SingleClusterPartitionReader::new(
+            ingester.ingest_cfg.kafka.clone(),
+            ingester.ingest_partition_id,
+            &ingester.cfg.ring.instance_id,
+            Some(offset_file_path),
+            consumer,
+            ingester.registry.as_ref(),
+        )?;
+        Arc::new(IngestReaderHandle::Single(Arc::new(single)))
+    };
 
-    reader.start().await?;
+    // Store handle before awaiting startup catchup so stop() and push readiness checks see it.
+    *ingester.ingest_reader.write() = Some(Arc::clone(&reader));
+    if let Err(e) = reader.start().await {
+        reader.stop().await;
+        *ingester.ingest_reader.write() = None;
+        return Err(e);
+    }
+
     info!(
         partition = ingester.ingest_partition_id,
         topic = %ingester.ingest_cfg.kafka.topic,
+        compartments_enabled = compartments.enabled,
         "ingest storage partition reader started"
     );
-    Ok(Arc::new(IngestReaderHandle::Single(reader)))
+    Ok(reader)
 }
 
 /// Delegate resetting the read reactive limiter when this ingester's partition transitions to ACTIVE.

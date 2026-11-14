@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::stream::BoxStream;
 use mimir_common::services::{start_and_await_running, stop_and_await_terminated, ServiceContext};
@@ -2027,12 +2027,12 @@ fn test_user_tsdb_add_pending_non_owned_refs() {
     let db = open_standalone_user_tsdb(dir.path(), "test", default_limits_test_config(), false, true);
 
     let set_of = |refs: &[u64]| -> HashSet<u64> { refs.iter().copied().collect() };
-    let keys_of = |m: &HashMap<u64, Instant>| -> HashSet<u64> { m.keys().copied().collect() };
+    let keys_of = |m: &HashMap<u64, SystemTime>| -> HashSet<u64> { m.keys().copied().collect() };
 
     // 1) initial snapshot populates timestamps
-    let before = Instant::now();
+    let before = SystemTime::now();
     db.add_pending_non_owned_refs(&set_of(&[1, 2, 3]));
-    let after = Instant::now();
+    let after = SystemTime::now();
     let snap = db.pending_non_owned_refs_snapshot();
     assert_eq!(keys_of(&snap), set_of(&[1, 2, 3]));
     for ts in snap.values() {
@@ -2097,17 +2097,17 @@ fn test_user_tsdb_take_pending_non_owned_refs() {
     let set_of = |refs: &[u64]| -> HashSet<u64> { refs.iter().copied().collect() };
 
     // 1) empty queue returns empty
-    assert!(db.take_pending_non_owned_refs(Instant::now()).is_empty());
+    assert!(db.take_pending_non_owned_refs(SystemTime::now()).is_empty());
 
     // 2) grace not elapsed leaves queue intact
-    let before_add = Instant::now();
+    let before_add = SystemTime::now();
     std::thread::sleep(Duration::from_millis(2));
     db.add_pending_non_owned_refs(&set_of(&[1, 2, 3]));
     assert!(db.take_pending_non_owned_refs(before_add).is_empty());
     assert_eq!(db.pending_non_owned_refs_snapshot().len(), 3);
 
     // 3) grace elapsed drains all
-    let mut got = db.take_pending_non_owned_refs(Instant::now() + Duration::from_secs(3600));
+    let mut got = db.take_pending_non_owned_refs(SystemTime::now() + Duration::from_secs(3600));
     got.sort_unstable();
     assert_eq!(got, vec![1, 2, 3]);
     assert!(db.pending_non_owned_refs_snapshot().is_empty());
@@ -2121,7 +2121,7 @@ fn test_user_tsdb_take_pending_non_owned_refs() {
     // 5) partial drain retains newer refs
     db.add_pending_non_owned_refs(&set_of(&[1, 2]));
     std::thread::sleep(Duration::from_millis(4));
-    let between = Instant::now();
+    let between = SystemTime::now();
     std::thread::sleep(Duration::from_millis(4));
     db.add_pending_non_owned_refs(&set_of(&[1, 2, 3]));
     let mut partial = db.take_pending_non_owned_refs(between);
@@ -2132,7 +2132,7 @@ fn test_user_tsdb_take_pending_non_owned_refs() {
         vec![3]
     );
 
-    let rest = db.take_pending_non_owned_refs(Instant::now() + Duration::from_secs(3600));
+    let rest = db.take_pending_non_owned_refs(SystemTime::now() + Duration::from_secs(3600));
     assert_eq!(rest, vec![3]);
     assert!(db.pending_non_owned_refs_snapshot().is_empty());
 
@@ -2270,7 +2270,7 @@ fn test_recompute_owned_series() {
         app.commit().unwrap();
         assert_eq!(db.compute_owned_series(), 0);
         assert_eq!(
-            db.take_pending_non_owned_refs(Instant::now() + Duration::from_secs(3600))
+            db.take_pending_non_owned_refs(SystemTime::now() + Duration::from_secs(3600))
                 .len(),
             1
         );
@@ -2284,7 +2284,7 @@ fn test_recompute_owned_series() {
         let db = open_standalone_user_tsdb(dir.path(), "test-user", default_limits_test_config(), false, true);
         assert_eq!(db.compute_owned_series(), 0);
         assert!(db
-            .take_pending_non_owned_refs(Instant::now() + Duration::from_secs(3600))
+            .take_pending_non_owned_refs(SystemTime::now() + Duration::from_secs(3600))
             .is_empty());
         db.close().unwrap();
     }
@@ -2302,7 +2302,7 @@ fn test_recompute_owned_series() {
         db.update_token_ranges(vec![0, u32::MAX]);
         assert_eq!(db.compute_owned_series(), 2);
         assert!(db
-            .take_pending_non_owned_refs(Instant::now() + Duration::from_secs(3600))
+            .take_pending_non_owned_refs(SystemTime::now() + Duration::from_secs(3600))
             .is_empty());
         db.close().unwrap();
     }
@@ -2325,7 +2325,7 @@ fn test_recompute_owned_series() {
         db.update_token_ranges(vec![0, ha.min(hb)]);
         assert_eq!(db.compute_owned_series(), 1);
         assert_eq!(
-            db.take_pending_non_owned_refs(Instant::now() + Duration::from_secs(3600))
+            db.take_pending_non_owned_refs(SystemTime::now() + Duration::from_secs(3600))
                 .len(),
             1
         );

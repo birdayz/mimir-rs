@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use thiserror::Error;
 
 use crate::block::{Block, BlockError};
@@ -56,6 +57,7 @@ pub struct QueryChunkSeries {
 pub struct TsdbQuerier<'a> {
     head: Option<&'a Head>,
     blocks: Vec<Arc<Block>>,
+    blocks_lock: Option<&'a RwLock<Vec<Arc<Block>>>>,
     mint: i64,
     maxt: i64,
 }
@@ -76,9 +78,50 @@ impl<'a> TsdbQuerier<'a> {
         Self {
             head,
             blocks,
+            blocks_lock: None,
             mint,
             maxt,
         }
+    }
+
+    pub fn with_blocks_lock(
+        head: Option<&'a Head>,
+        blocks_lock: &'a RwLock<Vec<Arc<Block>>>,
+        mint: i64,
+        maxt: i64,
+    ) -> Self {
+        Self {
+            head,
+            blocks: Vec::new(),
+            blocks_lock: Some(blocks_lock),
+            mint,
+            maxt,
+        }
+    }
+
+    fn effective_blocks<'b>(
+        &'b self,
+        guard: &'b Option<parking_lot::RwLockReadGuard<'a, Vec<Arc<Block>>>>,
+    ) -> Vec<Arc<Block>> {
+        match guard {
+            Some(g) => g
+                .iter()
+                .filter(|b| b.overlaps_closed_interval(self.mint, self.maxt))
+                .cloned()
+                .collect(),
+            None => self.blocks.clone(),
+        }
+    }
+
+    fn effective_head(&self) -> Option<&'a Head> {
+        self.head.filter(|h| {
+            let in_order =
+                h.initialized() && h.min_time() <= self.maxt && self.mint <= h.max_time();
+            let ooo = h.min_ooo_time() != i64::MAX
+                && h.min_ooo_time() <= self.maxt
+                && self.mint <= h.max_ooo_time();
+            in_order || ooo
+        })
     }
 
     /// Queries samples for all series matching `matchers` in `[mint, maxt]`.
@@ -125,9 +168,13 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        let lock_guard = self.blocks_lock.map(|l| l.read());
+        let blocks = self.effective_blocks(&lock_guard);
+        let head = self.effective_head();
+
         let mut per_series: BTreeMap<Labels, Vec<(ChunkMeta, Vec<Interval>)>> = BTreeMap::new();
 
-        if let Some(head) = self.head {
+        if let Some(head) = head {
             let refs = head.postings_for_matchers(matchers)?;
             for r in refs {
                 if let Some((labels, chks, tombs)) = head.series_chunks(r, self.mint, self.maxt)? {
@@ -139,7 +186,7 @@ impl<'a> TsdbQuerier<'a> {
             }
         }
 
-        for blk in &self.blocks {
+        for blk in &blocks {
             let idx = blk.index();
             let chkr = blk.chunks();
             let tombr = blk.tombstones();
@@ -247,14 +294,17 @@ impl<'a> TsdbQuerier<'a> {
 
     /// Returns sorted unique label names across Head and overlapping Blocks matching `matchers`.
     pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {
+        let lock_guard = self.blocks_lock.map(|l| l.read());
+        let blocks = self.effective_blocks(&lock_guard);
+        let head = self.effective_head();
         let mut set: BTreeSet<String> = BTreeSet::new();
 
-        if let Some(head) = self.head {
+        if let Some(head) = head {
             for name in head.label_names(matchers)? {
                 set.insert(name);
             }
         }
-        for blk in &self.blocks {
+        for blk in &blocks {
             let idx = blk.index();
             if matchers.is_empty() {
                 for name in idx.label_names() {
@@ -278,14 +328,17 @@ impl<'a> TsdbQuerier<'a> {
         limit: Option<usize>,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<String>, QuerierError> {
+        let lock_guard = self.blocks_lock.map(|l| l.read());
+        let blocks = self.effective_blocks(&lock_guard);
+        let head = self.effective_head();
         let mut set: BTreeSet<String> = BTreeSet::new();
 
-        if let Some(head) = self.head {
+        if let Some(head) = head {
             for val in head.label_values(name, matchers)? {
                 set.insert(val);
             }
         }
-        for blk in &self.blocks {
+        for blk in &blocks {
             let idx = blk.index();
             if matchers.is_empty() {
                 for val in idx.label_values(name)? {
@@ -387,6 +440,17 @@ impl<'a> TsdbChunkQuerier<'a> {
     pub fn new(head: Option<&'a Head>, blocks: Vec<Arc<Block>>, mint: i64, maxt: i64) -> Self {
         Self {
             inner: TsdbQuerier::new(head, blocks, mint, maxt),
+        }
+    }
+
+    pub fn with_blocks_lock(
+        head: Option<&'a Head>,
+        blocks_lock: &'a RwLock<Vec<Arc<Block>>>,
+        mint: i64,
+        maxt: i64,
+    ) -> Self {
+        Self {
+            inner: TsdbQuerier::with_blocks_lock(head, blocks_lock, mint, maxt),
         }
     }
 

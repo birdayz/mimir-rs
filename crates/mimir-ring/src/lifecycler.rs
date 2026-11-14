@@ -109,6 +109,42 @@ pub struct BasicLifecyclerConfig {
     pub versions: HashMap<u64, u64>,
 }
 
+impl BasicLifecyclerConfig {
+    pub fn from_ring_config_tokenless(
+        cfg: &RingConfig,
+        listen_port: u16,
+    ) -> Result<Self, LifecyclerError> {
+        let host = if !cfg.instance_addr.is_empty() {
+            cfg.instance_addr.clone()
+        } else {
+            "127.0.0.1".to_string()
+        };
+        let port = if cfg.instance_port > 0 {
+            cfg.instance_port as u16
+        } else {
+            listen_port
+        };
+        let addr = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+
+        Ok(Self {
+            id: cfg.instance_id.clone(),
+            addr,
+            zone: cfg.instance_availability_zone.clone(),
+            heartbeat_period: cfg.heartbeat_period.as_std().unwrap_or(Duration::ZERO),
+            heartbeat_timeout: cfg.heartbeat_timeout.as_std().unwrap_or(Duration::ZERO),
+            tokens_observe_period: Duration::ZERO,
+            num_tokens: 0,
+            keep_instance_in_the_ring_on_shutdown: !cfg.unregister_on_shutdown,
+            token_generator: None,
+            versions: HashMap::new(),
+        })
+    }
+}
+
 struct BasicLifecyclerMetrics {
     heartbeats: Counter,
     tokens_owned: Gauge,
@@ -1448,10 +1484,17 @@ impl Lifecycler {
         Ok(())
     }
 
-    async fn auto_join(&self, target_state: InstanceState) -> Result<(), LifecyclerError> {
+    async fn auto_join(
+        &self,
+        ctx: &ServiceContext,
+        target_state: InstanceState,
+    ) -> Result<(), LifecyclerError> {
         if self.token_generator.can_join_enabled() {
             let deadline = tokio::time::Instant::now() + self.can_join_timeout;
             loop {
+                if ctx.is_canceled() {
+                    return Err(LifecyclerError::NotRunning);
+                }
                 if let Ok(Some(any)) = self.kv_store.get(&self.ring_key).await {
                     if let Ok(desc) = any.downcast::<Desc>() {
                         if self.token_generator.can_join(&desc.ingesters).is_ok() {
@@ -1462,7 +1505,10 @@ impl Lifecycler {
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
             }
         }
 
@@ -1749,12 +1795,12 @@ impl Lifecycler {
                                 join_fired = true;
                                 if l.get_state() == InstanceState::Pending {
                                     if !l.cfg.observe_period.is_zero() {
-                                        l.auto_join(InstanceState::Joining).await.map_err(|e| {
+                                        l.auto_join(&ctx, InstanceState::Joining).await.map_err(|e| {
                                             ServiceError::failure(format!("failed to pick tokens: {e}"))
                                         })?;
                                         observe_deadline = Some(tokio::time::Instant::now() + l.cfg.observe_period);
                                     } else {
-                                        l.auto_join(InstanceState::Active).await.map_err(|e| {
+                                        l.auto_join(&ctx, InstanceState::Active).await.map_err(|e| {
                                             ServiceError::failure(format!("failed to pick tokens: {e}"))
                                         })?;
                                     }

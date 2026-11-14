@@ -91,6 +91,41 @@ impl From<&RingConfig> for RingSettings {
     }
 }
 
+fn split_host_from_addr(addr: &str) -> String {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some((host, port)) = rest.split_once("]:") {
+            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                return host.to_string();
+            }
+        }
+        return addr.to_string();
+    }
+    if let Some((host, port)) = addr.rsplit_once(':') {
+        if !host.contains(':') && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            return host.to_string();
+        }
+    }
+    addr.to_string()
+}
+
+pub fn to_status_page_config(cfg: &RingConfig) -> http::StatusPageConfig {
+    let link_template = cfg.status_page_ingester_link_template.clone();
+    http::StatusPageConfig {
+        hide_tokens_ui_elements: false,
+        show_versions: false,
+        component_names: HashMap::new(),
+        instance_link: Some(Arc::new(move |ingester_id: &str, instance: &InstanceDesc| {
+            let mut host = split_host_from_addr(&instance.addr);
+            if host.contains(':') {
+                host = format!("[{host}]");
+            }
+            link_template
+                .replace("{host}", &host)
+                .replace("{ingester}", ingester_id)
+        })),
+    }
+}
+
 struct RingInner {
     ring_desc: Desc,
     ring_tokens: Vec<u32>,

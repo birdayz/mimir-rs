@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mimir_common::services::ServiceContext;
+use mimir_common::services::{ServiceContext, State};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -167,6 +167,151 @@ impl Ingester {
             }
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeriesReductionEstimation {
+    pub user_id: String,
+    pub estimated_count: i64,
+    pub estimated_percentage: i64,
+}
+
+pub fn filter_users_to_compact_to_reduce_in_memory_series(
+    num_memory_series: i64,
+    early_compaction_min_series: i64,
+    early_compaction_min_percentage: i64,
+    mut estimations: Vec<SeriesReductionEstimation>,
+) -> Vec<String> {
+    let total_est: i64 = estimations.iter().map(|e| e.estimated_count).sum();
+    if num_memory_series <= 0 || (total_est * 100) / num_memory_series < early_compaction_min_percentage {
+        return Vec::new();
+    }
+
+    estimations.sort_by_key(|e| std::cmp::Reverse(e.estimated_count));
+    let target_reduction = num_memory_series - early_compaction_min_series;
+    let mut sum_reduction = 0i64;
+    let mut users = Vec::new();
+    for entry in estimations {
+        if sum_reduction < target_reduction || entry.estimated_percentage >= early_compaction_min_percentage {
+            users.push(entry.user_id);
+            sum_reduction += entry.estimated_count;
+        }
+    }
+    users
+}
+
+pub fn compaction_loop_extra_delay(
+    iteration_duration: Duration,
+    standard_interval: Duration,
+    min_delay: Duration,
+) -> Duration {
+    if standard_interval.saturating_sub(iteration_duration) >= min_delay {
+        Duration::ZERO
+    } else {
+        min_delay
+    }
+}
+
+pub fn time_until_compaction(
+    now: SystemTime,
+    compaction_interval: Duration,
+    zone_offset: Duration,
+) -> Duration {
+    let interval_ns = compaction_interval.as_nanos() as i128;
+    if interval_ns <= 0 {
+        return Duration::ZERO;
+    }
+    let now_ns = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i128;
+    let hour_ns = 3600_i128 * 1_000_000_000_i128;
+    let elapsed_ns = now_ns % hour_ns;
+    let offset_ns = zone_offset.as_nanos() as i128;
+    let mut since_last = (elapsed_ns - offset_ns) % interval_ns;
+    if since_last < 0 {
+        since_last += interval_ns;
+    }
+    Duration::from_nanos((interval_ns - since_last) as u64)
+}
+
+impl Ingester {
+    pub fn time_to_next_zone_aware_compaction(
+        &self,
+        now: SystemTime,
+        zones: &[String],
+    ) -> Duration {
+        let mut sorted_zones = zones.to_vec();
+        sorted_zones.sort();
+
+        let interval = Duration::from_nanos(
+            self.blocks_cfg
+                .tsdb
+                .head_compaction_interval
+                .as_nanos()
+                .max(0) as u64,
+        );
+        if !self.cfg.ring.zone_awareness_enabled
+            || self.cfg.ring.instance_availability_zone.is_empty()
+            || sorted_zones.len() <= 1
+        {
+            return interval;
+        }
+        let current = &self.cfg.ring.instance_availability_zone;
+        let Some(zone_idx) = sorted_zones.iter().position(|z| z == current) else {
+            warn!(
+                current_zone = %current,
+                "current zone not found in zones list, using default interval"
+            );
+            return interval;
+        };
+
+        let offset_step = interval / (sorted_zones.len() as u32);
+        let zone_offset = offset_step * (zone_idx as u32);
+        time_until_compaction(now, interval, zone_offset)
+    }
+
+    pub fn compaction_service_interval(
+        &self,
+        now: SystemTime,
+        zones: &[String],
+    ) -> (Duration, Duration) {
+        let starting_interval = self.head_compaction_interval_while_starting();
+        let interval = Duration::from_nanos(
+            self.blocks_cfg
+                .tsdb
+                .head_compaction_interval
+                .as_nanos()
+                .max(0) as u64,
+        );
+
+        if self.state() == State::Starting {
+            let standard = starting_interval.min(interval);
+            let first = if self.head_compaction_interval_jitter_enabled() && !standard.is_zero() {
+                let ns = standard.as_nanos().max(1) as u64;
+                Duration::from_nanos(rand::random::<u64>() % ns)
+            } else {
+                standard
+            };
+            return (first, standard);
+        }
+
+        let zone_aware = self.time_to_next_zone_aware_compaction(now, zones);
+        if !self.head_compaction_interval_jitter_enabled() {
+            return (zone_aware, interval);
+        }
+        let jitter = if !zones.is_empty() {
+            let max_ns = ((interval.as_nanos() as u64) / (zones.len() as u64)) / 2;
+            if max_ns > 0 {
+                Duration::from_nanos(rand::random::<u64>() % max_ns)
+            } else {
+                Duration::ZERO
+            }
+        } else {
+            Duration::ZERO
+        };
+        (zone_aware + jitter, interval)
+    }
 
     pub async fn compact_blocks_to_reduce_in_memory_series(&self, now: SystemTime) {
         let mut min_series = self.blocks_cfg.tsdb.early_head_compaction_min_in_memory_series;
@@ -196,31 +341,27 @@ impl Ingester {
             let active = db.active_series.active().0;
             let reduction = (user_series as i64 - active as i64).max(0);
             let pct = ((reduction as u64 * 100) / user_series) as i64;
-            estimations.push((user_id, reduction, pct));
+            estimations.push(SeriesReductionEstimation {
+                user_id,
+                estimated_count: reduction,
+                estimated_percentage: pct,
+            });
         }
 
         let min_pct = self
             .blocks_cfg
             .tsdb
             .early_head_compaction_min_estimated_series_reduction_percentage;
-        let total_est: i64 = estimations.iter().map(|e| e.1).sum();
-        if (total_est * 100) / total_mem_series.max(1) < min_pct {
+        let users_vec = filter_users_to_compact_to_reduce_in_memory_series(
+            total_mem_series,
+            min_series,
+            min_pct,
+            estimations,
+        );
+        if users_vec.is_empty() {
             return;
         }
-
-        estimations.sort_by_key(|a| std::cmp::Reverse(a.1));
-        let target_reduction = total_mem_series - min_series;
-        let mut sum_reduction = 0i64;
-        let mut users = HashSet::new();
-        for (uid, cnt, pct) in estimations {
-            if sum_reduction < target_reduction || pct >= min_pct {
-                users.insert(uid);
-                sum_reduction += cnt;
-            }
-        }
-        if users.is_empty() {
-            return;
-        }
+        let users: HashSet<String> = users_vec.into_iter().collect();
 
         let idle_timeout = Duration::from_nanos(
             self.cfg
@@ -243,7 +384,74 @@ impl Ingester {
         }
     }
 
-    pub async fn compact_blocks_due_to_non_owned_series(&self) {
+    pub async fn compact_blocks_to_reduce_per_tenant_owned_series(&self, now: SystemTime) {
+        if !self.cfg.active_series.active_series_metrics_enabled
+            || !self.cfg.use_ingester_owned_series_for_limits
+        {
+            return;
+        }
+
+        let idle_timeout = Duration::from_nanos(
+            self.cfg
+                .active_series
+                .active_series_metrics_idle_timeout
+                .as_nanos()
+                .max(0) as u64,
+        );
+        let forced_max_ms = now
+            .checked_sub(idle_timeout)
+            .unwrap_or(UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        for user_id in self.get_tsdb_users() {
+            let limits = self.overrides.for_tenant(&user_id);
+            let threshold = limits.early_head_compaction_owned_series_threshold;
+            if threshold <= 0 {
+                continue;
+            }
+            let Some(db) = self.get_tsdb(&user_id) else {
+                continue;
+            };
+
+            let last_ms = db.last_early_compaction_ms();
+            if last_ms > 0 {
+                let last = UNIX_EPOCH + Duration::from_millis(last_ms as u64);
+                if now.duration_since(last).unwrap_or_default() < idle_timeout {
+                    continue;
+                }
+            }
+
+            let owned_count = db.owned_series_state().owned_series_count;
+            let local_threshold = self
+                .limiter
+                .convert_global_to_local_limit(&user_id, threshold as usize);
+            if local_threshold == 0 || owned_count < local_threshold {
+                continue;
+            }
+
+            let user_series = db.db.head().num_series();
+            if user_series == 0 {
+                continue;
+            }
+            db.active_series.purge(now);
+            let active = db.active_series.active().0;
+            let est_reduction = (user_series as i64 - active as i64).max(0);
+            let est_pct = ((est_reduction as u64 * 100) / user_series) as i64;
+            if est_pct < limits.early_head_compaction_min_estimated_series_reduction_percentage {
+                continue;
+            }
+
+            let mut allowed = HashSet::new();
+            allowed.insert(user_id.clone());
+            self.compact_blocks(true, forced_max_ms, Some(&allowed)).await;
+            self.metrics.per_tenant_early_compactions_triggered.inc();
+            db.set_last_early_compaction(now);
+        }
+    }
+
+    pub async fn compact_blocks_due_to_non_owned_series(&self, jitter: Duration) {
         if !self.cfg.early_compaction_non_owned_series_enabled {
             return;
         }
@@ -271,16 +479,16 @@ impl Ingester {
             let Some(db) = self.get_tsdb(&user_id) else {
                 continue;
             };
-            let now = Instant::now();
+            let now = SystemTime::now();
             let local_threshold = self
                 .limiter
                 .convert_global_to_local_limit(&user_id, threshold as usize);
 
             let refs = if local_threshold > 0 && db.db.head().num_series() >= local_threshold as u64
             {
-                db.take_pending_non_owned_refs(now.checked_sub(min_grace).unwrap_or(now))
+                db.take_pending_non_owned_refs(now - min_grace - jitter)
             } else if !max_grace.is_zero() {
-                db.take_pending_non_owned_refs(now.checked_sub(max_grace).unwrap_or(now))
+                db.take_pending_non_owned_refs(now - max_grace - jitter)
             } else {
                 Vec::new()
             };
@@ -291,6 +499,7 @@ impl Ingester {
             let series_before = db.db.head().num_series();
             let _ = db.db.compact_ooo_head();
             if let Err(e) = db.db.compact_selected_series(&refs) {
+                db.update_last_series_removal();
                 warn!(user = %user_id, error = %e, "selected series compaction failed");
                 continue;
             }
@@ -567,29 +776,102 @@ pub fn spawn_compaction_loop(
     mut force_rx: mpsc::Receiver<TriggerRequest>,
     ctx: ServiceContext,
 ) -> JoinHandle<()> {
-    let interval = Duration::from_nanos(
-        ingester
-            .blocks_cfg
-            .tsdb
-            .head_compaction_interval
+    let zones = ingester
+        .instance_ring
+        .as_ref()
+        .map(|r| r.zones())
+        .unwrap_or_default();
+    let (first_interval, mut standard_interval) =
+        ingester.compaction_service_interval(SystemTime::now(), &zones);
+    let min_delay = ingester.min_compaction_loop_delay();
+
+    let non_owned_jitter = {
+        let min_g = ingester
+            .cfg
+            .early_compaction_non_owned_series_min_grace_period
             .as_nanos()
-            .max(10_000_000) as u64,
-    );
+            .max(0) as u64;
+        if min_g > 0 {
+            Duration::from_nanos(rand::random::<u64>() % (2 * min_g))
+        } else {
+            Duration::ZERO
+        }
+    };
+
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        ingester.set_compaction_service_state(State::Running);
+        let first = first_interval.max(Duration::from_millis(10));
+        let std_period = standard_interval.max(Duration::from_millis(10));
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + first, std_period);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Consume the immediate first tick so startup doesn't force-run at t=0
-        ticker.tick().await;
+
         loop {
             tokio::select! {
                 _ = ctx.canceled() => break,
                 _ = ticker.tick() => {
+                    let zones = ingester
+                        .instance_ring
+                        .as_ref()
+                        .map(|r| r.zones())
+                        .unwrap_or_default();
+                    let (new_first, new_std) =
+                        ingester.compaction_service_interval(SystemTime::now(), &zones);
+                    if new_std != standard_interval && ingester.state() != State::Starting {
+                        standard_interval = new_std;
+                        let nf = new_first.max(Duration::from_millis(10));
+                        let ns = new_std.max(Duration::from_millis(10));
+                        ticker = tokio::time::interval_at(tokio::time::Instant::now() + nf, ns);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        continue;
+                    }
+
+                    let iter_start = Instant::now();
                     ingester.num_compactions_in_progress.fetch_add(1, Ordering::AcqRel);
                     ingester.compact_blocks(false, 0, None).await;
                     ingester.compact_blocks_to_reduce_in_memory_series(SystemTime::now()).await;
-                    ingester.compact_blocks_due_to_non_owned_series().await;
+                    ingester.compact_blocks_to_reduce_per_tenant_owned_series(SystemTime::now()).await;
+                    ingester.compact_blocks_due_to_non_owned_series(non_owned_jitter).await;
                     ingester.num_compactions_in_progress.fetch_sub(1, Ordering::AcqRel);
                     ingester.sync_offset_catalogues().await;
+
+                    let extra = compaction_loop_extra_delay(iter_start.elapsed(), standard_interval, min_delay);
+                    if !extra.is_zero() {
+                        let sleep_fut = tokio::time::sleep(extra);
+                        tokio::pin!(sleep_fut);
+                        loop {
+                            tokio::select! {
+                                _ = ctx.canceled() => {
+                                    ingester.set_compaction_service_state(State::Terminated);
+                                    return;
+                                }
+                                _ = &mut sleep_fut => break,
+                                req_opt = force_rx.recv() => {
+                                    let Some(req) = req_opt else {
+                                        ingester.set_compaction_service_state(State::Terminated);
+                                        return;
+                                    };
+                                    ingester.compact_blocks(true, i64::MAX, req.users.as_ref()).await;
+                                    ingester.sync_offset_catalogues().await;
+                                    let _ = req.callback.send(());
+                                }
+                            }
+                        }
+                    }
+
+                    let zones = ingester
+                        .instance_ring
+                        .as_ref()
+                        .map(|r| r.zones())
+                        .unwrap_or_default();
+                    let (new_first, new_std) =
+                        ingester.compaction_service_interval(SystemTime::now(), &zones);
+                    if new_std != standard_interval {
+                        standard_interval = new_std;
+                        let nf = new_first.max(Duration::from_millis(10));
+                        let ns = new_std.max(Duration::from_millis(10));
+                        ticker = tokio::time::interval_at(tokio::time::Instant::now() + nf, ns);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    }
                 }
                 req_opt = force_rx.recv() => {
                     let Some(req) = req_opt else { break; };
@@ -599,6 +881,7 @@ pub fn spawn_compaction_loop(
                 }
             }
         }
+        ingester.set_compaction_service_state(State::Terminated);
     })
 }
 
@@ -636,7 +919,7 @@ pub fn spawn_shipping_loop(
 }
 
 pub fn spawn_idle_tsdb_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> JoinHandle<()> {
-    let interval = Duration::from_secs(5 * 60);
+    let interval = ingester.close_idle_tsdb_interval().max(Duration::from_millis(10));
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -653,6 +936,7 @@ pub fn spawn_idle_tsdb_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> Joi
 pub fn spawn_metadata_purger_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> JoinHandle<()> {
     let interval = Duration::from_secs(5 * 60);
     tokio::spawn(async move {
+        ingester.set_metadata_purger_service_state(State::Running);
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
@@ -662,6 +946,7 @@ pub fn spawn_metadata_purger_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
                 _ = ticker.tick() => ingester.purge_user_metrics_metadata(),
             }
         }
+        ingester.set_metadata_purger_service_state(State::Terminated);
     })
 }
 
@@ -686,13 +971,16 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
             .max(0) as u64,
     );
 
+    let limit_period = ingester.limit_metrics_update_period().max(Duration::from_millis(10));
+
     tokio::spawn(async move {
+        ingester.set_metrics_updater_service_state(State::Running);
         let started_at = Instant::now();
         let mut flipped_loading = false;
         let mut ingest_rate_tick = tokio::time::interval(INSTANCE_INGESTION_RATE_TICK_INTERVAL);
         let mut rate_tick = tokio::time::interval(rate_period);
         let mut active_tick = tokio::time::interval(active_period);
-        let mut limit_tick = tokio::time::interval(Duration::from_secs(15));
+        let mut limit_tick = tokio::time::interval(limit_period);
         let mut churn_tick = tokio::time::interval(LABEL_CHURN_RECORD_INTERVAL);
 
         ingest_rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -739,6 +1027,7 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
                 }
             }
         }
+        ingester.set_metrics_updater_service_state(State::Terminated);
     })
 }
 
@@ -754,11 +1043,15 @@ pub fn spawn_owned_series_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> 
         let Some(ref strategy) = ingester.owned_series_strategy else {
             return;
         };
+        ingester.set_owned_series_service_state(State::Running);
         let mut cur_interval = DEFAULT_OWNED_SERIES_INITIAL_RETRY_INTERVAL;
         loop {
             tokio::select! {
                 _ = ctx.canceled() => break,
                 _ = tokio::time::sleep(cur_interval) => {
+                    if ingester.is_owned_series_paused() {
+                        continue;
+                    }
                     match strategy.check_ring_for_changes() {
                         Ok(changed) => {
                             cur_interval = normal_interval;
@@ -780,5 +1073,6 @@ pub fn spawn_owned_series_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> 
                 }
             }
         }
+        ingester.set_owned_series_service_state(State::Terminated);
     })
 }

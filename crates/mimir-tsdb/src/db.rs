@@ -144,7 +144,7 @@ impl Tsdb {
     pub fn compact_head_range(&self, mint: i64, maxt: i64) -> Result<Option<Ulid>, TsdbError> {
         let _guard = self.compact_mtx.lock();
         let uid = self.compact_head_range_locked(mint, maxt, true)?;
-        if uid.is_some() {
+        if maxt > mint {
             self.head.truncate_wal(maxt)?;
         }
         Ok(uid)
@@ -170,7 +170,7 @@ impl Tsdb {
             return Ok(None);
         }
         let series = self.head.collect_compaction_series(mint, maxt - 1)?;
-        let Some(meta) = write_block_from_series(
+        let meta_opt = write_block_from_series(
             &self.dir,
             mint,
             maxt,
@@ -178,19 +178,24 @@ impl Tsdb {
             BlockMetaCompaction::default(),
             false,
             self.opts.max_block_chunk_segment_size,
-        )?
-        else {
-            return Ok(None);
+        )?;
+
+        let uid = if let Some(meta) = meta_opt {
+            let reloaded = Self::load_blocks(&self.dir)?;
+            let mut blocks_guard = self.blocks.write();
+            *blocks_guard = reloaded;
+            if truncate_memory {
+                self.head.truncate_memory(maxt)?;
+            }
+            Some(meta.ulid)
+        } else {
+            if truncate_memory {
+                self.head.truncate_memory(maxt)?;
+            }
+            None
         };
 
-        let uid = meta.ulid;
-        let reloaded = Self::load_blocks(&self.dir)?;
-        *self.blocks.write() = reloaded;
-
-        if truncate_memory {
-            self.head.truncate_memory(maxt)?;
-        }
-        Ok(Some(uid))
+        Ok(uid)
     }
 
     /// Compacts all out-of-order samples in Head into an OOO ULID block on disk and clears OOO state.
@@ -201,12 +206,14 @@ impl Tsdb {
             return Ok(None);
         }
         let maxt = maxt_inclusive.saturating_add(1);
+        let mut compaction = BlockMetaCompaction::default();
+        compaction.set_out_of_order();
         let Some(meta) = write_block_from_series(
             &self.dir,
             mint,
             maxt,
             series,
-            BlockMetaCompaction::default(),
+            compaction,
             true,
             self.opts.max_block_chunk_segment_size,
         )?
@@ -215,7 +222,8 @@ impl Tsdb {
         };
         let uid = meta.ulid;
         let reloaded = Self::load_blocks(&self.dir)?;
-        *self.blocks.write() = reloaded;
+        let mut blocks_guard = self.blocks.write();
+        *blocks_guard = reloaded;
         self.head.clear_ooo_data()?;
         Ok(Some(uid))
     }
@@ -231,12 +239,14 @@ impl Tsdb {
             return Ok(None);
         }
         let maxt = maxt_inclusive.saturating_add(1);
+        let mut compaction = BlockMetaCompaction::default();
+        compaction.set_selected_series();
         let Some(meta) = write_block_from_series(
             &self.dir,
             mint,
             maxt,
             series,
-            BlockMetaCompaction::default(),
+            compaction,
             false,
             self.opts.max_block_chunk_segment_size,
         )?
@@ -245,7 +255,8 @@ impl Tsdb {
         };
         let uid = meta.ulid;
         let reloaded = Self::load_blocks(&self.dir)?;
-        *self.blocks.write() = reloaded;
+        let mut blocks_guard = self.blocks.write();
+        *blocks_guard = reloaded;
         self.head.evict_series_refs(refs)?;
         Ok(Some(uid))
     }
@@ -259,12 +270,12 @@ impl Tsdb {
 
     /// Returns a [`TsdbQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
     pub fn querier(&self, mint: i64, maxt: i64) -> TsdbQuerier<'_> {
-        TsdbQuerier::new(Some(&self.head), self.blocks(), mint, maxt)
+        TsdbQuerier::with_blocks_lock(Some(&self.head), &self.blocks, mint, maxt)
     }
 
     /// Returns a [`TsdbChunkQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
     pub fn chunk_querier(&self, mint: i64, maxt: i64) -> TsdbChunkQuerier<'_> {
-        TsdbChunkQuerier::new(Some(&self.head), self.blocks(), mint, maxt)
+        TsdbChunkQuerier::with_blocks_lock(Some(&self.head), &self.blocks, mint, maxt)
     }
 
     /// Returns the Head's [`CircularExemplarStorage`].

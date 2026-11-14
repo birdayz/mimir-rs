@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use mimir_common::services::{basic_service, ManagedBasicService, ServiceContext, ServiceError};
+use mimir_config::ingester::PartitionRingConfig;
 use mimir_proto::ringpb::{OwnerState, PartitionRingDesc, PartitionState};
+use parking_lot::Mutex;
 use prometheus::{CounterVec, Opts, Registry};
 use tracing::{info, warn};
 
@@ -19,7 +21,7 @@ use super::model::{
 };
 use crate::kv::{CasCallbackError, CasOutcome, KvClient, KvError};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionInstanceLifecyclerConfig {
     pub partition_id: i32,
     pub create_partitions_with_derived_tokens: bool,
@@ -30,6 +32,33 @@ pub struct PartitionInstanceLifecyclerConfig {
     pub wait_owners_duration_on_pending: Duration,
     pub delete_inactive_partition_after: Duration,
     pub polling_interval: Duration,
+}
+
+impl PartitionInstanceLifecyclerConfig {
+    pub fn from_partition_ring_config(
+        cfg: &PartitionRingConfig,
+        partition_id: i32,
+        instance_id: impl Into<String>,
+        polling_interval: Duration,
+    ) -> Self {
+        Self {
+            partition_id,
+            create_partitions_with_derived_tokens: cfg.create_partitions_with_derived_tokens,
+            max_derived_token_partitions: cfg.max_derived_token_partitions as i32,
+            instance_id: instance_id.into(),
+            multi_partition_ownership: false,
+            wait_owners_count_on_pending: cfg.min_partition_owners_count.max(0) as usize,
+            wait_owners_duration_on_pending: cfg
+                .min_partition_owners_duration
+                .as_std()
+                .unwrap_or(Duration::from_secs(10)),
+            delete_inactive_partition_after: cfg
+                .delete_inactive_partition_after
+                .as_std()
+                .unwrap_or(Duration::from_secs(13 * 3600)),
+            polling_interval,
+        }
+    }
 }
 
 impl Default for PartitionInstanceLifecyclerConfig {
@@ -126,6 +155,7 @@ pub struct PartitionInstanceLifecycler {
     store: Arc<dyn KvClient>,
     create_partition_on_startup: AtomicBool,
     remove_owner_on_shutdown: AtomicBool,
+    started: AtomicBool,
     metrics: LifecyclerMetrics,
 }
 
@@ -162,8 +192,13 @@ impl PartitionInstanceLifecycler {
             store,
             create_partition_on_startup: AtomicBool::new(true),
             remove_owner_on_shutdown: AtomicBool::new(false),
+            started: AtomicBool::new(false),
             metrics: LifecyclerMetrics::new(ring_name, reg),
         }))
+    }
+
+    pub fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
     }
 
     pub fn create_partition_on_startup(&self) -> bool {
@@ -228,7 +263,10 @@ impl PartitionInstanceLifecycler {
     where
         F: Fn(&mut PartitionRingDesc) -> Result<bool, PartitionRingError> + Send + Sync + 'static,
     {
-        self.store
+        let typed_err: Arc<Mutex<Option<PartitionRingError>>> = Arc::new(Mutex::new(None));
+        let typed_err_cb = Arc::clone(&typed_err);
+        let res = self
+            .store
             .cas(
                 &self.ring_key,
                 Box::new(move |in_val| {
@@ -236,8 +274,14 @@ impl PartitionInstanceLifecycler {
                         .and_then(|a| a.downcast_ref::<PartitionRingDesc>())
                         .cloned()
                         .unwrap_or_default();
-                    let changed = update(&mut next)
-                        .map_err(|e| CasCallbackError::fatal(KvError::Other(e.to_string())))?;
+                    let changed = match update(&mut next) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            *typed_err_cb.lock() = Some(e);
+                            return Err(CasCallbackError::fatal(KvError::Other(msg)));
+                        }
+                    };
                     if !changed {
                         Ok(CasOutcome::NoChange)
                     } else {
@@ -245,8 +289,17 @@ impl PartitionInstanceLifecycler {
                     }
                 }),
             )
-            .await
-            .map_err(|e| PartitionRingError::Other(e.to_string()))
+            .await;
+        match res {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(pe) = typed_err.lock().take() {
+                    Err(pe)
+                } else {
+                    Err(PartitionRingError::Other(e.to_string()))
+                }
+            }
+        }
     }
 
     async fn create_partition_and_register_owner(&self) -> Result<(), PartitionRingError> {
@@ -392,6 +445,7 @@ impl PartitionInstanceLifecycler {
     }
 
     pub fn into_service(self: Arc<Self>) -> Arc<ManagedBasicService> {
+        self.started.store(true, Ordering::Release);
         let l_start = self.clone();
         let l_run = self.clone();
         let l_stop = self.clone();

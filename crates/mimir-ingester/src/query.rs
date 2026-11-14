@@ -26,7 +26,7 @@ use mimir_tsdb::db::Tsdb;
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::matcher::{LabelMatcher, MatchType};
 use mimir_tsdb::querier::QueryChunkSeries;
-use mimir_tsdb::search::{FuzzAlg, SearchHints, SearchOrdering};
+use mimir_tsdb::search::{FuzzAlg, SearchHints, SearchOrdering, SearchResult};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tonic::metadata::MetadataMap;
@@ -205,6 +205,36 @@ pub fn tsdb_encoding_to_wire(enc: Encoding) -> i32 {
     }
 }
 
+pub fn proto_to_params(
+    wf: Option<&ingesterpb::SearchFilter>,
+) -> Result<Option<SearchHints>, IngesterError> {
+    let Some(wf) = wf else {
+        return Ok(None);
+    };
+    let fuzz_alg = match ingesterpb::search_filter::FuzzAlg::try_from(wf.fuzz_alg) {
+        Ok(ingesterpb::search_filter::FuzzAlg::Subsequence) => FuzzAlg::Subsequence,
+        Ok(ingesterpb::search_filter::FuzzAlg::JaroWinkler) => FuzzAlg::JaroWinkler,
+        Ok(ingesterpb::search_filter::FuzzAlg::SubstringLeft) => FuzzAlg::SubstringLeft,
+        Ok(ingesterpb::search_filter::FuzzAlg::Substring) => FuzzAlg::Substring,
+        Err(_) => {
+            return Err(IngesterError::BadRequest {
+                message: format!("unknown fuzz algorithm {}", wf.fuzz_alg),
+            });
+        }
+    };
+    let hints = SearchHints {
+        terms: wf.terms.clone(),
+        case_sensitive: !wf.case_insensitive,
+        fuzz_alg,
+        fuzz_threshold: wf.fuzz_threshold,
+        ..Default::default()
+    };
+    hints.validate().map_err(|e| IngesterError::BadRequest {
+        message: e.to_string(),
+    })?;
+    Ok(Some(hints))
+}
+
 pub fn build_search_hints(
     filter: Option<&ingesterpb::SearchFilter>,
     ordering: i32,
@@ -212,6 +242,7 @@ pub fn build_search_hints(
     wire_matchers: &[ingesterpb::LabelMatcher],
 ) -> Result<(SearchHints, Vec<LabelMatcher>), IngesterError> {
     let matchers = from_proto_matchers(wire_matchers)?;
+    let parsed_filter = proto_to_params(filter)?;
     if limit < 0 {
         return Err(IngesterError::BadRequest {
             message: format!("limit must be >= 0, got {limit}"),
@@ -223,34 +254,110 @@ pub fn build_search_hints(
         _ => SearchOrdering::ValueAsc,
     };
 
-    let mut hints = SearchHints {
-        order_by,
-        limit: limit.min(usize::MAX as i64) as usize,
-        ..Default::default()
-    };
-
-    if let Some(wf) = filter {
-        let fuzz_alg = match ingesterpb::search_filter::FuzzAlg::try_from(wf.fuzz_alg) {
-            Ok(ingesterpb::search_filter::FuzzAlg::Subsequence) => FuzzAlg::Subsequence,
-            Ok(ingesterpb::search_filter::FuzzAlg::JaroWinkler) => FuzzAlg::JaroWinkler,
-            Ok(ingesterpb::search_filter::FuzzAlg::SubstringLeft) => FuzzAlg::SubstringLeft,
-            Ok(ingesterpb::search_filter::FuzzAlg::Substring) => FuzzAlg::Substring,
-            Err(_) => {
-                return Err(IngesterError::BadRequest {
-                    message: format!("unknown fuzz algorithm {}", wf.fuzz_alg),
-                });
-            }
-        };
-        hints.terms = wf.terms.clone();
-        hints.case_sensitive = !wf.case_insensitive;
-        hints.fuzz_alg = fuzz_alg;
-        hints.fuzz_threshold = wf.fuzz_threshold;
-        hints.validate().map_err(|e| IngesterError::BadRequest {
-            message: e.to_string(),
-        })?;
-    }
+    let mut hints = parsed_filter.unwrap_or_default();
+    hints.order_by = order_by;
+    hints.limit = (limit.min(isize::MAX as i64)) as usize;
 
     Ok((hints, matchers))
+}
+
+/// Iterator trait matching Prometheus `storage.SearchResultSet` (`pkg/ingester/ingester_search.go`).
+pub trait SearchResultSet {
+    fn next(&mut self) -> bool;
+    fn at(&self) -> SearchResult;
+    fn warnings(&self) -> &[String];
+    fn err(&self) -> Option<String>;
+}
+
+pub struct VecSearchResultSet {
+    results: Vec<SearchResult>,
+    idx: usize,
+    warnings: Vec<String>,
+    err: Option<String>,
+}
+
+impl VecSearchResultSet {
+    pub fn new(results: Vec<SearchResult>, warnings: Vec<String>, err: Option<String>) -> Self {
+        Self {
+            results,
+            idx: 0,
+            warnings,
+            err,
+        }
+    }
+}
+
+impl SearchResultSet for VecSearchResultSet {
+    fn next(&mut self) -> bool {
+        if self.idx >= self.results.len() {
+            return false;
+        }
+        self.idx += 1;
+        true
+    }
+
+    fn at(&self) -> SearchResult {
+        self.results[self.idx - 1].clone()
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    fn err(&self) -> Option<String> {
+        self.err.clone()
+    }
+}
+
+/// Streams results from `rs` in batches of `SEARCH_BATCH_SIZE` (`pkg/ingester/ingester_search.go:streamSearchResults`).
+pub fn stream_search_results(
+    is_canceled: &dyn Fn() -> bool,
+    rs: &mut dyn SearchResultSet,
+    send: &mut dyn FnMut(ingesterpb::SearchResultBatch) -> Result<(), String>,
+) -> Result<(), String> {
+    if is_canceled() {
+        return Err("context canceled".to_string());
+    }
+    let mut batch = ingesterpb::SearchResultBatch {
+        results: Vec::with_capacity(SEARCH_BATCH_SIZE),
+        warnings: Vec::new(),
+    };
+    while rs.next() {
+        if is_canceled() {
+            return Err("context canceled".to_string());
+        }
+        let v = rs.at();
+        batch.results.push(ingesterpb::search_result_batch::Result {
+            value: v.value,
+            score: v.score,
+        });
+        if batch.results.len() >= SEARCH_BATCH_SIZE {
+            let full = std::mem::replace(
+                &mut batch,
+                ingesterpb::SearchResultBatch {
+                    results: Vec::with_capacity(SEARCH_BATCH_SIZE),
+                    warnings: Vec::new(),
+                },
+            );
+            send(full)?;
+        }
+    }
+    if let Some(err) = rs.err() {
+        return Err(err);
+    }
+    batch.warnings = rs.warnings().to_vec();
+    if !batch.results.is_empty() || !batch.warnings.is_empty() {
+        send(batch)?;
+    }
+    Ok(())
+}
+
+/// Async sink for streaming `QueryStreamResponse` batches incrementally (releasing label memory per batch).
+pub trait QueryStreamSink: Send + Sync {
+    fn send<'a>(
+        &'a self,
+        resp: ingesterpb::QueryStreamResponse,
+    ) -> mimir_ring::kv::BoxFuture<'a, Result<(), IngesterError>>;
 }
 
 impl Ingester {
@@ -487,31 +594,30 @@ impl Ingester {
             });
         }
 
-        let num_series = chunk_series.len();
-        let mut num_samples = 0usize;
-        let mut responses = Vec::new();
-
-        // Phase 1: stream QueryStreamSeries in batches of QUERY_STREAM_BATCH_SIZE (128).
-        let mut series_batch = Vec::with_capacity(QUERY_STREAM_BATCH_SIZE);
-        for cs in &chunk_series {
-            series_batch.push(ingesterpb::QueryStreamSeries {
-                labels: labels_to_proto_pairs(&cs.labels),
-                chunk_count: cs.chunks.len() as i64,
-            });
-            if series_batch.len() >= QUERY_STREAM_BATCH_SIZE {
-                responses.push(ingesterpb::QueryStreamResponse {
-                    streaming_series: std::mem::take(&mut series_batch),
-                    is_end_of_series_stream: false,
-                    streaming_series_chunks: Vec::new(),
-                });
+        struct VecSink {
+            responses: parking_lot::Mutex<Vec<ingesterpb::QueryStreamResponse>>,
+        }
+        impl QueryStreamSink for VecSink {
+            fn send<'a>(
+                &'a self,
+                resp: ingesterpb::QueryStreamResponse,
+            ) -> mimir_ring::kv::BoxFuture<'a, Result<(), IngesterError>> {
+                Box::pin(async move {
+                    self.responses.lock().push(resp);
+                    Ok(())
+                })
             }
         }
-        // Always send final series batch with is_end_of_series_stream = true.
-        responses.push(ingesterpb::QueryStreamResponse {
-            streaming_series: series_batch,
-            is_end_of_series_stream: true,
-            streaming_series_chunks: Vec::new(),
-        });
+
+        let sink = VecSink {
+            responses: parking_lot::Mutex::new(Vec::new()),
+        };
+
+        let num_series = self
+            .send_streaming_query_series_from_chunk_series(&mut chunk_series, &sink)
+            .await?;
+        let mut responses = std::mem::take(&mut *sink.responses.lock());
+        let mut num_samples = 0usize;
 
         // Phase 2: stream QueryStreamSeriesChunks batches respecting streaming_chunks_batch_size & 1MiB cap.
         let batch_limit = req.streaming_chunks_batch_size as usize;
@@ -573,6 +679,62 @@ impl Ingester {
         self.metrics.queried_samples.observe(num_samples as f64);
 
         Ok(responses)
+    }
+
+    /// Streams Phase 1 (`QueryStreamSeries` batches ending with `is_end_of_series_stream: true`)
+    /// from `db.chunk_querier(mint, maxt)` via `sink`, releasing each series' labels as each batch
+    /// is flushed (`pkg/ingester/ingester_query.go:sendStreamingQuerySeries`).
+    pub async fn send_streaming_query_series(
+        &self,
+        db: &UserTsdb,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        matchers: &[LabelMatcher],
+        sink: &dyn QueryStreamSink,
+    ) -> Result<Vec<QueryChunkSeries>, IngesterError> {
+        let cq = db.db.chunk_querier(start_timestamp_ms, end_timestamp_ms);
+        let mut chunk_series = cq
+            .select(true, matchers)
+            .map_err(|e| IngesterError::Internal {
+                message: format!("selecting series from ChunkQuerier: {e}"),
+            })?;
+        self.send_streaming_query_series_from_chunk_series(&mut chunk_series, sink)
+            .await?;
+        Ok(chunk_series)
+    }
+
+    async fn send_streaming_query_series_from_chunk_series(
+        &self,
+        chunk_series: &mut [QueryChunkSeries],
+        sink: &dyn QueryStreamSink,
+    ) -> Result<usize, IngesterError> {
+        let num_series = chunk_series.len();
+        let mut series_batch = Vec::with_capacity(QUERY_STREAM_BATCH_SIZE);
+        for cs in chunk_series.iter_mut() {
+            // Release each series' labels as soon as it is serialized into the batch,
+            // bounding peak label memory to ~QUERY_STREAM_BATCH_SIZE * labels_per_series.
+            let labels = std::mem::take(&mut cs.labels);
+            series_batch.push(ingesterpb::QueryStreamSeries {
+                labels: labels_to_proto_pairs(&labels),
+                chunk_count: cs.chunks.len() as i64,
+            });
+            drop(labels);
+            if series_batch.len() >= QUERY_STREAM_BATCH_SIZE {
+                sink.send(ingesterpb::QueryStreamResponse {
+                    streaming_series: std::mem::take(&mut series_batch),
+                    is_end_of_series_stream: false,
+                    streaming_series_chunks: Vec::new(),
+                })
+                .await?;
+            }
+        }
+        sink.send(ingesterpb::QueryStreamResponse {
+            streaming_series: series_batch,
+            is_end_of_series_stream: true,
+            streaming_series_chunks: Vec::new(),
+        })
+        .await?;
+        Ok(num_series)
     }
 
     pub async fn handle_query_exemplars(
@@ -1161,7 +1323,18 @@ impl Ingester {
                     .map_err(|e| IngesterError::Internal {
                         message: e.to_string(),
                     })?;
-            Ok(chunk_search_results(results))
+            let mut rs = VecSearchResultSet::new(results, Vec::new(), None);
+            let mut batches = Vec::new();
+            stream_search_results(
+                &|| false,
+                &mut rs,
+                &mut |b| {
+                    batches.push(b);
+                    Ok(())
+                },
+            )
+            .map_err(|message| IngesterError::Internal { message })?;
+            Ok(batches)
         }
         .await;
         permit.finish(false);
@@ -1188,7 +1361,18 @@ impl Ingester {
                 .map_err(|e| IngesterError::Internal {
                     message: e.to_string(),
                 })?;
-            Ok(chunk_search_results(results))
+            let mut rs = VecSearchResultSet::new(results, Vec::new(), None);
+            let mut batches = Vec::new();
+            stream_search_results(
+                &|| false,
+                &mut rs,
+                &mut |b| {
+                    batches.push(b);
+                    Ok(())
+                },
+            )
+            .map_err(|message| IngesterError::Internal { message })?;
+            Ok(batches)
         }
         .await;
         permit.finish(false);
@@ -1217,28 +1401,6 @@ fn create_user_stats(
         api_ingestion_rate: api_rate,
         rule_ingestion_rate: rule_rate,
     })
-}
-
-fn chunk_search_results(
-    results: Vec<mimir_tsdb::search::SearchResult>,
-) -> Vec<ingesterpb::SearchResultBatch> {
-    if results.is_empty() {
-        return Vec::new();
-    }
-    let mut batches = Vec::new();
-    for chunk in results.chunks(SEARCH_BATCH_SIZE) {
-        batches.push(ingesterpb::SearchResultBatch {
-            results: chunk
-                .iter()
-                .map(|r| ingesterpb::search_result_batch::Result {
-                    value: r.value.clone(),
-                    score: r.score,
-                })
-                .collect(),
-            warnings: Vec::new(),
-        });
-    }
-    batches
 }
 
 /// Ported from `prometheus/model/labels/sharding.go:StableHash`, the per-series shard hash

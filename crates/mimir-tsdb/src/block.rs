@@ -142,6 +142,20 @@ impl BlockMetaCompaction {
     pub fn from_out_of_order(&self) -> bool {
         self.hints.iter().any(|h| h == COMPACTION_HINT_FROM_OUT_OF_ORDER)
     }
+
+    pub fn set_selected_series(&mut self) {
+        if !self.from_selected_series() {
+            self.hints
+                .push(COMPACTION_HINT_FROM_SELECTED_SERIES.to_string());
+            self.hints.sort();
+        }
+    }
+
+    pub fn from_selected_series(&self) -> bool {
+        self.hints
+            .iter()
+            .any(|h| h == COMPACTION_HINT_FROM_SELECTED_SERIES)
+    }
 }
 
 /// Thanos downsample metadata (`block.ThanosDownsample`).

@@ -359,15 +359,33 @@ impl RingConfig {
                     "\"spread-minimizing\" token generation strategy is misconfigured: instance id cannot be empty".to_string(),
                 ));
             }
-            if !self.spread_minimizing_zones.0.is_empty()
-                && !self
-                    .spread_minimizing_zones
-                    .0
-                    .contains(&self.instance_availability_zone)
+            if self.spread_minimizing_zones.0.is_empty() || self.spread_minimizing_zones.0.len() > 8
             {
-                return Err(ConfigError::Validation(
-                    "\"spread-minimizing\" token generation strategy is misconfigured: instance availability zone is not in configured zones".to_string(),
-                ));
+                return Err(ConfigError::Validation(format!(
+                    "\"spread-minimizing\" token generation strategy is misconfigured: number of zones {} is not correct: it must be greater than 0 and less or equal than 8",
+                    self.spread_minimizing_zones.0.len()
+                )));
+            }
+            if !self
+                .spread_minimizing_zones
+                .0
+                .contains(&self.instance_availability_zone)
+            {
+                return Err(ConfigError::Validation(format!(
+                    "\"spread-minimizing\" token generation strategy is misconfigured: zone {} is not valid",
+                    self.instance_availability_zone
+                )));
+            }
+            let valid_suffix = self
+                .instance_id
+                .rfind('-')
+                .map(|pos| &self.instance_id[pos + 1..])
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            if !valid_suffix {
+                return Err(ConfigError::Validation(format!(
+                    "\"spread-minimizing\" token generation strategy is misconfigured: unable to extract instance id from {:?}",
+                    self.instance_id
+                )));
             }
             return Ok(());
         }
