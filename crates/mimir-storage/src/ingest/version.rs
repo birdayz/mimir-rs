@@ -8,10 +8,11 @@ use bytes::Bytes;
 use mimir_proto::cortexpb;
 use mimir_proto::prost::Message;
 use mimir_proto::symbols::{
-    v2_common_symbols, LATEST_RECORD_VERSION, RECORD_VERSION_HEADER_KEY, V2_RECORD_SYMBOL_OFFSET,
+    v2_common_symbols, CommonSymbols, FastSymbolsTable, LATEST_RECORD_VERSION,
+    MIN_PREALLOCATED_SYMBOLS_PER_REQUEST, RECORD_VERSION_HEADER_KEY, V2_RECORD_SYMBOL_OFFSET,
 };
 use mimir_proto::zerocopy::{
-    decode_write_request, encode_write_request_rw2_bytes, BorrowedWriteRequest, DecodeError,
+    decode_write_request, from_write_request_to_rw2, BorrowedWriteRequest, DecodeError,
     DecodeOptions, EncodeRw2Error, WriteRequestScratch,
 };
 use thiserror::Error;
@@ -61,7 +62,11 @@ pub fn validate_record_version(version: i64) -> Result<(), RecordCodecError> {
 }
 
 pub fn record_version_header(version: RecordVersion) -> [u8; 4] {
-    version.as_u32().to_be_bytes()
+    record_version_header_raw(version.as_u32())
+}
+
+pub fn record_version_header_raw(version: u32) -> [u8; 4] {
+    version.to_be_bytes()
 }
 
 /// Extracts the record version from Kafka record headers.
@@ -172,67 +177,311 @@ macro_rules! int_or_i32 {
 }
 use int_or_i32;
 
+fn new_partial_write_request(req: &cortexpb::WriteRequest) -> cortexpb::WriteRequest {
+    cortexpb::WriteRequest {
+        source: req.source,
+        skip_label_validation: req.skip_label_validation,
+        skip_label_count_validation: req.skip_label_count_validation,
+        ..Default::default()
+    }
+}
+
+#[inline]
+fn embedded_message_field_size(message_size: usize) -> usize {
+    1 + message_size + mimir_proto::prost::length_delimiter_len(message_size)
+}
+
+/// Splits a RW1 `WriteRequest` into partial requests each <= `max_size` bytes (best effort).
+/// Ported 1:1 from `mimirpb.SplitWriteRequestByMaxMarshalSize`.
+pub fn split_write_request_by_max_marshal_size(
+    req: &cortexpb::WriteRequest,
+    req_size: usize,
+    max_size: usize,
+) -> Vec<cortexpb::WriteRequest> {
+    if max_size == 0 || req_size <= max_size {
+        return vec![req.clone()];
+    }
+
+    let ts_reqs = split_timeseries_by_max_marshal_size(req, req_size, max_size);
+    let md_reqs = split_metadata_by_max_marshal_size(req, req_size, max_size);
+
+    if md_reqs.is_empty() {
+        return ts_reqs;
+    }
+    if ts_reqs.is_empty() {
+        return md_reqs;
+    }
+    let mut merged = Vec::with_capacity(ts_reqs.len() + md_reqs.len());
+    merged.extend(ts_reqs);
+    merged.extend(md_reqs);
+    merged
+}
+
+fn split_timeseries_by_max_marshal_size(
+    req: &cortexpb::WriteRequest,
+    req_size: usize,
+    max_size: usize,
+) -> Vec<cortexpb::WriteRequest> {
+    if req.timeseries.is_empty() {
+        return Vec::new();
+    }
+    let md_size: usize = req
+        .metadata
+        .iter()
+        .map(|m| embedded_message_field_size(m.encoded_len()))
+        .sum();
+    let req_size_without_md = req_size.saturating_sub(md_size);
+    if req_size_without_md <= max_size {
+        let mut partial = new_partial_write_request(req);
+        partial.timeseries = req.timeseries.clone();
+        return vec![partial];
+    }
+
+    let mut out = Vec::new();
+    let mut next_req = new_partial_write_request(req);
+    let mut next_req_size = next_req.encoded_len();
+
+    for ts in &req.timeseries {
+        let series_field_size = embedded_message_field_size(ts.encoded_len());
+        if next_req_size + series_field_size > max_size && !next_req.timeseries.is_empty() {
+            out.push(next_req);
+            next_req = new_partial_write_request(req);
+            next_req_size = next_req.encoded_len();
+        }
+        next_req_size += series_field_size;
+        next_req.timeseries.push(ts.clone());
+    }
+    if !next_req.timeseries.is_empty() {
+        out.push(next_req);
+    }
+    out
+}
+
+fn split_metadata_by_max_marshal_size(
+    req: &cortexpb::WriteRequest,
+    req_size: usize,
+    max_size: usize,
+) -> Vec<cortexpb::WriteRequest> {
+    if req.metadata.is_empty() {
+        return Vec::new();
+    }
+    let ts_size: usize = req
+        .timeseries
+        .iter()
+        .map(|ts| embedded_message_field_size(ts.encoded_len()))
+        .sum();
+    let req_size_without_ts = req_size.saturating_sub(ts_size);
+    if req_size_without_ts <= max_size {
+        let mut partial = new_partial_write_request(req);
+        partial.metadata = req.metadata.clone();
+        return vec![partial];
+    }
+
+    let mut out = Vec::new();
+    let mut next_req = new_partial_write_request(req);
+    let mut next_req_size = next_req.encoded_len();
+
+    for m in &req.metadata {
+        let md_field_size = embedded_message_field_size(m.encoded_len());
+        if next_req_size + md_field_size > max_size && !next_req.metadata.is_empty() {
+            out.push(next_req);
+            next_req = new_partial_write_request(req);
+            next_req_size = next_req.encoded_len();
+        }
+        next_req_size += md_field_size;
+        next_req.metadata.push(m.clone());
+    }
+    if !next_req.metadata.is_empty() {
+        out.push(next_req);
+    }
+    out
+}
+
+fn resolve_ref<'a>(
+    r: u32,
+    symbols: &'a [String],
+    common_symbols: &'a [String],
+    offset: u32,
+) -> &'a str {
+    if r < offset {
+        common_symbols.get(r as usize).map(String::as_str).unwrap_or("")
+    } else {
+        symbols
+            .get((r - offset) as usize)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+}
+
+fn resolved_symbol_size(r: u32, symbols: &[String], offset: u32) -> usize {
+    if r == 0 {
+        return 1 + mimir_proto::prost::length_delimiter_len(0);
+    }
+    if r < offset {
+        return 0;
+    }
+    let l = symbols.get((r - offset) as usize).map(String::len).unwrap_or(0);
+    1 + l + mimir_proto::prost::length_delimiter_len(l)
+}
+
+fn symbols_size_proto(symbols: &[String]) -> usize {
+    symbols
+        .iter()
+        .map(|s| 1 + s.len() + mimir_proto::prost::length_delimiter_len(s.len()))
+        .sum()
+}
+
+fn max_rw2_series_size_after_resymbolization(
+    ts: &cortexpb::TimeSeriesRw2,
+    symbols: &[String],
+    offset: u32,
+) -> (usize, usize) {
+    let highest_possible = symbols.len() as u64 + offset as u64;
+    let sym_upper = 1 + mimir_proto::prost::length_delimiter_len(highest_possible as usize);
+    let mut series_size = ts.encoded_len();
+    let mut syms_size = 0usize;
+
+    for &r in &ts.labels_refs {
+        series_size += sym_upper.saturating_sub(mimir_proto::prost::length_delimiter_len(r as usize));
+        syms_size += resolved_symbol_size(r, symbols, offset);
+    }
+    for ex in &ts.exemplars {
+        for &r in &ex.labels_refs {
+            series_size +=
+                sym_upper.saturating_sub(mimir_proto::prost::length_delimiter_len(r as usize));
+            syms_size += resolved_symbol_size(r, symbols, offset);
+        }
+    }
+    if let Some(ref md) = ts.metadata {
+        series_size += sym_upper
+            .saturating_sub(mimir_proto::prost::length_delimiter_len(md.help_ref as usize));
+        syms_size += resolved_symbol_size(md.help_ref, symbols, offset);
+        series_size += sym_upper
+            .saturating_sub(mimir_proto::prost::length_delimiter_len(md.unit_ref as usize));
+        syms_size += resolved_symbol_size(md.unit_ref, symbols, offset);
+    }
+    (series_size, syms_size)
+}
+
+fn resymbolize_timeseries_rw2(
+    ts: &cortexpb::TimeSeriesRw2,
+    orig_symbols: &[String],
+    symbols: &mut FastSymbolsTable<'_>,
+    common_symbols: &CommonSymbols,
+) -> cortexpb::TimeSeriesRw2 {
+    let offset = symbols.offset();
+    let common_slice = common_symbols.get_slice();
+
+    let labels_refs = ts
+        .labels_refs
+        .iter()
+        .map(|&r| symbols.symbolize(resolve_ref(r, orig_symbols, common_slice, offset)))
+        .collect();
+
+    let exemplars = ts
+        .exemplars
+        .iter()
+        .map(|ex| {
+            let ex_refs = ex
+                .labels_refs
+                .iter()
+                .map(|&r| symbols.symbolize(resolve_ref(r, orig_symbols, common_slice, offset)))
+                .collect();
+            cortexpb::ExemplarRw2 {
+                labels_refs: ex_refs,
+                value: ex.value,
+                timestamp: ex.timestamp,
+            }
+        })
+        .collect();
+
+    let metadata = ts.metadata.map(|md| cortexpb::MetadataRw2 {
+        r#type: md.r#type,
+        help_ref: symbols.symbolize(resolve_ref(md.help_ref, orig_symbols, common_slice, offset)),
+        unit_ref: symbols.symbolize(resolve_ref(md.unit_ref, orig_symbols, common_slice, offset)),
+    });
+
+    cortexpb::TimeSeriesRw2 {
+        labels_refs,
+        samples: ts.samples.clone(),
+        histograms: ts.histograms.clone(),
+        exemplars,
+        metadata,
+        created_timestamp: ts.created_timestamp,
+    }
+}
+
+/// Splits an RW2 `WriteRequest` into partial RW2 requests each <= `max_size` bytes (best effort),
+/// re-symbolizing each chunk against `common_symbols` and `offset`.
+/// Ported 1:1 from `mimirpb.SplitWriteRequestByMaxMarshalSizeRW2`.
+pub fn split_write_request_by_max_marshal_size_rw2(
+    req: &cortexpb::WriteRequest,
+    req_size: usize,
+    max_size: usize,
+    offset: u32,
+    common_symbols: &CommonSymbols,
+) -> Vec<cortexpb::WriteRequest> {
+    if max_size == 0 || req_size <= max_size {
+        return vec![req.clone()];
+    }
+    if req.timeseries_rw2.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut next_symbols = FastSymbolsTable::new(MIN_PREALLOCATED_SYMBOLS_PER_REQUEST);
+    next_symbols.configure_common_symbols(offset, Some(common_symbols));
+
+    let mut next_req = new_partial_write_request(req);
+    let mut next_req_size = next_req.encoded_len();
+    let mut next_req_symbols_size = 0usize;
+
+    for ts in &req.timeseries_rw2 {
+        let (series_size, syms_size) =
+            max_rw2_series_size_after_resymbolization(ts, &req.symbols_rw2, offset);
+        let series_field_size = embedded_message_field_size(series_size);
+
+        if next_req_size + series_field_size + syms_size > max_size
+            && !next_req.timeseries_rw2.is_empty()
+        {
+            next_req.symbols_rw2 = next_symbols.symbols();
+            out.push(next_req);
+
+            next_req = new_partial_write_request(req);
+            next_req_size = next_req.encoded_len();
+            next_req_symbols_size = 0;
+            next_symbols.reset();
+            next_symbols.configure_common_symbols(offset, Some(common_symbols));
+        }
+
+        let new_ts = resymbolize_timeseries_rw2(ts, &req.symbols_rw2, &mut next_symbols, common_symbols);
+        next_req_size += embedded_message_field_size(new_ts.encoded_len());
+        let new_syms_size = symbols_size_proto(&next_symbols.symbols());
+        next_req_size += new_syms_size.saturating_sub(next_req_symbols_size);
+        next_req_symbols_size = new_syms_size;
+        next_req.timeseries_rw2.push(new_ts);
+    }
+
+    if !next_req.timeseries_rw2.is_empty() {
+        next_req.symbols_rw2 = next_symbols.symbols();
+        out.push(next_req);
+    }
+
+    out
+}
+
 fn serialize_rw1_split(
     req: &cortexpb::WriteRequest,
     req_size: usize,
     max_size: usize,
 ) -> Result<Vec<Bytes>, RecordCodecError> {
-    if max_size == 0 || req_size <= max_size {
-        let mut buf = Vec::with_capacity(req_size);
-        req.encode(&mut buf)?;
-        return Ok(vec![Bytes::from(buf)]);
+    let parts = split_write_request_by_max_marshal_size(req, req_size, max_size);
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let mut buf = Vec::with_capacity(part.encoded_len());
+        part.encode(&mut buf)?;
+        out.push(Bytes::from(buf));
     }
-
-    let mut out = Vec::new();
-
-    if !req.timeseries.is_empty() {
-        let mut cur = cortexpb::WriteRequest {
-            source: req.source,
-            skip_label_validation: req.skip_label_validation,
-            skip_label_count_validation: req.skip_label_count_validation,
-            ..Default::default()
-        };
-        for ts in &req.timeseries {
-            let item_len = ts.encoded_len() + 4;
-            if !cur.timeseries.is_empty() && cur.encoded_len() + item_len > max_size {
-                let mut buf = Vec::with_capacity(cur.encoded_len());
-                cur.encode(&mut buf)?;
-                out.push(Bytes::from(buf));
-                cur.timeseries.clear();
-            }
-            cur.timeseries.push(ts.clone());
-        }
-        if !cur.timeseries.is_empty() {
-            let mut buf = Vec::with_capacity(cur.encoded_len());
-            cur.encode(&mut buf)?;
-            out.push(Bytes::from(buf));
-        }
-    }
-
-    if !req.metadata.is_empty() {
-        let mut cur = cortexpb::WriteRequest {
-            source: req.source,
-            skip_label_validation: req.skip_label_validation,
-            skip_label_count_validation: req.skip_label_count_validation,
-            ..Default::default()
-        };
-        for m in &req.metadata {
-            let item_len = m.encoded_len() + 4;
-            if !cur.metadata.is_empty() && cur.encoded_len() + item_len > max_size {
-                let mut buf = Vec::with_capacity(cur.encoded_len());
-                cur.encode(&mut buf)?;
-                out.push(Bytes::from(buf));
-                cur.metadata.clear();
-            }
-            cur.metadata.push(m.clone());
-        }
-        if !cur.metadata.is_empty() {
-            let mut buf = Vec::with_capacity(cur.encoded_len());
-            cur.encode(&mut buf)?;
-            out.push(Bytes::from(buf));
-        }
-    }
-
     Ok(out)
 }
 
@@ -240,82 +489,21 @@ fn serialize_rw2_split(
     req: &cortexpb::WriteRequest,
     max_size: usize,
 ) -> Result<Vec<Bytes>, RecordCodecError> {
-    let mut buf = Vec::new();
-    encode_write_request_rw2_bytes(req, V2_RECORD_SYMBOL_OFFSET, Some(v2_common_symbols()), &mut buf)?;
-    if max_size == 0 || buf.len() <= max_size || req.timeseries.len() <= 1 && req.metadata.len() <= 1
-    {
-        return Ok(vec![Bytes::from(buf)]);
+    let rw2 = from_write_request_to_rw2(req, V2_RECORD_SYMBOL_OFFSET, Some(v2_common_symbols()))?;
+    let rw2_size = rw2.encoded_len();
+    let parts = split_write_request_by_max_marshal_size_rw2(
+        &rw2,
+        rw2_size,
+        max_size,
+        V2_RECORD_SYMBOL_OFFSET,
+        v2_common_symbols(),
+    );
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let mut buf = Vec::with_capacity(part.encoded_len());
+        part.encode(&mut buf)?;
+        out.push(Bytes::from(buf));
     }
-
-    // Split by timeseries/metadata and encode each chunk to RW2.
-    let mut out = Vec::new();
-    let mut cur = cortexpb::WriteRequest {
-        source: req.source,
-        skip_label_validation: req.skip_label_validation,
-        skip_label_count_validation: req.skip_label_count_validation,
-        ..Default::default()
-    };
-
-    for ts in &req.timeseries {
-        cur.timeseries.push(ts.clone());
-        buf.clear();
-        encode_write_request_rw2_bytes(
-            &cur,
-            V2_RECORD_SYMBOL_OFFSET,
-            Some(v2_common_symbols()),
-            &mut buf,
-        )?;
-        if buf.len() > max_size && cur.timeseries.len() > 1 {
-            let popped = cur.timeseries.pop().unwrap();
-            buf.clear();
-            encode_write_request_rw2_bytes(
-                &cur,
-                V2_RECORD_SYMBOL_OFFSET,
-                Some(v2_common_symbols()),
-                &mut buf,
-            )?;
-            out.push(Bytes::copy_from_slice(&buf));
-            cur.timeseries.clear();
-            cur.timeseries.push(popped);
-        }
-    }
-
-    for m in &req.metadata {
-        cur.metadata.push(m.clone());
-        buf.clear();
-        encode_write_request_rw2_bytes(
-            &cur,
-            V2_RECORD_SYMBOL_OFFSET,
-            Some(v2_common_symbols()),
-            &mut buf,
-        )?;
-        if buf.len() > max_size && (cur.timeseries.len() + cur.metadata.len()) > 1 {
-            let popped = cur.metadata.pop().unwrap();
-            buf.clear();
-            encode_write_request_rw2_bytes(
-                &cur,
-                V2_RECORD_SYMBOL_OFFSET,
-                Some(v2_common_symbols()),
-                &mut buf,
-            )?;
-            out.push(Bytes::copy_from_slice(&buf));
-            cur.timeseries.clear();
-            cur.metadata.clear();
-            cur.metadata.push(popped);
-        }
-    }
-
-    if !cur.timeseries.is_empty() || !cur.metadata.is_empty() {
-        buf.clear();
-        encode_write_request_rw2_bytes(
-            &cur,
-            V2_RECORD_SYMBOL_OFFSET,
-            Some(v2_common_symbols()),
-            &mut buf,
-        )?;
-        out.push(Bytes::copy_from_slice(&buf));
-    }
-
     Ok(out)
 }
 

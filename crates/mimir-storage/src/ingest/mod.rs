@@ -14,9 +14,13 @@ pub mod offset_file;
 pub mod partition_offset_client;
 pub mod partition_offset_reader;
 pub mod partition_offset_watcher;
+pub mod pusher;
 pub mod reader;
+pub mod reader_client;
+pub mod util;
 pub mod version;
 pub mod writer;
+pub mod writer_client;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,18 +62,50 @@ pub use partition_offset_reader::{
     SingleClusterPartitionOffsetReader, SingleClusterTopicOffsetsReader,
 };
 pub use partition_offset_watcher::{OffsetWatcherError, PartitionOffsetWatcher};
+pub use pusher::{
+    label_adapters_hash, request_contents, BatchingQueue, BatchingQueueDoneHandle,
+    BatchingQueueMetrics, ErrorSampler, FlushableWriteRequest, LogPolicy, NoOpPreCommitNotifier,
+    ParallelStoragePusher, ParallelStorageShards, PreCommitNotifier, PushErrorHandler, Pusher,
+    PusherConsumer, PusherConsumerMetrics, PusherError, SequentialStoragePusher,
+    StoragePusherMetrics,
+};
 pub use reader::{
-    decode_fetched_record, DecodedKafkaRecord, MultiClusterPartitionReader, ReaderError,
-    ReaderMetrics, RecordBatchConsumer, SingleClusterPartitionReader, ZeroCopyBatchConsumer,
-    ZeroCopyRecordHandler,
+    decode_fetched_record, AdmClient, DecodedKafkaRecord, KafkaAdmClient,
+    MultiClusterPartitionReader, PartitionCommitter, ReaderError, ReaderMetrics, ReaderState,
+    RecordBatchConsumer, SingleClusterPartitionReader, StrongReadConsistencyMetrics,
+    ZeroCopyBatchConsumer, ZeroCopyRecordHandler, ERR_OFFSET_FILE_WRITE, READER_METRICS_PREFIX,
+};
+pub use reader_client::{
+    new_kafka_reader_client, new_kafka_reader_client_metrics, KafkaReaderClient,
+    READER_BROKER_MAX_READ_BYTES, READER_FETCH_MAX_BYTES, READER_FETCH_MAX_PARTITION_BYTES,
+    READER_FETCH_MIN_BYTES,
+};
+pub use util::{
+    base64_decode, base64_encode, create_topics, ingester_partition_id, request_json_from_socket,
+    sasl_mechanism, sha256, sha512, CredentialCallback, IngestKafkaClient,
+    KafkaClientExtendedMetrics, KafkaMskIamAuth, KafkaOauthbearerAuth, KafkaSaslSecretConfig,
+    RecordedSpan, ResolvedSaslMechanism, ResultPromise, SampledOnlyPropagator, SampledOnlyTracer,
+    SaslAuthConfig, ScramAlg, SpanRecorder, StaticSaslSecret, TraceSpanContext, TracedKafkaRecord,
 };
 pub use version::{
     deserialize_record_content, parse_record_version, record_version_header,
-    validate_record_version, RecordCodecError, RecordSerializer, RecordVersion,
-    SerializedKafkaRecord, MAX_PRODUCER_RECORD_DATA_BYTES_LIMIT,
+    record_version_header_raw, split_write_request_by_max_marshal_size,
+    split_write_request_by_max_marshal_size_rw2, validate_record_version, RecordCodecError,
+    RecordSerializer, RecordVersion, SerializedKafkaRecord, MAX_PRODUCER_RECORD_DATA_BYTES_LIMIT,
     MIN_PRODUCER_RECORD_DATA_BYTES_LIMIT, PRODUCER_BATCH_MAX_BYTES,
 };
-pub use writer::{IngestWriter, PartitionWriteRequest, WriterError, WriterMetrics};
+pub use writer::{
+    err_write_request_data_item_too_large_msg, is_write_request_empty,
+    marshal_write_request_to_records, produce_results_err, successful_produce_records_stats,
+    IngestWriter, PartitionWriteRequest, Writer, WriterError, WriterMetrics, WriterOptions,
+    DEFAULT_MAX_INFLIGHT_PRODUCE_REQUESTS,
+};
+pub use writer_client::{
+    first_produce_err, kafka_producer_compression_from_config, KafkaProducer, KafkaProducerClient,
+    KafkaWriterClient, KafkaWriterClientOptions, ProduceCancelSource, ProduceContext,
+    ProduceResult, ProducerError, SlidingWindowSummary, WriterRecord,
+    DEFAULT_METADATA_REFRESH_INTERVAL, DEFAULT_PRODUCER_LINGER, WRITER_METRICS_PREFIX,
+};
 
 // ---------------------------------------------------------------------------
 // Compartments & KafkaConfig helpers (ported from pkg/compartments & pkg/storage/ingest/config.go)
@@ -168,9 +204,6 @@ pub struct WarpstreamClientOptions {
     pub tls_enabled: bool,
     pub tls_insecure_skip_verify: bool,
 }
-
-pub const DEFAULT_PRODUCER_LINGER: Duration = Duration::from_millis(5);
-pub const DEFAULT_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn to_warpstream_client_options(cfg: &KafkaConfig) -> Result<WarpstreamClientOptions, String> {
     if cfg.tls_enabled {
