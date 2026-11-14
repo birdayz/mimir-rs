@@ -1,0 +1,418 @@
+//! Unified Querier, ChunkQuerier, and Searcher across TSDB Head and on-disk ULID Blocks.
+//!
+//! Ported from github.com/prometheus/prometheus/tsdb/querier.go
+//! and github.com/prometheus/prometheus/tsdb/db.go.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use thiserror::Error;
+
+use crate::block::{Block, BlockError};
+use crate::chunkenc::{ChunkError, EncodedChunk};
+use crate::chunks_block::{BlockChunksError, ChunkMeta};
+use crate::compact::{decode_chunk_samples, encode_samples_into_chunks, DecodedSample};
+use crate::head::{Head, HeadError, DEFAULT_SAMPLES_PER_CHUNK};
+use crate::index::IndexError;
+use crate::labels::Labels;
+use crate::matcher::LabelMatcher;
+use crate::postings::{postings_for_matchers, PostingsError};
+use crate::search::{apply_search_hints, SearchError, SearchHints, SearchResult};
+use crate::tombstones::Interval;
+
+#[derive(Debug, Error)]
+pub enum QuerierError {
+    #[error("head error: {0}")]
+    Head(#[from] HeadError),
+    #[error("block error: {0}")]
+    Block(#[from] BlockError),
+    #[error("index error: {0}")]
+    Index(#[from] IndexError),
+    #[error("block chunks error: {0}")]
+    BlockChunks(#[from] BlockChunksError),
+    #[error("chunk error: {0}")]
+    Chunk(#[from] ChunkError),
+    #[error("postings error: {0}")]
+    Postings(#[from] PostingsError),
+    #[error("search error: {0}")]
+    Search(#[from] SearchError),
+}
+
+/// A queried series yielding decoded samples in `[mint, maxt]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuerySeries {
+    pub labels: Labels,
+    pub samples: Vec<DecodedSample>,
+}
+
+/// A queried series yielding encoded chunks overlapping `[mint, maxt]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryChunkSeries {
+    pub labels: Labels,
+    pub chunks: Vec<ChunkMeta>,
+}
+
+/// Unified read view over `Head` and overlapping `Block`s for `[mint, maxt]`.
+pub struct TsdbQuerier<'a> {
+    head: Option<&'a Head>,
+    blocks: Vec<Arc<Block>>,
+    mint: i64,
+    maxt: i64,
+}
+
+impl<'a> TsdbQuerier<'a> {
+    pub fn new(head: Option<&'a Head>, blocks: Vec<Arc<Block>>, mint: i64, maxt: i64) -> Self {
+        let head = head.filter(|h| {
+            let in_order = h.initialized() && h.min_time() <= maxt && mint <= h.max_time();
+            let ooo = h.min_ooo_time() != i64::MAX
+                && h.min_ooo_time() <= maxt
+                && mint <= h.max_ooo_time();
+            in_order || ooo
+        });
+        let blocks = blocks
+            .into_iter()
+            .filter(|b| b.overlaps_closed_interval(mint, maxt))
+            .collect();
+        Self {
+            head,
+            blocks,
+            mint,
+            maxt,
+        }
+    }
+
+    /// Queries samples for all series matching `matchers` in `[mint, maxt]`.
+    pub fn select(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<QuerySeries>, QuerierError> {
+        let chunk_series = self.select_chunks(sort_series, matchers)?;
+        let mut out = Vec::with_capacity(chunk_series.len());
+
+        for cs in chunk_series {
+            let mut samples = Vec::new();
+            for cm in &cs.chunks {
+                let Some(ref enc) = cm.chunk else {
+                    continue;
+                };
+                for s in decode_chunk_samples(enc)? {
+                    if s.t < self.mint || s.t > self.maxt {
+                        continue;
+                    }
+                    samples.push(s);
+                }
+            }
+            if samples.is_empty() {
+                continue;
+            }
+            // Ensure sorted and deduplicated when multiple chunks or blocks overlap.
+            if samples.windows(2).any(|w| w[1].t <= w[0].t) {
+                samples.sort_by_key(|s| s.t);
+                samples.dedup_by_key(|s| s.t);
+            }
+            out.push(QuerySeries {
+                labels: cs.labels,
+                samples,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Queries encoded chunks for all series matching `matchers` in `[mint, maxt]`.
+    pub fn select_chunks(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        let mut per_series: BTreeMap<Labels, Vec<(ChunkMeta, Vec<Interval>)>> = BTreeMap::new();
+
+        if let Some(head) = self.head {
+            let refs = head.postings_for_matchers(matchers)?;
+            for r in refs {
+                if let Some((labels, chks, tombs)) = head.series_chunks(r, self.mint, self.maxt)? {
+                    let entry = per_series.entry(labels).or_default();
+                    for c in chks {
+                        entry.push((c, tombs.clone()));
+                    }
+                }
+            }
+        }
+
+        for blk in &self.blocks {
+            let idx = blk.index();
+            let chkr = blk.chunks();
+            let tombr = blk.tombstones();
+            let refs = postings_for_matchers(idx, matchers)?;
+            for r in refs {
+                let (labels, chks) = idx.series(r)?;
+                let tombs = tombr.get(r);
+                let mut loaded = Vec::new();
+                for mut cm in chks {
+                    if !cm.overlaps_closed_interval(self.mint, self.maxt) {
+                        continue;
+                    }
+                    if tombs
+                        .iter()
+                        .any(|iv| iv.is_subrange(cm.min_time, cm.max_time))
+                    {
+                        continue;
+                    }
+                    cm.chunk = Some(chkr.chunk(cm.ref_id)?);
+                    loaded.push((cm, tombs.clone()));
+                }
+                if !loaded.is_empty() {
+                    per_series.entry(labels).or_default().extend(loaded);
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(per_series.len());
+        for (labels, items) in per_series {
+            let mut chks: Vec<ChunkMeta> = Vec::with_capacity(items.len());
+            let mut has_tombstones = false;
+            for (cm, tombs) in items {
+                if tombs
+                    .iter()
+                    .any(|iv| iv.overlaps(cm.min_time, cm.max_time))
+                {
+                    has_tombstones = true;
+                }
+                chks.push(cm);
+            }
+
+            if has_tombstones {
+                // Filter out tombstoned samples cleanly.
+                let mut samples = Vec::new();
+                for cm in &chks {
+                    let Some(ref enc) = cm.chunk else {
+                        continue;
+                    };
+                    for s in decode_chunk_samples(enc)? {
+                        if s.t < self.mint || s.t > self.maxt {
+                            continue;
+                        }
+                        samples.push(s);
+                    }
+                }
+                samples.sort_by_key(|s| s.t);
+                samples.dedup_by_key(|s| s.t);
+                let rebuilt = encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?;
+                if !rebuilt.is_empty() {
+                    out.push(QueryChunkSeries {
+                        labels,
+                        chunks: rebuilt,
+                    });
+                }
+            } else {
+                chks.sort_by_key(|c| (c.min_time, c.max_time));
+                let has_overlap = chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
+                if has_overlap {
+                    let mut samples = Vec::new();
+                    for cm in &chks {
+                        let Some(ref enc) = cm.chunk else {
+                            continue;
+                        };
+                        for s in decode_chunk_samples(enc)? {
+                            if s.t < self.mint || s.t > self.maxt {
+                                continue;
+                            }
+                            samples.push(s);
+                        }
+                    }
+                    samples.sort_by_key(|s| s.t);
+                    samples.dedup_by_key(|s| s.t);
+                    let rebuilt =
+                        encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?;
+                    if !rebuilt.is_empty() {
+                        out.push(QueryChunkSeries {
+                            labels,
+                            chunks: rebuilt,
+                        });
+                    }
+                } else {
+                    out.push(QueryChunkSeries {
+                        labels,
+                        chunks: chks,
+                    });
+                }
+            }
+        }
+
+        if !sort_series {
+            // `per_series` is already sorted by Labels, which always satisfies both sorted & unsorted callers.
+        }
+        Ok(out)
+    }
+
+    /// Returns sorted unique label names across Head and overlapping Blocks matching `matchers`.
+    pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {
+        let mut set: BTreeSet<String> = BTreeSet::new();
+
+        if let Some(head) = self.head {
+            for name in head.label_names(matchers)? {
+                set.insert(name);
+            }
+        }
+        for blk in &self.blocks {
+            let idx = blk.index();
+            if matchers.is_empty() {
+                for name in idx.label_names() {
+                    set.insert(name);
+                }
+            } else {
+                let refs = postings_for_matchers(idx, matchers)?;
+                for name in idx.label_names_for(&refs)? {
+                    set.insert(name);
+                }
+            }
+        }
+
+        Ok(set.into_iter().collect())
+    }
+
+    /// Returns sorted unique label values for `name` across Head and overlapping Blocks matching `matchers`.
+    pub fn label_values(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<String>, QuerierError> {
+        let mut set: BTreeSet<String> = BTreeSet::new();
+
+        if let Some(head) = self.head {
+            for val in head.label_values(name, matchers)? {
+                set.insert(val);
+            }
+        }
+        for blk in &self.blocks {
+            let idx = blk.index();
+            if matchers.is_empty() {
+                for val in idx.label_values(name)? {
+                    set.insert(val);
+                }
+            } else {
+                let refs = postings_for_matchers(idx, matchers)?;
+                for r in refs {
+                    let lbls = idx.series_labels(r)?;
+                    let v = lbls.get(name);
+                    if !v.is_empty() {
+                        set.insert(v.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<String> = set.into_iter().collect();
+        if let Some(lim) = limit {
+            if lim > 0 && out.len() > lim {
+                out.truncate(lim);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Returns a sorted map of every label name -> sorted unique label values matching `matchers`.
+    pub fn label_names_and_values(
+        &self,
+        matchers: &[LabelMatcher],
+    ) -> Result<BTreeMap<String, Vec<String>>, QuerierError> {
+        let names = self.label_names(matchers)?;
+        let mut out = BTreeMap::new();
+        for name in names {
+            let vals = self.label_values(&name, None, matchers)?;
+            out.insert(name, vals);
+        }
+        Ok(out)
+    }
+
+    /// Returns the number of distinct values for `name` matching `matchers`.
+    pub fn label_values_cardinality(
+        &self,
+        name: &str,
+        matchers: &[LabelMatcher],
+    ) -> Result<usize, QuerierError> {
+        Ok(self.label_values(name, None, matchers)?.len())
+    }
+
+    /// Returns the number of active series in Head (plus series in overlapping blocks if queried).
+    pub fn series_count(&self) -> Result<usize, QuerierError> {
+        let mut set: BTreeSet<Labels> = BTreeSet::new();
+        if let Some(head) = self.head {
+            let all = LabelMatcher::new(crate::matcher::MatchType::RegexMatch, "__name__", ".*")
+                .map_err(PostingsError::from)?;
+            for r in head.postings_for_matchers(&[all])? {
+                if let Some(l) = head.series_labels(r) {
+                    set.insert(l);
+                }
+            }
+        }
+        for blk in &self.blocks {
+            let idx = blk.index();
+            for r in idx.postings("", &[""])? {
+                set.insert(idx.series_labels(r)?);
+            }
+        }
+        Ok(set.len())
+    }
+
+    /// Fuzzy-searches label names using [`SearchHints`].
+    pub fn search_label_names(
+        &self,
+        hints: &SearchHints,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<SearchResult>, QuerierError> {
+        let names = self.label_names(matchers)?;
+        Ok(apply_search_hints(&names, hints)?)
+    }
+
+    /// Fuzzy-searches label values for `name` using [`SearchHints`].
+    pub fn search_label_values(
+        &self,
+        name: &str,
+        hints: &SearchHints,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<SearchResult>, QuerierError> {
+        let values = self.label_values(name, None, matchers)?;
+        Ok(apply_search_hints(&values, hints)?)
+    }
+}
+
+/// Chunk-focused querier alias over [`TsdbQuerier`].
+pub struct TsdbChunkQuerier<'a> {
+    inner: TsdbQuerier<'a>,
+}
+
+impl<'a> TsdbChunkQuerier<'a> {
+    pub fn new(head: Option<&'a Head>, blocks: Vec<Arc<Block>>, mint: i64, maxt: i64) -> Self {
+        Self {
+            inner: TsdbQuerier::new(head, blocks, mint, maxt),
+        }
+    }
+
+    pub fn select(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        self.inner.select_chunks(sort_series, matchers)
+    }
+
+    pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {
+        self.inner.label_names(matchers)
+    }
+
+    pub fn label_values(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<String>, QuerierError> {
+        self.inner.label_values(name, limit, matchers)
+    }
+}
+
+/// Helper to iterate samples out of an [`EncodedChunk`] slice.
+pub fn chunk_to_samples(chunk: &EncodedChunk) -> Result<Vec<DecodedSample>, ChunkError> {
+    decode_chunk_samples(chunk)
+}
