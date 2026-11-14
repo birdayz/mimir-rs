@@ -1,0 +1,395 @@
+//! Best-effort timestamp-ordered min-heap merger across multiple Kafka write compartments.
+//!
+//! Ported from github.com/grafana/mimir/pkg/storage/ingest/heap_merger.go
+
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::time::{Duration, Instant};
+
+use mimir_config::OrderedConsumptionConfig;
+use prometheus::{Counter, Histogram, HistogramOpts, Opts, Registry};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tracing::warn;
+
+use super::kafka_client::FetchedRecord;
+
+/// A record submitted from a per-cluster consumer to the `HeapMerger`, ordered by
+/// `(timestamp_ms ASC, kafka_cluster_id ASC, offset ASC)`.
+#[derive(Debug, Clone)]
+pub struct MergeableRecord {
+    pub record: FetchedRecord,
+    pub kafka_cluster_id: usize,
+}
+
+impl PartialEq for MergeableRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.record.timestamp_ms == other.record.timestamp_ms
+            && self.kafka_cluster_id == other.kafka_cluster_id
+            && self.record.offset == other.record.offset
+    }
+}
+
+impl Eq for MergeableRecord {}
+
+impl Ord for MergeableRecord {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse order for BinaryHeap (Rust BinaryHeap is a max-heap, we want min-heap!).
+        other
+            .record
+            .timestamp_ms
+            .cmp(&self.record.timestamp_ms)
+            .then_with(|| other.kafka_cluster_id.cmp(&self.kafka_cluster_id))
+            .then_with(|| other.record.offset.cmp(&self.record.offset))
+    }
+}
+
+impl PartialOrd for MergeableRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct HeapItem {
+    entry: MergeableRecord,
+    ack: oneshot::Sender<Result<(), String>>,
+}
+
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry
+    }
+}
+impl Eq for HeapItem {}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.entry.cmp(&other.entry)
+    }
+}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone)]
+pub struct HeapMergerMetrics {
+    pub pushed_records: Counter,
+    pub out_of_order_emits: Counter,
+    pub batch_flush_latency: Histogram,
+}
+
+impl HeapMergerMetrics {
+    pub fn new(registry: Option<&Registry>) -> Self {
+        let pushed_records = Counter::with_opts(Opts::new(
+            "cortex_ingest_storage_ordered_consumption_records_total",
+            "Total number of records pushed by ordered consumption.",
+        ))
+        .expect("valid metric");
+        let out_of_order_emits = Counter::with_opts(Opts::new(
+            "cortex_ingest_storage_ordered_consumption_out_of_order_records_total",
+            "Total number of records pushed with a timestamp older than the most recently pushed record.",
+        ))
+        .expect("valid metric");
+        let batch_flush_latency = Histogram::with_opts(HistogramOpts::new(
+            "cortex_ingest_storage_ordered_consumption_batch_flush_latency_seconds",
+            "Elapsed time from the first record entering a batch to the batch finishing its downstream push.",
+        ))
+        .expect("valid metric");
+
+        if let Some(reg) = registry {
+            let _ = reg.register(Box::new(pushed_records.clone()));
+            let _ = reg.register(Box::new(out_of_order_emits.clone()));
+            let _ = reg.register(Box::new(batch_flush_latency.clone()));
+        }
+
+        Self {
+            pushed_records,
+            out_of_order_emits,
+            batch_flush_latency,
+        }
+    }
+}
+
+/// Asynchronous batch consumer callback invoked by `HeapMerger` on merged, timestamp-sorted batches.
+pub type MergedBatchConsumer = ArcConsumer;
+pub type ArcConsumer = std::sync::Arc<
+    dyn Fn(
+            Vec<FetchedRecord>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Synchronous min-heap sorter helper for merging pre-collected multi-cluster record slices
+/// in `(timestamp_ms ASC, kafka_cluster_id ASC, offset ASC)` order.
+pub fn merge_records_in_timestamp_order(
+    batches: impl IntoIterator<Item = (usize, Vec<FetchedRecord>)>,
+) -> Vec<MergeableRecord> {
+    let mut heap = BinaryHeap::new();
+    for (cluster_id, recs) in batches {
+        for record in recs {
+            heap.push(MergeableRecord {
+                record,
+                kafka_cluster_id: cluster_id,
+            });
+        }
+    }
+    let mut out = Vec::with_capacity(heap.len());
+    while let Some(item) = heap.pop() {
+        out.push(item);
+    }
+    out
+}
+
+/// Async `HeapMerger` service receiving records from multiple cluster readers, ordering them in a
+/// min-heap by `(timestamp_ms, kafka_cluster_id, offset)`, and flushing batches downstream.
+pub struct HeapMerger {
+    input_tx: mpsc::Sender<HeapItem>,
+    handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl HeapMerger {
+    pub fn start(
+        cfg: &OrderedConsumptionConfig,
+        consumer: MergedBatchConsumer,
+        metrics: HeapMergerMetrics,
+    ) -> Self {
+        let max_batch_records = (cfg.max_batch_records.max(1)) as usize;
+        let max_batch_wait = Duration::from_nanos(cfg.max_batch_wait.as_nanos().max(0) as u64)
+            .max(Duration::from_millis(1));
+        let buf_size = if cfg.input_buffer_size <= 0 {
+            max_batch_records * 2
+        } else {
+            cfg.input_buffer_size as usize
+        };
+
+        let (input_tx, mut input_rx) = mpsc::channel::<HeapItem>(buf_size);
+
+        let handle = tokio::spawn(async move {
+            let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(max_batch_records);
+            let mut batch_start: Option<Instant> = None;
+            let mut last_emitted_ts: Option<i64> = None;
+            let sleep = tokio::time::sleep(Duration::from_secs(3600));
+            tokio::pin!(sleep);
+            let mut timer_active = false;
+
+            loop {
+                tokio::select! {
+                    maybe_item = input_rx.recv() => {
+                        match maybe_item {
+                            Some(item) => {
+                                if heap.is_empty() {
+                                    batch_start = Some(Instant::now());
+                                }
+                                heap.push(item);
+                                if !timer_active {
+                                    sleep.as_mut().reset(tokio::time::Instant::now() + max_batch_wait);
+                                    timer_active = true;
+                                }
+                                if heap.len() >= max_batch_records {
+                                    timer_active = false;
+                                    Self::flush_heap(
+                                        &mut heap,
+                                        &consumer,
+                                        &metrics,
+                                        &mut batch_start,
+                                        &mut last_emitted_ts,
+                                    ).await;
+                                }
+                            }
+                            None => {
+                                Self::flush_heap(
+                                    &mut heap,
+                                    &consumer,
+                                    &metrics,
+                                    &mut batch_start,
+                                    &mut last_emitted_ts,
+                                ).await;
+                                break;
+                            }
+                        }
+                    }
+                    _ = &mut sleep, if timer_active => {
+                        timer_active = false;
+                        Self::flush_heap(
+                            &mut heap,
+                            &consumer,
+                            &metrics,
+                            &mut batch_start,
+                            &mut last_emitted_ts,
+                        ).await;
+                    }
+                }
+            }
+        });
+
+        Self {
+            input_tx,
+            handle: tokio::sync::Mutex::new(Some(handle)),
+        }
+    }
+
+    async fn flush_heap(
+        heap: &mut BinaryHeap<HeapItem>,
+        consumer: &MergedBatchConsumer,
+        metrics: &HeapMergerMetrics,
+        batch_start: &mut Option<Instant>,
+        last_emitted_ts: &mut Option<i64>,
+    ) {
+        if heap.is_empty() {
+            return;
+        }
+        let mut acks = Vec::with_capacity(heap.len());
+        let mut records = Vec::with_capacity(heap.len());
+        while let Some(item) = heap.pop() {
+            records.push(item.entry.record);
+            acks.push(item.ack);
+        }
+
+        let timestamps: Vec<i64> = records.iter().map(|r| r.timestamp_ms).collect();
+        let res = (consumer)(records).await;
+        match &res {
+            Ok(()) => {
+                let mut ooo = 0u64;
+                for ts in timestamps {
+                    if let Some(prev) = *last_emitted_ts {
+                        if ts < prev {
+                            ooo += 1;
+                        }
+                    }
+                    if last_emitted_ts.is_none_or(|prev| ts > prev) {
+                        *last_emitted_ts = Some(ts);
+                    }
+                }
+                metrics.pushed_records.inc_by(acks.len() as f64);
+                metrics.out_of_order_emits.inc_by(ooo as f64);
+            }
+            Err(e) => {
+                warn!(error = %e, records = acks.len(), "downstream consumer returned error from merged batch");
+            }
+        }
+        if let Some(start) = batch_start.take() {
+            metrics.batch_flush_latency.observe(start.elapsed().as_secs_f64());
+        }
+        for ack in acks {
+            let _ = ack.send(res.clone());
+        }
+    }
+
+    /// Submits a batch of records from `kafka_cluster_id` and awaits downstream forwarding.
+    pub async fn submit_and_wait(
+        &self,
+        kafka_cluster_id: usize,
+        records: Vec<FetchedRecord>,
+    ) -> Result<(), String> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut receivers = Vec::with_capacity(records.len());
+        for record in records {
+            let (tx, rx) = oneshot::channel();
+            let item = HeapItem {
+                entry: MergeableRecord {
+                    record,
+                    kafka_cluster_id,
+                },
+                ack: tx,
+            };
+            self.input_tx
+                .send(item)
+                .await
+                .map_err(|_| "heap merger stopped".to_string())?;
+            receivers.push(rx);
+        }
+        let mut first_err = None;
+        for rx in receivers {
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some("heap merger dropped ack".to_string());
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    pub async fn stop(self) {
+        drop(self.input_tx);
+        if let Some(handle) = self.handle.lock().await.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    fn mk_rec(offset: i64, ts: i64) -> FetchedRecord {
+        FetchedRecord {
+            offset,
+            timestamp_ms: ts,
+            key: Bytes::from_static(b"t1"),
+            value: Bytes::new(),
+            headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_merge_records_in_timestamp_order() {
+        let b0 = vec![mk_rec(0, 300), mk_rec(1, 100)];
+        let b1 = vec![mk_rec(0, 200), mk_rec(1, 100)];
+        let merged = merge_records_in_timestamp_order([(0, b0), (1, b1)]);
+        let keys: Vec<(i64, usize, i64)> = merged
+            .iter()
+            .map(|m| (m.record.timestamp_ms, m.kafka_cluster_id, m.record.offset))
+            .collect();
+        assert_eq!(keys, vec![(100, 0, 1), (100, 1, 1), (200, 1, 0), (300, 0, 0)]);
+    }
+
+    #[tokio::test]
+    async fn test_async_heap_merger() {
+        let collected = Arc::new(parking_lot::Mutex::new(Vec::<i64>::new()));
+        let collected_c = Arc::clone(&collected);
+        let consumer: MergedBatchConsumer = Arc::new(move |recs| {
+            let c = Arc::clone(&collected_c);
+            Box::pin(async move {
+                for r in recs {
+                    c.lock().push(r.timestamp_ms);
+                }
+                Ok(())
+            })
+        });
+
+        let cfg = OrderedConsumptionConfig {
+            enabled: true,
+            max_batch_records: 4,
+            max_batch_wait: mimir_config::GoDuration::from_millis(20),
+            ..Default::default()
+        };
+
+        let merger = HeapMerger::start(&cfg, consumer, HeapMergerMetrics::new(None));
+        let (r0, r1) = tokio::join!(
+            merger.submit_and_wait(0, vec![mk_rec(0, 50), mk_rec(1, 20)]),
+            merger.submit_and_wait(1, vec![mk_rec(0, 10), mk_rec(1, 30)]),
+        );
+        r0.unwrap();
+        r1.unwrap();
+        merger.stop().await;
+
+        assert_eq!(*collected.lock(), vec![10, 20, 30, 50]);
+    }
+}
