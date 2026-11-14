@@ -8,10 +8,16 @@
 //! - github.com/grafana/mimir/pkg/ingester/ingester.go
 //! - github.com/grafana/mimir/pkg/mimirpb/mimir.proto (ErrorCause, ErrorDetails)
 
+use std::error::Error as StdError;
 use std::fmt;
+use std::sync::Arc;
 
+use mimir_proto::cortexpb;
+use mimir_proto::grpcutilpb;
 use thiserror::Error;
 pub use tonic::{Code, Status};
+
+pub const GRPC_CLIENT_CONNECTION_IS_CLOSING_ERR: &str = "grpc: the client connection is closing";
 
 const ERR_PREFIX: &str = "err-mimir-";
 
@@ -278,16 +284,88 @@ pub struct ErrorDetails {
     pub rejected_samples: i64,
 }
 
+/// Context cancellation / deadline error (`context.Canceled` / `context.DeadlineExceeded`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+pub enum ContextError {
+    #[error("context canceled")]
+    Canceled,
+    #[error("context deadline exceeded")]
+    DeadlineExceeded,
+}
+
+/// Marker error matching `dskit/middleware.DoNotLogError`.
+#[derive(Debug)]
+pub struct DoNotLogError<E>(pub E);
+
+impl<E: fmt::Display> fmt::Display for DoNotLogError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<E: StdError + 'static> StdError for DoNotLogError<E> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// Error wrapper carrying gRPC status code, message, optional `ErrorDetails`,
-/// and optional HTTP status code (for `httpgrpc` translation).
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{message}")]
+/// optional underlying error cause, optional `ContextError`, and optional HTTP status code.
+///
+/// Ported from `github.com/grafana/mimir/pkg/util/globalerror/grpc.go:ErrorWithStatus`.
+#[derive(Clone)]
 pub struct ErrorWithStatus {
     pub message: String,
     pub grpc_code: Code,
     pub http_status: Option<u16>,
     pub details: Option<ErrorDetails>,
     pub do_not_log: bool,
+    pub ctx_err: Option<ContextError>,
+    underlying_err: Option<Arc<dyn StdError + Send + Sync>>,
+}
+
+impl fmt::Debug for ErrorWithStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ErrorWithStatus")
+            .field("message", &self.message)
+            .field("grpc_code", &self.grpc_code)
+            .field("http_status", &self.http_status)
+            .field("details", &self.details)
+            .field("do_not_log", &self.do_not_log)
+            .field("ctx_err", &self.ctx_err)
+            .finish()
+    }
+}
+
+impl PartialEq for ErrorWithStatus {
+    fn eq(&self, other: &Self) -> bool {
+        self.message == other.message
+            && self.grpc_code == other.grpc_code
+            && self.http_status == other.http_status
+            && self.details == other.details
+            && self.do_not_log == other.do_not_log
+            && self.ctx_err == other.ctx_err
+    }
+}
+
+impl Eq for ErrorWithStatus {}
+
+impl fmt::Display for ErrorWithStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl StdError for ErrorWithStatus {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        if let Some(ref u) = self.underlying_err {
+            return Some(u.as_ref());
+        }
+        if let Some(ref c) = self.ctx_err {
+            return Some(c);
+        }
+        None
+    }
 }
 
 impl ErrorWithStatus {
@@ -302,7 +380,24 @@ impl ErrorWithStatus {
             http_status: None,
             details,
             do_not_log: false,
+            ctx_err: None,
+            underlying_err: None,
         }
+    }
+
+    pub fn with_underlying<E: StdError + Send + Sync + 'static>(mut self, err: E) -> Self {
+        self.underlying_err = Some(Arc::new(err));
+        self
+    }
+
+    pub fn with_underlying_arc(mut self, err: Arc<dyn StdError + Send + Sync>) -> Self {
+        self.underlying_err = Some(err);
+        self
+    }
+
+    pub fn with_ctx_err(mut self, ctx_err: ContextError) -> Self {
+        self.ctx_err = Some(ctx_err);
+        self
     }
 
     pub fn with_http_status(mut self, status: u16) -> Self {
@@ -315,14 +410,173 @@ impl ErrorWithStatus {
         self
     }
 
+    pub fn underlying(&self) -> Option<&(dyn StdError + Send + Sync + 'static)> {
+        self.underlying_err.as_deref()
+    }
+
+    pub fn should_log(&self) -> bool {
+        !self.do_not_log
+    }
+
+    /// Returns an immutable `tonic::Status` representing this `ErrorWithStatus` without the
+    /// wrapped underlying error chain, or `None` if `grpc_code == Code::Ok` or no underlying error
+    /// was attached (`ErrorWithStatus.Err()` in `globalerror/grpc.go`).
+    pub fn err(&self) -> Option<Status> {
+        if self.underlying_err.is_none() || self.grpc_code == Code::Ok {
+            return None;
+        }
+        Some(self.to_tonic_status())
+    }
+
+    /// Encodes this error as a `tonic::Status`, embedding `cortexpb.ErrorDetails` into
+    /// `grpc-status-details-bin` if present.
     pub fn to_tonic_status(&self) -> Status {
-        Status::new(self.grpc_code, self.message.clone())
+        if let Some(details) = self.details {
+            let pb = cortexpb::ErrorDetails {
+                cause: details.cause as i32,
+                soft: details.soft,
+                rejected_samples: details.rejected_samples,
+            };
+            grpcutilpb::status_with_cortex_error_details(self.grpc_code, &self.message, &pb)
+        } else {
+            Status::new(self.grpc_code, self.message.clone())
+        }
+    }
+
+    /// Returns true if `other` has the same gRPC status code, message, and `ErrorDetails.cause`.
+    pub fn equals(&self, other: &Self) -> bool {
+        if self.grpc_code != other.grpc_code || self.message != other.message {
+            return false;
+        }
+        match (self.details, other.details) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.cause == b.cause,
+            _ => false,
+        }
     }
 }
 
 impl From<ErrorWithStatus> for Status {
     fn from(err: ErrorWithStatus) -> Self {
         err.to_tonic_status()
+    }
+}
+
+/// Wraps `original_err` with a gRPC status code and optional `ErrorDetails`, matching
+/// `pkg/util/globalerror/grpc.go:WrapErrorWithGRPCStatus`.
+pub fn wrap_error_with_grpc_status<E: StdError + Send + Sync + 'static>(
+    original_err: E,
+    err_code: Code,
+    err_details: Option<ErrorDetails>,
+) -> ErrorWithStatus {
+    let message = original_err.to_string();
+    ErrorWithStatus::new(message, err_code, err_details).with_underlying(original_err)
+}
+
+/// Wraps a `DoNotLogError` with a gRPC status code and optional `ErrorDetails`.
+pub fn wrap_do_not_log_error_with_grpc_status<E: StdError + Send + Sync + 'static>(
+    original_err: DoNotLogError<E>,
+    err_code: Code,
+    err_details: Option<ErrorDetails>,
+) -> ErrorWithStatus {
+    let message = original_err.to_string();
+    ErrorWithStatus::new(message, err_code, err_details)
+        .with_underlying(original_err)
+        .with_do_not_log(true)
+}
+
+/// Checks if `err` is a gRPC error (`Status` or `ErrorWithStatus`) corresponding to `ctx_err`
+/// (`ContextError::Canceled` or `ContextError::DeadlineExceeded`), and if so wraps it with `ctx_err`.
+///
+/// Ported from `pkg/util/globalerror/grpc.go:WrapGRPCErrorWithContextError`.
+pub fn wrap_grpc_error_with_context_error<E: StdError + Send + Sync + 'static>(
+    ctx_err: Option<ContextError>,
+    err: E,
+) -> Result<E, ErrorWithStatus> {
+    let Some(ctx_err) = ctx_err else {
+        return Ok(err);
+    };
+
+    let any: &dyn StdError = &err;
+    if let Some(status) = extract_status_from_error_chain(any) {
+        let code = status.code();
+        let msg = status.message().to_string();
+        let details = grpcutilpb::extract_cortex_error_details(&status).map(|d| ErrorDetails {
+            cause: error_cause_from_i32(d.cause),
+            soft: d.soft,
+            rejected_samples: d.rejected_samples,
+        });
+        match code {
+            Code::Cancelled => {
+                if msg != GRPC_CLIENT_CONNECTION_IS_CLOSING_ERR {
+                    return Err(ErrorWithStatus::new(msg, code, details)
+                        .with_underlying(err)
+                        .with_ctx_err(ContextError::Canceled));
+                }
+            }
+            Code::DeadlineExceeded => {
+                return Err(ErrorWithStatus::new(msg, code, details)
+                    .with_underlying(err)
+                    .with_ctx_err(ContextError::DeadlineExceeded));
+            }
+            _ => return Ok(err),
+        }
+    }
+    let _ = ctx_err;
+    Ok(err)
+}
+
+/// Extracts a `tonic::Status` from an error or its `source()` chain.
+pub fn extract_status_from_error_chain(err: &(dyn StdError + 'static)) -> Option<Status> {
+    let mut cur: Option<&(dyn StdError + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(ews) = e.downcast_ref::<ErrorWithStatus>() {
+            return Some(ews.to_tonic_status());
+        }
+        if let Some(st) = e.downcast_ref::<Status>() {
+            return Some(st.clone());
+        }
+        cur = e.source();
+    }
+    None
+}
+
+/// Checks whether `err` or any error in its `source()` chain (including `ErrorWithStatus::ctx_err`)
+/// matches the given `ContextError`.
+pub fn error_has_context_error(err: &(dyn StdError + 'static), target: ContextError) -> bool {
+    let mut cur: Option<&(dyn StdError + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(ce) = e.downcast_ref::<ContextError>() {
+            if *ce == target {
+                return true;
+            }
+        }
+        if let Some(ews) = e.downcast_ref::<ErrorWithStatus>() {
+            if ews.ctx_err == Some(target) {
+                return true;
+            }
+        }
+        cur = e.source();
+    }
+    false
+}
+
+fn error_cause_from_i32(v: i32) -> ErrorCause {
+    match v {
+        1 => ErrorCause::ReplicasDidNotMatch,
+        2 => ErrorCause::TooManyClusters,
+        3 => ErrorCause::BadData,
+        4 => ErrorCause::IngestionRateLimited,
+        5 => ErrorCause::RequestRateLimited,
+        6 => ErrorCause::InstanceLimit,
+        7 => ErrorCause::ServiceUnavailable,
+        8 => ErrorCause::TsdbUnavailable,
+        9 => ErrorCause::TooBusy,
+        10 => ErrorCause::CircuitBreakerOpen,
+        11 => ErrorCause::MethodNotAllowed,
+        12 => ErrorCause::TenantLimit,
+        13 => ErrorCause::ActiveSeriesLimited,
+        _ => ErrorCause::Unknown,
     }
 }
 

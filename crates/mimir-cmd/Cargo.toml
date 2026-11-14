@@ -18,12 +18,25 @@ mimir-storage = { path = "../mimir-storage" }
 mimir-tsdb = { path = "../mimir-tsdb" }
 anyhow = { workspace = true }
 axum = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+http = "1"
 hyper = { workspace = true }
 prometheus = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { workspace = true }

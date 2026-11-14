@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use memmap2::MmapMut;
@@ -230,6 +231,57 @@ impl ActivityTracker {
 
     pub fn loaded_activities_on_startup_count(&self) -> f64 {
         self.loaded_activities_on_startup.get()
+    }
+}
+
+/// Nil-safe extension trait matching Go's nil `*ActivityTracker` receiver semantics.
+pub trait ActivityTrackerExt {
+    fn insert_static_or_noop(&self, activity: &str) -> isize;
+    fn delete_or_noop(&self, activity_index: isize);
+    fn close_or_noop(self) -> io::Result<()>;
+}
+
+impl ActivityTrackerExt for Option<ActivityTracker> {
+    fn insert_static_or_noop(&self, activity: &str) -> isize {
+        match self {
+            Some(t) => t.insert_static(activity),
+            None => -1,
+        }
+    }
+
+    fn delete_or_noop(&self, activity_index: isize) {
+        if let Some(t) = self {
+            t.delete(activity_index);
+        }
+    }
+
+    fn close_or_noop(self) -> io::Result<()> {
+        match self {
+            Some(t) => t.close(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl ActivityTrackerExt for Option<Arc<ActivityTracker>> {
+    fn insert_static_or_noop(&self, activity: &str) -> isize {
+        match self {
+            Some(t) => t.insert_static(activity),
+            None => -1,
+        }
+    }
+
+    fn delete_or_noop(&self, activity_index: isize) {
+        if let Some(t) = self {
+            t.delete(activity_index);
+        }
+    }
+
+    fn close_or_noop(self) -> io::Result<()> {
+        match self {
+            Some(t) => t.flush(),
+            None => Ok(()),
+        }
     }
 }
 

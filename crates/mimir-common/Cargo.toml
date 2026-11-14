@@ -19,3 +19,9 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-stream = { workspace = true }
+tower = { workspace = true }
+http = "1"
