@@ -9,8 +9,12 @@ mimir-common = { path = "../mimir-common" }
 mimir-config = { path = "../mimir-config" }
 mimir-proto = { path = "../mimir-proto" }
 mimir-tsdb = { path = "../mimir-tsdb" }
+anyhow = { workspace = true }
 bytes = { workspace = true }
+crc32c = { workspace = true }
 flate2 = { workspace = true }
+futures = { workspace = true }
+kafka-protocol = { workspace = true }
 lz4_flex = { workspace = true }
 object_store = { workspace = true }
 parking_lot = { workspace = true }
@@ -20,6 +24,10 @@ serde_json = { workspace = true }
 snap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
