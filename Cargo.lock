@@ -1177,11 +1177,22 @@ name = "mimir-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures",
+ "parking_lot",
+ "prometheus",
  "prost",
  "prost-types",
+ "rand 0.8.8",
+ "regex",
+ "serde",
+ "serde_json",
  "snap",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
  "tonic",
+ "tower 0.5.3",
+ "xxhash-rust",
 ]
 
 [[package]]
