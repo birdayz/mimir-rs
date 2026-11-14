@@ -793,23 +793,35 @@ impl std::error::Error for IngesterError {}
 
 /// Maps native histogram validation error strings to their exact `GlobalErrorId`.
 pub fn map_native_histogram_err_id(msg: &str) -> GlobalErrorId {
-    if msg.contains("count mismatch") || msg.contains("positive/negative") {
+    if msg.contains("observation count should equal")
+        || msg.contains("count mismatch")
+        || msg.contains("positive/negative")
+    {
         NATIVE_HISTOGRAM_COUNT_MISMATCH
-    } else if msg.contains("not big enough") {
+    } else if msg.contains("observation count should be at least") || msg.contains("not big enough")
+    {
         NATIVE_HISTOGRAM_COUNT_NOT_BIG_ENOUGH
-    } else if msg.contains("negative bucket count") {
+    } else if msg.contains("observation count is negative")
+        || msg.contains("negative bucket count")
+    {
         NATIVE_HISTOGRAM_NEGATIVE_BUCKET_COUNT
-    } else if msg.contains("negative offset") {
+    } else if msg.contains("offset is negative") || msg.contains("negative offset") {
         NATIVE_HISTOGRAM_SPAN_NEGATIVE_OFFSET
     } else if msg.contains("spans") && msg.contains("buckets") {
         NATIVE_HISTOGRAM_SPANS_BUCKETS_MISMATCH
-    } else if msg.contains("custom buckets") && msg.contains("infinite") {
+    } else if (msg.contains("custom buckets") || msg.contains("custom bounds"))
+        && (msg.contains("must be finite") || msg.contains("infinite"))
+    {
         NATIVE_HISTOGRAM_CUSTOM_BUCKETS_INFINITE
-    } else if msg.contains("custom buckets") && msg.contains("reducible") {
+    } else if (msg.contains("custom buckets") || msg.contains("custom bounds"))
+        && msg.contains("reducible")
+    {
         NATIVE_HISTOGRAM_CUSTOM_BUCKETS_NOT_REDUCIBLE
-    } else if msg.contains("custom buckets") && msg.contains("mismatch") {
+    } else if msg.contains("custom bounds are too few")
+        || (msg.contains("custom buckets") && msg.contains("mismatch"))
+    {
         NATIVE_HISTOGRAM_CUSTOM_BUCKETS_MISMATCH
-    } else if msg.contains("custom buckets") {
+    } else if msg.contains("custom buckets") || msg.contains("custom bounds") {
         NATIVE_HISTOGRAM_CUSTOM_BUCKETS_INVALID
     } else if msg.contains("reducible") {
         NOT_REDUCIBLE_NATIVE_HISTOGRAM

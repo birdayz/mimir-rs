@@ -71,6 +71,8 @@ pub struct UsageStatsSnapshot {
     pub tenants_with_out_of_order_enabled: i64,
     pub min_out_of_order_time_window_seconds: i64,
     pub max_out_of_order_time_window_seconds: i64,
+    pub appended_samples: i64,
+    pub appended_exemplars: i64,
 }
 
 pub fn get_open_tsdbs_concurrency_config(
@@ -150,6 +152,8 @@ pub struct Ingester {
     partition_lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
     pub usage_stats: Mutex<UsageStatsSnapshot>,
+    pub appended_samples_total: AtomicI64,
+    pub appended_exemplars_total: AtomicI64,
 
     compaction_service_state: AtomicU8,
     owned_series_service_state: AtomicU8,
@@ -416,6 +420,8 @@ impl Ingester {
             partition_lifecycler_svc: Mutex::new(None),
             background_tasks: Mutex::new(Vec::new()),
             usage_stats: Mutex::new(UsageStatsSnapshot::default()),
+            appended_samples_total: AtomicI64::new(0),
+            appended_exemplars_total: AtomicI64::new(0),
             compaction_service_state: AtomicU8::new(State::New as u8),
             owned_series_service_state: AtomicU8::new(State::New as u8),
             owned_series_paused: AtomicBool::new(false),
@@ -974,6 +980,8 @@ impl Ingester {
         }
         snap.min_out_of_order_time_window_seconds = min_ooo;
         snap.max_out_of_order_time_window_seconds = max_ooo;
+        snap.appended_samples = self.appended_samples_total.load(Ordering::Relaxed);
+        snap.appended_exemplars = self.appended_exemplars_total.load(Ordering::Relaxed);
         *self.usage_stats.lock() = snap;
         snap
     }
