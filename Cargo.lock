@@ -1154,9 +1154,11 @@ dependencies = [
  "serde_json",
  "smallvec",
  "snap",
+ "tempfile",
  "thiserror 2.0.21",
  "ulid",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

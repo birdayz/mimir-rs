@@ -22,3 +22,7 @@ snap = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }
 xxhash-rust = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
