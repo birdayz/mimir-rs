@@ -117,11 +117,12 @@ impl Ingester {
             let Some(user_db) = self.get_tsdb(&user_id) else {
                 continue;
             };
-            let Some(ref shipper) = user_db.shipper else {
+            let Some(shipper) = user_db.shipper.read().clone() else {
                 continue;
             };
 
-            if user_db.check_deletion_mark(self.bucket.as_deref()).await {
+            let bucket_opt = self.bucket.read().clone();
+            if user_db.check_deletion_mark(bucket_opt.as_deref()).await {
                 continue;
             }
 
@@ -325,7 +326,7 @@ impl Ingester {
         }
     }
 
-    async fn close_and_delete_user_tsdb_if_idle(
+    pub async fn close_and_delete_user_tsdb_if_idle(
         &self,
         user_id: &str,
         idle_timeout: Duration,
@@ -333,7 +334,7 @@ impl Ingester {
         let Some(user_db) = self.get_tsdb(user_id) else {
             return TsdbCloseCheckResult::ShippingDisabled;
         };
-        if user_db.shipper.is_none()
+        if user_db.shipper.read().is_none()
             && !self
                 .blocks_cfg
                 .tsdb
@@ -359,6 +360,7 @@ impl Ingester {
             let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
             return recheck;
         }
+        let tenant_deleted = recheck == TsdbCloseCheckResult::TenantMarkedForDeletion;
 
         let num_series = user_db.db.head().num_series() as i64;
         self.series_count.fetch_sub(num_series, Ordering::Relaxed);
@@ -374,6 +376,7 @@ impl Ingester {
         let _ = user_db.change_state(TsdbState::Closing, TsdbState::Closed);
         self.tsdbs.remove(user_id);
         self.metrics.mem_users.dec();
+        self.tsdb_metrics.remove_registry_for_tenant(user_id);
         self.delete_user_metadata(user_id);
         self.metrics
             .delete_per_user_metrics(user_id, &tracker_names);
@@ -383,8 +386,13 @@ impl Ingester {
             return TsdbCloseCheckResult::DataRemovalFailed;
         }
 
-        info!(user = %user_id, "closed idle TSDB");
-        TsdbCloseCheckResult::IdleClosed
+        if tenant_deleted {
+            info!(user = %user_id, "deleted local TSDB, user marked for deletion");
+            TsdbCloseCheckResult::TenantMarkedForDeletion
+        } else {
+            info!(user = %user_id, "closed idle TSDB");
+            TsdbCloseCheckResult::IdleClosed
+        }
     }
 
     pub fn update_active_series_metrics(&self, now: SystemTime) {
@@ -631,7 +639,13 @@ pub fn spawn_shipping_loop(
 }
 
 pub fn spawn_idle_tsdb_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> JoinHandle<()> {
-    let interval = Duration::from_secs(5 * 60);
+    let interval_ns = ingester
+        .blocks_cfg
+        .tsdb
+        .close_idle_tsdb_interval
+        .as_nanos()
+        .max(10_000_000) as u64;
+    let interval = Duration::from_nanos(interval_ns);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

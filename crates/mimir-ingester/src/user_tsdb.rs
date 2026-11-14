@@ -6,7 +6,9 @@
 //! - github.com/grafana/mimir/pkg/util/math/rate.go
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,7 +17,7 @@ use mimir_config::{BlocksStorageConfig, IngesterConfig, Overrides};
 use mimir_proto::cortexpb;
 use mimir_storage::bucket::{tenant_deletion_mark_exists, BucketClient};
 use mimir_storage::ingest::{OffsetCatalogue, OffsetCatalogueMetrics};
-use mimir_storage::shipper::{read_shipped_blocks, Shipper, ShipperMetrics, SourceType};
+use mimir_storage::shipper::{read_shipped_blocks, Shipper, ShipperError, ShipperMetrics, SourceType};
 use mimir_tsdb::db::{Tsdb, TsdbError, TsdbOptions};
 use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
@@ -266,6 +268,17 @@ impl SeriesLifecycleCallback for LifecycleCallbackAdapter {
     }
 }
 
+/// Async block shipper interface matching Go `BlocksUploader` (`pkg/ingester/user_tsdb.go`).
+pub trait BlockShipper: Send + Sync {
+    fn sync(&self) -> Pin<Box<dyn Future<Output = Result<usize, ShipperError>> + Send + '_>>;
+}
+
+impl BlockShipper for Shipper {
+    fn sync(&self) -> Pin<Box<dyn Future<Output = Result<usize, ShipperError>> + Send + '_>> {
+        Box::pin(Shipper::sync(self))
+    }
+}
+
 /// Per-tenant TSDB + tracking state (`pkg/ingester/user_tsdb.go`).
 pub struct UserTsdb {
     pub user_id: String,
@@ -279,7 +292,7 @@ pub struct UserTsdb {
     pub ingested_rule_samples: EwmaRate,
     pub series_ref_history: SeriesRefHistory,
 
-    pub shipper: Option<Shipper>,
+    pub shipper: RwLock<Option<Arc<dyn BlockShipper>>>,
     pub offset_catalogue: Option<OffsetCatalogue>,
 
     state_mtx: parking_lot::RwLock<()>,
@@ -320,7 +333,9 @@ impl UserTsdb {
         limiter: Arc<Limiter>,
         bucket: Option<&BucketClient>,
         shipper_metrics: ShipperMetrics,
-        _reg: Option<&Registry>,
+        reg: Option<&Registry>,
+        tsdb_prom_reg: Option<Arc<Registry>>,
+        wal_replay_concurrency: usize,
         instance_series_count: Arc<AtomicI64>,
         max_in_memory_series_fn: Arc<dyn Fn() -> i64 + Send + Sync>,
         rejected_counter: CounterVec,
@@ -392,12 +407,14 @@ impl UserTsdb {
                 CompressionType::None
             },
             wal_segment_size: blocks_cfg.tsdb.wal_segment_size_bytes.max(1024) as usize,
+            wal_replay_concurrency,
             max_head_chunk_file_size: mimir_tsdb::head_chunks::MAX_HEAD_CHUNK_FILE_SIZE,
             metadata_limits: MetadataLimits {
                 max_metrics_with_metadata_per_user: limiter.max_metadata_per_user(&user_id),
                 max_metadata_per_metric: limiter.max_metadata_per_metric(&user_id),
             },
             series_lifecycle_callback: Some(lifecycle_adapter.clone()),
+            registry: tsdb_prom_reg,
         };
 
         let tsdb_opts = TsdbOptions {
@@ -430,17 +447,17 @@ impl UserTsdb {
         }
 
         let shipping_enabled = blocks_cfg.tsdb.ship_interval.0 > 0;
-        let shipper = if shipping_enabled {
+        let shipper: Option<Arc<dyn BlockShipper>> = if shipping_enabled {
             bucket.map(|b| {
                 let ooo_ext = tenant_limits.out_of_order_blocks_external_label_enabled;
-                Shipper::new_for_user(
+                Arc::new(Shipper::new_for_user(
                     &user_id,
                     &udir,
                     b,
                     SourceType::Receive,
                     ooo_ext,
                     shipper_metrics,
-                )
+                )) as Arc<dyn BlockShipper>
             })
         } else {
             None
@@ -463,7 +480,7 @@ impl UserTsdb {
                 &udir,
                 &user_id,
                 ingest_partition_id,
-                OffsetCatalogueMetrics::new(_reg),
+                OffsetCatalogueMetrics::new(reg),
             ))
         } else {
             None
@@ -483,7 +500,7 @@ impl UserTsdb {
             ingested_api_samples: EwmaRate::new(0.2, rate_period),
             ingested_rule_samples: EwmaRate::new(0.2, rate_period),
             series_ref_history: SeriesRefHistory::new(LABEL_CHURN_RECORDS),
-            shipper,
+            shipper: RwLock::new(shipper),
             offset_catalogue,
             state_mtx: parking_lot::RwLock::new(()),
             state: AtomicU8::new(TsdbState::Active as u8),
@@ -668,7 +685,7 @@ impl UserTsdb {
     }
 
     pub fn oldest_unshipped_block_time_ms(&self) -> u64 {
-        if self.shipper.is_none() {
+        if self.shipper.read().is_none() {
             return 0;
         }
         let shipped = self.shipped_blocks.lock();
@@ -743,13 +760,43 @@ impl UserTsdb {
     }
 
     fn delete_expired_blocks(&self) {
+        let retention_ms = self.block_min_retention.as_millis() as i64;
+        if retention_ms <= 0 {
+            return;
+        }
+        let mut blocks = self.db.blocks();
+        if blocks.len() <= 1 {
+            return;
+        }
+        // Sort by max_time descending matching Prometheus `BeyondTimeRetention`.
+        blocks.sort_by_key(|b| std::cmp::Reverse(b.max_time()));
+        let newest_max_time = blocks[0].max_time();
+        let mut time_deletable = HashSet::new();
+        for (i, blk) in blocks.iter().enumerate() {
+            if i > 0 && newest_max_time - blk.max_time() >= retention_ms {
+                for b in &blocks[i..] {
+                    time_deletable.insert(b.ulid());
+                }
+                break;
+            }
+        }
+        if time_deletable.is_empty() {
+            return;
+        }
+
         let cutoff = SystemTime::now()
             .checked_sub(self.block_min_retention)
             .unwrap_or(UNIX_EPOCH);
+        let has_shipper = self.shipper.read().is_some();
         let shipped = self.shipped_blocks.lock().clone();
-        for blk in self.db.blocks() {
+        let mut any_deleted = false;
+
+        for blk in &blocks {
             let uid = blk.ulid();
-            let eligible = if self.shipper.is_some() {
+            if !time_deletable.contains(&uid) {
+                continue;
+            }
+            let eligible = if has_shipper {
                 shipped.get(&uid).is_some_and(|&ts| ts < cutoff)
             } else {
                 let created = UNIX_EPOCH + Duration::from_millis(uid.timestamp_ms());
@@ -757,8 +804,14 @@ impl UserTsdb {
             };
             if eligible {
                 let dir = blk.dir().to_path_buf();
-                let _ = std::fs::remove_dir_all(dir);
+                if std::fs::remove_dir_all(dir).is_ok() {
+                    any_deleted = true;
+                }
             }
+        }
+
+        if any_deleted {
+            let _ = self.db.reload_blocks();
         }
     }
 

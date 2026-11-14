@@ -243,8 +243,25 @@ pub fn build_search_hints(
 }
 
 impl Ingester {
+    pub fn check_read_overloaded(&self) -> Result<(), IngesterError> {
+        let limiter_opt = self.utilization_based_limiter.read().clone();
+        if let Some(limiter) = limiter_opt {
+            if let Some(reason) = limiter.limiting_reason() {
+                if !reason.is_empty() {
+                    self.metrics
+                        .utilization_limited_requests
+                        .with_label_values(&[&reason])
+                        .inc();
+                    return Err(IngesterError::TooBusy);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn start_read_request(&self, md: &MetadataMap) -> Result<ReadPermit, IngesterError> {
         self.check_available_for_read()?;
+        self.check_read_overloaded()?;
         let started_at = Instant::now();
         let only_replica = is_only_replica_metadata(md);
 
@@ -393,9 +410,18 @@ impl Ingester {
             return Ok(Vec::new());
         };
 
-        let cq = db
-            .db
-            .chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms);
+        let ooo_window = self
+            .overrides
+            .for_tenant(user_id)
+            .out_of_order_time_window
+            .0;
+        let cq = if ooo_window > 0 {
+            db.db
+                .unordered_chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms)
+        } else {
+            db.db
+                .chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms)
+        };
         let mut chunk_series = cq
             .select(true, &matchers)
             .map_err(|e| IngesterError::Internal {
