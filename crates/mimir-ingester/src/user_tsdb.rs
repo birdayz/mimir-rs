@@ -16,6 +16,7 @@ use mimir_proto::cortexpb;
 use mimir_storage::bucket::{tenant_deletion_mark_exists, BucketClient};
 use mimir_storage::ingest::{OffsetCatalogue, OffsetCatalogueMetrics};
 use mimir_storage::shipper::{read_shipped_blocks, Shipper, ShipperMetrics, SourceType};
+use mimir_tsdb::chunkenc::Encoding;
 use mimir_tsdb::db::{Tsdb, TsdbError, TsdbOptions};
 use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
@@ -376,6 +377,13 @@ impl UserTsdb {
             .unwrap_or(2 * 3600 * 1000);
         let ooo_window_ms = (tenant_limits.out_of_order_time_window.0 / 1_000_000).max(0);
         let max_exemplars = limiter.max_exemplars_per_user(&user_id);
+        let float_chunk_encoding = if tenant_limits.float_chunk_encoding == "xor2" {
+            Encoding::Xor2
+        } else {
+            Encoding::Xor
+        };
+        let enable_histogram_st_encoding =
+            tenant_limits.histogram_chunk_encoding == "histogram_st";
 
         let head_opts = HeadOptions {
             chunk_range_ms: block_duration_ms,
@@ -386,6 +394,8 @@ impl UserTsdb {
             ooo_time_window_ms: ooo_window_ms,
             ooo_cap_max: (blocks_cfg.tsdb.out_of_order_capacity_max.clamp(1, 255)) as usize,
             enable_st_storage: false,
+            float_chunk_encoding,
+            enable_histogram_st_encoding,
             wal_compression: if blocks_cfg.tsdb.wal_compression_enabled {
                 CompressionType::Snappy
             } else {
@@ -398,6 +408,7 @@ impl UserTsdb {
                 max_metadata_per_metric: limiter.max_metadata_per_metric(&user_id),
             },
             series_lifecycle_callback: Some(lifecycle_adapter.clone()),
+            registry: _reg.cloned(),
         };
 
         let tsdb_opts = TsdbOptions {
@@ -812,6 +823,12 @@ impl UserTsdb {
         }
         let max_exemplars = self.limiter.max_exemplars_per_user(&self.user_id);
         self.db.head().set_max_exemplars(max_exemplars);
+        let float_enc = if limits.float_chunk_encoding == "xor2" {
+            Encoding::Xor2
+        } else {
+            Encoding::Xor
+        };
+        self.db.head().set_float_chunk_encoding(float_enc);
     }
 
     pub fn owned_series_state(&self) -> OwnedSeriesState {

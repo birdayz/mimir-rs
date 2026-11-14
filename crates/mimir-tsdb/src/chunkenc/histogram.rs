@@ -154,41 +154,41 @@ impl HistogramChunk {
 /// Snapshot of [`HistogramAppender`] state used to detect counter resets across chunks.
 #[derive(Clone, Debug)]
 pub struct HistogramAppenderState {
-    num_samples: usize,
-    counter_reset_header: CounterResetHeader,
-    schema: i32,
-    z_threshold: f64,
-    p_spans: Vec<HistogramSpan>,
-    n_spans: Vec<HistogramSpan>,
-    custom_values: Vec<f64>,
-    t: i64,
-    cnt: u64,
-    z_cnt: u64,
-    t_delta: i64,
-    cnt_delta: i64,
-    z_cnt_delta: i64,
-    p_buckets: Vec<i64>,
-    n_buckets: Vec<i64>,
-    p_buckets_delta: Vec<i64>,
-    n_buckets_delta: Vec<i64>,
-    sum: f64,
-    leading: u8,
-    trailing: u8,
+    pub(super) num_samples: usize,
+    pub(super) counter_reset_header: CounterResetHeader,
+    pub(super) schema: i32,
+    pub(super) z_threshold: f64,
+    pub(super) p_spans: Vec<HistogramSpan>,
+    pub(super) n_spans: Vec<HistogramSpan>,
+    pub(super) custom_values: Vec<f64>,
+    pub(super) t: i64,
+    pub(super) cnt: u64,
+    pub(super) z_cnt: u64,
+    pub(super) t_delta: i64,
+    pub(super) cnt_delta: i64,
+    pub(super) z_cnt_delta: i64,
+    pub(super) p_buckets: Vec<i64>,
+    pub(super) n_buckets: Vec<i64>,
+    pub(super) p_buckets_delta: Vec<i64>,
+    pub(super) n_buckets_delta: Vec<i64>,
+    pub(super) sum: f64,
+    pub(super) leading: u8,
+    pub(super) trailing: u8,
 }
 
 #[derive(Default)]
-struct AppendableGauge {
-    p_fwd: Vec<Insert>,
-    n_fwd: Vec<Insert>,
-    p_bwd: Vec<Insert>,
-    n_bwd: Vec<Insert>,
-    p_merged: Vec<HistogramSpan>,
-    n_merged: Vec<HistogramSpan>,
-    ok_to_append: bool,
+pub(super) struct AppendableGauge {
+    pub(super) p_fwd: Vec<Insert>,
+    pub(super) n_fwd: Vec<Insert>,
+    pub(super) p_bwd: Vec<Insert>,
+    pub(super) n_bwd: Vec<Insert>,
+    pub(super) p_merged: Vec<HistogramSpan>,
+    pub(super) n_merged: Vec<HistogramSpan>,
+    pub(super) ok_to_append: bool,
 }
 
 impl HistogramAppenderState {
-    fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             num_samples: 0,
             counter_reset_header: CounterResetHeader::UnknownCounterReset,
@@ -348,7 +348,7 @@ impl HistogramAppenderState {
         )
     }
 
-    fn appendable_gauge(&self, h: &Histogram) -> AppendableGauge {
+    pub(super) fn appendable_gauge(&self, h: &Histogram) -> AppendableGauge {
         if self.num_samples > 0 && self.counter_reset_header != CounterResetHeader::GaugeType {
             return AppendableGauge::default();
         }
@@ -414,6 +414,16 @@ impl<'a> HistogramAppender<'a> {
     }
 
     fn append_raw(&mut self, num: usize, t: i64, h: &Histogram) -> usize {
+        Self::append_raw_to_stream(&mut self.chunk.b, &mut self.state, num, t, h)
+    }
+
+    pub(super) fn append_raw_to_stream(
+        b: &mut BitStream,
+        state: &mut HistogramAppenderState,
+        num: usize,
+        t: i64,
+        h: &Histogram,
+    ) -> usize {
         let mut stale_holder;
         let h = if is_stale_nan(h.sum) {
             stale_holder = Histogram::default();
@@ -429,85 +439,85 @@ impl<'a> HistogramAppender<'a> {
 
         if num == 0 {
             write_histogram_chunk_layout(
-                &mut self.chunk.b,
+                b,
                 h.schema,
                 h.zero_threshold,
                 &h.positive_spans,
                 &h.negative_spans,
                 &h.custom_values,
             );
-            self.state.schema = h.schema;
-            self.state.z_threshold = h.zero_threshold;
-            self.state.p_spans = h.positive_spans.clone();
-            self.state.n_spans = h.negative_spans.clone();
-            self.state.custom_values = h.custom_values.clone();
+            state.schema = h.schema;
+            state.z_threshold = h.zero_threshold;
+            state.p_spans = h.positive_spans.clone();
+            state.n_spans = h.negative_spans.clone();
+            state.custom_values = h.custom_values.clone();
 
             let num_p = count_spans(&h.positive_spans);
             let num_n = count_spans(&h.negative_spans);
-            self.state.p_buckets = vec![0; num_p];
-            self.state.p_buckets_delta = vec![0; num_p];
-            self.state.n_buckets = vec![0; num_n];
-            self.state.n_buckets_delta = vec![0; num_n];
+            state.p_buckets = vec![0; num_p];
+            state.p_buckets_delta = vec![0; num_p];
+            state.n_buckets = vec![0; num_n];
+            state.n_buckets_delta = vec![0; num_n];
 
-            put_varbit_int(&mut self.chunk.b, t);
-            put_varbit_uint(&mut self.chunk.b, h.count);
-            put_varbit_uint(&mut self.chunk.b, h.zero_count);
-            self.chunk.b.write_bits(h.sum.to_bits(), 64);
-            for &b in &h.positive_buckets {
-                put_varbit_int(&mut self.chunk.b, b);
+            put_varbit_int(b, t);
+            put_varbit_uint(b, h.count);
+            put_varbit_uint(b, h.zero_count);
+            b.write_bits(h.sum.to_bits(), 64);
+            for &bkt in &h.positive_buckets {
+                put_varbit_int(b, bkt);
             }
-            for &b in &h.negative_buckets {
-                put_varbit_int(&mut self.chunk.b, b);
+            for &bkt in &h.negative_buckets {
+                put_varbit_int(b, bkt);
             }
         } else {
-            t_delta = t.wrapping_sub(self.state.t);
-            cnt_delta = (h.count as i64).wrapping_sub(self.state.cnt as i64);
-            z_cnt_delta = (h.zero_count as i64).wrapping_sub(self.state.z_cnt as i64);
+            t_delta = t.wrapping_sub(state.t);
+            cnt_delta = (h.count as i64).wrapping_sub(state.cnt as i64);
+            z_cnt_delta = (h.zero_count as i64).wrapping_sub(state.z_cnt as i64);
 
-            let t_dod = t_delta.wrapping_sub(self.state.t_delta);
-            let mut cnt_dod = cnt_delta.wrapping_sub(self.state.cnt_delta);
-            let mut z_cnt_dod = z_cnt_delta.wrapping_sub(self.state.z_cnt_delta);
+            let t_dod = t_delta.wrapping_sub(state.t_delta);
+            let mut cnt_dod = cnt_delta.wrapping_sub(state.cnt_delta);
+            let mut z_cnt_dod = z_cnt_delta.wrapping_sub(state.z_cnt_delta);
 
             if is_stale_nan(h.sum) {
                 cnt_dod = 0;
                 z_cnt_dod = 0;
             }
 
-            put_varbit_int(&mut self.chunk.b, t_dod);
-            put_varbit_int(&mut self.chunk.b, cnt_dod);
-            put_varbit_int(&mut self.chunk.b, z_cnt_dod);
+            put_varbit_int(b, t_dod);
+            put_varbit_int(b, cnt_dod);
+            put_varbit_int(b, z_cnt_dod);
 
             xor_write(
-                &mut self.chunk.b,
+                b,
                 h.sum,
-                self.state.sum,
-                &mut self.state.leading,
-                &mut self.state.trailing,
+                state.sum,
+                &mut state.leading,
+                &mut state.trailing,
             );
 
-            for (i, &b) in h.positive_buckets.iter().enumerate() {
-                let delta = b.wrapping_sub(self.state.p_buckets[i]);
-                let dod = delta.wrapping_sub(self.state.p_buckets_delta[i]);
-                put_varbit_int(&mut self.chunk.b, dod);
-                self.state.p_buckets_delta[i] = delta;
+            for (i, &bkt) in h.positive_buckets.iter().enumerate() {
+                let delta = bkt.wrapping_sub(state.p_buckets[i]);
+                let dod = delta.wrapping_sub(state.p_buckets_delta[i]);
+                put_varbit_int(b, dod);
+                state.p_buckets_delta[i] = delta;
             }
-            for (i, &b) in h.negative_buckets.iter().enumerate() {
-                let delta = b.wrapping_sub(self.state.n_buckets[i]);
-                let dod = delta.wrapping_sub(self.state.n_buckets_delta[i]);
-                put_varbit_int(&mut self.chunk.b, dod);
-                self.state.n_buckets_delta[i] = delta;
+            for (i, &bkt) in h.negative_buckets.iter().enumerate() {
+                let delta = bkt.wrapping_sub(state.n_buckets[i]);
+                let dod = delta.wrapping_sub(state.n_buckets_delta[i]);
+                put_varbit_int(b, dod);
+                state.n_buckets_delta[i] = delta;
             }
         }
 
-        self.state.t = t;
-        self.state.cnt = h.count;
-        self.state.z_cnt = h.zero_count;
-        self.state.t_delta = t_delta;
-        self.state.cnt_delta = cnt_delta;
-        self.state.z_cnt_delta = z_cnt_delta;
-        self.state.p_buckets.copy_from_slice(&h.positive_buckets);
-        self.state.n_buckets.copy_from_slice(&h.negative_buckets);
-        self.state.sum = h.sum;
+        state.t = t;
+        state.cnt = h.count;
+        state.z_cnt = h.zero_count;
+        state.t_delta = t_delta;
+        state.cnt_delta = cnt_delta;
+        state.z_cnt_delta = z_cnt_delta;
+        state.p_buckets.copy_from_slice(&h.positive_buckets);
+        state.n_buckets.copy_from_slice(&h.negative_buckets);
+        state.sum = h.sum;
 
         num + 1
     }
@@ -549,7 +559,7 @@ impl<'a> HistogramAppender<'a> {
         Ok(())
     }
 
-    fn recode_histogram(
+    pub(super) fn recode_histogram(
         h: &mut Histogram,
         p_backward_inserts: &[Insert],
         n_backward_inserts: &[Insert],
@@ -848,31 +858,62 @@ fn expand_int_spans_and_buckets(
 /// Iterator over integer native histograms in a [`HistogramChunk`].
 #[derive(Clone, Debug)]
 pub struct HistogramIterator<'a> {
-    br: BitReader<'a>,
-    num_total: u16,
-    num_read: u16,
-    counter_reset_header: CounterResetHeader,
-    schema: i32,
-    z_threshold: f64,
-    p_spans: Vec<HistogramSpan>,
-    n_spans: Vec<HistogramSpan>,
-    custom_values: Vec<f64>,
-    t: i64,
-    cnt: u64,
-    z_cnt: u64,
-    t_delta: i64,
-    cnt_delta: i64,
-    z_cnt_delta: i64,
-    p_buckets: Vec<i64>,
-    n_buckets: Vec<i64>,
-    p_buckets_delta: Vec<i64>,
-    n_buckets_delta: Vec<i64>,
-    sum: f64,
-    leading: u8,
-    trailing: u8,
+    pub(super) br: BitReader<'a>,
+    pub(super) num_total: u16,
+    pub(super) num_read: u16,
+    pub(super) counter_reset_header: CounterResetHeader,
+    pub(super) schema: i32,
+    pub(super) z_threshold: f64,
+    pub(super) p_spans: Vec<HistogramSpan>,
+    pub(super) n_spans: Vec<HistogramSpan>,
+    pub(super) custom_values: Vec<f64>,
+    pub(super) t: i64,
+    pub(super) cnt: u64,
+    pub(super) z_cnt: u64,
+    pub(super) t_delta: i64,
+    pub(super) cnt_delta: i64,
+    pub(super) z_cnt_delta: i64,
+    pub(super) p_buckets: Vec<i64>,
+    pub(super) n_buckets: Vec<i64>,
+    pub(super) p_buckets_delta: Vec<i64>,
+    pub(super) n_buckets_delta: Vec<i64>,
+    pub(super) sum: f64,
+    pub(super) leading: u8,
+    pub(super) trailing: u8,
 }
 
 impl<'a> HistogramIterator<'a> {
+    pub(super) fn new_with_header(
+        payload: &'a [u8],
+        num_total: u16,
+        counter_reset_header: CounterResetHeader,
+    ) -> Self {
+        Self {
+            br: BitReader::new(payload),
+            num_total,
+            num_read: 0,
+            counter_reset_header,
+            schema: 0,
+            z_threshold: 0.0,
+            p_spans: Vec::new(),
+            n_spans: Vec::new(),
+            custom_values: Vec::new(),
+            t: i64::MIN,
+            cnt: 0,
+            z_cnt: 0,
+            t_delta: 0,
+            cnt_delta: 0,
+            z_cnt_delta: 0,
+            p_buckets: Vec::new(),
+            n_buckets: Vec::new(),
+            p_buckets_delta: Vec::new(),
+            n_buckets_delta: Vec::new(),
+            sum: 0.0,
+            leading: 0,
+            trailing: 0,
+        }
+    }
+
     pub fn new(b: &'a [u8]) -> Self {
         if b.len() < HISTOGRAM_HEADER_SIZE {
             return Self {

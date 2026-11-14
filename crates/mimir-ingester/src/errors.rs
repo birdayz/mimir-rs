@@ -178,6 +178,13 @@ pub enum IngesterError {
         inner: Box<IngesterError>,
         rejected_samples: i64,
     },
+    Sampled {
+        inner: Box<IngesterError>,
+        should_log: bool,
+    },
+    DoNotLog {
+        inner: Box<IngesterError>,
+    },
 }
 
 impl IngesterError {
@@ -460,6 +467,36 @@ impl IngesterError {
         }
     }
 
+    pub fn with_sampling(self, should_log: bool) -> Self {
+        Self::Sampled {
+            inner: Box::new(self),
+            should_log,
+        }
+    }
+
+    pub fn with_do_not_log(self) -> Self {
+        Self::DoNotLog {
+            inner: Box::new(self),
+        }
+    }
+
+    pub fn should_log_error(&self) -> bool {
+        match self {
+            Self::Sampled { should_log, .. } => *should_log,
+            Self::DoNotLog { .. } => false,
+            Self::WrappedUser { inner, .. } => inner.should_log_error(),
+            _ => true,
+        }
+    }
+
+    pub fn is_optional_logging(&self) -> bool {
+        match self {
+            Self::Sampled { .. } | Self::DoNotLog { .. } => true,
+            Self::WrappedUser { inner, .. } => inner.is_optional_logging(),
+            _ => false,
+        }
+    }
+
     pub fn error_cause(&self) -> cortexpb::ErrorCause {
         match self {
             Self::Sample { .. }
@@ -481,14 +518,16 @@ impl IngesterError {
             Self::ReactiveLimiterExceeded { .. } => cortexpb::ErrorCause::RequestRateLimited,
             Self::BadRequest { .. } => cortexpb::ErrorCause::BadData,
             Self::Internal { .. } => cortexpb::ErrorCause::Unknown,
-            Self::WrappedUser { inner, .. } => inner.error_cause(),
+            Self::WrappedUser { inner, .. } | Self::Sampled { inner, .. } | Self::DoNotLog { inner } => inner.error_cause(),
         }
     }
 
     pub fn has_ingester_error_details(&self) -> bool {
         !matches!(self, Self::Internal { .. } | Self::BadRequest { .. })
             && match self {
-                Self::WrappedUser { inner, .. } => inner.has_ingester_error_details(),
+                Self::WrappedUser { inner, .. } | Self::Sampled { inner, .. } | Self::DoNotLog { inner } => {
+                    inner.has_ingester_error_details()
+                }
                 _ => true,
             }
     }
@@ -505,7 +544,7 @@ impl IngesterError {
             | Self::LabelsNotSorted { .. }
             | Self::Validation { .. }
             | Self::NativeHistogramValidation { .. } => true,
-            Self::WrappedUser { inner, .. } => inner.is_soft(),
+            Self::WrappedUser { inner, .. } | Self::Sampled { inner, .. } | Self::DoNotLog { inner } => inner.is_soft(),
             _ => false,
         }
     }
@@ -515,6 +554,7 @@ impl IngesterError {
             Self::WrappedUser {
                 rejected_samples, ..
             } => *rejected_samples,
+            Self::Sampled { inner, .. } | Self::DoNotLog { inner } => inner.rejected_samples(),
             _ => 0,
         }
     }
@@ -717,6 +757,7 @@ impl fmt::Display for IngesterError {
             Self::BadRequest { message } => f.write_str(message),
             Self::Internal { message } => f.write_str(message),
             Self::WrappedUser { user_id, inner, .. } => write!(f, "user={user_id}: {inner}"),
+            Self::Sampled { inner, .. } | Self::DoNotLog { inner } => write!(f, "{inner}"),
         }
     }
 }

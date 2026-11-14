@@ -373,6 +373,7 @@ impl Ingester {
 
         let _ = user_db.change_state(TsdbState::Closing, TsdbState::Closed);
         self.tsdbs.remove(user_id);
+        self.tsdb_metrics.remove_registry_for_tenant(user_id);
         self.metrics.mem_users.dec();
         self.delete_user_metadata(user_id);
         self.metrics
@@ -397,6 +398,20 @@ impl Ingester {
             let old_names = user_db.active_series.current_matcher_names();
             let new_names: Vec<String> = new_matchers.iter().map(|m| m.name.clone()).collect();
             if old_names != new_names {
+                for old_name in &old_names {
+                    let _ = self
+                        .metrics
+                        .active_series_custom_trackers_per_user
+                        .remove_label_values(&[&user_id, old_name]);
+                    let _ = self
+                        .metrics
+                        .active_series_custom_trackers_per_user_native_histograms
+                        .remove_label_values(&[&user_id, old_name]);
+                    let _ = self
+                        .metrics
+                        .active_native_histogram_buckets_custom_trackers_per_user
+                        .remove_label_values(&[&user_id, old_name]);
+                }
                 user_db
                     .active_series
                     .reload_matchers(new_matchers, user_db.db.head());

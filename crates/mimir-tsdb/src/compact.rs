@@ -76,6 +76,18 @@ pub fn decode_chunk_samples(chunk: &EncodedChunk) -> Result<Vec<DecodedSample>, 
             }
             Ok(out)
         }
+        EncodedChunk::Xor2(xc) => {
+            let mut out = Vec::with_capacity(xc.num_samples());
+            let mut it = xc.iter();
+            while let Some((t, v)) = it.next_sample()? {
+                out.push(DecodedSample {
+                    st: it.at_st(),
+                    t,
+                    value: SampleValue::Float(v),
+                });
+            }
+            Ok(out)
+        }
         EncodedChunk::Histogram(hc) => {
             let mut out = Vec::with_capacity(hc.num_samples());
             let mut it = hc.iter();
@@ -88,12 +100,36 @@ pub fn decode_chunk_samples(chunk: &EncodedChunk) -> Result<Vec<DecodedSample>, 
             }
             Ok(out)
         }
+        EncodedChunk::HistogramSt(hc) => {
+            let mut out = Vec::with_capacity(hc.num_samples());
+            let mut it = hc.iter();
+            while let Some((t, h)) = it.next_histogram()? {
+                out.push(DecodedSample {
+                    st: it.at_st(),
+                    t,
+                    value: SampleValue::Histogram(h),
+                });
+            }
+            Ok(out)
+        }
         EncodedChunk::FloatHistogram(fhc) => {
             let mut out = Vec::with_capacity(fhc.num_samples());
             let mut it = fhc.iter();
             while let Some((t, fh)) = it.next_float_histogram()? {
                 out.push(DecodedSample {
                     st: 0,
+                    t,
+                    value: SampleValue::FloatHistogram(fh),
+                });
+            }
+            Ok(out)
+        }
+        EncodedChunk::FloatHistogramSt(fhc) => {
+            let mut out = Vec::with_capacity(fhc.num_samples());
+            let mut it = fhc.iter();
+            while let Some((t, fh)) = it.next_float_histogram()? {
+                out.push(DecodedSample {
+                    st: it.at_st(),
                     t,
                     value: SampleValue::FloatHistogram(fh),
                 });
@@ -359,8 +395,11 @@ pub fn trim_and_merge_chunks(
             if let Some(chk) = c.chunk.as_mut() {
                 match chk {
                     EncodedChunk::Xor(x) => x.compact(),
+                    EncodedChunk::Xor2(x) => x.compact(),
                     EncodedChunk::Histogram(h) => h.compact(),
+                    EncodedChunk::HistogramSt(h) => h.compact(),
                     EncodedChunk::FloatHistogram(fh) => fh.compact(),
+                    EncodedChunk::FloatHistogramSt(fh) => fh.compact(),
                 }
             }
         }
@@ -500,6 +539,9 @@ pub fn write_block_from_series(
         }
         if comp.level <= 0 {
             comp.level = 1;
+        }
+        if out_of_order {
+            comp.set_out_of_order();
         }
 
         let mut meta = BlockMeta {

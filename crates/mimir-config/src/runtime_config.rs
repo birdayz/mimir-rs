@@ -387,6 +387,11 @@ impl RuntimeConfigManager {
         Overrides::with_manager(Arc::clone(&self.default_limits), Arc::clone(self))
     }
 
+    /// Replaces in-memory runtime config values (useful for tests).
+    pub fn set_values_for_tests(&self, values: RuntimeConfigValues) {
+        *self.current.write() = Arc::new(values);
+    }
+
     fn load_internal(&self, initial: bool) -> Result<(), ConfigError> {
         let mut sources = self.sources.write();
         if sources.is_empty() {
@@ -491,18 +496,18 @@ type StaticOverridesMap = Arc<RwLock<HashMap<String, Arc<LimitsConfig>>>>;
 /// static map) so the hot `Push` path performs zero heap allocations per lookup.
 #[derive(Clone)]
 pub struct Overrides {
-    default_limits: Arc<LimitsConfig>,
+    default_limits: Arc<RwLock<Arc<LimitsConfig>>>,
     manager: Option<Arc<RuntimeConfigManager>>,
-    static_overrides: Option<StaticOverridesMap>,
+    static_overrides: StaticOverridesMap,
 }
 
 impl Overrides {
     /// Creates an `Overrides` with only global defaults (no runtime overrides).
     pub fn new(default_limits: LimitsConfig) -> Self {
         Self {
-            default_limits: Arc::new(default_limits),
+            default_limits: Arc::new(RwLock::new(Arc::new(default_limits))),
             manager: None,
-            static_overrides: None,
+            static_overrides: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -512,9 +517,9 @@ impl Overrides {
         manager: Arc<RuntimeConfigManager>,
     ) -> Self {
         Self {
-            default_limits,
+            default_limits: Arc::new(RwLock::new(default_limits)),
             manager: Some(manager),
-            static_overrides: None,
+            static_overrides: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -528,10 +533,33 @@ impl Overrides {
             .map(|(k, v)| (k, Arc::new(v)))
             .collect();
         Self {
-            default_limits: Arc::new(default_limits),
+            default_limits: Arc::new(RwLock::new(Arc::new(default_limits))),
             manager: None,
-            static_overrides: Some(Arc::new(RwLock::new(map))),
+            static_overrides: Arc::new(RwLock::new(map)),
         }
+    }
+
+    /// Updates or removes a per-tenant static override dynamically across all clones.
+    pub fn set_static_override(&self, tenant_id: &str, limits: Option<LimitsConfig>) {
+        let mut g = self.static_overrides.write();
+        match limits {
+            Some(l) => {
+                g.insert(tenant_id.to_string(), Arc::new(l));
+            }
+            None => {
+                g.remove(tenant_id);
+            }
+        }
+    }
+
+    /// Clears all per-tenant static overrides across all clones.
+    pub fn clear_static_overrides(&self) {
+        self.static_overrides.write().clear();
+    }
+
+    /// Replaces the global default `LimitsConfig` across all clones.
+    pub fn set_defaults(&self, default_limits: LimitsConfig) {
+        *self.default_limits.write() = Arc::new(default_limits);
     }
 
     /// Returns the effective `LimitsConfig` for `tenant_id` (falling back to global defaults).
@@ -542,18 +570,19 @@ impl Overrides {
             if let Some(limits) = cfg.overrides.get(tenant_id) {
                 return Arc::clone(limits);
             }
-        } else if let Some(ref map) = self.static_overrides {
-            if let Some(limits) = map.read().get(tenant_id) {
+        } else {
+            let g = self.static_overrides.read();
+            if let Some(limits) = g.get(tenant_id) {
                 return Arc::clone(limits);
             }
         }
-        Arc::clone(&self.default_limits)
+        Arc::clone(&self.default_limits.read())
     }
 
-    /// Returns the global default `LimitsConfig`.
+    /// Returns a snapshot of the global default `LimitsConfig`.
     #[inline]
-    pub fn defaults(&self) -> &LimitsConfig {
-        &self.default_limits
+    pub fn defaults(&self) -> Arc<LimitsConfig> {
+        Arc::clone(&self.default_limits.read())
     }
 
     #[inline]

@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use mimir_common::limiter::InflightLimiter;
-use mimir_common::services::{Service, ServiceContext, State};
+use mimir_common::services::{ManagedBasicService, Service, ServiceContext, State};
 use mimir_common::shutdownmarker;
 use mimir_config::{
     BlocksStorageConfig, IngestStorageConfig, IngesterConfig, InstanceLimits, Overrides,
-    RuntimeConfigManager,
+    RuntimeConfigManager, TSDBConfig,
 };
 use mimir_proto::ringpb::InstanceState;
 use mimir_ring::lifecycler::Lifecycler;
@@ -25,6 +25,7 @@ use mimir_ring::partition_ring::{PartitionInstanceLifecycler, PartitionRingWatch
 use mimir_ring::ring::Ring;
 use mimir_storage::bucket::BucketClient;
 use mimir_storage::shipper::ShipperMetrics;
+use mimir_storage::tsdb_storage::TSDBMetrics;
 use parking_lot::{Mutex, RwLock};
 use prometheus::Registry;
 use tokio::sync::{mpsc, oneshot};
@@ -52,6 +53,19 @@ use crate::user_tsdb::{EwmaRate, TenantMetadataStore, UserTsdb};
 
 pub const INGEST_STORAGE_DEFAULT_READ_CONSISTENCY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const INSTANCE_INGESTION_RATE_TICK_INTERVAL: Duration = Duration::from_secs(1);
+pub const DEFAULT_MAX_TSDB_OPENING_CONCURRENCY_ON_STARTUP: usize = 10;
+pub const MAX_TSDB_OPEN_WITHOUT_CONCURRENCY: usize = 10;
+
+/// Usage statistics snapshot matching `pkg/ingester/ingester_metrics_update.go:updateUsageStats`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageStatsSnapshot {
+    pub memory_users: i64,
+    pub memory_series: i64,
+    pub active_series: i64,
+    pub tenants_with_out_of_order_enabled: i64,
+    pub min_out_of_order_time_window_seconds: i64,
+    pub max_out_of_order_time_window_seconds: i64,
+}
 
 pub struct TriggerRequest {
     pub users: Option<HashSet<String>>, // None means all tenants
@@ -68,11 +82,13 @@ pub struct Ingester {
 
     pub registry: Option<Registry>,
     pub metrics: Arc<IngesterMetrics>,
+    pub tsdb_metrics: Arc<TSDBMetrics>,
     pub shipper_metrics: ShipperMetrics,
     pub owned_series_metrics: OwnedSeriesMetrics,
 
     pub instance_ring: Option<Arc<Ring>>,
     pub lifecycler: Option<Arc<Lifecycler>>,
+    lifecycler_service: RwLock<Option<Arc<ManagedBasicService>>>,
     pub partition_ring_watcher: Option<Arc<PartitionRingWatcher>>,
     pub partition_lifecycler: Option<Arc<PartitionInstanceLifecycler>>,
     pub ingest_partition_id: i32,
@@ -102,6 +118,7 @@ pub struct Ingester {
     state: RwLock<State>,
     service_ctx: RwLock<Option<ServiceContext>>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
+    pub usage_stats: Mutex<UsageStatsSnapshot>,
 
     pub force_compact_tx: RwLock<Option<mpsc::Sender<TriggerRequest>>>,
     pub ship_tx: RwLock<Option<mpsc::Sender<TriggerRequest>>>,
@@ -211,6 +228,7 @@ impl Ingester {
 
         let shipper_metrics = ShipperMetrics::new(registry);
         let owned_series_metrics = OwnedSeriesMetrics::new(registry);
+        let tsdb_metrics = TSDBMetrics::new("cortex_ingester_", registry);
 
         let ignored_series_limit_metrics = cfg
             .ignore_series_limit_for_metric_names
@@ -277,10 +295,12 @@ impl Ingester {
             runtime_cfg,
             registry: registry.cloned(),
             metrics,
+            tsdb_metrics,
             shipper_metrics,
             owned_series_metrics,
             instance_ring,
             lifecycler,
+            lifecycler_service: RwLock::new(None),
             partition_ring_watcher,
             partition_lifecycler,
             ingest_partition_id,
@@ -305,6 +325,7 @@ impl Ingester {
             state: RwLock::new(State::New),
             service_ctx: RwLock::new(None),
             background_tasks: Mutex::new(Vec::new()),
+            usage_stats: Mutex::new(UsageStatsSnapshot::default()),
             force_compact_tx: RwLock::new(None),
             ship_tx: RwLock::new(None),
             verify_ring_ownership: AtomicBool::new(false),
@@ -447,7 +468,8 @@ impl Ingester {
             max_series_fn
         };
 
-        UserTsdb::open(
+        let tsdb_reg = Registry::new();
+        let db = UserTsdb::open(
             user_id.to_string(),
             &self.cfg,
             &self.blocks_cfg,
@@ -455,7 +477,7 @@ impl Ingester {
             Arc::clone(&self.limiter),
             self.bucket.as_deref(),
             self.shipper_metrics.clone(),
-            self.registry.as_ref(),
+            Some(&tsdb_reg),
             series_count,
             weak_self,
             rejected,
@@ -465,7 +487,10 @@ impl Ingester {
         )
         .map_err(|e| IngesterError::Internal {
             message: format!("failed to open TSDB for user {user_id}: {e}"),
-        })
+        })?;
+        self.tsdb_metrics
+            .set_registry_for_tenant(user_id, Arc::new(tsdb_reg));
+        Ok(db)
     }
 
     pub fn get_or_create_user_metadata(&self, user_id: &str) -> Arc<TenantMetadataStore> {
@@ -636,6 +661,7 @@ impl Ingester {
                 if let Err(e) = db.close() {
                     warn!(user = %k, error = %e, "unable to close TSDB");
                 }
+                self.tsdb_metrics.remove_registry_for_tenant(&k);
                 self.metrics.mem_users.dec();
                 self.metrics
                     .delete_per_user_custom_tracker_metrics(&k, &tracker_names);
@@ -643,9 +669,68 @@ impl Ingester {
         }
     }
 
+    pub fn lifecycler_service_state(&self) -> Option<State> {
+        self.lifecycler_service.read().as_ref().map(|s| s.state())
+    }
+
+    /// Computes anonymous usage statistics across all open tenant TSDBs (`updateUsageStats`).
+    pub fn update_usage_stats(&self) -> UsageStatsSnapshot {
+        let mut snap = UsageStatsSnapshot::default();
+        let mut min_ooo: i64 = 0;
+        let mut max_ooo: i64 = 0;
+        for user_id in self.get_tsdb_users() {
+            let Some(user_db) = self.get_tsdb(&user_id) else {
+                continue;
+            };
+            let num_series = user_db.db.head().num_series();
+            if num_series == 0 {
+                continue;
+            }
+            snap.memory_users += 1;
+            snap.memory_series += num_series as i64;
+            snap.active_series += user_db.active_series.active().0 as i64;
+
+            let ooo_ns = self.overrides.out_of_order_time_window_nanos(&user_id);
+            if ooo_ns > 0 {
+                let ooo_secs = ooo_ns / 1_000_000_000;
+                snap.tenants_with_out_of_order_enabled += 1;
+                if min_ooo == 0 || ooo_secs < min_ooo {
+                    min_ooo = ooo_secs;
+                }
+                if ooo_secs > max_ooo {
+                    max_ooo = ooo_secs;
+                }
+            }
+        }
+        snap.min_out_of_order_time_window_seconds = min_ooo;
+        snap.max_out_of_order_time_window_seconds = max_ooo;
+        *self.usage_stats.lock() = snap;
+        snap
+    }
+
+    /// Flushes WAL & WBL segments for all open tenant TSDBs (`NotifyPreCommit`).
+    pub fn notify_pre_commit(&self) -> Result<(), IngesterError> {
+        for user_id in self.get_tsdb_users() {
+            if let Some(db) = self.get_tsdb(&user_id) {
+                db.db.head().sync().map_err(|e| IngesterError::Internal {
+                    message: format!("failed to sync TSDB WAL for user {user_id}: {e}"),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Starts the Ingester service, opens existing TSDBs, starts Kafka reader (if enabled),
     /// lifecyclers, compaction/shipping/metrics loops, and transitions to `State::Running`.
     pub async fn start(self: &Arc<Self>) -> Result<(), IngesterError> {
+        self.start_with_context(ServiceContext::background()).await
+    }
+
+    /// Starts the Ingester service bound to a parent [`ServiceContext`].
+    pub async fn start_with_context(
+        self: &Arc<Self>,
+        ctx: ServiceContext,
+    ) -> Result<(), IngesterError> {
         {
             let mut st = self.state.write();
             if *st != State::New {
@@ -656,13 +741,44 @@ impl Ingester {
             *st = State::Starting;
         }
 
-        let ctx = ServiceContext::background();
         *self.service_ctx.write() = Some(ctx.clone());
+        if let Some(ref lc) = self.lifecycler {
+            let mut slot = self.lifecycler_service.write();
+            if slot.is_none() {
+                *slot = Some(Arc::clone(lc).into_service());
+            }
+        }
+
+        let fail_startup = |err: IngesterError| async {
+            ctx.cancel();
+            let lc_svc = self.lifecycler_service.read().clone();
+            if let Some(svc) = lc_svc {
+                svc.stop_async();
+                let _ = svc.await_terminated().await;
+            }
+            let tasks = std::mem::take(&mut *self.background_tasks.lock());
+            for t in tasks {
+                t.abort();
+            }
+            self.close_all_tsdbs().await;
+            *self.state.write() = State::Failed;
+            err
+        };
+
+        if ctx.is_canceled() {
+            return Err(fail_startup(IngesterError::Internal {
+                message: "context canceled".to_string(),
+            })
+            .await);
+        }
 
         let tsdb_dir = PathBuf::from(&self.blocks_cfg.tsdb.dir);
-        fs::create_dir_all(&tsdb_dir).map_err(|e| IngesterError::Internal {
-            message: format!("failed to create TSDB dir: {e}"),
-        })?;
+        if let Err(e) = fs::create_dir_all(&tsdb_dir) {
+            return Err(fail_startup(IngesterError::Internal {
+                message: format!("failed to create TSDB dir: {e}"),
+            })
+            .await);
+        }
 
         let marker_path = shutdownmarker::get_path(&tsdb_dir);
         if shutdownmarker::exists(&marker_path).unwrap_or(false) {
@@ -671,9 +787,7 @@ impl Ingester {
         }
 
         if let Err(e) = self.open_existing_tsdbs().await {
-            self.close_all_tsdbs().await;
-            *self.state.write() = State::Failed;
-            return Err(e);
+            return Err(fail_startup(e).await);
         }
 
         if let Some(ref strategy) = self.owned_series_strategy {
@@ -698,30 +812,57 @@ impl Ingester {
 
         // Start Kafka ingest storage reader BEFORE lifecycler enters ACTIVE
         if self.ingest_cfg.enabled {
-            let reader = crate::ingest_storage::start_ingest_reader(Arc::clone(self))
-                .await
-                .map_err(|e| IngesterError::Internal {
-                    message: format!("failed to start ingest reader: {e}"),
-                })?;
+            let reader = match crate::ingest_storage::start_ingest_reader(Arc::clone(self)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    *self.background_tasks.lock() = tasks;
+                    return Err(fail_startup(IngesterError::Internal {
+                        message: format!("failed to start ingest reader: {e}"),
+                    })
+                    .await);
+                }
+            };
             *self.ingest_reader.write() = Some(reader);
         }
 
-        if let Some(ref lc) = self.lifecycler {
-            let svc = Arc::clone(lc).into_service();
+        if self.lifecycler.is_some() {
+            let svc = self
+                .lifecycler_service
+                .read()
+                .clone()
+                .expect("lifecycler_service initialized");
             let lc_ctx = ctx.child();
-            svc.start_async(lc_ctx)
-                .await
-                .map_err(|e| IngesterError::Internal {
+            if let Err(e) = svc.start_async(lc_ctx).await {
+                *self.background_tasks.lock() = tasks;
+                return Err(fail_startup(IngesterError::Internal {
                     message: format!("failed to start lifecycler: {e}"),
-                })?;
+                })
+                .await);
+            }
             if let Err(e) = svc.await_running().await {
-                return Err(IngesterError::Internal {
+                *self.background_tasks.lock() = tasks;
+                return Err(fail_startup(IngesterError::Internal {
                     message: format!("lifecycler failed to reach running: {e}"),
-                });
+                })
+                .await);
+            }
+            if ctx.is_canceled() {
+                *self.background_tasks.lock() = tasks;
+                return Err(fail_startup(IngesterError::Internal {
+                    message: "context canceled".to_string(),
+                })
+                .await);
             }
             if let Some(ref ring) = self.instance_ring {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while Instant::now() < deadline {
+                    if ctx.is_canceled() {
+                        *self.background_tasks.lock() = tasks;
+                        return Err(fail_startup(IngesterError::Internal {
+                            message: "context canceled".to_string(),
+                        })
+                        .await);
+                    }
                     if ring
                         .get_instance_state(&self.cfg.ring.instance_id)
                         .ok()
@@ -732,6 +873,14 @@ impl Ingester {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }
+        }
+
+        if ctx.is_canceled() {
+            *self.background_tasks.lock() = tasks;
+            return Err(fail_startup(IngesterError::Internal {
+                message: "context canceled".to_string(),
+            })
+            .await);
         }
 
         if self.blocks_cfg.tsdb.ship_interval.0 > 0 {
@@ -825,7 +974,11 @@ impl Ingester {
         }
 
         // 4. Stop partition lifecycler & classic lifecycler
-        if let Some(ref lc) = self.lifecycler {
+        let lc_svc_opt = self.lifecycler_service.write().take();
+        if let Some(svc) = lc_svc_opt {
+            svc.stop_async();
+            let _ = svc.await_terminated().await;
+        } else if let Some(ref lc) = self.lifecycler {
             let svc = Arc::clone(lc).into_service();
             svc.stop_async();
             let _ = svc.await_terminated().await;
@@ -840,5 +993,62 @@ impl Ingester {
 
         *self.state.write() = State::Terminated;
         Ok(())
+    }
+}
+
+/// Ported from `pkg/ingester/ingester_tsdb.go:getOpenTSDBsConcurrencyConfig`.
+pub fn get_open_tsdbs_concurrency_config(
+    tsdb_config: &TSDBConfig,
+    user_count: usize,
+) -> (usize, usize) {
+    let mut tsdb_open_concurrency = DEFAULT_MAX_TSDB_OPENING_CONCURRENCY_ON_STARTUP;
+    let mut tsdb_wal_replay_concurrency = 0usize;
+    if tsdb_config.wal_replay_concurrency > 0 {
+        let wal_c = tsdb_config.wal_replay_concurrency as usize;
+        if user_count <= MAX_TSDB_OPEN_WITHOUT_CONCURRENCY {
+            tsdb_open_concurrency = 1;
+            tsdb_wal_replay_concurrency = wal_c;
+        } else {
+            tsdb_open_concurrency = wal_c;
+            tsdb_wal_replay_concurrency = 1;
+        }
+    }
+    (tsdb_open_concurrency, tsdb_wal_replay_concurrency)
+}
+
+/// Ported from `pkg/ingester/ingester.go:Config.getIgnoreSeriesLimitForMetricNamesMap`.
+pub fn get_ignore_series_limit_for_metric_names_map(raw: &str) -> Option<HashSet<String>> {
+    let set: HashSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
+/// Ported from `pkg/ingester/ingester_tsdb.go:blockGenerationCalculator`.
+pub fn block_generation_calculator(
+    db: &UserTsdb,
+    block_range_ms: i64,
+    is_head_range: bool,
+    block_min_time: i64,
+) -> String {
+    if is_head_range {
+        return "0".to_string();
+    }
+    let head_min_time = db.db.head().min_time();
+    if head_min_time == i64::MAX {
+        return "unknown".to_string();
+    }
+    let gen = 1i64.max((head_min_time - block_min_time) / block_range_ms);
+    if gen > 100 {
+        "100+".to_string()
+    } else {
+        gen.to_string()
     }
 }
