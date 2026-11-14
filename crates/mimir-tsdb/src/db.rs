@@ -146,6 +146,9 @@ impl Tsdb {
 
         if last_block_maxt != i64::MIN {
             self.head.truncate_wal(last_block_maxt)?;
+            if let Some(uid) = self.compact_ooo_head_locked()? {
+                created.push(uid);
+            }
         }
 
         Ok(created)
@@ -215,6 +218,10 @@ impl Tsdb {
     /// Compacts all out-of-order samples in Head into an OOO ULID block on disk and clears OOO state.
     pub fn compact_ooo_head(&self) -> Result<Option<Ulid>, TsdbError> {
         let _guard = self.compact_mtx.lock();
+        self.compact_ooo_head_locked()
+    }
+
+    fn compact_ooo_head_locked(&self) -> Result<Option<Ulid>, TsdbError> {
         let (series, mint, maxt_inclusive) = self.head.collect_ooo_compaction_series()?;
         if series.is_empty() || mint > maxt_inclusive {
             return Ok(None);

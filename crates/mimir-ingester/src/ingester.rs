@@ -62,6 +62,17 @@ pub trait UtilizationBasedLimiter: Send + Sync {
     fn limiting_reason(&self) -> Option<String>;
 }
 
+/// Usage statistics snapshot matching `pkg/ingester/ingester_metrics_update.go:updateUsageStats`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageStatsSnapshot {
+    pub memory_users: i64,
+    pub memory_series: i64,
+    pub active_series: i64,
+    pub tenants_with_out_of_order_enabled: i64,
+    pub min_out_of_order_time_window_seconds: i64,
+    pub max_out_of_order_time_window_seconds: i64,
+}
+
 pub fn get_open_tsdbs_concurrency_config(
     wal_replay_concurrency: i64,
     user_count: usize,
@@ -138,6 +149,7 @@ pub struct Ingester {
     lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
     partition_lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
+    pub usage_stats: Mutex<UsageStatsSnapshot>,
 
     compaction_service_state: AtomicU8,
     owned_series_service_state: AtomicU8,
@@ -403,6 +415,7 @@ impl Ingester {
             lifecycler_svc: Mutex::new(None),
             partition_lifecycler_svc: Mutex::new(None),
             background_tasks: Mutex::new(Vec::new()),
+            usage_stats: Mutex::new(UsageStatsSnapshot::default()),
             compaction_service_state: AtomicU8::new(State::New as u8),
             owned_series_service_state: AtomicU8::new(State::New as u8),
             owned_series_paused: AtomicBool::new(false),
@@ -686,7 +699,6 @@ impl Ingester {
         user_id: &str,
         wal_replay_concurrency: usize,
     ) -> Result<Arc<UserTsdb>, IngesterError> {
-        let tsdb_prom_reg = Arc::new(Registry::new());
         let series_count = Arc::clone(&self.series_count);
         let rejected = self.metrics.rejected.clone();
         let owned_shard_size = self
@@ -711,6 +723,7 @@ impl Ingester {
             max_series_fn
         };
 
+        let tsdb_prom_reg = Arc::new(Registry::new());
         let effective_wal_concurrency = if wal_replay_concurrency > 0 {
             wal_replay_concurrency
         } else {
@@ -921,6 +934,7 @@ impl Ingester {
                 if let Err(e) = db.close() {
                     warn!(user = %k, error = %e, "unable to close TSDB");
                 }
+                self.tsdb_metrics.remove_registry_for_tenant(&k);
                 self.metrics.mem_users.dec();
                 self.tsdb_metrics.remove_registry_for_tenant(&k);
                 self.metrics
@@ -929,8 +943,64 @@ impl Ingester {
         }
     }
 
+    /// Computes anonymous usage statistics across all open tenant TSDBs (`updateUsageStats`).
+    pub fn update_usage_stats(&self) -> UsageStatsSnapshot {
+        let mut snap = UsageStatsSnapshot::default();
+        let mut min_ooo: i64 = 0;
+        let mut max_ooo: i64 = 0;
+        for user_id in self.get_tsdb_users() {
+            let Some(user_db) = self.get_tsdb(&user_id) else {
+                continue;
+            };
+            let num_series = user_db.db.head().num_series();
+            if num_series == 0 {
+                continue;
+            }
+            snap.memory_users += 1;
+            snap.memory_series += num_series as i64;
+            snap.active_series += user_db.active_series.active().0 as i64;
+
+            let ooo_ns = self.overrides.out_of_order_time_window_nanos(&user_id);
+            if ooo_ns > 0 {
+                let ooo_secs = ooo_ns / 1_000_000_000;
+                snap.tenants_with_out_of_order_enabled += 1;
+                if min_ooo == 0 || ooo_secs < min_ooo {
+                    min_ooo = ooo_secs;
+                }
+                if ooo_secs > max_ooo {
+                    max_ooo = ooo_secs;
+                }
+            }
+        }
+        snap.min_out_of_order_time_window_seconds = min_ooo;
+        snap.max_out_of_order_time_window_seconds = max_ooo;
+        *self.usage_stats.lock() = snap;
+        snap
+    }
+
+    /// Flushes WAL & WBL segments for all open tenant TSDBs (`NotifyPreCommit`).
+    pub fn notify_pre_commit(&self) -> Result<(), IngesterError> {
+        for user_id in self.get_tsdb_users() {
+            if let Some(db) = self.get_tsdb(&user_id) {
+                db.db.head().sync().map_err(|e| IngesterError::Internal {
+                    message: format!("failed to sync TSDB WAL for user {user_id}: {e}"),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Starts the Ingester service asynchronously, returning immediately while startup progresses.
     pub async fn start_async(self: &Arc<Self>) -> Result<(), IngesterError> {
+        self.start_async_with_context(ServiceContext::background())
+            .await
+    }
+
+    /// Starts the Ingester service asynchronously bound to a parent [`ServiceContext`].
+    pub async fn start_async_with_context(
+        self: &Arc<Self>,
+        ctx: ServiceContext,
+    ) -> Result<(), IngesterError> {
         {
             let mut st = self.state.write();
             if *st != State::New {
@@ -941,13 +1011,21 @@ impl Ingester {
             *st = State::Starting;
         }
 
-        let ctx = ServiceContext::background();
         *self.service_ctx.write() = Some(ctx.clone());
 
         let ing = Arc::clone(self);
         let handle = tokio::spawn(async move { ing.run_starting(ctx).await });
         *self.startup_handle.lock().await = Some(handle);
         Ok(())
+    }
+
+    /// Starts the Ingester service bound to a parent [`ServiceContext`] and waits until running.
+    pub async fn start_with_context(
+        self: &Arc<Self>,
+        ctx: ServiceContext,
+    ) -> Result<(), IngesterError> {
+        self.start_async_with_context(ctx).await?;
+        self.await_running().await
     }
 
     /// Waits for `start_async` to finish transitioning the Ingester into `State::Running`.
@@ -974,23 +1052,33 @@ impl Ingester {
     async fn run_starting(self: &Arc<Self>, ctx: ServiceContext) -> Result<(), IngesterError> {
         let res = self.run_starting_inner(&ctx).await;
         if let Err(ref _e) = res {
-            // Stop lifecycler if starting failed, matching Go's defer in starting().
-            let lc_svc_opt = self.lifecycler_svc.lock().take();
+            ctx.cancel();
+            let lc_svc_opt = self.lifecycler_svc.lock().clone();
             if let Some(svc) = lc_svc_opt {
                 svc.stop_async();
                 let _ = svc.await_terminated().await;
             }
-            let plc_svc_opt = self.partition_lifecycler_svc.lock().take();
+            let plc_svc_opt = self.partition_lifecycler_svc.lock().clone();
             if let Some(svc) = plc_svc_opt {
                 svc.stop_async();
                 let _ = svc.await_terminated().await;
             }
+            let tasks = std::mem::take(&mut *self.background_tasks.lock());
+            for t in tasks {
+                let _ = t.await;
+            }
+            self.close_all_tsdbs().await;
             *self.state.write() = State::Failed;
         }
         res
     }
 
     async fn run_starting_inner(self: &Arc<Self>, ctx: &ServiceContext) -> Result<(), IngesterError> {
+        if ctx.is_canceled() {
+            return Err(IngesterError::Internal {
+                message: "context canceled".to_string(),
+            });
+        }
         let tsdb_dir = PathBuf::from(&self.blocks_cfg.tsdb.dir);
         fs::create_dir_all(&tsdb_dir).map_err(|e| IngesterError::Internal {
             message: format!("failed to create TSDB dir: {e}"),
@@ -1002,10 +1090,7 @@ impl Ingester {
             self.set_prepare_shutdown();
         }
 
-        if let Err(e) = self.open_existing_tsdbs().await {
-            self.close_all_tsdbs().await;
-            return Err(e);
-        }
+        self.open_existing_tsdbs().await?;
 
         // Start owned series loop before partition replay and lifecycler.
         if self.owned_series_strategy.is_some() {
@@ -1262,5 +1347,42 @@ impl Ingester {
 
         *self.state.write() = State::Terminated;
         Ok(())
+    }
+}
+
+/// Ported from `pkg/ingester/ingester.go:Config.getIgnoreSeriesLimitForMetricNamesMap`.
+pub fn get_ignore_series_limit_for_metric_names_map(raw: &str) -> Option<HashSet<String>> {
+    let set: HashSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
+/// Ported from `pkg/ingester/ingester_tsdb.go:blockGenerationCalculator`.
+pub fn block_generation_calculator(
+    db: &UserTsdb,
+    block_range_ms: i64,
+    is_head_range: bool,
+    block_min_time: i64,
+) -> String {
+    if is_head_range {
+        return "0".to_string();
+    }
+    let head_min_time = db.db.head().min_time();
+    if head_min_time == i64::MAX {
+        return "unknown".to_string();
+    }
+    let gen = 1i64.max((head_min_time - block_min_time) / block_range_ms);
+    if gen > 100 {
+        "100+".to_string()
+    } else {
+        gen.to_string()
     }
 }

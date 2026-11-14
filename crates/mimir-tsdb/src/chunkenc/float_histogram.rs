@@ -23,14 +23,14 @@ const CHUNK_ALLOCATION_SIZE: usize = 128;
 const CHUNK_COMPACT_CAPACITY_THRESHOLD: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default)]
-struct XorValue {
-    value: f64,
-    leading: u8,
-    trailing: u8,
+pub(super) struct XorValue {
+    pub(super) value: f64,
+    pub(super) leading: u8,
+    pub(super) trailing: u8,
 }
 
 impl XorValue {
-    const fn init_unseen() -> Self {
+    pub(super) const fn init_unseen() -> Self {
         Self {
             value: 0.0,
             leading: 0xff,
@@ -185,35 +185,35 @@ impl FloatHistogramChunk {
 /// Snapshot of [`FloatHistogramAppender`] state used to detect counter resets across chunks.
 #[derive(Clone, Debug)]
 pub struct FloatHistogramAppenderState {
-    num_samples: usize,
-    counter_reset_header: CounterResetHeader,
-    schema: i32,
-    z_threshold: f64,
-    p_spans: Vec<HistogramSpan>,
-    n_spans: Vec<HistogramSpan>,
-    custom_values: Vec<f64>,
-    t: i64,
-    t_delta: i64,
-    sum: XorValue,
-    cnt: XorValue,
-    z_cnt: XorValue,
-    p_buckets: Vec<XorValue>,
-    n_buckets: Vec<XorValue>,
+    pub(super) num_samples: usize,
+    pub(super) counter_reset_header: CounterResetHeader,
+    pub(super) schema: i32,
+    pub(super) z_threshold: f64,
+    pub(super) p_spans: Vec<HistogramSpan>,
+    pub(super) n_spans: Vec<HistogramSpan>,
+    pub(super) custom_values: Vec<f64>,
+    pub(super) t: i64,
+    pub(super) t_delta: i64,
+    pub(super) sum: XorValue,
+    pub(super) cnt: XorValue,
+    pub(super) z_cnt: XorValue,
+    pub(super) p_buckets: Vec<XorValue>,
+    pub(super) n_buckets: Vec<XorValue>,
 }
 
 #[derive(Default)]
-struct AppendableGauge {
-    p_fwd: Vec<Insert>,
-    n_fwd: Vec<Insert>,
-    p_bwd: Vec<Insert>,
-    n_bwd: Vec<Insert>,
-    p_merged: Vec<HistogramSpan>,
-    n_merged: Vec<HistogramSpan>,
-    ok_to_append: bool,
+pub(super) struct AppendableGauge {
+    pub(super) p_fwd: Vec<Insert>,
+    pub(super) n_fwd: Vec<Insert>,
+    pub(super) p_bwd: Vec<Insert>,
+    pub(super) n_bwd: Vec<Insert>,
+    pub(super) p_merged: Vec<HistogramSpan>,
+    pub(super) n_merged: Vec<HistogramSpan>,
+    pub(super) ok_to_append: bool,
 }
 
 impl FloatHistogramAppenderState {
-    fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             num_samples: 0,
             counter_reset_header: CounterResetHeader::UnknownCounterReset,
@@ -283,7 +283,7 @@ impl FloatHistogramAppenderState {
         (p_fwd, n_fwd, p_bwd, n_bwd, true, false)
     }
 
-    fn appendable_gauge(&self, h: &FloatHistogram) -> AppendableGauge {
+    pub(super) fn appendable_gauge(&self, h: &FloatHistogram) -> AppendableGauge {
         if self.num_samples > 0 && self.counter_reset_header != CounterResetHeader::GaugeType {
             return AppendableGauge::default();
         }
@@ -354,6 +354,16 @@ impl<'a> FloatHistogramAppender<'a> {
     }
 
     fn append_raw(&mut self, num: usize, t: i64, h: &FloatHistogram) -> usize {
+        Self::append_raw_to_stream(&mut self.chunk.b, &mut self.state, num, t, h)
+    }
+
+    pub(super) fn append_raw_to_stream(
+        b: &mut BitStream,
+        state: &mut FloatHistogramAppenderState,
+        num: usize,
+        t: i64,
+        h: &FloatHistogram,
+    ) -> usize {
         let mut stale_holder;
         let h = if is_stale_nan(h.sum) {
             stale_holder = FloatHistogram::default();
@@ -366,29 +376,29 @@ impl<'a> FloatHistogramAppender<'a> {
         let mut t_delta = 0i64;
         if num == 0 {
             write_histogram_chunk_layout(
-                &mut self.chunk.b,
+                b,
                 h.schema,
                 h.zero_threshold,
                 &h.positive_spans,
                 &h.negative_spans,
                 &h.custom_values,
             );
-            self.state.schema = h.schema;
-            self.state.z_threshold = h.zero_threshold;
-            self.state.p_spans = h.positive_spans.clone();
-            self.state.n_spans = h.negative_spans.clone();
-            self.state.custom_values = h.custom_values.clone();
+            state.schema = h.schema;
+            state.z_threshold = h.zero_threshold;
+            state.p_spans = h.positive_spans.clone();
+            state.n_spans = h.negative_spans.clone();
+            state.custom_values = h.custom_values.clone();
 
             let num_p = count_spans(&h.positive_spans);
             let num_n = count_spans(&h.negative_spans);
-            self.state.p_buckets = (0..num_p)
+            state.p_buckets = (0..num_p)
                 .map(|i| XorValue {
                     value: h.positive_buckets[i],
                     leading: 0xff,
                     trailing: 0,
                 })
                 .collect();
-            self.state.n_buckets = (0..num_n)
+            state.n_buckets = (0..num_n)
                 .map(|i| XorValue {
                     value: h.negative_buckets[i],
                     leading: 0xff,
@@ -396,38 +406,38 @@ impl<'a> FloatHistogramAppender<'a> {
                 })
                 .collect();
 
-            put_varbit_int(&mut self.chunk.b, t);
-            self.chunk.b.write_bits(h.count.to_bits(), 64);
-            self.chunk.b.write_bits(h.zero_count.to_bits(), 64);
-            self.chunk.b.write_bits(h.sum.to_bits(), 64);
-            self.state.cnt.value = h.count;
-            self.state.z_cnt.value = h.zero_count;
-            self.state.sum.value = h.sum;
-            for &b in &h.positive_buckets {
-                self.chunk.b.write_bits(b.to_bits(), 64);
+            put_varbit_int(b, t);
+            b.write_bits(h.count.to_bits(), 64);
+            b.write_bits(h.zero_count.to_bits(), 64);
+            b.write_bits(h.sum.to_bits(), 64);
+            state.cnt.value = h.count;
+            state.z_cnt.value = h.zero_count;
+            state.sum.value = h.sum;
+            for &bkt in &h.positive_buckets {
+                b.write_bits(bkt.to_bits(), 64);
             }
-            for &b in &h.negative_buckets {
-                self.chunk.b.write_bits(b.to_bits(), 64);
+            for &bkt in &h.negative_buckets {
+                b.write_bits(bkt.to_bits(), 64);
             }
         } else {
-            t_delta = t.wrapping_sub(self.state.t);
-            let t_dod = t_delta.wrapping_sub(self.state.t_delta);
-            put_varbit_int(&mut self.chunk.b, t_dod);
+            t_delta = t.wrapping_sub(state.t);
+            let t_dod = t_delta.wrapping_sub(state.t_delta);
+            put_varbit_int(b, t_dod);
 
-            Self::write_xor_value(&mut self.chunk.b, &mut self.state.cnt, h.count);
-            Self::write_xor_value(&mut self.chunk.b, &mut self.state.z_cnt, h.zero_count);
-            Self::write_xor_value(&mut self.chunk.b, &mut self.state.sum, h.sum);
+            Self::write_xor_value(b, &mut state.cnt, h.count);
+            Self::write_xor_value(b, &mut state.z_cnt, h.zero_count);
+            Self::write_xor_value(b, &mut state.sum, h.sum);
 
-            for (i, &b) in h.positive_buckets.iter().enumerate() {
-                Self::write_xor_value(&mut self.chunk.b, &mut self.state.p_buckets[i], b);
+            for (i, &bkt) in h.positive_buckets.iter().enumerate() {
+                Self::write_xor_value(b, &mut state.p_buckets[i], bkt);
             }
-            for (i, &b) in h.negative_buckets.iter().enumerate() {
-                Self::write_xor_value(&mut self.chunk.b, &mut self.state.n_buckets[i], b);
+            for (i, &bkt) in h.negative_buckets.iter().enumerate() {
+                Self::write_xor_value(b, &mut state.n_buckets[i], bkt);
             }
         }
 
-        self.state.t = t;
-        self.state.t_delta = t_delta;
+        state.t = t;
+        state.t_delta = t_delta;
         num + 1
     }
 
@@ -468,7 +478,7 @@ impl<'a> FloatHistogramAppender<'a> {
         Ok(())
     }
 
-    fn recode_histogram(
+    pub(super) fn recode_histogram(
         fh: &mut FloatHistogram,
         p_backward_inserts: &[Insert],
         n_backward_inserts: &[Insert],
@@ -773,29 +783,58 @@ fn expand_float_spans_and_buckets(
 /// Iterator over float histograms in a [`FloatHistogramChunk`].
 #[derive(Clone, Debug)]
 pub struct FloatHistogramIterator<'a> {
-    br: BitReader<'a>,
-    num_total: u16,
-    num_read: u16,
-    counter_reset_header: CounterResetHeader,
-    schema: i32,
-    z_threshold: f64,
-    p_spans: Vec<HistogramSpan>,
-    n_spans: Vec<HistogramSpan>,
-    custom_values: Vec<f64>,
-    t: i64,
-    t_delta: i64,
-    sum: XorValue,
-    cnt: XorValue,
-    z_cnt: XorValue,
-    p_buckets: Vec<f64>,
-    n_buckets: Vec<f64>,
-    p_buckets_leading: Vec<u8>,
-    n_buckets_leading: Vec<u8>,
-    p_buckets_trailing: Vec<u8>,
-    n_buckets_trailing: Vec<u8>,
+    pub(super) br: BitReader<'a>,
+    pub(super) num_total: u16,
+    pub(super) num_read: u16,
+    pub(super) counter_reset_header: CounterResetHeader,
+    pub(super) schema: i32,
+    pub(super) z_threshold: f64,
+    pub(super) p_spans: Vec<HistogramSpan>,
+    pub(super) n_spans: Vec<HistogramSpan>,
+    pub(super) custom_values: Vec<f64>,
+    pub(super) t: i64,
+    pub(super) t_delta: i64,
+    pub(super) sum: XorValue,
+    pub(super) cnt: XorValue,
+    pub(super) z_cnt: XorValue,
+    pub(super) p_buckets: Vec<f64>,
+    pub(super) n_buckets: Vec<f64>,
+    pub(super) p_buckets_leading: Vec<u8>,
+    pub(super) n_buckets_leading: Vec<u8>,
+    pub(super) p_buckets_trailing: Vec<u8>,
+    pub(super) n_buckets_trailing: Vec<u8>,
 }
 
 impl<'a> FloatHistogramIterator<'a> {
+    pub(super) fn new_with_header(
+        payload: &'a [u8],
+        num_total: u16,
+        counter_reset_header: CounterResetHeader,
+    ) -> Self {
+        Self {
+            br: BitReader::new(payload),
+            num_total,
+            num_read: 0,
+            counter_reset_header,
+            schema: 0,
+            z_threshold: 0.0,
+            p_spans: Vec::new(),
+            n_spans: Vec::new(),
+            custom_values: Vec::new(),
+            t: i64::MIN,
+            t_delta: 0,
+            sum: XorValue::default(),
+            cnt: XorValue::default(),
+            z_cnt: XorValue::default(),
+            p_buckets: Vec::new(),
+            n_buckets: Vec::new(),
+            p_buckets_leading: Vec::new(),
+            n_buckets_leading: Vec::new(),
+            p_buckets_trailing: Vec::new(),
+            n_buckets_trailing: Vec::new(),
+        }
+    }
+
     pub fn new(b: &'a [u8]) -> Self {
         if b.len() < HISTOGRAM_HEADER_SIZE {
             return Self {

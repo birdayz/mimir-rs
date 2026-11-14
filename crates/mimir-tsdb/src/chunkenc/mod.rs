@@ -5,24 +5,33 @@
 
 pub mod bstream;
 pub mod float_histogram;
+pub mod float_histogram_st;
 pub mod histogram;
 pub mod histogram_meta;
 pub mod histogram_model;
+pub mod histogram_st;
 pub mod ooo;
+pub mod st;
 pub mod varbit;
 pub mod xor;
+pub mod xor2;
 
 use thiserror::Error;
 
 pub use float_histogram::{FloatHistogramAppender, FloatHistogramChunk, FloatHistogramIterator};
+pub use float_histogram_st::{
+    FloatHistogramStAppender, FloatHistogramStChunk, FloatHistogramStIterator,
+};
 pub use histogram::{HistogramAppender, HistogramChunk, HistogramIterator};
 pub use histogram_model::{
     CounterResetHeader, CounterResetHint, FloatHistogram, Histogram, HistogramSpan,
     CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMA_MAX, EXPONENTIAL_SCHEMA_MAX_RESERVED,
     EXPONENTIAL_SCHEMA_MIN, EXPONENTIAL_SCHEMA_MIN_RESERVED,
 };
+pub use histogram_st::{HistogramStAppender, HistogramStChunk, HistogramStIterator};
 pub use ooo::{OooChunk, OooSample, OooSampleValue};
 pub use xor::{XorAppender, XorChunk, XorIterator};
+pub use xor2::{Xor2Appender, Xor2Chunk, Xor2Iterator};
 
 /// Maximum size in bytes of an XOR chunk.
 pub const MAX_BYTES_PER_XOR_CHUNK: usize = 1024;
@@ -137,8 +146,11 @@ pub enum ValueType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EncodedChunk {
     Xor(XorChunk),
+    Xor2(Xor2Chunk),
     Histogram(HistogramChunk),
+    HistogramSt(HistogramStChunk),
     FloatHistogram(FloatHistogramChunk),
+    FloatHistogramSt(FloatHistogramStChunk),
 }
 
 impl EncodedChunk {
@@ -153,6 +165,15 @@ impl EncodedChunk {
                 }
                 Ok(Self::Xor(XorChunk::from_bytes(data)))
             }
+            Encoding::Xor2 => {
+                if data.len() < 3 {
+                    return Err(ChunkError::InvalidHeader {
+                        len: data.len(),
+                        min: 3,
+                    });
+                }
+                Ok(Self::Xor2(Xor2Chunk::from_bytes(data)))
+            }
             Encoding::Histogram => {
                 if data.len() < 3 {
                     return Err(ChunkError::InvalidHeader {
@@ -161,6 +182,15 @@ impl EncodedChunk {
                     });
                 }
                 Ok(Self::Histogram(HistogramChunk::from_bytes(data)))
+            }
+            Encoding::HistogramSt => {
+                if data.len() < 3 {
+                    return Err(ChunkError::InvalidHeader {
+                        len: data.len(),
+                        min: 3,
+                    });
+                }
+                Ok(Self::HistogramSt(HistogramStChunk::from_bytes(data)))
             }
             Encoding::FloatHistogram => {
                 if data.len() < 3 {
@@ -171,6 +201,17 @@ impl EncodedChunk {
                 }
                 Ok(Self::FloatHistogram(FloatHistogramChunk::from_bytes(data)))
             }
+            Encoding::FloatHistogramSt => {
+                if data.len() < 3 {
+                    return Err(ChunkError::InvalidHeader {
+                        len: data.len(),
+                        min: 3,
+                    });
+                }
+                Ok(Self::FloatHistogramSt(FloatHistogramStChunk::from_bytes(
+                    data,
+                )))
+            }
             other => Err(ChunkError::InvalidEncoding(other.as_u8())),
         }
     }
@@ -179,8 +220,11 @@ impl EncodedChunk {
     pub fn encoding(&self) -> Encoding {
         match self {
             Self::Xor(_) => Encoding::Xor,
+            Self::Xor2(_) => Encoding::Xor2,
             Self::Histogram(_) => Encoding::Histogram,
+            Self::HistogramSt(_) => Encoding::HistogramSt,
             Self::FloatHistogram(_) => Encoding::FloatHistogram,
+            Self::FloatHistogramSt(_) => Encoding::FloatHistogramSt,
         }
     }
 
@@ -188,8 +232,11 @@ impl EncodedChunk {
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Xor(c) => c.as_bytes(),
+            Self::Xor2(c) => c.as_bytes(),
             Self::Histogram(c) => c.as_bytes(),
+            Self::HistogramSt(c) => c.as_bytes(),
             Self::FloatHistogram(c) => c.as_bytes(),
+            Self::FloatHistogramSt(c) => c.as_bytes(),
         }
     }
 
@@ -197,8 +244,11 @@ impl EncodedChunk {
     pub fn into_bytes(self) -> Vec<u8> {
         match self {
             Self::Xor(c) => c.into_bytes(),
+            Self::Xor2(c) => c.into_bytes(),
             Self::Histogram(c) => c.into_bytes(),
+            Self::HistogramSt(c) => c.into_bytes(),
             Self::FloatHistogram(c) => c.into_bytes(),
+            Self::FloatHistogramSt(c) => c.into_bytes(),
         }
     }
 
@@ -206,8 +256,11 @@ impl EncodedChunk {
     pub fn num_samples(&self) -> usize {
         match self {
             Self::Xor(c) => c.num_samples(),
+            Self::Xor2(c) => c.num_samples(),
             Self::Histogram(c) => c.num_samples(),
+            Self::HistogramSt(c) => c.num_samples(),
             Self::FloatHistogram(c) => c.num_samples(),
+            Self::FloatHistogramSt(c) => c.num_samples(),
         }
     }
 }

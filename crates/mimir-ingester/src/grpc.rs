@@ -51,10 +51,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<cortexpb::WriteRequest>,
     ) -> Result<Response<cortexpb::WriteResponse>, Status> {
         let user_id = tenant_from_req(&request)?;
-        self.ingester
-            .push_grpc(&user_id, request.get_ref())
-            .await
-            .map_err(|e| e.map_push_error_to_status())?;
+        if let Err(e) = self.ingester.push_grpc(&user_id, request.get_ref()).await {
+            if e.should_log_error() {
+                tracing::warn!(method = "/cortex.Ingester/Push", err = %e, "gRPC call failed");
+            }
+            return Err(e.map_push_error_to_status());
+        }
         Ok(Response::new(cortexpb::WriteResponse {}))
     }
 

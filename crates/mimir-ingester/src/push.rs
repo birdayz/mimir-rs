@@ -22,11 +22,12 @@ use mimir_tsdb::exemplar::{Exemplar, ExemplarError};
 use mimir_tsdb::head::HeadError;
 use mimir_tsdb::labels::Labels;
 use smallvec::SmallVec;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::circuit_breaker::BreakerPermit;
 use crate::errors::{
-    format_labels_string, map_native_histogram_err_id, IngesterError,
+    format_labels_string, map_native_histogram_err_id, ErrorSampler, ErrorSamplers,
+    IngesterError,
 };
 use crate::ingester::Ingester;
 use crate::metrics::{
@@ -91,12 +92,42 @@ struct PushStats {
 pub(crate) type ConvertedHistogram = (i64, bool, Option<Histogram>, Option<FloatHistogram>, usize);
 pub(crate) type SeriesFormatter<'b, 'a> = &'b mut dyn FnMut(&[(&'a str, &'a str)]) -> String;
 
+#[derive(Clone, Copy)]
+enum SampleKind {
+    SampleTimestampTooOld,
+    SampleTimestampTooOldOooEnabled,
+    SampleTimestampTooFarInFuture,
+    SampleOutOfOrder,
+    SampleDuplicateTimestamp,
+    MaxSeriesPerUser,
+    MaxSeriesPerMetric,
+    NativeHistogramValidation,
+    LabelsNotSorted,
+}
+
+impl SampleKind {
+    fn sampler(self, samplers: &ErrorSamplers) -> &ErrorSampler {
+        match self {
+            Self::SampleTimestampTooOld => &samplers.sample_timestamp_too_old,
+            Self::SampleTimestampTooOldOooEnabled => &samplers.sample_timestamp_too_old_ooo_enabled,
+            Self::SampleTimestampTooFarInFuture => &samplers.sample_timestamp_too_far_in_future,
+            Self::SampleOutOfOrder => &samplers.sample_out_of_order,
+            Self::SampleDuplicateTimestamp => &samplers.sample_duplicate_timestamp,
+            Self::MaxSeriesPerUser => &samplers.max_series_per_user_limit_exceeded,
+            Self::MaxSeriesPerMetric => &samplers.max_series_per_metric_limit_exceeded,
+            Self::NativeHistogramValidation => &samplers.native_histogram_validation_error,
+            Self::LabelsNotSorted => &samplers.labels_not_sorted,
+        }
+    }
+}
+
 /// Abstract view over a single time series in either owned `cortexpb::TimeSeries` or zero-copy `BorrowedTimeSeriesView`.
 trait TimeSeriesInput<'a> {
     fn fill_pairs(&self, out: &mut SmallVec<[(&'a str, &'a str); 24]>) -> Result<(), IngesterError>;
     fn samples(&self) -> &[cortexpb::Sample];
     fn created_timestamp(&self) -> i64;
     fn histogram_count(&self) -> usize;
+    fn histogram_timestamp(&self, idx: usize) -> i64;
     fn convert_histogram(&self, idx: usize) -> Result<ConvertedHistogram, (i64, String)>;
     fn exemplar_count(&self) -> usize;
     fn exemplar_at(&self, idx: usize) -> Result<(i64, f64, Labels, String), IngesterError>;
@@ -127,6 +158,10 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
 
     fn histogram_count(&self) -> usize {
         self.histograms.len()
+    }
+
+    fn histogram_timestamp(&self, idx: usize) -> i64 {
+        self.histograms[idx].timestamp
     }
 
     fn convert_histogram(
@@ -270,6 +305,12 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
 
     fn histogram_count(&self) -> usize {
         self.histograms().len()
+    }
+
+    fn histogram_timestamp(&self, idx: usize) -> i64 {
+        self.histograms()
+            .nth(idx)
+            .map_or(0, |h| h.timestamp())
     }
 
     fn convert_histogram(
@@ -680,7 +721,14 @@ impl Ingester {
 
         let db = self
             .get_or_create_tsdb(user_id)
-            .map_err(|e| e.with_user(user_id, 0))?;
+            .map_err(|e| {
+                let wrapped = e.with_user(user_id, 0);
+                if wrapped.error_cause() == cortexpb::ErrorCause::InstanceLimit {
+                    wrapped.with_do_not_log()
+                } else {
+                    wrapped
+                }
+            })?;
         let min_ts = min_timestamp_owned(&req.timeseries);
         let lock_guard = db
             .acquire_append_lock(min_ts)
@@ -698,7 +746,13 @@ impl Ingester {
             iter,
         );
         drop(lock_guard);
-        res
+        res.map_err(|e| {
+            if e.error_cause() == cortexpb::ErrorCause::InstanceLimit {
+                e.with_do_not_log()
+            } else {
+                e
+            }
+        })
     }
 
     fn push_borrowed_inner(
@@ -716,7 +770,14 @@ impl Ingester {
 
         let db = self
             .get_or_create_tsdb(user_id)
-            .map_err(|e| e.with_user(user_id, 0))?;
+            .map_err(|e| {
+                let wrapped = e.with_user(user_id, 0);
+                if wrapped.error_cause() == cortexpb::ErrorCause::InstanceLimit {
+                    wrapped.with_do_not_log()
+                } else {
+                    wrapped
+                }
+            })?;
         let mut min_ts = i64::MAX;
         for ts in req.timeseries() {
             for s in ts.samples() {
@@ -741,7 +802,13 @@ impl Ingester {
             req.timeseries(),
         );
         drop(lock_guard);
-        res
+        res.map_err(|e| {
+            if e.error_cause() == cortexpb::ErrorCause::InstanceLimit {
+                e.with_do_not_log()
+            } else {
+                e
+            }
+        })
     }
 
     fn push_metadata_owned(
@@ -850,13 +917,13 @@ impl Ingester {
 
         let mut app = db.db.appender();
         let mut stats = PushStats::default();
-        let mut first_partial: Option<IngesterError> = None;
+        let mut first_partial: Option<(IngesterError, Option<SampleKind>)> = None;
         let mut pairs: SmallVec<[(&str, &str); 24]> = SmallVec::new();
         let mut series_str_cache: Option<String>;
 
-        let mut record_partial = |err: IngesterError| {
+        let mut record_partial = |err: IngesterError, kind: Option<SampleKind>| {
             if first_partial.is_none() {
-                first_partial = Some(err);
+                first_partial = Some((err, kind));
             }
         };
 
@@ -872,6 +939,53 @@ impl Ingester {
                 return Err(e.with_user(user_id, 0));
             }
 
+            // Fast path when all samples (and histograms when enabled) are older than head's min_append_time and OOO is disabled.
+            if ooo_window_ms <= 0 && min_append_time_available && ts.exemplar_count() == 0 {
+                let all_samples_oob = samples.iter().all(|s| s.timestamp_ms < min_append_time);
+                if native_histograms_enabled {
+                    if (!samples.is_empty() || hist_count > 0)
+                        && all_samples_oob
+                        && (0..hist_count).all(|idx| ts.histogram_timestamp(idx) < min_append_time)
+                    {
+                        let total_oob = samples.len() + hist_count;
+                        stats.failed_samples += total_oob;
+                        stats.sample_timestamp_too_old += total_oob;
+                        let mut first_ts = samples.first().map_or(0, |s| s.timestamp_ms);
+                        if hist_count > 0 {
+                            let h0_ts = ts.histogram_timestamp(0);
+                            if first_ts == 0 || h0_ts < first_ts {
+                                first_ts = h0_ts;
+                            }
+                        }
+                        let s_str = format_labels_string(
+                            pairs.iter().copied().filter(|(_, v)| !v.is_empty()),
+                        );
+                        record_partial(
+                            IngesterError::sample_timestamp_too_old(first_ts, s_str),
+                            Some(SampleKind::SampleTimestampTooOld),
+                        );
+                        continue;
+                    }
+                } else if !samples.is_empty() && all_samples_oob {
+                    stats.failed_samples += samples.len();
+                    stats.sample_timestamp_too_old += samples.len();
+                    let first_ts = samples[0].timestamp_ms;
+                    let s_str = format_labels_string(
+                        pairs.iter().copied().filter(|(_, v)| !v.is_empty()),
+                    );
+                    record_partial(
+                        IngesterError::sample_timestamp_too_old(first_ts, s_str),
+                        Some(SampleKind::SampleTimestampTooOld),
+                    );
+                    continue;
+                }
+            }
+
+            // Look up existing ref (zero-alloc if pairs are already sorted & unique).
+            // Strip blank label values after checking sorted/unique, matching Prometheus Labels.WithoutEmpty().
+            let labels_sorted_unique = pairs.windows(2).all(|w| w[0].0 < w[1].0);
+            pairs.retain(|(_, v)| !v.is_empty());
+
             let mut make_series_str = |ps: &[(&str, &str)]| -> String {
                 if let Some(ref s) = series_str_cache {
                     return s.clone();
@@ -881,25 +995,7 @@ impl Ingester {
                 s
             };
 
-            // Fast path when all samples are older than head's min_append_time and OOO is disabled.
-            if ooo_window_ms <= 0
-                && min_append_time_available
-                && ts.exemplar_count() == 0
-                && !samples.is_empty()
-                && samples.iter().all(|s| s.timestamp_ms < min_append_time)
-                && (!native_histograms_enabled || hist_count == 0)
-            {
-                stats.failed_samples += samples.len();
-                stats.sample_timestamp_too_old += samples.len();
-                let first_ts = samples[0].timestamp_ms;
-                let s_str = make_series_str(&pairs);
-                record_partial(IngesterError::sample_timestamp_too_old(first_ts, s_str));
-                continue;
-            }
-
-            // Look up existing ref (zero-alloc if pairs are already sorted & unique)
-            let labels_sorted_unique = pairs.windows(2).all(|w| w[0].0 < w[1].0);
-            let mut series_ref = if labels_sorted_unique {
+            let mut series_ref = if labels_sorted_unique && !pairs.is_empty() {
                 head.get_ref_by_sorted_pairs(&pairs)
             } else {
                 None
@@ -911,10 +1007,10 @@ impl Ingester {
                 stats.failed_samples += total_bad;
                 stats.labels_not_sorted += total_bad;
                 stats.failed_exemplars += ts.exemplar_count();
-                if self.error_samplers.labels_not_sorted.should_log() {
-                    debug!(user = %user_id, series = %s_str, "labels not sorted");
-                }
-                record_partial(IngesterError::labels_not_sorted(s_str));
+                record_partial(
+                    IngesterError::labels_not_sorted(s_str),
+                    Some(SampleKind::LabelsNotSorted),
+                );
                 continue;
             }
 
@@ -926,7 +1022,7 @@ impl Ingester {
                             + if native_histograms_enabled { hist_count } else { 0 };
                         stats.failed_samples += total_bad;
                         stats.failed_exemplars += ts.exemplar_count();
-                        record_partial(err);
+                        record_partial(err, None);
                         continue;
                     }
                 }
@@ -951,17 +1047,20 @@ impl Ingester {
                     stats.failed_samples += 1;
                     stats.sample_too_far_in_future += 1;
                     let s_str = make_series_str(&pairs);
-                    record_partial(IngesterError::sample_too_far_in_future(
-                        s.timestamp_ms,
-                        s_str,
-                    ));
+                    record_partial(
+                        IngesterError::sample_too_far_in_future(s.timestamp_ms, s_str),
+                        Some(SampleKind::SampleTimestampTooFarInFuture),
+                    );
                     continue;
                 }
                 if s.timestamp_ms < min_timestamp_ms {
                     stats.failed_samples += 1;
                     stats.sample_too_old += 1;
                     let s_str = make_series_str(&pairs);
-                    record_partial(IngesterError::sample_too_far_in_past(s.timestamp_ms, s_str));
+                    record_partial(
+                        IngesterError::sample_too_far_in_past(s.timestamp_ms, s_str),
+                        None,
+                    );
                     continue;
                 }
 
@@ -1022,12 +1121,15 @@ impl Ingester {
                                 stats.invalid_native_histogram += 1;
                                 let err_id = map_native_histogram_err_id(&msg);
                                 let s_str = make_series_str(&pairs);
-                                record_partial(IngesterError::NativeHistogramValidation {
-                                    err_id,
-                                    original_err: msg,
-                                    series: s_str,
-                                    timestamp_ms: ts_err,
-                                });
+                                record_partial(
+                                    IngesterError::NativeHistogramValidation {
+                                        err_id,
+                                        original_err: msg,
+                                        series: s_str,
+                                        timestamp_ms: ts_err,
+                                    },
+                                    Some(SampleKind::NativeHistogramValidation),
+                                );
                                 continue;
                             }
                         };
@@ -1036,25 +1138,34 @@ impl Ingester {
                         stats.failed_samples += 1;
                         stats.sample_too_far_in_future += 1;
                         let s_str = make_series_str(&pairs);
-                        record_partial(IngesterError::sample_too_far_in_future(h_ts, s_str));
+                        record_partial(
+                            IngesterError::sample_too_far_in_future(h_ts, s_str),
+                            Some(SampleKind::SampleTimestampTooFarInFuture),
+                        );
                         continue;
                     }
                     if h_ts < min_timestamp_ms {
                         stats.failed_samples += 1;
                         stats.sample_too_old += 1;
                         let s_str = make_series_str(&pairs);
-                        record_partial(IngesterError::sample_too_far_in_past(h_ts, s_str));
+                        record_partial(
+                            IngesterError::sample_too_far_in_past(h_ts, s_str),
+                            None,
+                        );
                         continue;
                     }
                     if max_hist_buckets > 0 && bucket_count > max_hist_buckets {
                         stats.failed_samples += 1;
                         stats.invalid_native_histogram += 1;
                         let s_str = make_series_str(&pairs);
-                        record_partial(IngesterError::max_native_histogram_buckets(
-                            bucket_count,
-                            max_hist_buckets,
-                            s_str,
-                        ));
+                        record_partial(
+                            IngesterError::max_native_histogram_buckets(
+                                bucket_count,
+                                max_hist_buckets,
+                                s_str,
+                            ),
+                            Some(SampleKind::NativeHistogramValidation),
+                        );
                         continue;
                     }
 
@@ -1137,9 +1248,10 @@ impl Ingester {
                 if series_ref.is_none() {
                     if let Ok((ex_ts, _, _, ex_str)) = ts.exemplar_at(0) {
                         let s_str = make_series_str(&pairs);
-                        record_partial(IngesterError::exemplar_missing_series(
-                            ex_ts, s_str, ex_str,
-                        ));
+                        record_partial(
+                            IngesterError::exemplar_missing_series(ex_ts, s_str, ex_str),
+                            None,
+                        );
                     }
                     stats.failed_exemplars += ex_count;
                 } else {
@@ -1148,24 +1260,26 @@ impl Ingester {
                             Ok(v) => v,
                             Err(e) => {
                                 stats.failed_exemplars += 1;
-                                record_partial(e);
+                                record_partial(e, None);
                                 continue;
                             }
                         };
                         if ex_ts > max_timestamp_ms {
                             stats.failed_exemplars += 1;
                             let s_str = make_series_str(&pairs);
-                            record_partial(IngesterError::exemplar_too_far_in_future(
-                                ex_ts, s_str, ex_str,
-                            ));
+                            record_partial(
+                                IngesterError::exemplar_too_far_in_future(ex_ts, s_str, ex_str),
+                                None,
+                            );
                             continue;
                         }
                         if ex_ts < min_timestamp_ms {
                             stats.failed_exemplars += 1;
                             let s_str = make_series_str(&pairs);
-                            record_partial(IngesterError::exemplar_too_far_in_past(
-                                ex_ts, s_str, ex_str,
-                            ));
+                            record_partial(
+                                IngesterError::exemplar_too_far_in_past(ex_ts, s_str, ex_str),
+                                None,
+                            );
                             continue;
                         }
                         let exemplar = Exemplar::new(ex_labels, ex_val, ex_ts);
@@ -1175,23 +1289,29 @@ impl Ingester {
                                 stats.failed_exemplars += 1;
                                 if !ignore_ooo_exemplars {
                                     let s_str = make_series_str(&pairs);
-                                    record_partial(IngesterError::TsdbIngestExemplar {
-                                        original_err: "out of order exemplar".to_string(),
-                                        timestamp_ms: ex_ts,
-                                        series_labels: s_str,
-                                        exemplar_labels: ex_str,
-                                    });
+                                    record_partial(
+                                        IngesterError::TsdbIngestExemplar {
+                                            original_err: "out of order exemplar".to_string(),
+                                            timestamp_ms: ex_ts,
+                                            series_labels: s_str,
+                                            exemplar_labels: ex_str,
+                                        },
+                                        None,
+                                    );
                                 }
                             }
                             Err(e) => {
                                 stats.failed_exemplars += 1;
                                 let s_str = make_series_str(&pairs);
-                                record_partial(IngesterError::TsdbIngestExemplar {
-                                    original_err: e.to_string(),
-                                    timestamp_ms: ex_ts,
-                                    series_labels: s_str,
-                                    exemplar_labels: ex_str,
-                                });
+                                record_partial(
+                                    IngesterError::TsdbIngestExemplar {
+                                        original_err: e.to_string(),
+                                        timestamp_ms: ex_ts,
+                                        series_labels: s_str,
+                                        exemplar_labels: ex_str,
+                                    },
+                                    None,
+                                );
                             }
                         }
                     }
@@ -1235,8 +1355,14 @@ impl Ingester {
 
         self.record_discarded_metrics(user_id, "", &stats, source, db);
 
-        if let Some(partial) = first_partial {
-            return Err(partial.with_user(user_id, stats.failed_samples as i64));
+        if let Some((partial, sampler_kind)) = first_partial {
+            let err = if let Some(kind) = sampler_kind {
+                let should_log = kind.sampler(&self.error_samplers).should_log();
+                partial.with_sampling(should_log)
+            } else {
+                partial
+            };
+            return Err(err.with_user(user_id, stats.failed_samples as i64));
         }
 
         Ok(())
@@ -1348,65 +1474,78 @@ fn handle_head_append_error<'a>(
     limits: &LimitsConfig,
     stats: &mut PushStats,
     make_series_str: SeriesFormatter<'_, 'a>,
-    record_partial: &mut dyn FnMut(IngesterError),
+    record_partial: &mut dyn FnMut(IngesterError, Option<SampleKind>),
 ) -> Result<(), IngesterError> {
     stats.failed_samples += 1;
     match err {
         HeadError::OutOfBounds => {
             stats.sample_timestamp_too_old += 1;
             let s_str = make_series_str(pairs);
-            record_partial(IngesterError::sample_timestamp_too_old(ts, s_str));
+            record_partial(
+                IngesterError::sample_timestamp_too_old(ts, s_str),
+                Some(SampleKind::SampleTimestampTooOld),
+            );
             Ok(())
         }
         HeadError::OutOfOrderSample => {
             stats.sample_out_of_order += 1;
             let s_str = make_series_str(pairs);
-            record_partial(IngesterError::sample_out_of_order(ts, s_str));
+            record_partial(
+                IngesterError::sample_out_of_order(ts, s_str),
+                Some(SampleKind::SampleOutOfOrder),
+            );
             Ok(())
         }
         HeadError::TooOldSample => {
             stats.sample_too_old += 1;
             let s_str = make_series_str(pairs);
             if ooo_window_ms > 0 {
-                record_partial(IngesterError::sample_timestamp_too_old_ooo_enabled(
-                    ts,
-                    s_str,
-                    ooo_window_dur,
-                ));
+                record_partial(
+                    IngesterError::sample_timestamp_too_old_ooo_enabled(ts, s_str, ooo_window_dur),
+                    Some(SampleKind::SampleTimestampTooOldOooEnabled),
+                );
             } else {
-                record_partial(IngesterError::sample_timestamp_too_old(ts, s_str));
+                record_partial(
+                    IngesterError::sample_timestamp_too_old(ts, s_str),
+                    Some(SampleKind::SampleTimestampTooOld),
+                );
             }
             Ok(())
         }
         HeadError::DuplicateSampleForTimestamp => {
             stats.new_value_for_timestamp += 1;
             let s_str = make_series_str(pairs);
-            record_partial(IngesterError::sample_duplicate_timestamp(
-                "duplicate sample for timestamp",
-                ts,
-                s_str,
-            ));
+            record_partial(
+                IngesterError::sample_duplicate_timestamp("duplicate sample for timestamp", ts, s_str),
+                Some(SampleKind::SampleDuplicateTimestamp),
+            );
             Ok(())
         }
         HeadError::MaxSeriesPerUser => {
             stats.per_user_series_limit += 1;
-            record_partial(IngesterError::per_user_series_limit_reached(
-                limits.max_global_series_per_user.max(0) as usize,
-            ));
+            record_partial(
+                IngesterError::per_user_series_limit_reached(
+                    limits.max_global_series_per_user.max(0) as usize,
+                ),
+                Some(SampleKind::MaxSeriesPerUser),
+            );
             Ok(())
         }
         HeadError::MaxSeriesPerMetric => {
             stats.per_metric_series_limit += 1;
             let s_str = make_series_str(pairs);
-            record_partial(IngesterError::per_metric_series_limit_reached(
-                limits.max_global_series_per_metric.max(0) as usize,
-                s_str,
-            ));
+            record_partial(
+                IngesterError::per_metric_series_limit_reached(
+                    limits.max_global_series_per_metric.max(0) as usize,
+                    s_str,
+                ),
+                Some(SampleKind::MaxSeriesPerMetric),
+            );
             Ok(())
         }
         HeadError::MissingMetricName => {
             let s_str = make_series_str(pairs);
-            record_partial(IngesterError::invalid_label_name("__name__", s_str));
+            record_partial(IngesterError::invalid_label_name("__name__", s_str), None);
             Ok(())
         }
         HeadError::MaxInMemorySeriesReached => Err(IngesterError::max_in_memory_series_reached()),

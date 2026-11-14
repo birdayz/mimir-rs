@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, RawQuery, State as AxumState};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -240,7 +241,7 @@ struct PrepareUnregisterBody {
 async fn prepare_unregister_handler(
     AxumState(st): AxumState<HttpState>,
     method: Method,
-    body: Option<Json<PrepareUnregisterBody>>,
+    body: Bytes,
 ) -> Response {
     if st.ingester.state() != State::Running {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -253,7 +254,7 @@ async fn prepare_unregister_handler(
     };
     match method {
         Method::PUT => {
-            let Some(Json(input)) = body else {
+            let Ok(input) = serde_json::from_slice::<PrepareUnregisterBody>(&body) else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
             let Some(val) = input.unregister else {
