@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use parking_lot::RwLock;
+use prometheus::{Counter, Gauge, Opts, Registry};
 use thiserror::Error;
 
 use crate::labels::Labels;
@@ -23,11 +24,11 @@ pub enum ExemplarError {
     Disabled,
     #[error("duplicate label name {0:?} in exemplar")]
     DuplicateLabelName(String),
-    #[error("exemplar label set length exceeds {EXEMPLAR_MAX_LABEL_SET_LENGTH} characters")]
+    #[error("label length for exemplar exceeds maximum of {EXEMPLAR_MAX_LABEL_SET_LENGTH} UTF-8 characters")]
     LabelLengthExceeded,
     #[error("duplicate exemplar")]
     DuplicateExemplar,
-    #[error("out-of-order exemplar")]
+    #[error("out of order exemplar")]
     OutOfOrderExemplar,
 }
 
@@ -96,10 +97,74 @@ impl Default for CircularBufferEntry {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ExemplarMetrics {
+    exemplars_appended: Counter,
+    exemplars_in_storage: Gauge,
+    series_with_exemplars_in_storage: Gauge,
+    last_exemplars_ts: Gauge,
+    out_of_order_exemplars: Counter,
+    max_exemplars: Gauge,
+}
+
+impl ExemplarMetrics {
+    fn new(reg: Option<&Registry>) -> Self {
+        let exemplars_appended = Counter::with_opts(Opts::new(
+            "prometheus_tsdb_exemplar_exemplars_appended_total",
+            "Total number of appended exemplars.",
+        ))
+        .expect("valid counter");
+        let exemplars_in_storage = Gauge::with_opts(Opts::new(
+            "prometheus_tsdb_exemplar_exemplars_in_storage",
+            "Number of exemplars currently in circular storage.",
+        ))
+        .expect("valid gauge");
+        let series_with_exemplars_in_storage = Gauge::with_opts(Opts::new(
+            "prometheus_tsdb_exemplar_series_with_exemplars_in_storage",
+            "Number of series with exemplars currently in circular storage.",
+        ))
+        .expect("valid gauge");
+        let last_exemplars_ts = Gauge::with_opts(Opts::new(
+            "prometheus_tsdb_exemplar_last_exemplars_timestamp_seconds",
+            "The timestamp of the oldest exemplar stored in circular storage. Useful to check for what time range the current exemplar buffer limit allows. This usually means the last timestamp for all exemplars for a typical setup. This is not true though if one of the series timestamp is in future compared to rest series.",
+        ))
+        .expect("valid gauge");
+        let out_of_order_exemplars = Counter::with_opts(Opts::new(
+            "prometheus_tsdb_exemplar_out_of_order_exemplars_total",
+            "Total number of out of order exemplar ingestion failed attempts.",
+        ))
+        .expect("valid counter");
+        let max_exemplars = Gauge::with_opts(Opts::new(
+            "prometheus_tsdb_exemplar_max_exemplars",
+            "Total number of exemplars the exemplar storage can store, resizeable.",
+        ))
+        .expect("valid gauge");
+
+        if let Some(r) = reg {
+            let _ = r.register(Box::new(exemplars_appended.clone()));
+            let _ = r.register(Box::new(exemplars_in_storage.clone()));
+            let _ = r.register(Box::new(series_with_exemplars_in_storage.clone()));
+            let _ = r.register(Box::new(last_exemplars_ts.clone()));
+            let _ = r.register(Box::new(out_of_order_exemplars.clone()));
+            let _ = r.register(Box::new(max_exemplars.clone()));
+        }
+
+        Self {
+            exemplars_appended,
+            exemplars_in_storage,
+            series_with_exemplars_in_storage,
+            last_exemplars_ts,
+            out_of_order_exemplars,
+            max_exemplars,
+        }
+    }
+}
+
 /// Thread-safe circular exemplar buffer matching `tsdb.CircularExemplarStorage`.
 #[derive(Debug)]
 pub struct CircularExemplarStorage {
     inner: RwLock<CircularExemplarInner>,
+    metrics: ExemplarMetrics,
 }
 
 #[derive(Debug)]
@@ -115,8 +180,18 @@ struct CircularExemplarInner {
 impl CircularExemplarStorage {
     /// Creates a new circular exemplar storage with capacity `max_exemplars` and OOO window `ooo_time_window_ms`.
     pub fn new(max_exemplars: usize, ooo_time_window_ms: i64) -> Self {
+        Self::new_with_registry(max_exemplars, ooo_time_window_ms, None)
+    }
+
+    pub fn new_with_registry(
+        max_exemplars: usize,
+        ooo_time_window_ms: i64,
+        registry: Option<&Registry>,
+    ) -> Self {
         let ooo = ooo_time_window_ms.max(0);
         let init_index_cap = max_exemplars / ESTIMATED_EXEMPLARS_PER_SERIES;
+        let metrics = ExemplarMetrics::new(registry);
+        metrics.max_exemplars.set(max_exemplars as f64);
         Self {
             inner: RwLock::new(CircularExemplarInner {
                 exemplars: vec![CircularBufferEntry::default(); max_exemplars],
@@ -126,6 +201,37 @@ impl CircularExemplarStorage {
                 out_of_order_count: 0,
                 appended_count: 0,
             }),
+            metrics,
+        }
+    }
+
+    fn compute_metrics(&self, inner: &CircularExemplarInner) {
+        self.metrics
+            .series_with_exemplars_in_storage
+            .set(inner.index.len() as f64);
+        if inner.exemplars.is_empty() {
+            self.metrics.exemplars_in_storage.set(0.0);
+            self.metrics.last_exemplars_ts.set(0.0);
+            return;
+        }
+        if inner.exemplars[inner.next_index].series_key.is_some() {
+            self.metrics
+                .exemplars_in_storage
+                .set(inner.exemplars.len() as f64);
+            if let Some(ref ex) = inner.exemplars[inner.next_index].exemplar {
+                self.metrics
+                    .last_exemplars_ts
+                    .set((ex.timestamp_ms as f64) / 1000.0);
+            }
+            return;
+        }
+        self.metrics
+            .exemplars_in_storage
+            .set(inner.next_index as f64);
+        if let Some(ref ex) = inner.exemplars[0].exemplar {
+            self.metrics
+                .last_exemplars_ts
+                .set((ex.timestamp_ms as f64) / 1000.0);
         }
     }
 
@@ -167,6 +273,7 @@ impl CircularExemplarStorage {
         if let Err(err) = validation {
             if err == ExemplarError::OutOfOrderExemplar {
                 inner.out_of_order_count += 1;
+                self.metrics.out_of_order_exemplars.inc();
             }
             return Err(err);
         }
@@ -264,6 +371,8 @@ impl CircularExemplarStorage {
 
         inner.next_index = (idx + 1) % inner.exemplars.len();
         inner.appended_count += 1;
+        self.metrics.exemplars_appended.inc();
+        self.compute_metrics(&inner);
         Ok(())
     }
 
@@ -367,14 +476,17 @@ impl CircularExemplarStorage {
         inner.exemplars = vec![CircularBufferEntry::default(); new_size];
         inner.next_index = 0;
         inner.index.clear();
+        self.metrics.max_exemplars.set(new_size as f64);
 
         if new_size == 0 {
+            self.compute_metrics(&inner);
             return 0;
         }
 
         let skip = ordered.len().saturating_sub(new_size);
         let kept = ordered.into_iter().skip(skip).collect::<Vec<_>>();
         let migrated = kept.len();
+        self.compute_metrics(&inner);
         drop(inner);
 
         for (sl, ex) in kept {

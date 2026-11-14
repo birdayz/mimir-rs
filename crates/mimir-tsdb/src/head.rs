@@ -92,6 +92,10 @@ pub enum HeadError {
     TooOldSample,
     #[error("duplicate sample for timestamp")]
     DuplicateSampleForTimestamp,
+    #[error("{0}")]
+    DuplicateSampleWithDetails(String),
+    #[error("{0}")]
+    HistogramValidation(String),
     #[error("start timestamp newer than sample")]
     StNewerThanSample,
     #[error("unknown series ref {0}")]
@@ -189,6 +193,24 @@ impl Default for HeadOptions {
             series_lifecycle_callback: None,
             registry: None,
         }
+    }
+}
+
+fn format_go_g(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_positive() { "+Inf" } else { "-Inf" }.to_string();
+    }
+    let abs = v.abs();
+    if abs >= 1e6 || abs < 1e-4 {
+        format!("{v:e}")
+    } else {
+        format!("{v}")
     }
 }
 
@@ -455,13 +477,20 @@ impl SeriesState {
                 if let Some(last) = self.last_in_order_sample(chunks_reader) {
                     return match last {
                         LastSample::Histogram(_) | LastSample::FloatHistogram(_) => {
-                            Err(HeadError::DuplicateSampleForTimestamp)
+                            Err(HeadError::DuplicateSampleWithDetails(format!(
+                                "duplicate sample for timestamp {t}; overrides not allowed: existing is a histogram, new value {}",
+                                format_go_g(v)
+                            )))
                         }
                         LastSample::Float(prev_v) => {
                             if prev_v.to_bits() != v.to_bits()
                                 && v.to_bits() != QUIET_ZERO_NAN_BITS
                             {
-                                Err(HeadError::DuplicateSampleForTimestamp)
+                                Err(HeadError::DuplicateSampleWithDetails(format!(
+                                    "duplicate sample for timestamp {t}; overrides not allowed: existing {}, new value {}",
+                                    format_go_g(prev_v),
+                                    format_go_g(v)
+                                )))
                             } else {
                                 Ok((false, true))
                             }
@@ -1348,13 +1377,14 @@ impl Head {
             series_creation_mtx: Mutex::new(()),
             postings: MemPostings::new_unordered(),
             tombstones: MemTombstones::new(),
-            exemplars: CircularExemplarStorage::new(
+            exemplars: CircularExemplarStorage::new_with_registry(
                 if opts.enable_exemplar_storage {
                     opts.max_exemplars
                 } else {
                     0
                 },
                 opts.ooo_time_window_ms,
+                opts.registry.as_deref(),
             ),
             metadata: UserMetricsMetadata::new(),
             wal: Mutex::new(None),
@@ -3132,6 +3162,7 @@ impl<'a> HeadAppender<'a> {
         ref_id: u64,
         t: i64,
         val: &LastSample,
+        ooo_time_window: i64,
     ) -> Result<Option<(bool, bool)>, HeadError> {
         let Some((prev_t, prev_val)) = self.batch_last_sample.get(&ref_id) else {
             return Ok(None);
@@ -3154,6 +3185,21 @@ impl<'a> HeadAppender<'a> {
                 if same {
                     return Ok(Some((false, true)));
                 }
+                if let LastSample::Float(new_v) = val {
+                    let msg = match prev_val {
+                        LastSample::Float(prev_v) => format!(
+                            "duplicate sample for timestamp {t}; overrides not allowed: existing {}, new value {}",
+                            format_go_g(*prev_v),
+                            format_go_g(*new_v)
+                        ),
+                        LastSample::Histogram(_) | LastSample::FloatHistogram(_) => format!(
+                            "duplicate sample for timestamp {t}; overrides not allowed: existing is a histogram, new value {}",
+                            format_go_g(*new_v)
+                        ),
+                        LastSample::None => "duplicate sample for timestamp".to_string(),
+                    };
+                    return Err(HeadError::DuplicateSampleWithDetails(msg));
+                }
                 return Err(HeadError::DuplicateSampleForTimestamp);
             }
         }
@@ -3162,10 +3208,10 @@ impl<'a> HeadAppender<'a> {
                 return Ok(Some((true, true)));
             }
         }
-        if self.ooo_time_window > 0 && t >= self.head_maxt.saturating_sub(self.ooo_time_window) {
+        if ooo_time_window > 0 && t >= self.head_maxt.saturating_sub(ooo_time_window) {
             return Ok(Some((true, false)));
         }
-        if self.ooo_time_window > 0 {
+        if ooo_time_window > 0 {
             return Err(HeadError::TooOldSample);
         }
         if t < self.min_valid_time {
@@ -3230,6 +3276,29 @@ impl<'a> HeadAppender<'a> {
         t: i64,
         v: f64,
     ) -> Result<u64, HeadError> {
+        self.append_float_inner(series_ref, pairs, st, t, v, false)
+    }
+
+    /// Appends a float sample, rejecting out-of-order samples even when OOO is enabled.
+    pub fn append_float_reject_ooo(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        t: i64,
+        v: f64,
+    ) -> Result<u64, HeadError> {
+        self.append_float_inner(series_ref, pairs, 0, t, v, true)
+    }
+
+    fn append_float_inner(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        st: i64,
+        t: i64,
+        v: f64,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
         if self.closed {
             return Err(HeadError::AppenderClosed);
         }
@@ -3238,7 +3307,8 @@ impl<'a> HeadAppender<'a> {
             self.min_valid_time = self.head.appendable_min_valid_time();
             self.head_maxt = self.head.max_time();
         }
-        if self.ooo_time_window == 0 && t < self.min_valid_time {
+        let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
+        if effective_ooo == 0 && t < self.min_valid_time {
             return Err(HeadError::OutOfBounds);
         }
 
@@ -3246,7 +3316,7 @@ impl<'a> HeadAppender<'a> {
         let ref_id = entry.ref_id;
 
         if let Some((is_ooo, is_dup)) =
-            self.check_batch_last_sample(ref_id, t, &LastSample::Float(v))?
+            self.check_batch_last_sample(ref_id, t, &LastSample::Float(v), effective_ooo)?
         {
             if is_ooo && v.to_bits() != QUIET_ZERO_NAN_BITS {
                 let delta = self.head_maxt.saturating_sub(t);
@@ -3271,7 +3341,7 @@ impl<'a> HeadAppender<'a> {
                 v,
                 self.head_maxt,
                 self.min_valid_time,
-                self.ooo_time_window,
+                effective_ooo,
                 cr_guard.as_ref(),
             );
             drop(state);
@@ -3345,6 +3415,29 @@ impl<'a> HeadAppender<'a> {
         t: i64,
         h: Histogram,
     ) -> Result<u64, HeadError> {
+        self.append_histogram_inner(series_ref, pairs, st, t, h, false)
+    }
+
+    /// Appends an integer native histogram sample, rejecting out-of-order samples even when OOO is enabled.
+    pub fn append_histogram_reject_ooo(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        t: i64,
+        h: Histogram,
+    ) -> Result<u64, HeadError> {
+        self.append_histogram_inner(series_ref, pairs, 0, t, h, true)
+    }
+
+    fn append_histogram_inner(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        st: i64,
+        t: i64,
+        h: Histogram,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
         if self.closed {
             return Err(HeadError::AppenderClosed);
         }
@@ -3353,14 +3446,18 @@ impl<'a> HeadAppender<'a> {
             self.min_valid_time = self.head.appendable_min_valid_time();
             self.head_maxt = self.head.max_time();
         }
-        if self.ooo_time_window == 0 && t < self.min_valid_time {
+        let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
+        if effective_ooo == 0 && t < self.min_valid_time {
             return Err(HeadError::OutOfBounds);
         }
+        h.validate().map_err(HeadError::HistogramValidation)?;
 
         let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
         let ref_id = entry.ref_id;
         let ls = LastSample::Histogram(h.clone());
-        if let Some((is_ooo, is_dup)) = self.check_batch_last_sample(ref_id, t, &ls)? {
+        if let Some((is_ooo, is_dup)) =
+            self.check_batch_last_sample(ref_id, t, &ls, effective_ooo)?
+        {
             if is_ooo {
                 let delta = self.head_maxt.saturating_sub(t);
                 if delta > 0 {
@@ -3383,7 +3480,7 @@ impl<'a> HeadAppender<'a> {
                 &h,
                 self.head_maxt,
                 self.min_valid_time,
-                self.ooo_time_window,
+                effective_ooo,
                 cr_guard.as_ref(),
             );
             drop(state);
@@ -3415,6 +3512,29 @@ impl<'a> HeadAppender<'a> {
         t: i64,
         fh: FloatHistogram,
     ) -> Result<u64, HeadError> {
+        self.append_float_histogram_inner(series_ref, pairs, st, t, fh, false)
+    }
+
+    /// Appends a float native histogram sample, rejecting out-of-order samples even when OOO is enabled.
+    pub fn append_float_histogram_reject_ooo(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        t: i64,
+        fh: FloatHistogram,
+    ) -> Result<u64, HeadError> {
+        self.append_float_histogram_inner(series_ref, pairs, 0, t, fh, true)
+    }
+
+    fn append_float_histogram_inner(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        st: i64,
+        t: i64,
+        fh: FloatHistogram,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
         if self.closed {
             return Err(HeadError::AppenderClosed);
         }
@@ -3423,14 +3543,18 @@ impl<'a> HeadAppender<'a> {
             self.min_valid_time = self.head.appendable_min_valid_time();
             self.head_maxt = self.head.max_time();
         }
-        if self.ooo_time_window == 0 && t < self.min_valid_time {
+        let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
+        if effective_ooo == 0 && t < self.min_valid_time {
             return Err(HeadError::OutOfBounds);
         }
+        fh.validate().map_err(HeadError::HistogramValidation)?;
 
         let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
         let ref_id = entry.ref_id;
         let ls = LastSample::FloatHistogram(fh.clone());
-        if let Some((is_ooo, is_dup)) = self.check_batch_last_sample(ref_id, t, &ls)? {
+        if let Some((is_ooo, is_dup)) =
+            self.check_batch_last_sample(ref_id, t, &ls, effective_ooo)?
+        {
             if is_ooo {
                 let delta = self.head_maxt.saturating_sub(t);
                 if delta > 0 {
@@ -3453,7 +3577,7 @@ impl<'a> HeadAppender<'a> {
                 &fh,
                 self.head_maxt,
                 self.min_valid_time,
-                self.ooo_time_window,
+                effective_ooo,
                 cr_guard.as_ref(),
             );
             drop(state);
@@ -4167,10 +4291,11 @@ mod tests {
                 // Exact duplicate at last timestamp is a no-op
                 app.append_float(r, &pairs, 1_000_000 + 199 * 1000, 199.0)
                     .unwrap();
-                // Different value at last timestamp errors with DuplicateSampleForTimestamp
+                // Different value at last timestamp errors with DuplicateSampleForTimestamp / DuplicateSampleWithDetails
                 assert!(matches!(
                     app.append_float(r, &pairs, 1_000_000 + 199 * 1000, 999.0),
-                    Err(HeadError::DuplicateSampleForTimestamp)
+                    Err(HeadError::DuplicateSampleForTimestamp
+                        | HeadError::DuplicateSampleWithDetails(_))
                 ));
                 // StaleNaN at newer timestamp succeeds
                 app.append_float(r, &pairs, 1_000_000 + 200 * 1000, stale_nan())

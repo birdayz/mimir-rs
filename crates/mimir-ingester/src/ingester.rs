@@ -71,6 +71,8 @@ pub struct UsageStatsSnapshot {
     pub tenants_with_out_of_order_enabled: i64,
     pub min_out_of_order_time_window_seconds: i64,
     pub max_out_of_order_time_window_seconds: i64,
+    pub appended_samples: i64,
+    pub appended_exemplars: i64,
 }
 
 pub fn get_open_tsdbs_concurrency_config(
@@ -139,6 +141,8 @@ pub struct Ingester {
     pub num_compactions_in_progress: AtomicU32,
     pub compaction_idle_timeout: Duration,
     pub flush_on_shutdown: AtomicBool,
+    pub appended_samples: AtomicI64,
+    pub appended_exemplars: AtomicI64,
 
     pub error_samplers: ErrorSamplers,
     pub ignored_series_limit_metrics: HashSet<String>,
@@ -407,6 +411,8 @@ impl Ingester {
             num_compactions_in_progress: AtomicU32::new(0),
             compaction_idle_timeout,
             flush_on_shutdown,
+            appended_samples: AtomicI64::new(0),
+            appended_exemplars: AtomicI64::new(0),
             error_samplers,
             ignored_series_limit_metrics,
             state: RwLock::new(State::New),
@@ -974,6 +980,8 @@ impl Ingester {
         }
         snap.min_out_of_order_time_window_seconds = min_ooo;
         snap.max_out_of_order_time_window_seconds = max_ooo;
+        snap.appended_samples = self.appended_samples.load(Ordering::Relaxed);
+        snap.appended_exemplars = self.appended_exemplars.load(Ordering::Relaxed);
         *self.usage_stats.lock() = snap;
         snap
     }

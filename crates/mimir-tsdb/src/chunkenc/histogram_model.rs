@@ -151,6 +151,67 @@ impl Histogram {
             && self.positive_buckets == other.positive_buckets
     }
 
+    /// Validates this integer histogram matching Prometheus `Histogram.Validate()`.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut n_count = 0u64;
+        let mut p_count = 0u64;
+        if is_custom_buckets_schema(self.schema) {
+            check_histogram_custom_bounds(
+                &self.custom_values,
+                &self.positive_spans,
+                self.positive_buckets.len(),
+            )
+            .map_err(|e| format!("custom buckets: {e}"))?;
+            if self.zero_count != 0 {
+                return Err("custom buckets: must have zero count of 0".to_string());
+            }
+            if self.zero_threshold != 0.0 {
+                return Err("custom buckets: must have zero threshold of 0".to_string());
+            }
+            if !self.negative_spans.is_empty() {
+                return Err("custom buckets: must not have negative spans".to_string());
+            }
+            if !self.negative_buckets.is_empty() {
+                return Err("custom buckets: must not have negative buckets".to_string());
+            }
+        } else if is_exponential_schema(self.schema) {
+            check_histogram_spans(&self.positive_spans, self.positive_buckets.len())
+                .map_err(|e| format!("positive side: {e}"))?;
+            check_histogram_spans(&self.negative_spans, self.negative_buckets.len())
+                .map_err(|e| format!("negative side: {e}"))?;
+            check_histogram_int_buckets(&self.negative_buckets, &mut n_count)
+                .map_err(|e| format!("negative side: {e}"))?;
+            if !self.custom_values.is_empty() {
+                return Err("histogram with exponential schema must not have custom bounds".to_string());
+            }
+        } else {
+            return Err(format!(
+                "histogram has an invalid schema, which must be between {EXPONENTIAL_SCHEMA_MIN} and {EXPONENTIAL_SCHEMA_MAX} for exponential buckets, or {CUSTOM_BUCKETS_SCHEMA} for custom buckets, got schema {}",
+                self.schema
+            ));
+        }
+
+        check_histogram_int_buckets(&self.positive_buckets, &mut p_count)
+            .map_err(|e| format!("positive side: {e}"))?;
+
+        let sum_of_buckets = n_count.saturating_add(p_count).saturating_add(self.zero_count);
+        if self.sum.is_nan() {
+            if sum_of_buckets > self.count {
+                return Err(format!(
+                    "{sum_of_buckets} observations found in buckets, but the Count field is {}: histogram's observation count should be at least the number of observations found in the buckets",
+                    self.count
+                ));
+            }
+        } else if sum_of_buckets != self.count {
+            return Err(format!(
+                "{sum_of_buckets} observations found in buckets, but the Count field is {}: histogram's observation count should equal the number of observations found in the buckets (in absence of NaN)",
+                self.count
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Converts this integer histogram into a [`FloatHistogram`].
     pub fn to_float(&self) -> FloatHistogram {
         let mut p_buckets = Vec::with_capacity(self.positive_buckets.len());
@@ -232,6 +293,61 @@ impl FloatHistogram {
             && spans_match(&self.positive_spans, &other.positive_spans)
             && buckets_float_bits_eq(&self.positive_buckets, &other.positive_buckets)
     }
+
+    /// Validates this float histogram matching Prometheus `FloatHistogram.Validate()`.
+    pub fn validate(&self) -> Result<(), String> {
+        if is_custom_buckets_schema(self.schema) {
+            check_histogram_custom_bounds(
+                &self.custom_values,
+                &self.positive_spans,
+                self.positive_buckets.len(),
+            )
+            .map_err(|e| format!("custom buckets: {e}"))?;
+            if self.zero_count != 0.0 {
+                return Err("custom buckets: must have zero count of 0".to_string());
+            }
+            if self.zero_threshold != 0.0 {
+                return Err("custom buckets: must have zero threshold of 0".to_string());
+            }
+            if !self.negative_spans.is_empty() {
+                return Err("custom buckets: must not have negative spans".to_string());
+            }
+            if !self.negative_buckets.is_empty() {
+                return Err("custom buckets: must not have negative buckets".to_string());
+            }
+        } else if is_exponential_schema(self.schema) {
+            check_histogram_spans(&self.positive_spans, self.positive_buckets.len())
+                .map_err(|e| format!("positive side: {e}"))?;
+            check_histogram_spans(&self.negative_spans, self.negative_buckets.len())
+                .map_err(|e| format!("negative side: {e}"))?;
+            check_histogram_float_buckets(&self.negative_buckets)
+                .map_err(|e| format!("negative side: {e}"))?;
+            if self.zero_count < 0.0 {
+                return Err(format!(
+                    "zero bucket has observation count of {}: histogram has a bucket whose observation count is negative",
+                    self.zero_count
+                ));
+            }
+            if !self.custom_values.is_empty() {
+                return Err("histogram with exponential schema must not have custom bounds".to_string());
+            }
+        } else {
+            return Err(format!(
+                "histogram has an invalid schema, which must be between {EXPONENTIAL_SCHEMA_MIN} and {EXPONENTIAL_SCHEMA_MAX} for exponential buckets, or {CUSTOM_BUCKETS_SCHEMA} for custom buckets, got schema {}",
+                self.schema
+            ));
+        }
+
+        if self.count < 0.0 {
+            return Err(format!(
+                "observation count is  {}: histogram's observation count is negative",
+                self.count
+            ));
+        }
+        check_histogram_float_buckets(&self.positive_buckets)
+            .map_err(|e| format!("positive side: {e}"))?;
+        Ok(())
+    }
 }
 
 impl PartialEq for FloatHistogram {
@@ -296,4 +412,123 @@ fn spans_match(s1: &[HistogramSpan], s2: &[HistogramSpan]) -> bool {
             return false;
         }
     }
+}
+
+fn check_histogram_spans(spans: &[HistogramSpan], num_buckets: usize) -> Result<(), String> {
+    let mut span_buckets: usize = 0;
+    let mut end_idx: i64 = 0;
+    for (n, span) in spans.iter().enumerate() {
+        if n > 0 && span.offset < 0 {
+            return Err(format!(
+                "span number {} with offset {}: histogram has a span whose offset is negative",
+                n + 1,
+                span.offset
+            ));
+        } else if n == 0 && span.offset == i32::MIN {
+            return Err(format!(
+                "span number {} starts at bucket index {}: histogram has a span whose bucket index is out of range",
+                n + 1,
+                span.offset
+            ));
+        }
+        span_buckets = span_buckets.saturating_add(span.length as usize);
+        end_idx = end_idx
+            .saturating_add(span.offset as i64)
+            .saturating_add(span.length as i64);
+        if end_idx - 1 > i32::MAX as i64 {
+            return Err(format!(
+                "span number {} ends at bucket index {}: histogram has a span whose bucket index is out of range",
+                n + 1,
+                end_idx - 1
+            ));
+        }
+    }
+    if span_buckets != num_buckets {
+        return Err(format!(
+            "spans need {span_buckets} buckets, have {num_buckets} buckets: histogram spans specify different number of buckets than provided"
+        ));
+    }
+    Ok(())
+}
+
+fn check_histogram_int_buckets(buckets: &[i64], count: &mut u64) -> Result<(), String> {
+    let mut last = 0i64;
+    for (i, &delta) in buckets.iter().enumerate() {
+        let c = last + delta;
+        if c < 0 {
+            return Err(format!(
+                "bucket number {} has observation count of {c}: histogram has a bucket whose observation count is negative",
+                i + 1
+            ));
+        }
+        last = c;
+        *count = count.saturating_add(c as u64);
+    }
+    Ok(())
+}
+
+fn check_histogram_float_buckets(buckets: &[f64]) -> Result<(), String> {
+    for (i, &c) in buckets.iter().enumerate() {
+        if c < 0.0 {
+            return Err(format!(
+                "bucket number {} has observation count of {c}: histogram has a bucket whose observation count is negative",
+                i + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_histogram_custom_bounds(
+    bounds: &[f64],
+    spans: &[HistogramSpan],
+    num_buckets: usize,
+) -> Result<(), String> {
+    let mut prev = f64::NEG_INFINITY;
+    for (i, &curr) in bounds.iter().enumerate() {
+        if curr.is_nan() {
+            return Err("histogram custom bounds must not be NaN".to_string());
+        }
+        if i > 0 && curr <= prev {
+            return Err(format!(
+                "previous bound is {prev:.6} and current is {curr:.6}: histogram custom bounds must be in strictly increasing order"
+            ));
+        }
+        prev = curr;
+    }
+    if prev == f64::INFINITY {
+        return Err(
+            "last +Inf bound must not be explicitly defined: histogram custom bounds must be finite"
+                .to_string(),
+        );
+    }
+
+    let mut span_buckets: usize = 0;
+    let mut total_span_length: i64 = 0;
+    for (n, span) in spans.iter().enumerate() {
+        if span.offset < 0 {
+            return Err(format!(
+                "span number {} with offset {}: histogram has a span whose offset is negative",
+                n + 1,
+                span.offset
+            ));
+        }
+        span_buckets = span_buckets.saturating_add(span.length as usize);
+        total_span_length = total_span_length
+            .saturating_add(span.length as i64)
+            .saturating_add(span.offset as i64);
+    }
+    if span_buckets != num_buckets {
+        return Err(format!(
+            "spans need {span_buckets} buckets, have {num_buckets} buckets: histogram spans specify different number of buckets than provided"
+        ));
+    }
+    if ((bounds.len() + 1) as i64) < total_span_length {
+        return Err(format!(
+            "only {} custom bounds defined which is insufficient to cover total span length of {total_span_length}: histogram custom bounds are too few",
+            bounds.len()
+        ));
+    }
+
+    Ok(())
 }

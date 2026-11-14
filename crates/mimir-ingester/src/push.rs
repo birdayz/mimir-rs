@@ -14,10 +14,7 @@ use mimir_proto::prost::Message;
 use mimir_proto::sharding::shard_by_all_labels;
 use mimir_proto::zerocopy::{BorrowedTimeSeriesView, BorrowedWriteRequest};
 use mimir_ring::ring::replication_strategy::WRITE_NO_EXTEND;
-use mimir_tsdb::chunkenc::histogram_model::is_valid_schema;
-use mimir_tsdb::chunkenc::{
-    CounterResetHint, FloatHistogram, Histogram, HistogramSpan, CUSTOM_BUCKETS_SCHEMA,
-};
+use mimir_tsdb::chunkenc::{CounterResetHint, FloatHistogram, Histogram, HistogramSpan};
 use mimir_tsdb::exemplar::{Exemplar, ExemplarError};
 use mimir_tsdb::head::HeadError;
 use mimir_tsdb::labels::Labels;
@@ -128,7 +125,7 @@ trait TimeSeriesInput<'a> {
     fn created_timestamp(&self) -> i64;
     fn histogram_count(&self) -> usize;
     fn histogram_timestamp(&self, idx: usize) -> i64;
-    fn convert_histogram(&self, idx: usize) -> Result<ConvertedHistogram, (i64, String)>;
+    fn convert_histogram(&self, idx: usize) -> ConvertedHistogram;
     fn exemplar_count(&self) -> usize;
     fn exemplar_at(&self, idx: usize) -> Result<(i64, f64, Labels, String), IngesterError>;
 }
@@ -164,10 +161,7 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
         self.histograms[idx].timestamp
     }
 
-    fn convert_histogram(
-        &self,
-        idx: usize,
-    ) -> Result<(i64, bool, Option<Histogram>, Option<FloatHistogram>, usize), (i64, String)> {
+    fn convert_histogram(&self, idx: usize) -> ConvertedHistogram {
         let h = &self.histograms[idx];
         let ts = h.timestamp;
         let is_float = h.is_float_histogram();
@@ -188,20 +182,6 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
                 length: s.length,
             })
             .collect();
-        validate_histogram_proto_fields(
-            h.schema,
-            &pos_spans,
-            &h.positive_deltas,
-            &h.positive_counts,
-            &neg_spans,
-            &h.negative_deltas,
-            &h.negative_counts,
-            &h.custom_values,
-            is_float,
-            h.count,
-            h.zero_count,
-        )
-        .map_err(|e| (ts, e))?;
 
         if is_float {
             let count = match h.count {
@@ -228,7 +208,7 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
                 negative_buckets: h.negative_counts.clone(),
                 custom_values: h.custom_values.clone(),
             };
-            Ok((ts, true, None, Some(fh), buckets))
+            (ts, true, None, Some(fh), buckets)
         } else {
             let count = match h.count {
                 Some(cortexpb::histogram::Count::CountInt(v)) => v,
@@ -254,7 +234,7 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
                 negative_buckets: h.negative_deltas.clone(),
                 custom_values: h.custom_values.clone(),
             };
-            Ok((ts, false, Some(ih), None, buckets))
+            (ts, false, Some(ih), None, buckets)
         }
     }
 
@@ -313,10 +293,7 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
             .map_or(0, |h| h.timestamp())
     }
 
-    fn convert_histogram(
-        &self,
-        idx: usize,
-    ) -> Result<(i64, bool, Option<Histogram>, Option<FloatHistogram>, usize), (i64, String)> {
+    fn convert_histogram(&self, idx: usize) -> ConvertedHistogram {
         let h = self.histograms().nth(idx).expect("valid histogram idx");
         let ts = h.timestamp();
         let is_float = matches!(h.count(), Some(cortexpb::histogram::Count::CountFloat(_)));
@@ -337,20 +314,6 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
                 length: s.length,
             })
             .collect();
-        validate_histogram_proto_fields(
-            h.schema(),
-            &pos_spans,
-            h.positive_deltas(),
-            h.positive_counts(),
-            &neg_spans,
-            h.negative_deltas(),
-            h.negative_counts(),
-            h.custom_values(),
-            is_float,
-            h.count(),
-            h.zero_count(),
-        )
-        .map_err(|e| (ts, e))?;
 
         if is_float {
             let count = match h.count() {
@@ -377,7 +340,7 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
                 negative_buckets: h.negative_counts().to_vec(),
                 custom_values: h.custom_values().to_vec(),
             };
-            Ok((ts, true, None, Some(fh), buckets))
+            (ts, true, None, Some(fh), buckets)
         } else {
             let count = match h.count() {
                 Some(cortexpb::histogram::Count::CountInt(v)) => v,
@@ -403,7 +366,7 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
                 negative_buckets: h.negative_deltas().to_vec(),
                 custom_values: h.custom_values().to_vec(),
             };
-            Ok((ts, false, Some(ih), None, buckets))
+            (ts, false, Some(ih), None, buckets)
         }
     }
 
@@ -429,103 +392,20 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn validate_histogram_proto_fields(
-    schema: i32,
-    pos_spans: &[HistogramSpan],
-    pos_deltas: &[i64],
-    pos_counts: &[f64],
-    neg_spans: &[HistogramSpan],
-    neg_deltas: &[i64],
-    neg_counts: &[f64],
-    custom_values: &[f64],
-    is_float: bool,
-    count: Option<cortexpb::histogram::Count>,
-    zero_count: Option<cortexpb::histogram::ZeroCount>,
-) -> Result<(), String> {
-    if !is_valid_schema(schema) {
-        return Err(format!("invalid native histogram schema {schema}"));
-    }
-    for s in pos_spans.iter().chain(neg_spans.iter()) {
-        if s.offset < 0 && pos_spans.first().is_some_and(|f| std::ptr::eq(f, s)) {
-            // Note: negative offset on first span is valid in Prometheus; negative offset on subsequent spans is invalid
-        }
-    }
-    for spans in [pos_spans, neg_spans] {
-        for (idx, s) in spans.iter().enumerate() {
-            if idx > 0 && s.offset < 0 {
-                return Err("native histogram span has negative offset".to_string());
-            }
-        }
-    }
-    let pos_span_len: usize = pos_spans.iter().map(|s| s.length as usize).sum();
-    let neg_span_len: usize = neg_spans.iter().map(|s| s.length as usize).sum();
-    if is_float {
-        if pos_span_len != pos_counts.len() || neg_span_len != neg_counts.len() {
-            return Err("native histogram spans and buckets mismatch".to_string());
-        }
-        let mut total_buckets = match zero_count {
-            Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(v)) => {
-                if v < 0.0 {
-                    return Err("negative bucket count in native histogram".to_string());
-                }
-                v
-            }
-            _ => 0.0,
-        };
-        for &c in pos_counts.iter().chain(neg_counts.iter()) {
-            if c < 0.0 {
-                return Err("negative bucket count in native histogram".to_string());
-            }
-            total_buckets += c;
-        }
-        if let Some(cortexpb::histogram::Count::CountFloat(c)) = count {
-            if c < total_buckets && (total_buckets - c).abs() > 1e-6 * c.max(1.0) {
-                return Err("native histogram count not big enough".to_string());
-            }
-        }
-    } else {
-        if pos_span_len != pos_deltas.len() || neg_span_len != neg_deltas.len() {
-            return Err("native histogram spans and buckets mismatch".to_string());
-        }
-        let mut sum_buckets = match zero_count {
-            Some(cortexpb::histogram::ZeroCount::ZeroCountInt(v)) => v,
-            _ => 0,
-        };
-        for deltas in [pos_deltas, neg_deltas] {
-            let mut cur = 0i64;
-            for &d in deltas {
-                cur += d;
-                if cur < 0 {
-                    return Err("negative bucket count in native histogram".to_string());
-                }
-                sum_buckets = sum_buckets.saturating_add(cur as u64);
-            }
-        }
-        if let Some(cortexpb::histogram::Count::CountInt(c)) = count {
-            if c < sum_buckets {
-                return Err("native histogram count mismatch".to_string());
-            }
-        }
-    }
-
-    if schema == CUSTOM_BUCKETS_SCHEMA {
-        for &v in custom_values {
-            if v.is_nan() {
-                return Err("custom buckets invalid: NaN".to_string());
-            }
-            if v.is_infinite() {
-                return Err("custom buckets infinite".to_string());
-            }
-        }
-        if custom_values.windows(2).any(|w| w[1] <= w[0]) {
-            return Err("custom buckets invalid: not strictly increasing".to_string());
-        }
-    }
-    Ok(())
-}
-
 impl Ingester {
+    pub async fn start_push_request_with_state<'a>(
+        &'a self,
+        existing: Option<&PushPermit<'a>>,
+        req_size: i64,
+    ) -> Result<(Option<PushPermit<'a>>, bool), IngesterError> {
+        self.check_available_for_push()?;
+        if existing.is_some() {
+            return Ok((None, false));
+        }
+        let permit = self.start_push_request(req_size).await?;
+        Ok((Some(permit), true))
+    }
+
     pub async fn start_push_request(&self, req_size: i64) -> Result<PushPermit<'_>, IngesterError> {
         self.check_available_for_push()?;
 
@@ -1064,13 +944,22 @@ impl Ingester {
                     continue;
                 }
 
-                if ingest_created_ts && created_ts < s.timestamp_ms {
-                    match app.append_float(series_ref, &pairs, created_ts, 0.0) {
+                if ingest_created_ts
+                    && created_ts < s.timestamp_ms
+                    && (!native_histograms_enabled
+                        || hist_count == 0
+                        || ts.histogram_timestamp(0) >= s.timestamp_ms)
+                {
+                    match app.append_float_reject_ooo(series_ref, &pairs, created_ts, 0.0) {
                         Ok(r) => {
                             series_ref = Some(r);
                             stats.succeeded_samples += 1;
                         }
-                        Err(HeadError::DuplicateSampleForTimestamp | HeadError::OutOfOrderSample) => {}
+                        Err(
+                            HeadError::DuplicateSampleForTimestamp
+                            | HeadError::DuplicateSampleWithDetails(_)
+                            | HeadError::OutOfOrderSample,
+                        ) => {}
                         Err(err) => {
                             handle_head_append_error(
                                 err,
@@ -1114,25 +1003,7 @@ impl Ingester {
             if native_histograms_enabled && hist_count > 0 {
                 for h_idx in 0..hist_count {
                     let (h_ts, is_float, ih_opt, fh_opt, bucket_count) =
-                        match ts.convert_histogram(h_idx) {
-                            Ok(v) => v,
-                            Err((ts_err, msg)) => {
-                                stats.failed_samples += 1;
-                                stats.invalid_native_histogram += 1;
-                                let err_id = map_native_histogram_err_id(&msg);
-                                let s_str = make_series_str(&pairs);
-                                record_partial(
-                                    IngesterError::NativeHistogramValidation {
-                                        err_id,
-                                        original_err: msg,
-                                        series: s_str,
-                                        timestamp_ms: ts_err,
-                                    },
-                                    Some(SampleKind::NativeHistogramValidation),
-                                );
-                                continue;
-                            }
-                        };
+                        ts.convert_histogram(h_idx);
 
                     if h_ts > max_timestamp_ms {
                         stats.failed_samples += 1;
@@ -1169,16 +1040,65 @@ impl Ingester {
                         continue;
                     }
 
+                    if ingest_created_ts && created_ts < h_ts {
+                        let ct_res = if is_float {
+                            let fh_ref = fh_opt.as_ref().expect("float histogram");
+                            let zero_fh = FloatHistogram {
+                                counter_reset_hint: CounterResetHint::CounterReset,
+                                schema: fh_ref.schema,
+                                zero_threshold: fh_ref.zero_threshold,
+                                custom_values: fh_ref.custom_values.clone(),
+                                ..FloatHistogram::default()
+                            };
+                            app.append_float_histogram_reject_ooo(
+                                series_ref, &pairs, created_ts, zero_fh,
+                            )
+                        } else {
+                            let ih_ref = ih_opt.as_ref().expect("int histogram");
+                            let zero_ih = Histogram {
+                                counter_reset_hint: CounterResetHint::CounterReset,
+                                schema: ih_ref.schema,
+                                zero_threshold: ih_ref.zero_threshold,
+                                custom_values: ih_ref.custom_values.clone(),
+                                ..Histogram::default()
+                            };
+                            app.append_histogram_reject_ooo(
+                                series_ref, &pairs, created_ts, zero_ih,
+                            )
+                        };
+                        match ct_res {
+                            Ok(r) => {
+                                series_ref = Some(r);
+                                stats.succeeded_samples += 1;
+                            }
+                            Err(
+                                HeadError::DuplicateSampleForTimestamp
+                                | HeadError::DuplicateSampleWithDetails(_)
+                                | HeadError::OutOfOrderSample,
+                            ) => {}
+                            Err(err) => {
+                                handle_head_append_error(
+                                    err,
+                                    created_ts,
+                                    &pairs,
+                                    ooo_window_ms,
+                                    ooo_window_dur,
+                                    &limits,
+                                    &mut stats,
+                                    &mut make_series_str,
+                                    &mut record_partial,
+                                )?;
+                            }
+                        }
+                        ingest_created_ts = false;
+                        created_ts = 0;
+                    }
+
                     let res = if is_float {
                         app.append_float_histogram(
                             series_ref,
                             &pairs,
-                            if ingest_created_ts && created_ts < h_ts {
-                                ingest_created_ts = false;
-                                created_ts
-                            } else {
-                                0
-                            },
+                            0,
                             h_ts,
                             fh_opt.expect("float histogram"),
                         )
@@ -1186,12 +1106,7 @@ impl Ingester {
                         app.append_histogram(
                             series_ref,
                             &pairs,
-                            if ingest_created_ts && created_ts < h_ts {
-                                ingest_created_ts = false;
-                                created_ts
-                            } else {
-                                0
-                            },
+                            0,
                             h_ts,
                             ih_opt.expect("int histogram"),
                         )
@@ -1255,6 +1170,7 @@ impl Ingester {
                     }
                     stats.failed_exemplars += ex_count;
                 } else {
+                    let mut out_of_order_exemplars = 0usize;
                     for e_idx in 0..ex_count {
                         let (ex_ts, ex_val, ex_labels, ex_str) = match ts.exemplar_at(e_idx) {
                             Ok(v) => v,
@@ -1287,7 +1203,8 @@ impl Ingester {
                             Ok(_) => stats.succeeded_exemplars += 1,
                             Err(HeadError::Exemplar(ExemplarError::OutOfOrderExemplar)) => {
                                 stats.failed_exemplars += 1;
-                                if !ignore_ooo_exemplars {
+                                out_of_order_exemplars += 1;
+                                if out_of_order_exemplars == ex_count && !ignore_ooo_exemplars {
                                     let s_str = make_series_str(&pairs);
                                     record_partial(
                                         IngesterError::TsdbIngestExemplar {
@@ -1299,6 +1216,19 @@ impl Ingester {
                                         None,
                                     );
                                 }
+                            }
+                            Err(HeadError::Exemplar(ex_err)) => {
+                                stats.failed_exemplars += 1;
+                                let s_str = make_series_str(&pairs);
+                                record_partial(
+                                    IngesterError::TsdbIngestExemplar {
+                                        original_err: ex_err.to_string(),
+                                        timestamp_ms: ex_ts,
+                                        series_labels: s_str,
+                                        exemplar_labels: ex_str,
+                                    },
+                                    None,
+                                );
                             }
                             Err(e) => {
                                 stats.failed_exemplars += 1;
@@ -1352,6 +1282,11 @@ impl Ingester {
         self.metrics
             .ingested_exemplars_fail
             .inc_by(stats.failed_exemplars as f64);
+
+        self.appended_samples
+            .fetch_add(stats.succeeded_samples as i64, Ordering::Relaxed);
+        self.appended_exemplars
+            .fetch_add(stats.succeeded_exemplars as i64, Ordering::Relaxed);
 
         self.record_discarded_metrics(user_id, "", &stats, source, db);
 
@@ -1518,6 +1453,30 @@ fn handle_head_append_error<'a>(
             record_partial(
                 IngesterError::sample_duplicate_timestamp("duplicate sample for timestamp", ts, s_str),
                 Some(SampleKind::SampleDuplicateTimestamp),
+            );
+            Ok(())
+        }
+        HeadError::DuplicateSampleWithDetails(msg) => {
+            stats.new_value_for_timestamp += 1;
+            let s_str = make_series_str(pairs);
+            record_partial(
+                IngesterError::sample_duplicate_timestamp(msg, ts, s_str),
+                Some(SampleKind::SampleDuplicateTimestamp),
+            );
+            Ok(())
+        }
+        HeadError::HistogramValidation(msg) => {
+            stats.invalid_native_histogram += 1;
+            let err_id = map_native_histogram_err_id(&msg);
+            let s_str = make_series_str(pairs);
+            record_partial(
+                IngesterError::NativeHistogramValidation {
+                    err_id,
+                    original_err: msg,
+                    series: s_str,
+                    timestamp_ms: ts,
+                },
+                Some(SampleKind::NativeHistogramValidation),
             );
             Ok(())
         }

@@ -1,7 +1,7 @@
 //! Server-side push & read circuit breakers matching `pkg/ingester/circuitbreaker.go`.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -225,6 +225,9 @@ pub struct CircuitBreaker {
     activation_state: AtomicU8,
     activation_needed: AtomicBool,
     activation_gen: AtomicU64,
+    acquired_permits: AtomicI64,
+    recorded_successes: AtomicI64,
+    recorded_failures: AtomicI64,
     state_mtx: Mutex<()>,
     inner: Arc<Mutex<BreakerInner>>,
     metrics: BreakerMetrics,
@@ -281,6 +284,9 @@ impl CircuitBreaker {
             activation_state: AtomicU8::new(ActivationState::Inactive as u8),
             activation_needed: AtomicBool::new(false),
             activation_gen: AtomicU64::new(0),
+            acquired_permits: AtomicI64::new(0),
+            recorded_successes: AtomicI64::new(0),
+            recorded_failures: AtomicI64::new(0),
             state_mtx: Mutex::new(()),
             inner,
             metrics,
@@ -298,6 +304,18 @@ impl CircuitBreaker {
 
     pub fn test_request_delay(&self) -> Duration {
         Duration::from_nanos(self.test_request_delay_ns.load(Ordering::Acquire))
+    }
+
+    pub fn acquired_permits(&self) -> i64 {
+        self.acquired_permits.load(Ordering::Acquire)
+    }
+
+    pub fn recorded_successes(&self) -> i64 {
+        self.recorded_successes.load(Ordering::Acquire)
+    }
+
+    pub fn recorded_failures(&self) -> i64 {
+        self.recorded_failures.load(Ordering::Acquire)
     }
 
     pub fn activation_state(&self) -> ActivationState {
@@ -480,10 +498,13 @@ impl CircuitBreaker {
         self.maybe_transition_to_half_open(&mut inner, now);
 
         match inner.state {
-            BreakerState::Closed => Ok(Some(BreakerPermit {
-                breaker: Arc::clone(self),
-                is_half_open: false,
-            })),
+            BreakerState::Closed => {
+                self.acquired_permits.fetch_add(1, Ordering::AcqRel);
+                Ok(Some(BreakerPermit {
+                    breaker: Arc::clone(self),
+                    is_half_open: false,
+                }))
+            }
             BreakerState::Open => {
                 let rem = inner
                     .opened_at
@@ -505,6 +526,7 @@ impl CircuitBreaker {
                     });
                 }
                 inner.half_open_in_flight += 1;
+                self.acquired_permits.fetch_add(1, Ordering::AcqRel);
                 Ok(Some(BreakerPermit {
                     breaker: Arc::clone(self),
                     is_half_open: true,
@@ -590,6 +612,7 @@ impl CircuitBreaker {
     }
 
     fn record_failure_inner(&self, is_half_open: bool) {
+        self.recorded_failures.fetch_add(1, Ordering::AcqRel);
         let now = Instant::now();
         let mut inner = self.inner.lock();
         if is_half_open && inner.state == BreakerState::HalfOpen {
@@ -622,6 +645,7 @@ impl CircuitBreaker {
     }
 
     fn record_success_inner(&self, is_half_open: bool) {
+        self.recorded_successes.fetch_add(1, Ordering::AcqRel);
         let now = Instant::now();
         let mut inner = self.inner.lock();
         if is_half_open && inner.state == BreakerState::HalfOpen {

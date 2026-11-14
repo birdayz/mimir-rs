@@ -714,6 +714,10 @@ impl IngesterMetrics {
         self.forced_compaction_in_progress.set(0.0);
     }
 
+    pub fn forced_compactions_count(&self) -> i64 {
+        *self.forced_compactions_count.lock()
+    }
+
     pub fn delete_per_user_metrics(&self, user_id: &str, custom_tracker_names: &[String]) {
         let _ = self.ingested_samples.remove_label_values(&[user_id]);
         let _ = self.ingested_samples_fail.remove_label_values(&[user_id]);
