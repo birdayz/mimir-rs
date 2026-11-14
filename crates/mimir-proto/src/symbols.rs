@@ -175,6 +175,17 @@ impl<'a> FastSymbolsTable<'a> {
         self.symbols_map_capacity_lower_bound
     }
 
+    /// Returns the protobuf encoded size of `symbols_rw2` (field tag 4) for all symbolized strings,
+    /// matching `FastSymbolsTable.SymbolsSizeProto` in `pkg/mimirpb/symbols.go`.
+    pub fn symbols_size_proto(&self) -> usize {
+        let mut n = 0usize;
+        for k in self.symbols_map.keys() {
+            let l = k.len();
+            n += 1 + l + prost::encoding::encoded_len_varint(l as u64);
+        }
+        n
+    }
+
     pub fn symbols(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(self.count_symbols());
         self.symbols_into(&mut out);
@@ -213,9 +224,9 @@ impl<'a> FastSymbolsTable<'a> {
 mod tests {
     use super::*;
 
+    // Upstream: pkg/mimirpb/symbols_test.go::TestSymbolsTable
     #[test]
     fn test_fast_symbols_table_basic() {
-        // Ported from TestSymbolsTable in pkg/mimirpb/symbols_test.go
         let mut s = FastSymbolsTable::new(MIN_PREALLOCATED_SYMBOLS_PER_REQUEST);
         assert_eq!(s.symbols(), vec![""]);
         assert_eq!(s.symbolize(""), 0);
@@ -237,6 +248,45 @@ mod tests {
         assert_eq!(s.symbols(), vec!["", "__name__"]);
         assert_eq!(s.symbolize("abc"), 2);
         assert_eq!(s.symbols(), vec!["", "__name__", "abc"]);
+
+        let encoded = vec![
+            s.symbolize("__name__"),
+            s.symbolize("qwer"),
+            s.symbolize("zxcv"),
+            s.symbolize("1234"),
+        ];
+        assert_eq!(encoded, vec![1, 3, 4, 5]);
+        let syms = s.symbols();
+        let decoded: Vec<(&str, &str)> = encoded
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| (syms[pair[0] as usize].as_str(), syms[pair[1] as usize].as_str()))
+            .collect();
+        assert_eq!(decoded, vec![("__name__", "qwer"), ("zxcv", "1234")]);
+    }
+
+    #[test]
+    fn test_fast_symbols_table_symbols_size_proto() {
+        use prost::Message as _;
+        let mut s = FastSymbolsTable::new(0);
+        let wr = crate::cortexpb::WriteRequest::default();
+        assert_eq!(s.symbols_size_proto(), 0);
+        assert_eq!(wr.encoded_len(), 0);
+
+        s.symbolize("abc");
+        s.symbolize("def");
+        s.symbolize("test some other longer one");
+
+        let wr = crate::cortexpb::WriteRequest {
+            symbols_rw2: vec![
+                "abc".to_string(),
+                "def".to_string(),
+                "test some other longer one".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(wr.encoded_len(), s.symbols_size_proto());
     }
 
     #[test]

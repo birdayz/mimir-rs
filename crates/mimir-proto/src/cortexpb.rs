@@ -117,6 +117,47 @@ pub fn is_client_error_cause(cause: ErrorCause) -> bool {
     matches!(cause, ErrorCause::BadData | ErrorCause::TenantLimit)
 }
 
+/// Ported from `IsClientError` in `pkg/mimirpb/errors.go`.
+///
+/// Returns `true` if `status` represents a gRPC or `httpgrpc` 4xx status code,
+/// or carries `cortexpb::ErrorDetails` with a client error cause (`BadData` or `TenantLimit`).
+pub fn is_client_error(status: &tonic::Status) -> bool {
+    if let Some(resp) = crate::grpcutilpb::extract_http_response(status) {
+        if resp.code / 100 == 4 {
+            return true;
+        }
+    }
+    if let Ok(rpc_status) = crate::grpcutilpb::decode_status_details(status) {
+        if rpc_status.code / 100 == 4 {
+            return true;
+        }
+        for any in &rpc_status.details {
+            if let Some(Ok(err_details)) = crate::grpcutilpb::unpack_any::<ErrorDetails>(
+                any,
+                crate::grpcutilpb::CORTEXPB_ERROR_DETAILS_TYPE_URL,
+            ) {
+                if let Ok(cause) = ErrorCause::try_from(err_details.cause) {
+                    return is_client_error_cause(cause);
+                }
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// Ported from `IsClientError` in `pkg/mimirpb/errors.go` for generic Rust errors.
+pub fn is_client_error_err(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(status) = e.downcast_ref::<tonic::Status>() {
+            return is_client_error(status);
+        }
+        cur = e.source();
+    }
+    false
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
 pub struct ErrorDetails {
     #[prost(enumeration = "ErrorCause", tag = "1")]
@@ -629,3 +670,201 @@ pub type WriteRequestRW2 = WriteRequestRw2;
 pub type TimeSeriesRW2 = TimeSeriesRw2;
 pub type ExemplarRW2 = ExemplarRw2;
 pub type MetadataRW2 = MetadataRw2;
+
+pub const MINIMUM_HISTOGRAM_SCHEMA: i32 = -4;
+pub const MAXIMUM_HISTOGRAM_SCHEMA: i32 = 8;
+pub const NATIVE_HISTOGRAMS_WITH_CUSTOM_BUCKETS_SCHEMA: i32 = -53;
+
+pub const QUERY_RESPONSE_MIME_TYPE_TYPE: &str = "application";
+pub const QUERY_RESPONSE_MIME_TYPE_SUB_TYPE: &str = "vnd.mimir.queryresponse+protobuf";
+pub const QUERY_RESPONSE_MIME_TYPE: &str = "application/vnd.mimir.queryresponse+protobuf";
+
+impl WriteRequest {
+    /// Returns the minimum timestamp (milliseconds) among all series in the WriteRequest,
+    /// or `i64::MAX` if empty. Ported from `WriteRequest.MinTimestamp` in `pkg/mimirpb/custom.go`.
+    pub fn min_timestamp(&self) -> i64 {
+        let mut min = i64::MAX;
+        for series in &self.timeseries {
+            for entry in &series.samples {
+                if entry.timestamp_ms < min {
+                    min = entry.timestamp_ms;
+                }
+            }
+            for entry in &series.histograms {
+                if entry.timestamp < min {
+                    min = entry.timestamp;
+                }
+            }
+            for entry in &series.exemplars {
+                if entry.timestamp_ms < min {
+                    min = entry.timestamp_ms;
+                }
+            }
+        }
+        min
+    }
+
+    /// Returns whether the WriteRequest has no data to ingest.
+    /// Ported from `WriteRequest.IsEmpty` in `pkg/mimirpb/custom.go`.
+    pub fn is_empty(&self) -> bool {
+        self.timeseries.is_empty() && self.metadata.is_empty()
+    }
+
+    /// Returns only the marshalled size of the `Metadata` field (`tag = 3`).
+    pub fn metadata_size(&self) -> usize {
+        use prost::Message as _;
+        let mut n = 0usize;
+        for e in &self.metadata {
+            let l = e.encoded_len();
+            n += 1 + l + prost::encoding::encoded_len_varint(l as u64);
+        }
+        n
+    }
+
+    /// Returns only the marshalled size of the `Timeseries` field (`tag = 1`).
+    pub fn timeseries_size(&self) -> usize {
+        use prost::Message as _;
+        let mut n = 0usize;
+        for e in &self.timeseries {
+            let l = e.encoded_len();
+            n += 1 + l + prost::encoding::encoded_len_varint(l as u64);
+        }
+        n
+    }
+
+    /// Returns only the marshalled size of the `TimeseriesRW2` field (`tag = 5`).
+    pub fn timeseries_rw2_size(&self) -> usize {
+        use prost::Message as _;
+        let mut n = 0usize;
+        for e in &self.timeseries_rw2 {
+            let l = e.encoded_len();
+            n += 1 + l + prost::encoding::encoded_len_varint(l as u64);
+        }
+        n
+    }
+
+    /// Returns only the marshalled size of the `SymbolsRW2` field (`tag = 4`).
+    pub fn symbols_rw2_size(&self) -> usize {
+        let mut n = 0usize;
+        for s in &self.symbols_rw2 {
+            let l = s.len();
+            n += 1 + l + prost::encoding::encoded_len_varint(l as u64);
+        }
+        n
+    }
+
+    /// Builds a new `WriteRequest` containing only the timeseries and metadata for `indexes`.
+    /// Assumes indexes `< initial_metadata_index` refer to `timeseries`, and `>= initial_metadata_index` refer to `metadata`.
+    /// Ported from `WriteRequest.ForIndexes` in `pkg/mimirpb/timeseries.go`.
+    pub fn for_indexes(&self, indexes: &[usize], initial_metadata_index: usize) -> Self {
+        let mut timeseries_count = 0usize;
+        let mut metadata_count = 0usize;
+        for &i in indexes {
+            if i >= initial_metadata_index {
+                metadata_count += 1;
+            } else {
+                timeseries_count += 1;
+            }
+        }
+        let mut timeseries = Vec::with_capacity(timeseries_count);
+        let mut metadata = Vec::with_capacity(metadata_count);
+        for &i in indexes {
+            if i >= initial_metadata_index {
+                metadata.push(self.metadata[i - initial_metadata_index].clone());
+            } else {
+                timeseries.push(self.timeseries[i].clone());
+            }
+        }
+        Self {
+            timeseries,
+            metadata,
+            source: self.source,
+            skip_label_validation: self.skip_label_validation,
+            ..Default::default()
+        }
+    }
+}
+
+impl Histogram {
+    /// Counts the total number of buckets in the native histogram.
+    /// Ported from `Histogram.BucketCount` in `pkg/mimirpb/custom.go`.
+    pub fn bucket_count(&self) -> usize {
+        self.positive_counts.len()
+            + self.negative_counts.len()
+            + self.positive_deltas.len()
+            + self.negative_deltas.len()
+    }
+}
+
+impl QueryStatus {
+    pub fn to_prometheus_string(self) -> Result<&'static str, String> {
+        match self {
+            QueryStatus::Success => Ok("success"),
+            QueryStatus::Error => Ok("error"),
+        }
+    }
+
+    pub fn from_prometheus_string(s: &str) -> Result<Self, String> {
+        match s {
+            "success" => Ok(QueryStatus::Success),
+            "error" => Ok(QueryStatus::Error),
+            _ => Err(format!("unknown Prometheus status value: '{s}'")),
+        }
+    }
+}
+
+impl QueryErrorType {
+    pub fn to_prometheus_string(self) -> Result<&'static str, String> {
+        match self {
+            QueryErrorType::None => Ok(""),
+            QueryErrorType::Timeout => Ok("timeout"),
+            QueryErrorType::Canceled => Ok("canceled"),
+            QueryErrorType::Execution => Ok("execution"),
+            QueryErrorType::BadData => Ok("bad_data"),
+            QueryErrorType::Internal => Ok("internal"),
+            QueryErrorType::Unavailable => Ok("unavailable"),
+            QueryErrorType::NotFound => Ok("not_found"),
+            QueryErrorType::NotAcceptable => Ok("not_acceptable"),
+            QueryErrorType::TooLargeEntry => Ok("too_large_entry"),
+            QueryErrorType::TooManyRequests => Ok("too_many_requests"),
+            QueryErrorType::CostLimit => Ok("cost_limit"),
+        }
+    }
+
+    pub fn from_prometheus_string(s: &str) -> Result<Self, String> {
+        match s {
+            "" => Ok(QueryErrorType::None),
+            "timeout" => Ok(QueryErrorType::Timeout),
+            "canceled" => Ok(QueryErrorType::Canceled),
+            "execution" => Ok(QueryErrorType::Execution),
+            "bad_data" => Ok(QueryErrorType::BadData),
+            "internal" => Ok(QueryErrorType::Internal),
+            "unavailable" => Ok(QueryErrorType::Unavailable),
+            "not_found" => Ok(QueryErrorType::NotFound),
+            "not_acceptable" => Ok(QueryErrorType::NotAcceptable),
+            "too_large_entry" => Ok(QueryErrorType::TooLargeEntry),
+            "too_many_requests" => Ok(QueryErrorType::TooManyRequests),
+            "cost_limit" => Ok(QueryErrorType::CostLimit),
+            _ => Err(format!("unknown Prometheus error type value: '{s}'")),
+        }
+    }
+
+    /// Ported from `ErrorTypeFromAPIErrorType` in `pkg/mimirpb/query_response_extra.go`.
+    pub fn from_api_error_type(t: &str) -> Result<Self, String> {
+        match t {
+            "" => Ok(QueryErrorType::None),
+            "timeout" => Ok(QueryErrorType::Timeout),
+            "canceled" => Ok(QueryErrorType::Canceled),
+            "execution" => Ok(QueryErrorType::Execution),
+            "bad_data" => Ok(QueryErrorType::BadData),
+            "internal" => Ok(QueryErrorType::Internal),
+            "unavailable" => Ok(QueryErrorType::Unavailable),
+            "not_found" => Ok(QueryErrorType::NotFound),
+            "too_many_requests" => Ok(QueryErrorType::TooManyRequests),
+            "too_large_entry" => Ok(QueryErrorType::TooLargeEntry),
+            "not_acceptable" => Ok(QueryErrorType::NotAcceptable),
+            "cost_limit" => Ok(QueryErrorType::CostLimit),
+            _ => Err(format!("unknown API error type {t:?}")),
+        }
+    }
+}
