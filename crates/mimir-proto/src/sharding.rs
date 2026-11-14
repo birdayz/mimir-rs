@@ -62,10 +62,9 @@ where
 mod tests {
     use super::*;
 
+    // Upstream: pkg/mimirpb/series_sharding_test.go::TestShardByAllLabelAdaptersReturnsWrongResultsForUnsortedLabels
     #[test]
     fn test_shard_by_all_labels_order_sensitive() {
-        // Ported from series_sharding_test.go:
-        // TestShardByAllLabelAdaptersReturnsWrongResultsForUnsortedLabels
         let val1 = shard_by_all_labels("test", [("__name__", "foo"), ("bar", "baz"), ("sample", "1")]);
         let val2 = shard_by_all_labels("test", [("__name__", "foo"), ("sample", "1"), ("bar", "baz")]);
         assert_ne!(val1, val2);
