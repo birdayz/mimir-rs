@@ -1033,9 +1033,11 @@ version = "0.1.0"
 dependencies = [
  "mimir-common",
  "mimir-proto",
+ "parking_lot",
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 
