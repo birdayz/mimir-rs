@@ -3132,6 +3132,7 @@ impl<'a> HeadAppender<'a> {
         ref_id: u64,
         t: i64,
         val: &LastSample,
+        ooo_time_window: i64,
     ) -> Result<Option<(bool, bool)>, HeadError> {
         let Some((prev_t, prev_val)) = self.batch_last_sample.get(&ref_id) else {
             return Ok(None);
@@ -3162,10 +3163,10 @@ impl<'a> HeadAppender<'a> {
                 return Ok(Some((true, true)));
             }
         }
-        if self.ooo_time_window > 0 && t >= self.head_maxt.saturating_sub(self.ooo_time_window) {
+        if ooo_time_window > 0 && t >= self.head_maxt.saturating_sub(ooo_time_window) {
             return Ok(Some((true, false)));
         }
-        if self.ooo_time_window > 0 {
+        if ooo_time_window > 0 {
             return Err(HeadError::TooOldSample);
         }
         if t < self.min_valid_time {
@@ -3230,6 +3231,29 @@ impl<'a> HeadAppender<'a> {
         t: i64,
         v: f64,
     ) -> Result<u64, HeadError> {
+        self.append_float_inner(series_ref, pairs, st, t, v, false)
+    }
+
+    /// Appends a float sample, rejecting out-of-order samples even when OOO is enabled.
+    pub fn append_float_reject_ooo(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        t: i64,
+        v: f64,
+    ) -> Result<u64, HeadError> {
+        self.append_float_inner(series_ref, pairs, 0, t, v, true)
+    }
+
+    fn append_float_inner(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        st: i64,
+        t: i64,
+        v: f64,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
         if self.closed {
             return Err(HeadError::AppenderClosed);
         }
@@ -3238,7 +3262,8 @@ impl<'a> HeadAppender<'a> {
             self.min_valid_time = self.head.appendable_min_valid_time();
             self.head_maxt = self.head.max_time();
         }
-        if self.ooo_time_window == 0 && t < self.min_valid_time {
+        let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
+        if effective_ooo == 0 && t < self.min_valid_time {
             return Err(HeadError::OutOfBounds);
         }
 
@@ -3246,7 +3271,7 @@ impl<'a> HeadAppender<'a> {
         let ref_id = entry.ref_id;
 
         if let Some((is_ooo, is_dup)) =
-            self.check_batch_last_sample(ref_id, t, &LastSample::Float(v))?
+            self.check_batch_last_sample(ref_id, t, &LastSample::Float(v), effective_ooo)?
         {
             if is_ooo && v.to_bits() != QUIET_ZERO_NAN_BITS {
                 let delta = self.head_maxt.saturating_sub(t);
@@ -3271,7 +3296,7 @@ impl<'a> HeadAppender<'a> {
                 v,
                 self.head_maxt,
                 self.min_valid_time,
-                self.ooo_time_window,
+                effective_ooo,
                 cr_guard.as_ref(),
             );
             drop(state);
@@ -3345,6 +3370,29 @@ impl<'a> HeadAppender<'a> {
         t: i64,
         h: Histogram,
     ) -> Result<u64, HeadError> {
+        self.append_histogram_inner(series_ref, pairs, st, t, h, false)
+    }
+
+    /// Appends an integer native histogram sample, rejecting out-of-order samples even when OOO is enabled.
+    pub fn append_histogram_reject_ooo(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        t: i64,
+        h: Histogram,
+    ) -> Result<u64, HeadError> {
+        self.append_histogram_inner(series_ref, pairs, 0, t, h, true)
+    }
+
+    fn append_histogram_inner(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        st: i64,
+        t: i64,
+        h: Histogram,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
         if self.closed {
             return Err(HeadError::AppenderClosed);
         }
@@ -3353,14 +3401,17 @@ impl<'a> HeadAppender<'a> {
             self.min_valid_time = self.head.appendable_min_valid_time();
             self.head_maxt = self.head.max_time();
         }
-        if self.ooo_time_window == 0 && t < self.min_valid_time {
+        let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
+        if effective_ooo == 0 && t < self.min_valid_time {
             return Err(HeadError::OutOfBounds);
         }
 
         let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
         let ref_id = entry.ref_id;
         let ls = LastSample::Histogram(h.clone());
-        if let Some((is_ooo, is_dup)) = self.check_batch_last_sample(ref_id, t, &ls)? {
+        if let Some((is_ooo, is_dup)) =
+            self.check_batch_last_sample(ref_id, t, &ls, effective_ooo)?
+        {
             if is_ooo {
                 let delta = self.head_maxt.saturating_sub(t);
                 if delta > 0 {
@@ -3383,7 +3434,7 @@ impl<'a> HeadAppender<'a> {
                 &h,
                 self.head_maxt,
                 self.min_valid_time,
-                self.ooo_time_window,
+                effective_ooo,
                 cr_guard.as_ref(),
             );
             drop(state);
@@ -3415,6 +3466,29 @@ impl<'a> HeadAppender<'a> {
         t: i64,
         fh: FloatHistogram,
     ) -> Result<u64, HeadError> {
+        self.append_float_histogram_inner(series_ref, pairs, st, t, fh, false)
+    }
+
+    /// Appends a float native histogram sample, rejecting out-of-order samples even when OOO is enabled.
+    pub fn append_float_histogram_reject_ooo(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        t: i64,
+        fh: FloatHistogram,
+    ) -> Result<u64, HeadError> {
+        self.append_float_histogram_inner(series_ref, pairs, 0, t, fh, true)
+    }
+
+    fn append_float_histogram_inner(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        st: i64,
+        t: i64,
+        fh: FloatHistogram,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
         if self.closed {
             return Err(HeadError::AppenderClosed);
         }
@@ -3423,14 +3497,17 @@ impl<'a> HeadAppender<'a> {
             self.min_valid_time = self.head.appendable_min_valid_time();
             self.head_maxt = self.head.max_time();
         }
-        if self.ooo_time_window == 0 && t < self.min_valid_time {
+        let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
+        if effective_ooo == 0 && t < self.min_valid_time {
             return Err(HeadError::OutOfBounds);
         }
 
         let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
         let ref_id = entry.ref_id;
         let ls = LastSample::FloatHistogram(fh.clone());
-        if let Some((is_ooo, is_dup)) = self.check_batch_last_sample(ref_id, t, &ls)? {
+        if let Some((is_ooo, is_dup)) =
+            self.check_batch_last_sample(ref_id, t, &ls, effective_ooo)?
+        {
             if is_ooo {
                 let delta = self.head_maxt.saturating_sub(t);
                 if delta > 0 {
@@ -3453,7 +3530,7 @@ impl<'a> HeadAppender<'a> {
                 &fh,
                 self.head_maxt,
                 self.min_valid_time,
-                self.ooo_time_window,
+                effective_ooo,
                 cr_guard.as_ref(),
             );
             drop(state);

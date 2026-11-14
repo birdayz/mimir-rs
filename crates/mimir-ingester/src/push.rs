@@ -1041,6 +1041,11 @@ impl Ingester {
             let prev_succeeded = stats.succeeded_samples;
             let mut created_ts = ts.created_timestamp();
             let mut ingest_created_ts = created_ts > 0;
+            let first_hist_ts = if hist_count > 0 {
+                Some(ts.histogram_timestamp(0))
+            } else {
+                None
+            };
 
             for s in samples {
                 if s.timestamp_ms > max_timestamp_ms {
@@ -1064,8 +1069,13 @@ impl Ingester {
                     continue;
                 }
 
-                if ingest_created_ts && created_ts < s.timestamp_ms {
-                    match app.append_float(series_ref, &pairs, created_ts, 0.0) {
+                if ingest_created_ts
+                    && created_ts < s.timestamp_ms
+                    && (!native_histograms_enabled
+                        || hist_count == 0
+                        || first_hist_ts.is_none_or(|ht| ht >= s.timestamp_ms))
+                {
+                    match app.append_float_reject_ooo(series_ref, &pairs, created_ts, 0.0) {
                         Ok(r) => {
                             series_ref = Some(r);
                             stats.succeeded_samples += 1;
@@ -1169,16 +1179,64 @@ impl Ingester {
                         continue;
                     }
 
+                    if ingest_created_ts && created_ts < h_ts {
+                        let ct_res = if is_float {
+                            let fh_ref = fh_opt.as_ref().expect("float histogram");
+                            let zero_fh = FloatHistogram {
+                                counter_reset_hint: CounterResetHint::CounterReset,
+                                schema: fh_ref.schema,
+                                zero_threshold: fh_ref.zero_threshold,
+                                custom_values: fh_ref.custom_values.clone(),
+                                ..FloatHistogram::default()
+                            };
+                            app.append_float_histogram_reject_ooo(
+                                series_ref, &pairs, created_ts, zero_fh,
+                            )
+                        } else {
+                            let ih_ref = ih_opt.as_ref().expect("int histogram");
+                            let zero_ih = Histogram {
+                                counter_reset_hint: CounterResetHint::CounterReset,
+                                schema: ih_ref.schema,
+                                zero_threshold: ih_ref.zero_threshold,
+                                custom_values: ih_ref.custom_values.clone(),
+                                ..Histogram::default()
+                            };
+                            app.append_histogram_reject_ooo(
+                                series_ref, &pairs, created_ts, zero_ih,
+                            )
+                        };
+                        match ct_res {
+                            Ok(r) => {
+                                series_ref = Some(r);
+                                stats.succeeded_samples += 1;
+                            }
+                            Err(
+                                HeadError::DuplicateSampleForTimestamp
+                                | HeadError::OutOfOrderSample,
+                            ) => {}
+                            Err(err) => {
+                                handle_head_append_error(
+                                    err,
+                                    created_ts,
+                                    &pairs,
+                                    ooo_window_ms,
+                                    ooo_window_dur,
+                                    &limits,
+                                    &mut stats,
+                                    &mut make_series_str,
+                                    &mut record_partial,
+                                )?;
+                            }
+                        }
+                        ingest_created_ts = false;
+                        created_ts = 0;
+                    }
+
                     let res = if is_float {
                         app.append_float_histogram(
                             series_ref,
                             &pairs,
-                            if ingest_created_ts && created_ts < h_ts {
-                                ingest_created_ts = false;
-                                created_ts
-                            } else {
-                                0
-                            },
+                            0,
                             h_ts,
                             fh_opt.expect("float histogram"),
                         )
@@ -1186,12 +1244,7 @@ impl Ingester {
                         app.append_histogram(
                             series_ref,
                             &pairs,
-                            if ingest_created_ts && created_ts < h_ts {
-                                ingest_created_ts = false;
-                                created_ts
-                            } else {
-                                0
-                            },
+                            0,
                             h_ts,
                             ih_opt.expect("int histogram"),
                         )
