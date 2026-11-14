@@ -193,6 +193,63 @@ impl Tsdb {
         Ok(Some(uid))
     }
 
+    /// Compacts all out-of-order samples in Head into an OOO ULID block on disk and clears OOO state.
+    pub fn compact_ooo_head(&self) -> Result<Option<Ulid>, TsdbError> {
+        let _guard = self.compact_mtx.lock();
+        let (series, mint, maxt_inclusive) = self.head.collect_ooo_compaction_series()?;
+        if series.is_empty() || mint > maxt_inclusive {
+            return Ok(None);
+        }
+        let maxt = maxt_inclusive.saturating_add(1);
+        let Some(meta) = write_block_from_series(
+            &self.dir,
+            mint,
+            maxt,
+            series,
+            BlockMetaCompaction::default(),
+            true,
+            self.opts.max_block_chunk_segment_size,
+        )?
+        else {
+            return Ok(None);
+        };
+        let uid = meta.ulid;
+        let reloaded = Self::load_blocks(&self.dir)?;
+        *self.blocks.write() = reloaded;
+        self.head.clear_ooo_data()?;
+        Ok(Some(uid))
+    }
+
+    /// Compacts the selected series refs into a ULID block on disk and evicts them from Head.
+    pub fn compact_selected_series(&self, refs: &[u64]) -> Result<Option<Ulid>, TsdbError> {
+        if refs.is_empty() {
+            return Ok(None);
+        }
+        let _guard = self.compact_mtx.lock();
+        let (series, mint, maxt_inclusive) = self.head.collect_selected_compaction_series(refs)?;
+        if series.is_empty() || mint > maxt_inclusive {
+            return Ok(None);
+        }
+        let maxt = maxt_inclusive.saturating_add(1);
+        let Some(meta) = write_block_from_series(
+            &self.dir,
+            mint,
+            maxt,
+            series,
+            BlockMetaCompaction::default(),
+            false,
+            self.opts.max_block_chunk_segment_size,
+        )?
+        else {
+            return Ok(None);
+        };
+        let uid = meta.ulid;
+        let reloaded = Self::load_blocks(&self.dir)?;
+        *self.blocks.write() = reloaded;
+        self.head.evict_series_refs(refs)?;
+        Ok(Some(uid))
+    }
+
     /// Truncates Head memory and WAL older than `mint`.
     pub fn truncate(&self, mint: i64) -> Result<(), TsdbError> {
         let _guard = self.compact_mtx.lock();

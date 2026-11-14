@@ -153,6 +153,69 @@ impl MemPostings {
             .unwrap_or_default()
     }
 
+    /// Returns the number of postings for `(name_id, value_id)`.
+    pub fn postings_len(&self, name_id: SymbolId, value_id: SymbolId) -> usize {
+        let inner = self.inner.read();
+        inner
+            .m
+            .get(&name_id)
+            .and_then(|vm| vm.get(&value_id))
+            .map_or(0, Vec::len)
+    }
+
+    /// Returns the smallest/first posting ref for `(name_id, value_id)`, if any.
+    pub fn first_posting(&self, name_id: SymbolId, value_id: SymbolId) -> Option<u64> {
+        let inner = self.inner.read();
+        let list = inner.m.get(&name_id)?.get(&value_id)?;
+        if inner.ordered {
+            list.first().copied()
+        } else {
+            list.iter().copied().min()
+        }
+    }
+
+    /// Appends up to `limit` sample postings refs for `(name_id, value_id)` into `out`.
+    pub fn append_postings_sample(
+        &self,
+        name_id: SymbolId,
+        value_id: SymbolId,
+        limit: usize,
+        out: &mut Vec<u64>,
+    ) {
+        if limit == 0 {
+            return;
+        }
+        let inner = self.inner.read();
+        let Some(list) = inner.m.get(&name_id).and_then(|vm| vm.get(&value_id)) else {
+            return;
+        };
+        if list.len() <= limit {
+            out.extend_from_slice(list);
+        } else {
+            let step = (list.len() / limit).max(1);
+            for idx in (0..list.len()).step_by(step).take(limit) {
+                out.push(list[idx]);
+            }
+        }
+    }
+
+    /// Returns total byte length of distinct label values per label name.
+    pub fn label_values_bytes(&self, symbols: &SymbolTable) -> std::collections::HashMap<String, u64> {
+        let inner = self.inner.read();
+        let mut out = std::collections::HashMap::with_capacity(inner.lvs.len());
+        for (&name_id, val_ids) in &inner.lvs {
+            if name_id == ALL_POSTINGS_KEY.0 {
+                continue;
+            }
+            let total: u64 = val_ids
+                .iter()
+                .map(|&vid| symbols.resolve(vid).len() as u64)
+                .sum();
+            out.insert(symbols.resolve(name_id).to_string(), total);
+        }
+        out
+    }
+
     /// Returns sorted union of postings for `name_id` across `value_ids`.
     pub fn postings_for_ids(&self, name_id: SymbolId, value_ids: &[SymbolId]) -> Vec<u64> {
         if value_ids.is_empty() {

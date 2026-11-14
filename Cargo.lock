@@ -1106,7 +1106,10 @@ name = "mimir-conformance"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
+ "bytes",
+ "futures",
  "mimir-cmd",
  "mimir-common",
  "mimir-config",
@@ -1115,9 +1118,14 @@ dependencies = [
  "mimir-ring",
  "mimir-storage",
  "mimir-tsdb",
+ "prometheus",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
@@ -1136,11 +1144,17 @@ dependencies = [
  "mimir-tsdb",
  "parking_lot",
  "prometheus",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "smallvec",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tonic",
  "tracing",
+ "ulid",
+ "xxhash-rust",
 ]
 
 [[package]]
