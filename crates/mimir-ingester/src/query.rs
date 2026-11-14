@@ -17,7 +17,6 @@ use mimir_config::parse_go_duration;
 use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb;
 use mimir_proto::prost::Message;
-use mimir_proto::sharding::shard_by_all_labels;
 use mimir_storage::ingest::PartitionOffsets;
 use mimir_tsdb::chunkenc::Encoding;
 use mimir_tsdb::labels::Labels;
@@ -405,8 +404,7 @@ impl Ingester {
 
         if let Some((shard_idx, shard_count)) = shard {
             chunk_series.retain(|cs| {
-                let h = shard_by_all_labels(user_id, cs.labels.iter()) as u64;
-                h % shard_count == shard_idx
+                labels_stable_hash(&cs.labels) % shard_count == shard_idx
             });
         }
 
@@ -1039,8 +1037,7 @@ impl Ingester {
                 continue;
             };
             if let Some((shard_idx, shard_count)) = shard {
-                let h = shard_by_all_labels(user_id, lbls.iter()) as u64;
-                if h % shard_count != shard_idx {
+                if labels_stable_hash(&lbls) % shard_count != shard_idx {
                     continue;
                 }
             }
@@ -1163,6 +1160,19 @@ fn chunk_search_results(
         });
     }
     batches
+}
+
+/// Ported from `prometheus/model/labels/sharding.go:StableHash`, the per-series shard hash
+/// (`memSeries.shardHash`) used by the TSDB head `ShardedPostings`.
+fn labels_stable_hash(lbls: &Labels) -> u64 {
+    let mut buf = Vec::with_capacity(128);
+    for (name, value) in lbls.iter() {
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0xff);
+        buf.extend_from_slice(value.as_bytes());
+        buf.push(0xff);
+    }
+    xxhash_rust::xxh64::xxh64(&buf, 0)
 }
 
 #[allow(dead_code)]
