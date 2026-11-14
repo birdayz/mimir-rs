@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mimir_config::{BlocksStorageConfig, IngesterConfig, Overrides};
 use mimir_proto::cortexpb;
@@ -304,7 +304,7 @@ pub struct UserTsdb {
     owned_state: Arc<Mutex<OwnedSeriesState>>,
     owned_token_ranges: Mutex<Vec<u32>>,
     requires_owned_series_update: Mutex<Option<String>>,
-    pending_non_owned_refs: Mutex<HashMap<u64, Instant>>,
+    pending_non_owned_refs: Mutex<HashMap<u64, SystemTime>>,
     early_compaction_non_owned_enabled: bool,
 
     lifecycle_adapter: Arc<LifecycleCallbackAdapter>,
@@ -602,14 +602,26 @@ impl UserTsdb {
     }
 
     pub async fn wait_in_flight_appends(&self) {
-        while self.in_flight_appends.load(Ordering::Acquire) > 0 {
-            self.in_flight_notify.notified().await;
+        loop {
+            let notified = self.in_flight_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.in_flight_appends.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            notified.await;
         }
     }
 
     pub async fn wait_in_flight_before_forced_compaction(&self) {
-        while self.in_flight_appends_before_forced.load(Ordering::Acquire) > 0 {
-            self.in_flight_before_forced_notify.notified().await;
+        loop {
+            let notified = self.in_flight_before_forced_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.in_flight_appends_before_forced.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            notified.await;
         }
     }
 
@@ -839,6 +851,25 @@ impl UserTsdb {
         }
     }
 
+    pub fn set_owned_token_ranges(&self, new_ranges: Vec<u32>) {
+        *self.owned_token_ranges.lock() = new_ranges;
+    }
+
+    pub fn pending_non_owned_refs_len(&self) -> usize {
+        self.pending_non_owned_refs.lock().len()
+    }
+
+    pub fn pending_non_owned_refs_snapshot(&self) -> HashMap<u64, SystemTime> {
+        self.pending_non_owned_refs.lock().clone()
+    }
+
+    pub fn backdate_pending_non_owned_refs(&self, ts: SystemTime) {
+        let mut guard = self.pending_non_owned_refs.lock();
+        for v in guard.values_mut() {
+            *v = ts;
+        }
+    }
+
     pub fn add_pending_non_owned_refs(&self, refs: &HashSet<u64>) {
         let mut guard = self.pending_non_owned_refs.lock();
         if refs.is_empty() {
@@ -846,13 +877,13 @@ impl UserTsdb {
             return;
         }
         guard.retain(|r, _| refs.contains(r));
-        let now = Instant::now();
+        let now = SystemTime::now();
         for &r in refs {
             guard.entry(r).or_insert(now);
         }
     }
 
-    pub fn take_pending_non_owned_refs(&self, not_after: Instant) -> Vec<u64> {
+    pub fn take_pending_non_owned_refs(&self, not_after: SystemTime) -> Vec<u64> {
         let mut guard = self.pending_non_owned_refs.lock();
         let mut out = Vec::new();
         guard.retain(|&r, &mut ts| {

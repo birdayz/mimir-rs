@@ -31,7 +31,7 @@ use mimir_common::tenant::extract_tenant_id_from_http_headers;
 use mimir_config::parse_go_duration;
 use mimir_proto::ringpb::PartitionState;
 use mimir_ring::partition_ring::http::partition_ring_router;
-use mimir_ring::partition_ring::{PartitionRingEditor, PartitionRingReader};
+use mimir_ring::partition_ring::{PartitionRingEditor, PartitionRingError, PartitionRingReader};
 use mimir_ring::ring::http::{ring_router, StatusPageConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -303,7 +303,16 @@ async fn prepare_partition_downscale_handler(
                 .change_partition_state(PartitionState::PartitionInactive)
                 .await
             {
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                let status = if matches!(
+                    e,
+                    PartitionRingError::PartitionStateChangeLocked
+                        | PartitionRingError::PartitionStateChangeNotAllowed
+                ) {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                return (status, e.to_string()).into_response();
             }
         }
         Method::DELETE => {
@@ -315,7 +324,16 @@ async fn prepare_partition_downscale_handler(
                     .change_partition_state(PartitionState::PartitionActive)
                     .await
                 {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                    let status = if matches!(
+                        e,
+                        PartitionRingError::PartitionStateChangeLocked
+                            | PartitionRingError::PartitionStateChangeNotAllowed
+                    ) {
+                        StatusCode::CONFLICT
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    return (status, e.to_string()).into_response();
                 }
             }
         }

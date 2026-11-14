@@ -7,17 +7,17 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use mimir_common::limiter::InflightLimiter;
-use mimir_common::services::{Service, ServiceContext, State};
+use mimir_common::services::{ManagedBasicService, Service, ServiceContext, State};
 use mimir_common::shutdownmarker;
 use mimir_config::{
-    BlocksStorageConfig, IngestStorageConfig, IngesterConfig, InstanceLimits, Overrides,
-    RuntimeConfigManager,
+    BlocksStorageConfig, CompartmentsConfig, IngestStorageConfig, IngesterConfig, InstanceLimits,
+    Overrides, RuntimeConfigManager,
 };
 use mimir_proto::ringpb::InstanceState;
 use mimir_ring::lifecycler::Lifecycler;
@@ -38,6 +38,7 @@ use crate::compaction::{
 };
 use crate::errors::{ErrorSamplers, IngesterError};
 use crate::ingest_storage::{ingester_partition_id_from_instance_id, IngestReaderHandle};
+use crate::ingester_ring_lifecycler::IngesterLifecycler;
 use crate::limiter::{
     IngesterRingLimiterStrategy, Limiter, LimiterRingStrategy, NoopRingLimiterStrategy,
     PartitionRingLimiterStrategy,
@@ -58,6 +59,8 @@ pub struct TriggerRequest {
     pub callback: oneshot::Sender<()>,
 }
 
+type InstanceLimitsFn = Arc<dyn Fn() -> Option<InstanceLimits> + Send + Sync>;
+
 /// Core Mimir Ingester service (`pkg/ingester/ingester.go:Ingester`).
 pub struct Ingester {
     pub cfg: IngesterConfig,
@@ -72,11 +75,12 @@ pub struct Ingester {
     pub owned_series_metrics: OwnedSeriesMetrics,
 
     pub instance_ring: Option<Arc<Ring>>,
-    pub lifecycler: Option<Arc<Lifecycler>>,
+    pub lifecycler: Option<Arc<dyn IngesterLifecycler>>,
     pub partition_ring_watcher: Option<Arc<PartitionRingWatcher>>,
     pub partition_lifecycler: Option<Arc<PartitionInstanceLifecycler>>,
     pub ingest_partition_id: i32,
     pub ingest_reader: RwLock<Option<Arc<IngestReaderHandle>>>,
+    compartments: RwLock<CompartmentsConfig>,
 
     pub bucket: Option<Arc<BucketClient>>,
     pub limiter: Arc<Limiter>,
@@ -101,7 +105,23 @@ pub struct Ingester {
 
     state: RwLock<State>,
     service_ctx: RwLock<Option<ServiceContext>>,
+    startup_handle: tokio::sync::Mutex<Option<JoinHandle<Result<(), IngesterError>>>>,
+    lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
+    partition_lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
+
+    compaction_service_state: AtomicU8,
+    owned_series_service_state: AtomicU8,
+    owned_series_paused: AtomicBool,
+    metrics_updater_service_state: AtomicU8,
+    metadata_purger_service_state: AtomicU8,
+
+    head_compaction_interval_while_starting: RwLock<Duration>,
+    head_compaction_interval_jitter_enabled: AtomicBool,
+    min_compaction_loop_delay: RwLock<Duration>,
+    close_idle_tsdb_interval: RwLock<Duration>,
+    limit_metrics_update_period: RwLock<Duration>,
+    instance_limits_fn: RwLock<Option<InstanceLimitsFn>>,
 
     pub force_compact_tx: RwLock<Option<mpsc::Sender<TriggerRequest>>>,
     pub ship_tx: RwLock<Option<mpsc::Sender<TriggerRequest>>>,
@@ -119,6 +139,33 @@ impl Ingester {
         overrides: Overrides,
         instance_ring: Option<Arc<Ring>>,
         lifecycler: Option<Arc<Lifecycler>>,
+        partition_ring_watcher: Option<Arc<PartitionRingWatcher>>,
+        partition_lifecycler: Option<Arc<PartitionInstanceLifecycler>>,
+        runtime_cfg: Option<Arc<RuntimeConfigManager>>,
+        registry: Option<&Registry>,
+    ) -> Result<Arc<Self>, IngesterError> {
+        Self::new_with_ingester_lifecycler(
+            cfg,
+            blocks_cfg,
+            ingest_cfg,
+            overrides,
+            instance_ring,
+            lifecycler.map(|l| l as Arc<dyn IngesterLifecycler>),
+            partition_ring_watcher,
+            partition_lifecycler,
+            runtime_cfg,
+            registry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_ingester_lifecycler(
+        cfg: IngesterConfig,
+        blocks_cfg: BlocksStorageConfig,
+        ingest_cfg: IngestStorageConfig,
+        overrides: Overrides,
+        instance_ring: Option<Arc<Ring>>,
+        lifecycler: Option<Arc<dyn IngesterLifecycler>>,
         partition_ring_watcher: Option<Arc<PartitionRingWatcher>>,
         partition_lifecycler: Option<Arc<PartitionInstanceLifecycler>>,
         runtime_cfg: Option<Arc<RuntimeConfigManager>>,
@@ -285,6 +332,7 @@ impl Ingester {
             partition_lifecycler,
             ingest_partition_id,
             ingest_reader: RwLock::new(None),
+            compartments: RwLock::new(CompartmentsConfig::default()),
             bucket,
             limiter,
             owned_series_strategy,
@@ -304,7 +352,21 @@ impl Ingester {
             ignored_series_limit_metrics,
             state: RwLock::new(State::New),
             service_ctx: RwLock::new(None),
+            startup_handle: tokio::sync::Mutex::new(None),
+            lifecycler_svc: Mutex::new(None),
+            partition_lifecycler_svc: Mutex::new(None),
             background_tasks: Mutex::new(Vec::new()),
+            compaction_service_state: AtomicU8::new(State::New as u8),
+            owned_series_service_state: AtomicU8::new(State::New as u8),
+            owned_series_paused: AtomicBool::new(false),
+            metrics_updater_service_state: AtomicU8::new(State::New as u8),
+            metadata_purger_service_state: AtomicU8::new(State::New as u8),
+            head_compaction_interval_while_starting: RwLock::new(Duration::from_secs(30)),
+            head_compaction_interval_jitter_enabled: AtomicBool::new(true),
+            min_compaction_loop_delay: RwLock::new(Duration::from_secs(10)),
+            close_idle_tsdb_interval: RwLock::new(Duration::from_secs(5 * 60)),
+            limit_metrics_update_period: RwLock::new(Duration::from_secs(15)),
+            instance_limits_fn: RwLock::new(None),
             force_compact_tx: RwLock::new(None),
             ship_tx: RwLock::new(None),
             verify_ring_ownership: AtomicBool::new(false),
@@ -313,6 +375,132 @@ impl Ingester {
 
         *weak_slot.lock() = Some(Arc::downgrade(&ingester));
         Ok(ingester)
+    }
+
+    pub fn set_compartments(&self, compartments: CompartmentsConfig) {
+        *self.compartments.write() = compartments;
+    }
+
+    pub fn compartments_config(&self) -> CompartmentsConfig {
+        self.compartments.read().clone()
+    }
+
+    pub fn set_head_compaction_interval_while_starting(&self, d: Duration) {
+        *self.head_compaction_interval_while_starting.write() = d;
+    }
+
+    pub fn head_compaction_interval_while_starting(&self) -> Duration {
+        *self.head_compaction_interval_while_starting.read()
+    }
+
+    pub fn set_head_compaction_interval_jitter_enabled(&self, enabled: bool) {
+        self.head_compaction_interval_jitter_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    pub fn head_compaction_interval_jitter_enabled(&self) -> bool {
+        self.head_compaction_interval_jitter_enabled
+            .load(Ordering::Acquire)
+    }
+
+    pub fn set_min_compaction_loop_delay(&self, d: Duration) {
+        *self.min_compaction_loop_delay.write() = d;
+    }
+
+    pub fn min_compaction_loop_delay(&self) -> Duration {
+        *self.min_compaction_loop_delay.read()
+    }
+
+    pub fn set_close_idle_tsdb_interval(&self, d: Duration) {
+        *self.close_idle_tsdb_interval.write() = d;
+    }
+
+    pub fn close_idle_tsdb_interval(&self) -> Duration {
+        *self.close_idle_tsdb_interval.read()
+    }
+
+    pub fn set_limit_metrics_update_period(&self, d: Duration) {
+        *self.limit_metrics_update_period.write() = d;
+    }
+
+    pub fn limit_metrics_update_period(&self) -> Duration {
+        *self.limit_metrics_update_period.read()
+    }
+
+    pub fn set_instance_limits_fn(
+        &self,
+        f: Arc<dyn Fn() -> Option<InstanceLimits> + Send + Sync>,
+    ) {
+        *self.instance_limits_fn.write() = Some(f);
+    }
+
+    fn state_from_u8(v: u8) -> State {
+        match v {
+            0 => State::New,
+            1 => State::Starting,
+            2 => State::Running,
+            3 => State::Stopping,
+            4 => State::Terminated,
+            _ => State::Failed,
+        }
+    }
+
+    pub fn set_compaction_service_state(&self, s: State) {
+        self.compaction_service_state
+            .store(s as u8, Ordering::Release);
+    }
+
+    pub fn compaction_service_state(&self) -> State {
+        Self::state_from_u8(self.compaction_service_state.load(Ordering::Acquire))
+    }
+
+    pub fn set_owned_series_service_state(&self, s: State) {
+        self.owned_series_service_state
+            .store(s as u8, Ordering::Release);
+    }
+
+    pub fn owned_series_service_state(&self) -> State {
+        Self::state_from_u8(self.owned_series_service_state.load(Ordering::Acquire))
+    }
+
+    pub fn set_owned_series_paused(&self, paused: bool) {
+        self.owned_series_paused.store(paused, Ordering::Release);
+    }
+
+    pub fn is_owned_series_paused(&self) -> bool {
+        self.owned_series_paused.load(Ordering::Acquire)
+    }
+
+    pub fn set_metrics_updater_service_state(&self, s: State) {
+        self.metrics_updater_service_state
+            .store(s as u8, Ordering::Release);
+    }
+
+    pub fn metrics_updater_service_state(&self) -> State {
+        Self::state_from_u8(self.metrics_updater_service_state.load(Ordering::Acquire))
+    }
+
+    pub fn set_metadata_purger_service_state(&self, s: State) {
+        self.metadata_purger_service_state
+            .store(s as u8, Ordering::Release);
+    }
+
+    pub fn metadata_purger_service_state(&self) -> State {
+        Self::state_from_u8(self.metadata_purger_service_state.load(Ordering::Acquire))
+    }
+
+    pub fn lifecycler_service_state(&self) -> State {
+        self.lifecycler_svc
+            .lock()
+            .as_ref()
+            .map_or(State::New, |s| s.state())
+    }
+
+    pub fn partition_lifecycler_service_state(&self) -> State {
+        self.partition_lifecycler_svc
+            .lock()
+            .as_ref()
+            .map_or(State::New, |s| s.state())
     }
 
     #[inline]
@@ -327,6 +515,11 @@ impl Ingester {
     pub fn get_instance_limits(&self) -> Option<InstanceLimits> {
         if self.state() == State::Starting {
             return None;
+        }
+        if let Some(ref f) = *self.instance_limits_fn.read() {
+            if let Some(lim) = f() {
+                return Some(lim);
+            }
         }
         if let Some(ref rt) = self.runtime_cfg {
             if let Some(lim) = rt.ingester_limits() {
@@ -643,9 +836,8 @@ impl Ingester {
         }
     }
 
-    /// Starts the Ingester service, opens existing TSDBs, starts Kafka reader (if enabled),
-    /// lifecyclers, compaction/shipping/metrics loops, and transitions to `State::Running`.
-    pub async fn start(self: &Arc<Self>) -> Result<(), IngesterError> {
+    /// Starts the Ingester service asynchronously, returning immediately while startup progresses.
+    pub async fn start_async(self: &Arc<Self>) -> Result<(), IngesterError> {
         {
             let mut st = self.state.write();
             if *st != State::New {
@@ -659,6 +851,53 @@ impl Ingester {
         let ctx = ServiceContext::background();
         *self.service_ctx.write() = Some(ctx.clone());
 
+        let ing = Arc::clone(self);
+        let handle = tokio::spawn(async move { ing.run_starting(ctx).await });
+        *self.startup_handle.lock().await = Some(handle);
+        Ok(())
+    }
+
+    /// Waits for `start_async` to finish transitioning the Ingester into `State::Running`.
+    pub async fn await_running(&self) -> Result<(), IngesterError> {
+        let handle_opt = self.startup_handle.lock().await.take();
+        if let Some(handle) = handle_opt {
+            match handle.await {
+                Ok(res) => res,
+                Err(e) => Err(IngesterError::Internal {
+                    message: format!("ingester startup task panicked: {e}"),
+                }),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Starts the Ingester service and waits until it reaches `State::Running`.
+    pub async fn start(self: &Arc<Self>) -> Result<(), IngesterError> {
+        self.start_async().await?;
+        self.await_running().await
+    }
+
+    async fn run_starting(self: &Arc<Self>, ctx: ServiceContext) -> Result<(), IngesterError> {
+        let res = self.run_starting_inner(&ctx).await;
+        if let Err(ref _e) = res {
+            // Stop lifecycler if starting failed, matching Go's defer in starting().
+            let lc_svc_opt = self.lifecycler_svc.lock().take();
+            if let Some(svc) = lc_svc_opt {
+                svc.stop_async();
+                let _ = svc.await_terminated().await;
+            }
+            let plc_svc_opt = self.partition_lifecycler_svc.lock().take();
+            if let Some(svc) = plc_svc_opt {
+                svc.stop_async();
+                let _ = svc.await_terminated().await;
+            }
+            *self.state.write() = State::Failed;
+        }
+        res
+    }
+
+    async fn run_starting_inner(self: &Arc<Self>, ctx: &ServiceContext) -> Result<(), IngesterError> {
         let tsdb_dir = PathBuf::from(&self.blocks_cfg.tsdb.dir);
         fs::create_dir_all(&tsdb_dir).map_err(|e| IngesterError::Internal {
             message: format!("failed to create TSDB dir: {e}"),
@@ -672,56 +911,82 @@ impl Ingester {
 
         if let Err(e) = self.open_existing_tsdbs().await {
             self.close_all_tsdbs().await;
-            *self.state.write() = State::Failed;
             return Err(e);
         }
 
-        if let Some(ref strategy) = self.owned_series_strategy {
-            if let Ok(changed) = strategy.check_ring_for_changes() {
-                for user_id in self.get_tsdb_users() {
-                    if let Some(db) = self.get_tsdb(&user_id) {
-                        db.update_owned_series_if_needed(strategy.as_ref(), changed);
+        // Start owned series loop before partition replay and lifecycler.
+        if self.owned_series_strategy.is_some() {
+            if let Some(ref strategy) = self.owned_series_strategy {
+                if let Ok(changed) = strategy.check_ring_for_changes() {
+                    for user_id in self.get_tsdb_users() {
+                        if let Some(db) = self.get_tsdb(&user_id) {
+                            db.update_owned_series_if_needed(strategy.as_ref(), changed);
+                        }
                     }
                 }
             }
+            self.background_tasks
+                .lock()
+                .push(spawn_owned_series_loop(Arc::clone(self), ctx.child()));
         }
 
         let (fc_tx, fc_rx) = mpsc::channel(16);
         *self.force_compact_tx.write() = Some(fc_tx);
-        let (ship_tx, ship_rx) = mpsc::channel(16);
-        *self.ship_tx.write() = Some(ship_tx);
 
-        let mut tasks = Vec::new();
-        tasks.push(spawn_compaction_loop(Arc::clone(self), fc_rx, ctx.child()));
-        tasks.push(spawn_metrics_updater_loop(Arc::clone(self), ctx.child()));
-        tasks.push(spawn_metadata_purger_loop(Arc::clone(self), ctx.child()));
+        // Start compaction, metrics updater, and metadata purger before partition replay.
+        {
+            let mut tasks = self.background_tasks.lock();
+            tasks.push(spawn_compaction_loop(Arc::clone(self), fc_rx, ctx.child()));
+            tasks.push(spawn_metrics_updater_loop(Arc::clone(self), ctx.child()));
+            tasks.push(spawn_metadata_purger_loop(Arc::clone(self), ctx.child()));
+        }
 
-        // Start Kafka ingest storage reader BEFORE lifecycler enters ACTIVE
+        // Start Kafka ingest storage reader BEFORE lifecycler enters ACTIVE.
         if self.ingest_cfg.enabled {
-            let reader = crate::ingest_storage::start_ingest_reader(Arc::clone(self))
-                .await
-                .map_err(|e| IngesterError::Internal {
-                    message: format!("failed to start ingest reader: {e}"),
-                })?;
-            *self.ingest_reader.write() = Some(reader);
+            let reader_fut = crate::ingest_storage::start_ingest_reader(Arc::clone(self));
+            let res = tokio::select! {
+                _ = ctx.canceled() => {
+                    let reader_opt = self.ingest_reader.write().take();
+                    if let Some(r) = reader_opt {
+                        r.stop().await;
+                    }
+                    return Err(IngesterError::Internal {
+                        message: "failed to start partition reader: context canceled".to_string(),
+                    });
+                }
+                r = reader_fut => r,
+            };
+            res.map_err(|e| IngesterError::Internal {
+                message: format!("failed to start ingest reader: {e}"),
+            })?;
         }
 
         if let Some(ref lc) = self.lifecycler {
-            let svc = Arc::clone(lc).into_service();
-            let lc_ctx = ctx.child();
+            let svc = Arc::clone(lc).into_managed_service();
+            *self.lifecycler_svc.lock() = Some(Arc::clone(&svc));
+            let lc_ctx = ServiceContext::background();
             svc.start_async(lc_ctx)
                 .await
                 .map_err(|e| IngesterError::Internal {
                     message: format!("failed to start lifecycler: {e}"),
                 })?;
-            if let Err(e) = svc.await_running().await {
-                return Err(IngesterError::Internal {
-                    message: format!("lifecycler failed to reach running: {e}"),
-                });
+            tokio::select! {
+                _ = ctx.canceled() => {
+                    return Err(IngesterError::Internal {
+                        message: "failed to wait for lifecycler to be running: context canceled".to_string(),
+                    });
+                }
+                r = svc.await_running() => {
+                    if let Err(e) = r {
+                        return Err(IngesterError::Internal {
+                            message: format!("lifecycler failed to reach running: {e}"),
+                        });
+                    }
+                }
             }
             if let Some(ref ring) = self.instance_ring {
-                let deadline = Instant::now() + Duration::from_secs(30);
-                while Instant::now() < deadline {
+                let deadline = Instant::now() + Duration::from_secs(7 * 60);
+                loop {
                     if ring
                         .get_instance_state(&self.cfg.ring.instance_id)
                         .ok()
@@ -729,45 +994,78 @@ impl Ingester {
                     {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    if ctx.is_canceled() || Instant::now() >= deadline {
+                        return Err(IngesterError::Internal {
+                            message: "failed to wait for instance to be active in ring".to_string(),
+                        });
+                    }
+                    tokio::select! {
+                        _ = ctx.canceled() => {
+                            return Err(IngesterError::Internal {
+                                message: "failed to wait for instance to be active in ring: context canceled".to_string(),
+                            });
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
                 }
             }
         }
 
-        if self.blocks_cfg.tsdb.ship_interval.0 > 0 {
-            tasks.push(spawn_shipping_loop(Arc::clone(self), ship_rx, ctx.child()));
-        } else {
-            drop(ship_rx);
-        }
-
-        if self.blocks_cfg.tsdb.close_idle_tsdb_timeout.0 > 0 {
-            tasks.push(spawn_idle_tsdb_loop(Arc::clone(self), ctx.child()));
-        }
-
-        if self.owned_series_strategy.is_some() {
-            tasks.push(spawn_owned_series_loop(Arc::clone(self), ctx.child()));
-        }
-
-        // Start TSDB settings update loop
+        // Start post-lifecycler services (shipping, idle TSDB closer, TSDB settings, partition lifecycler).
         {
-            let ing = Arc::clone(self);
-            let sctx = ctx.child();
-            let period = Duration::from_nanos(
-                self.cfg.tsdb_config_update_period.as_nanos().max(10_000_000) as u64,
-            );
-            tasks.push(tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(period);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        _ = sctx.canceled() => break,
-                        _ = ticker.tick() => ing.apply_tsdb_settings(),
+            let mut tasks = self.background_tasks.lock();
+            if self.blocks_cfg.tsdb.ship_interval.0 > 0 {
+                let (ship_tx, ship_rx) = mpsc::channel(16);
+                *self.ship_tx.write() = Some(ship_tx);
+                tasks.push(spawn_shipping_loop(Arc::clone(self), ship_rx, ctx.child()));
+            }
+
+            if self.blocks_cfg.tsdb.close_idle_tsdb_timeout.0 > 0 {
+                tasks.push(spawn_idle_tsdb_loop(Arc::clone(self), ctx.child()));
+            }
+
+            {
+                let ing = Arc::clone(self);
+                let sctx = ctx.child();
+                let period = Duration::from_nanos(
+                    self.cfg.tsdb_config_update_period.as_nanos().max(10_000_000) as u64,
+                );
+                tasks.push(tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(period);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = sctx.canceled() => break,
+                            _ = ticker.tick() => ing.apply_tsdb_settings(),
+                        }
+                    }
+                }));
+            }
+        }
+
+        if let Some(ref plc) = self.partition_lifecycler {
+            if !plc.is_started() {
+                let psvc = Arc::clone(plc).into_service();
+                *self.partition_lifecycler_svc.lock() = Some(Arc::clone(&psvc));
+                psvc.start_async(ctx.child())
+                    .await
+                    .map_err(|e| IngesterError::Internal {
+                        message: format!("failed to start partition lifecycler: {e}"),
+                    })?;
+                tokio::select! {
+                    _ = ctx.canceled() => {
+                        return Err(IngesterError::Internal {
+                            message: "failed to wait for partition lifecycler: context canceled".to_string(),
+                        });
+                    }
+                    r = psvc.await_running() => {
+                        r.map_err(|e| IngesterError::Internal {
+                            message: format!("partition lifecycler failed to reach running: {e}"),
+                        })?;
                     }
                 }
-            }));
+            }
         }
-
-        *self.background_tasks.lock() = tasks;
 
         if let Some(ref r_cb) = self.circuit_breaker.read {
             r_cb.activate();
@@ -797,46 +1095,75 @@ impl Ingester {
             *st = State::Stopping;
         }
 
-        // 1. Stop Kafka reader first
+        // 1. Stop Kafka reader first so any blocked catchup exits.
         let reader_opt = self.ingest_reader.write().take();
         if let Some(reader) = reader_opt {
             reader.stop().await;
         }
 
-        // 2. Cancel background loops & await tasks
+        // 2. Cancel service context & await startup task (if still starting).
         let ctx_opt = self.service_ctx.write().take();
         if let Some(ctx) = ctx_opt {
             ctx.cancel();
         }
+
+        let startup_res = {
+            let handle_opt = self.startup_handle.lock().await.take();
+            if let Some(handle) = handle_opt {
+                match handle.await {
+                    Ok(r) => r,
+                    Err(e) => Err(IngesterError::Internal {
+                        message: format!("ingester startup task panicked: {e}"),
+                    }),
+                }
+            } else {
+                Ok(())
+            }
+        };
+
+        // 3. Await background loops.
         let tasks = std::mem::take(&mut *self.background_tasks.lock());
         for t in tasks {
             let _ = t.await;
         }
 
-        // 3. Flush if configured via lifecycler / blocks config
-        let should_flush = self
-            .lifecycler
-            .as_ref()
-            .map_or(self.blocks_cfg.tsdb.flush_blocks_on_shutdown, |lc| {
-                lc.flush_on_shutdown()
-            });
-        if should_flush {
-            self.flush().await;
+        // 4. Flush if configured via lifecycler / blocks config (only if startup succeeded).
+        if startup_res.is_ok() {
+            let should_flush = self
+                .lifecycler
+                .as_ref()
+                .map_or(self.blocks_cfg.tsdb.flush_blocks_on_shutdown, |lc| {
+                    lc.flush_on_shutdown()
+                });
+            if should_flush {
+                self.flush().await;
+            }
         }
 
-        // 4. Stop partition lifecycler & classic lifecycler
-        if let Some(ref lc) = self.lifecycler {
-            let svc = Arc::clone(lc).into_service();
+        // 5. Stop partition lifecycler & classic lifecycler.
+        let plc_svc_opt = self.partition_lifecycler_svc.lock().take();
+        if let Some(svc) = plc_svc_opt {
             svc.stop_async();
             let _ = svc.await_terminated().await;
         }
 
-        // 5. Remove shutdown marker
+        let lc_svc_opt = self.lifecycler_svc.lock().take();
+        if let Some(svc) = lc_svc_opt {
+            svc.stop_async();
+            let _ = svc.await_terminated().await;
+        }
+
+        // 6. Remove shutdown marker.
         let marker_path = shutdownmarker::get_path(&self.blocks_cfg.tsdb.dir);
         let _ = shutdownmarker::remove(&marker_path);
 
-        // 6. Close all TSDBs unless KeepUserTSDBOpenOnShutdown
+        // 7. Close all TSDBs.
         self.close_all_tsdbs().await;
+
+        if startup_res.is_err() {
+            *self.state.write() = State::Failed;
+            return startup_res;
+        }
 
         *self.state.write() = State::Terminated;
         Ok(())

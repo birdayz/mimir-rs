@@ -1873,9 +1873,8 @@ impl MultiClusterPartitionReader {
     }
 
     pub async fn start(&self) -> Result<(), ReaderError> {
-        for r in &self.readers {
-            r.start().await?;
-        }
+        let futs = self.readers.iter().map(|r| r.start());
+        try_join_all(futs).await?;
         Ok(())
     }
 
