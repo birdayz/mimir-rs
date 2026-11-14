@@ -400,6 +400,19 @@ impl BucketClient {
         }
     }
 
+    /// Deletes object `name`, returning `BucketError::NotFound` if the object does not exist
+    /// (matching Go `objstore.Bucket.Delete` for strict deletion checks such as `DeleteNoCompactMarker`).
+    pub async fn delete_strict(&self, name: &str) -> Result<(), BucketError> {
+        let path = self.object_path(name)?;
+        match self.store.delete(&path).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => {
+                Err(BucketError::NotFound(name.to_string()))
+            }
+            Err(e) => Err(BucketError::Store(e)),
+        }
+    }
+
     /// Returns object metadata attributes (size and last modified unix seconds).
     pub async fn attributes(&self, name: &str) -> Result<ObjectAttributes, BucketError> {
         let path = self.object_path(name)?;

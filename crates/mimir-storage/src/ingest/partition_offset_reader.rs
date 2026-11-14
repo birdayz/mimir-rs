@@ -24,6 +24,9 @@ use super::partition_offset_client::PartitionOffsetClient;
 pub type FetchOffsetsFn<O> =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<O, String>> + Send>> + Send + Sync>;
 
+pub type GetPartitionIDsFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<i32>, String>> + Send>> + Send + Sync>;
+
 type NextWaiterTx<O> = Arc<Mutex<watch::Sender<Option<(u64, Result<O, String>)>>>>;
 
 /// Generic periodic offset poller supporting `wait_next_fetch_last_produced_offset` and `cached_offset`.
@@ -32,7 +35,7 @@ pub struct GenericOffsetReader<O: Clone + Send + Sync + 'static> {
     poll_interval: Duration,
     last_result: Arc<RwLock<Option<Result<O, String>>>>,
     next_waiter_tx: NextWaiterTx<O>,
-    seq: Arc<std::sync::atomic::AtomicU64>,
+    issued_seq: Arc<std::sync::atomic::AtomicU64>,
     stop_tx: watch::Sender<bool>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -46,7 +49,7 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
             poll_interval: poll_interval.max(Duration::from_millis(10)),
             last_result: Arc::new(RwLock::new(None)),
             next_waiter_tx: Arc::new(Mutex::new(next_waiter_tx)),
-            seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            issued_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stop_tx,
             task: Mutex::new(None),
         }
@@ -64,7 +67,7 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
         let poll_interval = self.poll_interval;
         let last_result = Arc::clone(&self.last_result);
         let next_waiter_tx = Arc::clone(&self.next_waiter_tx);
-        let seq = Arc::clone(&self.seq);
+        let issued_seq = Arc::clone(&self.issued_seq);
         let mut stop_rx = self.stop_tx.subscribe();
 
         let handle = tokio::spawn(async move {
@@ -79,14 +82,14 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
                         }
                     }
                     _ = interval.tick() => {
+                        let req_seq = issued_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         let res = (fetch_fn)().await;
                         if let Err(ref e) = res {
                             warn!(error = %e, "failed to fetch the last produced offset");
                         }
                         *last_result.write() = Some(res.clone());
-                        let next_seq = seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         let tx = next_waiter_tx.lock().await;
-                        let _ = tx.send(Some((next_seq, res)));
+                        let _ = tx.send(Some((req_seq, res)));
                     }
                 }
             }
@@ -95,14 +98,14 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
     }
 
     async fn poll_once(&self) {
+        let req_seq = self.issued_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let res = (self.fetch_fn)().await;
         if let Err(ref e) = res {
             warn!(error = %e, "failed to fetch the last produced offset");
         }
         *self.last_result.write() = Some(res.clone());
-        let next_seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let tx = self.next_waiter_tx.lock().await;
-        let _ = tx.send(Some((next_seq, res)));
+        let _ = tx.send(Some((req_seq, res)));
     }
 
     pub async fn stop(&self) {
@@ -112,9 +115,9 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
         }
     }
 
-    /// Waits for the *next* poll cycle to complete and returns its result.
+    /// Waits for the *next* poll cycle to be issued and complete, and returns its result.
     pub async fn wait_next_fetch_last_produced_offset(&self) -> Result<O, String> {
-        let target_seq = self.seq.load(std::sync::atomic::Ordering::SeqCst) + 1;
+        let target_seq = self.issued_seq.load(std::sync::atomic::Ordering::SeqCst) + 1;
         let mut rx = self.next_waiter_tx.lock().await.subscribe();
         let mut stop_rx = self.stop_tx.subscribe();
 
@@ -222,13 +225,34 @@ impl SingleClusterTopicOffsetsReader {
     pub fn new(client: PartitionOffsetClient, topic: impl Into<String>, poll_interval: Duration) -> Self {
         let topic = topic.into();
         let t = topic.clone();
+        let c = client.clone();
+        let get_pids: GetPartitionIDsFn = Arc::new(move || {
+            let c = c.clone();
+            let t = t.clone();
+            Box::pin(async move {
+                c.list_topic_partition_ids(&t)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        });
+        Self::with_partition_ids(client, topic, get_pids, poll_interval)
+    }
+
+    pub fn with_partition_ids(
+        client: PartitionOffsetClient,
+        topic: impl Into<String>,
+        get_partition_ids: GetPartitionIDsFn,
+        poll_interval: Duration,
+    ) -> Self {
+        let topic = topic.into();
+        let t = topic.clone();
         let c = client;
         let fetch_fn: FetchOffsetsFn<HashMap<i32, i64>> = Arc::new(move || {
             let c = c.clone();
             let t = t.clone();
+            let get_pids = Arc::clone(&get_partition_ids);
             Box::pin(async move {
-                let pids = c
-                    .list_topic_partition_ids(&t)
+                let pids = (get_pids)()
                     .await
                     .map_err(|e| format!("listing partitions of topic {t:?}: {e}"))?;
                 let mut req = HashMap::new();
@@ -268,6 +292,8 @@ impl SingleClusterTopicOffsetsReader {
 /// Multi-cluster topic offsets reader (one `PartitionOffsetClient` per write compartment).
 pub struct MultiClusterOffsetsReader {
     topics: Vec<String>,
+    clients: Vec<PartitionOffsetClient>,
+    close_on_stop: bool,
     generic: GenericOffsetReader<TopicsPartitionsOffsets>,
 }
 
@@ -283,16 +309,58 @@ impl MultiClusterOffsetsReader {
         if topics.is_empty() {
             return Err("at least one topic must be configured".to_string());
         }
+        let c0 = clients[0].clone();
+        let get_pids: Vec<GetPartitionIDsFn> = topics
+            .iter()
+            .map(|t| {
+                let c = c0.clone();
+                let t = t.clone();
+                let f: GetPartitionIDsFn = Arc::new(move || {
+                    let c = c.clone();
+                    let t = t.clone();
+                    Box::pin(async move {
+                        c.list_topic_partition_ids(&t)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                });
+                f
+            })
+            .collect();
+        Self::with_partition_ids(clients, topics, get_pids, poll_interval, false)
+    }
+
+    pub fn with_partition_ids(
+        clients: Vec<PartitionOffsetClient>,
+        topics: Vec<String>,
+        get_partition_ids: Vec<GetPartitionIDsFn>,
+        poll_interval: Duration,
+        close_on_stop: bool,
+    ) -> Result<Self, String> {
+        if clients.is_empty() {
+            return Err("at least one Kafka cluster must be configured".to_string());
+        }
+        if topics.is_empty() {
+            return Err("at least one topic must be configured".to_string());
+        }
+        if topics.len() != get_partition_ids.len() {
+            return Err(format!(
+                "the number of topics ({}) and partition ID functions ({}) must match",
+                topics.len(),
+                get_partition_ids.len()
+            ));
+        }
 
         let topics_cloned = topics.clone();
+        let clients_cloned = clients.clone();
         let fetch_fn: FetchOffsetsFn<TopicsPartitionsOffsets> = Arc::new(move || {
-            let clients = clients.clone();
+            let clients = clients_cloned.clone();
             let topics = topics_cloned.clone();
+            let get_pids = get_partition_ids.clone();
             Box::pin(async move {
                 let mut partitions_by_topic = HashMap::with_capacity(topics.len());
-                for t in &topics {
-                    let pids = clients[0]
-                        .list_topic_partition_ids(t)
+                for (t, f) in topics.iter().zip(get_pids.iter()) {
+                    let pids = (f)()
                         .await
                         .map_err(|e| format!("listing partitions of topic {t:?}: {e}"))?;
                     partitions_by_topic.insert(t.clone(), pids);
@@ -313,8 +381,14 @@ impl MultiClusterOffsetsReader {
 
         Ok(Self {
             topics,
+            clients,
+            close_on_stop,
             generic: GenericOffsetReader::new(fetch_fn, poll_interval),
         })
+    }
+
+    pub fn clients(&self) -> &[PartitionOffsetClient] {
+        &self.clients
     }
 
     pub fn topics(&self) -> &[String] {
@@ -327,6 +401,11 @@ impl MultiClusterOffsetsReader {
 
     pub async fn stop(&self) {
         self.generic.stop().await;
+        if self.close_on_stop {
+            for c in &self.clients {
+                c.close();
+            }
+        }
     }
 
     pub async fn wait_next_fetch_last_produced_offset(

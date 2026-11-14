@@ -346,6 +346,30 @@ impl BlockMeta {
         encoded.push(b'\n');
         Ok(encoded)
     }
+
+    /// Returns true if the block was created from out-of-order samples
+    /// (`Meta.IsOutOfOrder` in `pkg/storage/tsdb/block/meta.go`).
+    pub fn is_out_of_order(&self) -> bool {
+        if self.compaction.from_out_of_order() {
+            return true;
+        }
+        self.thanos
+            .labels
+            .get(OUT_OF_ORDER_EXTERNAL_LABEL)
+            .map(|v| v == OUT_OF_ORDER_EXTERNAL_LABEL_VALUE)
+            .unwrap_or(false)
+    }
+
+    /// Calculates the total size in bytes of all files listed in `thanos.files`
+    /// (`Meta.BlockBytes` in `pkg/storage/tsdb/block/meta.go`).
+    pub fn block_bytes(&self) -> i64 {
+        self.thanos
+            .files
+            .iter()
+            .filter(|f| f.size_bytes > 0)
+            .map(|f| f.size_bytes)
+            .sum()
+    }
 }
 
 /// Ported from `shipperMeta` in `pkg/ingester/shipper.go`.
@@ -749,6 +773,196 @@ pub fn write_shipper_meta_file(dir: &Path, meta: &ShipperMeta) -> Result<(), Shi
     bytes.push(b'\n');
     atomic_write_file(&path, &bytes)?;
     Ok(())
+}
+
+pub const DELETION_MARK_FILENAME: &str = "deletion-mark.json";
+pub const NO_COMPACT_MARK_FILENAME: &str = "no-compact-mark.json";
+pub const DELETION_MARK_VERSION_1: i32 = 1;
+pub const NO_COMPACT_MARK_VERSION_1: i32 = 1;
+
+/// Ported from `block.DeletionMark` in `pkg/storage/tsdb/block/markers.go`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletionMark {
+    #[serde(with = "ulid_serde")]
+    pub id: Ulid,
+    pub version: i32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub details: String,
+    pub deletion_time: i64,
+}
+
+/// Ported from `block.NoCompactReason` in `pkg/storage/tsdb/block/markers.go`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NoCompactReason {
+    Manual,
+    #[serde(rename = "block-index-out-of-order-chunk")]
+    OutOfOrderChunks,
+    Critical,
+    PostingsOffsetTableTooLarge,
+    #[serde(rename = "index-exceeds-64gib")]
+    IndexExceeds64GiB,
+    SymbolTableTooLarge,
+    Preemptive,
+}
+
+/// Ported from `block.NoCompactMark` in `pkg/storage/tsdb/block/markers.go`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoCompactMark {
+    #[serde(with = "ulid_serde")]
+    pub id: Ulid,
+    pub version: i32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub details: String,
+    pub no_compact_time: i64,
+    pub reason: NoCompactReason,
+}
+
+/// Ported from `block.IsBlockDir` in `pkg/storage/tsdb/block/block.go`.
+pub fn is_block_dir(path: &str) -> (Ulid, bool) {
+    let Some(base) = Path::new(path).file_name().and_then(|s| s.to_str()) else {
+        return (Ulid::nil(), false);
+    };
+    match Ulid::from_string(base) {
+        Ok(id) => (id, true),
+        Err(_) => (Ulid::nil(), false),
+    }
+}
+
+/// Ported from `block.Upload` in `pkg/storage/tsdb/block/block.go`.
+/// If `meta` is `None`, reads `meta.json` from `block_dir`.
+/// Local `meta.json` must still exist on disk even when `meta` is supplied.
+pub async fn upload_block(
+    bucket: &BucketClient,
+    block_dir: &Path,
+    meta: Option<BlockMeta>,
+) -> Result<BlockMeta, ShipperError> {
+    let dir_meta = fs::metadata(block_dir)?;
+    if !dir_meta.is_dir() {
+        return Err(ShipperError::InvalidBlockDir(
+            block_dir.display().to_string(),
+        ));
+    }
+    let dir_name = block_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| ShipperError::InvalidBlockDir(block_dir.display().to_string()))?;
+    let _id = Ulid::from_string(dir_name)
+        .map_err(|_| ShipperError::InvalidBlockDir(block_dir.display().to_string()))?;
+
+    let mut meta = match meta {
+        Some(m) => m,
+        None => BlockMeta::read_from_dir(block_dir)?,
+    };
+    upload_block_to_bucket(bucket, block_dir, &mut meta).await?;
+    Ok(meta)
+}
+
+/// Ported from `block.DownloadMeta` in `pkg/storage/tsdb/block/block.go`.
+pub async fn download_meta(bucket: &BucketClient, id: Ulid) -> Result<BlockMeta, ShipperError> {
+    let key = format!("{id}/{META_FILENAME}");
+    let bytes = bucket.download(&key).await?;
+    let meta: BlockMeta = serde_json::from_slice(&bytes)?;
+    Ok(meta)
+}
+
+/// Ported from `block.Delete` in `pkg/storage/tsdb/block/block.go`.
+/// Deletes `meta.json` first, then all other block files, and `deletion-mark.json` last.
+pub async fn delete_block(bucket: &BucketClient, id: Ulid) -> Result<(), BucketError> {
+    let meta_file = format!("{id}/{META_FILENAME}");
+    let deletion_mark_file = format!("{id}/{DELETION_MARK_FILENAME}");
+
+    if bucket.exists(&meta_file).await? {
+        bucket.delete(&meta_file).await?;
+    }
+
+    let keys = bucket.list_all(&id.to_string()).await?;
+    for key in keys {
+        if key == meta_file || key == deletion_mark_file {
+            continue;
+        }
+        bucket.delete(&key).await?;
+    }
+
+    if bucket.exists(&deletion_mark_file).await? {
+        bucket.delete(&deletion_mark_file).await?;
+    }
+
+    Ok(())
+}
+
+/// Ported from `block.MarkForDeletion` in `pkg/storage/tsdb/block/block.go`.
+pub async fn mark_for_deletion(
+    bucket: &BucketClient,
+    id: Ulid,
+    details: &str,
+    marked_for_deletion: Option<&Counter>,
+) -> Result<(), ShipperError> {
+    let marker_file = format!("{id}/{DELETION_MARK_FILENAME}");
+    if bucket.exists(&marker_file).await? {
+        warn!(block = %id, file = %marker_file, "requested to mark for deletion, but file already exists");
+        return Ok(());
+    }
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let mark = DeletionMark {
+        id,
+        version: DELETION_MARK_VERSION_1,
+        details: details.to_string(),
+        deletion_time: now_secs,
+    };
+    let encoded = serde_json::to_vec(&mark)?;
+    bucket.upload(&marker_file, Bytes::from(encoded)).await?;
+    if let Some(c) = marked_for_deletion {
+        c.inc();
+    }
+    Ok(())
+}
+
+/// Ported from `block.MarkForNoCompact` in `pkg/storage/tsdb/block/block.go`.
+pub async fn mark_for_no_compact(
+    bucket: &BucketClient,
+    id: Ulid,
+    reason: NoCompactReason,
+    details: &str,
+    marked_for_no_compact: &[&Counter],
+) -> Result<(), ShipperError> {
+    let marker_file = format!("{id}/{NO_COMPACT_MARK_FILENAME}");
+    if bucket.exists(&marker_file).await? {
+        warn!(block = %id, file = %marker_file, "requested to mark for no compaction, but file already exists");
+        return Ok(());
+    }
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let mark = NoCompactMark {
+        id,
+        version: NO_COMPACT_MARK_VERSION_1,
+        details: details.to_string(),
+        no_compact_time: now_secs,
+        reason,
+    };
+    let encoded = serde_json::to_vec(&mark)?;
+    bucket.upload(&marker_file, Bytes::from(encoded)).await?;
+    for c in marked_for_no_compact {
+        c.inc();
+    }
+    Ok(())
+}
+
+/// Ported from `block.DeleteNoCompactMarker` in `pkg/storage/tsdb/block/block.go`.
+pub async fn delete_no_compact_marker(
+    bucket: &BucketClient,
+    id: Ulid,
+) -> Result<(), BucketError> {
+    let marker_file = format!("{id}/{NO_COMPACT_MARK_FILENAME}");
+    if !bucket.exists(&marker_file).await? {
+        return Err(BucketError::NotFound(marker_file));
+    }
+    bucket.delete_strict(&marker_file).await
 }
 
 pub(crate) fn atomic_write_file(target: &Path, data: &[u8]) -> std::io::Result<()> {
