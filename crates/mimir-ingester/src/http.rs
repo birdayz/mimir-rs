@@ -413,6 +413,9 @@ async fn prepare_instance_ring_downscale_handler(
 }
 
 async fn shutdown_handler(AxumState(st): AxumState<HttpState>) -> Response {
+    st.ingester
+        .flush_on_shutdown
+        .store(true, Ordering::Release);
     if let Some(ref lc) = st.ingester.lifecycler {
         lc.set_flush_on_shutdown(true);
         lc.set_unregister_on_shutdown(true);

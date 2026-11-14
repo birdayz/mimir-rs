@@ -168,19 +168,39 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        self.select_chunks_with_mode(sort_series, matchers, false)
+    }
+
+    /// Queries encoded chunks for all series matching `matchers` in `[mint, maxt]`.
+    /// When `unordered` is true, chunks from Head (in-order + OOO merged) and each Block are
+    /// concatenated without cross-block compaction, matching Prometheus `UnorderedChunkQuerier`.
+    pub fn select_chunks_with_mode(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+        unordered: bool,
+    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
         let blocks = self.effective_blocks(&lock_guard);
         let head = self.effective_head();
 
-        let mut per_series: BTreeMap<Labels, Vec<(ChunkMeta, Vec<Interval>)>> = BTreeMap::new();
+        struct SeriesSources {
+            head: Vec<(ChunkMeta, Vec<Interval>)>,
+            blocks: Vec<(ChunkMeta, Vec<Interval>)>,
+        }
+
+        let mut per_series: BTreeMap<Labels, SeriesSources> = BTreeMap::new();
 
         if let Some(head) = head {
             let refs = head.postings_for_matchers(matchers)?;
             for r in refs {
                 if let Some((labels, chks, tombs)) = head.series_chunks(r, self.mint, self.maxt)? {
-                    let entry = per_series.entry(labels).or_default();
+                    let entry = per_series.entry(labels).or_insert_with(|| SeriesSources {
+                        head: Vec::new(),
+                        blocks: Vec::new(),
+                    });
                     for c in chks {
-                        entry.push((c, tombs.clone()));
+                        entry.head.push((c, tombs.clone()));
                     }
                 }
             }
@@ -209,13 +229,21 @@ impl<'a> TsdbQuerier<'a> {
                     loaded.push((cm, tombs.clone()));
                 }
                 if !loaded.is_empty() {
-                    per_series.entry(labels).or_default().extend(loaded);
+                    let entry = per_series.entry(labels).or_insert_with(|| SeriesSources {
+                        head: Vec::new(),
+                        blocks: Vec::new(),
+                    });
+                    entry.blocks.extend(loaded);
                 }
             }
         }
 
-        let mut out = Vec::with_capacity(per_series.len());
-        for (labels, items) in per_series {
+        let merge_or_collect = |items: Vec<(ChunkMeta, Vec<Interval>)>,
+                                allow_non_overlapping_raw: bool|
+         -> Result<Vec<ChunkMeta>, QuerierError> {
+            if items.is_empty() {
+                return Ok(Vec::new());
+            }
             let mut chks: Vec<ChunkMeta> = Vec::with_capacity(items.len());
             let mut has_tombstones = false;
             for (cm, tombs) in items {
@@ -227,9 +255,7 @@ impl<'a> TsdbQuerier<'a> {
                 }
                 chks.push(cm);
             }
-
             if has_tombstones {
-                // Filter out tombstoned samples cleanly.
                 let mut samples = Vec::new();
                 for cm in &chks {
                     let Some(ref enc) = cm.chunk else {
@@ -244,13 +270,9 @@ impl<'a> TsdbQuerier<'a> {
                 }
                 samples.sort_by_key(|s| s.t);
                 samples.dedup_by_key(|s| s.t);
-                let rebuilt = encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?;
-                if !rebuilt.is_empty() {
-                    out.push(QueryChunkSeries {
-                        labels,
-                        chunks: rebuilt,
-                    });
-                }
+                Ok(encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?)
+            } else if allow_non_overlapping_raw {
+                Ok(chks)
             } else {
                 chks.sort_by_key(|c| (c.min_time, c.max_time));
                 let has_overlap = chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
@@ -269,20 +291,30 @@ impl<'a> TsdbQuerier<'a> {
                     }
                     samples.sort_by_key(|s| s.t);
                     samples.dedup_by_key(|s| s.t);
-                    let rebuilt =
-                        encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?;
-                    if !rebuilt.is_empty() {
-                        out.push(QueryChunkSeries {
-                            labels,
-                            chunks: rebuilt,
-                        });
-                    }
+                    Ok(encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?)
                 } else {
-                    out.push(QueryChunkSeries {
-                        labels,
-                        chunks: chks,
-                    });
+                    Ok(chks)
                 }
+            }
+        };
+
+        let mut out = Vec::with_capacity(per_series.len());
+        for (labels, sources) in per_series {
+            let final_chunks = if unordered {
+                let mut combined = merge_or_collect(sources.head, false)?;
+                let blk_chks = merge_or_collect(sources.blocks, true)?;
+                combined.extend(blk_chks);
+                combined
+            } else {
+                let mut all_items = sources.head;
+                all_items.extend(sources.blocks);
+                merge_or_collect(all_items, false)?
+            };
+            if !final_chunks.is_empty() {
+                out.push(QueryChunkSeries {
+                    labels,
+                    chunks: final_chunks,
+                });
             }
         }
 
@@ -434,12 +466,26 @@ impl<'a> TsdbQuerier<'a> {
 /// Chunk-focused querier alias over [`TsdbQuerier`].
 pub struct TsdbChunkQuerier<'a> {
     inner: TsdbQuerier<'a>,
+    unordered: bool,
 }
 
 impl<'a> TsdbChunkQuerier<'a> {
     pub fn new(head: Option<&'a Head>, blocks: Vec<Arc<Block>>, mint: i64, maxt: i64) -> Self {
         Self {
             inner: TsdbQuerier::new(head, blocks, mint, maxt),
+            unordered: false,
+        }
+    }
+
+    pub fn new_unordered(
+        head: Option<&'a Head>,
+        blocks: Vec<Arc<Block>>,
+        mint: i64,
+        maxt: i64,
+    ) -> Self {
+        Self {
+            inner: TsdbQuerier::new(head, blocks, mint, maxt),
+            unordered: true,
         }
     }
 
@@ -451,6 +497,19 @@ impl<'a> TsdbChunkQuerier<'a> {
     ) -> Self {
         Self {
             inner: TsdbQuerier::with_blocks_lock(head, blocks_lock, mint, maxt),
+            unordered: false,
+        }
+    }
+
+    pub fn with_blocks_lock_unordered(
+        head: Option<&'a Head>,
+        blocks_lock: &'a RwLock<Vec<Arc<Block>>>,
+        mint: i64,
+        maxt: i64,
+    ) -> Self {
+        Self {
+            inner: TsdbQuerier::with_blocks_lock(head, blocks_lock, mint, maxt),
+            unordered: true,
         }
     }
 
@@ -459,7 +518,8 @@ impl<'a> TsdbChunkQuerier<'a> {
         sort_series: bool,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
-        self.inner.select_chunks(sort_series, matchers)
+        self.inner
+            .select_chunks_with_mode(sort_series, matchers, self.unordered)
     }
 
     pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {

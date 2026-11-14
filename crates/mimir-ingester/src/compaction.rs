@@ -117,11 +117,12 @@ impl Ingester {
             let Some(user_db) = self.get_tsdb(&user_id) else {
                 continue;
             };
-            let Some(ref shipper) = user_db.shipper else {
+            let Some(shipper) = user_db.shipper.read().clone() else {
                 continue;
             };
 
-            if user_db.check_deletion_mark(self.bucket.as_deref()).await {
+            let bucket_opt = self.bucket.read().clone();
+            if user_db.check_deletion_mark(bucket_opt.as_deref()).await {
                 continue;
             }
 
@@ -542,7 +543,7 @@ impl Ingester {
         let Some(user_db) = self.get_tsdb(user_id) else {
             return TsdbCloseCheckResult::ShippingDisabled;
         };
-        if user_db.shipper.is_none()
+        if user_db.shipper.read().is_none()
             && !self
                 .blocks_cfg
                 .tsdb
@@ -568,6 +569,7 @@ impl Ingester {
             let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
             return recheck;
         }
+        let tenant_deleted = recheck == TsdbCloseCheckResult::TenantMarkedForDeletion;
 
         let num_series = user_db.db.head().num_series() as i64;
         self.series_count.fetch_sub(num_series, Ordering::Relaxed);
@@ -589,6 +591,7 @@ impl Ingester {
         let _ = user_db.change_state(TsdbState::Closing, TsdbState::Closed);
         self.tsdbs.remove(user_id);
         self.metrics.mem_users.dec();
+        self.tsdb_metrics.remove_registry_for_tenant(user_id);
         self.delete_user_metadata(user_id);
         self.metrics.delete_per_user_metrics(user_id, &tracker_names);
         self.metrics
@@ -599,8 +602,13 @@ impl Ingester {
             return TsdbCloseCheckResult::DataRemovalFailed;
         }
 
-        info!(user = %user_id, "closed idle TSDB");
-        TsdbCloseCheckResult::IdleClosed
+        if tenant_deleted {
+            info!(user = %user_id, "deleted local TSDB, user marked for deletion");
+            TsdbCloseCheckResult::TenantMarkedForDeletion
+        } else {
+            info!(user = %user_id, "closed idle TSDB");
+            TsdbCloseCheckResult::IdleClosed
+        }
     }
 
     pub fn update_active_series_metrics(&self, now: SystemTime) {

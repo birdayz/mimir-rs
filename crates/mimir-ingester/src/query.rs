@@ -361,8 +361,25 @@ pub trait QueryStreamSink: Send + Sync {
 }
 
 impl Ingester {
+    pub fn check_read_overloaded(&self) -> Result<(), IngesterError> {
+        let limiter_opt = self.utilization_based_limiter.read().clone();
+        if let Some(limiter) = limiter_opt {
+            if let Some(reason) = limiter.limiting_reason() {
+                if !reason.is_empty() {
+                    self.metrics
+                        .utilization_limited_requests
+                        .with_label_values(&[&reason])
+                        .inc();
+                    return Err(IngesterError::TooBusy);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn start_read_request(&self, md: &MetadataMap) -> Result<ReadPermit, IngesterError> {
         self.check_available_for_read()?;
+        self.check_read_overloaded()?;
         let started_at = Instant::now();
         let only_replica = is_only_replica_metadata(md);
 
@@ -511,6 +528,11 @@ impl Ingester {
             return Ok(Vec::new());
         };
 
+        let ooo_window = self
+            .overrides
+            .for_tenant(user_id)
+            .out_of_order_time_window
+            .0;
         let mut chunk_series = if self
             .blocks_cfg
             .tsdb
@@ -518,11 +540,12 @@ impl Ingester {
             .index_lookup_planning_enabled
         {
             let planner: Arc<dyn LookupPlanner> = Arc::new(NoopPlanner);
-            let mut planned_cq = PlannedTsdbChunkQuerier::new(
+            let mut planned_cq = PlannedTsdbChunkQuerier::new_with_unordered(
                 Arc::clone(&db.db),
                 req.start_timestamp_ms,
                 req.end_timestamp_ms,
                 planner,
+                ooo_window > 0,
             );
             let select_hints = shard.map(|(shard_index, shard_count)| SelectHints {
                 shard_index,
@@ -579,9 +602,13 @@ impl Ingester {
                 out
             }
         } else {
-            let cq = db
-                .db
-                .chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms);
+            let cq = if ooo_window > 0 {
+                db.db
+                    .unordered_chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms)
+            } else {
+                db.db
+                    .chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms)
+            };
             cq.select(true, &matchers)
                 .map_err(|e| IngesterError::Internal {
                     message: format!("selecting series from ChunkQuerier: {e}"),
@@ -1470,15 +1497,27 @@ pub struct PlannedTsdbChunkQuerier {
     mint: i64,
     maxt: i64,
     planner: Arc<dyn LookupPlanner>,
+    unordered: bool,
 }
 
 impl PlannedTsdbChunkQuerier {
     pub fn new(db: Arc<Tsdb>, mint: i64, maxt: i64, planner: Arc<dyn LookupPlanner>) -> Self {
+        Self::new_with_unordered(db, mint, maxt, planner, false)
+    }
+
+    pub fn new_with_unordered(
+        db: Arc<Tsdb>,
+        mint: i64,
+        maxt: i64,
+        planner: Arc<dyn LookupPlanner>,
+        unordered: bool,
+    ) -> Self {
         Self {
             db,
             mint,
             maxt,
             planner,
+            unordered,
         }
     }
 }
@@ -1506,7 +1545,11 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
             }
         };
 
-        let cq = self.db.chunk_querier(self.mint, self.maxt);
+        let cq = if self.unordered {
+            self.db.unordered_chunk_querier(self.mint, self.maxt)
+        } else {
+            self.db.chunk_querier(self.mint, self.maxt)
+        };
         match cq.select(sort_series, &plan.index_matchers) {
             Ok(series) => {
                 let items = series

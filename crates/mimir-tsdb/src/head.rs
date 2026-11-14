@@ -121,9 +121,11 @@ pub struct HeadOptions {
     pub enable_st_storage: bool,
     pub wal_compression: CompressionType,
     pub wal_segment_size: usize,
+    pub wal_replay_concurrency: usize,
     pub max_head_chunk_file_size: usize,
     pub metadata_limits: MetadataLimits,
     pub series_lifecycle_callback: Option<Arc<dyn SeriesLifecycleCallback>>,
+    pub registry: Option<Arc<prometheus::Registry>>,
 }
 
 impl std::fmt::Debug for HeadOptions {
@@ -139,12 +141,14 @@ impl std::fmt::Debug for HeadOptions {
             .field("enable_st_storage", &self.enable_st_storage)
             .field("wal_compression", &self.wal_compression)
             .field("wal_segment_size", &self.wal_segment_size)
+            .field("wal_replay_concurrency", &self.wal_replay_concurrency)
             .field("max_head_chunk_file_size", &self.max_head_chunk_file_size)
             .field("metadata_limits", &self.metadata_limits)
             .field(
                 "series_lifecycle_callback",
                 &self.series_lifecycle_callback.as_ref().map(|_| "..."),
             )
+            .field("registry", &self.registry.as_ref().map(|_| "..."))
             .finish()
     }
 }
@@ -162,9 +166,11 @@ impl Default for HeadOptions {
             enable_st_storage: false,
             wal_compression: CompressionType::None,
             wal_segment_size: DEFAULT_SEGMENT_SIZE,
+            wal_replay_concurrency: 0,
             max_head_chunk_file_size: MAX_HEAD_CHUNK_FILE_SIZE,
             metadata_limits: MetadataLimits::default(),
             series_lifecycle_callback: None,
+            registry: None,
         }
     }
 }
@@ -1066,6 +1072,9 @@ pub struct Head {
     wal_expiries: Mutex<HashMap<u64, i64>>,
     wbl_pinned_refs: Mutex<HashSet<u64>>,
     lifecycle_callback: RwLock<Option<Arc<dyn SeriesLifecycleCallback>>>,
+    series_gauge: Option<prometheus::Gauge>,
+    series_created_total: Option<prometheus::Counter>,
+    series_removed_total: Option<prometheus::Counter>,
 }
 
 impl Head {
@@ -1094,6 +1103,30 @@ impl Head {
         let _ = delete_temp_checkpoints(&wal_dir);
 
         let lifecycle_cb = opts.series_lifecycle_callback.clone();
+        let (series_gauge, series_created_total, series_removed_total) =
+            if let Some(ref reg) = opts.registry {
+                let g = prometheus::Gauge::new(
+                    "prometheus_tsdb_head_series",
+                    "Total number of series in the head block.",
+                )
+                .expect("valid gauge");
+                let c_created = prometheus::Counter::new(
+                    "prometheus_tsdb_head_series_created_total",
+                    "Total number of series created in the head",
+                )
+                .expect("valid counter");
+                let c_removed = prometheus::Counter::new(
+                    "prometheus_tsdb_head_series_removed_total",
+                    "Total number of series removed in the head",
+                )
+                .expect("valid counter");
+                let _ = reg.register(Box::new(g.clone()));
+                let _ = reg.register(Box::new(c_created.clone()));
+                let _ = reg.register(Box::new(c_removed.clone()));
+                (Some(g), Some(c_created), Some(c_removed))
+            } else {
+                (None, None, None)
+            };
         let head = Self {
             dir: dir.clone(),
             opts: opts.clone(),
@@ -1128,6 +1161,9 @@ impl Head {
             wal_expiries: Mutex::new(HashMap::new()),
             wbl_pinned_refs: Mutex::new(HashSet::new()),
             lifecycle_callback: RwLock::new(lifecycle_cb),
+            series_gauge,
+            series_created_total,
+            series_removed_total,
         };
 
         head.replay_on_open(&wal_dir, &wbl_dir, &chunks_dir)?;
@@ -1946,6 +1982,12 @@ impl Head {
         self.series.insert(Arc::clone(&entry));
         self.postings.add(ref_id, &symbol_labels);
         self.num_series.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref g) = self.series_gauge {
+            g.inc();
+        }
+        if let Some(ref c) = self.series_created_total {
+            c.inc();
+        }
         if let Some(ref cb) = cb_opt {
             cb.post_creation(ref_id, &entry.labels);
         }
@@ -1985,6 +2027,12 @@ impl Head {
         self.series.insert(Arc::clone(&entry));
         self.postings.add(ref_id, &symbol_labels);
         self.num_series.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref g) = self.series_gauge {
+            g.inc();
+        }
+        if let Some(ref c) = self.series_created_total {
+            c.inc();
+        }
         if let Some(ref cb) = *self.lifecycle_callback.read() {
             cb.post_creation(ref_id, &entry.labels);
         }
@@ -2012,7 +2060,14 @@ impl Head {
                 self.update_wal_expiry(e.ref_id, keep_until);
             }
         }
-        self.num_series.fetch_sub(deleted.len() as u64, Ordering::Relaxed);
+        let removed_count = deleted.len();
+        self.num_series.fetch_sub(removed_count as u64, Ordering::Relaxed);
+        if let Some(ref g) = self.series_gauge {
+            g.sub(removed_count as f64);
+        }
+        if let Some(ref c) = self.series_removed_total {
+            c.inc_by(removed_count as f64);
+        }
         self.postings.delete(&deleted, &affected);
         self.tombstones.delete_tombstones(&deleted);
         if let Some(ref cb) = *self.lifecycle_callback.read() {
@@ -2483,8 +2538,8 @@ impl Head {
         }
 
         if actual_mint != i64::MAX && actual_mint > self.min_time() {
+            self.min_time.store(actual_mint, Ordering::Release);
             let clamped = actual_mint.min(self.appendable_min_valid_time());
-            self.min_time.store(clamped, Ordering::Release);
             self.min_valid_time.store(clamped, Ordering::Release);
         }
 

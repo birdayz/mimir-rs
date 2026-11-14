@@ -1942,6 +1942,8 @@ fn open_standalone_user_tsdb(
         None,
         ShipperMetrics::new(Some(&reg)),
         Some(&reg),
+        None,
+        1,
         Arc::new(std::sync::atomic::AtomicI64::new(0)),
         Arc::new(|| 0),
         metrics.rejected.clone(),

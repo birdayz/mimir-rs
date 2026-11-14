@@ -965,6 +965,8 @@ fn test_user_tsdb_update_last_series_removal() {
         None,
         mimir_storage::shipper::ShipperMetrics::new(Some(&reg)),
         Some(&reg),
+        None,
+        1,
         Arc::new(std::sync::atomic::AtomicI64::new(0)),
         Arc::new(|| 0),
         metrics.rejected.clone(),

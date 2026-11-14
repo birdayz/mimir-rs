@@ -54,6 +54,7 @@ pub struct Tsdb {
     head: Head,
     blocks: RwLock<Vec<Arc<Block>>>,
     compact_mtx: Mutex<()>,
+    compactions_total: Option<prometheus::Counter>,
 }
 
 impl Tsdb {
@@ -70,6 +71,16 @@ impl Tsdb {
             .max()
             .unwrap_or(i64::MIN);
 
+        let compactions_total = opts.head.registry.as_ref().map(|reg| {
+            let c = prometheus::Counter::new(
+                "prometheus_tsdb_compactions_total",
+                "Total number of compactions that were executed for the partition.",
+            )
+            .expect("valid counter");
+            let _ = reg.register(Box::new(c.clone()));
+            c
+        });
+
         let head = Head::open(&dir, opts.head.clone(), min_valid_time)?;
 
         Ok(Self {
@@ -78,6 +89,7 @@ impl Tsdb {
             head,
             blocks: RwLock::new(blocks),
             compact_mtx: Mutex::new(()),
+            compactions_total,
         })
     }
 
@@ -181,6 +193,9 @@ impl Tsdb {
         )?;
 
         let uid = if let Some(meta) = meta_opt {
+            if let Some(ref c) = self.compactions_total {
+                c.inc();
+            }
             let reloaded = Self::load_blocks(&self.dir)?;
             let mut blocks_guard = self.blocks.write();
             *blocks_guard = reloaded;
@@ -194,7 +209,6 @@ impl Tsdb {
             }
             None
         };
-
         Ok(uid)
     }
 
@@ -221,6 +235,9 @@ impl Tsdb {
             return Ok(None);
         };
         let uid = meta.ulid;
+        if let Some(ref c) = self.compactions_total {
+            c.inc();
+        }
         let reloaded = Self::load_blocks(&self.dir)?;
         let mut blocks_guard = self.blocks.write();
         *blocks_guard = reloaded;
@@ -254,11 +271,22 @@ impl Tsdb {
             return Ok(None);
         };
         let uid = meta.ulid;
+        if let Some(ref c) = self.compactions_total {
+            c.inc();
+        }
         let reloaded = Self::load_blocks(&self.dir)?;
         let mut blocks_guard = self.blocks.write();
         *blocks_guard = reloaded;
         self.head.evict_series_refs(refs)?;
         Ok(Some(uid))
+    }
+
+    /// Reloads on-disk ULID blocks (e.g., after retention deletion).
+    pub fn reload_blocks(&self) -> Result<(), TsdbError> {
+        let _guard = self.compact_mtx.lock();
+        let reloaded = Self::load_blocks(&self.dir)?;
+        *self.blocks.write() = reloaded;
+        Ok(())
     }
 
     /// Truncates Head memory and WAL older than `mint`.
@@ -276,6 +304,12 @@ impl Tsdb {
     /// Returns a [`TsdbChunkQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
     pub fn chunk_querier(&self, mint: i64, maxt: i64) -> TsdbChunkQuerier<'_> {
         TsdbChunkQuerier::with_blocks_lock(Some(&self.head), &self.blocks, mint, maxt)
+    }
+
+    /// Returns an unordered [`TsdbChunkQuerier`] (concatenating chunks across Head and Blocks
+    /// without cross-block compaction, matching Prometheus `UnorderedChunkQuerier`).
+    pub fn unordered_chunk_querier(&self, mint: i64, maxt: i64) -> TsdbChunkQuerier<'_> {
+        TsdbChunkQuerier::with_blocks_lock_unordered(Some(&self.head), &self.blocks, mint, maxt)
     }
 
     /// Returns the Head's [`CircularExemplarStorage`].

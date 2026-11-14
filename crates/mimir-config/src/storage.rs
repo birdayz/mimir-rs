@@ -1303,6 +1303,12 @@ pub struct TSDBConfig {
     pub timely_head_compaction_enabled: bool,
     pub index_lookup_planning: IndexLookupPlanningConfig,
     pub offset_catalogue: OffsetCatalogueConfig,
+    #[serde(skip)]
+    pub keep_user_tsdb_open_on_shutdown: bool,
+    #[serde(skip)]
+    pub close_idle_tsdb_interval: GoDuration,
+    #[serde(skip)]
+    pub head_compaction_interval_jitter_enabled: bool,
 }
 
 impl Default for TSDBConfig {
@@ -1344,6 +1350,9 @@ impl Default for TSDBConfig {
             timely_head_compaction_enabled: false,
             index_lookup_planning: IndexLookupPlanningConfig::default(),
             offset_catalogue: OffsetCatalogueConfig::default(),
+            keep_user_tsdb_open_on_shutdown: false,
+            close_idle_tsdb_interval: GoDuration::from_secs(5 * 60),
+            head_compaction_interval_jitter_enabled: true,
         }
     }
 }
