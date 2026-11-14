@@ -98,8 +98,10 @@ Unit tests translated by hand are necessary but **never sufficient** — ported 
 
 - **No silent stubs or fake implementations.** Never return `Ok(())` or dummy empty responses for unimplemented behavior to make something "look green". If a target or optional backend is not yet wired in the current milestone, return an explicit error and track it in `PORT_STATUS.md`.
 - **Port upstream tests alongside code.** When porting `pkg/foo/bar.go`, port the test cases from `.ref/mimir/pkg/foo/bar_test.go` in the same task, plus add differential Go-vs-Rust tests for wire/disk formats and hashes.
-- **Verification before completion:** Every task must pass:
-  - `cargo check --workspace --all-targets`
-  - `cargo test --workspace`
-  - `cargo clippy --workspace --all-targets -- -D warnings`
+- **Verification before completion:** Every task must pass (or run `just qa` for the full suite):
+  - `just check` (`cargo check --workspace --all-targets`)
+  - `just lint` (`cargo clippy --workspace --all-targets -- -D warnings`)
+  - `just test` (`cargo test --workspace`)
+  - `just conformance` (`./scripts/build-go-oracle.sh && cargo test -p mimir-conformance`)
+  - `just parity` (`./scripts/verify-test-parity.sh`)
 - **Minimal dependencies, maximum control on hot paths:** Prefer battle-tested crates (`tokio`, `tonic`/`prost`, `hyper`/`axum`, `rdkafka` or pure-Rust Kafka protocol where needed for exact `ListOffsets`/headers control, `object_store`, `prometheus` / custom zero-overhead registry, `xxhash-rust`, `snap`, `zstd`, `lz4_flex`, `flate2`, `memmap2`, `parking_lot`, `dashmap`/`hashbrown`), and hand-roll hot wire codecs (`WriteRequest`, TSDB WAL/chunks/index, memberlist KV framing) wherever generic derive macros add allocations or break Go/gogo wire quirks.
