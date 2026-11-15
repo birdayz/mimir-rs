@@ -628,12 +628,90 @@ impl Ingester {
                 .fetch_sub(req_size, std::sync::atomic::Ordering::AcqRel);
         }
         if let Some(bp) = breaker_permit {
-            bp.finish(started_at.elapsed(), false);
+            let be = res
+                .as_ref()
+                .err()
+                .map(|e| crate::circuit_breaker::BreakerError::Ingester(e.clone()));
+            bp.finish_with_err(started_at.elapsed(), be.as_ref());
+        }
+        res
+    }
+
+    /// Sharded `ingest_storage` batch push entrypoint (`PushToStorageAndReleaseRequest`).
+    pub fn push_to_storage(
+        &self,
+        user_id: &str,
+        req: &cortexpb::WriteRequest,
+    ) -> Result<(), IngesterError> {
+        self.check_available_for_push()?;
+        let started_at = Instant::now();
+        let breaker_permit = self.circuit_breaker.try_acquire_push_permit()?;
+        let track_bytes = self
+            .get_instance_limits()
+            .is_some_and(|il| il.max_inflight_push_requests_bytes > 0);
+        let req_size = if track_bytes {
+            req.encoded_len() as i64
+        } else {
+            0
+        };
+
+        let inflight = self
+            .inflight_push_requests
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let (inflight_bytes, reject_equal) = if req_size > 0 {
+            let b = self
+                .inflight_push_requests_bytes
+                .fetch_add(req_size, std::sync::atomic::Ordering::AcqRel)
+                + req_size;
+            (b, false)
+        } else {
+            (
+                self.inflight_push_requests_bytes
+                    .load(std::sync::atomic::Ordering::Acquire),
+                true,
+            )
+        };
+        if let Err(err) = self.check_instance_limits(inflight, inflight_bytes, reject_equal) {
+            self.inflight_push_requests
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            if req_size > 0 {
+                self.inflight_push_requests_bytes
+                    .fetch_sub(req_size, std::sync::atomic::Ordering::AcqRel);
+            }
+            if let Some(bp) = breaker_permit {
+                bp.finish(started_at.elapsed(), false);
+            }
+            return Err(err);
+        }
+
+        let res = self.push_write_request_sync(user_id, req);
+
+        self.inflight_push_requests
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        if req_size > 0 {
+            self.inflight_push_requests_bytes
+                .fetch_sub(req_size, std::sync::atomic::Ordering::AcqRel);
+        }
+        if let Some(bp) = breaker_permit {
+            let be = res
+                .as_ref()
+                .err()
+                .map(|e| crate::circuit_breaker::BreakerError::Ingester(e.clone()));
+            bp.finish_with_err(started_at.elapsed(), be.as_ref());
         }
         res
     }
 
     pub async fn push_write_request(
+        &self,
+        user_id: &str,
+        req: &cortexpb::WriteRequest,
+    ) -> Result<(), IngesterError> {
+        self.push_write_request_sync(user_id, req)
+    }
+
+    pub fn push_write_request_sync(
         &self,
         user_id: &str,
         req: &cortexpb::WriteRequest,
@@ -768,11 +846,21 @@ impl Ingester {
             return 0;
         }
         let store = self.get_or_create_user_metadata(user_id);
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
         let mut ingested = 0usize;
         let mut failed = 0usize;
         let mut first_err: Option<IngesterError> = None;
         for m in metadata {
-            match store.add(m) {
+            match store.add_parts_at(
+                m.r#type,
+                &m.metric_family_name,
+                &m.help,
+                &m.unit,
+                now_nanos,
+            ) {
                 Ok(()) => ingested += 1,
                 Err(e) => {
                     failed += 1;
@@ -799,16 +887,20 @@ impl Ingester {
             return 0;
         }
         let store = self.get_or_create_user_metadata(user_id);
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
         let mut ingested = 0usize;
         let mut failed = 0usize;
         for bm in req.metadata() {
-            let owned = cortexpb::MetricMetadata {
-                r#type: bm.metric_type,
-                metric_family_name: bm.metric_family_name.to_string(),
-                help: bm.help.to_string(),
-                unit: bm.unit.to_string(),
-            };
-            match store.add(&owned) {
+            match store.add_parts_at(
+                bm.metric_type,
+                bm.metric_family_name,
+                bm.help,
+                bm.unit,
+                now_nanos,
+            ) {
                 Ok(()) => ingested += 1,
                 Err(_) => failed += 1,
             }
