@@ -17,7 +17,7 @@ use crate::head::{Head, HeadError, DEFAULT_SAMPLES_PER_CHUNK};
 use crate::index::IndexError;
 use crate::labels::Labels;
 use crate::matcher::LabelMatcher;
-use crate::postings::{postings_for_matchers, PostingsError};
+use crate::postings::PostingsError;
 use crate::search::{apply_search_hints, SearchError, SearchHints, SearchResult};
 use crate::tombstones::Interval;
 
@@ -188,9 +188,9 @@ impl<'a> TsdbQuerier<'a> {
             let Some(head) = head else {
                 return Ok(Vec::new());
             };
-            let refs = head.postings_for_matchers(matchers)?;
+            let refs = head.postings_for_matchers_arc(matchers)?;
             let mut out = Vec::with_capacity(refs.len());
-            for r in refs {
+            for &r in refs.iter() {
                 if let Some((labels, chks, tombs)) = head.series_chunks(r, self.mint, self.maxt)? {
                     if chks.is_empty() {
                         continue;
@@ -267,8 +267,8 @@ impl<'a> TsdbQuerier<'a> {
         let mut per_series: BTreeMap<Labels, SeriesSources> = BTreeMap::new();
 
         if let Some(head) = head {
-            let refs = head.postings_for_matchers(matchers)?;
-            for r in refs {
+            let refs = head.postings_for_matchers_arc(matchers)?;
+            for &r in refs.iter() {
                 if let Some((labels, chks, tombs)) = head.series_chunks(r, self.mint, self.maxt)? {
                     let entry = per_series.entry(labels).or_insert_with(|| SeriesSources {
                         head: Vec::new(),
@@ -285,8 +285,8 @@ impl<'a> TsdbQuerier<'a> {
             let idx = blk.index();
             let chkr = blk.chunks();
             let tombr = blk.tombstones();
-            let refs = postings_for_matchers(idx, matchers)?;
-            for r in refs {
+            let refs = blk.postings_for_matchers(matchers)?;
+            for &r in refs.iter() {
                 let (labels, chks) = idx.series(r)?;
                 let tombs = tombr.get(r);
                 let mut loaded = Vec::new();
@@ -413,9 +413,9 @@ impl<'a> TsdbQuerier<'a> {
             let Some(head) = head else {
                 return Ok(Vec::new());
             };
-            let refs = head.postings_for_matchers(matchers)?;
+            let refs = head.postings_for_matchers_arc(matchers)?;
             let mut out = Vec::with_capacity(refs.len());
-            for r in refs {
+            for &r in refs.iter() {
                 if let Some(labels) = head.series_has_chunks_in_range(r, self.mint, self.maxt) {
                     out.push(labels);
                 }
@@ -428,8 +428,8 @@ impl<'a> TsdbQuerier<'a> {
 
         let mut set: BTreeSet<Labels> = BTreeSet::new();
         if let Some(head) = head {
-            let refs = head.postings_for_matchers(matchers)?;
-            for r in refs {
+            let refs = head.postings_for_matchers_arc(matchers)?;
+            for &r in refs.iter() {
                 if let Some(labels) = head.series_has_chunks_in_range(r, self.mint, self.maxt) {
                     set.insert(labels);
                 }
@@ -438,8 +438,8 @@ impl<'a> TsdbQuerier<'a> {
         for blk in &blocks {
             let idx = blk.index();
             let tombr = blk.tombstones();
-            let refs = postings_for_matchers(idx, matchers)?;
-            for r in refs {
+            let refs = blk.postings_for_matchers(matchers)?;
+            for &r in refs.iter() {
                 let (labels, chks) = idx.series(r)?;
                 let tombs = tombr.get(r);
                 let any_chunk = chks.iter().any(|cm| {
@@ -473,7 +473,7 @@ impl<'a> TsdbQuerier<'a> {
                     set.insert(name);
                 }
             } else {
-                let refs = postings_for_matchers(idx, matchers)?;
+                let refs = blk.postings_for_matchers(matchers)?;
                 for name in idx.label_names_for(&refs)? {
                     set.insert(name);
                 }
@@ -515,8 +515,8 @@ impl<'a> TsdbQuerier<'a> {
                     set.insert(val);
                 }
             } else {
-                let refs = postings_for_matchers(idx, matchers)?;
-                for r in refs {
+                let refs = blk.postings_for_matchers(matchers)?;
+                for &r in refs.iter() {
                     let lbls = idx.series_labels(r)?;
                     let v = lbls.get(name);
                     if !v.is_empty() {
@@ -560,17 +560,19 @@ impl<'a> TsdbQuerier<'a> {
 
     /// Returns the number of active series in Head (plus series in overlapping blocks if queried).
     pub fn series_count(&self) -> Result<usize, QuerierError> {
+        let lock_guard = self.blocks_lock.map(|l| l.read());
+        let blocks = self.effective_blocks(&lock_guard);
         let mut set: BTreeSet<Labels> = BTreeSet::new();
         if let Some(head) = self.head {
             let all = LabelMatcher::new(crate::matcher::MatchType::RegexMatch, "__name__", ".*")
                 .map_err(PostingsError::from)?;
-            for r in head.postings_for_matchers(&[all])? {
+            for &r in head.postings_for_matchers_arc(&[all])?.iter() {
                 if let Some(l) = head.series_labels(r) {
                     set.insert(l);
                 }
             }
         }
-        for blk in &self.blocks {
+        for blk in &blocks {
             let idx = blk.index();
             for r in idx.postings("", &[""])? {
                 set.insert(idx.series_labels(r)?);

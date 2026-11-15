@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -14,6 +15,9 @@ use ulid::Ulid;
 
 use crate::chunks_block::{BlockChunksError, BlockChunksReader};
 use crate::index::{IndexError, IndexReader, INDEX_FILENAME};
+use crate::matcher::LabelMatcher;
+use crate::postings::{postings_for_matchers, PostingsError};
+use crate::postings_cache::{PostingsForMatchersCache, PostingsForMatchersCacheConfig};
 use crate::tombstones::{read_tombstones_file, MemTombstones, TombstoneError, TOMBSTONES_FILENAME};
 
 pub const META_FILENAME: &str = "meta.json";
@@ -289,6 +293,7 @@ pub struct Block {
     chunks: BlockChunksReader,
     tombstones: MemTombstones,
     total_size: u64,
+    postings_cache: PostingsForMatchersCache,
 }
 
 impl Block {
@@ -316,7 +321,20 @@ impl Block {
             chunks,
             tombstones,
             total_size,
+            postings_cache: PostingsForMatchersCache::new(
+                PostingsForMatchersCacheConfig::default(),
+                None,
+            ),
         })
+    }
+
+    /// Evaluates `matchers` against this block's index using its `PostingsForMatchersCache`.
+    pub fn postings_for_matchers(
+        &self,
+        matchers: &[LabelMatcher],
+    ) -> Result<Arc<[u64]>, PostingsError> {
+        self.postings_cache
+            .get_or_compute(matchers, || postings_for_matchers(&self.index, matchers))
     }
 
     #[inline]

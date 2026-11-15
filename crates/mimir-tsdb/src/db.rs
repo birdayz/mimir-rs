@@ -95,10 +95,41 @@ impl Tsdb {
 
     fn load_blocks(dir: &Path) -> Result<Vec<Arc<Block>>, TsdbError> {
         let dirs = list_block_dirs(dir)?;
+        if dirs.len() <= 1 {
+            let mut blocks = Vec::with_capacity(dirs.len());
+            for (_, bdir) in dirs {
+                let blk = Block::open(&bdir)?;
+                blocks.push(Arc::new(blk));
+            }
+            blocks.sort_by_key(|b| b.min_time());
+            return Ok(blocks);
+        }
+
+        let workers = dirs.len().min(
+            std::thread::available_parallelism()
+                .map_or(4, |n| n.get())
+                .clamp(2, 16),
+        );
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let results: Mutex<Vec<Result<Arc<Block>, BlockError>>> =
+            Mutex::new(Vec::with_capacity(dirs.len()));
+
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((_, ref bdir)) = dirs.get(idx) else {
+                        break;
+                    };
+                    let res = Block::open(bdir).map(Arc::new);
+                    results.lock().push(res);
+                });
+            }
+        });
+
         let mut blocks = Vec::with_capacity(dirs.len());
-        for (_, bdir) in dirs {
-            let blk = Block::open(&bdir)?;
-            blocks.push(Arc::new(blk));
+        for res in results.into_inner() {
+            blocks.push(res?);
         }
         blocks.sort_by_key(|b| b.min_time());
         Ok(blocks)

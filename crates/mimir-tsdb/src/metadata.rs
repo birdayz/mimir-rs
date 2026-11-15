@@ -2,11 +2,13 @@
 //!
 //! Ported from github.com/grafana/mimir/pkg/ingester/user_metrics_metadata.go.
 
-use std::collections::HashMap;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use hashbrown::{HashMap, HashTable};
 use parking_lot::RwLock;
 use thiserror::Error;
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::record::MetricType;
 
@@ -34,6 +36,56 @@ pub struct MetricMetadata {
     pub unit: String,
 }
 
+#[inline]
+fn system_time_to_nanos(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+#[inline]
+fn now_nanos() -> u64 {
+    system_time_to_nanos(SystemTime::now())
+}
+
+#[inline]
+fn metadata_hash(metric_type: MetricType, family: &str, help: &str, unit: &str) -> u64 {
+    let mut h = Xxh3::new();
+    h.update(&[metric_type as u8]);
+    h.update(&(family.len() as u32).to_le_bytes());
+    h.update(family.as_bytes());
+    h.update(&(help.len() as u32).to_le_bytes());
+    h.update(help.as_bytes());
+    h.update(&(unit.len() as u32).to_le_bytes());
+    h.update(unit.as_bytes());
+    h.digest()
+}
+
+#[derive(Debug)]
+struct StoredMetadata {
+    meta: MetricMetadata,
+    last_seen_nanos: AtomicU64,
+}
+
+impl StoredMetadata {
+    #[inline]
+    fn matches(&self, metric_type: MetricType, family: &str, help: &str, unit: &str) -> bool {
+        self.meta.metric_type == metric_type
+            && self.meta.metric_family_name == family
+            && self.meta.help == help
+            && self.meta.unit == unit
+    }
+
+    #[inline]
+    fn hash(&self) -> u64 {
+        metadata_hash(
+            self.meta.metric_type,
+            &self.meta.metric_family_name,
+            &self.meta.help,
+            &self.meta.unit,
+        )
+    }
+}
+
 /// Thread-safe per-tenant metadata store (`userMetricsMetadata`).
 #[derive(Debug, Default)]
 pub struct UserMetricsMetadata {
@@ -42,13 +94,97 @@ pub struct UserMetricsMetadata {
 
 #[derive(Debug, Default)]
 struct UserMetricsMetadataInner {
-    metrics: HashMap<String, HashMap<MetricMetadata, SystemTime>>,
+    metrics: HashMap<String, HashTable<StoredMetadata>>,
     total_entries: usize,
 }
 
 impl UserMetricsMetadata {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Zero-allocation fast-path insert/refresh using borrowed `&str` fields.
+    ///
+    /// Under a shared `RwLock::read()`, checks if `(metric_name, metric_type, help, unit)`
+    /// already exists; if so, atomically updates its last-seen timestamp and returns `Ok(false)`
+    /// with zero `String` allocations and zero write locks. Only acquires `RwLock::write()` when
+    /// inserting a genuinely new entry.
+    pub fn add_str(
+        &self,
+        metric_name: &str,
+        metric_type: MetricType,
+        help: &str,
+        unit: &str,
+        limits: MetadataLimits,
+    ) -> Result<bool, MetadataError> {
+        let now = now_nanos();
+        let hash = metadata_hash(metric_type, metric_name, help, unit);
+
+        {
+            let inner = self.inner.read();
+            if let Some(table) = inner.metrics.get(metric_name) {
+                if let Some(entry) =
+                    table.find(hash, |s| s.matches(metric_type, metric_name, help, unit))
+                {
+                    entry.last_seen_nanos.store(now, Ordering::Relaxed);
+                    return Ok(false);
+                }
+            }
+        }
+
+        let mut inner = self.inner.write();
+        if let Some(table) = inner.metrics.get(metric_name) {
+            if let Some(entry) =
+                table.find(hash, |s| s.matches(metric_type, metric_name, help, unit))
+            {
+                entry.last_seen_nanos.store(now, Ordering::Relaxed);
+                return Ok(false);
+            }
+        }
+
+        if !inner.metrics.contains_key(metric_name)
+            && limits.max_metrics_with_metadata_per_user > 0
+            && inner.metrics.len() >= limits.max_metrics_with_metadata_per_user
+        {
+            return Err(MetadataError::MaxMetricsPerUserReached {
+                limit: limits.max_metrics_with_metadata_per_user,
+            });
+        }
+
+        let existing_count = inner.metrics.get(metric_name).map_or(0, HashTable::len);
+        if limits.max_metadata_per_metric > 0 && existing_count >= limits.max_metadata_per_metric {
+            return Err(MetadataError::MaxMetadataPerMetricReached {
+                limit: limits.max_metadata_per_metric,
+                metric: metric_name.to_string(),
+            });
+        }
+
+        let table = inner.metrics.entry(metric_name.to_string()).or_default();
+        let stored = StoredMetadata {
+            meta: MetricMetadata {
+                metric_type,
+                metric_family_name: metric_name.to_string(),
+                help: help.to_string(),
+                unit: unit.to_string(),
+            },
+            last_seen_nanos: AtomicU64::new(now),
+        };
+        table.insert_unique(hash, stored, StoredMetadata::hash);
+        inner.total_entries += 1;
+        Ok(true)
+    }
+
+    /// Alias for [`Self::add_str`] for callers using borrowed metadata slices.
+    #[inline]
+    pub fn add_borrowed(
+        &self,
+        metric_name: &str,
+        metric_type: MetricType,
+        help: &str,
+        unit: &str,
+        limits: MetadataLimits,
+    ) -> Result<bool, MetadataError> {
+        self.add_str(metric_name, metric_type, help, unit, limits)
     }
 
     /// Inserts or refreshes a metadata entry for `metric_name`, enforcing `limits` when non-zero.
@@ -59,7 +195,32 @@ impl UserMetricsMetadata {
         metadata: MetricMetadata,
         limits: MetadataLimits,
     ) -> Result<bool, MetadataError> {
+        let now = now_nanos();
+        let hash = metadata_hash(
+            metadata.metric_type,
+            &metadata.metric_family_name,
+            &metadata.help,
+            &metadata.unit,
+        );
+
+        {
+            let inner = self.inner.read();
+            if let Some(table) = inner.metrics.get(metric_name) {
+                if let Some(entry) = table.find(hash, |s| s.meta == metadata) {
+                    entry.last_seen_nanos.store(now, Ordering::Relaxed);
+                    return Ok(false);
+                }
+            }
+        }
+
         let mut inner = self.inner.write();
+        if let Some(table) = inner.metrics.get(metric_name) {
+            if let Some(entry) = table.find(hash, |s| s.meta == metadata) {
+                entry.last_seen_nanos.store(now, Ordering::Relaxed);
+                return Ok(false);
+            }
+        }
+
         if !inner.metrics.contains_key(metric_name)
             && limits.max_metrics_with_metadata_per_user > 0
             && inner.metrics.len() >= limits.max_metrics_with_metadata_per_user
@@ -69,31 +230,22 @@ impl UserMetricsMetadata {
             });
         }
 
-        let existing_count = inner.metrics.get(metric_name).map_or(0, |s| s.len());
-        let already_exists = inner
-            .metrics
-            .get(metric_name)
-            .is_some_and(|s| s.contains_key(&metadata));
-
-        if !already_exists
-            && limits.max_metadata_per_metric > 0
-            && existing_count >= limits.max_metadata_per_metric
-        {
+        let existing_count = inner.metrics.get(metric_name).map_or(0, HashTable::len);
+        if limits.max_metadata_per_metric > 0 && existing_count >= limits.max_metadata_per_metric {
             return Err(MetadataError::MaxMetadataPerMetricReached {
                 limit: limits.max_metadata_per_metric,
                 metric: metric_name.to_string(),
             });
         }
 
-        let set = inner
-            .metrics
-            .entry(metric_name.to_string())
-            .or_default();
-        let inserted = set.insert(metadata, SystemTime::now()).is_none();
-        if inserted {
-            inner.total_entries += 1;
-        }
-        Ok(inserted)
+        let table = inner.metrics.entry(metric_name.to_string()).or_default();
+        let stored = StoredMetadata {
+            meta: metadata,
+            last_seen_nanos: AtomicU64::new(now),
+        };
+        table.insert_unique(hash, stored, StoredMetadata::hash);
+        inner.total_entries += 1;
+        Ok(true)
     }
 
     /// Purges all metadata entries whose timestamp is strictly older than `deadline`
@@ -102,16 +254,23 @@ impl UserMetricsMetadata {
         let mut inner = self.inner.write();
         let mut deleted = 0usize;
 
-        inner.metrics.retain(|_, set| {
-            let before = set.len();
-            match deadline {
-                None => set.clear(),
-                Some(dl) => set.retain(|_, ts| *ts >= dl),
+        match deadline {
+            None => {
+                deleted = inner.total_entries;
+                inner.metrics.clear();
+                inner.total_entries = 0;
             }
-            deleted += before - set.len();
-            !set.is_empty()
-        });
-        inner.total_entries = inner.total_entries.saturating_sub(deleted);
+            Some(dl) => {
+                let dl_nanos = system_time_to_nanos(dl);
+                inner.metrics.retain(|_, table| {
+                    let before = table.len();
+                    table.retain(|s| *s.last_seen_nanos.get_mut() >= dl_nanos);
+                    deleted += before - table.len();
+                    !table.is_empty()
+                });
+                inner.total_entries = inner.total_entries.saturating_sub(deleted);
+            }
+        }
         deleted
     }
 
@@ -130,12 +289,12 @@ impl UserMetricsMetadata {
         let inner = self.inner.read();
         let mut out = Vec::new();
 
-        let push_set = |out: &mut Vec<MetricMetadata>, set: &HashMap<MetricMetadata, SystemTime>| {
-            for (per_metric, m) in set.keys().enumerate() {
+        let push_set = |out: &mut Vec<MetricMetadata>, table: &HashTable<StoredMetadata>| {
+            for (per_metric, s) in table.iter().enumerate() {
                 if limit_per_metric > 0 && (per_metric as i32) >= limit_per_metric {
                     break;
                 }
-                out.push(m.clone());
+                out.push(s.meta.clone());
             }
         };
 
@@ -145,8 +304,8 @@ impl UserMetricsMetadata {
                 if limit > 0 && num_metrics >= limit {
                     break;
                 }
-                if let Some(set) = inner.metrics.get(name) {
-                    push_set(&mut out, set);
+                if let Some(table) = inner.metrics.get(name) {
+                    push_set(&mut out, table);
                     num_metrics += 1;
                 }
             }
@@ -154,17 +313,17 @@ impl UserMetricsMetadata {
         }
 
         if !single_metric.is_empty() {
-            if let Some(set) = inner.metrics.get(single_metric) {
-                push_set(&mut out, set);
+            if let Some(table) = inner.metrics.get(single_metric) {
+                push_set(&mut out, table);
             }
             return out;
         }
 
-        for (num_metrics, set) in inner.metrics.values().enumerate() {
+        for (num_metrics, table) in inner.metrics.values().enumerate() {
             if limit > 0 && (num_metrics as i32) >= limit {
                 break;
             }
-            push_set(&mut out, set);
+            push_set(&mut out, table);
         }
         out
     }
@@ -237,5 +396,37 @@ mod tests {
         let future = SystemTime::now() + Duration::from_secs(60);
         assert_eq!(store.purge(Some(future)), 2);
         assert_eq!(store.num_entries(), 0);
+    }
+
+    #[test]
+    fn metadata_add_str_read_lock_refresh_and_purge() {
+        let store = UserMetricsMetadata::new();
+        let limits = MetadataLimits {
+            max_metrics_with_metadata_per_user: 2,
+            max_metadata_per_metric: 2,
+        };
+
+        assert_eq!(
+            store.add_str("http_requests_total", MetricType::Counter, "Total HTTP", "requests", limits),
+            Ok(true)
+        );
+        // Fast-path refresh returns Ok(false) without inserting duplicate
+        assert_eq!(
+            store.add_borrowed("http_requests_total", MetricType::Counter, "Total HTTP", "requests", limits),
+            Ok(false)
+        );
+        assert_eq!(store.num_entries(), 1);
+        assert_eq!(store.num_metrics(), 1);
+
+        // Past deadline keeps refreshed entry
+        let past = SystemTime::now() - Duration::from_secs(60);
+        assert_eq!(store.purge(Some(past)), 0);
+        assert_eq!(store.num_entries(), 1);
+
+        // Future deadline purges it
+        let future = SystemTime::now() + Duration::from_secs(60);
+        assert_eq!(store.purge(Some(future)), 1);
+        assert_eq!(store.num_entries(), 0);
+        assert_eq!(store.num_metrics(), 0);
     }
 }

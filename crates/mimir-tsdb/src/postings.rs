@@ -43,7 +43,8 @@ pub trait PostingsSource {
     ) -> Result<Vec<u64>, PostingsError>;
 }
 
-/// Inverted index mapping `(label_name_id, label_value_id)` -> sorted `Vec<u64>` series refs.
+/// Inverted index mapping `(label_name_id, label_value_id)` -> sorted `Vec<u32>` series refs
+/// (with overflow `Vec<u64>` map only if any explicit ref exceeds `u32::MAX`).
 #[derive(Debug)]
 pub struct MemPostings {
     inner: RwLock<MemPostingsInner>,
@@ -51,7 +52,8 @@ pub struct MemPostings {
 
 #[derive(Debug)]
 struct MemPostingsInner {
-    m: HashMap<SymbolId, HashMap<SymbolId, Vec<u64>>>,
+    m: HashMap<SymbolId, HashMap<SymbolId, Vec<u32>>>,
+    overflow: HashMap<(SymbolId, SymbolId), Vec<u64>>,
     lvs: HashMap<SymbolId, Vec<SymbolId>>,
     ordered: bool,
 }
@@ -77,6 +79,7 @@ impl MemPostings {
         Self {
             inner: RwLock::new(MemPostingsInner {
                 m: HashMap::with_capacity(512),
+                overflow: HashMap::new(),
                 lvs: HashMap::with_capacity(512),
                 ordered,
             }),
@@ -103,6 +106,10 @@ impl MemPostings {
                 list.sort_unstable();
                 list.dedup();
             }
+        }
+        for list in inner.overflow.values_mut() {
+            list.sort_unstable();
+            list.dedup();
         }
         inner.ordered = true;
     }
@@ -137,44 +144,57 @@ impl MemPostings {
     /// Returns a sorted list of all series refs in the index.
     pub fn all_postings(&self) -> Vec<u64> {
         let inner = self.inner.read();
-        inner
-            .m
-            .get(&ALL_POSTINGS_KEY.0)
-            .and_then(|vm| vm.get(&ALL_POSTINGS_KEY.1))
-            .cloned()
-            .unwrap_or_default()
+        inner.pair_to_u64(ALL_POSTINGS_KEY.0, ALL_POSTINGS_KEY.1)
     }
 
     /// Returns sorted postings for `(name_id, value_id)`.
     pub fn postings_for_id(&self, name_id: SymbolId, value_id: SymbolId) -> Vec<u64> {
         let inner = self.inner.read();
-        inner
-            .m
-            .get(&name_id)
-            .and_then(|vm| vm.get(&value_id))
-            .cloned()
-            .unwrap_or_default()
+        inner.pair_to_u64(name_id, value_id)
     }
 
     /// Returns the number of postings for `(name_id, value_id)`.
     pub fn postings_len(&self, name_id: SymbolId, value_id: SymbolId) -> usize {
         let inner = self.inner.read();
-        inner
+        let u32_len = inner
             .m
             .get(&name_id)
             .and_then(|vm| vm.get(&value_id))
-            .map_or(0, Vec::len)
+            .map_or(0, Vec::len);
+        let ov_len = if inner.overflow.is_empty() {
+            0
+        } else {
+            inner
+                .overflow
+                .get(&(name_id, value_id))
+                .map_or(0, Vec::len)
+        };
+        u32_len + ov_len
     }
 
     /// Returns the smallest/first posting ref for `(name_id, value_id)`, if any.
     pub fn first_posting(&self, name_id: SymbolId, value_id: SymbolId) -> Option<u64> {
         let inner = self.inner.read();
-        let list = inner.m.get(&name_id)?.get(&value_id)?;
-        if inner.ordered {
-            list.first().copied()
-        } else {
-            list.iter().copied().min()
+        let list = inner.m.get(&name_id).and_then(|vm| vm.get(&value_id));
+        if let Some(l) = list {
+            if !l.is_empty() {
+                return if inner.ordered {
+                    l.first().map(|&x| x as u64)
+                } else {
+                    l.iter().copied().min().map(|x| x as u64)
+                };
+            }
         }
+        if !inner.overflow.is_empty() {
+            if let Some(ov) = inner.overflow.get(&(name_id, value_id)) {
+                return if inner.ordered {
+                    ov.first().copied()
+                } else {
+                    ov.iter().copied().min()
+                };
+            }
+        }
+        None
     }
 
     /// Appends up to `limit` sample postings refs for `(name_id, value_id)` into `out`.
@@ -189,18 +209,40 @@ impl MemPostings {
             return;
         }
         let inner = self.inner.read();
-        let Some(list) = inner.m.get(&name_id).and_then(|vm| vm.get(&value_id)) else {
-            return;
+        let list = inner
+            .m
+            .get(&name_id)
+            .and_then(|vm| vm.get(&value_id))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let ov = if inner.overflow.is_empty() {
+            &[]
+        } else {
+            inner
+                .overflow
+                .get(&(name_id, value_id))
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
         };
-        if list.is_empty() {
+        let total_len = list.len() + ov.len();
+        if total_len == 0 {
             return;
         }
+        let first_val = if !list.is_empty() {
+            list[0] as u64
+        } else {
+            ov[0]
+        };
         // Sample `limit` entries independently with replacement (matching Go MemPostings.AppendRandomPostingsRefs).
-        let mut seed = (list.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (list[0]);
+        let mut seed = (total_len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ first_val;
         for _ in 0..limit {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let idx = ((seed >> 33) as usize) % list.len();
-            out.push(list[idx]);
+            let idx = ((seed >> 33) as usize) % total_len;
+            if idx < list.len() {
+                out.push(list[idx] as u64);
+            } else {
+                out.push(ov[idx - list.len()]);
+            }
         }
     }
 
@@ -233,12 +275,38 @@ impl MemPostings {
         let Some(vm) = inner.m.get(&name_id) else {
             return Vec::new();
         };
-        let lists: Vec<&[u64]> = value_ids
-            .iter()
-            .filter_map(|vid| vm.get(vid).map(|v| v.as_slice()))
-            .filter(|s| !s.is_empty())
-            .collect();
-        merge_postings(&lists)
+        if inner.overflow.is_empty() {
+            let lists: Vec<&[u32]> = value_ids
+                .iter()
+                .filter_map(|vid| vm.get(vid).map(|v| v.as_slice()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            return merge_postings_u32_to_u64(&lists);
+        }
+        let mut total = 0usize;
+        for vid in value_ids {
+            if let Some(v) = vm.get(vid) {
+                total += v.len();
+            }
+            if let Some(ov) = inner.overflow.get(&(name_id, *vid)) {
+                total += ov.len();
+            }
+        }
+        if total == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(total);
+        for vid in value_ids {
+            if let Some(v) = vm.get(vid) {
+                out.extend(v.iter().map(|&x| x as u64));
+            }
+            if let Some(ov) = inner.overflow.get(&(name_id, *vid)) {
+                out.extend_from_slice(ov);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Returns sorted union of all postings for `name_id`.
@@ -247,12 +315,24 @@ impl MemPostings {
         let Some(vm) = inner.m.get(&name_id) else {
             return Vec::new();
         };
-        let lists: Vec<&[u64]> = vm
-            .values()
-            .map(|v| v.as_slice())
-            .filter(|s| !s.is_empty())
-            .collect();
-        merge_postings(&lists)
+        if inner.overflow.is_empty() {
+            let lists: Vec<&[u32]> = vm
+                .values()
+                .map(|v| v.as_slice())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return merge_postings_u32_to_u64(&lists);
+        }
+        let mut out = Vec::new();
+        for (&vid, v) in vm {
+            out.extend(v.iter().map(|&x| x as u64));
+            if let Some(ov) = inner.overflow.get(&(name_id, vid)) {
+                out.extend_from_slice(ov);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Returns sorted postings for `(name_id, value)` where `pred(value_str)` is true.
@@ -380,6 +460,27 @@ impl MemPostings {
 }
 
 impl MemPostingsInner {
+    fn pair_to_u64(&self, name_id: SymbolId, value_id: SymbolId) -> Vec<u64> {
+        let u32_list = self.m.get(&name_id).and_then(|vm| vm.get(&value_id));
+        let ov_list = if self.overflow.is_empty() {
+            None
+        } else {
+            self.overflow.get(&(name_id, value_id))
+        };
+        let total = u32_list.map_or(0, Vec::len) + ov_list.map_or(0, Vec::len);
+        if total == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(total);
+        if let Some(l) = u32_list {
+            out.extend(l.iter().map(|&x| x as u64));
+        }
+        if let Some(ov) = ov_list {
+            out.extend_from_slice(ov);
+        }
+        out
+    }
+
     fn add_for(&mut self, id: u64, name_id: SymbolId, value_id: SymbolId) {
         let vm = self.m.entry(name_id).or_default();
         let list = match vm.get_mut(&value_id) {
@@ -389,13 +490,25 @@ impl MemPostingsInner {
                 vm.entry(value_id).or_default()
             }
         };
-        list.push(id);
-        if self.ordered && list.len() >= 2 {
-            // Repair tail if out-of-order ID was inserted; usually O(1) break immediately.
-            let mut i = list.len() - 1;
-            while i >= 1 && list[i] < list[i - 1] {
-                list.swap(i, i - 1);
-                i -= 1;
+        if let Ok(id32) = u32::try_from(id) {
+            list.push(id32);
+            if self.ordered && list.len() >= 2 {
+                // Repair tail if out-of-order ID was inserted; usually O(1) break immediately.
+                let mut i = list.len() - 1;
+                while i >= 1 && list[i] < list[i - 1] {
+                    list.swap(i, i - 1);
+                    i -= 1;
+                }
+            }
+        } else {
+            let ov = self.overflow.entry((name_id, value_id)).or_default();
+            ov.push(id);
+            if self.ordered && ov.len() >= 2 {
+                let mut i = ov.len() - 1;
+                while i >= 1 && ov[i] < ov[i - 1] {
+                    ov.swap(i, i - 1);
+                    i -= 1;
+                }
             }
         }
     }
@@ -408,13 +521,41 @@ impl MemPostingsInner {
         let Some(list) = vm.get_mut(&value_id) else {
             return false;
         };
-        list.retain(|id| !deleted.contains(id));
-        if list.is_empty() {
+        list.retain(|&id| !deleted.contains(&(id as u64)));
+        let mut ov_empty = true;
+        if !self.overflow.is_empty() {
+            if let Some(ov) = self.overflow.get_mut(&(name_id, value_id)) {
+                ov.retain(|id| !deleted.contains(id));
+                if ov.is_empty() {
+                    self.overflow.remove(&(name_id, value_id));
+                } else {
+                    ov_empty = false;
+                }
+            }
+        }
+        if list.is_empty() && ov_empty {
             vm.remove(&value_id);
             return true;
         }
         false
     }
+}
+
+fn merge_postings_u32_to_u64(lists: &[&[u32]]) -> Vec<u64> {
+    if lists.is_empty() {
+        return Vec::new();
+    }
+    if lists.len() == 1 {
+        return lists[0].iter().map(|&x| x as u64).collect();
+    }
+    let total: usize = lists.iter().map(|s| s.len()).sum();
+    let mut merged = Vec::with_capacity(total);
+    for s in lists {
+        merged.extend_from_slice(s);
+    }
+    merged.sort_unstable();
+    merged.dedup();
+    merged.into_iter().map(|x| x as u64).collect()
 }
 
 /// Borrowed view pairing [`MemPostings`] with a [`SymbolTable`] to implement [`PostingsSource`].
@@ -789,5 +930,34 @@ mod tests {
         del.insert(2);
         p.delete(&del, s2.as_slice());
         assert_eq!(p.all_postings(), vec![1, 3]);
+    }
+
+    #[test]
+    fn mem_postings_u32_and_u64_overflow_refs() {
+        let mut syms = SymbolTable::new();
+        let p = MemPostings::new_unordered();
+        let big1 = (u32::MAX as u64) + 100;
+        let big2 = (u32::MAX as u64) + 5;
+
+        let s1 = SymbolLabels::from_pairs(&mut syms, [("__name__", "up"), ("job", "a")]);
+        let s2 = SymbolLabels::from_pairs(&mut syms, [("__name__", "up"), ("job", "b")]);
+        let s3 = SymbolLabels::from_pairs(&mut syms, [("__name__", "up"), ("job", "a")]);
+
+        p.add(big1, &s1);
+        p.add(42, &s2);
+        p.add(big2, &s3);
+        p.ensure_order();
+
+        assert_eq!(p.all_postings(), vec![42, big2, big1]);
+        let nid = syms.get("__name__").unwrap();
+        let vid = syms.get("up").unwrap();
+        assert_eq!(p.postings_len(nid, vid), 3);
+        assert_eq!(p.first_posting(nid, vid), Some(42));
+        assert_eq!(p.postings_for_all_values_id(nid), vec![42, big2, big1]);
+
+        let mut del = HashSet::new();
+        del.insert(big2);
+        p.delete(&del, s3.as_slice());
+        assert_eq!(p.all_postings(), vec![42, big1]);
     }
 }

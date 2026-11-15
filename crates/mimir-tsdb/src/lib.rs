@@ -29,6 +29,7 @@ pub mod labels;
 pub mod matcher;
 pub mod metadata;
 pub mod postings;
+pub mod postings_cache;
 pub mod querier;
 pub mod record;
 pub mod search;
