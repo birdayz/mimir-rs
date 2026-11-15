@@ -866,17 +866,13 @@ fn decode_timeseries_rw2(
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
                     let mut p = packed.start;
+                    scratch.labels.reserve((packed.end - p) / 2);
                     while p < packed.end {
-                        let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        scratch.rw2_label_refs.push(r);
-                    }
-                    if !scratch.rw2_label_refs.len().is_multiple_of(2) {
-                        return Err(DecodeError::OddNumberOfLabelRefs);
-                    }
-                    let mut i = 0;
-                    while i < scratch.rw2_label_refs.len() {
-                        let name_idx = scratch.rw2_label_refs[i];
-                        let val_idx = scratch.rw2_label_refs[i + 1];
+                        let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
+                        if p >= packed.end {
+                            return Err(DecodeError::OddNumberOfLabelRefs);
+                        }
+                        let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
                         let name = resolve_symbol_ref(
                             name_idx,
                             symbol_offset,
@@ -897,11 +893,12 @@ fn decode_timeseries_rw2(
                             index: val_idx,
                             offset: symbol_offset,
                         })?;
-                        if name.resolve(input, common_symbols) == b"__name__" {
+                        if metric_name_ref == SliceRef::Empty
+                            && name.resolve(input, common_symbols) == b"__name__"
+                        {
                             metric_name_ref = value;
                         }
                         scratch.labels.push(LabelRefPair { name, value });
-                        i += 2;
                     }
                 } else {
                     return Err(DecodeError::InvalidWireType {
@@ -1886,8 +1883,26 @@ fn read_varint(input: &[u8], pos: &mut usize) -> Result<u64, DecodeError> {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn read_varint_bounded(input: &[u8], pos: &mut usize, end: usize) -> Result<u64, DecodeError> {
+    if *pos < end {
+        let b = input[*pos];
+        if b < 0x80 {
+            *pos += 1;
+            return Ok(b as u64);
+        }
+        return read_varint_bounded_slow(input, pos, end);
+    }
+    Err(DecodeError::UnexpectedEof)
+}
+
+#[cold]
+#[inline(never)]
+fn read_varint_bounded_slow(
+    input: &[u8],
+    pos: &mut usize,
+    end: usize,
+) -> Result<u64, DecodeError> {
     let mut val = 0u64;
     let mut shift = 0u32;
     loop {

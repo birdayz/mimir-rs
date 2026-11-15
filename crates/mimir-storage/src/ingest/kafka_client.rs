@@ -14,10 +14,11 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use mimir_common::thread_pool::ScopedWorkerPool;
 use kafka_protocol::error::{ParseResponseErrorCode, ResponseError};
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::{
@@ -309,6 +310,7 @@ pub struct KafkaClient {
     request_timeout: Duration,
     conns_by_addr: Mutex<HashMap<String, Arc<BrokerConn>>>,
     metadata: RwLock<ClusterMetadata>,
+    decode_pool: OnceLock<ScopedWorkerPool>,
 }
 
 impl KafkaClient {
@@ -330,6 +332,14 @@ impl KafkaClient {
             request_timeout,
             conns_by_addr: Mutex::new(HashMap::new()),
             metadata: RwLock::new(ClusterMetadata::default()),
+            decode_pool: OnceLock::new(),
+        })
+    }
+
+    fn get_decode_pool(&self) -> &ScopedWorkerPool {
+        self.decode_pool.get_or_init(|| {
+            let hw = std::thread::available_parallelism().map_or(4, |n| n.get());
+            ScopedWorkerPool::new("kafka-decode", hw.clamp(2, 8).saturating_sub(1))
         })
     }
 
@@ -680,32 +690,16 @@ impl KafkaClient {
                     return Err(KafkaClientError::Broker(err));
                 }
 
-                let mut decoded_records = Vec::new();
-                if let Some(mut raw_records) = rp.records {
-                    if !raw_records.is_empty() {
-                        let batch = RecordBatchDecoder::decode_with_custom_compression(
-                            &mut raw_records,
-                            Some(decompress_record_batch),
-                        )?;
-                        for rec in batch {
-                            if rec.control || rec.offset < fetch_offset {
-                                continue;
-                            }
-                            let headers = rec
-                                .headers
-                                .into_iter()
-                                .map(|(k, v)| (k.as_str().to_owned(), v.unwrap_or_default()))
-                                .collect();
-                            decoded_records.push(FetchedRecord {
-                                offset: rec.offset,
-                                timestamp_ms: rec.timestamp,
-                                key: rec.key.unwrap_or_default(),
-                                value: rec.value.unwrap_or_default(),
-                                headers,
-                            });
-                        }
+                let decoded_records = match rp.records {
+                    Some(raw_records) if !raw_records.is_empty() => {
+                        decode_fetch_records_parallel(
+                            raw_records,
+                            fetch_offset,
+                            || self.get_decode_pool(),
+                        )?
                     }
-                }
+                    _ => Vec::new(),
+                };
 
                 return Ok(FetchPartitionResult {
                     high_watermark: rp.high_watermark,
@@ -953,5 +947,182 @@ impl KafkaClient {
             }
         }
         Ok(None)
+    }
+}
+
+fn split_record_batch_v2_frames(raw: &Bytes) -> Option<Vec<Bytes>> {
+    let mut frames = Vec::new();
+    let mut pos = 0usize;
+    let total = raw.len();
+    while pos < total {
+        if pos + 17 > total {
+            return None;
+        }
+        if raw[pos + 16] != 2 {
+            return None;
+        }
+        let batch_len =
+            i32::from_be_bytes([raw[pos + 8], raw[pos + 9], raw[pos + 10], raw[pos + 11]]);
+        if batch_len < 49 {
+            return None;
+        }
+        let frame_len = 12usize.checked_add(batch_len as usize)?;
+        if pos + frame_len > total {
+            return None;
+        }
+        frames.push(raw.slice(pos..pos + frame_len));
+        pos += frame_len;
+    }
+    Some(frames)
+}
+
+fn decode_single_batch_slice(
+    mut slice: Bytes,
+    fetch_offset: i64,
+) -> Result<Vec<FetchedRecord>, KafkaClientError> {
+    let batch =
+        RecordBatchDecoder::decode_with_custom_compression(&mut slice, Some(decompress_record_batch))?;
+    let mut out = Vec::with_capacity(batch.len());
+    for rec in batch {
+        if rec.control || rec.offset < fetch_offset {
+            continue;
+        }
+        let headers = rec
+            .headers
+            .into_iter()
+            .map(|(k, v)| (k.as_str().to_owned(), v.unwrap_or_default()))
+            .collect();
+        out.push(FetchedRecord {
+            offset: rec.offset,
+            timestamp_ms: rec.timestamp,
+            key: rec.key.unwrap_or_default(),
+            value: rec.value.unwrap_or_default(),
+            headers,
+        });
+    }
+    Ok(out)
+}
+
+fn decode_fetch_records_parallel<'a>(
+    mut raw_records: Bytes,
+    fetch_offset: i64,
+    get_pool: impl FnOnce() -> &'a ScopedWorkerPool,
+) -> Result<Vec<FetchedRecord>, KafkaClientError> {
+    if let Some(frames) = split_record_batch_v2_frames(&raw_records) {
+        if frames.len() > 1 {
+            let pool = get_pool();
+            type BatchDecodeSlot =
+                parking_lot::Mutex<Option<Result<Vec<FetchedRecord>, KafkaClientError>>>;
+            let slots: Vec<BatchDecodeSlot> =
+                (0..frames.len()).map(|_| parking_lot::Mutex::new(None)).collect();
+            let run = || {
+                pool.scoped_execute(frames.len(), |idx| {
+                    let res = decode_single_batch_slice(frames[idx].clone(), fetch_offset);
+                    *slots[idx].lock() = Some(res);
+                });
+            };
+            if tokio::runtime::Handle::try_current()
+                .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            {
+                tokio::task::block_in_place(run);
+            } else {
+                run();
+            }
+            let mut decoded = Vec::new();
+            for slot in slots {
+                let recs = slot
+                    .into_inner()
+                    .expect("parallel batch slot populated")?;
+                if decoded.is_empty() {
+                    decoded = recs;
+                } else {
+                    decoded.extend(recs);
+                }
+            }
+            return Ok(decoded);
+        }
+        if frames.len() == 1 {
+            return decode_single_batch_slice(
+                frames.into_iter().next().unwrap(),
+                fetch_offset,
+            );
+        }
+        return Ok(Vec::new());
+    }
+
+    let batch = RecordBatchDecoder::decode_with_custom_compression(
+        &mut raw_records,
+        Some(decompress_record_batch),
+    )?;
+    let mut decoded_records = Vec::with_capacity(batch.len());
+    for rec in batch {
+        if rec.control || rec.offset < fetch_offset {
+            continue;
+        }
+        let headers = rec
+            .headers
+            .into_iter()
+            .map(|(k, v)| (k.as_str().to_owned(), v.unwrap_or_default()))
+            .collect();
+        decoded_records.push(FetchedRecord {
+            offset: rec.offset,
+            timestamp_ms: rec.timestamp,
+            key: rec.key.unwrap_or_default(),
+            value: rec.value.unwrap_or_default(),
+            headers,
+        });
+    }
+    Ok(decoded_records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kafka_protocol::records::Compression;
+
+    #[test]
+    fn parallel_multi_batch_zstd_decode_matches_sequential() {
+        let mut combined = BytesMut::new();
+        for batch_idx in 0..4i64 {
+            let mut records = Vec::new();
+            for i in 0..5i64 {
+                let offset = batch_idx * 5 + i;
+                let mut headers = IndexMap::new();
+                headers.insert(StrBytes::from_static_str("v"), Some(Bytes::from_static(b"2")));
+                records.push(Record {
+                    transactional: false,
+                    control: false,
+                    partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                    producer_id: NO_PRODUCER_ID,
+                    producer_epoch: NO_PRODUCER_EPOCH,
+                    timestamp_type: TimestampType::Creation,
+                    offset,
+                    sequence: NO_SEQUENCE,
+                    timestamp: 1_700_000_000_000 + offset,
+                    key: Some(Bytes::from(format!("tenant-{}", offset % 2))),
+                    value: Some(Bytes::from(format!("payload-{offset}-repeated-repeated-data"))),
+                    headers,
+                });
+            }
+            let opts = RecordEncodeOptions {
+                version: 2,
+                compression: Compression::Zstd,
+            };
+            RecordBatchEncoder::encode_with_custom_compression(
+                &mut combined,
+                records.iter(),
+                &opts,
+                Some(compress_record_batch),
+            )
+            .unwrap();
+        }
+
+        let raw = combined.freeze();
+        let pool = ScopedWorkerPool::new("test-kafka-dec", 3);
+        let decoded = decode_fetch_records_parallel(raw, 3, || &pool).unwrap();
+        assert_eq!(decoded.len(), 17);
+        assert_eq!(decoded[0].offset, 3);
+        assert_eq!(decoded[0].value, Bytes::from_static(b"payload-3-repeated-repeated-data"));
+        assert_eq!(decoded.last().unwrap().offset, 19);
     }
 }

@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mimir_common::thread_pool::ScopedWorkerPool;
 use mimir_config::KafkaConfig;
 use mimir_proto::cortexpb::{self, ErrorCause};
 use mimir_proto::ringpb::PartitionRingDesc;
@@ -281,6 +282,22 @@ impl Drop for ArenaPoolGuard<'_> {
     }
 }
 
+struct MutSlicePtr<T>(*mut T);
+
+impl<T> MutSlicePtr<T> {
+    /// SAFETY: caller must ensure `idx` is in-bounds and no two threads concurrently
+    /// call `get(idx)` with the same `idx`.
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self, idx: usize) -> &mut T {
+        &mut *self.0.add(idx)
+    }
+}
+
+// SAFETY: callers only access disjoint indices `idx` across worker jobs.
+unsafe impl<T: Send> Send for MutSlicePtr<T> {}
+unsafe impl<T: Send> Sync for MutSlicePtr<T> {}
+
 /// Zero-allocation, pre-hashed, two-phase scoped-parallel Kafka `ingest_storage` consumer.
 ///
 /// Phase A: parallel decode (`BorrowedWriteRequest`) + metadata + single `xxh64` hash +
@@ -293,6 +310,7 @@ pub struct IngesterShardedBatchConsumer {
     metrics: PusherConsumerMetrics,
     error_handler: Arc<PushErrorHandler>,
     arena_pool: Mutex<Vec<WorkerArena>>,
+    worker_pool: ScopedWorkerPool,
 }
 
 impl IngesterShardedBatchConsumer {
@@ -313,12 +331,22 @@ impl IngesterShardedBatchConsumer {
             sampler,
             None,
         ));
+        let hw_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let max_shards = if kafka_cfg.ingestion_concurrency_max <= 0 {
+            1
+        } else {
+            let max_s = kafka_cfg.ingestion_concurrency_max as usize;
+            (1usize << (usize::BITS - 1 - max_s.leading_zeros())).clamp(1, 16)
+        };
+        let pool_threads = hw_threads.min(8).max(max_shards).saturating_sub(1);
+        let worker_pool = ScopedWorkerPool::new("ingest-batch", pool_threads);
         Self {
             ingester,
             kafka_cfg,
             metrics,
             error_handler,
             arena_pool: Mutex::new(Vec::new()),
+            worker_pool,
         }
     }
 
@@ -512,11 +540,13 @@ impl IngesterShardedBatchConsumer {
 
                 for ts in borrowed.timeseries() {
                     let pairs_start = pairs_mut.len() as u32;
+                    let ts_labels = ts.labels();
+                    pairs_mut.reserve(ts_labels.len());
                     let mut labels_sorted_unique = true;
                     let mut bad_utf8 = false;
                     let mut prev_name: Option<&str> = None;
 
-                    for lp in ts.labels() {
+                    for lp in ts_labels {
                         let Ok(k) = fast_utf8_str(lp.name) else {
                             bad_utf8 = true;
                             break;
@@ -615,21 +645,20 @@ impl IngesterShardedBatchConsumer {
             decode_worker(0, 0, records, &rec_tenant_idx, &mut pool_guard.arenas[0]);
         } else {
             let chunk_size = records.len().div_ceil(num_workers);
-            std::thread::scope(|scope| {
-                let mut rem_records = records;
-                let mut rem_tids = rec_tenant_idx.as_slice();
-                let mut offset = 0usize;
-                for (w_idx, arena) in pool_guard.arenas.iter_mut().enumerate() {
-                    let take = chunk_size.min(rem_records.len());
-                    let (r_head, r_tail) = rem_records.split_at(take);
-                    let (t_head, t_tail) = rem_tids.split_at(take);
-                    rem_records = r_tail;
-                    rem_tids = t_tail;
-                    scope.spawn(move || {
-                        decode_worker(w_idx, offset, r_head, t_head, arena);
-                    });
-                    offset += take;
-                }
+            let arenas_ptr = MutSlicePtr(pool_guard.arenas.as_mut_ptr());
+            self.worker_pool.scoped_execute(num_workers, |w_idx| {
+                let start = (w_idx * chunk_size).min(records.len());
+                let end = (start + chunk_size).min(records.len());
+                // SAFETY: `w_idx < num_workers == pool_guard.arenas.len()`, and each `w_idx`
+                // executes at most once so `&mut arenas[w_idx]` is exclusive.
+                let arena = unsafe { arenas_ptr.get(w_idx) };
+                decode_worker(
+                    w_idx,
+                    start,
+                    &records[start..end],
+                    &rec_tenant_idx[start..end],
+                    arena,
+                );
             });
         }
 
@@ -807,14 +836,15 @@ impl IngesterShardedBatchConsumer {
                 }
             }
         } else {
-            let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..num_shards)
-                    .map(|s| scope.spawn(move || run_shard(s)))
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            let shard_errs: SmallVec<[Mutex<Option<String>>; 16]> =
+                (0..num_shards).map(|_| Mutex::new(None)).collect();
+            self.worker_pool.scoped_execute(num_shards, |s| {
+                if let Err(e) = run_shard(s) {
+                    *shard_errs[s].lock() = Some(e);
+                }
             });
-            for res in results {
-                if let Err(e) = res {
+            for slot in shard_errs {
+                if let Some(e) = slot.into_inner() {
                     first_err = Some(e);
                     break;
                 }

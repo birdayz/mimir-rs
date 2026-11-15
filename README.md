@@ -61,21 +61,21 @@ Measured via `just bench-vs-go` (`100k` float + `2k` histogram series, 5 tenants
 
 | Phase / Metric | Go `go-mimir` | Rust `mimir-rs` | Improvement (Go vs Rust) |
 |----------------|---------------|-----------------|--------------------------|
-| Pure write-only steady CPU (`--no-reads`) | 5.00 µs/sample | 3.15 µs/sample | **1.59x** (**37.0% less CPU**) |
-| Pure write-only Kafka proc p50 / p99 | 20.59 ms / 92.50 ms | 2.84 ms / 19.03 ms | **7.25x** p50 / **4.86x** p99 |
-| Phase 1 Catch-up (`2.4M` samples, reads ON) | 13.02 s (34.62 s CPU) | 11.42 s (23.56 s CPU) | **1.14x** faster (**1.47x** less CPU) |
-| Phase 1 `RssAnon` | 2,898.3 MiB (1,520 B/series) | 2,054.7 MiB (1,077 B/series) | **1.41x** (**29.1% less heap**) |
-| Phase 2 Steady CPU (reads ON) | 6.60 µs/sample | 3.75 µs/sample | **1.76x** (**43.1% less CPU**) |
-| Phase 2 Steady `RssAnon` | 5,336.8 MiB (2,664 B/series) | 2,370.7 MiB (1,189 B/series) | **2.25x** (**55.6% less heap RAM**) |
-| `QueryStream` small (`~7 series`) p50 / p99 | 0.58 ms / 2.76 ms | 0.48 ms / 1.11 ms | **1.21x** p50 / **2.47x** p99 |
-| `QueryStream` heavy (`~28k series`) p50 / p99 | 668.94 ms / 800.07 ms | 259.68 ms / 277.39 ms | **2.58x** p50 / **2.88x** p99 |
-| `LabelNamesAndValues` p50 | 1,775.54 ms | 681.27 ms | **2.61x** faster |
-| `LabelValuesCardinality` p50 | 817.79 ms | 157.89 ms | **5.18x** faster |
-| Phase 3 Head Compaction wall | 36.93 s | 27.96 s | **1.32x** faster |
-| Phase 3 Peak `RssAnon` (sawtooth) | 6,667.8 MiB (+1,331.0 MiB) | 2,500.1 MiB (+129.4 MiB) | **2.67x** (**62.5% less peak RAM**) |
-| Phase 4 `SIGKILL` `/ready` / `0-lag` catch-up | 14.94 s / 33.79 s | 14.50 s / 25.80 s | **1.03x** `/ready` / **1.31x** catch-up |
+| Pure write-only steady CPU (`--no-reads`) | 5.01 µs/sample | 2.87 µs/sample | **1.75x** (**42.7% less CPU**) |
+| Pure write-only Kafka proc p50 / p99 | 36.21 ms / 99.88 ms | 2.88 ms / 21.25 ms | **12.57x** p50 / **4.70x** p99 |
+| Phase 1 Catch-up (`2.4M` samples, reads ON) | 14.69 s (37.87 s CPU) | 12.11 s (24.42 s CPU) | **1.21x** faster (**1.55x** less CPU) |
+| Phase 1 `RssAnon` | 2,883.7 MiB (1,512 B/series) | 2,124.2 MiB (1,114 B/series) | **1.36x** (**26.3% less heap**) |
+| Phase 2 Steady CPU (reads ON) | 7.24 µs/sample | 3.54 µs/sample | **2.04x** (**51.0% less CPU**) |
+| Phase 2 Steady `RssAnon` | 5,312.1 MiB (2,651 B/series) | 2,437.1 MiB (1,222 B/series) | **2.18x** (**54.1% less heap RAM**) |
+| `QueryStream` small (`~7 series`) p50 / p99 | 0.62 ms / 1.19 ms | 0.49 ms / 1.34 ms | **1.27x** p50 / 0.89x p99 |
+| `QueryStream` heavy (`~28k series`) p50 / p99 | 717.79 ms / 876.88 ms | 263.42 ms / 271.71 ms | **2.72x** p50 / **3.23x** p99 |
+| `LabelNamesAndValues` p50 | 1,857.62 ms | 690.10 ms | **2.69x** faster |
+| `LabelValuesCardinality` p50 | 866.18 ms | 176.62 ms | **4.90x** faster |
+| Phase 3 Head Compaction wall | 40.91 s | 28.16 s | **1.45x** faster |
+| Phase 3 Peak `RssAnon` (sawtooth) | 6,730.1 MiB (+1,417.9 MiB) | 2,570.3 MiB (+133.1 MiB) | **2.62x** (**61.8% less peak RAM**) |
+| Phase 4 `SIGKILL` `/ready` / `0-lag` catch-up | 15.98 s / 37.62 s | 15.15 s / 28.25 s | **1.05x** `/ready` / **1.33x** catch-up |
 
-Go `/debug/pprof/heap -inuse_space` after Phase 1 preload (`2M` series): `1,505.34 MB` live heap vs `2,898.3 MiB` OS `RssAnon` (`~1,393 MiB` `GOGC=100` headroom; climbs to `5,336.8 MiB` in steady state).
+Go `/debug/pprof/heap -inuse_space` after Phase 1 preload (`2M` series): `1,493.18 MB` live heap vs `2,883.7 MiB` OS `RssAnon` (`~1,390.5 MiB` `GOGC=100` GC headroom; climbs to `5,312.1 MiB` in steady state).
 
 ## Quickstart
 

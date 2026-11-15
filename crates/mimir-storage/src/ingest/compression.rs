@@ -3,6 +3,7 @@
 //! Ported from github.com/twmb/franz-go/pkg/kgo/compression.go
 //! and Apache Kafka RecordBatch compression spec.
 
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::str::FromStr;
 
@@ -144,13 +145,29 @@ pub fn decompress_record_batch(
                 .context("lz4 decompress record batch")?;
             Ok(Bytes::from(out))
         }
-        Compression::Zstd => {
-            let mut out = Vec::with_capacity(raw.len() * 2);
-            zstd::stream::copy_decode(&raw[..], &mut out)
-                .context("zstd decompress record batch")?;
-            Ok(Bytes::from(out))
+        Compression::Zstd => decompress_zstd(&raw),
+    }
+}
+
+thread_local! {
+    static ZSTD_DECOMPRESSOR: RefCell<zstd::bulk::Decompressor<'static>> =
+        RefCell::new(zstd::bulk::Decompressor::default());
+}
+
+fn decompress_zstd(raw: &[u8]) -> Result<Bytes> {
+    if let Ok(Some(sz)) = zstd::zstd_safe::get_frame_content_size(raw) {
+        if sz <= 64 * 1024 * 1024 {
+            let mut out = Vec::with_capacity(sz as usize);
+            let bulk_res = ZSTD_DECOMPRESSOR
+                .with(|dec| dec.borrow_mut().decompress_to_buffer(raw, &mut out));
+            if bulk_res.is_ok() {
+                return Ok(Bytes::from(out));
+            }
         }
     }
+    let mut out = Vec::with_capacity(raw.len().saturating_mul(3));
+    zstd::stream::copy_decode(raw, &mut out).context("zstd decompress record batch")?;
+    Ok(Bytes::from(out))
 }
 
 fn decompress_snappy(src: &[u8]) -> Result<Bytes> {

@@ -40,3 +40,6 @@ tempfile = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+pprof = "0.14"

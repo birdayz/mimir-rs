@@ -233,27 +233,45 @@ impl Labels {
     /// Returns `true` if `self` has the exact same sorted `(name, value)` pairs.
     #[inline]
     pub fn eq_sorted_pairs(&self, pairs: &[(&str, &str)]) -> bool {
+        let data = &self.data;
+        let len = data.len();
         let mut pos = 0usize;
-        let len = self.data.len();
         for &(k, v) in pairs {
-            if pos >= len {
-                return false;
+            let kb = k.as_bytes();
+            let vb = v.as_bytes();
+            if kb.len() < 255 && vb.len() < 255 {
+                let need = 2 + kb.len() + vb.len();
+                if pos + need > len {
+                    return false;
+                }
+                let kstart = pos + 1;
+                let kend = kstart + kb.len();
+                if data[pos] != kb.len() as u8 || data[kend] != vb.len() as u8 {
+                    return false;
+                }
+                if &data[kstart..kend] != kb {
+                    return false;
+                }
+                let vstart = kend + 1;
+                let vend = vstart + vb.len();
+                if &data[vstart..vend] != vb {
+                    return false;
+                }
+                pos = vend;
+            } else {
+                if pos >= len {
+                    return false;
+                }
+                let (nlen, nstart) = decode_stringlabel_size(data, pos);
+                if nstart + nlen > len || &data[nstart..nstart + nlen] != kb {
+                    return false;
+                }
+                let (vlen, vstart) = decode_stringlabel_size(data, nstart + nlen);
+                if vstart + vlen > len || &data[vstart..vstart + vlen] != vb {
+                    return false;
+                }
+                pos = vstart + vlen;
             }
-            let (nlen, nstart) = decode_stringlabel_size(&self.data, pos);
-            if nstart + nlen > len {
-                return false;
-            }
-            if &self.data[nstart..nstart + nlen] != k.as_bytes() {
-                return false;
-            }
-            let (vlen, vstart) = decode_stringlabel_size(&self.data, nstart + nlen);
-            if vstart + vlen > len {
-                return false;
-            }
-            if &self.data[vstart..vstart + vlen] != v.as_bytes() {
-                return false;
-            }
-            pos = vstart + vlen;
         }
         pos == len
     }

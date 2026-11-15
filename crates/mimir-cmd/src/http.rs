@@ -51,7 +51,8 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         .route("/api/v1/user_limits", get(user_limits_handler))
         .route("/api/v1/status/buildinfo", get(buildinfo_handler))
         .route("/api/v1/status/config", get(status_config_handler))
-        .route("/api/v1/status/flags", get(status_flags_handler));
+        .route("/api/v1/status/flags", get(status_flags_handler))
+        .route("/debug/pprof/profile", get(pprof_profile_handler));
 
     let has_prefix = !path_prefix.is_empty() && path_prefix != "/";
     if !has_prefix {
@@ -670,4 +671,127 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[derive(Deserialize)]
+struct PprofQuery {
+    seconds: Option<u64>,
+    frequency: Option<i32>,
+    format: Option<String>,
+}
+
+#[cfg(unix)]
+async fn pprof_profile_handler(Query(q): Query<PprofQuery>) -> Response {
+    use std::collections::{HashMap, HashSet};
+    use std::fmt::Write as _;
+    use std::time::Duration;
+
+    let _ = q.format;
+    let seconds = q.seconds.unwrap_or(30).clamp(1, 300);
+    let frequency = q.frequency.unwrap_or(999).clamp(10, 4000);
+
+    let guard = match pprof::ProfilerGuardBuilder::default()
+        .frequency(frequency)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+    {
+        Ok(g) => g,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to start cpu profiler: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
+
+    let report = match guard.report().build() {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to build cpu profile report: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+
+    let mut total_samples: isize = 0;
+    let mut flat_counts: HashMap<String, isize> = HashMap::new();
+    let mut cum_counts: HashMap<String, isize> = HashMap::new();
+    let mut stacks: Vec<(isize, String)> = Vec::new();
+
+    for (frames, count) in &report.data {
+        let count = *count;
+        if count <= 0 {
+            continue;
+        }
+        total_samples += count;
+
+        let mut seen_in_stack = HashSet::new();
+        let mut stack_syms: Vec<String> = Vec::new();
+        for group in &frames.frames {
+            for sym in group {
+                let name = sym.name();
+                if stack_syms.is_empty() {
+                    *flat_counts.entry(name.clone()).or_insert(0) += count;
+                }
+                if seen_in_stack.insert(name.clone()) {
+                    *cum_counts.entry(name.clone()).or_insert(0) += count;
+                }
+                stack_syms.push(name);
+            }
+        }
+        if stack_syms.is_empty() {
+            *flat_counts.entry("<unknown>".to_string()).or_insert(0) += count;
+            stack_syms.push("<unknown>".to_string());
+        }
+        stacks.push((count, stack_syms.join("; ")));
+    }
+
+    let mut flat_vec: Vec<(String, isize)> = flat_counts.into_iter().collect();
+    flat_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
+    let mut cum_vec: Vec<(String, isize)> = cum_counts.into_iter().collect();
+    cum_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
+    stacks.sort_by_key(|a| std::cmp::Reverse(a.0));
+
+    let denom = (total_samples.max(1)) as f64;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "CPU profile: duration={seconds}s frequency={frequency}Hz total_samples={total_samples}"
+    );
+    let _ = writeln!(out, "\n=== Top 30 Flat (Self) ===");
+    for (name, c) in flat_vec.iter().take(30) {
+        let pct = (*c as f64) * 100.0 / denom;
+        let _ = writeln!(out, "{c:>8} ({pct:>5.2}%)  {name}");
+    }
+    let _ = writeln!(out, "\n=== Top 30 Cumulative ===");
+    for (name, c) in cum_vec.iter().take(30) {
+        let pct = (*c as f64) * 100.0 / denom;
+        let _ = writeln!(out, "{c:>8} ({pct:>5.2}%)  {name}");
+    }
+    let _ = writeln!(out, "\n=== Top 20 Hot Stacks (leaf -> root) ===");
+    for (c, s) in stacks.iter().take(20) {
+        let pct = (*c as f64) * 100.0 / denom;
+        let _ = writeln!(out, "{c:>8} ({pct:>5.2}%)  {s}");
+    }
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        out,
+    )
+        .into_response()
+}
+
+#[cfg(not(unix))]
+async fn pprof_profile_handler(Query(_q): Query<PprofQuery>) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "CPU profiling is only supported on Unix targets\n",
+    )
+        .into_response()
 }

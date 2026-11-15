@@ -28,7 +28,8 @@ use prometheus::proto::MetricFamily;
 use prometheus::{GaugeVec, Opts, Registry};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-const NUM_STRIPES: usize = 128;
+const NUM_STRIPES: usize = 4096;
+const STRIPE_MASK: usize = NUM_STRIPES - 1;
 
 pub const ENABLED_FLAG: &str = "ingester.active-series-metrics-enabled";
 pub const IDLE_TIMEOUT_FLAG: &str = "ingester.active-series-metrics-idle-timeout";
@@ -1378,16 +1379,8 @@ impl SeriesStripe {
             if let Some(entry) = guard.refs.get(&ref_id) {
                 let prev = entry.nanos.load(Ordering::Relaxed);
                 if now_ns > prev {
-                    if entry
-                        .nanos
-                        .compare_exchange(prev, now_ns, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        entry_time_set = true;
-                    } else if now_ns > entry.nanos.load(Ordering::Relaxed) {
-                        entry.nanos.store(now_ns, Ordering::Relaxed);
-                        entry_time_set = true;
-                    }
+                    entry.nanos.store(now_ns, Ordering::Relaxed);
+                    entry_time_set = true;
                 }
                 if entry.num_native_histogram_buckets != buckets_i32
                     || (is_otlp && !entry.is_otlp())
@@ -1949,7 +1942,7 @@ impl ActiveSeries {
         is_otlp: bool,
     ) {
         let now_ns = system_time_to_unix_nanos(now);
-        let stripe_id = (ref_id as usize) % NUM_STRIPES;
+        let stripe_id = (ref_id as usize) & STRIPE_MASK;
         let created = self.stripes[stripe_id].update_series_timestamp(
             now_ns,
             None,
@@ -1961,7 +1954,7 @@ impl ActiveSeries {
         if created && !self.deleted.is_empty() {
             let lbls = Labels::from_pairs(pairs.iter().copied());
             if let Some(deleted_ref) = self.deleted.find(lbls.as_bytes()) {
-                let d_stripe = (deleted_ref as usize) % NUM_STRIPES;
+                let d_stripe = (deleted_ref as usize) & STRIPE_MASK;
                 self.stripes[d_stripe].remove(deleted_ref, None, &self.deleted);
             }
         }
@@ -1977,7 +1970,7 @@ impl ActiveSeries {
         idx: Option<&dyn SeriesIndexReader>,
     ) {
         let now_ns = system_time_to_unix_nanos(now);
-        let stripe_id = (ref_id as usize) % NUM_STRIPES;
+        let stripe_id = (ref_id as usize) & STRIPE_MASK;
         let created = self.stripes[stripe_id].update_series_timestamp(
             now_ns,
             Some(series),
@@ -1988,7 +1981,7 @@ impl ActiveSeries {
         );
         if created && !self.deleted.is_empty() {
             if let Some(deleted_ref) = self.deleted.find(series.as_bytes()) {
-                let d_stripe = (deleted_ref as usize) % NUM_STRIPES;
+                let d_stripe = (deleted_ref as usize) & STRIPE_MASK;
                 self.stripes[d_stripe].remove(deleted_ref, idx, &self.deleted);
             }
         }
@@ -1996,7 +1989,7 @@ impl ActiveSeries {
 
     pub fn post_deletion(&self, deleted: &[(u64, Labels)]) {
         for (ref_id, lbls) in deleted {
-            let stripe_id = (*ref_id as usize) % NUM_STRIPES;
+            let stripe_id = (*ref_id as usize) & STRIPE_MASK;
             if self.stripes[stripe_id].contains_ref(*ref_id) {
                 self.stripes[stripe_id].mark_deleted(*ref_id, lbls, &self.deleted);
             }
@@ -2021,10 +2014,10 @@ impl ActiveSeries {
     }
 
     pub fn contains_ref(&self, ref_id: u64) -> bool {
-        self.stripes[(ref_id as usize) % NUM_STRIPES].contains_ref(ref_id)
+        self.stripes[(ref_id as usize) & STRIPE_MASK].contains_ref(ref_id)
     }
 
-    /// Buckets `(small, large)` series refs by `ref_id % 128` for fast lock-free-of-postings counting.
+    /// Buckets `(small, large)` series refs by `ref_id & STRIPE_MASK` for fast lock-free-of-postings counting.
     pub fn bucket_refs_by_stripe(small: &[u32], large: &[u64]) -> Vec<Vec<u64>> {
         let total_len = small.len() + large.len();
         let per_stripe = (total_len / NUM_STRIPES).max(4);
@@ -2033,10 +2026,10 @@ impl ActiveSeries {
             .collect();
         for &r in small {
             let r64 = r as u64;
-            buckets[(r64 as usize) % NUM_STRIPES].push(r64);
+            buckets[(r64 as usize) & STRIPE_MASK].push(r64);
         }
         for &r in large {
-            buckets[(r as usize) % NUM_STRIPES].push(r);
+            buckets[(r as usize) & STRIPE_MASK].push(r);
         }
         buckets
     }
@@ -2084,7 +2077,7 @@ impl ActiveSeries {
     }
 
     pub fn native_histogram_buckets(&self, ref_id: u64) -> Option<u64> {
-        self.stripes[(ref_id as usize) % NUM_STRIPES].native_histogram_buckets(ref_id)
+        self.stripes[(ref_id as usize) & STRIPE_MASK].native_histogram_buckets(ref_id)
     }
 
     pub fn active(&self) -> (usize, usize, usize, usize) {
@@ -2169,7 +2162,7 @@ impl ActiveSeries {
     }
 
     pub fn delete_with_index(&self, ref_id: u64, idx: Option<&dyn SeriesIndexReader>) {
-        self.stripes[(ref_id as usize) % NUM_STRIPES].remove(ref_id, idx, &self.deleted);
+        self.stripes[(ref_id as usize) & STRIPE_MASK].remove(ref_id, idx, &self.deleted);
     }
 
     pub fn clear(&self) {

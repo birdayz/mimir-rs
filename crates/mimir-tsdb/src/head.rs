@@ -1526,7 +1526,11 @@ pub struct Head {
 
 impl Head {
     /// Opens (or initializes) a [`Head`] in `dir`, replaying `chunks_head`, `wal`, and `wbl`.
-    pub fn open(dir: impl AsRef<Path>, opts: HeadOptions, min_valid_time: i64) -> Result<Self, HeadError> {
+    pub fn open(
+        dir: impl AsRef<Path>,
+        mut opts: HeadOptions,
+        min_valid_time: i64,
+    ) -> Result<Self, HeadError> {
         if opts.chunk_range_ms < 1 {
             return Err(HeadError::InvalidOption(format!(
                 "invalid chunk_range_ms {}",
@@ -1538,6 +1542,9 @@ impl Head {
                 "invalid ooo_cap_max {} (must be 1..=255)",
                 opts.ooo_cap_max
             )));
+        }
+        if opts.wal_replay_concurrency == 0 {
+            opts.wal_replay_concurrency = std::thread::available_parallelism().map_or(4, |n| n.get());
         }
 
         let dir = dir.as_ref().to_path_buf();
@@ -6416,5 +6423,23 @@ mod tests {
             ]
         );
         head.close().unwrap();
+    }
+
+    #[test]
+    fn wal_replay_concurrency_zero_defaults_to_available_parallelism_and_one_stays_one() {
+        let dir0 = tempfile::tempdir().unwrap();
+        let head0 = Head::open(dir0.path(), HeadOptions::default(), i64::MIN).unwrap();
+        let expected = std::thread::available_parallelism().map_or(4, |n| n.get());
+        assert_eq!(head0.options().wal_replay_concurrency, expected);
+        head0.close().unwrap();
+
+        let dir1 = tempfile::tempdir().unwrap();
+        let opts1 = HeadOptions {
+            wal_replay_concurrency: 1,
+            ..HeadOptions::default()
+        };
+        let head1 = Head::open(dir1.path(), opts1, i64::MIN).unwrap();
+        assert_eq!(head1.options().wal_replay_concurrency, 1);
+        head1.close().unwrap();
     }
 }
