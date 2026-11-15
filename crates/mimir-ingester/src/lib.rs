@@ -28,7 +28,7 @@ pub mod reactive_limiter;
 pub mod user_tsdb;
 
 pub use errors::IngesterError;
-pub use grpc::IngesterService;
+pub use grpc::{IngesterService, IngesterZeroCopyServer};
 pub use http::ingester_router;
 pub use ingester::Ingester;
 pub use ingester_ring_lifecycler::{IngesterLifecycler, TokenlessLifecycler};

@@ -621,29 +621,29 @@ impl Ingester {
             });
         }
 
-        struct VecSink {
-            responses: parking_lot::Mutex<Vec<ingesterpb::QueryStreamResponse>>,
-        }
-        impl QueryStreamSink for VecSink {
-            fn send<'a>(
-                &'a self,
-                resp: ingesterpb::QueryStreamResponse,
-            ) -> mimir_ring::kv::BoxFuture<'a, Result<(), IngesterError>> {
-                Box::pin(async move {
-                    self.responses.lock().push(resp);
-                    Ok(())
-                })
+        let num_series = chunk_series.len();
+        let mut responses = Vec::with_capacity((num_series / QUERY_STREAM_BATCH_SIZE) + 8);
+        let mut series_batch = Vec::with_capacity(QUERY_STREAM_BATCH_SIZE.min(num_series.max(1)));
+        for cs in chunk_series.iter_mut() {
+            let labels = std::mem::take(&mut cs.labels);
+            series_batch.push(ingesterpb::QueryStreamSeries {
+                labels: labels_to_proto_pairs(&labels),
+                chunk_count: cs.chunks.len() as i64,
+            });
+            drop(labels);
+            if series_batch.len() >= QUERY_STREAM_BATCH_SIZE {
+                responses.push(ingesterpb::QueryStreamResponse {
+                    streaming_series: std::mem::take(&mut series_batch),
+                    is_end_of_series_stream: false,
+                    streaming_series_chunks: Vec::new(),
+                });
             }
         }
-
-        let sink = VecSink {
-            responses: parking_lot::Mutex::new(Vec::new()),
-        };
-
-        let num_series = self
-            .send_streaming_query_series_from_chunk_series(&mut chunk_series, &sink)
-            .await?;
-        let mut responses = std::mem::take(&mut *sink.responses.lock());
+        responses.push(ingesterpb::QueryStreamResponse {
+            streaming_series: series_batch,
+            is_end_of_series_stream: true,
+            streaming_series_chunks: Vec::new(),
+        });
         let mut num_samples = 0usize;
 
         // Phase 2: stream QueryStreamSeriesChunks batches respecting streaming_chunks_batch_size & 1MiB cap.
@@ -1276,7 +1276,7 @@ impl Ingester {
             == ingesterpb::active_series_request::RequestType::NativeHistogramSeries as i32;
         let head = db.db.head();
         let refs = if matchers.is_empty() {
-            head.all_postings()
+            Vec::new()
         } else {
             head.postings_for_matchers(&matchers)
                 .map_err(|e| IngesterError::Internal {

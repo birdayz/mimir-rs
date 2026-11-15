@@ -16,7 +16,6 @@ use crate::matcher::LabelMatcher;
 pub const EXEMPLAR_MAX_LABEL_SET_LENGTH: usize = 128;
 
 const NO_EXEMPLAR: usize = usize::MAX;
-const ESTIMATED_EXEMPLARS_PER_SERIES: usize = 16;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExemplarError {
@@ -170,6 +169,7 @@ pub struct CircularExemplarStorage {
 #[derive(Debug)]
 struct CircularExemplarInner {
     exemplars: Vec<CircularBufferEntry>,
+    max_exemplars: usize,
     next_index: usize,
     ooo_time_window_ms: i64,
     index: HashMap<Vec<u8>, SeriesIndexEntry>,
@@ -189,15 +189,15 @@ impl CircularExemplarStorage {
         registry: Option<&Registry>,
     ) -> Self {
         let ooo = ooo_time_window_ms.max(0);
-        let init_index_cap = max_exemplars / ESTIMATED_EXEMPLARS_PER_SERIES;
         let metrics = ExemplarMetrics::new(registry);
         metrics.max_exemplars.set(max_exemplars as f64);
         Self {
             inner: RwLock::new(CircularExemplarInner {
-                exemplars: vec![CircularBufferEntry::default(); max_exemplars],
+                exemplars: Vec::new(),
+                max_exemplars,
                 next_index: 0,
                 ooo_time_window_ms: ooo,
-                index: HashMap::with_capacity(init_index_cap),
+                index: HashMap::new(),
                 out_of_order_count: 0,
                 appended_count: 0,
             }),
@@ -209,12 +209,14 @@ impl CircularExemplarStorage {
         self.metrics
             .series_with_exemplars_in_storage
             .set(inner.index.len() as f64);
-        if inner.exemplars.is_empty() {
+        if inner.max_exemplars == 0 || inner.exemplars.is_empty() {
             self.metrics.exemplars_in_storage.set(0.0);
             self.metrics.last_exemplars_ts.set(0.0);
             return;
         }
-        if inner.exemplars[inner.next_index].series_key.is_some() {
+        if inner.exemplars.len() == inner.max_exemplars
+            && inner.exemplars[inner.next_index].series_key.is_some()
+        {
             self.metrics
                 .exemplars_in_storage
                 .set(inner.exemplars.len() as f64);
@@ -227,7 +229,7 @@ impl CircularExemplarStorage {
         }
         self.metrics
             .exemplars_in_storage
-            .set(inner.next_index as f64);
+            .set(inner.exemplars.len() as f64);
         if let Some(ref ex) = inner.exemplars[0].exemplar {
             self.metrics
                 .last_exemplars_ts
@@ -240,7 +242,7 @@ impl CircularExemplarStorage {
     }
 
     pub fn capacity(&self) -> usize {
-        self.inner.read().exemplars.len()
+        self.inner.read().max_exemplars
     }
 
     pub fn out_of_order_count(&self) -> u64 {
@@ -261,7 +263,7 @@ impl CircularExemplarStorage {
     /// Validates and appends an exemplar for `series_labels`.
     pub fn add_exemplar(&self, series_labels: &Labels, e: Exemplar) -> Result<(), ExemplarError> {
         let mut inner = self.inner.write();
-        if inner.exemplars.is_empty() {
+        if inner.max_exemplars == 0 {
             return Err(ExemplarError::Disabled);
         }
 
@@ -278,11 +280,17 @@ impl CircularExemplarStorage {
             return Err(err);
         }
 
-        let idx = inner.next_index;
-        // Evict existing occupant at `idx` if present.
-        if inner.exemplars[idx].series_key.is_some() {
-            inner.remove_at(idx);
-        }
+        let idx = if inner.exemplars.len() < inner.max_exemplars {
+            let i = inner.exemplars.len();
+            inner.exemplars.push(CircularBufferEntry::default());
+            i
+        } else {
+            let i = inner.next_index;
+            if inner.exemplars[i].series_key.is_some() {
+                inner.remove_at(i);
+            }
+            i
+        };
 
         let key_vec = key.to_vec();
         let entry = inner.index.entry(key_vec.clone()).or_insert_with(|| SeriesIndexEntry {
@@ -369,7 +377,7 @@ impl CircularExemplarStorage {
             }
         }
 
-        inner.next_index = (idx + 1) % inner.exemplars.len();
+        inner.next_index = (idx + 1) % inner.max_exemplars;
         inner.appended_count += 1;
         self.metrics.exemplars_appended.inc();
         self.compute_metrics(&inner);
@@ -452,16 +460,21 @@ impl CircularExemplarStorage {
     /// Resizes the circular buffer, preserving the newest entries up to `new_size`.
     pub fn resize(&self, new_size: usize) -> usize {
         let mut inner = self.inner.write();
-        let old_size = inner.exemplars.len();
-        if new_size == old_size {
+        if new_size == inner.max_exemplars {
             return 0;
         }
 
         // Collect all active exemplars in ingestion order (oldest -> newest).
         let mut ordered: Vec<(Labels, Exemplar)> = Vec::new();
-        if old_size > 0 {
-            for offset in 0..old_size {
-                let pos = (inner.next_index + offset) % old_size;
+        let cur_len = inner.exemplars.len();
+        if cur_len > 0 {
+            let start = if cur_len == inner.max_exemplars {
+                inner.next_index
+            } else {
+                0
+            };
+            for offset in 0..cur_len {
+                let pos = (start + offset) % cur_len;
                 if let (Some(ex), Some(key)) = (
                     inner.exemplars[pos].exemplar.take(),
                     inner.exemplars[pos].series_key.take(),
@@ -473,7 +486,9 @@ impl CircularExemplarStorage {
             }
         }
 
-        inner.exemplars = vec![CircularBufferEntry::default(); new_size];
+        inner.exemplars.clear();
+        inner.exemplars.shrink_to_fit();
+        inner.max_exemplars = new_size;
         inner.next_index = 0;
         inner.index.clear();
         self.metrics.max_exemplars.set(new_size as f64);
@@ -502,7 +517,7 @@ impl CircularExemplarInner {
         entry: Option<&SeriesIndexEntry>,
         e: &Exemplar,
     ) -> Result<(), ExemplarError> {
-        if self.exemplars.is_empty() {
+        if self.max_exemplars == 0 {
             return Err(ExemplarError::Disabled);
         }
 

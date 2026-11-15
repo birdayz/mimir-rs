@@ -230,7 +230,7 @@ fn compute_chunk_end_time(start: i64, cur: i64, max_t: i64, ratio_to_full: f64) 
 
 /// Zero-allocation hash of sorted `(&str, &str)` pairs matching Prometheus `stringlabels.Labels.Hash()`.
 #[inline]
-fn hash_sorted_pairs(pairs: &[(&str, &str)]) -> u64 {
+pub fn hash_sorted_pairs(pairs: &[(&str, &str)]) -> u64 {
     let mut stack_buf = [0u8; 512];
     let mut pos = 0usize;
     let mut heap_buf: Option<Vec<u8>> = None;
@@ -453,6 +453,13 @@ impl SeriesState {
             SampleValue::Histogram(h) => LastSample::Histogram(h),
             SampleValue::FloatHistogram(fh) => LastSample::FloatHistogram(fh),
         })
+    }
+
+    #[inline]
+    fn needs_chunk_reader_for_t(&self, t: i64) -> bool {
+        !self.mmapped_chunks.is_empty()
+            && matches!(self.last_sample, LastSample::None)
+            && t == self.max_time()
     }
 
     fn appendable_float(
@@ -1048,18 +1055,13 @@ impl StripeSeries {
         self.stripes[idx].read().by_id.get(&ref_id).cloned()
     }
 
-    fn get_by_sorted_pairs(
-        &self,
-        hash: u64,
-        pairs: &[(&str, &str)],
-        symbols: &SymbolTable,
-    ) -> Option<Arc<SeriesEntry>> {
+    fn get_by_sorted_pairs(&self, hash: u64, pairs: &[(&str, &str)]) -> Option<Arc<SeriesEntry>> {
         let idx = self.stripe_idx(hash);
         let stripe = self.stripes[idx].read();
         stripe
             .by_hash
             .find(hash, |entry| {
-                entry.hash == hash && symbol_labels_eq_pairs(&entry.symbol_labels, symbols, pairs)
+                entry.hash == hash && entry.labels.eq_sorted_pairs(pairs)
             })
             .cloned()
     }
@@ -1141,20 +1143,6 @@ impl StripeSeries {
         }
         out
     }
-}
-
-#[inline]
-fn symbol_labels_eq_pairs(sl: &SymbolLabels, symbols: &SymbolTable, pairs: &[(&str, &str)]) -> bool {
-    let slice = sl.as_slice();
-    if slice.len() != pairs.len() {
-        return false;
-    }
-    for (&(kid, vid), &(k, v)) in slice.iter().zip(pairs.iter()) {
-        if symbols.resolve(kid) != k || symbols.resolve(vid) != v {
-            return false;
-        }
-    }
-    true
 }
 
 /// Series chunks + tombstones returned by [`Head::series_chunks`].
@@ -2055,6 +2043,12 @@ impl Head {
         self.get_by_sorted_pairs(hash, pairs).map(|e| e.ref_id)
     }
 
+    /// Zero-allocation `SeriesEntry` lookup by sorted `(&str, &str)` pairs.
+    pub fn get_entry_by_sorted_pairs(&self, pairs: &[(&str, &str)]) -> Option<Arc<SeriesEntry>> {
+        let hash = hash_sorted_pairs(pairs);
+        self.get_by_sorted_pairs(hash, pairs)
+    }
+
     /// Iterates every live series `(ref_id, &Labels)` in Head.
     pub fn for_each_series<F>(&self, mut f: F)
     where
@@ -2233,8 +2227,7 @@ impl Head {
 
     /// Looks up an existing series by sorted `(&str, &str)` pairs with ZERO heap allocations!
     fn get_by_sorted_pairs(&self, hash: u64, pairs: &[(&str, &str)]) -> Option<Arc<SeriesEntry>> {
-        let syms = self.symbols.read();
-        self.series.get_by_sorted_pairs(hash, pairs, &syms)
+        self.series.get_by_sorted_pairs(hash, pairs)
     }
 
     /// Gets or creates a series from already-sorted `(&str, &str)` pairs.
@@ -2373,6 +2366,10 @@ impl Head {
 
     /// Creates a new [`HeadAppender`] for transactional batched writes.
     pub fn appender(&self) -> HeadAppender<'_> {
+        self.appender_with_capacity(0)
+    }
+
+    pub fn appender_with_capacity(&self, series_hint: usize) -> HeadAppender<'_> {
         self.metrics.active_appenders.inc();
         let min_valid = self.appendable_min_valid_time();
         let head_maxt = self.max_time();
@@ -2382,12 +2379,12 @@ impl Head {
             head_maxt,
             ooo_time_window: self.ooo_time_window_ms.load(Ordering::Acquire),
             series_refs: Vec::new(),
-            floats: Vec::new(),
+            floats: Vec::with_capacity(series_hint),
             histograms: Vec::new(),
             float_histograms: Vec::new(),
             exemplars: Vec::new(),
             metadata: Vec::new(),
-            batch_last_sample: HashMap::new(),
+            batch_last_sample: HashMap::with_capacity(series_hint),
             closed: false,
         }
     }
@@ -3047,6 +3044,17 @@ impl Head {
             (mmapped_in_order, head_chks, mmapped_ooo, ooo_head_chks)
         };
 
+        // Acquire chunk_reader only if there are mmapped chunks to load.
+        if mmapped_in_order.is_empty() && mmapped_ooo.is_empty() {
+            let mut chks = head_chks;
+            chks.extend(ooo_head_chks);
+            if chks.is_empty() {
+                return Ok(None);
+            }
+            let tombs = self.tombstones.get(ref_id);
+            return Ok(Some((entry.labels.clone(), chks, tombs)));
+        }
+
         // Acquire chunk_reader AFTER releasing entry.inner so any MmappedChunk observed
         // is guaranteed to be present in chunk_reader.
         let chunk_reader_guard = self.chunk_reader.read();
@@ -3300,9 +3308,10 @@ impl<'a> HeadAppender<'a> {
         self.append_float_inner(series_ref, pairs, 0, t, v, true)
     }
 
-    fn append_float_inner(
+    /// Appends a float sample using a cached `Option<Arc<SeriesEntry>>`, resolving and caching on creation.
+    pub fn append_float_with_entry(
         &mut self,
-        series_ref: Option<u64>,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
         pairs: &[(&str, &str)],
         st: i64,
         t: i64,
@@ -3322,7 +3331,14 @@ impl<'a> HeadAppender<'a> {
             return Err(HeadError::OutOfBounds);
         }
 
-        let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
+        let entry = match series_entry {
+            Some(ref e) => Arc::clone(e),
+            None => {
+                let e = self.resolve_sorted_pairs(None, pairs)?;
+                *series_entry = Some(Arc::clone(&e));
+                e
+            }
+        };
         let ref_id = entry.ref_id;
 
         if let Some((is_ooo, is_dup)) =
@@ -3344,28 +3360,51 @@ impl<'a> HeadAppender<'a> {
                     .insert(ref_id, (t, LastSample::Float(v)));
             }
         } else {
-            let cr_guard = self.head.chunk_reader.read();
-            let state = entry.inner.lock();
-            let res = state.appendable_float(
-                t,
-                v,
-                self.head_maxt,
-                self.min_valid_time,
-                effective_ooo,
-                cr_guard.as_ref(),
-            );
-            drop(state);
-            if v.to_bits() != QUIET_ZERO_NAN_BITS && !matches!(res, Ok((false, _))) {
+            let mut state = entry.inner.lock();
+            let res = if state.needs_chunk_reader_for_t(t) {
+                let cr_guard = self.head.chunk_reader.read();
+                state.appendable_float(
+                    t,
+                    v,
+                    self.head_maxt,
+                    self.min_valid_time,
+                    effective_ooo,
+                    cr_guard.as_ref(),
+                )
+            } else {
+                state.appendable_float(
+                    t,
+                    v,
+                    self.head_maxt,
+                    self.min_valid_time,
+                    effective_ooo,
+                    None,
+                )
+            };
+            let (is_ooo, is_dup) = match res {
+                Ok(v) => v,
+                Err(e) => {
+                    drop(state);
+                    if v.to_bits() != QUIET_ZERO_NAN_BITS {
+                        let delta = self.head_maxt.saturating_sub(t);
+                        if delta > 0 {
+                            self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+            if is_ooo && v.to_bits() != QUIET_ZERO_NAN_BITS {
                 let delta = self.head_maxt.saturating_sub(t);
                 if delta > 0 {
                     self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
                 }
             }
-            let (is_ooo, is_dup) = res?;
             if is_dup {
                 return Ok(ref_id);
             }
-            entry.inner.lock().pending_commits += 1;
+            state.pending_commits += 1;
+            drop(state);
             if !is_ooo {
                 self.batch_last_sample
                     .insert(ref_id, (t, LastSample::Float(v)));
@@ -3374,6 +3413,19 @@ impl<'a> HeadAppender<'a> {
 
         self.floats.push(PendingFloat { entry, st, t, v });
         Ok(ref_id)
+    }
+
+    fn append_float_inner(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+        st: i64,
+        t: i64,
+        v: f64,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        let mut opt = series_ref.and_then(|r| self.head.series.get_by_id(r));
+        self.append_float_with_entry(&mut opt, pairs, st, t, v, reject_ooo)
     }
 
     /// Appends a float sample directly by `series_ref` (zero label hashing or lookup overhead).
@@ -3820,7 +3872,7 @@ impl<'a> HeadAppender<'a> {
                 }
             }
 
-            let check = {
+            let check = if state.needs_chunk_reader_for_t(pf.t) {
                 let cr_guard = self.head.chunk_reader.read();
                 state.appendable_float(
                     pf.t,
@@ -3829,6 +3881,15 @@ impl<'a> HeadAppender<'a> {
                     self.min_valid_time,
                     self.ooo_time_window,
                     cr_guard.as_ref(),
+                )
+            } else {
+                state.appendable_float(
+                    pf.t,
+                    v,
+                    self.head_maxt,
+                    self.min_valid_time,
+                    self.ooo_time_window,
+                    None,
                 )
             };
             let Ok((is_ooo, is_dup)) = check else {
@@ -4176,17 +4237,15 @@ impl<'a> HeadAppender<'a> {
             recs.push(enc.metadata(&metas, Vec::new()));
         }
         if !self.floats.is_empty() {
-            let samples: Vec<RefSample> = self
-                .floats
-                .iter()
-                .map(|f| RefSample {
+            recs.push(enc.samples_iter(
+                self.floats.iter().map(|f| RefSample {
                     ref_id: f.entry.ref_id,
                     st: f.st,
                     t: f.t,
                     v: f.v,
-                })
-                .collect();
-            recs.push(enc.samples(&samples, Vec::new()));
+                }),
+                Vec::with_capacity(self.floats.len() * 14 + 17),
+            ));
         }
         if !self.histograms.is_empty() {
             let hists: Vec<RefHistogramSample> = self

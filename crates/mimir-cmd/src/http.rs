@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
 use crate::cli::{diff_yaml_values, effective_config_yaml};
-use crate::metrics::{branch_str, build_date_str, build_user_str, go_version_str, revision_str, version_str};
+use crate::metrics::{branch_str, go_version_str, revision_str, version_str};
 
 #[derive(Clone)]
 pub struct AppHttpState {
@@ -420,8 +420,6 @@ struct BuildInfoData {
     version: &'static str,
     revision: &'static str,
     branch: &'static str,
-    build_user: &'static str,
-    build_date: &'static str,
     go_version: String,
     features: BuildInfoFeatures,
 }
@@ -467,8 +465,6 @@ async fn buildinfo_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
             version: version_str(),
             revision: revision_str(),
             branch: branch_str(),
-            build_user: build_user_str(),
-            build_date: build_date_str(),
             go_version: go_version_str(),
             features: BuildInfoFeatures {
                 alertmanager_config_api: extra_bool("alertmanager", "enable_api").to_string(),

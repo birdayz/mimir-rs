@@ -4,11 +4,16 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use futures::Stream;
+use axum::http;
+use bytes::{Buf, Bytes};
+use futures::{Future, Stream};
 use mimir_common::tenant::extract_tenant_id_from_grpc_metadata;
 use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb;
+use mimir_proto::prost::Message;
+use tonic::codec::{Codec, CompressionEncoding, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::{Request, Response, Status};
 
 use crate::errors::IngesterError;
@@ -27,8 +32,172 @@ impl IngesterService {
         &self.ingester
     }
 
-    pub fn into_server(self) -> ingesterpb::ingester_server::IngesterServer<Self> {
-        ingesterpb::ingester_server::IngesterServer::new(self)
+    pub fn into_server(self) -> IngesterZeroCopyServer {
+        let ingester = Arc::clone(&self.ingester);
+        IngesterZeroCopyServer {
+            inner: ingesterpb::ingester_server::IngesterServer::new(self),
+            ingester,
+            accept_compression: Vec::new(),
+            send_compression: None,
+            max_decoding_message_size: None,
+            max_encoding_message_size: None,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RawPushDecoder;
+
+impl Decoder for RawPushDecoder {
+    type Item = Bytes;
+    type Error = Status;
+
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+        let rem = src.remaining();
+        Ok(Some(src.copy_to_bytes(rem)))
+    }
+}
+
+#[derive(Clone, Default)]
+struct WriteResponseEncoder;
+
+impl Encoder for WriteResponseEncoder {
+    type Item = cortexpb::WriteResponse;
+    type Error = Status;
+
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        dst: &mut EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
+        item.encode(dst)
+            .map_err(|e| Status::internal(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default)]
+struct RawPushCodec;
+
+impl Codec for RawPushCodec {
+    type Encode = cortexpb::WriteResponse;
+    type Decode = Bytes;
+    type Encoder = WriteResponseEncoder;
+    type Decoder = RawPushDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        WriteResponseEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        RawPushDecoder
+    }
+}
+
+/// `cortex.Ingester` Tonic server wrapper that decodes `/cortex.Ingester/Push`
+/// directly from raw gRPC frame bytes using the zero-copy `WriteRequestScratch` decoder.
+#[derive(Clone)]
+pub struct IngesterZeroCopyServer {
+    inner: ingesterpb::ingester_server::IngesterServer<IngesterService>,
+    ingester: Arc<Ingester>,
+    accept_compression: Vec<CompressionEncoding>,
+    send_compression: Option<CompressionEncoding>,
+    max_decoding_message_size: Option<usize>,
+    max_encoding_message_size: Option<usize>,
+}
+
+impl IngesterZeroCopyServer {
+    pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+        self.accept_compression.push(encoding);
+        self.inner = self.inner.accept_compressed(encoding);
+        self
+    }
+
+    pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+        self.send_compression = Some(encoding);
+        self.inner = self.inner.send_compressed(encoding);
+        self
+    }
+
+    pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+        self.max_decoding_message_size = Some(limit);
+        self.inner = self.inner.max_decoding_message_size(limit);
+        self
+    }
+
+    pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+        self.max_encoding_message_size = Some(limit);
+        self.inner = self.inner.max_encoding_message_size(limit);
+        self
+    }
+}
+
+impl tonic::server::NamedService for IngesterZeroCopyServer {
+    const NAME: &'static str = "cortex.Ingester";
+}
+
+impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopyServer {
+    type Response = http::Response<tonic::body::BoxBody>;
+    type Error = std::convert::Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        <ingesterpb::ingester_server::IngesterServer<IngesterService> as tower::Service<
+            http::Request<tonic::body::BoxBody>,
+        >>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+        if req.uri().path() == "/cortex.Ingester/Push" {
+            struct RawPushSvc(Arc<Ingester>);
+            impl tonic::server::UnaryService<Bytes> for RawPushSvc {
+                type Response = cortexpb::WriteResponse;
+                type Future = Pin<
+                    Box<
+                        dyn Future<Output = Result<Response<Self::Response>, Status>>
+                            + Send
+                            + 'static,
+                    >,
+                >;
+
+                fn call(&mut self, request: Request<Bytes>) -> Self::Future {
+                    let ingester = Arc::clone(&self.0);
+                    Box::pin(async move {
+                        let user_id = tenant_from_req(&request)?;
+                        let raw = request.into_inner();
+                        if let Err(e) = ingester.push_grpc_raw(&user_id, &raw).await {
+                            if e.should_log_error() {
+                                tracing::warn!(
+                                    method = "/cortex.Ingester/Push",
+                                    err = %e,
+                                    "gRPC call failed"
+                                );
+                            }
+                            return Err(e.map_push_error_to_status());
+                        }
+                        Ok(Response::new(cortexpb::WriteResponse {}))
+                    })
+                }
+            }
+
+            let mut grpc = tonic::server::Grpc::new(RawPushCodec);
+            for enc in &self.accept_compression {
+                grpc = grpc.accept_compressed(*enc);
+            }
+            if let Some(enc) = self.send_compression {
+                grpc = grpc.send_compressed(enc);
+            }
+            if let Some(lim) = self.max_decoding_message_size {
+                grpc = grpc.max_decoding_message_size(lim);
+            }
+            if let Some(lim) = self.max_encoding_message_size {
+                grpc = grpc.max_encoding_message_size(lim);
+            }
+            let ingester = Arc::clone(&self.ingester);
+            Box::pin(async move { Ok(grpc.unary(RawPushSvc(ingester), req).await) })
+        } else {
+            Box::pin(self.inner.call(req))
+        }
     }
 }
 

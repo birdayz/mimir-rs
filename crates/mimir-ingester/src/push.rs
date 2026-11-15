@@ -16,7 +16,7 @@ use mimir_proto::zerocopy::{BorrowedTimeSeriesView, BorrowedWriteRequest};
 use mimir_ring::ring::replication_strategy::WRITE_NO_EXTEND;
 use mimir_tsdb::chunkenc::{CounterResetHint, FloatHistogram, Histogram, HistogramSpan};
 use mimir_tsdb::exemplar::{Exemplar, ExemplarError};
-use mimir_tsdb::head::HeadError;
+use mimir_tsdb::head::{HeadError, SeriesEntry};
 use mimir_tsdb::labels::Labels;
 use smallvec::SmallVec;
 use tracing::warn;
@@ -521,6 +521,53 @@ impl Ingester {
         Ok(())
     }
 
+    /// Zero-copy raw protobuf gRPC `Push` entrypoint.
+    pub async fn push_grpc_raw(
+        &self,
+        user_id: &str,
+        raw_bytes: &[u8],
+    ) -> Result<(), IngesterError> {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<mimir_proto::zerocopy::WriteRequestScratch> =
+                std::cell::RefCell::new(mimir_proto::zerocopy::WriteRequestScratch::new());
+        }
+
+        if !self.cfg.push_grpc_method_enabled {
+            return Err(IngesterError::PushGrpcDisabled);
+        }
+        let req_size = raw_bytes.len() as i64;
+        let permit = self.start_push_request(req_size).await?;
+        let res = SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let borrowed = match mimir_proto::zerocopy::decode_write_request(
+                raw_bytes,
+                mimir_proto::zerocopy::DecodeOptions::classic(),
+                &mut scratch,
+            ) {
+                Ok(b) => b,
+                Err(
+                    mimir_proto::zerocopy::DecodeError::UnexpectedRw2Timeseries
+                    | mimir_proto::zerocopy::DecodeError::UnexpectedRw2Symbols,
+                ) => mimir_proto::zerocopy::decode_write_request(
+                    raw_bytes,
+                    mimir_proto::zerocopy::DecodeOptions::rw2(),
+                    &mut scratch,
+                )
+                .map_err(|e| IngesterError::BadRequest {
+                    message: e.to_string(),
+                })?,
+                Err(e) => {
+                    return Err(IngesterError::BadRequest {
+                        message: e.to_string(),
+                    });
+                }
+            };
+            self.push_borrowed_inner(user_id, &borrowed)
+        });
+        permit.finish(res.as_ref().err());
+        res
+    }
+
     /// gRPC `Push` entrypoint.
     pub async fn push_grpc(
         &self,
@@ -633,6 +680,7 @@ impl Ingester {
 
         let source = cortexpb::write_request::SourceEnum::try_from(req.source)
             .unwrap_or(cortexpb::write_request::SourceEnum::Api);
+        let ts_len = req.timeseries.len();
         let iter = req.timeseries.iter();
         let res = self.ingest_timeseries(
             user_id,
@@ -640,6 +688,7 @@ impl Ingester {
             source,
             req.skip_label_validation,
             req.skip_label_count_validation,
+            ts_len,
             iter,
         );
         drop(lock_guard);
@@ -690,12 +739,14 @@ impl Ingester {
 
         let source = cortexpb::write_request::SourceEnum::try_from(req.source)
             .unwrap_or(cortexpb::write_request::SourceEnum::Api);
+        let ts_len = req.timeseries_len();
         let res = self.ingest_timeseries(
             user_id,
             &db,
             source,
             req.skip_label_validation,
             req.skip_label_count_validation,
+            ts_len,
             req.timeseries(),
         );
         drop(lock_guard);
@@ -767,6 +818,7 @@ impl Ingester {
         ingested
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ingest_timeseries<'a, I, T>(
         &self,
         user_id: &str,
@@ -774,6 +826,7 @@ impl Ingester {
         source: cortexpb::write_request::SourceEnum,
         skip_label_validation: bool,
         _skip_label_count_validation: bool,
+        series_hint: usize,
         timeseries: I,
     ) -> Result<(), IngesterError>
     where
@@ -812,7 +865,7 @@ impl Ingester {
         let is_otlp = source == cortexpb::write_request::SourceEnum::Otlp;
         let verify_ownership = self.verify_ring_ownership.load(Ordering::Relaxed);
 
-        let mut app = db.db.appender();
+        let mut app = db.db.appender_with_capacity(series_hint);
         let mut stats = PushStats::default();
         let mut first_partial: Option<(IngesterError, Option<SampleKind>)> = None;
         let mut pairs: SmallVec<[(&str, &str); 24]> = SmallVec::new();
@@ -892,11 +945,13 @@ impl Ingester {
                 s
             };
 
-            let mut series_ref = if labels_sorted_unique && !pairs.is_empty() {
-                head.get_ref_by_sorted_pairs(&pairs)
-            } else {
-                None
-            };
+            let mut series_entry: Option<Arc<SeriesEntry>> =
+                if labels_sorted_unique && !pairs.is_empty() {
+                    head.get_entry_by_sorted_pairs(&pairs)
+                } else {
+                    None
+                };
+            let mut series_ref = series_entry.as_ref().map(|e| e.ref_id);
 
             if series_ref.is_none() && !labels_sorted_unique {
                 let s_str = make_series_str(&pairs);
@@ -968,7 +1023,14 @@ impl Ingester {
                         || hist_count == 0
                         || first_hist_ts.is_none_or(|ht| ht >= s.timestamp_ms))
                 {
-                    match app.append_float_reject_ooo(series_ref, &pairs, created_ts, 0.0) {
+                    match app.append_float_with_entry(
+                        &mut series_entry,
+                        &pairs,
+                        0,
+                        created_ts,
+                        0.0,
+                        true,
+                    ) {
                         Ok(r) => {
                             series_ref = Some(r);
                             stats.succeeded_samples += 1;
@@ -996,7 +1058,14 @@ impl Ingester {
                     created_ts = 0;
                 }
 
-                match app.append_float_with_st(series_ref, &pairs, 0, s.timestamp_ms, s.value) {
+                match app.append_float_with_entry(
+                    &mut series_entry,
+                    &pairs,
+                    0,
+                    s.timestamp_ms,
+                    s.value,
+                    false,
+                ) {
                     Ok(r) => {
                         series_ref = Some(r);
                         stats.succeeded_samples += 1;
@@ -1162,9 +1231,9 @@ impl Ingester {
                 && stats.succeeded_samples > prev_succeeded
             {
                 if let Some(ref_id) = series_ref {
-                    let h = head
-                        .series_labels(ref_id)
-                        .map_or(0, |l| l.hash());
+                    let h = series_entry
+                        .as_ref()
+                        .map_or_else(|| mimir_tsdb::head::hash_sorted_pairs(&pairs), |e| e.hash);
                     db.active_series.update_series(
                         &pairs,
                         h,

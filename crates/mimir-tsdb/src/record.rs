@@ -941,6 +941,52 @@ impl RecordEncoder {
         }
     }
 
+    pub fn samples_iter<I>(&self, samples: I, b: Vec<u8>) -> Vec<u8>
+    where
+        I: IntoIterator<Item = RefSample>,
+        I::IntoIter: Clone,
+    {
+        let mut it = samples.into_iter();
+        let Some(first) = it.clone().next() else {
+            let mut buf = Encbuf { buf: b };
+            buf.put_byte(if self.enable_st_storage {
+                RecordType::SamplesV2 as u8
+            } else {
+                RecordType::Samples as u8
+            });
+            return buf.into_vec();
+        };
+        let mut buf = Encbuf { buf: b };
+        if self.enable_st_storage {
+            buf.put_byte(RecordType::SamplesV2 as u8);
+            let _ = it.next();
+            buf.put_varint64(first.ref_id as i64);
+            buf.put_varint64(first.t);
+            buf.put_varint64(first.st);
+            buf.put_be_f64(first.v);
+            let mut prev_ref = first.ref_id;
+            let mut prev_st = first.st;
+            for s in it {
+                buf.put_varint64((s.ref_id as i64).wrapping_sub(prev_ref as i64));
+                buf.put_varint64(s.t.wrapping_sub(first.t));
+                write_st_marker(&mut buf, s.st, first.st, prev_st);
+                buf.put_be_f64(s.v);
+                prev_ref = s.ref_id;
+                prev_st = s.st;
+            }
+        } else {
+            buf.put_byte(RecordType::Samples as u8);
+            buf.put_be64(first.ref_id);
+            buf.put_be64_i64(first.t);
+            for s in it {
+                buf.put_varint64((s.ref_id as i64).wrapping_sub(first.ref_id as i64));
+                buf.put_varint64(s.t.wrapping_sub(first.t));
+                buf.put_be_f64(s.v);
+            }
+        }
+        buf.into_vec()
+    }
+
     pub fn samples_v1(&self, samples: &[RefSample], b: Vec<u8>) -> Vec<u8> {
         let mut buf = Encbuf { buf: b };
         buf.put_byte(RecordType::Samples as u8);

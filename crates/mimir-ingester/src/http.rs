@@ -87,10 +87,7 @@ pub fn ingester_router(ingester: Arc<Ingester>) -> Router {
         .with_state(state);
 
     if let Some(ref ring) = ingester.instance_ring {
-        router = router.nest(
-            "/ingester/ring",
-            ring_router(Arc::clone(ring), StatusPageConfig::default()),
-        );
+        router = router.merge(ring_router(Arc::clone(ring), StatusPageConfig::default()));
     }
 
     if let Some(ref watcher) = ingester.partition_ring_watcher {
@@ -101,10 +98,7 @@ pub fn ingester_router(ingester: Arc<Ingester>) -> Router {
         {
             let editor = Arc::new(PartitionRingEditor::new("ingester-partitions", kv));
             let reader: Arc<dyn PartitionRingReader> = Arc::clone(watcher) as Arc<dyn PartitionRingReader>;
-            router = router.nest(
-                "/ingester/partition-ring",
-                partition_ring_router(reader, editor),
-            );
+            router = router.merge(partition_ring_router(reader, editor));
         }
     }
 

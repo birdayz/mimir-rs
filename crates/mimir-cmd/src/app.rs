@@ -472,6 +472,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let health_svc = HealthService::new(Arc::clone(&shutdown_requested), ingester_opt.clone());
 
     let mut grpc_builder = tonic::transport::Server::builder()
+        .tcp_nodelay(true)
         .add_service(health_svc)
         .add_service(http_grpc_svc);
 
@@ -496,9 +497,16 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             .await
     });
 
+    let incoming = tokio_stream::StreamExt::map(TcpListenerStream::new(grpc_listener), |res| {
+        if let Ok(ref stream) = res {
+            let _ = stream.set_nodelay(true);
+        }
+        res
+    });
+
     let grpc_task = tokio::spawn(async move {
         grpc_builder
-            .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), async {
+            .serve_with_incoming_shutdown(incoming, async {
                 let _ = grpc_shutdown_rx.await;
             })
             .await

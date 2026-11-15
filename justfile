@@ -43,3 +43,8 @@ qa:
     just lint
     just parity
     just test
+
+bench-vs-go *args:
+    just build-release
+    just go-oracle
+    cargo run --release -p mimir-conformance --example bench_vs_go -- {{args}}

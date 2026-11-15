@@ -184,6 +184,73 @@ impl<'a> TsdbQuerier<'a> {
         let blocks = self.effective_blocks(&lock_guard);
         let head = self.effective_head();
 
+        if blocks.is_empty() {
+            let Some(head) = head else {
+                return Ok(Vec::new());
+            };
+            let refs = head.postings_for_matchers(matchers)?;
+            let mut out = Vec::with_capacity(refs.len());
+            for r in refs {
+                if let Some((labels, chks, tombs)) = head.series_chunks(r, self.mint, self.maxt)? {
+                    if chks.is_empty() {
+                        continue;
+                    }
+                    let has_tombstones = !tombs.is_empty()
+                        && chks
+                            .iter()
+                            .any(|cm| tombs.iter().any(|iv| iv.overlaps(cm.min_time, cm.max_time)));
+                    let final_chunks = if has_tombstones {
+                        let mut samples = Vec::new();
+                        for cm in &chks {
+                            if let Some(ref enc) = cm.chunk {
+                                for s in decode_chunk_samples(enc)? {
+                                    if s.t >= self.mint && s.t <= self.maxt {
+                                        samples.push(s);
+                                    }
+                                }
+                            }
+                        }
+                        samples.sort_by_key(|s| s.t);
+                        samples.dedup_by_key(|s| s.t);
+                        encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
+                    } else if chks.len() > 1 {
+                        let mut chks = chks;
+                        chks.sort_by_key(|c| (c.min_time, c.max_time));
+                        let has_overlap = chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
+                        if has_overlap {
+                            let mut samples = Vec::new();
+                            for cm in &chks {
+                                if let Some(ref enc) = cm.chunk {
+                                    for s in decode_chunk_samples(enc)? {
+                                        if s.t >= self.mint && s.t <= self.maxt {
+                                            samples.push(s);
+                                        }
+                                    }
+                                }
+                            }
+                            samples.sort_by_key(|s| s.t);
+                            samples.dedup_by_key(|s| s.t);
+                            encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
+                        } else {
+                            chks
+                        }
+                    } else {
+                        chks
+                    };
+                    if !final_chunks.is_empty() {
+                        out.push(QueryChunkSeries {
+                            labels,
+                            chunks: final_chunks,
+                        });
+                    }
+                }
+            }
+            if sort_series {
+                out.sort_by(|a, b| a.labels.cmp(&b.labels));
+            }
+            return Ok(out);
+        }
+
         struct SeriesSources {
             head: Vec<(ChunkMeta, Vec<Interval>)>,
             blocks: Vec<(ChunkMeta, Vec<Interval>)>,

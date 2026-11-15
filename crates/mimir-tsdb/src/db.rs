@@ -129,6 +129,10 @@ impl Tsdb {
         self.head.appender()
     }
 
+    pub fn appender_with_capacity(&self, series_hint: usize) -> HeadAppender<'_> {
+        self.head.appender_with_capacity(series_hint)
+    }
+
     /// Compacts any ready `chunk_range` windows from Head into ULID blocks on disk.
     pub fn compact(&self) -> Result<Vec<Ulid>, TsdbError> {
         let _guard = self.compact_mtx.lock();

@@ -525,11 +525,16 @@ fn test_ingester_all_14_rpcs_and_query_stream_two_phase_protocol() {
         assert_eq!(job_card.get("worker"), Some(&1));
 
         // 12. ActiveSeries (SERIES & NATIVE_HISTOGRAM_SERIES)
+        let all_name_matcher = vec![ingesterpb::LabelMatcher {
+            r#type: ingesterpb::MatchType::RegexMatch as i32,
+            name: "__name__".to_string(),
+            value: ".+".to_string(),
+        }];
         let mut as_stream = client
             .active_series(with_tenant(
                 tenant,
                 ingesterpb::ActiveSeriesRequest {
-                    matchers: Vec::new(),
+                    matchers: all_name_matcher.clone(),
                     r#type: ingesterpb::active_series_request::RequestType::Series as i32,
                 },
             ))
@@ -546,7 +551,7 @@ fn test_ingester_all_14_rpcs_and_query_stream_two_phase_protocol() {
             .active_series(with_tenant(
                 tenant,
                 ingesterpb::ActiveSeriesRequest {
-                    matchers: Vec::new(),
+                    matchers: all_name_matcher,
                     r#type:
                         ingesterpb::active_series_request::RequestType::NativeHistogramSeries as i32,
                 },

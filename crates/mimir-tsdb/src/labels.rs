@@ -189,6 +189,34 @@ impl Labels {
         ""
     }
 
+    /// Returns `true` if `self` has the exact same sorted `(name, value)` pairs.
+    #[inline]
+    pub fn eq_sorted_pairs(&self, pairs: &[(&str, &str)]) -> bool {
+        let mut pos = 0usize;
+        let len = self.data.len();
+        for &(k, v) in pairs {
+            if pos >= len {
+                return false;
+            }
+            let (nlen, nstart) = decode_stringlabel_size(&self.data, pos);
+            if nstart + nlen > len {
+                return false;
+            }
+            if &self.data[nstart..nstart + nlen] != k.as_bytes() {
+                return false;
+            }
+            let (vlen, vstart) = decode_stringlabel_size(&self.data, nstart + nlen);
+            if vstart + vlen > len {
+                return false;
+            }
+            if &self.data[vstart..vstart + vlen] != v.as_bytes() {
+                return false;
+            }
+            pos = vstart + vlen;
+        }
+        pos == len
+    }
+
     /// Returns `true` if `name` is present in the label set.
     pub fn has(&self, name: &str) -> bool {
         if name.is_empty() {

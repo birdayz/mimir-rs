@@ -27,6 +27,28 @@ pub fn go_mimir_bin() -> PathBuf {
     workspace_root().join("target").join("go-mimir")
 }
 
+/// Returns the path to `target/release/mimir`.
+pub fn rust_mimir_release_bin() -> PathBuf {
+    workspace_root().join("target").join("release").join("mimir")
+}
+
+/// Ensures `target/release/mimir` exists, building it if missing.
+pub fn ensure_rust_mimir_release_built() -> Result<PathBuf> {
+    let bin = rust_mimir_release_bin();
+    if bin.exists() {
+        return Ok(bin);
+    }
+    let status = Command::new("cargo")
+        .args(["build", "--release", "-p", "mimir-cmd"])
+        .current_dir(workspace_root())
+        .status()
+        .context("failed to execute cargo build --release -p mimir-cmd")?;
+    if !status.success() {
+        bail!("cargo build --release -p mimir-cmd exited with status {status}");
+    }
+    Ok(bin)
+}
+
 /// Ensures `target/go-oracle` (and `target/go-mimir`) exist, running `scripts/build-go-oracle.sh` if missing.
 pub fn ensure_go_oracle_built() -> Result<PathBuf> {
     let oracle = go_oracle_bin();
