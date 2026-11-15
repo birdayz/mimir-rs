@@ -276,6 +276,91 @@ impl MemPostings {
         }
     }
 
+    /// Batch-inserts multiple `(ref_id, SymbolLabels)` slices concurrently across `pool`.
+    pub fn add_batches_unordered_parallel(
+        &self,
+        batches: &[Vec<(u64, SymbolLabels)>],
+        pool: &mimir_common::thread_pool::ScopedWorkerPool,
+    ) {
+        let non_empty: usize = batches.iter().map(Vec::len).sum();
+        if non_empty == 0 {
+            return;
+        }
+        if batches.len() <= 1 || non_empty < 256 {
+            let mut scratch = PostingsBatchScratch::new();
+            for b in batches {
+                self.add_batch_unordered_with_scratch(b, &mut scratch);
+            }
+            return;
+        }
+
+        let ordered = self.ordered.load(AtomicOrdering::Acquire);
+        let mut scratches: Vec<PostingsBatchScratch> =
+            (0..batches.len()).map(|_| PostingsBatchScratch::new()).collect();
+
+        // Phase 1: bucket each batch's `(ref_id, nid, vid)` into 64 stripe buckets in parallel.
+        struct MutScratchPtr(*mut PostingsBatchScratch);
+        impl MutScratchPtr {
+            #[inline]
+            #[allow(clippy::mut_from_ref)]
+            unsafe fn get(&self, idx: usize) -> &mut PostingsBatchScratch {
+                unsafe { &mut *self.0.add(idx) }
+            }
+        }
+        unsafe impl Send for MutScratchPtr {}
+        unsafe impl Sync for MutScratchPtr {}
+        let s_ptr = MutScratchPtr(scratches.as_mut_ptr());
+        let num_workers = batches.len().clamp(2, 16);
+
+        pool.scoped_execute(batches.len(), |b_idx| {
+            // SAFETY: each `b_idx` is distinct across the `batches.len()` jobs.
+            let scratch = unsafe { s_ptr.get(b_idx) };
+            for (ref_id, labels) in &batches[b_idx] {
+                for &(nid, vid) in labels.as_slice() {
+                    if (nid, vid) != ALL_POSTINGS_KEY {
+                        scratch.buckets[Self::stripe_idx(nid)].push((*ref_id, nid, vid));
+                    }
+                }
+            }
+        });
+
+        // Phase 2: apply all_postings (task 64) + 64 postings stripes (tasks 0..64) in parallel.
+        let next_task = AtomicUsize::new(0);
+        let total_tasks = POSTINGS_STRIPES + 1;
+        let scratches_ref: &[PostingsBatchScratch] = &scratches;
+        pool.scoped_execute(num_workers, |_| loop {
+            let task = next_task.fetch_add(1, AtomicOrdering::Relaxed);
+            if task >= total_tasks {
+                break;
+            }
+            if task == POSTINGS_STRIPES {
+                let mut all = self.all_postings.write();
+                all.small.reserve(non_empty);
+                for b in batches {
+                    for &(ref_id, _) in b {
+                        all.push(ref_id, ordered);
+                    }
+                }
+            } else {
+                let mut has_any = false;
+                for sc in scratches_ref {
+                    if !sc.buckets[task].is_empty() {
+                        has_any = true;
+                        break;
+                    }
+                }
+                if has_any {
+                    let mut stripe = self.stripes[task].write();
+                    for sc in scratches_ref {
+                        for &(ref_id, nid, vid) in &sc.buckets[task] {
+                            stripe.add_for(ref_id, nid, vid, ordered);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Ensures all postings lists are sorted in ascending order (and deduplicated) and switches to ordered mode.
     pub fn ensure_order(&self) {
         self.ensure_order_parallel();

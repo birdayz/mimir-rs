@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1178,17 +1178,191 @@ impl SeriesIndexReader for mimir_tsdb::head::Head {
 }
 
 // ---------------------------------------------------------------------------
+// Lock-free NanosSlab for zero-lock ActiveSeries timestamp updates
+// ---------------------------------------------------------------------------
+
+const SLAB_PAGE_SHIFT: usize = 16;
+const SLAB_PAGE_SIZE: usize = 1 << SLAB_PAGE_SHIFT; // 65,536 slots = 512 KiB/page
+const SLAB_PAGE_MASK: usize = SLAB_PAGE_SIZE - 1;
+const SLAB_MAX_PAGES: usize = 512; // 33,554,432 slots max
+const SLAB_MAX_SLOTS: u32 = (SLAB_MAX_PAGES * SLAB_PAGE_SIZE) as u32;
+const SLOT_NONE: u32 = u32::MAX;
+const SLOT_INACTIVE: i64 = i64::MIN;
+
+#[inline(always)]
+const fn pack_active_cache(epoch: u16, is_plain_float: bool, is_otlp: bool, slot: u32) -> u64 {
+    ((epoch as u64) << 48)
+        | (((is_plain_float as u64) & 1) << 40)
+        | (((is_otlp as u64) & 1) << 32)
+        | (slot as u64)
+}
+
+#[inline(always)]
+const fn unpack_active_cache(packed: u64) -> (u16, u8, u8, u32) {
+    let epoch = (packed >> 48) as u16;
+    let is_plain_float = ((packed >> 40) & 0xff) as u8;
+    let is_otlp = ((packed >> 32) & 0xff) as u8;
+    let slot = packed as u32;
+    (epoch, is_plain_float, is_otlp, slot)
+}
+
+#[repr(align(64))]
+struct SlabPage {
+    slots: [AtomicI64; SLAB_PAGE_SIZE],
+}
+
+impl SlabPage {
+    fn new_boxed() -> Box<Self> {
+        let mut v: Vec<AtomicI64> = Vec::with_capacity(SLAB_PAGE_SIZE);
+        for _ in 0..SLAB_PAGE_SIZE {
+            v.push(AtomicI64::new(SLOT_INACTIVE));
+        }
+        let raw = Box::into_raw(v.into_boxed_slice()) as *mut Self;
+        // SAFETY: `SlabPage` is `#[repr(align(64))]` wrapping `[AtomicI64; SLAB_PAGE_SIZE]`,
+        // matching the exact size and alignment of `Box<[AtomicI64; SLAB_PAGE_SIZE]>`.
+        unsafe { Box::from_raw(raw) }
+    }
+}
+
+struct NanosSlab {
+    pages: Box<[AtomicPtr<SlabPage>; SLAB_MAX_PAGES]>,
+    next_slot: AtomicU32,
+    alloc_mtx: Mutex<()>,
+}
+
+impl NanosSlab {
+    fn new() -> Self {
+        let mut v: Vec<AtomicPtr<SlabPage>> = Vec::with_capacity(SLAB_MAX_PAGES);
+        for _ in 0..SLAB_MAX_PAGES {
+            v.push(AtomicPtr::new(std::ptr::null_mut()));
+        }
+        let raw = Box::into_raw(v.into_boxed_slice()) as *mut [AtomicPtr<SlabPage>; SLAB_MAX_PAGES];
+        Self {
+            // SAFETY: `[AtomicPtr<SlabPage>; SLAB_MAX_PAGES]` has exact length `SLAB_MAX_PAGES`.
+            pages: unsafe { Box::from_raw(raw) },
+            next_slot: AtomicU32::new(0),
+            alloc_mtx: Mutex::new(()),
+        }
+    }
+
+    #[inline(always)]
+    fn slot_ref(&self, slot: u32) -> Option<&AtomicI64> {
+        if slot >= SLAB_MAX_SLOTS {
+            return None;
+        }
+        let page_idx = (slot as usize) >> SLAB_PAGE_SHIFT;
+        let offset = (slot as usize) & SLAB_PAGE_MASK;
+        let ptr = self.pages[page_idx].load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `ptr` points to a heap-allocated `SlabPage` freed only in `NanosSlab::drop`,
+        // and `offset < SLAB_PAGE_SIZE`.
+        Some(unsafe { &(*ptr).slots[offset] })
+    }
+
+    fn alloc_slot(&self, initial_nanos: i64) -> u32 {
+        if self.next_slot.load(Ordering::Relaxed) >= SLAB_MAX_SLOTS {
+            return SLOT_NONE;
+        }
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
+        if slot >= SLAB_MAX_SLOTS {
+            return SLOT_NONE;
+        }
+        let page_idx = (slot as usize) >> SLAB_PAGE_SHIFT;
+        let offset = (slot as usize) & SLAB_PAGE_MASK;
+        let mut page_ptr = self.pages[page_idx].load(Ordering::Acquire);
+        if page_ptr.is_null() {
+            let _g = self.alloc_mtx.lock();
+            page_ptr = self.pages[page_idx].load(Ordering::Acquire);
+            if page_ptr.is_null() {
+                page_ptr = Box::into_raw(SlabPage::new_boxed());
+                self.pages[page_idx].store(page_ptr, Ordering::Release);
+            }
+        }
+        // SAFETY: `page_ptr` was just initialized/loaded and `offset < SLAB_PAGE_SIZE`.
+        unsafe { &(*page_ptr).slots[offset] }.store(initial_nanos, Ordering::Release);
+        slot
+    }
+
+    #[inline(always)]
+    fn load(&self, slot: u32) -> i64 {
+        self.slot_ref(slot)
+            .map_or(SLOT_INACTIVE, |a| a.load(Ordering::Relaxed))
+    }
+
+    #[inline(always)]
+    fn mark_inactive(&self, slot: u32) {
+        if let Some(a) = self.slot_ref(slot) {
+            a.store(SLOT_INACTIVE, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for NanosSlab {
+    fn drop(&mut self) {
+        for ptr in self.pages.iter() {
+            let p = ptr.load(Ordering::Acquire);
+            if !p.is_null() {
+                // SAFETY: every non-null entry came from `Box::into_raw(SlabPage::new_boxed())`.
+                unsafe { drop(Box::from_raw(p)) };
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ActiveSeries & Stripes (`activeseries/active_series.go`)
 // ---------------------------------------------------------------------------
 
 struct SeriesEntry {
     nanos: AtomicI64,
+    slot: u32,
     num_native_histogram_buckets: i32, // -1 if not a native histogram
     flags: u8,
     matches: PreAllocDynamicSlice,
 }
 
 impl SeriesEntry {
+    fn read_nanos(&self, slab: &NanosSlab) -> i64 {
+        if self.slot != SLOT_NONE {
+            let v = slab.load(self.slot);
+            if v != SLOT_INACTIVE {
+                return v;
+            }
+        }
+        self.nanos.load(Ordering::Relaxed)
+    }
+
+    fn write_nanos(&self, slab: &NanosSlab, now_ns: i64) -> bool {
+        if self.slot != SLOT_NONE && now_ns != SLOT_INACTIVE {
+            if let Some(slot_atomic) = slab.slot_ref(self.slot) {
+                let mut cur = slot_atomic.load(Ordering::Relaxed);
+                while cur != SLOT_INACTIVE && now_ns > cur {
+                    match slot_atomic.compare_exchange_weak(
+                        cur,
+                        now_ns,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return true,
+                        Err(actual) => cur = actual,
+                    }
+                }
+                if cur != SLOT_INACTIVE {
+                    return false;
+                }
+            }
+        }
+        let prev = self.nanos.load(Ordering::Relaxed);
+        if now_ns > prev {
+            self.nanos.store(now_ns, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     fn is_deleted(&self) -> bool {
         (self.flags & FLAG_IS_DELETED) != 0
     }
@@ -1360,6 +1534,7 @@ impl SeriesStripe {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn update_series_timestamp(
         &self,
         now_ns: i64,
@@ -1368,6 +1543,9 @@ impl SeriesStripe {
         ref_id: u64,
         num_native_histogram_buckets: i64,
         is_otlp: bool,
+        slab: &NanosSlab,
+        epoch: u16,
+        head_entry: Option<&mimir_tsdb::head::SeriesEntry>,
     ) -> bool {
         let buckets_i32 = num_native_histogram_buckets.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let mut need_write = false;
@@ -1377,15 +1555,24 @@ impl SeriesStripe {
         {
             let guard = self.inner.read();
             if let Some(entry) = guard.refs.get(&ref_id) {
-                let prev = entry.nanos.load(Ordering::Relaxed);
-                if now_ns > prev {
-                    entry.nanos.store(now_ns, Ordering::Relaxed);
+                if entry.write_nanos(slab, now_ns) {
                     entry_time_set = true;
                 }
                 if entry.num_native_histogram_buckets != buckets_i32
                     || (is_otlp && !entry.is_otlp())
                 {
                     need_write = true;
+                } else if let Some(he) = head_entry {
+                    if buckets_i32 < 0 && entry.slot != SLOT_NONE {
+                        he.set_active_cache(pack_active_cache(
+                            epoch,
+                            true,
+                            entry.is_otlp(),
+                            entry.slot,
+                        ));
+                    } else if buckets_i32 >= 0 {
+                        he.set_active_cache(0);
+                    }
                 }
             } else {
                 need_write = true;
@@ -1395,11 +1582,9 @@ impl SeriesStripe {
         if need_write {
             let mut guard = self.inner.write();
             if guard.refs.contains_key(&ref_id) {
-                let (old_buckets, was_otlp, matches) = {
+                let (old_buckets, was_otlp, matches, entry_slot, now_is_otlp) = {
                     let entry = guard.refs.get_mut(&ref_id).expect("checked contains_key");
-                    let prev = entry.nanos.load(Ordering::Relaxed);
-                    if now_ns > prev {
-                        entry.nanos.store(now_ns, Ordering::Relaxed);
+                    if entry.write_nanos(slab, now_ns) {
                         entry_time_set = true;
                     }
                     let was_otlp = entry.is_otlp();
@@ -1410,8 +1595,20 @@ impl SeriesStripe {
                     if old_b != buckets_i32 {
                         entry.num_native_histogram_buckets = buckets_i32;
                     }
-                    (old_b, was_otlp, entry.matches.clone())
+                    (old_b, was_otlp, entry.matches.clone(), entry.slot, entry.is_otlp())
                 };
+                if let Some(he) = head_entry {
+                    if buckets_i32 < 0 && entry_slot != SLOT_NONE {
+                        he.set_active_cache(pack_active_cache(
+                            epoch,
+                            true,
+                            now_is_otlp,
+                            entry_slot,
+                        ));
+                    } else if buckets_i32 >= 0 {
+                        he.set_active_cache(0);
+                    }
+                }
                 if is_otlp && !was_otlp {
                     guard.active_otlp += 1;
                 }
@@ -1535,10 +1732,23 @@ impl SeriesStripe {
                     );
                 }
 
+                let slot = if now_ns != SLOT_INACTIVE {
+                    slab.alloc_slot(now_ns)
+                } else {
+                    SLOT_NONE
+                };
+                if let Some(he) = head_entry {
+                    if buckets_i32 < 0 && slot != SLOT_NONE {
+                        he.set_active_cache(pack_active_cache(epoch, true, is_otlp, slot));
+                    } else {
+                        he.set_active_cache(0);
+                    }
+                }
                 guard.refs.insert(
                     ref_id,
                     SeriesEntry {
                         nanos: AtomicI64::new(now_ns),
+                        slot,
                         matches,
                         num_native_histogram_buckets: buckets_i32,
                         flags,
@@ -1594,11 +1804,15 @@ impl SeriesStripe {
         ref_id: u64,
         idx: Option<&dyn SeriesIndexReader>,
         deleted: &DeletedSeries,
+        slab: &NanosSlab,
     ) {
         let mut guard = self.inner.write();
         let Some(entry) = guard.refs.remove(&ref_id) else {
             return;
         };
+        if entry.slot != SLOT_NONE {
+            slab.mark_inactive(entry.slot);
+        }
         guard.active = guard.active.saturating_sub(1);
         if entry.is_otlp() {
             guard.active_otlp = guard.active_otlp.saturating_sub(1);
@@ -1641,6 +1855,7 @@ impl SeriesStripe {
         matchers_changed: bool,
         cat_changed: bool,
         idx: Option<&dyn SeriesIndexReader>,
+        slab: &NanosSlab,
     ) {
         // Phase 1: pre-fetch refs under lock.
         let refs: Vec<u64> = {
@@ -1682,7 +1897,7 @@ impl SeriesStripe {
                 if let Some((lbls, matches)) = resolved.get(&ref_id) {
                     if cat_changed {
                         if let Some(ref cat) = new_cat {
-                            let ts = entry.nanos.load(Ordering::Relaxed);
+                            let ts = entry.read_nanos(slab);
                             cat.increment(
                                 lbls,
                                 UNIX_EPOCH + Duration::from_nanos(ts.max(0) as u64),
@@ -1699,7 +1914,7 @@ impl SeriesStripe {
                 if let Some(lbls) = idx.and_then(|r| r.series_labels(ref_id)) {
                     if cat_changed {
                         if let Some(ref cat) = new_cat {
-                            let ts = entry.nanos.load(Ordering::Relaxed);
+                            let ts = entry.read_nanos(slab);
                             cat.increment(
                                 &lbls,
                                 UNIX_EPOCH + Duration::from_nanos(ts.max(0) as u64),
@@ -1758,6 +1973,7 @@ impl SeriesStripe {
         keep_until_ns: i64,
         idx: Option<&dyn SeriesIndexReader>,
         deleted: &DeletedSeries,
+        slab: &NanosSlab,
     ) {
         let oldest = self.oldest_entry_ns.load(Ordering::Relaxed);
         if oldest > 0 && keep_until_ns <= oldest {
@@ -1775,6 +1991,36 @@ impl SeriesStripe {
         let mut new_oldest = i64::MAX;
         let mut to_remove = Vec::new();
         for (&ref_id, entry) in &guard.refs {
+            if entry.slot != SLOT_NONE {
+                if let Some(slot_atomic) = slab.slot_ref(entry.slot) {
+                    loop {
+                        let ts = slot_atomic.load(Ordering::Acquire);
+                        if ts == SLOT_INACTIVE {
+                            to_remove.push(ref_id);
+                            break;
+                        }
+                        if ts >= keep_until_ns {
+                            if ts < new_oldest {
+                                new_oldest = ts;
+                            }
+                            break;
+                        }
+                        if slot_atomic
+                            .compare_exchange_weak(
+                                ts,
+                                SLOT_INACTIVE,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            to_remove.push(ref_id);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
             let ts = entry.nanos.load(Ordering::Relaxed);
             if ts < keep_until_ns {
                 to_remove.push(ref_id);
@@ -1836,8 +2082,13 @@ impl SeriesStripe {
         }
     }
 
-    fn clear(&self) {
+    fn clear(&self, slab: &NanosSlab) {
         let mut guard = self.inner.write();
+        for entry in guard.refs.values() {
+            if entry.slot != SLOT_NONE {
+                slab.mark_inactive(entry.slot);
+            }
+        }
         guard.refs.clear();
         guard.active = 0;
         guard.active_otlp = 0;
@@ -1850,9 +2101,11 @@ impl SeriesStripe {
     }
 }
 
-/// 128-stripe active series & native histogram bucket tracker for a single tenant.
+/// 4096-stripe active series & native histogram bucket tracker for a single tenant.
 pub struct ActiveSeries {
     stripes: Vec<SeriesStripe>,
+    slab: NanosSlab,
+    epoch: AtomicU16,
     deleted: DeletedSeries,
     config_mtx: RwLock<(Matchers, Option<Arc<CostAttributionActiveTracker>>)>,
     timeout: Duration,
@@ -1875,6 +2128,8 @@ impl ActiveSeries {
         }
         Self {
             stripes,
+            slab: NanosSlab::new(),
+            epoch: AtomicU16::new(1),
             deleted: DeletedSeries::default(),
             config_mtx: RwLock::new((matchers, cat)),
             timeout,
@@ -1922,7 +2177,14 @@ impl ActiveSeries {
     ) {
         let mut guard = self.config_mtx.write();
         for stripe in &self.stripes {
-            stripe.reload_config(&matchers, &cat, matchers_changed, cat_changed, idx);
+            stripe.reload_config(
+                &matchers,
+                &cat,
+                matchers_changed,
+                cat_changed,
+                idx,
+                &self.slab,
+            );
         }
         if matchers_changed {
             guard.0 = matchers;
@@ -1932,8 +2194,11 @@ impl ActiveSeries {
         }
     }
 
-    pub fn update_series(
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_series_with_entry(
         &self,
+        entry: Option<&mimir_tsdb::head::SeriesEntry>,
         pairs: &[(&str, &str)],
         _hash: u64,
         ref_id: u64,
@@ -1942,6 +2207,58 @@ impl ActiveSeries {
         is_otlp: bool,
     ) {
         let now_ns = system_time_to_unix_nanos(now);
+        if num_native_histogram_buckets < 0 && now_ns != SLOT_INACTIVE {
+            if let Some(head_entry) = entry {
+                let packed = head_entry.active_cache();
+                if packed != 0 {
+                    let (c_epoch, c_is_plain_float, c_is_otlp, slot) = unpack_active_cache(packed);
+                    let cur_epoch = self.epoch.load(Ordering::Acquire);
+                    if c_epoch == cur_epoch
+                        && c_is_plain_float != 0
+                        && (!is_otlp || c_is_otlp != 0)
+                    {
+                        if let Some(slot_atomic) = self.slab.slot_ref(slot) {
+                            let mut cur = slot_atomic.load(Ordering::Relaxed);
+                            loop {
+                                if cur == SLOT_INACTIVE {
+                                    break;
+                                }
+                                if now_ns <= cur {
+                                    return;
+                                }
+                                match slot_atomic.compare_exchange_weak(
+                                    cur,
+                                    now_ns,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => {
+                                        let stripe = &self.stripes[(ref_id as usize) & STRIPE_MASK];
+                                        let mut prev_oldest =
+                                            stripe.oldest_entry_ns.load(Ordering::Relaxed);
+                                        while prev_oldest > 0 && now_ns < prev_oldest {
+                                            match stripe.oldest_entry_ns.compare_exchange_weak(
+                                                prev_oldest,
+                                                0,
+                                                Ordering::Relaxed,
+                                                Ordering::Relaxed,
+                                            ) {
+                                                Ok(_) => break,
+                                                Err(actual) => prev_oldest = actual,
+                                            }
+                                        }
+                                        return;
+                                    }
+                                    Err(actual) => cur = actual,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let epoch = self.epoch.load(Ordering::Acquire);
         let stripe_id = (ref_id as usize) & STRIPE_MASK;
         let created = self.stripes[stripe_id].update_series_timestamp(
             now_ns,
@@ -1950,14 +2267,37 @@ impl ActiveSeries {
             ref_id,
             num_native_histogram_buckets,
             is_otlp,
+            &self.slab,
+            epoch,
+            entry,
         );
         if created && !self.deleted.is_empty() {
             let lbls = Labels::from_pairs(pairs.iter().copied());
             if let Some(deleted_ref) = self.deleted.find(lbls.as_bytes()) {
                 let d_stripe = (deleted_ref as usize) & STRIPE_MASK;
-                self.stripes[d_stripe].remove(deleted_ref, None, &self.deleted);
+                self.stripes[d_stripe].remove(deleted_ref, None, &self.deleted, &self.slab);
             }
         }
+    }
+
+    pub fn update_series(
+        &self,
+        pairs: &[(&str, &str)],
+        hash: u64,
+        ref_id: u64,
+        now: SystemTime,
+        num_native_histogram_buckets: i64,
+        is_otlp: bool,
+    ) {
+        self.update_series_with_entry(
+            None,
+            pairs,
+            hash,
+            ref_id,
+            now,
+            num_native_histogram_buckets,
+            is_otlp,
+        );
     }
 
     pub fn update_series_labels(
@@ -1970,6 +2310,7 @@ impl ActiveSeries {
         idx: Option<&dyn SeriesIndexReader>,
     ) {
         let now_ns = system_time_to_unix_nanos(now);
+        let epoch = self.epoch.load(Ordering::Acquire);
         let stripe_id = (ref_id as usize) & STRIPE_MASK;
         let created = self.stripes[stripe_id].update_series_timestamp(
             now_ns,
@@ -1978,11 +2319,14 @@ impl ActiveSeries {
             ref_id,
             num_native_histogram_buckets,
             is_otlp,
+            &self.slab,
+            epoch,
+            None,
         );
         if created && !self.deleted.is_empty() {
             if let Some(deleted_ref) = self.deleted.find(series.as_bytes()) {
                 let d_stripe = (deleted_ref as usize) & STRIPE_MASK;
-                self.stripes[d_stripe].remove(deleted_ref, idx, &self.deleted);
+                self.stripes[d_stripe].remove(deleted_ref, idx, &self.deleted, &self.slab);
             }
         }
     }
@@ -2009,7 +2353,7 @@ impl ActiveSeries {
     pub fn purge_at(&self, keep_until: SystemTime, idx: Option<&dyn SeriesIndexReader>) {
         let keep_until_ns = system_time_to_unix_nanos(keep_until);
         for stripe in &self.stripes {
-            stripe.purge(keep_until_ns, idx, &self.deleted);
+            stripe.purge(keep_until_ns, idx, &self.deleted, &self.slab);
         }
     }
 
@@ -2162,12 +2506,28 @@ impl ActiveSeries {
     }
 
     pub fn delete_with_index(&self, ref_id: u64, idx: Option<&dyn SeriesIndexReader>) {
-        self.stripes[(ref_id as usize) & STRIPE_MASK].remove(ref_id, idx, &self.deleted);
+        self.stripes[(ref_id as usize) & STRIPE_MASK].remove(
+            ref_id,
+            idx,
+            &self.deleted,
+            &self.slab,
+        );
     }
 
     pub fn clear(&self) {
+        let mut cur = self.epoch.load(Ordering::Acquire);
+        loop {
+            let next = if cur == u16::MAX { 1 } else { cur + 1 };
+            match self
+                .epoch
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
         for stripe in &self.stripes {
-            stripe.clear();
+            stripe.clear(&self.slab);
         }
         self.deleted.clear();
     }
@@ -2497,5 +2857,105 @@ mod tests {
         assert_eq!(deleted.find(lbls.as_bytes()), Some(42));
         deleted.purge(42);
         assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn nanos_slab_fast_path_purge_clear_and_flip_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = mimir_tsdb::head::Head::open(
+            dir.path(),
+            mimir_tsdb::head::HeadOptions::default(),
+            i64::MIN,
+        )
+        .unwrap();
+        let pairs = [("__name__", "up"), ("job", "api")];
+        {
+            let mut app = head.appender();
+            app.append_float(None, &pairs, 1_000, 1.0).unwrap();
+            app.commit().unwrap();
+        }
+        let head_entry = head.get_entry_by_sorted_pairs(&pairs).unwrap();
+        assert_eq!(head_entry.active_cache(), 0);
+
+        let tracker = ActiveSeries::new(Vec::new(), Duration::from_secs(60));
+        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        // 1. Slow path populates NanosSlab & head_entry.active_cache
+        tracker.update_series_with_entry(
+            Some(&head_entry),
+            &pairs,
+            head_entry.hash,
+            head_entry.ref_id,
+            t0,
+            -1,
+            false,
+        );
+        assert_ne!(head_entry.active_cache(), 0);
+        assert_eq!(tracker.active(), (1, 0, 0, 0));
+
+        // 2. Fast path updates slab timestamp without touching Stripe lock
+        let t1 = t0 + Duration::from_secs(30);
+        tracker.update_series_with_entry(
+            Some(&head_entry),
+            &pairs,
+            head_entry.hash,
+            head_entry.ref_id,
+            t1,
+            -1,
+            false,
+        );
+        assert_eq!(tracker.active(), (1, 0, 0, 0));
+
+        // 3. Purge at t0 + 10s (keep_until = t0 + 10s -> kept because ts == t1 == t0 + 30s!)
+        tracker.purge(t0 + Duration::from_secs(70));
+        assert_eq!(tracker.active(), (1, 0, 0, 0));
+
+        // 4. Purge past t1 -> evicted & slab slot marked SLOT_INACTIVE
+        tracker.purge(t1 + Duration::from_secs(61));
+        assert_eq!(tracker.active(), (0, 0, 0, 0));
+
+        // 5. Fast path sees SLOT_INACTIVE and falls back to slow path -> re-activates!
+        let t2 = t1 + Duration::from_secs(70);
+        tracker.update_series_with_entry(
+            Some(&head_entry),
+            &pairs,
+            head_entry.hash,
+            head_entry.ref_id,
+            t2,
+            -1,
+            false,
+        );
+        assert_eq!(tracker.active(), (1, 0, 0, 0));
+
+        // 6. clear() bumps epoch; stale active_cache misses and re-inserts with new slot
+        let old_packed = head_entry.active_cache();
+        tracker.clear();
+        assert_eq!(tracker.active(), (0, 0, 0, 0));
+        let t3 = t2 + Duration::from_secs(10);
+        tracker.update_series_with_entry(
+            Some(&head_entry),
+            &pairs,
+            head_entry.hash,
+            head_entry.ref_id,
+            t3,
+            -1,
+            false,
+        );
+        assert_eq!(tracker.active(), (1, 0, 0, 0));
+        assert_ne!(head_entry.active_cache(), old_packed);
+
+        // 7. Switching to native histogram clears active_cache
+        tracker.update_series_with_entry(
+            Some(&head_entry),
+            &pairs,
+            head_entry.hash,
+            head_entry.ref_id,
+            t3 + Duration::from_secs(1),
+            8,
+            true,
+        );
+        assert_eq!(head_entry.active_cache(), 0);
+        assert_eq!(tracker.active(), (1, 1, 1, 8));
+
+        head.close().unwrap();
     }
 }

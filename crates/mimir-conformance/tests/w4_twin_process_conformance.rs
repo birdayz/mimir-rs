@@ -5,9 +5,12 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio_stream::StreamExt;
@@ -37,21 +40,43 @@ use tonic::transport::Channel;
 struct ProcessGuard {
     name: String,
     child: Option<Child>,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    stderr_thread: Option<JoinHandle<()>>,
 }
 
 impl ProcessGuard {
     fn spawn(name: impl Into<String>, bin: &Path, args: &[String], workdir: &Path) -> Self {
         let name = name.into();
-        let child = Command::new(bin)
+        let mut child = Command::new(bin)
             .args(args)
             .current_dir(workdir)
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn {name} ({}): {e}", bin.display()));
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stderr_thread = child.stderr.take().map(|mut err| {
+            let buf = Arc::clone(&stderr_buf);
+            std::thread::spawn(move || {
+                let mut tmp = [0u8; 8192];
+                while let Ok(n) = err.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut g) = buf.lock() {
+                        if g.len() < 1024 * 1024 {
+                            let rem = (1024 * 1024) - g.len();
+                            g.extend_from_slice(&tmp[..n.min(rem)]);
+                        }
+                    }
+                }
+            })
+        });
         Self {
             name,
             child: Some(child),
+            stderr_buf,
+            stderr_thread,
         }
     }
 
@@ -64,11 +89,17 @@ impl ProcessGuard {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = child.try_wait().expect("try_wait") {
+                if let Some(t) = self.stderr_thread.take() {
+                    let _ = t.join();
+                }
                 return status;
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let status = child.wait().expect("wait after kill");
+                if let Some(t) = self.stderr_thread.take() {
+                    let _ = t.join();
+                }
                 panic!("{} did not exit within {:?} (killed: {:?})", self.name, timeout, status);
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -76,28 +107,28 @@ impl ProcessGuard {
     }
 
     fn dump_stderr_with_sigquit(&mut self) -> String {
-        use std::io::Read;
-        let Some(ref mut c) = self.child else {
-            return String::new();
-        };
-        if c.try_wait().ok().flatten().is_none() {
-            #[cfg(unix)]
-            {
-                let _ = Command::new("kill")
-                    .args(["-QUIT", &c.id().to_string()])
-                    .status();
-                std::thread::sleep(Duration::from_millis(200));
-            }
+        if let Some(ref mut c) = self.child {
             if c.try_wait().ok().flatten().is_none() {
-                let _ = c.kill();
+                #[cfg(unix)]
+                {
+                    let _ = Command::new("kill")
+                        .args(["-QUIT", &c.id().to_string()])
+                        .status();
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                if c.try_wait().ok().flatten().is_none() {
+                    let _ = c.kill();
+                }
+                let _ = c.wait();
             }
-            let _ = c.wait();
         }
-        let mut s = String::new();
-        if let Some(mut err) = c.stderr.take() {
-            let _ = err.read_to_string(&mut s);
+        if let Some(t) = self.stderr_thread.take() {
+            let _ = t.join();
         }
-        s
+        self.stderr_buf
+            .lock()
+            .map(|g| String::from_utf8_lossy(&g).into_owned())
+            .unwrap_or_default()
     }
 }
 
@@ -108,6 +139,9 @@ impl Drop for ProcessGuard {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+        }
+        if let Some(t) = self.stderr_thread.take() {
+            let _ = t.join();
         }
     }
 }

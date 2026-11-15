@@ -540,29 +540,44 @@ impl IngesterShardedBatchConsumer {
 
                 for ts in borrowed.timeseries() {
                     let pairs_start = pairs_mut.len() as u32;
-                    let ts_labels = ts.labels();
-                    pairs_mut.reserve(ts_labels.len());
                     let mut labels_sorted_unique = true;
                     let mut bad_utf8 = false;
                     let mut prev_name: Option<&str> = None;
 
-                    for lp in ts_labels {
-                        let Ok(k) = fast_utf8_str(lp.name) else {
-                            bad_utf8 = true;
-                            break;
-                        };
-                        let Ok(v) = fast_utf8_str(lp.value) else {
-                            bad_utf8 = true;
-                            break;
-                        };
-                        if let Some(pn) = prev_name {
-                            if pn >= k {
-                                labels_sorted_unique = false;
+                    if let Some(ts_labels_str) = ts.labels_str() {
+                        pairs_mut.reserve(ts_labels_str.len());
+                        for (k, v) in ts_labels_str {
+                            if let Some(pn) = prev_name {
+                                if pn >= k {
+                                    labels_sorted_unique = false;
+                                }
+                            }
+                            prev_name = Some(k);
+                            if !v.is_empty() {
+                                pairs_mut.push((k, v));
                             }
                         }
-                        prev_name = Some(k);
-                        if !v.is_empty() {
-                            pairs_mut.push((k, v));
+                    } else {
+                        let ts_labels = ts.labels();
+                        pairs_mut.reserve(ts_labels.len());
+                        for lp in ts_labels {
+                            let Ok(k) = fast_utf8_str(lp.name) else {
+                                bad_utf8 = true;
+                                break;
+                            };
+                            let Ok(v) = fast_utf8_str(lp.value) else {
+                                bad_utf8 = true;
+                                break;
+                            };
+                            if let Some(pn) = prev_name {
+                                if pn >= k {
+                                    labels_sorted_unique = false;
+                                }
+                            }
+                            prev_name = Some(k);
+                            if !v.is_empty() {
+                                pairs_mut.push((k, v));
+                            }
                         }
                     }
 

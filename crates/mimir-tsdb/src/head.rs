@@ -11,7 +11,7 @@ use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -381,17 +381,58 @@ struct CompactSeriesMetadata {
     help: SymbolId,
 }
 
-const PENDING_COMMITS_MASK: u32 = 0x1FFF_FFFF;
 const FLAG_COMPUTED_HIST_END_TIME: u32 = 1 << 29;
 const FLAG_GCED: u32 = 1 << 30;
 const FLAG_HAS_LAST_EXEMPLAR: u32 = 1 << 31;
+
+#[inline(always)]
+pub fn prefetch_read_data<T>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr.cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
+}
 
 #[derive(Debug)]
 pub struct SeriesEntry {
     pub ref_id: u64,
     pub hash: u64,
     pub labels: Labels,
+    active_cache: AtomicU64,
+    in_order_max_time: AtomicI64,
+    pending_commits: AtomicU32,
     inner: Mutex<SeriesState>,
+}
+
+impl SeriesEntry {
+    #[inline(always)]
+    pub fn active_cache(&self) -> u64 {
+        self.active_cache.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    pub fn set_active_cache(&self, packed: u64) {
+        self.active_cache.store(packed, Ordering::Release);
+    }
+}
+
+struct PendingCommitGuard<'g>(&'g AtomicU32);
+
+impl Drop for PendingCommitGuard<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -454,7 +495,7 @@ struct SeriesState {
     last_exemplar_ts: i64,
     last_sample: LastSample,
     metadata: Option<CompactSeriesMetadata>,
-    pending_commits_and_flags: u32,
+    flags: u32,
     xor_state: XorAppendState,
     xor2_state: Option<Box<Xor2AppendState>>,
     hist_state: Option<Box<HistAppendCache>>,
@@ -471,7 +512,7 @@ impl SeriesState {
             last_exemplar_ts: i64::MIN,
             last_sample: LastSample::None,
             metadata: None,
-            pending_commits_and_flags: 0,
+            flags: 0,
             xor_state: XorAppendState::default(),
             xor2_state: None,
             hist_state: None,
@@ -489,61 +530,40 @@ impl SeriesState {
     }
 
     #[inline]
-    fn pending_commits(&self) -> u32 {
-        self.pending_commits_and_flags & PENDING_COMMITS_MASK
-    }
-
-    #[inline]
-    fn inc_pending_commits(&mut self) {
-        let count = self.pending_commits();
-        debug_assert!(count < PENDING_COMMITS_MASK);
-        self.pending_commits_and_flags =
-            (self.pending_commits_and_flags & !PENDING_COMMITS_MASK) | (count + 1);
-    }
-
-    #[inline]
-    fn dec_pending_commits(&mut self) {
-        let count = self.pending_commits().saturating_sub(1);
-        self.pending_commits_and_flags =
-            (self.pending_commits_and_flags & !PENDING_COMMITS_MASK) | count;
-    }
-
-    #[inline]
     fn computed_hist_end_time(&self) -> bool {
-        (self.pending_commits_and_flags & FLAG_COMPUTED_HIST_END_TIME) != 0
+        (self.flags & FLAG_COMPUTED_HIST_END_TIME) != 0
     }
 
     #[inline]
     fn set_computed_hist_end_time(&mut self, val: bool) {
         if val {
-            self.pending_commits_and_flags |= FLAG_COMPUTED_HIST_END_TIME;
+            self.flags |= FLAG_COMPUTED_HIST_END_TIME;
         } else {
-            self.pending_commits_and_flags &= !FLAG_COMPUTED_HIST_END_TIME;
+            self.flags &= !FLAG_COMPUTED_HIST_END_TIME;
         }
     }
 
     #[inline]
     fn set_gced(&mut self, val: bool) {
         if val {
-            self.pending_commits_and_flags |= FLAG_GCED;
+            self.flags |= FLAG_GCED;
         } else {
-            self.pending_commits_and_flags &= !FLAG_GCED;
+            self.flags &= !FLAG_GCED;
         }
     }
 
     #[inline]
     fn last_exemplar_ts(&self) -> Option<i64> {
-        ((self.pending_commits_and_flags & FLAG_HAS_LAST_EXEMPLAR) != 0)
-            .then_some(self.last_exemplar_ts)
+        ((self.flags & FLAG_HAS_LAST_EXEMPLAR) != 0).then_some(self.last_exemplar_ts)
     }
 
     #[inline]
     fn update_last_exemplar_ts(&mut self, ts: i64) {
-        if (self.pending_commits_and_flags & FLAG_HAS_LAST_EXEMPLAR) != 0 {
+        if (self.flags & FLAG_HAS_LAST_EXEMPLAR) != 0 {
             self.last_exemplar_ts = self.last_exemplar_ts.max(ts);
         } else {
             self.last_exemplar_ts = ts;
-            self.pending_commits_and_flags |= FLAG_HAS_LAST_EXEMPLAR;
+            self.flags |= FLAG_HAS_LAST_EXEMPLAR;
         }
     }
 
@@ -1276,6 +1296,76 @@ impl StripeSeries {
             .cloned()
     }
 
+    fn resolve_prehashed_batch<T>(
+        &self,
+        items: &[T],
+        get_hp: impl Fn(&T) -> Option<(u64, &[(&str, &str)])>,
+        out: &mut Vec<Option<Arc<SeriesEntry>>>,
+    ) {
+        out.clear();
+        let n = items.len();
+        if n == 0 {
+            return;
+        }
+        out.resize_with(n, || None);
+
+        const CHUNK: usize = 16;
+        const STRIPE_PREFETCH_AHEAD: usize = 4;
+
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + CHUNK).min(n);
+
+            // Pass 1: prefetch stripes ahead, probe H2 tag in HashTable, clone candidate,
+            // and prefetch `labels.as_bytes()` + `SeriesState` for Pass 2.
+            for i in start..end {
+                if i + STRIPE_PREFETCH_AHEAD < end {
+                    if let Some((h_ahead, _)) = get_hp(&items[i + STRIPE_PREFETCH_AHEAD]) {
+                        let idx_ahead = self.stripe_idx(h_ahead);
+                        prefetch_read_data(&self.stripes[idx_ahead]);
+                    }
+                }
+                let Some((hash, _)) = get_hp(&items[i]) else {
+                    continue;
+                };
+                let idx = self.stripe_idx(hash);
+                let stripe = self.stripes[idx].read();
+                let mut found: Option<Arc<SeriesEntry>> = None;
+                for cand in stripe.by_hash.iter_hash(hash) {
+                    if cand.hash == hash {
+                        found = Some(Arc::clone(cand));
+                        break;
+                    }
+                }
+                drop(stripe);
+                if let Some(cloned) = found {
+                    let ptr = Arc::as_ptr(&cloned);
+                    let lbl_bytes = cloned.labels.as_bytes();
+                    if !lbl_bytes.is_empty() {
+                        prefetch_read_data(lbl_bytes.as_ptr());
+                    }
+                    prefetch_read_data((ptr as *const u8).wrapping_add(64));
+                    out[i] = Some(cloned);
+                }
+            }
+
+            // Pass 2: verify candidate `hash` and `eq_sorted_pairs` while `labels` bytes are hot in L1.
+            for i in start..end {
+                let Some((hash, pairs)) = get_hp(&items[i]) else {
+                    continue;
+                };
+                if let Some(ref cand) = out[i] {
+                    if cand.hash == hash && cand.labels.eq_sorted_pairs(pairs) {
+                        continue;
+                    }
+                    out[i] = self.get_by_sorted_pairs(hash, pairs);
+                }
+            }
+
+            start = end;
+        }
+    }
+
     fn get_by_hash_and_labels(&self, hash: u64, labels: &Labels) -> Option<Arc<SeriesEntry>> {
         let idx = self.stripe_idx(hash);
         let stripe = self.stripes[idx].read();
@@ -1794,6 +1884,9 @@ impl Head {
             if mv.len() > 1 {
                 mv.sort_by_key(|c| (c.min_time, c.max_time));
             }
+            entry
+                .in_order_max_time
+                .store(st.max_time(), Ordering::Release);
         }
         if !ooo_mmc.is_empty() {
             for m in &ooo_mmc {
@@ -1841,6 +1934,9 @@ impl Head {
                         *mint = (*mint).min(s.t);
                         *maxt = (*maxt).max(s.t);
                     }
+                    entry
+                        .in_order_max_time
+                        .store(state.max_time(), Ordering::Release);
                     return Ok(());
                 }
                 Some(Encoding::FloatHistogram | Encoding::FloatHistogramSt) => {
@@ -1861,6 +1957,9 @@ impl Head {
                         *mint = (*mint).min(s.t);
                         *maxt = (*maxt).max(s.t);
                     }
+                    entry
+                        .in_order_max_time
+                        .store(state.max_time(), Ordering::Release);
                     return Ok(());
                 }
                 _ => {}
@@ -1880,6 +1979,9 @@ impl Head {
             *mint = (*mint).min(s.t);
             *maxt = (*maxt).max(s.t);
         }
+        entry
+            .in_order_max_time
+            .store(state.max_time(), Ordering::Release);
         Ok(())
     }
 
@@ -1907,6 +2009,9 @@ impl Head {
             *mint = (*mint).min(hs.t);
             *maxt = (*maxt).max(hs.t);
         }
+        entry
+            .in_order_max_time
+            .store(state.max_time(), Ordering::Release);
         Ok(())
     }
 
@@ -1934,6 +2039,9 @@ impl Head {
             *mint = (*mint).min(fhs.t);
             *maxt = (*maxt).max(fhs.t);
         }
+        entry
+            .in_order_max_time
+            .store(state.max_time(), Ordering::Release);
         Ok(())
     }
 
@@ -2146,10 +2254,15 @@ impl Head {
             },
         }
 
+        enum ParallelDecodedRecord {
+            Series(Vec<RefSeries>, Vec<u64>),
+            Other(DecodedRecord),
+        }
+
         const WAL_SHARD_BATCH_MAX: usize = 5000;
         const WAL_DECODE_BATCH_RECORDS: usize = 64;
         const WAL_DECODE_BATCH_BYTES: usize = 1024 * 1024;
-        const WAL_POSTINGS_BATCH: usize = 4096;
+        const WAL_SERIES_PARALLEL_BATCH_MAX: usize = 32_768;
 
         let max_threads = std::thread::available_parallelism()
             .map_or(8, |n| n.get())
@@ -2157,9 +2270,10 @@ impl Head {
         let workers = self.opts.wal_replay_concurrency.min(max_threads).max(2);
         let dec_workers = workers.min(8);
         let min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
+        let series_pool = mimir_common::thread_pool::ScopedWorkerPool::new("wal-series", workers);
 
         type RawBatch = (u64, Vec<(CompressionType, Vec<u8>)>);
-        type DecodedBatch = (u64, Vec<DecodedRecord>);
+        type DecodedBatch = (u64, Vec<ParallelDecodedRecord>);
 
         // Channel capacity > dec_workers * dec_queue_cap ensures zero deadlock when reordering.
         let (decoded_tx, decoded_rx) =
@@ -2241,7 +2355,13 @@ impl Head {
                                 break;
                             }
                             match dec.decode_record(&decomp_buf) {
-                                Ok(rec) => decoded_batch.push(rec),
+                                Ok(DecodedRecord::Series(series_list)) => {
+                                    let hashes: Vec<u64> =
+                                        series_list.iter().map(|rs| rs.labels.hash()).collect();
+                                    decoded_batch
+                                        .push(ParallelDecodedRecord::Series(series_list, hashes));
+                                }
+                                Ok(rec) => decoded_batch.push(ParallelDecodedRecord::Other(rec)),
                                 Err(e) => {
                                     err = Some(HeadError::from(e));
                                     break;
@@ -2335,17 +2455,157 @@ impl Head {
             }
 
             // Stage 2: Coordinator processes decoded batches in exact WAL order (`batch_id`),
-            // resolves Series & multi_ref, batches unordered postings, and shards samples.
+            // resolves Series in parallel (sharded by hash % workers), and shards samples.
             let mut coord_res: Result<(), HeadError> = Ok(());
             let mut sample_shards: Vec<Vec<RefSample>> = vec![Vec::new(); workers];
             let mut hist_shards: Vec<Vec<RefHistogramSample>> = vec![Vec::new(); workers];
             let mut fhist_shards: Vec<Vec<RefFloatHistogramSample>> = vec![Vec::new(); workers];
             let mut pending_deletes: Vec<Arc<SeriesEntry>> = Vec::new();
-            let mut pending_postings: Vec<(u64, SymbolLabels)> =
-                Vec::with_capacity(WAL_POSTINGS_BATCH);
-            let mut postings_scratch = PostingsBatchScratch::new();
-            let mut reorder: BTreeMap<u64, Vec<DecodedRecord>> = BTreeMap::new();
+            let mut pending_series: Vec<(RefSeries, u64)> = Vec::new();
+            let mut reorder: BTreeMap<u64, Vec<ParallelDecodedRecord>> = BTreeMap::new();
             let mut next_batch_id = 0u64;
+
+            let flush_series_batch = |pending: &mut Vec<(RefSeries, u64)>,
+                                      multi_ref: &mut HashMap<u64, u64>,
+                                      mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
+                                      ooo_mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
+                                      failed_outer: &mut bool|
+             -> Result<(), HeadError> {
+                if pending.is_empty() {
+                    return Ok(());
+                }
+                let batch = std::mem::take(pending);
+                let mut max_ref_id = 0u64;
+                let has_mm = !mmapped_map.is_empty();
+                let has_ooo_mm = !ooo_mmapped_map.is_empty();
+                type SeriesShardItem = (RefSeries, u64, Vec<MmappedChunk>, Vec<MmappedChunk>);
+                let mut shards: Vec<Vec<SeriesShardItem>> =
+                    (0..workers).map(|_| Vec::new()).collect();
+                for (rs, hash) in batch {
+                    max_ref_id = max_ref_id.max(rs.ref_id);
+                    let mmc = if has_mm {
+                        mmapped_map.remove(&rs.ref_id).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let ooo_mmc = if has_ooo_mm {
+                        ooo_mmapped_map.remove(&rs.ref_id).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let w = (hash as usize) % workers;
+                    shards[w].push((rs, hash, mmc, ooo_mmc));
+                }
+
+                let mut out_multi_ref: Vec<Vec<(u64, u64)>> =
+                    (0..workers).map(|_| Vec::new()).collect();
+                let mut out_postings: Vec<Vec<(u64, SymbolLabels)>> =
+                    (0..workers).map(|_| Vec::new()).collect();
+                type AttachItem = (Arc<SeriesEntry>, Vec<MmappedChunk>, Vec<MmappedChunk>);
+                let mut out_attach: Vec<Vec<AttachItem>> =
+                    (0..workers).map(|_| Vec::new()).collect();
+                let mut out_created: Vec<u64> = vec![0u64; workers];
+
+                struct MutPtr<T>(*mut T);
+                impl<T> MutPtr<T> {
+                    #[inline]
+                    #[allow(clippy::mut_from_ref)]
+                    unsafe fn get(&self, idx: usize) -> &mut T {
+                        unsafe { &mut *self.0.add(idx) }
+                    }
+                }
+                unsafe impl<T: Send> Send for MutPtr<T> {}
+                unsafe impl<T: Send> Sync for MutPtr<T> {}
+
+                let shards_ptr = MutPtr(shards.as_mut_ptr());
+                let multi_ptr = MutPtr(out_multi_ref.as_mut_ptr());
+                let postings_ptr = MutPtr(out_postings.as_mut_ptr());
+                let attach_ptr = MutPtr(out_attach.as_mut_ptr());
+                let created_ptr = MutPtr(out_created.as_mut_ptr());
+                let cb_opt = self.lifecycle_callback.read().clone();
+
+                series_pool.scoped_execute(workers, |w| {
+                    // SAFETY: each `w` in `0..workers` owns disjoint index `w`.
+                    let shard = unsafe { std::mem::take(shards_ptr.get(w)) };
+                    if shard.is_empty() {
+                        return;
+                    }
+                    let w_multi = unsafe { multi_ptr.get(w) };
+                    let w_postings = unsafe { postings_ptr.get(w) };
+                    let w_attach = unsafe { attach_ptr.get(w) };
+                    let w_created = unsafe { created_ptr.get(w) };
+
+                    for (rs, hash, mmc, ooo_mmc) in shard {
+                        if let Some(existing) =
+                            self.series.get_by_hash_and_labels(hash, &rs.labels)
+                        {
+                            w_multi.push((rs.ref_id, existing.ref_id));
+                            if !mmc.is_empty() || !ooo_mmc.is_empty() {
+                                w_attach.push((existing, mmc, ooo_mmc));
+                            }
+                            continue;
+                        }
+                        let symbol_labels = self.intern_labels_read_first(&rs.labels);
+                        let entry = Arc::new(SeriesEntry {
+                            ref_id: rs.ref_id,
+                            hash,
+                            labels: rs.labels,
+                            active_cache: AtomicU64::new(0),
+                            in_order_max_time: AtomicI64::new(i64::MIN),
+                            pending_commits: AtomicU32::new(0),
+                            inner: Mutex::new(SeriesState::new()),
+                        });
+                        self.series.insert(Arc::clone(&entry));
+                        w_postings.push((rs.ref_id, symbol_labels));
+                        *w_created += 1;
+                        if let Some(ref cb) = cb_opt {
+                            cb.post_creation(rs.ref_id, &entry.labels);
+                        }
+                        if !mmc.is_empty() || !ooo_mmc.is_empty() {
+                            w_attach.push((entry, mmc, ooo_mmc));
+                        }
+                    }
+                });
+
+                for mvec in out_multi_ref {
+                    for (k, v) in mvec {
+                        multi_ref.insert(k, v);
+                    }
+                }
+                let created_count: u64 = out_created.into_iter().sum();
+                if created_count > 0 {
+                    self.num_series.fetch_add(created_count, Ordering::Relaxed);
+                    if let Some(ref g) = self.series_gauge {
+                        g.add(created_count as f64);
+                    }
+                    if let Some(ref c) = self.series_created_total {
+                        c.inc_by(created_count as f64);
+                    }
+                }
+                if max_ref_id > 0 {
+                    self.bump_last_series_id(max_ref_id);
+                }
+                self.postings
+                    .add_batches_unordered_parallel(&out_postings, &series_pool);
+
+                for avec in out_attach {
+                    for (entry, mmc, ooo_mmc) in avec {
+                        let idx = (entry.ref_id as usize) % workers;
+                        if worker_txs[idx]
+                            .send(WalWorkerMsg::AttachMmapped {
+                                entry,
+                                mmc,
+                                ooo_mmc,
+                            })
+                            .is_err()
+                        {
+                            *failed_outer = true;
+                            return Err(HeadError::Closed);
+                        }
+                    }
+                }
+                Ok(())
+            };
 
             let mut failed_outer = false;
             'outer: while let Ok(item) = decoded_rx.recv() {
@@ -2371,47 +2631,46 @@ impl Head {
                     }
                     b
                 }) {
-                    for decoded in records {
-                        match decoded {
-                            DecodedRecord::Series(series_list) => {
-                                if let Err(e) = self.replay_wal_series_batch(
-                                    &series_list,
-                                    multi_ref,
-                                    mmapped_map,
-                                    ooo_mmapped_map,
-                                    &mut pending_postings,
-                                    |entry, mmc, ooo_mmc| {
-                                        if !mmc.is_empty() || !ooo_mmc.is_empty() {
-                                            let idx = (entry.ref_id as usize) % workers;
-                                            if worker_txs[idx]
-                                                .send(WalWorkerMsg::AttachMmapped {
-                                                    entry,
-                                                    mmc,
-                                                    ooo_mmc,
-                                                })
-                                                .is_err()
-                                            {
-                                                failed_outer = true;
-                                                return Err(HeadError::Closed);
-                                            }
-                                        }
-                                        Ok(())
-                                    },
-                                ) {
-                                    if !failed_outer {
-                                        coord_res = Err(e);
-                                    }
-                                    break 'outer;
+                    for prec in records {
+                        match prec {
+                            ParallelDecodedRecord::Series(series_list, hashes) => {
+                                pending_series.reserve(series_list.len());
+                                for (rs, h) in series_list.into_iter().zip(hashes) {
+                                    pending_series.push((rs, h));
                                 }
-                                if pending_postings.len() >= WAL_POSTINGS_BATCH {
-                                    self.postings.add_batch_unordered_with_scratch(
-                                        &pending_postings,
-                                        &mut postings_scratch,
-                                    );
-                                    pending_postings.clear();
+                                if pending_series.len() >= WAL_SERIES_PARALLEL_BATCH_MAX {
+                                    if let Err(e) = flush_series_batch(
+                                        &mut pending_series,
+                                        multi_ref,
+                                        mmapped_map,
+                                        ooo_mmapped_map,
+                                        &mut failed_outer,
+                                    ) {
+                                        if !failed_outer {
+                                            coord_res = Err(e);
+                                        }
+                                        break 'outer;
+                                    }
                                 }
                             }
-                            DecodedRecord::Samples(samples) => {
+                            ParallelDecodedRecord::Other(decoded) => {
+                                if !pending_series.is_empty() {
+                                    if let Err(e) = flush_series_batch(
+                                        &mut pending_series,
+                                        multi_ref,
+                                        mmapped_map,
+                                        ooo_mmapped_map,
+                                        &mut failed_outer,
+                                    ) {
+                                        if !failed_outer {
+                                            coord_res = Err(e);
+                                        }
+                                        break 'outer;
+                                    }
+                                }
+                                match decoded {
+                                    DecodedRecord::Series(_) => unreachable!(),
+                                    DecodedRecord::Samples(samples) => {
                                 for &(mut s) in &samples {
                                     if s.t < min_valid_time {
                                         continue;
@@ -2487,13 +2746,6 @@ impl Head {
                                 }
                             }
                             DecodedRecord::Tombstones(stones) => {
-                                if !pending_postings.is_empty() {
-                                    self.postings.add_batch_unordered_with_scratch(
-                                        &pending_postings,
-                                        &mut postings_scratch,
-                                    );
-                                    pending_postings.clear();
-                                }
                                 for mut stone in stones {
                                     self.bump_last_series_id(stone.ref_id);
                                     if stone.mint == i64::MIN && stone.maxt == i64::MAX {
@@ -2569,17 +2821,27 @@ impl Head {
                             DecodedRecord::MinValidTime(_)
                             | DecodedRecord::MmapMarkers(_)
                             | DecodedRecord::Unknown(_) => {}
+                                }
+                            }
                         }
                     }
                 }
             }
-            let _ = failed_outer;
 
-            if !pending_postings.is_empty() {
-                self.postings
-                    .add_batch_unordered_with_scratch(&pending_postings, &mut postings_scratch);
-                pending_postings.clear();
+            if coord_res.is_ok() && !pending_series.is_empty() {
+                if let Err(e) = flush_series_batch(
+                    &mut pending_series,
+                    multi_ref,
+                    mmapped_map,
+                    ooo_mmapped_map,
+                    &mut failed_outer,
+                ) {
+                    if !failed_outer {
+                        coord_res = Err(e);
+                    }
+                }
             }
+            let _ = failed_outer;
 
             for (idx, shard) in sample_shards.into_iter().enumerate() {
                 if !shard.is_empty() {
@@ -2889,6 +3151,23 @@ impl Head {
         self.get_by_sorted_pairs(hash, pairs)
     }
 
+    /// Prefetches the `StripeSeries` stripe bucket for a precomputed `hash`.
+    #[inline]
+    pub fn prefetch_stripe_for_hash(&self, hash: u64) {
+        let idx = self.series.stripe_idx(hash);
+        prefetch_read_data(&self.series.stripes[idx]);
+    }
+
+    /// Pipelined, software-prefetched batch resolution of prehashed sorted pairs.
+    pub fn resolve_prehashed_batch<T>(
+        &self,
+        items: &[T],
+        get_hp: impl Fn(&T) -> Option<(u64, &[(&str, &str)])>,
+        out: &mut Vec<Option<Arc<SeriesEntry>>>,
+    ) {
+        self.series.resolve_prehashed_batch(items, get_hp, out);
+    }
+
     /// Iterates every live series `(ref_id, &Labels)` in Head.
     pub fn for_each_series<F>(&self, mut f: F)
     where
@@ -3122,6 +3401,9 @@ impl Head {
             ref_id,
             hash,
             labels,
+            active_cache: AtomicU64::new(0),
+            in_order_max_time: AtomicI64::new(i64::MIN),
+            pending_commits: AtomicU32::new(0),
             inner: Mutex::new(SeriesState::new()),
         });
         self.series.insert(Arc::clone(&entry));
@@ -3255,6 +3537,9 @@ impl Head {
                 ref_id: rs.ref_id,
                 hash,
                 labels: rs.labels.clone(),
+                active_cache: AtomicU64::new(0),
+                in_order_max_time: AtomicI64::new(i64::MIN),
+                pending_commits: AtomicU32::new(0),
                 inner: Mutex::new(SeriesState::new()),
             });
             self.series.insert(Arc::clone(&entry));
@@ -3310,6 +3595,9 @@ impl Head {
             ref_id,
             hash,
             labels: labels.clone(),
+            active_cache: AtomicU64::new(0),
+            in_order_max_time: AtomicI64::new(i64::MIN),
+            pending_commits: AtomicU32::new(0),
             inner: Mutex::new(SeriesState::new()),
         });
         self.series.insert(Arc::clone(&entry));
@@ -3353,6 +3641,9 @@ impl Head {
             ref_id,
             hash,
             labels: labels.clone(),
+            active_cache: AtomicU64::new(0),
+            in_order_max_time: AtomicI64::new(i64::MIN),
+            pending_commits: AtomicU32::new(0),
             inner: Mutex::new(SeriesState::new()),
         });
         self.series.insert(Arc::clone(&entry));
@@ -4008,8 +4299,11 @@ impl Head {
                 stripe_buf.extend(guard.by_id.values().cloned());
             }
             for entry in stripe_buf.drain(..) {
+                if entry.pending_commits.load(Ordering::Acquire) > 0 {
+                    continue;
+                }
                 let mut st = entry.inner.lock();
-                if st.pending_commits() > 0 {
+                if entry.pending_commits.load(Ordering::Acquire) > 0 {
                     continue;
                 }
                 st.ooo = None;
@@ -4119,8 +4413,11 @@ impl Head {
         let mut to_delete = Vec::new();
         for &ref_id in refs {
             if let Some(entry) = self.series.get_by_id(ref_id) {
+                if entry.pending_commits.load(Ordering::Acquire) > 0 {
+                    continue;
+                }
                 let mut st = entry.inner.lock();
-                if st.pending_commits() > 0 {
+                if entry.pending_commits.load(Ordering::Acquire) > 0 {
                     continue;
                 }
                 let has_ooo = st.ooo.as_ref().is_some_and(|o| {
@@ -4132,6 +4429,9 @@ impl Head {
                         // matching Prometheus `gcSeries`.
                         st.mmapped_chunks = None;
                         st.head_chunks.clear();
+                        entry
+                            .in_order_max_time
+                            .store(st.max_time(), Ordering::Release);
                     } else {
                         to_delete.push(Arc::clone(&entry));
                     }
@@ -4197,8 +4497,11 @@ impl Head {
                 stripe_buf.extend(guard.by_id.values().cloned());
             }
             for entry in stripe_buf.drain(..) {
+                if entry.pending_commits.load(Ordering::Acquire) > 0 {
+                    continue;
+                }
                 let mut st = entry.inner.lock();
-                if st.pending_commits() > 0 {
+                if entry.pending_commits.load(Ordering::Acquire) > 0 {
                     continue;
                 }
                 if let Some(ref mut mv) = st.mmapped_chunks {
@@ -4208,6 +4511,9 @@ impl Head {
                     }
                 }
                 st.head_chunks.retain(|hc| hc.max_time >= mint);
+                entry
+                    .in_order_max_time
+                    .store(st.max_time(), Ordering::Release);
                 if st.head_chunks.is_empty() {
                     st.xor_state.valid = false;
                     if let Some(ref mut s2) = st.xor2_state {
@@ -5021,12 +5327,68 @@ impl<'a> HeadAppender<'a> {
         }
     }
 
+    /// Returns a borrowed reference to the most recently appended float `SeriesEntry`
+    /// without cloning its `Arc`.
+    #[inline]
+    pub fn last_float_entry(&self) -> Option<&SeriesEntry> {
+        self.floats.last().map(|pf| &*pf.entry)
+    }
+
     /// Appends a float sample using a cached `Option<Arc<SeriesEntry>>` and optional precomputed Prometheus hash
     /// (for already-sorted, unique, non-empty `pairs`).
     #[allow(clippy::too_many_arguments)]
     pub fn append_float_with_entry_prehashed(
         &mut self,
         series_entry: &mut Option<Arc<SeriesEntry>>,
+        prehashed: Option<u64>,
+        pairs: &[(&str, &str)],
+        st: i64,
+        t: i64,
+        v: f64,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        self.append_float_with_entry_prehashed_inner(
+            series_entry,
+            false,
+            prehashed,
+            pairs,
+            st,
+            t,
+            v,
+            reject_ooo,
+        )
+    }
+
+    /// Same as [`append_float_with_entry_prehashed`], but moves `series_entry` by value into `self.floats`
+    /// on success to avoid a second `Arc::clone`/`Arc::drop` pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_float_with_entry_prehashed_take(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        prehashed: Option<u64>,
+        pairs: &[(&str, &str)],
+        st: i64,
+        t: i64,
+        v: f64,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        self.append_float_with_entry_prehashed_inner(
+            series_entry,
+            true,
+            prehashed,
+            pairs,
+            st,
+            t,
+            v,
+            reject_ooo,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_float_with_entry_prehashed_inner(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        take_entry: bool,
         prehashed: Option<u64>,
         pairs: &[(&str, &str)],
         st: i64,
@@ -5047,24 +5409,80 @@ impl<'a> HeadAppender<'a> {
             return Err(HeadError::OutOfBounds);
         }
 
-        let entry = match series_entry {
-            Some(ref e) => Arc::clone(e),
+        let entry = match series_entry.take() {
+            Some(e) => {
+                if !take_entry {
+                    *series_entry = Some(Arc::clone(&e));
+                }
+                e
+            }
             None => {
                 let e = self.resolve_sorted_pairs_prehashed(None, prehashed, pairs)?;
-                *series_entry = Some(Arc::clone(&e));
+                if !take_entry {
+                    *series_entry = Some(Arc::clone(&e));
+                }
                 e
             }
         };
         let ref_id = entry.ref_id;
 
-        let is_ooo = {
-            let mut state = entry.inner.lock();
-            if state.pending_commits() > 0 {
-                drop(state);
-                self.sync_batch_last_sample();
-                if let Some((is_ooo, is_dup)) =
-                    self.check_batch_last_sample(ref_id, t, &LastSample::Float(v), effective_ooo)?
-                {
+        // Lock-free single-lock fast path: claim `pending_commits` 0 -> 1 and check `t > in_order_max_time`.
+        // `commit()` updates `in_order_max_time` before decrementing `pending_commits` (`Release`).
+        if !is_stale_nan(v)
+            && t >= self.min_valid_time
+            && entry
+                .pending_commits
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let max_t = entry.in_order_max_time.load(Ordering::Acquire);
+            if t > max_t {
+                self.floats.push(PendingFloat {
+                    entry,
+                    st,
+                    t,
+                    v,
+                    is_ooo: false,
+                });
+                return Ok(ref_id);
+            }
+            let res = {
+                let mut state = entry.inner.lock();
+                self.check_entry_appendable_float(&mut state, t, v, effective_ooo)
+            };
+            match res {
+                Ok((is_ooo, is_dup)) => {
+                    if is_dup {
+                        entry.pending_commits.fetch_sub(1, Ordering::Release);
+                        if take_entry {
+                            *series_entry = Some(entry);
+                        }
+                        return Ok(ref_id);
+                    }
+                    self.floats.push(PendingFloat {
+                        entry,
+                        st,
+                        t,
+                        v,
+                        is_ooo,
+                    });
+                    return Ok(ref_id);
+                }
+                Err(e) => {
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    if take_entry {
+                        *series_entry = Some(entry);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        let prev = entry.pending_commits.fetch_add(1, Ordering::AcqRel);
+        let is_ooo = if prev > 0 {
+            self.sync_batch_last_sample();
+            match self.check_batch_last_sample(ref_id, t, &LastSample::Float(v), effective_ooo) {
+                Ok(Some((is_ooo, is_dup))) => {
                     if is_ooo && v.to_bits() != QUIET_ZERO_NAN_BITS {
                         let delta = self.head_maxt.saturating_sub(t);
                         if delta > 0 {
@@ -5072,29 +5490,70 @@ impl<'a> HeadAppender<'a> {
                         }
                     }
                     if is_dup {
+                        entry.pending_commits.fetch_sub(1, Ordering::Release);
+                        if take_entry {
+                            *series_entry = Some(entry);
+                        }
                         return Ok(ref_id);
                     }
-                    let mut state = entry.inner.lock();
-                    state.inc_pending_commits();
                     is_ooo
-                } else {
-                    let mut state = entry.inner.lock();
-                    let (is_ooo, is_dup) =
-                        self.check_entry_appendable_float(&mut state, t, v, effective_ooo)?;
+                }
+                Ok(None) => {
+                    let res = {
+                        let mut state = entry.inner.lock();
+                        self.check_entry_appendable_float(&mut state, t, v, effective_ooo)
+                    };
+                    match res {
+                        Ok((is_ooo, is_dup)) => {
+                            if is_dup {
+                                entry.pending_commits.fetch_sub(1, Ordering::Release);
+                                if take_entry {
+                                    *series_entry = Some(entry);
+                                }
+                                return Ok(ref_id);
+                            }
+                            is_ooo
+                        }
+                        Err(e) => {
+                            entry.pending_commits.fetch_sub(1, Ordering::Release);
+                            if take_entry {
+                                *series_entry = Some(entry);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    if take_entry {
+                        *series_entry = Some(entry);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            let res = {
+                let mut state = entry.inner.lock();
+                self.check_entry_appendable_float(&mut state, t, v, effective_ooo)
+            };
+            match res {
+                Ok((is_ooo, is_dup)) => {
                     if is_dup {
+                        entry.pending_commits.fetch_sub(1, Ordering::Release);
+                        if take_entry {
+                            *series_entry = Some(entry);
+                        }
                         return Ok(ref_id);
                     }
-                    state.inc_pending_commits();
                     is_ooo
                 }
-            } else {
-                let (is_ooo, is_dup) =
-                    self.check_entry_appendable_float(&mut state, t, v, effective_ooo)?;
-                if is_dup {
-                    return Ok(ref_id);
+                Err(e) => {
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    if take_entry {
+                        *series_entry = Some(entry);
+                    }
+                    return Err(e);
                 }
-                state.inc_pending_commits();
-                is_ooo
             }
         };
 
@@ -5139,54 +5598,77 @@ impl<'a> HeadAppender<'a> {
             .series
             .get_by_id(series_ref)
             .ok_or(HeadError::UnknownSeriesRef(series_ref))?;
-        let is_ooo = {
-            let mut state = entry.inner.lock();
-            if state.pending_commits() > 0 {
-                drop(state);
-                self.sync_batch_last_sample();
-                if let Some((is_ooo, is_dup)) = self.check_batch_last_sample(
-                    series_ref,
-                    t,
-                    &LastSample::Float(v),
-                    self.ooo_time_window,
-                )? {
+        let prev = entry.pending_commits.fetch_add(1, Ordering::AcqRel);
+        let is_ooo = if prev > 0 {
+            self.sync_batch_last_sample();
+            match self.check_batch_last_sample(
+                series_ref,
+                t,
+                &LastSample::Float(v),
+                self.ooo_time_window,
+            ) {
+                Ok(Some((is_ooo, is_dup))) => {
                     if is_dup {
+                        entry.pending_commits.fetch_sub(1, Ordering::Release);
                         return Ok(series_ref);
                     }
-                    entry.inner.lock().inc_pending_commits();
                     is_ooo
-                } else {
+                }
+                Ok(None) => {
                     let cr_guard = self.head.chunk_reader.read();
-                    let mut state = entry.inner.lock();
-                    let (is_ooo, is_dup) = state.appendable_float(
+                    let state = entry.inner.lock();
+                    let res = state.appendable_float(
                         t,
                         v,
                         self.head_maxt,
                         self.min_valid_time,
                         self.ooo_time_window,
                         cr_guard.as_ref(),
-                    )?;
+                    );
+                    drop(state);
+                    match res {
+                        Ok((is_ooo, is_dup)) => {
+                            if is_dup {
+                                entry.pending_commits.fetch_sub(1, Ordering::Release);
+                                return Ok(series_ref);
+                            }
+                            is_ooo
+                        }
+                        Err(e) => {
+                            entry.pending_commits.fetch_sub(1, Ordering::Release);
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    return Err(e);
+                }
+            }
+        } else {
+            let cr_guard = self.head.chunk_reader.read();
+            let state = entry.inner.lock();
+            let res = state.appendable_float(
+                t,
+                v,
+                self.head_maxt,
+                self.min_valid_time,
+                self.ooo_time_window,
+                cr_guard.as_ref(),
+            );
+            drop(state);
+            match res {
+                Ok((is_ooo, is_dup)) => {
                     if is_dup {
+                        entry.pending_commits.fetch_sub(1, Ordering::Release);
                         return Ok(series_ref);
                     }
-                    state.inc_pending_commits();
                     is_ooo
                 }
-            } else {
-                let cr_guard = self.head.chunk_reader.read();
-                let (is_ooo, is_dup) = state.appendable_float(
-                    t,
-                    v,
-                    self.head_maxt,
-                    self.min_valid_time,
-                    self.ooo_time_window,
-                    cr_guard.as_ref(),
-                )?;
-                if is_dup {
-                    return Ok(series_ref);
+                Err(e) => {
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    return Err(e);
                 }
-                state.inc_pending_commits();
-                is_ooo
             }
         };
         self.floats.push(PendingFloat {
@@ -5248,10 +5730,16 @@ impl<'a> HeadAppender<'a> {
         let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
         let ref_id = entry.ref_id;
         let ls = LastSample::Histogram(Box::new(h.clone()));
-        let has_pending = entry.inner.lock().pending_commits() > 0;
-        let batch_check = if has_pending {
+        let prev = entry.pending_commits.fetch_add(1, Ordering::AcqRel);
+        let batch_check = if prev > 0 {
             self.sync_batch_last_sample();
-            self.check_batch_last_sample(ref_id, t, &ls, effective_ooo)?
+            match self.check_batch_last_sample(ref_id, t, &ls, effective_ooo) {
+                Ok(v) => v,
+                Err(e) => {
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    return Err(e);
+                }
+            }
         } else {
             None
         };
@@ -5263,10 +5751,9 @@ impl<'a> HeadAppender<'a> {
                 }
             }
             if is_dup {
+                entry.pending_commits.fetch_sub(1, Ordering::Release);
                 return Ok(ref_id);
             }
-            let mut state = entry.inner.lock();
-            state.inc_pending_commits();
             is_ooo
         } else {
             let cr_guard = self.head.chunk_reader.read();
@@ -5286,11 +5773,17 @@ impl<'a> HeadAppender<'a> {
                     self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
                 }
             }
-            let (is_ooo, is_dup) = res?;
+            let (is_ooo, is_dup) = match res {
+                Ok(v) => v,
+                Err(e) => {
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    return Err(e);
+                }
+            };
             if is_dup {
+                entry.pending_commits.fetch_sub(1, Ordering::Release);
                 return Ok(ref_id);
             }
-            entry.inner.lock().inc_pending_commits();
             is_ooo
         };
         self.histograms.push(PendingHist {
@@ -5352,10 +5845,16 @@ impl<'a> HeadAppender<'a> {
         let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
         let ref_id = entry.ref_id;
         let ls = LastSample::FloatHistogram(Box::new(fh.clone()));
-        let has_pending = entry.inner.lock().pending_commits() > 0;
-        let batch_check = if has_pending {
+        let prev = entry.pending_commits.fetch_add(1, Ordering::AcqRel);
+        let batch_check = if prev > 0 {
             self.sync_batch_last_sample();
-            self.check_batch_last_sample(ref_id, t, &ls, effective_ooo)?
+            match self.check_batch_last_sample(ref_id, t, &ls, effective_ooo) {
+                Ok(v) => v,
+                Err(e) => {
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    return Err(e);
+                }
+            }
         } else {
             None
         };
@@ -5367,10 +5866,9 @@ impl<'a> HeadAppender<'a> {
                 }
             }
             if is_dup {
+                entry.pending_commits.fetch_sub(1, Ordering::Release);
                 return Ok(ref_id);
             }
-            let mut state = entry.inner.lock();
-            state.inc_pending_commits();
             is_ooo
         } else {
             let cr_guard = self.head.chunk_reader.read();
@@ -5390,11 +5888,17 @@ impl<'a> HeadAppender<'a> {
                     self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
                 }
             }
-            let (is_ooo, is_dup) = res?;
+            let (is_ooo, is_dup) = match res {
+                Ok(v) => v,
+                Err(e) => {
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    return Err(e);
+                }
+            };
             if is_dup {
+                entry.pending_commits.fetch_sub(1, Ordering::Release);
                 return Ok(ref_id);
             }
-            entry.inner.lock().inc_pending_commits();
             is_ooo
         };
         self.float_histograms.push(PendingFloatHist {
@@ -5536,11 +6040,18 @@ impl<'a> HeadAppender<'a> {
         let chunk_range_ms = self.head.opts.chunk_range_ms;
         let samples_per_chunk = self.head.opts.samples_per_chunk;
 
-        // Commit floats
-        for pf in self.floats.drain(..) {
+        // Commit floats (software-prefetching SeriesEntry + SeriesState 4 iterations ahead)
+        let floats_len = self.floats.len();
+        for i in 0..floats_len {
+            if i + 4 < floats_len {
+                let next_ptr = Arc::as_ptr(&self.floats[i + 4].entry);
+                prefetch_read_data(next_ptr);
+                prefetch_read_data((next_ptr as *const u8).wrapping_add(64));
+            }
+            let pf = &self.floats[i];
             let mut v = pf.v;
+            let _pending_guard = PendingCommitGuard(&pf.entry.pending_commits);
             let mut state = pf.entry.inner.lock();
-            state.dec_pending_commits();
 
             if !pf.is_ooo
                 && !is_stale_nan(v)
@@ -5564,6 +6075,9 @@ impl<'a> HeadAppender<'a> {
                     in_order_mint = in_order_mint.min(pf.t);
                     in_order_maxt = in_order_maxt.max(pf.t);
                 }
+                pf.entry
+                    .in_order_max_time
+                    .store(state.max_time(), Ordering::Release);
                 continue;
             }
 
@@ -5597,6 +6111,9 @@ impl<'a> HeadAppender<'a> {
                                 in_order_mint = in_order_mint.min(pf.t);
                                 in_order_maxt = in_order_maxt.max(pf.t);
                             }
+                            pf.entry
+                                .in_order_max_time
+                                .store(state.max_time(), Ordering::Release);
                         }
                         continue;
                     }
@@ -5628,6 +6145,9 @@ impl<'a> HeadAppender<'a> {
                                 in_order_mint = in_order_mint.min(pf.t);
                                 in_order_maxt = in_order_maxt.max(pf.t);
                             }
+                            pf.entry
+                                .in_order_max_time
+                                .store(state.max_time(), Ordering::Release);
                         }
                         continue;
                     }
@@ -5720,13 +6240,17 @@ impl<'a> HeadAppender<'a> {
                     in_order_mint = in_order_mint.min(pf.t);
                     in_order_maxt = in_order_maxt.max(pf.t);
                 }
+                pf.entry
+                    .in_order_max_time
+                    .store(state.max_time(), Ordering::Release);
             }
         }
+        self.floats.clear();
 
         // Commit integer histograms
         for ph in self.histograms.drain(..) {
+            let _pending_guard = PendingCommitGuard(&ph.entry.pending_commits);
             let mut state = ph.entry.inner.lock();
-            state.dec_pending_commits();
             let check = {
                 let cr_guard = self.head.chunk_reader.read();
                 state.appendable_histogram(
@@ -5797,13 +6321,16 @@ impl<'a> HeadAppender<'a> {
             {
                 in_order_mint = in_order_mint.min(ph.t);
                 in_order_maxt = in_order_maxt.max(ph.t);
+                ph.entry
+                    .in_order_max_time
+                    .store(state.max_time(), Ordering::Release);
             }
         }
 
         // Commit float histograms
         for pfh in self.float_histograms.drain(..) {
+            let _pending_guard = PendingCommitGuard(&pfh.entry.pending_commits);
             let mut state = pfh.entry.inner.lock();
-            state.dec_pending_commits();
             let check = {
                 let cr_guard = self.head.chunk_reader.read();
                 state.appendable_float_histogram(
@@ -5874,6 +6401,9 @@ impl<'a> HeadAppender<'a> {
             {
                 in_order_mint = in_order_mint.min(pfh.t);
                 in_order_maxt = in_order_maxt.max(pfh.t);
+                pfh.entry
+                    .in_order_max_time
+                    .store(state.max_time(), Ordering::Release);
             }
         }
 
@@ -5952,16 +6482,13 @@ impl<'a> HeadAppender<'a> {
         self.closed = true;
         self.head.metrics.active_appenders.dec();
         for pf in self.floats.drain(..) {
-            let mut st = pf.entry.inner.lock();
-            st.dec_pending_commits();
+            pf.entry.pending_commits.fetch_sub(1, Ordering::Release);
         }
         for ph in self.histograms.drain(..) {
-            let mut st = ph.entry.inner.lock();
-            st.dec_pending_commits();
+            ph.entry.pending_commits.fetch_sub(1, Ordering::Release);
         }
         for pfh in self.float_histograms.drain(..) {
-            let mut st = pfh.entry.inner.lock();
-            st.dec_pending_commits();
+            pfh.entry.pending_commits.fetch_sub(1, Ordering::Release);
         }
         self.exemplars.clear();
         self.metadata.clear();
@@ -6109,16 +6636,13 @@ impl Drop for HeadAppender<'_> {
         if !self.closed {
             self.head.metrics.active_appenders.dec();
             for pf in self.floats.drain(..) {
-                let mut st = pf.entry.inner.lock();
-                st.dec_pending_commits();
+                pf.entry.pending_commits.fetch_sub(1, Ordering::Release);
             }
             for ph in self.histograms.drain(..) {
-                let mut st = ph.entry.inner.lock();
-                st.dec_pending_commits();
+                ph.entry.pending_commits.fetch_sub(1, Ordering::Release);
             }
             for pfh in self.float_histograms.drain(..) {
-                let mut st = pfh.entry.inner.lock();
-                st.dec_pending_commits();
+                pfh.entry.pending_commits.fetch_sub(1, Ordering::Release);
             }
             self.return_scratch();
         }
@@ -6441,5 +6965,63 @@ mod tests {
         let head1 = Head::open(dir1.path(), opts1, i64::MIN).unwrap();
         assert_eq!(head1.options().wal_replay_concurrency, 1);
         head1.close().unwrap();
+    }
+
+    #[test]
+    fn resolve_prehashed_batch_matches_single_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+
+        let owned_pairs: Vec<(String, String)> = (0..100)
+            .map(|i| (format!("metric_{i}"), format!("val_{i}")))
+            .collect();
+        {
+            let mut app = head.appender();
+            for (m, v) in &owned_pairs {
+                app.append_float(
+                    None,
+                    &[("__name__", m.as_str()), ("job", v.as_str())],
+                    1_000,
+                    1.0,
+                )
+                .unwrap();
+            }
+            app.commit().unwrap();
+        }
+
+        type QueryPair<'a> = (u64, [(&'a str, &'a str); 2]);
+        // Mix existing series, missing series, and skipped items.
+        let mut queries: Vec<Option<QueryPair<'_>>> = Vec::new();
+        for (i, (m, v)) in owned_pairs.iter().enumerate() {
+            if i % 5 == 0 {
+                queries.push(None);
+            } else {
+                let pairs = [("__name__", m.as_str()), ("job", v.as_str())];
+                let h = hash_sorted_pairs(&pairs);
+                queries.push(Some((h, pairs)));
+            }
+        }
+        let missing_pairs = [("__name__", "does_not_exist"), ("job", "none")];
+        queries.push(Some((hash_sorted_pairs(&missing_pairs), missing_pairs)));
+
+        let mut batch_out = Vec::new();
+        head.resolve_prehashed_batch(
+            &queries,
+            |q| q.as_ref().map(|(h, p)| (*h, &p[..])),
+            &mut batch_out,
+        );
+
+        assert_eq!(batch_out.len(), queries.len());
+        for (i, q) in queries.iter().enumerate() {
+            let expected = q
+                .as_ref()
+                .and_then(|(h, p)| head.get_entry_by_prehashed_sorted_pairs(*h, p));
+            assert_eq!(
+                batch_out[i].as_ref().map(|e| e.ref_id),
+                expected.as_ref().map(|e| e.ref_id),
+                "mismatch at index {i}"
+            );
+        }
+        head.close().unwrap();
     }
 }

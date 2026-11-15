@@ -19,7 +19,7 @@ use mimir_proto::zerocopy::{
 use mimir_ring::ring::replication_strategy::WRITE_NO_EXTEND;
 use mimir_tsdb::chunkenc::{CounterResetHint, FloatHistogram, Histogram, HistogramSpan};
 use mimir_tsdb::exemplar::{Exemplar, ExemplarError};
-use mimir_tsdb::head::{HeadError, SeriesEntry};
+use mimir_tsdb::head::{prefetch_read_data, HeadError, SeriesEntry};
 use mimir_tsdb::labels::Labels;
 use tracing::warn;
 
@@ -123,6 +123,55 @@ impl SampleKind {
 thread_local! {
     static PAIRS_SCRATCH: RefCell<Vec<(&'static str, &'static str)>> =
         RefCell::new(Vec::with_capacity(32));
+    static RESOLVED_ENTRIES_SCRATCH: RefCell<Vec<Option<Arc<SeriesEntry>>>> =
+        RefCell::new(Vec::with_capacity(256));
+}
+
+struct ResolvedEntriesGuard {
+    from_tls: bool,
+    vec: Vec<Option<Arc<SeriesEntry>>>,
+}
+
+impl ResolvedEntriesGuard {
+    fn take(cap: usize) -> Self {
+        let taken = RESOLVED_ENTRIES_SCRATCH.with(|cell| {
+            cell.try_borrow_mut()
+                .ok()
+                .map(|mut v| std::mem::take(&mut *v))
+        });
+        match taken {
+            Some(mut vec) => {
+                vec.clear();
+                if vec.capacity() < cap {
+                    vec.reserve(cap - vec.len());
+                }
+                Self {
+                    from_tls: true,
+                    vec,
+                }
+            }
+            None => Self {
+                from_tls: false,
+                vec: Vec::with_capacity(cap),
+            },
+        }
+    }
+}
+
+impl Drop for ResolvedEntriesGuard {
+    fn drop(&mut self) {
+        self.vec.clear();
+        if self.from_tls {
+            let vec = std::mem::take(&mut self.vec);
+            RESOLVED_ENTRIES_SCRATCH.with(|cell| {
+                if let Ok(mut slot) = cell.try_borrow_mut() {
+                    if slot.capacity() < vec.capacity() && vec.capacity() <= 8192 {
+                        *slot = vec;
+                    }
+                }
+            });
+        }
+    }
 }
 
 struct PairsScratchGuard {
@@ -439,6 +488,10 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
 impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
     fn fill_pairs(&self, out: &mut Vec<(&'a str, &'a str)>) -> Result<(), IngesterError> {
         out.clear();
+        if let Some(labels_str) = self.labels_str() {
+            out.extend(labels_str);
+            return Ok(());
+        }
         for lp in self.labels() {
             let k = fast_utf8_str(lp.name).map_err(|_| IngesterError::BadRequest {
                 message: "invalid UTF-8 in label name".to_string(),
@@ -1062,7 +1115,44 @@ impl Ingester {
         let mut stats = PushStats::default();
         let mut first_partial: Option<(IngesterError, Option<SampleKind>)> = None;
 
-        for item in items.iter() {
+        let use_batch_resolve = items.len() > 2;
+        let mut resolved_guard = if use_batch_resolve {
+            let mut g = ResolvedEntriesGuard::take(items.len());
+            head.resolve_prehashed_batch(
+                items,
+                |item| {
+                    if item.bad_utf8 || !item.labels_sorted_unique || item.pairs.is_empty() {
+                        return None;
+                    }
+                    if ooo_window_ms <= 0 && min_append_time_available && item.exemplars.is_empty() {
+                        let all_samples_oob =
+                            item.samples.iter().all(|s| s.timestamp_ms < min_append_time);
+                        if all_samples_oob
+                            && (!native_histograms_enabled
+                                || item.histograms.iter().all(|h| h.0 < min_append_time))
+                            && (!item.samples.is_empty()
+                                || (native_histograms_enabled && !item.histograms.is_empty()))
+                        {
+                            return None;
+                        }
+                    }
+                    Some((item.prom_hash, item.pairs))
+                },
+                &mut g.vec,
+            );
+            Some(g)
+        } else {
+            None
+        };
+
+        for (idx, item) in items.iter().enumerate() {
+            if let Some(ref g) = resolved_guard {
+                if let Some(Some(ref next_entry)) = g.vec.get(idx + 4) {
+                    let next_ptr = Arc::as_ptr(next_entry);
+                    prefetch_read_data(next_ptr);
+                    prefetch_read_data((next_ptr as *const u8).wrapping_add(64));
+                }
+            }
             if item.bad_utf8 {
                 drop(app);
                 drop(lock_guard);
@@ -1145,7 +1235,10 @@ impl Ingester {
                 continue;
             }
 
-            let mut series_entry: Option<Arc<SeriesEntry>> = if !pairs.is_empty() {
+            let mut series_entry: Option<Arc<SeriesEntry>> = if let Some(ref mut g) = resolved_guard
+            {
+                g.vec[idx].take()
+            } else if !pairs.is_empty() {
                 head.get_entry_by_prehashed_sorted_pairs(item.prom_hash, pairs)
             } else {
                 None
@@ -1181,7 +1274,7 @@ impl Ingester {
             let mut ingest_created_ts = created_ts > 0;
             let first_hist_ts = item.histograms.first().map(|h| h.0);
 
-            for s in samples {
+            for (s_idx, s) in samples.iter().enumerate() {
                 if s.timestamp_ms > max_timestamp_ms {
                     stats.failed_samples += 1;
                     stats.sample_too_far_in_future += 1;
@@ -1249,15 +1342,29 @@ impl Ingester {
                     created_ts = 0;
                 }
 
-                match app.append_float_with_entry_prehashed(
-                    &mut series_entry,
-                    Some(item.prom_hash),
-                    pairs,
-                    0,
-                    s.timestamp_ms,
-                    s.value,
-                    false,
-                ) {
+                let is_last_sample = s_idx + 1 == samples.len() && hist_count == 0;
+                let append_res = if is_last_sample {
+                    app.append_float_with_entry_prehashed_take(
+                        &mut series_entry,
+                        Some(item.prom_hash),
+                        pairs,
+                        0,
+                        s.timestamp_ms,
+                        s.value,
+                        false,
+                    )
+                } else {
+                    app.append_float_with_entry_prehashed(
+                        &mut series_entry,
+                        Some(item.prom_hash),
+                        pairs,
+                        0,
+                        s.timestamp_ms,
+                        s.value,
+                        false,
+                    )
+                };
+                match append_res {
                     Ok(r) => {
                         series_ref = Some(r);
                         stats.succeeded_samples += 1;
@@ -1434,7 +1541,11 @@ impl Ingester {
 
             if active_series_enabled && stats.succeeded_samples > prev_succeeded {
                 if let Some(ref_id) = series_ref {
-                    db.active_series.update_series(
+                    let entry_ref = series_entry
+                        .as_deref()
+                        .or_else(|| app.last_float_entry().filter(|e| e.ref_id == ref_id));
+                    db.active_series.update_series_with_entry(
+                        entry_ref,
                         pairs,
                         item.prom_hash,
                         ref_id,
@@ -2020,10 +2131,9 @@ impl Ingester {
                 && stats.succeeded_samples > prev_succeeded
             {
                 if let Some(ref_id) = series_ref {
-                    let h = series_entry
-                        .as_ref()
-                        .map_or_else(|| mimir_tsdb::head::hash_sorted_pairs(pairs), |e| e.hash);
-                    db.active_series.update_series(
+                    let h = series_entry.as_ref().map_or(0, |e| e.hash);
+                    db.active_series.update_series_with_entry(
+                        series_entry.as_deref(),
                         pairs,
                         h,
                         ref_id,

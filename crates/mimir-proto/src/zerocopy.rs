@@ -145,6 +145,24 @@ impl SliceRef {
         }
     }
 
+    #[inline(always)]
+    unsafe fn resolve_str_unchecked<'a>(
+        self,
+        input: &'a [u8],
+        common_symbols: &'a [&'a str],
+    ) -> &'a str {
+        match self {
+            SliceRef::Empty => "",
+            SliceRef::Input { start, len } => {
+                let s = start as usize;
+                let e = s + len as usize;
+                // SAFETY: caller guarantees `SliceRef::Input` was validated as UTF-8 on decode.
+                unsafe { std::str::from_utf8_unchecked(&input[s..e]) }
+            }
+            SliceRef::Common { idx, len } => &common_symbols[idx as usize][..len as usize],
+        }
+    }
+
     #[inline]
     fn is_empty(self) -> bool {
         matches!(self, SliceRef::Empty)
@@ -287,6 +305,7 @@ pub struct BorrowedWriteRequest<'a, 's> {
     pub source: i32,
     pub skip_label_validation: bool,
     pub skip_label_count_validation: bool,
+    pub labels_utf8_validated: bool,
 }
 
 impl<'a, 's> BorrowedWriteRequest<'a, 's> {
@@ -311,6 +330,7 @@ impl<'a, 's> BorrowedWriteRequest<'a, 's> {
             common_symbols: self.common_symbols,
             scratch: self.scratch,
             meta: &self.scratch.timeseries[idx],
+            labels_utf8_validated: self.labels_utf8_validated,
         }
     }
 
@@ -356,9 +376,40 @@ pub struct BorrowedTimeSeriesView<'v, 'a> {
     common_symbols: &'a [&'a str],
     scratch: &'v WriteRequestScratch,
     meta: &'v TimeSeriesMeta,
+    labels_utf8_validated: bool,
 }
 
 impl<'v, 'a> BorrowedTimeSeriesView<'v, 'a> {
+    #[inline]
+    pub fn is_labels_utf8_validated(&self) -> bool {
+        self.labels_utf8_validated
+    }
+
+    /// Zero-validation `(&str, &str)` label iterator when decoded in RW2/KafkaV2 mode
+    /// (all `symbols_rw2` and `common_symbols` were already UTF-8 validated on decode).
+    /// Returns `None` in Classic RW1 mode where individual label pairs were not pre-validated.
+    #[inline]
+    pub fn labels_str(&self) -> Option<impl ExactSizeIterator<Item = (&'a str, &'a str)> + '_> {
+        if !self.labels_utf8_validated {
+            return None;
+        }
+        Some(
+            self.scratch.labels[self.meta.labels.clone()]
+                .iter()
+                .map(move |pair| {
+                    // SAFETY: in RW2/KafkaV2 mode, every `SliceRef` in `scratch.labels` comes from
+                    // `SliceRef::Empty`, `common_symbols: &[&str]`, or `rw2_symbols` which were
+                    // already validated via `std::str::from_utf8` during `decode_write_request`.
+                    unsafe {
+                        (
+                            pair.name.resolve_str_unchecked(self.input, self.common_symbols),
+                            pair.value.resolve_str_unchecked(self.input, self.common_symbols),
+                        )
+                    }
+                }),
+        )
+    }
+
     pub fn labels(&self) -> impl ExactSizeIterator<Item = BorrowedLabel<'a>> + '_ {
         self.scratch.labels[self.meta.labels.clone()]
             .iter()
@@ -747,6 +798,7 @@ pub fn decode_write_request<'a, 's>(
         source,
         skip_label_validation,
         skip_label_count_validation,
+        labels_utf8_validated: is_rw2,
     })
 }
 
@@ -2452,5 +2504,49 @@ mod tests {
         assert_eq!(metas2.len(), 2);
         assert_eq!(metas2[0].metric_family_name, "http_duration_bucket");
         assert_eq!(metas2[1].metric_family_name, "http_duration_count");
+    }
+
+    #[test]
+    fn test_labels_str_rw2_and_classic() {
+        let rw1 = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair {
+                        name: bytes::Bytes::from_static(b"__name__"),
+                        value: bytes::Bytes::from_static(b"up"),
+                    },
+                    cortexpb::LabelPair {
+                        name: bytes::Bytes::from_static(b"job"),
+                        value: bytes::Bytes::from_static(b"api"),
+                    },
+                ],
+                samples: vec![cortexpb::Sample {
+                    value: 1.0,
+                    timestamp_ms: 1000,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut scratch = WriteRequestScratch::new();
+        let rw1_wire = rw1.encode_to_vec();
+        let dec1 = decode_write_request(&rw1_wire, DecodeOptions::classic(), &mut scratch).unwrap();
+        assert!(!dec1.labels_utf8_validated);
+        assert!(dec1.timeseries_at(0).labels_str().is_none());
+
+        let mut rw2_wire = Vec::new();
+        encode_write_request_rw2_bytes(
+            &rw1,
+            V2_RECORD_SYMBOL_OFFSET,
+            Some(v2_common_symbols()),
+            &mut rw2_wire,
+        )
+        .unwrap();
+        let dec2 =
+            decode_write_request(&rw2_wire, DecodeOptions::kafka_v2(), &mut scratch).unwrap();
+        assert!(dec2.labels_utf8_validated);
+        let pairs: Vec<_> = dec2.timeseries_at(0).labels_str().unwrap().collect();
+        assert_eq!(pairs, vec![("__name__", "up"), ("job", "api")]);
     }
 }
