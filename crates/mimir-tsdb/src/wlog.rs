@@ -694,8 +694,9 @@ impl<R: Read + SegmentTracker> WlogReader<R> {
         }
     }
 
-    /// Reads the next logical WAL record. Returns `Ok(None)` on clean EOF.
-    pub fn next_record(&mut self) -> Result<Option<&[u8]>, WlogError> {
+    /// Reads the next raw (possibly compressed) logical WAL record without decompressing it.
+    /// Returns `Ok(None)` on clean EOF.
+    pub fn next_raw_record(&mut self) -> Result<Option<(CompressionType, &[u8])>, WlogError> {
         self.precompr_buf.clear();
         let mut part_idx = 0usize;
 
@@ -771,45 +772,62 @@ impl<R: Read + SegmentTracker> WlogReader<R> {
             }
 
             if self.cur_rec_typ == REC_LAST || self.cur_rec_typ == REC_FULL {
-                self.decompress_into_rec(compr)?;
-                return Ok(Some(&self.rec));
+                return Ok(Some((compr, &self.precompr_buf)));
             }
 
             part_idx += 1;
         }
     }
 
-    fn decompress_into_rec(&mut self, compr: CompressionType) -> Result<(), WlogError> {
-        match compr {
-            CompressionType::None => {
-                self.rec.clear();
-                self.rec.extend_from_slice(&self.precompr_buf);
-                Ok(())
+    /// Reads the next logical WAL record. Returns `Ok(None)` on clean EOF.
+    pub fn next_record(&mut self) -> Result<Option<&[u8]>, WlogError> {
+        let Some((compr, _)) = self.next_raw_record()? else {
+            return Ok(None);
+        };
+        if let Err(msg) = decompress_record_into(compr, &self.precompr_buf, &mut self.rec) {
+            return Err(self.make_corruption(msg));
+        }
+        Ok(Some(&self.rec))
+    }
+}
+
+/// Decompresses a raw WAL record payload produced by [`WlogReader::next_raw_record`] into `dst`.
+pub fn decompress_record_into(
+    compr: CompressionType,
+    src: &[u8],
+    dst: &mut Vec<u8>,
+) -> Result<(), String> {
+    match compr {
+        CompressionType::None => {
+            dst.clear();
+            dst.extend_from_slice(src);
+            Ok(())
+        }
+        CompressionType::Snappy => {
+            if src.is_empty() {
+                dst.clear();
+                return Ok(());
             }
-            CompressionType::Snappy => {
-                if self.precompr_buf.is_empty() {
-                    self.rec.clear();
-                    return Ok(());
-                }
-                let dec_len = snap::raw::decompress_len(&self.precompr_buf)
-                    .map_err(|e| self.make_corruption(format!("snappy decompress_len: {e}")))?;
-                self.rec.resize(dec_len, 0);
-                let n = snap::raw::Decoder::new()
-                    .decompress(&self.precompr_buf, &mut self.rec)
-                    .map_err(|e| self.make_corruption(format!("snappy decompress: {e}")))?;
-                self.rec.truncate(n);
-                Ok(())
+            let dec_len = snap::raw::decompress_len(src)
+                .map_err(|e| format!("snappy decompress_len: {e}"))?;
+            dst.resize(dec_len, 0);
+            let n = snap::raw::Decoder::new()
+                .decompress(src, dst)
+                .map_err(|e| format!("snappy decompress: {e}"))?;
+            dst.truncate(n);
+            Ok(())
+        }
+        CompressionType::Zstd => {
+            if src.is_empty() {
+                dst.clear();
+                return Ok(());
             }
-            CompressionType::Zstd => {
-                if self.precompr_buf.is_empty() {
-                    self.rec.clear();
-                    return Ok(());
-                }
-                let out = zstd::stream::decode_all(self.precompr_buf.as_slice())
-                    .map_err(|e| self.make_corruption(format!("zstd decompress: {e}")))?;
-                self.rec = out;
-                Ok(())
-            }
+            dst.clear();
+            let mut dec = zstd::stream::Decoder::new(src)
+                .map_err(|e| format!("zstd decoder: {e}"))?;
+            io::Read::read_to_end(&mut dec, dst)
+                .map_err(|e| format!("zstd decompress: {e}"))?;
+            Ok(())
         }
     }
 }

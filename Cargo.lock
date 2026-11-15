@@ -1156,6 +1156,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "hashbrown 0.15.5",
  "kafka-protocol",
  "mimir-common",
  "mimir-config",

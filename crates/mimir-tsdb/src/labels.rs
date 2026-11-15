@@ -186,6 +186,12 @@ impl Labels {
         &self.data
     }
 
+    /// Clones the underlying `Bytes` buffer with an atomic refcount increment (zero-copy).
+    #[inline]
+    pub fn clone_bytes(&self) -> Bytes {
+        self.data.clone()
+    }
+
     /// Exact Prometheus `stringlabels` `Labels.Hash()`.
     #[inline]
     pub fn hash(&self) -> u64 {

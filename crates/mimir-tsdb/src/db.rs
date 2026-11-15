@@ -12,7 +12,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::block::{list_block_dirs, Block, BlockError, BlockMetaCompaction};
-use crate::compact::{write_block_from_series, CompactError};
+use crate::compact::{write_head_block_streaming, CompactError};
 use crate::exemplar::{CircularExemplarStorage, ExemplarQueryResult};
 use crate::head::{range_for_timestamp, Head, HeadAppender, HeadError, HeadOptions};
 use crate::matcher::LabelMatcher;
@@ -219,15 +219,21 @@ impl Tsdb {
         if maxt <= mint {
             return Ok(None);
         }
-        let series = self.head.collect_compaction_series(mint, maxt - 1)?;
-        let meta_opt = write_block_from_series(
+        let maxt_inclusive = maxt - 1;
+        let candidates = self.head.collect_compaction_candidates(mint, maxt_inclusive)?;
+        let meta_opt = write_head_block_streaming(
             &self.dir,
             mint,
             maxt,
-            series,
+            candidates,
             BlockMetaCompaction::default(),
             false,
             self.opts.max_block_chunk_segment_size,
+            |ref_id, chks, tombs| {
+                self.head
+                    .load_series_in_order_chunks_into(ref_id, mint, maxt_inclusive, chks, tombs)
+                    .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
+            },
         )?;
 
         let uid = if let Some(meta) = meta_opt {
@@ -257,21 +263,26 @@ impl Tsdb {
     }
 
     fn compact_ooo_head_locked(&self) -> Result<Option<Ulid>, TsdbError> {
-        let (series, mint, maxt_inclusive) = self.head.collect_ooo_compaction_series()?;
-        if series.is_empty() || mint > maxt_inclusive {
+        let (candidates, mint, maxt_inclusive) = self.head.collect_ooo_compaction_candidates()?;
+        if candidates.is_empty() || mint > maxt_inclusive {
             return Ok(None);
         }
         let maxt = maxt_inclusive.saturating_add(1);
         let mut compaction = BlockMetaCompaction::default();
         compaction.set_out_of_order();
-        let Some(meta) = write_block_from_series(
+        let Some(meta) = write_head_block_streaming(
             &self.dir,
             mint,
             maxt,
-            series,
+            candidates,
             compaction,
             true,
             self.opts.max_block_chunk_segment_size,
+            |ref_id, chks, tombs| {
+                self.head
+                    .load_series_ooo_chunks_into(ref_id, chks, tombs)
+                    .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
+            },
         )?
         else {
             return Ok(None);
@@ -293,21 +304,27 @@ impl Tsdb {
             return Ok(None);
         }
         let _guard = self.compact_mtx.lock();
-        let (series, mint, maxt_inclusive) = self.head.collect_selected_compaction_series(refs)?;
-        if series.is_empty() || mint > maxt_inclusive {
+        let (candidates, mint, maxt_inclusive) =
+            self.head.collect_selected_compaction_candidates(refs)?;
+        if candidates.is_empty() || mint > maxt_inclusive {
             return Ok(None);
         }
         let maxt = maxt_inclusive.saturating_add(1);
         let mut compaction = BlockMetaCompaction::default();
         compaction.set_selected_series();
-        let Some(meta) = write_block_from_series(
+        let Some(meta) = write_head_block_streaming(
             &self.dir,
             mint,
             maxt,
-            series,
+            candidates,
             compaction,
             false,
             self.opts.max_block_chunk_segment_size,
+            |ref_id, chks, tombs| {
+                self.head
+                    .load_series_in_order_chunks_into(ref_id, mint, maxt_inclusive, chks, tombs)
+                    .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
+            },
         )?
         else {
             return Ok(None);

@@ -2,6 +2,7 @@
 //!
 //! Ported from github.com/grafana/mimir/pkg/ingester/ingester_push.go.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -18,7 +19,6 @@ use mimir_tsdb::chunkenc::{CounterResetHint, FloatHistogram, Histogram, Histogra
 use mimir_tsdb::exemplar::{Exemplar, ExemplarError};
 use mimir_tsdb::head::{HeadError, SeriesEntry};
 use mimir_tsdb::labels::Labels;
-use smallvec::SmallVec;
 use tracing::warn;
 
 use crate::circuit_breaker::BreakerPermit;
@@ -118,9 +118,77 @@ impl SampleKind {
     }
 }
 
+thread_local! {
+    static PAIRS_SCRATCH: RefCell<Vec<(&'static str, &'static str)>> =
+        RefCell::new(Vec::with_capacity(32));
+}
+
+struct PairsScratchGuard {
+    from_tls: bool,
+    vec: Vec<(&'static str, &'static str)>,
+}
+
+impl PairsScratchGuard {
+    fn take() -> Self {
+        let taken = PAIRS_SCRATCH.with(|cell| {
+            cell.try_borrow_mut()
+                .ok()
+                .map(|mut v| std::mem::take(&mut *v))
+        });
+        match taken {
+            Some(mut vec) => {
+                vec.clear();
+                if vec.capacity() < 32 {
+                    vec.reserve(32);
+                }
+                Self {
+                    from_tls: true,
+                    vec,
+                }
+            }
+            None => Self {
+                from_tls: false,
+                vec: Vec::with_capacity(32),
+            },
+        }
+    }
+
+    #[inline]
+    fn as_mut_pairs<'a>(&mut self) -> &mut Vec<(&'a str, &'a str)> {
+        // SAFETY: `self.vec` is empty when taken and cleared on Drop before `'a` ends.
+        unsafe { &mut *(&mut self.vec as *mut Vec<(&'static str, &'static str)>).cast() }
+    }
+}
+
+impl Drop for PairsScratchGuard {
+    fn drop(&mut self) {
+        self.vec.clear();
+        if self.from_tls {
+            let vec = std::mem::take(&mut self.vec);
+            PAIRS_SCRATCH.with(|cell| {
+                if let Ok(mut slot) = cell.try_borrow_mut() {
+                    if slot.capacity() < vec.capacity() {
+                        *slot = vec;
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[inline(always)]
+fn fast_utf8_str(b: &[u8]) -> Result<&str, std::str::Utf8Error> {
+    if b.is_ascii() {
+        // SAFETY: every byte < 0x80 is valid UTF-8.
+        Ok(unsafe { std::str::from_utf8_unchecked(b) })
+    } else {
+        std::str::from_utf8(b)
+    }
+}
+
 /// Abstract view over a single time series in either owned `cortexpb::TimeSeries` or zero-copy `BorrowedTimeSeriesView`.
 trait TimeSeriesInput<'a> {
-    fn fill_pairs(&self, out: &mut SmallVec<[(&'a str, &'a str); 24]>) -> Result<(), IngesterError>;
+    fn fill_pairs(&self, out: &mut Vec<(&'a str, &'a str)>) -> Result<(), IngesterError>;
     fn samples(&self) -> &[cortexpb::Sample];
     fn created_timestamp(&self) -> i64;
     fn histogram_count(&self) -> usize;
@@ -131,13 +199,13 @@ trait TimeSeriesInput<'a> {
 }
 
 impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
-    fn fill_pairs(&self, out: &mut SmallVec<[(&'a str, &'a str); 24]>) -> Result<(), IngesterError> {
+    fn fill_pairs(&self, out: &mut Vec<(&'a str, &'a str)>) -> Result<(), IngesterError> {
         out.clear();
         for lp in &self.labels {
-            let k = lp.name_str().map_err(|_| IngesterError::BadRequest {
+            let k = fast_utf8_str(&lp.name).map_err(|_| IngesterError::BadRequest {
                 message: "invalid UTF-8 in label name".to_string(),
             })?;
-            let v = lp.value_str().map_err(|_| IngesterError::BadRequest {
+            let v = fast_utf8_str(&lp.value).map_err(|_| IngesterError::BadRequest {
                 message: "invalid UTF-8 in label value".to_string(),
             })?;
             out.push((k, v));
@@ -261,13 +329,13 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
 }
 
 impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
-    fn fill_pairs(&self, out: &mut SmallVec<[(&'a str, &'a str); 24]>) -> Result<(), IngesterError> {
+    fn fill_pairs(&self, out: &mut Vec<(&'a str, &'a str)>) -> Result<(), IngesterError> {
         out.clear();
         for lp in self.labels() {
-            let k = lp.name_str().map_err(|_| IngesterError::BadRequest {
+            let k = fast_utf8_str(lp.name).map_err(|_| IngesterError::BadRequest {
                 message: "invalid UTF-8 in label name".to_string(),
             })?;
-            let v = lp.value_str().map_err(|_| IngesterError::BadRequest {
+            let v = fast_utf8_str(lp.value).map_err(|_| IngesterError::BadRequest {
                 message: "invalid UTF-8 in label value".to_string(),
             })?;
             out.push((k, v));
@@ -960,7 +1028,8 @@ impl Ingester {
         let mut app = db.db.appender_with_capacity(series_hint);
         let mut stats = PushStats::default();
         let mut first_partial: Option<(IngesterError, Option<SampleKind>)> = None;
-        let mut pairs: SmallVec<[(&str, &str); 24]> = SmallVec::new();
+        let mut pairs_guard = PairsScratchGuard::take();
+        let pairs = pairs_guard.as_mut_pairs();
         let mut series_str_cache: Option<String>;
 
         let mut record_partial = |err: IngesterError, kind: Option<SampleKind>| {
@@ -977,7 +1046,7 @@ impl Ingester {
                 stats.series_with_floats_and_histograms += 1;
             }
 
-            if let Err(e) = ts.fill_pairs(&mut pairs) {
+            if let Err(e) = ts.fill_pairs(pairs) {
                 return Err(e.with_user(user_id, 0));
             }
 
@@ -1025,8 +1094,23 @@ impl Ingester {
 
             // Look up existing ref (zero-alloc if pairs are already sorted & unique).
             // Strip blank label values after checking sorted/unique, matching Prometheus Labels.WithoutEmpty().
-            let labels_sorted_unique = pairs.windows(2).all(|w| w[0].0 < w[1].0);
-            pairs.retain(|(_, v)| !v.is_empty());
+            let mut labels_sorted_unique = true;
+            let mut has_empty_val = false;
+            let mut prev_name: Option<&str> = None;
+            for &(k, v) in pairs.iter() {
+                if let Some(pn) = prev_name {
+                    if pn >= k {
+                        labels_sorted_unique = false;
+                    }
+                }
+                prev_name = Some(k);
+                if v.is_empty() {
+                    has_empty_val = true;
+                }
+            }
+            if has_empty_val {
+                pairs.retain(|(_, v)| !v.is_empty());
+            }
 
             let mut make_series_str = |ps: &[(&str, &str)]| -> String {
                 if let Some(ref s) = series_str_cache {
@@ -1039,14 +1123,14 @@ impl Ingester {
 
             let mut series_entry: Option<Arc<SeriesEntry>> =
                 if labels_sorted_unique && !pairs.is_empty() {
-                    head.get_entry_by_sorted_pairs(&pairs)
+                    head.get_entry_by_sorted_pairs(pairs)
                 } else {
                     None
                 };
             let mut series_ref = series_entry.as_ref().map(|e| e.ref_id);
 
             if series_ref.is_none() && !labels_sorted_unique {
-                let s_str = make_series_str(&pairs);
+                let s_str = make_series_str(pairs);
                 let total_bad = samples.len() + if native_histograms_enabled { hist_count } else { 0 };
                 stats.failed_samples += total_bad;
                 stats.labels_not_sorted += total_bad;
@@ -1061,7 +1145,7 @@ impl Ingester {
             // Additional validation when not skipped
             if series_ref.is_none() {
                 if !skip_label_validation {
-                    if let Some(err) = validate_label_pairs(&pairs, &limits, &mut make_series_str) {
+                    if let Some(err) = validate_label_pairs(pairs, &limits, &mut make_series_str) {
                         let total_bad = samples.len()
                             + if native_histograms_enabled { hist_count } else { 0 };
                         stats.failed_samples += total_bad;
@@ -1071,11 +1155,11 @@ impl Ingester {
                     }
                 }
 
-                if verify_ownership && !self.check_ring_ownership(user_id, &pairs) {
+                if verify_ownership && !self.check_ring_ownership(user_id, pairs) {
                     return Err(IngesterError::Internal {
                         message: format!(
                             "series {} is not owned by this ingester",
-                            make_series_str(&pairs)
+                            make_series_str(pairs)
                         ),
                     }
                     .with_user(user_id, 0));
@@ -1091,7 +1175,7 @@ impl Ingester {
                 if s.timestamp_ms > max_timestamp_ms {
                     stats.failed_samples += 1;
                     stats.sample_too_far_in_future += 1;
-                    let s_str = make_series_str(&pairs);
+                    let s_str = make_series_str(pairs);
                     record_partial(
                         IngesterError::sample_too_far_in_future(s.timestamp_ms, s_str),
                         Some(SampleKind::SampleTimestampTooFarInFuture),
@@ -1101,7 +1185,7 @@ impl Ingester {
                 if s.timestamp_ms < min_timestamp_ms {
                     stats.failed_samples += 1;
                     stats.sample_too_old += 1;
-                    let s_str = make_series_str(&pairs);
+                    let s_str = make_series_str(pairs);
                     record_partial(
                         IngesterError::sample_too_far_in_past(s.timestamp_ms, s_str),
                         None,
@@ -1117,7 +1201,7 @@ impl Ingester {
                 {
                     match app.append_float_with_entry(
                         &mut series_entry,
-                        &pairs,
+                        pairs,
                         0,
                         created_ts,
                         0.0,
@@ -1136,7 +1220,7 @@ impl Ingester {
                             handle_head_append_error(
                                 err,
                                 created_ts,
-                                &pairs,
+                                pairs,
                                 ooo_window_ms,
                                 ooo_window_dur,
                                 &limits,
@@ -1152,7 +1236,7 @@ impl Ingester {
 
                 match app.append_float_with_entry(
                     &mut series_entry,
-                    &pairs,
+                    pairs,
                     0,
                     s.timestamp_ms,
                     s.value,
@@ -1166,7 +1250,7 @@ impl Ingester {
                         handle_head_append_error(
                             err,
                             s.timestamp_ms,
-                            &pairs,
+                            pairs,
                             ooo_window_ms,
                             ooo_window_dur,
                             &limits,
@@ -1187,7 +1271,7 @@ impl Ingester {
                     if h_ts > max_timestamp_ms {
                         stats.failed_samples += 1;
                         stats.sample_too_far_in_future += 1;
-                        let s_str = make_series_str(&pairs);
+                        let s_str = make_series_str(pairs);
                         record_partial(
                             IngesterError::sample_too_far_in_future(h_ts, s_str),
                             Some(SampleKind::SampleTimestampTooFarInFuture),
@@ -1197,7 +1281,7 @@ impl Ingester {
                     if h_ts < min_timestamp_ms {
                         stats.failed_samples += 1;
                         stats.sample_too_old += 1;
-                        let s_str = make_series_str(&pairs);
+                        let s_str = make_series_str(pairs);
                         record_partial(
                             IngesterError::sample_too_far_in_past(h_ts, s_str),
                             None,
@@ -1207,7 +1291,7 @@ impl Ingester {
                     if max_hist_buckets > 0 && bucket_count > max_hist_buckets {
                         stats.failed_samples += 1;
                         stats.invalid_native_histogram += 1;
-                        let s_str = make_series_str(&pairs);
+                        let s_str = make_series_str(pairs);
                         record_partial(
                             IngesterError::max_native_histogram_buckets(
                                 bucket_count,
@@ -1230,7 +1314,7 @@ impl Ingester {
                                 ..FloatHistogram::default()
                             };
                             app.append_float_histogram_reject_ooo(
-                                series_ref, &pairs, created_ts, zero_fh,
+                                series_ref, pairs, created_ts, zero_fh,
                             )
                         } else {
                             let ih_ref = ih_opt.as_ref().expect("int histogram");
@@ -1242,7 +1326,7 @@ impl Ingester {
                                 ..Histogram::default()
                             };
                             app.append_histogram_reject_ooo(
-                                series_ref, &pairs, created_ts, zero_ih,
+                                series_ref, pairs, created_ts, zero_ih,
                             )
                         };
                         match ct_res {
@@ -1259,7 +1343,7 @@ impl Ingester {
                                 handle_head_append_error(
                                     err,
                                     created_ts,
-                                    &pairs,
+                                    pairs,
                                     ooo_window_ms,
                                     ooo_window_dur,
                                     &limits,
@@ -1276,7 +1360,7 @@ impl Ingester {
                     let res = if is_float {
                         app.append_float_histogram(
                             series_ref,
-                            &pairs,
+                            pairs,
                             0,
                             h_ts,
                             fh_opt.expect("float histogram"),
@@ -1284,7 +1368,7 @@ impl Ingester {
                     } else {
                         app.append_histogram(
                             series_ref,
-                            &pairs,
+                            pairs,
                             0,
                             h_ts,
                             ih_opt.expect("int histogram"),
@@ -1306,7 +1390,7 @@ impl Ingester {
                             handle_head_append_error(
                                 err,
                                 h_ts,
-                                &pairs,
+                                pairs,
                                 ooo_window_ms,
                                 ooo_window_dur,
                                 &limits,
@@ -1325,9 +1409,9 @@ impl Ingester {
                 if let Some(ref_id) = series_ref {
                     let h = series_entry
                         .as_ref()
-                        .map_or_else(|| mimir_tsdb::head::hash_sorted_pairs(&pairs), |e| e.hash);
+                        .map_or_else(|| mimir_tsdb::head::hash_sorted_pairs(pairs), |e| e.hash);
                     db.active_series.update_series(
-                        &pairs,
+                        pairs,
                         h,
                         ref_id,
                         start_append,
@@ -1341,7 +1425,7 @@ impl Ingester {
             if ex_count > 0 && max_exemplars > 0 {
                 if series_ref.is_none() {
                     if let Ok((ex_ts, _, _, ex_str)) = ts.exemplar_at(0) {
-                        let s_str = make_series_str(&pairs);
+                        let s_str = make_series_str(pairs);
                         record_partial(
                             IngesterError::exemplar_missing_series(ex_ts, s_str, ex_str),
                             None,
@@ -1361,7 +1445,7 @@ impl Ingester {
                         };
                         if ex_ts > max_timestamp_ms {
                             stats.failed_exemplars += 1;
-                            let s_str = make_series_str(&pairs);
+                            let s_str = make_series_str(pairs);
                             record_partial(
                                 IngesterError::exemplar_too_far_in_future(ex_ts, s_str, ex_str),
                                 None,
@@ -1370,7 +1454,7 @@ impl Ingester {
                         }
                         if ex_ts < min_timestamp_ms {
                             stats.failed_exemplars += 1;
-                            let s_str = make_series_str(&pairs);
+                            let s_str = make_series_str(pairs);
                             record_partial(
                                 IngesterError::exemplar_too_far_in_past(ex_ts, s_str, ex_str),
                                 None,
@@ -1378,13 +1462,13 @@ impl Ingester {
                             continue;
                         }
                         let exemplar = Exemplar::new(ex_labels, ex_val, ex_ts);
-                        match app.append_exemplar(series_ref, &pairs, exemplar) {
+                        match app.append_exemplar(series_ref, pairs, exemplar) {
                             Ok(_) => stats.succeeded_exemplars += 1,
                             Err(HeadError::Exemplar(ExemplarError::OutOfOrderExemplar)) => {
                                 stats.failed_exemplars += 1;
                                 out_of_order_exemplars += 1;
                                 if out_of_order_exemplars == ex_count && !ignore_ooo_exemplars {
-                                    let s_str = make_series_str(&pairs);
+                                    let s_str = make_series_str(pairs);
                                     record_partial(
                                         IngesterError::TsdbIngestExemplar {
                                             original_err: "out of order exemplar".to_string(),
@@ -1398,7 +1482,7 @@ impl Ingester {
                             }
                             Err(HeadError::Exemplar(ex_err)) => {
                                 stats.failed_exemplars += 1;
-                                let s_str = make_series_str(&pairs);
+                                let s_str = make_series_str(pairs);
                                 record_partial(
                                     IngesterError::TsdbIngestExemplar {
                                         original_err: ex_err.to_string(),
@@ -1411,7 +1495,7 @@ impl Ingester {
                             }
                             Err(e) => {
                                 stats.failed_exemplars += 1;
-                                let s_str = make_series_str(&pairs);
+                                let s_str = make_series_str(pairs);
                                 record_partial(
                                     IngesterError::TsdbIngestExemplar {
                                         original_err: e.to_string(),

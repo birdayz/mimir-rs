@@ -263,8 +263,12 @@ impl IndexWriter {
                 self.toc.series = self.pos;
             }
             WriterStage::Done => {
+                self.last_series = None;
                 self.toc.label_indices = self.pos;
                 self.write_postings_to_tmp_files()?;
+                self.symbols = Vec::new();
+                self.symbol_index = HashMap::new();
+                self.label_names.clear();
                 self.toc.postings = self.pos;
                 self.write_postings()?;
                 self.toc.label_indices_table = self.pos;

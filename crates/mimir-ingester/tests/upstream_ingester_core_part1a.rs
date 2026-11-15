@@ -945,7 +945,7 @@ fn decode_querystream_responses(responses: &[ingesterpb::QueryStreamResponse]) -
                 for ds in decoded {
                     match ds.value {
                         SampleValue::Float(v) => entry.0.push((ds.t, v)),
-                        SampleValue::Histogram(h) => entry.1.push((ds.t, h)),
+                        SampleValue::Histogram(h) => entry.1.push((ds.t, *h)),
                         SampleValue::FloatHistogram(_) => panic!("unexpected float histogram"),
                     }
                 }

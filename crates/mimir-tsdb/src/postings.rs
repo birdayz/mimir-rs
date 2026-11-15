@@ -5,9 +5,11 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
 use hashbrown::HashMap;
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::labels::SymbolLabels;
@@ -43,19 +45,121 @@ pub trait PostingsSource {
     ) -> Result<Vec<u64>, PostingsError>;
 }
 
-/// Inverted index mapping `(label_name_id, label_value_id)` -> sorted `Vec<u32>` series refs
-/// (with overflow `Vec<u64>` map only if any explicit ref exceeds `u32::MAX`).
-#[derive(Debug)]
-pub struct MemPostings {
-    inner: RwLock<MemPostingsInner>,
+const POSTINGS_STRIPES: usize = 64;
+
+#[derive(Debug, Default)]
+struct PostingsList {
+    small: Vec<u32>,
+    overflow: Vec<u64>,
 }
 
-#[derive(Debug)]
-struct MemPostingsInner {
+impl PostingsList {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.small.is_empty() && self.overflow.is_empty()
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.small.len() + self.overflow.len()
+    }
+
+    #[inline]
+    fn push(&mut self, id: u64, ordered: bool) {
+        if let Ok(id32) = u32::try_from(id) {
+            if !ordered || self.small.last().copied() < Some(id32) {
+                self.small.push(id32);
+            } else if let Err(pos) = self.small.binary_search(&id32) {
+                self.small.insert(pos, id32);
+            }
+        } else if !ordered || self.overflow.last().copied() < Some(id) {
+            self.overflow.push(id);
+        } else if let Err(pos) = self.overflow.binary_search(&id) {
+            self.overflow.insert(pos, id);
+        }
+    }
+
+    fn delete(&mut self, deleted: &HashSet<u64>) {
+        self.small.retain(|&id| !deleted.contains(&(id as u64)));
+        if !self.overflow.is_empty() {
+            self.overflow.retain(|id| !deleted.contains(id));
+        }
+    }
+
+    fn sort_and_dedup(&mut self) {
+        if self.small.len() > 1 {
+            self.small.sort_unstable();
+            self.small.dedup();
+        }
+        if self.overflow.len() > 1 {
+            self.overflow.sort_unstable();
+            self.overflow.dedup();
+        }
+    }
+
+    fn to_u64_vec(&self) -> Vec<u64> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.len());
+        out.extend(self.small.iter().map(|&x| x as u64));
+        out.extend_from_slice(&self.overflow);
+        out
+    }
+
+    fn first(&self, ordered: bool) -> Option<u64> {
+        if !self.small.is_empty() {
+            return if ordered {
+                self.small.first().map(|&x| x as u64)
+            } else {
+                self.small.iter().copied().min().map(|x| x as u64)
+            };
+        }
+        if !self.overflow.is_empty() {
+            return if ordered {
+                self.overflow.first().copied()
+            } else {
+                self.overflow.iter().copied().min()
+            };
+        }
+        None
+    }
+}
+
+#[derive(Debug, Default)]
+struct PostingsStripe {
     m: HashMap<SymbolId, HashMap<SymbolId, Vec<u32>>>,
     overflow: HashMap<(SymbolId, SymbolId), Vec<u64>>,
     lvs: HashMap<SymbolId, Vec<SymbolId>>,
-    ordered: bool,
+}
+
+/// Reusable scratch buffers for [`MemPostings::add_batch_unordered_with_scratch`].
+pub struct PostingsBatchScratch {
+    buckets: [Vec<(u64, SymbolId, SymbolId)>; POSTINGS_STRIPES],
+}
+
+impl Default for PostingsBatchScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PostingsBatchScratch {
+    pub fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| Vec::new()),
+        }
+    }
+}
+
+/// 64-stripe sharded inverted index mapping `(label_name_id, label_value_id)` -> sorted
+/// `Vec<u32>` series refs (with overflow `Vec<u64>` map only if any explicit ref exceeds `u32::MAX`),
+/// plus a dedicated `all_postings` list for `ALL_POSTINGS_KEY`.
+#[derive(Debug)]
+pub struct MemPostings {
+    stripes: [RwLock<PostingsStripe>; POSTINGS_STRIPES],
+    all_postings: RwLock<PostingsList>,
+    ordered: AtomicBool,
 }
 
 impl Default for MemPostings {
@@ -77,41 +181,135 @@ impl MemPostings {
 
     fn with_ordered(ordered: bool) -> Self {
         Self {
-            inner: RwLock::new(MemPostingsInner {
-                m: HashMap::with_capacity(512),
-                overflow: HashMap::new(),
-                lvs: HashMap::with_capacity(512),
-                ordered,
-            }),
+            stripes: std::array::from_fn(|_| RwLock::new(PostingsStripe::default())),
+            all_postings: RwLock::new(PostingsList::default()),
+            ordered: AtomicBool::new(ordered),
         }
+    }
+
+    #[inline]
+    fn stripe_idx(name_id: SymbolId) -> usize {
+        (name_id.0 as usize).wrapping_mul(0x9E37_79B9) & (POSTINGS_STRIPES - 1)
     }
 
     /// Adds `series_ref` for all `(name_id, value_id)` pairs in `labels`, plus `ALL_POSTINGS_KEY`.
     pub fn add(&self, series_ref: u64, labels: &SymbolLabels) {
-        let mut inner = self.inner.write();
-        for &(name_id, value_id) in labels.as_slice() {
-            inner.add_for(series_ref, name_id, value_id);
+        let ordered = self.ordered.load(AtomicOrdering::Acquire);
+        {
+            let mut all = self.all_postings.write();
+            all.push(series_ref, ordered);
         }
-        inner.add_for(series_ref, ALL_POSTINGS_KEY.0, ALL_POSTINGS_KEY.1);
+        let pairs = labels.as_slice();
+        if pairs.is_empty() {
+            return;
+        }
+        if pairs.len() == 1 {
+            let (nid, vid) = pairs[0];
+            if (nid, vid) != ALL_POSTINGS_KEY {
+                self.stripes[Self::stripe_idx(nid)]
+                    .write()
+                    .add_for(series_ref, nid, vid, ordered);
+            }
+            return;
+        }
+        let mut routed: SmallVec<[(usize, SymbolId, SymbolId); 24]> =
+            SmallVec::with_capacity(pairs.len());
+        for &(nid, vid) in pairs {
+            if (nid, vid) != ALL_POSTINGS_KEY {
+                routed.push((Self::stripe_idx(nid), nid, vid));
+            }
+        }
+        routed.sort_unstable_by_key(|x| x.0);
+        let mut i = 0;
+        while i < routed.len() {
+            let s_idx = routed[i].0;
+            let mut stripe = self.stripes[s_idx].write();
+            while i < routed.len() && routed[i].0 == s_idx {
+                stripe.add_for(series_ref, routed[i].1, routed[i].2, ordered);
+                i += 1;
+            }
+        }
+    }
+
+    /// Batch-inserts series postings in unordered mode, acquiring each stripe lock at most once per batch.
+    pub fn add_batch_unordered(&self, batch: &[(u64, SymbolLabels)]) {
+        let mut scratch = PostingsBatchScratch::new();
+        self.add_batch_unordered_with_scratch(batch, &mut scratch);
+    }
+
+    /// Batch-inserts series postings in unordered mode using reusable `scratch` buffers.
+    pub fn add_batch_unordered_with_scratch(
+        &self,
+        batch: &[(u64, SymbolLabels)],
+        scratch: &mut PostingsBatchScratch,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+        let ordered = self.ordered.load(AtomicOrdering::Acquire);
+        {
+            let mut all = self.all_postings.write();
+            all.small.reserve(batch.len());
+            for &(ref_id, _) in batch {
+                all.push(ref_id, ordered);
+            }
+        }
+        for b in &mut scratch.buckets {
+            b.clear();
+        }
+        for (ref_id, labels) in batch {
+            for &(nid, vid) in labels.as_slice() {
+                if (nid, vid) != ALL_POSTINGS_KEY {
+                    scratch.buckets[Self::stripe_idx(nid)].push((*ref_id, nid, vid));
+                }
+            }
+        }
+        for (s_idx, bucket) in scratch.buckets.iter_mut().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            let mut stripe = self.stripes[s_idx].write();
+            for &(ref_id, nid, vid) in bucket.iter() {
+                stripe.add_for(ref_id, nid, vid, ordered);
+            }
+            bucket.clear();
+        }
     }
 
     /// Ensures all postings lists are sorted in ascending order (and deduplicated) and switches to ordered mode.
     pub fn ensure_order(&self) {
-        let mut inner = self.inner.write();
-        if inner.ordered {
+        self.ensure_order_parallel();
+    }
+
+    /// Sorts and deduplicates all 64 stripes and `all_postings` concurrently across worker threads.
+    pub fn ensure_order_parallel(&self) {
+        if self.ordered.load(AtomicOrdering::Acquire) {
             return;
         }
-        for values_map in inner.m.values_mut() {
-            for list in values_map.values_mut() {
-                list.sort_unstable();
-                list.dedup();
+        let next_task = AtomicUsize::new(0);
+        let num_tasks = POSTINGS_STRIPES + 1;
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .clamp(2, 16)
+            .min(num_tasks);
+
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let task = next_task.fetch_add(1, AtomicOrdering::Relaxed);
+                    if task >= num_tasks {
+                        break;
+                    }
+                    if task == POSTINGS_STRIPES {
+                        self.all_postings.write().sort_and_dedup();
+                    } else {
+                        self.stripes[task].write().sort_and_dedup();
+                    }
+                });
             }
-        }
-        for list in inner.overflow.values_mut() {
-            list.sort_unstable();
-            list.dedup();
-        }
-        inner.ordered = true;
+        });
+
+        self.ordered.store(true, AtomicOrdering::Release);
     }
 
     /// Removes all `deleted` series refs from `affected` label pairs and `ALL_POSTINGS_KEY`.
@@ -119,38 +317,56 @@ impl MemPostings {
         if deleted.is_empty() {
             return;
         }
-        let mut inner = self.inner.write();
-        let mut affected_names: HashSet<SymbolId> = HashSet::new();
-
-        for &(name_id, value_id) in affected {
-            if inner.delete_pair(deleted, name_id, value_id) {
-                affected_names.insert(name_id);
+        {
+            let mut all = self.all_postings.write();
+            all.delete(deleted);
+        }
+        if affected.is_empty() {
+            return;
+        }
+        let mut buckets: [Vec<(SymbolId, SymbolId)>; POSTINGS_STRIPES] =
+            std::array::from_fn(|_| Vec::new());
+        for &(nid, vid) in affected {
+            if (nid, vid) != ALL_POSTINGS_KEY {
+                buckets[Self::stripe_idx(nid)].push((nid, vid));
             }
         }
-        inner.delete_pair(deleted, ALL_POSTINGS_KEY.0, ALL_POSTINGS_KEY.1);
-
-        for name_id in affected_names {
-            let empty_name = inner.m.get(&name_id).is_none_or(|vm| vm.is_empty());
-            if empty_name {
-                inner.m.remove(&name_id);
-                inner.lvs.remove(&name_id);
-            } else if let Some(vm) = inner.m.get(&name_id) {
-                let lvs: Vec<SymbolId> = vm.keys().copied().collect();
-                inner.lvs.insert(name_id, lvs);
+        for (s_idx, pairs) in buckets.into_iter().enumerate() {
+            if pairs.is_empty() {
+                continue;
+            }
+            let mut stripe = self.stripes[s_idx].write();
+            let mut affected_names: HashSet<SymbolId> = HashSet::new();
+            for (name_id, value_id) in pairs {
+                if stripe.delete_pair(deleted, name_id, value_id) {
+                    affected_names.insert(name_id);
+                }
+            }
+            for name_id in affected_names {
+                let empty_name = stripe.m.get(&name_id).is_none_or(|vm| vm.is_empty());
+                if empty_name {
+                    stripe.m.remove(&name_id);
+                    stripe.lvs.remove(&name_id);
+                } else if let Some(vm) = stripe.m.get(&name_id) {
+                    let lvs: Vec<SymbolId> = vm.keys().copied().collect();
+                    stripe.lvs.insert(name_id, lvs);
+                }
             }
         }
     }
 
     /// Returns a sorted list of all series refs in the index.
     pub fn all_postings(&self) -> Vec<u64> {
-        let inner = self.inner.read();
-        inner.pair_to_u64(ALL_POSTINGS_KEY.0, ALL_POSTINGS_KEY.1)
+        self.all_postings.read().to_u64_vec()
     }
 
     /// Returns sorted postings for `(name_id, value_id)`.
     pub fn postings_for_id(&self, name_id: SymbolId, value_id: SymbolId) -> Vec<u64> {
-        let inner = self.inner.read();
-        inner.pair_to_u64(name_id, value_id)
+        if (name_id, value_id) == ALL_POSTINGS_KEY {
+            return self.all_postings();
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        stripe.pair_to_u64(name_id, value_id)
     }
 
     /// Visits postings slices for `(name_id, value_id)` under the read lock with zero allocation.
@@ -160,17 +376,21 @@ impl MemPostings {
         value_id: SymbolId,
         f: impl FnOnce(&[u32], &[u64]) -> R,
     ) -> R {
-        let inner = self.inner.read();
-        let small = inner
+        if (name_id, value_id) == ALL_POSTINGS_KEY {
+            let all = self.all_postings.read();
+            return f(&all.small, &all.overflow);
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let small = stripe
             .m
             .get(&name_id)
             .and_then(|vm| vm.get(&value_id))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let large = if inner.overflow.is_empty() {
+        let large = if stripe.overflow.is_empty() {
             &[]
         } else {
-            inner
+            stripe
                 .overflow
                 .get(&(name_id, value_id))
                 .map(Vec::as_slice)
@@ -181,16 +401,19 @@ impl MemPostings {
 
     /// Returns the number of postings for `(name_id, value_id)`.
     pub fn postings_len(&self, name_id: SymbolId, value_id: SymbolId) -> usize {
-        let inner = self.inner.read();
-        let u32_len = inner
+        if (name_id, value_id) == ALL_POSTINGS_KEY {
+            return self.all_postings.read().len();
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let u32_len = stripe
             .m
             .get(&name_id)
             .and_then(|vm| vm.get(&value_id))
             .map_or(0, Vec::len);
-        let ov_len = if inner.overflow.is_empty() {
+        let ov_len = if stripe.overflow.is_empty() {
             0
         } else {
-            inner
+            stripe
                 .overflow
                 .get(&(name_id, value_id))
                 .map_or(0, Vec::len)
@@ -200,20 +423,24 @@ impl MemPostings {
 
     /// Returns the smallest/first posting ref for `(name_id, value_id)`, if any.
     pub fn first_posting(&self, name_id: SymbolId, value_id: SymbolId) -> Option<u64> {
-        let inner = self.inner.read();
-        let list = inner.m.get(&name_id).and_then(|vm| vm.get(&value_id));
+        let ordered = self.ordered.load(AtomicOrdering::Acquire);
+        if (name_id, value_id) == ALL_POSTINGS_KEY {
+            return self.all_postings.read().first(ordered);
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let list = stripe.m.get(&name_id).and_then(|vm| vm.get(&value_id));
         if let Some(l) = list {
             if !l.is_empty() {
-                return if inner.ordered {
+                return if ordered {
                     l.first().map(|&x| x as u64)
                 } else {
                     l.iter().copied().min().map(|x| x as u64)
                 };
             }
         }
-        if !inner.overflow.is_empty() {
-            if let Some(ov) = inner.overflow.get(&(name_id, value_id)) {
-                return if inner.ordered {
+        if !stripe.overflow.is_empty() {
+            if let Some(ov) = stripe.overflow.get(&(name_id, value_id)) {
+                return if ordered {
                     ov.first().copied()
                 } else {
                     ov.iter().copied().min()
@@ -234,59 +461,47 @@ impl MemPostings {
         if limit == 0 {
             return;
         }
-        let inner = self.inner.read();
-        let list = inner
+        if (name_id, value_id) == ALL_POSTINGS_KEY {
+            let all = self.all_postings.read();
+            append_random_sample_from_slices(&all.small, &all.overflow, limit, out);
+            return;
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let list = stripe
             .m
             .get(&name_id)
             .and_then(|vm| vm.get(&value_id))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let ov = if inner.overflow.is_empty() {
+        let ov = if stripe.overflow.is_empty() {
             &[]
         } else {
-            inner
+            stripe
                 .overflow
                 .get(&(name_id, value_id))
                 .map(Vec::as_slice)
                 .unwrap_or(&[])
         };
-        let total_len = list.len() + ov.len();
-        if total_len == 0 {
-            return;
-        }
-        let first_val = if !list.is_empty() {
-            list[0] as u64
-        } else {
-            ov[0]
-        };
-        // Sample `limit` entries independently with replacement (matching Go MemPostings.AppendRandomPostingsRefs).
-        let mut seed = (total_len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ first_val;
-        for _ in 0..limit {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let idx = ((seed >> 33) as usize) % total_len;
-            if idx < list.len() {
-                out.push(list[idx] as u64);
-            } else {
-                out.push(ov[idx - list.len()]);
-            }
-        }
+        append_random_sample_from_slices(list, ov, limit, out);
     }
 
     /// Returns total byte length of distinct label values (longer than `LABEL_VALUE_BYTES_MIN_LENGTH`) per label name.
     pub fn label_values_bytes(&self, symbols: &SymbolTable) -> std::collections::HashMap<String, u64> {
-        let inner = self.inner.read();
-        let mut out = std::collections::HashMap::with_capacity(inner.lvs.len());
-        for (&name_id, val_ids) in &inner.lvs {
-            if name_id == ALL_POSTINGS_KEY.0 {
-                continue;
-            }
-            let total: u64 = val_ids
-                .iter()
-                .map(|&vid| symbols.resolve(vid).len() as u64)
-                .filter(|&len| len > LABEL_VALUE_BYTES_MIN_LENGTH as u64)
-                .sum();
-            if total > 0 {
-                out.insert(symbols.resolve(name_id).to_string(), total);
+        let mut out = std::collections::HashMap::new();
+        for s_rw in &self.stripes {
+            let stripe = s_rw.read();
+            for (&name_id, val_ids) in &stripe.lvs {
+                if name_id == ALL_POSTINGS_KEY.0 {
+                    continue;
+                }
+                let total: u64 = val_ids
+                    .iter()
+                    .map(|&vid| symbols.resolve(vid).len() as u64)
+                    .filter(|&len| len > LABEL_VALUE_BYTES_MIN_LENGTH as u64)
+                    .sum();
+                if total > 0 {
+                    out.insert(symbols.resolve(name_id).to_string(), total);
+                }
             }
         }
         out
@@ -297,11 +512,14 @@ impl MemPostings {
         if value_ids.is_empty() {
             return Vec::new();
         }
-        let inner = self.inner.read();
-        let Some(vm) = inner.m.get(&name_id) else {
+        if name_id == ALL_POSTINGS_KEY.0 && value_ids.contains(&ALL_POSTINGS_KEY.1) {
+            return self.all_postings();
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let Some(vm) = stripe.m.get(&name_id) else {
             return Vec::new();
         };
-        if inner.overflow.is_empty() {
+        if stripe.overflow.is_empty() {
             let lists: Vec<&[u32]> = value_ids
                 .iter()
                 .filter_map(|vid| vm.get(vid).map(|v| v.as_slice()))
@@ -314,7 +532,7 @@ impl MemPostings {
             if let Some(v) = vm.get(vid) {
                 total += v.len();
             }
-            if let Some(ov) = inner.overflow.get(&(name_id, *vid)) {
+            if let Some(ov) = stripe.overflow.get(&(name_id, *vid)) {
                 total += ov.len();
             }
         }
@@ -326,7 +544,7 @@ impl MemPostings {
             if let Some(v) = vm.get(vid) {
                 out.extend(v.iter().map(|&x| x as u64));
             }
-            if let Some(ov) = inner.overflow.get(&(name_id, *vid)) {
+            if let Some(ov) = stripe.overflow.get(&(name_id, *vid)) {
                 out.extend_from_slice(ov);
             }
         }
@@ -337,11 +555,14 @@ impl MemPostings {
 
     /// Returns sorted union of all postings for `name_id`.
     pub fn postings_for_all_values_id(&self, name_id: SymbolId) -> Vec<u64> {
-        let inner = self.inner.read();
-        let Some(vm) = inner.m.get(&name_id) else {
+        if name_id == ALL_POSTINGS_KEY.0 {
+            return self.all_postings();
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let Some(vm) = stripe.m.get(&name_id) else {
             return Vec::new();
         };
-        if inner.overflow.is_empty() {
+        if stripe.overflow.is_empty() {
             let lists: Vec<&[u32]> = vm
                 .values()
                 .map(|v| v.as_slice())
@@ -352,7 +573,7 @@ impl MemPostings {
         let mut out = Vec::new();
         for (&vid, v) in vm {
             out.extend(v.iter().map(|&x| x as u64));
-            if let Some(ov) = inner.overflow.get(&(name_id, vid)) {
+            if let Some(ov) = stripe.overflow.get(&(name_id, vid)) {
                 out.extend_from_slice(ov);
             }
         }
@@ -368,11 +589,9 @@ impl MemPostings {
         symbols: &SymbolTable,
         pred: &mut dyn FnMut(&str) -> bool,
     ) -> Vec<u64> {
-        // Snapshot the candidate value SymbolIds while holding the postings lock briefly,
-        // then evaluate `pred` without holding the postings write lock.
         let value_ids: Vec<SymbolId> = {
-            let inner = self.inner.read();
-            match inner.lvs.get(&name_id) {
+            let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+            match stripe.lvs.get(&name_id) {
                 Some(v) => v.clone(),
                 None => return Vec::new(),
             }
@@ -388,15 +607,15 @@ impl MemPostings {
 
     /// Returns all unique label names (excluding the internal `ALL_POSTINGS_KEY` empty name), sorted.
     pub fn label_names(&self, symbols: &SymbolTable) -> Vec<String> {
-        let ids: Vec<SymbolId> = {
-            let inner = self.inner.read();
-            inner
-                .m
-                .keys()
-                .copied()
-                .filter(|&k| k != ALL_POSTINGS_KEY.0)
-                .collect()
-        };
+        let mut ids: Vec<SymbolId> = Vec::new();
+        for s_rw in &self.stripes {
+            let stripe = s_rw.read();
+            for &k in stripe.m.keys() {
+                if k != ALL_POSTINGS_KEY.0 {
+                    ids.push(k);
+                }
+            }
+        }
         let mut names: Vec<String> = ids
             .into_iter()
             .map(|id| symbols.resolve(id).to_string())
@@ -411,8 +630,8 @@ impl MemPostings {
             return Vec::new();
         };
         let ids: Vec<SymbolId> = {
-            let inner = self.inner.read();
-            match inner.lvs.get(&name_id) {
+            let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+            match stripe.lvs.get(&name_id) {
                 Some(v) => v.clone(),
                 None => return Vec::new(),
             }
@@ -434,8 +653,8 @@ impl MemPostings {
             return Vec::new();
         };
         let ids: Vec<SymbolId> = {
-            let inner = self.inner.read();
-            match inner.lvs.get(&name_id) {
+            let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+            match stripe.lvs.get(&name_id) {
                 Some(v) => v.clone(),
                 None => return Vec::new(),
             }
@@ -458,16 +677,18 @@ impl MemPostings {
 
     /// Returns all `(name, value)` pairs present in postings sorted lexicographically.
     pub fn sorted_keys(&self, symbols: &SymbolTable) -> Vec<(String, String)> {
-        let pairs: Vec<(SymbolId, SymbolId)> = {
-            let inner = self.inner.read();
-            let mut out = Vec::new();
-            for (&nid, vm) in &inner.m {
+        let mut pairs: Vec<(SymbolId, SymbolId)> = Vec::new();
+        if !self.all_postings.read().is_empty() {
+            pairs.push(ALL_POSTINGS_KEY);
+        }
+        for s_rw in &self.stripes {
+            let stripe = s_rw.read();
+            for (&nid, vm) in &stripe.m {
                 for &vid in vm.keys() {
-                    out.push((nid, vid));
+                    pairs.push((nid, vid));
                 }
             }
-            out
-        };
+        }
         let mut resolved: Vec<(String, String)> = pairs
             .into_iter()
             .map(|(nid, vid)| (symbols.resolve(nid).to_string(), symbols.resolve(vid).to_string()))
@@ -485,7 +706,46 @@ impl MemPostings {
     }
 }
 
-impl MemPostingsInner {
+fn append_random_sample_from_slices(list: &[u32], ov: &[u64], limit: usize, out: &mut Vec<u64>) {
+    let total_len = list.len() + ov.len();
+    if total_len == 0 {
+        return;
+    }
+    let first_val = if !list.is_empty() {
+        list[0] as u64
+    } else {
+        ov[0]
+    };
+    let mut seed = (total_len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ first_val;
+    for _ in 0..limit {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let idx = ((seed >> 33) as usize) % total_len;
+        if idx < list.len() {
+            out.push(list[idx] as u64);
+        } else {
+            out.push(ov[idx - list.len()]);
+        }
+    }
+}
+
+impl PostingsStripe {
+    fn sort_and_dedup(&mut self) {
+        for values_map in self.m.values_mut() {
+            for list in values_map.values_mut() {
+                if list.len() > 1 {
+                    list.sort_unstable();
+                    list.dedup();
+                }
+            }
+        }
+        for list in self.overflow.values_mut() {
+            if list.len() > 1 {
+                list.sort_unstable();
+                list.dedup();
+            }
+        }
+    }
+
     fn pair_to_u64(&self, name_id: SymbolId, value_id: SymbolId) -> Vec<u64> {
         let u32_list = self.m.get(&name_id).and_then(|vm| vm.get(&value_id));
         let ov_list = if self.overflow.is_empty() {
@@ -507,7 +767,7 @@ impl MemPostingsInner {
         out
     }
 
-    fn add_for(&mut self, id: u64, name_id: SymbolId, value_id: SymbolId) {
+    fn add_for(&mut self, id: u64, name_id: SymbolId, value_id: SymbolId, ordered: bool) {
         let vm = self.m.entry(name_id).or_default();
         let list = match vm.get_mut(&value_id) {
             Some(list) => list,
@@ -517,24 +777,17 @@ impl MemPostingsInner {
             }
         };
         if let Ok(id32) = u32::try_from(id) {
-            list.push(id32);
-            if self.ordered && list.len() >= 2 {
-                // Repair tail if out-of-order ID was inserted; usually O(1) break immediately.
-                let mut i = list.len() - 1;
-                while i >= 1 && list[i] < list[i - 1] {
-                    list.swap(i, i - 1);
-                    i -= 1;
-                }
+            if !ordered || list.last().copied() < Some(id32) {
+                list.push(id32);
+            } else if let Err(pos) = list.binary_search(&id32) {
+                list.insert(pos, id32);
             }
         } else {
             let ov = self.overflow.entry((name_id, value_id)).or_default();
-            ov.push(id);
-            if self.ordered && ov.len() >= 2 {
-                let mut i = ov.len() - 1;
-                while i >= 1 && ov[i] < ov[i - 1] {
-                    ov.swap(i, i - 1);
-                    i -= 1;
-                }
+            if !ordered || ov.last().copied() < Some(id) {
+                ov.push(id);
+            } else if let Err(pos) = ov.binary_search(&id) {
+                ov.insert(pos, id);
             }
         }
     }

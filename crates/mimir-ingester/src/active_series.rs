@@ -1203,51 +1203,80 @@ impl SeriesEntry {
 
 #[derive(Default)]
 struct DeletedSeriesInner {
-    keys: HashMap<u64, Bytes>,
-    refs: HashMap<Bytes, u64>,
+    keys: hashbrown::HashMap<u64, Bytes>,
+    by_hash: hashbrown::HashTable<u64>,
 }
 
 #[derive(Default)]
 struct DeletedSeries {
+    has_entries: AtomicBool,
     inner: Mutex<DeletedSeriesInner>,
 }
 
 impl DeletedSeries {
+    #[inline]
     fn is_empty(&self) -> bool {
-        self.inner.lock().refs.is_empty()
+        !self.has_entries.load(Ordering::Acquire)
     }
 
     fn add(&self, ref_id: u64, labels: &Labels) {
-        let bytes = Bytes::copy_from_slice(labels.as_bytes());
+        let bytes = labels.clone_bytes();
+        let hash = xxhash_rust::xxh64::xxh64(&bytes, 0);
         let mut g = self.inner.lock();
-        g.keys.insert(ref_id, bytes.clone());
-        g.refs.insert(bytes, ref_id);
+        let DeletedSeriesInner { keys, by_hash } = &mut *g;
+        if let Some(old_bytes) = keys.insert(ref_id, bytes) {
+            let old_hash = xxhash_rust::xxh64::xxh64(&old_bytes, 0);
+            if let Ok(found) = by_hash.find_entry(old_hash, |&id| id == ref_id) {
+                found.remove();
+            }
+        }
+        by_hash.insert_unique(hash, ref_id, |&id| {
+            keys.get(&id).map_or(0, |b| xxhash_rust::xxh64::xxh64(b, 0))
+        });
+        self.has_entries.store(true, Ordering::Release);
     }
 
     fn find(&self, labels_bytes: &[u8]) -> Option<u64> {
-        let g = self.inner.lock();
-        if g.refs.is_empty() {
+        if self.is_empty() {
             return None;
         }
-        g.refs.get(labels_bytes).copied()
+        let hash = xxhash_rust::xxh64::xxh64(labels_bytes, 0);
+        let g = self.inner.lock();
+        g.by_hash
+            .find(hash, |&id| {
+                g.keys.get(&id).is_some_and(|b| b.as_ref() == labels_bytes)
+            })
+            .copied()
     }
 
     fn purge(&self, ref_id: u64) {
+        if self.is_empty() {
+            return;
+        }
         let mut g = self.inner.lock();
         if let Some(key) = g.keys.remove(&ref_id) {
-            g.refs.remove(&key);
+            let hash = xxhash_rust::xxh64::xxh64(&key, 0);
+            if let Ok(found) = g.by_hash.find_entry(hash, |&id| id == ref_id) {
+                found.remove();
+            }
+            if g.keys.is_empty() {
+                g.keys.shrink_to_fit();
+                g.by_hash.shrink_to(0, |_| 0);
+                self.has_entries.store(false, Ordering::Release);
+            }
         }
     }
 
     fn clear(&self) {
         let mut g = self.inner.lock();
-        g.keys.clear();
-        g.refs.clear();
+        g.keys = hashbrown::HashMap::new();
+        g.by_hash = hashbrown::HashTable::new();
+        self.has_entries.store(false, Ordering::Release);
     }
 
     pub fn counts(&self) -> (usize, usize) {
         let g = self.inner.lock();
-        (g.refs.len(), g.keys.len())
+        (g.by_hash.len(), g.keys.len())
     }
 }
 

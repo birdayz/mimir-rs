@@ -119,12 +119,28 @@ impl MemTombstones {
         }
     }
 
+    #[inline]
+    pub fn has_any(&self) -> bool {
+        self.has_tombstones.load(Ordering::Acquire)
+    }
+
     pub fn get(&self, ref_id: u64) -> Intervals {
         if !self.has_tombstones.load(Ordering::Acquire) {
             return Vec::new();
         }
         let groups = self.groups.read();
         groups.get(&ref_id).cloned().unwrap_or_default()
+    }
+
+    pub fn get_into(&self, ref_id: u64, out: &mut Intervals) {
+        out.clear();
+        if !self.has_tombstones.load(Ordering::Acquire) {
+            return;
+        }
+        let groups = self.groups.read();
+        if let Some(ivs) = groups.get(&ref_id) {
+            out.extend_from_slice(ivs);
+        }
     }
 
     pub fn delete_tombstones(&self, refs: &HashSet<u64>) {

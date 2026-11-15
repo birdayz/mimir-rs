@@ -48,9 +48,11 @@ pub enum CompactError {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SampleValue {
     Float(f64),
-    Histogram(Histogram),
-    FloatHistogram(FloatHistogram),
+    Histogram(Box<Histogram>),
+    FloatHistogram(Box<FloatHistogram>),
 }
+
+const _: () = assert!(std::mem::size_of::<SampleValue>() <= 16);
 
 /// A single decoded timestamped sample.
 #[derive(Clone, Debug, PartialEq)]
@@ -94,7 +96,7 @@ pub fn decode_chunk_samples(chunk: &EncodedChunk) -> Result<Vec<DecodedSample>, 
                 out.push(DecodedSample {
                     st: 0,
                     t,
-                    value: SampleValue::Histogram(h),
+                    value: SampleValue::Histogram(Box::new(h)),
                 });
             }
             Ok(out)
@@ -106,7 +108,7 @@ pub fn decode_chunk_samples(chunk: &EncodedChunk) -> Result<Vec<DecodedSample>, 
                 out.push(DecodedSample {
                     st: it.at_st(),
                     t,
-                    value: SampleValue::Histogram(h),
+                    value: SampleValue::Histogram(Box::new(h)),
                 });
             }
             Ok(out)
@@ -118,7 +120,7 @@ pub fn decode_chunk_samples(chunk: &EncodedChunk) -> Result<Vec<DecodedSample>, 
                 out.push(DecodedSample {
                     st: 0,
                     t,
-                    value: SampleValue::FloatHistogram(fh),
+                    value: SampleValue::FloatHistogram(Box::new(fh)),
                 });
             }
             Ok(out)
@@ -130,7 +132,7 @@ pub fn decode_chunk_samples(chunk: &EncodedChunk) -> Result<Vec<DecodedSample>, 
                 out.push(DecodedSample {
                     st: it.at_st(),
                     t,
-                    value: SampleValue::FloatHistogram(fh),
+                    value: SampleValue::FloatHistogram(Box::new(fh)),
                 });
             }
             Ok(out)
@@ -428,6 +430,163 @@ pub fn trim_and_merge_chunks(
     samples.sort_by_key(|s| s.t);
     samples.dedup_by_key(|s| s.t);
     encode_samples_into_chunks(&samples, samples_per_chunk)
+}
+
+/// Streams Head compaction without materializing all `CompactionSeries` or chunk buffers in RAM.
+///
+/// `candidates` is a lightweight `Vec<(u64, Labels)>` (each `Labels` clone is an O(1) `Bytes`
+/// refcount bump) already pre-filtered to series overlapping `[mint, maxt - 1]`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_head_block_streaming<F>(
+    dest: &Path,
+    mint: i64,
+    maxt: i64,
+    mut candidates: Vec<(u64, Labels)>,
+    compaction: BlockMetaCompaction,
+    out_of_order: bool,
+    segment_size: usize,
+    mut load_series_chunks: F,
+) -> Result<Option<BlockMeta>, CompactError>
+where
+    F: FnMut(u64, &mut Vec<ChunkMeta>, &mut Vec<Interval>) -> Result<(), CompactError>,
+{
+    if maxt <= mint || candidates.is_empty() {
+        return Ok(None);
+    }
+    let maxt_inclusive = maxt - 1;
+
+    candidates.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    candidates.dedup_by_key(|a| a.0);
+
+    let uid = Ulid::new();
+    let final_dir = dest.join(uid.to_string());
+    let tmp_dir = dest.join(format!("{uid}{TMP_BLOCK_DIR_SUFFIX}"));
+    if tmp_dir.exists() {
+        fs::remove_dir_all(&tmp_dir)?;
+    }
+    fs::create_dir_all(&tmp_dir)?;
+
+    let write_res = (|| -> Result<Option<BlockMeta>, CompactError> {
+        let seg_sz = if segment_size == 0 {
+            DEFAULT_CHUNK_SEGMENT_SIZE
+        } else {
+            segment_size
+        };
+        let mut chunkw = BlockChunksWriter::with_segment_size(tmp_dir.join("chunks"), seg_sz)?;
+        let mut indexw = IndexWriter::new(tmp_dir.join(INDEX_FILENAME))?;
+
+        // Pass 1: collect unique &str symbols across lightweight candidate Labels (zero chunk allocs).
+        {
+            let mut sym_set: hashbrown::HashSet<&str> =
+                hashbrown::HashSet::with_capacity(candidates.len().min(65536));
+            sym_set.insert("");
+            for (_, labels) in &candidates {
+                for (k, v) in labels.iter() {
+                    sym_set.insert(k);
+                    sym_set.insert(v);
+                }
+            }
+            let mut symbols: Vec<&str> = sym_set.into_iter().collect();
+            symbols.sort_unstable();
+            for sym in symbols {
+                indexw.add_symbol(sym)?;
+            }
+        }
+
+        // Pass 2: stream one series at a time using reused ChunkMeta/Interval scratch Vecs.
+        let mut stats = BlockStats::default();
+        let mut chks_buf: Vec<ChunkMeta> = Vec::with_capacity(4);
+        let mut tombs_buf: Vec<Interval> = Vec::with_capacity(2);
+        let mut series_idx = 0u64;
+
+        for (ref_id, labels) in candidates {
+            chks_buf.clear();
+            tombs_buf.clear();
+            load_series_chunks(ref_id, &mut chks_buf, &mut tombs_buf)?;
+            if chks_buf.is_empty() {
+                continue;
+            }
+            let mut trimmed = trim_and_merge_chunks(
+                std::mem::take(&mut chks_buf),
+                &tombs_buf,
+                mint,
+                maxt_inclusive,
+                DEFAULT_SAMPLES_PER_CHUNK,
+            )?;
+            if trimmed.is_empty() {
+                chks_buf = trimmed;
+                continue;
+            }
+
+            chunkw.write_chunks(&mut trimmed)?;
+            indexw.add_series(series_idx, &labels, &trimmed)?;
+            series_idx += 1;
+
+            stats.num_series += 1;
+            stats.num_chunks += trimmed.len() as u64;
+            for chk in &trimmed {
+                if let Some(ref enc) = chk.chunk {
+                    let n = enc.num_samples() as u64;
+                    stats.num_samples += n;
+                    match enc.encoding() {
+                        Encoding::Xor | Encoding::Xor2 => stats.num_float_samples += n,
+                        Encoding::Histogram
+                        | Encoding::FloatHistogram
+                        | Encoding::HistogramSt
+                        | Encoding::FloatHistogramSt => stats.num_histogram_samples += n,
+                        Encoding::None => {}
+                    }
+                }
+            }
+            trimmed.clear();
+            chks_buf = trimmed;
+        }
+
+        chunkw.close()?;
+        indexw.close()?;
+
+        if stats.num_samples == 0 {
+            return Ok(None);
+        }
+
+        let mut comp = compaction;
+        if comp.sources.is_empty() {
+            comp.sources = vec![uid];
+        } else {
+            comp.sources.sort();
+            comp.sources.dedup();
+        }
+        if comp.level <= 0 {
+            comp.level = 1;
+        }
+        if out_of_order {
+            comp.set_out_of_order();
+        }
+
+        let mut meta = BlockMeta {
+            ulid: uid,
+            min_time: mint,
+            max_time: maxt,
+            stats,
+            compaction: comp,
+            version: META_VERSION_1,
+            out_of_order,
+            thanos: None,
+        };
+        write_meta_file(&tmp_dir, &mut meta)?;
+        write_tombstones_file(&tmp_dir, &MemTombstones::new())?;
+
+        if final_dir.exists() {
+            fs::remove_dir_all(&final_dir)?;
+        }
+        fs::rename(&tmp_dir, &final_dir)?;
+        Ok(Some(meta))
+    })();
+
+    if write_res.is_err() || matches!(write_res, Ok(None)) {
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+    write_res
 }
 
 /// Writes a single Prometheus ULID block directory into `dest` from sorted [`CompactionSeries`]

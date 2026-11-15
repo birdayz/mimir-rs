@@ -488,29 +488,55 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
     let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel::<()>();
     let (grpc_shutdown_tx, grpc_shutdown_rx) = oneshot::channel::<()>();
+    let (server_done_tx, server_done_rx) = oneshot::channel::<()>();
 
-    let http_task = tokio::spawn(async move {
-        axum::serve(http_listener, http_router)
-            .with_graceful_shutdown(async {
-                let _ = http_shutdown_rx.await;
-            })
-            .await
-    });
+    let http_std = http_listener.into_std()?;
+    let grpc_std = grpc_listener.into_std()?;
+    http_std.set_nonblocking(true)?;
+    grpc_std.set_nonblocking(true)?;
 
-    let incoming = tokio_stream::StreamExt::map(TcpListenerStream::new(grpc_listener), |res| {
-        if let Ok(ref stream) = res {
-            let _ = stream.set_nodelay(true);
-        }
-        res
-    });
+    std::thread::Builder::new()
+        .name("mimir-rpc-rt".to_string())
+        .spawn(move || {
+            let rpc_rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_name("mimir-rpc")
+                .enable_all()
+                .build()
+                .expect("build mimir-rpc runtime");
+            rpc_rt.block_on(async move {
+                let http_l = TcpListener::from_std(http_std).expect("from_std http listener");
+                let grpc_l = TcpListener::from_std(grpc_std).expect("from_std grpc listener");
 
-    let grpc_task = tokio::spawn(async move {
-        grpc_builder
-            .serve_with_incoming_shutdown(incoming, async {
-                let _ = grpc_shutdown_rx.await;
-            })
-            .await
-    });
+                let http_task = tokio::spawn(async move {
+                    axum::serve(http_l, http_router)
+                        .with_graceful_shutdown(async {
+                            let _ = http_shutdown_rx.await;
+                        })
+                        .await
+                });
+
+                let incoming =
+                    tokio_stream::StreamExt::map(TcpListenerStream::new(grpc_l), |res| {
+                        if let Ok(ref stream) = res {
+                            let _ = stream.set_nodelay(true);
+                        }
+                        res
+                    });
+
+                let grpc_task = tokio::spawn(async move {
+                    grpc_builder
+                        .serve_with_incoming_shutdown(incoming, async {
+                            let _ = grpc_shutdown_rx.await;
+                        })
+                        .await
+                });
+
+                let _ = tokio::join!(http_task, grpc_task);
+            });
+            let _ = server_done_tx.send(());
+        })
+        .context("spawning mimir-rpc runtime thread")?;
 
     logger.log(LogLevel::Info, &[("msg", "Application started")]);
 
@@ -531,10 +557,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             .0
             .max(100_000_000) as u64,
     );
-    let _ = tokio::join!(
-        tokio::time::timeout(graceful_timeout, http_task),
-        tokio::time::timeout(graceful_timeout, grpc_task),
-    );
+    let _ = tokio::time::timeout(graceful_timeout, server_done_rx).await;
 
     if let Some(ref ing) = ingester_opt {
         if let Err(err) = ing.stop().await {

@@ -53,6 +53,45 @@ pub struct QueryChunkSeries {
     pub chunks: Vec<ChunkMeta>,
 }
 
+/// Pre-evaluated postings selection across TSDB `Head` and overlapping `Block`s.
+///
+/// `'static + Send + Sync` so callers can evaluate postings inline (hitting caches in microseconds)
+/// and decide whether to materialize chunks inline or offload to a blocking worker pool.
+#[derive(Clone, Debug)]
+pub struct PreparedChunkSelect {
+    pub head_refs: Option<Arc<[u64]>>,
+    pub block_refs: Vec<(Arc<Block>, Arc<[u64]>)>,
+    overlapping_blocks: Vec<Arc<Block>>,
+    pub mint: i64,
+    pub maxt: i64,
+    pub unordered: bool,
+}
+
+impl PreparedChunkSelect {
+    #[inline]
+    pub fn total_refs(&self) -> usize {
+        self.head_refs.as_ref().map_or(0, |r| r.len())
+            + self.block_refs.iter().map(|(_, r)| r.len()).sum::<usize>()
+    }
+
+    #[inline]
+    pub fn max_source_series_len(&self) -> usize {
+        let h = self.head_refs.as_ref().map_or(0, |r| r.len());
+        let b = self
+            .block_refs
+            .iter()
+            .map(|(_, r)| r.len())
+            .max()
+            .unwrap_or(0);
+        h.max(b)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.total_refs() == 0
+    }
+}
+
 /// Unified read view over `Head` and overlapping `Block`s for `[mint, maxt]`.
 pub struct TsdbQuerier<'a> {
     head: Option<&'a Head>,
@@ -171,27 +210,126 @@ impl<'a> TsdbQuerier<'a> {
         self.select_chunks_with_mode(sort_series, matchers, false)
     }
 
-    /// Queries encoded chunks for all series matching `matchers` in `[mint, maxt]`.
-    /// When `unordered` is true, chunks from Head (in-order + OOO merged) and each Block are
-    /// concatenated without cross-block compaction, matching Prometheus `UnorderedChunkQuerier`.
-    pub fn select_chunks_with_mode(
+    fn prepare_select_locked(
+        &self,
+        blocks: Vec<Arc<Block>>,
+        matchers: &[LabelMatcher],
+        unordered: bool,
+    ) -> Result<PreparedChunkSelect, QuerierError> {
+        let head = self.effective_head();
+        let head_refs = match head {
+            Some(h) => Some(h.postings_for_matchers_arc(matchers)?),
+            None => None,
+        };
+        let mut block_refs = Vec::with_capacity(blocks.len());
+        for blk in &blocks {
+            let refs = blk.postings_for_matchers(matchers)?;
+            if !refs.is_empty() {
+                block_refs.push((Arc::clone(blk), refs));
+            }
+        }
+        Ok(PreparedChunkSelect {
+            head_refs,
+            block_refs,
+            overlapping_blocks: blocks,
+            mint: self.mint,
+            maxt: self.maxt,
+            unordered,
+        })
+    }
+
+    /// Evaluates postings matchers across `Head` and overlapping `Block`s (hitting
+    /// `PostingsForMatchersCache` when cached) without loading any chunk bytes.
+    pub fn prepare_select_chunks(
+        &self,
+        matchers: &[LabelMatcher],
+        unordered: bool,
+    ) -> Result<PreparedChunkSelect, QuerierError> {
+        let lock_guard = self.blocks_lock.map(|l| l.read());
+        let blocks = self.effective_blocks(&lock_guard);
+        drop(lock_guard);
+        self.prepare_select_locked(blocks, matchers, unordered)
+    }
+
+    /// Evaluates postings inline under `blocks_lock.read()`. If the matched series count is small
+    /// (`<= max_source_series` and `<= max_total_refs`), materializes chunks immediately while still
+    /// holding `blocks_lock.read()` and returns `Ok(Ok(series))`. Otherwise releases the lock and
+    /// returns `Ok(Err(prepared))` so the caller can offload chunk loading to a blocking pool.
+    pub fn select_chunks_adaptive(
         &self,
         sort_series: bool,
         matchers: &[LabelMatcher],
         unordered: bool,
-    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        max_source_series: usize,
+        max_total_refs: usize,
+    ) -> Result<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
         let blocks = self.effective_blocks(&lock_guard);
-        let head = self.effective_head();
+        let prepared = self.prepare_select_locked(blocks, matchers, unordered)?;
+        if prepared.is_empty() {
+            return Ok(Ok(Vec::new()));
+        }
+        if prepared.max_source_series_len() <= max_source_series
+            && prepared.total_refs() <= max_total_refs
+        {
+            let series = self.execute_prepared_select_locked(prepared, sort_series)?;
+            return Ok(Ok(series));
+        }
+        drop(lock_guard);
+        Ok(Err(prepared))
+    }
 
-        if blocks.is_empty() {
-            let Some(head) = head else {
+    /// Materializes chunks for a [`PreparedChunkSelect`] while holding `blocks_lock.read()`,
+    /// refreshing the selection if concurrent compaction updated `blocks`.
+    pub fn execute_prepared_select_with_matchers(
+        &self,
+        mut prepared: PreparedChunkSelect,
+        matchers: &[LabelMatcher],
+        sort_series: bool,
+    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        let lock_guard = self.blocks_lock.map(|l| l.read());
+        if self.blocks_lock.is_some() {
+            let current_blocks = self.effective_blocks(&lock_guard);
+            let same = current_blocks.len() == prepared.overlapping_blocks.len()
+                && current_blocks
+                    .iter()
+                    .zip(prepared.overlapping_blocks.iter())
+                    .all(|(a, b)| Arc::ptr_eq(a, b));
+            if !same {
+                prepared =
+                    self.prepare_select_locked(current_blocks, matchers, prepared.unordered)?;
+            }
+        }
+        self.execute_prepared_select_locked(prepared, sort_series)
+    }
+
+    /// Materializes chunks for a [`PreparedChunkSelect`] produced by [`Self::prepare_select_chunks`].
+    pub fn execute_prepared_select(
+        &self,
+        prepared: PreparedChunkSelect,
+        sort_series: bool,
+    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        let _lock_guard = self.blocks_lock.map(|l| l.read());
+        self.execute_prepared_select_locked(prepared, sort_series)
+    }
+
+    fn execute_prepared_select_locked(
+        &self,
+        prepared: PreparedChunkSelect,
+        sort_series: bool,
+    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        let head = self.effective_head();
+        let mint = prepared.mint;
+        let maxt = prepared.maxt;
+        let unordered = prepared.unordered;
+
+        if prepared.block_refs.is_empty() {
+            let (Some(head), Some(refs)) = (head, prepared.head_refs) else {
                 return Ok(Vec::new());
             };
-            let refs = head.postings_for_matchers_arc(matchers)?;
             let mut out = Vec::with_capacity(refs.len());
             for &r in refs.iter() {
-                if let Some((labels, chks, tombs)) = head.series_chunks(r, self.mint, self.maxt)? {
+                if let Some((labels, chks, tombs)) = head.series_chunks(r, mint, maxt)? {
                     if chks.is_empty() {
                         continue;
                     }
@@ -204,7 +342,7 @@ impl<'a> TsdbQuerier<'a> {
                         for cm in &chks {
                             if let Some(ref enc) = cm.chunk {
                                 for s in decode_chunk_samples(enc)? {
-                                    if s.t >= self.mint && s.t <= self.maxt {
+                                    if s.t >= mint && s.t <= maxt {
                                         samples.push(s);
                                     }
                                 }
@@ -229,7 +367,7 @@ impl<'a> TsdbQuerier<'a> {
                                 for cm in &chks {
                                     if let Some(ref enc) = cm.chunk {
                                         for s in decode_chunk_samples(enc)? {
-                                            if s.t >= self.mint && s.t <= self.maxt {
+                                            if s.t >= mint && s.t <= maxt {
                                                 samples.push(s);
                                             }
                                         }
@@ -266,10 +404,9 @@ impl<'a> TsdbQuerier<'a> {
 
         let mut per_series: BTreeMap<Labels, SeriesSources> = BTreeMap::new();
 
-        if let Some(head) = head {
-            let refs = head.postings_for_matchers_arc(matchers)?;
+        if let (Some(head), Some(refs)) = (head, prepared.head_refs) {
             for &r in refs.iter() {
-                if let Some((labels, chks, tombs)) = head.series_chunks(r, self.mint, self.maxt)? {
+                if let Some((labels, chks, tombs)) = head.series_chunks(r, mint, maxt)? {
                     let entry = per_series.entry(labels).or_insert_with(|| SeriesSources {
                         head: Vec::new(),
                         blocks: Vec::new(),
@@ -281,17 +418,16 @@ impl<'a> TsdbQuerier<'a> {
             }
         }
 
-        for blk in &blocks {
+        for (blk, refs) in prepared.block_refs {
             let idx = blk.index();
             let chkr = blk.chunks();
             let tombr = blk.tombstones();
-            let refs = blk.postings_for_matchers(matchers)?;
             for &r in refs.iter() {
                 let (labels, chks) = idx.series(r)?;
                 let tombs = tombr.get(r);
                 let mut loaded = Vec::new();
                 for mut cm in chks {
-                    if !cm.overlaps_closed_interval(self.mint, self.maxt) {
+                    if !cm.overlaps_closed_interval(mint, maxt) {
                         continue;
                     }
                     if tombs
@@ -337,7 +473,7 @@ impl<'a> TsdbQuerier<'a> {
                         continue;
                     };
                     for s in decode_chunk_samples(enc)? {
-                        if s.t < self.mint || s.t > self.maxt {
+                        if s.t < mint || s.t > maxt {
                             continue;
                         }
                         samples.push(s);
@@ -358,7 +494,7 @@ impl<'a> TsdbQuerier<'a> {
                             continue;
                         };
                         for s in decode_chunk_samples(enc)? {
-                            if s.t < self.mint || s.t > self.maxt {
+                            if s.t < mint || s.t > maxt {
                                 continue;
                             }
                             samples.push(s);
@@ -397,6 +533,21 @@ impl<'a> TsdbQuerier<'a> {
             // `per_series` is already sorted by Labels, which always satisfies both sorted & unsorted callers.
         }
         Ok(out)
+    }
+
+    /// Queries encoded chunks for all series matching `matchers` in `[mint, maxt]`.
+    /// When `unordered` is true, chunks from Head (in-order + OOO merged) and each Block are
+    /// concatenated without cross-block compaction, matching Prometheus `UnorderedChunkQuerier`.
+    pub fn select_chunks_with_mode(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+        unordered: bool,
+    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        let _lock_guard = self.blocks_lock.map(|l| l.read());
+        let blocks = self.effective_blocks(&_lock_guard);
+        let prepared = self.prepare_select_locked(blocks, matchers, unordered)?;
+        self.execute_prepared_select_locked(prepared, sort_series)
     }
 
     /// Queries matching series labels directly (without decoding or cloning chunk bytes).
@@ -651,6 +802,47 @@ impl<'a> TsdbChunkQuerier<'a> {
             inner: TsdbQuerier::with_blocks_lock(head, blocks_lock, mint, maxt),
             unordered: true,
         }
+    }
+
+    pub fn select_adaptive(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+        max_source_series: usize,
+        max_total_refs: usize,
+    ) -> Result<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>, QuerierError> {
+        self.inner.select_chunks_adaptive(
+            sort_series,
+            matchers,
+            self.unordered,
+            max_source_series,
+            max_total_refs,
+        )
+    }
+
+    pub fn execute_prepared_select_with_matchers(
+        &self,
+        prepared: PreparedChunkSelect,
+        matchers: &[LabelMatcher],
+        sort_series: bool,
+    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        self.inner
+            .execute_prepared_select_with_matchers(prepared, matchers, sort_series)
+    }
+
+    pub fn prepare_select(
+        &self,
+        matchers: &[LabelMatcher],
+    ) -> Result<PreparedChunkSelect, QuerierError> {
+        self.inner.prepare_select_chunks(matchers, self.unordered)
+    }
+
+    pub fn execute_prepared_select(
+        &self,
+        prepared: PreparedChunkSelect,
+        sort_series: bool,
+    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        self.inner.execute_prepared_select(prepared, sort_series)
     }
 
     pub fn select(

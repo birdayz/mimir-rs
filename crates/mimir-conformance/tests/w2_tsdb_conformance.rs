@@ -64,7 +64,7 @@ fn to_label_json(labels: &Labels) -> Vec<LabelJson> {
 
 fn from_hist_json(h: &HistogramJson) -> SampleValue {
     if h.is_float {
-        SampleValue::FloatHistogram(FloatHistogram {
+        SampleValue::FloatHistogram(Box::new(FloatHistogram {
             counter_reset_hint: CounterResetHint::from_u8(h.reset_hint as u8),
             schema: h.schema,
             zero_threshold: h.zero_threshold,
@@ -90,9 +90,9 @@ fn from_hist_json(h: &HistogramJson) -> SampleValue {
                 .collect(),
             negative_buckets: h.negative_counts.clone(),
             custom_values: h.custom_values.clone(),
-        })
+        }))
     } else {
-        SampleValue::Histogram(Histogram {
+        SampleValue::Histogram(Box::new(Histogram {
             counter_reset_hint: CounterResetHint::from_u8(h.reset_hint as u8),
             schema: h.schema,
             zero_threshold: h.zero_threshold,
@@ -118,7 +118,7 @@ fn from_hist_json(h: &HistogramJson) -> SampleValue {
                 .collect(),
             negative_buckets: h.negative_deltas.clone(),
             custom_values: h.custom_values.clone(),
-        })
+        }))
     }
 }
 

@@ -1036,11 +1036,19 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
                             ingester.metrics.active_series_loading.set(0.0);
                             flipped_loading = true;
                         }
-                        ingester.update_active_series_metrics(SystemTime::now());
+                        let ing_c = Arc::clone(&ingester);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            ing_c.update_active_series_metrics(SystemTime::now());
+                        })
+                        .await;
                     }
                 }
                 _ = limit_tick.tick() => {
-                    ingester.update_limit_metrics();
+                    let ing_c = Arc::clone(&ingester);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        ing_c.update_limit_metrics();
+                    })
+                    .await;
                 }
                 _ = churn_tick.tick() => {
                     if ingester.cfg.label_churn_enabled {

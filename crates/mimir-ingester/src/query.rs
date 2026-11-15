@@ -540,18 +540,77 @@ impl Ingester {
             return Ok(Box::pin(tokio_stream::empty()));
         };
 
-        let ing_c = Arc::clone(self);
-        let db_c = Arc::clone(&db);
-        let uid_c = user_id.to_string();
         let start_ts = req.start_timestamp_ms;
         let end_ts = req.end_timestamp_ms;
-        let mut chunk_series = tokio::task::spawn_blocking(move || {
-            ing_c.select_chunk_series_for_query(&db_c, &uid_c, start_ts, end_ts, shard, &matchers)
-        })
-        .await
-        .map_err(|e| IngesterError::Internal {
-            message: format!("query task join error: {e}"),
-        })??;
+        let mut chunk_series = if !self
+            .blocks_cfg
+            .tsdb
+            .index_lookup_planning
+            .index_lookup_planning_enabled
+        {
+            const INLINE_CHUNK_LOAD_SERIES_LIMIT: usize = 256;
+            const INLINE_CHUNK_LOAD_REFS_LIMIT: usize = 512;
+
+            let ooo_window = self
+                .overrides
+                .for_tenant(user_id)
+                .out_of_order_time_window
+                .0;
+            let unordered = ooo_window > 0;
+            let cq = if unordered {
+                db.db.unordered_chunk_querier(start_ts, end_ts)
+            } else {
+                db.db.chunk_querier(start_ts, end_ts)
+            };
+            let mut out = match cq
+                .select_adaptive(
+                    true,
+                    &matchers,
+                    INLINE_CHUNK_LOAD_SERIES_LIMIT,
+                    INLINE_CHUNK_LOAD_REFS_LIMIT,
+                )
+                .map_err(|e| IngesterError::Internal {
+                    message: format!("selecting series from ChunkQuerier: {e}"),
+                })? {
+                Ok(inline_series) => inline_series,
+                Err(prepared) => {
+                    let db_c = Arc::clone(&db);
+                    tokio::task::spawn_blocking(move || {
+                        let cq_b = if unordered {
+                            db_c.db.unordered_chunk_querier(start_ts, end_ts)
+                        } else {
+                            db_c.db.chunk_querier(start_ts, end_ts)
+                        };
+                        cq_b.execute_prepared_select_with_matchers(prepared, &matchers, true)
+                    })
+                    .await
+                    .map_err(|e| IngesterError::Internal {
+                        message: format!("query task join error: {e}"),
+                    })?
+                    .map_err(|e| IngesterError::Internal {
+                        message: format!("selecting series from ChunkQuerier: {e}"),
+                    })?
+                }
+            };
+
+            if let Some((shard_idx, shard_count)) = shard {
+                out.retain(|cs| labels_stable_hash(&cs.labels) % shard_count == shard_idx);
+            }
+            out
+        } else {
+            let ing_c = Arc::clone(self);
+            let db_c = Arc::clone(&db);
+            let uid_c = user_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                ing_c.select_chunk_series_for_query(
+                    &db_c, &uid_c, start_ts, end_ts, shard, &matchers,
+                )
+            })
+            .await
+            .map_err(|e| IngesterError::Internal {
+                message: format!("query task join error: {e}"),
+            })??
+        };
 
         let batch_limit = req.streaming_chunks_batch_size as usize;
         let num_series = chunk_series.len();

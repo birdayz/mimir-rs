@@ -1725,13 +1725,13 @@ async fn test_ingester_query_stream() {
                 (4, SampleValue::Float(v)) => assert_eq!(*v, sid as f64),
                 (5, SampleValue::Histogram(h)) => {
                     assert_eq!(
-                        *h,
+                        **h,
                         generate_test_histogram(sid as i64, CounterResetHint::UnknownCounterReset)
                     );
                 }
                 (6, SampleValue::FloatHistogram(fh)) => {
                     assert_eq!(
-                        *fh,
+                        **fh,
                         generate_test_float_histogram(
                             sid as i64,
                             CounterResetHint::UnknownCounterReset

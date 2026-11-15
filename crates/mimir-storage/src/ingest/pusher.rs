@@ -4,12 +4,13 @@
 //! - github.com/grafana/mimir/pkg/storage/ingest/pusher.go
 //! - github.com/grafana/mimir/pkg/storage/ingest/pusher_metrics.go
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -98,6 +99,43 @@ fn xxh64_seed0(data: &[u8]) -> u64 {
     h ^ (h >> 32)
 }
 
+static COMMON_SYMBOLS_BY_PTR: OnceLock<Vec<(usize, &'static [u8])>> = OnceLock::new();
+
+fn common_symbols_table() -> &'static [(usize, &'static [u8])] {
+    COMMON_SYMBOLS_BY_PTR.get_or_init(|| {
+        let mut items: Vec<(usize, &'static [u8])> = V2_COMMON_SYMBOLS_LIST
+            .iter()
+            .map(|&s| {
+                let b = s.as_bytes();
+                (b.as_ptr() as usize, b)
+            })
+            .collect();
+        items.sort_unstable_by_key(|&(p, _)| p);
+        items
+    })
+}
+
+thread_local! {
+    static WR_SCRATCH: RefCell<WriteRequestScratch> = RefCell::new(WriteRequestScratch::new());
+}
+
+fn take_wr_scratch() -> WriteRequestScratch {
+    match WR_SCRATCH.with(|c| c.try_borrow_mut().ok().map(|mut s| std::mem::take(&mut *s))) {
+        Some(s) => s,
+        None => WriteRequestScratch::new(),
+    }
+}
+
+fn return_wr_scratch(mut scratch: WriteRequestScratch) {
+    scratch.clear();
+    WR_SCRATCH.with(|c| {
+        if let Ok(mut slot) = c.try_borrow_mut() {
+            *slot = scratch;
+        }
+    });
+}
+
+#[inline]
 fn slice_to_bytes(payload: &Bytes, s: &[u8]) -> Bytes {
     if s.is_empty() {
         return Bytes::new();
@@ -107,11 +145,11 @@ fn slice_to_bytes(payload: &Bytes, s: &[u8]) -> Bytes {
     if ptr >= base && ptr + s.len() <= base + payload.len() {
         return payload.slice_ref(s);
     }
-    for &sym in V2_COMMON_SYMBOLS_LIST {
-        let sb = sym.as_bytes();
-        let s_base = sb.as_ptr() as usize;
-        if ptr >= s_base && ptr + s.len() <= s_base + sb.len() {
-            return Bytes::from_static(&sb[ptr - s_base..ptr - s_base + s.len()]);
+    let table = common_symbols_table();
+    if let Ok(idx) = table.binary_search_by_key(&ptr, |&(p, _)| p) {
+        let sym = table[idx].1;
+        if s.len() <= sym.len() {
+            return Bytes::from_static(&sym[..s.len()]);
         }
     }
     Bytes::copy_from_slice(s)
@@ -611,113 +649,23 @@ impl PusherConsumer {
             return Ok(());
         }
 
-        let mut bytes_per_tenant: HashMap<String, usize> = HashMap::new();
-        for rec in &records {
-            if let Ok(tenant) = std::str::from_utf8(&rec.key) {
-                if let Some(entry) = bytes_per_tenant.get_mut(tenant) {
-                    *entry += rec.value.len();
+        let bytes_per_tenant: HashMap<String, usize> = if self.kafka_cfg.ingestion_concurrency_max > 0 {
+            let mut map: HashMap<String, usize> = HashMap::new();
+            for rec in &records {
+                if let Ok(tenant) = std::str::from_utf8(&rec.key) {
+                    if let Some(entry) = map.get_mut(tenant) {
+                        *entry += rec.value.len();
+                    } else {
+                        map.insert(tenant.to_owned(), rec.value.len());
+                    }
                 } else {
-                    bytes_per_tenant.insert(tenant.to_owned(), rec.value.len());
+                    let tenant = String::from_utf8_lossy(&rec.key).into_owned();
+                    *map.entry(tenant).or_insert(0) += rec.value.len();
                 }
-            } else {
-                let tenant = String::from_utf8_lossy(&rec.key).into_owned();
-                *bytes_per_tenant.entry(tenant).or_insert(0) += rec.value.len();
             }
-        }
-
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (tx, mut rx) = mpsc::channel::<ParsedRecord>(256);
-
-        let unmarshal_handle: JoinHandle<()> = if records.len() >= 16 {
-            let workers = (records.len() / 8).clamp(2, 8);
-            let chunk_size = records.len().div_ceil(workers);
-            let mut chunks: Vec<Vec<FetchedRecord>> = Vec::with_capacity(workers);
-            let mut iter = records.into_iter();
-            loop {
-                let c: Vec<FetchedRecord> = iter.by_ref().take(chunk_size).collect();
-                if c.is_empty() {
-                    break;
-                }
-                chunks.push(c);
-            }
-            tokio::spawn(async move {
-                let mut dec_handles = Vec::with_capacity(chunks.len());
-                for chunk in chunks {
-                    let cancel = cancel_rx.clone();
-                    dec_handles.push(tokio::task::spawn_blocking(move || {
-                        let mut scratch = WriteRequestScratch::new();
-                        let mut out = Vec::with_capacity(chunk.len());
-                        for rec in chunk {
-                            if *cancel.borrow() {
-                                break;
-                            }
-                            let tenant_id = String::from_utf8_lossy(&rec.key).into_owned();
-                            let version = parse_record_version(
-                                rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
-                            );
-                            let parsed = match deserialize_record_content(
-                                &rec.value,
-                                version,
-                                &mut scratch,
-                            ) {
-                                Ok(borrowed) => Ok(borrowed_write_request_to_owned_with_backing(
-                                    &borrowed,
-                                    &rec.value,
-                                )),
-                                Err(e) => Err(format!("parsing ingest consumer write request: {e}")),
-                            };
-                            out.push(ParsedRecord {
-                                tenant_id,
-                                offset: rec.offset,
-                                write_request: parsed,
-                            });
-                        }
-                        out
-                    }));
-                }
-                for h in dec_handles {
-                    if let Ok(items) = h.await {
-                        for item in items {
-                            if *cancel_rx.borrow() || tx.send(item).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            })
+            map
         } else {
-            tokio::spawn(async move {
-                let mut scratch = WriteRequestScratch::new();
-                for rec in records {
-                    if *cancel_rx.borrow() {
-                        return;
-                    }
-                    let tenant_id = String::from_utf8_lossy(&rec.key).into_owned();
-                    let version = parse_record_version(
-                        rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
-                    );
-                    let parsed =
-                        match deserialize_record_content(&rec.value, version, &mut scratch) {
-                            Ok(borrowed) => Ok(borrowed_write_request_to_owned_with_backing(
-                                &borrowed,
-                                &rec.value,
-                            )),
-                            Err(e) => Err(format!("parsing ingest consumer write request: {e}")),
-                        };
-
-                    if *cancel_rx.borrow() {
-                        return;
-                    }
-                    let item = ParsedRecord {
-                        tenant_id,
-                        offset: rec.offset,
-                        write_request: parsed,
-                    };
-                    if tx.send(item).await.is_err() {
-                        return;
-                    }
-                }
-            })
+            HashMap::new()
         };
 
         let sampler = if self.fallback_client_error_sample_rate > 0 {
@@ -758,36 +706,142 @@ impl PusherConsumer {
         };
 
         let mut return_err: Option<String> = None;
-        while let Some(item) = rx.recv().await {
-            let wr = match item.write_request {
-                Ok(wr) => wr,
-                Err(err_msg) => {
-                    error!(err = %err_msg, "failed to parse write request; skipping");
-                    if let Some(ref sink) = self.log_sink {
-                        sink.lock().push(format!(
-                            "level=error msg=\"failed to parse write request; skipping\" err=\"{err_msg}\""
-                        ));
+
+        if records.len() < 16 {
+            // Fast inline path for small steady-state batches: avoid tokio::spawn / spawn_blocking / mpsc hops.
+            let mut scratch = take_wr_scratch();
+            for rec in records {
+                let tenant_id_cow = String::from_utf8_lossy(&rec.key);
+                let version = parse_record_version(
+                    rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
+                );
+                let parsed = match deserialize_record_content(&rec.value, version, &mut scratch) {
+                    Ok(borrowed) => {
+                        Ok(borrowed_write_request_to_owned_with_backing(&borrowed, &rec.value))
                     }
-                    continue;
+                    Err(e) => Err(format!("parsing ingest consumer write request: {e}")),
+                };
+                scratch.clear();
+
+                let wr = match parsed {
+                    Ok(wr) => wr,
+                    Err(err_msg) => {
+                        error!(err = %err_msg, "failed to parse write request; skipping");
+                        if let Some(ref sink) = self.log_sink {
+                            sink.lock().push(format!(
+                                "level=error msg=\"failed to parse write request; skipping\" err=\"{err_msg}\""
+                            ));
+                        }
+                        continue;
+                    }
+                };
+
+                if let Err(err) = writer
+                    .push_to_storage_and_release_request(&tenant_id_cow, wr)
+                    .await
+                {
+                    return_err = Some(format!(
+                        "consuming record at offset {} for tenant {}: {err}",
+                        rec.offset, tenant_id_cow
+                    ));
+                    break;
                 }
-            };
-
-            if let Err(err) = writer
-                .push_to_storage_and_release_request(&item.tenant_id, wr)
-                .await
-            {
-                let _ = cancel_tx.send(true);
-                return_err = Some(format!(
-                    "consuming record at offset {} for tenant {}: {err}",
-                    item.offset, item.tenant_id
-                ));
-                break;
             }
-        }
+            return_wr_scratch(scratch);
+        } else {
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let (tx, mut rx) = mpsc::channel::<ParsedRecord>(256);
 
-        let _ = cancel_tx.send(true);
-        drop(rx);
-        let _ = unmarshal_handle.await;
+            let workers = (records.len() / 8).clamp(2, 8);
+            let chunk_size = records.len().div_ceil(workers);
+            let mut chunks: Vec<Vec<FetchedRecord>> = Vec::with_capacity(workers);
+            let mut iter = records.into_iter();
+            loop {
+                let c: Vec<FetchedRecord> = iter.by_ref().take(chunk_size).collect();
+                if c.is_empty() {
+                    break;
+                }
+                chunks.push(c);
+            }
+            let unmarshal_handle: JoinHandle<()> = tokio::spawn(async move {
+                let mut dec_handles = Vec::with_capacity(chunks.len());
+                for chunk in chunks {
+                    let cancel = cancel_rx.clone();
+                    dec_handles.push(tokio::task::spawn_blocking(move || {
+                        let mut scratch = take_wr_scratch();
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for rec in chunk {
+                            if *cancel.borrow() {
+                                break;
+                            }
+                            let tenant_id = String::from_utf8_lossy(&rec.key).into_owned();
+                            let version = parse_record_version(
+                                rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
+                            );
+                            let parsed = match deserialize_record_content(
+                                &rec.value,
+                                version,
+                                &mut scratch,
+                            ) {
+                                Ok(borrowed) => Ok(borrowed_write_request_to_owned_with_backing(
+                                    &borrowed,
+                                    &rec.value,
+                                )),
+                                Err(e) => Err(format!("parsing ingest consumer write request: {e}")),
+                            };
+                            scratch.clear();
+                            out.push(ParsedRecord {
+                                tenant_id,
+                                offset: rec.offset,
+                                write_request: parsed,
+                            });
+                        }
+                        return_wr_scratch(scratch);
+                        out
+                    }));
+                }
+                for h in dec_handles {
+                    if let Ok(items) = h.await {
+                        for item in items {
+                            if *cancel_rx.borrow() || tx.send(item).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+
+            while let Some(item) = rx.recv().await {
+                let wr = match item.write_request {
+                    Ok(wr) => wr,
+                    Err(err_msg) => {
+                        error!(err = %err_msg, "failed to parse write request; skipping");
+                        if let Some(ref sink) = self.log_sink {
+                            sink.lock().push(format!(
+                                "level=error msg=\"failed to parse write request; skipping\" err=\"{err_msg}\""
+                            ));
+                        }
+                        continue;
+                    }
+                };
+
+                if let Err(err) = writer
+                    .push_to_storage_and_release_request(&item.tenant_id, wr)
+                    .await
+                {
+                    let _ = cancel_tx.send(true);
+                    return_err = Some(format!(
+                        "consuming record at offset {} for tenant {}: {err}",
+                        item.offset, item.tenant_id
+                    ));
+                    break;
+                }
+            }
+
+            let _ = cancel_tx.send(true);
+            drop(rx);
+            let _ = unmarshal_handle.await;
+        }
 
         let close_errs = writer.close().await;
         if return_err.is_none() && !close_errs.is_empty() {

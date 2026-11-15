@@ -313,7 +313,7 @@ async fn query_ingested(ing: &Ingester, user_id: &str) -> Vec<ExpectedSeries> {
                 for s in samples {
                     match s.value {
                         SampleValue::Float(v) => entry.1 .0.push((s.t, v)),
-                        SampleValue::Histogram(h) => entry.1 .1.push((s.t, h)),
+                        SampleValue::Histogram(h) => entry.1 .1.push((s.t, *h)),
                         SampleValue::FloatHistogram(_) => panic!("unexpected float histogram"),
                     }
                 }
