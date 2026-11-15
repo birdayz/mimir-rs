@@ -108,6 +108,12 @@ impl Labels {
         Self { data: Bytes::new() }
     }
 
+    /// Wraps pre-encoded `stringlabels` bytes directly without copying.
+    #[inline]
+    pub fn from_raw_stringlabels_bytes(data: Bytes) -> Self {
+        Self { data }
+    }
+
     /// Constructs sorted `Labels` from `(name, value)` pairs.
     pub fn from_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
         let mut items: SmallVec<[(&str, &str); 16]> = pairs.into_iter().collect();

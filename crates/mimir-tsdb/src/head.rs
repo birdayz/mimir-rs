@@ -30,10 +30,11 @@ use crate::chunkenc::float_histogram_st::AppendFloatHistogramStOutcome;
 use crate::chunkenc::histogram::AppendHistogramOutcome;
 use crate::chunkenc::histogram_st::AppendHistogramStOutcome;
 use crate::chunkenc::{
-    is_stale_nan, ChunkError, EncodedChunk, Encoding, FloatHistogram, FloatHistogramChunk,
-    FloatHistogramStChunk, Histogram, HistogramChunk, HistogramStChunk, OooChunk, OooSampleValue,
-    Xor2Chunk, XorChunk, MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND, MIN_SAMPLES_PER_HISTOGRAM_CHUNK,
-    QUIET_ZERO_NAN_BITS, TARGET_BYTES_PER_HISTOGRAM_CHUNK,
+    is_stale_nan, ChunkError, EncodedChunk, Encoding, FloatHistogram, FloatHistogramAppenderState,
+    FloatHistogramChunk, FloatHistogramStChunk, Histogram, HistogramAppenderState, HistogramChunk,
+    HistogramStChunk, OooChunk, OooSampleValue, StEncoder, Xor2AppendState, Xor2Chunk,
+    XorAppendState, XorChunk, MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND,
+    MIN_SAMPLES_PER_HISTOGRAM_CHUNK, QUIET_ZERO_NAN_BITS, TARGET_BYTES_PER_HISTOGRAM_CHUNK,
 };
 use crate::chunks_block::ChunkMeta;
 use crate::compact::{decode_chunk_samples, CompactionSeries, SampleValue};
@@ -393,6 +394,55 @@ pub struct SeriesEntry {
     inner: Mutex<SeriesState>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct FastU64Hasher(u64);
+
+impl std::hash::Hasher for FastU64Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self
+                .0
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(b as u64);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 32;
+        self.0 = x;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FastU64BuildHasher;
+
+impl std::hash::BuildHasher for FastU64BuildHasher {
+    type Hasher = FastU64Hasher;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        FastU64Hasher(0)
+    }
+}
+
+type FastU64Map<V> = hashbrown::HashMap<u64, V, FastU64BuildHasher>;
+
+#[derive(Clone, Debug)]
+enum HistAppendCache {
+    Histogram(Option<HistogramAppenderState>),
+    HistogramSt(Option<(HistogramAppenderState, StEncoder)>),
+    FloatHistogram(Option<FloatHistogramAppenderState>),
+    FloatHistogramSt(Option<(FloatHistogramAppenderState, StEncoder)>),
+}
+
 #[derive(Debug)]
 struct SeriesState {
     head_chunks: SmallVec<[MemChunk; 1]>,
@@ -405,6 +455,9 @@ struct SeriesState {
     last_sample: LastSample,
     metadata: Option<CompactSeriesMetadata>,
     pending_commits_and_flags: u32,
+    xor_state: XorAppendState,
+    xor2_state: Option<Box<Xor2AppendState>>,
+    hist_state: Option<Box<HistAppendCache>>,
 }
 
 impl SeriesState {
@@ -419,6 +472,9 @@ impl SeriesState {
             last_sample: LastSample::None,
             metadata: None,
             pending_commits_and_flags: 0,
+            xor_state: XorAppendState::default(),
+            xor2_state: None,
+            hist_state: None,
         }
     }
 
@@ -698,14 +754,33 @@ impl SeriesState {
 
     fn cut_new_head_chunk(&mut self, mint: i64, enc: Encoding, chunk_range_ms: i64) {
         let chunk = match enc {
-            Encoding::Xor2 => EncodedChunk::Xor2(Xor2Chunk::new()),
-            Encoding::Histogram => EncodedChunk::Histogram(HistogramChunk::new()),
-            Encoding::HistogramSt => EncodedChunk::HistogramSt(HistogramStChunk::new()),
-            Encoding::FloatHistogram => EncodedChunk::FloatHistogram(FloatHistogramChunk::new()),
+            Encoding::Xor2 => {
+                match self.xor2_state {
+                    Some(ref mut s) => **s = Xor2AppendState::new_empty(),
+                    None => self.xor2_state = Some(Box::new(Xor2AppendState::new_empty())),
+                }
+                EncodedChunk::Xor2(Xor2Chunk::new())
+            }
+            Encoding::Histogram => {
+                self.hist_state = None;
+                EncodedChunk::Histogram(HistogramChunk::new())
+            }
+            Encoding::HistogramSt => {
+                self.hist_state = None;
+                EncodedChunk::HistogramSt(HistogramStChunk::new())
+            }
+            Encoding::FloatHistogram => {
+                self.hist_state = None;
+                EncodedChunk::FloatHistogram(FloatHistogramChunk::new())
+            }
             Encoding::FloatHistogramSt => {
+                self.hist_state = None;
                 EncodedChunk::FloatHistogramSt(FloatHistogramStChunk::new())
             }
-            _ => EncodedChunk::Xor(XorChunk::new()),
+            _ => {
+                self.xor_state = XorAppendState::new_empty();
+                EncodedChunk::Xor(XorChunk::new())
+            }
         };
         self.head_chunks.push(MemChunk {
             chunk,
@@ -758,6 +833,13 @@ impl SeriesState {
             chunk_created = true;
         }
 
+        let prev_v = match self.last_sample {
+            LastSample::Float(pv) => pv,
+            _ => {
+                self.xor_state.valid = false;
+                0.0
+            }
+        };
         let cur = self.head_chunks.last_mut().unwrap();
         let num_samples = cur.chunk.num_samples();
         if num_samples == 0 {
@@ -770,12 +852,13 @@ impl SeriesState {
 
         match cur.chunk {
             EncodedChunk::Xor(ref mut xc) => {
-                let mut app = xc.appender()?;
-                app.append(st, t, v)?;
+                xc.append_with_state(&mut self.xor_state, cur.max_time, prev_v, t, v)?;
             }
             EncodedChunk::Xor2(ref mut xc) => {
-                let mut app = xc.appender()?;
-                app.append(st, t, v)?;
+                let s = self
+                    .xor2_state
+                    .get_or_insert_with(|| Box::new(Xor2AppendState::default()));
+                xc.append_with_state(s, st, t, v)?;
             }
             _ => unreachable!(),
         }
@@ -856,8 +939,16 @@ impl SeriesState {
         let cur = self.head_chunks.last_mut().unwrap();
         match cur.chunk {
             EncodedChunk::Histogram(ref mut hc) => {
-                let mut app = hc.appender()?;
-                match app.append_histogram(None, st, t, h, false)? {
+                let cache = self
+                    .hist_state
+                    .get_or_insert_with(|| Box::new(HistAppendCache::Histogram(None)));
+                if !matches!(**cache, HistAppendCache::Histogram(_)) {
+                    **cache = HistAppendCache::Histogram(None);
+                }
+                let HistAppendCache::Histogram(ref mut st_opt) = **cache else {
+                    unreachable!();
+                };
+                match hc.append_with_state(st_opt, st, t, h)? {
                     AppendHistogramOutcome::Appended { .. } => {
                         cur.max_time = t;
                     }
@@ -874,8 +965,16 @@ impl SeriesState {
                 }
             }
             EncodedChunk::HistogramSt(ref mut hc) => {
-                let mut app = hc.appender()?;
-                match app.append_histogram(None, st, t, h, false)? {
+                let cache = self
+                    .hist_state
+                    .get_or_insert_with(|| Box::new(HistAppendCache::HistogramSt(None)));
+                if !matches!(**cache, HistAppendCache::HistogramSt(_)) {
+                    **cache = HistAppendCache::HistogramSt(None);
+                }
+                let HistAppendCache::HistogramSt(ref mut st_opt) = **cache else {
+                    unreachable!();
+                };
+                match hc.append_with_state(st_opt, st, t, h)? {
                     AppendHistogramStOutcome::Appended { .. } => {
                         cur.max_time = t;
                     }
@@ -969,8 +1068,16 @@ impl SeriesState {
         let cur = self.head_chunks.last_mut().unwrap();
         match cur.chunk {
             EncodedChunk::FloatHistogram(ref mut fhc) => {
-                let mut app = fhc.appender()?;
-                match app.append_float_histogram(None, st, t, fh, false)? {
+                let cache = self
+                    .hist_state
+                    .get_or_insert_with(|| Box::new(HistAppendCache::FloatHistogram(None)));
+                if !matches!(**cache, HistAppendCache::FloatHistogram(_)) {
+                    **cache = HistAppendCache::FloatHistogram(None);
+                }
+                let HistAppendCache::FloatHistogram(ref mut st_opt) = **cache else {
+                    unreachable!();
+                };
+                match fhc.append_with_state(st_opt, st, t, fh)? {
                     AppendFloatHistogramOutcome::Appended { .. } => {
                         cur.max_time = t;
                     }
@@ -987,8 +1094,16 @@ impl SeriesState {
                 }
             }
             EncodedChunk::FloatHistogramSt(ref mut fhc) => {
-                let mut app = fhc.appender()?;
-                match app.append_float_histogram(None, st, t, fh, false)? {
+                let cache = self
+                    .hist_state
+                    .get_or_insert_with(|| Box::new(HistAppendCache::FloatHistogramSt(None)));
+                if !matches!(**cache, HistAppendCache::FloatHistogramSt(_)) {
+                    **cache = HistAppendCache::FloatHistogramSt(None);
+                }
+                let HistAppendCache::FloatHistogramSt(ref mut st_opt) = **cache else {
+                    unreachable!();
+                };
+                match fhc.append_with_state(st_opt, st, t, fh)? {
                     AppendFloatHistogramStOutcome::Appended { .. } => {
                         cur.max_time = t;
                     }
@@ -1109,14 +1224,14 @@ impl SeriesState {
 
 struct SeriesStripe {
     by_hash: HashTable<Arc<SeriesEntry>>,
-    by_id: HashMap<u64, Arc<SeriesEntry>>,
+    by_id: FastU64Map<Arc<SeriesEntry>>,
 }
 
 impl SeriesStripe {
     fn new() -> Self {
         Self {
             by_hash: HashTable::new(),
-            by_id: HashMap::new(),
+            by_id: FastU64Map::default(),
         }
     }
 }
@@ -1402,6 +1517,7 @@ pub struct Head {
     closed: AtomicBool,
     wal_expiries: Mutex<HashMap<u64, i64>>,
     wbl_pinned_refs: Mutex<HashSet<u64>>,
+    appender_pool: Mutex<Vec<AppenderScratch>>,
     lifecycle_callback: RwLock<Option<Arc<dyn SeriesLifecycleCallback>>>,
     series_gauge: Option<prometheus::Gauge>,
     series_created_total: Option<prometheus::Counter>,
@@ -1507,6 +1623,7 @@ impl Head {
             closed: AtomicBool::new(false),
             wal_expiries: Mutex::new(HashMap::new()),
             wbl_pinned_refs: Mutex::new(HashSet::new()),
+            appender_pool: Mutex::new(Vec::new()),
             lifecycle_callback: RwLock::new(lifecycle_cb),
             series_gauge,
             series_created_total,
@@ -2755,6 +2872,16 @@ impl Head {
         self.get_by_sorted_pairs(hash, pairs)
     }
 
+    /// Zero-allocation `SeriesEntry` lookup using a caller-supplied precomputed Prometheus `hash`.
+    #[inline]
+    pub fn get_entry_by_prehashed_sorted_pairs(
+        &self,
+        hash: u64,
+        pairs: &[(&str, &str)],
+    ) -> Option<Arc<SeriesEntry>> {
+        self.get_by_sorted_pairs(hash, pairs)
+    }
+
     /// Iterates every live series `(ref_id, &Labels)` in Head.
     pub fn for_each_series<F>(&self, mut f: F)
     where
@@ -3332,18 +3459,26 @@ impl Head {
         self.metrics.active_appenders.inc();
         let min_valid = self.appendable_min_valid_time();
         let head_maxt = self.max_time();
+        let mut scratch = self.appender_pool.lock().pop().unwrap_or_default();
+        if series_hint > 0 && scratch.floats.capacity() < series_hint {
+            scratch.floats.reserve(series_hint - scratch.floats.len());
+        }
         HeadAppender {
             head: self,
             min_valid_time: min_valid,
             head_maxt,
             ooo_time_window: self.ooo_time_window_ms.load(Ordering::Acquire),
-            series_refs: Vec::new(),
-            floats: Vec::with_capacity(series_hint),
-            histograms: Vec::new(),
-            float_histograms: Vec::new(),
-            exemplars: Vec::new(),
-            metadata: Vec::new(),
-            batch_last_sample: HashMap::with_capacity(series_hint),
+            series_refs: scratch.series_refs,
+            floats: scratch.floats,
+            histograms: scratch.histograms,
+            float_histograms: scratch.float_histograms,
+            exemplars: scratch.exemplars,
+            metadata: scratch.metadata,
+            batch_last_sample: scratch.batch_last_sample,
+            indexed_floats_len: 0,
+            indexed_hists_len: 0,
+            indexed_fhists_len: 0,
+            wal_buf: scratch.wal_buf,
             closed: false,
         }
     }
@@ -4066,6 +4201,13 @@ impl Head {
                     }
                 }
                 st.head_chunks.retain(|hc| hc.max_time >= mint);
+                if st.head_chunks.is_empty() {
+                    st.xor_state.valid = false;
+                    if let Some(ref mut s2) = st.xor2_state {
+                        s2.valid = false;
+                    }
+                    st.hist_state = None;
+                }
 
                 let has_ooo = st.ooo.as_ref().is_some_and(|o| {
                     o.ooo_head_chunk.is_some() || !o.ooo_mmapped_chunks.is_empty()
@@ -4496,6 +4638,7 @@ struct PendingFloat {
     st: i64,
     t: i64,
     v: f64,
+    is_ooo: bool,
 }
 
 #[derive(Clone)]
@@ -4504,6 +4647,7 @@ struct PendingHist {
     st: i64,
     t: i64,
     h: Histogram,
+    is_ooo: bool,
 }
 
 #[derive(Clone)]
@@ -4512,6 +4656,7 @@ struct PendingFloatHist {
     st: i64,
     t: i64,
     fh: FloatHistogram,
+    is_ooo: bool,
 }
 
 #[derive(Clone)]
@@ -4526,6 +4671,18 @@ struct PendingMetadata {
     meta: CompactSeriesMetadata,
 }
 
+#[derive(Default)]
+struct AppenderScratch {
+    series_refs: Vec<RefSeries>,
+    floats: Vec<PendingFloat>,
+    histograms: Vec<PendingHist>,
+    float_histograms: Vec<PendingFloatHist>,
+    exemplars: Vec<PendingExemplar>,
+    metadata: Vec<PendingMetadata>,
+    batch_last_sample: FastU64Map<(i64, LastSample)>,
+    wal_buf: Vec<u8>,
+}
+
 /// Transactional write appender for [`Head`] matching `tsdb.headAppender`.
 pub struct HeadAppender<'a> {
     head: &'a Head,
@@ -4538,11 +4695,106 @@ pub struct HeadAppender<'a> {
     float_histograms: Vec<PendingFloatHist>,
     exemplars: Vec<PendingExemplar>,
     metadata: Vec<PendingMetadata>,
-    batch_last_sample: HashMap<u64, (i64, LastSample)>,
+    batch_last_sample: FastU64Map<(i64, LastSample)>,
+    indexed_floats_len: usize,
+    indexed_hists_len: usize,
+    indexed_fhists_len: usize,
+    wal_buf: Vec<u8>,
     closed: bool,
 }
 
 impl<'a> HeadAppender<'a> {
+    #[inline]
+    fn upsert_batch_last(
+        map: &mut FastU64Map<(i64, LastSample)>,
+        ref_id: u64,
+        t: i64,
+        ls: LastSample,
+    ) {
+        match map.entry(ref_id) {
+            hashbrown::hash_map::Entry::Occupied(mut o) => {
+                if t >= o.get().0 {
+                    *o.get_mut() = (t, ls);
+                }
+            }
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                v.insert((t, ls));
+            }
+        }
+    }
+
+    fn sync_batch_last_sample(&mut self) {
+        while self.indexed_floats_len < self.floats.len() {
+            let pf = &self.floats[self.indexed_floats_len];
+            self.indexed_floats_len += 1;
+            if !pf.is_ooo {
+                Self::upsert_batch_last(
+                    &mut self.batch_last_sample,
+                    pf.entry.ref_id,
+                    pf.t,
+                    LastSample::Float(pf.v),
+                );
+            }
+        }
+        while self.indexed_hists_len < self.histograms.len() {
+            let ph = &self.histograms[self.indexed_hists_len];
+            self.indexed_hists_len += 1;
+            if !ph.is_ooo {
+                Self::upsert_batch_last(
+                    &mut self.batch_last_sample,
+                    ph.entry.ref_id,
+                    ph.t,
+                    LastSample::Histogram(Box::new(ph.h.clone())),
+                );
+            }
+        }
+        while self.indexed_fhists_len < self.float_histograms.len() {
+            let pfh = &self.float_histograms[self.indexed_fhists_len];
+            self.indexed_fhists_len += 1;
+            if !pfh.is_ooo {
+                Self::upsert_batch_last(
+                    &mut self.batch_last_sample,
+                    pfh.entry.ref_id,
+                    pfh.t,
+                    LastSample::FloatHistogram(Box::new(pfh.fh.clone())),
+                );
+            }
+        }
+    }
+
+    fn return_scratch(&mut self) {
+        self.series_refs.clear();
+        self.floats.clear();
+        self.histograms.clear();
+        self.float_histograms.clear();
+        self.exemplars.clear();
+        self.metadata.clear();
+        self.batch_last_sample.clear();
+        self.wal_buf.clear();
+        if self.floats.capacity() > 16_384 {
+            self.floats = Vec::new();
+        }
+        if self.batch_last_sample.capacity() > 16_384 {
+            self.batch_last_sample = FastU64Map::default();
+        }
+        if self.wal_buf.capacity() > 512 * 1024 {
+            self.wal_buf = Vec::new();
+        }
+        let mut pool = self.head.appender_pool.lock();
+        if pool.len() < 32 {
+            pool.push(AppenderScratch {
+                series_refs: std::mem::take(&mut self.series_refs),
+                floats: std::mem::take(&mut self.floats),
+                histograms: std::mem::take(&mut self.histograms),
+                float_histograms: std::mem::take(&mut self.float_histograms),
+                exemplars: std::mem::take(&mut self.exemplars),
+                metadata: std::mem::take(&mut self.metadata),
+                batch_last_sample: std::mem::take(&mut self.batch_last_sample),
+                wal_buf: std::mem::take(&mut self.wal_buf),
+            });
+        }
+    }
+
     fn check_batch_last_sample(
         &self,
         ref_id: u64,
@@ -4605,14 +4857,28 @@ impl<'a> HeadAppender<'a> {
         }
         Err(HeadError::OutOfOrderSample)
     }
-    fn resolve_sorted_pairs(
+    fn resolve_sorted_pairs_prehashed(
         &mut self,
         series_ref: Option<u64>,
+        prehashed: Option<u64>,
         pairs: &[(&str, &str)],
     ) -> Result<Arc<SeriesEntry>, HeadError> {
         if let Some(r) = series_ref {
             if let Some(e) = self.head.series.get_by_id(r) {
                 return Ok(e);
+            }
+        }
+
+        if let Some(hash) = prehashed {
+            if !pairs.is_empty() {
+                let (entry, created) = self.head.get_or_create_sorted_pairs(hash, pairs)?;
+                if created {
+                    self.series_refs.push(RefSeries {
+                        ref_id: entry.ref_id,
+                        labels: entry.labels.clone(),
+                    });
+                }
+                return Ok(entry);
             }
         }
 
@@ -4640,6 +4906,14 @@ impl<'a> HeadAppender<'a> {
             });
         }
         Ok(entry)
+    }
+
+    fn resolve_sorted_pairs(
+        &mut self,
+        series_ref: Option<u64>,
+        pairs: &[(&str, &str)],
+    ) -> Result<Arc<SeriesEntry>, HeadError> {
+        self.resolve_sorted_pairs_prehashed(series_ref, None, pairs)
     }
 
     /// Appends a float sample using raw `(&str, &str)` pairs (zero heap allocation on existing series!).
@@ -4677,9 +4951,76 @@ impl<'a> HeadAppender<'a> {
     }
 
     /// Appends a float sample using a cached `Option<Arc<SeriesEntry>>`, resolving and caching on creation.
+    #[inline]
     pub fn append_float_with_entry(
         &mut self,
         series_entry: &mut Option<Arc<SeriesEntry>>,
+        pairs: &[(&str, &str)],
+        st: i64,
+        t: i64,
+        v: f64,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        self.append_float_with_entry_prehashed(series_entry, None, pairs, st, t, v, reject_ooo)
+    }
+
+    #[inline]
+    fn check_entry_appendable_float(
+        &self,
+        state: &mut SeriesState,
+        t: i64,
+        v: f64,
+        effective_ooo: i64,
+    ) -> Result<(bool, bool), HeadError> {
+        let res = if state.needs_chunk_reader_for_t(t) {
+            let cr_guard = self.head.chunk_reader.read();
+            state.appendable_float(
+                t,
+                v,
+                self.head_maxt,
+                self.min_valid_time,
+                effective_ooo,
+                cr_guard.as_ref(),
+            )
+        } else {
+            state.appendable_float(
+                t,
+                v,
+                self.head_maxt,
+                self.min_valid_time,
+                effective_ooo,
+                None,
+            )
+        };
+        match res {
+            Ok((is_ooo, is_dup)) => {
+                if is_ooo && v.to_bits() != QUIET_ZERO_NAN_BITS {
+                    let delta = self.head_maxt.saturating_sub(t);
+                    if delta > 0 {
+                        self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
+                    }
+                }
+                Ok((is_ooo, is_dup))
+            }
+            Err(e) => {
+                if v.to_bits() != QUIET_ZERO_NAN_BITS {
+                    let delta = self.head_maxt.saturating_sub(t);
+                    if delta > 0 {
+                        self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Appends a float sample using a cached `Option<Arc<SeriesEntry>>` and optional precomputed Prometheus hash
+    /// (for already-sorted, unique, non-empty `pairs`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_float_with_entry_prehashed(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        prehashed: Option<u64>,
         pairs: &[(&str, &str)],
         st: i64,
         t: i64,
@@ -4702,84 +5043,61 @@ impl<'a> HeadAppender<'a> {
         let entry = match series_entry {
             Some(ref e) => Arc::clone(e),
             None => {
-                let e = self.resolve_sorted_pairs(None, pairs)?;
+                let e = self.resolve_sorted_pairs_prehashed(None, prehashed, pairs)?;
                 *series_entry = Some(Arc::clone(&e));
                 e
             }
         };
         let ref_id = entry.ref_id;
 
-        if let Some((is_ooo, is_dup)) =
-            self.check_batch_last_sample(ref_id, t, &LastSample::Float(v), effective_ooo)?
-        {
-            if is_ooo && v.to_bits() != QUIET_ZERO_NAN_BITS {
-                let delta = self.head_maxt.saturating_sub(t);
-                if delta > 0 {
-                    self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
-                }
-            }
-            if is_dup {
-                return Ok(ref_id);
-            }
+        let is_ooo = {
             let mut state = entry.inner.lock();
-            state.inc_pending_commits();
-            if !is_ooo {
-                self.batch_last_sample
-                    .insert(ref_id, (t, LastSample::Float(v)));
-            }
-        } else {
-            let mut state = entry.inner.lock();
-            let res = if state.needs_chunk_reader_for_t(t) {
-                let cr_guard = self.head.chunk_reader.read();
-                state.appendable_float(
-                    t,
-                    v,
-                    self.head_maxt,
-                    self.min_valid_time,
-                    effective_ooo,
-                    cr_guard.as_ref(),
-                )
-            } else {
-                state.appendable_float(
-                    t,
-                    v,
-                    self.head_maxt,
-                    self.min_valid_time,
-                    effective_ooo,
-                    None,
-                )
-            };
-            let (is_ooo, is_dup) = match res {
-                Ok(v) => v,
-                Err(e) => {
-                    drop(state);
-                    if v.to_bits() != QUIET_ZERO_NAN_BITS {
+            if state.pending_commits() > 0 {
+                drop(state);
+                self.sync_batch_last_sample();
+                if let Some((is_ooo, is_dup)) =
+                    self.check_batch_last_sample(ref_id, t, &LastSample::Float(v), effective_ooo)?
+                {
+                    if is_ooo && v.to_bits() != QUIET_ZERO_NAN_BITS {
                         let delta = self.head_maxt.saturating_sub(t);
                         if delta > 0 {
                             self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
                         }
                     }
-                    return Err(e);
+                    if is_dup {
+                        return Ok(ref_id);
+                    }
+                    let mut state = entry.inner.lock();
+                    state.inc_pending_commits();
+                    is_ooo
+                } else {
+                    let mut state = entry.inner.lock();
+                    let (is_ooo, is_dup) =
+                        self.check_entry_appendable_float(&mut state, t, v, effective_ooo)?;
+                    if is_dup {
+                        return Ok(ref_id);
+                    }
+                    state.inc_pending_commits();
+                    is_ooo
                 }
-            };
-            if is_ooo && v.to_bits() != QUIET_ZERO_NAN_BITS {
-                let delta = self.head_maxt.saturating_sub(t);
-                if delta > 0 {
-                    self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
+            } else {
+                let (is_ooo, is_dup) =
+                    self.check_entry_appendable_float(&mut state, t, v, effective_ooo)?;
+                if is_dup {
+                    return Ok(ref_id);
                 }
+                state.inc_pending_commits();
+                is_ooo
             }
-            if is_dup {
-                return Ok(ref_id);
-            }
-            state.inc_pending_commits();
-            drop(state);
-            if !is_ooo {
-                self.batch_last_sample
-                    .insert(ref_id, (t, LastSample::Float(v)));
-            }
-        }
+        };
 
-        self.floats.push(PendingFloat { entry, st, t, v });
+        self.floats.push(PendingFloat {
+            entry,
+            st,
+            t,
+            v,
+            is_ooo,
+        });
         Ok(ref_id)
     }
 
@@ -4814,24 +5132,62 @@ impl<'a> HeadAppender<'a> {
             .series
             .get_by_id(series_ref)
             .ok_or(HeadError::UnknownSeriesRef(series_ref))?;
-        {
-            let cr_guard = self.head.chunk_reader.read();
+        let is_ooo = {
             let mut state = entry.inner.lock();
-            state.appendable_float(
-                t,
-                v,
-                self.head_maxt,
-                self.min_valid_time,
-                self.ooo_time_window,
-                cr_guard.as_ref(),
-            )?;
-            state.inc_pending_commits();
-        }
+            if state.pending_commits() > 0 {
+                drop(state);
+                self.sync_batch_last_sample();
+                if let Some((is_ooo, is_dup)) = self.check_batch_last_sample(
+                    series_ref,
+                    t,
+                    &LastSample::Float(v),
+                    self.ooo_time_window,
+                )? {
+                    if is_dup {
+                        return Ok(series_ref);
+                    }
+                    entry.inner.lock().inc_pending_commits();
+                    is_ooo
+                } else {
+                    let cr_guard = self.head.chunk_reader.read();
+                    let mut state = entry.inner.lock();
+                    let (is_ooo, is_dup) = state.appendable_float(
+                        t,
+                        v,
+                        self.head_maxt,
+                        self.min_valid_time,
+                        self.ooo_time_window,
+                        cr_guard.as_ref(),
+                    )?;
+                    if is_dup {
+                        return Ok(series_ref);
+                    }
+                    state.inc_pending_commits();
+                    is_ooo
+                }
+            } else {
+                let cr_guard = self.head.chunk_reader.read();
+                let (is_ooo, is_dup) = state.appendable_float(
+                    t,
+                    v,
+                    self.head_maxt,
+                    self.min_valid_time,
+                    self.ooo_time_window,
+                    cr_guard.as_ref(),
+                )?;
+                if is_dup {
+                    return Ok(series_ref);
+                }
+                state.inc_pending_commits();
+                is_ooo
+            }
+        };
         self.floats.push(PendingFloat {
             entry,
             st: 0,
             t,
             v,
+            is_ooo,
         });
         Ok(series_ref)
     }
@@ -4885,9 +5241,14 @@ impl<'a> HeadAppender<'a> {
         let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
         let ref_id = entry.ref_id;
         let ls = LastSample::Histogram(Box::new(h.clone()));
-        if let Some((is_ooo, is_dup)) =
+        let has_pending = entry.inner.lock().pending_commits() > 0;
+        let batch_check = if has_pending {
+            self.sync_batch_last_sample();
             self.check_batch_last_sample(ref_id, t, &ls, effective_ooo)?
-        {
+        } else {
+            None
+        };
+        let is_ooo = if let Some((is_ooo, is_dup)) = batch_check {
             if is_ooo {
                 let delta = self.head_maxt.saturating_sub(t);
                 if delta > 0 {
@@ -4899,9 +5260,7 @@ impl<'a> HeadAppender<'a> {
             }
             let mut state = entry.inner.lock();
             state.inc_pending_commits();
-            if !is_ooo {
-                self.batch_last_sample.insert(ref_id, (t, ls));
-            }
+            is_ooo
         } else {
             let cr_guard = self.head.chunk_reader.read();
             let state = entry.inner.lock();
@@ -4925,11 +5284,15 @@ impl<'a> HeadAppender<'a> {
                 return Ok(ref_id);
             }
             entry.inner.lock().inc_pending_commits();
-            if !is_ooo {
-                self.batch_last_sample.insert(ref_id, (t, ls));
-            }
-        }
-        self.histograms.push(PendingHist { entry, st, t, h });
+            is_ooo
+        };
+        self.histograms.push(PendingHist {
+            entry,
+            st,
+            t,
+            h,
+            is_ooo,
+        });
         Ok(ref_id)
     }
 
@@ -4982,9 +5345,14 @@ impl<'a> HeadAppender<'a> {
         let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
         let ref_id = entry.ref_id;
         let ls = LastSample::FloatHistogram(Box::new(fh.clone()));
-        if let Some((is_ooo, is_dup)) =
+        let has_pending = entry.inner.lock().pending_commits() > 0;
+        let batch_check = if has_pending {
+            self.sync_batch_last_sample();
             self.check_batch_last_sample(ref_id, t, &ls, effective_ooo)?
-        {
+        } else {
+            None
+        };
+        let is_ooo = if let Some((is_ooo, is_dup)) = batch_check {
             if is_ooo {
                 let delta = self.head_maxt.saturating_sub(t);
                 if delta > 0 {
@@ -4996,9 +5364,7 @@ impl<'a> HeadAppender<'a> {
             }
             let mut state = entry.inner.lock();
             state.inc_pending_commits();
-            if !is_ooo {
-                self.batch_last_sample.insert(ref_id, (t, ls));
-            }
+            is_ooo
         } else {
             let cr_guard = self.head.chunk_reader.read();
             let state = entry.inner.lock();
@@ -5022,12 +5388,15 @@ impl<'a> HeadAppender<'a> {
                 return Ok(ref_id);
             }
             entry.inner.lock().inc_pending_commits();
-            if !is_ooo {
-                self.batch_last_sample.insert(ref_id, (t, ls));
-            }
-        }
-        self.float_histograms
-            .push(PendingFloatHist { entry, st, t, fh });
+            is_ooo
+        };
+        self.float_histograms.push(PendingFloatHist {
+            entry,
+            st,
+            t,
+            fh,
+            is_ooo,
+        });
         Ok(ref_id)
     }
 
@@ -5156,11 +5525,40 @@ impl<'a> HeadAppender<'a> {
         let mut wbl_markers: Vec<RefMmapMarker> = Vec::new();
         let mut wrote_ooo_mmap = false;
 
+        let float_enc = self.head.float_chunk_encoding();
+        let chunk_range_ms = self.head.opts.chunk_range_ms;
+        let samples_per_chunk = self.head.opts.samples_per_chunk;
+
         // Commit floats
         for pf in self.floats.drain(..) {
             let mut v = pf.v;
             let mut state = pf.entry.inner.lock();
             state.dec_pending_commits();
+
+            if !pf.is_ooo
+                && !is_stale_nan(v)
+                && pf.t >= self.min_valid_time
+                && pf.t > state.max_time()
+            {
+                if v.to_bits() == QUIET_ZERO_NAN_BITS {
+                    v = 0.0;
+                }
+                if state
+                    .append_float_in_order(
+                        pf.st,
+                        pf.t,
+                        v,
+                        chunk_range_ms,
+                        samples_per_chunk,
+                        float_enc,
+                    )?
+                    .0
+                {
+                    in_order_mint = in_order_mint.min(pf.t);
+                    in_order_maxt = in_order_maxt.max(pf.t);
+                }
+                continue;
+            }
 
             if is_stale_nan(v) {
                 match &state.last_sample {
@@ -5535,6 +5933,7 @@ impl<'a> HeadAppender<'a> {
             *self.head.chunk_reader.write() = Some(reader);
         }
 
+        self.return_scratch();
         Ok(())
     }
 
@@ -5567,6 +5966,7 @@ impl<'a> HeadAppender<'a> {
                 wal.log(&[&rec])?;
             }
         }
+        self.return_scratch();
         Ok(())
     }
 
@@ -5586,6 +5986,12 @@ impl<'a> HeadAppender<'a> {
             if self.floats.is_empty() {
                 return Ok(());
             }
+            self.wal_buf.clear();
+            let need = self.floats.len() * 14 + 17;
+            if self.wal_buf.capacity() < need {
+                self.wal_buf.reserve(need - self.wal_buf.capacity());
+            }
+            let buf = std::mem::take(&mut self.wal_buf);
             let rec = enc.samples_iter(
                 self.floats.iter().map(|f| RefSample {
                     ref_id: f.entry.ref_id,
@@ -5593,9 +5999,11 @@ impl<'a> HeadAppender<'a> {
                     t: f.t,
                     v: f.v,
                 }),
-                Vec::with_capacity(self.floats.len() * 14 + 17),
+                buf,
             );
-            wal.log(&[&rec])?;
+            let res = wal.log(&[&rec]);
+            self.wal_buf = rec;
+            res?;
             return Ok(());
         }
 
@@ -5705,6 +6113,7 @@ impl Drop for HeadAppender<'_> {
                 let mut st = pfh.entry.inner.lock();
                 st.dec_pending_commits();
             }
+            self.return_scratch();
         }
     }
 }
@@ -5956,6 +6365,56 @@ mod tests {
         assert!(head
             .get_entry_by_sorted_pairs(&[("__name__", "metric_1"), ("job", "worker")])
             .is_none());
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn head_appender_pending_commits_in_batch_dup_and_ooo() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 10_000,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let pairs = [("__name__", "up"), ("job", "api")];
+
+        let mut app = head.appender();
+        // First sample in batch (pending_commits == 0 fast path)
+        let r = app.append_float(None, &pairs, 1_000_000, 1.0).unwrap();
+        // Exact duplicate in same uncommitted batch (pending_commits > 0 -> no-op)
+        app.append_float(Some(r), &pairs, 1_000_000, 1.0).unwrap();
+        // Conflicting duplicate in same uncommitted batch -> error
+        assert!(matches!(
+            app.append_float(Some(r), &pairs, 1_000_000, 2.0),
+            Err(HeadError::DuplicateSampleWithDetails(_))
+        ));
+        // Newer in-order sample in same uncommitted batch -> succeeds
+        app.append_float(Some(r), &pairs, 1_005_000, 5.0).unwrap();
+        // OOO sample within window against batch_last_sample (1_005_000) -> accepted as OOO
+        app.append_float(Some(r), &pairs, 1_002_000, 2.5).unwrap();
+        // Duplicate against updated batch_last_sample (1_005_000) -> error
+        assert!(matches!(
+            app.append_float(Some(r), &pairs, 1_005_000, 9.0),
+            Err(HeadError::DuplicateSampleWithDetails(_))
+        ));
+        app.commit().unwrap();
+
+        let (_, chks, _) = head.series_chunks(r, i64::MIN, i64::MAX).unwrap().unwrap();
+        let mut got = Vec::new();
+        for c in chks {
+            for s in decode_chunk_samples(&c.chunk.unwrap()).unwrap() {
+                got.push((s.t, s.value));
+            }
+        }
+        got.sort_by_key(|(t, _)| *t);
+        assert_eq!(
+            got,
+            vec![
+                (1_000_000, SampleValue::Float(1.0)),
+                (1_002_000, SampleValue::Float(2.5)),
+                (1_005_000, SampleValue::Float(5.0)),
+            ]
+        );
         head.close().unwrap();
     }
 }

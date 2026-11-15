@@ -18,6 +18,7 @@ Upstream reference: `grafana/mimir` `main` @ `06de3ebd` (`.ref/mimir`)
 | P1-A / P1-B | Production RAM Diet, Postings Cache & Sharded Kafka `PusherConsumer` | `crates/mimir-tsdb`, `crates/mimir-storage`, `crates/mimir-ingester` | Done | Compact `SeriesEntry`/`SeriesState`/`ActiveSeries`, `XorChunk` 32B initial alloc, `u32` `MemPostings`, lock-free-for-readers metadata fast path, `PostingsForMatchersCache`, parallel WAL & block replay, `PusherConsumer` + `ParallelStoragePusher` + pipelined Kafka fetch |
 | P2 | Production Kafka `ingest_storage` Benchmark (`2M` Series) & Grind | `examples/prod_bench.rs`, `just prod-bench`, `crates/mimir-tsdb`, `crates/mimir-storage`, `crates/mimir-ingester`, `crates/mimir-cmd` | Done | `2,000,000`-series 4-phase Kafka v2 Zstd + 4 local ULID blocks + bimodal reads + live compaction + `SIGKILL` restart benchmark |
 | P3 | Streaming Compaction, 64-Stripe Postings, Parallel WAL Decode & Isolated RPC Runtime | `crates/mimir-tsdb`, `crates/mimir-storage`, `crates/mimir-ingester`, `crates/mimir-cmd` | Done | Streaming Head compaction + zero-copy `DeletedSeries` (`+124.6 MiB` sawtooth, **2.92x** less peak RAM), 64-stripe `MemPostings` + parallel WAL decompression/decode (`13.91 s` `SIGKILL /ready`, **1.08x** faster than Go), inline `<= 256`-series `QueryStream` on dedicated RPC runtime (**0.46 ms p50 / 1.01 ms p99**), **35.0% less steady CPU (`1.54x`)**, **59.7% less steady heap (`2.48x`)** |
+| P4 | CPU Obliteration: O(1) Chunk Appenders, Zero-Alloc Sharded Kafka Pipeline, `pending_commits` Fast Path & O(1) Block Symbol Decode | `crates/mimir-tsdb`, `crates/mimir-ingester`, `crates/mimir-conformance` | Done | Cached `XorAppendState` / `Xor2AppendState` & histogram appender state (`O(1)` appends), zero-alloc single-hash `IngesterShardedBatchConsumer` (2,048-sample shard commits), `pending_commits == 0` `HeadAppender` fast path + pooled scratch + `FastU64BuildHasher` in `ActiveSeries`/`MetricCounter`, once-at-open UTF-8 validation + direct `Labels` encode in `IndexReader`: **37.0% less pure-write CPU (`3.15 vs 5.00 µs/sample`)**, **43.1% less steady CPU with reads (`3.75 vs 6.60 µs/sample`)**, **2.88x** `QueryStream` heavy p99 (`277.39 vs 800.07 ms`) |
 
 ## Verified Wave 4 Conformance & Head-to-Head Benchmark Results
 
@@ -50,24 +51,36 @@ Upstream reference: `grafana/mimir` `main` @ `06de3ebd` (`.ref/mimir`)
 | Final RSS / Peak HWM | 754.72 MiB | 364.96 MiB | **2.07x** (**51.6% less RAM**) |
 
 ### Production Kafka `ingest_storage` Benchmark (`just prod-bench --series 2000000 --steady-secs 30`)
-Workload: `2,000,000` active series (10 K8s labels, `prod` 99.5% + `preprod` 0.5%, `1,600` metric families), Kafka v2 RW2 (`82.4 B/sample` uncompressed, Zstd `10.32x` wire compression, `500` samples/record, `95` metadata/record), `4` historical 2h ULID blocks on disk, steady `327k samples/s` + `0.07%` OOO + `1%/h` churn + bimodal concurrent reads (`6.35/s` `QueryStream`, `LabelNamesAndValues`, `LabelValuesCardinality`, `UserStats`), live head compaction, and `SIGKILL` cold restart with 5s Kafka backlog (`1.635M` samples).
+Workload: `2,000,000` active series (10 K8s labels, `prod` 99.5% + `preprod` 0.5%, `1,600` metric families), Kafka v2 RW2 (`82.4 B/sample` uncompressed, Zstd `10.32x` wire compression, `500` samples/record, `95` metadata/record), `4` historical 2h ULID blocks on disk, steady `327k samples/s` + `0.07%` OOO + `1%/h` churn + bimodal concurrent reads (`QueryStream`, `LabelNamesAndValues`, `LabelValuesCardinality`, `UserStats`), live head compaction, and `SIGKILL` cold restart with 5s Kafka backlog (`1.635M` samples).
 
+#### Pure Write Path (`--series 2000000 --steady-secs 30 --no-reads`)
 | Phase / Metric | Go `go-mimir` | Rust `mimir-rs` | Improvement (Go vs Rust) |
 |----------------|---------------|-----------------|--------------------------|
-| Phase 1 Catch-up (`2.4M` samples, `1.2` chunks/series) | 13.21 s (181,661 samples/s, 35.76 s CPU) | 13.64 s (175,945 samples/s, 28.18 s CPU) | **1.27x** less CPU (0.97x wall) |
-| Phase 1 `RssAnon` (`B/series`) | 2,952.5 MiB (`1,548 B/series`) | 1,826.0 MiB (`957 B/series`) | **1.62x** (**38.2% less heap**) |
-| Phase 2 Steady CPU (`µs / ingested sample`, reads ON) | 6.49 µs/sample | 4.22 µs/sample | **1.54x** (**35.0% less CPU**) |
-| Phase 2 Steady `RssAnon` (`B/series`) | 5,318.8 MiB (`2,655 B/series`) | 2,142.0 MiB (`1,074 B/series`) | **2.48x** (**59.7% less heap RAM**) |
-| `QueryStream` small (`~7 series`) p50 / p99 | 0.58 ms / 1.09 ms | 0.46 ms / 1.01 ms | **1.26x** p50 / **1.08x** p99 |
-| `QueryStream` heavy (`~28k series`) p50 / p99 | 623.75 ms / 1,185.18 ms | 521.52 ms / 564.99 ms | **1.20x** p50 / **2.10x** p99 |
-| `LabelNamesAndValues` p50 | 1,784.36 ms | 759.10 ms | **2.35x** faster |
-| `LabelValuesCardinality` p50 | 733.33 ms | 366.54 ms | **2.00x** faster |
-| `UserStats` p50 | 0.38 ms | 0.84 ms | — |
-| Phase 3 Head Compaction wall | 35.89 s | 28.00 s | **1.28x** faster |
-| Phase 3 Peak `RssAnon` (sawtooth) | 6,607.7 MiB (+1,288.9 MiB) | 2,265.3 MiB (+124.6 MiB) | **2.92x** (**65.7% less peak RAM**, **10.3x smaller sawtooth**) |
-| Phase 4 `SIGKILL` `/ready` / `0-lag` catch-up | 14.97 s / 33.23 s | 13.91 s / 30.11 s | **1.08x** `/ready` / **1.10x** catch-up |
-| Phase 4 Post-restart `RssAnon` | 5,410.2 MiB | 3,435.4 MiB | **1.57x** (**36.5% less heap**) |
+| Phase 1 Catch-up (`2.4M` samples, `1.2` chunks/series) | 13.39 s (179,232 samples/s, 36.14 s CPU) | 12.24 s (196,125 samples/s, 24.50 s CPU) | **1.09x** faster (**1.48x** less CPU) |
+| Phase 2 Steady Write CPU (`µs / ingested sample`) | 5.00 µs/sample | 3.15 µs/sample | **1.59x** (**37.0% less CPU**) |
+| Phase 2 Steady `RssAnon` (`B/series`) | 4,966.9 MiB (`2,510 B/series`) | 2,151.5 MiB (`1,087 B/series`) | **2.31x** (**56.7% less heap RAM**) |
+| Phase 2 Kafka record proc p50 / p99 | 20.59 ms / 92.50 ms | 2.84 ms / 19.03 ms | **7.25x** p50 / **4.86x** p99 |
+| Phase 3 Head Compaction wall | 36.60 s | 28.31 s | **1.29x** faster |
+| Phase 3 Peak `RssAnon` (sawtooth) | 5,466.7 MiB (+499.8 MiB) | 2,283.9 MiB (+131.7 MiB) | **2.39x** less peak RAM |
+| Phase 4 `SIGKILL` `/ready` / `0-lag` catch-up | 15.14 s / 35.33 s | 15.72 s / 27.95 s | **1.26x** faster `0-lag` catch-up |
+
+#### Full Production Workload (`--series 2000000 --steady-secs 30`, concurrent bimodal reads ON)
+| Phase / Metric | Go `go-mimir` | Rust `mimir-rs` | Improvement (Go vs Rust) |
+|----------------|---------------|-----------------|--------------------------|
+| Phase 1 Catch-up (`2.4M` samples, `1.2` chunks/series) | 13.02 s (184,327 samples/s, 34.62 s CPU) | 11.42 s (210,206 samples/s, 23.56 s CPU) | **1.14x** faster (**1.47x** less CPU) |
+| Phase 1 `RssAnon` (`B/series`) | 2,898.3 MiB (`1,520 B/series`) | 2,054.7 MiB (`1,077 B/series`) | **1.41x** (**29.1% less heap**) |
+| Phase 2 Steady CPU (`µs / ingested sample`, reads ON) | 6.60 µs/sample | 3.75 µs/sample | **1.76x** (**43.1% less CPU**) |
+| Phase 2 Steady `RssAnon` (`B/series`) | 5,336.8 MiB (`2,664 B/series`) | 2,370.7 MiB (`1,189 B/series`) | **2.25x** (**55.6% less heap RAM**) |
+| `QueryStream` small (`~7 series`) p50 / p99 | 0.58 ms / 2.76 ms | 0.48 ms / 1.11 ms | **1.21x** p50 / **2.47x** p99 |
+| `QueryStream` heavy (`~28k series`) p50 / p99 | 668.94 ms / 800.07 ms | 259.68 ms / 277.39 ms | **2.58x** p50 / **2.88x** p99 |
+| `LabelNamesAndValues` p50 | 1,775.54 ms | 681.27 ms | **2.61x** faster |
+| `LabelValuesCardinality` p50 | 817.79 ms | 157.89 ms | **5.18x** faster |
+| `UserStats` p50 | 0.60 ms | 0.44 ms | **1.36x** faster |
+| Phase 3 Head Compaction wall | 36.93 s | 27.96 s | **1.32x** faster |
+| Phase 3 Peak `RssAnon` (sawtooth) | 6,667.8 MiB (+1,331.0 MiB) | 2,500.1 MiB (+129.4 MiB) | **2.67x** (**62.5% less peak RAM**, **10.3x smaller sawtooth**) |
+| Phase 4 `SIGKILL` `/ready` / `0-lag` catch-up | 14.94 s / 33.79 s | 14.50 s / 25.80 s | **1.03x** `/ready` / **1.31x** catch-up |
+| Phase 4 Post-restart `RssAnon` | 5,405.3 MiB | 2,875.6 MiB | **1.88x** (**46.8% less heap**) |
 
 #### Go `go-mimir` Heap Decomposition (`/debug/pprof/heap -inuse_space` after Phase 1 preload, 2M series)
-- **Go live heap (`inuse_space`)**: `1,526.21 MB` vs OS `RssAnon = 2,952.5 MiB` (**1,426 MiB `GOGC=100` GC headroom**, ~1.93x live heap; grows to `5,318.8 MiB` during steady state!).
-- **Top Go `inuse_space` allocators**: `stringslite.Clone` (`312.59 MB`, `20.48%`), `chunkenc.NewXORChunk` (`224.02 MB`, `14.68%`), `tsdb.newMemSeries` (`211.04 MB`, `13.83%`), `tsdb/index.appendWithExponentialGrowth` (`152.42 MB`, `9.99%`), `activeseries.(*seriesStripe).findAndUpdateOrCreateEntryForSeries` (`130.75 MB`, `8.57%`), `zstd.(*sequenceDecs).executeSeq` (`108.30 MB`, `7.10%`), `mimirpb.newTimeSeries` (`85.04 MB`, `5.57%`), `tsdb.(*memSeries).cutNewHeadChunk` (`68.00 MB`, `4.46%`).
+- **Go live heap (`inuse_space`)**: `1,505.34 MB` vs OS `RssAnon = 2,898.3 MiB` (**1,393 MiB `GOGC=100` GC headroom**, ~1.93x live heap; grows to `5,336.8 MiB` during steady state!).
+- **Top Go `inuse_space` allocators**: `stringslite.Clone` (`306.08 MB`, `20.33%`), `chunkenc.NewXORChunk` (`218.02 MB`, `14.48%`), `tsdb.newMemSeries` (`207.54 MB`, `13.79%`), `activeseries.(*seriesStripe).findAndUpdateOrCreateEntryForSeries` (`171.95 MB`, `11.42%`), `tsdb/index.appendWithExponentialGrowth` (`132.50 MB`, `8.80%`), `zstd.(*sequenceDecs).executeSeq` (`127.99 MB`, `8.50%`), `tsdb.(*memSeries).cutNewHeadChunk` (`72.50 MB`, `4.82%`), `mimirpb.newTimeSeries` (`68.03 MB`, `4.52%`).

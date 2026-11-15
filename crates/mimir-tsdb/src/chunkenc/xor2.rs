@@ -15,6 +15,41 @@ const XOR2_HEADER_SIZE: usize = CHUNK_HEADER_SIZE + CHUNK_ST_HEADER_SIZE;
 const CHUNK_ALLOCATION_SIZE: usize = 128;
 const CHUNK_COMPACT_CAPACITY_THRESHOLD: usize = 32;
 
+/// Compact cached appender state for O(1) sequential appends on [`Xor2Chunk`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Xor2AppendState {
+    pub st: i64,
+    pub t: i64,
+    pub v: f64,
+    pub t_delta: u64,
+    pub st_diff: i64,
+    pub leading: u8,
+    pub trailing: u8,
+    pub num_total: u16,
+    pub first_st_change_on: u16,
+    pub first_st_known: bool,
+    pub valid: bool,
+}
+
+impl Xor2AppendState {
+    #[inline]
+    pub const fn new_empty() -> Self {
+        Self {
+            st: 0,
+            t: i64::MIN,
+            v: 0.0,
+            t_delta: 0,
+            st_diff: 0,
+            leading: 0xff,
+            trailing: 0,
+            num_total: 0,
+            first_st_change_on: 0,
+            first_st_known: false,
+            valid: true,
+        }
+    }
+}
+
 /// Prometheus `EncXOR2` (`4`) encoded float64 chunk with optional start timestamp support.
 #[derive(Clone, Debug)]
 pub struct Xor2Chunk {
@@ -139,6 +174,61 @@ impl Xor2Chunk {
             first_st_change_on: u16::from(first_st_change_on),
             first_st_known,
         })
+    }
+
+    /// Appends `(st, t, v)` in O(1) using cached [`Xor2AppendState`] (recovering state once via
+    /// [`Self::appender`] only if `!state.valid`).
+    #[inline]
+    pub fn append_with_state(
+        &mut self,
+        state: &mut Xor2AppendState,
+        st: i64,
+        t: i64,
+        v: f64,
+    ) -> Result<(), ChunkError> {
+        if !state.valid {
+            let mut app = self.appender()?;
+            app.append(st, t, v)?;
+            *state = Xor2AppendState {
+                st: app.st,
+                t: app.t,
+                v: app.v,
+                t_delta: app.t_delta,
+                st_diff: app.st_diff,
+                leading: app.leading,
+                trailing: app.trailing,
+                num_total: app.num_total,
+                first_st_change_on: app.first_st_change_on,
+                first_st_known: app.first_st_known,
+                valid: true,
+            };
+            return Ok(());
+        }
+        let mut app = Xor2Appender {
+            b: &mut self.b,
+            st: state.st,
+            t: state.t,
+            v: state.v,
+            t_delta: state.t_delta,
+            st_diff: state.st_diff,
+            leading: state.leading,
+            trailing: state.trailing,
+            num_total: state.num_total,
+            first_st_change_on: state.first_st_change_on,
+            first_st_known: state.first_st_known,
+        };
+        app.append(st, t, v)?;
+        state.st = app.st;
+        state.t = app.t;
+        state.v = app.v;
+        state.t_delta = app.t_delta;
+        state.st_diff = app.st_diff;
+        state.leading = app.leading;
+        state.trailing = app.trailing;
+        state.num_total = app.num_total;
+        state.first_st_change_on = app.first_st_change_on;
+        state.first_st_known = app.first_st_known;
+        Ok(())
     }
 
     #[inline]
@@ -771,5 +861,52 @@ mod tests {
                 (500, 4000, 3.0),
             ]
         );
+    }
+
+    #[test]
+    fn xor2_append_with_state_matches_appender_bit_for_bit() {
+        let mut samples = Vec::new();
+        let mut t = 1_700_000_000_000i64;
+        for i in 0..250usize {
+            t += match i % 5 {
+                0 => 15_000,
+                1 => 15_500,
+                2 => 200_000,
+                3 => 5_000_000,
+                _ => 15_000,
+            };
+            let st = if i < 20 { 1_699_999_000_000 } else { 1_700_000_000_000 + (i as i64 / 50) * 100 };
+            let v = match i % 4 {
+                0 => 10.5,
+                1 => 10.5,
+                2 => stale_nan(),
+                _ => (i as f64) * 2.25,
+            };
+            samples.push((st, t, v));
+        }
+
+        let mut c_ref = Xor2Chunk::new();
+        for &(st, ts, val) in &samples {
+            c_ref.appender().unwrap().append(st, ts, val).unwrap();
+        }
+
+        let mut c_fast = Xor2Chunk::new();
+        let mut state = Xor2AppendState::new_empty();
+        for &(st, ts, val) in &samples {
+            c_fast.append_with_state(&mut state, st, ts, val).unwrap();
+        }
+        assert_eq!(c_fast.as_bytes(), c_ref.as_bytes());
+
+        let mut c_ref_partial = Xor2Chunk::new();
+        for &(st, ts, val) in &samples[..100] {
+            c_ref_partial.appender().unwrap().append(st, ts, val).unwrap();
+        }
+        let mut c_cold = Xor2Chunk::from_bytes(c_ref_partial.as_bytes().to_vec());
+        let mut cold_state = Xor2AppendState::default();
+        for &(st, ts, val) in &samples[100..] {
+            c_cold.append_with_state(&mut cold_state, st, ts, val).unwrap();
+            assert!(cold_state.valid);
+        }
+        assert_eq!(c_cold.as_bytes(), c_ref.as_bytes());
     }
 }

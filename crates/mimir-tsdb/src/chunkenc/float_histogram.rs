@@ -180,6 +180,26 @@ impl FloatHistogramChunk {
         self.b.count = valid_bits;
         Ok(FloatHistogramAppender { chunk: self, state })
     }
+
+    /// Appends `(st, t, fh)` in O(1) using a cached [`FloatHistogramAppenderState`],
+    /// recovering state once via [`Self::appender`] only if `*state` is `None`.
+    pub fn append_with_state(
+        &mut self,
+        state: &mut Option<FloatHistogramAppenderState>,
+        st: i64,
+        t: i64,
+        fh: &FloatHistogram,
+    ) -> Result<AppendFloatHistogramOutcome, ChunkError> {
+        let mut app = match state.take() {
+            Some(s) => FloatHistogramAppender { chunk: self, state: s },
+            None => self.appender()?,
+        };
+        let out = app.append_float_histogram(None, st, t, fh, false)?;
+        if matches!(out, AppendFloatHistogramOutcome::Appended { .. }) {
+            *state = Some(app.state);
+        }
+        Ok(out)
+    }
 }
 
 /// Snapshot of [`FloatHistogramAppender`] state used to detect counter resets across chunks.

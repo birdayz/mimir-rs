@@ -10,6 +10,27 @@ const CHUNK_HEADER_SIZE: usize = 2;
 const CHUNK_ALLOCATION_SIZE: usize = 32;
 const CHUNK_COMPACT_CAPACITY_THRESHOLD: usize = 32;
 
+/// Compact cached appender state for O(1) sequential appends on [`XorChunk`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XorAppendState {
+    pub t_delta: u64,
+    pub leading: u8,
+    pub trailing: u8,
+    pub valid: bool,
+}
+
+impl XorAppendState {
+    #[inline]
+    pub const fn new_empty() -> Self {
+        Self {
+            t_delta: 0,
+            leading: 0xff,
+            trailing: 0,
+            valid: true,
+        }
+    }
+}
+
 /// Gorilla/Prometheus XOR-encoded float64 chunk (`EncXOR = 1`).
 #[derive(Clone, Debug)]
 pub struct XorChunk {
@@ -107,6 +128,43 @@ impl XorChunk {
             leading,
             trailing,
         })
+    }
+
+    /// Appends `(t, v)` in O(1) using cached [`XorAppendState`] (recovering state once via
+    /// [`Self::appender`] only if `!state.valid`).
+    #[inline]
+    pub fn append_with_state(
+        &mut self,
+        state: &mut XorAppendState,
+        prev_t: i64,
+        prev_v: f64,
+        t: i64,
+        v: f64,
+    ) -> Result<(), ChunkError> {
+        if !state.valid {
+            let mut app = self.appender()?;
+            app.append(0, t, v)?;
+            *state = XorAppendState {
+                t_delta: app.t_delta,
+                leading: app.leading,
+                trailing: app.trailing,
+                valid: true,
+            };
+            return Ok(());
+        }
+        let mut app = XorAppender {
+            b: &mut self.b,
+            t: prev_t,
+            v: prev_v,
+            t_delta: state.t_delta,
+            leading: state.leading,
+            trailing: state.trailing,
+        };
+        app.append(0, t, v)?;
+        state.t_delta = app.t_delta;
+        state.leading = app.leading;
+        state.trailing = app.trailing;
+        Ok(())
     }
 
     #[inline]
@@ -408,4 +466,71 @@ pub(crate) fn xor_read(
     let vbits = value.to_bits() ^ (bits << new_trailing);
     *value = f64::from_bits(vbits);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xor_append_with_state_matches_appender_bit_for_bit() {
+        let mut samples = Vec::new();
+        let mut t = 1_700_000_000_000i64;
+        for i in 0..250usize {
+            let step = match i % 7 {
+                0 => 15_000,
+                1 => 15_000,
+                2 => 15_123,       // 14-bit dod
+                3 => 45_000,       // 17-bit dod
+                4 => 300_000,      // 20-bit dod
+                5 => 10_000_000,   // 64-bit dod
+                _ => 15_000,
+            };
+            t += step;
+            let v = match i % 5 {
+                0 => 42.0,
+                1 => 42.0,
+                2 => (i as f64) * 1.375,
+                3 => f64::from_bits(0x7ff0_0000_0000_0002), // StaleNaN
+                _ => -0.00125 * (i as f64),
+            };
+            samples.push((t, v));
+        }
+
+        let mut c_ref = XorChunk::new();
+        for &(ts, val) in &samples {
+            let mut app = c_ref.appender().unwrap();
+            app.append(0, ts, val).unwrap();
+        }
+
+        let mut c_fast = XorChunk::new();
+        let mut state = XorAppendState::new_empty();
+        let mut prev_t = i64::MIN;
+        let mut prev_v = 0.0;
+        for &(ts, val) in &samples {
+            c_fast
+                .append_with_state(&mut state, prev_t, prev_v, ts, val)
+                .unwrap();
+            prev_t = ts;
+            prev_v = val;
+        }
+        assert_eq!(c_fast.as_bytes(), c_ref.as_bytes());
+
+        // Cold recovery after loading raw bytes with invalid state
+        let mut c_ref2 = XorChunk::new();
+        for &(ts, val) in &samples[..150] {
+            c_ref2.appender().unwrap().append(0, ts, val).unwrap();
+        }
+        let mut c_cold2 = XorChunk::from_bytes(c_ref2.as_bytes().to_vec());
+        let mut cold_state = XorAppendState::default(); // valid == false
+        let mut pt = 0;
+        let mut pv = 0.0;
+        for &(ts, val) in &samples[150..] {
+            c_cold2.append_with_state(&mut cold_state, pt, pv, ts, val).unwrap();
+            assert!(cold_state.valid);
+            pt = ts;
+            pv = val;
+        }
+        assert_eq!(c_cold2.as_bytes(), c_ref.as_bytes());
+    }
 }

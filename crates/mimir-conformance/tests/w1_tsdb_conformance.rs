@@ -252,6 +252,86 @@ fn xor_chunk_conformance_bit_for_bit() {
     assert_xor_parity("monotonic_120", &mono_120);
 
     // Irregular timestamps covering 14-bit, 17-bit, 20-bit, and 64-bit DoD buckets + boundary values
+    let mut t = 1_700_000_000_000i64;
+    let mut mixed_220 = Vec::with_capacity(220);
+    for i in 0..220usize {
+        t += match i % 6 {
+            0 => 15_000,
+            1 => 15_100,
+            2 => 30_000,
+            3 => 250_000,
+            4 => 10_000_000,
+            _ => 15_000,
+        };
+        let v = match i % 4 {
+            0 => 42.0,
+            1 => 42.0,
+            2 => (i as f64) * 0.375,
+            _ => -123.5 + (i as f64),
+        };
+        mixed_220.push(ChunkSampleJson { st: 0, t, v });
+    }
+    assert_xor_parity("mixed_220", &mixed_220);
+
+    // Explicitly verify XorChunk::append_with_state and Xor2Chunk::append_with_state match Go oracle bit-for-bit!
+    let mut xor_fast = XorChunk::new();
+    let mut xor_state = mimir_tsdb::chunkenc::XorAppendState::new_empty();
+    let mut pt = i64::MIN;
+    let mut pv = 0.0;
+    for s in &mixed_220 {
+        xor_fast
+            .append_with_state(&mut xor_state, pt, pv, s.t, s.v)
+            .unwrap();
+        pt = s.t;
+        pv = s.v;
+    }
+    xor_fast.compact();
+    let go_xor: ChunkResponse = invoke_oracle(
+        "encode-chunk",
+        &EncodeChunkRequest {
+            encoding: Encoding::Xor.as_u8(),
+            samples: mixed_220.clone(),
+            histograms: Vec::new(),
+        },
+    )
+    .expect("go encode xor");
+    assert_eq!(
+        xor_fast.into_bytes(),
+        B64.decode(&go_xor.bytes_b64).unwrap(),
+        "XorAppendState must match Go encode-chunk bit-for-bit"
+    );
+
+    let xor2_samples: Vec<ChunkSampleJson> = mixed_220
+        .iter()
+        .enumerate()
+        .map(|(i, s)| ChunkSampleJson {
+            st: if i < 20 { 1_699_999_000_000 } else { 1_700_000_000_000 + (i as i64 / 30) * 500 },
+            t: s.t,
+            v: s.v,
+        })
+        .collect();
+    let mut xor2_fast = mimir_tsdb::chunkenc::Xor2Chunk::new();
+    let mut xor2_state = mimir_tsdb::chunkenc::Xor2AppendState::new_empty();
+    for s in &xor2_samples {
+        xor2_fast
+            .append_with_state(&mut xor2_state, s.st, s.t, s.v)
+            .unwrap();
+    }
+    xor2_fast.compact();
+    let go_xor2: ChunkResponse = invoke_oracle(
+        "encode-chunk",
+        &EncodeChunkRequest {
+            encoding: Encoding::Xor2.as_u8(),
+            samples: xor2_samples,
+            histograms: Vec::new(),
+        },
+    )
+    .expect("go encode xor2");
+    assert_eq!(
+        xor2_fast.into_bytes(),
+        B64.decode(&go_xor2.bytes_b64).unwrap(),
+        "Xor2AppendState must match Go encode-chunk bit-for-bit"
+    );
     let irregular: Vec<ChunkSampleJson> = vec![
         ChunkSampleJson { st: 0, t: 10_000, v: 1.0 },
         ChunkSampleJson { st: 0, t: 20_000, v: 1.0 },          // tDelta = 10000

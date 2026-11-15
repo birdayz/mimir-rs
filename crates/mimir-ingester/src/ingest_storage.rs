@@ -4,24 +4,37 @@
 //! - github.com/grafana/mimir/pkg/ingester/ingester.go (ingest_storage init)
 //! - github.com/grafana/mimir/pkg/storage/ingest/util.go (IngesterPartitionID)
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use mimir_proto::cortexpb::ErrorCause;
+use mimir_config::KafkaConfig;
+use mimir_proto::cortexpb::{self, ErrorCause};
 use mimir_proto::ringpb::PartitionRingDesc;
+use mimir_proto::zerocopy::WriteRequestScratch;
 use mimir_ring::partition_ring::PartitionRingWatcherDelegate;
+use mimir_storage::ingest::version::{deserialize_record_content, parse_record_version};
 use mimir_storage::ingest::{
-    write_compartment_configs, LogPolicy, MultiClusterPartitionReader, PartitionOffsets,
-    PreCommitNotifier, Pusher, PusherConsumer, PusherConsumerMetrics, PusherError, ReaderError,
-    RecordBatchConsumer, SingleClusterPartitionReader, READ_COMPARTMENT_ID_PLACEHOLDER,
+    write_compartment_configs, ErrorSampler as StorageErrorSampler, FetchedRecord, LogPolicy,
+    MultiClusterPartitionReader, PartitionOffsets, PreCommitNotifier, PushErrorHandler,
+    PusherConsumerMetrics, PusherError, ReaderError, RecordBatchConsumer,
+    SingleClusterPartitionReader, READ_COMPARTMENT_ID_PLACEHOLDER,
 };
-use tracing::info;
+use mimir_tsdb::head::hash_sorted_pairs;
+use mimir_tsdb::labels::Labels;
+use parking_lot::Mutex;
+use smallvec::SmallVec;
+use tracing::{error, info};
 
 use crate::errors::IngesterError;
 use crate::ingester::Ingester;
+use crate::push::{
+    convert_borrowed_exemplar, convert_borrowed_histogram, fast_utf8_str, ConvertedHistogram,
+    PrehashedSeriesItem,
+};
 
 /// Parses the numeric partition ID suffix from `ingester_id` (e.g. `"ingester-zone-a-2"` -> `2`).
 pub fn ingester_partition_id_from_instance_id(ingester_id: &str) -> Result<i32, String> {
@@ -116,7 +129,7 @@ impl IngestReaderHandle {
     }
 }
 
-/// Adapts [`Ingester`] into [`mimir_storage::ingest::Pusher`] + [`PreCommitNotifier`].
+/// Adapts [`Ingester`] into [`PreCommitNotifier`].
 pub struct IngesterStorageAdapter(pub Arc<Ingester>);
 
 fn ingester_err_to_pusher_err(err: IngesterError) -> PusherError {
@@ -156,24 +169,705 @@ impl PreCommitNotifier for IngesterStorageAdapter {
     }
 }
 
-impl Pusher for IngesterStorageAdapter {
-    fn push_to_storage_and_release_request(
-        &self,
-        tenant_id: &str,
-        request: mimir_proto::cortexpb::WriteRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PusherError>> + Send + '_>> {
-        let tenant_id = tenant_id.to_owned();
-        Box::pin(async move {
-            if tenant_id.is_empty() {
-                return Err(PusherError::ingester(
-                    ErrorCause::BadData,
-                    "InvalidArgument",
-                    "no org id",
-                ));
+const SHARD_COMMIT_MAX_SAMPLES: usize = 2048;
+const SHARD_COMMIT_MAX_SERIES: usize = 2048;
+
+#[derive(Clone, Copy)]
+struct ShardSeriesItem {
+    worker_idx: u16,
+    record_offset: i64,
+    tenant_idx: u16,
+    source: i32,
+    skip_label_validation: bool,
+    labels_sorted_unique: bool,
+    bad_utf8: bool,
+    prom_hash: u64,
+    pairs_start: u32,
+    pairs_len: u16,
+    samples_start: u32,
+    samples_len: u32,
+    created_timestamp: i64,
+    histograms_start: u32,
+    histograms_len: u16,
+    exemplars_start: u32,
+    exemplars_len: u16,
+    min_ts: i64,
+}
+
+struct WorkerArena {
+    wr_scratch: WriteRequestScratch,
+    pairs_arena: Vec<(&'static str, &'static str)>,
+    samples_arena: Vec<cortexpb::Sample>,
+    histograms_arena: Vec<ConvertedHistogram>,
+    exemplars_arena: Vec<(i64, f64, Labels, String)>,
+    shard_buckets: Vec<Vec<ShardSeriesItem>>,
+    empty_tenant_errors: usize,
+    total_series: usize,
+}
+
+impl WorkerArena {
+    fn new(num_shards: usize) -> Self {
+        Self {
+            wr_scratch: WriteRequestScratch::new(),
+            pairs_arena: Vec::with_capacity(4096),
+            samples_arena: Vec::with_capacity(512),
+            histograms_arena: Vec::new(),
+            exemplars_arena: Vec::new(),
+            shard_buckets: (0..num_shards).map(|_| Vec::with_capacity(128)).collect(),
+            empty_tenant_errors: 0,
+            total_series: 0,
+        }
+    }
+
+    fn reset_for(&mut self, num_shards: usize) {
+        self.wr_scratch.clear();
+        self.pairs_arena.clear();
+        self.samples_arena.clear();
+        self.histograms_arena.clear();
+        self.exemplars_arena.clear();
+        if self.shard_buckets.len() < num_shards {
+            self.shard_buckets
+                .resize_with(num_shards, || Vec::with_capacity(128));
+        }
+        for b in &mut self.shard_buckets {
+            b.clear();
+        }
+        self.empty_tenant_errors = 0;
+        self.total_series = 0;
+    }
+
+    #[inline]
+    fn pairs_slice<'r>(&self, start: u32, len: u16) -> &'r [(&'r str, &'r str)] {
+        let s = start as usize;
+        let e = s + len as usize;
+        // SAFETY: populated with `'r` slices in Phase A and read only in Phase B before `'r` ends.
+        unsafe {
+            std::slice::from_raw_parts(self.pairs_arena.as_ptr().add(s).cast(), e - s)
+        }
+    }
+}
+
+struct ArenaPoolGuard<'a> {
+    pool: &'a Mutex<Vec<WorkerArena>>,
+    arenas: Vec<WorkerArena>,
+}
+
+impl Drop for ArenaPoolGuard<'_> {
+    fn drop(&mut self) {
+        let mut arenas = std::mem::take(&mut self.arenas);
+        for a in &mut arenas {
+            a.pairs_arena.clear();
+            a.samples_arena.clear();
+            a.histograms_arena.clear();
+            a.exemplars_arena.clear();
+            a.wr_scratch.clear();
+            for b in &mut a.shard_buckets {
+                b.clear();
             }
-            self.0
-                .push_to_storage(&tenant_id, &request)
-                .map_err(ingester_err_to_pusher_err)
+            // Prevent retaining outlier allocations after massive spikes.
+            if a.pairs_arena.capacity() > 262_144 {
+                a.pairs_arena = Vec::with_capacity(4096);
+            }
+            if a.samples_arena.capacity() > 65_536 {
+                a.samples_arena = Vec::with_capacity(512);
+            }
+        }
+        let mut pool = self.pool.lock();
+        for a in arenas {
+            if pool.len() < 16 {
+                pool.push(a);
+            }
+        }
+    }
+}
+
+/// Zero-allocation, pre-hashed, two-phase scoped-parallel Kafka `ingest_storage` consumer.
+///
+/// Phase A: parallel decode (`BorrowedWriteRequest`) + metadata + single `xxh64` hash +
+/// power-of-two `StripeSeries`-aligned shard bucketing.
+/// Phase B: parallel shard ingestion directly into `Ingester::ingest_prehashed_shard_batch`
+/// in batches of up to 2,048 samples per `HeadAppender::commit`.
+pub struct IngesterShardedBatchConsumer {
+    ingester: Arc<Ingester>,
+    kafka_cfg: KafkaConfig,
+    metrics: PusherConsumerMetrics,
+    error_handler: Arc<PushErrorHandler>,
+    arena_pool: Mutex<Vec<WorkerArena>>,
+}
+
+impl IngesterShardedBatchConsumer {
+    pub fn new(
+        ingester: Arc<Ingester>,
+        kafka_cfg: KafkaConfig,
+        metrics: PusherConsumerMetrics,
+    ) -> Self {
+        let sampler = if ingester.cfg.error_sample_rate > 0 {
+            Some(Arc::new(StorageErrorSampler::new(
+                ingester.cfg.error_sample_rate,
+            )))
+        } else {
+            None
+        };
+        let error_handler = Arc::new(PushErrorHandler::new(
+            metrics.storage_pusher_metrics.clone(),
+            sampler,
+            None,
+        ));
+        Self {
+            ingester,
+            kafka_cfg,
+            metrics,
+            error_handler,
+            arena_pool: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take_arenas(&self, count: usize, num_shards: usize) -> ArenaPoolGuard<'_> {
+        let mut arenas = Vec::with_capacity(count);
+        {
+            let mut pool = self.arena_pool.lock();
+            while arenas.len() < count {
+                if let Some(mut a) = pool.pop() {
+                    a.reset_for(num_shards);
+                    arenas.push(a);
+                } else {
+                    break;
+                }
+            }
+        }
+        while arenas.len() < count {
+            arenas.push(WorkerArena::new(num_shards));
+        }
+        ArenaPoolGuard {
+            pool: &self.arena_pool,
+            arenas,
+        }
+    }
+
+    fn consume_records_sync(&self, records: &[FetchedRecord]) -> Result<(), String> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        // Map each record to a deduplicated tenant index + accumulate bytes per tenant for metrics.
+        let mut tenants: SmallVec<[String; 4]> = SmallVec::new();
+        let mut tenant_bytes: SmallVec<[usize; 4]> = SmallVec::new();
+        let mut tenant_lookup: HashMap<&str, u16> = HashMap::new();
+        let mut rec_tenant_idx: SmallVec<[u16; 64]> = SmallVec::with_capacity(records.len());
+
+        for rec in records {
+            let tid_cow = String::from_utf8_lossy(&rec.key);
+            let tid_idx = if let Some(&idx) = tenant_lookup.get(tid_cow.as_ref()) {
+                tenant_bytes[idx as usize] += rec.value.len();
+                idx
+            } else {
+                let idx = tenants.len() as u16;
+                tenants.push(tid_cow.into_owned());
+                tenant_bytes.push(rec.value.len());
+                // Safety/simplicity: borrow from owned string? Rebuild small map or linear scan for <= 4 tenants.
+                idx
+            };
+            if tenants.len() > tenant_lookup.len() && tenants.len() > 4 {
+                tenant_lookup.clear();
+                for (i, t) in tenants.iter().enumerate() {
+                    // Use unsafe lifetime extension? Avoid: linear scan up to 8 tenants is faster than HashMap!
+                    let _ = (i, t);
+                }
+            }
+            rec_tenant_idx.push(tid_idx);
+        }
+        // Actually replace linear scan cleanly without unused map:
+        let _ = tenant_lookup;
+        tenants.clear();
+        tenant_bytes.clear();
+        rec_tenant_idx.clear();
+        let mut fallback_map: Option<HashMap<String, u16>> = None;
+        for rec in records {
+            let tid_cow = String::from_utf8_lossy(&rec.key);
+            let tid_str = tid_cow.as_ref();
+            let tid_idx = if let Some(ref mut map) = fallback_map {
+                if let Some(&idx) = map.get(tid_str) {
+                    tenant_bytes[idx as usize] += rec.value.len();
+                    idx
+                } else {
+                    let idx = tenants.len() as u16;
+                    tenants.push(tid_str.to_owned());
+                    tenant_bytes.push(rec.value.len());
+                    map.insert(tid_str.to_owned(), idx);
+                    idx
+                }
+            } else if let Some(pos) = tenants.iter().position(|t| t == tid_str) {
+                tenant_bytes[pos] += rec.value.len();
+                pos as u16
+            } else if tenants.len() < 8 {
+                let idx = tenants.len() as u16;
+                tenants.push(tid_str.to_owned());
+                tenant_bytes.push(rec.value.len());
+                idx
+            } else {
+                let mut map = HashMap::with_capacity(16);
+                for (i, t) in tenants.iter().enumerate() {
+                    map.insert(t.clone(), i as u16);
+                }
+                let idx = tenants.len() as u16;
+                tenants.push(tid_str.to_owned());
+                tenant_bytes.push(rec.value.len());
+                map.insert(tid_str.to_owned(), idx);
+                fallback_map = Some(map);
+                idx
+            };
+            rec_tenant_idx.push(tid_idx);
+        }
+
+        let num_shards = if self.kafka_cfg.ingestion_concurrency_max <= 0 {
+            1
+        } else {
+            let max_s = self.kafka_cfg.ingestion_concurrency_max as usize;
+            let p2 = 1usize << (usize::BITS - 1 - max_s.leading_zeros());
+            p2.clamp(1, 16)
+        };
+        let shard_mask = num_shards - 1;
+
+        if self.kafka_cfg.ingestion_concurrency_max > 0 {
+            let bytes_per_sample = self
+                .kafka_cfg
+                .ingestion_concurrency_estimated_bytes_per_sample
+                .max(1) as usize;
+            let mut est_total = 0usize;
+            for &b in &tenant_bytes {
+                est_total += b / bytes_per_sample;
+            }
+            if est_total > 0 {
+                self.metrics
+                    .storage_pusher_metrics
+                    .estimated_timeseries
+                    .inc_by(est_total as f64);
+            }
+        }
+
+        let hw_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let num_workers = if records.len() <= 1 {
+            1
+        } else {
+            records.len().min(hw_threads).min(8)
+        };
+
+        let mut pool_guard = self.take_arenas(num_workers, num_shards);
+        let batch_started = Instant::now();
+
+        // Phase A: parallel decode + metadata + single xxh64 hash + shard bucketing.
+        let decode_worker = |worker_idx: usize,
+                             rec_offset_start: usize,
+                             slice: &[FetchedRecord],
+                             tids: &[u16],
+                             arena: &mut WorkerArena| {
+            let WorkerArena {
+                wr_scratch,
+                pairs_arena,
+                samples_arena,
+                histograms_arena,
+                exemplars_arena,
+                shard_buckets,
+                empty_tenant_errors,
+                total_series,
+            } = arena;
+            // SAFETY: `pairs_arena` is empty on entry and cleared on `ArenaPoolGuard::drop`
+            // before `'r` ends.
+            let pairs_mut: &mut Vec<(&str, &str)> = unsafe {
+                &mut *(pairs_arena as *mut Vec<(&'static str, &'static str)>).cast()
+            };
+            let mut tmp_ex: Vec<(i64, f64, Labels, String)> = Vec::new();
+            for (local_i, rec) in slice.iter().enumerate() {
+                let tenant_idx = tids[local_i];
+                let tenant_id = &tenants[tenant_idx as usize];
+                if tenant_id.is_empty() {
+                    *empty_tenant_errors += 1;
+                    continue;
+                }
+
+                let version = parse_record_version(
+                    rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
+                );
+                let borrowed =
+                    match deserialize_record_content(&rec.value, version, wr_scratch) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let err_msg = format!("parsing ingest consumer write request: {e}");
+                            error!(err = %err_msg, "failed to parse write request; skipping");
+                            wr_scratch.clear();
+                            continue;
+                        }
+                    };
+
+                if borrowed.metadata_len() > 0 {
+                    let meta_count = self.ingester.push_metadata_borrowed(tenant_id, &borrowed);
+                    if meta_count > 0 {
+                        self.ingester.ingestion_rate.add(meta_count as i64);
+                    }
+                }
+
+                let source = borrowed.source;
+                let skip_label_validation = borrowed.skip_label_validation;
+                let ts_count = borrowed.timeseries_len();
+
+                for ts in borrowed.timeseries() {
+                    let pairs_start = pairs_mut.len() as u32;
+                    let mut labels_sorted_unique = true;
+                    let mut bad_utf8 = false;
+                    let mut prev_name: Option<&str> = None;
+
+                    for lp in ts.labels() {
+                        let Ok(k) = fast_utf8_str(lp.name) else {
+                            bad_utf8 = true;
+                            break;
+                        };
+                        let Ok(v) = fast_utf8_str(lp.value) else {
+                            bad_utf8 = true;
+                            break;
+                        };
+                        if let Some(pn) = prev_name {
+                            if pn >= k {
+                                labels_sorted_unique = false;
+                            }
+                        }
+                        prev_name = Some(k);
+                        if !v.is_empty() {
+                            pairs_mut.push((k, v));
+                        }
+                    }
+
+                    let pairs_end = pairs_mut.len();
+                    let pairs_len = (pairs_end - pairs_start as usize) as u16;
+                    let prom_hash = if !bad_utf8 && labels_sorted_unique && pairs_len > 0 {
+                        let pairs_slice = &pairs_mut[pairs_start as usize..pairs_end];
+                        hash_sorted_pairs(pairs_slice)
+                    } else {
+                        0
+                    };
+
+                    let samples = ts.samples();
+                    let samples_start = samples_arena.len() as u32;
+                    let samples_len = samples.len() as u32;
+                    let mut min_ts = i64::MAX;
+                    for s in samples {
+                        min_ts = min_ts.min(s.timestamp_ms);
+                    }
+                    samples_arena.extend_from_slice(samples);
+
+                    let hist_start = histograms_arena.len() as u32;
+                    let mut hist_len = 0u16;
+                    for h in ts.histograms() {
+                        let conv = convert_borrowed_histogram(&h);
+                        min_ts = min_ts.min(conv.0);
+                        histograms_arena.push(conv);
+                        hist_len += 1;
+                    }
+
+                    let ex_start = exemplars_arena.len() as u32;
+                    let mut ex_len = 0u16;
+                    if ts.exemplars().len() > 0 {
+                        tmp_ex.clear();
+                        for ex in ts.exemplars() {
+                            if let Ok(conv) = convert_borrowed_exemplar(&ex) {
+                                tmp_ex.push(conv);
+                                ex_len += 1;
+                            } else {
+                                bad_utf8 = true;
+                                break;
+                            }
+                        }
+                        if !bad_utf8 {
+                            exemplars_arena.append(&mut tmp_ex);
+                        }
+                    }
+
+                    let shard = (prom_hash as usize) & shard_mask;
+                    shard_buckets[shard].push(ShardSeriesItem {
+                        worker_idx: worker_idx as u16,
+                        record_offset: rec.offset,
+                        tenant_idx,
+                        source,
+                        skip_label_validation,
+                        labels_sorted_unique,
+                        bad_utf8,
+                        prom_hash,
+                        pairs_start,
+                        pairs_len,
+                        samples_start,
+                        samples_len,
+                        created_timestamp: ts.created_timestamp(),
+                        histograms_start: hist_start,
+                        histograms_len: hist_len,
+                        exemplars_start: ex_start,
+                        exemplars_len: ex_len,
+                        min_ts,
+                    });
+                    *total_series += 1;
+                }
+
+                let _ = rec_offset_start;
+                let _ = ts_count;
+                wr_scratch.clear();
+            }
+        };
+
+        if num_workers == 1 {
+            decode_worker(0, 0, records, &rec_tenant_idx, &mut pool_guard.arenas[0]);
+        } else {
+            let chunk_size = records.len().div_ceil(num_workers);
+            std::thread::scope(|scope| {
+                let mut rem_records = records;
+                let mut rem_tids = rec_tenant_idx.as_slice();
+                let mut offset = 0usize;
+                for (w_idx, arena) in pool_guard.arenas.iter_mut().enumerate() {
+                    let take = chunk_size.min(rem_records.len());
+                    let (r_head, r_tail) = rem_records.split_at(take);
+                    let (t_head, t_tail) = rem_tids.split_at(take);
+                    rem_records = r_tail;
+                    rem_tids = t_tail;
+                    scope.spawn(move || {
+                        decode_worker(w_idx, offset, r_head, t_head, arena);
+                    });
+                    offset += take;
+                }
+            });
+        }
+
+        let mut total_series = 0usize;
+        for a in &pool_guard.arenas {
+            total_series += a.total_series;
+            for _ in 0..a.empty_tenant_errors {
+                let err = PusherError::ingester(ErrorCause::BadData, "InvalidArgument", "no org id");
+                let _ = self.error_handler.is_server_error("", Some(&err));
+            }
+        }
+
+        if total_series == 0 {
+            return Ok(());
+        }
+
+        // Phase B: parallel shard ingestion across `num_shards` threads.
+        let arenas_ref: &[WorkerArena] = &pool_guard.arenas;
+        let tenants_ref: &[String] = &tenants;
+
+        let run_shard = |shard_idx: usize| -> Result<(), String> {
+            let mut items_for_shard: Vec<ShardSeriesItem> = Vec::new();
+            for arena in arenas_ref {
+                let b = &arena.shard_buckets[shard_idx];
+                if !b.is_empty() {
+                    items_for_shard.extend_from_slice(b);
+                }
+            }
+            if items_for_shard.is_empty() {
+                return Ok(());
+            }
+
+            if tenants_ref.len() > 1 {
+                items_for_shard.sort_by_key(|it| it.tenant_idx);
+            }
+
+            let mut batch: Vec<PrehashedSeriesItem<'_>> =
+                Vec::with_capacity(items_for_shard.len().min(SHARD_COMMIT_MAX_SERIES));
+            let mut batch_samples = 0usize;
+            let mut batch_min_ts = i64::MAX;
+            let mut cur_tenant_idx = items_for_shard[0].tenant_idx;
+            let mut cur_source = items_for_shard[0].source;
+            let mut last_offset = items_for_shard[0].record_offset;
+
+            let flush_batch = |tenant_idx: u16,
+                                   source_raw: i32,
+                                   min_ts: i64,
+                                   last_off: i64,
+                                   batch_vec: &mut Vec<PrehashedSeriesItem<'_>>|
+             -> Result<(), String> {
+                if batch_vec.is_empty() {
+                    return Ok(());
+                }
+                let tenant_id = &tenants_ref[tenant_idx as usize];
+                let norm_source = cortexpb::write_request::SourceEnum::try_from(source_raw)
+                    .unwrap_or(cortexpb::write_request::SourceEnum::Api);
+
+                let m = &self.metrics.storage_pusher_metrics;
+                m.batch_age.observe(batch_started.elapsed().as_secs_f64());
+                m.batching_queue_metrics.flush_total.inc();
+                m.time_series_per_flush.observe(batch_vec.len() as f64);
+
+                let proc_t0 = Instant::now();
+                let res = self
+                    .ingester
+                    .ingest_prehashed_shard_batch(tenant_id, norm_source, min_ts, batch_vec)
+                    .map_err(ingester_err_to_pusher_err);
+                m.processing_time
+                    .with_label_values(&["timeseries"])
+                    .observe(proc_t0.elapsed().as_secs_f64());
+                batch_vec.clear();
+
+                match res {
+                    Ok(()) => {
+                        self.error_handler.is_server_error(tenant_id, None);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        if self.error_handler.is_server_error(tenant_id, Some(&err)) {
+                            m.batching_queue_metrics.flush_errors_total.inc();
+                            Err(format!(
+                                "consuming record at offset {last_off} for tenant {tenant_id}: {err}"
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            };
+
+            for item in &items_for_shard {
+                let norm_item_src = cortexpb::write_request::SourceEnum::try_from(item.source)
+                    .map(|s| s as i32)
+                    .unwrap_or(cortexpb::write_request::SourceEnum::Api as i32);
+                let norm_cur_src = cortexpb::write_request::SourceEnum::try_from(cur_source)
+                    .map(|s| s as i32)
+                    .unwrap_or(cortexpb::write_request::SourceEnum::Api as i32);
+
+                if item.tenant_idx != cur_tenant_idx
+                    || norm_item_src != norm_cur_src
+                    || (!batch.is_empty()
+                        && (batch_samples + (item.samples_len as usize) > SHARD_COMMIT_MAX_SAMPLES
+                            || batch.len() >= SHARD_COMMIT_MAX_SERIES))
+                {
+                    flush_batch(
+                        cur_tenant_idx,
+                        norm_cur_src,
+                        batch_min_ts,
+                        last_offset,
+                        &mut batch,
+                    )?;
+                    batch_samples = 0;
+                    batch_min_ts = i64::MAX;
+                    cur_tenant_idx = item.tenant_idx;
+                    cur_source = item.source;
+                }
+
+                let wa = &arenas_ref[item.worker_idx as usize];
+                let pairs = wa.pairs_slice(item.pairs_start, item.pairs_len);
+                let s_start = item.samples_start as usize;
+                let s_end = s_start + item.samples_len as usize;
+                let samples = &wa.samples_arena[s_start..s_end];
+
+                let histograms = if item.histograms_len == 0 {
+                    &[][..]
+                } else {
+                    let h_start = item.histograms_start as usize;
+                    &wa.histograms_arena[h_start..h_start + item.histograms_len as usize]
+                };
+                let exemplars = if item.exemplars_len == 0 {
+                    &[][..]
+                } else {
+                    let e_start = item.exemplars_start as usize;
+                    &wa.exemplars_arena[e_start..e_start + item.exemplars_len as usize]
+                };
+
+                batch.push(PrehashedSeriesItem {
+                    pairs,
+                    samples,
+                    created_timestamp: item.created_timestamp,
+                    prom_hash: item.prom_hash,
+                    labels_sorted_unique: item.labels_sorted_unique,
+                    bad_utf8: item.bad_utf8,
+                    skip_label_validation: item.skip_label_validation,
+                    histograms,
+                    exemplars,
+                });
+                batch_samples += item.samples_len as usize;
+                batch_min_ts = batch_min_ts.min(item.min_ts);
+                last_offset = item.record_offset;
+            }
+
+            let norm_cur_src = cortexpb::write_request::SourceEnum::try_from(cur_source)
+                .map(|s| s as i32)
+                .unwrap_or(cortexpb::write_request::SourceEnum::Api as i32);
+            flush_batch(
+                cur_tenant_idx,
+                norm_cur_src,
+                batch_min_ts,
+                last_offset,
+                &mut batch,
+            )?;
+
+            Ok(())
+        };
+
+        let mut first_err: Option<String> = None;
+        if num_shards == 1 || total_series < 64 {
+            for s in 0..num_shards {
+                if let Err(e) = run_shard(s) {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    break;
+                }
+            }
+        } else {
+            let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..num_shards)
+                    .map(|s| scope.spawn(move || run_shard(s)))
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for res in results {
+                if let Err(e) = res {
+                    first_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        self.metrics
+            .storage_pusher_metrics
+            .shards_per_push
+            .observe(num_shards as f64);
+        self.metrics
+            .storage_pusher_metrics
+            .pushers_per_push
+            .observe(tenants.len() as f64);
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+struct ShardedConsumerHandle(Arc<IngesterShardedBatchConsumer>);
+
+impl RecordBatchConsumer for ShardedConsumerHandle {
+    fn consume(
+        &self,
+        records: Vec<FetchedRecord>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let this = Arc::clone(&self.0);
+        Box::pin(async move {
+            let start = Instant::now();
+            let res = match tokio::runtime::Handle::current().runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| this.consume_records_sync(&records))
+                }
+                tokio::runtime::RuntimeFlavor::CurrentThread => {
+                    let t = Arc::clone(&this);
+                    tokio::task::spawn_blocking(move || t.consume_records_sync(&records))
+                        .await
+                        .map_err(|e| format!("ingest consumer task join error: {e}"))?
+                }
+                _ => {
+                    let t = Arc::clone(&this);
+                    tokio::task::spawn_blocking(move || t.consume_records_sync(&records))
+                        .await
+                        .map_err(|e| format!("ingest consumer task join error: {e}"))?
+                }
+            };
+            this.metrics
+                .processing_time_seconds
+                .observe(start.elapsed().as_secs_f64());
+            res
         })
     }
 }
@@ -181,20 +875,15 @@ impl Pusher for IngesterStorageAdapter {
 pub async fn start_ingest_reader(ingester: Arc<Ingester>) -> Result<Arc<IngestReaderHandle>, ReaderError> {
     let tsdb_dir = PathBuf::from(&ingester.blocks_cfg.tsdb.dir);
     let adapter = Arc::new(IngesterStorageAdapter(Arc::clone(&ingester)));
-    let pusher: Arc<dyn Pusher> = Arc::clone(&adapter) as Arc<dyn Pusher>;
     let notifier: Arc<dyn PreCommitNotifier> = adapter;
 
     let pusher_metrics = PusherConsumerMetrics::new(ingester.registry.as_ref());
-    let mut pusher_consumer = PusherConsumer::new(
-        pusher,
+    let sharded_consumer = Arc::new(IngesterShardedBatchConsumer::new(
+        Arc::clone(&ingester),
         ingester.ingest_cfg.kafka.clone(),
         pusher_metrics,
-    );
-    if ingester.cfg.error_sample_rate > 0 {
-        pusher_consumer =
-            pusher_consumer.with_fallback_client_error_sample_rate(ingester.cfg.error_sample_rate);
-    }
-    let consumer: Arc<dyn RecordBatchConsumer> = Arc::new(pusher_consumer);
+    ));
+    let consumer: Arc<dyn RecordBatchConsumer> = Arc::new(ShardedConsumerHandle(sharded_consumer));
     let max_replay_period = Duration::from_nanos(
         ingester
             .blocks_cfg

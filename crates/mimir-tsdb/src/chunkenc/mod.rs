@@ -18,11 +18,16 @@ pub mod xor2;
 
 use thiserror::Error;
 
-pub use float_histogram::{FloatHistogramAppender, FloatHistogramChunk, FloatHistogramIterator};
+pub use float_histogram::{
+    FloatHistogramAppender, FloatHistogramAppenderState, FloatHistogramChunk,
+    FloatHistogramIterator,
+};
 pub use float_histogram_st::{
     FloatHistogramStAppender, FloatHistogramStChunk, FloatHistogramStIterator,
 };
-pub use histogram::{HistogramAppender, HistogramChunk, HistogramIterator};
+pub use histogram::{
+    HistogramAppender, HistogramAppenderState, HistogramChunk, HistogramIterator,
+};
 pub use histogram_model::{
     CounterResetHeader, CounterResetHint, FloatHistogram, Histogram, HistogramSpan,
     CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMA_MAX, EXPONENTIAL_SCHEMA_MAX_RESERVED,
@@ -30,8 +35,9 @@ pub use histogram_model::{
 };
 pub use histogram_st::{HistogramStAppender, HistogramStChunk, HistogramStIterator};
 pub use ooo::{OooChunk, OooSample, OooSampleValue};
-pub use xor::{XorAppender, XorChunk, XorIterator};
-pub use xor2::{Xor2Appender, Xor2Chunk, Xor2Iterator};
+pub use st::StEncoder;
+pub use xor::{XorAppendState, XorAppender, XorChunk, XorIterator};
+pub use xor2::{Xor2AppendState, Xor2Appender, Xor2Chunk, Xor2Iterator};
 
 /// Maximum size in bytes of an XOR chunk.
 pub const MAX_BYTES_PER_XOR_CHUNK: usize = 1024;

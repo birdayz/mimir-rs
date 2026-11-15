@@ -1280,8 +1280,47 @@ impl DeletedSeries {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct FastU64Hasher(u64);
+
+impl std::hash::Hasher for FastU64Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self
+                .0
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(b as u64);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 32;
+        self.0 = x;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct FastU64BuildHasher;
+
+impl std::hash::BuildHasher for FastU64BuildHasher {
+    type Hasher = FastU64Hasher;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        FastU64Hasher(0)
+    }
+}
+
 struct SeriesStripeInner {
-    refs: HashMap<u64, SeriesEntry>,
+    refs: hashbrown::HashMap<u64, SeriesEntry, FastU64BuildHasher>,
     active: u32,
     active_otlp: u32,
     active_matching: Vec<u32>,
@@ -1305,7 +1344,7 @@ impl SeriesStripe {
         Self {
             oldest_entry_ns: AtomicI64::new(0),
             inner: RwLock::new(SeriesStripeInner {
-                refs: HashMap::new(),
+                refs: hashbrown::HashMap::with_hasher(FastU64BuildHasher),
                 active: 0,
                 active_otlp: 0,
                 active_matching: vec![0; num_matchers],

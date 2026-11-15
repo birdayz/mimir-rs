@@ -402,7 +402,20 @@ impl<'a> TsdbQuerier<'a> {
             blocks: Vec<(ChunkMeta, Vec<Interval>)>,
         }
 
-        let mut per_series: BTreeMap<Labels, SeriesSources> = BTreeMap::new();
+        let est = prepared
+            .head_refs
+            .as_ref()
+            .map_or(0, |r| r.len())
+            .max(
+                prepared
+                    .block_refs
+                    .iter()
+                    .map(|(_, r)| r.len())
+                    .max()
+                    .unwrap_or(0),
+            );
+        let mut per_series: hashbrown::HashMap<Labels, SeriesSources> =
+            hashbrown::HashMap::with_capacity(est);
 
         if let (Some(head), Some(refs)) = (head, prepared.head_refs) {
             for &r in refs.iter() {
@@ -529,8 +542,8 @@ impl<'a> TsdbQuerier<'a> {
             }
         }
 
-        if !sort_series {
-            // `per_series` is already sorted by Labels, which always satisfies both sorted & unsorted callers.
+        if sort_series {
+            out.sort_by(|a, b| a.labels.cmp(&b.labels));
         }
         Ok(out)
     }

@@ -107,6 +107,7 @@ struct ProdBenchConfig {
     topic: String,
     run_go: bool,
     run_rust: bool,
+    no_reads: bool,
     work_dir: Option<PathBuf>,
     perf_out: Option<String>,
 }
@@ -122,6 +123,7 @@ impl Default for ProdBenchConfig {
             topic: "mimir-prod-bench".to_string(),
             run_go: true,
             run_rust: true,
+            no_reads: false,
             work_dir: None,
             perf_out: None,
         }
@@ -158,6 +160,9 @@ fn parse_args() -> ProdBenchConfig {
             "--rust-only" => {
                 cfg.run_go = false;
                 cfg.run_rust = true;
+            }
+            "--no-reads" => {
+                cfg.no_reads = true;
             }
             "--work-dir" => cfg.work_dir = Some(PathBuf::from(next_str(&mut i))),
             "--perf-out" => cfg.perf_out = Some(next_str(&mut i)),
@@ -2189,25 +2194,29 @@ async fn run_engine(
     };
 
     // -----------------------------------------------------------------------
-    // Phase 2: Steady-State Prod Traffic (327k samples/s) + Bimodal Reads
+    // Phase 2: Steady-State Prod Traffic (327k samples/s) + Optional Bimodal Reads
     // -----------------------------------------------------------------------
-    let grpc_ch = Channel::from_shared(format!("http://127.0.0.1:{grpc_port}"))
-        .unwrap()
-        .tcp_nodelay(true)
-        .connect()
-        .await
-        .expect("connect ingester grpc");
-
     let stop_reads = Arc::new(AtomicBool::new(false));
-    let query_start_ms = t_block_end - (cfg.local_blocks as i64) * TWO_HOURS_MS;
-    let query_end_ms = t_p1_c2 + 7_200_000;
-    let read_handle = spawn_read_workers(
-        Arc::clone(&stop_reads),
-        grpc_ch,
-        Arc::clone(layout),
-        query_start_ms,
-        query_end_ms,
-    );
+    let read_handle = if cfg.no_reads {
+        None
+    } else {
+        let grpc_ch = Channel::from_shared(format!("http://127.0.0.1:{grpc_port}"))
+            .unwrap()
+            .tcp_nodelay(true)
+            .connect()
+            .await
+            .expect("connect ingester grpc");
+
+        let query_start_ms = t_block_end - (cfg.local_blocks as i64) * TWO_HOURS_MS;
+        let query_end_ms = t_p1_c2 + 7_200_000;
+        Some(spawn_read_workers(
+            Arc::clone(&stop_reads),
+            grpc_ch,
+            Arc::clone(layout),
+            query_start_ms,
+            query_end_ms,
+        ))
+    };
 
     // Steady-state producer task (runs through Phase 2 AND Phase 3 AND 5s post-Phase-3 WAL warm-up!)
     let stop_steady_prod = Arc::new(AtomicBool::new(false));
@@ -2310,7 +2319,10 @@ async fn run_engine(
     tokio::time::sleep(Duration::from_secs(cfg.steady_secs)).await;
 
     stop_reads.store(true, Ordering::Release);
-    let mut read_stats = read_handle.await.expect("read workers");
+    let mut read_stats = match read_handle {
+        Some(h) => h.await.expect("read workers"),
+        None => ReadStats::default(),
+    };
 
     let p2_wall = p2_start.elapsed().as_secs_f64();
     let p2_stats = read_proc_stats(pid);

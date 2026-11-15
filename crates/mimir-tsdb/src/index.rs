@@ -7,12 +7,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
 use memmap2::{Mmap, MmapOptions};
 use thiserror::Error;
 
 use crate::chunks_block::ChunkMeta;
 use crate::encoding::{Decbuf, Encbuf, EncodingError};
-use crate::labels::Labels;
+use crate::labels::{encode_stringlabel_size, Labels};
 use crate::postings::{merge_postings, PostingsError, PostingsSource};
 
 pub const MAGIC_INDEX: u32 = 0xBAAA_D700;
@@ -747,18 +748,38 @@ impl IndexReader {
         self.mmap.len()
     }
 
-    /// Looks up symbol string by index `o`.
+    /// Looks up symbol string by index `o` (using `SYMBOL_FACTOR = 32` checkpoints and
+    /// pre-validated UTF-8 from `IndexReader::open`, matching Go `tsdb/index`).
+    #[inline]
     pub fn lookup_symbol(&self, o: u32) -> Result<&str, IndexError> {
         if (o as usize) >= self.num_symbols {
             return Err(IndexError::UnknownSymbolOffset(o));
         }
-        let block_off = self.symbol_offsets[(o as usize) / SYMBOL_FACTOR];
-        let mut dec = Decbuf::new(&self.mmap[block_off..]);
+        let mut off = self.symbol_offsets[(o as usize) / SYMBOL_FACTOR];
         let skip = (o as usize) % SYMBOL_FACTOR;
+        let mmap = &self.mmap;
         for _ in 0..skip {
-            let _ = dec.uvarint_bytes()?;
+            let b0 = mmap[off];
+            if b0 < 0x80 {
+                off += 1 + (b0 as usize);
+            } else {
+                let mut dec = Decbuf::new(&mmap[off..]);
+                let len = dec.uvarint()?;
+                let hdr = (mmap.len() - off) - dec.len();
+                off += hdr + len;
+            }
         }
-        Ok(dec.uvarint_str()?)
+        let b0 = mmap[off];
+        let (len, str_off) = if b0 < 0x80 {
+            (b0 as usize, off + 1)
+        } else {
+            let mut dec = Decbuf::new(&mmap[off..]);
+            let len = dec.uvarint()?;
+            let hdr = (mmap.len() - off) - dec.len();
+            (len, off + hdr)
+        };
+        // SAFETY: `parse_symbols_index` validates bounds and UTF-8 for every symbol on open.
+        Ok(unsafe { std::str::from_utf8_unchecked(&mmap[str_off..str_off + len]) })
     }
 
     /// Returns all symbols in ascending lexicographical order.
@@ -799,14 +820,16 @@ impl IndexReader {
         Ok(out)
     }
 
-    /// Decodes the series entry at `ref_id` (`series_id = file_offset / 16`).
-    pub fn series(&self, ref_id: u64) -> Result<(Labels, Vec<ChunkMeta>), IndexError> {
-        let offset = (ref_id as usize) * SERIES_BYTE_ALIGN;
-        let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
-        let mut dec = Decbuf::new(payload);
-
+    #[inline]
+    fn decode_series_labels(&self, dec: &mut Decbuf<'_>) -> Result<Labels, IndexError> {
         let num_labels = dec.uvarint()?;
-        let mut pairs: Vec<(&str, &str)> = Vec::with_capacity(num_labels);
+        if num_labels == 0 {
+            return Ok(Labels::empty());
+        }
+        let mut stack_buf = [0u8; 512];
+        let mut pos = 0usize;
+        let mut heap_buf: Option<Vec<u8>> = None;
+
         for _ in 0..num_labels {
             let lno = dec.uvarint32()?;
             let lvo = dec.uvarint32()?;
@@ -815,9 +838,43 @@ impl IndexReader {
                 None => self.lookup_symbol(lno)?,
             };
             let lv = self.lookup_symbol(lvo)?;
-            pairs.push((ln, lv));
+            let need = (if ln.len() < 255 { 1 } else { 4 })
+                + ln.len()
+                + (if lv.len() < 255 { 1 } else { 4 })
+                + lv.len();
+
+            if let Some(ref mut hb) = heap_buf {
+                encode_stringlabel_size(hb, ln.len());
+                hb.extend_from_slice(ln.as_bytes());
+                encode_stringlabel_size(hb, lv.len());
+                hb.extend_from_slice(lv.as_bytes());
+            } else if pos + need <= stack_buf.len() {
+                pos = write_stringlabel_slice(&mut stack_buf, pos, ln.as_bytes());
+                pos = write_stringlabel_slice(&mut stack_buf, pos, lv.as_bytes());
+            } else {
+                let mut hb = Vec::with_capacity((pos + need) * 2);
+                hb.extend_from_slice(&stack_buf[..pos]);
+                encode_stringlabel_size(&mut hb, ln.len());
+                hb.extend_from_slice(ln.as_bytes());
+                encode_stringlabel_size(&mut hb, lv.len());
+                hb.extend_from_slice(lv.as_bytes());
+                heap_buf = Some(hb);
+            }
         }
-        let labels = Labels::from_sorted_pairs(pairs);
+
+        let bytes = match heap_buf {
+            Some(hb) => Bytes::from(hb),
+            None => Bytes::copy_from_slice(&stack_buf[..pos]),
+        };
+        Ok(Labels::from_raw_stringlabels_bytes(bytes))
+    }
+
+    /// Decodes the series entry at `ref_id` (`series_id = file_offset / 16`).
+    pub fn series(&self, ref_id: u64) -> Result<(Labels, Vec<ChunkMeta>), IndexError> {
+        let offset = (ref_id as usize) * SERIES_BYTE_ALIGN;
+        let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
+        let mut dec = Decbuf::new(payload);
+        let labels = self.decode_series_labels(&mut dec)?;
 
         let num_chunks = dec.uvarint()?;
         let mut chks = Vec::with_capacity(num_chunks);
@@ -853,19 +910,7 @@ impl IndexReader {
         let offset = (ref_id as usize) * SERIES_BYTE_ALIGN;
         let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
         let mut dec = Decbuf::new(payload);
-        let num_labels = dec.uvarint()?;
-        let mut pairs: Vec<(&str, &str)> = Vec::with_capacity(num_labels);
-        for _ in 0..num_labels {
-            let lno = dec.uvarint32()?;
-            let lvo = dec.uvarint32()?;
-            let ln = match self.name_cache.get(&lno) {
-                Some(s) => s.as_str(),
-                None => self.lookup_symbol(lno)?,
-            };
-            let lv = self.lookup_symbol(lvo)?;
-            pairs.push((ln, lv));
-        }
-        Ok(Labels::from_sorted_pairs(pairs))
+        self.decode_series_labels(&mut dec)
     }
 
     /// Decodes a raw postings list at `postings_off`.
@@ -1108,6 +1153,23 @@ fn checked_uvarint_decbuf_at(buf: &[u8], off: usize) -> Result<&[u8], IndexError
     Ok(payload)
 }
 
+#[inline]
+fn write_stringlabel_slice(dst: &mut [u8; 512], mut pos: usize, bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    if len < 255 {
+        dst[pos] = len as u8;
+        pos += 1;
+    } else {
+        dst[pos] = 255;
+        dst[pos + 1] = (len & 0xff) as u8;
+        dst[pos + 2] = ((len >> 8) & 0xff) as u8;
+        dst[pos + 3] = ((len >> 16) & 0xff) as u8;
+        pos += 4;
+    }
+    dst[pos..pos + len].copy_from_slice(bytes);
+    pos + len
+}
+
 fn parse_symbols_index(buf: &[u8], off: usize) -> Result<(Vec<usize>, usize), IndexError> {
     let payload = checked_decbuf_at(buf, off)?;
     let mut dec = Decbuf::new(payload);
@@ -1120,7 +1182,8 @@ fn parse_symbols_index(buf: &[u8], off: usize) -> Result<(Vec<usize>, usize), In
         if seen % SYMBOL_FACTOR == 0 {
             offsets.push(base_pos + orig_len - dec.len());
         }
-        let _ = dec.uvarint_bytes()?;
+        // Validate UTF-8 and bounds once at IndexReader::open so lookup_symbol can skip UTF-8 checks.
+        let _ = dec.uvarint_str()?;
     }
     Ok((offsets, cnt))
 }

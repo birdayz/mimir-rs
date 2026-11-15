@@ -149,6 +149,26 @@ impl HistogramChunk {
         self.b.count = valid_bits;
         Ok(HistogramAppender { chunk: self, state })
     }
+
+    /// Appends `(st, t, h)` in O(1) using a cached [`HistogramAppenderState`],
+    /// recovering state once via [`Self::appender`] only if `*state` is `None`.
+    pub fn append_with_state(
+        &mut self,
+        state: &mut Option<HistogramAppenderState>,
+        st: i64,
+        t: i64,
+        h: &Histogram,
+    ) -> Result<AppendHistogramOutcome, ChunkError> {
+        let mut app = match state.take() {
+            Some(s) => HistogramAppender { chunk: self, state: s },
+            None => self.appender()?,
+        };
+        let out = app.append_histogram(None, st, t, h, false)?;
+        if matches!(out, AppendHistogramOutcome::Appended { .. }) {
+            *state = Some(app.state);
+        }
+        Ok(out)
+    }
 }
 
 /// Snapshot of [`HistogramAppender`] state used to detect counter resets across chunks.

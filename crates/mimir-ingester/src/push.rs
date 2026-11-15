@@ -13,7 +13,9 @@ use mimir_config::LimitsConfig;
 use mimir_proto::cortexpb;
 use mimir_proto::prost::Message;
 use mimir_proto::sharding::shard_by_all_labels;
-use mimir_proto::zerocopy::{BorrowedTimeSeriesView, BorrowedWriteRequest};
+use mimir_proto::zerocopy::{
+    BorrowedExemplarView, BorrowedHistogramView, BorrowedTimeSeriesView, BorrowedWriteRequest,
+};
 use mimir_ring::ring::replication_strategy::WRITE_NO_EXTEND;
 use mimir_tsdb::chunkenc::{CounterResetHint, FloatHistogram, Histogram, HistogramSpan};
 use mimir_tsdb::exemplar::{Exemplar, ExemplarError};
@@ -177,13 +179,119 @@ impl Drop for PairsScratchGuard {
 }
 
 #[inline(always)]
-fn fast_utf8_str(b: &[u8]) -> Result<&str, std::str::Utf8Error> {
+pub(crate) fn fast_utf8_str(b: &[u8]) -> Result<&str, std::str::Utf8Error> {
     if b.is_ascii() {
         // SAFETY: every byte < 0x80 is valid UTF-8.
         Ok(unsafe { std::str::from_utf8_unchecked(b) })
     } else {
         std::str::from_utf8(b)
     }
+}
+
+pub(crate) struct PrehashedSeriesItem<'a> {
+    pub pairs: &'a [(&'a str, &'a str)],
+    pub samples: &'a [cortexpb::Sample],
+    pub created_timestamp: i64,
+    pub prom_hash: u64,
+    pub labels_sorted_unique: bool,
+    pub bad_utf8: bool,
+    pub skip_label_validation: bool,
+    pub histograms: &'a [ConvertedHistogram],
+    pub exemplars: &'a [(i64, f64, Labels, String)],
+}
+
+pub(crate) fn convert_borrowed_histogram(h: &BorrowedHistogramView<'_>) -> ConvertedHistogram {
+    let ts = h.timestamp();
+    let is_float = matches!(h.count(), Some(cortexpb::histogram::Count::CountFloat(_)));
+    let hint = CounterResetHint::from_u8(h.reset_hint() as u8);
+    let pos_spans: Vec<HistogramSpan> = h
+        .positive_spans()
+        .iter()
+        .map(|s| HistogramSpan {
+            offset: s.offset,
+            length: s.length,
+        })
+        .collect();
+    let neg_spans: Vec<HistogramSpan> = h
+        .negative_spans()
+        .iter()
+        .map(|s| HistogramSpan {
+            offset: s.offset,
+            length: s.length,
+        })
+        .collect();
+
+    if is_float {
+        let count = match h.count() {
+            Some(cortexpb::histogram::Count::CountFloat(v)) => v,
+            Some(cortexpb::histogram::Count::CountInt(v)) => v as f64,
+            None => 0.0,
+        };
+        let zero_count = match h.zero_count() {
+            Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(v)) => v,
+            Some(cortexpb::histogram::ZeroCount::ZeroCountInt(v)) => v as f64,
+            None => 0.0,
+        };
+        let buckets = h.positive_counts().len() + h.negative_counts().len();
+        let fh = FloatHistogram {
+            counter_reset_hint: hint,
+            schema: h.schema(),
+            zero_threshold: h.zero_threshold(),
+            zero_count,
+            count,
+            sum: h.sum(),
+            positive_spans: pos_spans,
+            negative_spans: neg_spans,
+            positive_buckets: h.positive_counts().to_vec(),
+            negative_buckets: h.negative_counts().to_vec(),
+            custom_values: h.custom_values().to_vec(),
+        };
+        (ts, true, None, Some(fh), buckets)
+    } else {
+        let count = match h.count() {
+            Some(cortexpb::histogram::Count::CountInt(v)) => v,
+            Some(cortexpb::histogram::Count::CountFloat(v)) => v as u64,
+            None => 0,
+        };
+        let zero_count = match h.zero_count() {
+            Some(cortexpb::histogram::ZeroCount::ZeroCountInt(v)) => v,
+            Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(v)) => v as u64,
+            None => 0,
+        };
+        let buckets = h.positive_deltas().len() + h.negative_deltas().len();
+        let ih = Histogram {
+            counter_reset_hint: hint,
+            schema: h.schema(),
+            zero_threshold: h.zero_threshold(),
+            zero_count,
+            count,
+            sum: h.sum(),
+            positive_spans: pos_spans,
+            negative_spans: neg_spans,
+            positive_buckets: h.positive_deltas().to_vec(),
+            negative_buckets: h.negative_deltas().to_vec(),
+            custom_values: h.custom_values().to_vec(),
+        };
+        (ts, false, Some(ih), None, buckets)
+    }
+}
+
+pub(crate) fn convert_borrowed_exemplar(
+    ex: &BorrowedExemplarView<'_, '_>,
+) -> Result<(i64, f64, Labels, String), IngesterError> {
+    let mut pairs = Vec::with_capacity(ex.labels().len());
+    for lp in ex.labels() {
+        let k = lp.name_str().map_err(|_| IngesterError::BadRequest {
+            message: "invalid UTF-8 in exemplar label name".to_string(),
+        })?;
+        let v = lp.value_str().map_err(|_| IngesterError::BadRequest {
+            message: "invalid UTF-8 in exemplar label value".to_string(),
+        })?;
+        pairs.push((k, v));
+    }
+    let ex_str = format_labels_string(pairs.iter().copied());
+    let labels = Labels::from_pairs(pairs);
+    Ok((ex.timestamp_ms(), ex.value(), labels, ex_str))
 }
 
 /// Abstract view over a single time series in either owned `cortexpb::TimeSeries` or zero-copy `BorrowedTimeSeriesView`.
@@ -363,79 +471,7 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
 
     fn convert_histogram(&self, idx: usize) -> ConvertedHistogram {
         let h = self.histograms().nth(idx).expect("valid histogram idx");
-        let ts = h.timestamp();
-        let is_float = matches!(h.count(), Some(cortexpb::histogram::Count::CountFloat(_)));
-        let hint = CounterResetHint::from_u8(h.reset_hint() as u8);
-        let pos_spans: Vec<HistogramSpan> = h
-            .positive_spans()
-            .iter()
-            .map(|s| HistogramSpan {
-                offset: s.offset,
-                length: s.length,
-            })
-            .collect();
-        let neg_spans: Vec<HistogramSpan> = h
-            .negative_spans()
-            .iter()
-            .map(|s| HistogramSpan {
-                offset: s.offset,
-                length: s.length,
-            })
-            .collect();
-
-        if is_float {
-            let count = match h.count() {
-                Some(cortexpb::histogram::Count::CountFloat(v)) => v,
-                Some(cortexpb::histogram::Count::CountInt(v)) => v as f64,
-                None => 0.0,
-            };
-            let zero_count = match h.zero_count() {
-                Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(v)) => v,
-                Some(cortexpb::histogram::ZeroCount::ZeroCountInt(v)) => v as f64,
-                None => 0.0,
-            };
-            let buckets = h.positive_counts().len() + h.negative_counts().len();
-            let fh = FloatHistogram {
-                counter_reset_hint: hint,
-                schema: h.schema(),
-                zero_threshold: h.zero_threshold(),
-                zero_count,
-                count,
-                sum: h.sum(),
-                positive_spans: pos_spans,
-                negative_spans: neg_spans,
-                positive_buckets: h.positive_counts().to_vec(),
-                negative_buckets: h.negative_counts().to_vec(),
-                custom_values: h.custom_values().to_vec(),
-            };
-            (ts, true, None, Some(fh), buckets)
-        } else {
-            let count = match h.count() {
-                Some(cortexpb::histogram::Count::CountInt(v)) => v,
-                Some(cortexpb::histogram::Count::CountFloat(v)) => v as u64,
-                None => 0,
-            };
-            let zero_count = match h.zero_count() {
-                Some(cortexpb::histogram::ZeroCount::ZeroCountInt(v)) => v,
-                Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(v)) => v as u64,
-                None => 0,
-            };
-            let buckets = h.positive_deltas().len() + h.negative_deltas().len();
-            let ih = Histogram {
-                counter_reset_hint: hint,
-                schema: h.schema(),
-                zero_threshold: h.zero_threshold(),
-                zero_count,
-                count,
-                sum: h.sum(),
-                positive_spans: pos_spans,
-                negative_spans: neg_spans,
-                positive_buckets: h.positive_deltas().to_vec(),
-                negative_buckets: h.negative_deltas().to_vec(),
-                custom_values: h.custom_values().to_vec(),
-            };
-            (ts, false, Some(ih), None, buckets)
-        }
+        convert_borrowed_histogram(&h)
     }
 
     fn exemplar_count(&self) -> usize {
@@ -444,19 +480,7 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
 
     fn exemplar_at(&self, idx: usize) -> Result<(i64, f64, Labels, String), IngesterError> {
         let ex = self.exemplars().nth(idx).expect("valid exemplar idx");
-        let mut pairs = Vec::with_capacity(ex.labels().len());
-        for lp in ex.labels() {
-            let k = lp.name_str().map_err(|_| IngesterError::BadRequest {
-                message: "invalid UTF-8 in exemplar label name".to_string(),
-            })?;
-            let v = lp.value_str().map_err(|_| IngesterError::BadRequest {
-                message: "invalid UTF-8 in exemplar label value".to_string(),
-            })?;
-            pairs.push((k, v));
-        }
-        let ex_str = format_labels_string(pairs.iter().copied());
-        let labels = Labels::from_pairs(pairs);
-        Ok((ex.timestamp_ms(), ex.value(), labels, ex_str))
+        convert_borrowed_exemplar(&ex)
     }
 }
 
@@ -946,7 +970,7 @@ impl Ingester {
         ingested
     }
 
-    fn push_metadata_borrowed(
+    pub(crate) fn push_metadata_borrowed(
         &self,
         user_id: &str,
         req: &BorrowedWriteRequest<'_, '_>,
@@ -976,6 +1000,595 @@ impl Ingester {
         self.metrics.ingested_metadata.inc_by(ingested as f64);
         self.metrics.ingested_metadata_fail.inc_by(failed as f64);
         ingested
+    }
+
+    pub(crate) fn ingest_prehashed_shard_batch(
+        &self,
+        user_id: &str,
+        source: cortexpb::write_request::SourceEnum,
+        min_ts: i64,
+        items: &[PrehashedSeriesItem<'_>],
+    ) -> Result<(), IngesterError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let db = self.get_or_create_tsdb(user_id).map_err(|e| {
+            let wrapped = e.with_user(user_id, 0);
+            if wrapped.error_cause() == cortexpb::ErrorCause::InstanceLimit {
+                wrapped.with_do_not_log()
+            } else {
+                wrapped
+            }
+        })?;
+        let lock_guard = db
+            .acquire_append_lock(min_ts)
+            .map_err(|e| e.with_user(user_id, 0))?;
+
+        let start_append = SystemTime::now();
+        let start_append_ms = start_append
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let add_timer = Instant::now();
+
+        let limits = self.overrides.for_tenant(user_id);
+        let native_histograms_enabled = limits.native_histograms_ingestion_enabled;
+        let max_hist_buckets = limits.max_native_histogram_buckets.max(0) as usize;
+        let creation_grace_ms = (limits.creation_grace_period.0 / 1_000_000).max(0);
+        let past_grace_ms = (limits.past_grace_period.0 / 1_000_000).max(0);
+        let ooo_window_ms = (limits.out_of_order_time_window.0 / 1_000_000).max(0);
+        let ooo_window_dur = Duration::from_millis(ooo_window_ms as u64);
+
+        let max_timestamp_ms = start_append_ms.saturating_add(creation_grace_ms);
+        let min_timestamp_ms = if past_grace_ms > 0 {
+            start_append_ms
+                .saturating_sub(past_grace_ms)
+                .saturating_sub(ooo_window_ms)
+        } else {
+            i64::MIN
+        };
+
+        let head = db.db.head();
+        let min_append_time_available = head.initialized();
+        let min_append_time = head.appendable_min_valid_time();
+        let max_exemplars = self.limiter.max_exemplars_per_user(user_id);
+        let ignore_ooo_exemplars = limits.ignore_ooo_exemplars;
+        let is_otlp = source == cortexpb::write_request::SourceEnum::Otlp;
+        let verify_ownership = self.verify_ring_ownership.load(Ordering::Relaxed);
+        let active_series_enabled = self.cfg.active_series.active_series_metrics_enabled;
+
+        let mut app = db.db.appender_with_capacity(items.len());
+        let mut stats = PushStats::default();
+        let mut first_partial: Option<(IngesterError, Option<SampleKind>)> = None;
+
+        for item in items.iter() {
+            if item.bad_utf8 {
+                drop(app);
+                drop(lock_guard);
+                return Err(IngesterError::BadRequest {
+                    message: "invalid UTF-8 in label".to_string(),
+                }
+                .with_user(user_id, 0));
+            }
+
+            let pairs = item.pairs;
+            let samples = item.samples;
+            let hist_count = item.histograms.len();
+            if !samples.is_empty() && hist_count > 0 {
+                stats.series_with_floats_and_histograms += 1;
+            }
+
+            let mut series_str_cache: Option<String> = None;
+            let mut make_series_str = |ps: &[(&str, &str)]| -> String {
+                if let Some(ref s) = series_str_cache {
+                    return s.clone();
+                }
+                let s = format_labels_string(ps.iter().copied());
+                series_str_cache = Some(s.clone());
+                s
+            };
+            let mut record_partial = |err: IngesterError, kind: Option<SampleKind>| {
+                if first_partial.is_none() {
+                    first_partial = Some((err, kind));
+                }
+            };
+
+            if ooo_window_ms <= 0 && min_append_time_available && item.exemplars.is_empty() {
+                let all_samples_oob = samples.iter().all(|s| s.timestamp_ms < min_append_time);
+                if native_histograms_enabled {
+                    if (!samples.is_empty() || hist_count > 0)
+                        && all_samples_oob
+                        && item.histograms.iter().all(|h| h.0 < min_append_time)
+                    {
+                        let total_oob = samples.len() + hist_count;
+                        stats.failed_samples += total_oob;
+                        stats.sample_timestamp_too_old += total_oob;
+                        let mut first_ts = samples.first().map_or(0, |s| s.timestamp_ms);
+                        if hist_count > 0 {
+                            let h0_ts = item.histograms[0].0;
+                            if first_ts == 0 || h0_ts < first_ts {
+                                first_ts = h0_ts;
+                            }
+                        }
+                        let s_str = make_series_str(pairs);
+                        record_partial(
+                            IngesterError::sample_timestamp_too_old(first_ts, s_str),
+                            Some(SampleKind::SampleTimestampTooOld),
+                        );
+                        continue;
+                    }
+                } else if !samples.is_empty() && all_samples_oob {
+                    stats.failed_samples += samples.len();
+                    stats.sample_timestamp_too_old += samples.len();
+                    let first_ts = samples[0].timestamp_ms;
+                    let s_str = make_series_str(pairs);
+                    record_partial(
+                        IngesterError::sample_timestamp_too_old(first_ts, s_str),
+                        Some(SampleKind::SampleTimestampTooOld),
+                    );
+                    continue;
+                }
+            }
+
+            if !item.labels_sorted_unique {
+                let s_str = make_series_str(pairs);
+                let total_bad =
+                    samples.len() + if native_histograms_enabled { hist_count } else { 0 };
+                stats.failed_samples += total_bad;
+                stats.labels_not_sorted += total_bad;
+                stats.failed_exemplars += item.exemplars.len();
+                record_partial(
+                    IngesterError::labels_not_sorted(s_str),
+                    Some(SampleKind::LabelsNotSorted),
+                );
+                continue;
+            }
+
+            let mut series_entry: Option<Arc<SeriesEntry>> = if !pairs.is_empty() {
+                head.get_entry_by_prehashed_sorted_pairs(item.prom_hash, pairs)
+            } else {
+                None
+            };
+            let mut series_ref = series_entry.as_ref().map(|e| e.ref_id);
+
+            if series_ref.is_none() {
+                if !item.skip_label_validation {
+                    if let Some(err) = validate_label_pairs(pairs, &limits, &mut make_series_str) {
+                        let total_bad = samples.len()
+                            + if native_histograms_enabled { hist_count } else { 0 };
+                        stats.failed_samples += total_bad;
+                        stats.failed_exemplars += item.exemplars.len();
+                        record_partial(err, None);
+                        continue;
+                    }
+                }
+                if verify_ownership && !self.check_ring_ownership(user_id, pairs) {
+                    drop(app);
+                    drop(lock_guard);
+                    return Err(IngesterError::Internal {
+                        message: format!(
+                            "series {} is not owned by this ingester",
+                            make_series_str(pairs)
+                        ),
+                    }
+                    .with_user(user_id, 0));
+                }
+            }
+
+            let prev_succeeded = stats.succeeded_samples;
+            let mut created_ts = item.created_timestamp;
+            let mut ingest_created_ts = created_ts > 0;
+            let first_hist_ts = item.histograms.first().map(|h| h.0);
+
+            for s in samples {
+                if s.timestamp_ms > max_timestamp_ms {
+                    stats.failed_samples += 1;
+                    stats.sample_too_far_in_future += 1;
+                    let s_str = make_series_str(pairs);
+                    record_partial(
+                        IngesterError::sample_too_far_in_future(s.timestamp_ms, s_str),
+                        Some(SampleKind::SampleTimestampTooFarInFuture),
+                    );
+                    continue;
+                }
+                if s.timestamp_ms < min_timestamp_ms {
+                    stats.failed_samples += 1;
+                    stats.sample_too_old += 1;
+                    let s_str = make_series_str(pairs);
+                    record_partial(
+                        IngesterError::sample_too_far_in_past(s.timestamp_ms, s_str),
+                        None,
+                    );
+                    continue;
+                }
+
+                if ingest_created_ts
+                    && created_ts < s.timestamp_ms
+                    && (!native_histograms_enabled
+                        || hist_count == 0
+                        || first_hist_ts.is_none_or(|ht| ht >= s.timestamp_ms))
+                {
+                    match app.append_float_with_entry_prehashed(
+                        &mut series_entry,
+                        Some(item.prom_hash),
+                        pairs,
+                        0,
+                        created_ts,
+                        0.0,
+                        true,
+                    ) {
+                        Ok(r) => {
+                            series_ref = Some(r);
+                            stats.succeeded_samples += 1;
+                        }
+                        Err(
+                            HeadError::DuplicateSampleForTimestamp
+                            | HeadError::DuplicateSampleWithDetails(_)
+                            | HeadError::OutOfOrderSample,
+                        ) => {}
+                        Err(err) => {
+                            if let Err(e) = handle_head_append_error(
+                                err,
+                                created_ts,
+                                pairs,
+                                ooo_window_ms,
+                                ooo_window_dur,
+                                &limits,
+                                &mut stats,
+                                &mut make_series_str,
+                                &mut record_partial,
+                            ) {
+                                drop(app);
+                                drop(lock_guard);
+                                return Err(e.with_user(user_id, 0));
+                            }
+                        }
+                    }
+                    ingest_created_ts = false;
+                    created_ts = 0;
+                }
+
+                match app.append_float_with_entry_prehashed(
+                    &mut series_entry,
+                    Some(item.prom_hash),
+                    pairs,
+                    0,
+                    s.timestamp_ms,
+                    s.value,
+                    false,
+                ) {
+                    Ok(r) => {
+                        series_ref = Some(r);
+                        stats.succeeded_samples += 1;
+                    }
+                    Err(err) => {
+                        if let Err(e) = handle_head_append_error(
+                            err,
+                            s.timestamp_ms,
+                            pairs,
+                            ooo_window_ms,
+                            ooo_window_dur,
+                            &limits,
+                            &mut stats,
+                            &mut make_series_str,
+                            &mut record_partial,
+                        ) {
+                            drop(app);
+                            drop(lock_guard);
+                            return Err(e.with_user(user_id, 0));
+                        }
+                    }
+                }
+            }
+
+            let mut num_native_hist_buckets: i64 = -1;
+            if native_histograms_enabled && hist_count > 0 {
+                for (h_ts, is_float, ih_opt, fh_opt, bucket_count) in item.histograms.iter() {
+                    let h_ts = *h_ts;
+                    let is_float = *is_float;
+                    let bucket_count = *bucket_count;
+
+                    if h_ts > max_timestamp_ms {
+                        stats.failed_samples += 1;
+                        stats.sample_too_far_in_future += 1;
+                        let s_str = make_series_str(pairs);
+                        record_partial(
+                            IngesterError::sample_too_far_in_future(h_ts, s_str),
+                            Some(SampleKind::SampleTimestampTooFarInFuture),
+                        );
+                        continue;
+                    }
+                    if h_ts < min_timestamp_ms {
+                        stats.failed_samples += 1;
+                        stats.sample_too_old += 1;
+                        let s_str = make_series_str(pairs);
+                        record_partial(
+                            IngesterError::sample_too_far_in_past(h_ts, s_str),
+                            None,
+                        );
+                        continue;
+                    }
+                    if max_hist_buckets > 0 && bucket_count > max_hist_buckets {
+                        stats.failed_samples += 1;
+                        stats.invalid_native_histogram += 1;
+                        let s_str = make_series_str(pairs);
+                        record_partial(
+                            IngesterError::max_native_histogram_buckets(
+                                bucket_count,
+                                max_hist_buckets,
+                                s_str,
+                            ),
+                            Some(SampleKind::NativeHistogramValidation),
+                        );
+                        continue;
+                    }
+
+                    if ingest_created_ts && created_ts < h_ts {
+                        let ct_res = if is_float {
+                            let fh_ref = fh_opt.as_ref().expect("float histogram");
+                            let zero_fh = FloatHistogram {
+                                counter_reset_hint: CounterResetHint::CounterReset,
+                                schema: fh_ref.schema,
+                                zero_threshold: fh_ref.zero_threshold,
+                                custom_values: fh_ref.custom_values.clone(),
+                                ..FloatHistogram::default()
+                            };
+                            app.append_float_histogram_reject_ooo(
+                                series_ref, pairs, created_ts, zero_fh,
+                            )
+                        } else {
+                            let ih_ref = ih_opt.as_ref().expect("int histogram");
+                            let zero_ih = Histogram {
+                                counter_reset_hint: CounterResetHint::CounterReset,
+                                schema: ih_ref.schema,
+                                zero_threshold: ih_ref.zero_threshold,
+                                custom_values: ih_ref.custom_values.clone(),
+                                ..Histogram::default()
+                            };
+                            app.append_histogram_reject_ooo(
+                                series_ref, pairs, created_ts, zero_ih,
+                            )
+                        };
+                        match ct_res {
+                            Ok(r) => {
+                                series_ref = Some(r);
+                                stats.succeeded_samples += 1;
+                            }
+                            Err(
+                                HeadError::DuplicateSampleForTimestamp
+                                | HeadError::DuplicateSampleWithDetails(_)
+                                | HeadError::OutOfOrderSample,
+                            ) => {}
+                            Err(err) => {
+                                if let Err(e) = handle_head_append_error(
+                                    err,
+                                    created_ts,
+                                    pairs,
+                                    ooo_window_ms,
+                                    ooo_window_dur,
+                                    &limits,
+                                    &mut stats,
+                                    &mut make_series_str,
+                                    &mut record_partial,
+                                ) {
+                                    drop(app);
+                                    drop(lock_guard);
+                                    return Err(e.with_user(user_id, 0));
+                                }
+                            }
+                        }
+                        ingest_created_ts = false;
+                        created_ts = 0;
+                    }
+
+                    let res = if is_float {
+                        app.append_float_histogram(
+                            series_ref,
+                            pairs,
+                            0,
+                            h_ts,
+                            fh_opt.as_ref().expect("float histogram").clone(),
+                        )
+                    } else {
+                        app.append_histogram(
+                            series_ref,
+                            pairs,
+                            0,
+                            h_ts,
+                            ih_opt.as_ref().expect("int histogram").clone(),
+                        )
+                    };
+
+                    match res {
+                        Ok(r) => {
+                            series_ref = Some(r);
+                            stats.succeeded_samples += 1;
+                            if samples
+                                .last()
+                                .is_none_or(|ls| ls.timestamp_ms < h_ts)
+                            {
+                                num_native_hist_buckets = bucket_count as i64;
+                            }
+                        }
+                        Err(err) => {
+                            if let Err(e) = handle_head_append_error(
+                                err,
+                                h_ts,
+                                pairs,
+                                ooo_window_ms,
+                                ooo_window_dur,
+                                &limits,
+                                &mut stats,
+                                &mut make_series_str,
+                                &mut record_partial,
+                            ) {
+                                drop(app);
+                                drop(lock_guard);
+                                return Err(e.with_user(user_id, 0));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if active_series_enabled && stats.succeeded_samples > prev_succeeded {
+                if let Some(ref_id) = series_ref {
+                    db.active_series.update_series(
+                        pairs,
+                        item.prom_hash,
+                        ref_id,
+                        start_append,
+                        num_native_hist_buckets,
+                        is_otlp,
+                    );
+                }
+            }
+
+            let ex_count = item.exemplars.len();
+            if ex_count > 0 && max_exemplars > 0 {
+                if series_ref.is_none() {
+                    let (ex_ts, _, _, ex_str) = &item.exemplars[0];
+                    let s_str = make_series_str(pairs);
+                    record_partial(
+                        IngesterError::exemplar_missing_series(*ex_ts, s_str, ex_str.clone()),
+                        None,
+                    );
+                    stats.failed_exemplars += ex_count;
+                } else {
+                    let mut out_of_order_exemplars = 0usize;
+                    for (ex_ts, ex_val, ex_labels, ex_str) in item.exemplars {
+                        let ex_ts = *ex_ts;
+                        if ex_ts > max_timestamp_ms {
+                            stats.failed_exemplars += 1;
+                            let s_str = make_series_str(pairs);
+                            record_partial(
+                                IngesterError::exemplar_too_far_in_future(
+                                    ex_ts,
+                                    s_str,
+                                    ex_str.clone(),
+                                ),
+                                None,
+                            );
+                            continue;
+                        }
+                        if ex_ts < min_timestamp_ms {
+                            stats.failed_exemplars += 1;
+                            let s_str = make_series_str(pairs);
+                            record_partial(
+                                IngesterError::exemplar_too_far_in_past(
+                                    ex_ts,
+                                    s_str,
+                                    ex_str.clone(),
+                                ),
+                                None,
+                            );
+                            continue;
+                        }
+                        let exemplar = Exemplar::new(ex_labels.clone(), *ex_val, ex_ts);
+                        match app.append_exemplar(series_ref, pairs, exemplar) {
+                            Ok(_) => stats.succeeded_exemplars += 1,
+                            Err(HeadError::Exemplar(ExemplarError::OutOfOrderExemplar)) => {
+                                stats.failed_exemplars += 1;
+                                out_of_order_exemplars += 1;
+                                if out_of_order_exemplars == ex_count && !ignore_ooo_exemplars {
+                                    let s_str = make_series_str(pairs);
+                                    record_partial(
+                                        IngesterError::TsdbIngestExemplar {
+                                            original_err: "out of order exemplar".to_string(),
+                                            timestamp_ms: ex_ts,
+                                            series_labels: s_str,
+                                            exemplar_labels: ex_str.clone(),
+                                        },
+                                        None,
+                                    );
+                                }
+                            }
+                            Err(HeadError::Exemplar(ex_err)) => {
+                                stats.failed_exemplars += 1;
+                                let s_str = make_series_str(pairs);
+                                record_partial(
+                                    IngesterError::TsdbIngestExemplar {
+                                        original_err: ex_err.to_string(),
+                                        timestamp_ms: ex_ts,
+                                        series_labels: s_str,
+                                        exemplar_labels: ex_str.clone(),
+                                    },
+                                    None,
+                                );
+                            }
+                            Err(e) => {
+                                stats.failed_exemplars += 1;
+                                let s_str = make_series_str(pairs);
+                                record_partial(
+                                    IngesterError::TsdbIngestExemplar {
+                                        original_err: e.to_string(),
+                                        timestamp_ms: ex_ts,
+                                        series_labels: s_str,
+                                        exemplar_labels: ex_str.clone(),
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.metrics
+            .appender_add_duration
+            .observe(add_timer.elapsed().as_secs_f64());
+
+        let commit_timer = Instant::now();
+        if let Err(e) = app.commit() {
+            drop(lock_guard);
+            return Err(IngesterError::Internal {
+                message: format!("failed to commit TSDB appender: {e}"),
+            }
+            .with_user(user_id, stats.failed_samples as i64));
+        }
+        drop(lock_guard);
+        self.metrics
+            .appender_commit_duration
+            .observe(commit_timer.elapsed().as_secs_f64());
+
+        if stats.succeeded_samples > 0 {
+            db.set_last_update(SystemTime::now());
+        }
+
+        self.metrics
+            .ingested_samples
+            .with_label_values(&[user_id])
+            .inc_by(stats.succeeded_samples as f64);
+        self.metrics
+            .ingested_samples_fail
+            .with_label_values(&[user_id])
+            .inc_by(stats.failed_samples as f64);
+        self.metrics
+            .ingested_exemplars
+            .inc_by(stats.succeeded_exemplars as f64);
+        self.metrics
+            .ingested_exemplars_fail
+            .inc_by(stats.failed_exemplars as f64);
+        self.appended_samples
+            .fetch_add(stats.succeeded_samples as i64, Ordering::Relaxed);
+        self.appended_exemplars
+            .fetch_add(stats.succeeded_exemplars as i64, Ordering::Relaxed);
+
+        self.record_discarded_metrics(user_id, "", &stats, source, &db);
+
+        if let Some((partial, sampler_kind)) = first_partial {
+            let err = if let Some(kind) = sampler_kind {
+                let should_log = kind.sampler(&self.error_samplers).should_log();
+                partial.with_sampling(should_log)
+            } else {
+                partial
+            };
+            return Err(err.with_user(user_id, stats.failed_samples as i64));
+        }
+
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

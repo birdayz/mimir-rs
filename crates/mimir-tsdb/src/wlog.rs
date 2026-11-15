@@ -153,7 +153,6 @@ impl Page {
     }
 
     fn reset(&mut self) {
-        self.buf.fill(0);
         self.alloc = 0;
         self.flushed = 0;
     }
@@ -241,6 +240,9 @@ impl WlogWriter {
         let seg = self.segment.as_mut().ok_or(WlogError::Closed)?;
         let should_clear = force_clear || self.page.full();
         if should_clear {
+            if self.page.alloc < PAGE_SIZE {
+                self.page.buf[self.page.alloc..PAGE_SIZE].fill(0);
+            }
             self.page.alloc = PAGE_SIZE;
         }
         let slice = &self.page.buf[self.page.flushed..self.page.alloc];

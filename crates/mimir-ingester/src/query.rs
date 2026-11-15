@@ -1507,20 +1507,20 @@ impl Ingester {
                     message: e.to_string(),
                 })?;
 
-            let base_matching_active: Option<std::collections::HashSet<u64>> =
+            let base_matching_active: Option<hashbrown::HashSet<u64>> =
                 if active_only && !matchers.is_empty() {
                     let base_refs =
                         head.postings_for_matchers_arc(&matchers)
                             .map_err(|e| IngesterError::Internal {
                                 message: e.to_string(),
                             })?;
-                    Some(
-                        base_refs
-                            .iter()
-                            .copied()
-                            .filter(|r| db.active_series.contains_ref(*r))
-                            .collect(),
-                    )
+                    let mut set = hashbrown::HashSet::with_capacity(base_refs.len());
+                    for &r in base_refs.iter() {
+                        if db.active_series.contains_ref(r) {
+                            set.insert(r);
+                        }
+                    }
+                    Some(set)
                 } else {
                     None
                 };

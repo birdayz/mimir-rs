@@ -171,6 +171,29 @@ impl FloatHistogramStChunk {
             st_enc,
         })
     }
+
+    /// Appends `(st, t, fh)` in O(1) using cached `(FloatHistogramAppenderState, StEncoder)`.
+    pub fn append_with_state(
+        &mut self,
+        cached: &mut Option<(FloatHistogramAppenderState, StEncoder)>,
+        st: i64,
+        t: i64,
+        fh: &FloatHistogram,
+    ) -> Result<AppendFloatHistogramStOutcome, ChunkError> {
+        let mut app = match cached.take() {
+            Some((state, st_enc)) => FloatHistogramStAppender {
+                chunk: self,
+                state,
+                st_enc,
+            },
+            None => self.appender()?,
+        };
+        let out = app.append_float_histogram(None, st, t, fh, false)?;
+        if matches!(out, AppendFloatHistogramStOutcome::Appended { .. }) {
+            *cached = Some((app.state, app.st_enc));
+        }
+        Ok(out)
+    }
 }
 
 /// Appender for [`FloatHistogramStChunk`].
