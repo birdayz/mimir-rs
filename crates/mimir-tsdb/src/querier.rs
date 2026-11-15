@@ -215,24 +215,32 @@ impl<'a> TsdbQuerier<'a> {
                         encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
                     } else if chks.len() > 1 {
                         let mut chks = chks;
-                        chks.sort_by_key(|c| (c.min_time, c.max_time));
-                        let has_overlap = chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
-                        if has_overlap {
-                            let mut samples = Vec::new();
-                            for cm in &chks {
-                                if let Some(ref enc) = cm.chunk {
-                                    for s in decode_chunk_samples(enc)? {
-                                        if s.t >= self.mint && s.t <= self.maxt {
-                                            samples.push(s);
+                        let already_sorted_disjoint = chks
+                            .windows(2)
+                            .all(|w| w[0].min_time <= w[1].min_time && w[0].max_time < w[1].min_time);
+                        if already_sorted_disjoint {
+                            chks
+                        } else {
+                            chks.sort_by_key(|c| (c.min_time, c.max_time));
+                            let has_overlap =
+                                chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
+                            if has_overlap {
+                                let mut samples = Vec::new();
+                                for cm in &chks {
+                                    if let Some(ref enc) = cm.chunk {
+                                        for s in decode_chunk_samples(enc)? {
+                                            if s.t >= self.mint && s.t <= self.maxt {
+                                                samples.push(s);
+                                            }
                                         }
                                     }
                                 }
+                                samples.sort_by_key(|s| s.t);
+                                samples.dedup_by_key(|s| s.t);
+                                encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
+                            } else {
+                                chks
                             }
-                            samples.sort_by_key(|s| s.t);
-                            samples.dedup_by_key(|s| s.t);
-                            encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
-                        } else {
-                            chks
                         }
                     } else {
                         chks
@@ -391,6 +399,61 @@ impl<'a> TsdbQuerier<'a> {
         Ok(out)
     }
 
+    /// Queries matching series labels directly (without decoding or cloning chunk bytes).
+    pub fn select_raw_labels(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<Labels>, QuerierError> {
+        let lock_guard = self.blocks_lock.map(|l| l.read());
+        let blocks = self.effective_blocks(&lock_guard);
+        let head = self.effective_head();
+
+        if blocks.is_empty() {
+            let Some(head) = head else {
+                return Ok(Vec::new());
+            };
+            let refs = head.postings_for_matchers(matchers)?;
+            let mut out = Vec::with_capacity(refs.len());
+            for r in refs {
+                if let Some(labels) = head.series_has_chunks_in_range(r, self.mint, self.maxt) {
+                    out.push(labels);
+                }
+            }
+            if sort_series {
+                out.sort();
+            }
+            return Ok(out);
+        }
+
+        let mut set: BTreeSet<Labels> = BTreeSet::new();
+        if let Some(head) = head {
+            let refs = head.postings_for_matchers(matchers)?;
+            for r in refs {
+                if let Some(labels) = head.series_has_chunks_in_range(r, self.mint, self.maxt) {
+                    set.insert(labels);
+                }
+            }
+        }
+        for blk in &blocks {
+            let idx = blk.index();
+            let tombr = blk.tombstones();
+            let refs = postings_for_matchers(idx, matchers)?;
+            for r in refs {
+                let (labels, chks) = idx.series(r)?;
+                let tombs = tombr.get(r);
+                let any_chunk = chks.iter().any(|cm| {
+                    cm.overlaps_closed_interval(self.mint, self.maxt)
+                        && !tombs.iter().any(|iv| iv.is_subrange(cm.min_time, cm.max_time))
+                });
+                if any_chunk {
+                    set.insert(labels);
+                }
+            }
+        }
+        Ok(set.into_iter().collect())
+    }
+
     /// Returns sorted unique label names across Head and overlapping Blocks matching `matchers`.
     pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
@@ -430,10 +493,18 @@ impl<'a> TsdbQuerier<'a> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
         let blocks = self.effective_blocks(&lock_guard);
         let head = self.effective_head();
+
+        if blocks.is_empty() {
+            return match head {
+                Some(h) => Ok(h.label_values_with_limit(name, limit, matchers)?),
+                None => Ok(Vec::new()),
+            };
+        }
+
         let mut set: BTreeSet<String> = BTreeSet::new();
 
         if let Some(head) = head {
-            for val in head.label_values(name, matchers)? {
+            for val in head.label_values_with_limit(name, None, matchers)? {
                 set.insert(val);
             }
         }
@@ -587,6 +658,14 @@ impl<'a> TsdbChunkQuerier<'a> {
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
         self.inner
             .select_chunks_with_mode(sort_series, matchers, self.unordered)
+    }
+
+    pub fn select_raw_labels(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<Labels>, QuerierError> {
+        self.inner.select_raw_labels(sort_series, matchers)
     }
 
     pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {

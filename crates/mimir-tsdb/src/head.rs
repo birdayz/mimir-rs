@@ -2259,7 +2259,7 @@ impl Head {
             }
             SymbolLabels::from_sorted_ids(interned)
         };
-        let labels = Labels::from_sorted_pairs(pairs.iter().copied());
+        let labels = Labels::from_sorted_slice(pairs);
         let ref_id = self.last_series_id.fetch_add(1, Ordering::AcqRel) + 1;
         let entry = Arc::new(SeriesEntry {
             ref_id,
@@ -2948,17 +2948,17 @@ impl Head {
             return Ok(self.postings.label_names(&syms));
         }
         let refs = postings_for_matchers(&self.postings.as_source(&syms), matchers)?;
-        let mut names = HashSet::new();
+        let mut name_ids = HashSet::new();
         for r in refs {
             if let Some(entry) = self.series.get_by_id(r) {
                 for &(nid, _) in entry.symbol_labels.as_slice() {
-                    names.insert(syms.resolve(nid).to_string());
+                    name_ids.insert(nid);
                 }
             }
         }
-        let mut out: Vec<String> = names.into_iter().collect();
-        out.sort_unstable();
-        Ok(out)
+        let mut names: Vec<&str> = name_ids.into_iter().map(|id| syms.resolve(id)).collect();
+        names.sort_unstable();
+        Ok(names.into_iter().map(str::to_string).collect())
     }
 
     pub fn label_values(
@@ -2966,28 +2966,71 @@ impl Head {
         name: &str,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<String>, HeadError> {
+        self.label_values_with_limit(name, None, matchers)
+    }
+
+    pub fn label_values_with_limit(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<String>, HeadError> {
         let syms = self.symbols.read();
         if matchers.is_empty() {
-            return Ok(self.postings.sorted_label_values(name, &syms));
+            return Ok(self.postings.sorted_label_values_with_limit(name, &syms, limit));
         }
         let refs = postings_for_matchers(&self.postings.as_source(&syms), matchers)?;
         let Some(name_id) = syms.get(name) else {
             return Ok(Vec::new());
         };
-        let mut vals = HashSet::new();
+        let mut val_ids = HashSet::new();
         for r in refs {
             if let Some(entry) = self.series.get_by_id(r) {
                 for &(nid, vid) in entry.symbol_labels.as_slice() {
                     if nid == name_id {
-                        vals.insert(syms.resolve(vid).to_string());
+                        val_ids.insert(vid);
                         break;
                     }
                 }
             }
         }
-        let mut out: Vec<String> = vals.into_iter().collect();
-        out.sort_unstable();
-        Ok(out)
+        let mut vals: Vec<&str> = val_ids.into_iter().map(|id| syms.resolve(id)).collect();
+        if let Some(lim) = limit {
+            if lim > 0 && vals.len() > lim {
+                vals.select_nth_unstable(lim - 1);
+                vals.truncate(lim);
+            }
+        }
+        vals.sort_unstable();
+        Ok(vals.into_iter().map(str::to_string).collect())
+    }
+
+    /// Returns `Some(entry.labels.clone())` (O(1) refcount bump, zero chunk clone) if `ref_id`
+    /// has any non-tombstoned chunks overlapping `[mint, maxt]`.
+    pub fn series_has_chunks_in_range(&self, ref_id: u64, mint: i64, maxt: i64) -> Option<Labels> {
+        let entry = self.series.get_by_id(ref_id)?;
+        let tombs = self.tombstones.get(ref_id);
+        let st = entry.inner.lock();
+        let has_chunk = st.head_chunks.iter().any(|hc| {
+            hc.overlaps_closed_interval(mint, maxt)
+                && !tombs.iter().any(|iv| iv.is_subrange(hc.min_time, hc.max_time))
+        }) || st.mmapped_chunks.iter().any(|mc| {
+            mc.overlaps_closed_interval(mint, maxt)
+                && !tombs.iter().any(|iv| iv.is_subrange(mc.min_time, mc.max_time))
+        }) || st.ooo.as_ref().is_some_and(|ooo| {
+            ooo.ooo_mmapped_chunks
+                .iter()
+                .any(|mc| mc.overlaps_closed_interval(mint, maxt))
+                || ooo
+                    .ooo_head_chunk
+                    .as_ref()
+                    .is_some_and(|ohc| ohc.overlaps_closed_interval(mint, maxt))
+        });
+        if has_chunk {
+            Some(entry.labels.clone())
+        } else {
+            None
+        }
     }
 
     /// Reads series labels and encoded chunks (in-order + OOO merged if overlapping) in `[mint, maxt]`.
@@ -3003,23 +3046,37 @@ impl Head {
 
         let (mmapped_in_order, head_chks, mmapped_ooo, ooo_head_chks) = {
             let st = entry.inner.lock();
-            let mmapped_in_order: Vec<MmappedChunk> = st
+            let mmapped_count = st
                 .mmapped_chunks
                 .iter()
                 .filter(|mc| mc.overlaps_closed_interval(mint, maxt))
-                .cloned()
-                .collect();
-            let head_chks: Vec<ChunkMeta> = st
+                .count();
+            let mut mmapped_in_order = Vec::with_capacity(mmapped_count);
+            if mmapped_count > 0 {
+                for mc in &st.mmapped_chunks {
+                    if mc.overlaps_closed_interval(mint, maxt) {
+                        mmapped_in_order.push(*mc);
+                    }
+                }
+            }
+            let head_count = st
                 .head_chunks
                 .iter()
                 .filter(|hc| hc.overlaps_closed_interval(mint, maxt))
-                .map(|hc| ChunkMeta {
-                    ref_id: 0,
-                    min_time: hc.min_time,
-                    max_time: hc.max_time,
-                    chunk: Some(hc.chunk.clone()),
-                })
-                .collect();
+                .count();
+            let mut head_chks = Vec::with_capacity(head_count);
+            if head_count > 0 {
+                for hc in &st.head_chunks {
+                    if hc.overlaps_closed_interval(mint, maxt) {
+                        head_chks.push(ChunkMeta {
+                            ref_id: 0,
+                            min_time: hc.min_time,
+                            max_time: hc.max_time,
+                            chunk: Some(hc.chunk.clone()),
+                        });
+                    }
+                }
+            }
             let mut mmapped_ooo = Vec::new();
             let mut ooo_head_chks = Vec::new();
             if let Some(ref ooo) = st.ooo {

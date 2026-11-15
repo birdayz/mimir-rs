@@ -238,12 +238,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<Self::QueryStreamStream>, Status> {
         let user_id = tenant_from_req(&request)?;
         let (md, _, inner) = request.into_parts();
-        let items = self
+        let stream = self
             .ingester
-            .handle_query_stream(&md, &user_id, inner)
+            .handle_query_stream_rx(&md, &user_id, inner)
             .await
             .map_err(|e| e.map_read_error_to_status())?;
-        Ok(Response::new(vec_to_stream(items)))
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn query_exemplars(
@@ -392,12 +392,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<Self::ActiveSeriesStream>, Status> {
         let user_id = tenant_from_req(&request)?;
         let (md, _, inner) = request.into_parts();
-        let items = self
+        let stream = self
             .ingester
-            .handle_active_series(&md, &user_id, inner)
+            .handle_active_series_rx(&md, &user_id, inner)
             .await
             .map_err(|e| e.map_read_error_to_status())?;
-        Ok(Response::new(vec_to_stream(items)))
+        Ok(Response::new(Box::pin(stream)))
     }
 
     type SearchLabelNamesStream =

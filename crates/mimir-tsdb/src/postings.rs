@@ -316,11 +316,38 @@ impl MemPostings {
             .collect()
     }
 
+    /// Returns all label values for `name` sorted lexicographically, optionally truncated to `limit`
+    /// before allocating `String`s.
+    pub fn sorted_label_values_with_limit(
+        &self,
+        name: &str,
+        symbols: &SymbolTable,
+        limit: Option<usize>,
+    ) -> Vec<String> {
+        let Some(name_id) = symbols.get(name) else {
+            return Vec::new();
+        };
+        let ids: Vec<SymbolId> = {
+            let inner = self.inner.read();
+            match inner.lvs.get(&name_id) {
+                Some(v) => v.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let mut strs: Vec<&str> = ids.into_iter().map(|id| symbols.resolve(id)).collect();
+        if let Some(lim) = limit {
+            if lim > 0 && strs.len() > lim {
+                strs.select_nth_unstable(lim - 1);
+                strs.truncate(lim);
+            }
+        }
+        strs.sort_unstable();
+        strs.into_iter().map(str::to_string).collect()
+    }
+
     /// Returns all label values for `name` sorted lexicographically.
     pub fn sorted_label_values(&self, name: &str, symbols: &SymbolTable) -> Vec<String> {
-        let mut vals = self.label_values(name, symbols);
-        vals.sort_unstable();
-        vals
+        self.sorted_label_values_with_limit(name, symbols, None)
     }
 
     /// Returns all `(name, value)` pairs present in postings sorted lexicographically.
@@ -405,6 +432,12 @@ impl PostingsSource for MemPostingsView<'_> {
         let Some(name_id) = self.symbols.get(name) else {
             return Ok(Vec::new());
         };
+        if values.len() == 1 {
+            return Ok(match self.symbols.get(values[0]) {
+                Some(vid) => self.postings.postings_for_id(name_id, vid),
+                None => Vec::new(),
+            });
+        }
         let value_ids: Vec<SymbolId> = values
             .iter()
             .filter_map(|v| self.symbols.get(v))

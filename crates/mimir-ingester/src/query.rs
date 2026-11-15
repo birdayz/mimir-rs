@@ -29,7 +29,9 @@ use mimir_tsdb::querier::QueryChunkSeries;
 use mimir_tsdb::search::{FuzzAlg, SearchHints, SearchOrdering, SearchResult};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataMap;
+use tonic::Status;
 
 use crate::circuit_breaker::BreakerPermit;
 use crate::errors::IngesterError;
@@ -186,10 +188,11 @@ pub fn from_proto_matchers(
 }
 
 pub fn labels_to_proto_pairs(labels: &Labels) -> Vec<cortexpb::LabelPair> {
-    labels
-        .iter()
-        .map(|(k, v)| cortexpb::LabelPair::from_strs(k, v))
-        .collect()
+    let mut out = Vec::with_capacity(labels.len());
+    for (name, value) in labels.iter_bytes_slices() {
+        out.push(cortexpb::LabelPair { name, value });
+    }
+    out
 }
 
 /// Maps internal Prometheus TSDB chunk encoding to Mimir wire `chunk.Encoding` (`pkg/ingester/client/custom.go`).
@@ -509,12 +512,17 @@ impl Ingester {
         res
     }
 
-    async fn query_stream_inner(
-        &self,
+    /// Streaming `QueryStream` implementation backed by a bounded `mpsc::channel(8)` so
+    /// 128-series label batches and chunk batches are flushed and dropped incrementally
+    /// without buffering the entire query result set in memory.
+    pub async fn handle_query_stream_rx(
+        self: &Arc<Self>,
         md: &MetadataMap,
         user_id: &str,
-        req: &mut ingesterpb::QueryRequest,
-    ) -> Result<Vec<ingesterpb::QueryStreamResponse>, IngesterError> {
+        mut req: ingesterpb::QueryRequest,
+    ) -> Result<ReceiverStream<Result<ingesterpb::QueryStreamResponse, Status>>, IngesterError>
+    {
+        let permit = self.start_read_request(md).await?;
         if req.streaming_chunks_batch_size == 0 {
             req.streaming_chunks_batch_size = FALLBACK_CHUNK_STREAM_BATCH_SIZE;
         }
@@ -525,9 +533,50 @@ impl Ingester {
         self.enforce_read_consistency(md, user_id).await?;
 
         let Some(db) = self.get_tsdb(user_id) else {
-            return Ok(Vec::new());
+            permit.finish(false);
+            let (_tx, rx) = mpsc::channel(1);
+            return Ok(ReceiverStream::new(rx));
         };
 
+        let (tx, rx) = mpsc::channel(8);
+        let ingester = Arc::clone(self);
+        let user_id_owned = user_id.to_string();
+        let start_ts = req.start_timestamp_ms;
+        let end_ts = req.end_timestamp_ms;
+        let batch_limit = req.streaming_chunks_batch_size as usize;
+
+        tokio::spawn(async move {
+            let res = ingester
+                .stream_query_batches(
+                    &db,
+                    &user_id_owned,
+                    start_ts,
+                    end_ts,
+                    batch_limit,
+                    shard,
+                    &matchers,
+                    &tx,
+                )
+                .await;
+            if let Err(e) = res {
+                let _ = tx.send(Err(e.map_read_error_to_status())).await;
+            }
+            permit.finish(false);
+        });
+
+        Ok(ReceiverStream::new(rx))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select_chunk_series_for_query(
+        &self,
+        db: &UserTsdb,
+        user_id: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        shard: Option<(u64, u64)>,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<QueryChunkSeries>, IngesterError> {
         let ooo_window = self
             .overrides
             .for_tenant(user_id)
@@ -542,8 +591,8 @@ impl Ingester {
             let planner: Arc<dyn LookupPlanner> = Arc::new(NoopPlanner);
             let mut planned_cq = PlannedTsdbChunkQuerier::new_with_unordered(
                 Arc::clone(&db.db),
-                req.start_timestamp_ms,
-                req.end_timestamp_ms,
+                start_timestamp_ms,
+                end_timestamp_ms,
                 planner,
                 ooo_window > 0,
             );
@@ -560,12 +609,12 @@ impl Ingester {
                 let mut mq = MirroredChunkQuerier::new_with_meta(
                     user_id,
                     self.metrics.index_lookup_comparison_outcomes.clone(),
-                    req.start_timestamp_ms,
-                    req.end_timestamp_ms,
+                    start_timestamp_ms,
+                    end_timestamp_ms,
                     ChunkBlockMeta::default(),
                     Box::new(planned_cq),
                 );
-                let mut ss = mq.select(true, select_hints.as_ref(), &matchers);
+                let mut ss = mq.select(true, select_hints.as_ref(), matchers);
                 let mut out = Vec::new();
                 while ss.next() {
                     if let Some(s) = ss.at() {
@@ -584,7 +633,7 @@ impl Ingester {
                 let _ = mq.close();
                 out
             } else {
-                let mut ss = planned_cq.select(true, select_hints.as_ref(), &matchers);
+                let mut ss = planned_cq.select(true, select_hints.as_ref(), matchers);
                 let mut out = Vec::new();
                 while ss.next() {
                     if let Some(s) = ss.at() {
@@ -604,22 +653,171 @@ impl Ingester {
         } else {
             let cq = if ooo_window > 0 {
                 db.db
-                    .unordered_chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms)
+                    .unordered_chunk_querier(start_timestamp_ms, end_timestamp_ms)
             } else {
-                db.db
-                    .chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms)
+                db.db.chunk_querier(start_timestamp_ms, end_timestamp_ms)
             };
-            cq.select(true, &matchers)
+            cq.select(true, matchers)
                 .map_err(|e| IngesterError::Internal {
                     message: format!("selecting series from ChunkQuerier: {e}"),
                 })?
         };
 
         if let Some((shard_idx, shard_count)) = shard {
-            chunk_series.retain(|cs| {
-                labels_stable_hash(&cs.labels) % shard_count == shard_idx
-            });
+            chunk_series.retain(|cs| labels_stable_hash(&cs.labels) % shard_count == shard_idx);
         }
+        Ok(chunk_series)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_query_batches(
+        &self,
+        db: &UserTsdb,
+        user_id: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        batch_limit: usize,
+        shard: Option<(u64, u64)>,
+        matchers: &[LabelMatcher],
+        tx: &mpsc::Sender<Result<ingesterpb::QueryStreamResponse, Status>>,
+    ) -> Result<(), IngesterError> {
+        let mut chunk_series = self.select_chunk_series_for_query(
+            db,
+            user_id,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            shard,
+            matchers,
+        )?;
+
+        let num_series = chunk_series.len();
+        let mut series_batch = Vec::with_capacity(QUERY_STREAM_BATCH_SIZE.min(num_series.max(1)));
+        for cs in chunk_series.iter_mut() {
+            let labels = std::mem::take(&mut cs.labels);
+            series_batch.push(ingesterpb::QueryStreamSeries {
+                labels: labels_to_proto_pairs(&labels),
+                chunk_count: cs.chunks.len() as i64,
+            });
+            drop(labels);
+            if series_batch.len() >= QUERY_STREAM_BATCH_SIZE {
+                let resp = ingesterpb::QueryStreamResponse {
+                    streaming_series: std::mem::take(&mut series_batch),
+                    is_end_of_series_stream: false,
+                    streaming_series_chunks: Vec::new(),
+                };
+                if tx.send(Ok(resp)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        if tx
+            .send(Ok(ingesterpb::QueryStreamResponse {
+                streaming_series: series_batch,
+                is_end_of_series_stream: true,
+                streaming_series_chunks: Vec::new(),
+            }))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let mut num_samples = 0usize;
+        let mut chunks_batch = Vec::with_capacity(batch_limit.min(1024));
+        let mut batch_bytes = 0usize;
+
+        for (series_idx, cs) in chunk_series.into_iter().enumerate() {
+            let mut proto_chunks = Vec::with_capacity(cs.chunks.len());
+            for cm in cs.chunks {
+                let Some(enc_chunk) = cm.chunk else {
+                    return Err(IngesterError::Internal {
+                        message: "unfilled chunk returned from TSDB chunk querier".to_string(),
+                    });
+                };
+                num_samples += enc_chunk.num_samples();
+                let wire_enc = tsdb_encoding_to_wire(enc_chunk.encoding());
+                let data = Bytes::from(enc_chunk.into_bytes());
+                proto_chunks.push(ingesterpb::Chunk {
+                    start_timestamp_ms: cm.min_time,
+                    end_timestamp_ms: cm.max_time,
+                    encoding: wire_enc,
+                    data,
+                });
+            }
+
+            let sc = ingesterpb::QueryStreamSeriesChunks {
+                series_index: series_idx as u64,
+                chunks: proto_chunks,
+            };
+            let msg_size = sc.encoded_len();
+
+            if (batch_bytes > 0 && batch_bytes + msg_size > QUERY_STREAM_BATCH_MESSAGE_SIZE)
+                || chunks_batch.len() >= batch_limit
+            {
+                let resp = ingesterpb::QueryStreamResponse {
+                    streaming_series: Vec::new(),
+                    is_end_of_series_stream: false,
+                    streaming_series_chunks: std::mem::take(&mut chunks_batch),
+                };
+                if tx.send(Ok(resp)).await.is_err() {
+                    return Ok(());
+                }
+                batch_bytes = 0;
+            }
+
+            chunks_batch.push(sc);
+            batch_bytes += msg_size;
+        }
+
+        if !chunks_batch.is_empty()
+            && tx
+                .send(Ok(ingesterpb::QueryStreamResponse {
+                    streaming_series: Vec::new(),
+                    is_end_of_series_stream: false,
+                    streaming_series_chunks: chunks_batch,
+                }))
+                .await
+                .is_err()
+        {
+            return Ok(());
+        }
+
+        self.metrics
+            .queried_series
+            .with_label_values(&["merged_blocks"])
+            .observe(num_series as f64);
+        self.metrics.queried_samples.observe(num_samples as f64);
+
+        Ok(())
+    }
+
+    async fn query_stream_inner(
+        &self,
+        md: &MetadataMap,
+        user_id: &str,
+        req: &mut ingesterpb::QueryRequest,
+    ) -> Result<Vec<ingesterpb::QueryStreamResponse>, IngesterError> {
+        if req.streaming_chunks_batch_size == 0 {
+            req.streaming_chunks_batch_size = FALLBACK_CHUNK_STREAM_BATCH_SIZE;
+        }
+        let matchers = from_proto_matchers(&req.matchers)?;
+        let (shard, matchers) = remove_shard_from_matchers(matchers)?;
+
+        self.metrics.queries.inc();
+        self.enforce_read_consistency(md, user_id).await?;
+
+        let Some(db) = self.get_tsdb(user_id) else {
+            return Ok(Vec::new());
+        };
+
+        let mut chunk_series = self.select_chunk_series_for_query(
+            &db,
+            user_id,
+            req.start_timestamp_ms,
+            req.end_timestamp_ms,
+            shard,
+            &matchers,
+        )?;
 
         let num_series = chunk_series.len();
         let mut responses = Vec::with_capacity((num_series / QUERY_STREAM_BATCH_SIZE) + 8);
@@ -988,12 +1186,12 @@ impl Ingester {
             .chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms);
         let mut merged_labels: BTreeSet<Labels> = BTreeSet::new();
         for matchers in &matchers_set {
-            let series = cq.select(true, matchers).map_err(|e| IngesterError::Internal {
-                message: e.to_string(),
-            })?;
-            for cs in series {
-                merged_labels.insert(cs.labels);
-            }
+            let series = cq
+                .select_raw_labels(true, matchers)
+                .map_err(|e| IngesterError::Internal {
+                    message: e.to_string(),
+                })?;
+            merged_labels.extend(series);
         }
         let limit = if req.limit > 0 {
             req.limit as usize
@@ -1247,6 +1445,99 @@ impl Ingester {
         Ok(batches)
     }
 
+    pub async fn handle_active_series_rx(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::ActiveSeriesRequest,
+    ) -> Result<ReceiverStream<Result<ingesterpb::ActiveSeriesResponse, Status>>, IngesterError>
+    {
+        let permit = self.start_read_request(md).await?;
+        let matchers = from_proto_matchers(&req.matchers)?;
+        let (shard, matchers) = remove_shard_from_matchers(matchers)?;
+        self.enforce_read_consistency(md, user_id).await?;
+
+        let Some(db) = self.get_tsdb(user_id) else {
+            permit.finish(false);
+            let (_tx, rx) = mpsc::channel(1);
+            return Ok(ReceiverStream::new(rx));
+        };
+
+        let (tx, rx) = mpsc::channel(8);
+        let is_native_histogram = req.r#type
+            == ingesterpb::active_series_request::RequestType::NativeHistogramSeries as i32;
+
+        tokio::spawn(async move {
+            let head = db.db.head();
+            let refs = if matchers.is_empty() {
+                Ok(Vec::new())
+            } else {
+                head.postings_for_matchers(&matchers)
+                    .map_err(|e| IngesterError::Internal {
+                        message: e.to_string(),
+                    })
+            };
+            let refs = match refs {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(e.map_read_error_to_status())).await;
+                    permit.finish(false);
+                    return;
+                }
+            };
+
+            let mut resp = ingesterpb::ActiveSeriesResponse::default();
+            let mut current_size = 0usize;
+
+            for ref_id in refs {
+                let bucket_count = if is_native_histogram {
+                    let Some(bc) = db.active_series.native_histogram_buckets(ref_id) else {
+                        continue;
+                    };
+                    Some(bc)
+                } else {
+                    if !db.active_series.contains_ref(ref_id) {
+                        continue;
+                    }
+                    None
+                };
+
+                let Some(lbls) = head.series_labels(ref_id) else {
+                    continue;
+                };
+                if let Some((shard_idx, shard_count)) = shard {
+                    if labels_stable_hash(&lbls) % shard_count != shard_idx {
+                        continue;
+                    }
+                }
+
+                let m = cortexpb::Metric {
+                    labels: labels_to_proto_pairs(&lbls),
+                };
+                let m_size = m.encoded_len() + if is_native_histogram { 8 } else { 0 };
+                if current_size + m_size > ACTIVE_SERIES_MAX_SIZE_BYTES && !resp.metric.is_empty()
+                {
+                    if tx.send(Ok(std::mem::take(&mut resp))).await.is_err() {
+                        permit.finish(false);
+                        return;
+                    }
+                    current_size = 0;
+                }
+                resp.metric.push(m);
+                if let Some(bc) = bucket_count {
+                    resp.bucket_count.push(bc);
+                }
+                current_size += m_size;
+            }
+            if !resp.metric.is_empty() {
+                let _ = tx.send(Ok(resp)).await;
+            }
+            permit.finish(false);
+        });
+
+        Ok(ReceiverStream::new(rx))
+    }
+
     pub async fn handle_active_series(
         &self,
         md: &MetadataMap,
@@ -1433,14 +1724,14 @@ fn create_user_stats(
 /// Ported from `prometheus/model/labels/sharding.go:StableHash`, the per-series shard hash
 /// (`memSeries.shardHash`) used by the TSDB head `ShardedPostings`.
 fn labels_stable_hash(lbls: &Labels) -> u64 {
-    let mut buf = Vec::with_capacity(128);
+    let mut h = xxhash_rust::xxh64::Xxh64::new(0);
     for (name, value) in lbls.iter() {
-        buf.extend_from_slice(name.as_bytes());
-        buf.push(0xff);
-        buf.extend_from_slice(value.as_bytes());
-        buf.push(0xff);
+        h.update(name.as_bytes());
+        h.update(&[0xff]);
+        h.update(value.as_bytes());
+        h.update(&[0xff]);
     }
-    xxhash_rust::xxh64::xxh64(&buf, 0)
+    h.digest()
 }
 
 #[allow(dead_code)]

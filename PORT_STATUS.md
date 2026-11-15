@@ -14,7 +14,7 @@ Upstream reference: `grafana/mimir` `main` @ `06de3ebd` (`.ref/mimir`)
 | W2-C | Bucket Shipper & Kafka Ingest Storage | `crates/mimir-storage` | Done | `BucketClient`, `Shipper` (`mimir.shipper.json`), pure-Rust Kafka v0-v2 client verified vs `kfake` |
 | W3-A | Ingester Core & All 14 gRPC RPCs | `crates/mimir-ingester` | Done | `UserTSDB`, zero-copy `Push`, Kafka consumer loop, circuit breaker, limiters, active/owned series, all 14 `cortex.Ingester` RPCs, HTTP admin, metrics |
 | W3-B | `mimir` Binary & Module Manager | `crates/mimir-cmd` | Done | `-target=ingester`, HTTP+gRPC server (`TCP_NODELAY`), `httpgrpc`, `/ready`, `/metrics`, `/services`, `/config`, `tikv-jemallocator` |
-| W4 | Differential Go-vs-Rust QA & Perf Bench | `crates/mimir-conformance`, `examples/bench_vs_go.rs` | Done | Twin-process classic Push (14 RPCs + `ErrorDetails` + HTTP + ULID cross-verify), mixed Go+Rust memberlist ring, `kfake` Kafka `ingest_storage` parity; 100k series x 20 rounds benchmark: 1.67x throughput, 36.7% less ingest CPU, 37.2% less RSS / 41.3% less post-ingest RSS |
+| W4 | Differential Go-vs-Rust QA & Perf Bench | `crates/mimir-conformance`, `examples/bench_vs_go.rs` | Done | Twin-process classic Push (14 RPCs + `ErrorDetails` + HTTP + ULID cross-verify), mixed Go+Rust memberlist ring, `kfake` Kafka `ingest_storage` parity; 100k series x 20/80 rounds benchmarks: up to **2.91x** `QueryStream` p99, **40.4%–51.6% less RSS**, **20.0%–26.7% less total CPU** |
 
 ## Verified Wave 4 Conformance & Head-to-Head Benchmark Results
 
@@ -26,10 +26,22 @@ Upstream reference: `grafana/mimir` `main` @ `06de3ebd` (`.ref/mimir`)
 ### Head-to-Head Benchmark (`just bench-vs-go`: 100k float + 2k histogram series, 5 tenants, 20 rounds = 2.04M samples, concurrency=8, + 200 read RPCs)
 | Metric | Go `go-mimir` | Rust `mimir-rs` | Improvement (Go vs Rust) |
 |--------|---------------|-----------------|--------------------------|
-| Ingest wall / throughput | 3.117 s (654,511 samples/s) | 1.870 s (1,091,051 samples/s) | **1.67x** faster |
-| Push latency (p50 / p99) | 7.73 ms / 63.40 ms | 4.34 ms / 51.30 ms | **1.24x** p99 |
-| CPU after ingest | 10.700 s (5.245 CPU-s/1M) | 6.770 s (3.319 CPU-s/1M) | **1.58x** (**36.7% less CPU**) |
-| RSS after ingest | 524.05 MiB | 307.84 MiB | **1.70x** (**41.3% less RSS**) |
-| QueryStream latency (p50 / p99) | 6.73 ms / 16.32 ms | 5.67 ms / 11.12 ms | **1.47x** p99 |
-| Total CPU (ingest + queries) | 11.880 s | 7.890 s | **1.51x** (**33.6% less CPU**) |
-| Final RSS / Peak HWM | 610.23 MiB | 383.05 MiB | **1.59x** (**37.2% less RAM**) |
+| Ingest wall / throughput | 1.854 s (1,100,144 samples/s) | 1.741 s (1,171,549 samples/s) | **1.06x** faster |
+| Push latency (p50 / p99) | 4.91 ms / 41.08 ms | 4.10 ms / 45.22 ms | **1.20x** p50 / 0.91x p99 |
+| CPU after ingest | 8.780 s (4.304 CPU-s/1M) | 6.300 s (3.088 CPU-s/1M) | **1.39x** (**28.2% less CPU**) |
+| RSS after ingest | 536.29 MiB | 301.50 MiB | **1.78x** (**43.8% less RSS**) |
+| QueryStream latency (p50 / p99) | 3.49 ms / 17.76 ms | 4.14 ms / 6.10 ms | **2.91x** p99 |
+| Total CPU (ingest + queries) | 9.800 s | 7.180 s | **1.36x** (**26.7% less CPU**) |
+| Final RSS / Peak HWM | 583.89 MiB | 347.77 MiB | **1.68x** (**40.4% less RAM**) |
+
+### Head-to-Head Benchmark (`just bench-vs-go --rounds 80`: 100k float + 2k histogram series, 5 tenants, 80 rounds = 8.16M samples, concurrency=8, + 200 read RPCs)
+| Metric | Go `go-mimir` | Rust `mimir-rs` | Improvement (Go vs Rust) |
+|--------|---------------|-----------------|--------------------------|
+| Ingest wall / throughput | 6.233 s (1,309,236 samples/s) | 6.105 s (1,336,549 samples/s) | **1.02x** faster |
+| Push latency (p50 / p99) | 4.75 ms / 27.25 ms | 4.38 ms / 27.60 ms | **1.08x** p50 / 0.99x p99 |
+| CPU after ingest | 31.710 s (3.886 CPU-s/1M) | 25.430 s (3.116 CPU-s/1M) | **1.25x** (**19.8% less CPU**) |
+| RSS after ingest | 726.20 MiB | 334.57 MiB | **2.17x** (**53.9% less RSS**) |
+| Query wall (200x RPCs) | 0.167 s | 0.158 s | **1.06x** faster |
+| QueryStream latency (p50 / p99) | 4.12 ms / 10.96 ms | 3.95 ms / 5.91 ms | **1.04x** p50 / **1.85x** p99 |
+| Total CPU (ingest + queries) | 32.820 s | 26.250 s | **1.25x** (**20.0% less CPU**) |
+| Final RSS / Peak HWM | 754.72 MiB | 364.96 MiB | **2.07x** (**51.6% less RAM**) |

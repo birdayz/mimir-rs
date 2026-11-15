@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hashbrown::HashMap;
 use parking_lot::RwLock;
@@ -101,6 +102,7 @@ pub fn is_completely_deleted(ivs: &[Interval], mint: i64, maxt: i64) -> bool {
 #[derive(Debug, Default)]
 pub struct MemTombstones {
     groups: RwLock<HashMap<u64, Intervals>>,
+    has_tombstones: AtomicBool,
 }
 
 impl MemTombstones {
@@ -112,26 +114,44 @@ impl MemTombstones {
         let mut groups = self.groups.write();
         let ivs = groups.entry(ref_id).or_default();
         add_interval(ivs, itv);
+        if !groups.is_empty() {
+            self.has_tombstones.store(true, Ordering::Release);
+        }
     }
 
     pub fn get(&self, ref_id: u64) -> Intervals {
+        if !self.has_tombstones.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         let groups = self.groups.read();
         groups.get(&ref_id).cloned().unwrap_or_default()
     }
 
     pub fn delete_tombstones(&self, refs: &HashSet<u64>) {
+        if !self.has_tombstones.load(Ordering::Acquire) {
+            return;
+        }
         let mut groups = self.groups.write();
         for r in refs {
             groups.remove(r);
         }
+        if groups.is_empty() {
+            self.has_tombstones.store(false, Ordering::Release);
+        }
     }
 
     pub fn truncate_before(&self, before_t: i64) {
+        if !self.has_tombstones.load(Ordering::Acquire) {
+            return;
+        }
         let mut groups = self.groups.write();
         groups.retain(|_, ivs| {
             ivs.retain(|iv| iv.maxt >= before_t);
             !ivs.is_empty()
         });
+        if groups.is_empty() {
+            self.has_tombstones.store(false, Ordering::Release);
+        }
     }
 
     pub fn total(&self) -> u64 {

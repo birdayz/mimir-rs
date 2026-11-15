@@ -6,6 +6,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
+use bytes::Bytes;
 use smallvec::SmallVec;
 use xxhash_rust::xxh64::xxh64;
 
@@ -97,21 +98,47 @@ pub fn prom_labels_hash<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>)
 /// name and value is prefixed by its `stringlabels` length.
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct Labels {
-    data: Vec<u8>,
+    data: Bytes,
 }
 
 impl Labels {
     /// Returns an empty `Labels` set.
     #[inline]
     pub const fn empty() -> Self {
-        Self { data: Vec::new() }
+        Self { data: Bytes::new() }
     }
 
     /// Constructs sorted `Labels` from `(name, value)` pairs.
     pub fn from_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
         let mut items: SmallVec<[(&str, &str); 16]> = pairs.into_iter().collect();
         items.sort_by(|a, b| a.0.cmp(b.0));
-        Self::from_sorted_pairs(items)
+        Self::from_sorted_slice(&items)
+    }
+
+    /// Constructs `Labels` from an already-sorted slice of `(name, value)` pairs with exact capacity.
+    pub fn from_sorted_slice(pairs: &[(&str, &str)]) -> Self {
+        if pairs.is_empty() {
+            return Self::empty();
+        }
+        let cap: usize = pairs
+            .iter()
+            .map(|(name, value)| {
+                (if name.len() < 255 { 1 } else { 4 })
+                    + name.len()
+                    + (if value.len() < 255 { 1 } else { 4 })
+                    + value.len()
+            })
+            .sum();
+        let mut data = Vec::with_capacity(cap);
+        for &(name, value) in pairs {
+            encode_stringlabel_size(&mut data, name.len());
+            data.extend_from_slice(name.as_bytes());
+            encode_stringlabel_size(&mut data, value.len());
+            data.extend_from_slice(value.as_bytes());
+        }
+        Self {
+            data: Bytes::from(data),
+        }
     }
 
     /// Constructs `Labels` from already-sorted `(name, value)` pairs.
@@ -123,7 +150,9 @@ impl Labels {
             encode_stringlabel_size(&mut data, value.len());
             data.extend_from_slice(value.as_bytes());
         }
-        Self { data }
+        Self {
+            data: Bytes::from(data),
+        }
     }
 
     /// Constructs sorted `Labels` from a slice of [`Label`]s.
@@ -250,6 +279,16 @@ impl Labels {
         }
     }
 
+    /// Iterates over `(name, value)` pairs in sorted order as zero-copy [`Bytes`] slices
+    /// sharing `self`'s backing buffer.
+    #[inline]
+    pub fn iter_bytes_slices(&self) -> impl Iterator<Item = (Bytes, Bytes)> + '_ {
+        LabelsBytesIter {
+            data: &self.data,
+            pos: 0,
+        }
+    }
+
     /// Collects into a `Vec<Label>`.
     pub fn to_vec(&self) -> Vec<Label> {
         self.iter().map(|(n, v)| Label::new(n, v)).collect()
@@ -257,6 +296,9 @@ impl Labels {
 
     /// Returns a copy without any labels whose value is `""`.
     pub fn without_empty(&self) -> Self {
+        if self.iter().all(|(_, v)| !v.is_empty()) {
+            return self.clone();
+        }
         Self::from_sorted_pairs(self.iter().filter(|(_, v)| !v.is_empty()))
     }
 
@@ -329,6 +371,28 @@ impl<'a> Iterator for LabelsIter<'a> {
         let (value, p2) = decode_stringlabel_str(self.data, p1);
         self.pos = p2;
         Some((name, value))
+    }
+}
+
+struct LabelsBytesIter<'a> {
+    data: &'a Bytes,
+    pos: usize,
+}
+
+impl Iterator for LabelsBytesIter<'_> {
+    type Item = (Bytes, Bytes);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+        let (nlen, nstart) = decode_stringlabel_size(self.data, self.pos);
+        let nend = nstart + nlen;
+        let (vlen, vstart) = decode_stringlabel_size(self.data, nend);
+        let vend = vstart + vlen;
+        self.pos = vend;
+        Some((self.data.slice(nstart..nend), self.data.slice(vstart..vend)))
     }
 }
 
@@ -514,5 +578,29 @@ mod tests {
         let ls = Labels::from_pairs([("big", long_val.as_str())]);
         assert_eq!(ls.get("big"), long_val);
         assert_eq!(ls.len(), 1);
+    }
+
+    #[test]
+    fn labels_clone_and_iter_bytes_slices_zero_copy() {
+        let ls = Labels::from_pairs([("__name__", "up"), ("job", "api"), ("instance", "a:1")]);
+        let cloned = ls.clone();
+        assert_eq!(ls.as_bytes().as_ptr(), cloned.as_bytes().as_ptr());
+
+        let base_start = ls.as_bytes().as_ptr() as usize;
+        let base_end = base_start + ls.as_bytes().len();
+        let pairs: Vec<(Bytes, Bytes)> = ls.iter_bytes_slices().collect();
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0.as_ref(), b"__name__");
+        assert_eq!(pairs[0].1.as_ref(), b"up");
+        assert_eq!(pairs[1].0.as_ref(), b"instance");
+        assert_eq!(pairs[1].1.as_ref(), b"a:1");
+        assert_eq!(pairs[2].0.as_ref(), b"job");
+        assert_eq!(pairs[2].1.as_ref(), b"api");
+        for (k, v) in &pairs {
+            let kp = k.as_ptr() as usize;
+            let vp = v.as_ptr() as usize;
+            assert!(kp >= base_start && kp + k.len() <= base_end);
+            assert!(vp >= base_start && vp + v.len() <= base_end);
+        }
     }
 }
