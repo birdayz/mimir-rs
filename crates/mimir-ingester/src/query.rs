@@ -46,6 +46,9 @@ use crate::user_tsdb::UserTsdb;
 pub const QUERY_STREAM_BATCH_SIZE: usize = 128;
 pub const FALLBACK_CHUNK_STREAM_BATCH_SIZE: u64 = 256;
 pub const QUERY_STREAM_BATCH_MESSAGE_SIZE: usize = 1024 * 1024;
+pub type QueryStreamBox = std::pin::Pin<
+    Box<dyn futures::Stream<Item = Result<ingesterpb::QueryStreamResponse, Status>> + Send + 'static>,
+>;
 pub const LABEL_NAMES_AND_VALUES_TARGET_SIZE_BYTES: usize = 1024 * 1024;
 pub const LABEL_VALUES_CARDINALITY_TARGET_SIZE_BYTES: usize = 1024 * 1024;
 pub const ACTIVE_SERIES_MAX_SIZE_BYTES: usize = 1024 * 1024;
@@ -512,6 +515,163 @@ impl Ingester {
         res
     }
 
+    /// Bimodal `QueryStream` implementation:
+    /// - Fast inline path when matching series <= 128, total chunks <= batch_limit, and payload < 1 MiB
+    ///   (builds 1 or 2 `QueryStreamResponse`s synchronously without `tokio::spawn` or `mpsc::channel`).
+    /// - Bounded `mpsc::channel(8)` incremental streamer for larger queries so peak memory stays flat.
+    pub async fn handle_query_stream_bimodal(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        mut req: ingesterpb::QueryRequest,
+    ) -> Result<QueryStreamBox, IngesterError> {
+        let permit = self.start_read_request(md).await?;
+        if req.streaming_chunks_batch_size == 0 {
+            req.streaming_chunks_batch_size = FALLBACK_CHUNK_STREAM_BATCH_SIZE;
+        }
+        let matchers = from_proto_matchers(&req.matchers)?;
+        let (shard, matchers) = remove_shard_from_matchers(matchers)?;
+
+        self.metrics.queries.inc();
+        self.enforce_read_consistency(md, user_id).await?;
+
+        let Some(db) = self.get_tsdb(user_id) else {
+            permit.finish(false);
+            return Ok(Box::pin(tokio_stream::empty()));
+        };
+
+        let mut chunk_series = self.select_chunk_series_for_query(
+            &db,
+            user_id,
+            req.start_timestamp_ms,
+            req.end_timestamp_ms,
+            shard,
+            &matchers,
+        )?;
+
+        let batch_limit = req.streaming_chunks_batch_size as usize;
+        let num_series = chunk_series.len();
+        let total_chunks: usize = chunk_series.iter().map(|cs| cs.chunks.len()).sum();
+        let est_chunk_bytes: usize = chunk_series
+            .iter()
+            .flat_map(|cs| cs.chunks.iter())
+            .map(|cm| cm.chunk.as_ref().map_or(0, |c| c.as_bytes().len() + 32))
+            .sum();
+
+        if num_series <= QUERY_STREAM_BATCH_SIZE
+            && total_chunks <= batch_limit
+            && est_chunk_bytes < QUERY_STREAM_BATCH_MESSAGE_SIZE
+        {
+            if num_series == 0 {
+                self.metrics
+                    .queried_series
+                    .with_label_values(&["merged_blocks"])
+                    .observe(0.0);
+                self.metrics.queried_samples.observe(0.0);
+                permit.finish(false);
+                let resp = ingesterpb::QueryStreamResponse {
+                    streaming_series: Vec::new(),
+                    is_end_of_series_stream: true,
+                    streaming_series_chunks: Vec::new(),
+                };
+                return Ok(Box::pin(tokio_stream::iter(std::iter::once(Ok(resp)))));
+            }
+
+            let mut series_batch = Vec::with_capacity(num_series);
+            for cs in chunk_series.iter_mut() {
+                let labels = std::mem::take(&mut cs.labels);
+                series_batch.push(ingesterpb::QueryStreamSeries {
+                    labels: labels_to_proto_pairs(&labels),
+                    chunk_count: cs.chunks.len() as i64,
+                });
+            }
+
+            let mut responses: smallvec::SmallVec<
+                [Result<ingesterpb::QueryStreamResponse, Status>; 2],
+            > = smallvec::SmallVec::new();
+            responses.push(Ok(ingesterpb::QueryStreamResponse {
+                streaming_series: series_batch,
+                is_end_of_series_stream: true,
+                streaming_series_chunks: Vec::new(),
+            }));
+
+            let mut num_samples = 0usize;
+            let mut chunks_batch = Vec::with_capacity(num_series);
+            let mut batch_bytes = 0usize;
+
+            for (series_idx, cs) in chunk_series.into_iter().enumerate() {
+                let mut proto_chunks = Vec::with_capacity(cs.chunks.len());
+                for cm in cs.chunks {
+                    let Some(enc_chunk) = cm.chunk else {
+                        permit.finish(false);
+                        return Err(IngesterError::Internal {
+                            message: "unfilled chunk returned from TSDB chunk querier".to_string(),
+                        });
+                    };
+                    num_samples += enc_chunk.num_samples();
+                    let wire_enc = tsdb_encoding_to_wire(enc_chunk.encoding());
+                    let data = Bytes::from(enc_chunk.into_bytes());
+                    proto_chunks.push(ingesterpb::Chunk {
+                        start_timestamp_ms: cm.min_time,
+                        end_timestamp_ms: cm.max_time,
+                        encoding: wire_enc,
+                        data,
+                    });
+                }
+
+                let sc = ingesterpb::QueryStreamSeriesChunks {
+                    series_index: series_idx as u64,
+                    chunks: proto_chunks,
+                };
+                let msg_size = sc.encoded_len();
+
+                if (batch_bytes > 0 && batch_bytes + msg_size > QUERY_STREAM_BATCH_MESSAGE_SIZE)
+                    || chunks_batch.len() >= batch_limit
+                {
+                    responses.push(Ok(ingesterpb::QueryStreamResponse {
+                        streaming_series: Vec::new(),
+                        is_end_of_series_stream: false,
+                        streaming_series_chunks: std::mem::take(&mut chunks_batch),
+                    }));
+                    batch_bytes = 0;
+                }
+
+                chunks_batch.push(sc);
+                batch_bytes += msg_size;
+            }
+
+            if !chunks_batch.is_empty() {
+                responses.push(Ok(ingesterpb::QueryStreamResponse {
+                    streaming_series: Vec::new(),
+                    is_end_of_series_stream: false,
+                    streaming_series_chunks: chunks_batch,
+                }));
+            }
+
+            self.metrics
+                .queried_series
+                .with_label_values(&["merged_blocks"])
+                .observe(num_series as f64);
+            self.metrics.queried_samples.observe(num_samples as f64);
+            permit.finish(false);
+            return Ok(Box::pin(tokio_stream::iter(responses)));
+        }
+
+        let (tx, rx) = mpsc::channel(8);
+        let ingester = Arc::clone(self);
+        tokio::spawn(async move {
+            let res = ingester
+                .stream_selected_query_batches(chunk_series, batch_limit, &tx)
+                .await;
+            if let Err(e) = res {
+                let _ = tx.send(Err(e.map_read_error_to_status())).await;
+            }
+            permit.finish(false);
+        });
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
     /// Streaming `QueryStream` implementation backed by a bounded `mpsc::channel(8)` so
     /// 128-series label batches and chunk batches are flushed and dropped incrementally
     /// without buffering the entire query result set in memory.
@@ -681,7 +841,7 @@ impl Ingester {
         matchers: &[LabelMatcher],
         tx: &mpsc::Sender<Result<ingesterpb::QueryStreamResponse, Status>>,
     ) -> Result<(), IngesterError> {
-        let mut chunk_series = self.select_chunk_series_for_query(
+        let chunk_series = self.select_chunk_series_for_query(
             db,
             user_id,
             start_timestamp_ms,
@@ -689,6 +849,16 @@ impl Ingester {
             shard,
             matchers,
         )?;
+        self.stream_selected_query_batches(chunk_series, batch_limit, tx)
+            .await
+    }
+
+    async fn stream_selected_query_batches(
+        &self,
+        mut chunk_series: Vec<QueryChunkSeries>,
+        batch_limit: usize,
+        tx: &mpsc::Sender<Result<ingesterpb::QueryStreamResponse, Status>>,
+    ) -> Result<(), IngesterError> {
 
         let num_series = chunk_series.len();
         let mut series_batch = Vec::with_capacity(QUERY_STREAM_BATCH_SIZE.min(num_series.max(1)));
@@ -2314,5 +2484,129 @@ mod tests {
         assert_eq!(shard, Some((1, 4)));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "__name__");
+    }
+
+    #[tokio::test]
+    async fn bimodal_query_stream_matches_inline_and_channel_paths() {
+        use tokio_stream::StreamExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-0".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ingest_cfg = mimir_config::IngestStorageConfig::default();
+        let overrides = mimir_config::Overrides::new(mimir_config::LimitsConfig::default());
+
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            ingest_cfg,
+            overrides,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        // Push 150 series so we can test 0 (missing), 7 (inline fast path), and 150 (channel streaming path).
+        let mut ts_list = Vec::with_capacity(150);
+        for i in 0..150 {
+            let group = if i < 7 { "small" } else { "large" };
+            ts_list.push(cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair::from_strs("__name__", "bimodal_metric"),
+                    cortexpb::LabelPair::from_strs("group", group),
+                    cortexpb::LabelPair::from_strs("id", format!("{i:03}")),
+                ],
+                samples: vec![cortexpb::Sample {
+                    value: i as f64,
+                    timestamp_ms: 1_000,
+                }],
+                ..Default::default()
+            });
+        }
+        let wr = cortexpb::WriteRequest {
+            timeseries: ts_list,
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            ..Default::default()
+        };
+        ing.push_to_storage("user-a", &wr).unwrap();
+
+        let md = MetadataMap::new();
+        // 1) 0 matching series
+        let req0 = ingesterpb::QueryRequest {
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 2_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__name__".into(),
+                value: "missing_metric".into(),
+            }],
+            ..Default::default()
+        };
+        let mut s0 = ing
+            .handle_query_stream_bimodal(&md, "user-a", req0.clone())
+            .await
+            .unwrap();
+        let mut res0 = Vec::new();
+        while let Some(item) = s0.next().await {
+            res0.push(item.unwrap());
+        }
+        assert_eq!(res0.len(), 1);
+        assert!(res0[0].is_end_of_series_stream);
+        assert!(res0[0].streaming_series.is_empty());
+
+        // 2) 7 matching series (inline fast path <= 128)
+        let req7 = ingesterpb::QueryRequest {
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 2_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "group".into(),
+                value: "small".into(),
+            }],
+            ..Default::default()
+        };
+        let expected7 = ing.handle_query_stream(&md, "user-a", req7.clone()).await.unwrap();
+        let mut s7 = ing
+            .handle_query_stream_bimodal(&md, "user-a", req7)
+            .await
+            .unwrap();
+        let mut got7 = Vec::new();
+        while let Some(item) = s7.next().await {
+            got7.push(item.unwrap());
+        }
+        assert_eq!(got7.len(), 2);
+        assert_eq!(got7, expected7);
+
+        // 3) 150 matching series (channel streaming path > 128)
+        let req150 = ingesterpb::QueryRequest {
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 2_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__name__".into(),
+                value: "bimodal_metric".into(),
+            }],
+            ..Default::default()
+        };
+        let expected150 = ing
+            .handle_query_stream(&md, "user-a", req150.clone())
+            .await
+            .unwrap();
+        let mut s150 = ing
+            .handle_query_stream_bimodal(&md, "user-a", req150)
+            .await
+            .unwrap();
+        let mut got150 = Vec::new();
+        while let Some(item) = s150.next().await {
+            got150.push(item.unwrap());
+        }
+        assert_eq!(got150, expected150);
     }
 }

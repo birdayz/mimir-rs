@@ -240,10 +240,10 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         let (md, _, inner) = request.into_parts();
         let stream = self
             .ingester
-            .handle_query_stream_rx(&md, &user_id, inner)
+            .handle_query_stream_bimodal(&md, &user_id, inner)
             .await
             .map_err(|e| e.map_read_error_to_status())?;
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(stream))
     }
 
     async fn query_exemplars(

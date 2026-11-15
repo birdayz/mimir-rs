@@ -717,14 +717,36 @@ impl SingleClusterPartitionReader {
         consumer: Arc<dyn RecordBatchConsumer>,
         registry: Option<&Registry>,
     ) -> Result<Self, ReaderError> {
+        Self::new_with_notifier(
+            kafka_cfg,
+            partition_id,
+            instance_id,
+            offset_file_path,
+            consumer,
+            Arc::new(NoOpPreCommitNotifier),
+            registry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_notifier(
+        kafka_cfg: KafkaConfig,
+        partition_id: i32,
+        instance_id: &str,
+        offset_file_path: Option<PathBuf>,
+        consumer: Arc<dyn RecordBatchConsumer>,
+        notifier: Arc<dyn PreCommitNotifier>,
+        registry: Option<&Registry>,
+    ) -> Result<Self, ReaderError> {
         let client = Arc::new(KafkaClient::from_config(&kafka_cfg)?);
-        Self::with_client(
+        Self::with_client_and_notifier(
             kafka_cfg,
             partition_id,
             instance_id,
             offset_file_path,
             client,
             consumer,
+            notifier,
             registry,
         )
     }
@@ -1789,6 +1811,31 @@ impl MultiClusterPartitionReader {
         consumer: Arc<dyn RecordBatchConsumer>,
         registry: Option<&Registry>,
     ) -> Result<Self, ReaderError> {
+        Self::new_with_notifier(
+            cluster_configs,
+            ordered_cfg,
+            partition_id,
+            instance_id,
+            offset_file_paths,
+            consumer,
+            Arc::new(NoOpPreCommitNotifier),
+            Duration::ZERO,
+            registry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_notifier(
+        cluster_configs: &[KafkaConfig],
+        ordered_cfg: &OrderedConsumptionConfig,
+        partition_id: i32,
+        instance_id: &str,
+        offset_file_paths: Vec<Option<PathBuf>>,
+        consumer: Arc<dyn RecordBatchConsumer>,
+        notifier: Arc<dyn PreCommitNotifier>,
+        max_replay_period: Duration,
+        registry: Option<&Registry>,
+    ) -> Result<Self, ReaderError> {
         if cluster_configs.is_empty() {
             return Err(ReaderError::Config(
                 "at least one Kafka cluster must be configured".to_string(),
@@ -1851,15 +1898,19 @@ impl MultiClusterPartitionReader {
                 };
 
             let cluster_instance = format!("{instance_id}-wc-{cluster_id}");
-            let r = Arc::new(SingleClusterPartitionReader::new(
+            let mut r = SingleClusterPartitionReader::new_with_notifier(
                 cfg.clone(),
                 partition_id,
                 &cluster_instance,
                 off_path,
                 cluster_consumer,
+                Arc::clone(&notifier),
                 registry,
-            )?);
-            readers.push(r);
+            )?;
+            if !max_replay_period.is_zero() {
+                r = r.with_max_replay_period(max_replay_period);
+            }
+            readers.push(Arc::new(r));
         }
 
         let merger_holder = shared_merger

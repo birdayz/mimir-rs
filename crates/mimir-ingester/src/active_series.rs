@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
+
 use mimir_tsdb::labels::{Labels, METRIC_NAME};
 use mimir_tsdb::matcher::{LabelMatcher, MatchType};
 use mimir_tsdb::postings::MemPostings;
@@ -1176,11 +1178,10 @@ impl SeriesIndexReader for mimir_tsdb::head::Head {
 // ActiveSeries & Stripes (`activeseries/active_series.go`)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
 struct SeriesEntry {
-    nanos: Arc<AtomicI64>,
+    nanos: AtomicI64,
     matches: PreAllocDynamicSlice,
-    num_native_histogram_buckets: i64, // -1 if not a native histogram
+    num_native_histogram_buckets: i32, // -1 if not a native histogram
     flags: u8,
 }
 
@@ -1200,8 +1201,8 @@ impl SeriesEntry {
 
 #[derive(Default)]
 struct DeletedSeriesInner {
-    keys: HashMap<u64, Vec<u8>>,
-    refs: HashMap<Vec<u8>, u64>,
+    keys: HashMap<u64, Bytes>,
+    refs: HashMap<Bytes, u64>,
 }
 
 #[derive(Default)]
@@ -1210,8 +1211,12 @@ struct DeletedSeries {
 }
 
 impl DeletedSeries {
+    fn is_empty(&self) -> bool {
+        self.inner.lock().refs.is_empty()
+    }
+
     fn add(&self, ref_id: u64, labels: &Labels) {
-        let bytes = labels.as_bytes().to_vec();
+        let bytes = Bytes::copy_from_slice(labels.as_bytes());
         let mut g = self.inner.lock();
         g.keys.insert(ref_id, bytes.clone());
         g.refs.insert(bytes, ref_id);
@@ -1293,6 +1298,7 @@ impl SeriesStripe {
         num_native_histogram_buckets: i64,
         is_otlp: bool,
     ) -> bool {
+        let buckets_i32 = num_native_histogram_buckets.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let mut need_write = false;
         let mut created = false;
         let mut entry_time_set = false;
@@ -1313,7 +1319,7 @@ impl SeriesStripe {
                         entry_time_set = true;
                     }
                 }
-                if entry.num_native_histogram_buckets != num_native_histogram_buckets
+                if entry.num_native_histogram_buckets != buckets_i32
                     || (is_otlp && !entry.is_otlp())
                 {
                     need_write = true;
@@ -1326,7 +1332,7 @@ impl SeriesStripe {
         if need_write {
             let mut guard = self.inner.write();
             if guard.refs.contains_key(&ref_id) {
-                let (old_buckets, was_otlp, matches, nanos_arc) = {
+                let (old_buckets, was_otlp, matches) = {
                     let entry = guard.refs.get_mut(&ref_id).expect("checked contains_key");
                     let prev = entry.nanos.load(Ordering::Relaxed);
                     if now_ns > prev {
@@ -1338,17 +1344,16 @@ impl SeriesStripe {
                         entry.flags |= FLAG_IS_OTLP;
                     }
                     let old_b = entry.num_native_histogram_buckets;
-                    if old_b != num_native_histogram_buckets {
-                        entry.num_native_histogram_buckets = num_native_histogram_buckets;
+                    if old_b != buckets_i32 {
+                        entry.num_native_histogram_buckets = buckets_i32;
                     }
-                    (old_b, was_otlp, entry.matches.clone(), Arc::clone(&entry.nanos))
+                    (old_b, was_otlp, entry.matches.clone())
                 };
-                let _ = nanos_arc;
                 if is_otlp && !was_otlp {
                     guard.active_otlp += 1;
                 }
-                if old_buckets != num_native_histogram_buckets {
-                    if old_buckets >= 0 && num_native_histogram_buckets < 0 {
+                if old_buckets != buckets_i32 {
+                    if old_buckets >= 0 && buckets_i32 < 0 {
                         guard.active_native_histograms =
                             guard.active_native_histograms.saturating_sub(1);
                         guard.active_native_histogram_buckets = guard
@@ -1364,9 +1369,9 @@ impl SeriesStripe {
                                 *v = v.saturating_sub(old_buckets as u32);
                             }
                         }
-                    } else if old_buckets < 0 && num_native_histogram_buckets >= 0 {
+                    } else if old_buckets < 0 && buckets_i32 >= 0 {
                         guard.active_native_histograms += 1;
-                        guard.active_native_histogram_buckets += num_native_histogram_buckets as u32;
+                        guard.active_native_histogram_buckets += buckets_i32 as u32;
                         for idx in matches.iter() {
                             if let Some(v) = guard.active_matching_native_histograms.get_mut(idx) {
                                 *v += 1;
@@ -1374,11 +1379,11 @@ impl SeriesStripe {
                             if let Some(v) =
                                 guard.active_matching_native_histogram_buckets.get_mut(idx)
                             {
-                                *v += num_native_histogram_buckets as u32;
+                                *v += buckets_i32 as u32;
                             }
                         }
-                    } else if old_buckets >= 0 && num_native_histogram_buckets >= 0 {
-                        let delta = num_native_histogram_buckets - old_buckets;
+                    } else if old_buckets >= 0 && buckets_i32 >= 0 {
+                        let delta = buckets_i32 - old_buckets;
                         if delta >= 0 {
                             guard.active_native_histogram_buckets += delta as u32;
                             for idx in matches.iter() {
@@ -1411,11 +1416,11 @@ impl SeriesStripe {
                                 &lbls_owned
                             }
                         };
-                        cat.decrement(lbls, old_buckets);
+                        cat.decrement(lbls, old_buckets as i64);
                         cat.increment(
                             lbls,
                             UNIX_EPOCH + Duration::from_nanos(now_ns.max(0) as u64),
-                            num_native_histogram_buckets,
+                            buckets_i32 as i64,
                         );
                     }
                 }
@@ -1437,16 +1442,16 @@ impl SeriesStripe {
                         *v += 1;
                     }
                 }
-                if num_native_histogram_buckets >= 0 {
+                if buckets_i32 >= 0 {
                     guard.active_native_histograms += 1;
-                    guard.active_native_histogram_buckets += num_native_histogram_buckets as u32;
+                    guard.active_native_histogram_buckets += buckets_i32 as u32;
                     for idx in matches.iter() {
                         if let Some(v) = guard.active_matching_native_histograms.get_mut(idx) {
                             *v += 1;
                         }
                         if let Some(v) = guard.active_matching_native_histogram_buckets.get_mut(idx)
                         {
-                            *v += num_native_histogram_buckets as u32;
+                            *v += buckets_i32 as u32;
                         }
                     }
                 }
@@ -1463,16 +1468,16 @@ impl SeriesStripe {
                     cat.increment(
                         lbls,
                         UNIX_EPOCH + Duration::from_nanos(now_ns.max(0) as u64),
-                        num_native_histogram_buckets,
+                        buckets_i32 as i64,
                     );
                 }
 
                 guard.refs.insert(
                     ref_id,
                     SeriesEntry {
-                        nanos: Arc::new(AtomicI64::new(now_ns)),
+                        nanos: AtomicI64::new(now_ns),
                         matches,
-                        num_native_histogram_buckets,
+                        num_native_histogram_buckets: buckets_i32,
                         flags,
                     },
                 );
@@ -1537,7 +1542,7 @@ impl SeriesStripe {
         }
         if let Some(ref cat) = guard.cat {
             match idx.and_then(|r| r.series_labels(ref_id)) {
-                Some(lbls) => cat.decrement(&lbls, entry.num_native_histogram_buckets),
+                Some(lbls) => cat.decrement(&lbls, entry.num_native_histogram_buckets as i64),
                 None => guard.attribution_failures += 1.0,
             }
         }
@@ -1618,7 +1623,7 @@ impl SeriesStripe {
                             cat.increment(
                                 lbls,
                                 UNIX_EPOCH + Duration::from_nanos(ts.max(0) as u64),
-                                entry.num_native_histogram_buckets,
+                                entry.num_native_histogram_buckets as i64,
                             );
                         }
                     }
@@ -1635,7 +1640,7 @@ impl SeriesStripe {
                             cat.increment(
                                 &lbls,
                                 UNIX_EPOCH + Duration::from_nanos(ts.max(0) as u64),
-                                entry.num_native_histogram_buckets,
+                                entry.num_native_histogram_buckets as i64,
                             );
                         }
                     }
@@ -1719,7 +1724,7 @@ impl SeriesStripe {
             if let Some(entry) = guard.refs.remove(&ref_id) {
                 if let Some(ref cat) = guard.cat {
                     match idx.and_then(|r| r.series_labels(ref_id)) {
-                        Some(lbls) => cat.decrement(&lbls, entry.num_native_histogram_buckets),
+                        Some(lbls) => cat.decrement(&lbls, entry.num_native_histogram_buckets as i64),
                         None => guard.attribution_failures += 1.0,
                     }
                 }
@@ -1729,7 +1734,7 @@ impl SeriesStripe {
             }
         }
 
-        let entries: Vec<(PreAllocDynamicSlice, i64, bool)> = guard
+        let entries: Vec<(PreAllocDynamicSlice, i32, bool)> = guard
             .refs
             .values()
             .map(|e| (e.matches.clone(), e.num_native_histogram_buckets, e.is_otlp()))
@@ -1883,7 +1888,7 @@ impl ActiveSeries {
             num_native_histogram_buckets,
             is_otlp,
         );
-        if created {
+        if created && !self.deleted.is_empty() {
             let lbls = Labels::from_pairs(pairs.iter().copied());
             if let Some(deleted_ref) = self.deleted.find(lbls.as_bytes()) {
                 let d_stripe = (deleted_ref as usize) % NUM_STRIPES;
@@ -1911,7 +1916,7 @@ impl ActiveSeries {
             num_native_histogram_buckets,
             is_otlp,
         );
-        if created {
+        if created && !self.deleted.is_empty() {
             if let Some(deleted_ref) = self.deleted.find(series.as_bytes()) {
                 let d_stripe = (deleted_ref as usize) % NUM_STRIPES;
                 self.stripes[d_stripe].remove(deleted_ref, idx, &self.deleted);
@@ -2354,5 +2359,21 @@ mod tests {
 
         tracker.purge(t0 + Duration::from_secs(120));
         assert_eq!(tracker.active(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn series_entry_layout_is_compact_and_deleted_shares_bytes() {
+        assert!(
+            std::mem::size_of::<SeriesEntry>() <= 56,
+            "SeriesEntry grew unexpectedly: {}",
+            std::mem::size_of::<SeriesEntry>()
+        );
+        let deleted = DeletedSeries::default();
+        let lbls = Labels::from_pairs([("__name__", "up"), ("job", "api")]);
+        deleted.add(42, &lbls);
+        assert!(!deleted.is_empty());
+        assert_eq!(deleted.find(lbls.as_bytes()), Some(42));
+        deleted.purge(42);
+        assert!(deleted.is_empty());
     }
 }

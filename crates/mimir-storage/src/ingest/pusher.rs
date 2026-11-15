@@ -12,14 +12,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use mimir_config::KafkaConfig;
 use mimir_proto::cortexpb::{self, is_client_error_cause, ErrorCause};
+use mimir_proto::symbols::V2_COMMON_SYMBOLS_LIST;
+use mimir_proto::zerocopy::{BorrowedWriteRequest, WriteRequestScratch};
 use parking_lot::Mutex as SyncMutex;
 use prometheus::{Counter, CounterVec, Histogram, HistogramOpts, HistogramVec, Opts, Registry};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
+
+use super::kafka_client::FetchedRecord;
+use super::reader::RecordBatchConsumer;
+use super::version::{deserialize_record_content, parse_record_version};
 
 /// Standard xxHash64 (seed 0), matching `github.com/cespare/xxhash/v2.Sum64`.
 fn xxh64_seed0(data: &[u8]) -> u64 {
@@ -91,9 +98,94 @@ fn xxh64_seed0(data: &[u8]) -> u64 {
     h ^ (h >> 32)
 }
 
-use super::kafka_client::FetchedRecord;
-use super::version::{deserialize_record_content, parse_record_version};
-use mimir_proto::zerocopy::WriteRequestScratch;
+fn slice_to_bytes(payload: &Bytes, s: &[u8]) -> Bytes {
+    if s.is_empty() {
+        return Bytes::new();
+    }
+    let base = payload.as_ptr() as usize;
+    let ptr = s.as_ptr() as usize;
+    if ptr >= base && ptr + s.len() <= base + payload.len() {
+        return payload.slice_ref(s);
+    }
+    for &sym in V2_COMMON_SYMBOLS_LIST {
+        let sb = sym.as_bytes();
+        let s_base = sb.as_ptr() as usize;
+        if ptr >= s_base && ptr + s.len() <= s_base + sb.len() {
+            return Bytes::from_static(&sb[ptr - s_base..ptr - s_base + s.len()]);
+        }
+    }
+    Bytes::copy_from_slice(s)
+}
+
+fn borrowed_write_request_to_owned_with_backing(
+    borrowed: &BorrowedWriteRequest<'_, '_>,
+    payload: &Bytes,
+) -> cortexpb::WriteRequest {
+    let mut timeseries = Vec::with_capacity(borrowed.timeseries_len());
+    for ts in borrowed.timeseries() {
+        let mut labels = Vec::with_capacity(ts.labels().len());
+        for l in ts.labels() {
+            labels.push(cortexpb::LabelPair {
+                name: slice_to_bytes(payload, l.name),
+                value: slice_to_bytes(payload, l.value),
+            });
+        }
+        let samples = ts.samples().to_vec();
+        let exemplars = if ts.exemplars().len() == 0 {
+            Vec::new()
+        } else {
+            ts.exemplars()
+                .map(|e| cortexpb::Exemplar {
+                    labels: e
+                        .labels()
+                        .map(|l| cortexpb::LabelPair {
+                            name: slice_to_bytes(payload, l.name),
+                            value: slice_to_bytes(payload, l.value),
+                        })
+                        .collect(),
+                    value: e.value(),
+                    timestamp_ms: e.timestamp_ms(),
+                })
+                .collect()
+        };
+        let histograms = if ts.histograms().len() == 0 {
+            Vec::new()
+        } else {
+            ts.histograms().map(|h| h.to_owned_histogram()).collect()
+        };
+        timeseries.push(cortexpb::TimeSeries {
+            labels,
+            samples,
+            exemplars,
+            histograms,
+            created_timestamp: ts.created_timestamp(),
+        });
+    }
+
+    let metadata = if borrowed.metadata_len() == 0 {
+        Vec::new()
+    } else {
+        borrowed
+            .metadata()
+            .map(|m| cortexpb::MetricMetadata {
+                r#type: m.metric_type,
+                metric_family_name: m.metric_family_name.to_owned(),
+                help: m.help.to_owned(),
+                unit: m.unit.to_owned(),
+            })
+            .collect()
+    };
+
+    cortexpb::WriteRequest {
+        timeseries,
+        source: borrowed.source,
+        metadata,
+        symbols_rw2: Vec::new(),
+        timeseries_rw2: Vec::new(),
+        skip_label_validation: borrowed.skip_label_validation,
+        skip_label_count_validation: borrowed.skip_label_count_validation,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PreCommitNotifier & Pusher Traits
@@ -471,6 +563,15 @@ pub struct PusherConsumer {
     log_sink: Option<Arc<SyncMutex<Vec<String>>>>,
 }
 
+impl RecordBatchConsumer for PusherConsumer {
+    fn consume(
+        &self,
+        records: Vec<FetchedRecord>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(self.consume(records))
+    }
+}
+
 impl PusherConsumer {
     pub fn new(
         pusher: Arc<dyn Pusher>,
@@ -506,10 +607,22 @@ impl PusherConsumer {
     }
 
     async fn consume_inner(&self, records: Vec<FetchedRecord>) -> Result<(), String> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
         let mut bytes_per_tenant: HashMap<String, usize> = HashMap::new();
         for rec in &records {
-            let tenant = String::from_utf8_lossy(&rec.key).into_owned();
-            *bytes_per_tenant.entry(tenant).or_insert(0) += rec.value.len();
+            if let Ok(tenant) = std::str::from_utf8(&rec.key) {
+                if let Some(entry) = bytes_per_tenant.get_mut(tenant) {
+                    *entry += rec.value.len();
+                } else {
+                    bytes_per_tenant.insert(tenant.to_owned(), rec.value.len());
+                }
+            } else {
+                let tenant = String::from_utf8_lossy(&rec.key).into_owned();
+                *bytes_per_tenant.entry(tenant).or_insert(0) += rec.value.len();
+            }
         }
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -526,7 +639,10 @@ impl PusherConsumer {
                     rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
                 );
                 let parsed = match deserialize_record_content(&rec.value, version, &mut scratch) {
-                    Ok(borrowed) => Ok(borrowed.to_owned_write_request()),
+                    Ok(borrowed) => Ok(borrowed_write_request_to_owned_with_backing(
+                        &borrowed,
+                        &rec.value,
+                    )),
                     Err(e) => Err(format!("parsing ingest consumer write request: {e}")),
                 };
 
@@ -709,7 +825,7 @@ impl SequentialStoragePusher {
 
 pub struct ParallelStoragePusher {
     metrics: StoragePusherMetrics,
-    pushers: HashMap<String, ParallelStorageShards>,
+    pushers: HashMap<String, Vec<(i32, ParallelStorageShards)>>,
     upstream_pusher: Arc<dyn Pusher>,
     error_handler: Arc<PushErrorHandler>,
     max_shards: usize,
@@ -767,11 +883,14 @@ impl ParallelStoragePusher {
         user_id: &str,
         source: i32,
     ) -> &mut ParallelStorageShards {
-        let source_name = cortexpb::write_request::SourceEnum::try_from(source)
-            .map(|s| s.as_str_name())
-            .unwrap_or("API");
-        let key = format!("{user_id}|{source_name}");
-        if !self.pushers.contains_key(&key) {
+        let norm_source = cortexpb::write_request::SourceEnum::try_from(source)
+            .map(|s| s as i32)
+            .unwrap_or(cortexpb::write_request::SourceEnum::Api as i32);
+        let has_entry = self
+            .pushers
+            .get(user_id)
+            .is_some_and(|list| list.iter().any(|(s, _)| *s == norm_source));
+        if !has_entry {
             let ideal = self.ideal_shards_for(user_id);
             let shards = ParallelStorageShards::new(
                 self.metrics.clone(),
@@ -781,9 +900,15 @@ impl ParallelStoragePusher {
                 self.queue_capacity,
                 Arc::clone(&self.upstream_pusher),
             );
-            self.pushers.insert(key.clone(), shards);
+            if let Some(list) = self.pushers.get_mut(user_id) {
+                list.push((norm_source, shards));
+            } else {
+                self.pushers
+                    .insert(user_id.to_owned(), vec![(norm_source, shards)]);
+            }
         }
-        self.pushers.get_mut(&key).unwrap()
+        let list = self.pushers.get_mut(user_id).unwrap();
+        &mut list.iter_mut().find(|(s, _)| *s == norm_source).unwrap().1
     }
 
     pub async fn push_to_storage_and_release_request(
@@ -798,9 +923,12 @@ impl ParallelStoragePusher {
 
     pub async fn close(&mut self) -> Vec<PusherError> {
         let mut errs = Vec::new();
-        let num_pushers = self.pushers.len();
-        for (_, shards) in self.pushers.drain() {
-            errs.extend(shards.close().await);
+        let mut num_pushers = 0usize;
+        for (_, list) in self.pushers.drain() {
+            num_pushers += list.len();
+            for (_, shards) in list {
+                errs.extend(shards.close().await);
+            }
         }
         self.metrics
             .shards_per_push
@@ -828,6 +956,7 @@ pub struct ParallelStorageShards {
     shards: Vec<BatchingQueue>,
     workers: Vec<JoinHandle<()>>,
     rr_seed: AtomicU64,
+    hash_buf: Vec<u8>,
 }
 
 impl ParallelStorageShards {
@@ -891,6 +1020,11 @@ impl ParallelStorageShards {
             shards,
             workers,
             rr_seed: AtomicU64::new(0x517cc1b727220a95),
+            hash_buf: if num_shards > 1 {
+                Vec::with_capacity(1024)
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -899,16 +1033,11 @@ impl ParallelStorageShards {
         tenant_id: &str,
         request: cortexpb::WriteRequest,
     ) -> Result<(), PusherError> {
-        let mut hash_buf = if self.num_shards > 1 {
-            Vec::with_capacity(1024)
-        } else {
-            Vec::new()
-        };
         let source = request.source;
 
         for ts in request.timeseries {
             let shard = if self.num_shards > 1 {
-                (label_adapters_hash(&mut hash_buf, &ts.labels) as usize) % self.num_shards
+                (label_adapters_hash(&mut self.hash_buf, &ts.labels) as usize) % self.num_shards
             } else {
                 0
             };
@@ -1018,14 +1147,17 @@ impl BatchingQueue {
         metrics: BatchingQueueMetrics,
     ) -> (Self, mpsc::Receiver<FlushableWriteRequest>) {
         let (tx, rx) = mpsc::channel(capacity.max(1));
+        let batch_size = batch_size.max(1);
+        let mut current_batch = FlushableWriteRequest::default();
+        current_batch.write_request.timeseries.reserve(batch_size);
         let queue = Self {
             metrics,
             tx: Some(tx),
             errs: Arc::new(SyncMutex::new(Vec::new())),
             done: Arc::new(tokio::sync::Notify::new()),
             done_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            current_batch: FlushableWriteRequest::default(),
-            batch_size: batch_size.max(1),
+            current_batch,
+            batch_size,
         };
         (queue, rx)
     }
@@ -1060,7 +1192,10 @@ impl BatchingQueue {
             self.current_batch.started_at = Instant::now();
             self.current_batch.started_set = true;
         }
-        self.current_batch.tenant_id = tenant_id.to_owned();
+        if self.current_batch.tenant_id != tenant_id {
+            self.current_batch.tenant_id.clear();
+            self.current_batch.tenant_id.push_str(tenant_id);
+        }
         self.current_batch.write_request.source = source;
         self.current_batch.write_request.timeseries.push(ts);
         self.push_if_full().await
@@ -1076,7 +1211,10 @@ impl BatchingQueue {
             self.current_batch.started_at = Instant::now();
             self.current_batch.started_set = true;
         }
-        self.current_batch.tenant_id = tenant_id.to_owned();
+        if self.current_batch.tenant_id != tenant_id {
+            self.current_batch.tenant_id.clear();
+            self.current_batch.tenant_id.push_str(tenant_id);
+        }
         self.current_batch.write_request.source = source;
         self.current_batch.write_request.metadata.push(md);
         self.push_if_full().await
@@ -1107,6 +1245,10 @@ impl BatchingQueue {
         self.metrics.flush_total.inc();
 
         let batch = std::mem::take(&mut self.current_batch);
+        self.current_batch
+            .write_request
+            .timeseries
+            .reserve(self.batch_size);
         if let Some(ref tx) = self.tx {
             let _ = tx.send(batch).await;
         }
@@ -1179,4 +1321,57 @@ impl BatchingQueue {
 #[allow(dead_code)]
 fn _use_tokio_mutex() -> Option<Mutex<()>> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::version::{RecordSerializer, RecordVersion};
+
+    #[test]
+    fn rw2_zero_copy_backing_shares_payload_and_static_symbols() {
+        let req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair::from_strs("__name__", "up"),
+                    cortexpb::LabelPair::from_strs("custom_lbl", "custom_val"),
+                    cortexpb::LabelPair::from_strs("job", "node-exporter"),
+                ],
+                samples: vec![cortexpb::Sample {
+                    value: 1.0,
+                    timestamp_ms: 1000,
+                }],
+                ..Default::default()
+            }],
+            metadata: vec![cortexpb::MetricMetadata {
+                r#type: cortexpb::metric_metadata::MetricType::Gauge as i32,
+                metric_family_name: "up".into(),
+                help: "Target up".into(),
+                unit: String::new(),
+            }],
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            ..Default::default()
+        };
+
+        let (records, _) = RecordSerializer::new(RecordVersion::V2)
+            .to_records("topic", 0, "tenant-1", &req, 1024 * 1024)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        let payload = records[0].value.clone();
+        let mut scratch = WriteRequestScratch::new();
+        let borrowed = deserialize_record_content(&payload, 2, &mut scratch).unwrap();
+        let owned = borrowed_write_request_to_owned_with_backing(&borrowed, &payload);
+
+        assert_eq!(owned.timeseries.len(), 1);
+        assert_eq!(owned.timeseries[0].labels.len(), 3);
+        assert_eq!(owned.timeseries[0].labels[0].name.as_ref(), b"__name__");
+        assert_eq!(owned.timeseries[0].labels[0].value.as_ref(), b"up");
+        assert_eq!(owned.timeseries[0].labels[1].name.as_ref(), b"custom_lbl");
+        assert_eq!(owned.timeseries[0].labels[1].value.as_ref(), b"custom_val");
+        assert_eq!(owned.timeseries[0].labels[2].name.as_ref(), b"job");
+        assert_eq!(owned.timeseries[0].labels[2].value.as_ref(), b"node-exporter");
+        assert_eq!(owned.metadata.len(), 1);
+        assert_eq!(owned.metadata[0].metric_family_name, "up");
+        assert_eq!(owned.metadata[0].help, "Target up");
+    }
 }

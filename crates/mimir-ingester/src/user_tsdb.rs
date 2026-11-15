@@ -22,7 +22,7 @@ use mimir_tsdb::chunkenc::Encoding;
 use mimir_tsdb::db::{Tsdb, TsdbError, TsdbOptions};
 use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
-use mimir_tsdb::metadata::{MetadataError, MetadataLimits, MetricMetadata, UserMetricsMetadata};
+use mimir_tsdb::metadata::MetadataLimits;
 use mimir_tsdb::record::MetricType;
 use mimir_tsdb::wlog::CompressionType;
 use parking_lot::{Mutex, RwLock};
@@ -1172,10 +1172,57 @@ pub fn next_forced_head_compaction_range(
     }
 }
 
+struct MetadataEntry {
+    metric_type: MetricType,
+    help: String,
+    unit: String,
+    last_seen_nanos: AtomicI64,
+}
+
+#[derive(Default)]
+struct FastMetadataInner {
+    metrics: HashMap<String, Vec<MetadataEntry>>,
+}
+
+#[inline]
+fn system_time_to_nanos(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+#[inline]
+fn proto_metric_type_to_tsdb(t: i32) -> MetricType {
+    match cortexpb::metric_metadata::MetricType::try_from(t) {
+        Ok(cortexpb::metric_metadata::MetricType::Counter) => MetricType::Counter,
+        Ok(cortexpb::metric_metadata::MetricType::Gauge) => MetricType::Gauge,
+        Ok(cortexpb::metric_metadata::MetricType::Histogram) => MetricType::HistogramSample,
+        Ok(cortexpb::metric_metadata::MetricType::Gaugehistogram) => MetricType::GaugeHistogram,
+        Ok(cortexpb::metric_metadata::MetricType::Summary) => MetricType::Summary,
+        Ok(cortexpb::metric_metadata::MetricType::Info) => MetricType::Info,
+        Ok(cortexpb::metric_metadata::MetricType::Stateset) => MetricType::Stateset,
+        _ => MetricType::Unknown,
+    }
+}
+
+#[inline]
+fn tsdb_metric_type_to_proto(t: MetricType) -> i32 {
+    match t {
+        MetricType::Counter => cortexpb::metric_metadata::MetricType::Counter as i32,
+        MetricType::Gauge => cortexpb::metric_metadata::MetricType::Gauge as i32,
+        MetricType::HistogramSample => cortexpb::metric_metadata::MetricType::Histogram as i32,
+        MetricType::GaugeHistogram => cortexpb::metric_metadata::MetricType::Gaugehistogram as i32,
+        MetricType::Summary => cortexpb::metric_metadata::MetricType::Summary as i32,
+        MetricType::Info => cortexpb::metric_metadata::MetricType::Info as i32,
+        MetricType::Stateset => cortexpb::metric_metadata::MetricType::Stateset as i32,
+        MetricType::Unknown => cortexpb::metric_metadata::MetricType::Unknown as i32,
+    }
+}
+
 /// Per-tenant metric metadata wrapper tracking metrics & limits (`user_metrics_metadata.go`).
 pub struct TenantMetadataStore {
     user_id: String,
-    store: UserMetricsMetadata,
+    inner: RwLock<FastMetadataInner>,
     limiter: Arc<Limiter>,
     mem_metadata: prometheus::Gauge,
     mem_created: prometheus::CounterVec,
@@ -1197,7 +1244,7 @@ impl TenantMetadataStore {
     ) -> Self {
         Self {
             user_id,
-            store: UserMetricsMetadata::new(),
+            inner: RwLock::new(FastMetadataInner::default()),
             limiter,
             mem_metadata,
             mem_created,
@@ -1208,53 +1255,100 @@ impl TenantMetadataStore {
     }
 
     pub fn add(&self, m: &cortexpb::MetricMetadata) -> Result<(), IngesterError> {
-        let limits = MetadataLimits {
-            max_metrics_with_metadata_per_user: self.limiter.max_metadata_per_user(&self.user_id),
-            max_metadata_per_metric: self.limiter.max_metadata_per_metric(&self.user_id),
-        };
-        let metric_type = match cortexpb::metric_metadata::MetricType::try_from(m.r#type) {
-            Ok(cortexpb::metric_metadata::MetricType::Counter) => MetricType::Counter,
-            Ok(cortexpb::metric_metadata::MetricType::Gauge) => MetricType::Gauge,
-            Ok(cortexpb::metric_metadata::MetricType::Histogram) => MetricType::HistogramSample,
-            Ok(cortexpb::metric_metadata::MetricType::Gaugehistogram) => MetricType::GaugeHistogram,
-            Ok(cortexpb::metric_metadata::MetricType::Summary) => MetricType::Summary,
-            Ok(cortexpb::metric_metadata::MetricType::Info) => MetricType::Info,
-            Ok(cortexpb::metric_metadata::MetricType::Stateset) => MetricType::Stateset,
-            _ => MetricType::Unknown,
-        };
-        let rec = MetricMetadata {
-            metric_type,
-            metric_family_name: m.metric_family_name.clone(),
-            help: m.help.clone(),
-            unit: m.unit.clone(),
-        };
-        match self.store.add(&m.metric_family_name, rec, limits) {
-            Ok(inserted) => {
-                if inserted {
-                    self.mem_metadata.inc();
-                    self.mem_created.with_label_values(&[&self.user_id]).inc();
+        self.add_parts_at(
+            m.r#type,
+            &m.metric_family_name,
+            &m.help,
+            &m.unit,
+            system_time_to_nanos(SystemTime::now()),
+        )
+    }
+
+    pub fn add_parts_at(
+        &self,
+        raw_type: i32,
+        metric_family_name: &str,
+        help: &str,
+        unit: &str,
+        now_nanos: i64,
+    ) -> Result<(), IngesterError> {
+        let metric_type = proto_metric_type_to_tsdb(raw_type);
+
+        // Lock-free-for-readers fast path: 97%+ of metadata updates refresh an existing entry.
+        {
+            let guard = self.inner.read();
+            if let Some(entries) = guard.metrics.get(metric_family_name) {
+                for e in entries {
+                    if e.metric_type == metric_type && e.help == help && e.unit == unit {
+                        e.last_seen_nanos.store(now_nanos, Ordering::Relaxed);
+                        return Ok(());
+                    }
                 }
-                Ok(())
             }
-            Err(MetadataError::MaxMetricsPerUserReached { limit }) => {
-                self.discarded_per_user
-                    .with_label_values(&[&self.user_id])
-                    .inc();
-                Err(IngesterError::per_user_metadata_limit_reached(limit))
+        }
+
+        let max_per_user = self.limiter.max_metadata_per_user(&self.user_id);
+        let max_per_metric = self.limiter.max_metadata_per_metric(&self.user_id);
+
+        let mut guard = self.inner.write();
+        if let Some(entries) = guard.metrics.get(metric_family_name) {
+            for e in entries {
+                if e.metric_type == metric_type && e.help == help && e.unit == unit {
+                    e.last_seen_nanos.store(now_nanos, Ordering::Relaxed);
+                    return Ok(());
+                }
             }
-            Err(MetadataError::MaxMetadataPerMetricReached { limit, metric }) => {
+            if max_per_metric > 0 && entries.len() >= max_per_metric {
                 self.discarded_per_metric
                     .with_label_values(&[&self.user_id])
                     .inc();
-                Err(IngesterError::per_metric_metadata_limit_reached(
-                    limit, metric,
-                ))
+                return Err(IngesterError::per_metric_metadata_limit_reached(
+                    max_per_metric,
+                    metric_family_name.to_string(),
+                ));
             }
+        } else if max_per_user > 0 && guard.metrics.len() >= max_per_user {
+            self.discarded_per_user
+                .with_label_values(&[&self.user_id])
+                .inc();
+            return Err(IngesterError::per_user_metadata_limit_reached(max_per_user));
         }
+
+        let entry = MetadataEntry {
+            metric_type,
+            help: help.to_owned(),
+            unit: unit.to_owned(),
+            last_seen_nanos: AtomicI64::new(now_nanos),
+        };
+        if let Some(entries) = guard.metrics.get_mut(metric_family_name) {
+            entries.push(entry);
+        } else {
+            guard
+                .metrics
+                .insert(metric_family_name.to_owned(), vec![entry]);
+        }
+        drop(guard);
+
+        self.mem_metadata.inc();
+        self.mem_created.with_label_values(&[&self.user_id]).inc();
+        Ok(())
     }
 
     pub fn purge(&self, deadline: Option<SystemTime>) -> usize {
-        let deleted = self.store.purge(deadline);
+        let dl_nanos = deadline.map(system_time_to_nanos);
+        let mut guard = self.inner.write();
+        let mut deleted = 0usize;
+        guard.metrics.retain(|_, entries| {
+            let before = entries.len();
+            match dl_nanos {
+                None => entries.clear(),
+                Some(dl) => entries.retain(|e| e.last_seen_nanos.load(Ordering::Relaxed) >= dl),
+            }
+            deleted += before - entries.len();
+            !entries.is_empty()
+        });
+        drop(guard);
+
         if deleted > 0 {
             self.mem_metadata.sub(deleted as f64);
             self.mem_removed
@@ -1271,32 +1365,55 @@ impl TenantMetadataStore {
         limit: i32,
         limit_per_metric: i32,
     ) -> Vec<cortexpb::MetricMetadata> {
-        self.store
-            .query(metric_names, single_metric, limit, limit_per_metric)
-            .into_iter()
-            .map(|m| {
-                let r#type = match m.metric_type {
-                    MetricType::Counter => cortexpb::metric_metadata::MetricType::Counter as i32,
-                    MetricType::Gauge => cortexpb::metric_metadata::MetricType::Gauge as i32,
-                    MetricType::HistogramSample => {
-                        cortexpb::metric_metadata::MetricType::Histogram as i32
+        if limit == 0 {
+            return Vec::new();
+        }
+        let guard = self.inner.read();
+        let mut out = Vec::new();
+
+        let push_entries =
+            |out: &mut Vec<cortexpb::MetricMetadata>, name: &str, entries: &[MetadataEntry]| {
+                for (per_metric, e) in entries.iter().enumerate() {
+                    if limit_per_metric > 0 && (per_metric as i32) >= limit_per_metric {
+                        break;
                     }
-                    MetricType::GaugeHistogram => {
-                        cortexpb::metric_metadata::MetricType::Gaugehistogram as i32
-                    }
-                    MetricType::Summary => cortexpb::metric_metadata::MetricType::Summary as i32,
-                    MetricType::Info => cortexpb::metric_metadata::MetricType::Info as i32,
-                    MetricType::Stateset => cortexpb::metric_metadata::MetricType::Stateset as i32,
-                    MetricType::Unknown => cortexpb::metric_metadata::MetricType::Unknown as i32,
-                };
-                cortexpb::MetricMetadata {
-                    r#type,
-                    metric_family_name: m.metric_family_name,
-                    help: m.help,
-                    unit: m.unit,
+                    out.push(cortexpb::MetricMetadata {
+                        r#type: tsdb_metric_type_to_proto(e.metric_type),
+                        metric_family_name: name.to_owned(),
+                        help: e.help.clone(),
+                        unit: e.unit.clone(),
+                    });
                 }
-            })
-            .collect()
+            };
+
+        if !metric_names.is_empty() {
+            let mut num_metrics = 0i32;
+            for name in metric_names {
+                if limit > 0 && num_metrics >= limit {
+                    break;
+                }
+                if let Some(entries) = guard.metrics.get(name) {
+                    push_entries(&mut out, name, entries);
+                    num_metrics += 1;
+                }
+            }
+            return out;
+        }
+
+        if !single_metric.is_empty() {
+            if let Some(entries) = guard.metrics.get(single_metric) {
+                push_entries(&mut out, single_metric, entries);
+            }
+            return out;
+        }
+
+        for (num_metrics, (name, entries)) in guard.metrics.iter().enumerate() {
+            if limit > 0 && (num_metrics as i32) >= limit {
+                break;
+            }
+            push_entries(&mut out, name, entries);
+        }
+        out
     }
 }
 
