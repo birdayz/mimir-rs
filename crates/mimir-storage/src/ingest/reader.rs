@@ -1293,119 +1293,174 @@ impl SingleClusterPartitionReader {
         let mut stop_rx = self.stop_tx.subscribe();
 
         let handle = tokio::spawn(async move {
-            loop {
-                if *stop_rx.borrow() {
-                    break;
-                }
+            let (batch_tx, mut batch_rx) =
+                tokio::sync::mpsc::channel::<super::kafka_client::FetchPartitionResult>(2);
+            let mut fetch_stop_rx = stop_rx.clone();
+            let fetch_metrics = metrics.clone();
+            let fetch_topic = topic.clone();
+            let fetch_client = Arc::clone(&client);
+            let mut fetch_offset = next_offset;
 
-                let fetch_start = Instant::now();
-                let fetch_res = tokio::select! {
+            let fetcher_task = tokio::spawn(async move {
+                loop {
+                    if *fetch_stop_rx.borrow() {
+                        break;
+                    }
+                    let fetch_start = Instant::now();
+                    let fetch_res = tokio::select! {
+                        _ = fetch_stop_rx.changed() => {
+                            if *fetch_stop_rx.borrow() {
+                                break;
+                            }
+                            continue;
+                        }
+                        res = fetch_client.fetch(
+                            &fetch_topic,
+                            partition_id,
+                            fetch_offset,
+                            fetch_max_wait,
+                            1,
+                            max_partition_bytes,
+                        ) => res,
+                    };
+                    fetch_metrics
+                        .fetch_wait_duration
+                        .observe(fetch_start.elapsed().as_secs_f64());
+
+                    match fetch_res {
+                        Ok(batch) => {
+                            fetch_metrics.fetches_total.inc();
+                            fetch_metrics
+                                .records_per_fetch
+                                .observe(batch.records.len() as f64);
+                            if !batch.records.is_empty() {
+                                fetch_offset = batch.records.last().unwrap().offset + 1;
+                                tokio::select! {
+                                    _ = fetch_stop_rx.changed() => {
+                                        if *fetch_stop_rx.borrow() {
+                                            break;
+                                        }
+                                    }
+                                    res = batch_tx.send(batch) => {
+                                        if res.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            fetch_metrics.fetches_errors.inc();
+                            debug!(partition = partition_id, error = %err, "kafka fetch error");
+                            tokio::select! {
+                                _ = fetch_stop_rx.changed() => {
+                                    if *fetch_stop_rx.borrow() {
+                                        break;
+                                    }
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                            }
+                        }
+                    }
+                }
+            });
+
+            loop {
+                let batch = tokio::select! {
                     _ = stop_rx.changed() => {
                         if *stop_rx.borrow() {
                             break;
                         }
                         continue;
                     }
-                    res = client.fetch(&topic, partition_id, next_offset, fetch_max_wait, 1, max_partition_bytes) => res,
-                };
-                metrics
-                    .fetch_wait_duration
-                    .observe(fetch_start.elapsed().as_secs_f64());
-
-                match fetch_res {
-                    Ok(batch) => {
-                        metrics.fetches_total.inc();
-                        metrics
-                            .records_per_fetch
-                            .observe(batch.records.len() as f64);
-
-                        if !batch.records.is_empty() {
-                            let batch_last_offset = batch.records.last().unwrap().offset;
-                            let first_ts = batch.records.first().unwrap().timestamp_ms;
-                            let highest_ts =
-                                batch.records.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
-                            last_seen_offset.fetch_max(batch_last_offset, Ordering::SeqCst);
-
-                            let now_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64;
-                            for r in &batch.records {
-                                let delay = ((now_ms - r.timestamp_ms).max(0) as f64) / 1000.0;
-                                metrics
-                                    .receive_delay
-                                    .with_label_values(&["running"])
-                                    .observe(delay);
-                            }
-
-                            if highest_ts_ref.load(Ordering::SeqCst) == 0 {
-                                highest_ts_ref.store(first_ts, Ordering::SeqCst);
-                            }
-
-                            metrics
-                                .buffered_records_cb
-                                .store(batch.records.len() as i64, Ordering::Relaxed);
-                            let total_b: i64 =
-                                batch.records.iter().map(|r| r.value.len() as i64).sum();
-                            metrics
-                                .buffered_bytes_cb
-                                .store(total_b, Ordering::Relaxed);
-
-                            let consume_start = Instant::now();
-                            loop {
-                                match consumer.consume(batch.records.clone()).await {
-                                    Ok(()) => break,
-                                    Err(err) => {
-                                        error!(
-                                            partition = partition_id,
-                                            error = %err,
-                                            "error consuming Kafka batch; retrying"
-                                        );
-                                        if *stop_rx.borrow() {
-                                            break;
-                                        }
-                                        tokio::time::sleep(Duration::from_millis(50)).await;
-                                    }
-                                }
-                            }
-                            metrics
-                                .buffered_records_cb
-                                .store(0, Ordering::Relaxed);
-                            metrics.buffered_bytes_cb.store(0, Ordering::Relaxed);
-                            metrics
-                                .consume_latency
-                                .observe(consume_start.elapsed().as_secs_f64());
-
-                            if batch_last_offset + 1 >= batch.high_watermark {
-                                highest_ts_ref.store(0, Ordering::SeqCst);
-                            } else {
-                                highest_ts_ref.store(highest_ts, Ordering::SeqCst);
-                            }
-
-                            committer.enqueue_offset(batch_last_offset);
-                            offset_watcher.notify(batch_last_offset);
-                            metrics
-                                .last_consumed_offset
-                                .with_label_values(&[&partition_id.to_string()])
-                                .set(batch_last_offset as f64);
-
-                            next_offset = batch_last_offset + 1;
+                    maybe_batch = batch_rx.recv() => {
+                        match maybe_batch {
+                            Some(b) => b,
+                            None => break,
                         }
                     }
-                    Err(err) => {
-                        metrics.fetches_errors.inc();
-                        debug!(partition = partition_id, error = %err, "kafka fetch error");
-                        tokio::select! {
-                            _ = stop_rx.changed() => {
+                };
+
+                if !batch.records.is_empty() {
+                    let batch_last_offset = batch.records.last().unwrap().offset;
+                    let first_ts = batch.records.first().unwrap().timestamp_ms;
+                    let highest_ts =
+                        batch.records.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
+                    last_seen_offset.fetch_max(batch_last_offset, Ordering::SeqCst);
+
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    for r in &batch.records {
+                        let delay = ((now_ms - r.timestamp_ms).max(0) as f64) / 1000.0;
+                        metrics
+                            .receive_delay
+                            .with_label_values(&["running"])
+                            .observe(delay);
+                    }
+
+                    if highest_ts_ref.load(Ordering::SeqCst) == 0 {
+                        highest_ts_ref.store(first_ts, Ordering::SeqCst);
+                    }
+
+                    metrics
+                        .buffered_records_cb
+                        .store(batch.records.len() as i64, Ordering::Relaxed);
+                    let total_b: i64 =
+                        batch.records.iter().map(|r| r.value.len() as i64).sum();
+                    metrics
+                        .buffered_bytes_cb
+                        .store(total_b, Ordering::Relaxed);
+
+                    let consume_start = Instant::now();
+                    let mut first_try = Some(batch.records);
+                    loop {
+                        let to_consume = match first_try.take() {
+                            Some(recs) => recs,
+                            None => break,
+                        };
+                        match consumer.consume(to_consume.clone()).await {
+                            Ok(()) => break,
+                            Err(err) => {
+                                error!(
+                                    partition = partition_id,
+                                    error = %err,
+                                    "error consuming Kafka batch; retrying"
+                                );
                                 if *stop_rx.borrow() {
                                     break;
                                 }
+                                first_try = Some(to_consume);
+                                tokio::time::sleep(Duration::from_millis(50)).await;
                             }
-                            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
                         }
                     }
+                    metrics
+                        .buffered_records_cb
+                        .store(0, Ordering::Relaxed);
+                    metrics.buffered_bytes_cb.store(0, Ordering::Relaxed);
+                    metrics
+                        .consume_latency
+                        .observe(consume_start.elapsed().as_secs_f64());
+
+                    if batch_last_offset + 1 >= batch.high_watermark {
+                        highest_ts_ref.store(0, Ordering::SeqCst);
+                    } else {
+                        highest_ts_ref.store(highest_ts, Ordering::SeqCst);
+                    }
+
+                    committer.enqueue_offset(batch_last_offset);
+                    offset_watcher.notify(batch_last_offset);
+                    metrics
+                        .last_consumed_offset
+                        .with_label_values(&[&partition_id.to_string()])
+                        .set(batch_last_offset as f64);
                 }
             }
+
+            drop(batch_rx);
+            let _ = fetcher_task.await;
         });
 
         *guard = Some(handle);

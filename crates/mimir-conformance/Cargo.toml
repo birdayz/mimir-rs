@@ -17,7 +17,10 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+crc32c = { workspace = true }
 futures = { workspace = true }
+kafka-protocol = { workspace = true }
+parking_lot = { workspace = true }
 prometheus = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -26,3 +29,5 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+ulid = { workspace = true }
+zstd = { workspace = true }

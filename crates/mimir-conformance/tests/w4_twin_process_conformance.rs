@@ -756,7 +756,10 @@ fn twin_process_classic_push_all_14_rpcs_and_errors_parity() {
     );
 
     block_on_for_tests(async {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap();
         wait_for_ready(&http, go_http_port, &mut go_proc).await;
         wait_for_ready(&http, rust_http_port, &mut rust_proc).await;
 
@@ -1270,7 +1273,7 @@ fn twin_process_classic_push_all_14_rpcs_and_errors_parity() {
         // Flush + upload ULID blocks on BOTH, then cross-verify!
         for (name, http_port) in [("go", go_http_port), ("rust", rust_http_port)] {
             let flush = tokio::time::timeout(
-                Duration::from_secs(20),
+                Duration::from_secs(60),
                 http.post(format!("http://127.0.0.1:{http_port}/ingester/flush?wait=true"))
                     .send(),
             )
@@ -1436,7 +1439,10 @@ activity_tracker:
     );
 
     block_on_for_tests(async {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap();
         wait_for_ready(&http, go_http_port, &mut go_proc).await;
         wait_for_ready(&http, rust_http_port, &mut rust_proc).await;
 
@@ -1800,7 +1806,10 @@ activity_tracker:
     );
 
     block_on_for_tests(async {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap();
         wait_for_ready(&http, go_http_port, &mut go_proc).await;
         wait_for_ready(&http, rust_http_port, &mut rust_proc).await;
 

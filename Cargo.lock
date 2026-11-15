@@ -1124,7 +1124,9 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "crc32c",
  "futures",
+ "kafka-protocol",
  "mimir-cmd",
  "mimir-common",
  "mimir-config",
@@ -1133,6 +1135,7 @@ dependencies = [
  "mimir-ring",
  "mimir-storage",
  "mimir-tsdb",
+ "parking_lot",
  "prometheus",
  "reqwest",
  "serde",
@@ -1141,6 +1144,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "ulid",
+ "zstd",
 ]
 
 [[package]]

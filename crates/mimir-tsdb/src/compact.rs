@@ -3,7 +3,6 @@
 //! Ported from github.com/prometheus/prometheus/tsdb/compact.go
 //! and github.com/prometheus/prometheus/tsdb/async_block_writer.go.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -451,9 +450,6 @@ pub fn write_block_from_series(
 
     // Prepare trimmed series & collect sorted symbol set.
     let mut prepared: Vec<(Labels, Vec<ChunkMeta>)> = Vec::with_capacity(series.len());
-    let mut symbols: BTreeSet<String> = BTreeSet::new();
-    // Always include empty symbol matching Prometheus Head/Compactor convention.
-    symbols.insert(String::new());
 
     for mut s in series {
         let trimmed = trim_and_merge_chunks(
@@ -466,10 +462,6 @@ pub fn write_block_from_series(
         if trimmed.is_empty() {
             continue;
         }
-        for (k, v) in s.labels.iter() {
-            symbols.insert(k.to_string());
-            symbols.insert(v.to_string());
-        }
         prepared.push((std::mem::take(&mut s.labels), trimmed));
     }
 
@@ -477,7 +469,7 @@ pub fn write_block_from_series(
         return Ok(None);
     }
 
-    prepared.sort_by(|a, b| a.0.cmp(&b.0));
+    prepared.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     let uid = Ulid::new();
     let final_dir = dest.join(uid.to_string());
@@ -496,8 +488,22 @@ pub fn write_block_from_series(
         let mut chunkw = BlockChunksWriter::with_segment_size(tmp_dir.join("chunks"), seg_sz)?;
         let mut indexw = IndexWriter::new(tmp_dir.join(INDEX_FILENAME))?;
 
-        for sym in &symbols {
-            indexw.add_symbol(sym)?;
+        {
+            let mut sym_set: hashbrown::HashSet<&str> =
+                hashbrown::HashSet::with_capacity(prepared.len().min(65536));
+            // Always include empty symbol matching Prometheus Head/Compactor convention.
+            sym_set.insert("");
+            for (labels, _) in &prepared {
+                for (k, v) in labels.iter() {
+                    sym_set.insert(k);
+                    sym_set.insert(v);
+                }
+            }
+            let mut symbols: Vec<&str> = sym_set.into_iter().collect();
+            symbols.sort_unstable();
+            for sym in symbols {
+                indexw.add_symbol(sym)?;
+            }
         }
 
         let mut stats = BlockStats::default();

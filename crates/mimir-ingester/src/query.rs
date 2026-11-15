@@ -540,14 +540,18 @@ impl Ingester {
             return Ok(Box::pin(tokio_stream::empty()));
         };
 
-        let mut chunk_series = self.select_chunk_series_for_query(
-            &db,
-            user_id,
-            req.start_timestamp_ms,
-            req.end_timestamp_ms,
-            shard,
-            &matchers,
-        )?;
+        let ing_c = Arc::clone(self);
+        let db_c = Arc::clone(&db);
+        let uid_c = user_id.to_string();
+        let start_ts = req.start_timestamp_ms;
+        let end_ts = req.end_timestamp_ms;
+        let mut chunk_series = tokio::task::spawn_blocking(move || {
+            ing_c.select_chunk_series_for_query(&db_c, &uid_c, start_ts, end_ts, shard, &matchers)
+        })
+        .await
+        .map_err(|e| IngesterError::Internal {
+            message: format!("query task join error: {e}"),
+        })??;
 
         let batch_limit = req.streaming_chunks_batch_size as usize;
         let num_series = chunk_series.len();
@@ -1436,87 +1440,107 @@ impl Ingester {
             }
         };
 
-        let head = db.db.head();
-        let label_names = head
-            .label_names(&matchers)
-            .map_err(|e| IngesterError::Internal {
-                message: e.to_string(),
-            })?;
-
-        let mut batches = Vec::new();
-        let mut resp = ingesterpb::LabelNamesAndValuesResponse::default();
-        let mut resp_bytes = 0usize;
-
-        for label_name in label_names {
-            resp_bytes += label_name.len();
-            if resp_bytes >= LABEL_NAMES_AND_VALUES_TARGET_SIZE_BYTES && !resp.items.is_empty() {
-                batches.push(std::mem::take(&mut resp));
-                resp_bytes = label_name.len();
-            }
-
-            let values = head
-                .label_values(&label_name, &matchers)
+        tokio::task::spawn_blocking(move || -> Result<Vec<ingesterpb::LabelNamesAndValuesResponse>, IngesterError> {
+            let head = db.db.head();
+            let label_names = head
+                .label_names(&matchers)
                 .map_err(|e| IngesterError::Internal {
                     message: e.to_string(),
                 })?;
 
-            let mut filtered = Vec::with_capacity(values.len());
-            if active_only {
-                for val in values {
-                    let is_active = if matchers.is_empty() {
-                        head.postings_for_label_value(&label_name, &val)
-                            .into_iter()
-                            .any(|r| db.active_series.contains_ref(r))
-                    } else {
-                        let mut ms = matchers.clone();
-                        ms.push(
-                            LabelMatcher::new(MatchType::Equal, &label_name, &val)
-                                .expect("valid eq matcher"),
-                        );
-                        head.postings_for_matchers(&ms)
+            let base_matching_active: Option<std::collections::HashSet<u64>> =
+                if active_only && !matchers.is_empty() {
+                    let base_refs =
+                        head.postings_for_matchers_arc(&matchers)
                             .map_err(|e| IngesterError::Internal {
                                 message: e.to_string(),
-                            })?
-                            .into_iter()
-                            .any(|r| db.active_series.contains_ref(r))
-                    };
-                    if is_active {
-                        filtered.push(val);
+                            })?;
+                    Some(
+                        base_refs
+                            .iter()
+                            .copied()
+                            .filter(|r| db.active_series.contains_ref(*r))
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+
+            let mut batches = Vec::new();
+            let mut resp = ingesterpb::LabelNamesAndValuesResponse::default();
+            let mut resp_bytes = 0usize;
+
+            for label_name in label_names {
+                resp_bytes += label_name.len();
+                if resp_bytes >= LABEL_NAMES_AND_VALUES_TARGET_SIZE_BYTES && !resp.items.is_empty() {
+                    batches.push(std::mem::take(&mut resp));
+                    resp_bytes = label_name.len();
+                }
+
+                let values = head
+                    .label_values(&label_name, &matchers)
+                    .map_err(|e| IngesterError::Internal {
+                        message: e.to_string(),
+                    })?;
+
+                let mut filtered = Vec::with_capacity(values.len());
+                if active_only {
+                    for val in values {
+                        let is_active = if let Some(ref base_set) = base_matching_active {
+                            head.visit_postings_for_label_value(&label_name, &val, |small, large| {
+                                small.iter().any(|&r| base_set.contains(&(r as u64)))
+                                    || large.iter().any(|&r| base_set.contains(&r))
+                            })
+                        } else {
+                            head.visit_postings_for_label_value(&label_name, &val, |small, large| {
+                                small
+                                    .iter()
+                                    .any(|&r| db.active_series.contains_ref(r as u64))
+                                    || large.iter().any(|&r| db.active_series.contains_ref(r))
+                            })
+                        };
+                        if is_active {
+                            filtered.push(val);
+                        }
+                    }
+                } else {
+                    filtered = values;
+                }
+
+                if filtered.is_empty() {
+                    continue;
+                }
+
+                let mut cur_vals = Vec::new();
+                for (idx, val) in filtered.iter().enumerate() {
+                    resp_bytes += val.len();
+                    cur_vals.push(val.clone());
+                    let is_last = idx + 1 == filtered.len();
+                    if resp_bytes >= LABEL_NAMES_AND_VALUES_TARGET_SIZE_BYTES {
+                        resp.items.push(ingesterpb::LabelValues {
+                            label_name: label_name.clone(),
+                            values: std::mem::take(&mut cur_vals),
+                        });
+                        batches.push(std::mem::take(&mut resp));
+                        resp_bytes = if is_last { 0 } else { label_name.len() };
+                    } else if is_last && !cur_vals.is_empty() {
+                        resp.items.push(ingesterpb::LabelValues {
+                            label_name: label_name.clone(),
+                            values: std::mem::take(&mut cur_vals),
+                        });
                     }
                 }
-            } else {
-                filtered = values;
             }
 
-            if filtered.is_empty() {
-                continue;
+            if !resp.items.is_empty() {
+                batches.push(resp);
             }
-
-            let mut cur_vals = Vec::new();
-            for (idx, val) in filtered.iter().enumerate() {
-                resp_bytes += val.len();
-                cur_vals.push(val.clone());
-                let is_last = idx + 1 == filtered.len();
-                if resp_bytes >= LABEL_NAMES_AND_VALUES_TARGET_SIZE_BYTES {
-                    resp.items.push(ingesterpb::LabelValues {
-                        label_name: label_name.clone(),
-                        values: std::mem::take(&mut cur_vals),
-                    });
-                    batches.push(std::mem::take(&mut resp));
-                    resp_bytes = if is_last { 0 } else { label_name.len() };
-                } else if is_last && !cur_vals.is_empty() {
-                    resp.items.push(ingesterpb::LabelValues {
-                        label_name: label_name.clone(),
-                        values: std::mem::take(&mut cur_vals),
-                    });
-                }
-            }
-        }
-
-        if !resp.items.is_empty() {
-            batches.push(resp);
-        }
-        Ok(batches)
+            Ok(batches)
+        })
+        .await
+        .map_err(|e| IngesterError::Internal {
+            message: format!("label_names_and_values task join error: {e}"),
+        })?
     }
 
     pub async fn handle_label_values_cardinality(
@@ -1554,65 +1578,84 @@ impl Ingester {
             }
         };
 
-        let head = db.db.head();
-        let mut batches = Vec::new();
-        let mut resp = ingesterpb::LabelValuesCardinalityResponse::default();
-        let mut resp_bytes = 0usize;
+        let label_names = req.label_names;
+        tokio::task::spawn_blocking(move || -> Result<Vec<ingesterpb::LabelValuesCardinalityResponse>, IngesterError> {
+            let head = db.db.head();
+            let mut batches = Vec::new();
+            let mut resp = ingesterpb::LabelValuesCardinalityResponse::default();
+            let mut resp_bytes = 0usize;
 
-        for lbl_name in &req.label_names {
-            let lbl_values =
-                head.label_values(lbl_name, &matchers)
-                    .map_err(|e| IngesterError::Internal {
-                        message: e.to_string(),
-                    })?;
-
-            let mut map: HashMap<String, u64> = HashMap::new();
-            for val in lbl_values {
-                let refs = if matchers.is_empty() {
-                    head.postings_for_label_value(lbl_name, &val)
-                } else {
-                    let mut ms = matchers.clone();
-                    ms.push(
-                        LabelMatcher::new(MatchType::Equal, lbl_name, &val)
-                            .expect("valid eq matcher"),
-                    );
-                    head.postings_for_matchers(&ms)
+            for lbl_name in &label_names {
+                let lbl_values =
+                    head.label_values(lbl_name, &matchers)
                         .map_err(|e| IngesterError::Internal {
                             message: e.to_string(),
-                        })?
-                };
-                let count = if active_only {
-                    refs.into_iter()
-                        .filter(|r| db.active_series.contains_ref(*r))
-                        .count() as u64
-                } else {
-                    refs.len() as u64
-                };
-                if count == 0 {
-                    continue;
+                        })?;
+
+                let mut map: HashMap<String, u64> = HashMap::new();
+                for val in lbl_values {
+                    let count = if matchers.is_empty() {
+                        if active_only {
+                            let buckets = head.visit_postings_for_label_value(
+                                lbl_name,
+                                &val,
+                                crate::active_series::ActiveSeries::bucket_refs_by_stripe,
+                            );
+                            if buckets.is_empty() {
+                                0
+                            } else {
+                                db.active_series.count_active_in_buckets(&buckets)
+                            }
+                        } else {
+                            head.postings_length(lbl_name, &val) as u64
+                        }
+                    } else {
+                        let mut ms = matchers.clone();
+                        ms.push(
+                            LabelMatcher::new(MatchType::Equal, lbl_name, &val)
+                                .expect("valid eq matcher"),
+                        );
+                        let refs = head
+                            .postings_for_matchers_arc(&ms)
+                            .map_err(|e| IngesterError::Internal {
+                                message: e.to_string(),
+                            })?;
+                        if active_only {
+                            db.active_series.count_active_in_slices(&[], &refs)
+                        } else {
+                            refs.len() as u64
+                        }
+                    };
+                    if count == 0 {
+                        continue;
+                    }
+                    resp_bytes += val.len();
+                    map.insert(val, count);
+                    if resp_bytes >= LABEL_VALUES_CARDINALITY_TARGET_SIZE_BYTES {
+                        resp.items.push(ingesterpb::LabelValueSeriesCount {
+                            label_name: lbl_name.clone(),
+                            label_value_series: std::mem::take(&mut map),
+                        });
+                        batches.push(std::mem::take(&mut resp));
+                        resp_bytes = 0;
+                    }
                 }
-                resp_bytes += val.len();
-                map.insert(val, count);
-                if resp_bytes >= LABEL_VALUES_CARDINALITY_TARGET_SIZE_BYTES {
+                if !map.is_empty() {
                     resp.items.push(ingesterpb::LabelValueSeriesCount {
                         label_name: lbl_name.clone(),
-                        label_value_series: std::mem::take(&mut map),
+                        label_value_series: map,
                     });
-                    batches.push(std::mem::take(&mut resp));
-                    resp_bytes = 0;
                 }
             }
-            if !map.is_empty() {
-                resp.items.push(ingesterpb::LabelValueSeriesCount {
-                    label_name: lbl_name.clone(),
-                    label_value_series: map,
-                });
+            if !resp.items.is_empty() {
+                batches.push(resp);
             }
-        }
-        if !resp.items.is_empty() {
-            batches.push(resp);
-        }
-        Ok(batches)
+            Ok(batches)
+        })
+        .await
+        .map_err(|e| IngesterError::Internal {
+            message: format!("label_values_cardinality task join error: {e}"),
+        })?
     }
 
     pub async fn handle_active_series_rx(

@@ -6,6 +6,18 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(target_os = "linux")]
+#[repr(transparent)]
+struct MallocConfPtr(*const std::ffi::c_char);
+#[cfg(target_os = "linux")]
+unsafe impl Sync for MallocConfPtr {}
+
+#[cfg(target_os = "linux")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+static _rjem_malloc_conf_override: MallocConfPtr =
+    MallocConfPtr(c"dirty_decay_ms:500,muzzy_decay_ms:500,narenas:8".as_ptr());
+
 use mimir_cmd::{parse_cli_for_run, run_mimir};
 use mimir_config::CliAction;
 

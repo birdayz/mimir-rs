@@ -7,7 +7,7 @@ use super::varbit::bit_range;
 use super::{ChunkError, Encoding};
 
 const CHUNK_HEADER_SIZE: usize = 2;
-const CHUNK_ALLOCATION_SIZE: usize = 128;
+const CHUNK_ALLOCATION_SIZE: usize = 32;
 const CHUNK_COMPACT_CAPACITY_THRESHOLD: usize = 32;
 
 /// Gorilla/Prometheus XOR-encoded float64 chunk (`EncXOR = 1`).

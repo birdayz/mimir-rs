@@ -19,6 +19,9 @@ build:
 build-release:
     cargo build --release -p mimir-cmd
 
+build-release-arm64:
+    cargo build --release --target aarch64-unknown-linux-gnu -p mimir-cmd -p mimir-conformance --examples
+
 go-oracle *args:
     ./scripts/build-go-oracle.sh {{args}}
 
@@ -48,3 +51,8 @@ bench-vs-go *args:
     just build-release
     just go-oracle
     cargo run --release -p mimir-conformance --example bench_vs_go -- {{args}}
+
+prod-bench *args:
+    just build-release
+    just go-oracle
+    cargo run --release -p mimir-conformance --example prod_bench -- {{args}}

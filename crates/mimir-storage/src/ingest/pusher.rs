@@ -626,39 +626,99 @@ impl PusherConsumer {
         }
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (tx, mut rx) = mpsc::channel::<ParsedRecord>(128);
+        let (tx, mut rx) = mpsc::channel::<ParsedRecord>(256);
 
-        let unmarshal_handle: JoinHandle<()> = tokio::spawn(async move {
-            let mut scratch = WriteRequestScratch::new();
-            for rec in records {
-                if *cancel_rx.borrow() {
-                    return;
+        let unmarshal_handle: JoinHandle<()> = if records.len() >= 16 {
+            let workers = (records.len() / 8).clamp(2, 8);
+            let chunk_size = records.len().div_ceil(workers);
+            let mut chunks: Vec<Vec<FetchedRecord>> = Vec::with_capacity(workers);
+            let mut iter = records.into_iter();
+            loop {
+                let c: Vec<FetchedRecord> = iter.by_ref().take(chunk_size).collect();
+                if c.is_empty() {
+                    break;
                 }
-                let tenant_id = String::from_utf8_lossy(&rec.key).into_owned();
-                let version = parse_record_version(
-                    rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
-                );
-                let parsed = match deserialize_record_content(&rec.value, version, &mut scratch) {
-                    Ok(borrowed) => Ok(borrowed_write_request_to_owned_with_backing(
-                        &borrowed,
-                        &rec.value,
-                    )),
-                    Err(e) => Err(format!("parsing ingest consumer write request: {e}")),
-                };
-
-                if *cancel_rx.borrow() {
-                    return;
-                }
-                let item = ParsedRecord {
-                    tenant_id,
-                    offset: rec.offset,
-                    write_request: parsed,
-                };
-                if tx.send(item).await.is_err() {
-                    return;
-                }
+                chunks.push(c);
             }
-        });
+            tokio::spawn(async move {
+                let mut dec_handles = Vec::with_capacity(chunks.len());
+                for chunk in chunks {
+                    let cancel = cancel_rx.clone();
+                    dec_handles.push(tokio::task::spawn_blocking(move || {
+                        let mut scratch = WriteRequestScratch::new();
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for rec in chunk {
+                            if *cancel.borrow() {
+                                break;
+                            }
+                            let tenant_id = String::from_utf8_lossy(&rec.key).into_owned();
+                            let version = parse_record_version(
+                                rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
+                            );
+                            let parsed = match deserialize_record_content(
+                                &rec.value,
+                                version,
+                                &mut scratch,
+                            ) {
+                                Ok(borrowed) => Ok(borrowed_write_request_to_owned_with_backing(
+                                    &borrowed,
+                                    &rec.value,
+                                )),
+                                Err(e) => Err(format!("parsing ingest consumer write request: {e}")),
+                            };
+                            out.push(ParsedRecord {
+                                tenant_id,
+                                offset: rec.offset,
+                                write_request: parsed,
+                            });
+                        }
+                        out
+                    }));
+                }
+                for h in dec_handles {
+                    if let Ok(items) = h.await {
+                        for item in items {
+                            if *cancel_rx.borrow() || tx.send(item).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+        } else {
+            tokio::spawn(async move {
+                let mut scratch = WriteRequestScratch::new();
+                for rec in records {
+                    if *cancel_rx.borrow() {
+                        return;
+                    }
+                    let tenant_id = String::from_utf8_lossy(&rec.key).into_owned();
+                    let version = parse_record_version(
+                        rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
+                    );
+                    let parsed =
+                        match deserialize_record_content(&rec.value, version, &mut scratch) {
+                            Ok(borrowed) => Ok(borrowed_write_request_to_owned_with_backing(
+                                &borrowed,
+                                &rec.value,
+                            )),
+                            Err(e) => Err(format!("parsing ingest consumer write request: {e}")),
+                        };
+
+                    if *cancel_rx.borrow() {
+                        return;
+                    }
+                    let item = ParsedRecord {
+                        tenant_id,
+                        offset: rec.offset,
+                        write_request: parsed,
+                    };
+                    if tx.send(item).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        };
 
         let sampler = if self.fallback_client_error_sample_rate > 0 {
             Some(Arc::new(ErrorSampler::new(

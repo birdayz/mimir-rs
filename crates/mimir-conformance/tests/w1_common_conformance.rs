@@ -410,13 +410,16 @@ fn services_fsm_and_manager_conformance() {
             .unwrap();
         assert_eq!(svc.state(), State::Terminated);
 
-        // Give listener task a moment to drain final event
-        mimir_common::services::start_and_await_running(
-            ctx.clone(),
-            idle_service(None, None).as_ref(),
-        )
-        .await
-        .unwrap();
+        // Wait for async listener task to drain final Terminated event
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while transitions.lock().unwrap().len() < 4 {
+            assert!(
+                Instant::now() < wait_deadline,
+                "timed out waiting for listener transitions: {:?}",
+                *transitions.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
 
         let recorded = transitions.lock().unwrap().clone();
         assert_eq!(

@@ -153,6 +153,32 @@ impl MemPostings {
         inner.pair_to_u64(name_id, value_id)
     }
 
+    /// Visits postings slices for `(name_id, value_id)` under the read lock with zero allocation.
+    pub fn visit_postings_for_id<R>(
+        &self,
+        name_id: SymbolId,
+        value_id: SymbolId,
+        f: impl FnOnce(&[u32], &[u64]) -> R,
+    ) -> R {
+        let inner = self.inner.read();
+        let small = inner
+            .m
+            .get(&name_id)
+            .and_then(|vm| vm.get(&value_id))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let large = if inner.overflow.is_empty() {
+            &[]
+        } else {
+            inner
+                .overflow
+                .get(&(name_id, value_id))
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        };
+        f(small, large)
+    }
+
     /// Returns the number of postings for `(name_id, value_id)`.
     pub fn postings_len(&self, name_id: SymbolId, value_id: SymbolId) -> usize {
         let inner = self.inner.read();

@@ -495,30 +495,32 @@ pub fn merge_custom_trackers_config(
 #[derive(Clone, Debug, Default)]
 pub struct PreAllocDynamicSlice {
     arr: [u16; PRE_ALLOCATED_SIZE],
-    arr_len: usize,
-    rest: Vec<u16>,
+    arr_len: u8,
+    #[allow(clippy::box_collection)]
+    rest: Option<Box<Vec<u16>>>,
 }
 
 impl PreAllocDynamicSlice {
     pub fn append(&mut self, val: usize) {
-        if self.arr_len < PRE_ALLOCATED_SIZE {
-            self.arr[self.arr_len] = val as u16;
+        let len = self.arr_len as usize;
+        if len < PRE_ALLOCATED_SIZE {
+            self.arr[len] = val as u16;
             self.arr_len += 1;
             return;
         }
-        self.rest.push(val as u16);
+        self.rest.get_or_insert_with(Default::default).push(val as u16);
     }
 
     pub fn get(&self, idx: usize) -> u16 {
         if idx < PRE_ALLOCATED_SIZE {
             self.arr[idx]
         } else {
-            self.rest[idx - PRE_ALLOCATED_SIZE]
+            self.rest.as_ref().expect("index in bounds")[idx - PRE_ALLOCATED_SIZE]
         }
     }
 
     pub fn len(&self) -> usize {
-        self.arr_len + self.rest.len()
+        (self.arr_len as usize) + self.rest.as_ref().map_or(0, |v| v.len())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1180,9 +1182,9 @@ impl SeriesIndexReader for mimir_tsdb::head::Head {
 
 struct SeriesEntry {
     nanos: AtomicI64,
-    matches: PreAllocDynamicSlice,
     num_native_histogram_buckets: i32, // -1 if not a native histogram
     flags: u8,
+    matches: PreAllocDynamicSlice,
 }
 
 impl SeriesEntry {
@@ -1952,6 +1954,65 @@ impl ActiveSeries {
 
     pub fn contains_ref(&self, ref_id: u64) -> bool {
         self.stripes[(ref_id as usize) % NUM_STRIPES].contains_ref(ref_id)
+    }
+
+    /// Buckets `(small, large)` series refs by `ref_id % 128` for fast lock-free-of-postings counting.
+    pub fn bucket_refs_by_stripe(small: &[u32], large: &[u64]) -> Vec<Vec<u64>> {
+        let total_len = small.len() + large.len();
+        let per_stripe = (total_len / NUM_STRIPES).max(4);
+        let mut buckets: Vec<Vec<u64>> = (0..NUM_STRIPES)
+            .map(|_| Vec::with_capacity(per_stripe))
+            .collect();
+        for &r in small {
+            let r64 = r as u64;
+            buckets[(r64 as usize) % NUM_STRIPES].push(r64);
+        }
+        for &r in large {
+            buckets[(r as usize) % NUM_STRIPES].push(r);
+        }
+        buckets
+    }
+
+    /// Counts active series refs from pre-bucketed stripe lists.
+    pub fn count_active_in_buckets(&self, buckets: &[Vec<u64>]) -> u64 {
+        let mut count = 0u64;
+        for (s_idx, refs) in buckets.iter().enumerate() {
+            if refs.is_empty() {
+                continue;
+            }
+            let guard = self.stripes[s_idx].inner.read();
+            for r in refs {
+                if guard.refs.contains_key(r) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Counts how many series refs in `(small, large)` exist in `ActiveSeries`,
+    /// acquiring each of the 128 stripe read locks at most once.
+    pub fn count_active_in_slices(&self, small: &[u32], large: &[u64]) -> u64 {
+        let total_len = small.len() + large.len();
+        if total_len == 0 {
+            return 0;
+        }
+        if total_len <= 16 {
+            let mut count = 0u64;
+            for &r in small {
+                if self.contains_ref(r as u64) {
+                    count += 1;
+                }
+            }
+            for &r in large {
+                if self.contains_ref(r) {
+                    count += 1;
+                }
+            }
+            return count;
+        }
+        let buckets = Self::bucket_refs_by_stripe(small, large);
+        self.count_active_in_buckets(&buckets)
     }
 
     pub fn native_histogram_buckets(&self, ref_id: u64) -> Option<u64> {
