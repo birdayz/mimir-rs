@@ -108,7 +108,9 @@ fn ensure_fresh_binaries() {
             .status()
             .map_err(|e| format!("spawn cargo build --release -p mimir-cmd: {e}"))?;
         if !status.success() {
-            return Err(format!("cargo build --release -p mimir-cmd exited with {status}"));
+            return Err(format!(
+                "cargo build --release -p mimir-cmd exited with {status}"
+            ));
         }
         Ok(())
     });
@@ -124,15 +126,38 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// Reserves `n` distinct free TCP ports (all bound simultaneously, then released).
+/// Hands out `n` distinct free TCP ports for listeners.
+///
+/// Ports come from 20000..32000, i.e. BELOW Linux's default ephemeral range (32768..60999):
+/// dozens of concurrent Go/Rust processes open outgoing Kafka connections, and an OS-picked
+/// ephemeral port (`bind :0`, then release) can be grabbed by one of those connections before
+/// the ingester binds it. A process-wide counter also keeps concurrent scenarios apart.
 fn free_tcp_ports(n: usize) -> Vec<u16> {
-    let listeners: Vec<StdTcpListener> = (0..n)
-        .map(|_| StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral port"))
-        .collect();
-    listeners
-        .iter()
-        .map(|l| l.local_addr().unwrap().port())
-        .collect()
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const LOW: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let offset = (std::process::id() * 397) % SPAN;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..SPAN {
+        if out.len() == n {
+            break;
+        }
+        let port = (LOW + (offset + NEXT.fetch_add(1, Ordering::Relaxed)) % SPAN) as u16;
+        let free = ["127.0.0.1", "0.0.0.0"]
+            .iter()
+            .all(|host| StdTcpListener::bind((*host, port)).is_ok());
+        if free {
+            out.push(port);
+        }
+    }
+    assert_eq!(
+        out.len(),
+        n,
+        "no free TCP ports left in {LOW}..{}",
+        LOW + SPAN
+    );
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -338,11 +363,19 @@ fn redpanda_yaml(ports: &BTreeMap<Listener, u16>) -> String {
         } else {
             ""
         };
-        let _ = writeln!(y, "    - {{name: {}, address: 0.0.0.0, port: {p}{auth}}}", l.name());
+        let _ = writeln!(
+            y,
+            "    - {{name: {}, address: 0.0.0.0, port: {p}{auth}}}",
+            l.name()
+        );
     }
     y.push_str("  advertised_kafka_api:\n    - {name: internal, address: 127.0.0.1, port: 9092}\n");
     for (l, p) in ports {
-        let _ = writeln!(y, "    - {{name: {}, address: 127.0.0.1, port: {p}}}", l.name());
+        let _ = writeln!(
+            y,
+            "    - {{name: {}, address: 127.0.0.1, port: {p}}}",
+            l.name()
+        );
     }
     y.push_str("  kafka_api_tls:\n");
     for l in ports.keys() {
@@ -421,17 +454,35 @@ impl Redpanda {
         };
         rp.wait_healthy().await?;
         rp.rpk(&[
-            "security", "user", "create", SCRAM256_USER, "-p", SCRAM256_PASS, "--mechanism",
+            "security",
+            "user",
+            "create",
+            SCRAM256_USER,
+            "-p",
+            SCRAM256_PASS,
+            "--mechanism",
             "SCRAM-SHA-256",
         ])
         .await?;
         rp.rpk(&[
-            "security", "user", "create", SCRAM512_USER, "-p", SCRAM512_PASS, "--mechanism",
+            "security",
+            "user",
+            "create",
+            SCRAM512_USER,
+            "-p",
+            SCRAM512_PASS,
+            "--mechanism",
             "SCRAM-SHA-512",
         ])
         .await?;
-        rp.rpk(&["cluster", "config", "set", "sasl_mechanisms", r#"["SCRAM","PLAIN"]"#])
-            .await?;
+        rp.rpk(&[
+            "cluster",
+            "config",
+            "set",
+            "sasl_mechanisms",
+            r#"["SCRAM","PLAIN"]"#,
+        ])
+        .await?;
         Ok(rp)
     }
 
@@ -697,7 +748,11 @@ fn wire_enc_to_tsdb(enc: i32) -> Result<Encoding> {
     })
 }
 
-async fn query_stream(grpc_port: u16, consistency: Consistency, base_ts: i64) -> Result<Vec<Series>> {
+async fn query_stream(
+    grpc_port: u16,
+    consistency: Consistency,
+    base_ts: i64,
+) -> Result<Vec<Series>> {
     let ch = Channel::from_shared(format!("http://127.0.0.1:{grpc_port}"))?
         .connect_timeout(Duration::from_secs(5))
         .connect()
@@ -717,7 +772,10 @@ async fn query_stream(grpc_port: u16, consistency: Consistency, base_ts: i64) ->
     req.set_timeout(Duration::from_secs(30));
     let md = req.metadata_mut();
     md.insert(LOWER_ORG_ID_HEADER_NAME, MetadataValue::from_static(TENANT));
-    md.insert("__consistency_level__", MetadataValue::from_static("strong"));
+    md.insert(
+        "__consistency_level__",
+        MetadataValue::from_static("strong"),
+    );
     if let Consistency::Offset(off) = consistency {
         md.insert(
             "__consistency_offsets__",
@@ -751,8 +809,9 @@ async fn query_stream(grpc_port: u16, consistency: Consistency, base_ts: i64) ->
         for sc in msg.streaming_series_chunks {
             let entry = samples.entry(sc.series_index).or_default();
             for c in sc.chunks {
-                let chunk = EncodedChunk::from_bytes(wire_enc_to_tsdb(c.encoding)?, c.data.to_vec())
-                    .map_err(|e| anyhow::anyhow!("decode chunk: {e:?}"))?;
+                let chunk =
+                    EncodedChunk::from_bytes(wire_enc_to_tsdb(c.encoding)?, c.data.to_vec())
+                        .map_err(|e| anyhow::anyhow!("decode chunk: {e:?}"))?;
                 for s in decode_chunk_samples(&chunk).map_err(|e| anyhow::anyhow!("{e:?}"))? {
                     match s.value {
                         SampleValue::Float(v) => entry.push((s.t, v.to_bits())),
@@ -983,16 +1042,29 @@ impl Lifecycle {
             .count()
     }
 
-    fn not_ready_bodies(&self) -> BTreeSet<String> {
-        self.samples
-            .iter()
-            .filter_map(|(_, p)| match p {
-                Probe::Answered {
-                    ready, ready_body, ..
-                } if *ready != 200 => Some(format!("{ready} {ready_body:?}")),
-                _ => None,
-            })
-            .collect()
+    /// The last not-ready `/ready` response (steady state while Kafka is unavailable). Lines
+    /// after the first are sorted: Go's readyHandler iterates a map, so service order is random.
+    /// Earlier transient bodies (e.g. rings still `Starting` in the first few hundred ms) depend
+    /// on sampling phase and are intentionally not compared.
+    fn steady_not_ready_body(&self) -> Option<String> {
+        self.samples.iter().rev().find_map(|(_, p)| match p {
+            Probe::Answered {
+                ready, ready_body, ..
+            } if *ready != 200 => {
+                let mut lines = ready_body.lines();
+                let head = lines.next().unwrap_or_default().to_string();
+                let mut rest: Vec<&str> = lines.collect();
+                rest.sort_unstable();
+                Some(format!(
+                    "{ready} {:?}",
+                    std::iter::once(head.as_str())
+                        .chain(rest)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ))
+            }
+            _ => None,
+        })
     }
 
     fn timeline(&self) -> String {
@@ -1080,7 +1152,11 @@ fn settled(p: &Probe) -> bool {
 
 /// Samples both instances every `SAMPLE_INTERVAL` until both are settled (ready or exited) or
 /// `window` has elapsed (measured from now).
-async fn observe(twin: &mut Twin, window: Duration, stop_when_settled: bool) -> (Lifecycle, Lifecycle) {
+async fn observe(
+    twin: &mut Twin,
+    window: Duration,
+    stop_when_settled: bool,
+) -> (Lifecycle, Lifecycle) {
     let http = http_client();
     let start = Instant::now();
     let (mut go, mut rust) = (Lifecycle::default(), Lifecycle::default());
@@ -1117,7 +1193,7 @@ fn lifecycle_parity(go: &Lifecycle, rust: &Lifecycle) -> Vec<String> {
             _ => {}
         }
     }
-    if go.http_gaps() == 0 && rust.http_gaps() > 0 {
+    if !exited(go) && !exited(rust) && go.http_gaps() == 0 && rust.http_gaps() > 0 {
         errs.push(format!(
             "Rust had {} samples without an HTTP answer or with /metrics != 200 after first answering (Go: 0)",
             rust.http_gaps()
@@ -1131,9 +1207,11 @@ fn lifecycle_parity(go: &Lifecycle, rust: &Lifecycle) -> Vec<String> {
             }
         }
         (Outcome::NotReadyAlive, Outcome::NotReadyAlive) => {
-            let (gb, rb) = (go.not_ready_bodies(), rust.not_ready_bodies());
+            let (gb, rb) = (go.steady_not_ready_body(), rust.steady_not_ready_body());
             if gb != rb {
-                errs.push(format!("/ready not-ready responses differ: Go {gb:?}, Rust {rb:?}"));
+                errs.push(format!(
+                    "/ready not-ready responses differ: Go {gb:?}, Rust {rb:?}"
+                ));
             }
         }
         (g, r) => errs.push(format!("lifecycle outcome mismatch: Go {g:?}, Rust {r:?}")),
@@ -1145,7 +1223,11 @@ fn lifecycle_parity(go: &Lifecycle, rust: &Lifecycle) -> Vec<String> {
 // Ingest verification
 // ---------------------------------------------------------------------------------------------
 
-async fn query_both(twin: &Twin, c: Consistency, base_ts: i64) -> (Result<Vec<Series>>, Result<Vec<Series>>) {
+async fn query_both(
+    twin: &Twin,
+    c: Consistency,
+    base_ts: i64,
+) -> (Result<Vec<Series>>, Result<Vec<Series>>) {
     tokio::join!(
         query_stream(twin.go.grpc, c, base_ts),
         query_stream(twin.rust.grpc, c, base_ts)
@@ -1171,7 +1253,12 @@ fn check_query(
 }
 
 /// Polls committed consumer-group offsets until Go and Rust agree (Go is the reference).
-async fn check_committed_offsets(errs: &mut Vec<String>, cfg: &KafkaClientCfg, twin: &Twin, end: i64) {
+async fn check_committed_offsets(
+    errs: &mut Vec<String>,
+    cfg: &KafkaClientCfg,
+    twin: &Twin,
+    end: i64,
+) {
     let groups = twin.groups();
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut last = None;
@@ -1198,21 +1285,33 @@ async fn check_committed_offsets(errs: &mut Vec<String>, cfg: &KafkaClientCfg, t
 }
 
 /// Backlog (explicit offset) + live tail (`ListOffsets` path) + committed offsets.
-async fn verify_ingest(cfg: &KafkaClientCfg, twin: &Twin, scenario: &str, base_ts: i64) -> Vec<String> {
+async fn verify_ingest(
+    cfg: &KafkaClientCfg,
+    twin: &Twin,
+    scenario: &str,
+    base_ts: i64,
+) -> Vec<String> {
     let mut errs = Vec::new();
     let end0 = match oracle_kafka(cfg, Vec::new(), &[]).await {
         Ok(r) => r.end_offset(),
         Err(e) => return vec![format!("harness: ListEndOffsets: {e:#}")],
     };
     let got = query_both(twin, Consistency::Offset(end0 - 1), base_ts).await;
-    check_query(&mut errs, "backlog QueryStream", &expected_series(scenario, base_ts, 1), got);
+    check_query(
+        &mut errs,
+        "backlog QueryStream",
+        &expected_series(scenario, base_ts, 1),
+        got,
+    );
 
     let end1 = match oracle_kafka(cfg, batch_records(scenario, base_ts, 1), &[]).await {
         Ok(r) => r.end_offset(),
-        Err(e) => return {
-            errs.push(format!("harness: producing live batch: {e:#}"));
-            errs
-        },
+        Err(e) => {
+            return {
+                errs.push(format!("harness: producing live batch: {e:#}"));
+                errs
+            }
+        }
     };
     let got = query_both(twin, Consistency::LastProduced, base_ts).await;
     check_query(
@@ -1239,7 +1338,10 @@ struct Report {
 
 fn finish(title: &str, reports: Vec<Report>) {
     let failed = reports.iter().filter(|r| !r.errors.is_empty()).count();
-    let mut out = format!("\n===== {title}: {failed}/{} scenarios failed =====\n", reports.len());
+    let mut out = format!(
+        "\n===== {title}: {failed}/{} scenarios failed =====\n",
+        reports.len()
+    );
     for r in &reports {
         let status = if r.errors.is_empty() { "ok  " } else { "FAIL" };
         let _ = writeln!(out, "[{status}] {}", r.name);
@@ -1280,7 +1382,9 @@ fn observ_1374_prod_tls_scram_sha256_end_to_end() {
 
         oracle_kafka(&cfg, batch_records(scenario, base_ts, 0), &[])
             .await
-            .expect("harness: Go oracle must produce with the production TLS + SCRAM-SHA-256 config");
+            .expect(
+                "harness: Go oracle must produce with the production TLS + SCRAM-SHA-256 config",
+            );
 
         // 1. Startup with backlog.
         let mut twin = Twin::spawn(&cfg, "start");
@@ -1328,7 +1432,8 @@ fn observ_1374_prod_tls_scram_sha256_end_to_end() {
             // 4. Recovery: new data after the outage must be consumed by both.
             match oracle_kafka(&cfg, batch_records(scenario, base_ts, 2), &[]).await {
                 Ok(r) => {
-                    let got = query_both(&twin, Consistency::Offset(r.end_offset() - 1), base_ts).await;
+                    let got =
+                        query_both(&twin, Consistency::Offset(r.end_offset() - 1), base_ts).await;
                     check_query(
                         &mut errs,
                         "post-outage QueryStream",
@@ -1364,7 +1469,8 @@ fn observ_1374_prod_tls_scram_sha256_end_to_end() {
                     }
                     if matches!(rust_r.outcome(), Outcome::Ready(_)) {
                         let got =
-                            query_both(&twin, Consistency::Offset(resp.end_offset() - 1), base_ts).await;
+                            query_both(&twin, Consistency::Offset(resp.end_offset() - 1), base_ts)
+                                .await;
                         check_query(
                             &mut errs,
                             "post-restart QueryStream (WAL replay + resume from committed offset)",
@@ -1417,13 +1523,19 @@ fn client_scenarios(pki: &Pki) -> Vec<ClientScenario> {
         ClientScenario {
             name: "tls + scram-sha-256 (OBSERV-1374 prod)",
             listener: Listener::SaslTls,
-            extra: with(scram("SCRAM-SHA-256", SCRAM256_USER, SCRAM256_PASS), tls_ca(pki)),
+            extra: with(
+                scram("SCRAM-SHA-256", SCRAM256_USER, SCRAM256_PASS),
+                tls_ca(pki),
+            ),
             go_ready: true,
         },
         ClientScenario {
             name: "tls + scram-sha-512",
             listener: Listener::SaslTls,
-            extra: with(scram("SCRAM-SHA-512", SCRAM512_USER, SCRAM512_PASS), tls_ca(pki)),
+            extra: with(
+                scram("SCRAM-SHA-512", SCRAM512_USER, SCRAM512_PASS),
+                tls_ca(pki),
+            ),
             go_ready: true,
         },
         ClientScenario {
@@ -1436,7 +1548,10 @@ fn client_scenarios(pki: &Pki) -> Vec<ClientScenario> {
             name: "tls + scram-sha-256 + tls_min_version VersionTLS13",
             listener: Listener::SaslTls,
             extra: with(
-                with(scram("SCRAM-SHA-256", SCRAM256_USER, SCRAM256_PASS), tls_ca(pki)),
+                with(
+                    scram("SCRAM-SHA-256", SCRAM256_USER, SCRAM256_PASS),
+                    tls_ca(pki),
+                ),
                 vec![("tls_min_version", "VersionTLS13".to_string())],
             ),
             go_ready: true,
@@ -1484,13 +1599,19 @@ fn client_scenarios(pki: &Pki) -> Vec<ClientScenario> {
         ClientScenario {
             name: "wrong scram password",
             listener: Listener::SaslTls,
-            extra: with(scram("SCRAM-SHA-256", SCRAM256_USER, "wrong-password"), tls_ca(pki)),
+            extra: with(
+                scram("SCRAM-SHA-256", SCRAM256_USER, "wrong-password"),
+                tls_ca(pki),
+            ),
             go_ready: false,
         },
         ClientScenario {
             name: "scram-sha-512 mechanism for a scram-sha-256 user",
             listener: Listener::SaslTls,
-            extra: with(scram("SCRAM-SHA-512", SCRAM256_USER, SCRAM256_PASS), tls_ca(pki)),
+            extra: with(
+                scram("SCRAM-SHA-512", SCRAM256_USER, SCRAM256_PASS),
+                tls_ca(pki),
+            ),
             go_ready: false,
         },
         ClientScenario {
@@ -1532,7 +1653,12 @@ fn client_scenarios(pki: &Pki) -> Vec<ClientScenario> {
     ]
 }
 
-async fn run_client_scenario(rp: &Redpanda, idx: usize, sc: &ClientScenario, base_ts: i64) -> Report {
+async fn run_client_scenario(
+    rp: &Redpanda,
+    idx: usize,
+    sc: &ClientScenario,
+    base_ts: i64,
+) -> Report {
     let topic = format!("o1374-matrix-{idx}");
     let cfg = KafkaClientCfg {
         address: rp.addr(sc.listener),
@@ -1659,7 +1785,10 @@ fn observ_1374_kafka_unavailable_at_startup_lifecycle_parity() {
             plain("dns nxdomain", "kafka.invalid:9092".to_string()),
             plain("tcp accept + silence", blackhole_addr),
             // RFC 5737 TEST-NET-1: SYNs are normally dropped (dial timeout path).
-            plain("unroutable address (syn dropped)", "192.0.2.1:9092".to_string()),
+            plain(
+                "unroutable address (syn dropped)",
+                "192.0.2.1:9092".to_string(),
+            ),
             OutageScenario {
                 name: "redpanda paused, plaintext",
                 cfg: KafkaClientCfg {
@@ -1700,16 +1829,15 @@ fn observ_1374_kafka_unavailable_at_startup_lifecycle_parity() {
         rp.container.unpause().await.expect("unpause Redpanda");
 
         // Phase B: broker back (Redpanda scenarios only).
-        let phase_b: Vec<Option<(Lifecycle, Lifecycle)>> = futures::future::join_all(
-            twins.iter_mut().zip(&scenarios).map(|(t, sc)| async move {
+        let phase_b: Vec<Option<(Lifecycle, Lifecycle)>> =
+            futures::future::join_all(twins.iter_mut().zip(&scenarios).map(|(t, sc)| async move {
                 if sc.redpanda {
                     Some(observe(t, Duration::from_secs(60), true).await)
                 } else {
                     None
                 }
-            }),
-        )
-        .await;
+            }))
+            .await;
 
         let base_ts = now_ms() - 10 * 60_000;
         let mut reports = Vec::new();
@@ -1723,7 +1851,11 @@ fn observ_1374_kafka_unavailable_at_startup_lifecycle_parity() {
             let mut rust_tl = format!("unavailable: {}", rust_a.timeline());
             if let Some((go_b, rust_b)) = &phase_b[i] {
                 let _ = write!(go_tl, "\n                recovered: {}", go_b.timeline());
-                let _ = write!(rust_tl, "\n                recovered: {}", rust_b.timeline());
+                let _ = write!(
+                    rust_tl,
+                    "\n                recovered: {}",
+                    rust_b.timeline()
+                );
                 errors.extend(
                     lifecycle_parity(go_b, rust_b)
                         .into_iter()
@@ -1735,8 +1867,12 @@ fn observ_1374_kafka_unavailable_at_startup_lifecycle_parity() {
                     let scenario = format!("outage-{i}");
                     match oracle_kafka(&sc.cfg, batch_records(&scenario, base_ts, 0), &[]).await {
                         Ok(r) => {
-                            let got = query_both(&twins[i], Consistency::Offset(r.end_offset() - 1), base_ts)
-                                .await;
+                            let got = query_both(
+                                &twins[i],
+                                Consistency::Offset(r.end_offset() - 1),
+                                base_ts,
+                            )
+                            .await;
                             check_query(
                                 &mut errors,
                                 "post-recovery QueryStream",
