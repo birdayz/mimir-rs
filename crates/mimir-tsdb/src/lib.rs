@@ -32,6 +32,8 @@ pub mod postings;
 pub mod postings_cache;
 pub mod querier;
 pub mod record;
+#[cfg(test)]
+mod repair_tests;
 pub mod search;
 pub mod symbols;
 pub mod tombstones;

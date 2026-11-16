@@ -61,7 +61,7 @@ use crate::symbols::{SymbolId, SymbolTable};
 use crate::tombstones::{is_completely_deleted, Interval, MemTombstones};
 use crate::wlog::{
     checkpoint_dir, create_checkpoint, decompress_record_into, delete_checkpoints,
-    delete_temp_checkpoints, last_checkpoint, read_min_valid_time, repair_wal, segments_range,
+    delete_temp_checkpoints, last_checkpoint, read_min_valid_time, segments_range,
     CompressionType, SegmentRange, SegmentTracker, WlogError, WlogReader, WlogWriter,
     DEFAULT_SEGMENT_SIZE, WBL_DIR_NAME,
 };
@@ -92,6 +92,8 @@ pub enum HeadError {
     Metadata(#[from] MetadataError),
     #[error("invalid head option: {0}")]
     InvalidOption(String),
+    #[error("{0}")]
+    Repair(String),
     #[error("out of bounds")]
     OutOfBounds,
     #[error("out of order sample")]
@@ -1725,7 +1727,31 @@ impl Collector for WalFsyncSummary {
     }
 }
 
+/// Maps a WAL/WBL record decode error to a repairable `wlog.CorruptionErr` positioned at
+/// the reader's current segment/offset (Go `loadWAL` / `loadWBL`).
+fn record_decode_corruption<R: io::Read + SegmentTracker>(
+    r: &WlogReader<R>,
+    e: &dyn std::fmt::Display,
+) -> HeadError {
+    HeadError::Wlog(WlogError::Corruption {
+        dir: r.segment_dir().map(Path::to_path_buf),
+        segment: r.segment(),
+        offset: r.offset(),
+        message: format!("decode record: {e}"),
+    })
+}
+
+/// Result of [`Head::load_mmapped_chunks`] (Go `mmappedChunks`, `oooMmappedChunks`, `lastMmapRef`).
+#[derive(Default)]
+struct MmappedLoad {
+    in_order: HashMap<u64, Vec<MmappedChunk>>,
+    ooo: HashMap<u64, Vec<MmappedChunk>>,
+    last_ref: ChunkDiskMapperRef,
+}
+
 struct HeadMetrics {
+    mmap_chunk_corruptions_total: prometheus::Counter,
+    wal_corruptions_total: prometheus::Counter,
     ooo_samples_appended: CounterVec,
     ooo_histogram: PromHistogram,
     wal_fsync_duration: WalFsyncSummary,
@@ -1767,14 +1793,28 @@ impl HeadMetrics {
             "Number of currently active appender transactions.",
         )
         .expect("valid active appenders gauge");
+        let mmap_chunk_corruptions_total = prometheus::Counter::new(
+            "prometheus_tsdb_mmap_chunk_corruptions_total",
+            "Total number of memory-mapped chunk corruptions.",
+        )
+        .expect("valid mmap chunk corruptions counter");
+        let wal_corruptions_total = prometheus::Counter::new(
+            "prometheus_tsdb_wal_corruptions_total",
+            "Total number of WAL corruptions.",
+        )
+        .expect("valid wal corruptions counter");
 
         if let Some(r) = reg {
             let _ = r.register(Box::new(ooo_samples_appended.clone()));
             let _ = r.register(Box::new(ooo_histogram.clone()));
             let _ = r.register(Box::new(active_appenders.clone()));
+            let _ = r.register(Box::new(mmap_chunk_corruptions_total.clone()));
+            let _ = r.register(Box::new(wal_corruptions_total.clone()));
         }
         let wal_fsync_duration = WalFsyncSummary::new(reg);
         Self {
+            mmap_chunk_corruptions_total,
+            wal_corruptions_total,
             ooo_samples_appended,
             ooo_histogram,
             wal_fsync_duration,
@@ -1939,9 +1979,8 @@ impl Head {
             series_removed_total,
         };
 
-        head.replay_on_open(&wal_dir, &wbl_dir, &chunks_dir)?;
-
-        // Open writers after replay completes.
+        // Like Go `DB.Open`, the WAL/WBL are opened (cutting a new segment) before the
+        // head is initialised, so that a repair operates on the live write log.
         let wal_writer =
             WlogWriter::with_segment_size(&wal_dir, opts.wal_segment_size, opts.wal_compression)?;
         *head.wal.lock() = Some(wal_writer);
@@ -1954,6 +1993,8 @@ impl Head {
             )?;
             *head.wbl.lock() = Some(wbl_writer);
         }
+
+        head.replay_on_open(&wal_dir, &wbl_dir, &chunks_dir)?;
 
         let chunk_writer =
             HeadChunksWriter::with_max_file_size(&chunks_dir, opts.max_head_chunk_file_size)?;
@@ -1970,127 +2011,83 @@ impl Head {
         wbl_dir: &Path,
         chunks_dir: &Path,
     ) -> Result<(), HeadError> {
-        let min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
-
-        // 1. Load mmapped chunks from chunks_head.
-        let mut mmapped_map: HashMap<u64, Vec<MmappedChunk>> = HashMap::new();
-        let mut ooo_mmapped_map: HashMap<u64, Vec<MmappedChunk>> = HashMap::new();
-        let mut last_mmap_ref = ChunkDiskMapperRef(0);
-
-        let reader = HeadChunksReader::open(chunks_dir)?;
-        for rec in reader.collect_all_chunks()? {
-            last_mmap_ref = rec.chunk_ref;
-            if !rec.is_ooo && rec.maxt < min_valid_time {
-                continue;
+        // 1. Load mmapped chunks from chunks_head. Header/sequence errors are fatal (Go
+        // `NewChunkDiskMapper` fails `NewHead`); iteration errors are repaired exactly like
+        // Go `Head.Init` -> `removeCorruptedMmappedChunks` and the data is recovered from WAL.
+        let mut reader = HeadChunksReader::open(chunks_dir)?;
+        let MmappedLoad {
+            in_order: mut mmapped_map,
+            ooo: mut ooo_mmapped_map,
+            last_ref: last_mmap_ref,
+        } = match self.load_mmapped_chunks(&reader) {
+            Ok(load) => load,
+            Err((err, _)) => {
+                tracing::error!(err = %err, "Loading on-disk chunks failed");
+                if matches!(err, HeadChunksError::Corruption { .. }) {
+                    self.metrics.mmap_chunk_corruptions_total.inc();
+                }
+                self.remove_corrupted_mmapped_chunks(&mut reader, &err)
             }
-            if !rec.encoding.is_valid() {
-                continue;
-            }
-            let mc = MmappedChunk {
-                ref_id: rec.chunk_ref,
-                min_time: rec.mint,
-                max_time: rec.maxt,
-                num_samples: rec.num_samples,
-                encoding: rec.encoding,
-            };
-            if rec.is_ooo {
-                ooo_mmapped_map.entry(rec.series_ref).or_default().push(mc);
-            } else {
-                mmapped_map.entry(rec.series_ref).or_default().push(mc);
-            }
-        }
+        };
         *self.chunk_reader.write() = Some(reader);
 
-        // 2. Replay WAL checkpoint + segments (repairing any torn tail record on crash).
+        // 2. Replay WAL checkpoint + segments. Like Go `Head.Init`, the first WAL error
+        // aborts the replay (the WBL is then NOT replayed in this boot) and `DB.Open`
+        // increments `prometheus_tsdb_wal_corruptions_total` and runs `wal.Repair(err)`,
+        // which only handles `CorruptionErr`s carrying a segment index and always
+        // repairs the WAL directory itself (even for errors read from a checkpoint).
         let mut multi_ref: HashMap<u64, u64> = HashMap::new();
-        let mut start_from = 0usize;
-        if let Some((cp_dir, cp_idx)) = last_checkpoint(wal_dir)? {
-            let mut r = WlogReader::open_dir(&cp_dir)?;
-            if let Err(err) = self.replay_wal_reader(
-                &mut r,
-                &mut multi_ref,
-                &mut mmapped_map,
-                &mut ooo_mmapped_map,
-            ) {
-                match err {
-                    HeadError::Wlog(WlogError::Corruption {
-                        dir: Some(corrupt_dir),
-                        segment: Some(seg),
-                        offset,
-                        ..
-                    }) => {
-                        repair_wal(&corrupt_dir, seg, offset, self.opts.wal_compression)?;
-                    }
-                    other => return Err(other),
-                }
+        let wal_res = self.replay_wal_dir(
+            wal_dir,
+            &mut multi_ref,
+            &mut mmapped_map,
+            &mut ooo_mmapped_map,
+        );
+        match wal_res {
+            Err(err) => {
+                self.metrics.wal_corruptions_total.inc();
+                tracing::warn!(err = %err, "Encountered WAL read error, attempting repair");
+                self.repair_write_log(&self.wal, err).map_err(|e| {
+                    HeadError::Repair(format!("repair corrupted WAL: {e}"))
+                })?;
+                tracing::info!("Successfully repaired WAL");
             }
-            start_from = cp_idx + 1;
-        }
-
-        if let Some((first_seg, last_seg)) = segments_range(wal_dir)? {
-            let from = start_from.max(first_seg);
-            if from <= last_seg {
-                let mut r = WlogReader::open_ranges(&[SegmentRange {
-                    dir: wal_dir.to_path_buf(),
-                    first: Some(from),
-                    last: Some(last_seg),
-                }])?;
-                if let Err(err) = self.replay_wal_reader(
-                    &mut r,
-                    &mut multi_ref,
-                    &mut mmapped_map,
-                    &mut ooo_mmapped_map,
-                ) {
-                    match err {
-                        HeadError::Wlog(WlogError::Corruption {
-                            dir: Some(corrupt_dir),
-                            segment: Some(seg),
-                            offset,
-                            ..
-                        }) => {
-                            repair_wal(&corrupt_dir, seg, offset, self.opts.wal_compression)?;
+            Ok(()) => {
+                // 3. Replay WBL segments if present, passing a chunk_writer so overflowing OOO
+                // head chunks spill to `chunks_head` instead of dropping.
+                if wbl_dir.exists() {
+                    if let Some((first_wbl, last_wbl)) = segments_range(wbl_dir)? {
+                        let mut r = WlogReader::open_ranges(&[SegmentRange {
+                            dir: wbl_dir.to_path_buf(),
+                            first: Some(first_wbl),
+                            last: Some(last_wbl),
+                        }])?;
+                        let mut replay_cw = HeadChunksWriter::with_max_file_size(
+                            chunks_dir,
+                            self.opts.max_head_chunk_file_size,
+                        )?;
+                        let wbl_res = self.replay_wbl_reader(
+                            &mut r,
+                            &multi_ref,
+                            last_mmap_ref,
+                            Some(&mut replay_cw),
+                        );
+                        let spilled = replay_cw.close().map_err(HeadError::from);
+                        spilled?;
+                        if let Err(err) = wbl_res {
+                            // Go `DB.Open`: `errLoadWbl` -> `wbl.Repair(e.err)`.
+                            self.metrics.wal_corruptions_total.inc();
+                            tracing::warn!(err = %err, "Encountered WBL read error, attempting repair");
+                            self.repair_write_log(&self.wbl, err).map_err(|e| {
+                                HeadError::Repair(format!("repair corrupted WBL: {e}"))
+                            })?;
+                            tracing::info!("Successfully repaired WBL");
                         }
-                        other => return Err(other),
+                        let refreshed = HeadChunksReader::open_no_repair(chunks_dir)?;
+                        *self.chunk_reader.write() = Some(refreshed);
+                        self.promote_all_pending_ooo_mmapped();
                     }
                 }
-            }
-        }
-
-        // 3. Replay WBL segments if present, passing a chunk_writer so overflowing OOO head
-        // chunks spill to `chunks_head` instead of dropping, and repairing any torn tail record.
-        if wbl_dir.exists() {
-            if let Some((first_wbl, last_wbl)) = segments_range(wbl_dir)? {
-                let mut r = WlogReader::open_ranges(&[SegmentRange {
-                    dir: wbl_dir.to_path_buf(),
-                    first: Some(first_wbl),
-                    last: Some(last_wbl),
-                }])?;
-                let mut replay_cw =
-                    HeadChunksWriter::with_max_file_size(chunks_dir, self.opts.max_head_chunk_file_size)?;
-                let wbl_res = self.replay_wbl_reader(
-                    &mut r,
-                    &multi_ref,
-                    last_mmap_ref,
-                    Some(&mut replay_cw),
-                );
-                let spilled = replay_cw.close().map_err(HeadError::from);
-                spilled?;
-                if let Err(err) = wbl_res {
-                    match err {
-                        HeadError::Wlog(WlogError::Corruption {
-                            dir: Some(corrupt_dir),
-                            segment: Some(seg),
-                            offset,
-                            ..
-                        }) => {
-                            repair_wal(&corrupt_dir, seg, offset, self.opts.wal_compression)?;
-                        }
-                        other => return Err(other),
-                    }
-                }
-                let refreshed = HeadChunksReader::open_no_repair(chunks_dir)?;
-                *self.chunk_reader.write() = Some(refreshed);
-                self.promote_all_pending_ooo_mmapped();
             }
         }
 
@@ -2105,6 +2102,165 @@ impl Head {
             self.min_time.store(effective_mvt, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// WAL part of Go `Head.Init`: replays the last checkpoint (if any) and then every WAL
+    /// segment after it, stopping at the first error.
+    fn replay_wal_dir(
+        &self,
+        wal_dir: &Path,
+        multi_ref: &mut HashMap<u64, u64>,
+        mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
+        ooo_mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
+    ) -> Result<(), HeadError> {
+        let mut start_from = 0usize;
+        if let Some((cp_dir, cp_idx)) = last_checkpoint(wal_dir)? {
+            // A corrupted checkpoint is passed to the WAL repair like any other error
+            // (Go: `backfill checkpoint: %w`).
+            let mut r = WlogReader::open_dir(&cp_dir)?;
+            self.replay_wal_reader(&mut r, multi_ref, mmapped_map, ooo_mmapped_map)?;
+            start_from = cp_idx + 1;
+        }
+        if let Some((first_seg, last_seg)) = segments_range(wal_dir)? {
+            let from = start_from.max(first_seg);
+            if from <= last_seg {
+                let mut r = WlogReader::open_ranges(&[SegmentRange {
+                    dir: wal_dir.to_path_buf(),
+                    first: Some(from),
+                    last: Some(last_seg),
+                }])?;
+                self.replay_wal_reader(&mut r, multi_ref, mmapped_map, ooo_mmapped_map)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Port of Go `wlog.WL.Repair(origErr)` as invoked by `DB.Open`: only a corruption
+    /// error with a known segment index can be handled; the repair always operates on
+    /// the given write log's own directory (the `CorruptionErr.Dir` is ignored, exactly like
+    /// Go).
+    fn repair_write_log(
+        &self,
+        log: &Mutex<Option<WlogWriter>>,
+        err: HeadError,
+    ) -> Result<(), String> {
+        match err {
+            HeadError::Wlog(WlogError::Corruption {
+                segment: Some(seg),
+                offset,
+                ..
+            }) => {
+                tracing::warn!(segment = seg, offset = offset, "Starting corruption repair");
+                let mut guard = log.lock();
+                let w = guard.as_mut().ok_or_else(|| "write log not open".to_string())?;
+                w.repair(seg, offset).map_err(|e| e.to_string())
+            }
+            HeadError::Wlog(WlogError::Corruption { segment: None, .. }) => {
+                Err("corruption error does not specify position".to_string())
+            }
+            other => Err(format!("cannot handle error: {other}")),
+        }
+    }
+
+    /// Port of Go `Head.loadMmappedChunks` (no chunk snapshot: every chunk is collected
+    /// per series ref and attached during WAL replay). On error the partially collected
+    /// maps are returned together with `secondLastRef` as `last_ref`, like Go.
+    #[allow(clippy::result_large_err)]
+    fn load_mmapped_chunks(
+        &self,
+        reader: &HeadChunksReader,
+    ) -> Result<MmappedLoad, (HeadChunksError, MmappedLoad)> {
+        let min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
+        let mut load = MmappedLoad::default();
+        let mut second_last_ref = ChunkDiskMapperRef(0);
+        let res = reader.iterate_all_chunks(|rec| {
+            second_last_ref = load.last_ref;
+            load.last_ref = rec.chunk_ref;
+            if !rec.is_ooo && rec.maxt < min_valid_time {
+                return Ok(());
+            }
+            // We ignore any chunk that doesn't have a valid encoding.
+            if !rec.encoding.is_valid() {
+                return Ok(());
+            }
+            let mc = MmappedChunk {
+                ref_id: rec.chunk_ref,
+                min_time: rec.mint,
+                max_time: rec.maxt,
+                num_samples: rec.num_samples,
+                encoding: rec.encoding,
+            };
+            if rec.is_ooo {
+                load.ooo.entry(rec.series_ref).or_default().push(mc);
+                return Ok(());
+            }
+            let slice = load.in_order.entry(rec.series_ref).or_default();
+            if let Some(last) = slice.last() {
+                if last.max_time >= rec.mint {
+                    self.metrics.mmap_chunk_corruptions_total.inc();
+                    return Err(HeadChunksError::OutOfSequenceChunk {
+                        series_ref: rec.series_ref,
+                        last_mint: last.min_time,
+                        last_maxt: last.max_time,
+                        mint: rec.mint,
+                        maxt: rec.maxt,
+                    });
+                }
+            }
+            slice.push(mc);
+            Ok(())
+        });
+        match res {
+            Ok(()) => Ok(load),
+            Err(err) => {
+                // secondLastRef because the lastRef caused an error.
+                load.last_ref = second_last_ref;
+                Err((err, load))
+            }
+        }
+    }
+
+    /// Port of Go `Head.removeCorruptedMmappedChunks`: deletes the corrupted m-map chunk
+    /// files (or all of them if that is not possible) and re-attempts loading. Never fails:
+    /// the data is recovered from the WAL.
+    fn remove_corrupted_mmapped_chunks(
+        &self,
+        reader: &mut HeadChunksReader,
+        err: &HeadChunksError,
+    ) -> MmappedLoad {
+        tracing::info!("Deleting mmapped chunk files");
+        tracing::info!("Deleting mmapped chunk files");
+        if let Err(del_err) = reader.delete_corrupted(err) {
+            tracing::info!(
+                err = %del_err,
+                "Deletion of corrupted mmap chunk files failed, discarding chunk files completely"
+            );
+            if let Err(e) = reader.delete_all() {
+                tracing::error!(err = %e, "Deletion of all mmap chunk files failed");
+            }
+            return MmappedLoad::default();
+        }
+        tracing::info!(
+            "Deletion of mmap chunk files successful, reattempting m-mapping the on-disk chunks"
+        );
+        match self.load_mmapped_chunks(reader) {
+            Ok(load) => load,
+            Err((load_err, mut partial)) => {
+                tracing::error!(
+                    err = %load_err,
+                    "Loading on-disk chunks failed, discarding chunk files completely"
+                );
+                if let Err(e) = reader.delete_all() {
+                    tracing::error!(
+                        err = %e,
+                        "Deletion of all mmap chunk files failed after failed loading"
+                    );
+                }
+                // Go only resets the in-order map here; OOO map and lastRef are kept.
+                partial.in_order.clear();
+                partial
+            }
+        }
     }
 
     fn intern_metadata_symbols(
@@ -2350,7 +2506,8 @@ impl Head {
             let decoded = match dec.decode_record(rec) {
                 Ok(d) => d,
                 Err(e) => {
-                    replay_err = Some(HeadError::from(e));
+                    // Go `loadWAL`: decode errors are `wlog.CorruptionErr{Segment, Offset}`.
+                    replay_err = Some(record_decode_corruption(r, &e));
                     break;
                 }
             };
@@ -2571,7 +2728,10 @@ impl Head {
 
         type RawEntry = (CompressionType, Vec<u8>, Option<PathBuf>, Option<usize>, usize);
         type RawBatch = (u64, Vec<RawEntry>);
-        type DecodedBatch = (u64, Vec<ParallelDecodedRecord>);
+        // A batch carries the records decoded before a decode/decompress error (if any),
+        // so that the coordinator applies them in WAL order and stops exactly at the
+        // corrupt record, like Go `loadWAL`.
+        type DecodedBatch = (u64, Vec<ParallelDecodedRecord>, Option<HeadError>);
 
         // Channel capacity > dec_workers * dec_queue_cap ensures zero deadlock when reordering.
         let (decoded_tx, decoded_rx) =
@@ -2674,21 +2834,20 @@ impl Head {
                                 }
                                 Ok(rec) => decoded_batch.push(ParallelDecodedRecord::Other(rec)),
                                 Err(e) => {
-                                    err = Some(HeadError::from(e));
+                                    // Go `loadWAL`: decode errors are `wlog.CorruptionErr`.
+                                    err = Some(HeadError::Wlog(WlogError::Corruption {
+                                        dir,
+                                        segment: seg,
+                                        offset: off,
+                                        message: format!("decode record: {e}"),
+                                    }));
                                     break;
                                 }
                             }
                         }
-                        match err {
-                            Some(e) => {
-                                let _ = d_tx.send(Err(e));
-                                break;
-                            }
-                            None => {
-                                if d_tx.send(Ok((batch_id, decoded_batch))).is_err() {
-                                    break;
-                                }
-                            }
+                        let failed = err.is_some();
+                        if d_tx.send(Ok((batch_id, decoded_batch, err))).is_err() || failed {
+                            break;
                         }
                     }
                 }));
@@ -2773,7 +2932,7 @@ impl Head {
             let mut job_shards: Vec<Vec<WalSampleJob>> = (0..workers).map(|_| Vec::new()).collect();
             let mut pending_deletes: Vec<Arc<SeriesEntry>> = Vec::new();
             let mut pending_series: Vec<(RefSeries, u64)> = Vec::new();
-            let mut reorder: BTreeMap<u64, Vec<ParallelDecodedRecord>> = BTreeMap::new();
+            let mut reorder: BTreeMap<u64, (Vec<ParallelDecodedRecord>, Option<HeadError>)> = BTreeMap::new();
             let mut next_batch_id = 0u64;
 
             let flush_series_batch = |pending: &mut Vec<(RefSeries, u64)>,
@@ -2920,26 +3079,29 @@ impl Head {
             };
 
             let mut failed_outer = false;
+            let mut reader_err: Option<HeadError> = None;
             'outer: while let Ok(item) = decoded_rx.recv() {
-                let (batch_id, decoded_batch) = match item {
+                let (batch_id, decoded_batch, batch_err) = match item {
                     Ok(v) => v,
                     Err(e) => {
-                        if coord_res.is_ok() {
-                            coord_res = Err(e);
+                        // A reader error is positioned after every batch sent before it:
+                        // drain the remaining valid batches (an earlier decode error in
+                        // one of them takes precedence).
+                        if reader_err.is_none() {
+                            reader_err = Some(e);
                         }
-                        // Drain remaining valid batches already in flight before exiting.
                         continue;
                     }
                 };
                 let mut cur_batch = if batch_id == next_batch_id {
                     next_batch_id += 1;
-                    Some(decoded_batch)
+                    Some((decoded_batch, batch_err))
                 } else {
-                    reorder.insert(batch_id, decoded_batch);
+                    reorder.insert(batch_id, (decoded_batch, batch_err));
                     None
                 };
 
-                while let Some(records) = cur_batch.take().or_else(|| {
+                while let Some((records, records_err)) = cur_batch.take().or_else(|| {
                     let b = reorder.remove(&next_batch_id);
                     if b.is_some() {
                         next_batch_id += 1;
@@ -3144,6 +3306,13 @@ impl Head {
                             }
                         }
                     }
+                    if let Some(e) = records_err {
+                        // Records before the corrupt one were applied above; stop here.
+                        if coord_res.is_ok() {
+                            coord_res = Err(e);
+                        }
+                        break 'outer;
+                    }
                 }
             }
 
@@ -3161,6 +3330,11 @@ impl Head {
                 }
             }
             let _ = failed_outer;
+            if coord_res.is_ok() {
+                if let Some(e) = reader_err {
+                    coord_res = Err(e);
+                }
+            }
 
             for (idx, shard) in job_shards.into_iter().enumerate() {
                 if !shard.is_empty() {
@@ -3200,7 +3374,12 @@ impl Head {
         let mut pinned = HashSet::new();
 
         while let Some(rec) = r.next_record()? {
-            match dec.decode_record(rec)? {
+            let decoded = match dec.decode_record(rec) {
+                Ok(d) => d,
+                // Go `loadWBL`: decode errors are `wlog.CorruptionErr{Segment, Offset}`.
+                Err(e) => return Err(record_decode_corruption(r, &e)),
+            };
+            match decoded {
                 DecodedRecord::MmapMarkers(markers) => {
                     for mut rm in markers {
                         let (seq, off) = ChunkDiskMapperRef(rm.mmap_ref).unpack();
