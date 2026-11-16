@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -135,6 +136,8 @@ pub struct Hooks {
 pub struct FakeKafkaCluster {
     pub addr: String,
     pub port: i32,
+    /// Port advertised in Metadata / FindCoordinator (e.g. a TLS proxy in front of the cluster).
+    advertised_port: AtomicI32,
     sasl: ClusterSasl,
     pub custom_groups_enabled: bool,
     topics: SyncMutex<HashMap<String, Vec<PartitionState>>>,
@@ -173,6 +176,7 @@ impl FakeKafkaCluster {
         let cluster = Arc::new(Self {
             addr,
             port,
+            advertised_port: AtomicI32::new(port),
             sasl,
             custom_groups_enabled,
             topics: SyncMutex::new(topics),
@@ -207,6 +211,11 @@ impl FakeKafkaCluster {
 
     pub fn close(&self) {
         let _ = self.shutdown.send(true);
+    }
+
+    /// Advertises `port` (on 127.0.0.1) as the broker address in Metadata / FindCoordinator.
+    pub fn set_advertised_port(&self, port: i32) {
+        self.advertised_port.store(port, AtomicOrdering::SeqCst);
     }
 
     pub fn topic_exists(&self, topic: &str) -> bool {
@@ -411,7 +420,7 @@ impl FakeKafkaCluster {
                     resp.error_code = 0;
                     resp.node_id = BrokerId(0);
                     resp.host = StrBytes::from_static_str("127.0.0.1");
-                    resp.port = self.port;
+                    resp.port = self.advertised_port.load(AtomicOrdering::SeqCst);
                     let bytes = encode_resp(api_key, api_ver, corr_id, &resp);
                     if resp_tx.send(bytes).await.is_err() {
                         break;
@@ -613,7 +622,7 @@ impl FakeKafkaCluster {
         let mut broker = MetadataResponseBroker::default();
         broker.node_id = BrokerId(0);
         broker.host = StrBytes::from_static_str("127.0.0.1");
-        broker.port = self.port;
+        broker.port = self.advertised_port.load(AtomicOrdering::SeqCst);
         resp.brokers = vec![broker];
         resp.controller_id = BrokerId(0);
 

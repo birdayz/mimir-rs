@@ -17,6 +17,7 @@ pub mod partition_offset_watcher;
 pub mod pusher;
 pub mod reader;
 pub mod reader_client;
+pub mod transport;
 pub mod util;
 pub mod version;
 pub mod writer;
@@ -85,7 +86,10 @@ pub use util::{
     sasl_mechanism, sha256, sha512, CredentialCallback, IngestKafkaClient,
     KafkaClientExtendedMetrics, KafkaMskIamAuth, KafkaOauthbearerAuth, KafkaSaslSecretConfig,
     RecordedSpan, ResolvedSaslMechanism, ResultPromise, SampledOnlyPropagator, SampledOnlyTracer,
-    SaslAuthConfig, ScramAlg, SpanRecorder, StaticSaslSecret, TraceSpanContext, TracedKafkaRecord,
+    ScramAlg, SpanRecorder, StaticSaslSecret, TraceSpanContext, TracedKafkaRecord,
+};
+pub use transport::{
+    EstablishedConn, KafkaReadHalf, KafkaStream, KafkaTransport, KafkaWriteHalf, SaslAuthConfig,
 };
 pub use version::{
     deserialize_record_content, parse_record_version, record_version_header,
@@ -207,17 +211,9 @@ pub struct WarpstreamClientOptions {
 
 pub fn to_warpstream_client_options(cfg: &KafkaConfig) -> Result<WarpstreamClientOptions, String> {
     if cfg.tls_enabled {
-        let has_cert = !cfg.tls_cert_path.is_empty();
-        let has_key = !cfg.tls_key_path.is_empty();
-        if has_cert != has_key {
-            return Err("invalid Kafka TLS config: both cert_path and key_path must be specified".to_string());
-        }
-        if has_cert && !std::path::Path::new(&cfg.tls_cert_path).exists() {
-            return Err(format!("invalid Kafka TLS config: cert file does not exist: {}", cfg.tls_cert_path));
-        }
-        if has_key && !std::path::Path::new(&cfg.tls_key_path).exists() {
-            return Err(format!("invalid Kafka TLS config: key file does not exist: {}", cfg.tls_key_path));
-        }
+        cfg.tls_client_config()
+            .get_tls_config()
+            .map_err(|e| format!("invalid Kafka TLS config: {e}"))?;
     }
 
     let dial_timeout = Duration::from_nanos(cfg.dial_timeout.as_nanos().max(0) as u64);

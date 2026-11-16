@@ -454,3 +454,67 @@ overrides:
     );
     assert!(mgr.ingester_limits().is_none());
 }
+
+// Upstream: pkg/storage/ingest/config.go KafkaConfig.Validate (`invalid Kafka TLS config: %w`)
+// + dskit crypto/tls ClientConfig.GetTLSConfig (OBSERV-1374).
+#[test]
+fn test_kafka_config_validate_tls() {
+    let fixtures = format!(
+        "{}/../mimir-storage/tests/fixtures/kafka_tls",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let base = || mimir_config::KafkaConfig {
+        address: mimir_config::StringSliceCSV(vec!["localhost:9092".to_string()]),
+        topic: "ingest".to_string(),
+        ..Default::default()
+    };
+    let validation_err = |cfg: &mimir_config::KafkaConfig| match cfg.validate() {
+        Err(mimir_config::ConfigError::Validation(msg)) => msg,
+        other => panic!("expected validation error, got {other:?}"),
+    };
+
+    // TLS settings are not resolved while TLS is disabled (as in Go).
+    let mut cfg = base();
+    cfg.tls_cert_path = "/does/not/exist.crt".to_string();
+    cfg.validate().unwrap();
+
+    // A client cert without a key fails GetTLSConfig.
+    cfg.tls_enabled = true;
+    assert_eq!(
+        validation_err(&cfg),
+        "invalid Kafka TLS config: certificate given but no key configured"
+    );
+
+    let mut cfg = base();
+    cfg.tls_enabled = true;
+    cfg.tls_ca_path = "/does/not/exist.crt".to_string();
+    assert_eq!(
+        validation_err(&cfg),
+        "invalid Kafka TLS config: error loading ca cert: /does/not/exist.crt: open /does/not/exist.crt: no such file or directory"
+    );
+
+    let mut cfg = base();
+    cfg.tls_enabled = true;
+    cfg.tls_min_version = "VersionTLS99".to_string();
+    assert_eq!(
+        validation_err(&cfg),
+        "invalid Kafka TLS config: unknown minimum TLS version: \"VersionTLS99\""
+    );
+
+    let mut cfg = base();
+    cfg.tls_enabled = true;
+    cfg.tls_cipher_suites = "NOPE".to_string();
+    assert_eq!(
+        validation_err(&cfg),
+        "invalid Kafka TLS config: unsupported cipher suite: \"NOPE\""
+    );
+
+    let mut cfg = base();
+    cfg.tls_enabled = true;
+    cfg.tls_ca_path = format!("{fixtures}/ca.crt");
+    cfg.tls_cert_path = format!("{fixtures}/client.crt");
+    cfg.tls_key_path = format!("{fixtures}/client.key");
+    cfg.tls_server_name = "kafka.mimir-rs.test".to_string();
+    cfg.tls_min_version = "VersionTLS13".to_string();
+    cfg.validate().unwrap();
+}

@@ -19,11 +19,14 @@ lz4_flex = { workspace = true }
 object_store = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }

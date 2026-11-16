@@ -25,7 +25,6 @@ use parking_lot::Mutex as SyncMutex;
 use prometheus::{Counter, Histogram, HistogramOpts, Opts, Registry};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error};
@@ -33,6 +32,7 @@ use tracing::{debug, error};
 use super::compression::decompress_record_batch;
 use super::kafka_client::{FetchedRecord, KAFKA_OFFSET_END, KAFKA_OFFSET_START};
 use super::partition_offset_client::PartitionOffsetClient;
+use super::transport::KafkaTransport;
 use super::partition_offset_reader::GenericOffsetReader;
 
 pub const UNKNOWN_BROKER: &str = "unknown broker";
@@ -399,7 +399,7 @@ impl FetcherMetrics {
 struct FetchBrokerClient {
     seed_addrs: Vec<String>,
     client_id: String,
-    dial_timeout: Duration,
+    transport: Arc<KafkaTransport>,
     request_timeout: Duration,
     topic_name: String,
     topic_template: SyncMutex<Option<FetchTopic>>,
@@ -416,21 +416,23 @@ struct MuxConn {
     write_tx: mpsc::Sender<Bytes>,
     pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>>,
     alive: Arc<std::sync::atomic::AtomicBool>,
+    /// SASL session expiry: past it the connection is replaced instead of reused.
+    sasl_expiry: Option<std::time::Instant>,
 }
 
 impl MuxConn {
     async fn connect(
         addr: &str,
         client_id: String,
-        dial_timeout: Duration,
+        transport: &KafkaTransport,
+        request_timeout: Duration,
     ) -> Result<Arc<Self>, String> {
-        let stream = tokio::time::timeout(dial_timeout, TcpStream::connect(addr))
+        let established = transport
+            .connect(addr, &client_id, request_timeout)
             .await
-            .map_err(|_| format!("connect timeout to {addr}"))?
             .map_err(|e| format!("connect error to {addr}: {e}"))?;
-        let _ = stream.set_nodelay(true);
 
-        let (mut reader, mut writer) = stream.into_split();
+        let (mut reader, mut writer) = established.stream.into_split();
         let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(256);
         let pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>> =
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -439,7 +441,7 @@ impl MuxConn {
         let alive_w = Arc::clone(&alive);
         tokio::spawn(async move {
             while let Some(frame) = write_rx.recv().await {
-                if writer.write_all(&frame).await.is_err() {
+                if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
                     break;
                 }
             }
@@ -477,11 +479,20 @@ impl MuxConn {
 
         Ok(Arc::new(Self {
             client_id,
-            next_corr_id: AtomicI32::new(1),
+            next_corr_id: AtomicI32::new(established.next_correlation_id),
             write_tx,
             pending,
             alive,
+            sasl_expiry: established.sasl_expiry,
         }))
+    }
+
+    /// Alive and its SASL session (if any) has not expired: may be handed out for new requests.
+    fn is_usable(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+            && self
+                .sasl_expiry
+                .is_none_or(|e| std::time::Instant::now() < e)
     }
 
     async fn send<Req: Request + Encodable, Resp: Decodable + HeaderVersion>(
@@ -542,12 +553,19 @@ impl FetchBrokerClient {
     async fn conn(&self) -> Result<Arc<MuxConn>, KafkaFetchError> {
         let mut guard = self.state.lock().await;
         if let Some(ref st) = *guard {
-            if st.conn.alive.load(Ordering::SeqCst) {
+            if st.conn.is_usable() {
                 return Ok(Arc::clone(&st.conn));
             }
         }
         for addr in &self.seed_addrs {
-            if let Ok(conn) = MuxConn::connect(addr, self.client_id.clone(), self.dial_timeout).await {
+            if let Ok(conn) = MuxConn::connect(
+                addr,
+                self.client_id.clone(),
+                &self.transport,
+                self.request_timeout,
+            )
+            .await
+            {
                 *guard = Some(FetchBrokerState {
                     conn: Arc::clone(&conn),
                 });
@@ -678,7 +696,8 @@ impl ConcurrentFetchers {
         let broker = Arc::new(FetchBrokerClient {
             seed_addrs,
             client_id: client_id.into(),
-            dial_timeout: Duration::from_secs(2),
+            // Dial, TLS and SASL settings of the offset client's Kafka client (same KafkaConfig).
+            transport: Arc::clone(offset_reader.kafka_client().transport()),
             request_timeout: Duration::from_secs(10).max(min_bytes_wait_time + Duration::from_secs(5)),
             topic_name: topic_name.clone(),
             topic_template: SyncMutex::new(None),

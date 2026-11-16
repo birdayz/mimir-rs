@@ -18,10 +18,10 @@ use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 use mimir_config::KafkaConfig;
 use prometheus::{CounterVec, HistogramOpts, HistogramVec, Opts, Registry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::kafka_client::{KafkaClient, KafkaClientError, KAFKA_OFFSET_END};
+use super::transport::KafkaTransport;
 
 #[derive(Clone)]
 pub struct PartitionOffsetClientMetrics {
@@ -110,22 +110,20 @@ struct BatchConn {
     write_tx: mpsc::Sender<Bytes>,
     pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>>,
     alive: Arc<AtomicBool>,
+    /// SASL session expiry: past it the connection is replaced instead of reused.
+    sasl_expiry: Option<Instant>,
 }
 
 impl BatchConn {
     async fn connect(
         addr: &str,
         client_id: String,
-        dial_timeout: Duration,
+        transport: &KafkaTransport,
+        request_timeout: Duration,
     ) -> Result<Arc<Self>, KafkaClientError> {
-        let stream = tokio::time::timeout(dial_timeout, TcpStream::connect(addr))
-            .await
-            .map_err(|_| KafkaClientError::ConnectTimeout {
-                addr: addr.to_string(),
-            })??;
-        let _ = stream.set_nodelay(true);
+        let established = transport.connect(addr, &client_id, request_timeout).await?;
 
-        let (mut reader, mut writer) = stream.into_split();
+        let (mut reader, mut writer) = established.stream.into_split();
         let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(128);
         let pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>> =
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -134,7 +132,7 @@ impl BatchConn {
         let alive_w = Arc::clone(&alive);
         tokio::spawn(async move {
             while let Some(frame) = write_rx.recv().await {
-                if writer.write_all(&frame).await.is_err() {
+                if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
                     break;
                 }
             }
@@ -172,11 +170,17 @@ impl BatchConn {
 
         Ok(Arc::new(Self {
             client_id,
-            next_corr_id: AtomicI32::new(1),
+            next_corr_id: AtomicI32::new(established.next_correlation_id),
             write_tx,
             pending,
             alive,
+            sasl_expiry: established.sasl_expiry,
         }))
+    }
+
+    /// Alive and its SASL session (if any) has not expired: may be handed out for new requests.
+    fn is_usable(&self) -> bool {
+        self.alive.load(Ordering::SeqCst) && self.sasl_expiry.is_none_or(|e| Instant::now() < e)
     }
 
     async fn send_list_offsets(
@@ -232,7 +236,6 @@ pub struct PartitionOffsetClient {
     metrics: PartitionOffsetClientMetrics,
     batch_addrs: Vec<String>,
     client_id: String,
-    dial_timeout: Duration,
     request_timeout: Duration,
     batch_conn: Arc<Mutex<Option<Arc<BatchConn>>>>,
     closed: Arc<AtomicBool>,
@@ -245,7 +248,6 @@ impl PartitionOffsetClient {
             metrics: PartitionOffsetClientMetrics::new(registry),
             batch_addrs: Vec::new(),
             client_id: String::new(),
-            dial_timeout: Duration::from_secs(2),
             request_timeout: Duration::from_secs(10),
             batch_conn: Arc::new(Mutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
@@ -271,8 +273,6 @@ impl PartitionOffsetClient {
                 }
             }
         }
-        let dial_timeout = Duration::from_nanos(cfg.dial_timeout.as_nanos().max(0) as u64)
-            .max(Duration::from_millis(100));
         let retry_timeout =
             Duration::from_nanos(cfg.last_produced_offset_retry_timeout.as_nanos().max(0) as u64)
                 .max(Duration::from_millis(100));
@@ -281,7 +281,6 @@ impl PartitionOffsetClient {
             metrics: PartitionOffsetClientMetrics::new(registry),
             batch_addrs: addrs,
             client_id: cfg.client_id.clone(),
-            dial_timeout,
             request_timeout: retry_timeout,
             batch_conn: Arc::new(Mutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
@@ -380,13 +379,20 @@ impl PartitionOffsetClient {
     async fn get_batch_conn(&self) -> Result<Arc<BatchConn>, KafkaClientError> {
         let mut guard = self.batch_conn.lock().await;
         if let Some(ref c) = *guard {
-            if c.alive.load(Ordering::SeqCst) {
+            if c.is_usable() {
                 return Ok(Arc::clone(c));
             }
         }
         let mut last_err = None;
         for addr in &self.batch_addrs {
-            match BatchConn::connect(addr, self.client_id.clone(), self.dial_timeout).await {
+            match BatchConn::connect(
+                addr,
+                self.client_id.clone(),
+                self.client.transport(),
+                self.request_timeout,
+            )
+            .await
+            {
                 Ok(c) => {
                     *guard = Some(Arc::clone(&c));
                     return Ok(c);

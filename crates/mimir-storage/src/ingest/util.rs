@@ -14,13 +14,12 @@ use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::error::{ParseResponseErrorCode, ResponseError};
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::{
-    ApiKey, ApiVersionsRequest, ApiVersionsResponse, BrokerId, CreateTopicsRequest,
+    ApiKey, BrokerId, CreateTopicsRequest,
     CreateTopicsResponse, FetchRequest, FetchResponse, FindCoordinatorRequest,
     FindCoordinatorResponse, GroupId, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest,
     MetadataResponse, OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest,
     OffsetFetchResponse, ProduceRequest, ProduceResponse, RequestHeader, ResponseHeader,
-    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
-    SaslHandshakeResponse, TopicName,
+    TopicName,
 };
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
@@ -38,14 +37,14 @@ use kafka_protocol::records::{
 };
 use mimir_common::thread_pool::ScopedWorkerPool;
 use mimir_config::KafkaConfig;
-use mimir_config::types::SASLMechanism;
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use super::compression::{compress_record_batch, KafkaCompression};
+use super::transport::KafkaTransport;
 use super::kafka_client::{
     decode_fetch_records_with_pool, FetchPartitionResult, KafkaClientError, ListedOffset,
     ProduceRecord, KAFKA_OFFSET_END, KAFKA_OFFSET_START,
@@ -124,26 +123,122 @@ impl<T: Clone + Send + Sync + 'static> ResultPromise<T> {
 // SASL Credentials Resolution (ported from util.go)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// franz-go `oauth.Auth`. JSON field names are the Go struct field names (`Zid`, `Token`,
+/// `Extensions`), matched case-insensitively on decode like Go `encoding/json`.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct KafkaOauthbearerAuth {
-    #[serde(default)]
-    pub token: String,
-    #[serde(default)]
+    #[serde(rename = "Zid")]
     pub zid: String,
-    #[serde(default)]
+    #[serde(rename = "Token")]
+    pub token: String,
+    #[serde(rename = "Extensions")]
     pub extensions: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl std::fmt::Debug for KafkaOauthbearerAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaOauthbearerAuth")
+            .field("zid", &self.zid)
+            .field("token", &"<redacted>")
+            .field("extensions", &self.extensions)
+            .finish()
+    }
+}
+
+/// franz-go `aws.Auth`. JSON field names are the Go struct field names (`AccessKey`,
+/// `SecretKey`, `SessionToken`, `UserAgent`), matched case-insensitively on decode like Go
+/// `encoding/json`.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct KafkaMskIamAuth {
-    #[serde(default)]
+    #[serde(rename = "AccessKey")]
     pub access_key: String,
-    #[serde(default)]
+    #[serde(rename = "SecretKey")]
     pub secret_key: String,
-    #[serde(default)]
+    #[serde(rename = "SessionToken")]
     pub session_token: String,
-    #[serde(default)]
+    #[serde(rename = "UserAgent")]
     pub user_agent: String,
+}
+
+impl std::fmt::Debug for KafkaMskIamAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaMskIamAuth")
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("session_token", &"<redacted>")
+            .field("user_agent", &self.user_agent)
+            .finish()
+    }
+}
+
+/// Decodes a JSON object into Go struct fields the way Go `encoding/json` does: keys match field
+/// names exactly or case-insensitively, `null` leaves the field untouched, unknown keys are
+/// ignored, a later duplicate key wins.
+fn decode_go_json_fields<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    fields: &[&str],
+    mut set: impl FnMut(usize, serde_json::Value) -> Result<(), String>,
+) -> Result<(), D::Error> {
+    use serde::de::Error as _;
+    let obj = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+    for (key, value) in obj {
+        let idx = fields
+            .iter()
+            .position(|f| *f == key)
+            .or_else(|| fields.iter().position(|f| f.eq_ignore_ascii_case(&key)));
+        if let Some(idx) = idx {
+            if value.is_null() {
+                continue;
+            }
+            set(idx, value).map_err(|e| D::Error::custom(format!("field {}: {e}", fields[idx])))?;
+        }
+    }
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for KafkaOauthbearerAuth {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut out = KafkaOauthbearerAuth {
+            zid: String::new(),
+            token: String::new(),
+            extensions: BTreeMap::new(),
+        };
+        decode_go_json_fields(deserializer, &["Zid", "Token", "Extensions"], |idx, v| {
+            match idx {
+                0 => out.zid = serde_json::from_value(v).map_err(|e| e.to_string())?,
+                1 => out.token = serde_json::from_value(v).map_err(|e| e.to_string())?,
+                _ => out.extensions = serde_json::from_value(v).map_err(|e| e.to_string())?,
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
+impl<'de> Deserialize<'de> for KafkaMskIamAuth {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut out = KafkaMskIamAuth {
+            access_key: String::new(),
+            secret_key: String::new(),
+            session_token: String::new(),
+            user_agent: String::new(),
+        };
+        decode_go_json_fields(
+            deserializer,
+            &["AccessKey", "SecretKey", "SessionToken", "UserAgent"],
+            |idx, v| {
+                let s: String = serde_json::from_value(v).map_err(|e| e.to_string())?;
+                match idx {
+                    0 => out.access_key = s,
+                    1 => out.secret_key = s,
+                    2 => out.session_token = s,
+                    _ => out.user_agent = s,
+                }
+                Ok(())
+            },
+        )?;
+        Ok(out)
+    }
 }
 
 pub type CredentialCallback<A> =
@@ -152,6 +247,15 @@ pub type CredentialCallback<A> =
 pub enum ResolvedSaslMechanism<A> {
     Static(A),
     Callback(CredentialCallback<A>),
+}
+
+impl<A: Clone> Clone for ResolvedSaslMechanism<A> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Static(a) => Self::Static(a.clone()),
+            Self::Callback(cb) => Self::Callback(Arc::clone(cb)),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -709,57 +813,8 @@ pub async fn create_topics(cfg: &KafkaConfig, topics: &[&str]) -> Result<(), Str
 }
 
 // ---------------------------------------------------------------------------
-// SASL-Capable Kafka Client (supports PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
+// TLS- and SASL-capable Kafka Client (dial/TLS/SASL via super::transport)
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub enum SaslAuthConfig {
-    None,
-    Plain {
-        username: String,
-        password: String,
-    },
-    ScramSha256 {
-        username: String,
-        password: String,
-    },
-    ScramSha512 {
-        username: String,
-        password: String,
-    },
-}
-
-impl SaslAuthConfig {
-    pub fn from_kafka_config(cfg: &KafkaConfig) -> Self {
-        if (cfg.sasl_mechanism == SASLMechanism::Plain) && cfg.sasl_username.is_empty() {
-            return Self::None;
-        }
-        match cfg.sasl_mechanism {
-            SASLMechanism::Plain => Self::Plain {
-                username: cfg.sasl_username.clone(),
-                password: cfg.sasl_password.clone(),
-            },
-            SASLMechanism::ScramSha256 => Self::ScramSha256 {
-                username: cfg.sasl_username.clone(),
-                password: cfg.sasl_password.clone(),
-            },
-            SASLMechanism::ScramSha512 => Self::ScramSha512 {
-                username: cfg.sasl_username.clone(),
-                password: cfg.sasl_password.clone(),
-            },
-            _ => Self::None,
-        }
-    }
-
-    pub(crate) fn mechanism_name(&self) -> Option<&'static str> {
-        match self {
-            Self::None => None,
-            Self::Plain { .. } => Some("PLAIN"),
-            Self::ScramSha256 { .. } => Some("SCRAM-SHA-256"),
-            Self::ScramSha512 { .. } => Some("SCRAM-SHA-512"),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct BrokerInfo {
@@ -781,6 +836,8 @@ struct SaslBrokerConn {
     pending: Arc<SyncMutex<HashMap<i32, oneshot::Sender<Bytes>>>>,
     api_versions: RwLock<HashMap<i16, (i16, i16)>>,
     alive: Arc<AtomicBool>,
+    /// SASL session expiry: past it the connection is replaced instead of reused.
+    sasl_expiry: Option<Instant>,
     metrics: Option<KafkaClientExtendedMetrics>,
 }
 
@@ -802,20 +859,16 @@ impl SaslBrokerConn {
     async fn connect(
         addr: String,
         client_id: String,
-        dial_timeout: Duration,
+        transport: &KafkaTransport,
         request_timeout: Duration,
-        sasl: &SaslAuthConfig,
         metrics: Option<KafkaClientExtendedMetrics>,
     ) -> Result<Arc<Self>, KafkaClientError> {
-        let stream = tokio::time::timeout(dial_timeout, TcpStream::connect(&addr))
-            .await
-            .map_err(|_| KafkaClientError::ConnectTimeout { addr: addr.clone() })??;
-        let _ = stream.set_nodelay(true);
+        let established = transport.connect(&addr, &client_id, request_timeout).await?;
         if let Some(ref m) = metrics {
             m.connects_total.inc();
         }
 
-        let (mut reader, mut writer) = stream.into_split();
+        let (mut reader, mut writer) = established.stream.into_split();
         let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(512);
         let pending: Arc<SyncMutex<HashMap<i32, oneshot::Sender<Bytes>>>> =
             Arc::new(SyncMutex::new(HashMap::new()));
@@ -826,7 +879,7 @@ impl SaslBrokerConn {
         tokio::spawn(async move {
             while let Some(frame) = write_rx.recv().await {
                 let len = frame.len() as f64;
-                if writer.write_all(&frame).await.is_err() {
+                if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
                     break;
                 }
                 if let Some(ref m) = metrics_w {
@@ -866,205 +919,30 @@ impl SaslBrokerConn {
             pending_r.lock().clear();
         });
 
-        let conn = Arc::new(Self {
+        Ok(Arc::new(Self {
             addr,
             client_id,
-            next_corr_id: AtomicI32::new(1),
+            next_corr_id: AtomicI32::new(established.next_correlation_id),
             write_tx,
             pending,
-            api_versions: RwLock::new(HashMap::new()),
+            api_versions: RwLock::new(established.api_versions),
             alive,
+            sasl_expiry: established.sasl_expiry,
             metrics,
-        });
-
-        let handshake_timeout = request_timeout.max(Duration::from_secs(2));
-        if let Err(e) = tokio::time::timeout(handshake_timeout, conn.negotiate_api_versions())
-            .await
-            .map_err(|_| KafkaClientError::RequestTimeout(handshake_timeout))
-            .and_then(|r| r)
-        {
-            conn.mark_dead();
-            return Err(e);
-        }
-        if let Err(e) = tokio::time::timeout(handshake_timeout, conn.authenticate_sasl(sasl))
-            .await
-            .map_err(|_| KafkaClientError::RequestTimeout(handshake_timeout))
-            .and_then(|r| r)
-        {
-            conn.mark_dead();
-            return Err(e);
-        }
-        Ok(conn)
+        }))
     }
 
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
 
+    /// Alive and its SASL session (if any) has not expired: may be handed out for new requests.
+    fn is_usable(&self) -> bool {
+        self.is_alive() && self.sasl_expiry.is_none_or(|e| Instant::now() < e)
+    }
+
     fn mark_dead(&self) {
         self.alive.store(false, Ordering::SeqCst);
-    }
-
-    async fn negotiate_api_versions(&self) -> Result<(), KafkaClientError> {
-        let mut req = ApiVersionsRequest::default();
-        req.client_software_name = StrBytes::from_static_str("mimir-rs");
-        req.client_software_version = StrBytes::from_static_str("0.1.0");
-
-        let resp: ApiVersionsResponse = match self.send_raw(ApiKey::ApiVersions, 3, &req).await {
-            Ok(r) => r,
-            Err(_) => {
-                let req0 = ApiVersionsRequest::default();
-                self.send_raw(ApiKey::ApiVersions, 0, &req0).await?
-            }
-        };
-        if let Some(err) = resp.error_code.err() {
-            if err != ResponseError::UnsupportedVersion {
-                return Err(KafkaClientError::Broker(err));
-            }
-            let req0 = ApiVersionsRequest::default();
-            let resp0: ApiVersionsResponse = self.send_raw(ApiKey::ApiVersions, 0, &req0).await?;
-            if let Some(e) = resp0.error_code.err() {
-                return Err(KafkaClientError::Broker(e));
-            }
-            let mut map = self.api_versions.write();
-            for k in resp0.api_keys {
-                map.insert(k.api_key, (k.min_version, k.max_version));
-            }
-            return Ok(());
-        }
-
-        let mut map = self.api_versions.write();
-        for k in resp.api_keys {
-            map.insert(k.api_key, (k.min_version, k.max_version));
-        }
-        Ok(())
-    }
-
-    async fn authenticate_sasl(&self, sasl: &SaslAuthConfig) -> Result<(), KafkaClientError> {
-        let Some(mech) = sasl.mechanism_name() else {
-            return Ok(());
-        };
-
-        let hs_ver = self.pick_version(ApiKey::SaslHandshake, 0, 1);
-        let mut hs_req = SaslHandshakeRequest::default();
-        hs_req.mechanism = StrBytes::from_static_str(mech);
-        let hs_resp: SaslHandshakeResponse =
-            self.send_raw(ApiKey::SaslHandshake, hs_ver, &hs_req).await?;
-        if let Some(err) = hs_resp.error_code.err() {
-            return Err(KafkaClientError::Broker(err));
-        }
-
-        let auth_ver = self.pick_version(ApiKey::SaslAuthenticate, 0, 2);
-        match sasl {
-            SaslAuthConfig::None => Ok(()),
-            SaslAuthConfig::Plain { username, password } => {
-                let mut payload = Vec::with_capacity(username.len() + password.len() + 2);
-                payload.push(0);
-                payload.extend_from_slice(username.as_bytes());
-                payload.push(0);
-                payload.extend_from_slice(password.as_bytes());
-
-                let mut req = SaslAuthenticateRequest::default();
-                req.auth_bytes = Bytes::from(payload);
-                let resp: SaslAuthenticateResponse =
-                    self.send_raw(ApiKey::SaslAuthenticate, auth_ver, &req).await?;
-                if let Some(err) = resp.error_code.err() {
-                    return Err(KafkaClientError::Broker(err));
-                }
-                Ok(())
-            }
-            SaslAuthConfig::ScramSha256 { username, password } => {
-                self.scram_auth(auth_ver, username, password, ScramAlg::Sha256)
-                    .await
-            }
-            SaslAuthConfig::ScramSha512 { username, password } => {
-                self.scram_auth(auth_ver, username, password, ScramAlg::Sha512)
-                    .await
-            }
-        }
-    }
-
-    async fn scram_auth(
-        &self,
-        auth_ver: i16,
-        username: &str,
-        password: &str,
-        alg: ScramAlg,
-    ) -> Result<(), KafkaClientError> {
-        let client_nonce = format!(
-            "{:016x}{:016x}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
-            0x9e37_79b9_7f4a_7c15u64
-        );
-        let escaped_user = username.replace('=', "=3D").replace(',', "=2C");
-        let client_first_bare = format!("n={escaped_user},r={client_nonce}");
-        let client_first_msg = format!("n,,{client_first_bare}");
-
-        let mut req1 = SaslAuthenticateRequest::default();
-        req1.auth_bytes = Bytes::from(client_first_msg.into_bytes());
-        let resp1: SaslAuthenticateResponse =
-            self.send_raw(ApiKey::SaslAuthenticate, auth_ver, &req1).await?;
-        if let Some(err) = resp1.error_code.err() {
-            return Err(KafkaClientError::Broker(err));
-        }
-
-        let server_first = std::str::from_utf8(&resp1.auth_bytes)
-            .map_err(|_| KafkaClientError::UnexpectedResponse("non-utf8 scram".into()))?;
-        let mut s_nonce = "";
-        let mut salt_b64 = "";
-        let mut iter_count = 0u32;
-        for part in server_first.split(',') {
-            if let Some(v) = part.strip_prefix("r=") {
-                s_nonce = v;
-            } else if let Some(v) = part.strip_prefix("s=") {
-                salt_b64 = v;
-            } else if let Some(v) = part.strip_prefix("i=") {
-                iter_count = v.parse::<u32>().unwrap_or(0);
-            }
-        }
-        if !s_nonce.starts_with(&client_nonce) || iter_count == 0 {
-            return Err(KafkaClientError::UnexpectedResponse(
-                "invalid scram server-first".into(),
-            ));
-        }
-        let salt = base64_decode(salt_b64)
-            .map_err(|_| KafkaClientError::UnexpectedResponse("invalid scram salt".into()))?;
-
-        let salted_password = alg.pbkdf2(password.as_bytes(), &salt, iter_count);
-        let client_key = alg.hmac(&salted_password, b"Client Key");
-        let stored_key = alg.hash(&client_key);
-        let client_final_without_proof = format!("c=biws,r={s_nonce}");
-        let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
-        let client_signature = alg.hmac(&stored_key, auth_message.as_bytes());
-        let client_proof: Vec<u8> = client_key
-            .iter()
-            .zip(client_signature.iter())
-            .map(|(a, b)| a ^ b)
-            .collect();
-        let proof_b64 = base64_encode(&client_proof);
-        let client_final = format!("{client_final_without_proof},p={proof_b64}");
-
-        let mut req2 = SaslAuthenticateRequest::default();
-        req2.auth_bytes = Bytes::from(client_final.into_bytes());
-        let resp2: SaslAuthenticateResponse =
-            self.send_raw(ApiKey::SaslAuthenticate, auth_ver, &req2).await?;
-        if let Some(err) = resp2.error_code.err() {
-            return Err(KafkaClientError::Broker(err));
-        }
-
-        // Verify server signature.
-        let server_key = alg.hmac(&salted_password, b"Server Key");
-        let expected_server_sig = base64_encode(&alg.hmac(&server_key, auth_message.as_bytes()));
-        let server_final = std::str::from_utf8(&resp2.auth_bytes).unwrap_or("");
-        if let Some(v) = server_final.strip_prefix("v=") {
-            if v != expected_server_sig {
-                return Err(KafkaClientError::Broker(ResponseError::SaslAuthenticationFailed));
-            }
-        }
-        Ok(())
     }
 
     fn pick_version(&self, key: ApiKey, our_min: i16, our_max: i16) -> i16 {
@@ -1176,15 +1054,14 @@ fn sasl_is_leader_or_io_error(err: &KafkaClientError) -> bool {
         )
 }
 
-/// SASL-capable async Kafka TCP client sharing wire framing with [`super::kafka_client::KafkaClient`],
-/// extended with SASL PLAIN/SCRAM-SHA-256/SCRAM-SHA-512, strict `CreateTopics`, `ping()`, and metrics.
+/// TLS- and SASL-capable async Kafka client sharing wire framing with
+/// [`super::kafka_client::KafkaClient`], extended with strict `CreateTopics`, `ping()`, and metrics.
 pub struct IngestKafkaClient {
     seed_brokers: Vec<String>,
     client_id: String,
     client_rack: String,
-    dial_timeout: Duration,
     request_timeout: Duration,
-    sasl: SaslAuthConfig,
+    transport: Arc<KafkaTransport>,
     conns_by_addr: Mutex<HashMap<String, Arc<SaslBrokerConn>>>,
     metadata: RwLock<ClusterMetadata>,
     metrics: Option<KafkaClientExtendedMetrics>,
@@ -1208,7 +1085,7 @@ impl IngestKafkaClient {
         if addrs.is_empty() {
             return Err(KafkaClientError::NoSeedBrokers);
         }
-        let dial_timeout = Duration::from_nanos(cfg.dial_timeout.as_nanos().max(0) as u64);
+        let transport = Arc::new(KafkaTransport::from_kafka_config(cfg)?);
         let write_timeout = Duration::from_nanos(cfg.write_timeout.as_nanos().max(0) as u64);
         let overhead =
             Duration::from_nanos(cfg.write_timeout_overhead.as_nanos().max(0) as u64);
@@ -1217,13 +1094,8 @@ impl IngestKafkaClient {
             seed_brokers: addrs,
             client_id: cfg.client_id.clone(),
             client_rack: cfg.client_rack.clone(),
-            dial_timeout: if dial_timeout.is_zero() {
-                Duration::from_secs(2)
-            } else {
-                dial_timeout
-            },
             request_timeout,
-            sasl: SaslAuthConfig::from_kafka_config(cfg),
+            transport,
             conns_by_addr: Mutex::new(HashMap::new()),
             metadata: RwLock::new(ClusterMetadata::default()),
             metrics,
@@ -1246,7 +1118,7 @@ impl IngestKafkaClient {
         {
             let mut map = self.conns_by_addr.lock().await;
             if let Some(c) = map.get(addr) {
-                if c.is_alive() {
+                if c.is_usable() {
                     return Ok(Arc::clone(c));
                 }
                 map.remove(addr);
@@ -1256,16 +1128,15 @@ impl IngestKafkaClient {
         let conn = SaslBrokerConn::connect(
             addr.to_string(),
             self.client_id.clone(),
-            self.dial_timeout,
+            &self.transport,
             self.request_timeout,
-            &self.sasl,
             self.metrics.clone(),
         )
         .await?;
 
         let mut map = self.conns_by_addr.lock().await;
         if let Some(existing) = map.get(addr) {
-            if existing.is_alive() {
+            if existing.is_usable() {
                 conn.mark_dead();
                 return Ok(Arc::clone(existing));
             }

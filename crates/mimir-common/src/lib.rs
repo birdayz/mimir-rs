@@ -6,6 +6,7 @@
 //! - github.com/grafana/dskit/user
 //! - github.com/grafana/dskit/backoff
 //! - github.com/grafana/dskit/limiter
+//! - github.com/grafana/dskit/crypto/tls
 //! - github.com/grafana/mimir/pkg/util/log
 //! - github.com/grafana/mimir/pkg/util/globalerror
 //! - github.com/grafana/mimir/pkg/util/activitytracker
@@ -24,6 +25,7 @@ pub mod services;
 pub mod shutdownmarker;
 pub mod tenant;
 pub mod thread_pool;
+pub mod tls;
 
 #[doc(hidden)]
 pub fn block_on_for_tests<F: std::future::Future>(future: F) -> F::Output {

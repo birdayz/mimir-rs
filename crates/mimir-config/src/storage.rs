@@ -1933,6 +1933,11 @@ impl KafkaConfig {
             ));
         }
         self.validate_sasl()?;
+        if self.tls_enabled {
+            self.tls_client_config().get_tls_config().map_err(|e| {
+                ConfigError::Validation(format!("invalid Kafka TLS config: {e}"))
+            })?;
+        }
         if self.write_timeout_overhead.0 < MIN_KAFKA_REQUEST_TIMEOUT_OVERHEAD_NANOS {
             return Err(ConfigError::Validation(format!(
                 "ingest-storage.kafka.write-timeout-overhead must be at least 100ms, is {}",
@@ -1946,6 +1951,19 @@ impl KafkaConfig {
             ));
         }
         Ok(())
+    }
+
+    /// The inlined dskit `tls.ClientConfig` (`tls_*` keys) of this Kafka client config.
+    pub fn tls_client_config(&self) -> mimir_common::tls::ClientConfig {
+        mimir_common::tls::ClientConfig {
+            cert_path: self.tls_cert_path.clone(),
+            key_path: self.tls_key_path.clone(),
+            ca_path: self.tls_ca_path.clone(),
+            server_name: self.tls_server_name.clone(),
+            insecure_skip_verify: self.tls_insecure_skip_verify,
+            cipher_suites: self.tls_cipher_suites.clone(),
+            min_version: self.tls_min_version.clone(),
+        }
     }
 
     fn validate_sasl(&self) -> Result<(), ConfigError> {
