@@ -72,6 +72,26 @@ fn encode_size_into(out: &mut Vec<u8>, len: usize) {
 }
 
 #[inline]
+fn decode_size_checked(data: &[u8], mut index: usize) -> Result<(usize, usize), &'static str> {
+    if index >= data.len() {
+        return Err("unexpected end of stringlabels data");
+    }
+    let b = data[index];
+    index += 1;
+    if b == 255 {
+        if index + 3 > data.len() {
+            return Err("truncated 24-bit length in stringlabels data");
+        }
+        let len = (data[index] as usize)
+            | ((data[index + 1] as usize) << 8)
+            | ((data[index + 2] as usize) << 16);
+        Ok((len, index + 3))
+    } else {
+        Ok((b as usize, index))
+    }
+}
+
+#[inline]
 fn decode_size(data: &[u8], mut index: usize) -> (usize, usize) {
     let b = data[index];
     index += 1;
@@ -182,9 +202,27 @@ impl LabelsBytes {
         }
     }
 
-    /// Wraps raw encoded bytes directly.
-    pub fn from_raw(data: Vec<u8>) -> Self {
-        Self { data }
+    /// Validates framing and UTF-8, then wraps raw encoded bytes directly.
+    pub fn from_raw(data: Vec<u8>) -> Result<Self, &'static str> {
+        let mut i = 0;
+        while i < data.len() {
+            let (name_len, name_start) = decode_size_checked(&data, i)?;
+            let name_end = name_start
+                .checked_add(name_len)
+                .filter(|&end| end <= data.len())
+                .ok_or("truncated label name in raw stringlabels")?;
+            std::str::from_utf8(&data[name_start..name_end])
+                .map_err(|_| "invalid UTF-8 in label name")?;
+            let (val_len, val_start) = decode_size_checked(&data, name_end)?;
+            let val_end = val_start
+                .checked_add(val_len)
+                .filter(|&end| end <= data.len())
+                .ok_or("truncated label value in raw stringlabels")?;
+            std::str::from_utf8(&data[val_start..val_end])
+                .map_err(|_| "invalid UTF-8 in label value")?;
+            i = val_end;
+        }
+        Ok(Self { data })
     }
 
     /// Returns the raw flat byte slice.
@@ -724,5 +762,21 @@ mod tests {
         let val_offset = 8 + 255;
         // second label value len 300 = 0x12c -> [255, 0x2c, 0x01, 0x00]
         assert_eq!(&raw[val_offset..val_offset + 4], &[255, 0x2c, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn test_from_raw_validates_utf8_and_bounds() {
+        let valid = LabelsBytes::from_labels(&[("a", "1"), ("b", "2")]).into_bytes();
+        let parsed = LabelsBytes::from_raw(valid).expect("valid raw labels");
+        assert_eq!(parsed.get("a"), Some("1"));
+        assert_eq!(parsed.get("b"), Some("2"));
+
+        // Invalid UTF-8 in label value
+        assert!(LabelsBytes::from_raw(vec![1, b'a', 1, 0xff]).is_err());
+        // Invalid UTF-8 in label name
+        assert!(LabelsBytes::from_raw(vec![1, 0xff, 1, b'1']).is_err());
+        // Truncated payload
+        assert!(LabelsBytes::from_raw(vec![1, b'a']).is_err());
+        assert!(LabelsBytes::from_raw(vec![5, b'a', b'b']).is_err());
     }
 }

@@ -118,7 +118,7 @@ async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain")],
-        "ready\n",
+        "ready",
     )
         .into_response()
 }

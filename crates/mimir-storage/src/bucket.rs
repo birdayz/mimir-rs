@@ -14,6 +14,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncReadExt;
 
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -336,14 +337,49 @@ impl BucketClient {
         Ok(())
     }
 
-    /// Uploads a local file at `src_path` as object `name`.
+    /// Uploads a local file at `src_path` as object `name`, streaming files > 16 MiB via multipart upload.
     pub async fn upload_file(
         &self,
         name: &str,
         src_path: impl AsRef<Path>,
     ) -> Result<(), BucketError> {
-        let data = tokio::fs::read(src_path.as_ref()).await?;
-        self.upload(name, Bytes::from(data)).await
+        const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
+        const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+        let src_path = src_path.as_ref();
+        let meta = tokio::fs::metadata(src_path).await?;
+        if meta.len() <= MULTIPART_THRESHOLD {
+            let data = tokio::fs::read(src_path).await?;
+            return self.upload(name, Bytes::from(data)).await;
+        }
+
+        let path = self.object_path(name)?;
+        let mut file = tokio::fs::File::open(src_path).await?;
+        let mut upload = self.store.put_multipart(&path).await?;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                match file.read(&mut buf[filled..]).await {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => {
+                        let _ = upload.abort().await;
+                        return Err(BucketError::Io(e));
+                    }
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            let chunk = Bytes::copy_from_slice(&buf[..filled]);
+            if let Err(e) = upload.put_part(PutPayload::from_bytes(chunk)).await {
+                let _ = upload.abort().await;
+                return Err(BucketError::Store(e));
+            }
+        }
+        upload.complete().await?;
+        Ok(())
     }
 
     /// Downloads the entire object `name`.
@@ -612,5 +648,24 @@ mod tests {
         assert!(tenant_deletion_mark_exists(&bkt, "user-1").await.unwrap());
         let read_back = read_tenant_deletion_mark(&bkt, "user-1").await.unwrap().unwrap();
         assert_eq!(read_back, mark);
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_streams_multipart_above_16mib() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("large.bin");
+        let size = 17 * 1024 * 1024 + 123;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        tokio::fs::write(&file_path, &payload).await.unwrap();
+
+        for bkt in [
+            BucketClient::new_in_memory("test"),
+            BucketClient::new_filesystem(tempfile::tempdir().unwrap().path()).unwrap(),
+        ] {
+            bkt.upload_file("blocks/large.bin", &file_path).await.unwrap();
+            let got = bkt.download("blocks/large.bin").await.unwrap();
+            assert_eq!(got.len(), payload.len());
+            assert_eq!(got.as_ref(), payload.as_slice());
+        }
     }
 }

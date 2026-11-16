@@ -204,7 +204,46 @@ struct WatcherEntry {
 }
 
 struct PrefixWatcherEntry {
+    id: usize,
     tx: mpsc::Sender<String>,
+}
+
+static NEXT_PREFIX_WATCHER_ID: AtomicUsize = AtomicUsize::new(1);
+
+struct KeyWatcherGuard {
+    kv: Arc<MemberlistKv>,
+    key: String,
+    notify: Arc<Notify>,
+}
+
+impl Drop for KeyWatcherGuard {
+    fn drop(&mut self) {
+        let mut watchers = self.kv.watchers.lock();
+        if let Some(list) = watchers.get_mut(&self.key) {
+            list.retain(|w| !Arc::ptr_eq(&w.notify, &self.notify));
+            if list.is_empty() {
+                watchers.remove(&self.key);
+            }
+        }
+    }
+}
+
+struct PrefixWatcherGuard {
+    kv: Arc<MemberlistKv>,
+    prefix: String,
+    id: usize,
+}
+
+impl Drop for PrefixWatcherGuard {
+    fn drop(&mut self) {
+        let mut pw = self.kv.prefix_watchers.lock();
+        if let Some(list) = pw.get_mut(&self.prefix) {
+            list.retain(|entry| entry.id != self.id);
+            if list.is_empty() {
+                pw.remove(&self.prefix);
+            }
+        }
+    }
 }
 
 struct MemberlistMetrics {
@@ -2376,6 +2415,11 @@ impl KvClient for MemberlistKvClient {
                         notify: notify.clone(),
                     });
             }
+            let _guard = KeyWatcherGuard {
+                kv: Arc::clone(&self.kv),
+                key: key.to_string(),
+                notify: Arc::clone(&notify),
+            };
 
             if let Some((val, _)) = self.kv.get_value(key) {
                 if !f(val) {
@@ -2408,12 +2452,18 @@ impl KvClient for MemberlistKvClient {
         Box::pin(async move {
             let buf_size = self.kv.cfg.watch_prefix_buffer_size.max(1) as usize;
             let (tx, mut rx) = mpsc::channel(buf_size);
+            let watcher_id = NEXT_PREFIX_WATCHER_ID.fetch_add(1, Ordering::Relaxed);
             {
                 let mut pw = self.kv.prefix_watchers.lock();
                 pw.entry(prefix.to_string())
                     .or_default()
-                    .push(PrefixWatcherEntry { tx });
+                    .push(PrefixWatcherEntry { id: watcher_id, tx });
             }
+            let _guard = PrefixWatcherGuard {
+                kv: Arc::clone(&self.kv),
+                prefix: prefix.to_string(),
+                id: watcher_id,
+            };
 
             loop {
                 tokio::select! {
@@ -2430,5 +2480,66 @@ impl KvClient for MemberlistKvClient {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv::StringCodec;
+
+    #[tokio::test]
+    async fn test_dropped_watchers_are_unregistered() {
+        let cfg = MemberlistConfig {
+            bind_addr: vec!["127.0.0.1".to_string()],
+            bind_port: 0,
+            node_name: "watcher-test-node".to_string(),
+            ..Default::default()
+        };
+
+        let codec: Arc<dyn Codec> = Arc::new(StringCodec);
+        let kv = MemberlistKv::start(cfg, vec![Arc::clone(&codec)], "test", None)
+            .await
+            .unwrap();
+        let client = Arc::new(MemberlistKvClient::new(Arc::clone(&kv), codec).unwrap());
+
+        let ctx1 = ServiceContext::background();
+        let ctx1_c = ctx1.clone();
+        let c1 = Arc::clone(&client);
+        let h1 = tokio::spawn(async move {
+            c1.watch_key("k1", ctx1_c, Box::new(|_| true)).await;
+        });
+
+        let ctx2 = ServiceContext::background();
+        let ctx2_c = ctx2.clone();
+        let c2 = Arc::clone(&client);
+        let h2 = tokio::spawn(async move {
+            c2.watch_prefix("pref/", ctx2_c, Box::new(|_, _| true)).await;
+        });
+
+        // Wait for both watchers to register
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let wk = kv.watchers.lock().get("k1").map_or(0, Vec::len);
+                let pw = kv.prefix_watchers.lock().get("pref/").map_or(0, Vec::len);
+                if wk == 1 && pw == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Cancel both watchers and verify both maps clean up completely
+        ctx1.cancel();
+        ctx2.cancel();
+        h1.await.unwrap();
+        h2.await.unwrap();
+
+        assert!(kv.watchers.lock().is_empty());
+        assert!(kv.prefix_watchers.lock().is_empty());
+
+        kv.shutdown().await;
     }
 }
