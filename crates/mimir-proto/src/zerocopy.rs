@@ -115,6 +115,7 @@ enum SliceRef {
     Empty,
     Input { start: u32, len: u32 },
     Common { idx: u32, len: u32 },
+    Scratch { start: u32, len: u32 },
 }
 
 impl SliceRef {
@@ -128,20 +129,53 @@ impl SliceRef {
                 &input[s..e]
             }
             SliceRef::Common { idx, len } => &common_symbols[idx as usize].as_bytes()[..len as usize],
+            SliceRef::Scratch { .. } => &[],
         }
     }
 
     #[inline]
-    fn resolve_str<'a>(self, input: &'a [u8], common_symbols: &'a [&'a str]) -> &'a str {
-        // SAFETY/validity: all String/str SliceRefs are UTF-8 validated when created.
+    fn resolve_with_arena<'a>(
+        self,
+        input: &'a [u8],
+        common_symbols: &'a [&'a str],
+        utf8_arena: &'a [u8],
+    ) -> &'a [u8] {
+        match self {
+            SliceRef::Empty => &[],
+            SliceRef::Input { start, len } => {
+                let s = start as usize;
+                let e = s + len as usize;
+                &input[s..e]
+            }
+            SliceRef::Common { idx, len } => &common_symbols[idx as usize].as_bytes()[..len as usize],
+            SliceRef::Scratch { start, len } => {
+                let s = start as usize;
+                let e = s + len as usize;
+                &utf8_arena[s..e]
+            }
+        }
+    }
+
+    #[inline]
+    fn resolve_str<'a>(
+        self,
+        input: &'a [u8],
+        common_symbols: &'a [&'a str],
+        utf8_arena: &'a [u8],
+    ) -> &'a str {
         match self {
             SliceRef::Empty => "",
             SliceRef::Input { start, len } => {
                 let s = start as usize;
                 let e = s + len as usize;
-                std::str::from_utf8(&input[s..e]).expect("UTF-8 validated on decode")
+                std::str::from_utf8(&input[s..e]).unwrap_or("")
             }
             SliceRef::Common { idx, len } => &common_symbols[idx as usize][..len as usize],
+            SliceRef::Scratch { start, len } => {
+                let s = start as usize;
+                let e = s + len as usize;
+                std::str::from_utf8(&utf8_arena[s..e]).unwrap_or("")
+            }
         }
     }
 
@@ -160,6 +194,7 @@ impl SliceRef {
                 unsafe { std::str::from_utf8_unchecked(&input[s..e]) }
             }
             SliceRef::Common { idx, len } => &common_symbols[idx as usize][..len as usize],
+            SliceRef::Scratch { .. } => "",
         }
     }
 
@@ -168,6 +203,48 @@ impl SliceRef {
         matches!(self, SliceRef::Empty)
             || matches!(self, SliceRef::Input { len: 0, .. })
             || matches!(self, SliceRef::Common { len: 0, .. })
+            || matches!(self, SliceRef::Scratch { len: 0, .. })
+    }
+}
+
+#[inline]
+fn push_utf8_or_lossy(
+    bytes: &[u8],
+    base_offset: usize,
+    utf8_arena: &mut Vec<u8>,
+) -> SliceRef {
+    if bytes.is_empty() {
+        return SliceRef::Empty;
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return SliceRef::Input {
+            start: base_offset as u32,
+            len: bytes.len() as u32,
+        };
+    }
+    let lossy = String::from_utf8_lossy(bytes);
+    let start = utf8_arena.len();
+    utf8_arena.extend_from_slice(lossy.as_bytes());
+    let len = utf8_arena.len() - start;
+    SliceRef::Scratch {
+        start: start as u32,
+        len: len as u32,
+    }
+}
+
+#[inline]
+fn ensure_utf8_slice_ref(
+    r: SliceRef,
+    input: &[u8],
+    utf8_arena: &mut Vec<u8>,
+) -> SliceRef {
+    match r {
+        SliceRef::Input { start, len } => {
+            let s = start as usize;
+            let e = s + len as usize;
+            push_utf8_or_lossy(&input[s..e], s, utf8_arena)
+        }
+        other => other,
     }
 }
 
@@ -248,6 +325,7 @@ pub struct BorrowedMetadata<'a> {
 pub struct Rw2ResolvedScratch {
     v2_resolved: Vec<Option<&'static str>>,
     custom_resolved: Vec<Option<&'static str>>,
+    lossy_strings: Vec<Box<str>>,
 }
 
 impl Rw2ResolvedScratch {
@@ -257,6 +335,7 @@ impl Rw2ResolvedScratch {
         Self {
             v2_resolved,
             custom_resolved: Vec::with_capacity(128),
+            lossy_strings: Vec::new(),
         }
     }
 }
@@ -348,6 +427,7 @@ pub struct WriteRequestScratch {
     rw2_symbols: Vec<SliceRef>,
     rw2_label_refs: Vec<u32>,
     dedup_hashes: HashMap<u64, Vec<usize>>,
+    utf8_arena: Vec<u8>,
 }
 
 impl WriteRequestScratch {
@@ -366,6 +446,7 @@ impl WriteRequestScratch {
             rw2_symbols: Vec::with_capacity(128),
             rw2_label_refs: Vec::with_capacity(64),
             dedup_hashes: HashMap::with_capacity(32),
+            utf8_arena: Vec::new(),
         }
     }
 
@@ -383,6 +464,7 @@ impl WriteRequestScratch {
         self.rw2_symbols.clear();
         self.rw2_label_refs.clear();
         self.dedup_hashes.clear();
+        self.utf8_arena.clear();
     }
 }
 
@@ -423,12 +505,20 @@ impl<'a, 's> BorrowedWriteRequest<'a, 's> {
         }
     }
 
-    pub fn metadata(&self) -> impl ExactSizeIterator<Item = BorrowedMetadata<'a>> + '_ {
+    pub fn metadata(&self) -> impl ExactSizeIterator<Item = BorrowedMetadata<'_>> + '_ {
         self.scratch.metadata.iter().map(move |m| BorrowedMetadata {
             metric_type: m.metric_type,
-            metric_family_name: m.family_name.resolve_str(self.input, self.common_symbols),
-            help: m.help.resolve_str(self.input, self.common_symbols),
-            unit: m.unit.resolve_str(self.input, self.common_symbols),
+            metric_family_name: m.family_name.resolve_str(
+                self.input,
+                self.common_symbols,
+                &self.scratch.utf8_arena,
+            ),
+            help: m
+                .help
+                .resolve_str(self.input, self.common_symbols, &self.scratch.utf8_arena),
+            unit: m
+                .unit
+                .resolve_str(self.input, self.common_symbols, &self.scratch.utf8_arena),
         })
     }
 
@@ -583,12 +673,20 @@ pub struct BorrowedExemplarView<'v, 'a> {
 }
 
 impl<'v, 'a> BorrowedExemplarView<'v, 'a> {
-    pub fn labels(&self) -> impl ExactSizeIterator<Item = BorrowedLabel<'a>> + '_ {
+    pub fn labels(&self) -> impl ExactSizeIterator<Item = BorrowedLabel<'_>> + '_ {
         self.scratch.exemplar_labels[self.meta.labels.clone()]
             .iter()
             .map(move |pair| BorrowedLabel {
-                name: pair.name.resolve(self.input, self.common_symbols),
-                value: pair.value.resolve(self.input, self.common_symbols),
+                name: pair.name.resolve_with_arena(
+                    self.input,
+                    self.common_symbols,
+                    &self.scratch.utf8_arena,
+                ),
+                value: pair.value.resolve_with_arena(
+                    self.input,
+                    self.common_symbols,
+                    &self.scratch.utf8_arena,
+                ),
             })
     }
 
@@ -726,11 +824,12 @@ pub fn decode_write_request<'a, 's>(
     let mut skip_label_count_validation = false;
     let mut seen_first_symbol = false;
     let mut prescanned_symbols = false;
+    let mut all_symbols_utf8 = true;
 
     let mut pos = 0usize;
     let len = input.len();
     while pos < len {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, len)?;
         match field_num {
             1 => {
                 if is_rw2 {
@@ -742,7 +841,7 @@ pub fn decode_write_request<'a, 's>(
                         wire_type,
                     });
                 }
-                let sub = read_length_delimited_range(input, &mut pos)?;
+                let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
                 let ts_meta = decode_timeseries_rw1(
                     input,
                     sub,
@@ -770,8 +869,8 @@ pub fn decode_write_request<'a, 's>(
                         wire_type,
                     });
                 }
-                let sub = read_length_delimited_range(input, &mut pos)?;
-                let meta = decode_metadata_rw1(input, sub)?;
+                let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
+                let meta = decode_metadata_rw1(input, sub, scratch)?;
                 scratch.metadata.push(meta);
             }
             4 => {
@@ -784,14 +883,15 @@ pub fn decode_write_request<'a, 's>(
                         wire_type,
                     });
                 }
-                let sub = read_length_delimited_range(input, &mut pos)?;
+                let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
                 if !prescanned_symbols {
-                    let sym_str = std::str::from_utf8(&input[sub.clone()])
-                        .map_err(|_| DecodeError::InvalidUtf8)?;
-                    if !seen_first_symbol && !sym_str.is_empty() {
+                    if !seen_first_symbol && !sub.is_empty() {
                         return Err(DecodeError::InvalidFirstSymbol);
                     }
                     seen_first_symbol = true;
+                    if std::str::from_utf8(&input[sub.clone()]).is_err() {
+                        all_symbols_utf8 = false;
+                    }
                     scratch.rw2_symbols.push(if sub.is_empty() {
                         SliceRef::Empty
                     } else {
@@ -812,13 +912,13 @@ pub fn decode_write_request<'a, 's>(
                         wire_type,
                     });
                 }
-                let sub = read_length_delimited_range(input, &mut pos)?;
+                let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
                 if !seen_first_symbol && !prescanned_symbols {
                     // Handle rare out-of-order protobuf fields where field 5 appears before field 4.
                     prescanned_symbols = true;
                     let mut scan_pos = pos;
                     while scan_pos < len {
-                        let (sf, sw) = read_key(input, &mut scan_pos)?;
+                        let (sf, sw) = read_key_bounded(input, &mut scan_pos, len)?;
                         if sf == 4 {
                             if sw != 2 {
                                 return Err(DecodeError::InvalidWireType {
@@ -826,13 +926,15 @@ pub fn decode_write_request<'a, 's>(
                                     wire_type: sw,
                                 });
                             }
-                            let sym_range = read_length_delimited_range(input, &mut scan_pos)?;
-                            let sym_str = std::str::from_utf8(&input[sym_range.clone()])
-                                .map_err(|_| DecodeError::InvalidUtf8)?;
-                            if !seen_first_symbol && !sym_str.is_empty() {
+                            let sym_range =
+                                read_length_delimited_range_bounded(input, &mut scan_pos, len)?;
+                            if !seen_first_symbol && !sym_range.is_empty() {
                                 return Err(DecodeError::InvalidFirstSymbol);
                             }
                             seen_first_symbol = true;
+                            if std::str::from_utf8(&input[sym_range.clone()]).is_err() {
+                                all_symbols_utf8 = false;
+                            }
                             scratch.rw2_symbols.push(if sym_range.is_empty() {
                                 SliceRef::Empty
                             } else {
@@ -842,7 +944,7 @@ pub fn decode_write_request<'a, 's>(
                                 }
                             });
                         } else {
-                            skip_field(input, &mut scan_pos, sw)?;
+                            skip_field_bounded(input, &mut scan_pos, len, sw)?;
                         }
                     }
                 }
@@ -875,7 +977,7 @@ pub fn decode_write_request<'a, 's>(
                 skip_label_count_validation = read_varint(input, &mut pos)? != 0;
             }
             _ => {
-                skip_field(input, &mut pos, wire_type)?;
+                skip_field_bounded(input, &mut pos, len, wire_type)?;
             }
         }
     }
@@ -887,7 +989,7 @@ pub fn decode_write_request<'a, 's>(
         source,
         skip_label_validation,
         skip_label_count_validation,
-        labels_utf8_validated: is_rw2,
+        labels_utf8_validated: is_rw2 && all_symbols_utf8,
     })
 }
 
@@ -903,7 +1005,11 @@ impl Drop for ResolvedTableGuard<'_> {
 }
 
 #[inline(always)]
-fn append_stringlabel_pair_proto(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+fn append_stringlabel_pair_proto(
+    buf: &mut Vec<u8>,
+    name: &[u8],
+    value: &[u8],
+) -> Result<(), DecodeError> {
     let klen = name.len();
     let vlen = value.len();
     if klen < 255 && vlen < 255 {
@@ -919,20 +1025,27 @@ fn append_stringlabel_pair_proto(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
             std::ptr::copy_nonoverlapping(value.as_ptr(), ptr.add(2 + klen), vlen);
             buf.set_len(start + need);
         }
+        Ok(())
     } else {
-        append_stringlabel_pair_proto_slow(buf, name, value);
+        append_stringlabel_pair_proto_slow(buf, name, value)
     }
 }
 
 #[cold]
 #[inline(never)]
-fn append_stringlabel_pair_proto_slow(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+fn append_stringlabel_pair_proto_slow(
+    buf: &mut Vec<u8>,
+    name: &[u8],
+    value: &[u8],
+) -> Result<(), DecodeError> {
     for part in [name, value] {
         let len = part.len();
         if len < 255 {
             buf.push(len as u8);
         } else {
-            assert!(len <= (1 << 24), "string too long to encode as label");
+            if len >= (1 << 24) {
+                return Err(DecodeError::InputTooLarge);
+            }
             buf.push(255);
             buf.push((len & 0xff) as u8);
             buf.push(((len >> 8) & 0xff) as u8);
@@ -940,20 +1053,21 @@ fn append_stringlabel_pair_proto_slow(buf: &mut Vec<u8>, name: &[u8], value: &[u
         }
         buf.extend_from_slice(part);
     }
+    Ok(())
 }
 
 /// Streams an RW2 / Kafka-v2 `cortexpb.WriteRequest` directly into contiguous
 /// `stringlabels` bytes (`label_bytes_arena`) and `samples_arena`, without allocating
 /// `Vec<LabelRefPair>` or copying samples through `WriteRequestScratch`.
 #[allow(clippy::too_many_arguments)]
-pub fn decode_rw2_stream<'a, F>(
+pub fn decode_rw2_stream<'r, 'a: 'r, F>(
     input: &'a [u8],
     opts: DecodeOptions<'a>,
     scratch: &mut WriteRequestScratch,
-    resolved_scratch: &mut Rw2ResolvedScratch,
+    resolved_scratch: &'r mut Rw2ResolvedScratch,
     label_bytes_arena: &mut Vec<u8>,
     samples_arena: &mut Vec<cortexpb::Sample>,
-    meta_out: &mut Vec<BorrowedMetadata<'a>>,
+    meta_out: &mut Vec<BorrowedMetadata<'r>>,
     mut on_series: F,
 ) -> Result<StreamedRw2Header, DecodeError>
 where
@@ -975,6 +1089,8 @@ where
         } => (offset, common_symbols, false),
     };
 
+    resolved_scratch.lossy_strings.clear();
+    let lossy_strings = &mut resolved_scratch.lossy_strings;
     let guard = if is_kafka_v2 {
         if resolved_scratch.v2_resolved.len() < 64 {
             resolved_scratch.v2_resolved.clear();
@@ -998,8 +1114,8 @@ where
     };
 
     // SAFETY: `guard` truncates `guard.vec` back to `base_len` (`'static` common symbols or empty)
-    // on every return/unwind path before `'a` ends.
-    let resolved: &mut Vec<Option<&'a str>> = unsafe {
+    // on every return/unwind path before `'r` ends.
+    let resolved: &mut Vec<Option<&'r str>> = unsafe {
         &mut *(guard.vec as *mut Vec<Option<&'static str>>).cast()
     };
     if !is_kafka_v2 {
@@ -1021,7 +1137,7 @@ where
     let mut pos = 0usize;
     let len = input.len();
     while pos < len {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, len)?;
         match field_num {
             1 => return Err(DecodeError::UnexpectedRw1Timeseries),
             2 => {
@@ -1045,13 +1161,28 @@ where
                         wire_type,
                     });
                 }
-                let sub = read_length_delimited_range(input, &mut pos)?;
+                let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
                 if !prescanned_symbols {
-                    let sym_str = std::str::from_utf8(&input[sub])
-                        .map_err(|_| DecodeError::InvalidUtf8)?;
-                    if !seen_first_symbol && !sym_str.is_empty() {
-                        return Err(DecodeError::InvalidFirstSymbol);
-                    }
+                    let sym_str: &'r str = match std::str::from_utf8(&input[sub.clone()]) {
+                        Ok(s) => {
+                            if !seen_first_symbol && !s.is_empty() {
+                                return Err(DecodeError::InvalidFirstSymbol);
+                            }
+                            s
+                        }
+                        Err(_) => {
+                            if !seen_first_symbol && !sub.is_empty() {
+                                return Err(DecodeError::InvalidFirstSymbol);
+                            }
+                            let lossy: Box<str> =
+                                String::from_utf8_lossy(&input[sub]).into_owned().into_boxed_str();
+                            lossy_strings.push(lossy);
+                            let ptr: *const str = &**lossy_strings.last().unwrap();
+                            // SAFETY: `Box<str>` heap allocation does not move when `Vec<Box<str>>`
+                            // pushes, and `lossy_strings` lives in `resolved_scratch` for `'r`.
+                            unsafe { &*ptr }
+                        }
+                    };
                     seen_first_symbol = true;
                     resolved.push(Some(sym_str));
                 }
@@ -1063,12 +1194,12 @@ where
                         wire_type,
                     });
                 }
-                let sub = read_length_delimited_range(input, &mut pos)?;
+                let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
                 if !seen_first_symbol && !prescanned_symbols {
                     prescanned_symbols = true;
                     let mut scan_pos = pos;
                     while scan_pos < len {
-                        let (sf, sw) = read_key(input, &mut scan_pos)?;
+                        let (sf, sw) = read_key_bounded(input, &mut scan_pos, len)?;
                         if sf == 4 {
                             if sw != 2 {
                                 return Err(DecodeError::InvalidWireType {
@@ -1076,16 +1207,34 @@ where
                                     wire_type: sw,
                                 });
                             }
-                            let sym_range = read_length_delimited_range(input, &mut scan_pos)?;
-                            let sym_str = std::str::from_utf8(&input[sym_range])
-                                .map_err(|_| DecodeError::InvalidUtf8)?;
-                            if !seen_first_symbol && !sym_str.is_empty() {
-                                return Err(DecodeError::InvalidFirstSymbol);
-                            }
+                            let sym_range =
+                                read_length_delimited_range_bounded(input, &mut scan_pos, len)?;
+                            let sym_str: &'r str =
+                                match std::str::from_utf8(&input[sym_range.clone()]) {
+                                    Ok(s) => {
+                                        if !seen_first_symbol && !s.is_empty() {
+                                            return Err(DecodeError::InvalidFirstSymbol);
+                                        }
+                                        s
+                                    }
+                                    Err(_) => {
+                                        if !seen_first_symbol && !sym_range.is_empty() {
+                                            return Err(DecodeError::InvalidFirstSymbol);
+                                        }
+                                        let lossy: Box<str> =
+                                            String::from_utf8_lossy(&input[sym_range])
+                                                .into_owned()
+                                                .into_boxed_str();
+                                        lossy_strings.push(lossy);
+                                        let ptr: *const str = &**lossy_strings.last().unwrap();
+                                        // SAFETY: see above.
+                                        unsafe { &*ptr }
+                                    }
+                                };
                             seen_first_symbol = true;
                             resolved.push(Some(sym_str));
                         } else {
-                            skip_field(input, &mut scan_pos, sw)?;
+                            skip_field_bounded(input, &mut scan_pos, len, sw)?;
                         }
                     }
                     if resolved.is_empty() && rw2_offset == 0 {
@@ -1132,7 +1281,7 @@ where
                 skip_label_count_validation = read_varint(input, &mut pos)? != 0;
             }
             _ => {
-                skip_field(input, &mut pos, wire_type)?;
+                skip_field_bounded(input, &mut pos, len, wire_type)?;
             }
         }
     }
@@ -1146,17 +1295,17 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_timeseries_rw2_stream<'v, 'a>(
+fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
     input: &'a [u8],
     range: Range<usize>,
     symbol_offset: u32,
     common_symbols: &'a [&'a str],
-    resolved: &[Option<&'a str>],
+    resolved: &[Option<&'r str>],
     opts: &DecodeOptions<'a>,
     scratch: &'v mut WriteRequestScratch,
     label_bytes_arena: &'v mut Vec<u8>,
     samples_arena: &mut Vec<cortexpb::Sample>,
-    meta_out: &mut Vec<BorrowedMetadata<'a>>,
+    meta_out: &mut Vec<BorrowedMetadata<'r>>,
     source: i32,
     skip_label_validation: bool,
 ) -> Result<StreamedRw2Series<'v, 'a>, DecodeError> {
@@ -1166,14 +1315,14 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
     let histograms_start = scratch.histograms.len();
     let mut created_timestamp = 0i64;
     let mut min_sample_ts = i64::MAX;
-    let mut metric_name: &'a str = "";
-    let mut prev_name: Option<&'a str> = None;
+    let mut metric_name: &'r str = "";
+    let mut prev_name: Option<&'r str> = None;
     let mut labels_sorted_unique = true;
 
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type == 0 {
@@ -1182,7 +1331,8 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
                     let mut p = packed.start;
-                    label_bytes_arena.reserve((packed.end - p).saturating_mul(16).max(64));
+                    label_bytes_arena
+                        .reserve((packed.end - p).saturating_mul(16).clamp(64, 65536));
                     while p < packed.end {
                         let name_idx = read_varint_bounded(input, &mut p, packed.end)? as usize;
                         if p >= packed.end {
@@ -1203,7 +1353,7 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
                                 index: val_idx as u32,
                                 offset: symbol_offset,
                             })?;
-                        if metric_name.is_empty() && k == "__name__" {
+                        if k == "__name__" {
                             metric_name = v;
                         }
                         if let Some(pn) = prev_name {
@@ -1217,7 +1367,7 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
                                 label_bytes_arena,
                                 k.as_bytes(),
                                 v.as_bytes(),
-                            );
+                            )?;
                         }
                     }
                 } else {
@@ -1323,7 +1473,13 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
 }
 
 #[inline]
-fn str_to_slice_ref(s: &str, idx: usize, symbol_offset: u32, input: &[u8]) -> SliceRef {
+fn str_to_slice_ref(
+    s: &str,
+    idx: usize,
+    symbol_offset: u32,
+    input: &[u8],
+    utf8_arena: &mut Vec<u8>,
+) -> SliceRef {
     if s.is_empty() {
         SliceRef::Empty
     } else if idx < symbol_offset as usize {
@@ -1332,10 +1488,22 @@ fn str_to_slice_ref(s: &str, idx: usize, symbol_offset: u32, input: &[u8]) -> Sl
             len: s.len() as u32,
         }
     } else {
-        let start = (s.as_ptr() as usize) - (input.as_ptr() as usize);
-        SliceRef::Input {
-            start: start as u32,
-            len: s.len() as u32,
+        let input_start = input.as_ptr() as usize;
+        let input_end = input_start + input.len();
+        let s_ptr = s.as_ptr() as usize;
+        if s_ptr >= input_start && s_ptr + s.len() <= input_end {
+            let start = s_ptr - input_start;
+            SliceRef::Input {
+                start: start as u32,
+                len: s.len() as u32,
+            }
+        } else {
+            let start = utf8_arena.len();
+            utf8_arena.extend_from_slice(s.as_bytes());
+            SliceRef::Scratch {
+                start: start as u32,
+                len: s.len() as u32,
+            }
         }
     }
 }
@@ -1353,7 +1521,7 @@ fn decode_exemplar_rw2_resolved<'a>(
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type == 0 {
@@ -1382,9 +1550,13 @@ fn decode_exemplar_rw2_resolved<'a>(
                                 index: val_idx as u32,
                                 offset: symbol_offset,
                             })?;
+                        let name_ref =
+                            str_to_slice_ref(k, name_idx, symbol_offset, input, &mut scratch.utf8_arena);
+                        let val_ref =
+                            str_to_slice_ref(v, val_idx, symbol_offset, input, &mut scratch.utf8_arena);
                         scratch.exemplar_labels.push(LabelRefPair {
-                            name: str_to_slice_ref(k, name_idx, symbol_offset, input),
-                            value: str_to_slice_ref(v, val_idx, symbol_offset, input),
+                            name: name_ref,
+                            value: val_ref,
                         });
                     }
                 } else {
@@ -1425,24 +1597,24 @@ fn decode_exemplar_rw2_resolved<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_metadata_rw2_stream<'a>(
-    input: &'a [u8],
+fn decode_metadata_rw2_stream<'r>(
+    input: &[u8],
     range: Range<usize>,
     symbol_offset: u32,
-    resolved: &[Option<&'a str>],
-    metric_name: &'a str,
-    opts: &DecodeOptions<'a>,
+    resolved: &[Option<&'r str>],
+    metric_name: &'r str,
+    opts: &DecodeOptions<'_>,
     scratch: &mut WriteRequestScratch,
-    meta_out: &mut Vec<BorrowedMetadata<'a>>,
+    meta_out: &mut Vec<BorrowedMetadata<'r>>,
 ) -> Result<(), DecodeError> {
     let mut metric_type = 0i32;
-    let mut help: &'a str = "";
-    let mut unit: &'a str = "";
+    let mut help: &'r str = "";
+    let mut unit: &'r str = "";
 
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type != 0 {
@@ -1539,7 +1711,7 @@ fn decode_timeseries_rw1(
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type != 2 {
@@ -1629,7 +1801,7 @@ fn decode_timeseries_rw2(
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 scratch.rw2_label_refs.clear();
@@ -1640,7 +1812,7 @@ fn decode_timeseries_rw2(
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
                     let mut p = packed.start;
-                    scratch.labels.reserve((packed.end - p) / 2);
+                    scratch.labels.reserve(((packed.end - p) / 2).min(4096));
                     while p < packed.end {
                         let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
                         if p >= packed.end {
@@ -1667,9 +1839,7 @@ fn decode_timeseries_rw2(
                             index: val_idx,
                             offset: symbol_offset,
                         })?;
-                        if metric_name_ref == SliceRef::Empty
-                            && name.resolve(input, common_symbols) == b"__name__"
-                        {
+                        if name.resolve(input, common_symbols) == b"__name__" {
                             metric_name_ref = value;
                         }
                         scratch.labels.push(LabelRefPair { name, value });
@@ -1765,7 +1935,7 @@ fn decode_label_pair(input: &[u8], range: Range<usize>) -> Result<LabelRefPair, 
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type != 2 {
@@ -1805,7 +1975,7 @@ fn decode_label_pair(input: &[u8], range: Range<usize>) -> Result<LabelRefPair, 
 fn decode_sample(input: &[u8], range: Range<usize>) -> Result<cortexpb::Sample, DecodeError> {
     let pos = range.start;
     let end = range.end;
-    if pos + 10 <= end && input[pos] == 0x09 && input[pos + 9] == 0x10 {
+    if end.saturating_sub(pos) >= 10 && input[pos] == 0x09 && input[pos + 9] == 0x10 {
         let bytes: [u8; 8] = input[pos + 1..pos + 9]
             .try_into()
             .map_err(|_| DecodeError::UnexpectedEof)?;
@@ -1831,7 +2001,7 @@ fn decode_sample_slow(
     let mut value = 0.0f64;
     let mut timestamp_ms = 0i64;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type != 1 {
@@ -1873,7 +2043,7 @@ fn decode_exemplar_rw1(
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type != 2 {
@@ -1929,7 +2099,7 @@ fn decode_exemplar_rw2(
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 scratch.rw2_label_refs.clear();
@@ -2047,7 +2217,7 @@ fn decode_histogram(
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type != 0 {
@@ -2335,7 +2505,7 @@ fn decode_bucket_span(
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type != 0 {
@@ -2363,7 +2533,11 @@ fn decode_bucket_span(
     Ok(cortexpb::BucketSpan { offset, length })
 }
 
-fn decode_metadata_rw1(input: &[u8], range: Range<usize>) -> Result<MetadataMeta, DecodeError> {
+fn decode_metadata_rw1(
+    input: &[u8],
+    range: Range<usize>,
+    scratch: &mut WriteRequestScratch,
+) -> Result<MetadataMeta, DecodeError> {
     let mut metric_type = 0i32;
     let mut family_name = SliceRef::Empty;
     let mut help = SliceRef::Empty;
@@ -2372,7 +2546,7 @@ fn decode_metadata_rw1(input: &[u8], range: Range<usize>) -> Result<MetadataMeta
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type != 0 {
@@ -2391,16 +2565,11 @@ fn decode_metadata_rw1(input: &[u8], range: Range<usize>) -> Result<MetadataMeta
                     });
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                let _ =
-                    std::str::from_utf8(&input[sub.clone()]).map_err(|_| DecodeError::InvalidUtf8)?;
-                family_name = if sub.is_empty() {
-                    SliceRef::Empty
-                } else {
-                    SliceRef::Input {
-                        start: sub.start as u32,
-                        len: sub.len() as u32,
-                    }
-                };
+                family_name = push_utf8_or_lossy(
+                    &input[sub.clone()],
+                    sub.start,
+                    &mut scratch.utf8_arena,
+                );
             }
             4 => {
                 if wire_type != 2 {
@@ -2410,16 +2579,11 @@ fn decode_metadata_rw1(input: &[u8], range: Range<usize>) -> Result<MetadataMeta
                     });
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                let _ =
-                    std::str::from_utf8(&input[sub.clone()]).map_err(|_| DecodeError::InvalidUtf8)?;
-                help = if sub.is_empty() {
-                    SliceRef::Empty
-                } else {
-                    SliceRef::Input {
-                        start: sub.start as u32,
-                        len: sub.len() as u32,
-                    }
-                };
+                help = push_utf8_or_lossy(
+                    &input[sub.clone()],
+                    sub.start,
+                    &mut scratch.utf8_arena,
+                );
             }
             5 => {
                 if wire_type != 2 {
@@ -2429,16 +2593,11 @@ fn decode_metadata_rw1(input: &[u8], range: Range<usize>) -> Result<MetadataMeta
                     });
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                let _ =
-                    std::str::from_utf8(&input[sub.clone()]).map_err(|_| DecodeError::InvalidUtf8)?;
-                unit = if sub.is_empty() {
-                    SliceRef::Empty
-                } else {
-                    SliceRef::Input {
-                        start: sub.start as u32,
-                        len: sub.len() as u32,
-                    }
-                };
+                unit = push_utf8_or_lossy(
+                    &input[sub.clone()],
+                    sub.start,
+                    &mut scratch.utf8_arena,
+                );
             }
             _ => {
                 skip_field_bounded(input, &mut pos, end, wire_type)?;
@@ -2470,7 +2629,7 @@ fn decode_metadata_rw2(
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
-        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
                 if wire_type != 0 {
@@ -2499,6 +2658,7 @@ fn decode_metadata_rw2(
                     index: help_ref,
                     offset: symbol_offset,
                 })?;
+                help = ensure_utf8_slice_ref(help, input, &mut scratch.utf8_arena);
             }
             4 => {
                 if wire_type != 0 {
@@ -2518,6 +2678,7 @@ fn decode_metadata_rw2(
                     index: unit_ref,
                     offset: symbol_offset,
                 })?;
+                unit = ensure_utf8_slice_ref(unit, input, &mut scratch.utf8_arena);
             }
             _ => {
                 skip_field_bounded(input, &mut pos, end, wire_type)?;
@@ -2525,7 +2686,13 @@ fn decode_metadata_rw2(
         }
     }
 
-    let series_name = metric_name_ref.resolve_str(input, common_symbols);
+    let utf8_metric_name_ref =
+        ensure_utf8_slice_ref(metric_name_ref, input, &mut scratch.utf8_arena);
+    let series_name = utf8_metric_name_ref.resolve_str(
+        input,
+        common_symbols,
+        &scratch.utf8_arena,
+    );
     let normalized_name = if opts.skip_normalize_metadata_metric_name {
         series_name
     } else {
@@ -2538,14 +2705,20 @@ fn decode_metadata_rw2(
         return Ok(());
     }
 
-    let final_family_ref = truncate_slice_ref(metric_name_ref, normalized_name.len());
+    let final_family_ref = truncate_slice_ref(utf8_metric_name_ref, normalized_name.len());
 
     if !opts.skip_deduplicate_metadata {
         let h = fnv64a(normalized_name.as_bytes());
         let bucket = scratch.dedup_hashes.entry(h).or_default();
         for &existing_idx in bucket.iter() {
             let existing = scratch.metadata[existing_idx];
-            if resolve_str_any(existing.family_name, input, common_symbols) == normalized_name {
+            if resolve_str_any(
+                existing.family_name,
+                input,
+                common_symbols,
+                &scratch.utf8_arena,
+            ) == normalized_name
+            {
                 return Ok(());
             }
         }
@@ -2577,12 +2750,21 @@ fn truncate_slice_ref(r: SliceRef, new_len: usize) -> SliceRef {
             idx,
             len: (new_len as u32).min(len),
         },
+        SliceRef::Scratch { start, len } => SliceRef::Scratch {
+            start,
+            len: (new_len as u32).min(len),
+        },
     }
 }
 
 #[inline]
-fn resolve_str_any<'a>(r: SliceRef, input: &'a [u8], common_symbols: &'a [&'a str]) -> &'a str {
-    r.resolve_str(input, common_symbols)
+fn resolve_str_any<'a>(
+    r: SliceRef,
+    input: &'a [u8],
+    common_symbols: &'a [&'a str],
+    utf8_arena: &'a [u8],
+) -> &'a str {
+    r.resolve_str(input, common_symbols, utf8_arena)
 }
 
 #[inline]
@@ -2641,11 +2823,11 @@ fn resolve_symbol_ref(
 }
 
 #[inline(always)]
-fn read_key(input: &[u8], pos: &mut usize) -> Result<(u32, u8), DecodeError> {
-    let wire = read_varint_bounded(input, pos, input.len())?;
+fn read_key_bounded(input: &[u8], pos: &mut usize, end: usize) -> Result<(u32, u8), DecodeError> {
+    let wire = read_varint_bounded(input, pos, end)?;
     let field_num = (wire >> 3) as u32;
     let wire_type = (wire & 0x7) as u8;
-    if wire_type == 4 || wire_type == 3 || wire_type > 5 {
+    if wire_type == 4 || wire_type > 5 {
         return Err(DecodeError::InvalidWireType {
             field: field_num,
             wire_type,
@@ -2733,7 +2915,7 @@ fn read_varint_bounded_slow(
 #[inline(always)]
 fn read_f64_bounded(input: &[u8], pos: &mut usize, end: usize) -> Result<f64, DecodeError> {
     let p = *pos;
-    if end - p < 8 {
+    if end.checked_sub(p).is_none_or(|avail| avail < 8) {
         return Err(DecodeError::UnexpectedEof);
     }
     let next = p + 8;
@@ -2744,12 +2926,19 @@ fn read_f64_bounded(input: &[u8], pos: &mut usize, end: usize) -> Result<f64, De
     Ok(f64::from_le_bytes(bytes))
 }
 
+#[allow(dead_code)]
 #[inline(always)]
-fn read_length_delimited_range(
-    input: &[u8],
-    pos: &mut usize,
-) -> Result<Range<usize>, DecodeError> {
-    read_length_delimited_range_bounded(input, pos, input.len())
+fn read_fixed32_bounded(input: &[u8], pos: &mut usize, end: usize) -> Result<u32, DecodeError> {
+    let p = *pos;
+    if end.checked_sub(p).is_none_or(|avail| avail < 4) {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    let next = p + 4;
+    let bytes: [u8; 4] = input[p..next]
+        .try_into()
+        .map_err(|_| DecodeError::UnexpectedEof)?;
+    *pos = next;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 #[inline(always)]
@@ -2758,20 +2947,16 @@ fn read_length_delimited_range_bounded(
     pos: &mut usize,
     end: usize,
 ) -> Result<Range<usize>, DecodeError> {
-    let len = read_varint_bounded(input, pos, end)? as usize;
+    let len = read_varint_bounded(input, pos, end)?;
     let start = *pos;
-    let avail = end - start;
-    if len > avail {
+    let avail = end.checked_sub(start).ok_or(DecodeError::UnexpectedEof)?;
+    let len_usize = usize::try_from(len).map_err(|_| DecodeError::UnexpectedEof)?;
+    if len_usize > avail {
         return Err(DecodeError::UnexpectedEof);
     }
-    let next = start + len;
+    let next = start + len_usize;
     *pos = next;
     Ok(start..next)
-}
-
-#[inline]
-fn skip_field(input: &[u8], pos: &mut usize, wire_type: u8) -> Result<(), DecodeError> {
-    skip_field_bounded(input, pos, input.len(), wire_type)
 }
 
 fn skip_field_bounded(
@@ -2786,23 +2971,68 @@ fn skip_field_bounded(
             Ok(())
         }
         1 => {
-            let next = pos.checked_add(8).ok_or(DecodeError::UnexpectedEof)?;
-            if next > end {
+            if end.checked_sub(*pos).is_none_or(|avail| avail < 8) {
                 return Err(DecodeError::UnexpectedEof);
             }
-            *pos = next;
+            *pos += 8;
             Ok(())
         }
         2 => {
             let _ = read_length_delimited_range_bounded(input, pos, end)?;
             Ok(())
         }
+        3 => {
+            // Protobuf StartGroup: skip nested fields until matching EndGroup (wire_type 4).
+            let mut depth = 1usize;
+            while depth > 0 {
+                let wire = read_varint_bounded(input, pos, end)?;
+                let wt = (wire & 0x7) as u8;
+                match wt {
+                    0 => {
+                        let _ = read_varint_bounded(input, pos, end)?;
+                    }
+                    1 => {
+                        if end.checked_sub(*pos).is_none_or(|avail| avail < 8) {
+                            return Err(DecodeError::UnexpectedEof);
+                        }
+                        *pos += 8;
+                    }
+                    2 => {
+                        let _ = read_length_delimited_range_bounded(input, pos, end)?;
+                    }
+                    3 => {
+                        depth = depth.checked_add(1).ok_or(DecodeError::UnexpectedEof)?;
+                        if depth > 100 {
+                            return Err(DecodeError::InvalidWireType {
+                                field: (wire >> 3) as u32,
+                                wire_type: wt,
+                            });
+                        }
+                    }
+                    4 => {
+                        depth -= 1;
+                    }
+                    5 => {
+                        if end.checked_sub(*pos).is_none_or(|avail| avail < 4) {
+                            return Err(DecodeError::UnexpectedEof);
+                        }
+                        *pos += 4;
+                    }
+                    _ => {
+                        return Err(DecodeError::InvalidWireType {
+                            field: (wire >> 3) as u32,
+                            wire_type: wt,
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
         5 => {
-            let next = pos.checked_add(4).ok_or(DecodeError::UnexpectedEof)?;
-            if next > end {
+            if end.checked_sub(*pos).is_none_or(|avail| avail < 4) {
                 return Err(DecodeError::UnexpectedEof);
             }
-            *pos = next;
+            *pos += 4;
             Ok(())
         }
         _ => Err(DecodeError::InvalidWireType {
@@ -3407,5 +3637,170 @@ mod tests {
         );
         assert_eq!(meta_out.len(), 1);
         assert_eq!(meta_out[0].metric_family_name, "http_requests_total");
+    }
+
+    #[test]
+    fn test_malformed_protobuf_poc_and_fuzz_no_panic() {
+        let mut scratch = WriteRequestScratch::new();
+        let mut resolved = Rw2ResolvedScratch::new();
+        let mut label_bytes = Vec::new();
+        let mut samples = Vec::new();
+        let mut meta = Vec::new();
+
+        // Exact PoC that previously caused `end - p` usize underflow panic:
+        let poc = [0x0a, 0x04, 0x12, 0x01, 0x89, 0x00];
+        assert!(decode_write_request(&poc, DecodeOptions::classic(), &mut scratch).is_err());
+        assert!(decode_write_request(&poc, DecodeOptions::rw2(), &mut scratch).is_err());
+        assert!(decode_rw2_stream(
+            &poc,
+            DecodeOptions::rw2(),
+            &mut scratch,
+            &mut resolved,
+            &mut label_bytes,
+            &mut samples,
+            &mut meta,
+            |_| {},
+        )
+        .is_err());
+
+        // StartGroup / EndGroup wire types: unknown StartGroup(field 15) -> skipped cleanly,
+        // stray EndGroup -> Err(InvalidWireType) without panic.
+        let mut with_group = vec![
+            (15 << 3) | 3, // field 15, StartGroup
+            1 << 3,        // nested varint (wire type 0)
+            42,
+            (15 << 3) | 4, // field 15, EndGroup
+        ];
+        let classic = cortexpb::WriteRequest {
+            source: 7,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        with_group.extend_from_slice(&classic);
+        let dec = decode_write_request(&with_group, DecodeOptions::classic(), &mut scratch)
+            .expect("unknown group should skip cleanly");
+        assert_eq!(dec.source, 7);
+
+        let stray_end_group = [(15 << 3) | 4];
+        assert!(
+            decode_write_request(&stray_end_group, DecodeOptions::classic(), &mut scratch).is_err()
+        );
+
+        // Deterministic PRNG across 1,000 random/corrupted slices
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_u8 = || -> u8 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xff) as u8
+        };
+
+        for iter in 0..1000usize {
+            let len = (iter % 97) + 1;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                buf.push(next_u8());
+            }
+            let _ = decode_write_request(&buf, DecodeOptions::classic(), &mut scratch);
+            let _ = decode_write_request(&buf, DecodeOptions::rw2(), &mut scratch);
+            let _ = decode_write_request(&buf, DecodeOptions::kafka_v2(), &mut scratch);
+            label_bytes.clear();
+            samples.clear();
+            let mut meta_iter = Vec::new();
+            let _ = decode_rw2_stream(
+                &buf,
+                DecodeOptions::rw2(),
+                &mut scratch,
+                &mut resolved,
+                &mut label_bytes,
+                &mut samples,
+                &mut meta_iter,
+                |_| {},
+            );
+            label_bytes.clear();
+            samples.clear();
+            let mut meta_iter2 = Vec::new();
+            let _ = decode_rw2_stream(
+                &buf,
+                DecodeOptions::kafka_v2(),
+                &mut scratch,
+                &mut resolved,
+                &mut label_bytes,
+                &mut samples,
+                &mut meta_iter2,
+                |_| {},
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_utf8_and_duplicate_metric_name_rw2() {
+        let mut scratch = WriteRequestScratch::new();
+        let mut resolved = Rw2ResolvedScratch::new();
+        let mut label_bytes = Vec::new();
+        let mut samples = Vec::new();
+        let mut meta = Vec::new();
+
+        // RW1 metadata with invalid UTF-8 bytes in HELP / UNIT
+        // Field 3 (metadata): field 1=1(Counter), field 2="up", field 4=b"bad\xffhelp", field 5=b"u\xfe"
+        let mut meta_msg = Vec::new();
+        meta_msg.extend_from_slice(&[0x08, 0x01]); // type = 1
+        meta_msg.extend_from_slice(&[0x12, 0x02, b'u', b'p']); // family_name = "up"
+        meta_msg.extend_from_slice(&[0x22, 0x08, b'b', b'a', b'd', 0xff, b'h', b'e', b'l', b'p']);
+        meta_msg.extend_from_slice(&[0x2a, 0x02, b'u', 0xfe]);
+        let mut rw1_wire = Vec::new();
+        rw1_wire.push(0x1a); // field 3, len-delimited
+        rw1_wire.push(meta_msg.len() as u8);
+        rw1_wire.extend_from_slice(&meta_msg);
+        let dec1 = decode_write_request(&rw1_wire, DecodeOptions::classic(), &mut scratch)
+            .expect("classic decode should tolerate invalid UTF-8 in HELP/UNIT");
+        let ms: Vec<_> = dec1.metadata().collect();
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].metric_family_name, "up");
+        assert!(ms[0].help.contains('\u{FFFD}'));
+        assert!(ms[0].unit.contains('\u{FFFD}'));
+
+        // RW2 with duplicate __name__ (last __name__ wins) + invalid UTF-8 symbol
+        // symbols: ["", "__name__", "first_name", "last_name", b"help\xff"]
+        let mut rw2_wire = Vec::new();
+        let syms: [&[u8]; 5] = [b"", b"__name__", b"first_name", b"last_name", b"help\xff"];
+        for s in syms {
+            rw2_wire.push(0x22); // field 4, wire 2
+            rw2_wire.push(s.len() as u8);
+            rw2_wire.extend_from_slice(s);
+        }
+        // TimeSeriesRw2 (field 5): labels_refs=[1, 2, 1, 3], metadata={type: 1, help_ref: 4}
+        let mut ts_msg = Vec::new();
+        ts_msg.extend_from_slice(&[0x0a, 0x04, 1, 2, 1, 3]); // labels_refs
+        ts_msg.extend_from_slice(&[0x2a, 0x04, 0x08, 0x01, 0x18, 0x04]); // metadata
+        rw2_wire.push(0x2a); // field 5, wire 2
+        rw2_wire.push(ts_msg.len() as u8);
+        rw2_wire.extend_from_slice(&ts_msg);
+
+        let dec2 = decode_write_request(&rw2_wire, DecodeOptions::rw2(), &mut scratch)
+            .expect("rw2 decode should tolerate invalid UTF-8");
+        assert!(!dec2.labels_utf8_validated);
+        assert!(dec2.timeseries_at(0).labels_str().is_none());
+        let ms2: Vec<_> = dec2.metadata().collect();
+        assert_eq!(ms2.len(), 1);
+        assert_eq!(ms2[0].metric_family_name, "last_name");
+        assert_eq!(ms2[0].help, "help\u{FFFD}");
+
+        let mut emitted = 0usize;
+        decode_rw2_stream(
+            &rw2_wire,
+            DecodeOptions::rw2(),
+            &mut scratch,
+            &mut resolved,
+            &mut label_bytes,
+            &mut samples,
+            &mut meta,
+            |_| emitted += 1,
+        )
+        .expect("decode_rw2_stream should tolerate invalid UTF-8");
+        assert_eq!(emitted, 1);
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].metric_family_name, "last_name");
+        assert_eq!(meta[0].help, "help\u{FFFD}");
     }
 }

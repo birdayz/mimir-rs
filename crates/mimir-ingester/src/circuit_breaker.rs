@@ -210,6 +210,7 @@ struct BreakerInner {
     opened_at: Option<Instant>,
     half_open_in_flight: usize,
     half_open_successes: usize,
+    half_open_failures: usize,
     outcomes: VecDeque<(Instant, bool)>, // (timestamp, is_failure)
 }
 
@@ -255,6 +256,7 @@ impl CircuitBreaker {
             opened_at: None,
             half_open_in_flight: 0,
             half_open_successes: 0,
+            half_open_failures: 0,
             outcomes: VecDeque::new(),
         }));
         let inner_for_gauge = Arc::clone(&inner);
@@ -266,6 +268,7 @@ impl CircuitBreaker {
                         g.state = BreakerState::HalfOpen;
                         g.half_open_in_flight = 0;
                         g.half_open_successes = 0;
+                        g.half_open_failures = 0;
                     }
                 }
             }
@@ -357,6 +360,9 @@ impl CircuitBreaker {
         if inner.state != BreakerState::Open {
             inner.state = BreakerState::Open;
             inner.opened_at = Some(Instant::now());
+            inner.half_open_in_flight = 0;
+            inner.half_open_successes = 0;
+            inner.half_open_failures = 0;
             inner.outcomes.clear();
             self.metrics
                 .transitions
@@ -372,6 +378,7 @@ impl CircuitBreaker {
             inner.opened_at = None;
             inner.half_open_in_flight = 0;
             inner.half_open_successes = 0;
+            inner.half_open_failures = 0;
             inner.outcomes.clear();
             self.metrics
                 .transitions
@@ -387,6 +394,7 @@ impl CircuitBreaker {
             inner.opened_at = None;
             inner.half_open_in_flight = 0;
             inner.half_open_successes = 0;
+            inner.half_open_failures = 0;
             self.metrics
                 .transitions
                 .with_label_values(&[BreakerState::HalfOpen.as_str()])
@@ -464,6 +472,14 @@ impl CircuitBreaker {
         }
     }
 
+    fn half_open_capacity(&self) -> usize {
+        if self.test_mode_count_based.load(Ordering::Acquire) {
+            self.cfg.failure_threshold_percentage.max(1) as usize
+        } else {
+            self.cfg.failure_execution_threshold.max(1) as usize
+        }
+    }
+
     fn maybe_transition_to_half_open(&self, inner: &mut BreakerInner, now: Instant) {
         if inner.state == BreakerState::Open {
             if let Some(opened_at) = inner.opened_at {
@@ -471,6 +487,7 @@ impl CircuitBreaker {
                     inner.state = BreakerState::HalfOpen;
                     inner.half_open_in_flight = 0;
                     inner.half_open_successes = 0;
+                    inner.half_open_failures = 0;
                     self.metrics
                         .transitions
                         .with_label_values(&[BreakerState::HalfOpen.as_str()])
@@ -503,6 +520,7 @@ impl CircuitBreaker {
                 Ok(Some(BreakerPermit {
                     breaker: Arc::clone(self),
                     is_half_open: false,
+                    finished: false,
                 }))
             }
             BreakerState::Open => {
@@ -517,8 +535,8 @@ impl CircuitBreaker {
                 })
             }
             BreakerState::HalfOpen => {
-                // Allow a single probe at a time while half-open
-                if inner.half_open_in_flight >= 1 {
+                let cap = self.half_open_capacity();
+                if inner.half_open_in_flight >= cap {
                     self.metrics.results.with_label_values(&[RESULT_OPEN]).inc();
                     return Err(IngesterError::CircuitBreakerOpen {
                         request_type: self.request_type.to_string(),
@@ -530,6 +548,7 @@ impl CircuitBreaker {
                 Ok(Some(BreakerPermit {
                     breaker: Arc::clone(self),
                     is_half_open: true,
+                    finished: false,
                 }))
             }
         }
@@ -611,6 +630,15 @@ impl CircuitBreaker {
         );
     }
 
+    fn abort_permit(&self, is_half_open: bool) {
+        if is_half_open {
+            let mut inner = self.inner.lock();
+            if inner.state == BreakerState::HalfOpen {
+                inner.half_open_in_flight = inner.half_open_in_flight.saturating_sub(1);
+            }
+        }
+    }
+
     fn record_failure_inner(&self, is_half_open: bool) {
         self.recorded_failures.fetch_add(1, Ordering::AcqRel);
         let now = Instant::now();
@@ -619,13 +647,30 @@ impl CircuitBreaker {
             inner.half_open_in_flight = inner.half_open_in_flight.saturating_sub(1);
         }
         if inner.state == BreakerState::HalfOpen {
-            inner.state = BreakerState::Open;
-            inner.opened_at = Some(now);
-            self.metrics
-                .transitions
-                .with_label_values(&[BreakerState::Open.as_str()])
-                .inc();
-            warn!(request_type = self.request_type, "circuit breaker is open");
+            inner.half_open_failures += 1;
+            let should_open = if self.test_mode_count_based.load(Ordering::Acquire) {
+                inner.half_open_failures >= self.cfg.failure_threshold_percentage.max(1) as usize
+                    || (inner.half_open_failures + inner.half_open_successes
+                        >= self.half_open_capacity()
+                        && inner.half_open_successes == 0)
+            } else {
+                let total = inner.half_open_successes + inner.half_open_failures;
+                total >= self.cfg.failure_execution_threshold.max(1) as usize
+                    && (inner.half_open_failures * 100)
+                        >= total * (self.cfg.failure_threshold_percentage as usize)
+            };
+            if should_open {
+                inner.state = BreakerState::Open;
+                inner.opened_at = Some(now);
+                inner.half_open_in_flight = 0;
+                inner.half_open_successes = 0;
+                inner.half_open_failures = 0;
+                self.metrics
+                    .transitions
+                    .with_label_values(&[BreakerState::Open.as_str()])
+                    .inc();
+                warn!(request_type = self.request_type, "circuit breaker is open");
+            }
             return;
         }
         if inner.state == BreakerState::Closed {
@@ -653,9 +698,24 @@ impl CircuitBreaker {
         }
         if inner.state == BreakerState::HalfOpen {
             inner.half_open_successes += 1;
-            if inner.half_open_successes >= 1 {
+            let should_close = if self.test_mode_count_based.load(Ordering::Acquire) {
+                inner.half_open_successes >= 1
+            } else {
+                let total = inner.half_open_successes + inner.half_open_failures;
+                total >= self.cfg.failure_execution_threshold.max(1) as usize
+                    && if self.cfg.failure_threshold_percentage == 0 {
+                        inner.half_open_failures == 0
+                    } else {
+                        (inner.half_open_failures * 100)
+                            < total * (self.cfg.failure_threshold_percentage as usize)
+                    }
+            };
+            if should_close {
                 inner.state = BreakerState::Closed;
                 inner.opened_at = None;
+                inner.half_open_in_flight = 0;
+                inner.half_open_successes = 0;
+                inner.half_open_failures = 0;
                 inner.outcomes.clear();
                 self.metrics
                     .transitions
@@ -780,21 +840,33 @@ impl OptionalCircuitBreakerExt for Option<Arc<CircuitBreaker>> {
 pub struct BreakerPermit {
     breaker: Arc<CircuitBreaker>,
     is_half_open: bool,
+    finished: bool,
 }
 
 impl BreakerPermit {
-    pub fn finish(self, duration: Duration, deadline_exceeded: bool) {
+    pub fn finish(mut self, duration: Duration, deadline_exceeded: bool) {
+        self.finished = true;
         self.breaker
             .finish_request(duration, deadline_exceeded, self.is_half_open);
     }
 
-    pub fn finish_with_err(self, duration: Duration, err: Option<&BreakerError>) {
+    pub fn finish_with_err(mut self, duration: Duration, err: Option<&BreakerError>) {
+        self.finished = true;
         let _ = self.breaker.finish_request_with_max_duration(
             duration,
             self.breaker.request_timeout,
             err,
             self.is_half_open,
         );
+    }
+}
+
+impl Drop for BreakerPermit {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.breaker.abort_permit(self.is_half_open);
+        }
     }
 }
 
@@ -894,6 +966,38 @@ mod tests {
         // First half-open probe succeeds -> Closed
         let p = cb.try_acquire_permit().unwrap().unwrap();
         p.finish(Duration::from_millis(1), false);
+        assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    #[test]
+    fn half_open_permits_multiple_probes_and_drop_releases_slot() {
+        let cfg = CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold_percentage: 50,
+            failure_execution_threshold: 3,
+            cooldown_period: mimir_config::GoDuration::from_millis(10),
+            request_timeout: mimir_config::GoDuration::from_millis(100),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::new(&cfg, None, "push", false).unwrap();
+        cb.activate();
+        cb.force_half_open();
+
+        // Up to failure_execution_threshold (3) concurrent probes allowed in half-open.
+        let p1 = cb.try_acquire_permit().unwrap().unwrap();
+        let p2 = cb.try_acquire_permit().unwrap().unwrap();
+        let p3 = cb.try_acquire_permit().unwrap().unwrap();
+        assert!(cb.try_acquire_permit().is_err());
+
+        // Dropping p2 without finish() releases its half-open slot via RAII Drop.
+        drop(p2);
+        let p4 = cb.try_acquire_permit().unwrap().unwrap();
+        assert!(cb.try_acquire_permit().is_err());
+
+        p1.finish(Duration::from_millis(1), false);
+        p3.finish(Duration::from_millis(1), false);
+        assert_eq!(cb.state(), BreakerState::HalfOpen);
+        p4.finish(Duration::from_millis(1), false);
         assert_eq!(cb.state(), BreakerState::Closed);
     }
 }

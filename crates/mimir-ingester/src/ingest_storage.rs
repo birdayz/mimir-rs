@@ -77,15 +77,8 @@ impl IngestReaderHandle {
     ) -> Result<(), ReaderError> {
         match self {
             Self::Single(r) => {
-                if offsets.num_kafka_clusters() != 1 {
-                    return Err(ReaderError::ClusterCountMismatch {
-                        expected: 1,
-                        got: offsets.num_kafka_clusters(),
-                    });
-                }
-                r.wait_for_offset(offsets.for_kafka_cluster(0), timeout)
-                    .await?;
-                Ok(())
+                r.wait_read_consistency_until_offsets(offsets, timeout)
+                    .await
             }
             Self::Multi(r) => {
                 r.wait_read_consistency_until_offsets(offsets, timeout)
@@ -179,7 +172,7 @@ const SHARD_COMMIT_MAX_SERIES: usize = 2048;
 struct ShardSeriesItem {
     worker_idx: u16,
     record_offset: i64,
-    tenant_idx: u16,
+    tenant_idx: u32,
     source: i32,
     skip_label_validation: bool,
     labels_sorted_unique: bool,
@@ -191,9 +184,9 @@ struct ShardSeriesItem {
     samples_len: u32,
     created_timestamp: i64,
     histograms_start: u32,
-    histograms_len: u16,
+    histograms_len: u32,
     exemplars_start: u32,
-    exemplars_len: u16,
+    exemplars_len: u32,
     min_ts: i64,
 }
 
@@ -206,6 +199,7 @@ struct WorkerArena {
     exemplars_arena: Vec<(i64, f64, Labels, String)>,
     shard_buckets: Vec<Vec<ShardSeriesItem>>,
     empty_tenant_errors: usize,
+    invalid_tenant_indices: Vec<u32>,
     total_series: usize,
 }
 
@@ -220,6 +214,7 @@ impl WorkerArena {
             exemplars_arena: Vec::new(),
             shard_buckets: (0..num_shards).map(|_| Vec::with_capacity(128)).collect(),
             empty_tenant_errors: 0,
+            invalid_tenant_indices: Vec::new(),
             total_series: 0,
         }
     }
@@ -238,6 +233,7 @@ impl WorkerArena {
             b.clear();
         }
         self.empty_tenant_errors = 0;
+        self.invalid_tenant_indices.clear();
         self.total_series = 0;
     }
 
@@ -381,36 +377,8 @@ impl IngesterShardedBatchConsumer {
         // Map each record to a deduplicated tenant index + accumulate bytes per tenant for metrics.
         let mut tenants: SmallVec<[String; 4]> = SmallVec::new();
         let mut tenant_bytes: SmallVec<[usize; 4]> = SmallVec::new();
-        let mut tenant_lookup: HashMap<&str, u16> = HashMap::new();
-        let mut rec_tenant_idx: SmallVec<[u16; 64]> = SmallVec::with_capacity(records.len());
-
-        for rec in records {
-            let tid_cow = String::from_utf8_lossy(&rec.key);
-            let tid_idx = if let Some(&idx) = tenant_lookup.get(tid_cow.as_ref()) {
-                tenant_bytes[idx as usize] += rec.value.len();
-                idx
-            } else {
-                let idx = tenants.len() as u16;
-                tenants.push(tid_cow.into_owned());
-                tenant_bytes.push(rec.value.len());
-                // Safety/simplicity: borrow from owned string? Rebuild small map or linear scan for <= 4 tenants.
-                idx
-            };
-            if tenants.len() > tenant_lookup.len() && tenants.len() > 4 {
-                tenant_lookup.clear();
-                for (i, t) in tenants.iter().enumerate() {
-                    // Use unsafe lifetime extension? Avoid: linear scan up to 8 tenants is faster than HashMap!
-                    let _ = (i, t);
-                }
-            }
-            rec_tenant_idx.push(tid_idx);
-        }
-        // Actually replace linear scan cleanly without unused map:
-        let _ = tenant_lookup;
-        tenants.clear();
-        tenant_bytes.clear();
-        rec_tenant_idx.clear();
-        let mut fallback_map: Option<HashMap<String, u16>> = None;
+        let mut rec_tenant_idx: SmallVec<[u32; 64]> = SmallVec::with_capacity(records.len());
+        let mut fallback_map: Option<HashMap<String, u32>> = None;
         for rec in records {
             let tid_cow = String::from_utf8_lossy(&rec.key);
             let tid_str = tid_cow.as_ref();
@@ -419,7 +387,7 @@ impl IngesterShardedBatchConsumer {
                     tenant_bytes[idx as usize] += rec.value.len();
                     idx
                 } else {
-                    let idx = tenants.len() as u16;
+                    let idx = tenants.len() as u32;
                     tenants.push(tid_str.to_owned());
                     tenant_bytes.push(rec.value.len());
                     map.insert(tid_str.to_owned(), idx);
@@ -427,18 +395,18 @@ impl IngesterShardedBatchConsumer {
                 }
             } else if let Some(pos) = tenants.iter().position(|t| t == tid_str) {
                 tenant_bytes[pos] += rec.value.len();
-                pos as u16
+                pos as u32
             } else if tenants.len() < 8 {
-                let idx = tenants.len() as u16;
+                let idx = tenants.len() as u32;
                 tenants.push(tid_str.to_owned());
                 tenant_bytes.push(rec.value.len());
                 idx
             } else {
                 let mut map = HashMap::with_capacity(16);
                 for (i, t) in tenants.iter().enumerate() {
-                    map.insert(t.clone(), i as u16);
+                    map.insert(t.clone(), i as u32);
                 }
-                let idx = tenants.len() as u16;
+                let idx = tenants.len() as u32;
                 tenants.push(tid_str.to_owned());
                 tenant_bytes.push(rec.value.len());
                 map.insert(tid_str.to_owned(), idx);
@@ -447,6 +415,20 @@ impl IngesterShardedBatchConsumer {
             };
             rec_tenant_idx.push(tid_idx);
         }
+
+        // Validate every tenant ID once against dskit's strict rules (prevents path traversal).
+        let tenant_invalid_errors: SmallVec<[Option<String>; 4]> = tenants
+            .iter()
+            .map(|tid| {
+                if tid.is_empty() {
+                    None
+                } else {
+                    mimir_common::tenant::valid_tenant_id(tid)
+                        .err()
+                        .map(|e| e.to_string())
+                }
+            })
+            .collect();
 
         let num_shards = if self.kafka_cfg.ingestion_concurrency_max <= 0 {
             1
@@ -488,7 +470,7 @@ impl IngesterShardedBatchConsumer {
         let decode_worker = |worker_idx: usize,
                              rec_offset_start: usize,
                              slice: &[FetchedRecord],
-                             tids: &[u16],
+                             tids: &[u32],
                              arena: &mut WorkerArena| {
             let WorkerArena {
                 wr_scratch,
@@ -499,16 +481,20 @@ impl IngesterShardedBatchConsumer {
                 exemplars_arena,
                 shard_buckets,
                 empty_tenant_errors,
+                invalid_tenant_indices,
                 total_series,
             } = arena;
             let mut tmp_ex: Vec<(i64, f64, Labels, String)> = Vec::new();
-            let mut rec_metadata: Vec<BorrowedMetadata<'_>> = Vec::with_capacity(128);
             let mut bucket_bases = [0usize; 16];
             for (local_i, rec) in slice.iter().enumerate() {
                 let tenant_idx = tids[local_i];
                 let tenant_id = &tenants[tenant_idx as usize];
                 if tenant_id.is_empty() {
                     *empty_tenant_errors += 1;
+                    continue;
+                }
+                if tenant_invalid_errors[tenant_idx as usize].is_some() {
+                    invalid_tenant_indices.push(tenant_idx);
                     continue;
                 }
 
@@ -526,6 +512,7 @@ impl IngesterShardedBatchConsumer {
                         bucket_bases[s_idx] = shard_buckets[s_idx].len();
                     }
 
+                    let mut rec_metadata: Vec<BorrowedMetadata<'_>> = Vec::new();
                     let stream_res = decode_rw2_stream(
                         &rec.value,
                         DecodeOptions::kafka_v2(),
@@ -546,7 +533,7 @@ impl IngesterShardedBatchConsumer {
 
                             let mut min_ts = ts.min_sample_ts;
                             let hist_start = histograms_arena.len() as u32;
-                            let mut hist_len = 0u16;
+                            let mut hist_len = 0u32;
                             if ts.histograms_len() > 0 {
                                 for h in ts.histograms() {
                                     let conv = convert_borrowed_histogram(&h);
@@ -557,12 +544,13 @@ impl IngesterShardedBatchConsumer {
                             }
 
                             let ex_start = exemplars_arena.len() as u32;
-                            let mut ex_len = 0u16;
+                            let mut ex_len = 0u32;
                             let mut bad_utf8 = false;
                             if ts.exemplars_len() > 0 {
                                 tmp_ex.clear();
                                 for ex in ts.exemplars() {
                                     if let Ok(conv) = convert_borrowed_exemplar(&ex) {
+                                        min_ts = min_ts.min(conv.0);
                                         tmp_ex.push(conv);
                                         ex_len += 1;
                                     } else {
@@ -633,7 +621,7 @@ impl IngesterShardedBatchConsumer {
                             *total_series = total_series_base;
                         }
                     }
-                    rec_metadata.clear();
+                    drop(rec_metadata);
                     wr_scratch.clear();
                     let _ = rec_offset_start;
                     continue;
@@ -733,7 +721,7 @@ impl IngesterShardedBatchConsumer {
                     samples_arena.extend_from_slice(samples);
 
                     let hist_start = histograms_arena.len() as u32;
-                    let mut hist_len = 0u16;
+                    let mut hist_len = 0u32;
                     for h in ts.histograms() {
                         let conv = convert_borrowed_histogram(&h);
                         min_ts = min_ts.min(conv.0);
@@ -742,11 +730,12 @@ impl IngesterShardedBatchConsumer {
                     }
 
                     let ex_start = exemplars_arena.len() as u32;
-                    let mut ex_len = 0u16;
+                    let mut ex_len = 0u32;
                     if ts.exemplars().len() > 0 {
                         tmp_ex.clear();
                         for ex in ts.exemplars() {
                             if let Ok(conv) = convert_borrowed_exemplar(&ex) {
+                                min_ts = min_ts.min(conv.0);
                                 tmp_ex.push(conv);
                                 ex_len += 1;
                             } else {
@@ -817,6 +806,14 @@ impl IngesterShardedBatchConsumer {
                 let err = PusherError::ingester(ErrorCause::BadData, "InvalidArgument", "no org id");
                 let _ = self.error_handler.is_server_error("", Some(&err));
             }
+            for &tid_idx in &a.invalid_tenant_indices {
+                let tid = &tenants[tid_idx as usize];
+                let msg = tenant_invalid_errors[tid_idx as usize]
+                    .as_deref()
+                    .unwrap_or("invalid tenant id");
+                let err = PusherError::ingester(ErrorCause::BadData, "InvalidArgument", msg);
+                let _ = self.error_handler.is_server_error(tid, Some(&err));
+            }
         }
 
         if total_series == 0 {
@@ -851,7 +848,7 @@ impl IngesterShardedBatchConsumer {
             let mut cur_source = items_for_shard[0].source;
             let mut last_offset = items_for_shard[0].record_offset;
 
-            let flush_batch = |tenant_idx: u16,
+            let flush_batch = |tenant_idx: u32,
                                    source_raw: i32,
                                    min_ts: i64,
                                    last_off: i64,
@@ -1185,5 +1182,71 @@ mod tests {
         let inst_pusher = ingester_err_to_pusher_err(inst_limit);
         assert!(!inst_pusher.is_client_error());
         assert_eq!(inst_pusher.log_policy, Some(LogPolicy::DoNotLog));
+    }
+
+    #[test]
+    fn batch_consumer_rejects_path_traversal_tenant_and_starting_bypasses_max_series() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-0".to_string();
+        cfg.instance_limits.max_series = 1;
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ingest_cfg = mimir_config::IngestStorageConfig::default();
+        let overrides = mimir_config::Overrides::new(mimir_config::LimitsConfig::default());
+
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            ingest_cfg.clone(),
+            overrides,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // While Starting, get_instance_limits() returns None, so max_series=1 is bypassed.
+        ing.set_state_for_test(State::Starting);
+        assert!(ing.get_instance_limits().is_none());
+        let db = ing.get_or_create_tsdb("tenant-a").unwrap();
+        {
+            let mut app = db.db.appender();
+            app.append_float(None, &[("__name__", "m1")], 1000, 1.0).unwrap();
+            app.append_float(None, &[("__name__", "m2")], 1000, 2.0).unwrap();
+            app.commit().unwrap();
+        }
+        assert_eq!(db.db.head().num_series(), 2);
+
+        // Once Running, max_series=1 is enforced.
+        ing.set_state_for_test(State::Running);
+        assert_eq!(ing.get_instance_limits().unwrap().max_series, 1);
+        {
+            let mut app = db.db.appender();
+            assert!(app.append_float(None, &[("__name__", "m3")], 1000, 3.0).is_err());
+        }
+
+        // H6: path-traversal tenant ID in Kafka record key is rejected and never creates TSDB dir.
+        let reg = prometheus::Registry::new();
+        let pusher_metrics = PusherConsumerMetrics::new(Some(&reg));
+        let consumer =
+            IngesterShardedBatchConsumer::new(Arc::clone(&ing), ingest_cfg.kafka, pusher_metrics);
+        let rec = FetchedRecord {
+            key: bytes::Bytes::from_static(b"../mimir_traversal_probe"),
+            value: bytes::Bytes::from_static(&[1, 2, 3]),
+            headers: vec![],
+            offset: 1,
+            timestamp_ms: 0,
+        };
+        assert!(consumer.consume_records_sync(&[rec]).is_ok());
+        assert!(ing.get_tsdb("../mimir_traversal_probe").is_none());
+        assert!(!tmp.path().join("../mimir_traversal_probe").exists());
+        assert_eq!(
+            consumer.metrics.storage_pusher_metrics.client_err_requests.get(),
+            1.0
+        );
     }
 }

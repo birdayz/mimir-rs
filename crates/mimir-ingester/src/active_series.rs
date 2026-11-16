@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1181,46 +1181,69 @@ impl SeriesIndexReader for mimir_tsdb::head::Head {
 // Lock-free NanosSlab for zero-lock ActiveSeries timestamp updates
 // ---------------------------------------------------------------------------
 
-const SLAB_PAGE_SHIFT: usize = 16;
-const SLAB_PAGE_SIZE: usize = 1 << SLAB_PAGE_SHIFT; // 65,536 slots = 512 KiB/page
+const SLAB_PAGE_SHIFT: usize = 12;
+const SLAB_PAGE_SIZE: usize = 1 << SLAB_PAGE_SHIFT; // 4,096 slots = 36 KiB/page
 const SLAB_PAGE_MASK: usize = SLAB_PAGE_SIZE - 1;
-const SLAB_MAX_PAGES: usize = 512; // 33,554,432 slots max
+const SLAB_MAX_PAGES: usize = 8192; // 33,554,432 slots max
 const SLAB_MAX_SLOTS: u32 = (SLAB_MAX_PAGES * SLAB_PAGE_SIZE) as u32;
 const SLOT_NONE: u32 = u32::MAX;
 const SLOT_INACTIVE: i64 = i64::MIN;
 
+const CACHE_FLAG_PLAIN_FLOAT: u8 = 1 << 0;
+const CACHE_FLAG_IS_OTLP: u8 = 1 << 1;
+
 #[inline(always)]
-const fn pack_active_cache(epoch: u16, is_plain_float: bool, is_otlp: bool, slot: u32) -> u64 {
+const fn pack_active_cache(
+    epoch: u16,
+    slot_gen: u8,
+    is_plain_float: bool,
+    is_otlp: bool,
+    slot: u32,
+) -> u64 {
+    let flags = (if is_plain_float {
+        CACHE_FLAG_PLAIN_FLOAT
+    } else {
+        0
+    }) | (if is_otlp { CACHE_FLAG_IS_OTLP } else { 0 });
     ((epoch as u64) << 48)
-        | (((is_plain_float as u64) & 1) << 40)
-        | (((is_otlp as u64) & 1) << 32)
+        | ((slot_gen as u64) << 40)
+        | ((flags as u64) << 32)
         | (slot as u64)
 }
 
 #[inline(always)]
 const fn unpack_active_cache(packed: u64) -> (u16, u8, u8, u32) {
     let epoch = (packed >> 48) as u16;
-    let is_plain_float = ((packed >> 40) & 0xff) as u8;
-    let is_otlp = ((packed >> 32) & 0xff) as u8;
+    let slot_gen = (packed >> 40) as u8;
+    let flags = (packed >> 32) as u8;
     let slot = packed as u32;
-    (epoch, is_plain_float, is_otlp, slot)
+    (epoch, slot_gen, flags, slot)
 }
 
-#[repr(align(64))]
+#[repr(C, align(64))]
 struct SlabPage {
     slots: [AtomicI64; SLAB_PAGE_SIZE],
+    gens: [AtomicU8; SLAB_PAGE_SIZE],
 }
 
 impl SlabPage {
     fn new_boxed() -> Box<Self> {
-        let mut v: Vec<AtomicI64> = Vec::with_capacity(SLAB_PAGE_SIZE);
-        for _ in 0..SLAB_PAGE_SIZE {
-            v.push(AtomicI64::new(SLOT_INACTIVE));
+        let layout = std::alloc::Layout::new::<Self>();
+        // SAFETY: `Self` has non-zero size and alignment 64.
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut Self };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
         }
-        let raw = Box::into_raw(v.into_boxed_slice()) as *mut Self;
-        // SAFETY: `SlabPage` is `#[repr(align(64))]` wrapping `[AtomicI64; SLAB_PAGE_SIZE]`,
-        // matching the exact size and alignment of `Box<[AtomicI64; SLAB_PAGE_SIZE]>`.
-        unsafe { Box::from_raw(raw) }
+        // SAFETY: `ptr` is valid for writes of `SlabPage`; every field is initialized before `Box::from_raw`.
+        unsafe {
+            let slots_ptr = std::ptr::addr_of_mut!((*ptr).slots) as *mut AtomicI64;
+            let gens_ptr = std::ptr::addr_of_mut!((*ptr).gens) as *mut AtomicU8;
+            for i in 0..SLAB_PAGE_SIZE {
+                slots_ptr.add(i).write(AtomicI64::new(SLOT_INACTIVE));
+                gens_ptr.add(i).write(AtomicU8::new(0));
+            }
+            Box::from_raw(ptr)
+        }
     }
 }
 
@@ -1228,6 +1251,7 @@ struct NanosSlab {
     pages: Box<[AtomicPtr<SlabPage>; SLAB_MAX_PAGES]>,
     next_slot: AtomicU32,
     alloc_mtx: Mutex<()>,
+    free_slots: Mutex<Vec<(u32, u8)>>,
 }
 
 impl NanosSlab {
@@ -1242,11 +1266,17 @@ impl NanosSlab {
             pages: unsafe { Box::from_raw(raw) },
             next_slot: AtomicU32::new(0),
             alloc_mtx: Mutex::new(()),
+            free_slots: Mutex::new(Vec::new()),
         }
     }
 
     #[inline(always)]
     fn slot_ref(&self, slot: u32) -> Option<&AtomicI64> {
+        self.slot_and_gen_ref(slot).map(|(s, _)| s)
+    }
+
+    #[inline(always)]
+    fn slot_and_gen_ref(&self, slot: u32) -> Option<(&AtomicI64, &AtomicU8)> {
         if slot >= SLAB_MAX_SLOTS {
             return None;
         }
@@ -1258,16 +1288,22 @@ impl NanosSlab {
         }
         // SAFETY: `ptr` points to a heap-allocated `SlabPage` freed only in `NanosSlab::drop`,
         // and `offset < SLAB_PAGE_SIZE`.
-        Some(unsafe { &(*ptr).slots[offset] })
+        unsafe { Some((&(*ptr).slots[offset], &(*ptr).gens[offset])) }
     }
 
-    fn alloc_slot(&self, initial_nanos: i64) -> u32 {
+    fn alloc_slot(&self, initial_nanos: i64) -> (u32, u8) {
+        if let Some((slot, slot_gen)) = self.free_slots.lock().pop() {
+            if let Some(a) = self.slot_ref(slot) {
+                a.store(initial_nanos, Ordering::Release);
+                return (slot, slot_gen);
+            }
+        }
         if self.next_slot.load(Ordering::Relaxed) >= SLAB_MAX_SLOTS {
-            return SLOT_NONE;
+            return (SLOT_NONE, 0);
         }
         let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
         if slot >= SLAB_MAX_SLOTS {
-            return SLOT_NONE;
+            return (SLOT_NONE, 0);
         }
         let page_idx = (slot as usize) >> SLAB_PAGE_SHIFT;
         let offset = (slot as usize) & SLAB_PAGE_MASK;
@@ -1282,7 +1318,7 @@ impl NanosSlab {
         }
         // SAFETY: `page_ptr` was just initialized/loaded and `offset < SLAB_PAGE_SIZE`.
         unsafe { &(*page_ptr).slots[offset] }.store(initial_nanos, Ordering::Release);
-        slot
+        (slot, 0)
     }
 
     #[inline(always)]
@@ -1291,10 +1327,18 @@ impl NanosSlab {
             .map_or(SLOT_INACTIVE, |a| a.load(Ordering::Relaxed))
     }
 
-    #[inline(always)]
-    fn mark_inactive(&self, slot: u32) {
-        if let Some(a) = self.slot_ref(slot) {
-            a.store(SLOT_INACTIVE, Ordering::Release);
+    fn free_slot(&self, slot: u32) {
+        if let Some((slot_atomic, gen_atomic)) = self.slot_and_gen_ref(slot) {
+            slot_atomic.store(SLOT_INACTIVE, Ordering::Release);
+            let new_gen = gen_atomic.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+            self.free_slots.lock().push((slot, new_gen));
+        }
+    }
+
+    fn recycle_inactive_slot(&self, slot: u32) {
+        if let Some((_, gen_atomic)) = self.slot_and_gen_ref(slot) {
+            let new_gen = gen_atomic.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+            self.free_slots.lock().push((slot, new_gen));
         }
     }
 }
@@ -1320,6 +1364,7 @@ struct SeriesEntry {
     slot: u32,
     num_native_histogram_buckets: i32, // -1 if not a native histogram
     flags: u8,
+    slot_gen: u8,
     matches: PreAllocDynamicSlice,
 }
 
@@ -1503,7 +1548,7 @@ struct SeriesStripeInner {
     active_matching_native_histograms: Vec<u32>,
     active_native_histogram_buckets: u32,
     active_matching_native_histogram_buckets: Vec<u32>,
-    matchers: Matchers,
+    matchers: Arc<Matchers>,
     cat: Option<Arc<CostAttributionActiveTracker>>,
     attribution_failures: f64,
 }
@@ -1514,7 +1559,7 @@ struct SeriesStripe {
 }
 
 impl SeriesStripe {
-    fn new(matchers: Matchers, cat: Option<Arc<CostAttributionActiveTracker>>) -> Self {
+    fn new(matchers: Arc<Matchers>, cat: Option<Arc<CostAttributionActiveTracker>>) -> Self {
         let num_matchers = matchers.matcher_names().len();
         Self {
             oldest_entry_ns: AtomicI64::new(0),
@@ -1558,14 +1603,13 @@ impl SeriesStripe {
                 if entry.write_nanos(slab, now_ns) {
                     entry_time_set = true;
                 }
-                if entry.num_native_histogram_buckets != buckets_i32
-                    || (is_otlp && !entry.is_otlp())
-                {
+                if entry.num_native_histogram_buckets != buckets_i32 {
                     need_write = true;
                 } else if let Some(he) = head_entry {
                     if buckets_i32 < 0 && entry.slot != SLOT_NONE {
                         he.set_active_cache(pack_active_cache(
                             epoch,
+                            entry.slot_gen,
                             true,
                             entry.is_otlp(),
                             entry.slot,
@@ -1582,25 +1626,28 @@ impl SeriesStripe {
         if need_write {
             let mut guard = self.inner.write();
             if guard.refs.contains_key(&ref_id) {
-                let (old_buckets, was_otlp, matches, entry_slot, now_is_otlp) = {
+                let (old_buckets, matches, entry_slot, entry_slot_gen, now_is_otlp) = {
                     let entry = guard.refs.get_mut(&ref_id).expect("checked contains_key");
                     if entry.write_nanos(slab, now_ns) {
                         entry_time_set = true;
-                    }
-                    let was_otlp = entry.is_otlp();
-                    if is_otlp && !was_otlp {
-                        entry.flags |= FLAG_IS_OTLP;
                     }
                     let old_b = entry.num_native_histogram_buckets;
                     if old_b != buckets_i32 {
                         entry.num_native_histogram_buckets = buckets_i32;
                     }
-                    (old_b, was_otlp, entry.matches.clone(), entry.slot, entry.is_otlp())
+                    (
+                        old_b,
+                        entry.matches.clone(),
+                        entry.slot,
+                        entry.slot_gen,
+                        entry.is_otlp(),
+                    )
                 };
                 if let Some(he) = head_entry {
                     if buckets_i32 < 0 && entry_slot != SLOT_NONE {
                         he.set_active_cache(pack_active_cache(
                             epoch,
+                            entry_slot_gen,
                             true,
                             now_is_otlp,
                             entry_slot,
@@ -1608,9 +1655,6 @@ impl SeriesStripe {
                     } else if buckets_i32 >= 0 {
                         he.set_active_cache(0);
                     }
-                }
-                if is_otlp && !was_otlp {
-                    guard.active_otlp += 1;
                 }
                 if old_buckets != buckets_i32 {
                     if old_buckets >= 0 && buckets_i32 < 0 {
@@ -1732,14 +1776,16 @@ impl SeriesStripe {
                     );
                 }
 
-                let slot = if now_ns != SLOT_INACTIVE {
+                let (slot, slot_gen) = if now_ns != SLOT_INACTIVE {
                     slab.alloc_slot(now_ns)
                 } else {
-                    SLOT_NONE
+                    (SLOT_NONE, 0)
                 };
                 if let Some(he) = head_entry {
                     if buckets_i32 < 0 && slot != SLOT_NONE {
-                        he.set_active_cache(pack_active_cache(epoch, true, is_otlp, slot));
+                        he.set_active_cache(pack_active_cache(
+                            epoch, slot_gen, true, is_otlp, slot,
+                        ));
                     } else {
                         he.set_active_cache(0);
                     }
@@ -1752,6 +1798,7 @@ impl SeriesStripe {
                         matches,
                         num_native_histogram_buckets: buckets_i32,
                         flags,
+                        slot_gen,
                     },
                 );
                 created = true;
@@ -1811,12 +1858,9 @@ impl SeriesStripe {
             return;
         };
         if entry.slot != SLOT_NONE {
-            slab.mark_inactive(entry.slot);
+            slab.free_slot(entry.slot);
         }
         guard.active = guard.active.saturating_sub(1);
-        if entry.is_otlp() {
-            guard.active_otlp = guard.active_otlp.saturating_sub(1);
-        }
         if let Some(ref cat) = guard.cat {
             match idx.and_then(|r| r.series_labels(ref_id)) {
                 Some(lbls) => cat.decrement(&lbls, entry.num_native_histogram_buckets as i64),
@@ -1850,7 +1894,7 @@ impl SeriesStripe {
 
     fn reload_config(
         &self,
-        new_matchers: &Matchers,
+        new_matchers: &Arc<Matchers>,
         new_cat: &Option<Arc<CostAttributionActiveTracker>>,
         matchers_changed: bool,
         cat_changed: bool,
@@ -1883,7 +1927,7 @@ impl SeriesStripe {
         let mut guard = self.inner.write();
         if matchers_changed {
             let num_m = new_matchers.matcher_names().len();
-            guard.matchers = new_matchers.clone();
+            guard.matchers = Arc::clone(new_matchers);
             guard.active_matching = vec![0; num_m];
             guard.active_matching_native_histograms = vec![0; num_m];
             guard.active_matching_native_histogram_buckets = vec![0; num_m];
@@ -2031,6 +2075,9 @@ impl SeriesStripe {
 
         for ref_id in to_remove {
             if let Some(entry) = guard.refs.remove(&ref_id) {
+                if entry.slot != SLOT_NONE {
+                    slab.recycle_inactive_slot(entry.slot);
+                }
                 if let Some(ref cat) = guard.cat {
                     match idx.and_then(|r| r.series_labels(ref_id)) {
                         Some(lbls) => cat.decrement(&lbls, entry.num_native_histogram_buckets as i64),
@@ -2086,7 +2133,7 @@ impl SeriesStripe {
         let mut guard = self.inner.write();
         for entry in guard.refs.values() {
             if entry.slot != SLOT_NONE {
-                slab.mark_inactive(entry.slot);
+                slab.free_slot(entry.slot);
             }
         }
         guard.refs.clear();
@@ -2107,7 +2154,7 @@ pub struct ActiveSeries {
     slab: NanosSlab,
     epoch: AtomicU16,
     deleted: DeletedSeries,
-    config_mtx: RwLock<(Matchers, Option<Arc<CostAttributionActiveTracker>>)>,
+    config_mtx: RwLock<(Arc<Matchers>, Option<Arc<CostAttributionActiveTracker>>)>,
     timeout: Duration,
 }
 
@@ -2122,9 +2169,10 @@ impl ActiveSeries {
         timeout: Duration,
         cat: Option<Arc<CostAttributionActiveTracker>>,
     ) -> Self {
+        let matchers = Arc::new(matchers);
         let mut stripes = Vec::with_capacity(NUM_STRIPES);
         for _ in 0..NUM_STRIPES {
-            stripes.push(SeriesStripe::new(matchers.clone(), cat.clone()));
+            stripes.push(SeriesStripe::new(Arc::clone(&matchers), cat.clone()));
         }
         Self {
             stripes,
@@ -2138,6 +2186,10 @@ impl ActiveSeries {
 
     pub fn current_matcher_names(&self) -> Vec<String> {
         self.config_mtx.read().0.matcher_names().to_vec()
+    }
+
+    pub fn current_canonical_string(&self) -> String {
+        self.config_mtx.read().0.config().canonical_string.clone()
     }
 
     pub fn matchers_differ(&self, ct_cfg: &CustomTrackersConfig) -> bool {
@@ -2175,6 +2227,7 @@ impl ActiveSeries {
         cat_changed: bool,
         idx: Option<&dyn SeriesIndexReader>,
     ) {
+        let matchers = Arc::new(matchers);
         let mut guard = self.config_mtx.write();
         for stripe in &self.stripes {
             stripe.reload_config(
@@ -2200,18 +2253,24 @@ impl ActiveSeries {
         head_entry: &mimir_tsdb::head::SeriesEntry,
         ref_id: u64,
         now_ns: i64,
-        is_otlp: bool,
+        _is_otlp: bool,
     ) -> bool {
         let packed = head_entry.active_cache();
         if packed != 0 {
-            let (c_epoch, c_is_plain_float, c_is_otlp, slot) = unpack_active_cache(packed);
+            let (c_epoch, c_gen, c_flags, slot) = unpack_active_cache(packed);
             let cur_epoch = self.epoch.load(Ordering::Acquire);
-            if c_epoch == cur_epoch && c_is_plain_float != 0 && (!is_otlp || c_is_otlp != 0) {
-                if let Some(slot_atomic) = self.slab.slot_ref(slot) {
+            if c_epoch == cur_epoch && (c_flags & CACHE_FLAG_PLAIN_FLOAT) != 0 {
+                if let Some((slot_atomic, gen_atomic)) = self.slab.slot_and_gen_ref(slot) {
+                    if gen_atomic.load(Ordering::Acquire) != c_gen {
+                        return false;
+                    }
                     let mut cur = slot_atomic.load(Ordering::Relaxed);
                     loop {
                         if cur == SLOT_INACTIVE {
                             break;
+                        }
+                        if gen_atomic.load(Ordering::Acquire) != c_gen {
+                            return false;
                         }
                         if now_ns <= cur {
                             return true;
@@ -3013,10 +3072,68 @@ mod tests {
             head_entry.ref_id,
             t3 + Duration::from_secs(1),
             8,
-            true,
+            false,
         );
         assert_eq!(head_entry.active_cache(), 0);
-        assert_eq!(tracker.active(), (1, 1, 1, 8));
+        assert_eq!(tracker.active(), (1, 0, 1, 8));
+
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn nanos_slab_recycles_slots_with_generation_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = mimir_tsdb::head::Head::open(
+            dir.path(),
+            mimir_tsdb::head::HeadOptions::default(),
+            i64::MIN,
+        )
+        .unwrap();
+        let p1 = [("__name__", "m1"), ("job", "api")];
+        let p2 = [("__name__", "m2"), ("job", "api")];
+        {
+            let mut app = head.appender();
+            app.append_float(None, &p1, 1_000, 1.0).unwrap();
+            app.append_float(None, &p2, 1_000, 2.0).unwrap();
+            app.commit().unwrap();
+        }
+        let e1 = head.get_entry_by_sorted_pairs(&p1).unwrap();
+        let e2 = head.get_entry_by_sorted_pairs(&p2).unwrap();
+
+        let tracker = ActiveSeries::new(Vec::new(), Duration::from_secs(60));
+        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        tracker.update_series_with_entry(Some(&e1), &p1, e1.hash, e1.ref_id, t0, -1, false);
+        let packed1 = e1.active_cache();
+        let (_, gen1, _, slot1) = unpack_active_cache(packed1);
+        assert_eq!(slot1, 0);
+        assert_eq!(gen1, 0);
+
+        // Purge e1 -> slot 0 recycled with gen = 1
+        tracker.purge(t0 + Duration::from_secs(61));
+        assert_eq!(tracker.active(), (1 - 1, 0, 0, 0));
+
+        // Insert e2 -> reuses slot 0 with gen = 1
+        let t1 = t0 + Duration::from_secs(70);
+        tracker.update_series_with_entry(Some(&e2), &p2, e2.hash, e2.ref_id, t1, -1, false);
+        let packed2 = e2.active_cache();
+        let (_, gen2, _, slot2) = unpack_active_cache(packed2);
+        assert_eq!(slot2, 0);
+        assert_eq!(gen2, 1);
+
+        // Stale active_cache on e1 (slot=0, gen=0) must NOT update e2, and must re-insert e1!
+        tracker.update_series_with_entry(
+            Some(&e1),
+            &p1,
+            e1.hash,
+            e1.ref_id,
+            t1 + Duration::from_secs(1),
+            -1,
+            false,
+        );
+        assert_eq!(tracker.active(), (2, 0, 0, 0));
+        let (_, gen1_new, _, slot1_new) = unpack_active_cache(e1.active_cache());
+        assert_eq!(slot1_new, 1);
+        assert_eq!(gen1_new, 0);
 
         head.close().unwrap();
     }

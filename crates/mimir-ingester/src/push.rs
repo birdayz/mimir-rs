@@ -44,6 +44,7 @@ pub struct PushPermit<'a> {
     pub inflight_permit: Option<InflightPermit<'a>>,
     pub ingester: &'a Ingester,
     pub req_size: i64,
+    pub finished: bool,
 }
 
 impl PushPermit<'_> {
@@ -53,6 +54,10 @@ impl PushPermit<'_> {
     }
 
     pub fn finish_with_duration(mut self, dur: Duration, err: Option<&IngesterError>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
         self.ingester
             .inflight_push_requests
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -68,6 +73,27 @@ impl PushPermit<'_> {
         }
         if let Some(rp) = self.reactive_permit.take() {
             rp.record();
+        }
+    }
+}
+
+impl Drop for PushPermit<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.ingester
+                .inflight_push_requests
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            if self.req_size > 0 {
+                self.ingester
+                    .inflight_push_requests_bytes
+                    .fetch_sub(self.req_size, std::sync::atomic::Ordering::AcqRel);
+            }
+            drop(self.inflight_permit.take());
+            drop(self.breaker_permit.take());
+            if let Some(rp) = self.reactive_permit.take() {
+                rp.drop_permit();
+            }
         }
     }
 }
@@ -607,30 +633,59 @@ impl Ingester {
             )
         };
 
-        if let Err(err) = self.check_instance_limits(inflight, inflight_bytes, reject_equal) {
-            self.inflight_push_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            if req_size > 0 {
-                self.inflight_push_requests_bytes
-                    .fetch_sub(req_size, std::sync::atomic::Ordering::AcqRel);
-            }
-            if let Some(bp) = breaker_permit {
-                bp.finish(started_at.elapsed(), false);
-            }
-            if let Some(rp) = reactive_permit {
-                rp.drop_permit();
-            }
-            return Err(err);
-        }
-
-        Ok(PushPermit {
+        let permit = PushPermit {
             started_at,
             breaker_permit,
             reactive_permit,
             inflight_permit: None,
             ingester: self,
             req_size,
-        })
+            finished: false,
+        };
+
+        if let Err(err) = self.check_instance_limits(inflight, inflight_bytes, reject_equal) {
+            drop(permit);
+            return Err(err);
+        }
+
+        Ok(permit)
+    }
+
+    fn start_push_request_sync(&self, req_size: i64) -> Result<PushPermit<'_>, IngesterError> {
+        self.check_available_for_push()?;
+        let started_at = Instant::now();
+        let breaker_permit = self.circuit_breaker.try_acquire_push_permit()?;
+        let inflight = self
+            .inflight_push_requests
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let (inflight_bytes, reject_equal) = if req_size > 0 {
+            let b = self
+                .inflight_push_requests_bytes
+                .fetch_add(req_size, std::sync::atomic::Ordering::AcqRel)
+                + req_size;
+            (b, false)
+        } else {
+            (
+                self.inflight_push_requests_bytes
+                    .load(std::sync::atomic::Ordering::Acquire),
+                true,
+            )
+        };
+        let permit = PushPermit {
+            started_at,
+            breaker_permit,
+            reactive_permit: None,
+            inflight_permit: None,
+            ingester: self,
+            req_size,
+            finished: false,
+        };
+        if let Err(err) = self.check_instance_limits(inflight, inflight_bytes, reject_equal) {
+            permit.finish(Some(&err));
+            return Err(err);
+        }
+        Ok(permit)
     }
 
     fn check_instance_limits(
@@ -739,49 +794,9 @@ impl Ingester {
         req: &BorrowedWriteRequest<'_, '_>,
         req_size: i64,
     ) -> Result<(), IngesterError> {
-        self.check_available_for_push()?;
-        let started_at = Instant::now();
-        let breaker_permit = self.circuit_breaker.try_acquire_push_permit()?;
-        let inflight = self
-            .inflight_push_requests
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1;
-        let inflight_bytes = if req_size > 0 {
-            self.inflight_push_requests_bytes
-                .fetch_add(req_size, std::sync::atomic::Ordering::AcqRel)
-                + req_size
-        } else {
-            self.inflight_push_requests_bytes
-                .load(std::sync::atomic::Ordering::Acquire)
-        };
-        if let Err(err) = self.check_instance_limits(inflight, inflight_bytes, req_size <= 0) {
-            self.inflight_push_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            if req_size > 0 {
-                self.inflight_push_requests_bytes
-                    .fetch_sub(req_size, std::sync::atomic::Ordering::AcqRel);
-            }
-            if let Some(bp) = breaker_permit {
-                bp.finish(started_at.elapsed(), false);
-            }
-            return Err(err);
-        }
-
+        let permit = self.start_push_request_sync(req_size)?;
         let res = self.push_borrowed_inner(user_id, req);
-
-        self.inflight_push_requests
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        if req_size > 0 {
-            self.inflight_push_requests_bytes
-                .fetch_sub(req_size, std::sync::atomic::Ordering::AcqRel);
-        }
-        if let Some(bp) = breaker_permit {
-            let be = res
-                .as_ref()
-                .err()
-                .map(|e| crate::circuit_breaker::BreakerError::Ingester(e.clone()));
-            bp.finish_with_err(started_at.elapsed(), be.as_ref());
-        }
+        permit.finish(res.as_ref().err());
         res
     }
 
@@ -791,9 +806,6 @@ impl Ingester {
         user_id: &str,
         req: &cortexpb::WriteRequest,
     ) -> Result<(), IngesterError> {
-        self.check_available_for_push()?;
-        let started_at = Instant::now();
-        let breaker_permit = self.circuit_breaker.try_acquire_push_permit()?;
         let track_bytes = self
             .get_instance_limits()
             .is_some_and(|il| il.max_inflight_push_requests_bytes > 0);
@@ -802,52 +814,9 @@ impl Ingester {
         } else {
             0
         };
-
-        let inflight = self
-            .inflight_push_requests
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1;
-        let (inflight_bytes, reject_equal) = if req_size > 0 {
-            let b = self
-                .inflight_push_requests_bytes
-                .fetch_add(req_size, std::sync::atomic::Ordering::AcqRel)
-                + req_size;
-            (b, false)
-        } else {
-            (
-                self.inflight_push_requests_bytes
-                    .load(std::sync::atomic::Ordering::Acquire),
-                true,
-            )
-        };
-        if let Err(err) = self.check_instance_limits(inflight, inflight_bytes, reject_equal) {
-            self.inflight_push_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            if req_size > 0 {
-                self.inflight_push_requests_bytes
-                    .fetch_sub(req_size, std::sync::atomic::Ordering::AcqRel);
-            }
-            if let Some(bp) = breaker_permit {
-                bp.finish(started_at.elapsed(), false);
-            }
-            return Err(err);
-        }
-
+        let permit = self.start_push_request_sync(req_size)?;
         let res = self.push_write_request_sync(user_id, req);
-
-        self.inflight_push_requests
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        if req_size > 0 {
-            self.inflight_push_requests_bytes
-                .fetch_sub(req_size, std::sync::atomic::Ordering::AcqRel);
-        }
-        if let Some(bp) = breaker_permit {
-            let be = res
-                .as_ref()
-                .err()
-                .map(|e| crate::circuit_breaker::BreakerError::Ingester(e.clone()));
-            bp.finish_with_err(started_at.elapsed(), be.as_ref());
-        }
+        permit.finish(res.as_ref().err());
         res
     }
 
@@ -957,6 +926,9 @@ impl Ingester {
             }
             for h in ts.histograms() {
                 min_ts = min_ts.min(h.timestamp());
+            }
+            for ex in ts.exemplars() {
+                min_ts = min_ts.min(ex.timestamp_ms());
             }
         }
         let lock_guard = db
@@ -1100,6 +1072,35 @@ impl Ingester {
         if items.is_empty() {
             return Ok(());
         }
+        let track_bytes = self
+            .get_instance_limits()
+            .is_some_and(|il| il.max_inflight_push_requests_bytes > 0);
+        let req_size = if track_bytes {
+            items
+                .iter()
+                .map(|it| {
+                    it.encoded_labels.len()
+                        + it.samples.len() * 16
+                        + it.histograms.len() * 64
+                        + it.exemplars.len() * 48
+                })
+                .sum::<usize>() as i64
+        } else {
+            0
+        };
+        let permit = self.start_push_request_sync(req_size)?;
+        let res = self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, items);
+        permit.finish(res.as_ref().err());
+        res
+    }
+
+    fn ingest_prehashed_shard_batch_inner(
+        &self,
+        user_id: &str,
+        source: cortexpb::write_request::SourceEnum,
+        min_ts: i64,
+        items: &[PrehashedSeriesItem<'_>],
+    ) -> Result<(), IngesterError> {
 
         let db = self.get_or_create_tsdb(user_id).map_err(|e| {
             let wrapped = e.with_user(user_id, 0);
@@ -1329,12 +1330,6 @@ impl Ingester {
                 }
                 if s.timestamp_ms < min_timestamp_ms {
                     stats.failed_samples += 1;
-                    stats.sample_too_old += 1;
-                    let s_str = make_series_str(encoded_labels);
-                    record_partial(
-                        IngesterError::sample_too_far_in_past(s.timestamp_ms, s_str),
-                        None,
-                    );
                     continue;
                 }
 
@@ -1460,12 +1455,6 @@ impl Ingester {
                     }
                     if h_ts < min_timestamp_ms {
                         stats.failed_samples += 1;
-                        stats.sample_too_old += 1;
-                        let s_str = make_series_str(encoded_labels);
-                        record_partial(
-                            IngesterError::sample_too_far_in_past(h_ts, s_str),
-                            None,
-                        );
                         continue;
                     }
                     if max_hist_buckets > 0 && bucket_count > max_hist_buckets {
@@ -1960,12 +1949,6 @@ impl Ingester {
                 }
                 if s.timestamp_ms < min_timestamp_ms {
                     stats.failed_samples += 1;
-                    stats.sample_too_old += 1;
-                    let s_str = make_series_str(pairs);
-                    record_partial(
-                        IngesterError::sample_too_far_in_past(s.timestamp_ms, s_str),
-                        None,
-                    );
                     continue;
                 }
 
@@ -2056,12 +2039,6 @@ impl Ingester {
                     }
                     if h_ts < min_timestamp_ms {
                         stats.failed_samples += 1;
-                        stats.sample_too_old += 1;
-                        let s_str = make_series_str(pairs);
-                        record_partial(
-                            IngesterError::sample_too_far_in_past(h_ts, s_str),
-                            None,
-                        );
                         continue;
                     }
                     if max_hist_buckets > 0 && bucket_count > max_hist_buckets {
@@ -2623,6 +2600,9 @@ fn min_timestamp_owned(ts_list: &[cortexpb::TimeSeries]) -> i64 {
         }
         for h in &ts.histograms {
             min_ts = min_ts.min(h.timestamp);
+        }
+        for ex in &ts.exemplars {
+            min_ts = min_ts.min(ex.timestamp_ms);
         }
     }
     min_ts
