@@ -24,6 +24,7 @@ use crate::types::{LogLevel, StringSliceCSV, StringSliceCSVMulti};
 #[serde(default, deny_unknown_fields)]
 pub struct TLSConfig {
     pub cert: String,
+    #[serde(serialize_with = "crate::secret::serialize_prometheus_secret")]
     pub key: String,
     pub client_ca: String,
     pub cert_file: String,

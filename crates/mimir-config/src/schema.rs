@@ -21,6 +21,10 @@ pub enum FieldKind {
     String,
     StringList,
     Other,
+    /// `flagext.Secret`: rendered as `********` (or `""` when empty) in YAML output.
+    Secret,
+    /// `flagext.Secret` with `yaml:",omitempty"`: omitted from YAML output when empty.
+    SecretOmitEmpty,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -74,7 +78,7 @@ static BLOCK_2_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_3_FIELDS: &[SchemaField] = &[
     SchemaField { name: "host", flag: "distributor.ha-tracker.consul.hostname", kind: FieldKind::String, default_str: "localhost:8500", usage: "Hostname and port of Consul." },
-    SchemaField { name: "acl_token", flag: "distributor.ha-tracker.consul.acl-token", kind: FieldKind::String, default_str: "", usage: "ACL Token used to interact with Consul." },
+    SchemaField { name: "acl_token", flag: "distributor.ha-tracker.consul.acl-token", kind: FieldKind::Secret, default_str: "", usage: "ACL Token used to interact with Consul." },
     SchemaField { name: "http_client_timeout", flag: "distributor.ha-tracker.consul.client-timeout", kind: FieldKind::Duration, default_str: "20000000000", usage: "HTTP timeout when talking to Consul" },
     SchemaField { name: "consistent_reads", flag: "distributor.ha-tracker.consul.consistent-reads", kind: FieldKind::Bool, default_str: "false", usage: "Enable consistent reads to Consul." },
     SchemaField { name: "watch_rate_limit", flag: "distributor.ha-tracker.consul.watch-rate-limit", kind: FieldKind::Float, default_str: "1", usage: "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit." },
@@ -99,7 +103,7 @@ static BLOCK_4_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_cipher_suites", flag: "distributor.ha-tracker.etcd.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "Override the default cipher suite list (separated by commas). Allowed values:\n\nSecure Ciphers:\n- TLS_AES_128_GCM_SHA256\n- TLS_AES_256_GCM_SHA384\n- TLS_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\n\nInsecure Ciphers:\n- TLS_RSA_WITH_RC4_128_SHA\n- TLS_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA\n- TLS_RSA_WITH_AES_256_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA256\n- TLS_RSA_WITH_AES_128_GCM_SHA256\n- TLS_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_ECDSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256\n" },
     SchemaField { name: "tls_min_version", flag: "distributor.ha-tracker.etcd.tls-min-version", kind: FieldKind::String, default_str: "", usage: "Override the default minimum TLS version. Allowed values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13" },
     SchemaField { name: "username", flag: "distributor.ha-tracker.etcd.username", kind: FieldKind::String, default_str: "", usage: "Etcd username." },
-    SchemaField { name: "password", flag: "distributor.ha-tracker.etcd.password", kind: FieldKind::String, default_str: "", usage: "Etcd password." },
+    SchemaField { name: "password", flag: "distributor.ha-tracker.etcd.password", kind: FieldKind::Secret, default_str: "", usage: "Etcd password." },
 ];
 
 static BLOCK_4_BLOCKS: &[SchemaBlock] = &[
@@ -139,7 +143,7 @@ static BLOCK_7_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_8_FIELDS: &[SchemaField] = &[
     SchemaField { name: "host", flag: "distributor.ring.consul.hostname", kind: FieldKind::String, default_str: "localhost:8500", usage: "Hostname and port of Consul." },
-    SchemaField { name: "acl_token", flag: "distributor.ring.consul.acl-token", kind: FieldKind::String, default_str: "", usage: "ACL Token used to interact with Consul." },
+    SchemaField { name: "acl_token", flag: "distributor.ring.consul.acl-token", kind: FieldKind::Secret, default_str: "", usage: "ACL Token used to interact with Consul." },
     SchemaField { name: "http_client_timeout", flag: "distributor.ring.consul.client-timeout", kind: FieldKind::Duration, default_str: "20000000000", usage: "HTTP timeout when talking to Consul" },
     SchemaField { name: "consistent_reads", flag: "distributor.ring.consul.consistent-reads", kind: FieldKind::Bool, default_str: "false", usage: "Enable consistent reads to Consul." },
     SchemaField { name: "watch_rate_limit", flag: "distributor.ring.consul.watch-rate-limit", kind: FieldKind::Float, default_str: "1", usage: "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit." },
@@ -164,7 +168,7 @@ static BLOCK_9_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_cipher_suites", flag: "distributor.ring.etcd.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "Override the default cipher suite list (separated by commas). Allowed values:\n\nSecure Ciphers:\n- TLS_AES_128_GCM_SHA256\n- TLS_AES_256_GCM_SHA384\n- TLS_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\n\nInsecure Ciphers:\n- TLS_RSA_WITH_RC4_128_SHA\n- TLS_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA\n- TLS_RSA_WITH_AES_256_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA256\n- TLS_RSA_WITH_AES_128_GCM_SHA256\n- TLS_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_ECDSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256\n" },
     SchemaField { name: "tls_min_version", flag: "distributor.ring.etcd.tls-min-version", kind: FieldKind::String, default_str: "", usage: "Override the default minimum TLS version. Allowed values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13" },
     SchemaField { name: "username", flag: "distributor.ring.etcd.username", kind: FieldKind::String, default_str: "", usage: "Etcd username." },
-    SchemaField { name: "password", flag: "distributor.ring.etcd.password", kind: FieldKind::String, default_str: "", usage: "Etcd password." },
+    SchemaField { name: "password", flag: "distributor.ring.etcd.password", kind: FieldKind::Secret, default_str: "", usage: "Etcd password." },
 ];
 
 static BLOCK_9_BLOCKS: &[SchemaBlock] = &[
@@ -462,7 +466,7 @@ static BLOCK_24_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_25_FIELDS: &[SchemaField] = &[
     SchemaField { name: "host", flag: "querier.ring.consul.hostname", kind: FieldKind::String, default_str: "localhost:8500", usage: "Hostname and port of Consul." },
-    SchemaField { name: "acl_token", flag: "querier.ring.consul.acl-token", kind: FieldKind::String, default_str: "", usage: "ACL Token used to interact with Consul." },
+    SchemaField { name: "acl_token", flag: "querier.ring.consul.acl-token", kind: FieldKind::Secret, default_str: "", usage: "ACL Token used to interact with Consul." },
     SchemaField { name: "http_client_timeout", flag: "querier.ring.consul.client-timeout", kind: FieldKind::Duration, default_str: "20000000000", usage: "HTTP timeout when talking to Consul" },
     SchemaField { name: "consistent_reads", flag: "querier.ring.consul.consistent-reads", kind: FieldKind::Bool, default_str: "false", usage: "Enable consistent reads to Consul." },
     SchemaField { name: "watch_rate_limit", flag: "querier.ring.consul.watch-rate-limit", kind: FieldKind::Float, default_str: "1", usage: "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit." },
@@ -487,7 +491,7 @@ static BLOCK_26_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_cipher_suites", flag: "querier.ring.etcd.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "Override the default cipher suite list (separated by commas). Allowed values:\n\nSecure Ciphers:\n- TLS_AES_128_GCM_SHA256\n- TLS_AES_256_GCM_SHA384\n- TLS_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\n\nInsecure Ciphers:\n- TLS_RSA_WITH_RC4_128_SHA\n- TLS_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA\n- TLS_RSA_WITH_AES_256_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA256\n- TLS_RSA_WITH_AES_128_GCM_SHA256\n- TLS_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_ECDSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256\n" },
     SchemaField { name: "tls_min_version", flag: "querier.ring.etcd.tls-min-version", kind: FieldKind::String, default_str: "", usage: "Override the default minimum TLS version. Allowed values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13" },
     SchemaField { name: "username", flag: "querier.ring.etcd.username", kind: FieldKind::String, default_str: "", usage: "Etcd username." },
-    SchemaField { name: "password", flag: "querier.ring.etcd.password", kind: FieldKind::String, default_str: "", usage: "Etcd password." },
+    SchemaField { name: "password", flag: "querier.ring.etcd.password", kind: FieldKind::Secret, default_str: "", usage: "Etcd password." },
 ];
 
 static BLOCK_26_BLOCKS: &[SchemaBlock] = &[
@@ -839,7 +843,7 @@ static BLOCK_46_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_47_FIELDS: &[SchemaField] = &[
     SchemaField { name: "host", flag: "compactor.ring.consul.hostname", kind: FieldKind::String, default_str: "localhost:8500", usage: "Hostname and port of Consul." },
-    SchemaField { name: "acl_token", flag: "compactor.ring.consul.acl-token", kind: FieldKind::String, default_str: "", usage: "ACL Token used to interact with Consul." },
+    SchemaField { name: "acl_token", flag: "compactor.ring.consul.acl-token", kind: FieldKind::Secret, default_str: "", usage: "ACL Token used to interact with Consul." },
     SchemaField { name: "http_client_timeout", flag: "compactor.ring.consul.client-timeout", kind: FieldKind::Duration, default_str: "20000000000", usage: "HTTP timeout when talking to Consul" },
     SchemaField { name: "consistent_reads", flag: "compactor.ring.consul.consistent-reads", kind: FieldKind::Bool, default_str: "false", usage: "Enable consistent reads to Consul." },
     SchemaField { name: "watch_rate_limit", flag: "compactor.ring.consul.watch-rate-limit", kind: FieldKind::Float, default_str: "1", usage: "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit." },
@@ -864,7 +868,7 @@ static BLOCK_48_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_cipher_suites", flag: "compactor.ring.etcd.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "Override the default cipher suite list (separated by commas). Allowed values:\n\nSecure Ciphers:\n- TLS_AES_128_GCM_SHA256\n- TLS_AES_256_GCM_SHA384\n- TLS_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\n\nInsecure Ciphers:\n- TLS_RSA_WITH_RC4_128_SHA\n- TLS_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA\n- TLS_RSA_WITH_AES_256_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA256\n- TLS_RSA_WITH_AES_128_GCM_SHA256\n- TLS_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_ECDSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256\n" },
     SchemaField { name: "tls_min_version", flag: "compactor.ring.etcd.tls-min-version", kind: FieldKind::String, default_str: "", usage: "Override the default minimum TLS version. Allowed values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13" },
     SchemaField { name: "username", flag: "compactor.ring.etcd.username", kind: FieldKind::String, default_str: "", usage: "Etcd username." },
-    SchemaField { name: "password", flag: "compactor.ring.etcd.password", kind: FieldKind::String, default_str: "", usage: "Etcd password." },
+    SchemaField { name: "password", flag: "compactor.ring.etcd.password", kind: FieldKind::Secret, default_str: "", usage: "Etcd password." },
 ];
 
 static BLOCK_48_BLOCKS: &[SchemaBlock] = &[
@@ -1096,7 +1100,7 @@ static BLOCK_62_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_63_FIELDS: &[SchemaField] = &[
     SchemaField { name: "host", flag: "store-gateway.sharding-ring.consul.hostname", kind: FieldKind::String, default_str: "localhost:8500", usage: "Hostname and port of Consul." },
-    SchemaField { name: "acl_token", flag: "store-gateway.sharding-ring.consul.acl-token", kind: FieldKind::String, default_str: "", usage: "ACL Token used to interact with Consul." },
+    SchemaField { name: "acl_token", flag: "store-gateway.sharding-ring.consul.acl-token", kind: FieldKind::Secret, default_str: "", usage: "ACL Token used to interact with Consul." },
     SchemaField { name: "http_client_timeout", flag: "store-gateway.sharding-ring.consul.client-timeout", kind: FieldKind::Duration, default_str: "20000000000", usage: "HTTP timeout when talking to Consul" },
     SchemaField { name: "consistent_reads", flag: "store-gateway.sharding-ring.consul.consistent-reads", kind: FieldKind::Bool, default_str: "false", usage: "Enable consistent reads to Consul." },
     SchemaField { name: "watch_rate_limit", flag: "store-gateway.sharding-ring.consul.watch-rate-limit", kind: FieldKind::Float, default_str: "1", usage: "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit." },
@@ -1121,7 +1125,7 @@ static BLOCK_64_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_cipher_suites", flag: "store-gateway.sharding-ring.etcd.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "Override the default cipher suite list (separated by commas). Allowed values:\n\nSecure Ciphers:\n- TLS_AES_128_GCM_SHA256\n- TLS_AES_256_GCM_SHA384\n- TLS_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\n\nInsecure Ciphers:\n- TLS_RSA_WITH_RC4_128_SHA\n- TLS_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA\n- TLS_RSA_WITH_AES_256_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA256\n- TLS_RSA_WITH_AES_128_GCM_SHA256\n- TLS_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_ECDSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256\n" },
     SchemaField { name: "tls_min_version", flag: "store-gateway.sharding-ring.etcd.tls-min-version", kind: FieldKind::String, default_str: "", usage: "Override the default minimum TLS version. Allowed values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13" },
     SchemaField { name: "username", flag: "store-gateway.sharding-ring.etcd.username", kind: FieldKind::String, default_str: "", usage: "Etcd username." },
-    SchemaField { name: "password", flag: "store-gateway.sharding-ring.etcd.password", kind: FieldKind::String, default_str: "", usage: "Etcd password." },
+    SchemaField { name: "password", flag: "store-gateway.sharding-ring.etcd.password", kind: FieldKind::Secret, default_str: "", usage: "Etcd password." },
 ];
 
 static BLOCK_64_BLOCKS: &[SchemaBlock] = &[
@@ -1208,7 +1212,7 @@ static BLOCK_70_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_71_FIELDS: &[SchemaField] = &[
     SchemaField { name: "role_id", flag: "vault.auth.approle.role-id", kind: FieldKind::String, default_str: "", usage: "Role ID of the AppRole" },
-    SchemaField { name: "secret_id", flag: "vault.auth.approle.secret-id", kind: FieldKind::String, default_str: "", usage: "Secret ID issued against the AppRole" },
+    SchemaField { name: "secret_id", flag: "vault.auth.approle.secret-id", kind: FieldKind::Secret, default_str: "", usage: "Secret ID issued against the AppRole" },
     SchemaField { name: "wrapping_token", flag: "vault.auth.approle.wrapping-token", kind: FieldKind::Bool, default_str: "false", usage: "Response wrapping token if the Secret ID is response wrapped" },
     SchemaField { name: "mount_path", flag: "vault.auth.approle.mount-path", kind: FieldKind::String, default_str: "", usage: "Path if the Vault backend was mounted using a non-default path" },
 ];
@@ -1219,7 +1223,7 @@ static BLOCK_71_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_72_FIELDS: &[SchemaField] = &[
     SchemaField { name: "role_name", flag: "vault.auth.kubernetes.role-name", kind: FieldKind::String, default_str: "", usage: "The Kubernetes named role" },
-    SchemaField { name: "service_account_token", flag: "vault.auth.kubernetes.service-account-token", kind: FieldKind::String, default_str: "", usage: "The Service Account JWT" },
+    SchemaField { name: "service_account_token", flag: "vault.auth.kubernetes.service-account-token", kind: FieldKind::SecretOmitEmpty, default_str: "", usage: "The Service Account JWT" },
     SchemaField { name: "service_account_token_path", flag: "vault.auth.kubernetes.service-account-token-path", kind: FieldKind::String, default_str: "", usage: "Path to where the Kubernetes service account token is mounted. By default it lives at /var/run/secrets/kubernetes.io/serviceaccount/token. Field will be used if the service_account_token is not specified." },
     SchemaField { name: "mount_path", flag: "vault.auth.kubernetes.mount-path", kind: FieldKind::String, default_str: "", usage: "Path if the Vault backend was mounted using a non-default path" },
 ];
@@ -1230,7 +1234,7 @@ static BLOCK_72_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_73_FIELDS: &[SchemaField] = &[
     SchemaField { name: "username", flag: "vault.auth.userpass.username", kind: FieldKind::String, default_str: "", usage: "The userpass auth method username" },
-    SchemaField { name: "password", flag: "vault.auth.userpass.password", kind: FieldKind::String, default_str: "", usage: "The userpass auth method password" },
+    SchemaField { name: "password", flag: "vault.auth.userpass.password", kind: FieldKind::Secret, default_str: "", usage: "The userpass auth method password" },
     SchemaField { name: "mount_path", flag: "vault.auth.userpass.mount-path", kind: FieldKind::String, default_str: "", usage: "Path if the Vault backend was mounted using a non-default path" },
 ];
 
@@ -1239,7 +1243,7 @@ static BLOCK_73_BLOCKS: &[SchemaBlock] = &[
 ];
 
 static BLOCK_74_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "token", flag: "vault.auth.token", kind: FieldKind::String, default_str: "", usage: "The token used to authenticate against Vault" },
+    SchemaField { name: "token", flag: "vault.auth.token", kind: FieldKind::Secret, default_str: "", usage: "The token used to authenticate against Vault" },
 ];
 
 static BLOCK_74_BLOCKS: &[SchemaBlock] = &[
@@ -1317,7 +1321,7 @@ static BLOCK_79_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_80_FIELDS: &[SchemaField] = &[
     SchemaField { name: "client_id", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "client_secret", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "client_secret", flag: "", kind: FieldKind::Secret, default_str: "", usage: "" },
     SchemaField { name: "token_url", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
     SchemaField { name: "scopes", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
     SchemaField { name: "endpoint_params", flag: "", kind: FieldKind::Other, default_str: "[object Object]", usage: "" },
@@ -1337,7 +1341,7 @@ static BLOCK_81_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_cipher_suites", flag: "", kind: FieldKind::String, default_str: "", usage: "Override the default cipher suite list (separated by commas). Allowed values:\n\nSecure Ciphers:\n- TLS_AES_128_GCM_SHA256\n- TLS_AES_256_GCM_SHA384\n- TLS_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\n\nInsecure Ciphers:\n- TLS_RSA_WITH_RC4_128_SHA\n- TLS_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA\n- TLS_RSA_WITH_AES_256_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA256\n- TLS_RSA_WITH_AES_128_GCM_SHA256\n- TLS_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_ECDSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256\n" },
     SchemaField { name: "tls_min_version", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
     SchemaField { name: "basic_auth_username", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "basic_auth_password", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "basic_auth_password", flag: "", kind: FieldKind::Secret, default_str: "", usage: "" },
     SchemaField { name: "proxy_url", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
 ];
 
@@ -1347,7 +1351,7 @@ static BLOCK_81_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_82_FIELDS: &[SchemaField] = &[
     SchemaField { name: "host", flag: "ruler.ring.consul.hostname", kind: FieldKind::String, default_str: "localhost:8500", usage: "Hostname and port of Consul." },
-    SchemaField { name: "acl_token", flag: "ruler.ring.consul.acl-token", kind: FieldKind::String, default_str: "", usage: "ACL Token used to interact with Consul." },
+    SchemaField { name: "acl_token", flag: "ruler.ring.consul.acl-token", kind: FieldKind::Secret, default_str: "", usage: "ACL Token used to interact with Consul." },
     SchemaField { name: "http_client_timeout", flag: "ruler.ring.consul.client-timeout", kind: FieldKind::Duration, default_str: "20000000000", usage: "HTTP timeout when talking to Consul" },
     SchemaField { name: "consistent_reads", flag: "ruler.ring.consul.consistent-reads", kind: FieldKind::Bool, default_str: "false", usage: "Enable consistent reads to Consul." },
     SchemaField { name: "watch_rate_limit", flag: "ruler.ring.consul.watch-rate-limit", kind: FieldKind::Float, default_str: "1", usage: "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit." },
@@ -1372,7 +1376,7 @@ static BLOCK_83_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_cipher_suites", flag: "ruler.ring.etcd.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "Override the default cipher suite list (separated by commas). Allowed values:\n\nSecure Ciphers:\n- TLS_AES_128_GCM_SHA256\n- TLS_AES_256_GCM_SHA384\n- TLS_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\n\nInsecure Ciphers:\n- TLS_RSA_WITH_RC4_128_SHA\n- TLS_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA\n- TLS_RSA_WITH_AES_256_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA256\n- TLS_RSA_WITH_AES_128_GCM_SHA256\n- TLS_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_ECDSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256\n" },
     SchemaField { name: "tls_min_version", flag: "ruler.ring.etcd.tls-min-version", kind: FieldKind::String, default_str: "", usage: "Override the default minimum TLS version. Allowed values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13" },
     SchemaField { name: "username", flag: "ruler.ring.etcd.username", kind: FieldKind::String, default_str: "", usage: "Etcd username." },
-    SchemaField { name: "password", flag: "ruler.ring.etcd.password", kind: FieldKind::String, default_str: "", usage: "Etcd password." },
+    SchemaField { name: "password", flag: "ruler.ring.etcd.password", kind: FieldKind::Secret, default_str: "", usage: "Etcd password." },
 ];
 
 static BLOCK_83_BLOCKS: &[SchemaBlock] = &[
@@ -1629,9 +1633,9 @@ static BLOCK_101_FIELDS: &[SchemaField] = &[
     SchemaField { name: "endpoint", flag: "ruler-storage.s3.endpoint", kind: FieldKind::String, default_str: "", usage: "The S3 bucket endpoint. It could be an AWS S3 endpoint listed at https://docs.aws.amazon.com/general/latest/gr/s3.html or the address of an S3-compatible service in hostname:port format." },
     SchemaField { name: "region", flag: "ruler-storage.s3.region", kind: FieldKind::String, default_str: "", usage: "S3 region. If unset, the client will issue a S3 GetBucketLocation API call to autodetect it." },
     SchemaField { name: "bucket_name", flag: "ruler-storage.s3.bucket-name", kind: FieldKind::String, default_str: "", usage: "S3 bucket name" },
-    SchemaField { name: "secret_access_key", flag: "ruler-storage.s3.secret-access-key", kind: FieldKind::String, default_str: "", usage: "S3 secret access key" },
+    SchemaField { name: "secret_access_key", flag: "ruler-storage.s3.secret-access-key", kind: FieldKind::Secret, default_str: "", usage: "S3 secret access key" },
     SchemaField { name: "access_key_id", flag: "ruler-storage.s3.access-key-id", kind: FieldKind::String, default_str: "", usage: "S3 access key ID" },
-    SchemaField { name: "session_token", flag: "ruler-storage.s3.session-token", kind: FieldKind::String, default_str: "", usage: "S3 session token" },
+    SchemaField { name: "session_token", flag: "ruler-storage.s3.session-token", kind: FieldKind::Secret, default_str: "", usage: "S3 session token" },
     SchemaField { name: "insecure", flag: "ruler-storage.s3.insecure", kind: FieldKind::Bool, default_str: "false", usage: "If enabled, use http:// for the S3 endpoint instead of https://. This could be useful in local dev/test environments while using an S3-compatible backend storage, like Minio." },
     SchemaField { name: "signature_version", flag: "ruler-storage.s3.signature-version", kind: FieldKind::String, default_str: "v4", usage: "The signature version to use for authenticating against S3. Supported values are: v4, v2." },
     SchemaField { name: "list_objects_version", flag: "ruler-storage.s3.list-objects-version", kind: FieldKind::String, default_str: "", usage: "Use a specific version of the S3 list object API. Supported values are v1 or v2. Default is unset." },
@@ -1672,7 +1676,7 @@ static BLOCK_102_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_103_FIELDS: &[SchemaField] = &[
     SchemaField { name: "bucket_name", flag: "ruler-storage.gcs.bucket-name", kind: FieldKind::String, default_str: "", usage: "GCS bucket name" },
-    SchemaField { name: "service_account", flag: "ruler-storage.gcs.service-account", kind: FieldKind::String, default_str: "", usage: "JSON either from a Google Developers Console client_credentials.json file, or a Google Developers service account key. Needs to be valid JSON, not a filesystem path. If empty, fallback to Google default logic:\n1. A JSON file whose path is specified by the GOOGLE_APPLICATION_CREDENTIALS environment variable. For workload identity federation, refer to https://cloud.google.com/iam/docs/how-to#using-workload-identity-federation on how to generate the JSON configuration file for on-prem/non-Google cloud platforms.\n2. A JSON file in a location known to the gcloud command-line tool: $HOME/.config/gcloud/application_default_credentials.json.\n3. On Google Compute Engine it fetches credentials from the metadata server." },
+    SchemaField { name: "service_account", flag: "ruler-storage.gcs.service-account", kind: FieldKind::Secret, default_str: "", usage: "JSON either from a Google Developers Console client_credentials.json file, or a Google Developers service account key. Needs to be valid JSON, not a filesystem path. If empty, fallback to Google default logic:\n1. A JSON file whose path is specified by the GOOGLE_APPLICATION_CREDENTIALS environment variable. For workload identity federation, refer to https://cloud.google.com/iam/docs/how-to#using-workload-identity-federation on how to generate the JSON configuration file for on-prem/non-Google cloud platforms.\n2. A JSON file in a location known to the gcloud command-line tool: $HOME/.config/gcloud/application_default_credentials.json.\n3. On Google Compute Engine it fetches credentials from the metadata server." },
     SchemaField { name: "enable_upload_retries", flag: "ruler-storage.gcs.enable-upload-retries", kind: FieldKind::Bool, default_str: "true", usage: "Enable automatic retries for GCS uploads using the RetryAlways policy. Uploads will be retried on transient errors. Note: this does not guarantee idempotency." },
     SchemaField { name: "max_retries", flag: "ruler-storage.gcs.max-retries", kind: FieldKind::Int, default_str: "20", usage: "Maximum number of attempts for GCS operations (0 = unlimited, 1 = no retries). Applies to both regular and upload retry modes." },
 ];
@@ -1703,8 +1707,8 @@ static BLOCK_104_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_105_FIELDS: &[SchemaField] = &[
     SchemaField { name: "account_name", flag: "ruler-storage.azure.account-name", kind: FieldKind::String, default_str: "", usage: "Azure storage account name" },
-    SchemaField { name: "account_key", flag: "ruler-storage.azure.account-key", kind: FieldKind::String, default_str: "", usage: "Azure storage account key. If unset, Azure managed identities will be used for authentication instead." },
-    SchemaField { name: "connection_string", flag: "ruler-storage.azure.connection-string", kind: FieldKind::String, default_str: "", usage: "If `connection-string` is set, the value of `endpoint-suffix` will not be used. Use this method over `account-key` if you need to authenticate via a SAS token. Or if you use the Azurite emulator." },
+    SchemaField { name: "account_key", flag: "ruler-storage.azure.account-key", kind: FieldKind::Secret, default_str: "", usage: "Azure storage account key. If unset, Azure managed identities will be used for authentication instead." },
+    SchemaField { name: "connection_string", flag: "ruler-storage.azure.connection-string", kind: FieldKind::Secret, default_str: "", usage: "If `connection-string` is set, the value of `endpoint-suffix` will not be used. Use this method over `account-key` if you need to authenticate via a SAS token. Or if you use the Azurite emulator." },
     SchemaField { name: "container_name", flag: "ruler-storage.azure.container-name", kind: FieldKind::String, default_str: "", usage: "Azure storage container name" },
     SchemaField { name: "endpoint_suffix", flag: "ruler-storage.azure.endpoint-suffix", kind: FieldKind::String, default_str: "", usage: "Azure storage endpoint suffix without schema. The account name will be prefixed to this value to create the FQDN. If set to empty string, default endpoint suffix is used." },
     SchemaField { name: "max_retries", flag: "ruler-storage.azure.max-retries", kind: FieldKind::Int, default_str: "20", usage: "Number of retries for recoverable errors" },
@@ -1718,14 +1722,14 @@ static BLOCK_105_BLOCKS: &[SchemaBlock] = &[
 static BLOCK_106_FIELDS: &[SchemaField] = &[
     SchemaField { name: "application_credential_id", flag: "ruler-storage.swift.application-credential-id", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift application credential id" },
     SchemaField { name: "application_credential_name", flag: "ruler-storage.swift.application-credential-name", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift application credential name" },
-    SchemaField { name: "application_credential_secret", flag: "ruler-storage.swift.application-credential-secret", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift application credential secret" },
+    SchemaField { name: "application_credential_secret", flag: "ruler-storage.swift.application-credential-secret", kind: FieldKind::Secret, default_str: "", usage: "OpenStack Swift application credential secret" },
     SchemaField { name: "auth_version", flag: "ruler-storage.swift.auth-version", kind: FieldKind::Int, default_str: "0", usage: "OpenStack Swift authentication API version. 0 to autodetect." },
     SchemaField { name: "auth_url", flag: "ruler-storage.swift.auth-url", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift authentication URL" },
     SchemaField { name: "username", flag: "ruler-storage.swift.username", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift username." },
     SchemaField { name: "user_domain_name", flag: "ruler-storage.swift.user-domain-name", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift user's domain name." },
     SchemaField { name: "user_domain_id", flag: "ruler-storage.swift.user-domain-id", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift user's domain ID." },
     SchemaField { name: "user_id", flag: "ruler-storage.swift.user-id", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift user ID." },
-    SchemaField { name: "password", flag: "ruler-storage.swift.password", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift API key." },
+    SchemaField { name: "password", flag: "ruler-storage.swift.password", kind: FieldKind::Secret, default_str: "", usage: "OpenStack Swift API key." },
     SchemaField { name: "domain_id", flag: "ruler-storage.swift.domain-id", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift user's domain ID." },
     SchemaField { name: "domain_name", flag: "ruler-storage.swift.domain-name", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift user's domain name." },
     SchemaField { name: "project_id", flag: "ruler-storage.swift.project-id", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift project ID (v2,v3 auth only)." },
@@ -1812,7 +1816,7 @@ static BLOCK_111_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_112_FIELDS: &[SchemaField] = &[
     SchemaField { name: "host", flag: "alertmanager.sharding-ring.consul.hostname", kind: FieldKind::String, default_str: "localhost:8500", usage: "Hostname and port of Consul." },
-    SchemaField { name: "acl_token", flag: "alertmanager.sharding-ring.consul.acl-token", kind: FieldKind::String, default_str: "", usage: "ACL Token used to interact with Consul." },
+    SchemaField { name: "acl_token", flag: "alertmanager.sharding-ring.consul.acl-token", kind: FieldKind::Secret, default_str: "", usage: "ACL Token used to interact with Consul." },
     SchemaField { name: "http_client_timeout", flag: "alertmanager.sharding-ring.consul.client-timeout", kind: FieldKind::Duration, default_str: "20000000000", usage: "HTTP timeout when talking to Consul" },
     SchemaField { name: "consistent_reads", flag: "alertmanager.sharding-ring.consul.consistent-reads", kind: FieldKind::Bool, default_str: "false", usage: "Enable consistent reads to Consul." },
     SchemaField { name: "watch_rate_limit", flag: "alertmanager.sharding-ring.consul.watch-rate-limit", kind: FieldKind::Float, default_str: "1", usage: "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit." },
@@ -1837,7 +1841,7 @@ static BLOCK_113_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_cipher_suites", flag: "alertmanager.sharding-ring.etcd.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "Override the default cipher suite list (separated by commas). Allowed values:\n\nSecure Ciphers:\n- TLS_AES_128_GCM_SHA256\n- TLS_AES_256_GCM_SHA384\n- TLS_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\n\nInsecure Ciphers:\n- TLS_RSA_WITH_RC4_128_SHA\n- TLS_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA\n- TLS_RSA_WITH_AES_256_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA256\n- TLS_RSA_WITH_AES_128_GCM_SHA256\n- TLS_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_ECDSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256\n" },
     SchemaField { name: "tls_min_version", flag: "alertmanager.sharding-ring.etcd.tls-min-version", kind: FieldKind::String, default_str: "", usage: "Override the default minimum TLS version. Allowed values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13" },
     SchemaField { name: "username", flag: "alertmanager.sharding-ring.etcd.username", kind: FieldKind::String, default_str: "", usage: "Etcd username." },
-    SchemaField { name: "password", flag: "alertmanager.sharding-ring.etcd.password", kind: FieldKind::String, default_str: "", usage: "Etcd password." },
+    SchemaField { name: "password", flag: "alertmanager.sharding-ring.etcd.password", kind: FieldKind::Secret, default_str: "", usage: "Etcd password." },
 ];
 
 static BLOCK_113_BLOCKS: &[SchemaBlock] = &[
@@ -2001,9 +2005,9 @@ static BLOCK_124_FIELDS: &[SchemaField] = &[
     SchemaField { name: "endpoint", flag: "alertmanager-storage.s3.endpoint", kind: FieldKind::String, default_str: "", usage: "The S3 bucket endpoint. It could be an AWS S3 endpoint listed at https://docs.aws.amazon.com/general/latest/gr/s3.html or the address of an S3-compatible service in hostname:port format." },
     SchemaField { name: "region", flag: "alertmanager-storage.s3.region", kind: FieldKind::String, default_str: "", usage: "S3 region. If unset, the client will issue a S3 GetBucketLocation API call to autodetect it." },
     SchemaField { name: "bucket_name", flag: "alertmanager-storage.s3.bucket-name", kind: FieldKind::String, default_str: "", usage: "S3 bucket name" },
-    SchemaField { name: "secret_access_key", flag: "alertmanager-storage.s3.secret-access-key", kind: FieldKind::String, default_str: "", usage: "S3 secret access key" },
+    SchemaField { name: "secret_access_key", flag: "alertmanager-storage.s3.secret-access-key", kind: FieldKind::Secret, default_str: "", usage: "S3 secret access key" },
     SchemaField { name: "access_key_id", flag: "alertmanager-storage.s3.access-key-id", kind: FieldKind::String, default_str: "", usage: "S3 access key ID" },
-    SchemaField { name: "session_token", flag: "alertmanager-storage.s3.session-token", kind: FieldKind::String, default_str: "", usage: "S3 session token" },
+    SchemaField { name: "session_token", flag: "alertmanager-storage.s3.session-token", kind: FieldKind::Secret, default_str: "", usage: "S3 session token" },
     SchemaField { name: "insecure", flag: "alertmanager-storage.s3.insecure", kind: FieldKind::Bool, default_str: "false", usage: "If enabled, use http:// for the S3 endpoint instead of https://. This could be useful in local dev/test environments while using an S3-compatible backend storage, like Minio." },
     SchemaField { name: "signature_version", flag: "alertmanager-storage.s3.signature-version", kind: FieldKind::String, default_str: "v4", usage: "The signature version to use for authenticating against S3. Supported values are: v4, v2." },
     SchemaField { name: "list_objects_version", flag: "alertmanager-storage.s3.list-objects-version", kind: FieldKind::String, default_str: "", usage: "Use a specific version of the S3 list object API. Supported values are v1 or v2. Default is unset." },
@@ -2044,7 +2048,7 @@ static BLOCK_125_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_126_FIELDS: &[SchemaField] = &[
     SchemaField { name: "bucket_name", flag: "alertmanager-storage.gcs.bucket-name", kind: FieldKind::String, default_str: "", usage: "GCS bucket name" },
-    SchemaField { name: "service_account", flag: "alertmanager-storage.gcs.service-account", kind: FieldKind::String, default_str: "", usage: "JSON either from a Google Developers Console client_credentials.json file, or a Google Developers service account key. Needs to be valid JSON, not a filesystem path. If empty, fallback to Google default logic:\n1. A JSON file whose path is specified by the GOOGLE_APPLICATION_CREDENTIALS environment variable. For workload identity federation, refer to https://cloud.google.com/iam/docs/how-to#using-workload-identity-federation on how to generate the JSON configuration file for on-prem/non-Google cloud platforms.\n2. A JSON file in a location known to the gcloud command-line tool: $HOME/.config/gcloud/application_default_credentials.json.\n3. On Google Compute Engine it fetches credentials from the metadata server." },
+    SchemaField { name: "service_account", flag: "alertmanager-storage.gcs.service-account", kind: FieldKind::Secret, default_str: "", usage: "JSON either from a Google Developers Console client_credentials.json file, or a Google Developers service account key. Needs to be valid JSON, not a filesystem path. If empty, fallback to Google default logic:\n1. A JSON file whose path is specified by the GOOGLE_APPLICATION_CREDENTIALS environment variable. For workload identity federation, refer to https://cloud.google.com/iam/docs/how-to#using-workload-identity-federation on how to generate the JSON configuration file for on-prem/non-Google cloud platforms.\n2. A JSON file in a location known to the gcloud command-line tool: $HOME/.config/gcloud/application_default_credentials.json.\n3. On Google Compute Engine it fetches credentials from the metadata server." },
     SchemaField { name: "enable_upload_retries", flag: "alertmanager-storage.gcs.enable-upload-retries", kind: FieldKind::Bool, default_str: "true", usage: "Enable automatic retries for GCS uploads using the RetryAlways policy. Uploads will be retried on transient errors. Note: this does not guarantee idempotency." },
     SchemaField { name: "max_retries", flag: "alertmanager-storage.gcs.max-retries", kind: FieldKind::Int, default_str: "20", usage: "Maximum number of attempts for GCS operations (0 = unlimited, 1 = no retries). Applies to both regular and upload retry modes." },
 ];
@@ -2075,8 +2079,8 @@ static BLOCK_127_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_128_FIELDS: &[SchemaField] = &[
     SchemaField { name: "account_name", flag: "alertmanager-storage.azure.account-name", kind: FieldKind::String, default_str: "", usage: "Azure storage account name" },
-    SchemaField { name: "account_key", flag: "alertmanager-storage.azure.account-key", kind: FieldKind::String, default_str: "", usage: "Azure storage account key. If unset, Azure managed identities will be used for authentication instead." },
-    SchemaField { name: "connection_string", flag: "alertmanager-storage.azure.connection-string", kind: FieldKind::String, default_str: "", usage: "If `connection-string` is set, the value of `endpoint-suffix` will not be used. Use this method over `account-key` if you need to authenticate via a SAS token. Or if you use the Azurite emulator." },
+    SchemaField { name: "account_key", flag: "alertmanager-storage.azure.account-key", kind: FieldKind::Secret, default_str: "", usage: "Azure storage account key. If unset, Azure managed identities will be used for authentication instead." },
+    SchemaField { name: "connection_string", flag: "alertmanager-storage.azure.connection-string", kind: FieldKind::Secret, default_str: "", usage: "If `connection-string` is set, the value of `endpoint-suffix` will not be used. Use this method over `account-key` if you need to authenticate via a SAS token. Or if you use the Azurite emulator." },
     SchemaField { name: "container_name", flag: "alertmanager-storage.azure.container-name", kind: FieldKind::String, default_str: "", usage: "Azure storage container name" },
     SchemaField { name: "endpoint_suffix", flag: "alertmanager-storage.azure.endpoint-suffix", kind: FieldKind::String, default_str: "", usage: "Azure storage endpoint suffix without schema. The account name will be prefixed to this value to create the FQDN. If set to empty string, default endpoint suffix is used." },
     SchemaField { name: "max_retries", flag: "alertmanager-storage.azure.max-retries", kind: FieldKind::Int, default_str: "20", usage: "Number of retries for recoverable errors" },
@@ -2090,14 +2094,14 @@ static BLOCK_128_BLOCKS: &[SchemaBlock] = &[
 static BLOCK_129_FIELDS: &[SchemaField] = &[
     SchemaField { name: "application_credential_id", flag: "alertmanager-storage.swift.application-credential-id", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift application credential id" },
     SchemaField { name: "application_credential_name", flag: "alertmanager-storage.swift.application-credential-name", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift application credential name" },
-    SchemaField { name: "application_credential_secret", flag: "alertmanager-storage.swift.application-credential-secret", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift application credential secret" },
+    SchemaField { name: "application_credential_secret", flag: "alertmanager-storage.swift.application-credential-secret", kind: FieldKind::Secret, default_str: "", usage: "OpenStack Swift application credential secret" },
     SchemaField { name: "auth_version", flag: "alertmanager-storage.swift.auth-version", kind: FieldKind::Int, default_str: "0", usage: "OpenStack Swift authentication API version. 0 to autodetect." },
     SchemaField { name: "auth_url", flag: "alertmanager-storage.swift.auth-url", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift authentication URL" },
     SchemaField { name: "username", flag: "alertmanager-storage.swift.username", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift username." },
     SchemaField { name: "user_domain_name", flag: "alertmanager-storage.swift.user-domain-name", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift user's domain name." },
     SchemaField { name: "user_domain_id", flag: "alertmanager-storage.swift.user-domain-id", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift user's domain ID." },
     SchemaField { name: "user_id", flag: "alertmanager-storage.swift.user-id", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift user ID." },
-    SchemaField { name: "password", flag: "alertmanager-storage.swift.password", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift API key." },
+    SchemaField { name: "password", flag: "alertmanager-storage.swift.password", kind: FieldKind::Secret, default_str: "", usage: "OpenStack Swift API key." },
     SchemaField { name: "domain_id", flag: "alertmanager-storage.swift.domain-id", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift user's domain ID." },
     SchemaField { name: "domain_name", flag: "alertmanager-storage.swift.domain-name", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift user's domain name." },
     SchemaField { name: "project_id", flag: "alertmanager-storage.swift.project-id", kind: FieldKind::String, default_str: "", usage: "OpenStack Swift project ID (v2,v3 auth only)." },
@@ -2194,7 +2198,7 @@ static BLOCK_135_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_136_FIELDS: &[SchemaField] = &[
     SchemaField { name: "host", flag: "query-scheduler.ring.consul.hostname", kind: FieldKind::String, default_str: "localhost:8500", usage: "Hostname and port of Consul." },
-    SchemaField { name: "acl_token", flag: "query-scheduler.ring.consul.acl-token", kind: FieldKind::String, default_str: "", usage: "ACL Token used to interact with Consul." },
+    SchemaField { name: "acl_token", flag: "query-scheduler.ring.consul.acl-token", kind: FieldKind::Secret, default_str: "", usage: "ACL Token used to interact with Consul." },
     SchemaField { name: "http_client_timeout", flag: "query-scheduler.ring.consul.client-timeout", kind: FieldKind::Duration, default_str: "20000000000", usage: "HTTP timeout when talking to Consul" },
     SchemaField { name: "consistent_reads", flag: "query-scheduler.ring.consul.consistent-reads", kind: FieldKind::Bool, default_str: "false", usage: "Enable consistent reads to Consul." },
     SchemaField { name: "watch_rate_limit", flag: "query-scheduler.ring.consul.watch-rate-limit", kind: FieldKind::Float, default_str: "1", usage: "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit." },
@@ -2219,7 +2223,7 @@ static BLOCK_137_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_cipher_suites", flag: "query-scheduler.ring.etcd.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "Override the default cipher suite list (separated by commas). Allowed values:\n\nSecure Ciphers:\n- TLS_AES_128_GCM_SHA256\n- TLS_AES_256_GCM_SHA384\n- TLS_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\n\nInsecure Ciphers:\n- TLS_RSA_WITH_RC4_128_SHA\n- TLS_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA\n- TLS_RSA_WITH_AES_256_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA256\n- TLS_RSA_WITH_AES_128_GCM_SHA256\n- TLS_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_ECDSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256\n" },
     SchemaField { name: "tls_min_version", flag: "query-scheduler.ring.etcd.tls-min-version", kind: FieldKind::String, default_str: "", usage: "Override the default minimum TLS version. Allowed values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13" },
     SchemaField { name: "username", flag: "query-scheduler.ring.etcd.username", kind: FieldKind::String, default_str: "", usage: "Etcd username." },
-    SchemaField { name: "password", flag: "query-scheduler.ring.etcd.password", kind: FieldKind::String, default_str: "", usage: "Etcd password." },
+    SchemaField { name: "password", flag: "query-scheduler.ring.etcd.password", kind: FieldKind::Secret, default_str: "", usage: "Etcd password." },
 ];
 
 static BLOCK_137_BLOCKS: &[SchemaBlock] = &[
@@ -2281,7 +2285,7 @@ static BLOCK_141_BLOCKS: &[SchemaBlock] = &[
 
 static BLOCK_142_FIELDS: &[SchemaField] = &[
     SchemaField { name: "host", flag: "overrides-exporter.ring.consul.hostname", kind: FieldKind::String, default_str: "localhost:8500", usage: "Hostname and port of Consul." },
-    SchemaField { name: "acl_token", flag: "overrides-exporter.ring.consul.acl-token", kind: FieldKind::String, default_str: "", usage: "ACL Token used to interact with Consul." },
+    SchemaField { name: "acl_token", flag: "overrides-exporter.ring.consul.acl-token", kind: FieldKind::Secret, default_str: "", usage: "ACL Token used to interact with Consul." },
     SchemaField { name: "http_client_timeout", flag: "overrides-exporter.ring.consul.client-timeout", kind: FieldKind::Duration, default_str: "20000000000", usage: "HTTP timeout when talking to Consul" },
     SchemaField { name: "consistent_reads", flag: "overrides-exporter.ring.consul.consistent-reads", kind: FieldKind::Bool, default_str: "false", usage: "Enable consistent reads to Consul." },
     SchemaField { name: "watch_rate_limit", flag: "overrides-exporter.ring.consul.watch-rate-limit", kind: FieldKind::Float, default_str: "1", usage: "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit." },
@@ -2306,7 +2310,7 @@ static BLOCK_143_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_cipher_suites", flag: "overrides-exporter.ring.etcd.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "Override the default cipher suite list (separated by commas). Allowed values:\n\nSecure Ciphers:\n- TLS_AES_128_GCM_SHA256\n- TLS_AES_256_GCM_SHA384\n- TLS_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA\n- TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\n- TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\n\nInsecure Ciphers:\n- TLS_RSA_WITH_RC4_128_SHA\n- TLS_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA\n- TLS_RSA_WITH_AES_256_CBC_SHA\n- TLS_RSA_WITH_AES_128_CBC_SHA256\n- TLS_RSA_WITH_AES_128_GCM_SHA256\n- TLS_RSA_WITH_AES_256_GCM_SHA384\n- TLS_ECDHE_ECDSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_RC4_128_SHA\n- TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA\n- TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256\n- TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256\n" },
     SchemaField { name: "tls_min_version", flag: "overrides-exporter.ring.etcd.tls-min-version", kind: FieldKind::String, default_str: "", usage: "Override the default minimum TLS version. Allowed values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13" },
     SchemaField { name: "username", flag: "overrides-exporter.ring.etcd.username", kind: FieldKind::String, default_str: "", usage: "Etcd username." },
-    SchemaField { name: "password", flag: "overrides-exporter.ring.etcd.password", kind: FieldKind::String, default_str: "", usage: "Etcd password." },
+    SchemaField { name: "password", flag: "overrides-exporter.ring.etcd.password", kind: FieldKind::Secret, default_str: "", usage: "Etcd password." },
 ];
 
 static BLOCK_143_BLOCKS: &[SchemaBlock] = &[
@@ -2446,7 +2450,7 @@ pub fn register_extra_flags<T: 'static>(
                 FieldKind::Int => "int",
                 FieldKind::Float => "float",
                 FieldKind::Duration => "duration",
-                FieldKind::String => "string",
+                FieldKind::String | FieldKind::Secret | FieldKind::SecretOmitEmpty => "string",
                 FieldKind::StringList | FieldKind::Other => "value",
             };
             let def = if kind == FieldKind::Duration {
@@ -2483,7 +2487,11 @@ pub fn register_extra_flags<T: 'static>(
                         FieldKind::Duration => {
                             s.parse::<GoDuration>()?;
                         }
-                        FieldKind::String | FieldKind::StringList | FieldKind::Other => {}
+                        FieldKind::String
+                        | FieldKind::StringList
+                        | FieldKind::Other
+                        | FieldKind::Secret
+                        | FieldKind::SecretOmitEmpty => {}
                     }
                     get_mut(t).insert(name_for_set.clone(), s.to_string());
                     Ok(())

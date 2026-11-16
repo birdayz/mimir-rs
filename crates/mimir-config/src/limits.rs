@@ -98,6 +98,7 @@ pub struct MetricRelabelConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct OAuth2ClientConfig {
     pub client_id: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub client_secret: String,
     pub token_url: String,
     pub scopes: StringSliceCSV,
@@ -117,6 +118,7 @@ pub struct RulerAlertmanagerClientConfig {
     pub tls_cipher_suites: String,
     pub tls_min_version: String,
     pub basic_auth_username: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub basic_auth_password: String,
     pub oauth2: OAuth2ClientConfig,
     pub proxy_url: String,

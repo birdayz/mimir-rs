@@ -119,6 +119,17 @@ pub fn effective_config_yaml(cfg: &MimirConfig) -> Value {
         root_map.insert(Value::String(block.name.to_string()), Value::Mapping(merged));
     }
 
+    // Sections without a schema (hidden `usage_tracker`, `block_builder*`) are rendered from the
+    // raw YAML; mask their `flagext.Secret` values like Go's MarshalYAML does.
+    for name in cfg.extra_sections.keys() {
+        if EXTRA_TOP_BLOCKS.iter().any(|b| b.name == name) {
+            continue;
+        }
+        if let Some(v) = root_map.get_mut(Value::String(name.clone())) {
+            mimir_config::secret::mask_secrets_by_key_name(v);
+        }
+    }
+
     val
 }
 
@@ -158,6 +169,16 @@ fn build_block_yaml(
         } else {
             default_yaml_value(field.kind, field.default_str)
         };
+        let val = match field.kind {
+            FieldKind::Secret => mask_secret_yaml_value(&val),
+            FieldKind::SecretOmitEmpty => {
+                if secret_yaml_value_is_empty(&val) {
+                    continue;
+                }
+                mask_secret_yaml_value(&val)
+            }
+            _ => val,
+        };
         out.insert(yaml_key, val);
     }
 
@@ -169,6 +190,25 @@ fn build_block_yaml(
     }
 
     out
+}
+
+/// A secret is empty when its YAML value unmarshals into an empty string (`""`, `null`, `~`).
+fn secret_yaml_value_is_empty(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => s.is_empty(),
+        _ => false,
+    }
+}
+
+/// Renders a secret the way `flagext.Secret.MarshalYAML` does (`dskit/flagext/secret.go`).
+fn mask_secret_yaml_value(v: &Value) -> Value {
+    let masked = if secret_yaml_value_is_empty(v) {
+        ""
+    } else {
+        mimir_config::secret::FLAGEXT_SECRET_MASK
+    };
+    Value::String(masked.to_string())
 }
 
 fn default_yaml_value(kind: FieldKind, default_str: &str) -> Value {
@@ -200,7 +240,9 @@ fn default_yaml_value(kind: FieldKind, default_str: &str) -> Value {
                 Value::String(default_str.to_string())
             }
         }
-        FieldKind::Other => Value::String(default_str.to_string()),
+        FieldKind::Other | FieldKind::Secret | FieldKind::SecretOmitEmpty => {
+            Value::String(default_str.to_string())
+        }
     }
 }
 
@@ -231,7 +273,9 @@ fn parse_cli_value_for_yaml(kind: FieldKind, raw: &str) -> Value {
                 Value::Sequence(raw.split(',').map(|s| Value::String(s.to_string())).collect())
             }
         }
-        FieldKind::Other => Value::String(raw.to_string()),
+        FieldKind::Other | FieldKind::Secret | FieldKind::SecretOmitEmpty => {
+            Value::String(raw.to_string())
+        }
     }
 }
 
@@ -264,5 +308,96 @@ pub fn diff_yaml_values(default_val: &Value, actual_val: &Value) -> Option<Value
             }
         }
         _ => Some(actual_val.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(yaml: &str) -> MimirConfig {
+        let mut cfg = MimirConfig::default();
+        cfg.load_config_from_bytes(yaml.as_bytes(), false).unwrap();
+        cfg
+    }
+
+    // Go: dskit/flagext/secret.go MarshalYAML, prometheus/common/config.Secret MarshalYAML.
+    #[test]
+    fn dump_yaml_masks_secrets_like_go() {
+        let cfg = load(
+            r#"
+blocks_storage:
+  s3:
+    secret_access_key: S3SECRETXYZ
+    session_token: S3TOKENXYZ
+  azure:
+    account_key: AZKEYXYZ
+    connection_string: AZCONNXYZ
+  gcs:
+    service_account: GCSSAXYZ
+  swift:
+    password: SWIFTPWXYZ
+    application_credential_secret: SWIFTACSXYZ
+ingest_storage:
+  kafka:
+    sasl_password: KAFKAPWXYZ
+    sasl_oauthbearer_token: OAUTHXYZ
+ingester:
+  ring:
+    kvstore:
+      consul:
+        acl_token: ACLXYZ
+      etcd:
+        password: ETCDXYZ
+limits:
+  ruler_alertmanager_client_config:
+    basic_auth_password: RULERPWXYZ
+    oauth2:
+      client_secret: OAUTH2XYZ
+server:
+  http_tls_config:
+    key: TLSKEYXYZ
+ruler_storage:
+  s3:
+    secret_access_key: RSXYZ
+distributor:
+  ha_tracker:
+    kvstore:
+      etcd:
+        password: HAXYZ
+vault:
+  auth:
+    token:
+      token: VAULTXYZ
+usage_tracker:
+  snapshots_storage:
+    s3:
+      secret_access_key: UTXYZ
+"#,
+        );
+        let out = dump_yaml(&cfg);
+        assert!(!out.contains("XYZ"), "secret leaked:\n{out}");
+        assert!(out.contains("secret_access_key: '********'"));
+        assert!(out.contains("sasl_password: '********'"));
+        assert!(out.contains("basic_auth_password: '********'"));
+        assert!(out.contains("key: <secret>"));
+        // Empty secrets render as "" (flagext.Secret) / null (prometheus config.Secret).
+        assert!(out.contains("sasl_msk_iam_secret_key: ''"));
+        assert!(out.contains("key: null"));
+        // `service_account_token` is `omitempty` in Go.
+        assert!(!out.contains("service_account_token:"));
+
+        // The in-memory config still holds the real values.
+        assert_eq!(cfg.ingest_storage.kafka.sasl_password, "KAFKAPWXYZ");
+
+        // `?mode=diff` compares masked values.
+        let diff = diff_yaml_values(
+            &effective_config_yaml(&MimirConfig::default()),
+            &effective_config_yaml(&cfg),
+        )
+        .unwrap();
+        let diff = serde_yaml::to_string(&diff).unwrap();
+        assert!(!diff.contains("XYZ"), "secret leaked in diff:\n{diff}");
+        assert!(diff.contains("sasl_password: '********'"));
     }
 }

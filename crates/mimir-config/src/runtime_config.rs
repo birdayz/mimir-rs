@@ -224,8 +224,11 @@ fn parse_runtime_config_value(
             let overrides_map = overrides_val.as_mapping().ok_or_else(|| {
                 ConfigError::RuntimeConfig("overrides must be a YAML mapping".to_string())
             })?;
-            let base_limits_val = serde_yaml::to_value(default_limits)
-                .map_err(|e| ConfigError::RuntimeConfig(e.to_string()))?;
+            // Tenant overrides start from the real default limits (Go copies the struct), so
+            // secrets must not be masked in this internal round trip.
+            let base_limits_val =
+                crate::secret::with_secrets_revealed(|| serde_yaml::to_value(default_limits))
+                    .map_err(|e| ConfigError::RuntimeConfig(e.to_string()))?;
 
             for (tenant_k, tenant_v) in overrides_map {
                 let tenant_id = tenant_k.as_str().ok_or_else(|| {
@@ -658,5 +661,28 @@ impl Overrides {
     #[inline]
     pub fn max_native_histogram_buckets(&self, tenant_id: &str) -> i64 {
         self.for_tenant(tenant_id).max_native_histogram_buckets
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    // Go copies the default limits struct before unmarshalling a tenant's overrides, so a
+    // secret set in the defaults must survive (and must not become the "********" mask).
+    #[test]
+    fn tenant_overrides_keep_default_secrets() {
+        let mut defaults = LimitsConfig::default();
+        defaults.ruler_alertmanager_client_config.basic_auth_password = "pw".to_string();
+        let out = parse_runtime_config_yaml(
+            b"overrides:\n  t1:\n    max_global_series_per_user: 5\n",
+            &defaults,
+            &InstanceLimits::default(),
+        )
+        .unwrap();
+        let t1 = out.overrides.get("t1").unwrap();
+        assert_eq!(t1.ruler_alertmanager_client_config.basic_auth_password, "pw");
+        let rendered = serde_yaml::to_string(t1.as_ref()).unwrap();
+        assert!(rendered.contains("basic_auth_password: '********'"));
     }
 }
