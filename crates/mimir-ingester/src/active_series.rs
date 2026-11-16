@@ -2195,6 +2195,60 @@ impl ActiveSeries {
     }
 
     #[inline]
+    fn try_fast_active_cache_update(
+        &self,
+        head_entry: &mimir_tsdb::head::SeriesEntry,
+        ref_id: u64,
+        now_ns: i64,
+        is_otlp: bool,
+    ) -> bool {
+        let packed = head_entry.active_cache();
+        if packed != 0 {
+            let (c_epoch, c_is_plain_float, c_is_otlp, slot) = unpack_active_cache(packed);
+            let cur_epoch = self.epoch.load(Ordering::Acquire);
+            if c_epoch == cur_epoch && c_is_plain_float != 0 && (!is_otlp || c_is_otlp != 0) {
+                if let Some(slot_atomic) = self.slab.slot_ref(slot) {
+                    let mut cur = slot_atomic.load(Ordering::Relaxed);
+                    loop {
+                        if cur == SLOT_INACTIVE {
+                            break;
+                        }
+                        if now_ns <= cur {
+                            return true;
+                        }
+                        match slot_atomic.compare_exchange_weak(
+                            cur,
+                            now_ns,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => {
+                                let stripe = &self.stripes[(ref_id as usize) & STRIPE_MASK];
+                                let mut prev_oldest =
+                                    stripe.oldest_entry_ns.load(Ordering::Relaxed);
+                                while prev_oldest > 0 && now_ns < prev_oldest {
+                                    match stripe.oldest_entry_ns.compare_exchange_weak(
+                                        prev_oldest,
+                                        0,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    ) {
+                                        Ok(_) => break,
+                                        Err(actual) => prev_oldest = actual,
+                                    }
+                                }
+                                return true;
+                            }
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn update_series_with_entry(
         &self,
@@ -2209,51 +2263,8 @@ impl ActiveSeries {
         let now_ns = system_time_to_unix_nanos(now);
         if num_native_histogram_buckets < 0 && now_ns != SLOT_INACTIVE {
             if let Some(head_entry) = entry {
-                let packed = head_entry.active_cache();
-                if packed != 0 {
-                    let (c_epoch, c_is_plain_float, c_is_otlp, slot) = unpack_active_cache(packed);
-                    let cur_epoch = self.epoch.load(Ordering::Acquire);
-                    if c_epoch == cur_epoch
-                        && c_is_plain_float != 0
-                        && (!is_otlp || c_is_otlp != 0)
-                    {
-                        if let Some(slot_atomic) = self.slab.slot_ref(slot) {
-                            let mut cur = slot_atomic.load(Ordering::Relaxed);
-                            loop {
-                                if cur == SLOT_INACTIVE {
-                                    break;
-                                }
-                                if now_ns <= cur {
-                                    return;
-                                }
-                                match slot_atomic.compare_exchange_weak(
-                                    cur,
-                                    now_ns,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                ) {
-                                    Ok(_) => {
-                                        let stripe = &self.stripes[(ref_id as usize) & STRIPE_MASK];
-                                        let mut prev_oldest =
-                                            stripe.oldest_entry_ns.load(Ordering::Relaxed);
-                                        while prev_oldest > 0 && now_ns < prev_oldest {
-                                            match stripe.oldest_entry_ns.compare_exchange_weak(
-                                                prev_oldest,
-                                                0,
-                                                Ordering::Relaxed,
-                                                Ordering::Relaxed,
-                                            ) {
-                                                Ok(_) => break,
-                                                Err(actual) => prev_oldest = actual,
-                                            }
-                                        }
-                                        return;
-                                    }
-                                    Err(actual) => cur = actual,
-                                }
-                            }
-                        }
-                    }
+                if self.try_fast_active_cache_update(head_entry, ref_id, now_ns, is_otlp) {
+                    return;
                 }
             }
         }
@@ -2274,6 +2285,57 @@ impl ActiveSeries {
         if created && !self.deleted.is_empty() {
             let lbls = Labels::from_pairs(pairs.iter().copied());
             if let Some(deleted_ref) = self.deleted.find(lbls.as_bytes()) {
+                let d_stripe = (deleted_ref as usize) & STRIPE_MASK;
+                self.stripes[d_stripe].remove(deleted_ref, None, &self.deleted, &self.slab);
+            }
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_series_with_entry_encoded(
+        &self,
+        entry: Option<&mimir_tsdb::head::SeriesEntry>,
+        encoded_labels: &[u8],
+        _hash: u64,
+        ref_id: u64,
+        now: SystemTime,
+        num_native_histogram_buckets: i64,
+        is_otlp: bool,
+    ) {
+        let now_ns = system_time_to_unix_nanos(now);
+        if num_native_histogram_buckets < 0 && now_ns != SLOT_INACTIVE {
+            if let Some(head_entry) = entry {
+                if self.try_fast_active_cache_update(head_entry, ref_id, now_ns, is_otlp) {
+                    return;
+                }
+            }
+        }
+
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let stripe_id = (ref_id as usize) & STRIPE_MASK;
+        let owned_labels;
+        let series_labels = match entry {
+            Some(e) => &e.labels,
+            None => {
+                owned_labels =
+                    Labels::from_raw_stringlabels_bytes(bytes::Bytes::copy_from_slice(encoded_labels));
+                &owned_labels
+            }
+        };
+        let created = self.stripes[stripe_id].update_series_timestamp(
+            now_ns,
+            Some(series_labels),
+            None,
+            ref_id,
+            num_native_histogram_buckets,
+            is_otlp,
+            &self.slab,
+            epoch,
+            entry,
+        );
+        if created && !self.deleted.is_empty() {
+            if let Some(deleted_ref) = self.deleted.find(encoded_labels) {
                 let d_stripe = (deleted_ref as usize) & STRIPE_MASK;
                 self.stripes[d_stripe].remove(deleted_ref, None, &self.deleted, &self.slab);
             }

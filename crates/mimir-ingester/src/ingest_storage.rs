@@ -15,7 +15,9 @@ use mimir_common::thread_pool::ScopedWorkerPool;
 use mimir_config::KafkaConfig;
 use mimir_proto::cortexpb::{self, ErrorCause};
 use mimir_proto::ringpb::PartitionRingDesc;
-use mimir_proto::zerocopy::WriteRequestScratch;
+use mimir_proto::zerocopy::{
+    decode_rw2_stream, BorrowedMetadata, DecodeOptions, Rw2ResolvedScratch, WriteRequestScratch,
+};
 use mimir_ring::partition_ring::PartitionRingWatcherDelegate;
 use mimir_storage::ingest::version::{deserialize_record_content, parse_record_version};
 use mimir_storage::ingest::{
@@ -24,11 +26,11 @@ use mimir_storage::ingest::{
     PusherConsumerMetrics, PusherError, ReaderError, RecordBatchConsumer,
     SingleClusterPartitionReader, READ_COMPARTMENT_ID_PLACEHOLDER,
 };
-use mimir_tsdb::head::hash_sorted_pairs;
-use mimir_tsdb::labels::Labels;
+use mimir_tsdb::labels::{append_stringlabel_pair, Labels};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use tracing::{error, info};
+use xxhash_rust::xxh64::xxh64;
 
 use crate::errors::IngesterError;
 use crate::ingester::Ingester;
@@ -183,8 +185,8 @@ struct ShardSeriesItem {
     labels_sorted_unique: bool,
     bad_utf8: bool,
     prom_hash: u64,
-    pairs_start: u32,
-    pairs_len: u16,
+    label_bytes_start: u32,
+    label_bytes_len: u32,
     samples_start: u32,
     samples_len: u32,
     created_timestamp: i64,
@@ -197,7 +199,8 @@ struct ShardSeriesItem {
 
 struct WorkerArena {
     wr_scratch: WriteRequestScratch,
-    pairs_arena: Vec<(&'static str, &'static str)>,
+    rw2_resolved: Rw2ResolvedScratch,
+    label_bytes_arena: Vec<u8>,
     samples_arena: Vec<cortexpb::Sample>,
     histograms_arena: Vec<ConvertedHistogram>,
     exemplars_arena: Vec<(i64, f64, Labels, String)>,
@@ -210,7 +213,8 @@ impl WorkerArena {
     fn new(num_shards: usize) -> Self {
         Self {
             wr_scratch: WriteRequestScratch::new(),
-            pairs_arena: Vec::with_capacity(4096),
+            rw2_resolved: Rw2ResolvedScratch::new(),
+            label_bytes_arena: Vec::with_capacity(65_536),
             samples_arena: Vec::with_capacity(512),
             histograms_arena: Vec::new(),
             exemplars_arena: Vec::new(),
@@ -222,7 +226,7 @@ impl WorkerArena {
 
     fn reset_for(&mut self, num_shards: usize) {
         self.wr_scratch.clear();
-        self.pairs_arena.clear();
+        self.label_bytes_arena.clear();
         self.samples_arena.clear();
         self.histograms_arena.clear();
         self.exemplars_arena.clear();
@@ -238,13 +242,10 @@ impl WorkerArena {
     }
 
     #[inline]
-    fn pairs_slice<'r>(&self, start: u32, len: u16) -> &'r [(&'r str, &'r str)] {
+    fn label_bytes_slice(&self, start: u32, len: u32) -> &[u8] {
         let s = start as usize;
         let e = s + len as usize;
-        // SAFETY: populated with `'r` slices in Phase A and read only in Phase B before `'r` ends.
-        unsafe {
-            std::slice::from_raw_parts(self.pairs_arena.as_ptr().add(s).cast(), e - s)
-        }
+        &self.label_bytes_arena[s..e]
     }
 }
 
@@ -257,7 +258,7 @@ impl Drop for ArenaPoolGuard<'_> {
     fn drop(&mut self) {
         let mut arenas = std::mem::take(&mut self.arenas);
         for a in &mut arenas {
-            a.pairs_arena.clear();
+            a.label_bytes_arena.clear();
             a.samples_arena.clear();
             a.histograms_arena.clear();
             a.exemplars_arena.clear();
@@ -266,8 +267,8 @@ impl Drop for ArenaPoolGuard<'_> {
                 b.clear();
             }
             // Prevent retaining outlier allocations after massive spikes.
-            if a.pairs_arena.capacity() > 262_144 {
-                a.pairs_arena = Vec::with_capacity(4096);
+            if a.label_bytes_arena.capacity() > 4 * 1024 * 1024 {
+                a.label_bytes_arena = Vec::with_capacity(65_536);
             }
             if a.samples_arena.capacity() > 65_536 {
                 a.samples_arena = Vec::with_capacity(512);
@@ -491,7 +492,8 @@ impl IngesterShardedBatchConsumer {
                              arena: &mut WorkerArena| {
             let WorkerArena {
                 wr_scratch,
-                pairs_arena,
+                rw2_resolved,
+                label_bytes_arena,
                 samples_arena,
                 histograms_arena,
                 exemplars_arena,
@@ -499,12 +501,9 @@ impl IngesterShardedBatchConsumer {
                 empty_tenant_errors,
                 total_series,
             } = arena;
-            // SAFETY: `pairs_arena` is empty on entry and cleared on `ArenaPoolGuard::drop`
-            // before `'r` ends.
-            let pairs_mut: &mut Vec<(&str, &str)> = unsafe {
-                &mut *(pairs_arena as *mut Vec<(&'static str, &'static str)>).cast()
-            };
             let mut tmp_ex: Vec<(i64, f64, Labels, String)> = Vec::new();
+            let mut rec_metadata: Vec<BorrowedMetadata<'_>> = Vec::with_capacity(128);
+            let mut bucket_bases = [0usize; 16];
             for (local_i, rec) in slice.iter().enumerate() {
                 let tenant_idx = tids[local_i];
                 let tenant_id = &tenants[tenant_idx as usize];
@@ -516,6 +515,130 @@ impl IngesterShardedBatchConsumer {
                 let version = parse_record_version(
                     rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
                 );
+
+                if version == 2 {
+                    let label_bytes_base = label_bytes_arena.len();
+                    let samples_base = samples_arena.len();
+                    let hist_base = histograms_arena.len();
+                    let ex_base = exemplars_arena.len();
+                    let total_series_base = *total_series;
+                    for s_idx in 0..num_shards {
+                        bucket_bases[s_idx] = shard_buckets[s_idx].len();
+                    }
+
+                    let stream_res = decode_rw2_stream(
+                        &rec.value,
+                        DecodeOptions::kafka_v2(),
+                        wr_scratch,
+                        rw2_resolved,
+                        label_bytes_arena,
+                        samples_arena,
+                        &mut rec_metadata,
+                        |ts| {
+                            let label_bytes_start = ts.label_bytes_range.start as u32;
+                            let label_bytes_len =
+                                (ts.label_bytes_range.end - ts.label_bytes_range.start) as u32;
+                            let prom_hash = if ts.labels_sorted_unique && label_bytes_len > 0 {
+                                xxh64(ts.encoded_labels, 0)
+                            } else {
+                                0
+                            };
+
+                            let mut min_ts = ts.min_sample_ts;
+                            let hist_start = histograms_arena.len() as u32;
+                            let mut hist_len = 0u16;
+                            if ts.histograms_len() > 0 {
+                                for h in ts.histograms() {
+                                    let conv = convert_borrowed_histogram(&h);
+                                    min_ts = min_ts.min(conv.0);
+                                    histograms_arena.push(conv);
+                                    hist_len += 1;
+                                }
+                            }
+
+                            let ex_start = exemplars_arena.len() as u32;
+                            let mut ex_len = 0u16;
+                            let mut bad_utf8 = false;
+                            if ts.exemplars_len() > 0 {
+                                tmp_ex.clear();
+                                for ex in ts.exemplars() {
+                                    if let Ok(conv) = convert_borrowed_exemplar(&ex) {
+                                        tmp_ex.push(conv);
+                                        ex_len += 1;
+                                    } else {
+                                        bad_utf8 = true;
+                                        break;
+                                    }
+                                }
+                                if !bad_utf8 {
+                                    exemplars_arena.append(&mut tmp_ex);
+                                }
+                            }
+
+                            let shard = (prom_hash as usize) & shard_mask;
+                            shard_buckets[shard].push(ShardSeriesItem {
+                                worker_idx: worker_idx as u16,
+                                record_offset: rec.offset,
+                                tenant_idx,
+                                source: ts.source,
+                                skip_label_validation: ts.skip_label_validation,
+                                labels_sorted_unique: ts.labels_sorted_unique,
+                                bad_utf8,
+                                prom_hash,
+                                label_bytes_start,
+                                label_bytes_len,
+                                samples_start: ts.samples_range.start as u32,
+                                samples_len: (ts.samples_range.end - ts.samples_range.start)
+                                    as u32,
+                                created_timestamp: ts.created_timestamp,
+                                histograms_start: hist_start,
+                                histograms_len: hist_len,
+                                exemplars_start: ex_start,
+                                exemplars_len: ex_len,
+                                min_ts,
+                            });
+                            *total_series += 1;
+                        },
+                    );
+
+                    match stream_res {
+                        Ok(hdr) => {
+                            if hdr.header_changed_after_series {
+                                for s_idx in 0..num_shards {
+                                    for item in &mut shard_buckets[s_idx][bucket_bases[s_idx]..] {
+                                        item.source = hdr.source;
+                                        item.skip_label_validation = hdr.skip_label_validation;
+                                    }
+                                }
+                            }
+                            if !rec_metadata.is_empty() {
+                                let meta_count = self
+                                    .ingester
+                                    .push_metadata_items(tenant_id, &rec_metadata);
+                                if meta_count > 0 {
+                                    self.ingester.ingestion_rate.add(meta_count as i64);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let err_msg = format!("parsing ingest consumer write request: {e}");
+                            error!(err = %err_msg, "failed to parse write request; skipping");
+                            label_bytes_arena.truncate(label_bytes_base);
+                            samples_arena.truncate(samples_base);
+                            histograms_arena.truncate(hist_base);
+                            exemplars_arena.truncate(ex_base);
+                            for s_idx in 0..num_shards {
+                                shard_buckets[s_idx].truncate(bucket_bases[s_idx]);
+                            }
+                            *total_series = total_series_base;
+                        }
+                    }
+                    rec_metadata.clear();
+                    wr_scratch.clear();
+                    let _ = rec_offset_start;
+                    continue;
+                }
+
                 let borrowed =
                     match deserialize_record_content(&rec.value, version, wr_scratch) {
                         Ok(b) => b,
@@ -539,13 +662,13 @@ impl IngesterShardedBatchConsumer {
                 let ts_count = borrowed.timeseries_len();
 
                 for ts in borrowed.timeseries() {
-                    let pairs_start = pairs_mut.len() as u32;
+                    let label_bytes_start = label_bytes_arena.len();
                     let mut labels_sorted_unique = true;
                     let mut bad_utf8 = false;
                     let mut prev_name: Option<&str> = None;
 
                     if let Some(ts_labels_str) = ts.labels_str() {
-                        pairs_mut.reserve(ts_labels_str.len());
+                        label_bytes_arena.reserve(ts_labels_str.len() * 24);
                         for (k, v) in ts_labels_str {
                             if let Some(pn) = prev_name {
                                 if pn >= k {
@@ -554,12 +677,16 @@ impl IngesterShardedBatchConsumer {
                             }
                             prev_name = Some(k);
                             if !v.is_empty() {
-                                pairs_mut.push((k, v));
+                                append_stringlabel_pair(
+                                    label_bytes_arena,
+                                    k.as_bytes(),
+                                    v.as_bytes(),
+                                );
                             }
                         }
                     } else {
                         let ts_labels = ts.labels();
-                        pairs_mut.reserve(ts_labels.len());
+                        label_bytes_arena.reserve(ts_labels.len() * 24);
                         for lp in ts_labels {
                             let Ok(k) = fast_utf8_str(lp.name) else {
                                 bad_utf8 = true;
@@ -576,16 +703,22 @@ impl IngesterShardedBatchConsumer {
                             }
                             prev_name = Some(k);
                             if !v.is_empty() {
-                                pairs_mut.push((k, v));
+                                append_stringlabel_pair(
+                                    label_bytes_arena,
+                                    k.as_bytes(),
+                                    v.as_bytes(),
+                                );
                             }
                         }
                     }
 
-                    let pairs_end = pairs_mut.len();
-                    let pairs_len = (pairs_end - pairs_start as usize) as u16;
-                    let prom_hash = if !bad_utf8 && labels_sorted_unique && pairs_len > 0 {
-                        let pairs_slice = &pairs_mut[pairs_start as usize..pairs_end];
-                        hash_sorted_pairs(pairs_slice)
+                    if bad_utf8 {
+                        label_bytes_arena.truncate(label_bytes_start);
+                    }
+                    let label_bytes_end = label_bytes_arena.len();
+                    let label_bytes_len = (label_bytes_end - label_bytes_start) as u32;
+                    let prom_hash = if !bad_utf8 && labels_sorted_unique && label_bytes_len > 0 {
+                        xxh64(&label_bytes_arena[label_bytes_start..label_bytes_end], 0)
                     } else {
                         0
                     };
@@ -636,8 +769,8 @@ impl IngesterShardedBatchConsumer {
                         labels_sorted_unique,
                         bad_utf8,
                         prom_hash,
-                        pairs_start,
-                        pairs_len,
+                        label_bytes_start: label_bytes_start as u32,
+                        label_bytes_len,
                         samples_start,
                         samples_len,
                         created_timestamp: ts.created_timestamp(),
@@ -792,7 +925,8 @@ impl IngesterShardedBatchConsumer {
                 }
 
                 let wa = &arenas_ref[item.worker_idx as usize];
-                let pairs = wa.pairs_slice(item.pairs_start, item.pairs_len);
+                let encoded_labels =
+                    wa.label_bytes_slice(item.label_bytes_start, item.label_bytes_len);
                 let s_start = item.samples_start as usize;
                 let s_end = s_start + item.samples_len as usize;
                 let samples = &wa.samples_arena[s_start..s_end];
@@ -811,7 +945,7 @@ impl IngesterShardedBatchConsumer {
                 };
 
                 batch.push(PrehashedSeriesItem {
-                    pairs,
+                    encoded_labels,
                     samples,
                     created_timestamp: item.created_timestamp,
                     prom_hash: item.prom_hash,

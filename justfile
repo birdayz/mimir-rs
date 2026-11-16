@@ -56,3 +56,6 @@ prod-bench *args:
     just build-release
     just go-oracle
     cargo run --release -p mimir-conformance --example prod_bench -- {{args}}
+
+docker-build tag="mimir-rs:local":
+    docker build --build-arg revision=$(git rev-parse HEAD) -t {{tag}} .

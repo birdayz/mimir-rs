@@ -243,6 +243,95 @@ pub struct BorrowedMetadata<'a> {
     pub unit: &'a str,
 }
 
+/// Reusable flat resolved symbol table scratch for `decode_rw2_stream`.
+#[derive(Debug, Default)]
+pub struct Rw2ResolvedScratch {
+    v2_resolved: Vec<Option<&'static str>>,
+    custom_resolved: Vec<Option<&'static str>>,
+}
+
+impl Rw2ResolvedScratch {
+    pub fn new() -> Self {
+        let mut v2_resolved = Vec::with_capacity(256);
+        v2_resolved.extend_from_slice(&V2_COMMON_SYMBOLS_64);
+        Self {
+            v2_resolved,
+            custom_resolved: Vec::with_capacity(128),
+        }
+    }
+}
+
+const V2_COMMON_SYMBOLS_64: [Option<&'static str>; 64] = {
+    let mut arr: [Option<&'static str>; 64] = [None; 64];
+    let mut i = 0;
+    while i < V2_COMMON_SYMBOLS_LIST.len() && i < 64 {
+        arr[i] = Some(V2_COMMON_SYMBOLS_LIST[i]);
+        i += 1;
+    }
+    arr
+};
+
+/// Header fields decoded by [`decode_rw2_stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamedRw2Header {
+    pub source: i32,
+    pub skip_label_validation: bool,
+    pub skip_label_count_validation: bool,
+    pub header_changed_after_series: bool,
+}
+
+/// Borrowed view of a single `TimeSeriesRw2` emitted by [`decode_rw2_stream`].
+///
+/// Labels are encoded directly into `label_bytes_arena` in Prometheus `stringlabels` flat byte
+/// format, and samples are appended directly into `samples_arena`.
+pub struct StreamedRw2Series<'v, 'a> {
+    pub label_bytes_range: Range<usize>,
+    pub encoded_labels: &'v [u8],
+    pub labels_sorted_unique: bool,
+    pub samples_range: Range<usize>,
+    pub min_sample_ts: i64,
+    pub created_timestamp: i64,
+    pub histograms_range: Range<usize>,
+    pub exemplars_range: Range<usize>,
+    pub source: i32,
+    pub skip_label_validation: bool,
+    scratch: &'v WriteRequestScratch,
+    input: &'a [u8],
+    common_symbols: &'a [&'a str],
+}
+
+impl<'v, 'a> StreamedRw2Series<'v, 'a> {
+    #[inline]
+    pub fn histograms_len(&self) -> usize {
+        self.histograms_range.len()
+    }
+
+    #[inline]
+    pub fn exemplars_len(&self) -> usize {
+        self.exemplars_range.len()
+    }
+
+    pub fn histograms(&self) -> impl ExactSizeIterator<Item = BorrowedHistogramView<'_>> {
+        self.scratch.histograms[self.histograms_range.clone()]
+            .iter()
+            .map(move |h| BorrowedHistogramView {
+                scratch: self.scratch,
+                meta: h,
+            })
+    }
+
+    pub fn exemplars(&self) -> impl ExactSizeIterator<Item = BorrowedExemplarView<'_, 'a>> {
+        self.scratch.exemplars[self.exemplars_range.clone()]
+            .iter()
+            .map(move |ex| BorrowedExemplarView {
+                input: self.input,
+                common_symbols: self.common_symbols,
+                scratch: self.scratch,
+                meta: ex,
+            })
+    }
+}
+
 /// Reusable lifetime-free scratch space for zero-allocation `WriteRequest` decoding.
 #[derive(Debug, Default)]
 pub struct WriteRequestScratch {
@@ -802,6 +891,639 @@ pub fn decode_write_request<'a, 's>(
     })
 }
 
+struct ResolvedTableGuard<'r> {
+    vec: &'r mut Vec<Option<&'static str>>,
+    base_len: usize,
+}
+
+impl Drop for ResolvedTableGuard<'_> {
+    fn drop(&mut self) {
+        self.vec.truncate(self.base_len);
+    }
+}
+
+#[inline(always)]
+fn append_stringlabel_pair_proto(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    let klen = name.len();
+    let vlen = value.len();
+    if klen < 255 && vlen < 255 {
+        let need = 2 + klen + vlen;
+        buf.reserve(need);
+        let start = buf.len();
+        // SAFETY: `reserve(need)` ensures capacity >= start + need, and `klen < 255 && vlen < 255`.
+        unsafe {
+            let ptr = buf.as_mut_ptr().add(start);
+            *ptr = klen as u8;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), ptr.add(1), klen);
+            *ptr.add(1 + klen) = vlen as u8;
+            std::ptr::copy_nonoverlapping(value.as_ptr(), ptr.add(2 + klen), vlen);
+            buf.set_len(start + need);
+        }
+    } else {
+        append_stringlabel_pair_proto_slow(buf, name, value);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn append_stringlabel_pair_proto_slow(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    for part in [name, value] {
+        let len = part.len();
+        if len < 255 {
+            buf.push(len as u8);
+        } else {
+            assert!(len <= (1 << 24), "string too long to encode as label");
+            buf.push(255);
+            buf.push((len & 0xff) as u8);
+            buf.push(((len >> 8) & 0xff) as u8);
+            buf.push(((len >> 16) & 0xff) as u8);
+        }
+        buf.extend_from_slice(part);
+    }
+}
+
+/// Streams an RW2 / Kafka-v2 `cortexpb.WriteRequest` directly into contiguous
+/// `stringlabels` bytes (`label_bytes_arena`) and `samples_arena`, without allocating
+/// `Vec<LabelRefPair>` or copying samples through `WriteRequestScratch`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_rw2_stream<'a, F>(
+    input: &'a [u8],
+    opts: DecodeOptions<'a>,
+    scratch: &mut WriteRequestScratch,
+    resolved_scratch: &mut Rw2ResolvedScratch,
+    label_bytes_arena: &mut Vec<u8>,
+    samples_arena: &mut Vec<cortexpb::Sample>,
+    meta_out: &mut Vec<BorrowedMetadata<'a>>,
+    mut on_series: F,
+) -> Result<StreamedRw2Header, DecodeError>
+where
+    F: FnMut(StreamedRw2Series<'_, 'a>),
+{
+    if input.len() > u32::MAX as usize {
+        return Err(DecodeError::InputTooLarge);
+    }
+    scratch.clear();
+    meta_out.clear();
+
+    let (rw2_offset, common_symbols, is_kafka_v2): (u32, &'a [&'a str], bool) = match opts.mode {
+        DecodeMode::Classic => return Err(DecodeError::UnexpectedRw1Timeseries),
+        DecodeMode::Rw2 => (0, &[], false),
+        DecodeMode::KafkaV2 => (V2_RECORD_SYMBOL_OFFSET, V2_COMMON_SYMBOLS_LIST, true),
+        DecodeMode::Rw2Custom {
+            offset,
+            common_symbols,
+        } => (offset, common_symbols, false),
+    };
+
+    let guard = if is_kafka_v2 {
+        if resolved_scratch.v2_resolved.len() < 64 {
+            resolved_scratch.v2_resolved.clear();
+            resolved_scratch
+                .v2_resolved
+                .extend_from_slice(&V2_COMMON_SYMBOLS_64);
+        }
+        ResolvedTableGuard {
+            vec: &mut resolved_scratch.v2_resolved,
+            base_len: 64,
+        }
+    } else {
+        resolved_scratch.custom_resolved.clear();
+        resolved_scratch
+            .custom_resolved
+            .resize(rw2_offset as usize, None);
+        ResolvedTableGuard {
+            vec: &mut resolved_scratch.custom_resolved,
+            base_len: 0,
+        }
+    };
+
+    // SAFETY: `guard` truncates `guard.vec` back to `base_len` (`'static` common symbols or empty)
+    // on every return/unwind path before `'a` ends.
+    let resolved: &mut Vec<Option<&'a str>> = unsafe {
+        &mut *(guard.vec as *mut Vec<Option<&'static str>>).cast()
+    };
+    if !is_kafka_v2 {
+        for (i, &sym) in common_symbols.iter().enumerate() {
+            if i < resolved.len() {
+                resolved[i] = Some(sym);
+            }
+        }
+    }
+
+    let mut source: i32 = 0;
+    let mut skip_label_validation = false;
+    let mut skip_label_count_validation = false;
+    let mut seen_first_symbol = false;
+    let mut prescanned_symbols = false;
+    let mut emitted_any_series = false;
+    let mut header_changed_after_series = false;
+
+    let mut pos = 0usize;
+    let len = input.len();
+    while pos < len {
+        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        match field_num {
+            1 => return Err(DecodeError::UnexpectedRw1Timeseries),
+            2 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 2,
+                        wire_type,
+                    });
+                }
+                let new_src = read_varint(input, &mut pos)? as i32;
+                if emitted_any_series && new_src != source {
+                    header_changed_after_series = true;
+                }
+                source = new_src;
+            }
+            3 => return Err(DecodeError::UnexpectedRw1Metadata),
+            4 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 4,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range(input, &mut pos)?;
+                if !prescanned_symbols {
+                    let sym_str = std::str::from_utf8(&input[sub])
+                        .map_err(|_| DecodeError::InvalidUtf8)?;
+                    if !seen_first_symbol && !sym_str.is_empty() {
+                        return Err(DecodeError::InvalidFirstSymbol);
+                    }
+                    seen_first_symbol = true;
+                    resolved.push(Some(sym_str));
+                }
+            }
+            5 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 5,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range(input, &mut pos)?;
+                if !seen_first_symbol && !prescanned_symbols {
+                    prescanned_symbols = true;
+                    let mut scan_pos = pos;
+                    while scan_pos < len {
+                        let (sf, sw) = read_key(input, &mut scan_pos)?;
+                        if sf == 4 {
+                            if sw != 2 {
+                                return Err(DecodeError::InvalidWireType {
+                                    field: 4,
+                                    wire_type: sw,
+                                });
+                            }
+                            let sym_range = read_length_delimited_range(input, &mut scan_pos)?;
+                            let sym_str = std::str::from_utf8(&input[sym_range])
+                                .map_err(|_| DecodeError::InvalidUtf8)?;
+                            if !seen_first_symbol && !sym_str.is_empty() {
+                                return Err(DecodeError::InvalidFirstSymbol);
+                            }
+                            seen_first_symbol = true;
+                            resolved.push(Some(sym_str));
+                        } else {
+                            skip_field(input, &mut scan_pos, sw)?;
+                        }
+                    }
+                    if resolved.is_empty() && rw2_offset == 0 {
+                        resolved.push(Some(""));
+                    }
+                }
+                let series = decode_timeseries_rw2_stream(
+                    input,
+                    sub,
+                    rw2_offset,
+                    common_symbols,
+                    resolved,
+                    &opts,
+                    scratch,
+                    label_bytes_arena,
+                    samples_arena,
+                    meta_out,
+                    source,
+                    skip_label_validation,
+                )?;
+                emitted_any_series = true;
+                on_series(series);
+            }
+            1000 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 1000,
+                        wire_type,
+                    });
+                }
+                let val = read_varint(input, &mut pos)? != 0;
+                if emitted_any_series && val != skip_label_validation {
+                    header_changed_after_series = true;
+                }
+                skip_label_validation = val;
+            }
+            1001 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 1001,
+                        wire_type,
+                    });
+                }
+                skip_label_count_validation = read_varint(input, &mut pos)? != 0;
+            }
+            _ => {
+                skip_field(input, &mut pos, wire_type)?;
+            }
+        }
+    }
+
+    Ok(StreamedRw2Header {
+        source,
+        skip_label_validation,
+        skip_label_count_validation,
+        header_changed_after_series,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_timeseries_rw2_stream<'v, 'a>(
+    input: &'a [u8],
+    range: Range<usize>,
+    symbol_offset: u32,
+    common_symbols: &'a [&'a str],
+    resolved: &[Option<&'a str>],
+    opts: &DecodeOptions<'a>,
+    scratch: &'v mut WriteRequestScratch,
+    label_bytes_arena: &'v mut Vec<u8>,
+    samples_arena: &mut Vec<cortexpb::Sample>,
+    meta_out: &mut Vec<BorrowedMetadata<'a>>,
+    source: i32,
+    skip_label_validation: bool,
+) -> Result<StreamedRw2Series<'v, 'a>, DecodeError> {
+    let label_bytes_start = label_bytes_arena.len();
+    let samples_start = samples_arena.len();
+    let exemplars_start = scratch.exemplars.len();
+    let histograms_start = scratch.histograms.len();
+    let mut created_timestamp = 0i64;
+    let mut min_sample_ts = i64::MAX;
+    let mut metric_name: &'a str = "";
+    let mut prev_name: Option<&'a str> = None;
+    let mut labels_sorted_unique = true;
+
+    let mut pos = range.start;
+    let end = range.end;
+    while pos < end {
+        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        match field_num {
+            1 => {
+                if wire_type == 0 {
+                    let _ = read_varint_bounded(input, &mut pos, end)?;
+                    return Err(DecodeError::OddNumberOfLabelRefs);
+                } else if wire_type == 2 {
+                    let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                    let mut p = packed.start;
+                    label_bytes_arena.reserve((packed.end - p).saturating_mul(16).max(64));
+                    while p < packed.end {
+                        let name_idx = read_varint_bounded(input, &mut p, packed.end)? as usize;
+                        if p >= packed.end {
+                            return Err(DecodeError::OddNumberOfLabelRefs);
+                        }
+                        let val_idx = read_varint_bounded(input, &mut p, packed.end)? as usize;
+                        let k = *resolved
+                            .get(name_idx)
+                            .and_then(|o| o.as_ref())
+                            .ok_or(DecodeError::InvalidLabelRef {
+                                index: name_idx as u32,
+                                offset: symbol_offset,
+                            })?;
+                        let v = *resolved
+                            .get(val_idx)
+                            .and_then(|o| o.as_ref())
+                            .ok_or(DecodeError::InvalidLabelRef {
+                                index: val_idx as u32,
+                                offset: symbol_offset,
+                            })?;
+                        if metric_name.is_empty() && k == "__name__" {
+                            metric_name = v;
+                        }
+                        if let Some(pn) = prev_name {
+                            if pn >= k {
+                                labels_sorted_unique = false;
+                            }
+                        }
+                        prev_name = Some(k);
+                        if !v.is_empty() {
+                            append_stringlabel_pair_proto(
+                                label_bytes_arena,
+                                k.as_bytes(),
+                                v.as_bytes(),
+                            );
+                        }
+                    }
+                } else {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 1,
+                        wire_type,
+                    });
+                }
+            }
+            2 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 2,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                let sample = decode_sample(input, sub)?;
+                min_sample_ts = min_sample_ts.min(sample.timestamp_ms);
+                samples_arena.push(sample);
+            }
+            3 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 3,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                let hist = decode_histogram(input, sub, scratch)?;
+                scratch.histograms.push(hist);
+            }
+            4 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 4,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                if !opts.skip_unmarshaling_exemplars {
+                    let ex = decode_exemplar_rw2_resolved(
+                        input,
+                        sub,
+                        symbol_offset,
+                        resolved,
+                        scratch,
+                    )?;
+                    scratch.exemplars.push(ex);
+                }
+            }
+            5 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 5,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                decode_metadata_rw2_stream(
+                    input,
+                    sub,
+                    symbol_offset,
+                    resolved,
+                    metric_name,
+                    opts,
+                    scratch,
+                    meta_out,
+                )?;
+            }
+            6 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 6,
+                        wire_type,
+                    });
+                }
+                created_timestamp = read_varint_bounded(input, &mut pos, end)? as i64;
+            }
+            _ => {
+                skip_field_bounded(input, &mut pos, end, wire_type)?;
+            }
+        }
+    }
+
+    let label_bytes_end = label_bytes_arena.len();
+    let encoded_labels = &label_bytes_arena[label_bytes_start..label_bytes_end];
+    Ok(StreamedRw2Series {
+        label_bytes_range: label_bytes_start..label_bytes_end,
+        encoded_labels,
+        labels_sorted_unique,
+        samples_range: samples_start..samples_arena.len(),
+        min_sample_ts,
+        created_timestamp,
+        histograms_range: histograms_start..scratch.histograms.len(),
+        exemplars_range: exemplars_start..scratch.exemplars.len(),
+        source,
+        skip_label_validation,
+        scratch,
+        input,
+        common_symbols,
+    })
+}
+
+#[inline]
+fn str_to_slice_ref(s: &str, idx: usize, symbol_offset: u32, input: &[u8]) -> SliceRef {
+    if s.is_empty() {
+        SliceRef::Empty
+    } else if idx < symbol_offset as usize {
+        SliceRef::Common {
+            idx: idx as u32,
+            len: s.len() as u32,
+        }
+    } else {
+        let start = (s.as_ptr() as usize) - (input.as_ptr() as usize);
+        SliceRef::Input {
+            start: start as u32,
+            len: s.len() as u32,
+        }
+    }
+}
+
+fn decode_exemplar_rw2_resolved<'a>(
+    input: &'a [u8],
+    range: Range<usize>,
+    symbol_offset: u32,
+    resolved: &[Option<&'a str>],
+    scratch: &mut WriteRequestScratch,
+) -> Result<ExemplarMeta, DecodeError> {
+    let labels_start = scratch.exemplar_labels.len();
+    let mut value = 0.0f64;
+    let mut timestamp_ms = 0i64;
+    let mut pos = range.start;
+    let end = range.end;
+    while pos < end {
+        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        match field_num {
+            1 => {
+                if wire_type == 0 {
+                    let _ = read_varint_bounded(input, &mut pos, end)?;
+                    return Err(DecodeError::OddNumberOfExemplarLabelRefs);
+                } else if wire_type == 2 {
+                    let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                    let mut p = packed.start;
+                    while p < packed.end {
+                        let name_idx = read_varint_bounded(input, &mut p, packed.end)? as usize;
+                        if p >= packed.end {
+                            return Err(DecodeError::OddNumberOfExemplarLabelRefs);
+                        }
+                        let val_idx = read_varint_bounded(input, &mut p, packed.end)? as usize;
+                        let k = *resolved
+                            .get(name_idx)
+                            .and_then(|o| o.as_ref())
+                            .ok_or(DecodeError::InvalidExemplarLabelRef {
+                                index: name_idx as u32,
+                                offset: symbol_offset,
+                            })?;
+                        let v = *resolved
+                            .get(val_idx)
+                            .and_then(|o| o.as_ref())
+                            .ok_or(DecodeError::InvalidExemplarLabelRef {
+                                index: val_idx as u32,
+                                offset: symbol_offset,
+                            })?;
+                        scratch.exemplar_labels.push(LabelRefPair {
+                            name: str_to_slice_ref(k, name_idx, symbol_offset, input),
+                            value: str_to_slice_ref(v, val_idx, symbol_offset, input),
+                        });
+                    }
+                } else {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 1,
+                        wire_type,
+                    });
+                }
+            }
+            2 => {
+                if wire_type != 1 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 2,
+                        wire_type,
+                    });
+                }
+                value = read_f64_bounded(input, &mut pos, end)?;
+            }
+            3 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 3,
+                        wire_type,
+                    });
+                }
+                timestamp_ms = read_varint_bounded(input, &mut pos, end)? as i64;
+            }
+            _ => {
+                skip_field_bounded(input, &mut pos, end, wire_type)?;
+            }
+        }
+    }
+    Ok(ExemplarMeta {
+        labels: labels_start..scratch.exemplar_labels.len(),
+        value,
+        timestamp_ms,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_metadata_rw2_stream<'a>(
+    input: &'a [u8],
+    range: Range<usize>,
+    symbol_offset: u32,
+    resolved: &[Option<&'a str>],
+    metric_name: &'a str,
+    opts: &DecodeOptions<'a>,
+    scratch: &mut WriteRequestScratch,
+    meta_out: &mut Vec<BorrowedMetadata<'a>>,
+) -> Result<(), DecodeError> {
+    let mut metric_type = 0i32;
+    let mut help: &'a str = "";
+    let mut unit: &'a str = "";
+
+    let mut pos = range.start;
+    let end = range.end;
+    while pos < end {
+        let (field_num, wire_type) = read_key(input, &mut pos)?;
+        match field_num {
+            1 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 1,
+                        wire_type,
+                    });
+                }
+                metric_type = read_varint_bounded(input, &mut pos, end)? as i32;
+            }
+            3 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 3,
+                        wire_type,
+                    });
+                }
+                let help_ref = read_varint_bounded(input, &mut pos, end)? as usize;
+                help = *resolved
+                    .get(help_ref)
+                    .and_then(|o| o.as_ref())
+                    .ok_or(DecodeError::InvalidHelpRef {
+                        index: help_ref as u32,
+                        offset: symbol_offset,
+                    })?;
+            }
+            4 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 4,
+                        wire_type,
+                    });
+                }
+                let unit_ref = read_varint_bounded(input, &mut pos, end)? as usize;
+                unit = *resolved
+                    .get(unit_ref)
+                    .and_then(|o| o.as_ref())
+                    .ok_or(DecodeError::InvalidUnitRef {
+                        index: unit_ref as u32,
+                        offset: symbol_offset,
+                    })?;
+            }
+            _ => {
+                skip_field_bounded(input, &mut pos, end, wire_type)?;
+            }
+        }
+    }
+
+    let normalized_name = if opts.skip_normalize_metadata_metric_name {
+        metric_name
+    } else {
+        normalize_metric_name(metric_name, metric_type)
+    };
+    if normalized_name.is_empty() {
+        return Ok(());
+    }
+    if unit.is_empty() && help.is_empty() && metric_type == 0 {
+        return Ok(());
+    }
+
+    if !opts.skip_deduplicate_metadata {
+        let h = fnv64a(normalized_name.as_bytes());
+        let bucket = scratch.dedup_hashes.entry(h).or_default();
+        for &existing_idx in bucket.iter() {
+            if meta_out[existing_idx].metric_family_name == normalized_name {
+                return Ok(());
+            }
+        }
+        let idx = meta_out.len();
+        bucket.push(idx);
+    }
+
+    meta_out.push(BorrowedMetadata {
+        metric_type,
+        metric_family_name: normalized_name,
+        help,
+        unit,
+    });
+    Ok(())
+}
+
 fn decode_timeseries_rw1(
     input: &[u8],
     range: Range<usize>,
@@ -1079,11 +1801,35 @@ fn decode_label_pair(input: &[u8], range: Range<usize>) -> Result<LabelRefPair, 
     Ok(LabelRefPair { name, value })
 }
 
+#[inline(always)]
 fn decode_sample(input: &[u8], range: Range<usize>) -> Result<cortexpb::Sample, DecodeError> {
+    let pos = range.start;
+    let end = range.end;
+    if pos + 10 <= end && input[pos] == 0x09 && input[pos + 9] == 0x10 {
+        let bytes: [u8; 8] = input[pos + 1..pos + 9]
+            .try_into()
+            .map_err(|_| DecodeError::UnexpectedEof)?;
+        let value = f64::from_le_bytes(bytes);
+        let mut p = pos + 10;
+        let ts = read_varint_bounded(input, &mut p, end)?;
+        if p == end {
+            return Ok(cortexpb::Sample {
+                value,
+                timestamp_ms: ts as i64,
+            });
+        }
+    }
+    decode_sample_slow(input, pos, end)
+}
+
+#[inline(never)]
+fn decode_sample_slow(
+    input: &[u8],
+    mut pos: usize,
+    end: usize,
+) -> Result<cortexpb::Sample, DecodeError> {
     let mut value = 0.0f64;
     let mut timestamp_ms = 0i64;
-    let mut pos = range.start;
-    let end = range.end;
     while pos < end {
         let (field_num, wire_type) = read_key(input, &mut pos)?;
         match field_num {
@@ -1894,9 +2640,9 @@ fn resolve_symbol_ref(
     rw2_symbols.get(idx).copied()
 }
 
-#[inline]
+#[inline(always)]
 fn read_key(input: &[u8], pos: &mut usize) -> Result<(u32, u8), DecodeError> {
-    let wire = read_varint(input, pos)?;
+    let wire = read_varint_bounded(input, pos, input.len())?;
     let field_num = (wire >> 3) as u32;
     let wire_type = (wire & 0x7) as u8;
     if wire_type == 4 || wire_type == 3 || wire_type > 5 {
@@ -1937,18 +2683,25 @@ fn read_varint(input: &[u8], pos: &mut usize) -> Result<u64, DecodeError> {
 
 #[inline(always)]
 fn read_varint_bounded(input: &[u8], pos: &mut usize, end: usize) -> Result<u64, DecodeError> {
-    if *pos < end {
-        let b = input[*pos];
-        if b < 0x80 {
-            *pos += 1;
-            return Ok(b as u64);
+    let p = *pos;
+    if p < end {
+        let b0 = input[p];
+        if b0 < 0x80 {
+            *pos = p + 1;
+            return Ok(b0 as u64);
+        }
+        if p + 1 < end {
+            let b1 = input[p + 1];
+            if b1 < 0x80 {
+                *pos = p + 2;
+                return Ok(((b0 & 0x7f) as u64) | ((b1 as u64) << 7));
+            }
         }
         return read_varint_bounded_slow(input, pos, end);
     }
     Err(DecodeError::UnexpectedEof)
 }
 
-#[cold]
 #[inline(never)]
 fn read_varint_bounded_slow(
     input: &[u8],
@@ -1977,20 +2730,21 @@ fn read_varint_bounded_slow(
     }
 }
 
-#[inline]
+#[inline(always)]
 fn read_f64_bounded(input: &[u8], pos: &mut usize, end: usize) -> Result<f64, DecodeError> {
-    let next = pos.checked_add(8).ok_or(DecodeError::UnexpectedEof)?;
-    if next > end {
+    let p = *pos;
+    if end - p < 8 {
         return Err(DecodeError::UnexpectedEof);
     }
-    let bytes: [u8; 8] = input[*pos..next]
+    let next = p + 8;
+    let bytes: [u8; 8] = input[p..next]
         .try_into()
         .map_err(|_| DecodeError::UnexpectedEof)?;
     *pos = next;
     Ok(f64::from_le_bytes(bytes))
 }
 
-#[inline]
+#[inline(always)]
 fn read_length_delimited_range(
     input: &[u8],
     pos: &mut usize,
@@ -1998,7 +2752,7 @@ fn read_length_delimited_range(
     read_length_delimited_range_bounded(input, pos, input.len())
 }
 
-#[inline]
+#[inline(always)]
 fn read_length_delimited_range_bounded(
     input: &[u8],
     pos: &mut usize,
@@ -2006,10 +2760,11 @@ fn read_length_delimited_range_bounded(
 ) -> Result<Range<usize>, DecodeError> {
     let len = read_varint_bounded(input, pos, end)? as usize;
     let start = *pos;
-    let next = start.checked_add(len).ok_or(DecodeError::UnexpectedEof)?;
-    if next > end {
+    let avail = end - start;
+    if len > avail {
         return Err(DecodeError::UnexpectedEof);
     }
+    let next = start + len;
     *pos = next;
     Ok(start..next)
 }
@@ -2548,5 +3303,109 @@ mod tests {
         assert!(dec2.labels_utf8_validated);
         let pairs: Vec<_> = dec2.timeseries_at(0).labels_str().unwrap().collect();
         assert_eq!(pairs, vec![("__name__", "up"), ("job", "api")]);
+    }
+
+    #[test]
+    fn test_decode_rw2_stream_matches_borrowed_decode() {
+        let rw1 = cortexpb::WriteRequest {
+            timeseries: vec![
+                cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_static("__name__", "http_requests_total"),
+                        cortexpb::LabelPair::from_static("empty", ""),
+                        cortexpb::LabelPair::from_static("job", "api"),
+                    ],
+                    samples: vec![
+                        cortexpb::Sample {
+                            value: 1.5,
+                            timestamp_ms: 1_700_000_000_000,
+                        },
+                        cortexpb::Sample {
+                            value: 2.5,
+                            timestamp_ms: 1_700_000_015_000,
+                        },
+                    ],
+                    exemplars: vec![cortexpb::Exemplar {
+                        labels: vec![cortexpb::LabelPair::from_static("trace_id", "xyz")],
+                        value: 0.75,
+                        timestamp_ms: 1_700_000_015_000,
+                    }],
+                    created_timestamp: 1_699_999_000_000,
+                    ..Default::default()
+                },
+                cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_static("z", "1"),
+                        cortexpb::LabelPair::from_static("a", "2"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        value: 3.0,
+                        timestamp_ms: 1_700_000_000_500,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            source: cortexpb::write_request::SourceEnum::Rule as i32,
+            metadata: vec![cortexpb::MetricMetadata {
+                r#type: cortexpb::metric_metadata::MetricType::Counter as i32,
+                metric_family_name: "http_requests_total".to_string(),
+                help: "total".to_string(),
+                unit: "requests".to_string(),
+            }],
+            skip_label_validation: true,
+            ..Default::default()
+        };
+
+        let mut kv2_wire = Vec::new();
+        encode_write_request_rw2_bytes(
+            &rw1,
+            V2_RECORD_SYMBOL_OFFSET,
+            Some(v2_common_symbols()),
+            &mut kv2_wire,
+        )
+        .unwrap();
+
+        let mut scratch = WriteRequestScratch::new();
+        let mut resolved_scratch = Rw2ResolvedScratch::new();
+        let mut label_bytes_arena = Vec::new();
+        let mut samples_arena = Vec::new();
+        let mut meta_out = Vec::new();
+        let mut series_meta = Vec::new();
+
+        let hdr = decode_rw2_stream(
+            &kv2_wire,
+            DecodeOptions::kafka_v2(),
+            &mut scratch,
+            &mut resolved_scratch,
+            &mut label_bytes_arena,
+            &mut samples_arena,
+            &mut meta_out,
+            |s| {
+                series_meta.push((
+                    s.label_bytes_range.clone(),
+                    s.labels_sorted_unique,
+                    s.samples_range.clone(),
+                    s.min_sample_ts,
+                    s.created_timestamp,
+                    s.exemplars_len(),
+                ));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(hdr.source, cortexpb::write_request::SourceEnum::Rule as i32);
+        assert!(hdr.skip_label_validation);
+        assert_eq!(series_meta.len(), 2);
+        assert!(series_meta[0].1); // sorted
+        assert!(!series_meta[1].1); // unsorted ("z", "a")
+        assert_eq!(series_meta[0].3, 1_700_000_000_000);
+        assert_eq!(series_meta[0].4, 1_699_999_000_000);
+        assert_eq!(series_meta[0].5, 1);
+        assert_eq!(
+            &samples_arena[series_meta[0].2.clone()],
+            &rw1.timeseries[0].samples[..]
+        );
+        assert_eq!(meta_out.len(), 1);
+        assert_eq!(meta_out[0].metric_family_name, "http_requests_total");
     }
 }

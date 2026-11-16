@@ -2246,64 +2246,93 @@ async fn run_engine(
             let mut rec_idx = 0usize;
             let mut next_tick = Instant::now();
 
-            // Pre-spawn encoder thread so producer stays paced accurately without jitter
+            let spawn_encode_batch =
+                |sc_in: usize, ca_in: f64, cid_in: usize, r_in: usize, do_ooo: bool| {
+                    let lay_enc = Arc::clone(&lay_c);
+                    let ts_enc = Arc::clone(&ts_atomic);
+                    // Advance deterministic cursor state synchronously so pipelined batches stay ordered.
+                    let mut sc = sc_in;
+                    let mut ca = ca_in;
+                    let mut cid_next = cid_in;
+                    let mut r_idx = r_in;
+                    let mut batch_plan = Vec::with_capacity(batch_records);
+                    for _ in 0..batch_records {
+                        let tenant = if (r_idx % 200) == 199 { "preprod" } else { "prod" };
+                        let round = sc / base_series;
+                        let base_ts =
+                            t_p1_c2 + 15_000 + (round as i64) * 15_000 + ((r_idx % 1000) as i64);
+                        ts_enc.fetch_max(base_ts, Ordering::Relaxed);
+                        ca += churn_per_sec / records_per_sec;
+                        let churn_here = if ca >= 1.0 {
+                            ca -= 1.0;
+                            1usize
+                        } else {
+                            0usize
+                        };
+                        let mut pts = Vec::with_capacity(SAMPLES_PER_RECORD);
+                        for j in 0..SAMPLES_PER_RECORD {
+                            let s_id = if j == 0 && churn_here > 0 {
+                                let cid = cid_next;
+                                cid_next += 1;
+                                cid
+                            } else {
+                                let id = sc % base_series;
+                                sc += 1;
+                                id
+                            };
+                            let ts = if do_ooo && j == 1 && r_idx.is_multiple_of(3) {
+                                base_ts - 4 * 60 * 1000
+                            } else {
+                                base_ts
+                            };
+                            pts.push((s_id, ts, (round as f64) * 2.0 + (s_id as f64) * 0.01));
+                        }
+                        let meta_off = (r_idx * METADATA_PER_RECORD) % NUM_METRIC_FAMILIES;
+                        batch_plan.push((tenant, pts, meta_off));
+                        r_idx += 1;
+                    }
+                    let fut = tokio::task::spawn_blocking(move || {
+                        let mut precs = Vec::with_capacity(batch_records);
+                        let mut batch_samples = 0usize;
+                        for (tenant, pts, meta_off) in batch_plan {
+                            batch_samples += pts.len();
+                            let (pr, _) = encode_v2_record(&lay_enc, tenant, &pts, meta_off);
+                            precs.push(pr);
+                        }
+                        (precs, batch_samples)
+                    });
+                    (fut, sc, ca, cid_next, r_idx)
+                };
+
+            let mut inflight = VecDeque::with_capacity(4);
             while !stop_c.load(Ordering::Relaxed) {
+                while inflight.len() < 3 {
+                    let do_ooo = !ooo_pause_c.load(Ordering::Relaxed);
+                    let (fut, sc, ca, cid, r) =
+                        spawn_encode_batch(series_cursor, churn_accum, next_churn_id, rec_idx, do_ooo);
+                    series_cursor = sc;
+                    churn_accum = ca;
+                    next_churn_id = cid;
+                    rec_idx = r;
+                    inflight.push_back(fut);
+                }
+
                 let now_i = Instant::now();
                 if next_tick > now_i {
                     tokio::time::sleep(next_tick - now_i).await;
+                } else {
+                    tokio::task::yield_now().await;
                 }
                 next_tick += batch_interval;
                 if stop_c.load(Ordering::Relaxed) {
                     break;
                 }
 
-                let do_ooo = !ooo_pause_c.load(Ordering::Relaxed);
-                let mut precs = Vec::with_capacity(batch_records);
-                let mut batch_samples = 0usize;
-
-                for _ in 0..batch_records {
-                    let tenant = if (rec_idx % 200) == 199 { "preprod" } else { "prod" };
-                    let mut pts = Vec::with_capacity(SAMPLES_PER_RECORD);
-                    let round = series_cursor / base_series;
-                    let base_ts = t_p1_c2 + 15_000 + (round as i64) * 15_000 + ((rec_idx % 1000) as i64);
-                    ts_atomic.fetch_max(base_ts, Ordering::Relaxed);
-
-                    churn_accum += churn_per_sec / records_per_sec;
-                    let churn_here = if churn_accum >= 1.0 {
-                        churn_accum -= 1.0;
-                        1usize
-                    } else {
-                        0usize
-                    };
-
-                    for j in 0..SAMPLES_PER_RECORD {
-                        let s_id = if j == 0 && churn_here > 0 {
-                            let cid = next_churn_id;
-                            next_churn_id += 1;
-                            cid
-                        } else {
-                            let id = series_cursor % base_series;
-                            series_cursor += 1;
-                            id
-                        };
-                        // 0.07% OOO: 1 sample in ~35% of 500-sample records = 0.07%
-                        let ts = if do_ooo && j == 1 && rec_idx.is_multiple_of(3) {
-                            base_ts - 4 * 60 * 1000 // 4 minutes behind head maxt
-                        } else {
-                            base_ts
-                        };
-                        pts.push((s_id, ts, (round as f64) * 2.0 + (s_id as f64) * 0.01));
-                    }
-                    batch_samples += pts.len();
-                    let (pr, _) = encode_v2_record(
-                        &lay_c,
-                        tenant,
-                        &pts,
-                        (rec_idx * METADATA_PER_RECORD) % NUM_METRIC_FAMILIES,
-                    );
-                    precs.push(pr);
-                    rec_idx += 1;
-                }
+                let (precs, batch_samples) = inflight
+                    .pop_front()
+                    .unwrap()
+                    .await
+                    .expect("encode_v2_record task");
 
                 sink_c.produce_batch(precs, true).await;
                 sent_ctr.fetch_add(batch_samples, Ordering::Relaxed);

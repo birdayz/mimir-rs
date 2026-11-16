@@ -61,21 +61,21 @@ Measured via `just bench-vs-go` (`100k` float + `2k` histogram series, 5 tenants
 
 | Phase / Metric | Go `go-mimir` | Rust `mimir-rs` | Improvement (Go vs Rust) |
 |----------------|---------------|-----------------|--------------------------|
-| Pure write-only steady CPU (`--no-reads`) | 4.22 µs/sample | 2.19 µs/sample | **1.92x** (**48.0% less CPU**) |
-| Pure write-only Kafka proc p50 / p99 | 12.46 ms / 48.15 ms | 2.59 ms / 18.94 ms | **4.81x** p50 / **2.54x** p99 |
-| Phase 1 Catch-up (`2.4M` samples, reads ON) | 14.19 s (35.96 s CPU) | 13.17 s (25.65 s CPU) | **1.08x** faster (**1.40x** less CPU) |
-| Phase 1 `RssAnon` | 2,936.1 MiB (1,539 B/series) | 2,179.7 MiB (1,143 B/series) | **1.35x** (**25.8% less heap**) |
-| Phase 2 Steady CPU (reads ON) | 6.47 µs/sample | 2.86 µs/sample | **2.26x** (**55.7% less CPU**) |
-| Phase 2 Steady `RssAnon` | 5,431.3 MiB (2,712 B/series) | 2,539.9 MiB (1,274 B/series) | **2.14x** (**53.2% less heap RAM**) |
-| `QueryStream` small (`~7 series`) p50 / p99 | 0.53 ms / 1.95 ms | 0.41 ms / 1.36 ms | **1.29x** p50 / **1.44x** p99 |
-| `QueryStream` heavy (`~28k series`) p50 / p99 | 641.60 ms / 1,254.84 ms | 241.94 ms / 289.78 ms | **2.65x** p50 / **4.33x** p99 |
-| `LabelNamesAndValues` p50 | 1,768.26 ms | 590.31 ms | **3.00x** faster |
-| `LabelValuesCardinality` p50 | 742.23 ms | 152.95 ms | **4.85x** faster |
-| Phase 3 Head Compaction wall | 34.22 s | 25.42 s | **1.35x** faster |
-| Phase 3 Peak `RssAnon` (sawtooth) | 6,545.3 MiB (+1,114.0 MiB) | 2,686.1 MiB (+145.9 MiB) | **2.44x** (**59.0% less peak RAM**) |
-| Phase 4 `SIGKILL` `/ready` / `0-lag` catch-up | 14.03 s / 34.79 s | 12.09 s / 24.33 s | **1.16x** `/ready` / **1.43x** catch-up |
+| Pure write-only steady CPU (`--no-reads`) | 3.96 µs/sample | 2.05 µs/sample | **1.94x** (**48.4% less CPU**) |
+| Pure write-only Kafka proc p50 / p99 | 7.52 ms / 9.99 ms | 2.54 ms / 8.92 ms | **2.96x** p50 / **1.12x** p99 |
+| Phase 1 Catch-up (`2.4M` samples, reads ON) | 13.92 s (33.68 s CPU) | 10.23 s (21.10 s CPU) | **1.36x** faster (**1.60x** less CPU) |
+| Phase 1 `RssAnon` | 2,885.8 MiB (1,513 B/series) | 2,320.5 MiB (1,217 B/series) | **1.24x** (**19.6% less heap**) |
+| Phase 2 Steady CPU (reads ON) | 6.15 µs/sample | 2.51 µs/sample | **2.45x** (**59.2% less CPU**) |
+| Phase 2 Steady `RssAnon` | 5,690.0 MiB (2,840 B/series) | 2,651.3 MiB (1,330 B/series) | **2.15x** (**53.4% less heap RAM**) |
+| `QueryStream` small (`~7 series`) p50 / p99 | 0.51 ms / 1.02 ms | 0.37 ms / 0.59 ms | **1.38x** p50 / **1.74x** p99 |
+| `QueryStream` heavy (`~28k series`) p50 / p99 | 609.63 ms / 919.57 ms | 228.43 ms / 244.50 ms | **2.67x** p50 / **3.76x** p99 |
+| `LabelNamesAndValues` p50 | 1,714.35 ms | 540.06 ms | **3.17x** faster |
+| `LabelValuesCardinality` p50 | 763.35 ms | 130.27 ms | **5.86x** faster |
+| Phase 3 Head Compaction wall | 33.07 s | 22.63 s | **1.46x** faster |
+| Phase 3 Peak `RssAnon` (sawtooth) | 7,270.1 MiB (+1,580.1 MiB) | 3,122.3 MiB (+472.0 MiB) | **2.33x** (**57.1% less peak RAM**) |
+| Phase 4 `SIGKILL` `/ready` / `0-lag` catch-up | 11.86 s / 26.53 s | 11.32 s / 19.36 s | **1.05x** `/ready` / **1.37x** catch-up |
 
-Go `/debug/pprof/heap -inuse_space` after Phase 1 preload (`2M` series): `1,513.85 MB` live heap vs `2,936.1 MiB` OS `RssAnon` (`~1,422.3 MiB` `GOGC=100` GC headroom; climbs to `5,431.3 MiB` in steady state).
+Go `/debug/pprof/heap -inuse_space` after Phase 1 preload (`2M` series): `1,471.23 MB` live heap vs `2,885.8 MiB` OS `RssAnon` (`~1,414.6 MiB` `GOGC=100` GC headroom; climbs to `5,690.0 MiB` in steady state).
 
 ## Quickstart
 
@@ -84,6 +84,22 @@ Build the release binary (`target/release/mimir`) and run workspace tests:
 ```bash
 just build-release
 just test
+```
+
+### Docker & Kubernetes Drop-In Image (GHCR)
+
+Multi-architecture (`linux/amd64` and `linux/arm64`) distroless images (`gcr.io/distroless/cc-debian13`, UID/GID `10001:10001`, `/bin/mimir` entrypoint, `/data` pre-owned by `10001:10001`) are published automatically on pushes to `main`:
+
+```bash
+docker pull ghcr.io/birdayz/mimir-rs:<git-sha>
+# or floating main tag:
+docker pull ghcr.io/birdayz/mimir-rs:main
+```
+
+Build locally with:
+
+```bash
+just docker-build
 ```
 
 ### Go Oracle Conformance & Benchmarks

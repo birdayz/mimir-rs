@@ -37,7 +37,7 @@ impl Label {
 /// - `len < 255`: 1 byte (`len as u8`)
 /// - `255 <= len <= 2^24`: `[255, le0, le1, le2]`
 #[inline]
-pub(crate) fn encode_stringlabel_size(buf: &mut Vec<u8>, len: usize) {
+pub fn encode_stringlabel_size(buf: &mut Vec<u8>, len: usize) {
     if len < 255 {
         buf.push(len as u8);
     } else {
@@ -47,6 +47,46 @@ pub(crate) fn encode_stringlabel_size(buf: &mut Vec<u8>, len: usize) {
         buf.push(((len >> 8) & 0xff) as u8);
         buf.push(((len >> 16) & 0xff) as u8);
     }
+}
+
+/// Appends a single `(name, value)` pair in Prometheus `stringlabels` flat byte encoding.
+#[inline(always)]
+pub fn append_stringlabel_pair(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    let klen = name.len();
+    let vlen = value.len();
+    if klen < 255 && vlen < 255 {
+        let need = 2 + klen + vlen;
+        buf.reserve(need);
+        let start = buf.len();
+        // SAFETY: `reserve(need)` ensures capacity >= start + need, and `klen < 255 && vlen < 255`.
+        unsafe {
+            let ptr = buf.as_mut_ptr().add(start);
+            *ptr = klen as u8;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), ptr.add(1), klen);
+            *ptr.add(1 + klen) = vlen as u8;
+            std::ptr::copy_nonoverlapping(value.as_ptr(), ptr.add(2 + klen), vlen);
+            buf.set_len(start + need);
+        }
+    } else {
+        append_stringlabel_pair_slow(buf, name, value);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn append_stringlabel_pair_slow(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    encode_stringlabel_size(buf, name.len());
+    buf.extend_from_slice(name);
+    encode_stringlabel_size(buf, value.len());
+    buf.extend_from_slice(value);
+}
+
+/// Iterates over `(name, value)` pairs inside a raw Prometheus `stringlabels` byte slice.
+///
+/// Caller must ensure `data` was produced from valid UTF-8 `stringlabels` pairs.
+#[inline]
+pub fn iter_stringlabels(data: &[u8]) -> LabelsIter<'_> {
+    LabelsIter { data, pos: 0 }
 }
 
 #[inline]
@@ -632,5 +672,25 @@ mod tests {
             assert!(kp >= base_start && kp + k.len() <= base_end);
             assert!(vp >= base_start && vp + v.len() <= base_end);
         }
+    }
+
+    #[test]
+    fn append_stringlabel_pair_and_iter_parity() {
+        let long_val = "v".repeat(300);
+        let pairs = [
+            ("__name__", "http_requests_total"),
+            ("instance", "10.0.0.1:9090"),
+            ("job", "api"),
+            ("long", long_val.as_str()),
+        ];
+        let mut buf = Vec::new();
+        for &(k, v) in &pairs {
+            append_stringlabel_pair(&mut buf, k.as_bytes(), v.as_bytes());
+        }
+        let expected = Labels::from_sorted_slice(&pairs);
+        assert_eq!(buf.as_slice(), expected.as_bytes());
+        assert_eq!(xxh64(&buf, 0), expected.hash());
+        let decoded: Vec<(&str, &str)> = iter_stringlabels(&buf).collect();
+        assert_eq!(decoded, pairs);
     }
 }

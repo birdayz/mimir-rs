@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, O
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use hashbrown::HashTable;
 use parking_lot::{Mutex, RwLock};
 use prometheus::core::{Collector, Desc};
@@ -43,7 +44,7 @@ use crate::head_chunks::{
     ChunkDiskMapperRef, HeadChunksError, HeadChunksReader, HeadChunksWriter,
     MAX_HEAD_CHUNK_FILE_SIZE,
 };
-use crate::labels::{encode_stringlabel_size, Labels, SymbolLabels, METRIC_NAME};
+use crate::labels::{encode_stringlabel_size, iter_stringlabels, Labels, SymbolLabels, METRIC_NAME};
 use crate::metadata::{MetadataError, MetadataLimits, UserMetricsMetadata};
 use crate::postings::{
     postings_for_matchers, MemPostings, PostingsBatchScratch, PostingsError,
@@ -1243,7 +1244,7 @@ impl SeriesState {
 }
 
 struct SeriesStripe {
-    by_hash: HashTable<Arc<SeriesEntry>>,
+    by_hash: HashTable<(u64, Arc<SeriesEntry>)>,
     by_id: FastU64Map<Arc<SeriesEntry>>,
 }
 
@@ -1290,10 +1291,22 @@ impl StripeSeries {
         let stripe = self.stripes[idx].read();
         stripe
             .by_hash
-            .find(hash, |entry| {
-                entry.hash == hash && entry.labels.eq_sorted_pairs(pairs)
+            .find(hash, |&(h, ref entry)| {
+                h == hash && entry.labels.eq_sorted_pairs(pairs)
             })
-            .cloned()
+            .map(|(_, entry)| Arc::clone(entry))
+    }
+
+    #[inline]
+    fn get_by_encoded_labels(&self, hash: u64, encoded_labels: &[u8]) -> Option<Arc<SeriesEntry>> {
+        let idx = self.stripe_idx(hash);
+        let stripe = self.stripes[idx].read();
+        stripe
+            .by_hash
+            .find(hash, |&(h, ref entry)| {
+                h == hash && entry.labels.as_bytes() == encoded_labels
+            })
+            .map(|(_, entry)| Arc::clone(entry))
     }
 
     fn resolve_prehashed_batch<T>(
@@ -1316,8 +1329,8 @@ impl StripeSeries {
         while start < n {
             let end = (start + CHUNK).min(n);
 
-            // Pass 1: prefetch stripes ahead, probe H2 tag in HashTable, clone candidate,
-            // and prefetch `labels.as_bytes()` + `SeriesState` for Pass 2.
+            // Pass 1: prefetch stripes ahead, probe H2 + inline 64-bit `h` in HashTable,
+            // clone candidate, and prefetch `labels.as_bytes()` + `SeriesState` for Pass 2.
             for i in start..end {
                 if i + STRIPE_PREFETCH_AHEAD < end {
                     if let Some((h_ahead, _)) = get_hp(&items[i + STRIPE_PREFETCH_AHEAD]) {
@@ -1331,8 +1344,8 @@ impl StripeSeries {
                 let idx = self.stripe_idx(hash);
                 let stripe = self.stripes[idx].read();
                 let mut found: Option<Arc<SeriesEntry>> = None;
-                for cand in stripe.by_hash.iter_hash(hash) {
-                    if cand.hash == hash {
+                for &(h, ref cand) in stripe.by_hash.iter_hash(hash) {
+                    if h == hash {
                         found = Some(Arc::clone(cand));
                         break;
                     }
@@ -1366,13 +1379,83 @@ impl StripeSeries {
         }
     }
 
+    fn resolve_prehashed_encoded_batch<T>(
+        &self,
+        items: &[T],
+        get_he: impl Fn(&T) -> Option<(u64, &[u8])>,
+        out: &mut Vec<Option<Arc<SeriesEntry>>>,
+    ) {
+        out.clear();
+        let n = items.len();
+        if n == 0 {
+            return;
+        }
+        out.resize_with(n, || None);
+
+        const CHUNK: usize = 16;
+        const STRIPE_PREFETCH_AHEAD: usize = 4;
+
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + CHUNK).min(n);
+
+            // Pass 1: prefetch stripes ahead, probe H2 + inline 64-bit `h` in HashTable,
+            // clone candidate, and prefetch `labels.as_bytes()` + `SeriesState` for Pass 2.
+            for i in start..end {
+                if i + STRIPE_PREFETCH_AHEAD < end {
+                    if let Some((h_ahead, _)) = get_he(&items[i + STRIPE_PREFETCH_AHEAD]) {
+                        let idx_ahead = self.stripe_idx(h_ahead);
+                        prefetch_read_data(&self.stripes[idx_ahead]);
+                    }
+                }
+                let Some((hash, _)) = get_he(&items[i]) else {
+                    continue;
+                };
+                let idx = self.stripe_idx(hash);
+                let stripe = self.stripes[idx].read();
+                let mut found: Option<Arc<SeriesEntry>> = None;
+                for &(h, ref cand) in stripe.by_hash.iter_hash(hash) {
+                    if h == hash {
+                        found = Some(Arc::clone(cand));
+                        break;
+                    }
+                }
+                drop(stripe);
+                if let Some(cloned) = found {
+                    let ptr = Arc::as_ptr(&cloned);
+                    let lbl_bytes = cloned.labels.as_bytes();
+                    if !lbl_bytes.is_empty() {
+                        prefetch_read_data(lbl_bytes.as_ptr());
+                    }
+                    prefetch_read_data((ptr as *const u8).wrapping_add(64));
+                    out[i] = Some(cloned);
+                }
+            }
+
+            // Pass 2: verify `cand.labels.as_bytes() == encoded_labels` via single SIMD memcmp.
+            for i in start..end {
+                let Some((hash, encoded_labels)) = get_he(&items[i]) else {
+                    continue;
+                };
+                if let Some(ref cand) = out[i] {
+                    if cand.labels.as_bytes() == encoded_labels {
+                        continue;
+                    }
+                    out[i] = self.get_by_encoded_labels(hash, encoded_labels);
+                }
+            }
+
+            start = end;
+        }
+    }
+
     fn get_by_hash_and_labels(&self, hash: u64, labels: &Labels) -> Option<Arc<SeriesEntry>> {
         let idx = self.stripe_idx(hash);
         let stripe = self.stripes[idx].read();
         stripe
             .by_hash
-            .find(hash, |entry| entry.hash == hash && &entry.labels == labels)
-            .cloned()
+            .find(hash, |&(h, ref entry)| h == hash && &entry.labels == labels)
+            .map(|(_, entry)| Arc::clone(entry))
     }
 
     fn insert(&self, entry: Arc<SeriesEntry>) {
@@ -1383,12 +1466,13 @@ impl StripeSeries {
             let mut s = self.stripes[h_idx].write();
             s.by_id.insert(entry.ref_id, Arc::clone(&entry));
             let hash = entry.hash;
-            s.by_hash.insert_unique(hash, entry, |e| e.hash);
+            s.by_hash.insert_unique(hash, (hash, entry), |&(h, _)| h);
         } else {
             {
                 let mut hs = self.stripes[h_idx].write();
                 let hash = entry.hash;
-                hs.by_hash.insert_unique(hash, Arc::clone(&entry), |e| e.hash);
+                hs.by_hash
+                    .insert_unique(hash, (hash, Arc::clone(&entry)), |&(h, _)| h);
             }
             {
                 let mut rs = self.stripes[r_idx].write();
@@ -1406,7 +1490,9 @@ impl StripeSeries {
             s.by_id.remove(&entry.ref_id);
             if let Ok(found) = s
                 .by_hash
-                .find_entry(entry.hash, |e| e.ref_id == entry.ref_id)
+                .find_entry(entry.hash, |&(h, ref e)| {
+                    h == entry.hash && e.ref_id == entry.ref_id
+                })
             {
                 found.remove();
             }
@@ -1415,7 +1501,9 @@ impl StripeSeries {
                 let mut hs = self.stripes[h_idx].write();
                 if let Ok(found) = hs
                     .by_hash
-                    .find_entry(entry.hash, |e| e.ref_id == entry.ref_id)
+                    .find_entry(entry.hash, |&(h, ref e)| {
+                        h == entry.hash && e.ref_id == entry.ref_id
+                    })
                 {
                     found.remove();
                 }
@@ -1430,7 +1518,10 @@ impl StripeSeries {
     fn unlink_hash(&self, hash: u64, ref_id: u64) {
         let h_idx = self.stripe_idx(hash);
         let mut hs = self.stripes[h_idx].write();
-        if let Ok(found) = hs.by_hash.find_entry(hash, |e| e.ref_id == ref_id) {
+        if let Ok(found) = hs
+            .by_hash
+            .find_entry(hash, |&(h, ref e)| h == hash && e.ref_id == ref_id)
+        {
             found.remove();
         }
     }
@@ -3151,6 +3242,16 @@ impl Head {
         self.get_by_sorted_pairs(hash, pairs)
     }
 
+    /// Zero-allocation `SeriesEntry` lookup using precomputed `hash` and `stringlabels`-encoded bytes.
+    #[inline]
+    pub fn get_entry_by_prehashed_encoded_labels(
+        &self,
+        hash: u64,
+        encoded_labels: &[u8],
+    ) -> Option<Arc<SeriesEntry>> {
+        self.series.get_by_encoded_labels(hash, encoded_labels)
+    }
+
     /// Prefetches the `StripeSeries` stripe bucket for a precomputed `hash`.
     #[inline]
     pub fn prefetch_stripe_for_hash(&self, hash: u64) {
@@ -3166,6 +3267,17 @@ impl Head {
         out: &mut Vec<Option<Arc<SeriesEntry>>>,
     ) {
         self.series.resolve_prehashed_batch(items, get_hp, out);
+    }
+
+    /// Pipelined, software-prefetched batch resolution of prehashed `stringlabels`-encoded bytes.
+    pub fn resolve_prehashed_encoded_batch<T>(
+        &self,
+        items: &[T],
+        get_he: impl Fn(&T) -> Option<(u64, &[u8])>,
+        out: &mut Vec<Option<Arc<SeriesEntry>>>,
+    ) {
+        self.series
+            .resolve_prehashed_encoded_batch(items, get_he, out);
     }
 
     /// Iterates every live series `(ref_id, &Labels)` in Head.
@@ -3420,6 +3532,95 @@ impl Head {
             cb.post_creation(ref_id, &entry.labels);
         }
         Ok((entry, true))
+    }
+
+    /// Gets or creates a series directly from pre-encoded `stringlabels` bytes (ZERO re-encoding!).
+    fn get_or_create_encoded_labels(
+        &self,
+        hash: u64,
+        encoded_labels: &[u8],
+    ) -> Result<(Arc<SeriesEntry>, bool), HeadError> {
+        if let Some(existing) = self.series.get_by_encoded_labels(hash, encoded_labels) {
+            return Ok((existing, false));
+        }
+
+        let _creation_guard = self.series_creation_mtx.lock();
+        if let Some(existing) = self.series.get_by_encoded_labels(hash, encoded_labels) {
+            return Ok((existing, false));
+        }
+
+        let cb_opt = self.lifecycle_callback.read().clone();
+        if let Some(ref cb) = cb_opt {
+            let pairs_tmp: SmallVec<[(&str, &str); 24]> =
+                iter_stringlabels(encoded_labels).collect();
+            cb.pre_creation(&pairs_tmp)?;
+        }
+
+        let symbol_labels = self.intern_encoded_labels_read_first(encoded_labels);
+        let labels = Labels::from_raw_stringlabels_bytes(Bytes::copy_from_slice(encoded_labels));
+        let ref_id = self.last_series_id.fetch_add(1, Ordering::AcqRel) + 1;
+        let entry = Arc::new(SeriesEntry {
+            ref_id,
+            hash,
+            labels,
+            active_cache: AtomicU64::new(0),
+            in_order_max_time: AtomicI64::new(i64::MIN),
+            pending_commits: AtomicU32::new(0),
+            inner: Mutex::new(SeriesState::new()),
+        });
+        self.series.insert(Arc::clone(&entry));
+        self.postings.add(ref_id, &symbol_labels);
+        self.postings_cache
+            .invalidate_metric(entry.labels.get(METRIC_NAME));
+        self.num_series.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref g) = self.series_gauge {
+            g.inc();
+        }
+        if let Some(ref c) = self.series_created_total {
+            c.inc();
+        }
+        if let Some(ref cb) = cb_opt {
+            cb.post_creation(ref_id, &entry.labels);
+        }
+        Ok((entry, true))
+    }
+
+    fn intern_encoded_labels_read_first(&self, encoded_labels: &[u8]) -> SymbolLabels {
+        let mut missing = false;
+        let mut resolved: SmallVec<[(Option<SymbolId>, Option<SymbolId>); 24]> = SmallVec::new();
+        {
+            let syms = self.symbols.read();
+            for (k, v) in iter_stringlabels(encoded_labels) {
+                let kid = syms.get(k);
+                let vid = syms.get(v);
+                if kid.is_none() || vid.is_none() {
+                    missing = true;
+                }
+                resolved.push((kid, vid));
+            }
+        }
+        let interned: SmallVec<[(SymbolId, SymbolId); 8]> = if !missing {
+            resolved
+                .into_iter()
+                .map(|(k, v)| (k.unwrap(), v.unwrap()))
+                .collect()
+        } else {
+            let mut syms = self.symbols.write();
+            let mut out = SmallVec::with_capacity(resolved.len());
+            for ((k, v), (kid, vid)) in iter_stringlabels(encoded_labels).zip(resolved) {
+                let kf = match kid {
+                    Some(id) => id,
+                    None => syms.intern(k),
+                };
+                let vf = match vid {
+                    Some(id) => id,
+                    None => syms.intern(v),
+                };
+                out.push((kf, vf));
+            }
+            out
+        };
+        SymbolLabels::from_sorted_ids(interned)
     }
 
     fn intern_sorted_pairs_read_first(&self, pairs: &[(&str, &str)]) -> SymbolLabels {
@@ -5221,6 +5422,26 @@ impl<'a> HeadAppender<'a> {
         Ok(entry)
     }
 
+    fn resolve_encoded_labels_prehashed(
+        &mut self,
+        prehashed: u64,
+        encoded_labels: &[u8],
+    ) -> Result<Arc<SeriesEntry>, HeadError> {
+        if encoded_labels.is_empty() {
+            return Err(HeadError::MissingMetricName);
+        }
+        let (entry, created) = self
+            .head
+            .get_or_create_encoded_labels(prehashed, encoded_labels)?;
+        if created {
+            self.series_refs.push(RefSeries {
+                ref_id: entry.ref_id,
+                labels: entry.labels.clone(),
+            });
+        }
+        Ok(entry)
+    }
+
     fn resolve_sorted_pairs(
         &mut self,
         series_ref: Option<u64>,
@@ -5384,6 +5605,107 @@ impl<'a> HeadAppender<'a> {
         )
     }
 
+    /// Appends a float sample using a cached `Option<Arc<SeriesEntry>>`, precomputed Prometheus hash,
+    /// and pre-encoded `stringlabels` bytes (zero re-encoding on creation, zero label inspection on hit).
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_float_with_entry_prehashed_encoded(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        prehashed: u64,
+        encoded_labels: &[u8],
+        st: i64,
+        t: i64,
+        v: f64,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        self.append_float_with_entry_prehashed_encoded_inner(
+            series_entry,
+            false,
+            prehashed,
+            encoded_labels,
+            st,
+            t,
+            v,
+            reject_ooo,
+        )
+    }
+
+    /// Same as [`append_float_with_entry_prehashed_encoded`], but moves `series_entry` by value into
+    /// `self.floats` on success to avoid a second `Arc::clone`/`Arc::drop` pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_float_with_entry_prehashed_encoded_take(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        prehashed: u64,
+        encoded_labels: &[u8],
+        st: i64,
+        t: i64,
+        v: f64,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        self.append_float_with_entry_prehashed_encoded_inner(
+            series_entry,
+            true,
+            prehashed,
+            encoded_labels,
+            st,
+            t,
+            v,
+            reject_ooo,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_float_with_entry_prehashed_encoded_inner(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        take_entry: bool,
+        prehashed: u64,
+        encoded_labels: &[u8],
+        st: i64,
+        t: i64,
+        v: f64,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        if self.closed {
+            return Err(HeadError::AppenderClosed);
+        }
+        if !self.head.initialized() {
+            self.head.init_time(t);
+            self.min_valid_time = self.head.appendable_min_valid_time();
+            self.head_maxt = self.head.max_time();
+        }
+        let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
+        if effective_ooo == 0 && t < self.min_valid_time {
+            return Err(HeadError::OutOfBounds);
+        }
+
+        let entry = match series_entry.take() {
+            Some(e) => {
+                if !take_entry {
+                    *series_entry = Some(Arc::clone(&e));
+                }
+                e
+            }
+            None => {
+                let e = self.resolve_encoded_labels_prehashed(prehashed, encoded_labels)?;
+                if !take_entry {
+                    *series_entry = Some(Arc::clone(&e));
+                }
+                e
+            }
+        };
+        self.append_float_with_resolved_entry_inner(
+            series_entry,
+            take_entry,
+            entry,
+            st,
+            t,
+            v,
+            effective_ooo,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn append_float_with_entry_prehashed_inner(
         &mut self,
@@ -5424,6 +5746,28 @@ impl<'a> HeadAppender<'a> {
                 e
             }
         };
+        self.append_float_with_resolved_entry_inner(
+            series_entry,
+            take_entry,
+            entry,
+            st,
+            t,
+            v,
+            effective_ooo,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_float_with_resolved_entry_inner(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        take_entry: bool,
+        entry: Arc<SeriesEntry>,
+        st: i64,
+        t: i64,
+        v: f64,
+        effective_ooo: i64,
+    ) -> Result<u64, HeadError> {
         let ref_id = entry.ref_id;
 
         // Lock-free single-lock fast path: claim `pending_commits` 0 -> 1 and check `t > in_order_max_time`.
@@ -7016,6 +7360,70 @@ mod tests {
             let expected = q
                 .as_ref()
                 .and_then(|(h, p)| head.get_entry_by_prehashed_sorted_pairs(*h, p));
+            assert_eq!(
+                batch_out[i].as_ref().map(|e| e.ref_id),
+                expected.as_ref().map(|e| e.ref_id),
+                "mismatch at index {i}"
+            );
+        }
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn resolve_prehashed_encoded_batch_matches_single_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+
+        let encoded_items: Vec<(u64, Labels)> = (0..100)
+            .map(|i| {
+                let lbls = Labels::from_sorted_slice(&[
+                    ("__name__", format!("metric_{i}").as_str()),
+                    ("job", format!("val_{i}").as_str()),
+                ]);
+                (lbls.hash(), lbls)
+            })
+            .collect();
+        {
+            let mut app = head.appender();
+            for (h, lbls) in &encoded_items {
+                let mut entry_opt = None;
+                app.append_float_with_entry_prehashed_encoded_take(
+                    &mut entry_opt,
+                    *h,
+                    lbls.as_bytes(),
+                    0,
+                    1_000,
+                    1.0,
+                    false,
+                )
+                .unwrap();
+            }
+            app.commit().unwrap();
+        }
+
+        let mut queries: Vec<Option<(u64, Labels)>> = Vec::new();
+        for (i, (h, lbls)) in encoded_items.iter().enumerate() {
+            if i % 5 == 0 {
+                queries.push(None);
+            } else {
+                queries.push(Some((*h, lbls.clone())));
+            }
+        }
+        let missing = Labels::from_sorted_slice(&[("__name__", "does_not_exist"), ("job", "none")]);
+        queries.push(Some((missing.hash(), missing)));
+
+        let mut batch_out = Vec::new();
+        head.resolve_prehashed_encoded_batch(
+            &queries,
+            |q| q.as_ref().map(|(h, l)| (*h, l.as_bytes())),
+            &mut batch_out,
+        );
+
+        assert_eq!(batch_out.len(), queries.len());
+        for (i, q) in queries.iter().enumerate() {
+            let expected = q
+                .as_ref()
+                .and_then(|(h, l)| head.get_entry_by_prehashed_encoded_labels(*h, l.as_bytes()));
             assert_eq!(
                 batch_out[i].as_ref().map(|e| e.ref_id),
                 expected.as_ref().map(|e| e.ref_id),

@@ -1,0 +1,7 @@
+.git
+.ref
+.worktrees
+target
+tests/go-oracle
+*.prof
+*.log
