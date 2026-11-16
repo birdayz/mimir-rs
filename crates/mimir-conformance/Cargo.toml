@@ -31,3 +31,6 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 ulid = { workspace = true }
 zstd = { workspace = true }
+
+[dev-dependencies]
+testcontainers = { workspace = true }

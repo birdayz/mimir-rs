@@ -75,6 +75,10 @@ func main() {
 		out, err = cmdPartitionRingLookup(input)
 	case "httpgrpc-call":
 		out, err = cmdHttpGrpcCall(input)
+	case "gen-test-pki":
+		out, err = cmdGenTestPKI(input)
+	case "kafka-produce":
+		out, err = cmdKafkaProduce(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}

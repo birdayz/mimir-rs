@@ -70,3 +70,4 @@ md-5 = "0.10"
 rmp = "0.8"
 rmp-serde = "1"
 kafka-protocol = "0.14"
+testcontainers = { version = "0.28", default-features = false }
