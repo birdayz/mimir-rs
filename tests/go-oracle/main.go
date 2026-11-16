@@ -73,6 +73,8 @@ func main() {
 		out, err = cmdRingMerge(input)
 	case "partition-ring-lookup":
 		out, err = cmdPartitionRingLookup(input)
+	case "httpgrpc-call":
+		out, err = cmdHttpGrpcCall(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}

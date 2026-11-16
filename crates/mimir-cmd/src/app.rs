@@ -415,6 +415,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             Some(&registry),
         )
         .context("creating ingester")?;
+        ingester.set_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
 
         if let Some(ref watcher) = partition_ring_watcher {
             watcher.with_delegate(IngesterPartitionRingDelegate::new(Arc::clone(&ingester)));

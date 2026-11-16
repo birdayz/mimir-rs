@@ -84,6 +84,17 @@ impl ProcessGuard {
         self.child.as_mut().and_then(|c| c.try_wait().ok().flatten())
     }
 
+    fn send_sigterm(&self) {
+        if let Some(ref c) = self.child {
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &c.id().to_string()])
+                    .status();
+            }
+        }
+    }
+
     fn wait_for_exit(mut self, timeout: Duration) -> std::process::ExitStatus {
         let mut child = self.child.take().expect("child already taken");
         let deadline = Instant::now() + timeout;
@@ -1578,15 +1589,15 @@ activity_tracker:
         let rust_q = run_query_stream(&mut rust_client, tenant, ts - 1000, ts + 1000, matcher, &[]).await;
         assert_eq!(rust_q, go_q);
 
-        // Gracefully shut down Rust via POST /ingester/shutdown and verify clean exit + Go ring sees exit
+        // Gracefully shut down Rust via POST /ingester/shutdown:
+        // matches Go Mimir 1:1 by stopping the ingester + leaving the ring + returning 204
+        // while keeping the HTTP server alive (GET /ready == 503) until SIGTERM.
         let sd = http
             .post(format!("http://127.0.0.1:{rust_http_port}/ingester/shutdown"))
             .send()
             .await
             .unwrap();
         assert_eq!(sd.status().as_u16(), 204);
-        let status = rust_proc.wait_for_exit(Duration::from_secs(15));
-        assert_eq!(status.code(), Some(0), "rust-mimir shutdown exit status");
 
         // Go ring should observe rust-ingester-1 unregistered cleanly
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -1614,6 +1625,18 @@ activity_tracker:
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+
+        // Rust HTTP server remains alive with GET /ready == 503 until SIGTERM
+        let ready_after_shutdown = http
+            .get(format!("http://127.0.0.1:{rust_http_port}/ready"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ready_after_shutdown.status().as_u16(), 503);
+
+        rust_proc.send_sigterm();
+        let status = rust_proc.wait_for_exit(Duration::from_secs(15));
+        assert_eq!(status.code(), Some(0), "rust-mimir shutdown exit status");
     });
 }
 

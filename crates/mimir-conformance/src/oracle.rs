@@ -507,3 +507,25 @@ impl Drop for SpawnedKfakeBroker {
         let _ = self.child.wait();
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HttpGrpcCallRequest {
+    pub grpc_addr: String,
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub body_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpGrpcCallResponse {
+    pub code: i32,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub body_b64: String,
+    #[serde(default)]
+    pub raw_grpc_error: Option<String>,
+}

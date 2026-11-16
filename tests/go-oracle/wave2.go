@@ -15,6 +15,7 @@ import (
 	"time"
 
 	kitlog "github.com/go-kit/log"
+	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/kv/consul"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
@@ -23,6 +24,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func ptrStr(s string) *string {
@@ -558,4 +561,94 @@ func cmdKfakeBroker() error {
 	// Block reading stdin until EOF so the caller controls the broker lifetime.
 	_, _ = io.Copy(io.Discard, br)
 	return nil
+}
+
+// --- httpgrpc-call ---
+
+type httpgrpcCallIn struct {
+	GrpcAddr string              `json:"grpc_addr"`
+	Method   string              `json:"method"`
+	Url      string              `json:"url"`
+	Headers  map[string][]string `json:"headers,omitempty"`
+	BodyB64  string              `json:"body_b64,omitempty"`
+}
+
+type httpgrpcCallOut struct {
+	Code         int32               `json:"code"`
+	Headers      map[string][]string `json:"headers"`
+	BodyB64      string              `json:"body_b64"`
+	RawGrpcError *string             `json:"raw_grpc_error,omitempty"`
+}
+
+func httpgrpcHeadersToMap(hs []*httpgrpc.Header) map[string][]string {
+	out := make(map[string][]string, len(hs))
+	for _, h := range hs {
+		vals := make([]string, len(h.Values))
+		copy(vals, h.Values)
+		out[h.Key] = vals
+	}
+	return out
+}
+
+func cmdHttpGrpcCall(input []byte) (*httpgrpcCallOut, error) {
+	var in httpgrpcCallIn
+	if err := json.Unmarshal(input, &in); err != nil {
+		return nil, err
+	}
+	var body []byte
+	if in.BodyB64 != "" {
+		var err error
+		body, err = base64.StdEncoding.DecodeString(in.BodyB64)
+		if err != nil {
+			return nil, fmt.Errorf("decode body_b64: %w", err)
+		}
+	}
+
+	var hs []*httpgrpc.Header
+	for k, vs := range in.Headers {
+		hs = append(hs, &httpgrpc.Header{
+			Key:    k,
+			Values: vs,
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := grpc.NewClient(in.GrpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("grpc NewClient %s: %w", in.GrpcAddr, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	client := httpgrpc.NewHTTPClient(conn)
+	resp, err := client.Handle(ctx, &httpgrpc.HTTPRequest{
+		Method:  in.Method,
+		Url:     in.Url,
+		Headers: hs,
+		Body:    body,
+	})
+	if err != nil {
+		errStr := err.Error()
+		if httpResp, ok := httpgrpc.HTTPResponseFromError(err); ok && httpResp != nil {
+			return &httpgrpcCallOut{
+				Code:         httpResp.Code,
+				Headers:      httpgrpcHeadersToMap(httpResp.Headers),
+				BodyB64:      base64.StdEncoding.EncodeToString(httpResp.Body),
+				RawGrpcError: &errStr,
+			}, nil
+		}
+		return &httpgrpcCallOut{
+			Code:         0,
+			Headers:      map[string][]string{},
+			BodyB64:      "",
+			RawGrpcError: &errStr,
+		}, nil
+	}
+
+	return &httpgrpcCallOut{
+		Code:    resp.Code,
+		Headers: httpgrpcHeadersToMap(resp.Headers),
+		BodyB64: base64.StdEncoding.EncodeToString(resp.Body),
+	}, nil
 }
