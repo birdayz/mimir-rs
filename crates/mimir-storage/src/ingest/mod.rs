@@ -9,6 +9,7 @@ pub mod fetcher;
 pub mod fixture_generator;
 pub mod heap_merger;
 pub mod kafka_client;
+pub mod kgo_retry;
 pub mod offset_catalogue;
 pub mod offset_file;
 pub mod partition_offset_client;

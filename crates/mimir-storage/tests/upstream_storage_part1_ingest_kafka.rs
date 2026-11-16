@@ -2017,8 +2017,12 @@ async fn test_multi_cluster_partition_reader_fails_to_start_if_any_cluster_reade
     let healthy = MockKafkaCluster::start(1, "ingest-rc-0").await;
     let healthy_cfg = make_test_kafka_cfg(&healthy.addr, "ingest-rc-0");
 
-    let mut broken_cfg = make_test_kafka_cfg("127.0.0.1:1", "ingest-rc-0");
-    broken_cfg.dial_timeout = GoDuration::from_millis(100);
+    // Write compartment 1 is misconfigured so that its reader fails to start: with file-based offset
+    // enforcement enabled but no replay period and consumption from the last committed offset,
+    // getStartOffset returns an error synchronously at startup.
+    let mut broken_cfg = make_test_kafka_cfg(&healthy.addr, "ingest-rc-0");
+    broken_cfg.consumer_group_offset_commit_file_enforced = true;
+    broken_cfg.consume_from_position_at_startup = "last-offset".to_string();
     let dir = tempfile::tempdir().unwrap();
 
     let reader = MultiClusterPartitionReader::new(

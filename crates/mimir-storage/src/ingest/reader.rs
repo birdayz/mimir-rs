@@ -23,6 +23,8 @@ use tracing::{debug, error, info, warn};
 
 use mimir_proto::zerocopy::{BorrowedWriteRequest, WriteRequestScratch};
 
+use mimir_common::backoff::{Backoff, BackoffConfig};
+
 use super::heap_merger::{HeapMerger, HeapMergerMetrics};
 use super::kafka_client::{
     FetchedRecord, KafkaClient, KafkaClientError, KAFKA_OFFSET_END, KAFKA_OFFSET_START,
@@ -1197,38 +1199,73 @@ impl SingleClusterPartitionReader {
         }
 
         let mut startup_stop_rx = self.stop_tx.subscribe();
-        let (start_offset, last_consumed, concrete_start) = {
-            let mut attempt = 0u32;
-            loop {
-                if *startup_stop_rx.borrow() {
+        let canceled = |rx: &watch::Receiver<bool>| *rx.borrow();
+
+        // getStartOffset(): resolving the start offset is retried with a dskit backoff
+        // (min 100ms, max 2s, 10 retries); configuration errors are returned immediately.
+        let (start_offset, last_consumed) = {
+            let mut retry = Backoff::new(BackoffConfig {
+                min_backoff: Duration::from_millis(100),
+                max_backoff: Duration::from_secs(2),
+                max_retries: 10,
+            });
+            let mut last_err = None;
+            let mut resolved = None;
+            while retry.ongoing() {
+                if canceled(&startup_stop_rx) {
                     self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
                     return Err(ReaderError::Canceled);
                 }
-                let res = async {
-                    let (so, lc) = self.get_start_offset().await?;
-                    let cs = self.resolve_concrete_fetch_offset(so).await?;
-                    Ok::<_, ReaderError>((so, lc, cs))
+                match self.get_start_offset().await {
+                    Ok(v) => {
+                        resolved = Some(v);
+                        break;
+                    }
+                    Err(e @ ReaderError::Config(_)) => {
+                        self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        warn!(partition = self.partition_id, err = %e, "failed to fetch offset");
+                        last_err = Some(e);
+                    }
                 }
-                .await;
-                match res {
+                tokio::select! {
+                    _ = startup_stop_rx.changed() => {}
+                    _ = retry.wait() => {}
+                }
+            }
+            match resolved {
+                Some(v) => v,
+                None => {
+                    self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+                    return Err(last_err.unwrap_or(ReaderError::Canceled));
+                }
+            }
+        };
+
+        // Upstream hands the special -2 / -1 start offsets to the fetchers, which resolve them
+        // against Kafka retrying forever (until the reader is stopped); do the same here.
+        let concrete_start = {
+            let mut retry = Backoff::new(BackoffConfig {
+                min_backoff: Duration::from_millis(100),
+                max_backoff: Duration::from_secs(1),
+                max_retries: 0,
+            });
+            loop {
+                if canceled(&startup_stop_rx) {
+                    self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+                    return Err(ReaderError::Canceled);
+                }
+                match self.resolve_concrete_fetch_offset(start_offset).await {
                     Ok(v) => break v,
                     Err(e) => {
-                        if matches!(e, ReaderError::Config(_)) || attempt >= 10 {
-                            self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
-                            return Err(e);
-                        }
-                        attempt += 1;
-                        warn!(partition = self.partition_id, error = %e, "failed to fetch offset; retrying");
-                        tokio::select! {
-                            _ = startup_stop_rx.changed() => {
-                                if *startup_stop_rx.borrow() {
-                                    self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
-                                    return Err(ReaderError::Canceled);
-                                }
-                            }
-                            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                        }
+                        warn!(partition = self.partition_id, err = %e, start_offset, "failed to resolve start offset");
                     }
+                }
+                tokio::select! {
+                    _ = startup_stop_rx.changed() => {}
+                    _ = retry.wait() => {}
                 }
             }
         };
@@ -1613,6 +1650,12 @@ impl SingleClusterPartitionReader {
         stop_rx: &mut watch::Receiver<bool>,
     ) -> Result<Duration, ReaderError> {
         let deadline = deadline_dur.map(|d| Instant::now() + d);
+        // Retry forever (unless stopped / the deadline expires), like upstream's dskit backoff.
+        let mut boff = Backoff::new(BackoffConfig {
+            min_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(1),
+            max_retries: 0,
+        });
         loop {
             if *stop_rx.borrow() {
                 return Err(ReaderError::Canceled);
@@ -1625,16 +1668,18 @@ impl SingleClusterPartitionReader {
 
             let part_start = match self.offset_reader.fetch_partition_start_offset().await {
                 Ok(v) => v,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                Err(e) => {
+                    warn!(partition = self.partition_id, err = %e, "partition reader failed to fetch partition start offset");
+                    boff.wait().await;
                     continue;
                 }
             };
             let req_at = Instant::now();
             let last_produced = match self.offset_reader.fetch_last_produced_offset().await {
                 Ok(v) => v,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                Err(e) => {
+                    warn!(partition = self.partition_id, err = %e, "partition reader failed to fetch last produced offset");
+                    boff.wait().await;
                     continue;
                 }
             };

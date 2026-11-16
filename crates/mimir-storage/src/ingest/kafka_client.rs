@@ -50,6 +50,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::compression::{compress_record_batch, decompress_record_batch, KafkaCompression};
+use super::kgo_retry::{
+    self, classify_connect_error, handle_dial_err, load_connection_retrying_once,
+    mimir_retry_timeout, retryable_request, sharded_retry_backoff, AnyBrokerRotation,
+    BrokerChoice, BrokerKey,
+};
 use super::transport::{KafkaTransport, SaslAuthConfig};
 
 pub const KAFKA_OFFSET_START: i64 = -2;
@@ -59,8 +64,21 @@ pub const KAFKA_OFFSET_END: i64 = -1;
 pub enum KafkaClientError {
     #[error("no seed brokers configured")]
     NoSeedBrokers,
-    #[error("connection timeout connecting to {addr}")]
+    /// The dial deadline (`-ingest-storage.kafka.dial-timeout`) expired (retried, like kgo).
+    #[error("unable to dial: dial tcp {addr}: i/o timeout")]
     ConnectTimeout { addr: String },
+    /// Any other dial failure (connection refused, DNS, unreachable, ...).
+    #[error("unable to dial: {0}")]
+    Dial(super::kgo_retry::DialError),
+    /// The broker closed a new connection during its setup (`kgo.ErrFirstReadEOF`); never retried.
+    #[error("{0}")]
+    FirstReadEof(String),
+    #[error("the broker connection has died and the request will be retried on a new connection")]
+    ChosenBrokerDead,
+    #[error("{}", unknown_controller_msg(*.0))]
+    UnknownController(i32),
+    #[error("unknown broker")]
+    UnknownBroker,
     #[error("request timeout after {0:?}")]
     RequestTimeout(Duration),
     #[error("io error: {0}")]
@@ -79,6 +97,16 @@ pub enum KafkaClientError {
     /// SASL authentication failed on a new broker connection.
     #[error("{0}")]
     Sasl(String),
+}
+
+fn unknown_controller_msg(id: i32) -> String {
+    if id == -1 {
+        "broker replied that the controller broker is not available".to_string()
+    } else {
+        format!(
+            "broker replied that the controller broker is {id}, but did not reply with that broker in the broker list"
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -327,16 +355,11 @@ fn is_leader_or_io_error(err: &KafkaClientError) -> bool {
         )
 }
 
-fn is_coordinator_or_io_error(err: &KafkaClientError) -> bool {
-    is_transport_error(err)
-        || matches!(
-            err,
-            KafkaClientError::Broker(
-                ResponseError::NotCoordinator
-                    | ResponseError::CoordinatorNotAvailable
-                    | ResponseError::CoordinatorLoadInProgress
-            )
-        )
+/// Discovered brokers sorted by node ID (kgo keeps `cl.brokers` sorted).
+fn sorted_brokers(md: &ClusterMetadata) -> Vec<(i32, String)> {
+    let mut v: Vec<(i32, String)> = md.brokers.iter().map(|(id, b)| (*id, b.addr.clone())).collect();
+    v.sort_by_key(|(id, _)| *id);
+    v
 }
 
 /// Pure-Rust async TCP Kafka client supporting broker pooling, metadata routing, SASL,
@@ -350,6 +373,12 @@ pub struct KafkaClient {
     conns_by_addr: Mutex<HashMap<String, Arc<BrokerConn>>>,
     metadata: RwLock<ClusterMetadata>,
     decode_pool: OnceLock<ScopedWorkerPool>,
+    /// `-ingest-storage.kafka.last-produced-offset-retry-timeout`: the `ListOffsets` retry timeout
+    /// (Mimir's `kgo.RetryTimeoutFn`).
+    last_produced_offset_retry_timeout: Duration,
+    /// Cached controller broker ID (`-1` = unknown), as kgo's `controllerID`.
+    controller_id: AtomicI32,
+    any_broker: parking_lot::Mutex<AnyBrokerRotation>,
 }
 
 impl KafkaClient {
@@ -376,7 +405,25 @@ impl KafkaClient {
             conns_by_addr: Mutex::new(HashMap::new()),
             metadata: RwLock::new(ClusterMetadata::default()),
             decode_pool: OnceLock::new(),
+            last_produced_offset_retry_timeout: Duration::from_secs(10),
+            controller_id: AtomicI32::new(-1),
+            any_broker: parking_lot::Mutex::new(AnyBrokerRotation::default()),
         })
+    }
+
+    /// Sets the read deadline used for requests without a timeout field and for the connection
+    /// handshake (kgo `RequestTimeoutOverhead`).
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        if !timeout.is_zero() {
+            self.request_timeout = timeout;
+        }
+        self
+    }
+
+    /// Sets the `ListOffsets` retry timeout (`last_produced_offset_retry_timeout`; zero = no limit).
+    pub fn with_last_produced_offset_retry_timeout(mut self, timeout: Duration) -> Self {
+        self.last_produced_offset_retry_timeout = timeout;
+        self
     }
 
     pub fn with_sasl(mut self, sasl: SaslAuthConfig) -> Self {
@@ -424,7 +471,10 @@ impl KafkaClient {
             Duration::from_nanos(cfg.write_timeout.as_nanos().max(0) as u64)
                 .max(Duration::from_secs(10)),
         )?
-        .with_transport(Arc::new(KafkaTransport::from_kafka_config(cfg)?));
+        .with_transport(Arc::new(KafkaTransport::from_kafka_config(cfg)?))
+        .with_last_produced_offset_retry_timeout(Duration::from_nanos(
+            cfg.last_produced_offset_retry_timeout.as_nanos().max(0) as u64,
+        ));
         Ok(client)
     }
 
@@ -446,7 +496,20 @@ impl KafkaClient {
             &self.transport,
             self.request_timeout,
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            let e = classify_connect_error(addr, e);
+            if kgo_retry::is_any_dial_err(&e) {
+                let err = e.to_string();
+                tracing::warn!(
+                    component = "kafka_client",
+                    addr,
+                    err = err.trim_start_matches("unable to dial: "),
+                    "unable to open connection to broker"
+                );
+            }
+            e
+        })?;
 
         let mut map = self.conns_by_addr.lock().await;
         if let Some(existing) = map.get(addr) {
@@ -476,10 +539,137 @@ impl KafkaClient {
             .remove(&(topic.to_string(), partition));
     }
 
+    /// Returns a pooled connection, dialing a new one if needed. A new connection failing with a
+    /// retryable error is retried once (kgo `broker.handleReq`).
+    async fn load_conn(&self, addr: &str) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        load_connection_retrying_once(|| self.get_conn_for_addr(addr)).await
+    }
+
+    /// `cl.broker()`: the next "any" broker (discovered brokers, then seeds).
+    fn next_any_broker(&self) -> Result<BrokerChoice, KafkaClientError> {
+        let discovered = sorted_brokers(&self.metadata.read());
+        self.any_broker
+            .lock()
+            .next(&self.seed_brokers, &discovered)
+            .ok_or(KafkaClientError::NoSeedBrokers)
+    }
+
+    /// Sends `req` on `conn` with a read deadline of `timeout`, dropping the connection on
+    /// transport errors.
+    async fn send_on<Req, Resp>(
+        &self,
+        conn: &Arc<BrokerConn>,
+        api_key: ApiKey,
+        ver: i16,
+        req: &Req,
+        timeout: Duration,
+    ) -> Result<Resp, KafkaClientError>
+    where
+        Req: Request + Encodable,
+        Resp: Decodable + HeaderVersion,
+    {
+        let res = tokio::time::timeout(timeout, conn.send_raw(api_key, ver, req))
+            .await
+            .map_err(|_| KafkaClientError::RequestTimeout(timeout))
+            .and_then(|r| r);
+        if let Err(ref e) = res {
+            if is_transport_error(e) {
+                self.drop_conn(conn).await;
+            }
+        }
+        res
+    }
+
+    /// `cl.fetchMetadata`: a `Metadata` request to any broker with kgo's retry semantics
+    /// (`limit_retries = 3` for internal loads, 30s retry timeout). Updates the known brokers and
+    /// the controller ID from the response.
+    async fn fetch_metadata(
+        &self,
+        topics: Option<&[&str]>,
+        limit_retries: u32,
+    ) -> Result<MetadataResponse, KafkaClientError> {
+        let mut req = MetadataRequest::default();
+        req.allow_auto_topic_creation = false;
+        req.topics = topics.map(|ts| {
+            ts.iter()
+                .map(|t| {
+                    let mut mt = MetadataRequestTopic::default();
+                    mt.name = Some(TopicName(StrBytes::from_string((*t).to_owned())));
+                    mt
+                })
+                .collect()
+        });
+        let resp: MetadataResponse = retryable_request(
+            mimir_retry_timeout(ApiKey::Metadata, self.last_produced_offset_retry_timeout),
+            limit_retries,
+            || std::future::ready(self.next_any_broker()),
+            |b: BrokerChoice| {
+                let req = &req;
+                async move {
+                    let conn = self.load_conn(&b.addr).await?;
+                    let ver = conn.pick_version(ApiKey::Metadata, 1, 9);
+                    self.send_on(&conn, ApiKey::Metadata, ver, req, self.request_timeout)
+                        .await
+                }
+            },
+            |_, _| None,
+        )
+        .await?;
+
+        if resp.controller_id.0 >= 0 {
+            self.controller_id.store(resp.controller_id.0, Ordering::SeqCst);
+        }
+        let mut md = self.metadata.write();
+        md.brokers = resp
+            .brokers
+            .iter()
+            .map(|b| {
+                (
+                    b.node_id.0,
+                    BrokerInfo {
+                        addr: format!("{}:{}", b.host.as_str(), b.port),
+                    },
+                )
+            })
+            .collect();
+        drop(md);
+        Ok(resp)
+    }
+
+    /// `cl.controller()`: the controller broker, loading broker metadata if it is unknown.
+    async fn controller(&self) -> Result<BrokerChoice, KafkaClientError> {
+        let mut id = self.controller_id.load(Ordering::SeqCst);
+        if id < 0 {
+            self.fetch_metadata(Some(&[]), kgo_retry::METADATA_LIMIT_RETRIES)
+                .await?;
+            id = self.controller_id.load(Ordering::SeqCst);
+            if id < 0 {
+                return Err(KafkaClientError::UnknownController(id));
+            }
+        }
+        let addr = self.metadata.read().brokers.get(&id).map(|b| b.addr.clone());
+        match addr {
+            Some(addr) => Ok(BrokerChoice {
+                key: BrokerKey::Node(id),
+                addr,
+            }),
+            None => {
+                self.forget_controller_id(id);
+                Err(KafkaClientError::UnknownController(id))
+            }
+        }
+    }
+
+    fn forget_controller_id(&self, id: i32) {
+        let _ = self
+            .controller_id
+            .compare_exchange(id, -1, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
     async fn any_conn(&self) -> Result<Arc<BrokerConn>, KafkaClientError> {
         let mut last_err = None;
         for seed in &self.seed_brokers {
-            match self.get_conn_for_addr(seed).await {
+            match self.load_conn(seed).await {
                 Ok(c) => return Ok(c),
                 Err(e) => last_err = Some(e),
             }
@@ -493,7 +683,7 @@ impl KafkaClient {
             md.brokers.get(&node_id).map(|b| b.addr.clone())
         };
         if let Some(addr) = addr {
-            if let Ok(conn) = self.get_conn_for_addr(&addr).await {
+            if let Ok(conn) = self.load_conn(&addr).await {
                 return Ok(conn);
             }
         }
@@ -529,78 +719,30 @@ impl KafkaClient {
 
     /// Refreshes cluster & topic metadata from any reachable broker.
     pub async fn refresh_metadata(&self, topics: &[&str]) -> Result<(), KafkaClientError> {
-        let mut last_err = None;
-        for seed in &self.seed_brokers {
-            let conn = match self.get_conn_for_addr(seed).await {
-                Ok(c) => c,
-                Err(e) => {
-                    last_err = Some(e);
-                    continue;
-                }
+        let topics_opt = if topics.is_empty() { None } else { Some(topics) };
+        let resp = self
+            .fetch_metadata(topics_opt, kgo_retry::METADATA_LIMIT_RETRIES)
+            .await?;
+
+        let mut md = self.metadata.write();
+        for t in resp.topics {
+            let Some(name) = t.name else {
+                continue;
             };
-            let ver = conn.pick_version(ApiKey::Metadata, 1, 9);
-
-            let mut req = MetadataRequest::default();
-            req.allow_auto_topic_creation = false;
-            if topics.is_empty() {
-                req.topics = None;
-            } else {
-                req.topics = Some(
-                    topics
-                        .iter()
-                        .map(|t| {
-                            let mut mt = MetadataRequestTopic::default();
-                            mt.name = Some(TopicName(StrBytes::from_string((*t).to_owned())));
-                            mt
-                        })
-                        .collect(),
-                );
+            let topic_name = name.0.as_str().to_owned();
+            if let Some(err) = t.error_code.err() {
+                return Err(KafkaClientError::Broker(err));
             }
-
-            let resp_res: Result<MetadataResponse, KafkaClientError> = tokio::time::timeout(
-                self.request_timeout,
-                conn.send_raw(ApiKey::Metadata, ver, &req),
-            )
-            .await
-            .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))
-            .and_then(|r| r);
-
-            let resp = match resp_res {
-                Ok(r) => r,
-                Err(e) => {
-                    if is_transport_error(&e) {
-                        self.drop_conn(&conn).await;
-                    }
-                    last_err = Some(e);
-                    continue;
-                }
-            };
-
-            let mut md = self.metadata.write();
-            for b in resp.brokers {
-                let addr = format!("{}:{}", b.host.as_str(), b.port);
-                md.brokers.insert(b.node_id.0, BrokerInfo { addr });
+            let mut pids = Vec::with_capacity(t.partitions.len());
+            for p in t.partitions {
+                pids.push(p.partition_index);
+                md.partition_leaders
+                    .insert((topic_name.clone(), p.partition_index), p.leader_id.0);
             }
-            for t in resp.topics {
-                let Some(name) = t.name else {
-                    continue;
-                };
-                let topic_name = name.0.as_str().to_owned();
-                if let Some(err) = t.error_code.err() {
-                    return Err(KafkaClientError::Broker(err));
-                }
-                let mut pids = Vec::with_capacity(t.partitions.len());
-                for p in t.partitions {
-                    pids.push(p.partition_index);
-                    md.partition_leaders
-                        .insert((topic_name.clone(), p.partition_index), p.leader_id.0);
-                }
-                pids.sort();
-                md.topic_partitions.insert(topic_name, pids);
-            }
-            return Ok(());
+            pids.sort();
+            md.topic_partitions.insert(topic_name, pids);
         }
-        Err(last_err.unwrap_or(KafkaClientError::NoSeedBrokers))
+        Ok(())
     }
 
     /// Returns sorted partition IDs for `topic`.
@@ -614,31 +756,19 @@ impl KafkaClient {
     }
 
     /// Creates topics if they do not exist (ignoring `TopicAlreadyExists`).
+    ///
+    /// Issued like kadm/kgo admin requests (`handleAdminReq`): to the controller (loaded through
+    /// broker metadata), retried with backoff on retryable errors, transient dial errors to the
+    /// controller and `NOT_CONTROLLER`, for up to the 30s retry timeout.
     pub async fn create_topics(
         &self,
         topics: &[&str],
         num_partitions: i32,
         replication_factor: i16,
     ) -> Result<(), KafkaClientError> {
-        let conn = self.any_conn().await?;
-        let ver = conn.pick_version(ApiKey::CreateTopics, 0, 5);
-        let mut req = CreateTopicsRequest::default();
-        req.timeout_ms = self.request_timeout.as_millis().min(i32::MAX as u128) as i32;
-        for t in topics {
-            let mut ct = CreatableTopic::default();
-            ct.name = TopicName(StrBytes::from_string((*t).to_owned()));
-            ct.num_partitions = num_partitions;
-            ct.replication_factor = replication_factor;
-            req.topics.push(ct);
-        }
-
-        let resp: CreateTopicsResponse = tokio::time::timeout(
-            self.request_timeout,
-            conn.send_raw(ApiKey::CreateTopics, ver, &req),
-        )
-        .await
-        .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
-
+        let resp = self
+            .create_topics_request(topics, num_partitions, replication_factor)
+            .await?;
         for t in resp.topics {
             if let Some(err) = t.error_code.err() {
                 if err != ResponseError::TopicAlreadyExists {
@@ -649,19 +779,85 @@ impl KafkaClient {
         Ok(())
     }
 
+    /// Issues a `CreateTopics` admin request with kgo `handleAdminReq` semantics and returns the
+    /// raw response.
+    pub async fn create_topics_request(
+        &self,
+        topics: &[&str],
+        num_partitions: i32,
+        replication_factor: i16,
+    ) -> Result<CreateTopicsResponse, KafkaClientError> {
+        let mut req = CreateTopicsRequest::default();
+        req.timeout_ms = kgo_retry::KADM_DEFAULT_TIMEOUT_MILLIS;
+        for t in topics {
+            let mut ct = CreatableTopic::default();
+            ct.name = TopicName(StrBytes::from_string((*t).to_owned()));
+            ct.num_partitions = num_partitions;
+            ct.replication_factor = replication_factor;
+            req.topics.push(ct);
+        }
+        // CreateTopics is a kmsg.TimeoutRequest: read deadline = overhead + TimeoutMillis.
+        let read_timeout =
+            self.request_timeout + Duration::from_millis(req.timeout_ms.max(0) as u64);
+
+        retryable_request(
+            mimir_retry_timeout(ApiKey::CreateTopics, self.last_produced_offset_retry_timeout),
+            0,
+            || self.controller(),
+            |b: BrokerChoice| {
+                let req = &req;
+                async move {
+                    let conn = self.load_conn(&b.addr).await?;
+                    let ver = conn.pick_version(ApiKey::CreateTopics, 0, 5);
+                    self.send_on(&conn, ApiKey::CreateTopics, ver, req, read_timeout)
+                        .await
+                }
+            },
+            |b: &BrokerChoice, res: &Result<CreateTopicsResponse, KafkaClientError>| {
+                let forget = || {
+                    if let BrokerKey::Node(id) = b.key {
+                        self.forget_controller_id(id);
+                    }
+                };
+                match res {
+                    Err(e) => handle_dial_err(e, forget),
+                    Ok(resp) => {
+                        let code = resp.topics.first().map_or(0, |t| t.error_code);
+                        if code == ResponseError::NotController.code() {
+                            forget();
+                            return Some(KafkaClientError::Broker(ResponseError::NotController));
+                        }
+                        None
+                    }
+                }
+            },
+        )
+        .await
+    }
+
     /// Issues `ListOffsets` for a single `(topic, partition)` and `timestamp`.
     /// - `timestamp = -2`: earliest / partition start offset
     /// - `timestamp = -1`: latest (next write offset; last produced offset is `offset - 1`)
     /// - `timestamp >= 0`: first offset with record timestamp >= `timestamp`
+    ///
+    /// Retried like kgo's sharded `ListOffsets` (`handleShardedReq` + `listOffsetsSharder`): failing
+    /// to load the partition leader metadata is not retried; request errors are retried with
+    /// backoff while retryable, for up to `last_produced_offset_retry_timeout`; a
+    /// `NOT_LEADER_OR_FOLLOWER` / `UNKNOWN_TOPIC_OR_PARTITION` partition error invalidates the
+    /// cached leader and re-shards.
     pub async fn list_offset_with_timestamp(
         &self,
         topic: &str,
         partition: i32,
         timestamp: i64,
     ) -> Result<ListedOffset, KafkaClientError> {
-        for attempt in 0..2 {
-            let conn = self.leader_conn(topic, partition).await?;
-            let ver = conn.pick_version(ApiKey::ListOffsets, 2, 7);
+        let start = tokio::time::Instant::now();
+        let retry_timeout =
+            mimir_retry_timeout(ApiKey::ListOffsets, self.last_produced_offset_retry_timeout);
+        let mut tries = 0u32;
+        loop {
+            let broker = self.partition_leader_choice(topic, partition).await?;
+            tries += 1;
 
             let mut p = ListOffsetsPartition::default();
             p.partition_index = partition;
@@ -679,12 +875,11 @@ impl KafkaClient {
             req.topics = vec![t];
 
             let res: Result<ListedOffset, KafkaClientError> = async {
-                let resp: ListOffsetsResponse = tokio::time::timeout(
-                    self.request_timeout,
-                    conn.send_raw(ApiKey::ListOffsets, ver, &req),
-                )
-                .await
-                .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
+                let conn = self.load_conn(&broker.addr).await?;
+                let ver = conn.pick_version(ApiKey::ListOffsets, 2, 7);
+                let resp: ListOffsetsResponse = self
+                    .send_on(&conn, ApiKey::ListOffsets, ver, &req, self.request_timeout)
+                    .await?;
 
                 for rt in resp.topics {
                     if rt.name.0.as_str() != topic {
@@ -717,19 +912,59 @@ impl KafkaClient {
             match res {
                 Ok(v) => return Ok(v),
                 Err(err) => {
-                    if is_transport_error(&err) {
-                        self.drop_conn(&conn).await;
-                    }
-                    if attempt == 0 && is_leader_or_io_error(&err) {
+                    let stale_leader = matches!(
+                        err,
+                        KafkaClientError::Broker(
+                            ResponseError::NotLeaderOrFollower
+                                | ResponseError::UnknownTopicOrPartition
+                        )
+                    );
+                    if stale_leader || is_leader_or_io_error(&err) {
                         self.invalidate_partition_leader(topic, partition);
-                        let _ = self.refresh_metadata(&[topic]).await;
-                        continue;
+                    }
+                    // listOffsetsSharder.onResp only asks for a retry on stale-leader partition
+                    // errors; any other partition error is returned as part of the response.
+                    let retryable = !matches!(err, KafkaClientError::Broker(_)) || stale_leader;
+                    if retryable {
+                        if let Some(backoff) =
+                            sharded_retry_backoff(start, retry_timeout, tries, &err)
+                        {
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
                     }
                     return Err(err);
                 }
             }
         }
-        unreachable!()
+    }
+
+    /// The broker a partition request is sharded to: the cached (or freshly loaded) partition
+    /// leader, falling back to any broker when the leader is unknown. Metadata load errors are
+    /// returned as-is (sharding failures are not retried by kgo).
+    async fn partition_leader_choice(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<BrokerChoice, KafkaClientError> {
+        let lookup = |md: &ClusterMetadata| -> Option<BrokerChoice> {
+            let node = *md.partition_leaders.get(&(topic.to_string(), partition))?;
+            if node < 0 {
+                return None;
+            }
+            md.brokers.get(&node).map(|b| BrokerChoice {
+                key: BrokerKey::Node(node),
+                addr: b.addr.clone(),
+            })
+        };
+        if let Some(b) = lookup(&self.metadata.read()) {
+            return Ok(b);
+        }
+        self.refresh_metadata(&[topic]).await?;
+        if let Some(b) = lookup(&self.metadata.read()) {
+            return Ok(b);
+        }
+        self.next_any_broker()
     }
 
     pub async fn list_offset(
@@ -1016,7 +1251,7 @@ impl KafkaClient {
             return Err(KafkaClientError::Broker(err));
         }
         let addr = format!("{}:{}", resp.host.as_str(), resp.port);
-        self.get_conn_for_addr(&addr).await
+        self.load_conn(&addr).await
     }
 
     /// Commits a consumer group offset for `(topic, partition)`.
@@ -1030,8 +1265,20 @@ impl KafkaClient {
         if group_id.is_empty() {
             return Ok(());
         }
-        for attempt in 0..2 {
-            let conn = self.find_group_coordinator(group_id).await?;
+        let start = tokio::time::Instant::now();
+        let mut tries = 0u32;
+        loop {
+            tries += 1;
+            let conn = match self.find_group_coordinator(group_id).await {
+                Ok(c) => c,
+                Err(err) => match sharded_retry_backoff(start, kgo_retry::DEFAULT_RETRY_TIMEOUT, tries, &err) {
+                    Some(backoff) => {
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    None => return Err(err),
+                },
+            };
             let ver = conn.pick_version(ApiKey::OffsetCommit, 2, 8);
 
             let mut p = OffsetCommitRequestPartition::default();
@@ -1080,14 +1327,19 @@ impl KafkaClient {
                     if is_transport_error(&err) {
                         self.drop_conn(&conn).await;
                     }
-                    if attempt == 0 && is_coordinator_or_io_error(&err) {
+                    if let Some(backoff) = sharded_retry_backoff(
+                        start,
+                        kgo_retry::DEFAULT_RETRY_TIMEOUT,
+                        tries,
+                        &err,
+                    ) {
+                        tokio::time::sleep(backoff).await;
                         continue;
                     }
                     return Err(err);
                 }
             }
         }
-        unreachable!()
     }
 
     /// Fetches the committed consumer group offset for `(topic, partition)`, returning `None` if
@@ -1101,8 +1353,20 @@ impl KafkaClient {
         if group_id.is_empty() {
             return Ok(None);
         }
-        for attempt in 0..2 {
-            let conn = self.find_group_coordinator(group_id).await?;
+        let start = tokio::time::Instant::now();
+        let mut tries = 0u32;
+        loop {
+            tries += 1;
+            let conn = match self.find_group_coordinator(group_id).await {
+                Ok(c) => c,
+                Err(err) => match sharded_retry_backoff(start, kgo_retry::DEFAULT_RETRY_TIMEOUT, tries, &err) {
+                    Some(backoff) => {
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    None => return Err(err),
+                },
+            };
             let ver = conn.pick_version(ApiKey::OffsetFetch, 1, 7);
 
             let mut t = OffsetFetchRequestTopic::default();
@@ -1159,14 +1423,19 @@ impl KafkaClient {
                     if is_transport_error(&err) {
                         self.drop_conn(&conn).await;
                     }
-                    if attempt == 0 && is_coordinator_or_io_error(&err) {
+                    if let Some(backoff) = sharded_retry_backoff(
+                        start,
+                        kgo_retry::DEFAULT_RETRY_TIMEOUT,
+                        tries,
+                        &err,
+                    ) {
+                        tokio::time::sleep(backoff).await;
                         continue;
                     }
                     return Err(err);
                 }
             }
         }
-        unreachable!()
     }
 }
 

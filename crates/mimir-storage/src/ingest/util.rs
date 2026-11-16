@@ -14,14 +14,12 @@ use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::error::{ParseResponseErrorCode, ResponseError};
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::{
-    ApiKey, BrokerId, CreateTopicsRequest,
-    CreateTopicsResponse, FetchRequest, FetchResponse, FindCoordinatorRequest,
+    ApiKey, BrokerId, FetchRequest, FetchResponse, FindCoordinatorRequest,
     FindCoordinatorResponse, GroupId, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest,
     MetadataResponse, OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest,
     OffsetFetchResponse, ProduceRequest, ProduceResponse, RequestHeader, ResponseHeader,
     TopicName,
 };
-use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
 use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
@@ -803,13 +801,59 @@ impl KafkaClientExtendedMetrics {
 /// Creates the given topics in the Kafka cluster.
 /// A topic that already exists (`TopicAlreadyExists`) is treated as success.
 /// Missing topics from the broker response or any other error cause an error to be returned.
+///
+/// Like upstream, the request goes through a client built from the common Kafka client options
+/// (`commonKafkaClientOptions`: default 10s request timeout overhead, Mimir's retry timeouts) and
+/// is issued as a kadm admin request: to the controller, retried by the kgo retry policy (see
+/// [`super::kgo_retry`]). While the broker is unreachable but the failure is transient (dial
+/// timeouts, unresponsive / paused broker) this keeps retrying for up to the 30s retry timeout;
+/// a single bad seed (connection refused, DNS NXDOMAIN) fails fast.
 pub async fn create_topics(cfg: &KafkaConfig, topics: &[&str]) -> Result<(), String> {
-    let client = IngestKafkaClient::from_config(cfg, None).map_err(|e| {
-        format!("failed to create kafka client: {e}")
-    })?;
-    client
-        .create_topics_strict(topics, cfg.auto_create_topic_default_partitions as i32, -1)
+    let client = super::kafka_client::KafkaClient::from_config(cfg)
+        .map_err(|e| format!("failed to create kafka client: {e}"))?
+        .with_request_timeout(super::kgo_retry::DEFAULT_REQUEST_TIMEOUT_OVERHEAD);
+
+    // As of kafka 2.4 we can pass -1 and the broker will use its default configuration.
+    const DEFAULT_REPLICATION: i16 = -1;
+    let resp = client
+        .create_topics_request(
+            topics,
+            cfg.auto_create_topic_default_partitions as i32,
+            DEFAULT_REPLICATION,
+        )
         .await
+        .map_err(|e| format!("failed to create topics [{}]: {e}", topics.join(" ")))?;
+
+    let mut by_name: HashMap<String, &kafka_protocol::messages::create_topics_response::CreatableTopicResult> =
+        HashMap::new();
+    for t in &resp.topics {
+        by_name.insert(t.name.0.as_str().to_owned(), t);
+    }
+
+    for topic in topics {
+        let Some(t) = by_name.get(*topic) else {
+            // The broker should return a response for every requested topic; a missing one means we
+            // can't confirm it was created, so fail rather than report a success we didn't observe.
+            return Err(format!(
+                "failed to create topic {topic}: not part of the create topics response"
+            ));
+        };
+        if let Some(err) = t.error_code.err() {
+            if err == ResponseError::TopicAlreadyExists {
+                tracing::info!(task = "autocreate_topic", topic = %topic, "skipped Kafka topic creation because it already exists");
+                continue;
+            }
+            return Err(format!("failed to create topic {topic}: {err:?}"));
+        }
+        tracing::info!(
+            task = "autocreate_topic",
+            topic = %topic,
+            num_partitions = t.num_partitions,
+            replication_factor = t.replication_factor,
+            "successfully created Kafka topic"
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,7 +1176,8 @@ impl IngestKafkaClient {
             self.request_timeout,
             self.metrics.clone(),
         )
-        .await?;
+        .await
+        .map_err(|e| super::kgo_retry::classify_connect_error(addr, e))?;
 
         let mut map = self.conns_by_addr.lock().await;
         if let Some(existing) = map.get(addr) {
@@ -1306,56 +1351,6 @@ impl IngestKafkaClient {
                 }
             })
             .collect())
-    }
-
-    pub async fn create_topics_strict(
-        &self,
-        topics: &[&str],
-        num_partitions: i32,
-        replication_factor: i16,
-    ) -> Result<(), String> {
-        let conn = self
-            .any_conn()
-            .await
-            .map_err(|e| format!("failed to connect to kafka: {e}"))?;
-        let ver = conn.pick_version(ApiKey::CreateTopics, 0, 5);
-        let mut req = CreateTopicsRequest::default();
-        req.timeout_ms = self.request_timeout.as_millis().min(i32::MAX as u128) as i32;
-        for t in topics {
-            let mut ct = CreatableTopic::default();
-            ct.name = TopicName(StrBytes::from_string((*t).to_owned()));
-            ct.num_partitions = num_partitions;
-            ct.replication_factor = replication_factor;
-            req.topics.push(ct);
-        }
-
-        let resp: CreateTopicsResponse = tokio::time::timeout(
-            self.request_timeout,
-            conn.send_raw(ApiKey::CreateTopics, ver, &req),
-        )
-        .await
-        .map_err(|_| format!("failed to create topics {topics:?}: request timeout"))?
-        .map_err(|e| format!("failed to create topics {topics:?}: {e}"))?;
-
-        let mut by_name: HashMap<String, Option<ResponseError>> = HashMap::new();
-        for t in resp.topics {
-            by_name.insert(t.name.0.as_str().to_owned(), t.error_code.err());
-        }
-
-        for topic in topics {
-            let Some(err_opt) = by_name.get(*topic) else {
-                return Err(format!(
-                    "failed to create topic {topic}: not part of the create topics response"
-                ));
-            };
-            if let Some(err) = err_opt {
-                if *err == ResponseError::TopicAlreadyExists {
-                    continue;
-                }
-                return Err(format!("failed to create topic {topic}: {err:?}"));
-            }
-        }
-        Ok(())
     }
 
     pub async fn produce(
