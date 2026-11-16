@@ -538,6 +538,7 @@ async fn test_ingester_start_push_request() {
             inflight_permit: None,
             ingester: &ing,
             req_size: REQ_SIZE,
+            finished: true,
         };
 
         let existing_opt = if tc.has_existing_state {

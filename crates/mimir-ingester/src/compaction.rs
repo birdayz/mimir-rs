@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::active_series::parse_custom_tracker_matchers;
+use crate::active_series::{parse_custom_tracker_matchers, Matchers};
 use crate::ingester::{Ingester, TriggerRequest, INSTANCE_INGESTION_RATE_TICK_INTERVAL};
 use crate::label_churn::LABEL_CHURN_RECORD_INTERVAL;
 use crate::owned_series::{
@@ -618,9 +618,9 @@ impl Ingester {
             };
             let limits = self.overrides.for_tenant(&user_id);
             let new_matchers = parse_custom_tracker_matchers(&limits.active_series_custom_trackers);
-            let old_names = user_db.active_series.current_matcher_names();
-            let new_names: Vec<String> = new_matchers.iter().map(|m| m.name.clone()).collect();
-            if old_names != new_names {
+            let new_matcher_set = Matchers::from_custom_trackers(&new_matchers);
+            if user_db.active_series.matchers_differ(new_matcher_set.config()) {
+                let old_names = user_db.active_series.current_matcher_names();
                 for old_name in &old_names {
                     let _ = self
                         .metrics
@@ -635,9 +635,14 @@ impl Ingester {
                         .active_native_histogram_buckets_custom_trackers_per_user
                         .remove_label_values(&[&user_id, old_name]);
                 }
-                user_db
-                    .active_series
-                    .reload_matchers(new_matchers, user_db.db.head());
+                let cat = user_db.active_series.cost_attribution_tracker();
+                user_db.active_series.reload_series_config(
+                    new_matcher_set,
+                    cat,
+                    true,
+                    false,
+                    Some(user_db.db.head()),
+                );
             }
 
             user_db.active_series.purge(now);

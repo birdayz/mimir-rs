@@ -35,7 +35,7 @@ use tonic::Status;
 
 use crate::circuit_breaker::BreakerPermit;
 use crate::errors::IngesterError;
-use crate::ingester::{Ingester, INGEST_STORAGE_DEFAULT_READ_CONSISTENCY_TIMEOUT};
+use crate::ingester::Ingester;
 use crate::lookupplan::{self, BasicLookupPlan, LookupPlanner, NoopPlanner, SelectHints};
 use crate::metrics::REASON_MAX_INFLIGHT_READ_REQUESTS;
 use crate::mirror_querier::{
@@ -77,6 +77,15 @@ impl ReadPermit {
         }
         if let Some(rp) = self.reactive_permit.take() {
             rp.record();
+        }
+    }
+}
+
+impl Drop for ReadPermit {
+    fn drop(&mut self) {
+        drop(self.breaker_permit.take());
+        if let Some(rp) = self.reactive_permit.take() {
+            rp.drop_permit();
         }
     }
 }
@@ -472,7 +481,13 @@ impl Ingester {
         }
 
         if level == READ_CONSISTENCY_STRONG {
-            let timeout = INGEST_STORAGE_DEFAULT_READ_CONSISTENCY_TIMEOUT;
+            let timeout = Duration::from_nanos(
+                self.ingest_cfg
+                    .kafka
+                    .wait_strong_read_consistency_timeout
+                    .as_nanos()
+                    .max(0) as u64,
+            );
             if let Some(encoded) = md
                 .get(CONSISTENCY_OFFSETS_MD_KEY)
                 .and_then(|v| v.to_str().ok())

@@ -163,7 +163,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 fn call(&mut self, request: Request<Bytes>) -> Self::Future {
                     let ingester = Arc::clone(&self.0);
                     Box::pin(async move {
-                        let user_id = tenant_from_req(&request)?;
+                        let user_id = tenant_from_req(&ingester, &request)?;
                         let raw = request.into_inner();
                         if let Err(e) = ingester.push_grpc_raw(&user_id, &raw).await {
                             if e.should_log_error() {
@@ -202,9 +202,17 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
 }
 
 #[allow(clippy::result_large_err)]
-fn tenant_from_req<T>(req: &Request<T>) -> Result<String, Status> {
-    extract_tenant_id_from_grpc_metadata(req.metadata())
-        .map_err(|e| Status::invalid_argument(e.to_string()))
+fn tenant_from_req<T>(ingester: &Ingester, req: &Request<T>) -> Result<String, Status> {
+    match extract_tenant_id_from_grpc_metadata(req.metadata()) {
+        Ok(id) => Ok(id),
+        Err(mimir_common::tenant::TenantError::NoOrgID) if !ingester.is_multitenancy_enabled() => {
+            Ok(ingester.no_auth_tenant())
+        }
+        Err(mimir_common::tenant::TenantError::NoOrgID) => {
+            Err(Status::unknown(mimir_common::tenant::TenantError::NoOrgID.to_string()))
+        }
+        Err(e) => Err(Status::invalid_argument(e.to_string())),
+    }
 }
 
 fn vec_to_stream<T: Send + 'static>(
@@ -219,7 +227,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<cortexpb::WriteRequest>,
     ) -> Result<Response<cortexpb::WriteResponse>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         if let Err(e) = self.ingester.push_grpc(&user_id, request.get_ref()).await {
             if e.should_log_error() {
                 tracing::warn!(method = "/cortex.Ingester/Push", err = %e, "gRPC call failed");
@@ -236,7 +244,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::QueryRequest>,
     ) -> Result<Response<Self::QueryStreamStream>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let stream = self
             .ingester
@@ -250,7 +258,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::ExemplarQueryRequest>,
     ) -> Result<Response<ingesterpb::ExemplarQueryResponse>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let resp = self
             .ingester
@@ -264,7 +272,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::LabelValuesRequest>,
     ) -> Result<Response<ingesterpb::LabelValuesResponse>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let resp = self
             .ingester
@@ -278,7 +286,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::LabelNamesRequest>,
     ) -> Result<Response<ingesterpb::LabelNamesResponse>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let resp = self
             .ingester
@@ -292,7 +300,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::UserStatsRequest>,
     ) -> Result<Response<ingesterpb::UserStatsResponse>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let resp = self
             .ingester
@@ -319,7 +327,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::MetricsForLabelMatchersRequest>,
     ) -> Result<Response<ingesterpb::MetricsForLabelMatchersResponse>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let resp = self
             .ingester
@@ -333,7 +341,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::MetricsMetadataRequest>,
     ) -> Result<Response<ingesterpb::MetricsMetadataResponse>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let resp = self
             .ingester
@@ -351,7 +359,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::LabelNamesAndValuesRequest>,
     ) -> Result<Response<Self::LabelNamesAndValuesStream>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let items = self
             .ingester
@@ -373,7 +381,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::LabelValuesCardinalityRequest>,
     ) -> Result<Response<Self::LabelValuesCardinalityStream>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let items = self
             .ingester
@@ -390,7 +398,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::ActiveSeriesRequest>,
     ) -> Result<Response<Self::ActiveSeriesStream>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let stream = self
             .ingester
@@ -407,7 +415,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::SearchLabelNamesRequest>,
     ) -> Result<Response<Self::SearchLabelNamesStream>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let items = self
             .ingester
@@ -424,7 +432,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::SearchLabelValuesRequest>,
     ) -> Result<Response<Self::SearchLabelValuesStream>, Status> {
-        let user_id = tenant_from_req(&request)?;
+        let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let items = self
             .ingester
@@ -432,5 +440,45 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
             .await
             .map_err(|e: IngesterError| e.map_read_error_to_status())?;
         Ok(Response::new(vec_to_stream(items)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grpc_tenant_extraction_handles_multitenancy_disabled_and_unknown_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-0".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Multitenancy enabled + missing header => Code::Unknown
+        let req = Request::new(());
+        let err = tenant_from_req(&ing, &req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unknown);
+
+        // Multitenancy disabled + missing header => no_auth_tenant ("fake" default)
+        ing.set_multitenancy(false, "fake");
+        assert_eq!(tenant_from_req(&ing, &req).unwrap(), "fake");
+
+        // Custom no_auth_tenant
+        ing.set_multitenancy(false, "anonymous");
+        assert_eq!(tenant_from_req(&ing, &req).unwrap(), "anonymous");
     }
 }

@@ -173,6 +173,9 @@ pub struct Ingester {
 
     pub verify_ring_ownership: AtomicBool,
     pub read_only_override: AtomicBool,
+    weak_self: Arc<Mutex<Option<Weak<Ingester>>>>,
+    multitenancy_enabled: AtomicBool,
+    no_auth_tenant: RwLock<String>,
 }
 
 impl Ingester {
@@ -439,6 +442,9 @@ impl Ingester {
             ship_tx: RwLock::new(None),
             verify_ring_ownership: AtomicBool::new(false),
             read_only_override: AtomicBool::new(false),
+            weak_self: Arc::clone(&weak_slot),
+            multitenancy_enabled: AtomicBool::new(true),
+            no_auth_tenant: RwLock::new("fake".to_string()),
         });
 
         *weak_slot.lock() = Some(Arc::downgrade(&ingester));
@@ -500,6 +506,19 @@ impl Ingester {
         f: Arc<dyn Fn() -> Option<InstanceLimits> + Send + Sync>,
     ) {
         *self.instance_limits_fn.write() = Some(f);
+    }
+
+    pub fn set_multitenancy(&self, enabled: bool, no_auth_tenant: impl Into<String>) {
+        self.multitenancy_enabled.store(enabled, Ordering::Release);
+        *self.no_auth_tenant.write() = no_auth_tenant.into();
+    }
+
+    pub fn is_multitenancy_enabled(&self) -> bool {
+        self.multitenancy_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn no_auth_tenant(&self) -> String {
+        self.no_auth_tenant.read().clone()
     }
 
     fn state_from_u8(v: u8) -> State {
@@ -713,18 +732,13 @@ impl Ingester {
             .map_or(0, |s| s.shard_size_for_user(user_id));
 
         let weak_self = {
-            // Reconstruct weak check via runtime_cfg / state check
-            let cfg_limits = self.cfg.instance_limits.clone();
-            let rt = self.runtime_cfg.clone();
-            let state_ref = &self.state as *const RwLock<State>;
-            let _ = state_ref;
+            let weak_slot = Arc::clone(&self.weak_self);
             let max_series_fn: Arc<dyn Fn() -> i64 + Send + Sync> = Arc::new(move || {
-                if let Some(ref r) = rt {
-                    if let Some(l) = r.ingester_limits() {
-                        return l.max_series;
-                    }
+                let ing_opt = weak_slot.lock().as_ref().and_then(Weak::upgrade);
+                match ing_opt {
+                    Some(ing) => ing.get_instance_limits().map_or(0, |l| l.max_series),
+                    None => 0,
                 }
-                cfg_limits.max_series
             });
             max_series_fn
         };

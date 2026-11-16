@@ -423,22 +423,32 @@ async fn user_registry_handler(
     AxumState(st): AxumState<HttpState>,
     headers: HeaderMap,
 ) -> Response {
-    let Ok(user_id) = extract_tenant_id_from_http_headers(&headers) else {
-        return (StatusCode::UNAUTHORIZED, "no org id").into_response();
+    let user_id = match extract_tenant_id_from_http_headers(&headers) {
+        Ok(id) => id,
+        Err(mimir_common::tenant::TenantError::NoOrgID)
+            if !st.ingester.is_multitenancy_enabled() =>
+        {
+            st.ingester.no_auth_tenant()
+        }
+        Err(_) => return (StatusCode::UNAUTHORIZED, "no org id").into_response(),
     };
-    let Some(db) = st.ingester.get_tsdb(&user_id) else {
+    let Some(reg) = st.ingester.tsdb_metrics.registry_for_tenant(&user_id) else {
         return (StatusCode::NOT_FOUND, "user registry not found").into_response();
     };
-    let head = db.db.head();
-    let (series, chunks, samples, mint, maxt) = head.head_stats();
-    let body = format!(
-        "# TYPE prometheus_tsdb_head_series gauge\nprometheus_tsdb_head_series {series}\n\
-         # TYPE prometheus_tsdb_head_chunks gauge\nprometheus_tsdb_head_chunks {chunks}\n\
-         # TYPE prometheus_tsdb_head_samples_appended_total counter\nprometheus_tsdb_head_samples_appended_total {samples}\n\
-         # TYPE prometheus_tsdb_head_min_time gauge\nprometheus_tsdb_head_min_time {mint}\n\
-         # TYPE prometheus_tsdb_head_max_time gauge\nprometheus_tsdb_head_max_time {maxt}\n"
-    );
-    (StatusCode::OK, body).into_response()
+    let families = reg.gather();
+    let encoder = prometheus::TextEncoder::new();
+    match encoder.encode_to_string(&families) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[derive(Serialize)]
@@ -654,5 +664,47 @@ async fn label_churn_handler(
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn tsdb_metrics_endpoint_encodes_tenant_prometheus_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-0".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let _ = ing.get_or_create_tsdb("tenant-1").unwrap();
+        let app = ingester_router(ing);
+        let req = axum::http::Request::builder()
+            .uri("/ingester/tsdb_metrics")
+            .header("X-Scope-OrgID", "tenant-1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("prometheus_tsdb_head_series"));
     }
 }

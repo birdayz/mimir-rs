@@ -1281,30 +1281,26 @@ impl TenantMetadataStore {
     ) -> Result<(), IngesterError> {
         let metric_type = proto_metric_type_to_tsdb(raw_type);
 
+        let max_per_user = self.limiter.max_metadata_per_user(&self.user_id);
+        let max_per_metric = self.limiter.max_metadata_per_metric(&self.user_id);
+
         // Lock-free-for-readers fast path: 97%+ of metadata updates refresh an existing entry.
         {
             let guard = self.inner.read();
             if let Some(entries) = guard.metrics.get(metric_family_name) {
-                for e in entries {
-                    if e.metric_type == metric_type && e.help == help && e.unit == unit {
-                        e.last_seen_nanos.store(now_nanos, Ordering::Relaxed);
-                        return Ok(());
+                if max_per_metric == 0 || entries.len() < max_per_metric {
+                    for e in entries {
+                        if e.metric_type == metric_type && e.help == help && e.unit == unit {
+                            e.last_seen_nanos.store(now_nanos, Ordering::Relaxed);
+                            return Ok(());
+                        }
                     }
                 }
             }
         }
 
-        let max_per_user = self.limiter.max_metadata_per_user(&self.user_id);
-        let max_per_metric = self.limiter.max_metadata_per_metric(&self.user_id);
-
         let mut guard = self.inner.write();
         if let Some(entries) = guard.metrics.get(metric_family_name) {
-            for e in entries {
-                if e.metric_type == metric_type && e.help == help && e.unit == unit {
-                    e.last_seen_nanos.store(now_nanos, Ordering::Relaxed);
-                    return Ok(());
-                }
-            }
             if max_per_metric > 0 && entries.len() >= max_per_metric {
                 self.discarded_per_metric
                     .with_label_values(&[&self.user_id])
@@ -1313,6 +1309,12 @@ impl TenantMetadataStore {
                     max_per_metric,
                     metric_family_name.to_string(),
                 ));
+            }
+            for e in entries {
+                if e.metric_type == metric_type && e.help == help && e.unit == unit {
+                    e.last_seen_nanos.store(now_nanos, Ordering::Relaxed);
+                    return Ok(());
+                }
             }
         } else if max_per_user > 0 && guard.metrics.len() >= max_per_user {
             self.discarded_per_user
@@ -1426,4 +1428,62 @@ impl TenantMetadataStore {
 
 pub fn debug_log_push_head_error(user_id: &str, err: &HeadError) {
     debug!(user = %user_id, error = %err, "head append error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::limiter::LimiterRingStrategy;
+
+    struct OneInstanceStrategy;
+    impl LimiterRingStrategy for OneInstanceStrategy {
+        fn convert_global_to_local_limit(&self, _user_id: &str, global_limit: usize) -> usize {
+            global_limit
+        }
+        fn get_shard_size(&self, _user_id: &str) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn metadata_store_checks_per_metric_limit_before_refresh() {
+        let limits = mimir_config::LimitsConfig {
+            max_global_metadata_per_metric: 2,
+            ..Default::default()
+        };
+        let overrides = Overrides::new(limits);
+        let limiter = Arc::new(Limiter::new(
+            overrides.clone(),
+            Arc::new(OneInstanceStrategy),
+        ));
+        let reg = Registry::new();
+        let mem = prometheus::Gauge::new("t_mem", "h").unwrap();
+        let created = prometheus::CounterVec::new(prometheus::Opts::new("t_cr", "h"), &["user"]).unwrap();
+        let removed = prometheus::CounterVec::new(prometheus::Opts::new("t_rm", "h"), &["user"]).unwrap();
+        let d_user = prometheus::CounterVec::new(prometheus::Opts::new("t_du", "h"), &["user"]).unwrap();
+        let d_metric = prometheus::CounterVec::new(prometheus::Opts::new("t_dm", "h"), &["user"]).unwrap();
+        let _ = reg.register(Box::new(mem.clone()));
+
+        let store = TenantMetadataStore::new(
+            "t1".to_string(),
+            limiter,
+            mem,
+            created,
+            removed,
+            d_user,
+            d_metric,
+        );
+        store.add_parts_at(1, "up", "h1", "", 100).unwrap();
+        store.add_parts_at(1, "up", "h2", "", 100).unwrap();
+
+        // Dynamically lower limit to 1 -> refreshing existing ("up", "h1") must now fail!
+        let lowered = mimir_config::LimitsConfig {
+            max_global_metadata_per_metric: 1,
+            ..Default::default()
+        };
+        overrides.set_defaults(lowered);
+
+        let err = store.add_parts_at(1, "up", "h1", "", 200).unwrap_err();
+        assert!(matches!(err, IngesterError::PerMetricMetadataLimitReached { .. }));
+    }
 }
