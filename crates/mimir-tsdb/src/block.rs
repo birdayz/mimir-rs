@@ -4,8 +4,8 @@
 //! and github.com/grafana/mimir/pkg/storage/tsdb/block/meta.go.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -147,6 +147,17 @@ impl BlockMetaCompaction {
         self.hints.iter().any(|h| h == COMPACTION_HINT_FROM_OUT_OF_ORDER)
     }
 
+    pub fn set_stale_series(&mut self) {
+        if !self.from_stale_series() {
+            self.hints.push(COMPACTION_HINT_FROM_STALE_SERIES.to_string());
+            self.hints.sort();
+        }
+    }
+
+    pub fn from_stale_series(&self) -> bool {
+        self.hints.iter().any(|h| h == COMPACTION_HINT_FROM_STALE_SERIES)
+    }
+
     pub fn set_selected_series(&mut self) {
         if !self.from_selected_series() {
             self.hints
@@ -238,6 +249,19 @@ pub fn read_meta_file(dir: &Path) -> Result<BlockMeta, BlockError> {
     Ok(meta)
 }
 
+/// Fsyncs a directory entry so renames/creations inside `dir` are durable.
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 /// Atomically writes `<dir>/meta.json` with `version = 1` and tab indentation (matching Prometheus).
 pub fn write_meta_file(dir: &Path, meta: &mut BlockMeta) -> Result<usize, BlockError> {
     meta.version = META_VERSION_1;
@@ -248,8 +272,12 @@ pub fn write_meta_file(dir: &Path, meta: &mut BlockMeta) -> Result<usize, BlockE
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
     meta.serialize(&mut ser)?;
     buf.push(b'\n');
-    fs::write(&tmp, &buf)?;
+    let mut f = File::create(&tmp)?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    drop(f);
     fs::rename(&tmp, &path)?;
+    sync_dir(dir)?;
     Ok(buf.len())
 }
 

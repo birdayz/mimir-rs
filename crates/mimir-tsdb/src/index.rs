@@ -352,9 +352,9 @@ impl IndexWriter {
                 )));
             }
             last_chunk_ref = c.ref_id;
-            if ix > 0 && c.min_time <= last_maxt {
+            if ix > 0 && c.min_time < last_maxt {
                 return Err(IndexError::InvalidChunkOrder(format!(
-                    "chunk min_time {} <= previous max_time {}",
+                    "chunk min_time {} < previous max_time {}",
                     c.min_time, last_maxt
                 )));
             }
@@ -866,7 +866,9 @@ impl IndexReader {
             Some(hb) => Bytes::from(hb),
             None => Bytes::copy_from_slice(&stack_buf[..pos]),
         };
-        Ok(Labels::from_raw_stringlabels_bytes(bytes))
+        // SAFETY: `ln` and `lv` are `&str` (validated UTF-8 at `IndexReader::open`), encoded with
+        // valid `stringlabels` framing immediately above.
+        Ok(unsafe { Labels::from_valid_stringlabels_bytes_unchecked(bytes) })
     }
 
     /// Decodes the series entry at `ref_id` (`series_id = file_offset / 16`).
@@ -1355,5 +1357,65 @@ mod tests {
         let m = LabelMatcher::new(MatchType::Equal, "job", "db").unwrap();
         let matched = postings_for_matchers(&r, &[m]).unwrap();
         assert_eq!(matched, vec![all[1]]);
+    }
+
+    #[test]
+    fn index_allows_touching_chunk_boundaries_and_rejects_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx_path = dir.path().join(INDEX_FILENAME);
+        let l = Labels::from_pairs([("__name__", "m")]);
+        let mut w = IndexWriter::new(&idx_path).unwrap();
+        w.add_symbol("").unwrap();
+        w.add_symbol("__name__").unwrap();
+        w.add_symbol("m").unwrap();
+        // Touching boundaries (c2.min_time == c1.max_time) must be accepted.
+        w.add_series(
+            0,
+            &l,
+            &[
+                ChunkMeta {
+                    ref_id: 1,
+                    min_time: 100,
+                    max_time: 200,
+                    chunk: None,
+                },
+                ChunkMeta {
+                    ref_id: 2,
+                    min_time: 200,
+                    max_time: 300,
+                    chunk: None,
+                },
+            ],
+        )
+        .unwrap();
+        w.close().unwrap();
+
+        // Overlapping (c2.min_time < c1.max_time) must be rejected.
+        let idx_path2 = dir.path().join("index2");
+        let mut w2 = IndexWriter::new(&idx_path2).unwrap();
+        w2.add_symbol("").unwrap();
+        w2.add_symbol("__name__").unwrap();
+        w2.add_symbol("m").unwrap();
+        let err = w2
+            .add_series(
+                0,
+                &l,
+                &[
+                    ChunkMeta {
+                        ref_id: 1,
+                        min_time: 100,
+                        max_time: 200,
+                        chunk: None,
+                    },
+                    ChunkMeta {
+                        ref_id: 2,
+                        min_time: 199,
+                        max_time: 300,
+                        chunk: None,
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(err, IndexError::InvalidChunkOrder(_)));
     }
 }

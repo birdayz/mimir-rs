@@ -59,7 +59,7 @@ use crate::symbols::{SymbolId, SymbolTable};
 use crate::tombstones::{is_completely_deleted, Interval, MemTombstones};
 use crate::wlog::{
     checkpoint_dir, create_checkpoint, decompress_record_into, delete_checkpoints,
-    delete_temp_checkpoints, last_checkpoint, read_min_valid_time, segments_range,
+    delete_temp_checkpoints, last_checkpoint, read_min_valid_time, repair_wal, segments_range,
     CompressionType, SegmentRange, SegmentTracker, WlogError, WlogReader, WlogWriter,
     DEFAULT_SEGMENT_SIZE, WBL_DIR_NAME,
 };
@@ -355,6 +355,9 @@ impl OooHeadChunk {
 #[derive(Debug, Default)]
 struct SeriesOooState {
     ooo_head_chunk: Option<OooHeadChunk>,
+    /// Encoded chunks from cut `ooo_head_chunk`s written to `HeadChunksWriter`, awaiting
+    /// `writer.flush()` and `chunk_reader` refresh before promotion to `ooo_mmapped_chunks`.
+    ooo_pending_mmapped: Vec<(MmappedChunk, EncodedChunk)>,
     ooo_mmapped_chunks: Vec<MmappedChunk>,
 }
 
@@ -404,6 +407,9 @@ pub fn prefetch_read_data<T>(ptr: *const T) {
     let _ = ptr;
 }
 
+const PENDING_COMMIT_GCED_BIT: u32 = 1 << 31;
+const PENDING_COMMIT_COUNT_MASK: u32 = !PENDING_COMMIT_GCED_BIT;
+
 #[derive(Debug)]
 pub struct SeriesEntry {
     pub ref_id: u64,
@@ -412,6 +418,7 @@ pub struct SeriesEntry {
     active_cache: AtomicU64,
     in_order_max_time: AtomicI64,
     pending_commits: AtomicU32,
+    gced: AtomicBool,
     inner: Mutex<SeriesState>,
 }
 
@@ -424,6 +431,43 @@ impl SeriesEntry {
     #[inline(always)]
     pub fn set_active_cache(&self, packed: u64) {
         self.active_cache.store(packed, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn is_gced(&self) -> bool {
+        self.gced.load(Ordering::Acquire)
+            || (self.pending_commits.load(Ordering::Acquire) & PENDING_COMMIT_GCED_BIT) != 0
+    }
+
+    #[inline(always)]
+    pub fn pending_commits_count(&self) -> u32 {
+        self.pending_commits.load(Ordering::Acquire) & PENDING_COMMIT_COUNT_MASK
+    }
+
+    #[inline(always)]
+    fn try_inc_pending_commit(&self) -> bool {
+        let mut cur = self.pending_commits.load(Ordering::Acquire);
+        loop {
+            if (cur & PENDING_COMMIT_GCED_BIT) != 0 {
+                return false;
+            }
+            match self.pending_commits.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(next) => cur = next,
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn try_mark_gced(&self) -> bool {
+        self.pending_commits
+            .compare_exchange(0, PENDING_COMMIT_GCED_BIT, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
@@ -1180,13 +1224,14 @@ impl SeriesState {
                             true,
                         )?;
                         mmap_refs.push(r);
-                        ooo.ooo_mmapped_chunks.push(MmappedChunk {
+                        let mc = MmappedChunk {
                             ref_id: r,
                             min_time: cc.min_time,
                             max_time: cc.max_time,
                             num_samples: cc.chunk.num_samples() as u16,
                             encoding: cc.chunk.encoding(),
-                        });
+                        };
+                        ooo.ooo_pending_mmapped.push((mc, cc.chunk));
                     }
                 }
             }
@@ -1468,16 +1513,22 @@ impl StripeSeries {
             let hash = entry.hash;
             s.by_hash.insert_unique(hash, (hash, entry), |&(h, _)| h);
         } else {
-            {
-                let mut hs = self.stripes[h_idx].write();
-                let hash = entry.hash;
-                hs.by_hash
-                    .insert_unique(hash, (hash, Arc::clone(&entry)), |&(h, _)| h);
-            }
-            {
-                let mut rs = self.stripes[r_idx].write();
-                rs.by_id.insert(entry.ref_id, entry);
-            }
+            let (first_idx, second_idx) = if h_idx < r_idx {
+                (h_idx, r_idx)
+            } else {
+                (r_idx, h_idx)
+            };
+            let mut first = self.stripes[first_idx].write();
+            let mut second = self.stripes[second_idx].write();
+            let (hs, rs) = if h_idx < r_idx {
+                (&mut *first, &mut *second)
+            } else {
+                (&mut *second, &mut *first)
+            };
+            let hash = entry.hash;
+            hs.by_hash
+                .insert_unique(hash, (hash, Arc::clone(&entry)), |&(h, _)| h);
+            rs.by_id.insert(entry.ref_id, entry);
         }
     }
 
@@ -1497,21 +1548,82 @@ impl StripeSeries {
                 found.remove();
             }
         } else {
+            let (first_idx, second_idx) = if h_idx < r_idx {
+                (h_idx, r_idx)
+            } else {
+                (r_idx, h_idx)
+            };
+            let mut first = self.stripes[first_idx].write();
+            let mut second = self.stripes[second_idx].write();
+            let (hs, rs) = if h_idx < r_idx {
+                (&mut *first, &mut *second)
+            } else {
+                (&mut *second, &mut *first)
+            };
+            if let Ok(found) = hs
+                .by_hash
+                .find_entry(entry.hash, |&(h, ref e)| {
+                    h == entry.hash && e.ref_id == entry.ref_id
+                })
             {
-                let mut hs = self.stripes[h_idx].write();
-                if let Ok(found) = hs
-                    .by_hash
-                    .find_entry(entry.hash, |&(h, ref e)| {
-                        h == entry.hash && e.ref_id == entry.ref_id
-                    })
-                {
-                    found.remove();
-                }
+                found.remove();
             }
+            rs.by_id.remove(&entry.ref_id);
+        }
+    }
+
+    /// Atomically verifies `pending_commits == 0`, marks `entry` & `st` as GCed,
+    /// and unlinks `entry` from `by_id` and `by_hash` while holding both `entry.inner`
+    /// and the stripe write lock(s).
+    fn remove_if_gced_under_entry_lock(&self, entry: &SeriesEntry, st: &mut SeriesState) -> bool {
+        let h_idx = self.stripe_idx(entry.hash);
+        let r_idx = self.stripe_idx(entry.ref_id);
+
+        if h_idx == r_idx {
+            let mut s = self.stripes[h_idx].write();
+            if !entry.try_mark_gced() {
+                return false;
+            }
+            entry.gced.store(true, Ordering::Release);
+            st.set_gced(true);
+            s.by_id.remove(&entry.ref_id);
+            if let Ok(found) = s
+                .by_hash
+                .find_entry(entry.hash, |&(h, ref e)| {
+                    h == entry.hash && e.ref_id == entry.ref_id
+                })
             {
-                let mut rs = self.stripes[r_idx].write();
-                rs.by_id.remove(&entry.ref_id);
+                found.remove();
             }
+            true
+        } else {
+            let (first_idx, second_idx) = if h_idx < r_idx {
+                (h_idx, r_idx)
+            } else {
+                (r_idx, h_idx)
+            };
+            let mut first = self.stripes[first_idx].write();
+            let mut second = self.stripes[second_idx].write();
+            if !entry.try_mark_gced() {
+                return false;
+            }
+            entry.gced.store(true, Ordering::Release);
+            st.set_gced(true);
+            let (hs, rs) = if h_idx < r_idx {
+                (&mut *first, &mut *second)
+            } else {
+                (&mut *second, &mut *first)
+            };
+            if let Ok(found) = hs
+                .by_hash
+                .find_entry(entry.hash, |&(h, ref e)| {
+                    h == entry.hash && e.ref_id == entry.ref_id
+                })
+            {
+                found.remove();
+            }
+            rs.by_id.remove(&entry.ref_id);
+            true
         }
     }
 
@@ -1684,6 +1796,8 @@ pub struct Head {
     wbl: Mutex<Option<WlogWriter>>,
     chunk_writer: Mutex<Option<HeadChunksWriter>>,
     chunk_reader: RwLock<Option<HeadChunksReader>>,
+    mmap_mtx: Mutex<()>,
+    ooo_compact_wbl_cut_seg: Mutex<Option<usize>>,
 
     min_time: AtomicI64,
     max_time: AtomicI64,
@@ -1798,6 +1912,8 @@ impl Head {
             wbl: Mutex::new(None),
             chunk_writer: Mutex::new(None),
             chunk_reader: RwLock::new(None),
+            mmap_mtx: Mutex::new(()),
+            ooo_compact_wbl_cut_seg: Mutex::new(None),
             min_time: AtomicI64::new(i64::MAX),
             max_time: AtomicI64::new(i64::MIN),
             min_valid_time: AtomicI64::new(min_valid_time),
@@ -1837,7 +1953,7 @@ impl Head {
         let chunk_writer =
             HeadChunksWriter::with_max_file_size(&chunks_dir, opts.max_head_chunk_file_size)?;
         *head.chunk_writer.lock() = Some(chunk_writer);
-        let chunk_reader = HeadChunksReader::open(&chunks_dir)?;
+        let chunk_reader = HeadChunksReader::open_no_repair(&chunks_dir)?;
         *head.chunk_reader.write() = Some(chunk_reader);
 
         Ok(head)
@@ -1880,12 +1996,29 @@ impl Head {
         }
         *self.chunk_reader.write() = Some(reader);
 
-        // 2. Replay WAL checkpoint + segments.
+        // 2. Replay WAL checkpoint + segments (repairing any torn tail record on crash).
         let mut multi_ref: HashMap<u64, u64> = HashMap::new();
         let mut start_from = 0usize;
         if let Some((cp_dir, cp_idx)) = last_checkpoint(wal_dir)? {
             let mut r = WlogReader::open_dir(&cp_dir)?;
-            self.replay_wal_reader(&mut r, &mut multi_ref, &mut mmapped_map, &mut ooo_mmapped_map)?;
+            if let Err(err) = self.replay_wal_reader(
+                &mut r,
+                &mut multi_ref,
+                &mut mmapped_map,
+                &mut ooo_mmapped_map,
+            ) {
+                match err {
+                    HeadError::Wlog(WlogError::Corruption {
+                        dir: Some(corrupt_dir),
+                        segment: Some(seg),
+                        offset,
+                        ..
+                    }) => {
+                        repair_wal(&corrupt_dir, seg, offset, self.opts.wal_compression)?;
+                    }
+                    other => return Err(other),
+                }
+            }
             start_from = cp_idx + 1;
         }
 
@@ -1897,16 +2030,29 @@ impl Head {
                     first: Some(from),
                     last: Some(last_seg),
                 }])?;
-                self.replay_wal_reader(
+                if let Err(err) = self.replay_wal_reader(
                     &mut r,
                     &mut multi_ref,
                     &mut mmapped_map,
                     &mut ooo_mmapped_map,
-                )?;
+                ) {
+                    match err {
+                        HeadError::Wlog(WlogError::Corruption {
+                            dir: Some(corrupt_dir),
+                            segment: Some(seg),
+                            offset,
+                            ..
+                        }) => {
+                            repair_wal(&corrupt_dir, seg, offset, self.opts.wal_compression)?;
+                        }
+                        other => return Err(other),
+                    }
+                }
             }
         }
 
-        // 3. Replay WBL segments if present.
+        // 3. Replay WBL segments if present, passing a chunk_writer so overflowing OOO head
+        // chunks spill to `chunks_head` instead of dropping, and repairing any torn tail record.
         if wbl_dir.exists() {
             if let Some((first_wbl, last_wbl)) = segments_range(wbl_dir)? {
                 let mut r = WlogReader::open_ranges(&[SegmentRange {
@@ -1914,16 +2060,44 @@ impl Head {
                     first: Some(first_wbl),
                     last: Some(last_wbl),
                 }])?;
-                self.replay_wbl_reader(&mut r, &multi_ref, last_mmap_ref)?;
+                let mut replay_cw =
+                    HeadChunksWriter::with_max_file_size(chunks_dir, self.opts.max_head_chunk_file_size)?;
+                let wbl_res = self.replay_wbl_reader(
+                    &mut r,
+                    &multi_ref,
+                    last_mmap_ref,
+                    Some(&mut replay_cw),
+                );
+                let spilled = replay_cw.close().map_err(HeadError::from);
+                spilled?;
+                if let Err(err) = wbl_res {
+                    match err {
+                        HeadError::Wlog(WlogError::Corruption {
+                            dir: Some(corrupt_dir),
+                            segment: Some(seg),
+                            offset,
+                            ..
+                        }) => {
+                            repair_wal(&corrupt_dir, seg, offset, self.opts.wal_compression)?;
+                        }
+                        other => return Err(other),
+                    }
+                }
+                let refreshed = HeadChunksReader::open_no_repair(chunks_dir)?;
+                *self.chunk_reader.write() = Some(refreshed);
+                self.promote_all_pending_ooo_mmapped();
             }
         }
 
         self.postings.ensure_order_parallel();
         self.postings_cache.invalidate_all();
 
+        let effective_mvt = self.min_valid_time.load(Ordering::Relaxed);
+        self.gc(effective_mvt)?;
+
         // Clamp min_time to min_valid_time if initialized below it.
-        if self.initialized() && self.min_time() < min_valid_time {
-            self.min_time.store(min_valid_time, Ordering::Relaxed);
+        if self.initialized() && self.min_time() < effective_mvt {
+            self.min_time.store(effective_mvt, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -2150,16 +2324,32 @@ impl Head {
         const WAL_POSTINGS_BATCH: usize = 4096;
 
         let dec = RecordDecoder::new();
-        let min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
+        let mut min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
         let mut mint = i64::MAX;
         let mut maxt = i64::MIN;
         let mut ooo_mint = i64::MAX;
         let mut ooo_maxt = i64::MIN;
         let mut pending_postings: Vec<(u64, SymbolLabels)> = Vec::with_capacity(WAL_POSTINGS_BATCH);
         let mut postings_scratch = PostingsBatchScratch::new();
+        let mut replay_err: Option<HeadError> = None;
 
-        while let Some(rec) = r.next_record()? {
-            match dec.decode_record(rec)? {
+        loop {
+            let rec = match r.next_record() {
+                Ok(Some(rec)) => rec,
+                Ok(None) => break,
+                Err(e) => {
+                    replay_err = Some(HeadError::from(e));
+                    break;
+                }
+            };
+            let decoded = match dec.decode_record(rec) {
+                Ok(d) => d,
+                Err(e) => {
+                    replay_err = Some(HeadError::from(e));
+                    break;
+                }
+            };
+            match decoded {
                 DecodedRecord::Series(series_list) => {
                     self.replay_wal_series_batch(
                         &series_list,
@@ -2304,9 +2494,13 @@ impl Head {
                         st.metadata = Some(compact_meta);
                     }
                 }
-                DecodedRecord::MinValidTime(_)
-                | DecodedRecord::MmapMarkers(_)
-                | DecodedRecord::Unknown(_) => {}
+                DecodedRecord::MinValidTime(t) => {
+                    if t > min_valid_time {
+                        min_valid_time = t;
+                        self.min_valid_time.fetch_max(t, Ordering::AcqRel);
+                    }
+                }
+                DecodedRecord::MmapMarkers(_) | DecodedRecord::Unknown(_) => {}
             }
         }
         if !pending_postings.is_empty() {
@@ -2320,7 +2514,10 @@ impl Head {
         if ooo_mint <= ooo_maxt {
             self.update_min_ooo_max_ooo_time(ooo_mint, ooo_maxt);
         }
-        Ok(())
+        match replay_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     fn replay_wal_reader_parallel<R: io::Read + SegmentTracker + Send>(
@@ -2330,15 +2527,19 @@ impl Head {
         mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
         ooo_mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
     ) -> Result<(), HeadError> {
+        enum WalSampleJob {
+            Float(RefSample),
+            Histogram(RefHistogramSample),
+            FloatHistogram(RefFloatHistogramSample),
+        }
+
         enum WalWorkerMsg {
             AttachMmapped {
                 entry: Arc<SeriesEntry>,
                 mmc: Vec<MmappedChunk>,
                 ooo_mmc: Vec<MmappedChunk>,
             },
-            Samples(Vec<RefSample>),
-            HistogramSamples(Vec<RefHistogramSample>),
-            FloatHistogramSamples(Vec<RefFloatHistogramSample>),
+            SampleJobs(Vec<WalSampleJob>),
             AddTombstone {
                 ref_id: u64,
                 interval: Interval,
@@ -2360,10 +2561,11 @@ impl Head {
             .clamp(2, 32);
         let workers = self.opts.wal_replay_concurrency.min(max_threads).max(2);
         let dec_workers = workers.min(8);
-        let min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
+        let mut min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
         let series_pool = mimir_common::thread_pool::ScopedWorkerPool::new("wal-series", workers);
 
-        type RawBatch = (u64, Vec<(CompressionType, Vec<u8>)>);
+        type RawEntry = (CompressionType, Vec<u8>, Option<PathBuf>, Option<usize>, usize);
+        type RawBatch = (u64, Vec<RawEntry>);
         type DecodedBatch = (u64, Vec<ParallelDecodedRecord>);
 
         // Channel capacity > dec_workers * dec_queue_cap ensures zero deadlock when reordering.
@@ -2390,14 +2592,18 @@ impl Head {
             let reader_err_tx = decoded_tx.clone();
             let reader_handle = scope.spawn(move || {
                 let mut batch_id = 0u64;
-                let mut batch: Vec<(CompressionType, Vec<u8>)> =
-                    Vec::with_capacity(WAL_DECODE_BATCH_RECORDS);
+                let mut batch: Vec<RawEntry> = Vec::with_capacity(WAL_DECODE_BATCH_RECORDS);
                 let mut batch_bytes = 0usize;
                 loop {
+                    let cur_dir = r.segment_dir().map(Path::to_path_buf);
                     match r.next_raw_record() {
                         Ok(Some((compr, raw))) => {
-                            batch_bytes += raw.len();
-                            batch.push((compr, raw.to_vec()));
+                            let raw_vec = raw.to_vec();
+                            let post_dir = r.segment_dir().map(Path::to_path_buf).or(cur_dir);
+                            let post_seg = r.segment();
+                            let post_off = r.offset();
+                            batch_bytes += raw_vec.len();
+                            batch.push((compr, raw_vec, post_dir, post_seg, post_off));
                             if batch.len() >= WAL_DECODE_BATCH_RECORDS
                                 || batch_bytes >= WAL_DECODE_BATCH_BYTES
                             {
@@ -2421,6 +2627,10 @@ impl Head {
                             break;
                         }
                         Err(e) => {
+                            if !batch.is_empty() {
+                                let target = (batch_id as usize) % dec_workers;
+                                let _ = dec_txs[target].send((batch_id, batch));
+                            }
                             let _ = reader_err_tx.send(Err(HeadError::from(e)));
                             break;
                         }
@@ -2440,9 +2650,14 @@ impl Head {
                     while let Ok((batch_id, raw_batch)) = rx.recv() {
                         let mut decoded_batch = Vec::with_capacity(raw_batch.len());
                         let mut err: Option<HeadError> = None;
-                        for (compr, raw) in raw_batch {
+                        for (compr, raw, dir, seg, off) in raw_batch {
                             if let Err(msg) = decompress_record_into(compr, &raw, &mut decomp_buf) {
-                                err = Some(HeadError::Wlog(WlogError::Compression(msg)));
+                                err = Some(HeadError::Wlog(WlogError::Corruption {
+                                    dir,
+                                    segment: seg,
+                                    offset: off,
+                                    message: msg,
+                                }));
                                 break;
                             }
                             match dec.decode_record(&decomp_buf) {
@@ -2501,28 +2716,30 @@ impl Head {
                                     &mut ooo_maxt,
                                 );
                             }
-                            WalWorkerMsg::Samples(samples) => {
-                                for s in samples {
-                                    if let Some(entry) = self.series.get_by_id(s.ref_id) {
-                                        self.replay_one_sample(&entry, s, &mut mint, &mut maxt)?;
-                                    }
-                                }
-                            }
-                            WalWorkerMsg::HistogramSamples(hists) => {
-                                for hs in hists {
-                                    if let Some(entry) = self.series.get_by_id(hs.ref_id) {
-                                        self.replay_one_histogram(
-                                            &entry, hs, &mut mint, &mut maxt,
-                                        )?;
-                                    }
-                                }
-                            }
-                            WalWorkerMsg::FloatHistogramSamples(fhists) => {
-                                for fhs in fhists {
-                                    if let Some(entry) = self.series.get_by_id(fhs.ref_id) {
-                                        self.replay_one_float_histogram(
-                                            &entry, fhs, &mut mint, &mut maxt,
-                                        )?;
+                            WalWorkerMsg::SampleJobs(jobs) => {
+                                for job in jobs {
+                                    match job {
+                                        WalSampleJob::Float(s) => {
+                                            if let Some(entry) = self.series.get_by_id(s.ref_id) {
+                                                self.replay_one_sample(
+                                                    &entry, s, &mut mint, &mut maxt,
+                                                )?;
+                                            }
+                                        }
+                                        WalSampleJob::Histogram(hs) => {
+                                            if let Some(entry) = self.series.get_by_id(hs.ref_id) {
+                                                self.replay_one_histogram(
+                                                    &entry, hs, &mut mint, &mut maxt,
+                                                )?;
+                                            }
+                                        }
+                                        WalSampleJob::FloatHistogram(fhs) => {
+                                            if let Some(entry) = self.series.get_by_id(fhs.ref_id) {
+                                                self.replay_one_float_histogram(
+                                                    &entry, fhs, &mut mint, &mut maxt,
+                                                )?;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2548,9 +2765,7 @@ impl Head {
             // Stage 2: Coordinator processes decoded batches in exact WAL order (`batch_id`),
             // resolves Series in parallel (sharded by hash % workers), and shards samples.
             let mut coord_res: Result<(), HeadError> = Ok(());
-            let mut sample_shards: Vec<Vec<RefSample>> = vec![Vec::new(); workers];
-            let mut hist_shards: Vec<Vec<RefHistogramSample>> = vec![Vec::new(); workers];
-            let mut fhist_shards: Vec<Vec<RefFloatHistogramSample>> = vec![Vec::new(); workers];
+            let mut job_shards: Vec<Vec<WalSampleJob>> = (0..workers).map(|_| Vec::new()).collect();
             let mut pending_deletes: Vec<Arc<SeriesEntry>> = Vec::new();
             let mut pending_series: Vec<(RefSeries, u64)> = Vec::new();
             let mut reorder: BTreeMap<u64, Vec<ParallelDecodedRecord>> = BTreeMap::new();
@@ -2644,6 +2859,7 @@ impl Head {
                             active_cache: AtomicU64::new(0),
                             in_order_max_time: AtomicI64::new(i64::MIN),
                             pending_commits: AtomicU32::new(0),
+                            gced: AtomicBool::new(false),
                             inner: Mutex::new(SeriesState::new()),
                         });
                         self.series.insert(Arc::clone(&entry));
@@ -2703,8 +2919,11 @@ impl Head {
                 let (batch_id, decoded_batch) = match item {
                     Ok(v) => v,
                     Err(e) => {
-                        coord_res = Err(e);
-                        break;
+                        if coord_res.is_ok() {
+                            coord_res = Err(e);
+                        }
+                        // Drain remaining valid batches already in flight before exiting.
+                        continue;
                     }
                 };
                 let mut cur_batch = if batch_id == next_batch_id {
@@ -2737,7 +2956,7 @@ impl Head {
                                         ooo_mmapped_map,
                                         &mut failed_outer,
                                     ) {
-                                        if !failed_outer {
+                                        if !failed_outer && coord_res.is_ok() {
                                             coord_res = Err(e);
                                         }
                                         break 'outer;
@@ -2753,7 +2972,7 @@ impl Head {
                                         ooo_mmapped_map,
                                         &mut failed_outer,
                                     ) {
-                                        if !failed_outer {
+                                        if !failed_outer && coord_res.is_ok() {
                                             coord_res = Err(e);
                                         }
                                         break 'outer;
@@ -2762,156 +2981,160 @@ impl Head {
                                 match decoded {
                                     DecodedRecord::Series(_) => unreachable!(),
                                     DecodedRecord::Samples(samples) => {
-                                for &(mut s) in &samples {
-                                    if s.t < min_valid_time {
-                                        continue;
-                                    }
-                                    if let Some(&mapped) = multi_ref.get(&s.ref_id) {
-                                        self.update_wal_expiry(s.ref_id, s.t);
-                                        s.ref_id = mapped;
-                                    }
-                                    let idx = (s.ref_id as usize) % workers;
-                                    sample_shards[idx].push(s);
-                                    if sample_shards[idx].len() >= WAL_SHARD_BATCH_MAX {
-                                        let batch = std::mem::take(&mut sample_shards[idx]);
-                                        if worker_txs[idx].send(WalWorkerMsg::Samples(batch)).is_err()
-                                        {
-                                            failed_outer = true;
-                                            break 'outer;
+                                        for &(mut s) in &samples {
+                                            if s.t < min_valid_time {
+                                                continue;
+                                            }
+                                            if let Some(&mapped) = multi_ref.get(&s.ref_id) {
+                                                self.update_wal_expiry(s.ref_id, s.t);
+                                                s.ref_id = mapped;
+                                            }
+                                            let idx = (s.ref_id as usize) % workers;
+                                            job_shards[idx].push(WalSampleJob::Float(s));
+                                            if job_shards[idx].len() >= WAL_SHARD_BATCH_MAX {
+                                                let batch = std::mem::take(&mut job_shards[idx]);
+                                                if worker_txs[idx]
+                                                    .send(WalWorkerMsg::SampleJobs(batch))
+                                                    .is_err()
+                                                {
+                                                    failed_outer = true;
+                                                    break 'outer;
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                            }
-                            DecodedRecord::HistogramSamples(hists) => {
-                                let mut iter = hists.into_iter().peekable();
-                                while iter.peek().is_some() {
-                                    for mut hs in iter.by_ref().take(WAL_SHARD_BATCH_MAX) {
-                                        if hs.t < min_valid_time {
-                                            continue;
+                                    DecodedRecord::HistogramSamples(hists) => {
+                                        for mut hs in hists {
+                                            if hs.t < min_valid_time {
+                                                continue;
+                                            }
+                                            if let Some(&mapped) = multi_ref.get(&hs.ref_id) {
+                                                self.update_wal_expiry(hs.ref_id, hs.t);
+                                                hs.ref_id = mapped;
+                                            }
+                                            let idx = (hs.ref_id as usize) % workers;
+                                            job_shards[idx].push(WalSampleJob::Histogram(hs));
+                                            if job_shards[idx].len() >= WAL_SHARD_BATCH_MAX {
+                                                let batch = std::mem::take(&mut job_shards[idx]);
+                                                if worker_txs[idx]
+                                                    .send(WalWorkerMsg::SampleJobs(batch))
+                                                    .is_err()
+                                                {
+                                                    failed_outer = true;
+                                                    break 'outer;
+                                                }
+                                            }
                                         }
-                                        if let Some(&mapped) = multi_ref.get(&hs.ref_id) {
-                                            self.update_wal_expiry(hs.ref_id, hs.t);
-                                            hs.ref_id = mapped;
-                                        }
-                                        let idx = (hs.ref_id as usize) % workers;
-                                        hist_shards[idx].push(hs);
                                     }
-                                    for (idx, shard) in hist_shards.iter_mut().enumerate() {
-                                        if !shard.is_empty() {
-                                            let batch = std::mem::take(shard);
+                                    DecodedRecord::FloatHistogramSamples(fhists) => {
+                                        for mut fhs in fhists {
+                                            if fhs.t < min_valid_time {
+                                                continue;
+                                            }
+                                            if let Some(&mapped) = multi_ref.get(&fhs.ref_id) {
+                                                self.update_wal_expiry(fhs.ref_id, fhs.t);
+                                                fhs.ref_id = mapped;
+                                            }
+                                            let idx = (fhs.ref_id as usize) % workers;
+                                            job_shards[idx].push(WalSampleJob::FloatHistogram(fhs));
+                                            if job_shards[idx].len() >= WAL_SHARD_BATCH_MAX {
+                                                let batch = std::mem::take(&mut job_shards[idx]);
+                                                if worker_txs[idx]
+                                                    .send(WalWorkerMsg::SampleJobs(batch))
+                                                    .is_err()
+                                                {
+                                                    failed_outer = true;
+                                                    break 'outer;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    DecodedRecord::Tombstones(stones) => {
+                                        for mut stone in stones {
+                                            self.bump_last_series_id(stone.ref_id);
+                                            if stone.mint == i64::MIN && stone.maxt == i64::MAX {
+                                                let mut ref_id = stone.ref_id;
+                                                if let Some(&mapped) = multi_ref.get(&ref_id) {
+                                                    ref_id = mapped;
+                                                }
+                                                if let Some(entry) = self.series.get_by_id(ref_id) {
+                                                    self.series.unlink_hash(entry.hash, ref_id);
+                                                    pending_deletes.push(entry);
+                                                }
+                                                continue;
+                                            }
+                                            if stone.maxt < min_valid_time {
+                                                continue;
+                                            }
+                                            if let Some(&mapped) = multi_ref.get(&stone.ref_id) {
+                                                self.update_wal_expiry(stone.ref_id, stone.maxt);
+                                                stone.ref_id = mapped;
+                                            }
+                                            let idx = (stone.ref_id as usize) % workers;
                                             if worker_txs[idx]
-                                                .send(WalWorkerMsg::HistogramSamples(batch))
+                                                .send(WalWorkerMsg::AddTombstone {
+                                                    ref_id: stone.ref_id,
+                                                    interval: Interval::new(stone.mint, stone.maxt),
+                                                })
                                                 .is_err()
                                             {
+                                                failed_outer = true;
                                                 break 'outer;
                                             }
                                         }
                                     }
-                                }
-                            }
-                            DecodedRecord::FloatHistogramSamples(fhists) => {
-                                let mut iter = fhists.into_iter().peekable();
-                                while iter.peek().is_some() {
-                                    for mut fhs in iter.by_ref().take(WAL_SHARD_BATCH_MAX) {
-                                        if fhs.t < min_valid_time {
-                                            continue;
-                                        }
-                                        if let Some(&mapped) = multi_ref.get(&fhs.ref_id) {
-                                            self.update_wal_expiry(fhs.ref_id, fhs.t);
-                                            fhs.ref_id = mapped;
-                                        }
-                                        let idx = (fhs.ref_id as usize) % workers;
-                                        fhist_shards[idx].push(fhs);
-                                    }
-                                    for (idx, shard) in fhist_shards.iter_mut().enumerate() {
-                                        if !shard.is_empty() {
-                                            let batch = std::mem::take(shard);
-                                            if worker_txs[idx]
-                                                .send(WalWorkerMsg::FloatHistogramSamples(batch))
-                                                .is_err()
+                                    DecodedRecord::Exemplars(exemplars) => {
+                                        for mut ex in exemplars {
+                                            if ex.t < min_valid_time {
+                                                continue;
+                                            }
+                                            if let Some(&mapped) = multi_ref.get(&ex.ref_id) {
+                                                self.update_wal_expiry(ex.ref_id, ex.t);
+                                                ex.ref_id = mapped;
+                                            }
+                                            let Some(entry) = self.series.get_by_id(ex.ref_id)
+                                            else {
+                                                continue;
+                                            };
+                                            if self
+                                                .exemplars
+                                                .add_exemplar(
+                                                    &entry.labels,
+                                                    Exemplar::new(ex.labels, ex.v, ex.t),
+                                                )
+                                                .is_ok()
                                             {
-                                                break 'outer;
+                                                let mut st = entry.inner.lock();
+                                                st.update_last_exemplar_ts(ex.t);
                                             }
                                         }
                                     }
-                                }
-                            }
-                            DecodedRecord::Tombstones(stones) => {
-                                for mut stone in stones {
-                                    self.bump_last_series_id(stone.ref_id);
-                                    if stone.mint == i64::MIN && stone.maxt == i64::MAX {
-                                        let mut ref_id = stone.ref_id;
-                                        if let Some(&mapped) = multi_ref.get(&ref_id) {
-                                            ref_id = mapped;
+                                    DecodedRecord::Metadata(metas) => {
+                                        for mut m in metas {
+                                            if let Some(&mapped) = multi_ref.get(&m.ref_id) {
+                                                m.ref_id = mapped;
+                                            }
+                                            let Some(entry) = self.series.get_by_id(m.ref_id)
+                                            else {
+                                                continue;
+                                            };
+                                            let metric_type = MetricType::from_u8(m.metric_type);
+                                            let compact_meta = self.intern_metadata_symbols(
+                                                metric_type,
+                                                &m.unit,
+                                                &m.help,
+                                            );
+                                            let mut st = entry.inner.lock();
+                                            st.metadata = Some(compact_meta);
                                         }
-                                        if let Some(entry) = self.series.get_by_id(ref_id) {
-                                            self.series.unlink_hash(entry.hash, ref_id);
-                                            pending_deletes.push(entry);
+                                    }
+                                    DecodedRecord::MinValidTime(t) => {
+                                        if t > min_valid_time {
+                                            min_valid_time = t;
+                                            self.min_valid_time.fetch_max(t, Ordering::AcqRel);
                                         }
-                                        continue;
                                     }
-                                    if stone.maxt < min_valid_time {
-                                        continue;
-                                    }
-                                    if let Some(&mapped) = multi_ref.get(&stone.ref_id) {
-                                        self.update_wal_expiry(stone.ref_id, stone.maxt);
-                                        stone.ref_id = mapped;
-                                    }
-                                    let idx = (stone.ref_id as usize) % workers;
-                                    if worker_txs[idx]
-                                        .send(WalWorkerMsg::AddTombstone {
-                                            ref_id: stone.ref_id,
-                                            interval: Interval::new(stone.mint, stone.maxt),
-                                        })
-                                        .is_err()
-                                    {
-                                        break 'outer;
-                                    }
-                                }
-                            }
-                            DecodedRecord::Exemplars(exemplars) => {
-                                for mut ex in exemplars {
-                                    if ex.t < min_valid_time {
-                                        continue;
-                                    }
-                                    if let Some(&mapped) = multi_ref.get(&ex.ref_id) {
-                                        self.update_wal_expiry(ex.ref_id, ex.t);
-                                        ex.ref_id = mapped;
-                                    }
-                                    let Some(entry) = self.series.get_by_id(ex.ref_id) else {
-                                        continue;
-                                    };
-                                    if self
-                                        .exemplars
-                                        .add_exemplar(
-                                            &entry.labels,
-                                            Exemplar::new(ex.labels, ex.v, ex.t),
-                                        )
-                                        .is_ok()
-                                    {
-                                        let mut st = entry.inner.lock();
-                                        st.update_last_exemplar_ts(ex.t);
-                                    }
-                                }
-                            }
-                            DecodedRecord::Metadata(metas) => {
-                                for mut m in metas {
-                                    if let Some(&mapped) = multi_ref.get(&m.ref_id) {
-                                        m.ref_id = mapped;
-                                    }
-                                    let Some(entry) = self.series.get_by_id(m.ref_id) else {
-                                        continue;
-                                    };
-                                    let metric_type = MetricType::from_u8(m.metric_type);
-                                    let compact_meta =
-                                        self.intern_metadata_symbols(metric_type, &m.unit, &m.help);
-                                    let mut st = entry.inner.lock();
-                                    st.metadata = Some(compact_meta);
-                                }
-                            }
-                            DecodedRecord::MinValidTime(_)
-                            | DecodedRecord::MmapMarkers(_)
-                            | DecodedRecord::Unknown(_) => {}
+                                    DecodedRecord::MmapMarkers(_) | DecodedRecord::Unknown(_) => {}
                                 }
                             }
                         }
@@ -2919,7 +3142,7 @@ impl Head {
                 }
             }
 
-            if coord_res.is_ok() && !pending_series.is_empty() {
+            if !pending_series.is_empty() {
                 if let Err(e) = flush_series_batch(
                     &mut pending_series,
                     multi_ref,
@@ -2927,16 +3150,16 @@ impl Head {
                     ooo_mmapped_map,
                     &mut failed_outer,
                 ) {
-                    if !failed_outer {
+                    if !failed_outer && coord_res.is_ok() {
                         coord_res = Err(e);
                     }
                 }
             }
             let _ = failed_outer;
 
-            for (idx, shard) in sample_shards.into_iter().enumerate() {
+            for (idx, shard) in job_shards.into_iter().enumerate() {
                 if !shard.is_empty() {
-                    let _ = worker_txs[idx].send(WalWorkerMsg::Samples(shard));
+                    let _ = worker_txs[idx].send(WalWorkerMsg::SampleJobs(shard));
                 }
             }
 
@@ -2965,6 +3188,7 @@ impl Head {
         r: &mut WlogReader<R>,
         multi_ref: &HashMap<u64, u64>,
         last_mmap_ref: ChunkDiskMapperRef,
+        mut chunk_writer: Option<&mut HeadChunksWriter>,
     ) -> Result<(), HeadError> {
         let dec = RecordDecoder::new();
         let (last_seq, last_off) = last_mmap_ref.unpack();
@@ -3007,7 +3231,7 @@ impl Head {
                                 s.t,
                                 OooSampleValue::Float(s.v),
                                 self.opts.ooo_cap_max,
-                                None,
+                                chunk_writer.as_deref_mut(),
                             )?;
                             if ok {
                                 self.update_min_ooo_max_ooo_time(s.t, s.t);
@@ -3029,7 +3253,7 @@ impl Head {
                                 hs.t,
                                 OooSampleValue::Histogram(hs.h),
                                 self.opts.ooo_cap_max,
-                                None,
+                                chunk_writer.as_deref_mut(),
                             )?;
                             if ok {
                                 self.update_min_ooo_max_ooo_time(hs.t, hs.t);
@@ -3051,7 +3275,7 @@ impl Head {
                                 fhs.t,
                                 OooSampleValue::FloatHistogram(fhs.fh),
                                 self.opts.ooo_cap_max,
-                                None,
+                                chunk_writer.as_deref_mut(),
                             )?;
                             if ok {
                                 self.update_min_ooo_max_ooo_time(fhs.t, fhs.t);
@@ -3486,6 +3710,7 @@ impl Head {
         &self,
         hash: u64,
         pairs: &[(&str, &str)],
+        init_pending: u32,
     ) -> Result<(Arc<SeriesEntry>, bool), HeadError> {
         if let Some(existing) = self.get_by_sorted_pairs(hash, pairs) {
             return Ok((existing, false));
@@ -3515,7 +3740,8 @@ impl Head {
             labels,
             active_cache: AtomicU64::new(0),
             in_order_max_time: AtomicI64::new(i64::MIN),
-            pending_commits: AtomicU32::new(0),
+            pending_commits: AtomicU32::new(init_pending),
+            gced: AtomicBool::new(false),
             inner: Mutex::new(SeriesState::new()),
         });
         self.series.insert(Arc::clone(&entry));
@@ -3539,6 +3765,7 @@ impl Head {
         &self,
         hash: u64,
         encoded_labels: &[u8],
+        init_pending: u32,
     ) -> Result<(Arc<SeriesEntry>, bool), HeadError> {
         if let Some(existing) = self.series.get_by_encoded_labels(hash, encoded_labels) {
             return Ok((existing, false));
@@ -3565,7 +3792,8 @@ impl Head {
             labels,
             active_cache: AtomicU64::new(0),
             in_order_max_time: AtomicI64::new(i64::MIN),
-            pending_commits: AtomicU32::new(0),
+            pending_commits: AtomicU32::new(init_pending),
+            gced: AtomicBool::new(false),
             inner: Mutex::new(SeriesState::new()),
         });
         self.series.insert(Arc::clone(&entry));
@@ -3741,6 +3969,7 @@ impl Head {
                 active_cache: AtomicU64::new(0),
                 in_order_max_time: AtomicI64::new(i64::MIN),
                 pending_commits: AtomicU32::new(0),
+                gced: AtomicBool::new(false),
                 inner: Mutex::new(SeriesState::new()),
             });
             self.series.insert(Arc::clone(&entry));
@@ -3799,6 +4028,7 @@ impl Head {
             active_cache: AtomicU64::new(0),
             in_order_max_time: AtomicI64::new(i64::MIN),
             pending_commits: AtomicU32::new(0),
+            gced: AtomicBool::new(false),
             inner: Mutex::new(SeriesState::new()),
         });
         self.series.insert(Arc::clone(&entry));
@@ -3845,6 +4075,7 @@ impl Head {
             active_cache: AtomicU64::new(0),
             in_order_max_time: AtomicI64::new(i64::MIN),
             pending_commits: AtomicU32::new(0),
+            gced: AtomicBool::new(false),
             inner: Mutex::new(SeriesState::new()),
         });
         self.series.insert(Arc::clone(&entry));
@@ -3903,6 +4134,7 @@ impl Head {
 
         for e in entries {
             self.series.remove(&e);
+            e.gced.store(true, Ordering::Release);
             deleted.insert(e.ref_id);
             if has_cb {
                 deleted_pairs.push((e.ref_id, e.labels.clone()));
@@ -3949,6 +4181,101 @@ impl Head {
         }
     }
 
+    /// Cleans up postings, metrics, tombstones, WAL expiries, and lifecycle callbacks for series
+    /// that were already atomically marked GCed and unlinked from `StripeSeries`.
+    fn finish_deleted_series_cleanup(&self, entries: Vec<(Arc<SeriesEntry>, i64)>) {
+        if entries.is_empty() {
+            return;
+        }
+        let entries_len = entries.len();
+        let mut deleted = HashSet::with_capacity(entries_len);
+        let has_cb = self.lifecycle_callback.read().is_some();
+        let mut deleted_pairs = if has_cb {
+            Vec::with_capacity(entries_len)
+        } else {
+            Vec::new()
+        };
+        let mut small_metric_names: Vec<String> = if entries_len <= 64 {
+            Vec::with_capacity(entries_len)
+        } else {
+            Vec::new()
+        };
+        let mut affected_set: hashbrown::HashSet<(SymbolId, SymbolId)> =
+            hashbrown::HashSet::with_capacity(entries_len.min(65536));
+        {
+            let syms = self.symbols.read();
+            for (e, _) in &entries {
+                for (k, v) in e.labels.iter() {
+                    if let (Some(nid), Some(vid)) = (syms.get(k), syms.get(v)) {
+                        affected_set.insert((nid, vid));
+                    }
+                }
+            }
+        }
+        let affected: Vec<(SymbolId, SymbolId)> = affected_set.into_iter().collect();
+
+        for (e, keep_until) in entries {
+            deleted.insert(e.ref_id);
+            if has_cb {
+                deleted_pairs.push((e.ref_id, e.labels.clone()));
+            }
+            if entries_len <= 64 {
+                small_metric_names.push(e.labels.get(METRIC_NAME).to_owned());
+            }
+            if keep_until != i64::MIN {
+                self.update_wal_expiry(e.ref_id, keep_until);
+            }
+            drop(e);
+        }
+
+        let removed_count = deleted.len();
+        self.num_series.fetch_sub(removed_count as u64, Ordering::Relaxed);
+        if let Some(ref g) = self.series_gauge {
+            g.sub(removed_count as f64);
+        }
+        if let Some(ref c) = self.series_removed_total {
+            c.inc_by(removed_count as f64);
+        }
+        self.postings.delete(&deleted, &affected);
+        drop(affected);
+        if entries_len > 64 {
+            self.postings_cache.invalidate_all();
+        } else {
+            for m in &small_metric_names {
+                self.postings_cache.invalidate_metric(m);
+            }
+        }
+        self.tombstones.delete_tombstones(&deleted);
+        drop(deleted);
+        if let Some(ref cb) = *self.lifecycle_callback.read() {
+            cb.post_deletion(&deleted_pairs);
+        }
+    }
+
+    fn promote_all_pending_ooo_mmapped(&self) {
+        let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
+        for stripe in &self.series.stripes {
+            stripe_buf.clear();
+            {
+                let guard = stripe.read();
+                if guard.by_id.is_empty() {
+                    continue;
+                }
+                stripe_buf.extend(guard.by_id.values().cloned());
+            }
+            for entry in stripe_buf.drain(..) {
+                let mut st = entry.inner.lock();
+                if let Some(ref mut ooo) = st.ooo {
+                    if !ooo.ooo_pending_mmapped.is_empty() {
+                        for (mc, _) in ooo.ooo_pending_mmapped.drain(..) {
+                            ooo.ooo_mmapped_chunks.push(mc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Creates a new [`HeadAppender`] for transactional batched writes.
     pub fn appender(&self) -> HeadAppender<'_> {
         self.appender_with_capacity(0)
@@ -3968,6 +4295,7 @@ impl Head {
             head_maxt,
             ooo_time_window: self.ooo_time_window_ms.load(Ordering::Acquire),
             series_refs: scratch.series_refs,
+            created_series: scratch.created_series,
             floats: scratch.floats,
             histograms: scratch.histograms,
             float_histograms: scratch.float_histograms,
@@ -3977,6 +4305,7 @@ impl Head {
             indexed_floats_len: 0,
             indexed_hists_len: 0,
             indexed_fhists_len: 0,
+            floats_committed: 0,
             wal_buf: scratch.wal_buf,
             closed: false,
         }
@@ -3984,38 +4313,57 @@ impl Head {
 
     /// Flushes all sealed head chunks (`head_chunks[..len-1]`) to `HeadChunksWriter` (`chunks_head/`).
     pub fn mmap_head_chunks(&self) -> Result<usize, HeadChunksError> {
-        let mut writer_guard = self.chunk_writer.lock();
-        let Some(ref mut writer) = *writer_guard else {
-            return Ok(0);
-        };
+        let _mmap_guard = self.mmap_mtx.lock();
         let mut count = 0usize;
         let mut pending: Vec<(Arc<SeriesEntry>, Vec<MmappedChunk>)> = Vec::new();
         for stripe in &self.series.stripes {
             let entries: Vec<Arc<SeriesEntry>> = stripe.read().by_id.values().cloned().collect();
             for entry in entries {
+                // Lock order: entry.inner -> chunk_writer (matching commit()).
                 let mut st = entry.inner.lock();
                 if st.head_chunks.len() > 1 {
+                    let mut writer_guard = self.chunk_writer.lock();
+                    let Some(ref mut writer) = *writer_guard else {
+                        return Ok(count);
+                    };
                     let mmapped = st.write_sealed_head_chunks(entry.ref_id, writer)?;
+                    drop(writer_guard);
+                    drop(st);
                     if !mmapped.is_empty() {
                         count += mmapped.len();
-                        drop(st);
                         pending.push((entry, mmapped));
                     }
                 }
             }
         }
-        writer.flush()?;
 
-        // Refresh mmap reader BEFORE exposing new mmapped_chunks on series state,
-        // so concurrent readers never observe a ChunkDiskMapperRef not yet in chunk_reader.
         if count > 0 {
-            let reader = HeadChunksReader::open(self.dir.join("chunks_head"))?;
+            {
+                let mut writer_guard = self.chunk_writer.lock();
+                if let Some(ref mut writer) = *writer_guard {
+                    writer.flush()?;
+                }
+            }
+            // Refresh mmap reader BEFORE exposing new mmapped_chunks on series state,
+            // so concurrent readers never observe a ChunkDiskMapperRef not yet in chunk_reader.
+            let reader = HeadChunksReader::open_no_repair(self.dir.join("chunks_head"))?;
             *self.chunk_reader.write() = Some(reader);
             for (entry, mmapped) in pending {
                 let mut st = entry.inner.lock();
-                let n = mmapped.len().min(st.head_chunks.len().saturating_sub(1));
-                st.head_chunks.drain(..n);
-                st.mmapped_mut().extend(mmapped.into_iter().take(n));
+                let mut matched = 0usize;
+                for mc in mmapped {
+                    if st.head_chunks.len() > 1
+                        && st.head_chunks[0].min_time == mc.min_time
+                        && st.head_chunks[0].max_time == mc.max_time
+                    {
+                        st.head_chunks.remove(0);
+                        st.mmapped_mut().push(mc);
+                        matched += 1;
+                    }
+                }
+                if matched > 0 && st.mmapped().len() > 1 {
+                    st.mmapped_mut().sort_by_key(|c| (c.min_time, c.max_time));
+                }
             }
         }
         Ok(count)
@@ -4131,68 +4479,92 @@ impl Head {
     pub fn collect_ooo_compaction_candidates(
         &self,
     ) -> Result<CompactionCandidatesRange, HeadError> {
-        let mut writer_guard = self.chunk_writer.lock();
         let mut mmapped_any = false;
         let mut ooo_markers: Vec<RefMmapMarker> = Vec::new();
+        let mut pending_entries: Vec<Arc<SeriesEntry>> = Vec::new();
         let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
 
-        if let Some(ref mut writer) = *writer_guard {
-            for stripe in &self.series.stripes {
-                stripe_buf.clear();
-                {
-                    let guard = stripe.read();
-                    if guard.by_id.is_empty() {
-                        continue;
-                    }
-                    stripe_buf.extend(guard.by_id.values().cloned());
+        for stripe in &self.series.stripes {
+            stripe_buf.clear();
+            {
+                let guard = stripe.read();
+                if guard.by_id.is_empty() {
+                    continue;
                 }
-                for entry in stripe_buf.drain(..) {
-                    let mut st = entry.inner.lock();
-                    if let Some(ref mut ooo) = st.ooo {
-                        if let Some(ohc) = ooo.ooo_head_chunk.take() {
-                            let cut_chunks = ohc.chunk.to_encoded_chunks(i64::MIN, i64::MAX)?;
-                            for cc in cut_chunks {
-                                let r = writer.write_chunk(
-                                    entry.ref_id,
-                                    cc.min_time,
-                                    cc.max_time,
-                                    &cc.chunk,
-                                    true,
-                                )?;
-                                ooo.ooo_mmapped_chunks.push(MmappedChunk {
-                                    ref_id: r,
-                                    min_time: cc.min_time,
-                                    max_time: cc.max_time,
-                                    num_samples: cc.chunk.num_samples() as u16,
-                                    encoding: cc.chunk.encoding(),
-                                });
-                                ooo_markers.push(RefMmapMarker {
-                                    ref_id: entry.ref_id,
-                                    mmap_ref: r.as_u64(),
-                                });
-                                mmapped_any = true;
+                stripe_buf.extend(guard.by_id.values().cloned());
+            }
+            for entry in stripe_buf.drain(..) {
+                // Lock order: entry.inner -> chunk_writer (matching commit()).
+                let mut st = entry.inner.lock();
+                if let Some(ref mut ooo) = st.ooo {
+                    if let Some(ohc) = ooo.ooo_head_chunk.take() {
+                        let cut_chunks = ohc.chunk.to_encoded_chunks(i64::MIN, i64::MAX)?;
+                        if !cut_chunks.is_empty() {
+                            let mut writer_guard = self.chunk_writer.lock();
+                            if let Some(ref mut writer) = *writer_guard {
+                                for cc in cut_chunks {
+                                    let r = writer.write_chunk(
+                                        entry.ref_id,
+                                        cc.min_time,
+                                        cc.max_time,
+                                        &cc.chunk,
+                                        true,
+                                    )?;
+                                    let mc = MmappedChunk {
+                                        ref_id: r,
+                                        min_time: cc.min_time,
+                                        max_time: cc.max_time,
+                                        num_samples: cc.chunk.num_samples() as u16,
+                                        encoding: cc.chunk.encoding(),
+                                    };
+                                    ooo.ooo_pending_mmapped.push((mc, cc.chunk));
+                                    ooo_markers.push(RefMmapMarker {
+                                        ref_id: entry.ref_id,
+                                        mmap_ref: r.as_u64(),
+                                    });
+                                    mmapped_any = true;
+                                }
+                                pending_entries.push(Arc::clone(&entry));
+                            } else {
+                                ooo.ooo_head_chunk = Some(ohc);
                             }
                         }
                     }
                 }
             }
-            if mmapped_any {
+        }
+
+        if mmapped_any {
+            let mut writer_guard = self.chunk_writer.lock();
+            if let Some(ref mut writer) = *writer_guard {
                 writer.flush()?;
             }
         }
-        drop(writer_guard);
 
-        if !ooo_markers.is_empty() {
-            if let Some(ref mut wbl) = *self.wbl.lock() {
-                let enc = RecordEncoder::new(self.opts.enable_st_storage);
-                let rec = enc.mmap_markers(&ooo_markers, Vec::new());
-                wbl.log(&[&rec])?;
+        {
+            let mut wbl_guard = self.wbl.lock();
+            if let Some(ref mut wbl) = *wbl_guard {
+                if !ooo_markers.is_empty() {
+                    let enc = RecordEncoder::new(self.opts.enable_st_storage);
+                    let rec = enc.mmap_markers(&ooo_markers, Vec::new());
+                    wbl.log(&[&rec])?;
+                }
+                let next_seg = wbl.next_segment()?;
+                *self.ooo_compact_wbl_cut_seg.lock() = Some(next_seg);
             }
         }
 
         if mmapped_any {
-            let reader = HeadChunksReader::open(self.dir.join("chunks_head"))?;
+            let reader = HeadChunksReader::open_no_repair(self.dir.join("chunks_head"))?;
             *self.chunk_reader.write() = Some(reader);
+            for entry in pending_entries {
+                let mut st = entry.inner.lock();
+                if let Some(ref mut ooo) = st.ooo {
+                    for (mc, _) in ooo.ooo_pending_mmapped.drain(..) {
+                        ooo.ooo_mmapped_chunks.push(mc);
+                    }
+                }
+            }
         }
 
         let mut out = Vec::new();
@@ -4215,6 +4587,11 @@ impl Head {
                 };
                 let mut has_any = false;
                 for mc in &ooo.ooo_mmapped_chunks {
+                    mint = mint.min(mc.min_time);
+                    maxt = maxt.max(mc.max_time);
+                    has_any = true;
+                }
+                for (mc, _) in &ooo.ooo_pending_mmapped {
                     mint = mint.min(mc.min_time);
                     maxt = maxt.max(mc.max_time);
                     has_any = true;
@@ -4251,6 +4628,14 @@ impl Head {
             };
             for mc in &ooo.ooo_mmapped_chunks {
                 mmapped_refs.push(*mc);
+            }
+            for (mc, chk) in &ooo.ooo_pending_mmapped {
+                out_chunks.push(ChunkMeta {
+                    ref_id: mc.ref_id.as_u64(),
+                    min_time: mc.min_time,
+                    max_time: mc.max_time,
+                    chunk: Some(chk.clone()),
+                });
             }
             if let Some(ref ohc) = ooo.ooo_head_chunk {
                 for cc in ohc.chunk.to_encoded_chunks(i64::MIN, i64::MAX)? {
@@ -4299,7 +4684,9 @@ impl Head {
             };
             let st = entry.inner.lock();
             if st.ooo.as_ref().is_some_and(|o| {
-                o.ooo_head_chunk.is_some() || !o.ooo_mmapped_chunks.is_empty()
+                o.ooo_head_chunk.is_some()
+                    || !o.ooo_mmapped_chunks.is_empty()
+                    || !o.ooo_pending_mmapped.is_empty()
             }) {
                 continue;
             }
@@ -4328,31 +4715,29 @@ impl Head {
         maxt_inclusive: i64,
     ) -> Result<Vec<CompactionSeries>, HeadError> {
         self.mmap_head_chunks()?;
-        let chunk_reader_guard = self.chunk_reader.read();
-        let chunk_reader = chunk_reader_guard.as_ref();
-
         let entries = self.series.all_entries();
-        let mut out = Vec::with_capacity(entries.len());
+
+        struct ExtractedSeries {
+            entry: Arc<SeriesEntry>,
+            mmapped_refs: SmallVec<[MmappedChunk; 8]>,
+            head_chks: Vec<ChunkMeta>,
+        }
+        let mut extracted = Vec::with_capacity(entries.len());
+        let mut any_mmapped = false;
 
         for entry in entries {
             let st = entry.inner.lock();
-            let mut chks = Vec::new();
+            let mut mmapped_refs: SmallVec<[MmappedChunk; 8]> = SmallVec::new();
             for mc in st.mmapped() {
                 if mc.overlaps_closed_interval(mint, maxt_inclusive) {
-                    if let Some(r) = chunk_reader {
-                        let enc = r.chunk(mc.ref_id)?;
-                        chks.push(ChunkMeta {
-                            ref_id: mc.ref_id.as_u64(),
-                            min_time: mc.min_time,
-                            max_time: mc.max_time,
-                            chunk: Some(enc),
-                        });
-                    }
+                    mmapped_refs.push(*mc);
+                    any_mmapped = true;
                 }
             }
+            let mut head_chks = Vec::new();
             for hc in &st.head_chunks {
                 if hc.overlaps_closed_interval(mint, maxt_inclusive) {
-                    chks.push(ChunkMeta {
+                    head_chks.push(ChunkMeta {
                         ref_id: 0,
                         min_time: hc.min_time,
                         max_time: hc.max_time,
@@ -4360,10 +4745,42 @@ impl Head {
                     });
                 }
             }
+            if !mmapped_refs.is_empty() || !head_chks.is_empty() {
+                drop(st);
+                extracted.push(ExtractedSeries {
+                    entry,
+                    mmapped_refs,
+                    head_chks,
+                });
+            }
+        }
+
+        let mut out = Vec::with_capacity(extracted.len());
+        let chunk_reader_guard = if any_mmapped {
+            Some(self.chunk_reader.read())
+        } else {
+            None
+        };
+        let chunk_reader = chunk_reader_guard.as_ref().and_then(|g| g.as_ref());
+
+        for ex in extracted {
+            let mut chks = Vec::with_capacity(ex.mmapped_refs.len() + ex.head_chks.len());
+            for mc in ex.mmapped_refs {
+                if let Some(r) = chunk_reader {
+                    let enc = r.chunk(mc.ref_id)?;
+                    chks.push(ChunkMeta {
+                        ref_id: mc.ref_id.as_u64(),
+                        min_time: mc.min_time,
+                        max_time: mc.max_time,
+                        chunk: Some(enc),
+                    });
+                }
+            }
+            chks.extend(ex.head_chks);
             if !chks.is_empty() {
-                let tombs = self.tombstones.get(entry.ref_id);
+                let tombs = self.tombstones.get(ex.entry.ref_id);
                 out.push(CompactionSeries {
-                    labels: entry.labels.clone(),
+                    labels: ex.entry.labels.clone(),
                     chunks: chks,
                     tombstones: tombs,
                 });
@@ -4379,63 +4796,91 @@ impl Head {
     pub fn collect_ooo_compaction_series(
         &self,
     ) -> Result<(Vec<CompactionSeries>, i64, i64), HeadError> {
-        let mut writer_guard = self.chunk_writer.lock();
         let mut mmapped_any = false;
         let mut ooo_markers: Vec<RefMmapMarker> = Vec::new();
+        let mut pending_entries: Vec<Arc<SeriesEntry>> = Vec::new();
         let entries = self.series.all_entries();
-        if let Some(ref mut writer) = *writer_guard {
-            for entry in &entries {
-                let mut st = entry.inner.lock();
-                if let Some(ref mut ooo) = st.ooo {
-                    if let Some(ohc) = ooo.ooo_head_chunk.take() {
-                        let cut_chunks = ohc.chunk.to_encoded_chunks(i64::MIN, i64::MAX)?;
-                        for cc in cut_chunks {
-                            let r = writer.write_chunk(
-                                entry.ref_id,
-                                cc.min_time,
-                                cc.max_time,
-                                &cc.chunk,
-                                true,
-                            )?;
-                            ooo.ooo_mmapped_chunks.push(MmappedChunk {
-                                ref_id: r,
-                                min_time: cc.min_time,
-                                max_time: cc.max_time,
-                                num_samples: cc.chunk.num_samples() as u16,
-                                encoding: cc.chunk.encoding(),
-                            });
-                            ooo_markers.push(RefMmapMarker {
-                                ref_id: entry.ref_id,
-                                mmap_ref: r.as_u64(),
-                            });
-                            mmapped_any = true;
+
+        for entry in &entries {
+            // Lock order: entry.inner -> chunk_writer (matching commit()).
+            let mut st = entry.inner.lock();
+            if let Some(ref mut ooo) = st.ooo {
+                if let Some(ohc) = ooo.ooo_head_chunk.take() {
+                    let cut_chunks = ohc.chunk.to_encoded_chunks(i64::MIN, i64::MAX)?;
+                    if !cut_chunks.is_empty() {
+                        let mut writer_guard = self.chunk_writer.lock();
+                        if let Some(ref mut writer) = *writer_guard {
+                            for cc in cut_chunks {
+                                let r = writer.write_chunk(
+                                    entry.ref_id,
+                                    cc.min_time,
+                                    cc.max_time,
+                                    &cc.chunk,
+                                    true,
+                                )?;
+                                let mc = MmappedChunk {
+                                    ref_id: r,
+                                    min_time: cc.min_time,
+                                    max_time: cc.max_time,
+                                    num_samples: cc.chunk.num_samples() as u16,
+                                    encoding: cc.chunk.encoding(),
+                                };
+                                ooo.ooo_pending_mmapped.push((mc, cc.chunk));
+                                ooo_markers.push(RefMmapMarker {
+                                    ref_id: entry.ref_id,
+                                    mmap_ref: r.as_u64(),
+                                });
+                                mmapped_any = true;
+                            }
+                            pending_entries.push(Arc::clone(entry));
+                        } else {
+                            ooo.ooo_head_chunk = Some(ohc);
                         }
                     }
                 }
             }
-            if mmapped_any {
+        }
+
+        if mmapped_any {
+            let mut writer_guard = self.chunk_writer.lock();
+            if let Some(ref mut writer) = *writer_guard {
                 writer.flush()?;
             }
         }
-        drop(writer_guard);
 
-        if !ooo_markers.is_empty() {
-            if let Some(ref mut wbl) = *self.wbl.lock() {
-                let enc = RecordEncoder::new(self.opts.enable_st_storage);
-                let rec = enc.mmap_markers(&ooo_markers, Vec::new());
-                wbl.log(&[&rec])?;
+        {
+            let mut wbl_guard = self.wbl.lock();
+            if let Some(ref mut wbl) = *wbl_guard {
+                if !ooo_markers.is_empty() {
+                    let enc = RecordEncoder::new(self.opts.enable_st_storage);
+                    let rec = enc.mmap_markers(&ooo_markers, Vec::new());
+                    wbl.log(&[&rec])?;
+                }
+                let next_seg = wbl.next_segment()?;
+                *self.ooo_compact_wbl_cut_seg.lock() = Some(next_seg);
             }
         }
 
         if mmapped_any {
-            let reader = HeadChunksReader::open(self.dir.join("chunks_head"))?;
+            let reader = HeadChunksReader::open_no_repair(self.dir.join("chunks_head"))?;
             *self.chunk_reader.write() = Some(reader);
+            for entry in pending_entries {
+                let mut st = entry.inner.lock();
+                if let Some(ref mut ooo) = st.ooo {
+                    for (mc, _) in ooo.ooo_pending_mmapped.drain(..) {
+                        ooo.ooo_mmapped_chunks.push(mc);
+                    }
+                }
+            }
         }
 
-        let chunk_reader_guard = self.chunk_reader.read();
-        let chunk_reader = chunk_reader_guard.as_ref();
-
-        let mut out = Vec::new();
+        struct ExtractedOoo {
+            entry: Arc<SeriesEntry>,
+            mmapped_refs: SmallVec<[MmappedChunk; 8]>,
+            inline_chks: Vec<ChunkMeta>,
+        }
+        let mut extracted = Vec::new();
+        let mut any_mmapped = false;
         let mut mint = i64::MAX;
         let mut maxt = i64::MIN;
 
@@ -4444,8 +4889,55 @@ impl Head {
             let Some(ref ooo) = st.ooo else {
                 continue;
             };
-            let mut chks = Vec::new();
+            let mut mmapped_refs: SmallVec<[MmappedChunk; 8]> = SmallVec::new();
             for mc in &ooo.ooo_mmapped_chunks {
+                mmapped_refs.push(*mc);
+                any_mmapped = true;
+            }
+            let mut inline_chks = Vec::new();
+            for (mc, chk) in &ooo.ooo_pending_mmapped {
+                mint = mint.min(mc.min_time);
+                maxt = maxt.max(mc.max_time);
+                inline_chks.push(ChunkMeta {
+                    ref_id: mc.ref_id.as_u64(),
+                    min_time: mc.min_time,
+                    max_time: mc.max_time,
+                    chunk: Some(chk.clone()),
+                });
+            }
+            if let Some(ref ohc) = ooo.ooo_head_chunk {
+                for cc in ohc.chunk.to_encoded_chunks(i64::MIN, i64::MAX)? {
+                    mint = mint.min(cc.min_time);
+                    maxt = maxt.max(cc.max_time);
+                    inline_chks.push(ChunkMeta {
+                        ref_id: 0,
+                        min_time: cc.min_time,
+                        max_time: cc.max_time,
+                        chunk: Some(cc.chunk),
+                    });
+                }
+            }
+            if !mmapped_refs.is_empty() || !inline_chks.is_empty() {
+                drop(st);
+                extracted.push(ExtractedOoo {
+                    entry,
+                    mmapped_refs,
+                    inline_chks,
+                });
+            }
+        }
+
+        let chunk_reader_guard = if any_mmapped {
+            Some(self.chunk_reader.read())
+        } else {
+            None
+        };
+        let chunk_reader = chunk_reader_guard.as_ref().and_then(|g| g.as_ref());
+
+        let mut out = Vec::with_capacity(extracted.len());
+        for ex in extracted {
+            let mut chks = Vec::with_capacity(ex.mmapped_refs.len() + ex.inline_chks.len());
+            for mc in ex.mmapped_refs {
                 if let Some(r) = chunk_reader {
                     let enc = r.chunk(mc.ref_id)?;
                     mint = mint.min(mc.min_time);
@@ -4458,22 +4950,11 @@ impl Head {
                     });
                 }
             }
-            if let Some(ref ohc) = ooo.ooo_head_chunk {
-                for cc in ohc.chunk.to_encoded_chunks(i64::MIN, i64::MAX)? {
-                    mint = mint.min(cc.min_time);
-                    maxt = maxt.max(cc.max_time);
-                    chks.push(ChunkMeta {
-                        ref_id: 0,
-                        min_time: cc.min_time,
-                        max_time: cc.max_time,
-                        chunk: Some(cc.chunk),
-                    });
-                }
-            }
+            chks.extend(ex.inline_chks);
             if !chks.is_empty() {
-                let tombs = self.tombstones.get(entry.ref_id);
+                let tombs = self.tombstones.get(ex.entry.ref_id);
                 out.push(CompactionSeries {
-                    labels: entry.labels.clone(),
+                    labels: ex.entry.labels.clone(),
                     chunks: chks,
                     tombstones: tombs,
                 });
@@ -4487,9 +4968,46 @@ impl Head {
     /// Clears all out-of-order chunks from Head memory after OOO compaction and cleans up series
     /// that now have neither in-order nor OOO chunks.
     pub fn clear_ooo_data(&self) -> Result<(), HeadError> {
+        self.clear_ooo_data_before(i64::MAX)
+    }
+
+    /// Clears out-of-order chunks/samples `<= maxt_inclusive` from Head memory (preserving any OOO
+    /// samples `> maxt_inclusive` that arrived during compaction), truncates WBL segments, and
+    /// cleans up empty series and unused `chunks_head` files.
+    pub fn clear_ooo_data_before(&self, maxt_inclusive: i64) -> Result<(), HeadError> {
+        let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
         let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
-        let mut to_delete = Vec::new();
+        let mut to_delete: Vec<(Arc<SeriesEntry>, i64)> = Vec::new();
         let mut min_mmap_seq = usize::MAX;
+        let mut rem_ooo_mint = i64::MAX;
+        let mut rem_ooo_maxt = i64::MIN;
+
+        let record_series_refs =
+            |st: &SeriesState, min_mmap_seq: &mut usize, rem_mint: &mut i64, rem_maxt: &mut i64| {
+                for mc in st.mmapped() {
+                    let (seq, _) = mc.ref_id.unpack();
+                    *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
+                }
+                if let Some(ref ooo) = st.ooo {
+                    for mc in &ooo.ooo_mmapped_chunks {
+                        let (seq, _) = mc.ref_id.unpack();
+                        *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
+                        *rem_mint = (*rem_mint).min(mc.min_time);
+                        *rem_maxt = (*rem_maxt).max(mc.max_time);
+                    }
+                    for (mc, _) in &ooo.ooo_pending_mmapped {
+                        let (seq, _) = mc.ref_id.unpack();
+                        *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
+                        *rem_mint = (*rem_mint).min(mc.min_time);
+                        *rem_maxt = (*rem_maxt).max(mc.max_time);
+                    }
+                    if let Some(ref ohc) = ooo.ooo_head_chunk {
+                        *rem_mint = (*rem_mint).min(ohc.min_time);
+                        *rem_maxt = (*rem_maxt).max(ohc.max_time);
+                    }
+                }
+            };
+
         for stripe in &self.series.stripes {
             stripe_buf.clear();
             {
@@ -4500,30 +5018,76 @@ impl Head {
                 stripe_buf.extend(guard.by_id.values().cloned());
             }
             for entry in stripe_buf.drain(..) {
-                if entry.pending_commits.load(Ordering::Acquire) > 0 {
-                    continue;
-                }
                 let mut st = entry.inner.lock();
-                if entry.pending_commits.load(Ordering::Acquire) > 0 {
+                if entry.pending_commits_count() > 0 {
+                    // Series has an in-flight append: do not drop OOO data, and still count its
+                    // chunks_head sequence numbers so chunk files are never deleted prematurely.
+                    record_series_refs(&st, &mut min_mmap_seq, &mut rem_ooo_mint, &mut rem_ooo_maxt);
                     continue;
                 }
-                st.ooo = None;
-                if st.mmapped().is_empty() && st.head_chunks.is_empty() {
-                    drop(st);
-                    to_delete.push(entry);
-                } else {
-                    for mc in st.mmapped() {
-                        let (seq, _) = mc.ref_id.unpack();
-                        min_mmap_seq = min_mmap_seq.min(seq as usize);
+
+                if let Some(ref mut ooo) = st.ooo {
+                    ooo.ooo_mmapped_chunks
+                        .retain(|mc| mc.max_time > maxt_inclusive);
+                    ooo.ooo_pending_mmapped
+                        .retain(|(mc, _)| mc.max_time > maxt_inclusive);
+                    if let Some(ref mut ohc) = ooo.ooo_head_chunk {
+                        if ohc.max_time <= maxt_inclusive {
+                            ooo.ooo_head_chunk = None;
+                        } else if ohc.min_time <= maxt_inclusive {
+                            if let Some((nmin, nmax)) = ohc.chunk.retain_after(maxt_inclusive) {
+                                ohc.min_time = nmin;
+                                ohc.max_time = nmax;
+                            } else {
+                                ooo.ooo_head_chunk = None;
+                            }
+                        }
+                    }
+                    if ooo.ooo_mmapped_chunks.is_empty()
+                        && ooo.ooo_pending_mmapped.is_empty()
+                        && ooo.ooo_head_chunk.is_none()
+                    {
+                        st.ooo = None;
                     }
                 }
+
+                let has_ooo = st.ooo.is_some();
+                let has_recent_exemplar =
+                    st.last_exemplar_ts().is_some_and(|ts| ts >= min_valid_time);
+                if !has_ooo
+                    && st.mmapped().is_empty()
+                    && st.head_chunks.is_empty()
+                    && !has_recent_exemplar
+                {
+                    let keep_until = st.max_time();
+                    if self.series.remove_if_gced_under_entry_lock(&entry, &mut st) {
+                        drop(st);
+                        to_delete.push((entry, keep_until));
+                        continue;
+                    }
+                }
+                record_series_refs(&st, &mut min_mmap_seq, &mut rem_ooo_mint, &mut rem_ooo_maxt);
             }
         }
-        self.min_ooo_time.store(i64::MAX, Ordering::Release);
-        self.max_ooo_time.store(i64::MIN, Ordering::Release);
-        self.wbl_pinned_refs.lock().clear();
+
+        self.min_ooo_time.store(rem_ooo_mint, Ordering::Release);
+        self.max_ooo_time.store(rem_ooo_maxt, Ordering::Release);
+
+        let cut_seg_opt = self.ooo_compact_wbl_cut_seg.lock().take();
+        if let Some(ref mut wbl) = *self.wbl.lock() {
+            if let Some(cut_seg) = cut_seg_opt {
+                wbl.truncate(cut_seg)?;
+            } else if rem_ooo_mint == i64::MAX {
+                let next_seg = wbl.next_segment()?;
+                wbl.truncate(next_seg)?;
+            }
+        }
+        if rem_ooo_mint == i64::MAX {
+            self.wbl_pinned_refs.lock().clear();
+        }
+
         if !to_delete.is_empty() {
-            self.delete_series_entries_owned(to_delete);
+            self.finish_deleted_series_cleanup(to_delete);
         }
 
         let (has_active, active_seq) = {
@@ -4552,10 +5116,14 @@ impl Head {
         refs: &[u64],
     ) -> Result<(Vec<CompactionSeries>, i64, i64), HeadError> {
         self.mmap_head_chunks()?;
-        let chunk_reader_guard = self.chunk_reader.read();
-        let chunk_reader = chunk_reader_guard.as_ref();
 
-        let mut out = Vec::with_capacity(refs.len());
+        struct ExtractedSelected {
+            entry: Arc<SeriesEntry>,
+            mmapped_refs: SmallVec<[MmappedChunk; 8]>,
+            head_chks: Vec<ChunkMeta>,
+        }
+        let mut extracted = Vec::with_capacity(refs.len());
+        let mut any_mmapped = false;
         let mut mint = i64::MAX;
         let mut maxt = i64::MIN;
 
@@ -4566,12 +5134,49 @@ impl Head {
             let st = entry.inner.lock();
             // Skip series with active OOO state (caller should compact OOO head first).
             if st.ooo.as_ref().is_some_and(|o| {
-                o.ooo_head_chunk.is_some() || !o.ooo_mmapped_chunks.is_empty()
+                o.ooo_head_chunk.is_some()
+                    || !o.ooo_mmapped_chunks.is_empty()
+                    || !o.ooo_pending_mmapped.is_empty()
             }) {
                 continue;
             }
-            let mut chks = Vec::new();
+            let mut mmapped_refs: SmallVec<[MmappedChunk; 8]> = SmallVec::new();
             for mc in st.mmapped() {
+                mmapped_refs.push(*mc);
+                any_mmapped = true;
+            }
+            let mut head_chks = Vec::new();
+            for hc in &st.head_chunks {
+                mint = mint.min(hc.min_time);
+                maxt = maxt.max(hc.max_time);
+                head_chks.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: hc.min_time,
+                    max_time: hc.max_time,
+                    chunk: Some(hc.chunk.clone()),
+                });
+            }
+            if !mmapped_refs.is_empty() || !head_chks.is_empty() {
+                drop(st);
+                extracted.push(ExtractedSelected {
+                    entry,
+                    mmapped_refs,
+                    head_chks,
+                });
+            }
+        }
+
+        let chunk_reader_guard = if any_mmapped {
+            Some(self.chunk_reader.read())
+        } else {
+            None
+        };
+        let chunk_reader = chunk_reader_guard.as_ref().and_then(|g| g.as_ref());
+
+        let mut out = Vec::with_capacity(extracted.len());
+        for ex in extracted {
+            let mut chks = Vec::with_capacity(ex.mmapped_refs.len() + ex.head_chks.len());
+            for mc in ex.mmapped_refs {
                 if let Some(r) = chunk_reader {
                     let enc = r.chunk(mc.ref_id)?;
                     mint = mint.min(mc.min_time);
@@ -4584,20 +5189,11 @@ impl Head {
                     });
                 }
             }
-            for hc in &st.head_chunks {
-                mint = mint.min(hc.min_time);
-                maxt = maxt.max(hc.max_time);
-                chks.push(ChunkMeta {
-                    ref_id: 0,
-                    min_time: hc.min_time,
-                    max_time: hc.max_time,
-                    chunk: Some(hc.chunk.clone()),
-                });
-            }
+            chks.extend(ex.head_chks);
             if !chks.is_empty() {
-                let tombs = self.tombstones.get(entry.ref_id);
+                let tombs = self.tombstones.get(ex.entry.ref_id);
                 out.push(CompactionSeries {
-                    labels: entry.labels.clone(),
+                    labels: ex.entry.labels.clone(),
                     chunks: chks,
                     tombstones: tombs,
                 });
@@ -4610,19 +5206,27 @@ impl Head {
 
     /// Evicts the given `refs` from Head memory (used after `compact_selected_series`).
     pub fn evict_series_refs(&self, refs: &[u64]) -> Result<(), HeadError> {
+        self.evict_series_refs_before(refs, i64::MAX)
+    }
+
+    /// Evicts `refs` from Head memory ONLY if `pending_commits == 0` and `state.max_time() <= maxt_inclusive`.
+    pub fn evict_series_refs_before(
+        &self,
+        refs: &[u64],
+        maxt_inclusive: i64,
+    ) -> Result<(), HeadError> {
         let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
-        let mut to_delete = Vec::new();
+        let mut to_delete: Vec<(Arc<SeriesEntry>, i64)> = Vec::new();
         for &ref_id in refs {
             if let Some(entry) = self.series.get_by_id(ref_id) {
-                if entry.pending_commits.load(Ordering::Acquire) > 0 {
-                    continue;
-                }
                 let mut st = entry.inner.lock();
-                if entry.pending_commits.load(Ordering::Acquire) > 0 {
+                if entry.pending_commits_count() > 0 || st.max_time() > maxt_inclusive {
                     continue;
                 }
                 let has_ooo = st.ooo.as_ref().is_some_and(|o| {
-                    o.ooo_head_chunk.is_some() || !o.ooo_mmapped_chunks.is_empty()
+                    o.ooo_head_chunk.is_some()
+                        || !o.ooo_mmapped_chunks.is_empty()
+                        || !o.ooo_pending_mmapped.is_empty()
                 });
                 if !has_ooo {
                     if st.last_exemplar_ts().is_some_and(|ts| ts >= min_valid_time) {
@@ -4634,14 +5238,18 @@ impl Head {
                             .in_order_max_time
                             .store(st.max_time(), Ordering::Release);
                     } else {
-                        to_delete.push(Arc::clone(&entry));
+                        let keep_until = st.max_time();
+                        if self.series.remove_if_gced_under_entry_lock(&entry, &mut st) {
+                            drop(st);
+                            to_delete.push((entry, keep_until));
+                        }
                     }
                 }
             }
         }
         if !to_delete.is_empty() {
             let mut stones = Vec::with_capacity(to_delete.len());
-            for e in &to_delete {
+            for (e, _) in &to_delete {
                 stones.push(crate::record::Tombstone {
                     ref_id: e.ref_id,
                     mint: i64::MIN,
@@ -4653,7 +5261,7 @@ impl Head {
             if let Some(ref mut wal) = *self.wal.lock() {
                 wal.log(&[&rec])?;
             }
-            self.delete_series_entries(&to_delete);
+            self.finish_deleted_series_cleanup(to_delete);
         }
         Ok(())
     }
@@ -4683,10 +5291,118 @@ impl Head {
             return Ok(());
         }
 
+        let (to_delete, actual_mint, min_mmap_seq) = self.gc_collect_and_unlink(mint);
+
+        if !to_delete.is_empty() {
+            // Log tombstones to WAL in bounded chunks after atomic unlink.
+            const TOMBSTONE_BATCH: usize = 16_384;
+            let enc = RecordEncoder::new(self.opts.enable_st_storage);
+            let mut stones = Vec::with_capacity(to_delete.len().min(TOMBSTONE_BATCH));
+            let mut rec_buf = Vec::new();
+            for chunk in to_delete.chunks(TOMBSTONE_BATCH) {
+                stones.clear();
+                for (e, _) in chunk {
+                    stones.push(crate::record::Tombstone {
+                        ref_id: e.ref_id,
+                        mint: i64::MIN,
+                        maxt: i64::MAX,
+                    });
+                }
+                rec_buf.clear();
+                rec_buf = enc.tombstones(&stones, rec_buf);
+                if let Some(ref mut wal) = *self.wal.lock() {
+                    wal.log(&[&rec_buf])?;
+                }
+            }
+            drop(stones);
+            drop(rec_buf);
+            self.finish_deleted_series_cleanup(to_delete);
+        }
+
+        self.tombstones.truncate_before(mint);
+
+        if actual_mint != i64::MAX && actual_mint > self.min_time() {
+            self.min_time.store(actual_mint, Ordering::Release);
+            let clamped = actual_mint.min(self.appendable_min_valid_time());
+            self.min_valid_time.store(clamped, Ordering::Release);
+        }
+
+        let (has_active, active_seq) = {
+            let w = self.chunk_writer.lock();
+            w.as_ref()
+                .map_or((false, 0usize), |wr| (wr.has_active_file(), wr.current_seq()))
+        };
+        let cut_before = if has_active {
+            min_mmap_seq.min(active_seq)
+        } else {
+            min_mmap_seq
+        };
+        if cut_before > 1 {
+            let reader_opt = self.chunk_reader.write().take();
+            if let Some(reader) = reader_opt {
+                let truncated = reader.truncate(cut_before)?;
+                *self.chunk_reader.write() = Some(truncated);
+            }
+        }
+        Ok(())
+    }
+
+    /// Garbage-collects chunks `< mint` and empty series (used on startup after WAL/WBL replay).
+    pub fn gc(&self, mint: i64) -> Result<(), HeadError> {
+        let (to_delete, actual_mint, min_mmap_seq) = self.gc_collect_and_unlink(mint);
+        if !to_delete.is_empty() {
+            self.finish_deleted_series_cleanup(to_delete);
+        }
+        self.tombstones.truncate_before(mint);
+        if actual_mint != i64::MAX && self.initialized() && actual_mint > self.min_time() {
+            self.min_time.store(actual_mint, Ordering::Release);
+        }
+        let (has_active, active_seq) = {
+            let w = self.chunk_writer.lock();
+            w.as_ref()
+                .map_or((false, 0usize), |wr| (wr.has_active_file(), wr.current_seq()))
+        };
+        let cut_before = if has_active {
+            min_mmap_seq.min(active_seq)
+        } else {
+            min_mmap_seq
+        };
+        if cut_before > 1 {
+            let reader_opt = self.chunk_reader.write().take();
+            if let Some(reader) = reader_opt {
+                let truncated = reader.truncate(cut_before)?;
+                *self.chunk_reader.write() = Some(truncated);
+            }
+        }
+        Ok(())
+    }
+
+    fn gc_collect_and_unlink(&self, mint: i64) -> (Vec<(Arc<SeriesEntry>, i64)>, i64, usize) {
         let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
-        let mut to_delete = Vec::new();
+        let mut to_delete: Vec<(Arc<SeriesEntry>, i64)> = Vec::new();
         let mut actual_mint = i64::MAX;
         let mut min_mmap_seq = usize::MAX;
+
+        let record_refs = |st: &SeriesState, actual_mint: &mut i64, min_mmap_seq: &mut usize| {
+            let sm = st.min_time();
+            if sm < *actual_mint {
+                *actual_mint = sm;
+            }
+            for mc in st.mmapped() {
+                let (seq, _) = mc.ref_id.unpack();
+                *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
+            }
+            if let Some(ref ooo) = st.ooo {
+                for mc in &ooo.ooo_mmapped_chunks {
+                    let (seq, _) = mc.ref_id.unpack();
+                    *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
+                }
+                for (mc, _) in &ooo.ooo_pending_mmapped {
+                    let (seq, _) = mc.ref_id.unpack();
+                    *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
+                }
+            }
+        };
 
         for stripe in &self.series.stripes {
             stripe_buf.clear();
@@ -4698,13 +5414,15 @@ impl Head {
                 stripe_buf.extend(guard.by_id.values().cloned());
             }
             for entry in stripe_buf.drain(..) {
-                if entry.pending_commits.load(Ordering::Acquire) > 0 {
-                    continue;
-                }
                 let mut st = entry.inner.lock();
-                if entry.pending_commits.load(Ordering::Acquire) > 0 {
+                if entry.pending_commits_count() > 0 {
+                    // Always include in-flight series' chunks_head sequence numbers and min_time
+                    // so chunk files referenced by pending commits are NEVER deleted.
+                    record_refs(&st, &mut actual_mint, &mut min_mmap_seq);
                     continue;
                 }
+
+                let prev_max_time = st.max_time();
                 if let Some(ref mut mv) = st.mmapped_chunks {
                     mv.retain(|mc| mc.max_time >= mint);
                     if mv.is_empty() {
@@ -4724,7 +5442,9 @@ impl Head {
                 }
 
                 let has_ooo = st.ooo.as_ref().is_some_and(|o| {
-                    o.ooo_head_chunk.is_some() || !o.ooo_mmapped_chunks.is_empty()
+                    o.ooo_head_chunk.is_some()
+                        || !o.ooo_mmapped_chunks.is_empty()
+                        || !o.ooo_pending_mmapped.is_empty()
                 });
                 let has_recent_exemplar = st.last_exemplar_ts().is_some_and(|ts| ts >= mint);
 
@@ -4732,69 +5452,19 @@ impl Head {
                     && st.head_chunks.is_empty()
                     && !has_ooo
                     && !has_recent_exemplar
+                    && prev_max_time < mint
+                    && self.series.remove_if_gced_under_entry_lock(&entry, &mut st)
                 {
                     drop(st);
-                    to_delete.push(entry);
+                    to_delete.push((entry, prev_max_time));
                     continue;
                 }
 
-                let sm = st.min_time();
-                if sm < actual_mint {
-                    actual_mint = sm;
-                }
-                for mc in st.mmapped() {
-                    let (seq, _) = mc.ref_id.unpack();
-                    min_mmap_seq = min_mmap_seq.min(seq as usize);
-                }
-                if let Some(ref ooo) = st.ooo {
-                    for mc in &ooo.ooo_mmapped_chunks {
-                        let (seq, _) = mc.ref_id.unpack();
-                        min_mmap_seq = min_mmap_seq.min(seq as usize);
-                    }
-                }
+                record_refs(&st, &mut actual_mint, &mut min_mmap_seq);
             }
         }
 
-        if !to_delete.is_empty() {
-            // Log tombstones to WAL in bounded chunks before unlinking.
-            const TOMBSTONE_BATCH: usize = 16_384;
-            let enc = RecordEncoder::new(self.opts.enable_st_storage);
-            let mut stones = Vec::with_capacity(to_delete.len().min(TOMBSTONE_BATCH));
-            let mut rec_buf = Vec::new();
-            for chunk in to_delete.chunks(TOMBSTONE_BATCH) {
-                stones.clear();
-                for e in chunk {
-                    stones.push(crate::record::Tombstone {
-                        ref_id: e.ref_id,
-                        mint: i64::MIN,
-                        maxt: i64::MAX,
-                    });
-                }
-                rec_buf.clear();
-                rec_buf = enc.tombstones(&stones, rec_buf);
-                if let Some(ref mut wal) = *self.wal.lock() {
-                    wal.log(&[&rec_buf])?;
-                }
-            }
-            drop(stones);
-            drop(rec_buf);
-            self.delete_series_entries_owned(to_delete);
-        }
-
-        if actual_mint != i64::MAX && actual_mint > self.min_time() {
-            self.min_time.store(actual_mint, Ordering::Release);
-            let clamped = actual_mint.min(self.appendable_min_valid_time());
-            self.min_valid_time.store(clamped, Ordering::Release);
-        }
-
-        if min_mmap_seq != usize::MAX && min_mmap_seq > 1 {
-            let reader_opt = self.chunk_reader.write().take();
-            if let Some(reader) = reader_opt {
-                let truncated = reader.truncate(min_mmap_seq)?;
-                *self.chunk_reader.write() = Some(truncated);
-            }
-        }
-        Ok(())
+        (to_delete, actual_mint, min_mmap_seq)
     }
 
     pub fn truncate_wal(&self, mint: i64) -> Result<(), HeadError> {
@@ -4989,6 +5659,10 @@ impl Head {
                 .iter()
                 .any(|mc| mc.overlaps_closed_interval(mint, maxt))
                 || ooo
+                    .ooo_pending_mmapped
+                    .iter()
+                    .any(|(mc, _)| mc.overlaps_closed_interval(mint, maxt))
+                || ooo
                     .ooo_head_chunk
                     .as_ref()
                     .is_some_and(|ohc| ohc.overlaps_closed_interval(mint, maxt))
@@ -5050,6 +5724,16 @@ impl Head {
                 for mc in &ooo.ooo_mmapped_chunks {
                     if mc.overlaps_closed_interval(mint, maxt) {
                         mmapped_ooo.push(*mc);
+                    }
+                }
+                for (mc, chk) in &ooo.ooo_pending_mmapped {
+                    if mc.overlaps_closed_interval(mint, maxt) {
+                        ooo_head_chks.push(ChunkMeta {
+                            ref_id: mc.ref_id.as_u64(),
+                            min_time: mc.min_time,
+                            max_time: mc.max_time,
+                            chunk: Some(chk.clone()),
+                        });
                     }
                 }
                 if let Some(ref ohc) = ooo.ooo_head_chunk {
@@ -5188,6 +5872,7 @@ struct PendingMetadata {
 #[derive(Default)]
 struct AppenderScratch {
     series_refs: Vec<RefSeries>,
+    created_series: Vec<Arc<SeriesEntry>>,
     floats: Vec<PendingFloat>,
     histograms: Vec<PendingHist>,
     float_histograms: Vec<PendingFloatHist>,
@@ -5204,6 +5889,7 @@ pub struct HeadAppender<'a> {
     head_maxt: i64,
     ooo_time_window: i64,
     series_refs: Vec<RefSeries>,
+    created_series: Vec<Arc<SeriesEntry>>,
     floats: Vec<PendingFloat>,
     histograms: Vec<PendingHist>,
     float_histograms: Vec<PendingFloatHist>,
@@ -5213,6 +5899,7 @@ pub struct HeadAppender<'a> {
     indexed_floats_len: usize,
     indexed_hists_len: usize,
     indexed_fhists_len: usize,
+    floats_committed: usize,
     wal_buf: Vec<u8>,
     closed: bool,
 }
@@ -5276,8 +5963,28 @@ impl<'a> HeadAppender<'a> {
         }
     }
 
+    fn release_remaining_pending_commits(&mut self) {
+        if self.floats_committed < self.floats.len() {
+            for pf in &self.floats[self.floats_committed..] {
+                pf.entry.pending_commits.fetch_sub(1, Ordering::Release);
+            }
+        }
+        self.floats.clear();
+        self.floats_committed = 0;
+        for ph in self.histograms.drain(..) {
+            ph.entry.pending_commits.fetch_sub(1, Ordering::Release);
+        }
+        for pfh in self.float_histograms.drain(..) {
+            pfh.entry.pending_commits.fetch_sub(1, Ordering::Release);
+        }
+        for entry in self.created_series.drain(..) {
+            entry.pending_commits.fetch_sub(1, Ordering::Release);
+        }
+    }
+
     fn return_scratch(&mut self) {
         self.series_refs.clear();
+        self.created_series.clear();
         self.floats.clear();
         self.histograms.clear();
         self.float_histograms.clear();
@@ -5285,6 +5992,10 @@ impl<'a> HeadAppender<'a> {
         self.metadata.clear();
         self.batch_last_sample.clear();
         self.wal_buf.clear();
+        self.indexed_floats_len = 0;
+        self.indexed_hists_len = 0;
+        self.indexed_fhists_len = 0;
+        self.floats_committed = 0;
         if self.floats.capacity() > 16_384 {
             self.floats = Vec::new();
         }
@@ -5298,6 +6009,7 @@ impl<'a> HeadAppender<'a> {
         if pool.len() < 32 {
             pool.push(AppenderScratch {
                 series_refs: std::mem::take(&mut self.series_refs),
+                created_series: std::mem::take(&mut self.created_series),
                 floats: std::mem::take(&mut self.floats),
                 histograms: std::mem::take(&mut self.histograms),
                 float_histograms: std::mem::take(&mut self.float_histograms),
@@ -5379,18 +6091,21 @@ impl<'a> HeadAppender<'a> {
     ) -> Result<Arc<SeriesEntry>, HeadError> {
         if let Some(r) = series_ref {
             if let Some(e) = self.head.series.get_by_id(r) {
-                return Ok(e);
+                if !e.is_gced() {
+                    return Ok(e);
+                }
             }
         }
 
         if let Some(hash) = prehashed {
             if !pairs.is_empty() {
-                let (entry, created) = self.head.get_or_create_sorted_pairs(hash, pairs)?;
+                let (entry, created) = self.head.get_or_create_sorted_pairs(hash, pairs, 1)?;
                 if created {
                     self.series_refs.push(RefSeries {
                         ref_id: entry.ref_id,
                         labels: entry.labels.clone(),
                     });
+                    self.created_series.push(Arc::clone(&entry));
                 }
                 return Ok(entry);
             }
@@ -5412,12 +6127,13 @@ impl<'a> HeadAppender<'a> {
         }
 
         let hash = hash_sorted_pairs(sorted_slice);
-        let (entry, created) = self.head.get_or_create_sorted_pairs(hash, sorted_slice)?;
+        let (entry, created) = self.head.get_or_create_sorted_pairs(hash, sorted_slice, 1)?;
         if created {
             self.series_refs.push(RefSeries {
                 ref_id: entry.ref_id,
                 labels: entry.labels.clone(),
             });
+            self.created_series.push(Arc::clone(&entry));
         }
         Ok(entry)
     }
@@ -5432,12 +6148,13 @@ impl<'a> HeadAppender<'a> {
         }
         let (entry, created) = self
             .head
-            .get_or_create_encoded_labels(prehashed, encoded_labels)?;
+            .get_or_create_encoded_labels(prehashed, encoded_labels, 1)?;
         if created {
             self.series_refs.push(RefSeries {
                 ref_id: entry.ref_id,
                 labels: entry.labels.clone(),
             });
+            self.created_series.push(Arc::clone(&entry));
         }
         Ok(entry)
     }
@@ -5680,30 +6397,36 @@ impl<'a> HeadAppender<'a> {
             return Err(HeadError::OutOfBounds);
         }
 
-        let entry = match series_entry.take() {
-            Some(e) => {
-                if !take_entry {
-                    *series_entry = Some(Arc::clone(&e));
+        loop {
+            let entry = match series_entry.take() {
+                Some(e) => {
+                    if !take_entry {
+                        *series_entry = Some(Arc::clone(&e));
+                    }
+                    e
                 }
-                e
-            }
-            None => {
-                let e = self.resolve_encoded_labels_prehashed(prehashed, encoded_labels)?;
-                if !take_entry {
-                    *series_entry = Some(Arc::clone(&e));
+                None => {
+                    let e = self.resolve_encoded_labels_prehashed(prehashed, encoded_labels)?;
+                    if !take_entry {
+                        *series_entry = Some(Arc::clone(&e));
+                    }
+                    e
                 }
-                e
+            };
+            if let Some(ref_id) = self.append_float_with_resolved_entry_inner(
+                series_entry,
+                take_entry,
+                entry,
+                st,
+                t,
+                v,
+                effective_ooo,
+            )? {
+                return Ok(ref_id);
             }
-        };
-        self.append_float_with_resolved_entry_inner(
-            series_entry,
-            take_entry,
-            entry,
-            st,
-            t,
-            v,
-            effective_ooo,
-        )
+            // Entry was GCed before acquiring pending_commits; clear cached entry and re-resolve.
+            *series_entry = None;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5731,32 +6454,40 @@ impl<'a> HeadAppender<'a> {
             return Err(HeadError::OutOfBounds);
         }
 
-        let entry = match series_entry.take() {
-            Some(e) => {
-                if !take_entry {
-                    *series_entry = Some(Arc::clone(&e));
+        loop {
+            let entry = match series_entry.take() {
+                Some(e) => {
+                    if !take_entry {
+                        *series_entry = Some(Arc::clone(&e));
+                    }
+                    e
                 }
-                e
-            }
-            None => {
-                let e = self.resolve_sorted_pairs_prehashed(None, prehashed, pairs)?;
-                if !take_entry {
-                    *series_entry = Some(Arc::clone(&e));
+                None => {
+                    let e = self.resolve_sorted_pairs_prehashed(None, prehashed, pairs)?;
+                    if !take_entry {
+                        *series_entry = Some(Arc::clone(&e));
+                    }
+                    e
                 }
-                e
+            };
+            if let Some(ref_id) = self.append_float_with_resolved_entry_inner(
+                series_entry,
+                take_entry,
+                entry,
+                st,
+                t,
+                v,
+                effective_ooo,
+            )? {
+                return Ok(ref_id);
             }
-        };
-        self.append_float_with_resolved_entry_inner(
-            series_entry,
-            take_entry,
-            entry,
-            st,
-            t,
-            v,
-            effective_ooo,
-        )
+            // Entry was GCed before acquiring pending_commits; clear cached entry and re-resolve.
+            *series_entry = None;
+        }
     }
 
+    /// Returns `Ok(Some(ref_id))` on success, `Ok(None)` if `entry` was GCed before reservation
+    /// (caller must clear `*series_entry = None` and re-resolve).
     #[allow(clippy::too_many_arguments)]
     fn append_float_with_resolved_entry_inner(
         &mut self,
@@ -5767,7 +6498,7 @@ impl<'a> HeadAppender<'a> {
         t: i64,
         v: f64,
         effective_ooo: i64,
-    ) -> Result<u64, HeadError> {
+    ) -> Result<Option<u64>, HeadError> {
         let ref_id = entry.ref_id;
 
         // Lock-free single-lock fast path: claim `pending_commits` 0 -> 1 and check `t > in_order_max_time`.
@@ -5779,6 +6510,10 @@ impl<'a> HeadAppender<'a> {
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
+            if entry.is_gced() {
+                entry.pending_commits.fetch_sub(1, Ordering::Release);
+                return Ok(None);
+            }
             let max_t = entry.in_order_max_time.load(Ordering::Acquire);
             if t > max_t {
                 self.floats.push(PendingFloat {
@@ -5788,10 +6523,15 @@ impl<'a> HeadAppender<'a> {
                     v,
                     is_ooo: false,
                 });
-                return Ok(ref_id);
+                return Ok(Some(ref_id));
             }
             let res = {
                 let mut state = entry.inner.lock();
+                if entry.is_gced() {
+                    drop(state);
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    return Ok(None);
+                }
                 self.check_entry_appendable_float(&mut state, t, v, effective_ooo)
             };
             match res {
@@ -5801,7 +6541,7 @@ impl<'a> HeadAppender<'a> {
                         if take_entry {
                             *series_entry = Some(entry);
                         }
-                        return Ok(ref_id);
+                        return Ok(Some(ref_id));
                     }
                     self.floats.push(PendingFloat {
                         entry,
@@ -5810,7 +6550,7 @@ impl<'a> HeadAppender<'a> {
                         v,
                         is_ooo,
                     });
-                    return Ok(ref_id);
+                    return Ok(Some(ref_id));
                 }
                 Err(e) => {
                     entry.pending_commits.fetch_sub(1, Ordering::Release);
@@ -5822,7 +6562,14 @@ impl<'a> HeadAppender<'a> {
             }
         }
 
-        let prev = entry.pending_commits.fetch_add(1, Ordering::AcqRel);
+        if !entry.try_inc_pending_commit() {
+            return Ok(None);
+        }
+        if entry.is_gced() {
+            entry.pending_commits.fetch_sub(1, Ordering::Release);
+            return Ok(None);
+        }
+        let prev = entry.pending_commits_count().saturating_sub(1);
         let is_ooo = if prev > 0 {
             self.sync_batch_last_sample();
             match self.check_batch_last_sample(ref_id, t, &LastSample::Float(v), effective_ooo) {
@@ -5838,13 +6585,18 @@ impl<'a> HeadAppender<'a> {
                         if take_entry {
                             *series_entry = Some(entry);
                         }
-                        return Ok(ref_id);
+                        return Ok(Some(ref_id));
                     }
                     is_ooo
                 }
                 Ok(None) => {
                     let res = {
                         let mut state = entry.inner.lock();
+                        if entry.is_gced() {
+                            drop(state);
+                            entry.pending_commits.fetch_sub(1, Ordering::Release);
+                            return Ok(None);
+                        }
                         self.check_entry_appendable_float(&mut state, t, v, effective_ooo)
                     };
                     match res {
@@ -5854,7 +6606,7 @@ impl<'a> HeadAppender<'a> {
                                 if take_entry {
                                     *series_entry = Some(entry);
                                 }
-                                return Ok(ref_id);
+                                return Ok(Some(ref_id));
                             }
                             is_ooo
                         }
@@ -5878,6 +6630,11 @@ impl<'a> HeadAppender<'a> {
         } else {
             let res = {
                 let mut state = entry.inner.lock();
+                if entry.is_gced() {
+                    drop(state);
+                    entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    return Ok(None);
+                }
                 self.check_entry_appendable_float(&mut state, t, v, effective_ooo)
             };
             match res {
@@ -5887,7 +6644,7 @@ impl<'a> HeadAppender<'a> {
                         if take_entry {
                             *series_entry = Some(entry);
                         }
-                        return Ok(ref_id);
+                        return Ok(Some(ref_id));
                     }
                     is_ooo
                 }
@@ -5908,7 +6665,7 @@ impl<'a> HeadAppender<'a> {
             v,
             is_ooo,
         });
-        Ok(ref_id)
+        Ok(Some(ref_id))
     }
 
     fn append_float_inner(
@@ -5942,7 +6699,10 @@ impl<'a> HeadAppender<'a> {
             .series
             .get_by_id(series_ref)
             .ok_or(HeadError::UnknownSeriesRef(series_ref))?;
-        let prev = entry.pending_commits.fetch_add(1, Ordering::AcqRel);
+        if !entry.try_inc_pending_commit() || entry.is_gced() {
+            return Err(HeadError::UnknownSeriesRef(series_ref));
+        }
+        let prev = entry.pending_commits_count().saturating_sub(1);
         let is_ooo = if prev > 0 {
             self.sync_batch_last_sample();
             match self.check_batch_last_sample(
@@ -5959,16 +6719,33 @@ impl<'a> HeadAppender<'a> {
                     is_ooo
                 }
                 Ok(None) => {
-                    let cr_guard = self.head.chunk_reader.read();
+                    // Lock order: entry.inner BEFORE chunk_reader.read() (C2).
                     let state = entry.inner.lock();
-                    let res = state.appendable_float(
-                        t,
-                        v,
-                        self.head_maxt,
-                        self.min_valid_time,
-                        self.ooo_time_window,
-                        cr_guard.as_ref(),
-                    );
+                    if entry.is_gced() {
+                        drop(state);
+                        entry.pending_commits.fetch_sub(1, Ordering::Release);
+                        return Err(HeadError::UnknownSeriesRef(series_ref));
+                    }
+                    let res = if state.needs_chunk_reader_for_t(t) {
+                        let cr_guard = self.head.chunk_reader.read();
+                        state.appendable_float(
+                            t,
+                            v,
+                            self.head_maxt,
+                            self.min_valid_time,
+                            self.ooo_time_window,
+                            cr_guard.as_ref(),
+                        )
+                    } else {
+                        state.appendable_float(
+                            t,
+                            v,
+                            self.head_maxt,
+                            self.min_valid_time,
+                            self.ooo_time_window,
+                            None,
+                        )
+                    };
                     drop(state);
                     match res {
                         Ok((is_ooo, is_dup)) => {
@@ -5990,16 +6767,33 @@ impl<'a> HeadAppender<'a> {
                 }
             }
         } else {
-            let cr_guard = self.head.chunk_reader.read();
+            // Lock order: entry.inner BEFORE chunk_reader.read() (C2).
             let state = entry.inner.lock();
-            let res = state.appendable_float(
-                t,
-                v,
-                self.head_maxt,
-                self.min_valid_time,
-                self.ooo_time_window,
-                cr_guard.as_ref(),
-            );
+            if entry.is_gced() {
+                drop(state);
+                entry.pending_commits.fetch_sub(1, Ordering::Release);
+                return Err(HeadError::UnknownSeriesRef(series_ref));
+            }
+            let res = if state.needs_chunk_reader_for_t(t) {
+                let cr_guard = self.head.chunk_reader.read();
+                state.appendable_float(
+                    t,
+                    v,
+                    self.head_maxt,
+                    self.min_valid_time,
+                    self.ooo_time_window,
+                    cr_guard.as_ref(),
+                )
+            } else {
+                state.appendable_float(
+                    t,
+                    v,
+                    self.head_maxt,
+                    self.min_valid_time,
+                    self.ooo_time_window,
+                    None,
+                )
+            };
             drop(state);
             match res {
                 Ok((is_ooo, is_dup)) => {
@@ -6071,11 +6865,25 @@ impl<'a> HeadAppender<'a> {
         }
         h.validate().map_err(HeadError::HistogramValidation)?;
 
-        let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
+        let mut cur_ref = series_ref;
+        let entry = loop {
+            let e = self.resolve_sorted_pairs(cur_ref, pairs)?;
+            if !e.try_inc_pending_commit() {
+                cur_ref = None;
+                continue;
+            }
+            if e.is_gced() {
+                e.pending_commits.fetch_sub(1, Ordering::Release);
+                cur_ref = None;
+                continue;
+            }
+            break e;
+        };
+
         let ref_id = entry.ref_id;
-        let ls = LastSample::Histogram(Box::new(h.clone()));
-        let prev = entry.pending_commits.fetch_add(1, Ordering::AcqRel);
+        let prev = entry.pending_commits_count().saturating_sub(1);
         let batch_check = if prev > 0 {
+            let ls = LastSample::Histogram(Box::new(h.clone()));
             self.sync_batch_last_sample();
             match self.check_batch_last_sample(ref_id, t, &ls, effective_ooo) {
                 Ok(v) => v,
@@ -6100,16 +6908,28 @@ impl<'a> HeadAppender<'a> {
             }
             is_ooo
         } else {
-            let cr_guard = self.head.chunk_reader.read();
+            // Lock order: entry.inner BEFORE chunk_reader.read() (C2).
             let state = entry.inner.lock();
-            let res = state.appendable_histogram(
-                t,
-                &h,
-                self.head_maxt,
-                self.min_valid_time,
-                effective_ooo,
-                cr_guard.as_ref(),
-            );
+            let res = if state.needs_chunk_reader_for_t(t) {
+                let cr_guard = self.head.chunk_reader.read();
+                state.appendable_histogram(
+                    t,
+                    &h,
+                    self.head_maxt,
+                    self.min_valid_time,
+                    effective_ooo,
+                    cr_guard.as_ref(),
+                )
+            } else {
+                state.appendable_histogram(
+                    t,
+                    &h,
+                    self.head_maxt,
+                    self.min_valid_time,
+                    effective_ooo,
+                    None,
+                )
+            };
             drop(state);
             if !matches!(res, Ok((false, _))) {
                 let delta = self.head_maxt.saturating_sub(t);
@@ -6186,11 +7006,25 @@ impl<'a> HeadAppender<'a> {
         }
         fh.validate().map_err(HeadError::HistogramValidation)?;
 
-        let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
+        let mut cur_ref = series_ref;
+        let entry = loop {
+            let e = self.resolve_sorted_pairs(cur_ref, pairs)?;
+            if !e.try_inc_pending_commit() {
+                cur_ref = None;
+                continue;
+            }
+            if e.is_gced() {
+                e.pending_commits.fetch_sub(1, Ordering::Release);
+                cur_ref = None;
+                continue;
+            }
+            break e;
+        };
+
         let ref_id = entry.ref_id;
-        let ls = LastSample::FloatHistogram(Box::new(fh.clone()));
-        let prev = entry.pending_commits.fetch_add(1, Ordering::AcqRel);
+        let prev = entry.pending_commits_count().saturating_sub(1);
         let batch_check = if prev > 0 {
+            let ls = LastSample::FloatHistogram(Box::new(fh.clone()));
             self.sync_batch_last_sample();
             match self.check_batch_last_sample(ref_id, t, &ls, effective_ooo) {
                 Ok(v) => v,
@@ -6215,16 +7049,28 @@ impl<'a> HeadAppender<'a> {
             }
             is_ooo
         } else {
-            let cr_guard = self.head.chunk_reader.read();
+            // Lock order: entry.inner BEFORE chunk_reader.read() (C2).
             let state = entry.inner.lock();
-            let res = state.appendable_float_histogram(
-                t,
-                &fh,
-                self.head_maxt,
-                self.min_valid_time,
-                effective_ooo,
-                cr_guard.as_ref(),
-            );
+            let res = if state.needs_chunk_reader_for_t(t) {
+                let cr_guard = self.head.chunk_reader.read();
+                state.appendable_float_histogram(
+                    t,
+                    &fh,
+                    self.head_maxt,
+                    self.min_valid_time,
+                    effective_ooo,
+                    cr_guard.as_ref(),
+                )
+            } else {
+                state.appendable_float_histogram(
+                    t,
+                    &fh,
+                    self.head_maxt,
+                    self.min_valid_time,
+                    effective_ooo,
+                    None,
+                )
+            };
             drop(state);
             if !matches!(res, Ok((false, _))) {
                 let delta = self.head_maxt.saturating_sub(t);
@@ -6282,6 +7128,9 @@ impl<'a> HeadAppender<'a> {
                 .get_by_sorted_pairs(hash, &sorted)
                 .ok_or(HeadError::UnknownSeriesRef(0))?
         };
+        if entry.is_gced() {
+            return Err(HeadError::UnknownSeriesRef(entry.ref_id));
+        }
 
         let cleaned = Exemplar {
             labels: exemplar.labels.without_empty(),
@@ -6296,6 +7145,9 @@ impl<'a> HeadAppender<'a> {
         let ref_id = entry.ref_id;
         {
             let mut st = entry.inner.lock();
+            if entry.is_gced() {
+                return Err(HeadError::UnknownSeriesRef(ref_id));
+            }
             st.update_last_exemplar_ts(cleaned.timestamp_ms);
         }
         self.exemplars.push(PendingExemplar {
@@ -6318,7 +7170,20 @@ impl<'a> HeadAppender<'a> {
         if self.closed {
             return Err(HeadError::AppenderClosed);
         }
-        let entry = self.resolve_sorted_pairs(series_ref, pairs)?;
+        let mut cur_ref = series_ref;
+        let compact_meta = self.head.intern_metadata_symbols(metric_type, unit, help);
+        let (entry, changed) = loop {
+            let e = self.resolve_sorted_pairs(cur_ref, pairs)?;
+            let st = e.inner.lock();
+            if e.is_gced() {
+                drop(st);
+                cur_ref = None;
+                continue;
+            }
+            let ch = st.metadata != Some(compact_meta);
+            drop(st);
+            break (e, ch);
+        };
         let ref_id = entry.ref_id;
 
         if !metric_family_name.is_empty() {
@@ -6331,11 +7196,6 @@ impl<'a> HeadAppender<'a> {
             )?;
         }
 
-        let compact_meta = self.head.intern_metadata_symbols(metric_type, unit, help);
-        let changed = {
-            let st = entry.inner.lock();
-            st.metadata != Some(compact_meta)
-        };
         if changed {
             self.metadata.push(PendingMetadata {
                 entry,
@@ -6353,6 +7213,13 @@ impl<'a> HeadAppender<'a> {
         self.closed = true;
         self.head.metrics.active_appenders.dec();
 
+        let res = self.commit_inner();
+        self.release_remaining_pending_commits();
+        self.return_scratch();
+        res
+    }
+
+    fn commit_inner(&mut self) -> Result<(), HeadError> {
         // 1. Log to WAL.
         self.log_wal()?;
 
@@ -6374,11 +7241,61 @@ impl<'a> HeadAppender<'a> {
         let mut ooo_mint = i64::MAX;
         let mut ooo_maxt = i64::MIN;
 
+        let enc = RecordEncoder::new(self.head.opts.enable_st_storage);
         let mut wbl_samples: Vec<RefSample> = Vec::new();
         let mut wbl_histograms: Vec<RefHistogramSample> = Vec::new();
         let mut wbl_float_histograms: Vec<RefFloatHistogramSample> = Vec::new();
-        let mut wbl_markers: Vec<RefMmapMarker> = Vec::new();
-        let mut wrote_ooo_mmap = false;
+        let mut ooo_mmap_markers: HashMap<u64, Vec<ChunkDiskMapperRef>> = HashMap::new();
+        let mut ooo_records: Vec<Vec<u8>> = Vec::new();
+        let mut pending_ooo_promote: Vec<Arc<SeriesEntry>> = Vec::new();
+
+        let flush_ooo_records = |wbl_samples: &mut Vec<RefSample>,
+                                 wbl_histograms: &mut Vec<RefHistogramSample>,
+                                 wbl_float_histograms: &mut Vec<RefFloatHistogramSample>,
+                                 ooo_mmap_markers: &mut HashMap<u64, Vec<ChunkDiskMapperRef>>,
+                                 ooo_records: &mut Vec<Vec<u8>>| {
+            // Write previously queued MmapMarkers (if any) BEFORE samples that belong to those
+            // newly opened chunks, and flush samples from prior chunks BEFORE new MmapMarkers.
+            if !ooo_mmap_markers.is_empty() {
+                let mut markers = Vec::new();
+                for (&ref_id, refs) in ooo_mmap_markers.iter() {
+                    for &r in refs {
+                        markers.push(RefMmapMarker {
+                            ref_id,
+                            mmap_ref: r.as_u64(),
+                        });
+                    }
+                }
+                if !markers.is_empty() {
+                    ooo_records.push(enc.mmap_markers(&markers, Vec::new()));
+                }
+                ooo_mmap_markers.clear();
+            }
+            if !wbl_samples.is_empty() {
+                ooo_records.push(enc.samples(wbl_samples, Vec::new()));
+                wbl_samples.clear();
+            }
+            if !wbl_histograms.is_empty() {
+                let (r, cb) = enc.histogram_samples(wbl_histograms, Vec::new());
+                if !r.is_empty() {
+                    ooo_records.push(r);
+                }
+                if !cb.is_empty() {
+                    ooo_records.push(enc.custom_buckets_histogram_samples(&cb, Vec::new()));
+                }
+                wbl_histograms.clear();
+            }
+            if !wbl_float_histograms.is_empty() {
+                let (r, cb) = enc.float_histogram_samples(wbl_float_histograms, Vec::new());
+                if !r.is_empty() {
+                    ooo_records.push(r);
+                }
+                if !cb.is_empty() {
+                    ooo_records.push(enc.custom_buckets_float_histogram_samples(&cb, Vec::new()));
+                }
+                wbl_float_histograms.clear();
+            }
+        };
 
         let float_enc = self.head.float_chunk_encoding();
         let chunk_range_ms = self.head.opts.chunk_range_ms;
@@ -6392,6 +7309,7 @@ impl<'a> HeadAppender<'a> {
                 prefetch_read_data(next_ptr);
                 prefetch_read_data((next_ptr as *const u8).wrapping_add(64));
             }
+            self.floats_committed = i + 1;
             let pf = &self.floats[i];
             let mut v = pf.v;
             let _pending_guard = PendingCommitGuard(&pf.entry.pending_commits);
@@ -6441,6 +7359,7 @@ impl<'a> HeadAppender<'a> {
                             self.ooo_time_window,
                             cr_guard.as_ref(),
                         ) {
+                            drop(cr_guard);
                             if !is_dup && !is_ooo
                                 && state
                                     .append_histogram_in_order(
@@ -6475,6 +7394,7 @@ impl<'a> HeadAppender<'a> {
                             self.ooo_time_window,
                             cr_guard.as_ref(),
                         ) {
+                            drop(cr_guard);
                             if !is_dup && !is_ooo
                                 && state
                                     .append_float_histogram_in_order(
@@ -6535,20 +7455,24 @@ impl<'a> HeadAppender<'a> {
                     self.head.opts.ooo_cap_max,
                     cw_guard.as_mut(),
                 )?;
+                drop(cw_guard);
                 if chunk_created {
+                    let prev_markers = ooo_mmap_markers.get(&pf.entry.ref_id);
+                    if prev_markers.is_none() || prev_markers.is_some_and(|r| !r.is_empty()) {
+                        flush_ooo_records(
+                            &mut wbl_samples,
+                            &mut wbl_histograms,
+                            &mut wbl_float_histograms,
+                            &mut ooo_mmap_markers,
+                            &mut ooo_records,
+                        );
+                    }
                     if mmap_refs.is_empty() {
-                        wbl_markers.push(RefMmapMarker {
-                            ref_id: pf.entry.ref_id,
-                            mmap_ref: 0,
-                        });
+                        ooo_mmap_markers
+                            .insert(pf.entry.ref_id, vec![ChunkDiskMapperRef(0)]);
                     } else {
-                        wrote_ooo_mmap = true;
-                        for r in mmap_refs {
-                            wbl_markers.push(RefMmapMarker {
-                                ref_id: pf.entry.ref_id,
-                                mmap_ref: r.as_u64(),
-                            });
-                        }
+                        pending_ooo_promote.push(Arc::clone(&pf.entry));
+                        ooo_mmap_markers.insert(pf.entry.ref_id, mmap_refs);
                     }
                 }
                 if ok {
@@ -6590,6 +7514,7 @@ impl<'a> HeadAppender<'a> {
             }
         }
         self.floats.clear();
+        self.floats_committed = 0;
 
         // Commit integer histograms
         for ph in self.histograms.drain(..) {
@@ -6622,20 +7547,24 @@ impl<'a> HeadAppender<'a> {
                     self.head.opts.ooo_cap_max,
                     cw_guard.as_mut(),
                 )?;
+                drop(cw_guard);
                 if chunk_created {
+                    let prev_markers = ooo_mmap_markers.get(&ph.entry.ref_id);
+                    if prev_markers.is_none() || prev_markers.is_some_and(|r| !r.is_empty()) {
+                        flush_ooo_records(
+                            &mut wbl_samples,
+                            &mut wbl_histograms,
+                            &mut wbl_float_histograms,
+                            &mut ooo_mmap_markers,
+                            &mut ooo_records,
+                        );
+                    }
                     if mmap_refs.is_empty() {
-                        wbl_markers.push(RefMmapMarker {
-                            ref_id: ph.entry.ref_id,
-                            mmap_ref: 0,
-                        });
+                        ooo_mmap_markers
+                            .insert(ph.entry.ref_id, vec![ChunkDiskMapperRef(0)]);
                     } else {
-                        wrote_ooo_mmap = true;
-                        for r in mmap_refs {
-                            wbl_markers.push(RefMmapMarker {
-                                ref_id: ph.entry.ref_id,
-                                mmap_ref: r.as_u64(),
-                            });
-                        }
+                        pending_ooo_promote.push(Arc::clone(&ph.entry));
+                        ooo_mmap_markers.insert(ph.entry.ref_id, mmap_refs);
                     }
                 }
                 if ok {
@@ -6702,20 +7631,24 @@ impl<'a> HeadAppender<'a> {
                     self.head.opts.ooo_cap_max,
                     cw_guard.as_mut(),
                 )?;
+                drop(cw_guard);
                 if chunk_created {
+                    let prev_markers = ooo_mmap_markers.get(&pfh.entry.ref_id);
+                    if prev_markers.is_none() || prev_markers.is_some_and(|r| !r.is_empty()) {
+                        flush_ooo_records(
+                            &mut wbl_samples,
+                            &mut wbl_histograms,
+                            &mut wbl_float_histograms,
+                            &mut ooo_mmap_markers,
+                            &mut ooo_records,
+                        );
+                    }
                     if mmap_refs.is_empty() {
-                        wbl_markers.push(RefMmapMarker {
-                            ref_id: pfh.entry.ref_id,
-                            mmap_ref: 0,
-                        });
+                        ooo_mmap_markers
+                            .insert(pfh.entry.ref_id, vec![ChunkDiskMapperRef(0)]);
                     } else {
-                        wrote_ooo_mmap = true;
-                        for r in mmap_refs {
-                            wbl_markers.push(RefMmapMarker {
-                                ref_id: pfh.entry.ref_id,
-                                mmap_ref: r.as_u64(),
-                            });
-                        }
+                        pending_ooo_promote.push(Arc::clone(&pfh.entry));
+                        ooo_mmap_markers.insert(pfh.entry.ref_id, mmap_refs);
                     }
                 }
                 if ok {
@@ -6751,12 +7684,21 @@ impl<'a> HeadAppender<'a> {
             }
         }
 
-        if wrote_ooo_mmap {
+        // Flush chunk_writer and refresh chunk_reader BEFORE exposing any OOO MmappedChunk.
+        if !pending_ooo_promote.is_empty() {
             if let Some(ref mut cw) = *self.head.chunk_writer.lock() {
                 cw.flush()?;
             }
-            let reader = HeadChunksReader::open(self.head.dir.join("chunks_head"))?;
+            let reader = HeadChunksReader::open_no_repair(self.head.dir.join("chunks_head"))?;
             *self.head.chunk_reader.write() = Some(reader);
+            for entry in pending_ooo_promote {
+                let mut st = entry.inner.lock();
+                if let Some(ref mut ooo) = st.ooo {
+                    for (mc, _) in ooo.ooo_pending_mmapped.drain(..) {
+                        ooo.ooo_mmapped_chunks.push(mc);
+                    }
+                }
+            }
         }
 
         if in_order_mint <= in_order_maxt {
@@ -6766,55 +7708,23 @@ impl<'a> HeadAppender<'a> {
             self.head.update_min_ooo_max_ooo_time(ooo_mint, ooo_maxt);
         }
 
-        // 3. Log OOO records to WBL if any.
-        if !wbl_markers.is_empty()
-            || !wbl_samples.is_empty()
-            || !wbl_histograms.is_empty()
-            || !wbl_float_histograms.is_empty()
-        {
+        // 3. Log OOO records to WBL if any (samples before their corresponding MmapMarkers).
+        flush_ooo_records(
+            &mut wbl_samples,
+            &mut wbl_histograms,
+            &mut wbl_float_histograms,
+            &mut ooo_mmap_markers,
+            &mut ooo_records,
+        );
+        if !ooo_records.is_empty() {
             if let Some(ref mut wbl) = *self.head.wbl.lock() {
-                let enc = RecordEncoder::new(self.head.opts.enable_st_storage);
-                let mut recs: Vec<Vec<u8>> = Vec::new();
-                if !wbl_markers.is_empty() {
-                    recs.push(enc.mmap_markers(&wbl_markers, Vec::new()));
-                }
-                if !wbl_samples.is_empty() {
-                    recs.push(enc.samples(&wbl_samples, Vec::new()));
-                }
-                if !wbl_histograms.is_empty() {
-                    let (r, cb) = enc.histogram_samples(&wbl_histograms, Vec::new());
-                    if !r.is_empty() {
-                        recs.push(r);
-                    }
-                    if !cb.is_empty() {
-                        recs.push(enc.custom_buckets_histogram_samples(&cb, Vec::new()));
-                    }
-                }
-                if !wbl_float_histograms.is_empty() {
-                    let (r, cb) = enc.float_histogram_samples(&wbl_float_histograms, Vec::new());
-                    if !r.is_empty() {
-                        recs.push(r);
-                    }
-                    if !cb.is_empty() {
-                        recs.push(enc.custom_buckets_float_histogram_samples(&cb, Vec::new()));
-                    }
-                }
-                let slices: Vec<&[u8]> = recs.iter().map(|v| v.as_slice()).collect();
+                let slices: Vec<&[u8]> = ooo_records.iter().map(|v| v.as_slice()).collect();
                 if !slices.is_empty() {
                     wbl.log(&slices)?;
                 }
             }
         }
 
-        if wbl_markers.iter().any(|m| m.mmap_ref != 0) {
-            if let Some(ref mut cw) = *self.head.chunk_writer.lock() {
-                cw.flush()?;
-            }
-            let reader = HeadChunksReader::open(self.head.dir.join("chunks_head"))?;
-            *self.head.chunk_reader.write() = Some(reader);
-        }
-
-        self.return_scratch();
         Ok(())
     }
 
@@ -6825,27 +7735,23 @@ impl<'a> HeadAppender<'a> {
         }
         self.closed = true;
         self.head.metrics.active_appenders.dec();
-        for pf in self.floats.drain(..) {
-            pf.entry.pending_commits.fetch_sub(1, Ordering::Release);
-        }
-        for ph in self.histograms.drain(..) {
-            ph.entry.pending_commits.fetch_sub(1, Ordering::Release);
-        }
-        for pfh in self.float_histograms.drain(..) {
-            pfh.entry.pending_commits.fetch_sub(1, Ordering::Release);
-        }
         self.exemplars.clear();
         self.metadata.clear();
 
-        if !self.series_refs.is_empty() {
+        let log_res = if !self.series_refs.is_empty() {
             if let Some(ref mut wal) = *self.head.wal.lock() {
                 let enc = RecordEncoder::new(self.head.opts.enable_st_storage);
                 let rec = enc.series(&self.series_refs, Vec::new());
-                wal.log(&[&rec])?;
+                wal.log(&[&rec]).map_err(HeadError::from)
+            } else {
+                Ok(())
             }
-        }
+        } else {
+            Ok(())
+        };
+        self.release_remaining_pending_commits();
         self.return_scratch();
-        Ok(())
+        log_res
     }
 
     fn log_wal(&mut self) -> Result<(), HeadError> {
@@ -6978,18 +7884,11 @@ impl<'a> HeadAppender<'a> {
 impl Drop for HeadAppender<'_> {
     fn drop(&mut self) {
         if !self.closed {
+            self.closed = true;
             self.head.metrics.active_appenders.dec();
-            for pf in self.floats.drain(..) {
-                pf.entry.pending_commits.fetch_sub(1, Ordering::Release);
-            }
-            for ph in self.histograms.drain(..) {
-                ph.entry.pending_commits.fetch_sub(1, Ordering::Release);
-            }
-            for pfh in self.float_histograms.drain(..) {
-                pfh.entry.pending_commits.fetch_sub(1, Ordering::Release);
-            }
-            self.return_scratch();
         }
+        self.release_remaining_pending_commits();
+        self.return_scratch();
     }
 }
 
@@ -7430,6 +8329,350 @@ mod tests {
                 "mismatch at index {i}"
             );
         }
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn parallel_wal_replay_interleaved_histograms_stalena_n_histograms() {
+        use crate::chunkenc::{CounterResetHint, HistogramSpan};
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            wal_replay_concurrency: 4,
+            samples_per_chunk: 20,
+            ..HeadOptions::default()
+        };
+        let make_hist = |sum: f64| Histogram {
+            counter_reset_hint: CounterResetHint::NotCounterReset,
+            schema: 0,
+            zero_threshold: 0.001,
+            zero_count: 1,
+            count: 2,
+            sum,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            positive_buckets: vec![1],
+            negative_spans: Vec::new(),
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        };
+        let make_fhist = |sum: f64| FloatHistogram {
+            counter_reset_hint: CounterResetHint::NotCounterReset,
+            schema: 0,
+            zero_threshold: 0.001,
+            zero_count: 1.0,
+            count: 2.0,
+            sum,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            positive_buckets: vec![1.0],
+            negative_spans: Vec::new(),
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        };
+
+        let num_series = 16usize;
+        {
+            let head = Head::open(dir.path(), opts.clone(), i64::MIN).unwrap();
+            for s in 0..num_series {
+                let h_name = format!("hist_interleave_{s}");
+                let fh_name = format!("fhist_interleave_{s}");
+                let hp = [("__name__", h_name.as_str())];
+                let fhp = [("__name__", fh_name.as_str())];
+
+                // Step 1: Histogram at t=1000
+                let mut a1 = head.appender();
+                let hr = a1.append_histogram(None, &hp, 0, 1_000, make_hist(10.0)).unwrap();
+                let fhr = a1
+                    .append_float_histogram(None, &fhp, 0, 1_000, make_fhist(10.0))
+                    .unwrap();
+                a1.commit().unwrap();
+
+                // Step 2: Float StaleNaN at t=2000
+                let mut a2 = head.appender();
+                a2.append_float(Some(hr), &hp, 2_000, stale_nan()).unwrap();
+                a2.append_float(Some(fhr), &fhp, 2_000, stale_nan()).unwrap();
+                a2.commit().unwrap();
+
+                // Step 3: Histogram at t=3000
+                let mut a3 = head.appender();
+                a3.append_histogram(Some(hr), &hp, 0, 3_000, make_hist(25.0))
+                    .unwrap();
+                a3.append_float_histogram(Some(fhr), &fhp, 0, 3_000, make_fhist(25.0))
+                    .unwrap();
+                a3.commit().unwrap();
+            }
+            head.close().unwrap();
+        }
+
+        // Reopen with wal_replay_concurrency=4: every series must have all 3 samples in exact WAL order.
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        for s in 0..num_series {
+            let h_name = format!("hist_interleave_{s}");
+            let fh_name = format!("fhist_interleave_{s}");
+
+            let he = head
+                .get_entry_by_sorted_pairs(&[("__name__", h_name.as_str())])
+                .unwrap();
+            let (_, h_chks, _) = head
+                .series_chunks(he.ref_id, i64::MIN, i64::MAX)
+                .unwrap()
+                .unwrap();
+            let mut h_samples = Vec::new();
+            for c in h_chks {
+                h_samples.extend(decode_chunk_samples(&c.chunk.unwrap()).unwrap());
+            }
+            assert_eq!(h_samples.len(), 3, "hist series {s} lost sample");
+            assert_eq!(h_samples[0].t, 1_000);
+            assert_eq!(h_samples[1].t, 2_000);
+            assert!(matches!(
+                h_samples[1].value,
+                SampleValue::Histogram(ref hh) if is_stale_nan(hh.sum)
+            ));
+            assert_eq!(h_samples[2].t, 3_000);
+            assert!(matches!(
+                h_samples[2].value,
+                SampleValue::Histogram(ref hh) if hh.sum == 25.0
+            ));
+
+            let fhe = head
+                .get_entry_by_sorted_pairs(&[("__name__", fh_name.as_str())])
+                .unwrap();
+            let (_, fh_chks, _) = head
+                .series_chunks(fhe.ref_id, i64::MIN, i64::MAX)
+                .unwrap()
+                .unwrap();
+            let mut fh_samples = Vec::new();
+            for c in fh_chks {
+                fh_samples.extend(decode_chunk_samples(&c.chunk.unwrap()).unwrap());
+            }
+            assert_eq!(fh_samples.len(), 3, "fhist series {s} lost sample");
+            assert_eq!(fh_samples[0].t, 1_000);
+            assert_eq!(fh_samples[1].t, 2_000);
+            assert!(matches!(
+                fh_samples[1].value,
+                SampleValue::FloatHistogram(ref hh) if is_stale_nan(hh.sum)
+            ));
+            assert_eq!(fh_samples[2].t, 3_000);
+            assert!(matches!(
+                fh_samples[2].value,
+                SampleValue::FloatHistogram(ref hh) if hh.sum == 25.0
+            ));
+        }
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn concurrent_truncate_memory_append_and_ooo_commit_no_deadlock_or_loss() {
+        use std::sync::Barrier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            chunk_range_ms: 10_000,
+            samples_per_chunk: 5,
+            ooo_time_window_ms: 500_000,
+            ooo_cap_max: 4,
+            max_head_chunk_file_size: 4096,
+            ..HeadOptions::default()
+        };
+        let head = Arc::new(Head::open(dir.path(), opts, i64::MIN).unwrap());
+
+        let base_t = 100_000i64;
+        // Seed initial old samples on two series: one that stays old and gets GCed,
+        // and one that continues receiving new samples concurrently with truncation.
+        {
+            let mut app = head.appender();
+            app.append_float(None, &[("__name__", "ephemeral_old")], 1_000, 1.0)
+                .unwrap();
+            app.append_float(None, &[("__name__", "live_series")], base_t, 0.0)
+                .unwrap();
+            app.commit().unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(5));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        // Thread 1: In-order + OOO writer on `live_series` (also exercises cached SeriesEntry GC re-resolve)
+        {
+            let h = Arc::clone(&head);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let mut cached_entry = None;
+                let pairs = [("__name__", "live_series")];
+                for i in 1..=120i64 {
+                    let t = base_t + i * 1_000;
+                    let mut app = h.appender();
+                    app.append_float_with_entry(&mut cached_entry, &pairs, 0, t, i as f64, false)
+                        .unwrap();
+                    // Also append OOO samples to trigger OOO head chunk cuts -> chunk_writer -> chunk_reader
+                    app.append_float_with_entry(
+                        &mut cached_entry,
+                        &pairs,
+                        0,
+                        t - 500,
+                        (i as f64) + 0.5,
+                        false,
+                    )
+                    .unwrap();
+                    app.commit().unwrap();
+                }
+            }));
+        }
+
+        // Thread 2: Writer via `append_float_by_ref` + `append_histogram`
+        {
+            let h = Arc::clone(&head);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let mut app0 = h.appender();
+                let r_byref = app0
+                    .append_float(None, &[("__name__", "byref_series")], base_t, 0.0)
+                    .unwrap();
+                app0.commit().unwrap();
+
+                for i in 1..=60i64 {
+                    let mut app = h.appender();
+                    let _ = app.append_float_by_ref(r_byref, base_t + i * 1_000, i as f64);
+                    let _ = app.append_float_by_ref(r_byref, base_t + i * 1_000 - 250, i as f64);
+                    app.commit().unwrap();
+                }
+            }));
+        }
+
+        // Thread 3: Concurrent mmap_head_chunks + truncate_memory + OOO compaction prep
+        {
+            let h = Arc::clone(&head);
+            let b = Arc::clone(&barrier);
+            let st = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let mut cut = 5_000i64;
+                while !st.load(Ordering::Acquire) {
+                    let _ = h.mmap_head_chunks();
+                    let _ = h.truncate_memory(cut);
+                    if cut < base_t + 30_000 {
+                        cut += 2_000;
+                    }
+                    let _ = h.collect_ooo_compaction_candidates();
+                    let _ = h.clear_ooo_data_before(base_t + 10_000);
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        // Thread 4: Concurrent reader (`series_chunks`)
+        {
+            let h = Arc::clone(&head);
+            let b = Arc::clone(&barrier);
+            let st = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                while !st.load(Ordering::Acquire) {
+                    if let Some(e) = h.get_entry_by_sorted_pairs(&[("__name__", "live_series")]) {
+                        let _ = h.series_chunks(e.ref_id, i64::MIN, i64::MAX);
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        // Thread 5: Concurrent ephemeral churn series + cached SeriesEntry GC re-resolve test
+        {
+            let h = Arc::clone(&head);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let mut churn_cached = None;
+                for i in 0..40 {
+                    let name = format!("churn_{i}");
+                    let mut app = h.appender();
+                    app.append_float(None, &[("__name__", name.as_str())], 2_000, 1.0)
+                        .unwrap();
+                    let _ = app.append_float_with_entry(
+                        &mut churn_cached,
+                        &[("__name__", "ephemeral_old")],
+                        0,
+                        base_t + 50_000 + (i as i64) * 1000,
+                        i as f64,
+                        false,
+                    );
+                    app.commit().unwrap();
+                }
+            }));
+        }
+
+        // Join writer threads 1, 2, 5, then signal 3 & 4 to stop.
+        let h5 = handles.pop().unwrap();
+        let h4 = handles.pop().unwrap();
+        let h3 = handles.pop().unwrap();
+        let h2 = handles.pop().unwrap();
+        let h1 = handles.pop().unwrap();
+        h1.join().unwrap();
+        h2.join().unwrap();
+        h5.join().unwrap();
+        stop.store(true, Ordering::Release);
+        h3.join().unwrap();
+        h4.join().unwrap();
+
+        // Verify all post-truncation in-order samples on `live_series` are present (none lost!).
+        let live = head
+            .get_entry_by_sorted_pairs(&[("__name__", "live_series")])
+            .expect("live_series must still exist");
+        assert_eq!(live.pending_commits_count(), 0);
+        let (_, chks, _) = head
+            .series_chunks(live.ref_id, i64::MIN, i64::MAX)
+            .unwrap()
+            .unwrap();
+        let mut ts_set = HashSet::new();
+        for c in chks {
+            for s in decode_chunk_samples(&c.chunk.unwrap()).unwrap() {
+                ts_set.insert(s.t);
+            }
+        }
+        // Truncate only went up to base_t + 30_000; every sample > base_t + 30_000 must exist!
+        for i in 31..=120i64 {
+            assert!(
+                ts_set.contains(&(base_t + i * 1_000)),
+                "missing in-order sample i={i}"
+            );
+        }
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn commit_error_does_not_leak_pending_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+        let pairs = [("__name__", "leak_check")];
+
+        // Force WAL write error inside `commit()` (`log_wal` returns `WlogError::Closed`).
+        {
+            let mut wal = head.wal.lock();
+            wal.as_mut().unwrap().force_close_for_test();
+        }
+
+        let mut app = head.appender();
+        let ref_id = app.append_float(None, &pairs, 1_000, 1.0).unwrap();
+        app.append_float(Some(ref_id), &pairs, 2_000, 2.0).unwrap();
+        let entry = head.get_entry_by_sorted_pairs(&pairs).unwrap();
+        assert_eq!(entry.pending_commits_count(), 3); // 1 created_series + 2 floats
+
+        let err = app.commit().unwrap_err();
+        assert!(matches!(err, HeadError::Wlog(WlogError::Closed)));
+        // Every unconsumed pending_commits reservation must have been released on error!
+        assert_eq!(entry.pending_commits_count(), 0);
+
+        // Clear closed WAL writer so truncate_memory can GC the empty series cleanly.
+        *head.wal.lock() = None;
+        head.truncate_memory(5_000).unwrap();
+        assert!(head.get_entry_by_sorted_pairs(&pairs).is_none());
         head.close().unwrap();
     }
 }

@@ -535,8 +535,10 @@ impl<'a> HistogramAppender<'a> {
         state.t_delta = t_delta;
         state.cnt_delta = cnt_delta;
         state.z_cnt_delta = z_cnt_delta;
-        state.p_buckets.copy_from_slice(&h.positive_buckets);
-        state.n_buckets.copy_from_slice(&h.negative_buckets);
+        if !is_stale_nan(h.sum) {
+            state.p_buckets.copy_from_slice(&h.positive_buckets);
+            state.n_buckets.copy_from_slice(&h.negative_buckets);
+        }
         state.sum = h.sum;
 
         num + 1

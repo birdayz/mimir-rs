@@ -11,15 +11,18 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::block::{
-    write_meta_file, Block, BlockDesc, BlockError, BlockMeta, BlockMetaCompaction, BlockStats,
-    META_VERSION_1,
+    sync_dir, write_meta_file, Block, BlockDesc, BlockError, BlockMeta, BlockMetaCompaction,
+    BlockStats, META_VERSION_1,
 };
 use crate::chunkenc::{
-    ChunkError, EncodedChunk, Encoding, FloatHistogram, FloatHistogramChunk, Histogram,
-    HistogramChunk, XorChunk, MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND, TARGET_BYTES_PER_HISTOGRAM_CHUNK,
+    ChunkError, EncodedChunk, Encoding, FloatHistogram, FloatHistogramChunk,
+    FloatHistogramStChunk, Histogram, HistogramChunk, HistogramStChunk, Xor2Chunk, XorChunk,
+    MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND, TARGET_BYTES_PER_HISTOGRAM_CHUNK,
 };
 use crate::chunkenc::float_histogram::AppendFloatHistogramOutcome;
+use crate::chunkenc::float_histogram_st::AppendFloatHistogramStOutcome;
 use crate::chunkenc::histogram::AppendHistogramOutcome;
+use crate::chunkenc::histogram_st::AppendHistogramStOutcome;
 use crate::chunks_block::{BlockChunksError, BlockChunksWriter, ChunkMeta, DEFAULT_CHUNK_SEGMENT_SIZE};
 use crate::head::DEFAULT_SAMPLES_PER_CHUNK;
 use crate::index::{IndexError, IndexWriter, INDEX_FILENAME};
@@ -146,10 +149,31 @@ pub fn encode_samples_into_chunks(
     samples: &[DecodedSample],
     samples_per_chunk: usize,
 ) -> Result<Vec<ChunkMeta>, ChunkError> {
+    encode_samples_into_chunks_with_encodings(
+        samples,
+        samples_per_chunk,
+        Encoding::Xor,
+        Encoding::Histogram,
+        Encoding::FloatHistogram,
+    )
+}
+
+/// Encodes a sorted slice of [`DecodedSample`]s into [`ChunkMeta`]s using the specified target
+/// encodings (`Xor`/`Xor2`, `Histogram`/`HistogramSt`, `FloatHistogram`/`FloatHistogramSt`).
+pub fn encode_samples_into_chunks_with_encodings(
+    samples: &[DecodedSample],
+    samples_per_chunk: usize,
+    float_enc: Encoding,
+    hist_enc: Encoding,
+    fhist_enc: Encoding,
+) -> Result<Vec<ChunkMeta>, ChunkError> {
     if samples.is_empty() {
         return Ok(Vec::new());
     }
     let samples_per_chunk = samples_per_chunk.max(1);
+    let use_xor2 = float_enc == Encoding::Xor2;
+    let use_hist_st = hist_enc == Encoding::HistogramSt;
+    let use_fhist_st = fhist_enc == Encoding::FloatHistogramSt;
     let mut out = Vec::new();
 
     enum Active {
@@ -159,16 +183,33 @@ pub fn encode_samples_into_chunks(
             maxt: i64,
             chunk: XorChunk,
         },
+        Xor2 {
+            mint: i64,
+            maxt: i64,
+            chunk: Xor2Chunk,
+        },
         Hist {
             mint: i64,
             maxt: i64,
             chunk: HistogramChunk,
             prev_state: Option<crate::chunkenc::histogram::HistogramAppenderState>,
         },
+        HistSt {
+            mint: i64,
+            maxt: i64,
+            chunk: HistogramStChunk,
+            prev_state: Option<crate::chunkenc::histogram::HistogramAppenderState>,
+        },
         FloatHist {
             mint: i64,
             maxt: i64,
             chunk: FloatHistogramChunk,
+            prev_state: Option<crate::chunkenc::float_histogram::FloatHistogramAppenderState>,
+        },
+        FloatHistSt {
+            mint: i64,
+            maxt: i64,
+            chunk: FloatHistogramStChunk,
             prev_state: Option<crate::chunkenc::float_histogram::FloatHistogramAppenderState>,
         },
     }
@@ -191,6 +232,19 @@ pub fn encode_samples_into_chunks(
                     chunk: Some(EncodedChunk::Xor(chunk)),
                 });
             }
+            Active::Xor2 {
+                mint,
+                maxt,
+                mut chunk,
+            } => {
+                chunk.compact();
+                out.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: mint,
+                    max_time: maxt,
+                    chunk: Some(EncodedChunk::Xor2(chunk)),
+                });
+            }
             Active::Hist {
                 mint,
                 maxt,
@@ -203,6 +257,20 @@ pub fn encode_samples_into_chunks(
                     min_time: mint,
                     max_time: maxt,
                     chunk: Some(EncodedChunk::Histogram(chunk)),
+                });
+            }
+            Active::HistSt {
+                mint,
+                maxt,
+                mut chunk,
+                ..
+            } => {
+                chunk.compact();
+                out.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: mint,
+                    max_time: maxt,
+                    chunk: Some(EncodedChunk::HistogramSt(chunk)),
                 });
             }
             Active::FloatHist {
@@ -219,127 +287,264 @@ pub fn encode_samples_into_chunks(
                     chunk: Some(EncodedChunk::FloatHistogram(chunk)),
                 });
             }
+            Active::FloatHistSt {
+                mint,
+                maxt,
+                mut chunk,
+                ..
+            } => {
+                chunk.compact();
+                out.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: mint,
+                    max_time: maxt,
+                    chunk: Some(EncodedChunk::FloatHistogramSt(chunk)),
+                });
+            }
         }
     };
 
     for s in samples {
         match &s.value {
             SampleValue::Float(v) => {
-                let need_cut = match &active {
-                    Active::Xor { chunk, .. } => {
-                        chunk.num_samples() >= samples_per_chunk
-                            || chunk.as_bytes().len() > MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND
-                    }
-                    _ => true,
-                };
-                if need_cut {
-                    flush_active(&mut active, &mut out);
-                    active = Active::Xor {
-                        mint: s.t,
-                        maxt: s.t,
-                        chunk: XorChunk::new(),
+                if use_xor2 {
+                    let need_cut = match &active {
+                        Active::Xor2 { chunk, .. } => {
+                            chunk.num_samples() >= samples_per_chunk
+                                || chunk.as_bytes().len() > MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND
+                        }
+                        _ => true,
                     };
-                }
-                if let Active::Xor { maxt, chunk, .. } = &mut active {
-                    let mut app = chunk.appender()?;
-                    app.append(s.st, s.t, *v)?;
-                    *maxt = s.t;
+                    if need_cut {
+                        flush_active(&mut active, &mut out);
+                        active = Active::Xor2 {
+                            mint: s.t,
+                            maxt: s.t,
+                            chunk: Xor2Chunk::new(),
+                        };
+                    }
+                    if let Active::Xor2 { maxt, chunk, .. } = &mut active {
+                        let mut app = chunk.appender()?;
+                        app.append(s.st, s.t, *v)?;
+                        *maxt = s.t;
+                    }
+                } else {
+                    let need_cut = match &active {
+                        Active::Xor { chunk, .. } => {
+                            chunk.num_samples() >= samples_per_chunk
+                                || chunk.as_bytes().len() > MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND
+                        }
+                        _ => true,
+                    };
+                    if need_cut {
+                        flush_active(&mut active, &mut out);
+                        active = Active::Xor {
+                            mint: s.t,
+                            maxt: s.t,
+                            chunk: XorChunk::new(),
+                        };
+                    }
+                    if let Active::Xor { maxt, chunk, .. } = &mut active {
+                        let mut app = chunk.appender()?;
+                        app.append(s.st, s.t, *v)?;
+                        *maxt = s.t;
+                    }
                 }
             }
             SampleValue::Histogram(h) => {
-                let need_cut = match &active {
-                    Active::Hist { chunk, .. } => {
-                        chunk.as_bytes().len() >= TARGET_BYTES_PER_HISTOGRAM_CHUNK * 2
-                    }
-                    _ => true,
-                };
-                if need_cut {
-                    flush_active(&mut active, &mut out);
-                    active = Active::Hist {
-                        mint: s.t,
-                        maxt: s.t,
-                        chunk: HistogramChunk::new(),
-                        prev_state: None,
-                    };
-                }
-                if let Active::Hist {
-                    mint,
-                    maxt,
-                    chunk,
-                    prev_state,
-                } = &mut active
-                {
-                    let mut app = chunk.appender()?;
-                    let outcome =
-                        app.append_histogram(prev_state.as_ref(), s.st, s.t, h, false)?;
-                    let next_prev = app.state().clone();
-                    match outcome {
-                        AppendHistogramOutcome::Appended { .. } => {
-                            *maxt = s.t;
+                if use_hist_st {
+                    let need_cut = match &active {
+                        Active::HistSt { chunk, .. } => {
+                            chunk.as_bytes().len() >= TARGET_BYTES_PER_HISTOGRAM_CHUNK * 2
                         }
-                        AppendHistogramOutcome::NewChunk(new_chk) => {
-                            let cur_mint = *mint;
-                            let cur_maxt = *maxt;
-                            let mut old = std::mem::replace(chunk, new_chk);
-                            old.compact();
-                            out.push(ChunkMeta {
-                                ref_id: 0,
-                                min_time: cur_mint,
-                                max_time: cur_maxt,
-                                chunk: Some(EncodedChunk::Histogram(old)),
-                            });
-                            *mint = s.t;
-                            *maxt = s.t;
-                            *prev_state = Some(next_prev);
+                        _ => true,
+                    };
+                    if need_cut {
+                        flush_active(&mut active, &mut out);
+                        active = Active::HistSt {
+                            mint: s.t,
+                            maxt: s.t,
+                            chunk: HistogramStChunk::new(),
+                            prev_state: None,
+                        };
+                    }
+                    if let Active::HistSt {
+                        mint,
+                        maxt,
+                        chunk,
+                        prev_state,
+                    } = &mut active
+                    {
+                        let mut app = chunk.appender()?;
+                        let outcome =
+                            app.append_histogram(prev_state.as_ref(), s.st, s.t, h, false)?;
+                        let next_prev = app.state().clone();
+                        match outcome {
+                            AppendHistogramStOutcome::Appended { .. } => {
+                                *maxt = s.t;
+                            }
+                            AppendHistogramStOutcome::NewChunk(new_chk) => {
+                                let cur_mint = *mint;
+                                let cur_maxt = *maxt;
+                                let mut old = std::mem::replace(chunk, new_chk);
+                                old.compact();
+                                out.push(ChunkMeta {
+                                    ref_id: 0,
+                                    min_time: cur_mint,
+                                    max_time: cur_maxt,
+                                    chunk: Some(EncodedChunk::HistogramSt(old)),
+                                });
+                                *mint = s.t;
+                                *maxt = s.t;
+                                *prev_state = Some(next_prev);
+                            }
+                        }
+                    }
+                } else {
+                    let need_cut = match &active {
+                        Active::Hist { chunk, .. } => {
+                            chunk.as_bytes().len() >= TARGET_BYTES_PER_HISTOGRAM_CHUNK * 2
+                        }
+                        _ => true,
+                    };
+                    if need_cut {
+                        flush_active(&mut active, &mut out);
+                        active = Active::Hist {
+                            mint: s.t,
+                            maxt: s.t,
+                            chunk: HistogramChunk::new(),
+                            prev_state: None,
+                        };
+                    }
+                    if let Active::Hist {
+                        mint,
+                        maxt,
+                        chunk,
+                        prev_state,
+                    } = &mut active
+                    {
+                        let mut app = chunk.appender()?;
+                        let outcome =
+                            app.append_histogram(prev_state.as_ref(), s.st, s.t, h, false)?;
+                        let next_prev = app.state().clone();
+                        match outcome {
+                            AppendHistogramOutcome::Appended { .. } => {
+                                *maxt = s.t;
+                            }
+                            AppendHistogramOutcome::NewChunk(new_chk) => {
+                                let cur_mint = *mint;
+                                let cur_maxt = *maxt;
+                                let mut old = std::mem::replace(chunk, new_chk);
+                                old.compact();
+                                out.push(ChunkMeta {
+                                    ref_id: 0,
+                                    min_time: cur_mint,
+                                    max_time: cur_maxt,
+                                    chunk: Some(EncodedChunk::Histogram(old)),
+                                });
+                                *mint = s.t;
+                                *maxt = s.t;
+                                *prev_state = Some(next_prev);
+                            }
                         }
                     }
                 }
             }
             SampleValue::FloatHistogram(fh) => {
-                let need_cut = match &active {
-                    Active::FloatHist { chunk, .. } => {
-                        chunk.as_bytes().len() >= TARGET_BYTES_PER_HISTOGRAM_CHUNK * 2
-                    }
-                    _ => true,
-                };
-                if need_cut {
-                    flush_active(&mut active, &mut out);
-                    active = Active::FloatHist {
-                        mint: s.t,
-                        maxt: s.t,
-                        chunk: FloatHistogramChunk::new(),
-                        prev_state: None,
-                    };
-                }
-                if let Active::FloatHist {
-                    mint,
-                    maxt,
-                    chunk,
-                    prev_state,
-                } = &mut active
-                {
-                    let mut app = chunk.appender()?;
-                    let outcome =
-                        app.append_float_histogram(prev_state.as_ref(), s.st, s.t, fh, false)?;
-                    let next_prev = app.state().clone();
-                    match outcome {
-                        AppendFloatHistogramOutcome::Appended { .. } => {
-                            *maxt = s.t;
+                if use_fhist_st {
+                    let need_cut = match &active {
+                        Active::FloatHistSt { chunk, .. } => {
+                            chunk.as_bytes().len() >= TARGET_BYTES_PER_HISTOGRAM_CHUNK * 2
                         }
-                        AppendFloatHistogramOutcome::NewChunk(new_chk) => {
-                            let cur_mint = *mint;
-                            let cur_maxt = *maxt;
-                            let mut old = std::mem::replace(chunk, new_chk);
-                            old.compact();
-                            out.push(ChunkMeta {
-                                ref_id: 0,
-                                min_time: cur_mint,
-                                max_time: cur_maxt,
-                                chunk: Some(EncodedChunk::FloatHistogram(old)),
-                            });
-                            *mint = s.t;
-                            *maxt = s.t;
-                            *prev_state = Some(next_prev);
+                        _ => true,
+                    };
+                    if need_cut {
+                        flush_active(&mut active, &mut out);
+                        active = Active::FloatHistSt {
+                            mint: s.t,
+                            maxt: s.t,
+                            chunk: FloatHistogramStChunk::new(),
+                            prev_state: None,
+                        };
+                    }
+                    if let Active::FloatHistSt {
+                        mint,
+                        maxt,
+                        chunk,
+                        prev_state,
+                    } = &mut active
+                    {
+                        let mut app = chunk.appender()?;
+                        let outcome =
+                            app.append_float_histogram(prev_state.as_ref(), s.st, s.t, fh, false)?;
+                        let next_prev = app.state().clone();
+                        match outcome {
+                            AppendFloatHistogramStOutcome::Appended { .. } => {
+                                *maxt = s.t;
+                            }
+                            AppendFloatHistogramStOutcome::NewChunk(new_chk) => {
+                                let cur_mint = *mint;
+                                let cur_maxt = *maxt;
+                                let mut old = std::mem::replace(chunk, new_chk);
+                                old.compact();
+                                out.push(ChunkMeta {
+                                    ref_id: 0,
+                                    min_time: cur_mint,
+                                    max_time: cur_maxt,
+                                    chunk: Some(EncodedChunk::FloatHistogramSt(old)),
+                                });
+                                *mint = s.t;
+                                *maxt = s.t;
+                                *prev_state = Some(next_prev);
+                            }
+                        }
+                    }
+                } else {
+                    let need_cut = match &active {
+                        Active::FloatHist { chunk, .. } => {
+                            chunk.as_bytes().len() >= TARGET_BYTES_PER_HISTOGRAM_CHUNK * 2
+                        }
+                        _ => true,
+                    };
+                    if need_cut {
+                        flush_active(&mut active, &mut out);
+                        active = Active::FloatHist {
+                            mint: s.t,
+                            maxt: s.t,
+                            chunk: FloatHistogramChunk::new(),
+                            prev_state: None,
+                        };
+                    }
+                    if let Active::FloatHist {
+                        mint,
+                        maxt,
+                        chunk,
+                        prev_state,
+                    } = &mut active
+                    {
+                        let mut app = chunk.appender()?;
+                        let outcome =
+                            app.append_float_histogram(prev_state.as_ref(), s.st, s.t, fh, false)?;
+                        let next_prev = app.state().clone();
+                        match outcome {
+                            AppendFloatHistogramOutcome::Appended { .. } => {
+                                *maxt = s.t;
+                            }
+                            AppendFloatHistogramOutcome::NewChunk(new_chk) => {
+                                let cur_mint = *mint;
+                                let cur_maxt = *maxt;
+                                let mut old = std::mem::replace(chunk, new_chk);
+                                old.compact();
+                                out.push(ChunkMeta {
+                                    ref_id: 0,
+                                    min_time: cur_mint,
+                                    max_time: cur_maxt,
+                                    chunk: Some(EncodedChunk::FloatHistogram(old)),
+                                });
+                                *mint = s.t;
+                                *maxt = s.t;
+                                *prev_state = Some(next_prev);
+                            }
                         }
                     }
                 }
@@ -408,6 +613,19 @@ pub fn trim_and_merge_chunks(
     }
 
     // Slow path: decode samples, filter [mint, maxt_inclusive] & tombstones, sort & dedup by timestamp, re-encode.
+    let mut float_enc = Encoding::Xor;
+    let mut hist_enc = Encoding::Histogram;
+    let mut fhist_enc = Encoding::FloatHistogram;
+    for c in &chunks {
+        if let Some(ref enc) = c.chunk {
+            match enc.encoding() {
+                Encoding::Xor2 => float_enc = Encoding::Xor2,
+                Encoding::HistogramSt => hist_enc = Encoding::HistogramSt,
+                Encoding::FloatHistogramSt => fhist_enc = Encoding::FloatHistogramSt,
+                _ => {}
+            }
+        }
+    }
     let mut samples = Vec::new();
     for c in &chunks {
         let Some(ref encoded) = c.chunk else {
@@ -429,7 +647,13 @@ pub fn trim_and_merge_chunks(
 
     samples.sort_by_key(|s| s.t);
     samples.dedup_by_key(|s| s.t);
-    encode_samples_into_chunks(&samples, samples_per_chunk)
+    encode_samples_into_chunks_with_encodings(
+        &samples,
+        samples_per_chunk,
+        float_enc,
+        hist_enc,
+        fhist_enc,
+    )
 }
 
 /// Streams Head compaction without materializing all `CompactionSeries` or chunk buffers in RAM.
@@ -579,7 +803,10 @@ where
         if final_dir.exists() {
             fs::remove_dir_all(&final_dir)?;
         }
+        sync_dir(&tmp_dir.join("chunks"))?;
+        sync_dir(&tmp_dir)?;
         fs::rename(&tmp_dir, &final_dir)?;
+        sync_dir(dest)?;
         Ok(Some(meta))
     })();
 
@@ -725,7 +952,10 @@ pub fn write_block_from_series(
         if final_dir.exists() {
             fs::remove_dir_all(&final_dir)?;
         }
+        sync_dir(&tmp_dir.join("chunks"))?;
+        sync_dir(&tmp_dir)?;
         fs::rename(&tmp_dir, &final_dir)?;
+        sync_dir(dest)?;
         Ok(Some(meta))
     })();
 
@@ -809,4 +1039,150 @@ pub fn compact_blocks(dest: &Path, blocks: &[&Block]) -> Result<Option<BlockMeta
     }
 
     write_block_from_series(dest, mint, maxt, comp_series, comp, all_ooo, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunkenc::{FloatHistogram, FloatHistogramStChunk, Histogram, HistogramSpan, HistogramStChunk, Xor2Chunk};
+
+    #[test]
+    fn trim_and_merge_slow_path_preserves_st_encodings() {
+        // Overlapping Xor2 chunks force slow path; output must remain Xor2 with ST preserved.
+        let mut x1 = Xor2Chunk::new();
+        {
+            let mut a = x1.appender().unwrap();
+            a.append(50, 100, 1.0).unwrap();
+            a.append(50, 200, 2.0).unwrap();
+        }
+        let mut x2 = Xor2Chunk::new();
+        {
+            let mut a = x2.appender().unwrap();
+            a.append(150, 200, 2.0).unwrap();
+            a.append(150, 300, 3.0).unwrap();
+        }
+        let merged = trim_and_merge_chunks(
+            vec![
+                ChunkMeta {
+                    ref_id: 1,
+                    min_time: 100,
+                    max_time: 200,
+                    chunk: Some(EncodedChunk::Xor2(x1)),
+                },
+                ChunkMeta {
+                    ref_id: 2,
+                    min_time: 200,
+                    max_time: 300,
+                    chunk: Some(EncodedChunk::Xor2(x2)),
+                },
+            ],
+            &[],
+            100,
+            300,
+            120,
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].chunk.as_ref().unwrap().encoding(), Encoding::Xor2);
+        let decoded = decode_chunk_samples(merged[0].chunk.as_ref().unwrap()).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].st, 50);
+        assert_eq!(decoded[2].st, 150);
+
+        // Overlapping HistogramSt chunks preserve HistogramSt encoding.
+        let h = Histogram {
+            schema: 0,
+            zero_threshold: 0.001,
+            zero_count: 1,
+            count: 2,
+            sum: 3.0,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![1],
+            ..Histogram::default()
+        };
+        let mut hs1 = HistogramStChunk::new();
+        {
+            let mut a = hs1.appender().unwrap();
+            a.append_histogram(None, 40, 100, &h, false).unwrap();
+        }
+        let mut hs2 = HistogramStChunk::new();
+        {
+            let mut a = hs2.appender().unwrap();
+            a.append_histogram(None, 40, 100, &h, false).unwrap();
+            a.append_histogram(None, 40, 200, &h, false).unwrap();
+        }
+        let h_merged = trim_and_merge_chunks(
+            vec![
+                ChunkMeta {
+                    ref_id: 1,
+                    min_time: 100,
+                    max_time: 100,
+                    chunk: Some(EncodedChunk::HistogramSt(hs1)),
+                },
+                ChunkMeta {
+                    ref_id: 2,
+                    min_time: 100,
+                    max_time: 200,
+                    chunk: Some(EncodedChunk::HistogramSt(hs2)),
+                },
+            ],
+            &[],
+            100,
+            200,
+            120,
+        )
+        .unwrap();
+        assert_eq!(
+            h_merged[0].chunk.as_ref().unwrap().encoding(),
+            Encoding::HistogramSt
+        );
+
+        // Overlapping FloatHistogramSt chunks preserve FloatHistogramSt encoding.
+        let fh = FloatHistogram {
+            schema: 0,
+            zero_threshold: 0.001,
+            zero_count: 1.0,
+            count: 2.0,
+            sum: 3.0,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![1.0],
+            ..FloatHistogram::default()
+        };
+        let mut fhs1 = FloatHistogramStChunk::new();
+        {
+            let mut a = fhs1.appender().unwrap();
+            a.append_float_histogram(None, 77, 100, &fh, false).unwrap();
+        }
+        let mut fhs2 = FloatHistogramStChunk::new();
+        {
+            let mut a = fhs2.appender().unwrap();
+            a.append_float_histogram(None, 77, 100, &fh, false).unwrap();
+            a.append_float_histogram(None, 77, 200, &fh, false).unwrap();
+        }
+        let fh_merged = trim_and_merge_chunks(
+            vec![
+                ChunkMeta {
+                    ref_id: 1,
+                    min_time: 100,
+                    max_time: 100,
+                    chunk: Some(EncodedChunk::FloatHistogramSt(fhs1)),
+                },
+                ChunkMeta {
+                    ref_id: 2,
+                    min_time: 100,
+                    max_time: 200,
+                    chunk: Some(EncodedChunk::FloatHistogramSt(fhs2)),
+                },
+            ],
+            &[],
+            100,
+            200,
+            120,
+        )
+        .unwrap();
+        assert_eq!(
+            fh_merged[0].chunk.as_ref().unwrap().encoding(),
+            Encoding::FloatHistogramSt
+        );
+    }
 }

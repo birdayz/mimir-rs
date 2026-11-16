@@ -212,6 +212,33 @@ impl WlogWriter {
         })
     }
 
+    fn open_segment_exact(
+        dir: impl AsRef<Path>,
+        segment_size: usize,
+        segment_index: usize,
+        compress: CompressionType,
+    ) -> Result<Self, WlogError> {
+        if segment_size == 0 || !segment_size.is_multiple_of(PAGE_SIZE) {
+            return Err(WlogError::InvalidSegmentSize(segment_size));
+        }
+        let dir = dir.as_ref().to_path_buf();
+        fs::create_dir_all(&dir)?;
+
+        let seg = Self::create_segment(&dir, segment_index)?;
+        let done_pages = (seg.file.metadata()?.len() as usize) / PAGE_SIZE;
+
+        Ok(Self {
+            dir,
+            segment_size,
+            segment: Some(seg),
+            done_pages,
+            page: Page::new(),
+            compress,
+            closed: false,
+            comp_buf: Vec::new(),
+        })
+    }
+
     fn create_segment(dir: &Path, index: usize) -> Result<OpenSegment, WlogError> {
         let path = segment_name(dir, index);
         let file = OpenOptions::new()
@@ -245,9 +272,21 @@ impl WlogWriter {
             }
             self.page.alloc = PAGE_SIZE;
         }
-        let slice = &self.page.buf[self.page.flushed..self.page.alloc];
-        seg.file.write_all(slice)?;
-        self.page.flushed += slice.len();
+        while self.page.flushed < self.page.alloc {
+            match seg.file.write(&self.page.buf[self.page.flushed..self.page.alloc]) {
+                Ok(0) => {
+                    return Err(WlogError::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write whole WAL page",
+                    )));
+                }
+                Ok(n) => {
+                    self.page.flushed += n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(WlogError::Io(e)),
+            }
+        }
         if should_clear {
             self.page.reset();
             self.done_pages += 1;
@@ -419,6 +458,11 @@ impl WlogWriter {
         self.close_inner()
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_close_for_test(&mut self) {
+        self.closed = true;
+    }
+
     fn close_inner(&mut self) -> Result<(), WlogError> {
         if self.closed {
             return Ok(());
@@ -462,13 +506,12 @@ pub fn repair_wal(
     fs::rename(&seg_path, &tmp_path)?;
 
     {
-        let mut writer = WlogWriter::with_segment_size(dir, DEFAULT_SEGMENT_SIZE, compress)?;
-        // Recreate exact corrupt_segment index if writer picked another index.
-        if writer.segment.as_ref().map(|s| s.index) != Some(corrupt_segment) {
-            writer.segment = Some(WlogWriter::create_segment(dir, corrupt_segment)?);
-            writer.done_pages = 0;
-            writer.page.reset();
-        }
+        let mut writer = WlogWriter::open_segment_exact(
+            dir,
+            DEFAULT_SEGMENT_SIZE,
+            corrupt_segment,
+            compress,
+        )?;
 
         let f = File::open(&tmp_path)?;
         let mut reader = WlogReader::from_reader(BufReader::new(f));
@@ -487,6 +530,7 @@ pub fn repair_wal(
     fs::remove_file(&tmp_path)?;
     // Create next clean segment
     let _next = WlogWriter::create_segment(dir, corrupt_segment + 1)?;
+    crate::block::sync_dir(dir)?;
     Ok(())
 }
 
@@ -684,6 +728,12 @@ impl<R: Read + SegmentTracker> WlogReader<R> {
     pub fn segment(&self) -> Option<usize> {
         let (_, seg, _) = self.rdr.tracker_info();
         seg
+    }
+
+    #[inline]
+    pub fn segment_dir(&self) -> Option<&Path> {
+        let (dir, _, _) = self.rdr.tracker_info();
+        dir
     }
 
     fn make_corruption(&self, message: impl Into<String>) -> WlogError {
@@ -1216,7 +1266,9 @@ where
         if cp_final.exists() {
             fs::remove_dir_all(&cp_final)?;
         }
+        crate::block::sync_dir(&cp_tmp)?;
         fs::rename(&cp_tmp, &cp_final)?;
+        crate::block::sync_dir(dir)?;
         Ok(stats)
     })();
 

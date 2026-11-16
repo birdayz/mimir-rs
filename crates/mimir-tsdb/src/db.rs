@@ -64,12 +64,21 @@ impl Tsdb {
         fs::create_dir_all(&dir)?;
 
         let blocks = Self::load_blocks(&dir)?;
-        let min_valid_time = blocks
+        let mut min_valid_time = blocks
             .iter()
-            .filter(|b| !b.meta().out_of_order && !b.meta().compaction.from_out_of_order())
+            .filter(|b| {
+                !b.meta().out_of_order
+                    && !b.meta().compaction.from_out_of_order()
+                    && !b.meta().compaction.from_stale_series()
+                    && !b.meta().compaction.from_selected_series()
+            })
             .map(|b| b.max_time())
             .max()
             .unwrap_or(i64::MIN);
+
+        if let Ok(Some(stored_mvt)) = crate::wlog::read_min_valid_time(&dir.join("wal")) {
+            min_valid_time = min_valid_time.max(stored_mvt);
+        }
 
         let compactions_total = opts.head.registry.as_ref().map(|reg| {
             let c = prometheus::Counter::new(
@@ -294,7 +303,7 @@ impl Tsdb {
         let reloaded = Self::load_blocks(&self.dir)?;
         let mut blocks_guard = self.blocks.write();
         *blocks_guard = reloaded;
-        self.head.clear_ooo_data()?;
+        self.head.clear_ooo_data_before(maxt_inclusive)?;
         Ok(Some(uid))
     }
 
@@ -336,7 +345,7 @@ impl Tsdb {
         let reloaded = Self::load_blocks(&self.dir)?;
         let mut blocks_guard = self.blocks.write();
         *blocks_guard = reloaded;
-        self.head.evict_series_refs(refs)?;
+        self.head.evict_series_refs_before(refs, maxt_inclusive)?;
         Ok(Some(uid))
     }
 
@@ -469,6 +478,159 @@ mod tests {
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].samples.len(), 160);
         assert_eq!(series[0].samples[159].value, SampleValue::Float(159.0));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn torn_multipage_wal_tail_recovers_on_tsdb_open() {
+        use crate::record::{RecordEncoder, RefSample, RefSeries};
+        use crate::wlog::{segment_name, CompressionType, WlogWriter, PAGE_SIZE};
+
+        for concurrency in [1usize, 4usize] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = TsdbOptions::default();
+            opts.head.wal_compression = CompressionType::Snappy;
+            opts.head.wal_replay_concurrency = concurrency;
+
+            // 1. Write valid series and samples via Tsdb and close cleanly.
+            {
+                let db = Tsdb::open(dir.path(), opts.clone()).unwrap();
+                let mut app = db.appender();
+                for i in 0..10u64 {
+                    let name = format!("valid_metric_{i}");
+                    app.append_float(None, &[("__name__", &name)], 1_000_000, i as f64)
+                        .unwrap();
+                }
+                app.commit().unwrap();
+                db.close().unwrap();
+            }
+
+            // 2. Append a large multi-page (>64 KiB) WAL record to a new WAL segment,
+            // then truncate the file mid-record to simulate a SIGKILL mid-multi-page write.
+            let wal_dir = dir.path().join("wal");
+            {
+                let mut w = WlogWriter::open(&wal_dir, CompressionType::None).unwrap();
+                let enc = RecordEncoder::new(false);
+                let mut big_series = Vec::new();
+                let mut big_samples = Vec::new();
+                for i in 0..2000u64 {
+                    let ref_id = 1000 + i;
+                    big_series.push(RefSeries {
+                        ref_id,
+                        labels: Labels::from_pairs([
+                            ("__name__", "torn_series_metric"),
+                            ("idx", &format!("{i:05}")),
+                            ("pad", "padding_to_force_multipage_wal_record_over_64kb"),
+                        ]),
+                    });
+                    big_samples.push(RefSample {
+                        ref_id,
+                        st: 0,
+                        t: 2_000_000,
+                        v: i as f64,
+                    });
+                }
+                let s_rec = enc.series(&big_series, Vec::new());
+                let samp_rec = enc.samples(&big_samples, Vec::new());
+                assert!(s_rec.len() > PAGE_SIZE * 2);
+                w.log(&[&s_rec, &samp_rec]).unwrap();
+                w.close().unwrap();
+            }
+
+            let seg_idx = crate::wlog::segments_range(&wal_dir).unwrap().unwrap().1;
+            let seg_path = segment_name(&wal_dir, seg_idx);
+            let orig_len = std::fs::metadata(&seg_path).unwrap().len();
+            assert!(orig_len > (PAGE_SIZE * 2) as u64);
+            // Truncate into the middle of page 2 (leaving REC_FIRST + REC_MIDDLE without REC_LAST).
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&seg_path)
+                .unwrap();
+            f.set_len((PAGE_SIZE + 512) as u64).unwrap();
+            drop(f);
+
+            // 3. Tsdb::open must repair the torn WAL tail and recover all earlier committed data.
+            {
+                let db = Tsdb::open(dir.path(), opts.clone()).unwrap();
+                let q = db.querier(i64::MIN, i64::MAX);
+                let m = LabelMatcher::new(MatchType::RegexMatch, "__name__", "valid_metric_.*")
+                    .unwrap();
+                let series = q.select(true, &[m]).unwrap();
+                assert_eq!(series.len(), 10);
+
+                // Verify new writes still work after repair.
+                let mut app = db.appender();
+                app.append_float(None, &[("__name__", "post_repair")], 3_000_000, 99.0)
+                    .unwrap();
+                app.commit().unwrap();
+                db.close().unwrap();
+            }
+
+            // 4. Subsequent reopen succeeds cleanly with both pre-crash and post-repair data.
+            let db = Tsdb::open(dir.path(), opts).unwrap();
+            let q = db.querier(i64::MIN, i64::MAX);
+            let m_all = LabelMatcher::new(MatchType::RegexMatch, "__name__", ".*").unwrap();
+            let series = q.select(true, &[m_all]).unwrap();
+            assert_eq!(series.len(), 11);
+            db.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn from_selected_series_block_does_not_advance_min_valid_time_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = TsdbOptions::default();
+
+        let ref_s1;
+        {
+            let db = Tsdb::open(dir.path(), opts.clone()).unwrap();
+            let mut app = db.appender();
+            let p1 = [("__name__", "kept_series"), ("job", "a")];
+            let p2 = [("__name__", "selected_series"), ("job", "b")];
+            let r1 = app.append_float(None, &p1, 1_000, 1.0).unwrap();
+            app.append_float(Some(r1), &p1, 5_000, 5.0).unwrap();
+            ref_s1 = r1;
+
+            let r2 = app.append_float(None, &p2, 1_000, 10.0).unwrap();
+            app.append_float(Some(r2), &p2, 10_000, 20.0).unwrap();
+            app.commit().unwrap();
+
+            // Compact only r2 -> creates a block with `from-selected-series` hint and maxTime = 10_001.
+            let uid = db
+                .compact_selected_series(&[r2])
+                .unwrap()
+                .expect("selected block created");
+            let blk = db
+                .blocks()
+                .into_iter()
+                .find(|b| b.ulid() == uid)
+                .unwrap();
+            assert!(blk.meta().compaction.from_selected_series());
+            assert_eq!(blk.max_time(), 10_001);
+            db.close().unwrap();
+        }
+
+        // Reopen: `from-selected-series` block must NOT advance Head's `min_valid_time`.
+        let db = Tsdb::open(dir.path(), opts).unwrap();
+        assert_eq!(db.head().min_valid_time(), i64::MIN);
+
+        let q = db.querier(i64::MIN, i64::MAX);
+        let m1 = LabelMatcher::new(MatchType::Equal, "__name__", "kept_series").unwrap();
+        let s1 = q.select(true, &[m1]).unwrap();
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s1[0].samples.len(), 2);
+
+        // Appending at t=6000 (< 10_001) to kept_series must succeed!
+        let mut app = db.appender();
+        let _ = ref_s1;
+        app.append_float(
+            None,
+            &[("__name__", "kept_series"), ("job", "a")],
+            6_000,
+            6.0,
+        )
+        .unwrap();
+        app.commit().unwrap();
         db.close().unwrap();
     }
 }

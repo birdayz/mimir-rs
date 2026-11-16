@@ -188,6 +188,7 @@ impl HeadChunksWriter {
         hdr[..MAGIC_CHUNKS_SIZE].copy_from_slice(&MAGIC_HEAD_CHUNKS.to_be_bytes());
         hdr[MAGIC_CHUNKS_SIZE] = HEAD_CHUNKS_FORMAT_V1;
         f.write_all(&hdr)?;
+        f.flush()?;
 
         self.cur_writer = Some(BufWriter::with_capacity(DEFAULT_WRITE_BUFFER_SIZE, f));
         self.offset = HEAD_CHUNK_FILE_HEADER_SIZE;
@@ -290,11 +291,24 @@ pub struct HeadChunksReader {
 }
 
 impl HeadChunksReader {
-    /// Opens and memory-maps all head chunk files in `dir`, validating headers and sequence numbers.
+    /// Opens and memory-maps all head chunk files in `dir`, repairing any empty/zeroed
+    /// trailing file left behind by a crash before header write (startup only).
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, HeadChunksError> {
-        let dir = dir.as_ref().to_path_buf();
+        Self::open_inner(dir.as_ref(), true)
+    }
+
+    /// Opens and memory-maps all head chunk files in `dir` WITHOUT repairing or deleting
+    /// files on disk (safe for runtime refreshes while [`HeadChunksWriter`] is active).
+    pub fn open_no_repair(dir: impl AsRef<Path>) -> Result<Self, HeadChunksError> {
+        Self::open_inner(dir.as_ref(), false)
+    }
+
+    fn open_inner(dir: &Path, repair: bool) -> Result<Self, HeadChunksError> {
+        let dir = dir.to_path_buf();
         let mut paths = list_chunk_files(&dir)?;
-        repair_last_chunk_file(&mut paths)?;
+        if repair {
+            repair_last_chunk_file(&mut paths)?;
+        }
 
         let mut files = BTreeMap::new();
         let mut prev_seq: Option<usize> = None;

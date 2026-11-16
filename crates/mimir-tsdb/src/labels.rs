@@ -8,7 +8,17 @@ use std::fmt;
 
 use bytes::Bytes;
 use smallvec::SmallVec;
+use thiserror::Error;
 use xxhash_rust::xxh64::xxh64;
+
+/// Error returned when parsing raw `stringlabels` bytes.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum StringLabelsError {
+    #[error("truncated stringlabels buffer")]
+    Truncated,
+    #[error("invalid UTF-8 in stringlabels buffer: {0}")]
+    InvalidUtf8(#[from] std::str::Utf8Error),
+}
 
 use crate::matcher::LabelMatcher;
 use crate::symbols::{SymbolId, SymbolTable};
@@ -90,6 +100,22 @@ pub fn iter_stringlabels(data: &[u8]) -> LabelsIter<'_> {
 }
 
 #[inline]
+fn try_decode_stringlabel_size(data: &[u8], pos: usize) -> Result<(usize, usize), StringLabelsError> {
+    let b = *data.get(pos).ok_or(StringLabelsError::Truncated)?;
+    if b == 255 {
+        if pos + 4 > data.len() {
+            return Err(StringLabelsError::Truncated);
+        }
+        let len = (data[pos + 1] as usize)
+            | ((data[pos + 2] as usize) << 8)
+            | ((data[pos + 3] as usize) << 16);
+        Ok((len, pos + 4))
+    } else {
+        Ok((b as usize, pos + 1))
+    }
+}
+
+#[inline]
 fn decode_stringlabel_size(data: &[u8], pos: usize) -> (usize, usize) {
     let b = data[pos];
     if b == 255 {
@@ -148,9 +174,45 @@ impl Labels {
         Self { data: Bytes::new() }
     }
 
-    /// Wraps pre-encoded `stringlabels` bytes directly without copying.
+    /// Wraps pre-encoded `stringlabels` bytes after validating framing and UTF-8.
     #[inline]
     pub fn from_raw_stringlabels_bytes(data: Bytes) -> Self {
+        Self::try_from_raw_stringlabels_bytes(data).expect("invalid stringlabels bytes")
+    }
+
+    /// Validates `stringlabels` framing and UTF-8, wrapping `data` without copying.
+    pub fn try_from_raw_stringlabels_bytes(data: Bytes) -> Result<Self, StringLabelsError> {
+        let slice = data.as_ref();
+        let mut pos = 0usize;
+        while pos < slice.len() {
+            let (nlen, nstart) = try_decode_stringlabel_size(slice, pos)?;
+            let nend = nstart
+                .checked_add(nlen)
+                .ok_or(StringLabelsError::Truncated)?;
+            if nend > slice.len() {
+                return Err(StringLabelsError::Truncated);
+            }
+            std::str::from_utf8(&slice[nstart..nend])?;
+
+            let (vlen, vstart) = try_decode_stringlabel_size(slice, nend)?;
+            let vend = vstart
+                .checked_add(vlen)
+                .ok_or(StringLabelsError::Truncated)?;
+            if vend > slice.len() {
+                return Err(StringLabelsError::Truncated);
+            }
+            std::str::from_utf8(&slice[vstart..vend])?;
+            pos = vend;
+        }
+        Ok(Self { data })
+    }
+
+    /// Wraps pre-encoded `stringlabels` bytes directly without validating UTF-8 or framing.
+    ///
+    /// # Safety
+    /// Caller must guarantee `data` is validly framed Prometheus `stringlabels` containing valid UTF-8.
+    #[inline]
+    pub unsafe fn from_valid_stringlabels_bytes_unchecked(data: Bytes) -> Self {
         Self { data }
     }
 
@@ -692,5 +754,17 @@ mod tests {
         assert_eq!(xxh64(&buf, 0), expected.hash());
         let decoded: Vec<(&str, &str)> = iter_stringlabels(&buf).collect();
         assert_eq!(decoded, pairs);
+    }
+
+    #[test]
+    fn from_raw_stringlabels_bytes_validates_utf8_and_framing() {
+        // Invalid UTF-8 inside value
+        let bad_utf8 = Bytes::from_static(&[1, b'k', 2, 0xff, 0xfe]);
+        assert!(Labels::try_from_raw_stringlabels_bytes(bad_utf8.clone()).is_err());
+        assert!(std::panic::catch_unwind(|| Labels::from_raw_stringlabels_bytes(bad_utf8)).is_err());
+
+        // Truncated length
+        let trunc = Bytes::from_static(&[5, b'a', b'b']);
+        assert!(Labels::try_from_raw_stringlabels_bytes(trunc).is_err());
     }
 }

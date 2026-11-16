@@ -125,6 +125,16 @@ impl OooChunk {
         &self.samples
     }
 
+    /// Retains only samples with timestamp `> maxt_inclusive`, returning `(min_time, max_time)`
+    /// if any samples remain.
+    pub fn retain_after(&mut self, maxt_inclusive: i64) -> Option<(i64, i64)> {
+        self.samples.retain(|s| s.t > maxt_inclusive);
+        self.samples
+            .first()
+            .zip(self.samples.last())
+            .map(|(a, b)| (a.t, b.t))
+    }
+
     /// Cuts samples in `[mint, maxt]` into standard encoded chunks (`XorChunk`, `HistogramChunk`,
     /// `FloatHistogramChunk`), matching `tsdb.OOOChunk.ToEncodedChunks`.
     pub fn to_encoded_chunks(&self, mint: i64, maxt: i64) -> Result<Vec<CutChunk>, ChunkError> {

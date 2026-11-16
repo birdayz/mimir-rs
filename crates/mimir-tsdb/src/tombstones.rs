@@ -3,8 +3,8 @@
 //! Ported from github.com/prometheus/prometheus/tsdb/tombstones/tombstones.go.
 
 use std::collections::HashSet;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -231,8 +231,12 @@ pub fn write_tombstones_file(dir: &Path, tr: &MemTombstones) -> Result<usize, To
     out.extend_from_slice(&payload);
     out.extend_from_slice(&crc.to_be_bytes());
 
-    fs::write(&tmp, &out)?;
+    let mut f = File::create(&tmp)?;
+    f.write_all(&out)?;
+    f.sync_all()?;
+    drop(f);
     fs::rename(&tmp, &path)?;
+    crate::block::sync_dir(dir)?;
     Ok(out.len())
 }
 
