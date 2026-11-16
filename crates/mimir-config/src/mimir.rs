@@ -89,7 +89,14 @@ struct CoreMimirConfig {
 
 impl Default for CoreMimirConfig {
     fn default() -> Self {
-        let d = MimirConfig::default();
+        Self::from_config(&MimirConfig::default())
+    }
+}
+
+impl CoreMimirConfig {
+    /// Snapshot of the core sections of `d` (the values YAML is unmarshalled on top of).
+    fn from_config(d: &MimirConfig) -> Self {
+        let d = d.clone();
         Self {
             target: d.target,
             multitenancy_enabled: d.multitenancy_enabled,
@@ -527,7 +534,17 @@ impl MimirConfig {
         sanitize_null_block_values(&mut core_val);
         validate_flattened_core_keys(&core_val)?;
 
-        let core: CoreMimirConfig = serde_yaml::from_value(core_val)
+        // Go unmarshals the YAML on top of the already-populated (flag default) config, so
+        // omitted nested fields keep their context-specific defaults (e.g.
+        // `blocks_storage.filesystem.dir: blocks`) instead of the nested type's zero/default.
+        // Mirror that by deep-merging the document onto the serialized current values.
+        let mut merged_core = crate::secret::with_secrets_revealed(|| {
+            serde_yaml::to_value(CoreMimirConfig::from_config(self))
+        })
+        .map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        merge_yaml_onto(&mut merged_core, core_val);
+
+        let core: CoreMimirConfig = serde_yaml::from_value(merged_core)
             .map_err(|e| ConfigError::Yaml(e.to_string()))?;
 
         self.apply_core(core);
@@ -990,6 +1007,26 @@ fn validate_flattened_core_keys(core_val: &Value) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Deep-merges `src` onto `dst`: mappings merge key by key (yaml.v3 decoding into an existing
+/// struct/map), every other node replaces the destination value.
+fn merge_yaml_onto(dst: &mut Value, src: Value) {
+    match (dst, src) {
+        (Value::Mapping(dst_map), Value::Mapping(src_map)) => {
+            for (k, v) in src_map {
+                match dst_map.get_mut(&k) {
+                    Some(existing) if existing.is_mapping() && v.is_mapping() => {
+                        merge_yaml_onto(existing, v);
+                    }
+                    _ => {
+                        dst_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        (dst_slot, src_val) => *dst_slot = src_val,
+    }
+}
+
 fn sanitize_null_block_values(val: &mut Value) {
     if let Value::Mapping(map) = val {
         let keys: Vec<Value> = map.keys().cloned().collect();
@@ -1217,4 +1254,45 @@ pub fn parse_cli_and_load_config(
         action,
         usage_text: None,
     })
+}
+
+#[cfg(test)]
+mod yaml_defaults_tests {
+    use super::*;
+
+    // The YAML document is merged onto the serialized current config, which therefore must
+    // round-trip losslessly through serde (secrets revealed).
+    #[test]
+    fn core_config_serde_round_trip_is_lossless() {
+        let d = CoreMimirConfig::default();
+        let v = crate::secret::with_secrets_revealed(|| serde_yaml::to_value(&d)).unwrap();
+        let back: CoreMimirConfig = serde_yaml::from_value(v).unwrap();
+        assert_eq!(back, d);
+    }
+
+    // Go: yaml is unmarshalled on top of flag defaults, so `blocks_storage:` without
+    // `filesystem.dir` keeps the `blocks` default (RegisterFlagsWithPrefixAndDefaultDirectory).
+    #[test]
+    fn nested_yaml_keeps_context_specific_defaults() {
+        let mut cfg = MimirConfig::default();
+        cfg.load_config_from_bytes(b"blocks_storage:\n  tsdb:\n    dir: /tmp/x\n", false)
+            .unwrap();
+        assert_eq!(cfg.blocks_storage.bucket.backend_cfg.filesystem.dir, "blocks");
+        assert_eq!(cfg.blocks_storage.tsdb.dir, "/tmp/x");
+
+        let mut cfg = MimirConfig::default();
+        cfg.load_config_from_bytes(b"blocks_storage:\n  filesystem: {}\n", false)
+            .unwrap();
+        assert_eq!(cfg.blocks_storage.bucket.backend_cfg.filesystem.dir, "blocks");
+    }
+
+    #[test]
+    fn nested_yaml_keeps_secrets_and_overrides() {
+        let mut cfg = MimirConfig::default();
+        cfg.ingest_storage.kafka.sasl_password = "keep".to_string();
+        cfg.load_config_from_bytes(b"ingest_storage:\n  kafka:\n    topic: t\n", false)
+            .unwrap();
+        assert_eq!(cfg.ingest_storage.kafka.sasl_password, "keep");
+        assert_eq!(cfg.ingest_storage.kafka.topic, "t");
+    }
 }
