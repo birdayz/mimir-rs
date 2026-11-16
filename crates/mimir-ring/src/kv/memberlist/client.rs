@@ -26,7 +26,7 @@ use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Notify};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::mergeable::Mergeable;
 use super::node_meta::{encode_node_metadata, NodeRole};
@@ -441,19 +441,35 @@ impl MemberlistKv {
         kv.running.store(true, Ordering::Release);
 
         if !kv.cfg.join_members.0.is_empty() {
+            // dskit `starting()`: one bounded fast-join pass so we don't start with an empty KV store.
+            if let Err(err) = kv.fast_join_members_on_startup().await {
+                error!(%err, "failed to fast-join the memberlist cluster at startup");
+                if kv.cfg.abort_if_cluster_fast_join_fails {
+                    kv.shutdown().await;
+                    return Err(KvError::Other(format!(
+                        "failed to fast-join the memberlist cluster at startup: {err}"
+                    )));
+                }
+            }
+
+            // dskit `running()`: the retrying join must not run before the process is serving,
+            // since in K8S it may wait for DNS that only lists this pod once it is READY.
             let join_members = kv.cfg.join_members.0.clone();
-            let res = kv
-                .join_members_with_retries(
-                    &join_members,
-                    kv.cfg.max_join_retries.max(1) as usize,
-                )
-                .await;
-            if let Err(err) = res {
-                if kv.cfg.abort_if_cluster_join_fails {
+            let max_retries = kv.cfg.max_join_retries.max(1) as usize;
+            if kv.cfg.abort_if_cluster_join_fails {
+                // ponytail: blocks startup to keep fail-fast; Go runs this in the background and fails
+                // the service instead. Move it to the background once background tasks can abort startup.
+                if let Err(err) = kv.join_members_with_retries(&join_members, max_retries).await {
                     kv.shutdown().await;
                     return Err(err);
                 }
-                warn!(%err, "failed to join memberlist cluster on startup");
+            } else {
+                let bg = Arc::clone(&kv);
+                tokio::spawn(async move {
+                    if let Err(err) = bg.join_members_with_retries(&join_members, max_retries).await {
+                        warn!(%err, "failed to join memberlist cluster on startup");
+                    }
+                });
             }
         }
 
@@ -662,12 +678,75 @@ impl MemberlistKv {
         Err(last_err.unwrap_or_else(|| KvError::Other("failed to join cluster".to_string())))
     }
 
+    /// Ported from dskit `fastJoinMembersOnStartup`: join `retransmit_factor * ceil(log10(n+1))`
+    /// randomly chosen seed nodes, one at a time.
+    async fn fast_join_members_on_startup(&self) -> Result<(), KvError> {
+        // dskit `discoverMembersBackoff`.
+        let mut boff = Backoff::new(BackoffConfig {
+            min_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(5),
+            max_retries: 10,
+        });
+        let mut nodes = Vec::new();
+        while boff.ongoing() && !self.shutdown_ctx.is_canceled() {
+            nodes = self.resolve_members(&self.cfg.join_members.0).await;
+            if !nodes.is_empty() {
+                break;
+            }
+            boff.wait().await;
+        }
+        nodes.shuffle(&mut rand::thread_rng());
+
+        let retransmit_mult = self.cfg.retransmit_factor.max(1) as usize;
+        let mut to_join = retransmit_mult * ((nodes.len() as f64 + 1.0).log10().ceil() as usize);
+        info!(nodes_found = nodes.len(), to_join, "memberlist fast-join starting");
+
+        let mut joined = 0usize;
+        for addr in nodes {
+            if to_join == 0 || self.shutdown_ctx.is_canceled() {
+                break;
+            }
+            match self.push_pull_node(&addr, true).await {
+                Ok(()) => {
+                    joined += 1;
+                    to_join -= 1;
+                }
+                Err(err) => info!(node = %addr, %err, "fast-joining node failed"),
+            }
+        }
+
+        let required = self.cfg.abort_if_cluster_fast_join_fails_min_nodes.max(0) as usize;
+        if joined < required {
+            return Err(KvError::Other(format!(
+                "fast-join failed to reach minimum required seed nodes: joined {joined}, required {required}"
+            )));
+        }
+        info!(joined_nodes = joined, "memberlist fast-join finished");
+        Ok(())
+    }
+
     async fn resolve_members(&self, members: &[String]) -> Vec<String> {
         let default_port = self.cfg.bind_port.max(1) as u16;
         let mut out = Vec::new();
         for m in members {
             let trimmed = m.trim();
             if trimmed.is_empty() {
+                continue;
+            }
+            // dskit `dns.Provider` lookup types (`dns+host:port`, `dnssrv+`, `dnssrvnoa+`).
+            if let Some((qtype, name)) = trimmed.split_once('+') {
+                match qtype {
+                    "dns" => match name.rsplit_once(':') {
+                        Some((_, port)) if !port.is_empty() => match tokio::net::lookup_host(name).await {
+                            Ok(addrs) => out.extend(addrs.map(|sa| sa.to_string())),
+                            Err(err) => warn!(host = %name, %err, "failed to resolve members"),
+                        },
+                        _ => warn!("missing port in address given for dns lookup: {name}"),
+                    },
+                    // ponytail: no SRV resolver in the dependency tree; add hickory-resolver if anyone needs dnssrv+.
+                    "dnssrv" | "dnssrvnoa" => error!(member = %trimmed, "SRV lookups for memberlist join_members are not supported by mimir-rs"),
+                    _ => warn!(member = %trimmed, "unknown DNS lookup type in memberlist join_members"),
+                }
                 continue;
             }
             // Strip optional nodeName/ prefix.
@@ -2487,6 +2566,50 @@ impl KvClient for MemberlistKvClient {
 mod tests {
     use super::*;
     use crate::kv::StringCodec;
+
+    fn local_cfg(name: &str) -> MemberlistConfig {
+        MemberlistConfig {
+            bind_addr: vec!["127.0.0.1".to_string()],
+            bind_port: 0,
+            node_name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fast_join_resolves_dns_plus_members() {
+        let codec: Arc<dyn Codec> = Arc::new(StringCodec);
+        let seed = MemberlistKv::start(local_cfg("seed"), vec![Arc::clone(&codec)], "test", None)
+            .await
+            .unwrap();
+
+        let mut cfg = local_cfg("joiner");
+        cfg.join_members.0 = vec![format!("dns+localhost:{}", seed.advertise_port)];
+        cfg.abort_if_cluster_fast_join_fails = true;
+        let joiner = MemberlistKv::start(cfg, vec![codec], "test", None)
+            .await
+            .expect("fast-join via dns+ must reach the seed");
+
+        assert!(joiner.members().iter().any(|n| n.name == seed.node_name));
+        joiner.shutdown().await;
+        seed.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_start_does_not_block_on_join_retries() {
+        // Before the fix, start() ran all join retries (1s..1m backoff, 10 attempts) inline,
+        // so nothing after it (including the HTTP server) came up while seeds were unreachable.
+        let mut cfg = local_cfg("lonely");
+        cfg.join_members.0 = vec!["127.0.0.1:1".to_string()];
+        let kv = tokio::time::timeout(
+            Duration::from_secs(3),
+            MemberlistKv::start(cfg, vec![Arc::new(StringCodec) as Arc<dyn Codec>], "test", None),
+        )
+        .await
+        .expect("start() must return while join retries continue in the background")
+        .unwrap();
+        kv.shutdown().await;
+    }
 
     #[tokio::test]
     async fn test_dropped_watchers_are_unregistered() {
