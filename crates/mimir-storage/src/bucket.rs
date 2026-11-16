@@ -18,8 +18,7 @@ use tokio::io::AsyncReadExt;
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use mimir_config::{BucketConfig, S3BucketLookupType};
-use object_store::aws::AmazonS3Builder;
+use mimir_config::BucketConfig;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
@@ -29,6 +28,8 @@ use thiserror::Error;
 
 pub mod azure;
 pub mod gcs;
+pub mod s3;
+pub mod s3utils;
 
 pub const DIR_DELIM: &str = "/";
 pub const MIMIR_INTERNALS_PREFIX: &str = "__mimir_cluster";
@@ -142,53 +143,12 @@ impl BucketClient {
                 }
                 Self::new_filesystem(&b.filesystem.dir)?
             }
-            "s3" => {
-                let s3 = &b.s3;
-                let mut builder = AmazonS3Builder::from_env().with_bucket_name(&s3.bucket_name);
-                if !s3.region.is_empty() {
-                    builder = builder.with_region(&s3.region);
-                }
-                if !s3.endpoint.is_empty() {
-                    let endpoint = if s3.endpoint.starts_with("http://")
-                        || s3.endpoint.starts_with("https://")
-                    {
-                        s3.endpoint.clone()
-                    } else if s3.insecure {
-                        format!("http://{}", s3.endpoint)
-                    } else {
-                        format!("https://{}", s3.endpoint)
-                    };
-                    builder = builder.with_endpoint(endpoint);
-                }
-                if s3.insecure {
-                    builder = builder.with_allow_http(true);
-                }
-                if !s3.access_key_id.is_empty() {
-                    builder = builder.with_access_key_id(&s3.access_key_id);
-                }
-                if !s3.secret_access_key.is_empty() {
-                    builder = builder.with_secret_access_key(&s3.secret_access_key);
-                }
-                if !s3.session_token.is_empty() {
-                    builder = builder.with_token(&s3.session_token);
-                }
-                match s3.bucket_lookup_type {
-                    S3BucketLookupType::VirtualHost => {
-                        builder = builder.with_virtual_hosted_style_request(true);
-                    }
-                    S3BucketLookupType::Path => {
-                        builder = builder.with_virtual_hosted_style_request(false);
-                    }
-                    S3BucketLookupType::Auto => {}
-                }
-                let store = builder.build()?;
-                Self {
-                    store: Arc::new(store),
-                    prefix: None,
-                    name: s3.bucket_name.clone(),
-                    provider: "S3".to_string(),
-                }
-            }
+            "s3" => Self {
+                store: s3::new_store(&b.s3)?,
+                prefix: None,
+                name: b.s3.bucket_name.clone(),
+                provider: "S3".to_string(),
+            },
             "gcs" => Self {
                 store: gcs::new_store(&b.gcs)?,
                 prefix: None,

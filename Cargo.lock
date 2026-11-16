@@ -1672,6 +1672,8 @@ name = "mimir-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64 0.22.1",
  "bytes",
  "crc32c",
  "flate2",
@@ -1685,7 +1687,10 @@ dependencies = [
  "object_store",
  "parking_lot",
  "prometheus",
+ "quick-xml",
  "rand 0.8.8",
+ "regex",
+ "reqwest",
  "ring",
  "rustls",
  "serde",
