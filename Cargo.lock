@@ -1647,6 +1647,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
+ "libc",
  "md-5",
  "mimir-common",
  "mimir-config",

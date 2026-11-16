@@ -7,6 +7,7 @@
 //! - github.com/grafana/dskit/ring/lifecycler.go
 //! - github.com/grafana/dskit/ring/lifecycler_metrics.go
 //! - github.com/grafana/dskit/ring/flush.go
+//! - github.com/grafana/dskit/ring/util.go (`GetInstanceAddr`, via `crate::netutil`)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -109,16 +110,23 @@ pub struct BasicLifecyclerConfig {
     pub versions: HashMap<u64, u64>,
 }
 
+/// `instance_addr`, else the first usable address of `instance_interface_names` (dskit
+/// `ring.GetInstanceAddr`). Never falls back to loopback, which peers can't dial.
+fn instance_addr(cfg: &RingConfig) -> Result<String, LifecyclerError> {
+    crate::netutil::get_instance_addr(
+        &cfg.instance_addr,
+        &cfg.instance_interface_names,
+        cfg.instance_enable_ipv6,
+    )
+    .map_err(|e| LifecyclerError::InvalidConfig(format!("failed to get instance address: {e}")))
+}
+
 impl BasicLifecyclerConfig {
     pub fn from_ring_config_tokenless(
         cfg: &RingConfig,
         listen_port: u16,
     ) -> Result<Self, LifecyclerError> {
-        let host = if !cfg.instance_addr.is_empty() {
-            cfg.instance_addr.clone()
-        } else {
-            "127.0.0.1".to_string()
-        };
+        let host = instance_addr(cfg)?;
         let port = if cfg.instance_port > 0 {
             cfg.instance_port as u16
         } else {
@@ -898,11 +906,7 @@ pub struct LifecyclerConfig {
 
 impl LifecyclerConfig {
     pub fn from_ring_config(cfg: &RingConfig, listen_port: u16) -> Result<Self, LifecyclerError> {
-        let addr = if !cfg.instance_addr.is_empty() {
-            cfg.instance_addr.clone()
-        } else {
-            "127.0.0.1".to_string()
-        };
+        let addr = instance_addr(cfg)?;
         let port = if cfg.instance_port > 0 {
             cfg.instance_port as u16
         } else {
