@@ -169,6 +169,8 @@ struct BrokerConn {
     alive: Arc<std::sync::atomic::AtomicBool>,
     /// SASL session expiry: past it the connection is replaced instead of reused.
     sasl_expiry: Option<std::time::Instant>,
+    /// Responses successfully read on this connection after its setup (kgo `cxn.successes`).
+    successes: std::sync::atomic::AtomicU64,
 }
 
 struct PendingGuard<'a> {
@@ -246,6 +248,7 @@ impl BrokerConn {
             api_versions: RwLock::new(established.api_versions),
             alive,
             sasl_expiry: established.sasl_expiry,
+            successes: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -327,6 +330,7 @@ impl BrokerConn {
             Resp::header_version(api_version)
         };
         let _resp_header = ResponseHeader::decode(&mut resp_buf, resp_header_ver)?;
+        self.successes.fetch_add(1, Ordering::Relaxed);
         let resp = Resp::decode(&mut resp_buf, api_version)?;
         Ok(resp)
     }
@@ -339,6 +343,7 @@ fn is_transport_error(err: &KafkaClientError) -> bool {
             | KafkaClientError::ConnectionClosed
             | KafkaClientError::RequestTimeout(_)
             | KafkaClientError::ConnectTimeout { .. }
+            | KafkaClientError::FirstReadEof(_)
     )
 }
 
@@ -571,7 +576,27 @@ impl KafkaClient {
         let res = tokio::time::timeout(timeout, conn.send_raw(api_key, ver, req))
             .await
             .map_err(|_| KafkaClientError::RequestTimeout(timeout))
-            .and_then(|r| r);
+            .and_then(|r| r)
+            .map_err(|e| {
+                // kgo handleResp: EOF before any successful response on a connection without SASL
+                // is ErrFirstReadEOF ("is SASL missing?"), which is never retried.
+                if matches!(e, KafkaClientError::ConnectionClosed)
+                    && conn.successes.load(Ordering::Relaxed) == 0
+                    && self.transport.sasl().mechanism_name().is_none()
+                {
+                    tracing::warn!(
+                        component = "kafka_client",
+                        req = ?api_key,
+                        addr = %conn.addr,
+                        err = "EOF",
+                        "read from broker errored, killing connection after 0 successful responses (is SASL missing?)"
+                    );
+                    return KafkaClientError::FirstReadEof(
+                        kgo_retry::FirstReadEofKind::Sasl.to_string(),
+                    );
+                }
+                e
+            });
         if let Err(ref e) = res {
             if is_transport_error(e) {
                 self.drop_conn(conn).await;
