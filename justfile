@@ -31,6 +31,9 @@ test *args:
 test-crate crate *args:
     cargo test -p {{crate}} {{args}}
 
+conformance-kafka-tls *args:
+    ./scripts/build-go-oracle.sh && cargo test -p mimir-conformance --test w6_kafka_tls_sasl_testcontainers {{args}} -- --nocapture --test-threads 3
+
 conformance *args:
     ./scripts/build-go-oracle.sh && cargo test -p mimir-conformance {{args}}
 
