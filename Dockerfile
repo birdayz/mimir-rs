@@ -1,41 +1,38 @@
 # syntax=docker/dockerfile:1
 
-FROM debian:trixie-slim AS builder
+FROM docker.io/library/rust:1.100.0-trixie@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31 AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    clang \
-    pkg-config \
-    ca-certificates \
-    curl \
-  && rm -rf /var/lib/apt/lists/*
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y --profile minimal --default-toolchain stable
-ENV PATH="/root/.cargo/bin:${PATH}"
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    ZERO_AR_DATE=1 \
+    TZ=UTC \
+    LC_ALL=C \
+    LANG=C \
+    CARGO_INCREMENTAL=0 \
+    CFLAGS="-ffile-prefix-map=/app=. -ffile-prefix-map=/usr/local/cargo=/cargo -g0" \
+    CXXFLAGS="-ffile-prefix-map=/app=. -ffile-prefix-map=/usr/local/cargo=/cargo -g0" \
+    RUSTFLAGS="--remap-path-prefix=/app=. --remap-path-prefix=/usr/local/cargo=/cargo -C link-arg=-Wl,--build-id=sha1"
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-ARG TARGETARCH
 ARG revision=unknown
 
-RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry \
-    --mount=type=cache,id=cargo-git,target=/root/.cargo/git \
-    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/app/target \
-    MIMIR_REVISION="${revision}" cargo build --release -p mimir-cmd \
- && mkdir -p /out/data \
- && cp /app/target/release/mimir /out/mimir \
- && strip --strip-debug /out/mimir
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    MIMIR_REVISION="${revision}" cargo build --locked --release -p mimir-cmd \
+      --config 'profile.release.lto="fat"' \
+      --config 'profile.release.codegen-units=1' \
+      --config 'profile.release.debug=false' \
+      --config 'profile.release.strip="symbols"' \
+ && install -D -m 0755 /app/target/release/mimir /out/mimir \
+ && touch -h -d "@0" /out /out/mimir
 
-FROM gcr.io/distroless/cc-debian13
+FROM gcr.io/distroless/cc-debian13@sha256:809d04afa1be033c441f76bb0051878c342fb76d0ea236bc6dc94b655fa0fbd6
 
 COPY --from=builder /out/mimir /bin/mimir
-COPY --from=builder --chown=10001:10001 /out/data /data
 
-USER 10001:10001
 EXPOSE 8080
 ENTRYPOINT [ "/bin/mimir" ]
 

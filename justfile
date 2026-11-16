@@ -58,4 +58,23 @@ prod-bench *args:
     cargo run --release -p mimir-conformance --example prod_bench -- {{args}}
 
 docker-build tag="mimir-rs:local":
-    docker build --build-arg revision=$(git rev-parse HEAD) -t {{tag}} .
+    docker buildx build \
+        --provenance=false \
+        --sbom=false \
+        --build-arg SOURCE_DATE_EPOCH=0 \
+        --build-arg revision=$(git rev-parse HEAD) \
+        --load \
+        -t {{tag}} \
+        .
+
+docker-build-repro out="target/mimir-rs-oci.tar":
+    mkdir -p "$(dirname '{{out}}')"
+    docker buildx build \
+        --no-cache \
+        --provenance=false \
+        --sbom=false \
+        --build-arg SOURCE_DATE_EPOCH=0 \
+        --build-arg revision=$(git rev-parse HEAD) \
+        --output "type=oci,dest={{out}},rewrite-timestamp=true" \
+        .
+    sha256sum "{{out}}"

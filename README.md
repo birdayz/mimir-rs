@@ -88,7 +88,7 @@ just test
 
 ### Docker & Kubernetes Drop-In Image (GHCR)
 
-Multi-architecture (`linux/amd64` and `linux/arm64`) distroless images (`gcr.io/distroless/cc-debian13`, UID/GID `10001:10001`, `/bin/mimir` entrypoint, `/data` pre-owned by `10001:10001`) are published automatically on pushes to `main`:
+Multi-architecture (`linux/amd64` and `linux/arm64`) distroless images (`gcr.io/distroless/cc-debian13`, 1:1 OCI config-compatible with `docker.io/grafana/mimir:latest`: `User: "0"`, `WorkingDir: "/"`, `ExposedPorts: {"8080/tcp": {}}`, `/bin/mimir` entrypoint) are built **bit-for-bit reproducibly** (`SOURCE_DATE_EPOCH=0`, `rewrite-timestamp=true`, `provenance=false`, `sbom=false`, pinned base image digests) and published automatically on pushes to `main`:
 
 ```bash
 docker pull ghcr.io/birdayz/mimir-rs:<git-sha>
@@ -96,10 +96,13 @@ docker pull ghcr.io/birdayz/mimir-rs:<git-sha>
 docker pull ghcr.io/birdayz/mimir-rs:main
 ```
 
+The image works both as root and under Kubernetes `mimir-distributed` Helm chart `podSecurityContext` (`10001:10001`).
+
 Build locally with:
 
 ```bash
-just docker-build
+just docker-build        # loads mimir-rs:local into Docker
+just docker-build-repro  # clean --no-cache deterministic OCI tarball (target/mimir-rs-oci.tar)
 ```
 
 ### Go Oracle Conformance & Benchmarks

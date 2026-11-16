@@ -48,23 +48,25 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          provenance: false
+          sbom: false
+          no-cache: true
           build-args: |
+            SOURCE_DATE_EPOCH=0
             revision=${{ github.sha }}
-          outputs: type=image,name=ghcr.io/birdayz/mimir-rs,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          outputs: type=image,name=ghcr.io/birdayz/mimir-rs,push-by-digest=true,name-canonical=true,rewrite-timestamp=true,push=true
 
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          printf '%s\n' "${{ steps.build.outputs.digest }}" > "/tmp/digests/${{ matrix.arch }}"
+          cat "/tmp/digests/${{ matrix.arch }}"
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.arch }}
-          path: /tmp/digests/*
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 1
 
@@ -76,7 +78,7 @@ jobs:
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
-          pattern: digests-*
+          pattern: digest-*
           path: /tmp/digests
           merge-multiple: true
 
@@ -92,10 +94,15 @@ jobs:
 
       - name: Create multi-arch manifest list and push tags
         run: |
+          AMD64_DIGEST=$(cat /tmp/digests/amd64)
+          ARM64_DIGEST=$(cat /tmp/digests/arm64)
           SHORT_SHA="${GITHUB_SHA::7}"
+          echo "amd64 digest: ${AMD64_DIGEST}"
+          echo "arm64 digest: ${ARM64_DIGEST}"
           docker buildx imagetools create \
             -t "ghcr.io/birdayz/mimir-rs:${GITHUB_SHA}" \
             -t "ghcr.io/birdayz/mimir-rs:${SHORT_SHA}" \
             -t "ghcr.io/birdayz/mimir-rs:main" \
-            $(printf 'ghcr.io/birdayz/mimir-rs@sha256:%s ' $(ls /tmp/digests))
+            "ghcr.io/birdayz/mimir-rs@${AMD64_DIGEST}" \
+            "ghcr.io/birdayz/mimir-rs@${ARM64_DIGEST}"
           docker buildx imagetools inspect "ghcr.io/birdayz/mimir-rs:${GITHUB_SHA}"
