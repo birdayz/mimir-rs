@@ -556,3 +556,96 @@ fn test_sampled_only_tracer_produce_hooks() {
         assert_eq!(recorder.ended().len(), 1);
     }
 }
+
+// OBSERV-1374: CreateTopics is issued with franz-go kgo retry semantics (see ingest::kgo_retry).
+
+/// A single seed refusing connections fails fast (kgo: non-timeout dial errors are not retried and
+/// there is no other broker to move to), with the upstream error shape.
+#[tokio::test]
+async fn test_create_topics_single_seed_connection_refused_fails_fast() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = create_test_kafka_config(&addr, "topic-a");
+    let start = std::time::Instant::now();
+    let err = create_topics(&cfg, &["topic-a"]).await.unwrap_err();
+    assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
+    assert_eq!(
+        err,
+        format!("failed to create topics [topic-a]: unable to dial: dial tcp {addr}: connect: connection refused")
+    );
+}
+
+/// DNS NXDOMAIN is a permanent dial error: fails fast.
+#[tokio::test]
+async fn test_create_topics_nxdomain_fails_fast() {
+    let cfg = create_test_kafka_config("kafka.invalid:9092", "topic-a");
+    let start = std::time::Instant::now();
+    let err = create_topics(&cfg, &["topic-a"]).await.unwrap_err();
+    assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+    assert!(err.starts_with("failed to create topics [topic-a]: unable to dial: dial tcp: lookup kafka.invalid"), "{err}");
+}
+
+/// kgo handleAdminReq: a NOT_CONTROLLER answer forgets the controller and retries.
+#[tokio::test]
+async fn test_create_topics_retries_not_controller() {
+    let cluster = FakeKafkaCluster::start(0, "").await;
+    let cfg = create_test_kafka_config(&cluster.addr, "topic-a");
+    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let c = Arc::clone(&calls);
+    *cluster.hooks.create_topics.lock() = Some(Arc::new(move |req| {
+        let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            let mut resp = CreateTopicsResponse::default();
+            let mut tr = CreatableTopicResult::default();
+            tr.name = req.topics[0].name.clone();
+            if n == 0 {
+                tr.error_code = ResponseError::NotController.code();
+            } else {
+                tr.num_partitions = req.topics[0].num_partitions;
+                tr.replication_factor = 3;
+            }
+            resp.topics.push(tr);
+            HookAction::Respond(resp)
+        })
+    }));
+    create_topics(&cfg, &["topic-a"]).await.unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    cluster.close();
+}
+
+/// An accepted but unresponsive broker that comes back within the retry timeout: CreateTopics
+/// keeps retrying (handshake read timeouts are retryable) and succeeds once the broker answers.
+#[tokio::test]
+async fn test_create_topics_recovers_when_unresponsive_broker_comes_back() {
+    let cluster = FakeKafkaCluster::start(0, "").await;
+    // A proxy that holds the first connection silently and forwards later ones to the broker.
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap().to_string();
+    let upstream = cluster.addr.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        let mut n = 0;
+        while let Ok((mut inbound, _)) = proxy.accept().await {
+            n += 1;
+            if n == 1 {
+                held.push(inbound);
+                continue;
+            }
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                if let Ok(mut out) = tokio::net::TcpStream::connect(&upstream).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
+                }
+            });
+        }
+    });
+    let cfg = create_test_kafka_config(&proxy_addr, "topic-a");
+    let start = std::time::Instant::now();
+    create_topics(&cfg, &["topic-a"]).await.unwrap();
+    // The first connection's ApiVersions waited for the 10s request timeout overhead.
+    assert!(start.elapsed() >= Duration::from_secs(10), "took {:?}", start.elapsed());
+    cluster.close();
+}
