@@ -433,6 +433,14 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let config_arc = Arc::new(cfg.clone());
     let default_config_arc = Arc::new(MimirConfig::default());
 
+    let mut module_services: Vec<(String, Arc<dyn mimir_common::services::Service>)> = Vec::new();
+    if let Some(ref rsvc) = ring_svc {
+        module_services.push(("ingester-ring".to_string(), Arc::clone(rsvc) as _));
+    }
+    if let Some(ref wsvc) = watcher_svc {
+        module_services.push(("ingester-partitions-ring".to_string(), Arc::clone(wsvc) as _));
+    }
+
     let http_router = build_http_router(AppHttpState {
         config: Arc::clone(&config_arc),
         default_config: default_config_arc,
@@ -443,6 +451,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         overrides,
         memberlist_kv: memberlist_kv.clone(),
         active_service_names,
+        module_services,
     });
 
     // 7. Start HTTP & gRPC servers BEFORE awaiting ingester.start() so /metrics and /ready (503 -> 200)

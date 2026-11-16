@@ -11,7 +11,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use mimir_common::logging::format_rfc3339_nano_utc;
-use mimir_common::services::State;
+use mimir_common::services::{Service, State};
 use mimir_common::tenant::extract_tenant_id_from_http_headers;
 use mimir_config::{LimitsConfig, MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::{ingester_router, Ingester};
@@ -34,6 +34,9 @@ pub struct AppHttpState {
     pub overrides: Overrides,
     pub memberlist_kv: Option<Arc<MemberlistKv>>,
     pub active_service_names: Vec<String>,
+    /// Module services other than `ingester-service` whose state `/ready` reports (Go
+    /// `Mimir.ServiceMap` entries backed by a Rust service), keyed by upstream module name.
+    pub module_services: Vec<(String, Arc<dyn Service>)>,
 }
 
 /// Builds the full Axum HTTP router (with `server.http_path_prefix` honored).
@@ -96,16 +99,33 @@ async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "Application is stopping\n").into_response();
     }
 
-    if let Some(ref ing) = st.ingester {
-        let ing_state = ing.state();
-        if ing_state != State::Running {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Some services are not Running:\ningester: {ing_state}\n"),
-            )
-                .into_response();
+    // Go: `if !sm.IsHealthy()` lists every module service that is not Running, one
+    // "<module>: <state>" per line (pkg/mimir/mimir.go readyHandler). Every module service is
+    // started by the service manager at once, so a not yet started one is reported as Starting.
+    let module_state = |s: State| if s == State::New { State::Starting } else { s };
+    let mut not_running: Vec<String> = Vec::new();
+    for (name, svc) in &st.module_services {
+        let s = module_state(svc.state());
+        if s != State::Running {
+            not_running.push(format!("{name}: {s}"));
         }
+    }
+    if let Some(ref ing) = st.ingester {
+        let s = module_state(ing.state());
+        if s != State::Running {
+            not_running.push(format!("ingester-service: {s}"));
+        }
+    }
+    if !not_running.is_empty() {
+        // http.Error appends a trailing newline.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Some services are not Running:\n{}\n", not_running.join("\n")),
+        )
+            .into_response();
+    }
 
+    if let Some(ref ing) = st.ingester {
         if let Err(err) = ing.check_ready().await {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
