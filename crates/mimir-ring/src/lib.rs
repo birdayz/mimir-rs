@@ -7,7 +7,6 @@
 
 pub mod kv;
 pub mod lifecycler;
-pub mod netutil;
 pub mod partition_ring;
 pub mod prng;
 pub mod ring;

@@ -3,7 +3,7 @@
 //! Ported from github.com/grafana/dskit/kv/memberlist/tcp_transport.go
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -15,6 +15,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, warn};
+
+const ZERO_ZERO_ZERO_ZERO: &str = "0.0.0.0";
+const COLON_COLON: &str = "::";
 
 const PACKET_BYTE: u8 = 1;
 const STREAM_BYTE: u8 = 2;
@@ -94,6 +97,8 @@ pub struct TcpTransport {
     packet_write_timeout: Duration,
     acquire_writer_timeout: Duration,
     write_sem: Arc<Semaphore>,
+    /// `cfg.BindAddrs` as configured (Go switches on the string value of `BindAddrs[0]`).
+    bind_addrs: Vec<String>,
     local_addrs: Vec<SocketAddr>,
     advertise_addr: RwLock<String>,
     packet_tx: mpsc::Sender<ReceivedPacket>,
@@ -151,6 +156,7 @@ impl TcpTransport {
             packet_write_timeout: cfg.packet_write_timeout.as_std().unwrap_or(Duration::ZERO),
             acquire_writer_timeout: cfg.acquire_writer_timeout.as_std().unwrap_or(Duration::ZERO),
             write_sem: Arc::new(Semaphore::new(concurrent_writes)),
+            bind_addrs: bind_addrs.clone(),
             local_addrs,
             advertise_addr: RwLock::new(String::new()),
             packet_tx,
@@ -200,33 +206,53 @@ impl TcpTransport {
         self.local_addrs[0].port()
     }
 
+    /// `FinalAdvertiseAddr`: given the user's configured values (which might be empty),
+    /// returns the desired IP and port to advertise to the rest of the cluster.
     pub fn final_advertise_addr(
         &self,
         configured_addr: &str,
         configured_port: i64,
     ) -> Result<(IpAddr, u16), io::Error> {
+        let other = |msg: String| io::Error::other(msg);
         let (ip, port) = if !configured_addr.is_empty() {
+            // If they've supplied an address, use that.
             let ip: IpAddr = configured_addr.parse().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("failed to parse advertise address {configured_addr:?}"),
                 )
             })?;
-            let p = if configured_port > 0 {
-                configured_port as u16
-            } else {
-                self.auto_bind_port()
-            };
-            (ip, p)
+            (ip, configured_port as u16)
         } else {
-            let bound = self.local_addrs[0];
-            let ip = if bound.ip().is_unspecified() {
-                detect_local_ip(bound.is_ipv6()).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
-            } else {
-                bound.ip()
+            let ip = match self.bind_addrs[0].as_str() {
+                ZERO_ZERO_ZERO_ZERO => {
+                    // Otherwise, if we're not bound to a specific IP, let's use a suitable
+                    // private IP address.
+                    let ip = mimir_common::sockaddr::get_private_ip()
+                        .map_err(|e| other(format!("failed to get interface addresses: {e}")))?;
+                    if ip.is_empty() {
+                        return Err(other(
+                            "no private IP address found, and explicit IP not provided".to_string(),
+                        ));
+                    }
+                    ip.parse::<IpAddr>().map_err(|_| {
+                        other(format!("failed to parse advertise address {ip:?}"))
+                    })?
+                }
+                COLON_COLON => {
+                    let inet6_ip = mimir_common::netutil::get_first_address_of(&[], true)
+                        .map_err(|e| other(format!("failed to get private inet6 address: {e}")))?;
+                    inet6_ip.parse::<IpAddr>().map_err(|_| {
+                        other(format!("failed to parse inet6 advertise address {configured_addr:?}"))
+                    })?
+                }
+                // Use the IP that we're bound to, based on the first TCP listener.
+                _ => self.local_addrs[0].ip(),
             };
+            // Use the port we are bound to.
             (ip, self.auto_bind_port())
         };
+        debug!(msg = "FinalAdvertiseAddr", advertiseAddr = %ip, advertisePort = port);
 
         let formatted = SocketAddr::new(ip, port).to_string();
         *self.advertise_addr.write() = formatted;
@@ -404,14 +430,3 @@ impl TcpTransport {
     }
 }
 
-fn detect_local_ip(prefer_v6: bool) -> Option<IpAddr> {
-    let target = if prefer_v6 { "[2001:db8::1]:80" } else { "8.8.8.8:80" };
-    if let Ok(sock) = std::net::UdpSocket::bind(if prefer_v6 { "[::]:0" } else { "0.0.0.0:0" }) {
-        if sock.connect(target).is_ok() {
-            if let Ok(local) = sock.local_addr() {
-                return Some(local.ip());
-            }
-        }
-    }
-    None
-}

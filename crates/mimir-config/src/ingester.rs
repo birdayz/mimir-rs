@@ -276,7 +276,8 @@ impl Default for RingConfig {
             tokens_file_path: String::new(),
             num_tokens: 128,
             instance_id: default_hostname(),
-            instance_interface_names: vec!["eth0".to_string(), "en0".to_string()],
+            // pkg/ingester/ingester_ring.go:140: computed at flag registration time.
+            instance_interface_names: mimir_common::netutil::default_instance_interface_names(),
             instance_port: 0,
             instance_addr: String::new(),
             instance_enable_ipv6: false,

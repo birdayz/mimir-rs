@@ -8,6 +8,7 @@
 pub mod http;
 pub mod model;
 pub mod replication_strategy;
+pub mod util;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
