@@ -2666,3 +2666,7 @@ mod tests {
         kv.shutdown().await;
     }
 }
+
+#[cfg(test)]
+#[path = "upstream_client_tests.rs"]
+mod upstream_client_tests;
