@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use mimir_config::{KafkaConfig, OrderedConsumptionConfig};
 use parking_lot::Mutex as SyncMutex;
 use prometheus::{Counter, CounterVec, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts, PullingGauge, Registry};
@@ -806,11 +806,7 @@ impl SingleClusterPartitionReader {
         notifier: Arc<dyn PreCommitNotifier>,
         registry: Option<&Registry>,
     ) -> Result<Self, ReaderError> {
-        let consumer_group = if kafka_cfg.consumer_group.is_empty() {
-            format!("{instance_id}-{partition_id}")
-        } else {
-            format!("{}-{instance_id}-{partition_id}", kafka_cfg.consumer_group)
-        };
+        let consumer_group = super::get_consumer_group(&kafka_cfg, instance_id, partition_id);
         let offset_file = offset_file_path.map(|p| Arc::new(OffsetFile::new(p, partition_id)));
         let offset_watcher = Arc::new(PartitionOffsetWatcher::new());
         let offset_client = PartitionOffsetClient::new(Arc::clone(&client), registry);
@@ -1097,10 +1093,8 @@ impl SingleClusterPartitionReader {
             "end" => Ok((KAFKA_OFFSET_END, -1)),
             "timestamp" => {
                 let ts = self.kafka_cfg.consume_from_timestamp_at_startup;
-                if let Some((offset, matched)) = self.fetch_first_offset_after_time(ts).await? {
-                    if matched {
-                        return Ok((offset, offset - 1));
-                    }
+                if let Some((offset, _matched)) = self.fetch_first_offset_after_time(ts).await? {
+                    return Ok((offset, offset - 1));
                 }
                 Ok((KAFKA_OFFSET_START, -1))
             }
@@ -1242,10 +1236,6 @@ impl SingleClusterPartitionReader {
         self.last_seen_offset.store(last_consumed, Ordering::SeqCst);
         if last_consumed >= 0 {
             self.offset_watcher.notify(last_consumed);
-            self.metrics
-                .last_consumed_offset
-                .with_label_values(&[&self.partition_id.to_string()])
-                .set(last_consumed as f64);
         }
 
         self.offset_reader.start().await;
@@ -1333,8 +1323,12 @@ impl SingleClusterPartitionReader {
                             fetch_metrics
                                 .records_per_fetch
                                 .observe(batch.records.len() as f64);
-                            if !batch.records.is_empty() {
-                                fetch_offset = batch.records.last().unwrap().offset + 1;
+                            if batch.next_fetch_offset > fetch_offset {
+                                fetch_offset = batch.next_fetch_offset;
+                            } else if let Some(last) = batch.records.last() {
+                                fetch_offset = last.offset + 1;
+                            }
+                            if !batch.records.is_empty() || batch.last_batch_end_offset.is_some() {
                                 tokio::select! {
                                     _ = fetch_stop_rx.changed() => {
                                         if *fetch_stop_rx.borrow() {
@@ -1349,9 +1343,42 @@ impl SingleClusterPartitionReader {
                                 }
                             }
                         }
+                        Err(KafkaClientError::Broker(
+                            kafka_protocol::error::ResponseError::OffsetOutOfRange,
+                        )) => {
+                            fetch_metrics.fetches_errors.inc();
+                            warn!(
+                                partition = partition_id,
+                                fetch_offset,
+                                "kafka fetch offset out of range; resetting to partition start"
+                            );
+                            match fetch_client
+                                .fetch_partition_start_offset(&fetch_topic, partition_id)
+                                .await
+                            {
+                                Ok(start_off) => {
+                                    fetch_offset = start_off;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        partition = partition_id,
+                                        error = %e,
+                                        "failed to resolve partition start offset after OffsetOutOfRange"
+                                    );
+                                }
+                            }
+                            tokio::select! {
+                                _ = fetch_stop_rx.changed() => {
+                                    if *fetch_stop_rx.borrow() {
+                                        break;
+                                    }
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                            }
+                        }
                         Err(err) => {
                             fetch_metrics.fetches_errors.inc();
-                            debug!(partition = partition_id, error = %err, "kafka fetch error");
+                            warn!(partition = partition_id, error = %err, "kafka fetch error");
                             tokio::select! {
                                 _ = fetch_stop_rx.changed() => {
                                     if *fetch_stop_rx.borrow() {
@@ -1365,7 +1392,7 @@ impl SingleClusterPartitionReader {
                 }
             });
 
-            loop {
+            'consume_loop: loop {
                 let batch = tokio::select! {
                     _ = stop_rx.changed() => {
                         if *stop_rx.borrow() {
@@ -1381,8 +1408,18 @@ impl SingleClusterPartitionReader {
                     }
                 };
 
+                let record_last = batch.records.last().map(|r| r.offset);
+                let batch_last_offset_opt = match (record_last, batch.last_batch_end_offset) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let Some(batch_last_offset) = batch_last_offset_opt else {
+                    continue;
+                };
+
                 if !batch.records.is_empty() {
-                    let batch_last_offset = batch.records.last().unwrap().offset;
                     let first_ts = batch.records.first().unwrap().timestamp_ms;
                     let highest_ts =
                         batch.records.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
@@ -1414,6 +1451,7 @@ impl SingleClusterPartitionReader {
                         .store(total_b, Ordering::Relaxed);
 
                     let consume_start = Instant::now();
+                    let mut consumed_ok = false;
                     let mut first_try = Some(batch.records);
                     loop {
                         let to_consume = match first_try.take() {
@@ -1421,7 +1459,10 @@ impl SingleClusterPartitionReader {
                             None => break,
                         };
                         match consumer.consume(to_consume.clone()).await {
-                            Ok(()) => break,
+                            Ok(()) => {
+                                consumed_ok = true;
+                                break;
+                            }
                             Err(err) => {
                                 error!(
                                     partition = partition_id,
@@ -1432,7 +1473,14 @@ impl SingleClusterPartitionReader {
                                     break;
                                 }
                                 first_try = Some(to_consume);
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                tokio::select! {
+                                    _ = stop_rx.changed() => {
+                                        if *stop_rx.borrow() {
+                                            break;
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                                }
                             }
                         }
                     }
@@ -1444,19 +1492,30 @@ impl SingleClusterPartitionReader {
                         .consume_latency
                         .observe(consume_start.elapsed().as_secs_f64());
 
+                    if !consumed_ok {
+                        break 'consume_loop;
+                    }
+
                     if batch_last_offset + 1 >= batch.high_watermark {
                         highest_ts_ref.store(0, Ordering::SeqCst);
                     } else {
                         highest_ts_ref.store(highest_ts, Ordering::SeqCst);
                     }
-
-                    committer.enqueue_offset(batch_last_offset);
-                    offset_watcher.notify(batch_last_offset);
-                    metrics
-                        .last_consumed_offset
-                        .with_label_values(&[&partition_id.to_string()])
-                        .set(batch_last_offset as f64);
+                } else {
+                    // Control-only batch (e.g. transaction commit/abort marker):
+                    // advance offsets cleanly without invoking data consumer.
+                    last_seen_offset.fetch_max(batch_last_offset, Ordering::SeqCst);
+                    if batch_last_offset + 1 >= batch.high_watermark {
+                        highest_ts_ref.store(0, Ordering::SeqCst);
+                    }
                 }
+
+                committer.enqueue_offset(batch_last_offset);
+                offset_watcher.notify(batch_last_offset);
+                metrics
+                    .last_consumed_offset
+                    .with_label_values(&[&partition_id.to_string()])
+                    .set(batch_last_offset as f64);
             }
 
             drop(batch_rx);
@@ -1615,36 +1674,51 @@ impl SingleClusterPartitionReader {
                         self.metrics
                             .records_per_fetch
                             .observe(batch.records.len() as f64);
-                        if !batch.records.is_empty() {
-                            let last_off = batch.records.last().unwrap().offset;
-                            let first_ts = batch.records.first().unwrap().timestamp_ms;
-                            let high_ts = batch
-                                .records
-                                .iter()
-                                .map(|r| r.timestamp_ms)
-                                .max()
-                                .unwrap_or(0);
-                            self.last_seen_offset
-                                .fetch_max(last_off, Ordering::SeqCst);
-                            if self.highest_consumed_ts_before_end_ms.load(Ordering::SeqCst) == 0 {
-                                self.highest_consumed_ts_before_end_ms
-                                    .store(first_ts, Ordering::SeqCst);
-                            }
-
-                            while let Err(e) = self.consumer.consume(batch.records.clone()).await {
-                                error!(partition = self.partition_id, error = %e, "error consuming startup batch; retrying");
-                                if *stop_rx.borrow() {
-                                    return Err(ReaderError::Canceled);
+                        let record_last = batch.records.last().map(|r| r.offset);
+                        let last_off_opt = match (record_last, batch.last_batch_end_offset) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
+                        if let Some(last_off) = last_off_opt {
+                            if !batch.records.is_empty() {
+                                let first_ts = batch.records.first().unwrap().timestamp_ms;
+                                let high_ts = batch
+                                    .records
+                                    .iter()
+                                    .map(|r| r.timestamp_ms)
+                                    .max()
+                                    .unwrap_or(0);
+                                self.last_seen_offset
+                                    .fetch_max(last_off, Ordering::SeqCst);
+                                if self.highest_consumed_ts_before_end_ms.load(Ordering::SeqCst) == 0 {
+                                    self.highest_consumed_ts_before_end_ms
+                                        .store(first_ts, Ordering::SeqCst);
                                 }
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                            }
 
-                            if last_off + 1 >= batch.high_watermark {
-                                self.highest_consumed_ts_before_end_ms
-                                    .store(0, Ordering::SeqCst);
+                                while let Err(e) = self.consumer.consume(batch.records.clone()).await {
+                                    error!(partition = self.partition_id, error = %e, "error consuming startup batch; retrying");
+                                    if *stop_rx.borrow() {
+                                        return Err(ReaderError::Canceled);
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+
+                                if last_off + 1 >= batch.high_watermark {
+                                    self.highest_consumed_ts_before_end_ms
+                                        .store(0, Ordering::SeqCst);
+                                } else {
+                                    self.highest_consumed_ts_before_end_ms
+                                        .store(high_ts, Ordering::SeqCst);
+                                }
                             } else {
-                                self.highest_consumed_ts_before_end_ms
-                                    .store(high_ts, Ordering::SeqCst);
+                                self.last_seen_offset
+                                    .fetch_max(last_off, Ordering::SeqCst);
+                                if last_off + 1 >= batch.high_watermark {
+                                    self.highest_consumed_ts_before_end_ms
+                                        .store(0, Ordering::SeqCst);
+                                }
                             }
 
                             self.committer.enqueue_offset(last_off);
@@ -1653,11 +1727,33 @@ impl SingleClusterPartitionReader {
                                 .last_consumed_offset
                                 .with_label_values(&[&self.partition_id.to_string()])
                                 .set(last_off as f64);
-                            *next_offset = last_off + 1;
+                            *next_offset = batch.next_fetch_offset.max(last_off + 1);
                         }
                     }
-                    Err(_) => {
+                    Err(KafkaClientError::Broker(
+                        kafka_protocol::error::ResponseError::OffsetOutOfRange,
+                    )) => {
                         self.metrics.fetches_errors.inc();
+                        warn!(
+                            partition = self.partition_id,
+                            next_offset = *next_offset,
+                            "kafka fetch offset out of range during startup; resetting to partition start"
+                        );
+                        if let Ok(start_off) = self.fetch_partition_start_offset().await {
+                            *next_offset = start_off;
+                            if start_off > last_produced {
+                                return Ok(req_at.elapsed());
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(err) => {
+                        self.metrics.fetches_errors.inc();
+                        warn!(
+                            partition = self.partition_id,
+                            error = %err,
+                            "kafka fetch error during startup lag catchup"
+                        );
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
@@ -1853,7 +1949,7 @@ impl SingleClusterPartitionReader {
 /// compartments, optionally merging records in timestamp order via [`HeapMerger`].
 pub struct MultiClusterPartitionReader {
     readers: Vec<Arc<SingleClusterPartitionReader>>,
-    merger: Option<Mutex<Option<HeapMerger>>>,
+    merger: Option<Arc<HeapMerger>>,
 }
 
 impl MultiClusterPartitionReader {
@@ -1968,13 +2064,9 @@ impl MultiClusterPartitionReader {
             readers.push(Arc::new(r));
         }
 
-        let merger_holder = shared_merger
-            .and_then(|arc| Arc::try_unwrap(arc).ok())
-            .map(|m| Mutex::new(Some(m)));
-
         Ok(Self {
             readers,
-            merger: merger_holder,
+            merger: shared_merger,
         })
     }
 
@@ -1985,13 +2077,10 @@ impl MultiClusterPartitionReader {
     }
 
     pub async fn stop(&self) {
-        for r in &self.readers {
-            r.stop().await;
-        }
-        if let Some(ref m_lock) = self.merger {
-            if let Some(m) = m_lock.lock().await.take() {
-                m.stop().await;
-            }
+        let stop_futs = self.readers.iter().map(|r| r.stop());
+        join_all(stop_futs).await;
+        if let Some(ref m) = self.merger {
+            m.shutdown_and_drain().await;
         }
     }
 
@@ -2037,5 +2126,70 @@ impl MultiClusterPartitionReader {
             r.enforce_read_max_delay(max_delay)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mimir_config::types::StringSliceCSV;
+
+    #[test]
+    fn consumer_group_matches_upstream_single_and_multi_cluster() {
+        struct NoOpConsumer;
+        impl RecordBatchConsumer for NoOpConsumer {
+            fn consume(
+                &self,
+                _records: Vec<FetchedRecord>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "ingest".to_string(),
+            ..Default::default()
+        };
+
+        // Empty consumer_group -> instance_id verbatim (no -{partition} suffix)
+        let r = SingleClusterPartitionReader::new(
+            cfg.clone(),
+            7,
+            "ingester-zone-a-7",
+            None,
+            Arc::new(NoOpConsumer),
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.consumer_group(), "ingester-zone-a-7");
+
+        // Configured consumer_group with <partition> placeholder
+        let mut cfg_tpl = cfg.clone();
+        cfg_tpl.consumer_group = "my-group-<partition>".to_string();
+        let r_tpl = SingleClusterPartitionReader::new(
+            cfg_tpl,
+            7,
+            "ingester-zone-a-7",
+            None,
+            Arc::new(NoOpConsumer),
+            None,
+        )
+        .unwrap();
+        assert_eq!(r_tpl.consumer_group(), "my-group-7");
+
+        // MultiClusterPartitionReader with empty consumer_group -> {instance_id}-wc-{idx}
+        let multi = MultiClusterPartitionReader::new(
+            &[cfg.clone(), cfg],
+            &OrderedConsumptionConfig::default(),
+            3,
+            "ingester-3",
+            vec![None, None],
+            Arc::new(NoOpConsumer),
+            None,
+        )
+        .unwrap();
+        assert_eq!(multi.readers[0].consumer_group(), "ingester-3-wc-0");
+        assert_eq!(multi.readers[1].consumer_group(), "ingester-3-wc-1");
     }
 }

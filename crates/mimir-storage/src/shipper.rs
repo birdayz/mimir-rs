@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use futures::future::try_join_all;
 use prometheus::{Counter, Gauge, Opts, Registry};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -589,11 +588,10 @@ pub async fn upload_block_to_bucket(
     meta.thanos.files = gather_file_stats(block_dir)?;
     let meta_bytes = meta.encode_json_bytes()?;
 
-    let mut upload_futs = Vec::new();
-
-    // 1. Upload chunks/*
+    // 1. Upload chunks/* sequentially in sorted order to bound upload memory.
     let chunks_dir = block_dir.join(CHUNKS_DIRNAME);
     if chunks_dir.exists() {
+        let mut chunk_entries = Vec::new();
         for entry in fs::read_dir(&chunks_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -601,16 +599,19 @@ pub async fn upload_block_to_bucket(
                 continue;
             }
             let fname = entry.file_name().to_string_lossy().into_owned();
+            chunk_entries.push((fname, path));
+        }
+        chunk_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (fname, path) in chunk_entries {
             let obj_key = format!("{id}/{CHUNKS_DIRNAME}/{fname}");
-            let bkt = bucket.clone();
-            upload_futs.push(tokio::spawn(async move {
-                bkt.upload_file(&obj_key, &path)
-                    .await
-                    .map_err(|e| ShipperError::Upload {
-                        file_type: "chunks",
-                        message: e.to_string(),
-                    })
-            }));
+            if let Err(e) = bucket.upload_file(&obj_key, &path).await {
+                let _ = bucket.delete_prefix(&id.to_string()).await;
+                return Err(ShipperError::Upload {
+                    file_type: "chunks",
+                    message: e.to_string(),
+                });
+            }
         }
     }
 
@@ -618,15 +619,13 @@ pub async fn upload_block_to_bucket(
     {
         let index_path = block_dir.join(INDEX_FILENAME);
         let obj_key = format!("{id}/{INDEX_FILENAME}");
-        let bkt = bucket.clone();
-        upload_futs.push(tokio::spawn(async move {
-            bkt.upload_file(&obj_key, &index_path)
-                .await
-                .map_err(|e| ShipperError::Upload {
-                    file_type: "index",
-                    message: e.to_string(),
-                })
-        }));
+        if let Err(e) = bucket.upload_file(&obj_key, &index_path).await {
+            let _ = bucket.delete_prefix(&id.to_string()).await;
+            return Err(ShipperError::Upload {
+                file_type: "index",
+                message: e.to_string(),
+            });
+        }
     }
 
     // 3. Optional sparse-index-header
@@ -638,26 +637,12 @@ pub async fn upload_block_to_bucket(
     if has_sparse {
         let sparse_path = block_dir.join(SPARSE_INDEX_HEADER_FILENAME);
         let obj_key = format!("{id}/{SPARSE_INDEX_HEADER_FILENAME}");
-        let bkt = bucket.clone();
-        upload_futs.push(tokio::spawn(async move {
-            bkt.upload_file(&obj_key, &sparse_path)
-                .await
-                .map_err(|e| ShipperError::Upload {
-                    file_type: "sparse_index_header",
-                    message: e.to_string(),
-                })
-        }));
-    }
-
-    let results = try_join_all(upload_futs).await.map_err(|e| ShipperError::Upload {
-        file_type: "chunks",
-        message: format!("upload task panicked: {e}"),
-    })?;
-    for res in results {
-        if let Err(err) = res {
-            // Clean up partial files since meta.json has NOT been uploaded yet.
+        if let Err(e) = bucket.upload_file(&obj_key, &sparse_path).await {
             let _ = bucket.delete_prefix(&id.to_string()).await;
-            return Err(err);
+            return Err(ShipperError::Upload {
+                file_type: "sparse_index_header",
+                message: e.to_string(),
+            });
         }
     }
 

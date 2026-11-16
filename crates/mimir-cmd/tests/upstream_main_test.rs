@@ -565,7 +565,7 @@ runtime_config:
         if let Ok(resp) = http_client.get(&ready_url).send().await {
             if resp.status().as_u16() == 200 {
                 let body = resp.text().await.unwrap();
-                assert_eq!(body, "ready\n");
+                assert_eq!(body, "ready");
                 break;
             }
         }
@@ -877,7 +877,7 @@ activity_tracker:
     assert!(index_body.contains("Grafana Mimir Admin"));
     assert!(index_body.contains("/mimir/ingester/ring"));
 
-    // Trigger /mimir/ingester/shutdown and verify clean exit 0
+    // Trigger /mimir/ingester/shutdown: stops Ingester (204) while keeping HTTP/gRPC alive until SIGTERM
     let shutdown_resp = client
         .post(format!(
             "http://127.0.0.1:{http_port}/mimir/ingester/shutdown"
@@ -886,7 +886,29 @@ activity_tracker:
         .await
         .unwrap();
     assert_eq!(shutdown_resp.status().as_u16(), 204);
+
+    // HTTP server stays alive and /mimir/ready reports 503 after ingester shutdown
+    let ready_after = client
+        .get(format!("http://127.0.0.1:{http_port}/mimir/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready_after.status().as_u16(), 503);
     drop(client);
+
+    #[cfg(unix)]
+    {
+        let pid = child.id().to_string();
+        let kill_status = Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("send SIGTERM");
+        assert!(kill_status.success());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
 
     let output = tokio::task::spawn_blocking(move || child.wait_with_output())
         .await
@@ -895,7 +917,7 @@ activity_tracker:
     assert_eq!(
         output.status.code(),
         Some(0),
-        "expected exit 0 on /ingester/shutdown, stderr:\n{}",
+        "expected exit 0 on SIGTERM after /ingester/shutdown, stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

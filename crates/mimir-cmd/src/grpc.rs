@@ -12,11 +12,12 @@ use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::Router;
+use bytes::Bytes;
 use futures::Future;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request as HttpRequestMsg, Uri};
 use mimir_common::services::State;
 use mimir_ingester::Ingester;
-use mimir_proto::grpcutilpb::status_with_http_response;
+use mimir_proto::grpcutilpb::{extract_http_response, status_with_http_response};
 use mimir_proto::httpgrpcpb;
 use mimir_proto::httpgrpcpb::http_server::Http;
 use tonic::{Request, Response, Status};
@@ -263,7 +264,8 @@ impl Http for HttpGrpcBridge {
         resp_headers.remove("x-donotlogerror");
         let error_msg_override = resp_headers
             .remove("x-errormessage")
-            .and_then(|v| v.to_str().ok().map(str::to_string));
+            .and_then(|v| v.to_str().ok().map(str::to_string))
+            .filter(|s| !s.is_empty());
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -288,12 +290,29 @@ impl Http for HttpGrpcBridge {
     }
 }
 
+/// Canonicalizes an HTTP header key matching Go's `http.CanonicalHeaderKey`
+/// (e.g. `content-type` -> `Content-Type`, `x-scope-orgid` -> `X-Scope-Orgid`).
+pub fn http_canonical_header_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut upper = true;
+    for b in key.bytes() {
+        let ch = if upper {
+            b.to_ascii_uppercase()
+        } else {
+            b.to_ascii_lowercase()
+        };
+        out.push(ch as char);
+        upper = b == b'-';
+    }
+    out
+}
+
 fn header_map_to_httpgrpc(headers: &HeaderMap) -> Vec<httpgrpcpb::Header> {
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for (name, val) in headers {
         if let Ok(v) = val.to_str() {
             grouped
-                .entry(name.as_str().to_string())
+                .entry(http_canonical_header_key(name.as_str()))
                 .or_default()
                 .push(v.to_string());
         }
@@ -304,4 +323,209 @@ fn header_map_to_httpgrpc(headers: &HeaderMap) -> Vec<httpgrpcpb::Header> {
         .collect();
     out.sort_by(|a, b| a.key.cmp(&b.key));
     out
+}
+
+fn rewrite_httpgrpc_status_header(headers: &mut HeaderMap) {
+    if !headers.contains_key("grpc-status-details-bin") {
+        return;
+    }
+    if let Some(status) = tonic::Status::from_header_map(headers) {
+        if let Some(http_resp) = extract_http_response(&status) {
+            if let Ok(val) = HeaderValue::from_str(&http_resp.code.to_string()) {
+                headers.insert(Status::GRPC_STATUS, val);
+            }
+        }
+    }
+}
+
+struct RewriteGrpcStatusBody {
+    inner: tonic::body::BoxBody,
+}
+
+impl hyper::body::Body for RewriteGrpcStatusBody {
+    type Data = Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if frame.is_trailers() {
+                    let mut trailers = frame
+                        .into_trailers()
+                        .expect("is_trailers implies into_trailers succeeds");
+                    rewrite_httpgrpc_status_header(&mut trailers);
+                    Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))))
+                } else {
+                    Poll::Ready(Some(Ok(frame)))
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Tower service wrapper around `HttpServer` rewriting the HTTP/2 `grpc-status`
+/// header/trailer to `httpgrpc.HTTPResponse.Code` (matching `google.rpc.Status.code`)
+/// so Go `grpc-go` clients' `status.FromProto` never hits `"grpc-status-details-bin mismatch"`.
+#[derive(Clone)]
+pub struct HttpGrpcStatusFixService<S> {
+    inner: S,
+}
+
+impl<S> HttpGrpcStatusFixService<S> {
+    pub fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S: tonic::server::NamedService> tonic::server::NamedService for HttpGrpcStatusFixService<S> {
+    const NAME: &'static str = S::NAME;
+}
+
+impl<S> tower::Service<http::Request<tonic::body::BoxBody>> for HttpGrpcStatusFixService<S>
+where
+    S: tower::Service<
+            http::Request<tonic::body::BoxBody>,
+            Response = http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = http::Response<tonic::body::BoxBody>;
+    type Error = std::convert::Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+        let fut = self.inner.call(req);
+        Box::pin(async move {
+            let mut resp = fut.await?;
+            rewrite_httpgrpc_status_header(resp.headers_mut());
+            let resp = resp.map(|body| {
+                tonic::body::BoxBody::new(RewriteGrpcStatusBody { inner: body })
+            });
+            Ok(resp)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+    use http::StatusCode;
+    use mimir_proto::grpcutilpb::decode_status_details;
+    use mimir_proto::httpgrpcpb::http_server::HttpServer;
+    use prost::Message as _;
+
+    struct SingleChunkBody(Option<Bytes>);
+
+    impl hyper::body::Body for SingleChunkBody {
+        type Data = Bytes;
+        type Error = Status;
+
+        #[allow(clippy::result_large_err)]
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(self.0.take().map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+    }
+
+    #[test]
+    fn test_http_canonical_header_key() {
+        assert_eq!(http_canonical_header_key("content-type"), "Content-Type");
+        assert_eq!(http_canonical_header_key("x-scope-orgid"), "X-Scope-Orgid");
+        assert_eq!(http_canonical_header_key("etag"), "Etag");
+    }
+
+    #[tokio::test]
+    async fn test_httpgrpc_status_fix_rewrites_grpc_status_and_headers() {
+        let router = Router::new().route(
+            "/err",
+            get(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    [
+                        ("content-type", "text/plain"),
+                        ("x-donotlogerror", "1"),
+                        ("x-errormessage", "custom error msg"),
+                    ],
+                    "raw body",
+                )
+            }),
+        );
+
+        let svc = HttpGrpcStatusFixService::new(HttpServer::new(HttpGrpcBridge::new(router)));
+
+        let rpc_req = httpgrpcpb::HttpRequest {
+            method: "GET".to_string(),
+            url: "/err".to_string(),
+            body: Bytes::new(),
+            headers: Vec::new(),
+        };
+        let encoded = rpc_req.encode_to_vec();
+        let mut framed = Vec::with_capacity(5 + encoded.len());
+        framed.push(0);
+        framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&encoded);
+
+        let http_req = http::Request::builder()
+            .method(Method::POST)
+            .uri("/httpgrpc.HTTP/Handle")
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(
+                framed,
+            )))))
+            .unwrap();
+
+        let resp = svc.oneshot(http_req).await.unwrap();
+        let grpc_status = resp
+            .headers()
+            .get("grpc-status")
+            .and_then(|v| v.to_str().ok())
+            .expect("grpc-status header present");
+        assert_eq!(grpc_status, "404");
+
+        let parsed = tonic::Status::from_header_map(resp.headers()).expect("parse status");
+        assert_eq!(parsed.message(), "custom error msg");
+        let rpc_status = decode_status_details(&parsed).expect("decode google.rpc.Status");
+        assert_eq!(rpc_status.code, 404);
+        let http_resp = extract_http_response(&parsed).expect("extract http response");
+        assert_eq!(http_resp.code, 404);
+        assert!(
+            http_resp
+                .headers
+                .iter()
+                .any(|h| h.key == "Content-Type" && h.values == vec!["text/plain"]),
+            "headers: {:?}",
+            http_resp.headers
+        );
+        assert!(
+            !http_resp
+                .headers
+                .iter()
+                .any(|h| h.key.eq_ignore_ascii_case("x-donotlogerror")
+                    || h.key.eq_ignore_ascii_case("x-errormessage")),
+            "expected internal headers stripped: {:?}",
+            http_resp.headers
+        );
+    }
 }
