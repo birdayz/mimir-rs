@@ -79,6 +79,10 @@ func main() {
 		out, err = cmdGenTestPKI(input)
 	case "kafka-produce":
 		out, err = cmdKafkaProduce(input)
+	case "net-addr-detect":
+		out, err = cmdNetAddrDetect(input)
+	case "go-sort":
+		out, err = cmdGoSort(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}
