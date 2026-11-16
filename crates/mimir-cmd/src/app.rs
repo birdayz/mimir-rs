@@ -455,7 +455,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             .max_decoding_message_size(max_recv)
             .max_encoding_message_size(max_send)
             .accept_compressed(CompressionEncoding::Gzip)
-            .send_compressed(CompressionEncoding::Gzip),
+            .accept_compressed(CompressionEncoding::Zstd),
     );
 
     let health_svc = HealthService::new(Arc::clone(&shutdown_requested), ingester_opt.clone());
@@ -471,7 +471,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             .max_decoding_message_size(max_recv)
             .max_encoding_message_size(max_send)
             .accept_compressed(CompressionEncoding::Gzip)
-            .send_compressed(CompressionEncoding::Gzip);
+            .accept_compressed(CompressionEncoding::Zstd);
         grpc_builder = grpc_builder.add_service(ing_svc);
     }
 
@@ -487,8 +487,10 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     std::thread::Builder::new()
         .name("mimir-rpc-rt".to_string())
         .spawn(move || {
+            let rpc_workers =
+                std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 16));
             let rpc_rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
+                .worker_threads(rpc_workers)
                 .thread_name("mimir-rpc")
                 .enable_all()
                 .build()

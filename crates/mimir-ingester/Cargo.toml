@@ -16,6 +16,7 @@ bytes = { workspace = true }
 dashmap = { workspace = true }
 hashbrown = { workspace = true }
 futures = { workspace = true }
+hyper = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
 rand = { workspace = true }

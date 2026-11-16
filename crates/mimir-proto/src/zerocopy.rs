@@ -599,7 +599,7 @@ impl<'v, 'a> BorrowedTimeSeriesView<'v, 'a> {
     }
 
     #[inline]
-    pub fn samples(&self) -> &[cortexpb::Sample] {
+    pub fn samples(&self) -> &'v [cortexpb::Sample] {
         &self.scratch.samples[self.meta.samples.clone()]
     }
 

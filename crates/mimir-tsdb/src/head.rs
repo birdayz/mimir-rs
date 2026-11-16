@@ -38,7 +38,9 @@ use crate::chunkenc::{
     MIN_SAMPLES_PER_HISTOGRAM_CHUNK, QUIET_ZERO_NAN_BITS, TARGET_BYTES_PER_HISTOGRAM_CHUNK,
 };
 use crate::chunks_block::ChunkMeta;
-use crate::compact::{decode_chunk_samples, CompactionSeries, SampleValue};
+use crate::compact::{
+    decode_chunk_samples, encode_samples_into_chunks, CompactionSeries, SampleValue,
+};
 use crate::exemplar::{CircularExemplarStorage, Exemplar, ExemplarError};
 use crate::head_chunks::{
     ChunkDiskMapperRef, HeadChunksError, HeadChunksReader, HeadChunksWriter,
@@ -1650,6 +1652,9 @@ impl StripeSeries {
 
 /// Series chunks + tombstones returned by [`Head::series_chunks`].
 pub type SeriesChunksResult = Option<(Labels, Vec<ChunkMeta>, Vec<Interval>)>;
+
+/// Lightweight series chunk intervals returned by [`Head::series_chunk_metas_no_bytes`].
+pub type SeriesChunkMetasNoBytes = Option<(Labels, SmallVec<[(i64, i64); 4]>, bool)>;
 
 /// Lightweight candidate list + `[min_time, max_time_inclusive]` range for streaming compaction.
 pub type CompactionCandidatesRange = (Vec<(u64, Labels)>, i64, i64);
@@ -5799,6 +5804,229 @@ impl Head {
         }
         let tombs = self.tombstones.get(ref_id);
         Ok(Some((entry.labels.clone(), chks, tombs)))
+    }
+
+    /// Loads and overlap-merges (if tombstones or OOO overlaps exist) all chunks for `ref_id`
+    /// overlapping `[mint, maxt]`. Used by lazy Phase 2 chunk streaming for a single series at a time.
+    pub fn series_final_chunks(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+    ) -> Result<Option<(Labels, Vec<ChunkMeta>)>, HeadError> {
+        let Some((labels, chks, tombs)) = self.series_chunks(ref_id, mint, maxt)? else {
+            return Ok(None);
+        };
+        if chks.is_empty() {
+            return Ok(None);
+        }
+        let has_tombstones = !tombs.is_empty()
+            && chks
+                .iter()
+                .any(|cm| tombs.iter().any(|iv| iv.overlaps(cm.min_time, cm.max_time)));
+        let final_chunks = if has_tombstones {
+            let mut samples = Vec::new();
+            for cm in &chks {
+                if let Some(ref enc) = cm.chunk {
+                    for s in decode_chunk_samples(enc)? {
+                        if s.t >= mint && s.t <= maxt {
+                            samples.push(s);
+                        }
+                    }
+                }
+            }
+            samples.sort_by_key(|s| s.t);
+            samples.dedup_by_key(|s| s.t);
+            encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
+        } else if chks.len() > 1 {
+            let mut chks = chks;
+            let already_sorted_disjoint = chks
+                .windows(2)
+                .all(|w| w[0].min_time <= w[1].min_time && w[0].max_time < w[1].min_time);
+            if already_sorted_disjoint {
+                chks
+            } else {
+                chks.sort_by_key(|c| (c.min_time, c.max_time));
+                let has_overlap = chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
+                if has_overlap {
+                    let mut samples = Vec::new();
+                    for cm in &chks {
+                        if let Some(ref enc) = cm.chunk {
+                            for s in decode_chunk_samples(enc)? {
+                                if s.t >= mint && s.t <= maxt {
+                                    samples.push(s);
+                                }
+                            }
+                        }
+                    }
+                    samples.sort_by_key(|s| s.t);
+                    samples.dedup_by_key(|s| s.t);
+                    encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
+                } else {
+                    chks
+                }
+            }
+        } else {
+            chks
+        };
+        if final_chunks.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((labels, final_chunks)))
+        }
+    }
+
+    /// Computes `(labels, exact_chunk_count)` for `ref_id` in `[mint, maxt]` without cloning any
+    /// chunk bytes or reading mmap files on the normal in-order disjoint fast path.
+    pub fn series_lazy_chunk_count(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+    ) -> Result<Option<(Labels, u32)>, HeadError> {
+        let Some(entry) = self.series.get_by_id(ref_id) else {
+            return Ok(None);
+        };
+        if let Some(pred) = filter {
+            if !pred(&entry.labels) {
+                return Ok(None);
+            }
+        }
+
+        let has_any_tombs = self.tombstones.has_any();
+        let (fast_count, needs_slow_resolve) = {
+            let st = entry.inner.lock();
+            let has_ooo = st.ooo.as_ref().is_some_and(|ooo| {
+                ooo.ooo_mmapped_chunks
+                    .iter()
+                    .any(|mc| mc.overlaps_closed_interval(mint, maxt))
+                    || ooo
+                        .ooo_pending_mmapped
+                        .iter()
+                        .any(|(mc, _)| mc.overlaps_closed_interval(mint, maxt))
+                    || ooo
+                        .ooo_head_chunk
+                        .as_ref()
+                        .is_some_and(|ohc| ohc.overlaps_closed_interval(mint, maxt))
+            });
+            let mut count: u32 = 0;
+            let mut prev_min: i64 = i64::MIN;
+            let mut prev_max: i64 = i64::MIN;
+            let mut has_prev = false;
+            let mut sorted_disjoint = true;
+            for mc in st.mmapped() {
+                if mc.overlaps_closed_interval(mint, maxt) {
+                    if has_prev && (mc.min_time < prev_min || mc.min_time <= prev_max) {
+                        sorted_disjoint = false;
+                    }
+                    prev_min = mc.min_time;
+                    prev_max = mc.max_time;
+                    has_prev = true;
+                    count += 1;
+                }
+            }
+            for hc in &st.head_chunks {
+                if hc.overlaps_closed_interval(mint, maxt) {
+                    if has_prev && (hc.min_time < prev_min || hc.min_time <= prev_max) {
+                        sorted_disjoint = false;
+                    }
+                    prev_min = hc.min_time;
+                    prev_max = hc.max_time;
+                    has_prev = true;
+                    count += 1;
+                }
+            }
+            (count, has_ooo || has_any_tombs || !sorted_disjoint)
+        };
+
+        if !needs_slow_resolve {
+            return Ok(if fast_count == 0 {
+                None
+            } else {
+                Some((entry.labels.clone(), fast_count))
+            });
+        }
+
+        Ok(self
+            .series_final_chunks(ref_id, mint, maxt)?
+            .map(|(labels, chks)| (labels, chks.len() as u32)))
+    }
+
+    /// Returns `(labels, chunk_intervals, needs_chunk_load_for_count)` for `ref_id` in `[mint, maxt]`
+    /// without cloning chunk bytes on the fast path. Used when combining Head with on-disk Blocks.
+    pub fn series_chunk_metas_no_bytes(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+    ) -> Result<SeriesChunkMetasNoBytes, HeadError> {
+        let Some(entry) = self.series.get_by_id(ref_id) else {
+            return Ok(None);
+        };
+        if let Some(pred) = filter {
+            if !pred(&entry.labels) {
+                return Ok(None);
+            }
+        }
+        let has_any_tombs = self.tombstones.has_any();
+        let (intervals, needs_slow) = {
+            let st = entry.inner.lock();
+            let has_ooo = st.ooo.as_ref().is_some_and(|ooo| {
+                ooo.ooo_mmapped_chunks
+                    .iter()
+                    .any(|mc| mc.overlaps_closed_interval(mint, maxt))
+                    || ooo
+                        .ooo_pending_mmapped
+                        .iter()
+                        .any(|(mc, _)| mc.overlaps_closed_interval(mint, maxt))
+                    || ooo
+                        .ooo_head_chunk
+                        .as_ref()
+                        .is_some_and(|ohc| ohc.overlaps_closed_interval(mint, maxt))
+            });
+            let mut intervals: SmallVec<[(i64, i64); 4]> = SmallVec::new();
+            let mut prev_min = i64::MIN;
+            let mut prev_max = i64::MIN;
+            let mut has_prev = false;
+            let mut sorted_disjoint = true;
+            for mc in st.mmapped() {
+                if mc.overlaps_closed_interval(mint, maxt) {
+                    if has_prev && (mc.min_time < prev_min || mc.min_time <= prev_max) {
+                        sorted_disjoint = false;
+                    }
+                    prev_min = mc.min_time;
+                    prev_max = mc.max_time;
+                    has_prev = true;
+                    intervals.push((mc.min_time, mc.max_time));
+                }
+            }
+            for hc in &st.head_chunks {
+                if hc.overlaps_closed_interval(mint, maxt) {
+                    if has_prev && (hc.min_time < prev_min || hc.min_time <= prev_max) {
+                        sorted_disjoint = false;
+                    }
+                    prev_min = hc.min_time;
+                    prev_max = hc.max_time;
+                    has_prev = true;
+                    intervals.push((hc.min_time, hc.max_time));
+                }
+            }
+            (intervals, has_ooo || has_any_tombs || !sorted_disjoint)
+        };
+        if !needs_slow {
+            if intervals.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some((entry.labels.clone(), intervals, false)));
+        }
+        let Some((labels, chks)) = self.series_final_chunks(ref_id, mint, maxt)? else {
+            return Ok(None);
+        };
+        let ivs: SmallVec<[(i64, i64); 4]> =
+            chks.iter().map(|c| (c.min_time, c.max_time)).collect();
+        Ok(Some((labels, ivs, true)))
     }
 
     pub fn series_labels(&self, ref_id: u64) -> Option<Labels> {

@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use mimir_common::limiter::{InflightPermit, ReactivePermit};
 use mimir_config::LimitsConfig;
 use mimir_proto::cortexpb;
@@ -21,9 +22,10 @@ use mimir_ring::ring::replication_strategy::WRITE_NO_EXTEND;
 use mimir_tsdb::chunkenc::{CounterResetHint, FloatHistogram, Histogram, HistogramSpan};
 use mimir_tsdb::exemplar::{Exemplar, ExemplarError};
 use mimir_tsdb::head::{prefetch_read_data, HeadError, SeriesEntry};
-use mimir_tsdb::labels::{iter_stringlabels, Labels};
+use mimir_tsdb::labels::{append_stringlabel_pair, iter_stringlabels, Labels};
 use smallvec::SmallVec;
 use tracing::warn;
+use xxhash_rust::xxh64::xxh64;
 
 use crate::circuit_breaker::BreakerPermit;
 use crate::errors::{
@@ -725,27 +727,99 @@ impl Ingester {
     }
 
     /// Zero-copy raw protobuf gRPC `Push` entrypoint.
+    ///
+    /// Offloads non-trivial payloads (`>= 2048` bytes) onto Tokio's blocking worker pool so
+    /// `mimir-rpc` async I/O threads never stall behind TSDB + WAL writes, and encodes labels
+    /// directly into `stringlabels` + `xxh64` to reuse the Wave P6/P7 prehashed batch path.
     pub async fn push_grpc_raw(
-        &self,
+        self: &Arc<Self>,
         user_id: &str,
-        raw_bytes: &[u8],
+        raw_bytes: Bytes,
     ) -> Result<(), IngesterError> {
-        thread_local! {
-            static SCRATCH: std::cell::RefCell<mimir_proto::zerocopy::WriteRequestScratch> =
-                std::cell::RefCell::new(mimir_proto::zerocopy::WriteRequestScratch::new());
-        }
-
         if !self.cfg.push_grpc_method_enabled {
             return Err(IngesterError::PushGrpcDisabled);
         }
         let req_size = raw_bytes.len() as i64;
         let permit = self.start_push_request(req_size).await?;
-        let res = SCRATCH.with(|cell| {
-            let mut scratch = cell.borrow_mut();
+        let res = if raw_bytes.len() >= 2048 {
+            let ing = Arc::clone(self);
+            let uid = user_id.to_owned();
+            tokio::task::spawn_blocking(move || ing.push_grpc_raw_sync(&uid, &raw_bytes))
+                .await
+                .map_err(|e| IngesterError::Internal {
+                    message: format!("push worker join error: {e}"),
+                })?
+        } else {
+            self.push_grpc_raw_sync(user_id, &raw_bytes)
+        };
+        permit.finish(res.as_ref().err());
+        res
+    }
+
+    fn push_grpc_raw_sync(&self, user_id: &str, raw_bytes: &[u8]) -> Result<(), IngesterError> {
+        struct ClassicSeriesMeta {
+            label_start: u32,
+            label_len: u32,
+            prom_hash: u64,
+            labels_sorted_unique: bool,
+            hist_start: u32,
+            hist_len: u32,
+            ex_start: u32,
+            ex_len: u32,
+        }
+
+        struct ClassicPushScratch {
+            wr_scratch: mimir_proto::zerocopy::WriteRequestScratch,
+            label_bytes_arena: Vec<u8>,
+            histograms_arena: Vec<ConvertedHistogram>,
+            exemplars_arena: Vec<(i64, f64, Labels, String)>,
+            series_metas: Vec<ClassicSeriesMeta>,
+        }
+
+        impl ClassicPushScratch {
+            fn new() -> Self {
+                Self {
+                    wr_scratch: mimir_proto::zerocopy::WriteRequestScratch::new(),
+                    label_bytes_arena: Vec::with_capacity(64 * 1024),
+                    histograms_arena: Vec::new(),
+                    exemplars_arena: Vec::new(),
+                    series_metas: Vec::with_capacity(2048),
+                }
+            }
+
+            fn clear(&mut self) {
+                self.wr_scratch.clear();
+                self.label_bytes_arena.clear();
+                self.histograms_arena.clear();
+                self.exemplars_arena.clear();
+                self.series_metas.clear();
+                if self.label_bytes_arena.capacity() > 4 * 1024 * 1024 {
+                    self.label_bytes_arena.shrink_to(256 * 1024);
+                }
+            }
+        }
+
+        struct ScratchResetGuard<'a>(&'a mut ClassicPushScratch);
+        impl Drop for ScratchResetGuard<'_> {
+            fn drop(&mut self) {
+                self.0.clear();
+            }
+        }
+
+        thread_local! {
+            static PUSH_SCRATCH: std::cell::RefCell<ClassicPushScratch> =
+                std::cell::RefCell::new(ClassicPushScratch::new());
+        }
+
+        PUSH_SCRATCH.with(|cell| {
+            let mut scratch_ref = cell.borrow_mut();
+            let guard = ScratchResetGuard(&mut scratch_ref);
+            let s = &mut *guard.0;
+
             let borrowed = match mimir_proto::zerocopy::decode_write_request(
                 raw_bytes,
                 mimir_proto::zerocopy::DecodeOptions::classic(),
-                &mut scratch,
+                &mut s.wr_scratch,
             ) {
                 Ok(b) => b,
                 Err(
@@ -754,7 +828,7 @@ impl Ingester {
                 ) => mimir_proto::zerocopy::decode_write_request(
                     raw_bytes,
                     mimir_proto::zerocopy::DecodeOptions::rw2(),
-                    &mut scratch,
+                    &mut s.wr_scratch,
                 )
                 .map_err(|e| IngesterError::BadRequest {
                     message: e.to_string(),
@@ -765,10 +839,147 @@ impl Ingester {
                     });
                 }
             };
-            self.push_borrowed_inner(user_id, &borrowed)
-        });
-        permit.finish(res.as_ref().err());
-        res
+
+            let meta_count = self.push_metadata_borrowed(user_id, &borrowed);
+            if meta_count > 0 {
+                self.ingestion_rate.add(meta_count as i64);
+            }
+            let ts_len = borrowed.timeseries_len();
+            if ts_len == 0 {
+                return Ok(());
+            }
+
+            let source = cortexpb::write_request::SourceEnum::try_from(borrowed.source)
+                .unwrap_or(cortexpb::write_request::SourceEnum::Api);
+            let mut min_ts = i64::MAX;
+
+            s.series_metas.reserve(ts_len);
+            for ts in borrowed.timeseries() {
+                let label_start = s.label_bytes_arena.len();
+                let mut labels_sorted_unique = true;
+                let mut prev_name: Option<&str> = None;
+
+                if let Some(ts_labels_str) = ts.labels_str() {
+                    s.label_bytes_arena.reserve(ts_labels_str.len() * 24);
+                    for (k, v) in ts_labels_str {
+                        if let Some(pn) = prev_name {
+                            if pn >= k {
+                                labels_sorted_unique = false;
+                            }
+                        }
+                        prev_name = Some(k);
+                        if !v.is_empty() {
+                            append_stringlabel_pair(
+                                &mut s.label_bytes_arena,
+                                k.as_bytes(),
+                                v.as_bytes(),
+                            );
+                        }
+                    }
+                } else {
+                    let ts_labels = ts.labels();
+                    s.label_bytes_arena.reserve(ts_labels.len() * 24);
+                    for lp in ts_labels {
+                        let k = fast_utf8_str(lp.name).map_err(|_| {
+                            IngesterError::BadRequest {
+                                message: "invalid UTF-8 in label name".to_string(),
+                            }
+                            .with_user(user_id, 0)
+                        })?;
+                        let _v = fast_utf8_str(lp.value).map_err(|_| {
+                            IngesterError::BadRequest {
+                                message: "invalid UTF-8 in label value".to_string(),
+                            }
+                            .with_user(user_id, 0)
+                        })?;
+                        if let Some(pn) = prev_name {
+                            if pn >= k {
+                                labels_sorted_unique = false;
+                            }
+                        }
+                        prev_name = Some(k);
+                        if !lp.value.is_empty() {
+                            append_stringlabel_pair(&mut s.label_bytes_arena, lp.name, lp.value);
+                        }
+                    }
+                }
+
+                let label_end = s.label_bytes_arena.len();
+                let label_len = (label_end - label_start) as u32;
+                let prom_hash = if labels_sorted_unique && label_len > 0 {
+                    xxh64(&s.label_bytes_arena[label_start..label_end], 0)
+                } else {
+                    0
+                };
+
+                for sample in ts.samples() {
+                    min_ts = min_ts.min(sample.timestamp_ms);
+                }
+
+                let hist_start = s.histograms_arena.len() as u32;
+                let mut hist_len = 0u32;
+                for h in ts.histograms() {
+                    let conv = convert_borrowed_histogram(&h);
+                    min_ts = min_ts.min(conv.0);
+                    s.histograms_arena.push(conv);
+                    hist_len += 1;
+                }
+
+                let ex_start = s.exemplars_arena.len() as u32;
+                let mut ex_len = 0u32;
+                for ex in ts.exemplars() {
+                    let conv = convert_borrowed_exemplar(&ex)
+                        .map_err(|e| e.with_user(user_id, 0))?;
+                    min_ts = min_ts.min(conv.0);
+                    s.exemplars_arena.push(conv);
+                    ex_len += 1;
+                }
+
+                s.series_metas.push(ClassicSeriesMeta {
+                    label_start: label_start as u32,
+                    label_len,
+                    prom_hash,
+                    labels_sorted_unique,
+                    hist_start,
+                    hist_len,
+                    ex_start,
+                    ex_len,
+                });
+            }
+
+            let skip_label_validation = borrowed.skip_label_validation;
+            let mut items: Vec<PrehashedSeriesItem<'_>> = Vec::with_capacity(ts_len);
+            for (ts, m) in borrowed.timeseries().zip(s.series_metas.iter()) {
+                let l_start = m.label_start as usize;
+                let encoded_labels =
+                    &s.label_bytes_arena[l_start..l_start + m.label_len as usize];
+                let histograms = if m.hist_len == 0 {
+                    &[][..]
+                } else {
+                    let h_start = m.hist_start as usize;
+                    &s.histograms_arena[h_start..h_start + m.hist_len as usize]
+                };
+                let exemplars = if m.ex_len == 0 {
+                    &[][..]
+                } else {
+                    let e_start = m.ex_start as usize;
+                    &s.exemplars_arena[e_start..e_start + m.ex_len as usize]
+                };
+                items.push(PrehashedSeriesItem {
+                    encoded_labels,
+                    samples: ts.samples(),
+                    created_timestamp: ts.created_timestamp(),
+                    prom_hash: m.prom_hash,
+                    labels_sorted_unique: m.labels_sorted_unique,
+                    bad_utf8: false,
+                    skip_label_validation,
+                    histograms,
+                    exemplars,
+                });
+            }
+
+            self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, &items)
+        })
     }
 
     /// gRPC `Push` entrypoint.

@@ -1253,6 +1253,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hashbrown 0.15.5",
+ "hyper",
  "kafka-protocol",
  "mimir-common",
  "mimir-config",

@@ -25,7 +25,7 @@ use mimir_tsdb::chunks_block::ChunkMeta;
 use mimir_tsdb::db::Tsdb;
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::matcher::{LabelMatcher, MatchType};
-use mimir_tsdb::querier::QueryChunkSeries;
+use mimir_tsdb::querier::{LazyStreamEvent, QueryChunkSeries};
 use mimir_tsdb::search::{FuzzAlg, SearchHints, SearchOrdering, SearchResult};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -557,6 +557,7 @@ impl Ingester {
 
         let start_ts = req.start_timestamp_ms;
         let end_ts = req.end_timestamp_ms;
+        let batch_limit = req.streaming_chunks_batch_size as usize;
         let mut chunk_series = if !self
             .blocks_cfg
             .tsdb
@@ -577,7 +578,7 @@ impl Ingester {
             } else {
                 db.db.chunk_querier(start_ts, end_ts)
             };
-            let mut out = match cq
+            match cq
                 .select_adaptive(
                     true,
                     &matchers,
@@ -587,8 +588,18 @@ impl Ingester {
                 .map_err(|e| IngesterError::Internal {
                     message: format!("selecting series from ChunkQuerier: {e}"),
                 })? {
-                Ok(inline_series) => inline_series,
+                Ok(mut inline_series) => {
+                    if let Some((shard_idx, shard_count)) = shard {
+                        inline_series
+                            .retain(|cs| labels_stable_hash(&cs.labels) % shard_count == shard_idx);
+                    }
+                    inline_series
+                }
                 Err(prepared) => {
+                    // Large query (> INLINE_CHUNK_LOAD_SERIES_LIMIT): stream lazily in O(1) chunk
+                    // memory on a blocking worker using a bounded mpsc::channel(4).
+                    let (tx, rx) = mpsc::channel(4);
+                    let ingester = Arc::clone(self);
                     let db_c = Arc::clone(&db);
                     tokio::task::spawn_blocking(move || {
                         let cq_b = if unordered {
@@ -596,22 +607,136 @@ impl Ingester {
                         } else {
                             db_c.db.chunk_querier(start_ts, end_ts)
                         };
-                        cq_b.execute_prepared_select_with_matchers(prepared, &matchers, true)
-                    })
-                    .await
-                    .map_err(|e| IngesterError::Internal {
-                        message: format!("query task join error: {e}"),
-                    })?
-                    .map_err(|e| IngesterError::Internal {
-                        message: format!("selecting series from ChunkQuerier: {e}"),
-                    })?
-                }
-            };
+                        let shard_pred = shard.map(|(shard_idx, shard_count)| {
+                            move |lbls: &Labels| labels_stable_hash(lbls) % shard_count == shard_idx
+                        });
+                        let filter_ref: Option<&dyn Fn(&Labels) -> bool> =
+                            shard_pred.as_ref().map(|f| f as &dyn Fn(&Labels) -> bool);
 
-            if let Some((shard_idx, shard_count)) = shard {
-                out.retain(|cs| labels_stable_hash(&cs.labels) % shard_count == shard_idx);
+                        let mut num_series = 0usize;
+                        let mut num_samples = 0usize;
+                        let mut series_batch: Vec<ingesterpb::QueryStreamSeries> =
+                            Vec::with_capacity(QUERY_STREAM_BATCH_SIZE);
+                        let mut chunks_batch: Vec<ingesterpb::QueryStreamSeriesChunks> =
+                            Vec::with_capacity(batch_limit.min(1024));
+                        let mut batch_bytes = 0usize;
+                        let mut receiver_closed = false;
+
+                        let res = cq_b.stream_prepared_chunks_lazy(
+                            prepared,
+                            &matchers,
+                            true,
+                            filter_ref,
+                            |ev| match ev {
+                                LazyStreamEvent::Series(labels, chunk_count) => {
+                                    num_series += 1;
+                                    series_batch.push(ingesterpb::QueryStreamSeries {
+                                        labels: labels_to_proto_pairs(&labels),
+                                        chunk_count: chunk_count as i64,
+                                    });
+                                    drop(labels);
+                                    if series_batch.len() >= QUERY_STREAM_BATCH_SIZE {
+                                        let resp = ingesterpb::QueryStreamResponse {
+                                            streaming_series: std::mem::take(&mut series_batch),
+                                            is_end_of_series_stream: false,
+                                            streaming_series_chunks: Vec::new(),
+                                        };
+                                        if tx.blocking_send(Ok(resp)).is_err() {
+                                            receiver_closed = true;
+                                            return Ok(false);
+                                        }
+                                    }
+                                    Ok(true)
+                                }
+                                LazyStreamEvent::SeriesEnd => {
+                                    let resp = ingesterpb::QueryStreamResponse {
+                                        streaming_series: std::mem::take(&mut series_batch),
+                                        is_end_of_series_stream: true,
+                                        streaming_series_chunks: Vec::new(),
+                                    };
+                                    if tx.blocking_send(Ok(resp)).is_err() {
+                                        receiver_closed = true;
+                                        return Ok(false);
+                                    }
+                                    Ok(true)
+                                }
+                                LazyStreamEvent::SeriesChunks(series_idx, chks) => {
+                                    let mut proto_chunks = Vec::with_capacity(chks.len());
+                                    for cm in chks {
+                                        let Some(enc_chunk) = cm.chunk else {
+                                            return Err(mimir_tsdb::querier::QuerierError::Chunk(
+                                                mimir_tsdb::chunkenc::ChunkError::InvalidEncoding(0),
+                                            ));
+                                        };
+                                        num_samples += enc_chunk.num_samples();
+                                        let wire_enc = tsdb_encoding_to_wire(enc_chunk.encoding());
+                                        let data = Bytes::from(enc_chunk.into_bytes());
+                                        proto_chunks.push(ingesterpb::Chunk {
+                                            start_timestamp_ms: cm.min_time,
+                                            end_timestamp_ms: cm.max_time,
+                                            encoding: wire_enc,
+                                            data,
+                                        });
+                                    }
+                                    let sc = ingesterpb::QueryStreamSeriesChunks {
+                                        series_index: series_idx as u64,
+                                        chunks: proto_chunks,
+                                    };
+                                    let msg_size = sc.encoded_len();
+
+                                    if (batch_bytes > 0
+                                        && batch_bytes + msg_size > QUERY_STREAM_BATCH_MESSAGE_SIZE)
+                                        || chunks_batch.len() >= batch_limit
+                                    {
+                                        let resp = ingesterpb::QueryStreamResponse {
+                                            streaming_series: Vec::new(),
+                                            is_end_of_series_stream: false,
+                                            streaming_series_chunks: std::mem::take(
+                                                &mut chunks_batch,
+                                            ),
+                                        };
+                                        if tx.blocking_send(Ok(resp)).is_err() {
+                                            receiver_closed = true;
+                                            return Ok(false);
+                                        }
+                                        batch_bytes = 0;
+                                    }
+                                    chunks_batch.push(sc);
+                                    batch_bytes += msg_size;
+                                    Ok(true)
+                                }
+                            },
+                        );
+
+                        match res {
+                            Ok(()) => {
+                                if !receiver_closed && !chunks_batch.is_empty() {
+                                    let _ = tx.blocking_send(Ok(ingesterpb::QueryStreamResponse {
+                                        streaming_series: Vec::new(),
+                                        is_end_of_series_stream: false,
+                                        streaming_series_chunks: chunks_batch,
+                                    }));
+                                }
+                                ingester
+                                    .metrics
+                                    .queried_series
+                                    .with_label_values(&["merged_blocks"])
+                                    .observe(num_series as f64);
+                                ingester.metrics.queried_samples.observe(num_samples as f64);
+                            }
+                            Err(e) => {
+                                let err = IngesterError::Internal {
+                                    message: format!("selecting series from ChunkQuerier: {e}"),
+                                };
+                                let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                            }
+                        }
+                        permit.finish(false);
+                    });
+
+                    return Ok(Box::pin(ReceiverStream::new(rx)));
+                }
             }
-            out
         } else {
             let ing_c = Arc::clone(self);
             let db_c = Arc::clone(&db);
@@ -627,7 +752,6 @@ impl Ingester {
             })??
         };
 
-        let batch_limit = req.streaming_chunks_batch_size as usize;
         let num_series = chunk_series.len();
         let total_chunks: usize = chunk_series.iter().map(|cs| cs.chunks.len()).sum();
         let est_chunk_bytes: usize = chunk_series
@@ -2725,5 +2849,159 @@ mod tests {
             got150.push(item.unwrap());
         }
         assert_eq!(got150, expected150);
+    }
+
+    #[tokio::test]
+    async fn query_stream_bimodal_lazy_large_matches_expected_with_ooo_blocks_and_shard() {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "lazy-stream-test".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = dir.path().to_string_lossy().into_owned();
+        let limits = mimir_config::LimitsConfig {
+            out_of_order_time_window: mimir_config::ModelDuration::from_mins(30),
+            ..Default::default()
+        };
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(limits),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        // Write 500 series (> INLINE_CHUNK_LOAD_SERIES_LIMIT=256) with 2 timestamps so we can
+        // compact the earlier window into an on-disk ULID block while keeping newer + OOO in Head.
+        let mut ts_batch1 = Vec::with_capacity(500);
+        let mut ts_batch2 = Vec::with_capacity(500);
+        for i in 0..500usize {
+            let labels = vec![
+                cortexpb::LabelPair {
+                    name: "__name__".into(),
+                    value: "lazy_large_metric".into(),
+                },
+                cortexpb::LabelPair {
+                    name: "idx".into(),
+                    value: format!("{i:04}").into(),
+                },
+            ];
+            ts_batch1.push(cortexpb::TimeSeries {
+                labels: labels.clone(),
+                samples: vec![cortexpb::Sample {
+                    value: i as f64,
+                    timestamp_ms: 1_000_000,
+                }],
+                ..Default::default()
+            });
+            ts_batch2.push(cortexpb::TimeSeries {
+                labels,
+                samples: vec![
+                    cortexpb::Sample {
+                        value: (i + 1) as f64,
+                        timestamp_ms: 2_000_000,
+                    },
+                    // OOO sample for every 10th series overlapping the Head window
+                    cortexpb::Sample {
+                        value: (i + 2) as f64,
+                        timestamp_ms: if i % 10 == 0 { 1_900_000 } else { 2_010_000 },
+                    },
+                ],
+                ..Default::default()
+            });
+        }
+        ing.push_to_storage(
+            "user-lazy",
+            &cortexpb::WriteRequest {
+                timeseries: ts_batch1,
+                source: cortexpb::write_request::SourceEnum::Api as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Compact first batch into an on-disk ULID block
+        ing.get_tsdb("user-lazy")
+            .unwrap()
+            .db
+            .compact_head_all()
+            .unwrap();
+
+        // Push second batch into Head (includes OOO samples)
+        ing.push_to_storage(
+            "user-lazy",
+            &cortexpb::WriteRequest {
+                timeseries: ts_batch2,
+                source: cortexpb::write_request::SourceEnum::Api as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let md = MetadataMap::new();
+        // Unsharded 500-series lazy stream across Block + Head + OOO
+        let req_all = ingesterpb::QueryRequest {
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 3_000_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__name__".into(),
+                value: "lazy_large_metric".into(),
+            }],
+            ..Default::default()
+        };
+        let expected_all = ing
+            .handle_query_stream(&md, "user-lazy", req_all.clone())
+            .await
+            .unwrap();
+        let mut s_all = ing
+            .handle_query_stream_bimodal(&md, "user-lazy", req_all)
+            .await
+            .unwrap();
+        let mut got_all = Vec::new();
+        while let Some(item) = s_all.next().await {
+            got_all.push(item.unwrap());
+        }
+        assert_eq!(got_all, expected_all);
+
+        // Sharded 500-series lazy stream (`1_of_4`)
+        let req_shard = ingesterpb::QueryRequest {
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 3_000_000,
+            matchers: vec![
+                ingesterpb::LabelMatcher {
+                    r#type: ingesterpb::MatchType::Equal as i32,
+                    name: "__name__".into(),
+                    value: "lazy_large_metric".into(),
+                },
+                ingesterpb::LabelMatcher {
+                    r#type: ingesterpb::MatchType::Equal as i32,
+                    name: "__query_shard__".into(),
+                    value: "1_of_4".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let expected_shard = ing
+            .handle_query_stream(&md, "user-lazy", req_shard.clone())
+            .await
+            .unwrap();
+        let mut s_shard = ing
+            .handle_query_stream_bimodal(&md, "user-lazy", req_shard)
+            .await
+            .unwrap();
+        let mut got_shard = Vec::new();
+        while let Some(item) = s_shard.next().await {
+            got_shard.push(item.unwrap());
+        }
+        assert_eq!(got_shard, expected_shard);
     }
 }

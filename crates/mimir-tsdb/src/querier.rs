@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::block::{Block, BlockError};
@@ -51,6 +52,29 @@ pub struct QuerySeries {
 pub struct QueryChunkSeries {
     pub labels: Labels,
     pub chunks: Vec<ChunkMeta>,
+}
+
+/// Compact source locator for lazy Phase 2 chunk streaming (`0` = Head, `1 + idx` = `blocks[idx]`).
+#[derive(Clone, Debug)]
+pub enum LazyChunkSource {
+    Head(u64),
+    Block { block_idx: u16, ref_id: u64 },
+    Multi(Box<[(u16, u64)]>),
+}
+
+/// Lightweight Phase 1 series descriptor holding zero chunk bytes.
+#[derive(Clone, Debug)]
+pub struct LazySeriesEntry {
+    pub labels: Labels,
+    pub source: LazyChunkSource,
+    pub chunk_count: u32,
+}
+
+/// Incremental event emitted by [`TsdbQuerier::stream_prepared_chunks_lazy`].
+pub enum LazyStreamEvent {
+    Series(Labels, u32),
+    SeriesEnd,
+    SeriesChunks(usize, Vec<ChunkMeta>),
 }
 
 /// Pre-evaluated postings selection across TSDB `Head` and overlapping `Block`s.
@@ -548,6 +572,375 @@ impl<'a> TsdbQuerier<'a> {
         Ok(out)
     }
 
+    /// Two-phase lazy `QueryStream` executor holding `blocks_lock.read()` across Phase 1 and Phase 2:
+    /// - Phase 1 builds lightweight `LazySeriesEntry` descriptors (`chunk_count` without cloning chunk bytes
+    ///   on the fast path), sorts if requested, streams `(Labels, chunk_count)` via `on_series` (dropping
+    ///   `Labels` immediately), and calls `on_series_end`.
+    /// - Phase 2 loads `Vec<ChunkMeta>` for ONE series at a time and yields it to `on_series_chunks`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_prepared_chunks_lazy<F>(
+        &self,
+        mut prepared: PreparedChunkSelect,
+        matchers: &[LabelMatcher],
+        sort_series: bool,
+        series_filter: Option<&dyn Fn(&Labels) -> bool>,
+        mut on_event: F,
+    ) -> Result<(), QuerierError>
+    where
+        F: FnMut(LazyStreamEvent) -> Result<bool, QuerierError>,
+    {
+        let lock_guard = self.blocks_lock.map(|l| l.read());
+        if self.blocks_lock.is_some() {
+            let current_blocks = self.effective_blocks(&lock_guard);
+            let same = current_blocks.len() == prepared.overlapping_blocks.len()
+                && current_blocks
+                    .iter()
+                    .zip(prepared.overlapping_blocks.iter())
+                    .all(|(a, b)| Arc::ptr_eq(a, b));
+            if !same {
+                prepared =
+                    self.prepare_select_locked(current_blocks, matchers, prepared.unordered)?;
+            }
+        }
+
+        let head = self.effective_head();
+        let mint = prepared.mint;
+        let maxt = prepared.maxt;
+        let unordered = prepared.unordered;
+
+        let merge_or_collect = |items: Vec<(ChunkMeta, Vec<Interval>)>,
+                                allow_non_overlapping_raw: bool|
+         -> Result<Vec<ChunkMeta>, QuerierError> {
+            if items.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut chks: Vec<ChunkMeta> = Vec::with_capacity(items.len());
+            let mut has_tombstones = false;
+            for (cm, tombs) in items {
+                if tombs
+                    .iter()
+                    .any(|iv| iv.overlaps(cm.min_time, cm.max_time))
+                {
+                    has_tombstones = true;
+                }
+                chks.push(cm);
+            }
+            if has_tombstones {
+                let mut samples = Vec::new();
+                for cm in &chks {
+                    let Some(ref enc) = cm.chunk else {
+                        continue;
+                    };
+                    for s in decode_chunk_samples(enc)? {
+                        if s.t < mint || s.t > maxt {
+                            continue;
+                        }
+                        samples.push(s);
+                    }
+                }
+                samples.sort_by_key(|s| s.t);
+                samples.dedup_by_key(|s| s.t);
+                Ok(encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?)
+            } else if allow_non_overlapping_raw {
+                Ok(chks)
+            } else {
+                chks.sort_by_key(|c| (c.min_time, c.max_time));
+                let has_overlap = chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
+                if has_overlap {
+                    let mut samples = Vec::new();
+                    for cm in &chks {
+                        let Some(ref enc) = cm.chunk else {
+                            continue;
+                        };
+                        for s in decode_chunk_samples(enc)? {
+                            if s.t < mint || s.t > maxt {
+                                continue;
+                            }
+                            samples.push(s);
+                        }
+                    }
+                    samples.sort_by_key(|s| s.t);
+                    samples.dedup_by_key(|s| s.t);
+                    Ok(encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?)
+                } else {
+                    Ok(chks)
+                }
+            }
+        };
+
+        if prepared.block_refs.is_empty() {
+            let mut entries: Vec<LazySeriesEntry> = match (head, prepared.head_refs) {
+                (Some(h), Some(refs)) => {
+                    let mut v = Vec::with_capacity(refs.len());
+                    for &r in refs.iter() {
+                        if let Some((labels, chunk_count)) =
+                            h.series_lazy_chunk_count(r, mint, maxt, series_filter)?
+                        {
+                            if chunk_count > 0 {
+                                v.push(LazySeriesEntry {
+                                    labels,
+                                    source: LazyChunkSource::Head(r),
+                                    chunk_count,
+                                });
+                            }
+                        }
+                    }
+                    v
+                }
+                _ => Vec::new(),
+            };
+
+            if sort_series && entries.len() > 1 {
+                entries.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+            }
+
+            for entry in entries.iter_mut() {
+                let labels = std::mem::take(&mut entry.labels);
+                if !on_event(LazyStreamEvent::Series(labels, entry.chunk_count))? {
+                    return Ok(());
+                }
+            }
+            if !on_event(LazyStreamEvent::SeriesEnd)? {
+                return Ok(());
+            }
+
+            if let Some(h) = head {
+                for (series_idx, entry) in entries.into_iter().enumerate() {
+                    let r = match entry.source {
+                        LazyChunkSource::Head(r) => r,
+                        _ => continue,
+                    };
+                    let chks = match h.series_final_chunks(r, mint, maxt)? {
+                        Some((_, c)) => c,
+                        None => Vec::new(),
+                    };
+                    if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
+                        return Ok(());
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Multi-source path (Head and/or one or more ULID Blocks):
+        let blocks: Vec<Arc<Block>> = prepared
+            .block_refs
+            .iter()
+            .map(|(b, _)| Arc::clone(b))
+            .collect();
+
+        struct MultiMeta {
+            sources: SmallVec<[(u16, u64); 2]>,
+            head_ivs: SmallVec<[(i64, i64); 4]>,
+            block_ivs: SmallVec<[(i64, i64); 4]>,
+            has_block_tombstone_overlap: bool,
+        }
+
+        let est = prepared
+            .head_refs
+            .as_ref()
+            .map_or(0, |r| r.len())
+            .max(
+                prepared
+                    .block_refs
+                    .iter()
+                    .map(|(_, r)| r.len())
+                    .max()
+                    .unwrap_or(0),
+            );
+        let mut per_series: hashbrown::HashMap<Labels, MultiMeta> =
+            hashbrown::HashMap::with_capacity(est);
+
+        if let (Some(h), Some(refs)) = (head, prepared.head_refs) {
+            for &r in refs.iter() {
+                if let Some((labels, ivs, _had_slow)) =
+                    h.series_chunk_metas_no_bytes(r, mint, maxt, series_filter)?
+                {
+                    let entry = per_series.entry(labels).or_insert_with(|| MultiMeta {
+                        sources: SmallVec::new(),
+                        head_ivs: SmallVec::new(),
+                        block_ivs: SmallVec::new(),
+                        has_block_tombstone_overlap: false,
+                    });
+                    entry.sources.push((0, r));
+                    entry.head_ivs.extend(ivs);
+                }
+            }
+        }
+
+        for (b_idx, (blk, refs)) in prepared.block_refs.iter().enumerate() {
+            let idx = blk.index();
+            let tombr = blk.tombstones();
+            let blk_has_any_tombs = tombr.has_any();
+            let src_tag = 1u16 + (b_idx as u16);
+            for &r in refs.iter() {
+                let (labels, chks) = idx.series(r)?;
+                if let Some(pred) = series_filter {
+                    if !pred(&labels) {
+                        continue;
+                    }
+                }
+                let tombs = if blk_has_any_tombs {
+                    tombr.get(r)
+                } else {
+                    Vec::new()
+                };
+                let mut local_ivs: SmallVec<[(i64, i64); 4]> = SmallVec::new();
+                let mut partial_tomb = false;
+                for cm in chks {
+                    if !cm.overlaps_closed_interval(mint, maxt) {
+                        continue;
+                    }
+                    if tombs
+                        .iter()
+                        .any(|iv| iv.is_subrange(cm.min_time, cm.max_time))
+                    {
+                        continue;
+                    }
+                    if !tombs.is_empty()
+                        && tombs.iter().any(|iv| iv.overlaps(cm.min_time, cm.max_time))
+                    {
+                        partial_tomb = true;
+                    }
+                    local_ivs.push((cm.min_time, cm.max_time));
+                }
+                if !local_ivs.is_empty() {
+                    let entry = per_series.entry(labels).or_insert_with(|| MultiMeta {
+                        sources: SmallVec::new(),
+                        head_ivs: SmallVec::new(),
+                        block_ivs: SmallVec::new(),
+                        has_block_tombstone_overlap: false,
+                    });
+                    entry.sources.push((src_tag, r));
+                    entry.block_ivs.extend(local_ivs);
+                    if partial_tomb {
+                        entry.has_block_tombstone_overlap = true;
+                    }
+                }
+            }
+        }
+
+        let load_multi_chunks = |srcs: &[(u16, u64)]| -> Result<Vec<ChunkMeta>, QuerierError> {
+            let mut head_items: Vec<(ChunkMeta, Vec<Interval>)> = Vec::new();
+            let mut block_items: Vec<(ChunkMeta, Vec<Interval>)> = Vec::new();
+            for &(tag, r) in srcs {
+                if tag == 0 {
+                    if let Some(h) = head {
+                        if let Some((_, chks, tombs)) = h.series_chunks(r, mint, maxt)? {
+                            for c in chks {
+                                head_items.push((c, tombs.clone()));
+                            }
+                        }
+                    }
+                } else {
+                    let blk = &blocks[(tag - 1) as usize];
+                    let (_, chks) = blk.index().series(r)?;
+                    let chkr = blk.chunks();
+                    let tombs = blk.tombstones().get(r);
+                    for mut cm in chks {
+                        if !cm.overlaps_closed_interval(mint, maxt) {
+                            continue;
+                        }
+                        if tombs
+                            .iter()
+                            .any(|iv| iv.is_subrange(cm.min_time, cm.max_time))
+                        {
+                            continue;
+                        }
+                        cm.chunk = Some(chkr.chunk(cm.ref_id)?);
+                        block_items.push((cm, tombs.clone()));
+                    }
+                }
+            }
+            if unordered {
+                let mut combined = merge_or_collect(head_items, false)?;
+                let blk_chks = merge_or_collect(block_items, true)?;
+                combined.extend(blk_chks);
+                Ok(combined)
+            } else {
+                head_items.extend(block_items);
+                merge_or_collect(head_items, false)
+            }
+        };
+
+        let mut entries: Vec<LazySeriesEntry> = Vec::with_capacity(per_series.len());
+        for (labels, meta) in per_series {
+            let can_count_without_load = if meta.has_block_tombstone_overlap {
+                false
+            } else if unordered {
+                // `head_ivs` is already post-merge from `series_chunk_metas_no_bytes`;
+                // `blocks` in unordered mode concatenate without overlap merging.
+                true
+            } else {
+                let mut all_ivs: SmallVec<[(i64, i64); 8]> =
+                    SmallVec::with_capacity(meta.head_ivs.len() + meta.block_ivs.len());
+                all_ivs.extend_from_slice(&meta.head_ivs);
+                all_ivs.extend_from_slice(&meta.block_ivs);
+                if all_ivs.len() <= 1 {
+                    true
+                } else {
+                    all_ivs.sort_unstable();
+                    all_ivs.windows(2).all(|w| w[1].0 > w[0].1)
+                }
+            };
+
+            let chunk_count = if can_count_without_load {
+                (meta.head_ivs.len() + meta.block_ivs.len()) as u32
+            } else {
+                let chks = load_multi_chunks(&meta.sources)?;
+                chks.len() as u32
+            };
+            if chunk_count == 0 {
+                continue;
+            }
+            let source = match meta.sources.as_slice() {
+                [(0, r)] => LazyChunkSource::Head(*r),
+                [(tag, r)] => LazyChunkSource::Block {
+                    block_idx: *tag - 1,
+                    ref_id: *r,
+                },
+                many => LazyChunkSource::Multi(many.to_vec().into_boxed_slice()),
+            };
+            entries.push(LazySeriesEntry {
+                labels,
+                source,
+                chunk_count,
+            });
+        }
+
+        if sort_series && entries.len() > 1 {
+            entries.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+        }
+
+        for entry in entries.iter_mut() {
+            let labels = std::mem::take(&mut entry.labels);
+            if !on_event(LazyStreamEvent::Series(labels, entry.chunk_count))? {
+                return Ok(());
+            }
+        }
+        if !on_event(LazyStreamEvent::SeriesEnd)? {
+            return Ok(());
+        }
+
+        for (series_idx, entry) in entries.into_iter().enumerate() {
+            let chks = match entry.source {
+                LazyChunkSource::Head(r) => {
+                    let single = [(0u16, r)];
+                    load_multi_chunks(&single)?
+                }
+                LazyChunkSource::Block { block_idx, ref_id } => {
+                    let single = [(1u16 + block_idx, ref_id)];
+                    load_multi_chunks(&single)?
+                }
+                LazyChunkSource::Multi(srcs) => load_multi_chunks(&srcs)?,
+            };
+            if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     /// Queries encoded chunks for all series matching `matchers` in `[mint, maxt]`.
     /// When `unordered` is true, chunks from Head (in-order + OOO merged) and each Block are
     /// concatenated without cross-block compaction, matching Prometheus `UnorderedChunkQuerier`.
@@ -856,6 +1249,27 @@ impl<'a> TsdbChunkQuerier<'a> {
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
         self.inner.execute_prepared_select(prepared, sort_series)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_prepared_chunks_lazy<F>(
+        &self,
+        prepared: PreparedChunkSelect,
+        matchers: &[LabelMatcher],
+        sort_series: bool,
+        series_filter: Option<&dyn Fn(&Labels) -> bool>,
+        on_event: F,
+    ) -> Result<(), QuerierError>
+    where
+        F: FnMut(LazyStreamEvent) -> Result<bool, QuerierError>,
+    {
+        self.inner.stream_prepared_chunks_lazy(
+            prepared,
+            matchers,
+            sort_series,
+            series_filter,
+            on_event,
+        )
     }
 
     pub fn select(
