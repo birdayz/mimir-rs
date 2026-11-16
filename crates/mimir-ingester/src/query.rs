@@ -579,7 +579,7 @@ impl Ingester {
                 db.db.chunk_querier(start_ts, end_ts)
             };
             match cq
-                .select_adaptive(
+                .try_select_adaptive(
                     true,
                     &matchers,
                     INLINE_CHUNK_LOAD_SERIES_LIMIT,
@@ -588,16 +588,21 @@ impl Ingester {
                 .map_err(|e| IngesterError::Internal {
                     message: format!("selecting series from ChunkQuerier: {e}"),
                 })? {
-                Ok(mut inline_series) => {
+                Some(Ok(mut inline_series)) => {
                     if let Some((shard_idx, shard_count)) = shard {
                         inline_series
                             .retain(|cs| labels_stable_hash(&cs.labels) % shard_count == shard_idx);
                     }
                     inline_series
                 }
-                Err(prepared) => {
-                    // Large query (> INLINE_CHUNK_LOAD_SERIES_LIMIT): stream lazily in O(1) chunk
-                    // memory on a blocking worker using a bounded mpsc::channel(4).
+                maybe_prepared => {
+                    let prepared_opt = match maybe_prepared {
+                        Some(Err(p)) => Some(p),
+                        None => None,
+                        Some(Ok(_)) => unreachable!(),
+                    };
+                    // Large or lock-contended query: stream lazily in O(1) chunk memory on a
+                    // blocking worker using a bounded mpsc::channel(4).
                     let (tx, rx) = mpsc::channel(4);
                     let ingester = Arc::clone(self);
                     let db_c = Arc::clone(&db);
@@ -606,6 +611,20 @@ impl Ingester {
                             db_c.db.unordered_chunk_querier(start_ts, end_ts)
                         } else {
                             db_c.db.chunk_querier(start_ts, end_ts)
+                        };
+                        let prepared = match prepared_opt {
+                            Some(p) => p,
+                            None => match cq_b.prepare_select(&matchers) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    let err = IngesterError::Internal {
+                                        message: format!("selecting series from ChunkQuerier: {e}"),
+                                    };
+                                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                                    permit.finish(false);
+                                    return;
+                                }
+                            },
                         };
                         let shard_pred = shard.map(|(shard_idx, shard_count)| {
                             move |lbls: &Labels| labels_stable_hash(lbls) % shard_count == shard_idx
@@ -1426,12 +1445,20 @@ impl Ingester {
         let Some(db) = self.get_tsdb(user_id) else {
             return Ok(ingesterpb::LabelValuesResponse::default());
         };
-        let q = db.db.querier(req.start_timestamp_ms, req.end_timestamp_ms);
-        let mut vals = q
-            .label_values(&req.label_name, limit, &matchers)
-            .map_err(|e| IngesterError::Internal {
-                message: e.to_string(),
-            })?;
+        let label_name = req.label_name;
+        let start_ts = req.start_timestamp_ms;
+        let end_ts = req.end_timestamp_ms;
+        let mut vals = tokio::task::spawn_blocking(move || {
+            let q = db.db.querier(start_ts, end_ts);
+            q.label_values(&label_name, limit, &matchers)
+        })
+        .await
+        .map_err(|e| IngesterError::Internal {
+            message: format!("label_values task join error: {e}"),
+        })?
+        .map_err(|e| IngesterError::Internal {
+            message: e.to_string(),
+        })?;
         if let Some(lim) = limit {
             if vals.len() > lim {
                 vals.truncate(lim);
@@ -1472,8 +1499,17 @@ impl Ingester {
         let Some(db) = self.get_tsdb(user_id) else {
             return Ok(ingesterpb::LabelNamesResponse::default());
         };
-        let q = db.db.querier(req.start_timestamp_ms, req.end_timestamp_ms);
-        let mut names = q.label_names(&matchers).map_err(|e| IngesterError::Internal {
+        let start_ts = req.start_timestamp_ms;
+        let end_ts = req.end_timestamp_ms;
+        let mut names = tokio::task::spawn_blocking(move || {
+            let q = db.db.querier(start_ts, end_ts);
+            q.label_names(&matchers)
+        })
+        .await
+        .map_err(|e| IngesterError::Internal {
+            message: format!("label_names task join error: {e}"),
+        })?
+        .map_err(|e| IngesterError::Internal {
             message: e.to_string(),
         })?;
         if let Some(lim) = limit {
@@ -2046,12 +2082,19 @@ impl Ingester {
             let Some(db) = self.get_tsdb(user_id) else {
                 return Ok(Vec::new());
             };
-            let q = db.db.querier(req.start_timestamp_ms, req.end_timestamp_ms);
-            let results =
+            let start_ts = req.start_timestamp_ms;
+            let end_ts = req.end_timestamp_ms;
+            let results = tokio::task::spawn_blocking(move || {
+                let q = db.db.querier(start_ts, end_ts);
                 q.search_label_names(&hints, &matchers)
-                    .map_err(|e| IngesterError::Internal {
-                        message: e.to_string(),
-                    })?;
+            })
+            .await
+            .map_err(|e| IngesterError::Internal {
+                message: format!("search_label_names task join error: {e}"),
+            })?
+            .map_err(|e| IngesterError::Internal {
+                message: e.to_string(),
+            })?;
             let mut rs = VecSearchResultSet::new(results, Vec::new(), None);
             let mut batches = Vec::new();
             stream_search_results(
@@ -2084,12 +2127,20 @@ impl Ingester {
             let Some(db) = self.get_tsdb(user_id) else {
                 return Ok(Vec::new());
             };
-            let q = db.db.querier(req.start_timestamp_ms, req.end_timestamp_ms);
-            let results = q
-                .search_label_values(&req.name, &hints, &matchers)
-                .map_err(|e| IngesterError::Internal {
-                    message: e.to_string(),
-                })?;
+            let start_ts = req.start_timestamp_ms;
+            let end_ts = req.end_timestamp_ms;
+            let name = req.name;
+            let results = tokio::task::spawn_blocking(move || {
+                let q = db.db.querier(start_ts, end_ts);
+                q.search_label_values(&name, &hints, &matchers)
+            })
+            .await
+            .map_err(|e| IngesterError::Internal {
+                message: format!("search_label_values task join error: {e}"),
+            })?
+            .map_err(|e| IngesterError::Internal {
+                message: e.to_string(),
+            })?;
             let mut rs = VecSearchResultSet::new(results, Vec::new(), None);
             let mut batches = Vec::new();
             stream_search_results(

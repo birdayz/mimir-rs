@@ -303,6 +303,39 @@ impl<'a> TsdbQuerier<'a> {
         Ok(Err(prepared))
     }
 
+    /// Non-blocking variant of [`Self::select_chunks_adaptive`]: returns `Ok(None)` immediately
+    /// if `blocks_lock` is currently contended by a compaction writer, so async RPC threads never
+    /// block on `blocks_lock.read()`.
+    pub fn try_select_chunks_adaptive(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+        unordered: bool,
+        max_source_series: usize,
+        max_total_refs: usize,
+    ) -> Result<Option<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>>, QuerierError> {
+        let lock_guard = match self.blocks_lock {
+            Some(l) => match l.try_read() {
+                Some(g) => Some(g),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        let blocks = self.effective_blocks(&lock_guard);
+        let prepared = self.prepare_select_locked(blocks, matchers, unordered)?;
+        if prepared.is_empty() {
+            return Ok(Some(Ok(Vec::new())));
+        }
+        if prepared.max_source_series_len() <= max_source_series
+            && prepared.total_refs() <= max_total_refs
+        {
+            let series = self.execute_prepared_select_locked(prepared, sort_series)?;
+            return Ok(Some(Ok(series)));
+        }
+        drop(lock_guard);
+        Ok(Some(Err(prepared)))
+    }
+
     /// Materializes chunks for a [`PreparedChunkSelect`] while holding `blocks_lock.read()`,
     /// refreshing the selection if concurrent compaction updated `blocks`.
     pub fn execute_prepared_select_with_matchers(
@@ -1218,6 +1251,22 @@ impl<'a> TsdbChunkQuerier<'a> {
         max_total_refs: usize,
     ) -> Result<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>, QuerierError> {
         self.inner.select_chunks_adaptive(
+            sort_series,
+            matchers,
+            self.unordered,
+            max_source_series,
+            max_total_refs,
+        )
+    }
+
+    pub fn try_select_adaptive(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+        max_source_series: usize,
+        max_total_refs: usize,
+    ) -> Result<Option<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>>, QuerierError> {
+        self.inner.try_select_chunks_adaptive(
             sort_series,
             matchers,
             self.unordered,
