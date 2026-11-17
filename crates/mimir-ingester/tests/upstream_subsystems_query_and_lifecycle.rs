@@ -563,6 +563,12 @@ impl PostingsCursor for EmptyPostings {
     }
 }
 
+fn new_pool(workers: i64) -> Arc<ComputeWorkerPool> {
+    let pool = ComputeWorkerPool::new(workers, "test", None).unwrap();
+    pool.start().unwrap();
+    pool
+}
+
 // Upstream: pkg/ingester/label_names_and_values_test.go::TestCountLabelValueSeries_ContextCancellation
 #[test]
 fn test_count_label_value_series_context_cancellation() {
@@ -574,13 +580,14 @@ fn test_count_label_value_series_context_cancellation() {
 // Upstream: pkg/ingester/label_names_and_values_test.go::TestComputeLabelValuesSeriesCount_AbortsOnCancelledContext
 #[tokio::test]
 async fn test_compute_label_values_series_count_aborts_on_cancelled_context() {
-    let pool = ComputeWorkerPool::new(1);
+    let pool = new_pool(1);
     let lbl_values: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
     let fn_postings: PostingsForMatchersFn = Arc::new(|_| Ok(Box::new(InfinitePostings)));
 
     let mut rx = compute_label_values_series_count(
         Arc::new(|| true),
-        Arc::clone(&pool),
+        &pool,
+        "user-1",
         1,
         "lblName".into(),
         lbl_values,
@@ -594,19 +601,20 @@ async fn test_compute_label_values_series_count_aborts_on_cancelled_context() {
     }
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].err, Some(LabelNamesAndValuesError::Canceled));
-    pool.stop().await;
+    pool.stop();
 }
 
 // Upstream: pkg/ingester/label_names_and_values_test.go::TestComputeLabelValuesSeriesCount_PoolStopped
 #[tokio::test]
 async fn test_compute_label_values_series_count_pool_stopped() {
-    let pool = ComputeWorkerPool::new(1);
-    pool.stop().await;
+    let pool = new_pool(1);
+    pool.stop();
     let fn_postings: PostingsForMatchersFn = Arc::new(|_| Ok(Box::new(InfinitePostings)));
 
     let mut rx = compute_label_values_series_count(
         Arc::new(|| false),
-        pool,
+        &pool,
+        "user-1",
         2,
         "lblName".into(),
         vec!["a".into(), "b".into(), "c".into()],
@@ -625,7 +633,7 @@ async fn test_compute_label_values_series_count_pool_stopped() {
 // Upstream: pkg/ingester/label_names_and_values_test.go::TestComputeLabelValuesSeriesCount_MidStreamCancellationFreesPoolWorkers
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_compute_label_values_series_count_mid_stream_cancellation_frees_pool_workers() {
-    let pool = ComputeWorkerPool::new(1);
+    let pool = new_pool(1);
     let canceled = Arc::new(AtomicBool::new(false));
     let first_started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(AtomicBool::new(false));
@@ -653,7 +661,8 @@ async fn test_compute_label_values_series_count_mid_stream_cancellation_frees_po
     let cancel_flag = Arc::clone(&canceled);
     let mut rx = compute_label_values_series_count(
         Arc::new(move || cancel_flag.load(Ordering::Acquire)),
-        Arc::clone(&pool),
+        &pool,
+        "user-1",
         1,
         "lblName".into(),
         lbl_values,
@@ -671,7 +680,7 @@ async fn test_compute_label_values_series_count_mid_stream_cancellation_frees_po
 
     // Worker must still pick up another tenant's job
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    pool.submit(move || {
+    pool.submit("test", "user-2", move || {
         let _ = done_tx.send(());
     })
     .unwrap();
@@ -679,13 +688,13 @@ async fn test_compute_label_values_series_count_mid_stream_cancellation_frees_po
         .await
         .expect("pool worker freed")
         .unwrap();
-    pool.stop().await;
+    pool.stop();
 }
 
 // Upstream: pkg/ingester/label_names_and_values_test.go::TestComputeLabelValuesSeriesCount_ChunkBoundaries
 #[tokio::test]
 async fn test_compute_label_values_series_count_chunk_boundaries() {
-    let pool = ComputeWorkerPool::new(2);
+    let pool = new_pool(2);
     let chunk_size = 4usize;
 
     for num_values in [
@@ -700,7 +709,8 @@ async fn test_compute_label_values_series_count_chunk_boundaries() {
         let fn_postings: PostingsForMatchersFn = Arc::new(|_| Ok(Box::new(EmptyPostings)));
         let mut rx = compute_label_values_series_count(
             Arc::new(|| false),
-            Arc::clone(&pool),
+            &pool,
+            "user-1",
             chunk_size,
             "lblName".into(),
             lbl_values.clone(),
@@ -717,7 +727,7 @@ async fn test_compute_label_values_series_count_chunk_boundaries() {
             assert_eq!(seen.get(v).copied(), Some(1));
         }
     }
-    pool.stop().await;
+    pool.stop();
 }
 
 // ============================================================================

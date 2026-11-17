@@ -186,12 +186,7 @@ impl OwnedSeriesRingStrategy for OwnedSeriesPartitionRingStrategy {
 
     fn shard_size_for_user(&self, tenant: &str) -> usize {
         let l = self.overrides.for_tenant(tenant);
-        let write_ss = l.ingestion_partitions_tenant_write_shard_size;
-        if write_ss > 0 {
-            write_ss as usize
-        } else {
-            l.ingestion_partitions_tenant_shard_size.max(0) as usize
-        }
+        l.effective_ingestion_partitions_tenant_write_shard_size().max(0) as usize
     }
 
     fn token_ranges_for_user(&self, user_id: &str, shard_size: usize) -> Result<Vec<u32>, String> {

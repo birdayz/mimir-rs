@@ -1756,7 +1756,25 @@ fn test_ingester_reactive_limiter() {
     };
     let push_cfg = ReactiveLimiterConfig::default();
     let reg = Registry::new();
-    let rl = IngesterReactiveLimiter::new(&push_cfg, &read_cfg, Some(&reg)).unwrap();
+    let rl = IngesterReactiveLimiter::new(
+        &mimir_config::PrioritizerConfig::default(),
+        &push_cfg,
+        &read_cfg,
+        Some(&reg),
+    )
+    .unwrap();
+    assert!(rl.prioritizer.is_none());
+
+    // "newReactiveLimiter with Prioritizer": building a prioritized limiter works without panic.
+    let prioritizer = Arc::new(mimir_ingester::prioritizer::Prioritizer::new());
+    let prioritized = mimir_ingester::reactive_limiter::IngesterRl::new_with_priority(
+        &read_cfg,
+        mimir_ingester::prioritizer::Priority::High,
+        Arc::clone(&prioritizer),
+    )
+    .unwrap();
+    assert_eq!(prioritizer.registered_policies(), 1);
+    assert!(prioritized.can_acquire_permit());
     assert!(rl.push.is_none());
     assert!(rl.read.is_some());
 
