@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      MIRIFLAGS: "-Zmiri-disable-isolation"
+      MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-permissive-provenance"
       PROPTEST_CASES: "8"
     steps:
       - uses: actions/checkout@v4

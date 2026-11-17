@@ -517,14 +517,17 @@ impl PemSource {
                     .map_err(|e| (path.clone(), go_read_err(path, &e)))?;
                 let mtime = meta.modified().ok();
                 #[cfg(unix)]
-                let ino = {
+                let (ino, mtime_nsec, ctime, ctime_nsec) = {
                     use std::os::unix::fs::MetadataExt;
-                    meta.ino()
+                    (meta.ino(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())
                 };
                 #[cfg(not(unix))]
-                let ino = 0;
+                let (ino, mtime_nsec, ctime, ctime_nsec) = (0, 0, 0, 0);
                 Ok(SourceFingerprint::File(FileMeta {
                     mtime,
+                    mtime_nsec,
+                    ctime,
+                    ctime_nsec,
                     ino,
                     len: meta.len(),
                 }))
@@ -543,8 +546,22 @@ impl PemSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileMeta {
     mtime: Option<SystemTime>,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
     ino: u64,
     len: u64,
+}
+
+impl SourceFingerprint {
+    fn within_coarse_clock_window(&self, now: SystemTime) -> bool {
+        match self {
+            Self::Inline => false,
+            Self::File(meta) => meta
+                .mtime
+                .is_some_and(|mt| now.duration_since(mt).ok().is_some_and(|d| d < std::time::Duration::from_secs(2))),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -574,22 +591,28 @@ impl CertLoadError {
     }
 }
 
-fn load_certified_key(
+fn load_certified_key_with_hashes(
     cert_source: &PemSource,
     key_source: &PemSource,
     provider: &CryptoProvider,
-) -> Result<CertifiedKey, CertLoadError> {
+) -> Result<(CertifiedKey, (u64, u64)), CertLoadError> {
     let cert_pem = cert_source
         .read_bytes()
         .map_err(|(path, reason)| CertLoadError::ReadCert { path, reason })?;
     let key_pem = key_source
         .read_bytes()
         .map_err(|(path, reason)| CertLoadError::ReadKey { path, reason })?;
-    x509_key_pair(&cert_pem, &key_pem, provider).map_err(CertLoadError::KeyPair)
+    let hashes = (
+        xxhash_rust::xxh3::xxh3_64(&cert_pem),
+        xxhash_rust::xxh3::xxh3_64(&key_pem),
+    );
+    let ck = x509_key_pair(&cert_pem, &key_pem, provider).map_err(CertLoadError::KeyPair)?;
+    Ok((ck, hashes))
 }
 
 struct CachedCertState {
     fingerprint: (SourceFingerprint, SourceFingerprint),
+    content_hashes: (u64, u64),
     key: Arc<CertifiedKey>,
 }
 
@@ -648,7 +671,8 @@ impl CachedReloadingCert {
         let key_fp = key_source
             .fingerprint()
             .map_err(|(path, reason)| CertLoadError::ReadKey { path, reason })?;
-        let ck = load_certified_key(&cert_source, &key_source, &provider)?;
+        let (ck, content_hashes) =
+            load_certified_key_with_hashes(&cert_source, &key_source, &provider)?;
         Ok(Self {
             cert_source,
             key_source,
@@ -658,6 +682,7 @@ impl CachedReloadingCert {
             reload_lock: Mutex::new(()),
             state: RwLock::new(CachedCertState {
                 fingerprint: (cert_fp, key_fp),
+                content_hashes,
                 key: Arc::new(ck),
             }),
         })
@@ -716,18 +741,39 @@ impl CachedReloadingCert {
         };
         let next_fp = (cert_fp, key_fp);
 
-        {
+        let (cached_hashes, fp_matches) = {
             let guard = self.state.read();
             if guard.fingerprint == next_fp {
-                return Arc::clone(&guard.key);
+                let sys_now = SystemTime::now();
+                let in_coarse_window = next_fp.0.within_coarse_clock_window(sys_now)
+                    || next_fp.1.within_coarse_clock_window(sys_now);
+                if !in_coarse_window {
+                    return Arc::clone(&guard.key);
+                }
+                (guard.content_hashes, true)
+            } else {
+                (guard.content_hashes, false)
+            }
+        };
+
+        if fp_matches {
+            if let (Ok(cb), Ok(kb)) = (self.cert_source.read_bytes(), self.key_source.read_bytes()) {
+                let h = (
+                    xxhash_rust::xxh3::xxh3_64(&cb),
+                    xxhash_rust::xxh3::xxh3_64(&kb),
+                );
+                if h == cached_hashes {
+                    return Arc::clone(&self.state.read().key);
+                }
             }
         }
 
-        match load_certified_key(&self.cert_source, &self.key_source, &self.provider) {
-            Ok(ck) => {
+        match load_certified_key_with_hashes(&self.cert_source, &self.key_source, &self.provider) {
+            Ok((ck, content_hashes)) => {
                 let new_key = Arc::new(ck);
                 let mut guard = self.state.write();
                 guard.fingerprint = next_fp;
+                guard.content_hashes = content_hashes;
                 guard.key = Arc::clone(&new_key);
                 tracing::info!(
                     cert = %self.cert_source.display_name(),
@@ -1123,5 +1169,49 @@ mod tests {
             .resolve(&[], &[])
             .unwrap();
         assert_ne!(rotated.cert[0].as_ref(), initial_bytes.as_slice());
+    }
+
+    #[test]
+    fn cached_reloading_cert_detects_same_inode_overwrite_within_coarse_tick() {
+        use rustls::client::ResolvesClientCert;
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("ec.crt");
+        let key_path = dir.path().join("ec.key");
+
+        let cert1 = std::fs::read(fixture("client-ec.crt")).unwrap();
+        let key1 = std::fs::read(fixture("client-ec.key")).unwrap();
+        let cert2 = std::fs::read(fixture("server.crt")).unwrap();
+        let key2 = std::fs::read(fixture("server.key")).unwrap();
+
+        std::fs::write(&cert_path, &cert1).unwrap();
+        std::fs::write(&key_path, &key1).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let reloader = CachedReloadingCert::from_files(
+            cert_path.to_string_lossy().into_owned(),
+            key_path.to_string_lossy().into_owned(),
+            provider,
+        )
+        .unwrap();
+        let k1 = ResolvesClientCert::resolve(&reloader, &[], &[]).unwrap();
+        let k1_bytes = k1.cert[0].as_ref().to_vec();
+
+        // Overwrite in-place via O_TRUNC (preserving inode!) immediately after construction.
+        for (path, bytes) in [(&cert_path, &cert2), (&key_path, &key2)] {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .unwrap();
+            f.write_all(bytes).unwrap();
+            f.flush().unwrap();
+        }
+
+        std::thread::sleep(Duration::from_millis(230));
+        let k2 = ResolvesClientCert::resolve(&reloader, &[], &[]).unwrap();
+        assert_ne!(k2.cert[0].as_ref(), k1_bytes.as_slice());
     }
 }

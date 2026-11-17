@@ -1773,7 +1773,7 @@ impl SeriesState {
             .is_none_or(|c| c.chunk.num_samples() >= ooo_cap_max);
 
         if need_cut {
-            if let Some(old) = ooo.ooo_head_chunk.take() {
+            if let Some(ref old) = ooo.ooo_head_chunk {
                 if let Some(writer) = chunk_writer {
                     let cut_chunks = old.chunk.to_encoded_chunks(
                         i64::MIN,
@@ -1781,15 +1781,25 @@ impl SeriesState {
                         use_xor2,
                         use_histogram_st,
                     )?;
+                    let snap = writer.take_snapshot();
+                    let mut staged_refs: SmallVec<[ChunkDiskMapperRef; 4]> = SmallVec::new();
+                    let mut staged_pending: SmallVec<[(MmappedChunk, EncodedChunk); 4]> =
+                        SmallVec::new();
                     for cc in cut_chunks {
-                        let r = writer.write_chunk(
+                        let r = match writer.write_chunk(
                             ref_id,
                             cc.min_time,
                             cc.max_time,
                             &cc.chunk,
                             true,
-                        )?;
-                        mmap_refs.push(r);
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                writer.rollback_snapshot(snap);
+                                return Err(e);
+                            }
+                        };
+                        staged_refs.push(r);
                         let mc = MmappedChunk {
                             ref_id: r,
                             min_time: cc.min_time,
@@ -1797,8 +1807,10 @@ impl SeriesState {
                             num_samples: cc.chunk.num_samples() as u16,
                             encoding: cc.chunk.encoding(),
                         };
-                        ooo.ooo_pending_mmapped.push((mc, cc.chunk));
+                        staged_pending.push((mc, cc.chunk));
                     }
+                    ooo.ooo_pending_mmapped.extend(staged_pending);
+                    mmap_refs.extend(staged_refs);
                 }
             }
             ooo.ooo_head_chunk = Some(OooHeadChunk {
@@ -4852,6 +4864,11 @@ impl Head {
     }
 
     #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    #[inline]
     pub fn min_time(&self) -> i64 {
         self.min_time.load(Ordering::Acquire)
     }
@@ -5876,6 +5893,7 @@ impl Head {
         let mut count = 0usize;
         let mut max_mmapped_chunks = 0usize;
         let mut pending: Vec<(Arc<SeriesEntry>, Vec<MmappedChunk>)> = Vec::new();
+        let mut cw_start_epoch: Option<u64> = None;
         let mut entries = Vec::with_capacity(256);
         for stripe in &self.series.stripes {
             entries.clear();
@@ -5888,6 +5906,7 @@ impl Head {
                     let Some(ref mut writer) = *writer_guard else {
                         return Ok(count);
                     };
+                    cw_start_epoch.get_or_insert_with(|| writer.discard_epoch());
                     let mmapped = st.write_sealed_head_chunks(entry.ref_id, writer)?;
                     drop(writer_guard);
                     drop(st);
@@ -5904,6 +5923,11 @@ impl Head {
             {
                 let mut writer_guard = self.chunk_writer.lock();
                 if let Some(ref mut writer) = *writer_guard {
+                    if cw_start_epoch.is_some_and(|e| writer.discard_epoch() != e) {
+                        return Err(HeadChunksError::Io(io::Error::other(
+                            "unflushed head chunks discarded by prior flush error",
+                        )));
+                    }
                     writer.flush()?;
                 }
             }
@@ -6002,17 +6026,21 @@ impl Head {
             });
         }
         if !mmapped_refs.is_empty() {
+            if self.is_closed() {
+                return Err(HeadChunksError::Closed.into());
+            }
             let chunk_reader_guard = self.chunk_reader.read();
-            if let Some(r) = chunk_reader_guard.as_ref() {
-                for mc in mmapped_refs {
-                    let enc = r.chunk(mc.ref_id)?;
-                    out_chunks.push(ChunkMeta {
-                        ref_id: mc.ref_id.as_u64(),
-                        min_time: mc.min_time,
-                        max_time: mc.max_time,
-                        chunk: Some(enc),
-                    });
-                }
+            let Some(r) = chunk_reader_guard.as_ref() else {
+                return Err(HeadChunksError::Closed.into());
+            };
+            for mc in mmapped_refs {
+                let enc = r.chunk(mc.ref_id)?;
+                out_chunks.push(ChunkMeta {
+                    ref_id: mc.ref_id.as_u64(),
+                    min_time: mc.min_time,
+                    max_time: mc.max_time,
+                    chunk: Some(enc),
+                });
             }
         }
         if self.tombstones.has_any() {
@@ -6040,7 +6068,7 @@ impl Head {
                 // Lock order: entry.inner -> chunk_writer (matching commit()).
                 let mut st = entry.inner.lock();
                 if let Some(ref mut ooo) = st.ooo_mut() {
-                    if let Some(ohc) = ooo.ooo_head_chunk.take() {
+                    if let Some(ref ohc) = ooo.ooo_head_chunk {
                         let cut_chunks = ohc.chunk.to_encoded_chunks(
                             i64::MIN,
                             i64::MAX,
@@ -6050,14 +6078,25 @@ impl Head {
                         if !cut_chunks.is_empty() {
                             let mut writer_guard = self.chunk_writer.lock();
                             if let Some(ref mut writer) = *writer_guard {
+                                let snap = writer.take_snapshot();
+                                let mut staged_pending: SmallVec<[(MmappedChunk, EncodedChunk); 4]> =
+                                    SmallVec::new();
+                                let mut staged_markers: SmallVec<[RefMmapMarker; 4]> =
+                                    SmallVec::new();
                                 for cc in cut_chunks {
-                                    let r = writer.write_chunk(
+                                    let r = match writer.write_chunk(
                                         entry.ref_id,
                                         cc.min_time,
                                         cc.max_time,
                                         &cc.chunk,
                                         true,
-                                    )?;
+                                    ) {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            writer.rollback_snapshot(snap);
+                                            return Err(e.into());
+                                        }
+                                    };
                                     let mc = MmappedChunk {
                                         ref_id: r,
                                         min_time: cc.min_time,
@@ -6065,17 +6104,20 @@ impl Head {
                                         num_samples: cc.chunk.num_samples() as u16,
                                         encoding: cc.chunk.encoding(),
                                     };
-                                    ooo.ooo_pending_mmapped.push((mc, cc.chunk));
-                                    ooo_markers.push(RefMmapMarker {
+                                    staged_pending.push((mc, cc.chunk));
+                                    staged_markers.push(RefMmapMarker {
                                         ref_id: entry.ref_id,
                                         mmap_ref: r.as_u64(),
                                     });
-                                    mmapped_any = true;
                                 }
+                                ooo.ooo_head_chunk = None;
+                                ooo.ooo_pending_mmapped.extend(staged_pending);
+                                ooo_markers.extend(staged_markers);
+                                mmapped_any = true;
                                 pending_entries.push(Arc::clone(&entry));
-                            } else {
-                                ooo.ooo_head_chunk = Some(ohc);
                             }
+                        } else {
+                            ooo.ooo_head_chunk = None;
                         }
                     }
                 }
@@ -6200,17 +6242,21 @@ impl Head {
             }
         }
         if !mmapped_refs.is_empty() {
+            if self.is_closed() {
+                return Err(HeadChunksError::Closed.into());
+            }
             let chunk_reader_guard = self.chunk_reader.read();
-            if let Some(r) = chunk_reader_guard.as_ref() {
-                for (sort_ref, mc) in mmapped_refs {
-                    let enc = r.chunk(mc.ref_id)?;
-                    out_chunks.push(ChunkMeta {
-                        ref_id: sort_ref,
-                        min_time: mc.min_time,
-                        max_time: mc.max_time,
-                        chunk: Some(enc),
-                    });
-                }
+            let Some(r) = chunk_reader_guard.as_ref() else {
+                return Err(HeadChunksError::Closed.into());
+            };
+            for (sort_ref, mc) in mmapped_refs {
+                let enc = r.chunk(mc.ref_id)?;
+                out_chunks.push(ChunkMeta {
+                    ref_id: sort_ref,
+                    min_time: mc.min_time,
+                    max_time: mc.max_time,
+                    chunk: Some(enc),
+                });
             }
         }
         if self.tombstones.has_any() {
@@ -6314,8 +6360,14 @@ impl Head {
 
         for ex in extracted {
             let mut chks = Vec::with_capacity(ex.mmapped_refs.len() + ex.head_chks.len());
-            for mc in ex.mmapped_refs {
-                if let Some(r) = chunk_reader {
+            if !ex.mmapped_refs.is_empty() {
+                if self.is_closed() {
+                    return Err(HeadChunksError::Closed.into());
+                }
+                let Some(r) = chunk_reader else {
+                    return Err(HeadChunksError::Closed.into());
+                };
+                for mc in ex.mmapped_refs {
                     let enc = r.chunk(mc.ref_id)?;
                     chks.push(ChunkMeta {
                         ref_id: mc.ref_id.as_u64(),
@@ -6356,7 +6408,7 @@ impl Head {
             // Lock order: entry.inner -> chunk_writer (matching commit()).
             let mut st = entry.inner.lock();
             if let Some(ref mut ooo) = st.ooo_mut() {
-                if let Some(ohc) = ooo.ooo_head_chunk.take() {
+                if let Some(ref ohc) = ooo.ooo_head_chunk {
                     let cut_chunks = ohc.chunk.to_encoded_chunks(
                         i64::MIN,
                         i64::MAX,
@@ -6366,14 +6418,24 @@ impl Head {
                     if !cut_chunks.is_empty() {
                         let mut writer_guard = self.chunk_writer.lock();
                         if let Some(ref mut writer) = *writer_guard {
+                            let snap = writer.take_snapshot();
+                            let mut staged_pending: SmallVec<[(MmappedChunk, EncodedChunk); 4]> =
+                                SmallVec::new();
+                            let mut staged_markers: SmallVec<[RefMmapMarker; 4]> = SmallVec::new();
                             for cc in cut_chunks {
-                                let r = writer.write_chunk(
+                                let r = match writer.write_chunk(
                                     entry.ref_id,
                                     cc.min_time,
                                     cc.max_time,
                                     &cc.chunk,
                                     true,
-                                )?;
+                                ) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        writer.rollback_snapshot(snap);
+                                        return Err(e.into());
+                                    }
+                                };
                                 let mc = MmappedChunk {
                                     ref_id: r,
                                     min_time: cc.min_time,
@@ -6381,17 +6443,20 @@ impl Head {
                                     num_samples: cc.chunk.num_samples() as u16,
                                     encoding: cc.chunk.encoding(),
                                 };
-                                ooo.ooo_pending_mmapped.push((mc, cc.chunk));
-                                ooo_markers.push(RefMmapMarker {
+                                staged_pending.push((mc, cc.chunk));
+                                staged_markers.push(RefMmapMarker {
                                     ref_id: entry.ref_id,
                                     mmap_ref: r.as_u64(),
                                 });
-                                mmapped_any = true;
                             }
+                            ooo.ooo_head_chunk = None;
+                            ooo.ooo_pending_mmapped.extend(staged_pending);
+                            ooo_markers.extend(staged_markers);
+                            mmapped_any = true;
                             pending_entries.push(Arc::clone(entry));
-                        } else {
-                            ooo.ooo_head_chunk = Some(ohc);
                         }
+                    } else {
+                        ooo.ooo_head_chunk = None;
                     }
                 }
             }
@@ -6495,8 +6560,14 @@ impl Head {
         let mut out = Vec::with_capacity(extracted.len());
         for ex in extracted {
             let mut chks = Vec::with_capacity(ex.mmapped_refs.len() + ex.inline_chks.len());
-            for mc in ex.mmapped_refs {
-                if let Some(r) = chunk_reader {
+            if !ex.mmapped_refs.is_empty() {
+                if self.is_closed() {
+                    return Err(HeadChunksError::Closed.into());
+                }
+                let Some(r) = chunk_reader else {
+                    return Err(HeadChunksError::Closed.into());
+                };
+                for mc in ex.mmapped_refs {
                     let enc = r.chunk(mc.ref_id)?;
                     mint = mint.min(mc.min_time);
                     maxt = maxt.max(mc.max_time);
@@ -6757,8 +6828,14 @@ impl Head {
         let mut out = Vec::with_capacity(extracted.len());
         for ex in extracted {
             let mut chks = Vec::with_capacity(ex.mmapped_refs.len() + ex.head_chks.len());
-            for mc in ex.mmapped_refs {
-                if let Some(r) = chunk_reader {
+            if !ex.mmapped_refs.is_empty() {
+                if self.is_closed() {
+                    return Err(HeadChunksError::Closed.into());
+                }
+                let Some(r) = chunk_reader else {
+                    return Err(HeadChunksError::Closed.into());
+                };
+                for mc in ex.mmapped_refs {
                     let enc = r.chunk(mc.ref_id)?;
                     mint = mint.min(mc.min_time);
                     maxt = maxt.max(mc.max_time);
@@ -7348,6 +7425,9 @@ impl Head {
         const OOO_HEAD_CHUNK_REF_BIT: u64 = 1u64 << 31;
 
         'retry: loop {
+            if self.is_closed() {
+                return Err(HeadChunksError::Closed.into());
+            }
             let (mmapped_in_order, head_chks, mmapped_ooo, ooo_head_chks) = {
                 let st = entry.inner.lock();
                 if entry.is_gced() {
@@ -7441,61 +7521,68 @@ impl Head {
             // If truncate_memory/truncate_ooo concurrently removed a chunk and unlinked its chunks_head
             // file in the gap, drop chunk_reader first and re-check entry.inner before failing.
             let chunk_reader_guard = self.chunk_reader.read();
-            let chunk_reader = chunk_reader_guard.as_ref();
+            let Some(r) = chunk_reader_guard.as_ref() else {
+                return Err(HeadChunksError::Closed.into());
+            };
+            if self.is_closed() {
+                return Err(HeadChunksError::Closed.into());
+            }
 
             let mut chks = Vec::with_capacity(
                 mmapped_in_order.len() + head_chks.len() + mmapped_ooo.len() + ooo_head_chks.len(),
             );
             for (sort_ref, mc) in mmapped_in_order {
-                if let Some(r) = chunk_reader {
-                    match r.chunk(mc.ref_id) {
-                        Ok(enc) => chks.push(ChunkMeta {
-                            ref_id: sort_ref,
-                            min_time: mc.min_time,
-                            max_time: mc.max_time,
-                            chunk: Some(enc),
-                        }),
-                        Err(e) if !r.has_file(mc.ref_id.unpack().0 as usize) => {
-                            drop(chunk_reader_guard);
-                            let st = entry.inner.lock();
-                            if entry.is_gced() {
-                                return Ok(None);
-                            }
-                            if st.mmapped().iter().any(|m| m.ref_id == mc.ref_id) {
-                                return Err(e.into());
-                            }
-                            continue 'retry;
+                match r.chunk(mc.ref_id) {
+                    Ok(enc) => chks.push(ChunkMeta {
+                        ref_id: sort_ref,
+                        min_time: mc.min_time,
+                        max_time: mc.max_time,
+                        chunk: Some(enc),
+                    }),
+                    Err(e) if !r.has_file(mc.ref_id.unpack().0 as usize) => {
+                        drop(chunk_reader_guard);
+                        if self.is_closed() {
+                            return Err(HeadChunksError::Closed.into());
                         }
-                        Err(e) => return Err(e.into()),
+                        let st = entry.inner.lock();
+                        if entry.is_gced() {
+                            return Ok(None);
+                        }
+                        if st.mmapped().iter().any(|m| m.ref_id == mc.ref_id) {
+                            return Err(e.into());
+                        }
+                        continue 'retry;
                     }
+                    Err(e) => return Err(e.into()),
                 }
             }
             chks.extend(head_chks);
             for (sort_ref, mc) in mmapped_ooo {
-                if let Some(r) = chunk_reader {
-                    match r.chunk(mc.ref_id) {
-                        Ok(enc) => chks.push(ChunkMeta {
-                            ref_id: sort_ref,
-                            min_time: mc.min_time,
-                            max_time: mc.max_time,
-                            chunk: Some(enc),
-                        }),
-                        Err(e) if !r.has_file(mc.ref_id.unpack().0 as usize) => {
-                            drop(chunk_reader_guard);
-                            let st = entry.inner.lock();
-                            if entry.is_gced() {
-                                return Ok(None);
-                            }
-                            let still_present = st.ooo().is_some_and(|o| {
-                                o.ooo_mmapped_chunks.iter().any(|m| m.ref_id == mc.ref_id)
-                            });
-                            if still_present {
-                                return Err(e.into());
-                            }
-                            continue 'retry;
+                match r.chunk(mc.ref_id) {
+                    Ok(enc) => chks.push(ChunkMeta {
+                        ref_id: sort_ref,
+                        min_time: mc.min_time,
+                        max_time: mc.max_time,
+                        chunk: Some(enc),
+                    }),
+                    Err(e) if !r.has_file(mc.ref_id.unpack().0 as usize) => {
+                        drop(chunk_reader_guard);
+                        if self.is_closed() {
+                            return Err(HeadChunksError::Closed.into());
                         }
-                        Err(e) => return Err(e.into()),
+                        let st = entry.inner.lock();
+                        if entry.is_gced() {
+                            return Ok(None);
+                        }
+                        let still_present = st.ooo().is_some_and(|o| {
+                            o.ooo_mmapped_chunks.iter().any(|m| m.ref_id == mc.ref_id)
+                        });
+                        if still_present {
+                            return Err(e.into());
+                        }
+                        continue 'retry;
                     }
+                    Err(e) => return Err(e.into()),
                 }
             }
             chks.extend(ooo_head_chks);
@@ -7557,6 +7644,9 @@ impl Head {
         maxt: i64,
         filter: Option<&dyn Fn(&Labels) -> bool>,
     ) -> Result<Option<(Labels, u32)>, HeadError> {
+        if self.is_closed() {
+            return Err(HeadChunksError::Closed.into());
+        }
         let Some(entry) = self.series.get_by_id(ref_id) else {
             // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
             self.metrics.series_not_found.inc();
@@ -7636,6 +7726,9 @@ impl Head {
         maxt: i64,
         filter: Option<&dyn Fn(&Labels) -> bool>,
     ) -> Result<SeriesChunkMetasNoBytes, HeadError> {
+        if self.is_closed() {
+            return Err(HeadChunksError::Closed.into());
+        }
         let Some(entry) = self.series.get_by_id(ref_id) else {
             // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
             self.metrics.series_not_found.inc();
@@ -9466,6 +9559,7 @@ impl<'a> HeadAppender<'a> {
         let mut ooo_mmap_markers: HashMap<u64, Vec<ChunkDiskMapperRef>> = HashMap::new();
         let mut ooo_records: Vec<Vec<u8>> = Vec::new();
         let mut pending_ooo_promote: Vec<Arc<SeriesEntry>> = Vec::new();
+        let mut cw_start_epoch: Option<u64> = None;
 
         let flush_ooo_records = |wbl_samples: &mut Vec<RefSample>,
                                  wbl_histograms: &mut Vec<RefHistogramSample>,
@@ -9601,6 +9695,9 @@ impl<'a> HeadAppender<'a> {
                                 if !is_dup {
                                     if is_ooo {
                                         let mut cw_guard = self.head.chunk_writer.lock();
+                                        if let Some(ref cw) = *cw_guard {
+                                            cw_start_epoch.get_or_insert_with(|| cw.discard_epoch());
+                                        }
                                         let (ok, chunk_created, mmap_refs) = state.insert_ooo(
                                             pf.entry.ref_id,
                                             pf.st,
@@ -9692,6 +9789,9 @@ impl<'a> HeadAppender<'a> {
                                 if !is_dup {
                                     if is_ooo {
                                         let mut cw_guard = self.head.chunk_writer.lock();
+                                        if let Some(ref cw) = *cw_guard {
+                                            cw_start_epoch.get_or_insert_with(|| cw.discard_epoch());
+                                        }
                                         let (ok, chunk_created, mmap_refs) = state.insert_ooo(
                                             pf.entry.ref_id,
                                             pf.st,
@@ -9795,6 +9895,9 @@ impl<'a> HeadAppender<'a> {
                 }
                 if is_ooo {
                     let mut cw_guard = self.head.chunk_writer.lock();
+                    if let Some(ref cw) = *cw_guard {
+                        cw_start_epoch.get_or_insert_with(|| cw.discard_epoch());
+                    }
                     let (ok, chunk_created, mmap_refs) = state.insert_ooo(
                         pf.entry.ref_id,
                         pf.st,
@@ -9890,6 +9993,9 @@ impl<'a> HeadAppender<'a> {
                 }
                 if is_ooo {
                     let mut cw_guard = self.head.chunk_writer.lock();
+                    if let Some(ref cw) = *cw_guard {
+                        cw_start_epoch.get_or_insert_with(|| cw.discard_epoch());
+                    }
                     let (ok, chunk_created, mmap_refs) = state.insert_ooo(
                         ph.entry.ref_id,
                         ph.st,
@@ -9978,6 +10084,9 @@ impl<'a> HeadAppender<'a> {
                 }
                 if is_ooo {
                     let mut cw_guard = self.head.chunk_writer.lock();
+                    if let Some(ref cw) = *cw_guard {
+                        cw_start_epoch.get_or_insert_with(|| cw.discard_epoch());
+                    }
                     let (ok, chunk_created, mmap_refs) = state.insert_ooo(
                         pfh.entry.ref_id,
                         pfh.st,
@@ -10057,27 +10166,21 @@ impl<'a> HeadAppender<'a> {
         self.float_histograms.clear();
         self.fhists_committed = 0;
 
-        // Flush chunk_writer and refresh chunk_reader BEFORE exposing any OOO MmappedChunk.
-        if !pending_ooo_promote.is_empty() {
-            if let Some(ref mut cw) = *self.head.chunk_writer.lock() {
-                cw.flush()?;
-            }
-            self.head.refresh_chunk_reader()?;
-            for entry in pending_ooo_promote {
-                let mut st = entry.inner.lock();
-                if let Some(ref mut ooo) = st.ooo_mut() {
-                    for (mc, _) in ooo.ooo_pending_mmapped.drain(..) {
-                        ooo.ooo_mmapped_chunks.push(mc);
-                    }
-                }
-            }
-        }
-
         if in_order_mint <= in_order_maxt {
             self.head.update_min_max_time(in_order_mint, in_order_maxt);
         }
-        if ooo_mint <= ooo_maxt {
-            self.head.update_min_ooo_max_ooo_time(ooo_mint, ooo_maxt);
+
+        // Flush chunk_writer and log WBL BEFORE exposing any OOO MmappedChunk or OOO bounds.
+        if !pending_ooo_promote.is_empty() {
+            if let Some(ref mut cw) = *self.head.chunk_writer.lock() {
+                if cw_start_epoch.is_some_and(|e| cw.discard_epoch() != e) {
+                    return Err(HeadChunksError::Io(io::Error::other(
+                        "unflushed OOO head chunks discarded by prior flush error",
+                    ))
+                    .into());
+                }
+                cw.flush()?;
+            }
         }
 
         // 3. Log OOO records to WBL if any (samples before their corresponding MmapMarkers).
@@ -10095,6 +10198,21 @@ impl<'a> HeadAppender<'a> {
                     wbl.log(&slices)?;
                 }
             }
+        }
+
+        if !pending_ooo_promote.is_empty() {
+            self.head.refresh_chunk_reader()?;
+            for entry in pending_ooo_promote {
+                let mut st = entry.inner.lock();
+                if let Some(ref mut ooo) = st.ooo_mut() {
+                    for (mc, _) in ooo.ooo_pending_mmapped.drain(..) {
+                        ooo.ooo_mmapped_chunks.push(mc);
+                    }
+                }
+            }
+        }
+        if ooo_mint <= ooo_maxt {
+            self.head.update_min_ooo_max_ooo_time(ooo_mint, ooo_maxt);
         }
 
         Ok(())
@@ -10190,11 +10308,13 @@ impl<'a> HeadAppender<'a> {
             return Ok(());
         }
 
-        let mut recs: Vec<Vec<u8>> = Vec::new();
+        let series_rec = if !self.series_refs.is_empty() {
+            Some(enc.series(&self.series_refs, Vec::new()))
+        } else {
+            None
+        };
 
-        if !self.series_refs.is_empty() {
-            recs.push(enc.series(&self.series_refs, Vec::new()));
-        }
+        let mut recs: Vec<Vec<u8>> = Vec::new();
         if !self.metadata.is_empty() {
             let metas: Vec<RefMetadata> = self
                 .metadata
@@ -10292,23 +10412,41 @@ impl<'a> HeadAppender<'a> {
             recs.push(enc.exemplars(&exs, Vec::new()));
         }
 
-        if !recs.is_empty() {
-            let mut prepared: Vec<(Vec<u8>, bool)> = Vec::with_capacity(recs.len());
-            for r in recs {
+        let prepared_series = match series_rec {
+            Some(r) => {
                 let mut comp_buf = Vec::new();
                 if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
-                    prepared.push((comp_buf, true));
+                    Some((comp_buf, true))
                 } else {
-                    prepared.push((r, false));
+                    Some((r, false))
                 }
             }
-            let slices: Vec<(&[u8], bool)> = prepared
-                .iter()
-                .map(|(b, c)| (b.as_slice(), *c))
-                .collect();
+            None => None,
+        };
+
+        let mut prepared: Vec<(Vec<u8>, bool)> = Vec::with_capacity(recs.len());
+        for r in recs {
+            let mut comp_buf = Vec::new();
+            if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
+                prepared.push((comp_buf, true));
+            } else {
+                prepared.push((r, false));
+            }
+        }
+
+        if prepared_series.is_some() || !prepared.is_empty() {
             let mut wal_guard = self.head.wal.lock();
             if let Some(ref mut wal) = *wal_guard {
-                wal.log_precompressed(&slices)?;
+                if let Some((ref b, c)) = prepared_series {
+                    wal.log_precompressed(&[(b.as_slice(), c)])?;
+                }
+                if !prepared.is_empty() {
+                    let slices: Vec<(&[u8], bool)> = prepared
+                        .iter()
+                        .map(|(b, c)| (b.as_slice(), *c))
+                        .collect();
+                    wal.log_precompressed(&slices)?;
+                }
             }
         }
         Ok(())
@@ -12063,6 +12201,177 @@ mod tests {
             bytes_after < 16_384,
             "expected symbol arena bytes shrink: {bytes_before} -> {bytes_after}"
         );
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn p0_1_ooo_write_chunk_enospc_preserves_ooo_head_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 100_000,
+            ooo_cap_max: 4,
+            head_chunks_write_buffer_size: 16,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let pairs = [("__name__", "ooo_enospc_metric"), ("job", "api")];
+
+        // Establish in-order high-water mark so subsequent earlier timestamps go to OOO.
+        {
+            let mut app = head.appender();
+            app.append_float(None, &pairs, 100_000, 999.0).unwrap();
+            app.commit().unwrap();
+        }
+        // Fill OOO head chunk to ooo_cap_max (4 samples).
+        {
+            let mut app = head.appender();
+            for i in 1..=4i64 {
+                app.append_float(None, &pairs, i * 1_000, i as f64).unwrap();
+            }
+            app.commit().unwrap();
+        }
+
+        let entry = head.get_entry_by_sorted_pairs(&pairs).unwrap();
+        // Inject ENOSPC on HeadChunksWriter so cutting the 4-sample OOO head chunk fails.
+        {
+            let mut cw = head.chunk_writer.lock();
+            cw.as_mut().unwrap().set_write_fault_hook(Some(Arc::new(|_len| {
+                crate::head_chunks::WriteFaultAction::Error(io::ErrorKind::StorageFull)
+            })));
+        }
+        {
+            let mut app = head.appender();
+            app.append_float(None, &pairs, 5_000, 5.0).unwrap();
+            assert!(app.commit().is_err(), "commit must fail on OOO write_chunk ENOSPC");
+        }
+        // Clear fault hook and verify all 4 prior OOO samples are still preserved in ooo_head_chunk!
+        {
+            let mut cw = head.chunk_writer.lock();
+            cw.as_mut().unwrap().set_write_fault_hook(None);
+        }
+        {
+            let st = entry.inner.lock();
+            let ooo = st.ooo().expect("ooo state must still exist");
+            assert_eq!(
+                ooo.ooo_head_chunk.as_ref().map(|c| c.chunk.num_samples()),
+                Some(4),
+                "ooo_head_chunk must not be dropped when write_chunk fails with ENOSPC"
+            );
+        }
+        // Retry 5th sample after disk space recovers: all 5 OOO samples + 1 in-order must read back.
+        {
+            let mut app = head.appender();
+            app.append_float(None, &pairs, 5_000, 5.0).unwrap();
+            app.commit().unwrap();
+        }
+        let (_, chks) = head
+            .series_final_chunks(entry.ref_id, i64::MIN, i64::MAX)
+            .unwrap()
+            .unwrap();
+        let mut got: Vec<(i64, f64)> = chks
+            .into_iter()
+            .flat_map(|c| decode_chunk_samples(c.chunk.as_ref().unwrap()).unwrap())
+            .map(|s| match s.value {
+                SampleValue::Float(v) => (s.t, v),
+                _ => panic!("expected float"),
+            })
+            .collect();
+        got.sort_by_key(|x| x.0);
+        assert_eq!(
+            got,
+            vec![
+                (1_000, 1.0),
+                (2_000, 2.0),
+                (3_000, 3.0),
+                (4_000, 4.0),
+                (5_000, 5.0),
+                (100_000, 999.0),
+            ]
+        );
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn p0_2_closed_head_returns_closed_error_instead_of_skipping_mmapped_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            chunk_range_ms: 10_000,
+            samples_per_chunk: 4,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let pairs = [("__name__", "closed_read_metric"), ("job", "api")];
+        let mut r = None;
+        for i in 0..10i64 {
+            let mut app = head.appender();
+            let id = app.append_float(r, &pairs, 1_000 + i * 100, i as f64).unwrap();
+            r = Some(id);
+            app.commit().unwrap();
+        }
+        let ref_id = r.unwrap();
+        assert!(head.mmap_head_chunks().unwrap() >= 2);
+
+        head.close().unwrap();
+        let err = head.series_chunks(ref_id, i64::MIN, i64::MAX).unwrap_err();
+        assert!(matches!(err, HeadError::HeadChunks(HeadChunksError::Closed)), "got {err:?}");
+        let err2 = head.series_lazy_chunk_count(ref_id, i64::MIN, i64::MAX, None).unwrap_err();
+        assert!(matches!(err2, HeadError::HeadChunks(HeadChunksError::Closed)), "got {err2:?}");
+    }
+
+    #[test]
+    fn p1_3_mmap_head_chunks_flush_enospc_leaves_extra_chunks_intact_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            chunk_range_ms: 10_000,
+            samples_per_chunk: 4,
+            head_chunks_write_buffer_size: 1024 * 1024,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let pairs = [("__name__", "mmap_retry_metric"), ("job", "api")];
+        let mut r = None;
+        for i in 0..10i64 {
+            let mut app = head.appender();
+            let id = app.append_float(r, &pairs, 1_000 + i * 100, i as f64).unwrap();
+            r = Some(id);
+            app.commit().unwrap();
+        }
+        let ref_id = r.unwrap();
+
+        // Allow cut_new_file header write (8 bytes), fail flush_write_buf (> 8 bytes) with ENOSPC.
+        {
+            let mut cw = head.chunk_writer.lock();
+            cw.as_mut().unwrap().set_write_fault_hook(Some(Arc::new(|len| {
+                if len > crate::head_chunks::HEAD_CHUNK_FILE_HEADER_SIZE {
+                    crate::head_chunks::WriteFaultAction::Error(io::ErrorKind::StorageFull)
+                } else {
+                    crate::head_chunks::WriteFaultAction::PassThrough
+                }
+            })));
+        }
+        assert!(head.mmap_head_chunks().is_err());
+
+        // Sealed extra_head_chunks must remain intact in RAM, and write_buf must be discarded.
+        {
+            let entry = head.series.get_by_id(ref_id).unwrap();
+            let st = entry.inner.lock();
+            assert!(st.mmapped().is_empty());
+            assert!(st.head_chunks_len() >= 2);
+        }
+
+        // Clear fault hook and retry mmap_head_chunks: must write each sealed chunk exactly once.
+        {
+            let mut cw = head.chunk_writer.lock();
+            cw.as_mut().unwrap().set_write_fault_hook(None);
+        }
+        let mmapped_count = head.mmap_head_chunks().unwrap();
+        assert!(mmapped_count >= 2);
+
+        let chunks_dir = dir.path().join("chunks_head");
+        let reader = crate::head_chunks::HeadChunksReader::open(&chunks_dir).unwrap();
+        let mut on_disk = 0usize;
+        reader.iterate_all_chunks(|_| { on_disk += 1; Ok(()) }).unwrap();
+        assert_eq!(on_disk, mmapped_count, "no duplicate chunks may be written on retry");
         head.close().unwrap();
     }
 }

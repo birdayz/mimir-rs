@@ -179,8 +179,18 @@ pub struct HeadChunksWriter {
     write_buf: Vec<u8>,
     record_buf: Vec<u8>,
     cut_on_next_chunk: bool,
+    discard_epoch: u64,
     closed: bool,
     fault_hook: Option<WriteFaultHook>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeadChunksSnapshot {
+    seq: usize,
+    offset: usize,
+    file_offset: usize,
+    write_buf_len: usize,
+    cut_on_next_chunk: bool,
 }
 
 impl HeadChunksWriter {
@@ -220,9 +230,53 @@ impl HeadChunksWriter {
             write_buf: Vec::new(),
             record_buf: Vec::new(),
             cut_on_next_chunk: false,
+            discard_epoch: 0,
             closed: false,
             fault_hook: None,
         })
+    }
+
+    #[inline]
+    pub(crate) fn discard_epoch(&self) -> u64 {
+        self.discard_epoch
+    }
+
+    pub(crate) fn take_snapshot(&self) -> HeadChunksSnapshot {
+        HeadChunksSnapshot {
+            seq: self.seq,
+            offset: self.offset,
+            file_offset: self.file_offset,
+            write_buf_len: self.write_buf.len(),
+            cut_on_next_chunk: self.cut_on_next_chunk,
+        }
+    }
+
+    pub(crate) fn rollback_snapshot(&mut self, snap: HeadChunksSnapshot) {
+        if self.seq > snap.seq {
+            self.cur_file = None;
+            for s in (snap.seq + 1)..=self.seq {
+                let _ = fs::remove_file(head_chunk_file_path(&self.dir, s));
+            }
+            self.seq = snap.seq;
+            self.file_offset = 0;
+            self.offset = 0;
+            self.write_buf.clear();
+        } else if self.file_offset == snap.file_offset {
+            self.write_buf.truncate(snap.write_buf_len);
+            self.offset = snap.offset;
+        } else if self.file_offset >= snap.offset {
+            if let Some(ref mut file) = self.cur_file {
+                let _ = file.set_len(snap.offset as u64);
+                let _ = file.seek(SeekFrom::Start(snap.offset as u64));
+            }
+            self.file_offset = snap.offset;
+            self.offset = snap.offset;
+            self.write_buf.clear();
+        } else {
+            self.write_buf.clear();
+            self.offset = self.file_offset;
+        }
+        self.cut_on_next_chunk = snap.cut_on_next_chunk;
     }
 
     /// Installs or clears a write fault-injection hook (used by durability tests).
@@ -284,6 +338,9 @@ impl HeadChunksWriter {
         if let Err(e) = Self::write_all_with_hook(file, self.fault_hook.as_ref(), &self.write_buf) {
             let _ = file.set_len(saved_pos);
             let _ = file.seek(SeekFrom::Start(saved_pos));
+            self.offset = self.file_offset;
+            self.write_buf.clear();
+            self.discard_epoch = self.discard_epoch.wrapping_add(1);
             return Err(HeadChunksError::Io(e));
         }
         self.file_offset += self.write_buf.len();

@@ -431,6 +431,18 @@ pub trait QueryStreamSink: Send + Sync {
 }
 
 impl Ingester {
+    fn get_open_tsdb_for_query(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Arc<crate::user_tsdb::UserTsdb>>, IngesterError> {
+        let Some(db) = self.get_tsdb(user_id) else {
+            return Ok(None);
+        };
+        if db.state() == crate::user_tsdb::TsdbState::Closed || db.db.is_closed() {
+            return Err(IngesterError::tsdb_not_active());
+        }
+        Ok(Some(db))
+    }
     pub fn check_read_overloaded(&self) -> Result<(), IngesterError> {
         let limiter_opt = self.utilization_based_limiter.read().clone();
         if let Some(limiter) = limiter_opt {
@@ -605,9 +617,16 @@ impl Ingester {
             return Err(e);
         }
 
-        let Some(db) = self.get_tsdb(user_id) else {
-            permit.finish(false);
-            return Ok(Box::pin(tokio_stream::empty()));
+        let db = match self.get_open_tsdb_for_query(user_id) {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                permit.finish(false);
+                return Ok(Box::pin(tokio_stream::empty()));
+            }
+            Err(e) => {
+                permit.finish(e.is_deadline_exceeded());
+                return Err(e);
+            }
         };
 
         let start_ts = req.start_timestamp_ms;
@@ -995,9 +1014,16 @@ impl Ingester {
             return Err(e);
         }
 
-        let Some(db) = self.get_tsdb(user_id) else {
-            permit.finish(false);
-            return Ok(Box::pin(tokio_stream::empty()));
+        let db = match self.get_open_tsdb_for_query(user_id) {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                permit.finish(false);
+                return Ok(Box::pin(tokio_stream::empty()));
+            }
+            Err(e) => {
+                permit.finish(e.is_deadline_exceeded());
+                return Err(e);
+            }
         };
 
         let start_ts = req.start_timestamp_ms;
@@ -1428,10 +1454,17 @@ impl Ingester {
             return Err(e);
         }
 
-        let Some(db) = self.get_tsdb(user_id) else {
-            permit.finish(false);
-            let (_tx, rx) = mpsc::channel(1);
-            return Ok(ReceiverStream::new(rx));
+        let db = match self.get_open_tsdb_for_query(user_id) {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                permit.finish(false);
+                let (_tx, rx) = mpsc::channel(1);
+                return Ok(ReceiverStream::new(rx));
+            }
+            Err(e) => {
+                permit.finish(e.is_deadline_exceeded());
+                return Err(e);
+            }
         };
 
         let (tx, rx) = mpsc::channel(8);
@@ -1800,7 +1833,7 @@ impl Ingester {
         self.metrics.queries.inc();
         self.enforce_read_consistency(md, user_id).await?;
 
-        let Some(db) = self.get_tsdb(user_id) else {
+        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
             return Ok(Vec::new());
         };
 
@@ -1981,7 +2014,7 @@ impl Ingester {
         self.metrics.queries.inc();
         self.enforce_read_consistency(md, user_id).await?;
 
-        let Some(db) = self.get_tsdb(user_id) else {
+        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
             return Ok(ingesterpb::ExemplarQueryResponse::default());
         };
 
@@ -2045,7 +2078,7 @@ impl Ingester {
         };
         self.enforce_read_consistency(md, user_id).await?;
 
-        let Some(db) = self.get_tsdb(user_id) else {
+        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
             return Ok(ingesterpb::LabelValuesResponse::default());
         };
         let label_name = req.label_name;
@@ -2099,7 +2132,7 @@ impl Ingester {
         };
         self.enforce_read_consistency(md, user_id).await?;
 
-        let Some(db) = self.get_tsdb(user_id) else {
+        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
             return Ok(ingesterpb::LabelNamesResponse::default());
         };
         let start_ts = req.start_timestamp_ms;
@@ -2132,7 +2165,7 @@ impl Ingester {
         let permit = self.start_read_request(md).await?;
         let res = async {
             self.enforce_read_consistency(md, user_id).await?;
-            let Some(db) = self.get_tsdb(user_id) else {
+            let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
                 return Ok(ingesterpb::UserStatsResponse::default());
             };
             create_user_stats(&db, req.count_method)
@@ -2184,7 +2217,7 @@ impl Ingester {
         req: ingesterpb::MetricsForLabelMatchersRequest,
     ) -> Result<ingesterpb::MetricsForLabelMatchersResponse, IngesterError> {
         self.enforce_read_consistency(md, user_id).await?;
-        let Some(db) = self.get_tsdb(user_id) else {
+        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
             return Ok(ingesterpb::MetricsForLabelMatchersResponse::default());
         };
         let mut matchers_set = Vec::with_capacity(req.matchers_set.len());
@@ -2290,7 +2323,7 @@ impl Ingester {
         req: ingesterpb::LabelNamesAndValuesRequest,
     ) -> Result<Vec<ingesterpb::LabelNamesAndValuesResponse>, IngesterError> {
         self.enforce_read_consistency(md, user_id).await?;
-        let Some(db) = self.get_tsdb(user_id) else {
+        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
             return Ok(Vec::new());
         };
         let matchers = from_proto_matchers(&req.matchers)?;
@@ -2423,7 +2456,7 @@ impl Ingester {
         req: ingesterpb::LabelValuesCardinalityRequest,
     ) -> Result<Vec<ingesterpb::LabelValuesCardinalityResponse>, IngesterError> {
         self.enforce_read_consistency(md, user_id).await?;
-        let Some(db) = self.get_tsdb(user_id) else {
+        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
             return Ok(Vec::new());
         };
         let matchers = from_proto_matchers(&req.matchers)?;
@@ -2604,10 +2637,17 @@ impl Ingester {
             return Err(e);
         }
 
-        let Some(db) = self.get_tsdb(user_id) else {
-            permit.finish(false);
-            let (_tx, rx) = mpsc::channel(1);
-            return Ok(ReceiverStream::new(rx));
+        let db = match self.get_open_tsdb_for_query(user_id) {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                permit.finish(false);
+                let (_tx, rx) = mpsc::channel(1);
+                return Ok(ReceiverStream::new(rx));
+            }
+            Err(e) => {
+                permit.finish(e.is_deadline_exceeded());
+                return Err(e);
+            }
         };
 
         let (shard, matchers) = match remove_shard_from_matchers(matchers) {
@@ -2718,7 +2758,7 @@ impl Ingester {
         let matchers = active_series_matchers(&req.matchers)?;
         self.enforce_read_consistency(md, user_id).await?;
 
-        let Some(db) = self.get_tsdb(user_id) else {
+        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
             return Ok(Vec::new());
         };
         let (shard, matchers) =
@@ -2818,7 +2858,7 @@ impl Ingester {
         let permit = self.start_read_request(md).await?;
         let res = async {
             self.enforce_read_consistency(md, user_id).await?;
-            let Some(db) = self.get_tsdb(user_id) else {
+            let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
                 return Ok(Vec::new());
             };
             let start_ts = req.start_timestamp_ms;
@@ -2879,7 +2919,7 @@ impl Ingester {
         let permit = self.start_read_request(md).await?;
         let res = async {
             self.enforce_read_consistency(md, user_id).await?;
-            let Some(db) = self.get_tsdb(user_id) else {
+            let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
                 return Ok(Vec::new());
             };
             let start_ts = req.start_timestamp_ms;

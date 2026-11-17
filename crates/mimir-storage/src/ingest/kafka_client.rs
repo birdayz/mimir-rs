@@ -226,6 +226,8 @@ struct BrokerConn {
     pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>>,
     api_versions: RwLock<HashMap<i16, (i16, i16)>>,
     alive: Arc<std::sync::atomic::AtomicBool>,
+    disconnected: Arc<std::sync::atomic::AtomicBool>,
+    reader_abort: tokio::task::AbortHandle,
     /// SASL session expiry: past it the connection is replaced instead of reused.
     sasl_expiry: Option<std::time::Instant>,
     /// Responses successfully read on this connection after its setup (kgo `cxn.successes`).
@@ -233,6 +235,12 @@ struct BrokerConn {
     /// kprom `node_id` label value (`kgo.NodeName`) and hooks, when the client has them.
     node: String,
     kprom: Option<Arc<KpromMetrics>>,
+}
+
+impl Drop for BrokerConn {
+    fn drop(&mut self) {
+        self.reader_abort.abort();
+    }
 }
 
 struct PendingGuard<'a> {
@@ -291,8 +299,10 @@ impl BrokerConn {
 
         let pending_r = Arc::clone(&pending);
         let alive_r = Arc::clone(&alive);
+        let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let disconnected_r = Arc::clone(&disconnected);
         let disconnect_hook = kprom.clone().map(|k| (k, node.clone()));
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
             while let Some(payload) =
                 read_kafka_frame_bounded(&mut reader, MAX_KAFKA_FRAME_BYTES).await
             {
@@ -305,9 +315,12 @@ impl BrokerConn {
             alive_r.store(false, Ordering::SeqCst);
             pending_r.lock().clear();
             if let Some((k, node)) = disconnect_hook {
-                k.on_broker_disconnect(&node);
+                if !disconnected_r.swap(true, Ordering::SeqCst) {
+                    k.on_broker_disconnect(&node);
+                }
             }
         });
+        let reader_abort = reader_handle.abort_handle();
 
         Ok(Arc::new(Self {
             addr,
@@ -318,6 +331,8 @@ impl BrokerConn {
             pending,
             api_versions: RwLock::new(established.api_versions),
             alive,
+            disconnected,
+            reader_abort,
             sasl_expiry: established.sasl_expiry,
             successes: std::sync::atomic::AtomicU64::new(0),
             node,
@@ -360,6 +375,13 @@ impl BrokerConn {
 
     fn mark_dead(&self) {
         self.alive.store(false, Ordering::SeqCst);
+        self.reader_abort.abort();
+        self.pending.lock().clear();
+        if let Some(ref k) = self.kprom {
+            if !self.disconnected.swap(true, Ordering::SeqCst) {
+                k.on_broker_disconnect(&self.node);
+            }
+        }
     }
 
     fn pick_version(&self, key: ApiKey, our_min: i16, our_max: i16) -> i16 {
@@ -877,7 +899,7 @@ impl KafkaClient {
         if resp.controller_id.0 >= 0 {
             self.controller_id.store(resp.controller_id.0, Ordering::SeqCst);
         }
-        let live_addrs: std::collections::HashSet<String> = {
+        {
             let mut md = self.metadata.write();
             md.brokers = resp
                 .brokers
@@ -891,11 +913,17 @@ impl KafkaClient {
                     )
                 })
                 .collect();
-            md.brokers.values().map(|b| b.addr.clone()).collect()
-        };
+        }
 
+        let mut conns = self.conns_by_addr.lock().await;
+        let live_addrs: std::collections::HashSet<String> = self
+            .metadata
+            .read()
+            .brokers
+            .values()
+            .map(|b| b.addr.clone())
+            .collect();
         if !live_addrs.is_empty() {
-            let mut conns = self.conns_by_addr.lock().await;
             conns.retain(|(addr, _), conn| {
                 let keep = live_addrs.contains(addr)
                     || self.seed_brokers.iter().any(|seed| seed == addr);
@@ -2771,6 +2799,8 @@ mod tests {
                 pending: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 api_versions: RwLock::new(HashMap::new()),
                 alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                reader_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 sasl_expiry: None,
                 successes: std::sync::atomic::AtomicU64::new(0),
                 node: "99".to_string(),

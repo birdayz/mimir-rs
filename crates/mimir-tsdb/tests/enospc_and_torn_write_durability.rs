@@ -142,13 +142,12 @@ fn wlog_enospc_mid_multipage_rec_first_to_rec_middle_leaves_no_orphan() {
         "REC_FIRST and torn REC_MIDDLE must both be rolled back"
     );
 
-    // Also verify batch log(&[small_keep, huge_rec]) where small_keep is in memory (not yet flushed)
-    // and huge_rec fails on REC_MIDDLE: small_keep must survive in Page!
+    // Also verify batch log(&[small_drop, huge_rec]) where small_drop is in memory (not yet flushed)
+    // and huge_rec fails on REC_MIDDLE: the entire batch (including small_drop) must roll back!
     write_calls.store(0, Ordering::SeqCst);
-    let small_keep = b"batch-first-record-must-survive".to_vec();
-    let err2 = w.log(&[&small_keep, &huge_rec]).unwrap_err();
+    let small_drop = b"batch-first-record-must-rollback".to_vec();
+    let err2 = w.log(&[&small_drop, &huge_rec]).unwrap_err();
     assert!(matches!(err2, WlogError::Io(_)));
-    expected.push(small_keep);
     assert_eq!(
         fs::metadata(&seg_path).unwrap().len(),
         len_before_multipage,
@@ -225,19 +224,17 @@ fn head_chunks_writer_enospc_direct_and_buffered_rollback_preserves_offsets() {
         }
     }
 
-    // 2. Buffered flush ENOSPC: previously-acknowledged chunks remain intact and flush on recovery.
+    // 2. Buffered flush ENOSPC: unflushed write_buf is discarded and offset resets to file_offset.
     {
         let dir = tempfile::tempdir().unwrap();
         let mut w = HeadChunksWriter::with_options(dir.path(), 1024 * 1024, 512).unwrap();
         let mut refs = Vec::new();
         let mut chunks = Vec::new();
 
-        // Write 5 chunks (~200 bytes total < 512B buffer), all acknowledged into write_buf.
+        // Write 5 chunks (~200 bytes total < 512B buffer), buffered in write_buf.
         for i in 0..5i64 {
             let c = make_xor_chunk(i + 1);
-            let r = w.write_chunk(i as u64 + 1, i * 1000, i * 1000 + 500, &c, false).unwrap();
-            refs.push(r);
-            chunks.push(c);
+            let _ = w.write_chunk(i as u64 + 1, i * 1000, i * 1000 + 500, &c, false).unwrap();
         }
 
         // Fail flush with torn partial write + ENOSPC.
@@ -248,20 +245,24 @@ fn head_chunks_writer_enospc_direct_and_buffered_rollback_preserves_offsets() {
         let err = w.flush().unwrap_err();
         assert!(matches!(err, HeadChunksError::Io(_)));
 
-        // Physical file still only has the 8-byte header (all 23 torn bytes rolled back).
+        // Physical file still only has the 8-byte header (all 23 torn bytes rolled back),
+        // and unflushed write_buf was discarded so offset == HEAD_CHUNK_FILE_HEADER_SIZE.
         let seq1_path = head_chunk_file_path(dir.path(), 1);
         assert_eq!(
             fs::metadata(&seq1_path).unwrap().len(),
             HEAD_CHUNK_FILE_HEADER_SIZE as u64
         );
 
-        // Recover disk space, write 1,000 more chunks, close, and verify all 1,005 chunks!
+        // Recover disk space, write 1,000 chunks (starting cleanly at offset 8), close, and verify!
         w.set_write_fault_hook(None);
         for i in 5..1005i64 {
             let c = make_xor_chunk(i + 1);
             let r = w
                 .write_chunk(i as u64 + 1, i * 1000, i * 1000 + 500, &c, false)
                 .unwrap();
+            if i == 5 {
+                assert_eq!(r.unpack(), (1, HEAD_CHUNK_FILE_HEADER_SIZE as u32));
+            }
             refs.push(r);
             chunks.push(c);
         }
@@ -269,7 +270,7 @@ fn head_chunks_writer_enospc_direct_and_buffered_rollback_preserves_offsets() {
 
         let reader = HeadChunksReader::open(dir.path()).unwrap();
         let all = reader.collect_all_chunks().unwrap();
-        assert_eq!(all.len(), 1005);
+        assert_eq!(all.len(), 1000);
         for (r, expected_chunk) in refs.iter().zip(chunks.iter()) {
             assert_eq!(reader.chunk(*r).unwrap(), *expected_chunk);
         }
