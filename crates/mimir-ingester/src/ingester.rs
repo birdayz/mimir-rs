@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use mimir_common::limiter::InflightLimiter;
-use mimir_common::services::{ManagedBasicService, Service, ServiceContext, State};
+use mimir_common::services::{
+    describe_service, FnListener, ManagedBasicService, Service, ServiceContext, State,
+};
 use mimir_common::shutdownmarker;
 use mimir_config::{
     BlocksStorageConfig, CompartmentsConfig, IngestStorageConfig, IngesterConfig, InstanceLimits,
@@ -30,7 +32,7 @@ use parking_lot::{Mutex, RwLock};
 use prometheus::Registry;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::circuit_breaker::IngesterCircuitBreaker;
 use crate::compaction::{
@@ -153,6 +155,9 @@ pub struct Ingester {
     lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
     partition_lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// First failure of a watched subservice (`subservicesWatcher` in Go); makes the
+    /// ingester service fail and the whole process stop.
+    subservice_failure: tokio::sync::watch::Sender<Option<String>>,
     pub usage_stats: Mutex<UsageStatsSnapshot>,
 
     compaction_service_state: AtomicU8,
@@ -424,6 +429,7 @@ impl Ingester {
             lifecycler_svc: Mutex::new(None),
             partition_lifecycler_svc: Mutex::new(None),
             background_tasks: Mutex::new(Vec::new()),
+            subservice_failure: tokio::sync::watch::channel(None).0,
             usage_stats: Mutex::new(UsageStatsSnapshot::default()),
             compaction_service_state: AtomicU8::new(State::New as u8),
             owned_series_service_state: AtomicU8::new(State::New as u8),
@@ -448,6 +454,21 @@ impl Ingester {
         });
 
         *weak_slot.lock() = Some(Arc::downgrade(&ingester));
+
+        // Go passes the Ingester as the lifecycler's FlushTransferer (classic) / flush callback
+        // (tokenless): on shutdown the lifecycler switches to LEAVING, then calls `Flush()` while
+        // still heartbeating, then unregisters.
+        if let Some(ref lc) = ingester.lifecycler {
+            let weak = Arc::downgrade(&ingester);
+            lc.set_ingester_flush(Arc::new(move || {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    if let Some(ing) = weak.upgrade() {
+                        ing.flush().await;
+                    }
+                })
+            }));
+        }
         Ok(ingester)
     }
 
@@ -909,30 +930,81 @@ impl Ingester {
         Ok(users)
     }
 
-    pub async fn open_existing_tsdbs(&self) -> Result<(), IngesterError> {
+    /// Opens (and replays the WAL of) every tenant TSDB found on disk with a pool of
+    /// `tsdbOpenConcurrency` workers (`openExistingTSDB` in `ingester_tsdb.go`). Opening is
+    /// blocking I/O + CPU work, so the workers run on the blocking thread pool instead of
+    /// stalling async runtime workers.
+    pub async fn open_existing_tsdbs(self: &Arc<Self>) -> Result<(), IngesterError> {
+        info!("opening existing TSDBs");
         let start = Instant::now();
-        let user_ids = self.find_user_ids_with_tsdb_on_filesystem()?;
+        let user_ids = self.find_user_ids_with_tsdb_on_filesystem().map_err(|e| {
+            error!(err = %e, "error while finding existing TSDBs");
+            e
+        })?;
         if user_ids.is_empty() {
             return Ok(());
         }
-        info!(count = user_ids.len(), "opening existing TSDBs");
         let (open_concurrency, wal_replay_concurrency) = get_open_tsdbs_concurrency_config(
             self.blocks_cfg.tsdb.wal_replay_concurrency,
             user_ids.len(),
         );
-        let _ = open_concurrency;
-        for user_id in user_ids {
-            let db = self
-                .create_tsdb(&user_id, wal_replay_concurrency)
-                .map_err(|e| IngesterError::Internal {
-                    message: format!("unable to open TSDB for user {user_id}: {e}"),
-                })?;
-            self.tsdbs.insert(user_id, db);
-            self.metrics.mem_users.inc();
+
+        let queue = Arc::new(Mutex::new(user_ids.into_iter()));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::with_capacity(open_concurrency);
+        for _ in 0..open_concurrency {
+            let ing = Arc::clone(self);
+            let queue = Arc::clone(&queue);
+            let aborted = Arc::clone(&aborted);
+            workers.push(tokio::task::spawn_blocking(move || -> Result<(), IngesterError> {
+                loop {
+                    if aborted.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let Some(user_id) = queue.lock().next() else {
+                        return Ok(());
+                    };
+                    match ing.create_tsdb(&user_id, wal_replay_concurrency) {
+                        Ok(db) => {
+                            ing.tsdbs.insert(user_id, db);
+                            ing.metrics.mem_users.inc();
+                        }
+                        Err(e) => {
+                            aborted.store(true, Ordering::Release);
+                            error!(err = %e, user = %user_id, "unable to open TSDB");
+                            return Err(IngesterError::Internal {
+                                message: format!("unable to open TSDB for user {user_id}: {e}"),
+                            });
+                        }
+                    }
+                }
+            }));
         }
+
+        let mut first_err = None;
+        for w in workers {
+            let res = match w.await {
+                Ok(r) => r,
+                Err(e) => Err(IngesterError::Internal {
+                    message: format!("TSDB opening worker panicked: {e}"),
+                }),
+            };
+            if let Err(e) = res {
+                first_err.get_or_insert(e);
+            }
+        }
+        if let Some(err) = first_err {
+            error!(err = %err, "error while opening existing TSDBs");
+            return Err(err);
+        }
+
+        // Update the usage statistics once all TSDBs have been opened.
+        self.update_usage_stats();
+
         self.metrics
             .open_existing_tsdb
             .inc_by(start.elapsed().as_secs_f64());
+        info!("successfully opened existing TSDBs");
         Ok(())
     }
 
@@ -1010,6 +1082,67 @@ impl Ingester {
             }
         }
         Ok(())
+    }
+
+    /// Records the failure of a watched subservice (Go: `subservicesWatcher.Chan()` makes
+    /// `ingesterRunning` return `ingester subservice failed: ...`). Only the first one is kept.
+    pub fn report_subservice_failure(&self, err: String) {
+        // Failures observed while the ingester itself is stopping are only logged by Go.
+        if !matches!(self.state(), State::Starting | State::Running) {
+            warn!(err = %err, "ingester subservice failed while stopping");
+            return;
+        }
+        self.subservice_failure.send_if_modified(|cur| {
+            if cur.is_none() {
+                *cur = Some(err);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// The recorded subservice failure, if any.
+    pub fn subservice_failure(&self) -> Option<String> {
+        self.subservice_failure.borrow().clone()
+    }
+
+    /// Resolves with the failure case once a watched subservice failed while the ingester was
+    /// starting or running.
+    pub async fn wait_subservice_failure(&self) -> String {
+        let mut rx = self.subservice_failure.subscribe();
+        loop {
+            if let Some(err) = rx.borrow_and_update().clone() {
+                return err;
+            }
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Wraps a spawned subservice loop so that a panic is reported as a subservice failure
+    /// (in Go a panicking goroutine crashes the whole process) instead of being swallowed by
+    /// the tokio runtime.
+    fn watch_task(self: &Arc<Self>, name: &'static str, handle: JoinHandle<()>) -> JoinHandle<()> {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            if let Err(err) = handle.await {
+                if err.is_panic() {
+                    let payload = err.into_panic();
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    if let Some(ing) = weak.upgrade() {
+                        ing.report_subservice_failure(format!(
+                            "ingester subservice failed: service {name} panicked: {msg}"
+                        ));
+                    }
+                }
+            }
+        })
     }
 
     /// Starts the Ingester service asynchronously, returning immediately while startup progresses.
@@ -1125,9 +1258,11 @@ impl Ingester {
                     }
                 }
             }
-            self.background_tasks
-                .lock()
-                .push(spawn_owned_series_loop(Arc::clone(self), ctx.child()));
+            let h = self.watch_task(
+                "ingester-owned-series",
+                spawn_owned_series_loop(Arc::clone(self), ctx.child()),
+            );
+            self.background_tasks.lock().push(h);
         }
 
         let (fc_tx, fc_rx) = mpsc::channel(16);
@@ -1135,10 +1270,22 @@ impl Ingester {
 
         // Start compaction, metrics updater, and metadata purger before partition replay.
         {
+            let compaction = self.watch_task(
+                "ingester-compaction",
+                spawn_compaction_loop(Arc::clone(self), fc_rx, ctx.child()),
+            );
+            let metrics_updater = self.watch_task(
+                "ingester-metrics-updater",
+                spawn_metrics_updater_loop(Arc::clone(self), ctx.child()),
+            );
+            let metadata_purger = self.watch_task(
+                "ingester-metadata-purger",
+                spawn_metadata_purger_loop(Arc::clone(self), ctx.child()),
+            );
             let mut tasks = self.background_tasks.lock();
-            tasks.push(spawn_compaction_loop(Arc::clone(self), fc_rx, ctx.child()));
-            tasks.push(spawn_metrics_updater_loop(Arc::clone(self), ctx.child()));
-            tasks.push(spawn_metadata_purger_loop(Arc::clone(self), ctx.child()));
+            tasks.push(compaction);
+            tasks.push(metrics_updater);
+            tasks.push(metadata_purger);
         }
 
         // Start Kafka ingest storage reader BEFORE lifecycler enters ACTIVE.
@@ -1164,6 +1311,26 @@ impl Ingester {
         if let Some(ref lc) = self.lifecycler {
             let svc = Arc::clone(lc).into_managed_service();
             *self.lifecycler_svc.lock() = Some(Arc::clone(&svc));
+            // Go: `i.subservicesWatcher.WatchService(i.lifecycler)`.
+            {
+                let weak = Arc::downgrade(self);
+                let name = describe_service(svc.as_ref());
+                let listener = FnListener::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(Box::new(move |_, err| {
+                        if let Some(ing) = weak.upgrade() {
+                            ing.report_subservice_failure(format!(
+                                "ingester subservice failed: service {name} failed: {err}"
+                            ));
+                        }
+                    })),
+                );
+                // The listener stays registered for the lifetime of the lifecycler service.
+                std::mem::forget(svc.add_listener(listener));
+            }
             let lc_ctx = ServiceContext::background();
             svc.start_async(lc_ctx)
                 .await
@@ -1213,16 +1380,24 @@ impl Ingester {
 
         // Start post-lifecycler services (shipping, idle TSDB closer, TSDB settings, partition lifecycler).
         {
-            let mut tasks = self.background_tasks.lock();
+            let mut new_tasks = Vec::new();
             if self.blocks_cfg.tsdb.ship_interval.0 > 0 {
                 let (ship_tx, ship_rx) = mpsc::channel(16);
                 *self.ship_tx.write() = Some(ship_tx);
-                tasks.push(spawn_shipping_loop(Arc::clone(self), ship_rx, ctx.child()));
+                new_tasks.push(self.watch_task(
+                    "ingester-shipping",
+                    spawn_shipping_loop(Arc::clone(self), ship_rx, ctx.child()),
+                ));
             }
 
             if self.blocks_cfg.tsdb.close_idle_tsdb_timeout.0 > 0 {
-                tasks.push(spawn_idle_tsdb_loop(Arc::clone(self), ctx.child()));
+                new_tasks.push(self.watch_task(
+                    "ingester-close-idle-tsdb",
+                    spawn_idle_tsdb_loop(Arc::clone(self), ctx.child()),
+                ));
             }
+            let mut tasks = self.background_tasks.lock();
+            tasks.extend(new_tasks);
 
             {
                 let ing = Arc::clone(self);
@@ -1327,24 +1502,23 @@ impl Ingester {
             let _ = t.await;
         }
 
-        // 4. Flush if configured via lifecycler / blocks config / prepare_shutdown (only if startup succeeded).
-        if startup_res.is_ok() {
-            let should_flush = self
-                .lifecycler
-                .as_ref()
-                .map_or(self.flush_on_shutdown.load(Ordering::Acquire), |lc| {
-                    lc.flush_on_shutdown() || self.flush_on_shutdown.load(Ordering::Acquire)
-                });
-            if should_flush {
-                self.flush().await;
-            }
-        }
-
-        // 5. Stop partition lifecycler & classic lifecycler.
+        // 4. Stop the partition lifecycler (part of Go's subservicesAfterIngesterRingLifecycler,
+        // stopped before the ingester ring lifecycler).
         let plc_svc_opt = self.partition_lifecycler_svc.lock().take();
         if let Some(svc) = plc_svc_opt {
             svc.stop_async();
             let _ = svc.await_terminated().await;
+        }
+
+        // 5. Graceful exit from the ring: the lifecycler switches to LEAVING, flushes via the
+        // Ingester's FlushTransferer (if flush-on-shutdown is set) while heartbeating, sleeps
+        // final_sleep and unregisters (dskit `Lifecycler.stopping`).
+        // Without a lifecycler (tests only) flush directly.
+        if self.lifecycler.is_none()
+            && startup_res.is_ok()
+            && self.flush_on_shutdown.load(Ordering::Acquire)
+        {
+            self.flush().await;
         }
 
         let lc_svc_opt = self.lifecycler_svc.lock().take();
@@ -1365,6 +1539,13 @@ impl Ingester {
         if startup_res.is_err() {
             *self.state.write() = State::Failed;
             return startup_res;
+        }
+
+        // A subservice failure makes the ingester service fail (Go: `ingesterRunning` returns
+        // the error, `stopping` runs, then the service ends up Failed).
+        if let Some(err) = self.subservice_failure() {
+            *self.state.write() = State::Failed;
+            return Err(IngesterError::Internal { message: err });
         }
 
         *self.state.write() = State::Terminated;
