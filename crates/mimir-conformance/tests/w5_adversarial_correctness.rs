@@ -538,6 +538,8 @@ fn real_go_httpgrpc_client_against_rust_mimir_2xx_4xx_5xx() {
                 grpc_addr: grpc_addr.clone(),
                 method: "GET".to_string(),
                 url: "/ready".to_string(),
+                // Multitenant gRPC auth (noauth.SetupAuthMiddleware) applies to httpgrpc too.
+                org_id: Some("tenant-httpgrpc".to_string()),
                 ..Default::default()
             },
         )
@@ -560,6 +562,8 @@ fn real_go_httpgrpc_client_against_rust_mimir_2xx_4xx_5xx() {
                 grpc_addr: grpc_addr.clone(),
                 method: "GET".to_string(),
                 url: "/nonexistent".to_string(),
+                // Multitenant gRPC auth (noauth.SetupAuthMiddleware) applies to httpgrpc too.
+                org_id: Some("tenant-httpgrpc".to_string()),
                 ..Default::default()
             },
         )
@@ -578,6 +582,8 @@ fn real_go_httpgrpc_client_against_rust_mimir_2xx_4xx_5xx() {
                 grpc_addr: grpc_addr.clone(),
                 method: "GET".to_string(),
                 url: "/ingester/tsdb_metrics".to_string(),
+                // Multitenant gRPC auth (noauth.SetupAuthMiddleware) applies to httpgrpc too.
+                org_id: Some("tenant-httpgrpc".to_string()),
                 ..Default::default()
             },
         )
@@ -607,6 +613,8 @@ fn real_go_httpgrpc_client_against_rust_mimir_2xx_4xx_5xx() {
                 grpc_addr: grpc_addr.clone(),
                 method: "GET".to_string(),
                 url: "/ready".to_string(),
+                // Multitenant gRPC auth (noauth.SetupAuthMiddleware) applies to httpgrpc too.
+                org_id: Some("tenant-httpgrpc".to_string()),
                 ..Default::default()
             },
         )

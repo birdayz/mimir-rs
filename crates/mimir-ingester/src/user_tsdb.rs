@@ -39,6 +39,9 @@ use crate::active_series::{
 use crate::errors::IngesterError;
 use crate::label_churn::{SeriesRefHistory, LABEL_CHURN_RECORDS};
 use crate::limiter::Limiter;
+use crate::lookupplan::{
+    head_planning_meta, HeadIndexReader, LookupPlanner, NoopPlanner, PlannerProvider,
+};
 use crate::metric_counter::MetricCounter;
 use crate::metrics::REASON_MAX_IN_MEMORY_SERIES;
 use crate::owned_series::{
@@ -326,9 +329,36 @@ pub struct UserTsdb {
     early_compaction_non_owned_enabled: AtomicBool,
 
     lifecycle_adapter: Arc<LifecycleCallbackAdapter>,
+
+    /// `userTSDB.plannerProvider`: set when index lookup planning is enabled.
+    planner_provider: std::sync::OnceLock<Arc<PlannerProvider>>,
 }
 
 impl UserTsdb {
+    /// Enables index lookup planning for this tenant (`newPlannerProvider(plannerFactory)`).
+    pub fn set_planner_provider(&self, provider: Arc<PlannerProvider>) {
+        let _ = self.planner_provider.set(provider);
+    }
+
+    /// `userTSDB.generateHeadStatistics`: computes and caches the Head's lookup planner.
+    pub fn generate_head_statistics(&self) {
+        if let Some(provider) = self.planner_provider.get() {
+            let head = self.db.head();
+            provider.generate_and_store_planner(&head_planning_meta(head), &HeadIndexReader(head));
+        }
+    }
+
+    /// `getIndexLookupPlannerFunc` for the Head: the cached planner (or one generated on demand),
+    /// `NoopPlanner` when planning is disabled.
+    pub fn head_lookup_planner(&self) -> Arc<dyn LookupPlanner> {
+        match self.planner_provider.get() {
+            Some(provider) => {
+                let head = self.db.head();
+                provider.get_planner(&head_planning_meta(head), &HeadIndexReader(head))
+            }
+            None => Arc::new(NoopPlanner),
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         user_id: String,
@@ -631,6 +661,7 @@ impl UserTsdb {
                 ingester_cfg.early_compaction_non_owned_series_enabled,
             ),
             lifecycle_adapter,
+            planner_provider: std::sync::OnceLock::new(),
         });
         user_db_ready.store(true, Ordering::Release);
 

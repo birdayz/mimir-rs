@@ -101,7 +101,7 @@ pub enum HeadError {
     #[error("{0}")]
     DuplicateSampleWithDetails(String),
     #[error("{0}")]
-    HistogramValidation(String),
+    HistogramValidation(crate::chunkenc::HistogramValidationError),
     #[error("start timestamp newer than sample")]
     StNewerThanSample,
     #[error("unknown series ref {0}")]
@@ -116,8 +116,12 @@ pub enum HeadError {
     MaxSeriesPerUser,
     #[error("per-metric series limit exceeded")]
     MaxSeriesPerMetric,
-    #[error("missing metric name")]
+    /// `errNoMetricNameLabel` (`extract.MetricNameFromLabels` in Mimir's `PreCreation`).
+    #[error("no metric name label")]
     MissingMetricName,
+    /// `getOrCreate`: `fmt.Errorf("empty labelset: %w", ErrInvalidSample)`.
+    #[error("empty labelset: invalid sample")]
+    EmptyLabelset,
 }
 
 /// Lifecycle callback trait matching `prometheus/tsdb.SeriesLifecycleCallback`.
@@ -6860,7 +6864,7 @@ impl<'a> HeadAppender<'a> {
             &sorted
         };
         if sorted_slice.is_empty() {
-            return Err(HeadError::MissingMetricName);
+            return Err(HeadError::EmptyLabelset);
         }
 
         let hash = hash_sorted_pairs(sorted_slice);
@@ -6881,7 +6885,7 @@ impl<'a> HeadAppender<'a> {
         encoded_labels: &[u8],
     ) -> Result<Arc<SeriesEntry>, HeadError> {
         if encoded_labels.is_empty() {
-            return Err(HeadError::MissingMetricName);
+            return Err(HeadError::EmptyLabelset);
         }
         let (entry, created) = self
             .head

@@ -955,7 +955,6 @@ impl IngesterShardedBatchConsumer {
                     prom_hash: item.prom_hash,
                     labels_sorted_unique: item.labels_sorted_unique,
                     bad_utf8: item.bad_utf8,
-                    skip_label_validation: item.skip_label_validation,
                     histograms,
                     exemplars,
                 });

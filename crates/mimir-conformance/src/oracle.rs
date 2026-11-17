@@ -517,6 +517,9 @@ pub struct HttpGrpcCallRequest {
     pub headers: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub body_b64: String,
+    /// Sent as `x-scope-orgid` gRPC metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

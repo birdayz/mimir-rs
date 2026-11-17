@@ -21,7 +21,7 @@ const NO_EXEMPLAR: usize = usize::MAX;
 pub enum ExemplarError {
     #[error("exemplar storage is disabled")]
     Disabled,
-    #[error("duplicate label name {0:?} in exemplar")]
+    #[error("label name {0:?} is not unique: invalid exemplar")]
     DuplicateLabelName(String),
     #[error("label length for exemplar exceeds maximum of {EXEMPLAR_MAX_LABEL_SET_LENGTH} UTF-8 characters")]
     LabelLengthExceeded,
@@ -280,101 +280,87 @@ impl CircularExemplarStorage {
             return Err(err);
         }
 
+        // If we insert an out-of-order exemplar, preemptively find the insertion index to check
+        // for duplicates *before* evicting anything from the buffer (Go `AddExemplar`).
+        let (mut ooo, mut insertion) = match inner.index.get(key) {
+            Some(entry) => {
+                let oldest_ts = inner.ts_at(entry.oldest);
+                let newest_ts = inner.ts_at(entry.newest);
+                let ooo = e.timestamp_ms >= oldest_ts && e.timestamp_ms < newest_ts;
+                let mut insertion = NO_EXEMPLAR;
+                if ooo {
+                    insertion = inner.find_insertion_index(&e, entry);
+                    if inner.ts_at(insertion) == e.timestamp_ms {
+                        // Assume duplicate exemplar, noop.
+                        return Err(ExemplarError::DuplicateExemplar);
+                    }
+                }
+                (ooo, insertion)
+            }
+            None => (false, NO_EXEMPLAR),
+        };
+
         let idx = if inner.exemplars.len() < inner.max_exemplars {
             let i = inner.exemplars.len();
             inner.exemplars.push(CircularBufferEntry::default());
             i
         } else {
             let i = inner.next_index;
-            if inner.exemplars[i].series_key.is_some() {
+            if let Some(prev_key) = inner.exemplars[i].series_key.clone() {
                 inner.remove_at(i);
+                if prev_key.as_slice() == key && ooo && insertion == i {
+                    // The entry we were going to insert after was removed from the same series:
+                    // recalculate the insertion point in the updated linked list.
+                    match inner.index.get(key) {
+                        Some(entry) => insertion = inner.find_insertion_index(&e, entry),
+                        None => ooo = false,
+                    }
+                }
             }
             i
         };
 
         let key_vec = key.to_vec();
-        let entry = inner.index.entry(key_vec.clone()).or_insert_with(|| SeriesIndexEntry {
+        let (oldest, newest) = match inner.index.get(key) {
+            Some(entry) => (entry.oldest, entry.newest),
+            None => (NO_EXEMPLAR, NO_EXEMPLAR),
+        };
+        let (prev, next) = if newest == NO_EXEMPLAR {
+            // First and only exemplar of the series.
+            (NO_EXEMPLAR, NO_EXEMPLAR)
+        } else if e.timestamp_ms >= inner.ts_at(newest) {
+            // At the tip (after newest).
+            inner.exemplars[newest].next = idx;
+            (newest, NO_EXEMPLAR)
+        } else if e.timestamp_ms < inner.ts_at(oldest) || !ooo {
+            // At the tail (before oldest).
+            inner.exemplars[oldest].prev = idx;
+            (NO_EXEMPLAR, oldest)
+        } else {
+            // After the most recent in-order exemplar preceding it.
+            let next = inner.exemplars[insertion].next;
+            inner.exemplars[insertion].next = idx;
+            if next != NO_EXEMPLAR {
+                inner.exemplars[next].prev = idx;
+            }
+            (insertion, next)
+        };
+        inner.exemplars[idx] = CircularBufferEntry {
+            exemplar: Some(e),
+            next,
+            prev,
+            series_key: Some(key_vec.clone()),
+        };
+        let entry = inner.index.entry(key_vec).or_insert_with(|| SeriesIndexEntry {
             oldest: idx,
-            newest: NO_EXEMPLAR,
+            newest: idx,
             series_labels: series_labels.clone(),
         });
-
-        let prev_newest = entry.newest;
-        // Insert into doubly-linked list maintaining timestamp-ascending order for this series,
-        // matching CircularExemplarStorage.AddExemplar.
-        if prev_newest == NO_EXEMPLAR {
+        if prev == NO_EXEMPLAR {
             entry.oldest = idx;
+        }
+        if next == NO_EXEMPLAR {
             entry.newest = idx;
-            inner.exemplars[idx] = CircularBufferEntry {
-                exemplar: Some(e),
-                next: NO_EXEMPLAR,
-                prev: NO_EXEMPLAR,
-                series_key: Some(key_vec),
-            };
-        } else {
-            let newest_ts = inner.exemplars[prev_newest]
-                .exemplar
-                .as_ref()
-                .unwrap()
-                .timestamp_ms;
-            if e.timestamp_ms >= newest_ts {
-                inner.exemplars[prev_newest].next = idx;
-                inner.exemplars[idx] = CircularBufferEntry {
-                    exemplar: Some(e),
-                    next: NO_EXEMPLAR,
-                    prev: prev_newest,
-                    series_key: Some(key_vec.clone()),
-                };
-                if let Some(ent) = inner.index.get_mut(&key_vec) {
-                    ent.newest = idx;
-                }
-            } else {
-                // OOO exemplar insertion: walk backwards from newest to find insertion point.
-                let mut cur = prev_newest;
-                while cur != NO_EXEMPLAR {
-                    let cur_ex = inner.exemplars[cur].exemplar.as_ref().unwrap();
-                    if cur_ex.timestamp_ms < e.timestamp_ms
-                        || (cur_ex.timestamp_ms == e.timestamp_ms && cur_ex.value < e.value)
-                        || (cur_ex.timestamp_ms == e.timestamp_ms
-                            && cur_ex.value == e.value
-                            && cur_ex.labels.hash() < e.labels.hash())
-                    {
-                        break;
-                    }
-                    if cur_ex.prom_equals(&e) {
-                        return Err(ExemplarError::DuplicateExemplar);
-                    }
-                    cur = inner.exemplars[cur].prev;
-                }
-
-                if cur == NO_EXEMPLAR {
-                    // Insert at oldest.
-                    let old_oldest = inner.index.get(&key_vec).unwrap().oldest;
-                    inner.exemplars[old_oldest].prev = idx;
-                    inner.exemplars[idx] = CircularBufferEntry {
-                        exemplar: Some(e),
-                        next: old_oldest,
-                        prev: NO_EXEMPLAR,
-                        series_key: Some(key_vec.clone()),
-                    };
-                    inner.index.get_mut(&key_vec).unwrap().oldest = idx;
-                } else {
-                    let old_next = inner.exemplars[cur].next;
-                    inner.exemplars[cur].next = idx;
-                    if old_next != NO_EXEMPLAR {
-                        inner.exemplars[old_next].prev = idx;
-                    }
-                    inner.exemplars[idx] = CircularBufferEntry {
-                        exemplar: Some(e),
-                        next: old_next,
-                        prev: cur,
-                        series_key: Some(key_vec.clone()),
-                    };
-                    if old_next == NO_EXEMPLAR {
-                        inner.index.get_mut(&key_vec).unwrap().newest = idx;
-                    }
-                }
-            }
         }
 
         inner.next_index = (idx + 1) % inner.max_exemplars;
@@ -512,6 +498,26 @@ impl CircularExemplarStorage {
 }
 
 impl CircularExemplarInner {
+    /// Timestamp of the exemplar stored at buffer slot `i` (`i64::MIN` for an empty slot).
+    fn ts_at(&self, i: usize) -> i64 {
+        self.exemplars
+            .get(i)
+            .and_then(|c| c.exemplar.as_ref())
+            .map_or(i64::MIN, |e| e.timestamp_ms)
+    }
+
+    /// Go `findInsertionIndex`: the most recent exemplar of the series not newer than `e`.
+    fn find_insertion_index(&self, e: &Exemplar, entry: &SeriesIndexEntry) -> usize {
+        let mut i = entry.newest;
+        while i != NO_EXEMPLAR {
+            if self.ts_at(i) <= e.timestamp_ms {
+                return i;
+            }
+            i = self.exemplars[i].prev;
+        }
+        entry.oldest
+    }
+
     fn validate_exemplar(
         &self,
         entry: Option<&SeriesIndexEntry>,
@@ -588,10 +594,9 @@ impl CircularExemplarInner {
     }
 }
 
+/// Prometheus `matchesSomeMatcherSet`: an empty outer slice matches nothing (only `[{}]`, a
+/// single empty matcher set, matches every series).
 fn matches_some_matcher_set(lbls: &Labels, matcher_sets: &[&[LabelMatcher]]) -> bool {
-    if matcher_sets.is_empty() {
-        return true;
-    }
     matcher_sets.iter().any(|ms| lbls.matches(ms))
 }
 
@@ -636,6 +641,64 @@ mod tests {
         assert_eq!(res[0].exemplars.len(), 1);
         assert_eq!(res[0].exemplars[0].timestamp_ms, 300);
         assert_eq!(res[1].series_labels, s2);
+    }
+
+    #[test]
+    fn select_with_empty_matcher_sets_matches_nothing() {
+        // Prometheus matchesSomeMatcherSet: `[]` matches nothing, `[{}]` matches everything.
+        let store = CircularExemplarStorage::new(4, 0);
+        let s = Labels::from_pairs([("__name__", "m")]);
+        store
+            .add_exemplar(&s, Exemplar::new(Labels::from_pairs([("trace_id", "1")]), 1.0, 100))
+            .unwrap();
+        assert!(store.select(0, 1000, &[]).is_empty());
+        let empty: &[LabelMatcher] = &[];
+        assert_eq!(store.select(0, 1000, &[empty]).len(), 1);
+    }
+
+    #[test]
+    fn duplicate_exemplar_label_name_error_text() {
+        let store = CircularExemplarStorage::new(4, 0);
+        let s = Labels::from_pairs([("__name__", "m")]);
+        let dup = Labels::from_sorted_slice(&[("trace_id", "1"), ("trace_id", "2")]);
+        let err = store.add_exemplar(&s, Exemplar::new(dup, 1.0, 100)).unwrap_err();
+        assert_eq!(err.to_string(), "label name \"trace_id\" is not unique: invalid exemplar");
+    }
+
+    #[test]
+    fn ooo_duplicate_on_full_buffer_does_not_evict() {
+        // Go AddExemplar checks the OOO insertion point / duplicate timestamp before evicting.
+        let store = CircularExemplarStorage::new(3, 1000);
+        let s = Labels::from_pairs([("__name__", "m")]);
+        let other = Labels::from_pairs([("__name__", "o")]);
+        let l = |v: &str| Labels::from_pairs([("trace_id", v)]);
+        store.add_exemplar(&other, Exemplar::new(l("o"), 1.0, 50)).unwrap();
+        store.add_exemplar(&s, Exemplar::new(l("a"), 1.0, 100)).unwrap();
+        store.add_exemplar(&s, Exemplar::new(l("b"), 2.0, 300)).unwrap();
+        // Buffer full; OOO exemplar with the same timestamp as a stored one is a no-op.
+        assert_eq!(
+            store.add_exemplar(&s, Exemplar::new(l("c"), 3.0, 100)),
+            Err(ExemplarError::DuplicateExemplar)
+        );
+        let all: &[LabelMatcher] = &[];
+        let res = store.select(0, 1000, &[all]);
+        assert_eq!(res.len(), 2, "nothing evicted: {res:?}");
+        assert_eq!(res[0].series_labels, s);
+        assert_eq!(res[0].exemplars.len(), 2);
+        assert_eq!(res[1].exemplars.len(), 1);
+
+        // A genuine OOO exemplar evicts the oldest slot (series "o") and is linked in order.
+        store.add_exemplar(&s, Exemplar::new(l("d"), 4.0, 200)).unwrap();
+        let res = store.select(0, 1000, &[all]);
+        assert_eq!(res.len(), 1);
+        let ts: Vec<i64> = res[0].exemplars.iter().map(|e| e.timestamp_ms).collect();
+        assert_eq!(ts, vec![100, 200, 300]);
+
+        // OOO insertion whose insertion point is the slot being evicted (same series).
+        store.add_exemplar(&s, Exemplar::new(l("e"), 5.0, 150)).unwrap();
+        let res = store.select(0, 1000, &[all]);
+        let ts: Vec<i64> = res[0].exemplars.iter().map(|e| e.timestamp_ms).collect();
+        assert_eq!(ts, vec![150, 200, 300]);
     }
 
     #[test]

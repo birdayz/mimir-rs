@@ -31,7 +31,8 @@ use bytes::Bytes;
 use http_body::Frame;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use mimir_common::grpc_log::GrpcErrorLog;
+use mimir_common::grpc_deadline;
+use mimir_common::grpc_log::{GrpcErrorLog, GrpcErrorLogEntry};
 use mimir_common::logging::{LogLevel, Logger};
 use mimir_config::GoDuration;
 use parking_lot::Mutex;
@@ -57,6 +58,9 @@ pub struct GrpcServerConfig {
     pub stats_tracking: bool,
     pub report_grpc_status: bool,
     pub cluster_validation: Option<GrpcClusterValidation>,
+    /// `-auth.multitenancy-enabled`: require `x-scope-orgid` on every RPC except Mimir's
+    /// `noGRPCAuthOn` methods.
+    pub multitenancy_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -243,17 +247,166 @@ async fn serve_conn<T>(
 
 type GrpcResponse = hyper::Response<tonic::body::BoxBody>;
 
-async fn handle(
-    mut req: hyper::Request<Incoming>,
+/// Methods exempt from the multitenant gRPC auth interceptor (Mimir's `noGRPCAuthOn` list in
+/// `pkg/mimir/mimir.go`, passed to `noauth.SetupAuthMiddleware`).
+const NO_GRPC_AUTH_ON: &[&str] = &[
+    "/grpc.health.v1.Health/Check",
+    "/frontend.Frontend/Process",
+    "/frontend.Frontend/NotifyClientShutdown",
+    "/ruler.Ruler/SyncRules",
+    "/schedulerpb.SchedulerForFrontend/FrontendLoop",
+    "/schedulerpb.SchedulerForQuerier/QuerierLoop",
+    "/schedulerpb.SchedulerForQuerier/NotifyQuerierShutdown",
+    "/schedulerpb.BlockBuilderScheduler/AssignJob",
+    "/schedulerpb.BlockBuilderScheduler/UpdateJob",
+    "/usagetrackerpb.UsageTracker/GetUsersCloseToLimit",
+    "/usagetrackerpb.UsageTracker/TrackSeriesBatch",
+];
+
+/// dskit `middleware.ServerUserHeaderInterceptor` / `StreamServerUserHeaderInterceptor`
+/// (`user.ExtractFromGRPCRequest`): exactly one `x-scope-orgid` metadata value.
+fn check_org_id(headers: &http::HeaderMap, method: &str) -> Option<tonic::Status> {
+    if NO_GRPC_AUTH_ON.contains(&method) || headers.get_all("x-scope-orgid").iter().count() == 1 {
+        return None;
+    }
+    Some(tonic::Status::unknown("no org id"))
+}
+
+/// Per-RPC bookkeeping started when the request arrives and finalized exactly once: when the
+/// response body completes, or on drop (handler future or response body dropped because the
+/// client reset the stream), like the `defer`s of dskit's interceptors and stats handler.
+struct RpcGuard {
+    method: String,
+    begin: Instant,
+    conn: Arc<Conn>,
+    stream_tracker: Option<Arc<super::metrics::StreamTracker>>,
+    inflight: Option<prometheus::Gauge>,
+    duration_vec: mimir_common::native_histogram::HistogramVec,
+    report_grpc_status: bool,
+    logger: Arc<dyn Logger>,
+    error_log: GrpcErrorLog,
+    status: Arc<Mutex<(Option<i32>, Option<String>)>>,
+    done: bool,
+}
+
+impl RpcGuard {
+    fn finish(&mut self, completed: bool) {
+        if std::mem::replace(&mut self.done, true) {
+            return;
+        }
+        let (code, msg) = self.status.lock().clone();
+        let code = match code {
+            Some(c) => c,
+            None if completed => 0,
+            // A stream torn down before its status was sent (client reset, or the request
+            // deadline expired) is a canceled handler context in grpc-go.
+            None => 1,
+        };
+        let elapsed = self.begin.elapsed();
+        // dskit derives the label from the handler's Go error, which may differ from the code
+        // grpc-go sends (e.g. a wrapped context.DeadlineExceeded is labelled Unknown).
+        let label_code = match self.error_log.instrumentation_code() {
+            Some(c) if code != 0 => c,
+            _ => code,
+        };
+        self.duration_vec
+            .with_label_values(&[
+                "gRPC",
+                &self.method,
+                &grpc_status_label(label_code, self.report_grpc_status),
+                "false",
+            ])
+            .observe(elapsed.as_secs_f64());
+        if let Some(g) = &self.inflight {
+            g.dec();
+        }
+        if let Some(t) = &self.stream_tracker {
+            t.close_stream(self.conn.id);
+        }
+        if self.conn.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            *self.conn.idle_since.lock() = Instant::now();
+        }
+        if code != 0 {
+            // The handler's view of its error (Go error text, OptionalLogging), or a plain
+            // `status.Error` as grpc-go would format it.
+            let (err, keep) = match self.error_log.take() {
+                Some(e) => match e.reason {
+                    Some(r) => (format!("{} ({r})", e.err), e.keep),
+                    None => (e.err, e.keep),
+                },
+                None => (
+                    format!(
+                        "rpc error: code = {} desc = {}",
+                        grpc_status_label(code, true),
+                        percent_decode(msg.as_deref().unwrap_or(""))
+                    ),
+                    true,
+                ),
+            };
+            if keep {
+                let dur = GoDuration(elapsed.as_nanos() as i64).to_string();
+                let level = if code == 1 { LogLevel::Debug } else { LogLevel::Warn };
+                self.logger.log(
+                    level,
+                    &[("method", &self.method), ("duration", &dur), ("msg", "gRPC"), ("err", &err)],
+                );
+            }
+        }
+    }
+}
+
+impl Drop for RpcGuard {
+    fn drop(&mut self) {
+        self.finish(false);
+    }
+}
+
+/// A trailers-only gRPC error response with an explicit HTTP status (grpc-go `writeEarlyAbort`).
+fn early_abort(status: tonic::Status, http_status: http::StatusCode) -> GrpcResponse {
+    let mut resp = status.into_http();
+    *resp.status_mut() = http_status;
+    resp
+}
+
+async fn handle<B>(
+    mut req: hyper::Request<B>,
     remote: SocketAddr,
     conn: Arc<Conn>,
     routes: tonic::service::Routes,
     cfg: GrpcServerConfig,
     ctx: GrpcContext,
-) -> Result<GrpcResponse, std::convert::Infallible> {
+) -> Result<GrpcResponse, std::convert::Infallible>
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<super::body::BoxError>,
+{
     let method = req.uri().path().to_string();
     let begin = Instant::now();
     let m = &ctx.metrics;
+
+    // grpc-go operateHeaders: a malformed or already expired `grpc-timeout` aborts the stream
+    // before any interceptor or stats handler runs.
+    let deadline = match req.headers().get("grpc-timeout") {
+        None => None,
+        Some(v) => {
+            match v.to_str().map_err(|e| e.to_string()).and_then(grpc_deadline::decode_timeout) {
+                Err(e) => {
+                    return Ok(early_abort(
+                        tonic::Status::internal(format!("malformed grpc-timeout: {e}")),
+                        http::StatusCode::BAD_REQUEST,
+                    ))
+                }
+                Ok(d) if d.is_zero() => {
+                    return Ok(early_abort(
+                        tonic::Status::deadline_exceeded("context deadline exceeded"),
+                        http::StatusCode::OK,
+                    ))
+                }
+                // Overflowing deadlines (e.g. 99999999H) never fire.
+                Ok(d) => tokio::time::Instant::now().checked_add(d),
+            }
+        }
+    };
 
     conn.active.fetch_add(1, Ordering::AcqRel);
     let stream_tracker = if cfg.stats_tracking { m.stream_tracker.clone() } else { None };
@@ -266,20 +419,53 @@ async fn handle(
     if let Some(g) = &inflight {
         g.inc();
     }
+    let error_log = GrpcErrorLog::default();
+    // From here on every exit path (including this future being dropped when the client
+    // resets the stream) finalizes the RPC exactly once.
+    let guard = RpcGuard {
+        method: method.clone(),
+        begin,
+        conn,
+        stream_tracker,
+        inflight,
+        duration_vec: m.request_duration.clone(),
+        report_grpc_status: cfg.report_grpc_status,
+        logger: Arc::clone(&ctx.logger),
+        error_log: error_log.clone(),
+        status: Arc::new(Mutex::new((None, None))),
+        done: false,
+    };
+
     req.extensions_mut().insert(tonic::transport::server::TcpConnectInfo {
         local_addr: None,
         remote_addr: Some(remote),
     });
-    let error_log = GrpcErrorLog::default();
-    req.extensions_mut().insert(error_log.clone());
+    req.extensions_mut().insert(error_log);
 
-    // Cluster validation (unary RPCs only, never health checks).
-    let rejection = cfg.cluster_validation.as_ref().and_then(|cv| {
-        if STREAMING_METHODS.contains(&method.as_str()) || method.starts_with("/grpc.health.v1.Health/") {
-            return None;
-        }
-        check_cluster(req.headers(), &method, cv, &ctx)
-    });
+    // Interceptor order (dskit server.New): ..., Mimir's GRPCMiddleware (multitenant auth), then
+    // cluster validation (unary RPCs only, never health checks).
+    let auth_rejection = cfg
+        .multitenancy_enabled
+        .then(|| check_org_id(req.headers(), &method))
+        .flatten();
+    if auth_rejection.is_some() {
+        // `user.ErrNoOrgID` is a plain Go error: logged as its text.
+        guard.error_log.set(GrpcErrorLogEntry {
+            err: "no org id".to_string(),
+            keep: true,
+            reason: None,
+        });
+    }
+    let rejection = auth_rejection.or_else(|| {
+            cfg.cluster_validation.as_ref().and_then(|cv| {
+                if STREAMING_METHODS.contains(&method.as_str())
+                    || method.starts_with("/grpc.health.v1.Health/")
+                {
+                    return None;
+                }
+                check_cluster(req.headers(), &method, cv, &ctx)
+            })
+        });
 
     let req = if cfg.stats_tracking {
         let recv = m.received_message_size.with_label_values(&["gRPC", &method]);
@@ -297,10 +483,22 @@ async fn handle(
 
     let resp: GrpcResponse = match rejection {
         Some(status) => status.into_http(),
-        None => match routes.oneshot(req).await {
-            Ok(r) => r,
-            Err(e) => tonic::Status::internal(e.to_string()).into_http(),
-        },
+        None => {
+            let call = routes.oneshot(req);
+            let res = match deadline {
+                // grpc-go: at the deadline the stream is closed with RST_STREAM(CANCEL) and the
+                // handler's context is canceled; dropping the handler future cancels its waits.
+                Some(d) => match tokio::time::timeout_at(d, call).await {
+                    Ok(r) => r,
+                    Err(_) => return Ok(reset_stream_response()),
+                },
+                None => call.await,
+            };
+            match res {
+                Ok(r) => r,
+                Err(e) => tonic::Status::internal(e.to_string()).into_http(),
+            }
+        }
     };
 
     // Trailers-only responses carry grpc-status in the headers.
@@ -314,13 +512,13 @@ async fn handle(
         .get("grpc-message")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    *guard.status.lock() = (header_status, header_message);
 
-    let status: Arc<Mutex<(Option<i32>, Option<String>)>> = Arc::new(Mutex::new((header_status, header_message)));
     let sent = cfg
         .stats_tracking
         .then(|| m.sent_message_size.with_label_values(&["gRPC", &method]));
     let mut out_counter = GrpcFrameCounter::default();
-    let status_f = Arc::clone(&status);
+    let status_f = Arc::clone(&guard.status);
     let on_frame = Box::new(move |f: &Frame<Bytes>| {
         if let Some(d) = f.data_ref() {
             if let Some(h) = &sent {
@@ -339,58 +537,47 @@ async fn handle(
             }
         }
     });
-    let duration_vec = m.request_duration.clone();
-    let report = cfg.report_grpc_status;
-    let logger = Arc::clone(&ctx.logger);
     let on_done = Box::new(move |completed: bool| {
-        let (code, msg) = status.lock().clone();
-        // A stream torn down before its status was sent was canceled by the client.
-        let code = match code {
-            Some(c) => c,
-            None if completed => 0,
-            None => 1,
-        };
-        let elapsed = begin.elapsed();
-        duration_vec
-            .with_label_values(&["gRPC", &method, &grpc_status_label(code, report), "false"])
-            .observe(elapsed.as_secs_f64());
-        if let Some(g) = &inflight {
-            g.dec();
-        }
-        if let Some(t) = &stream_tracker {
-            t.close_stream(conn.id);
-        }
-        if conn.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            *conn.idle_since.lock() = Instant::now();
-        }
-        if code != 0 {
-            // The handler's view of its error (Go error text, OptionalLogging), or a plain
-            // `status.Error` as grpc-go would format it.
-            let (err, keep) = match error_log.take() {
-                Some(e) => match e.reason {
-                    Some(r) => (format!("{} ({r})", e.err), e.keep),
-                    None => (e.err, e.keep),
-                },
-                None => (
-                    format!(
-                        "rpc error: code = {} desc = {}",
-                        grpc_status_label(code, true),
-                        percent_decode(msg.as_deref().unwrap_or(""))
-                    ),
-                    true,
-                ),
-            };
-            if keep {
-                let dur = GoDuration(elapsed.as_nanos() as i64).to_string();
-                let level = if code == 1 { LogLevel::Debug } else { LogLevel::Warn };
-                logger.log(
-                    level,
-                    &[("method", &method), ("duration", &dur), ("msg", "gRPC"), ("err", &err)],
-                );
-            }
-        }
+        let mut guard = guard;
+        guard.finish(completed);
     });
-    Ok(resp.map(|b| tonic::body::boxed(TrackedBody::new(b).on_frame(on_frame).on_done(on_done))))
+    // grpc-go closes the stream (RST_STREAM CANCEL) when the deadline expires mid-response.
+    let body_deadline = deadline.map(tokio::time::Instant::into_std);
+    Ok(resp.map(|b| {
+        tonic::body::boxed(
+            TrackedBody::new(b)
+                .on_frame(on_frame)
+                .on_done(on_done)
+                .deadline_with(body_deadline, cancel_stream_error),
+        )
+    }))
+}
+
+/// The error making hyper reset the HTTP/2 stream with `RST_STREAM(CANCEL)`.
+fn cancel_stream_error() -> super::body::BoxError {
+    Box::new(h2::Error::from(h2::Reason::CANCEL))
+}
+
+/// A response whose body immediately fails with [`cancel_stream_error`]: the stream is reset
+/// like grpc-go does when the request deadline expires before the handler responded.
+fn reset_stream_response() -> GrpcResponse {
+    struct ResetBody;
+    impl http_body::Body for ResetBody {
+        type Data = Bytes;
+        type Error = super::body::BoxError;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            std::task::Poll::Ready(Some(Err(cancel_stream_error())))
+        }
+    }
+    let mut resp = hyper::Response::new(tonic::body::boxed(ResetBody));
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    resp
 }
 
 fn percent_decode(s: &str) -> String {
@@ -485,5 +672,252 @@ fn check_cluster(
                 ))
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A gRPC service whose unary handler never completes (like a strong read consistency wait).
+    #[derive(Clone)]
+    struct HangingSvc;
+
+    impl tonic::server::NamedService for HangingSvc {
+        const NAME: &'static str = "test.Hanging";
+    }
+
+    impl tower::Service<http::Request<tonic::body::BoxBody>> for HangingSvc {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+            Box::pin(async move {
+                if req.uri().path() == "/test.Hanging/Fast" {
+                    return Ok(tonic::Status::ok("").into_http());
+                }
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct VecLogger(Mutex<Vec<String>>);
+
+    impl Logger for VecLogger {
+        fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
+            let kv: Vec<String> = kvs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            self.0.lock().push(format!("{level:?} {}", kv.join(" ")));
+        }
+    }
+
+    struct Fixture {
+        reg: prometheus::Registry,
+        conn: Arc<Conn>,
+        ctx: GrpcContext,
+        cfg: GrpcServerConfig,
+        routes: tonic::service::Routes,
+    }
+
+    fn fixture(multitenancy_enabled: bool) -> Fixture {
+        let reg = prometheus::Registry::new();
+        let metrics = ServerMetrics::new(&reg, true, true).unwrap();
+        Fixture {
+            reg,
+            conn: Arc::new(Conn {
+                id: 1,
+                active: AtomicUsize::new(0),
+                idle_since: Mutex::new(Instant::now()),
+            }),
+            ctx: GrpcContext {
+                metrics,
+                logger: Arc::new(VecLogger::default()),
+            },
+            cfg: GrpcServerConfig {
+                max_concurrent_streams: 0,
+                keepalive_time: None,
+                keepalive_timeout: Duration::from_secs(20),
+                max_connection_idle: None,
+                max_connection_age: None,
+                max_connection_age_grace: None,
+                tls: None,
+                stats_tracking: true,
+                report_grpc_status: true,
+                cluster_validation: None,
+                multitenancy_enabled,
+            },
+            routes: tonic::service::Routes::new(HangingSvc).prepare(),
+        }
+    }
+
+    impl Fixture {
+        fn call(
+            &self,
+            path: &str,
+            headers: &[(&str, &str)],
+        ) -> impl Future<Output = Result<GrpcResponse, std::convert::Infallible>> + Send + 'static {
+            let mut b = http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/grpc");
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            let req = b.body(tonic::body::empty_body()).unwrap();
+            handle(
+                req,
+                "127.0.0.1:1".parse().unwrap(),
+                Arc::clone(&self.conn),
+                self.routes.clone(),
+                self.cfg.clone(),
+                self.ctx.clone(),
+            )
+        }
+
+        fn gauge(&self, name: &str, route: &str) -> f64 {
+            self.sample(name, route, None, |m| m.get_gauge().get_value())
+        }
+
+        fn duration_count(&self, route: &str, status: &str) -> f64 {
+            self.sample("cortex_request_duration_seconds", route, Some(status), |m| {
+                m.get_histogram().get_sample_count() as f64
+            })
+        }
+
+        fn sample(
+            &self,
+            name: &str,
+            route: &str,
+            status: Option<&str>,
+            f: impl Fn(&prometheus::proto::Metric) -> f64,
+        ) -> f64 {
+            for mf in self.reg.gather() {
+                if mf.get_name() != name {
+                    continue;
+                }
+                for m in mf.get_metric() {
+                    let has = |k: &str, v: &str| {
+                        m.get_label().iter().any(|l| l.get_name() == k && l.get_value() == v)
+                    };
+                    if has("route", route) && status.is_none_or(|s| has("status_code", s)) {
+                        return f(m);
+                    }
+                }
+            }
+            0.0
+        }
+    }
+
+    async fn drain(resp: GrpcResponse) -> Option<String> {
+        use http_body_util::BodyExt;
+        let header = resp.headers().get("grpc-status").map(|v| v.to_str().unwrap().to_string());
+        let collected = resp.into_body().collect().await.ok()?;
+        header.or_else(|| {
+            collected
+                .trailers()
+                .and_then(|t| t.get("grpc-status"))
+                .map(|v| v.to_str().unwrap().to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn canceled_rpc_does_not_leak_inflight_streams_or_conn_activity() {
+        let fx = fixture(false);
+        let route = "/test.Hanging/Wait";
+        let task = tokio::spawn(fx.call(route, &[]));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fx.gauge("cortex_inflight_requests", route), 1.0);
+        assert_eq!(fx.conn.active.load(Ordering::Acquire), 1);
+
+        // Client RST_STREAM: hyper drops the handler future.
+        task.abort();
+        let _ = task.await;
+        assert_eq!(fx.gauge("cortex_inflight_requests", route), 0.0);
+        assert_eq!(fx.conn.active.load(Ordering::Acquire), 0);
+        assert_eq!(fx.duration_count(route, "Canceled"), 1.0);
+    }
+
+    #[tokio::test]
+    async fn grpc_timeout_resets_the_stream_like_grpc_go() {
+        use http_body_util::BodyExt;
+
+        let fx = fixture(false);
+        let route = "/test.Hanging/Wait";
+        let started = Instant::now();
+        let resp = fx.call(route, &[("grpc-timeout", "100m")]).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The handler was dropped (its waits canceled): nothing is in flight any more.
+        assert_eq!(fx.gauge("cortex_inflight_requests", route), 0.0);
+        assert_eq!(fx.conn.active.load(Ordering::Acquire), 0);
+        // RST_STREAM(CANCEL) instead of a status; recorded as a canceled RPC.
+        let Err(err) = resp.into_body().collect().await else {
+            panic!("expected a stream reset");
+        };
+        // hyper picks the reset reason from the h2::Error in the body error's source chain.
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+        let mut reason = None;
+        while let Some(e) = source {
+            if let Some(h2e) = e.downcast_ref::<h2::Error>() {
+                reason = h2e.reason();
+                break;
+            }
+            source = e.source();
+        }
+        assert_eq!(reason, Some(h2::Reason::CANCEL));
+        assert_eq!(fx.duration_count(route, "Canceled"), 1.0);
+    }
+
+    #[tokio::test]
+    async fn malformed_or_expired_grpc_timeout_aborts_early() {
+        let fx = fixture(false);
+        let route = "/test.Hanging/Fast";
+        let resp = fx.call(route, &[("grpc-timeout", "1x")]).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::BAD_REQUEST);
+        let st = tonic::Status::from_header_map(resp.headers()).unwrap();
+        assert_eq!(st.code(), tonic::Code::Internal);
+        assert_eq!(
+            st.message(),
+            "malformed grpc-timeout: transport: timeout unit is not recognized: \"1x\""
+        );
+        let resp = fx.call(route, &[("grpc-timeout", "0n")]).await.unwrap();
+        let st = tonic::Status::from_header_map(resp.headers()).unwrap();
+        assert_eq!(st.code(), tonic::Code::DeadlineExceeded);
+        // Early aborts never reach the interceptors / stats handler.
+        assert_eq!(fx.duration_count(route, "Internal"), 0.0);
+        assert_eq!(fx.conn.active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn multitenancy_requires_exactly_one_org_id_except_no_auth_methods() {
+        let fx = fixture(true);
+        let route = "/test.Hanging/Fast";
+        let resp = fx.call(route, &[]).await.unwrap();
+        let st = tonic::Status::from_header_map(resp.headers()).unwrap();
+        assert_eq!(st.code(), tonic::Code::Unknown);
+        assert_eq!(st.message(), "no org id");
+        assert_eq!(drain(resp).await.as_deref(), Some("2"));
+        let resp = fx
+            .call(route, &[("x-scope-orgid", "a"), ("x-scope-orgid", "a")])
+            .await
+            .unwrap();
+        assert_eq!(drain(resp).await.as_deref(), Some("2"));
+        let resp = fx.call(route, &[("x-scope-orgid", "a|b")]).await.unwrap();
+        assert_eq!(drain(resp).await.as_deref(), Some("0"));
+        assert_eq!(fx.duration_count(route, "Unknown"), 2.0);
+        assert!(check_org_id(&http::HeaderMap::new(), "/grpc.health.v1.Health/Check").is_none());
+
+        let fx = fixture(false);
+        let resp = fx.call(route, &[]).await.unwrap();
+        assert_eq!(drain(resp).await.as_deref(), Some("0"));
     }
 }
