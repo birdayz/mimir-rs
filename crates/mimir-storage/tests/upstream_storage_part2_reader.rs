@@ -1723,91 +1723,148 @@ async fn test_single_cluster_partition_reader_consume_at_startup() {
 }
 
 // Upstream: pkg/storage/ingest/reader_test.go::TestSingleClusterPartitionReader_ShouldNotBufferRecordsInTheKafkaClientWhenDone
+//
+// Upstream relies on synctest to have the reader fetch record-3 and record-4 separately; here
+// record-4 is produced once the consumer is blocked on record-3.
 #[tokio::test]
 async fn test_single_cluster_partition_reader_should_not_buffer_records_in_the_kafka_client_when_done()
 {
     const TOPIC: &str = "test";
     const PARTITION_ID: i32 = 1;
+    const MAX_BUFFERED_BYTES: i64 = 2_000_000;
 
-    let cluster = FakeKafkaCluster::start(PARTITION_ID + 1, TOPIC).await;
-    produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-1", Some(1));
-    produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-2", Some(1));
+    // (fetch concurrency, expected buffered records, expected buffered bytes, expected
+    // records buffered in the client)
+    let variants: [(i64, f64, f64, f64); 3] = [
+        // without concurrency: kgo buffers the fetch (userSize = 8 value + 11 header bytes).
+        (0, 1.0, 19.0, 1.0),
+        // only one fetcher is active (no fetch over the HWM); it fetches 1MB.
+        (2, 1.0, 1_000_000.0, 0.0),
+        // one fetcher fetching 500KB.
+        (4, 1.0, 500_000.0, 0.0),
+    ];
 
-    let blocked = Arc::new(AtomicBool::new(false));
-    let consumed = Arc::new(SyncMutex::new(Vec::<String>::new()));
-    let blk_c = Arc::clone(&blocked);
-    let cons_c = Arc::clone(&consumed);
+    for file_enforced in [false, true] {
+        for (conc, exp_records, exp_bytes, exp_client_records) in variants {
+            let cluster = FakeKafkaCluster::start(PARTITION_ID + 1, TOPIC).await;
+            produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-1", Some(1));
+            produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-2", Some(1));
 
-    let dir = tempfile::tempdir().unwrap();
-    let reg = Registry::new();
-    let mut cfg = create_test_kafka_config(&cluster.addr, TOPIC);
-    cfg.consume_from_position_at_startup = "start".to_string();
-    cfg.target_consumer_lag_at_startup = GoDuration::from_secs(1);
-    cfg.max_consumer_lag_at_startup = GoDuration::from_secs(2);
+            let blocked = Arc::new(AtomicBool::new(false));
+            let waiting = Arc::new(AtomicBool::new(false));
+            let consumed = Arc::new(SyncMutex::new(Vec::<String>::new()));
+            let blk_c = Arc::clone(&blocked);
+            let wait_c = Arc::clone(&waiting);
+            let cons_c = Arc::clone(&consumed);
 
-    let reader = SingleClusterPartitionReader::new(
-        cfg,
-        PARTITION_ID,
-        "test-group",
-        Some(dir.path().join("offset.json")),
-        Arc::new(FnConsumer(move |recs: Vec<FetchedRecord>| {
-            let blk_c = Arc::clone(&blk_c);
-            let cons_c = Arc::clone(&cons_c);
-            async move {
-                while blk_c.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                let mut g = cons_c.lock();
-                for r in recs {
-                    g.push(String::from_utf8_lossy(&r.value).into_owned());
-                }
-                Ok(())
+            let dir = tempfile::tempdir().unwrap();
+            let reg = Registry::new();
+            let logs = Arc::new(SyncMutex::new(Vec::<String>::new()));
+            let mut cfg = create_test_kafka_config(&cluster.addr, TOPIC);
+            cfg.consume_from_position_at_startup = "start".to_string();
+            cfg.target_consumer_lag_at_startup = GoDuration::from_secs(1);
+            cfg.max_consumer_lag_at_startup = GoDuration::from_secs(2);
+            cfg.max_buffered_bytes = MAX_BUFFERED_BYTES;
+            cfg.fetch_concurrency_max = conc;
+            cfg.consumer_group_offset_commit_file_enforced = file_enforced;
+
+            let mut reader = SingleClusterPartitionReader::new(
+                cfg,
+                PARTITION_ID,
+                "test-group",
+                Some(dir.path().join("offset.json")),
+                Arc::new(FnConsumer(move |recs: Vec<FetchedRecord>| {
+                    let blk_c = Arc::clone(&blk_c);
+                    let wait_c = Arc::clone(&wait_c);
+                    let cons_c = Arc::clone(&cons_c);
+                    async move {
+                        while blk_c.load(Ordering::SeqCst) {
+                            wait_c.store(true, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        let mut g = cons_c.lock();
+                        for r in recs {
+                            g.push(String::from_utf8_lossy(&r.value).into_owned());
+                        }
+                        Ok(())
+                    }
+                })),
+                Some(&reg),
+            )
+            .unwrap()
+            .with_log_sink(Arc::clone(&logs));
+            if file_enforced {
+                reader = reader.with_max_replay_period(Duration::from_secs(3600));
             }
-        })),
-        Some(&reg),
-    )
-    .unwrap();
-    reader.start().await.unwrap();
-    assert_eq!(*consumed.lock(), vec!["record-1", "record-2"]);
-    assert_eq!(reader.buffered_records(), 0);
-    assert_eq!(
-        get_gauge_value(
-            &reg,
-            "cortex_ingest_storage_reader_buffered_fetched_records",
-            &[]
-        ),
-        Some(0.0)
-    );
+            reader.start().await.unwrap();
+            assert!(logs.lock().iter().any(|l| l
+                == "partition reader consumed partition and current lag is lower than configured target consumer lag"));
+            assert_eq!(*consumed.lock(), vec!["record-1", "record-2"]);
 
-    blocked.store(true, Ordering::SeqCst);
-    produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-3", Some(1));
-    produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-4", Some(1));
+            // Give the client some time to eventually read and buffer records (not expected).
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let gauges = |reg: &Registry| {
+                (
+                    get_gauge_value(reg, "cortex_ingest_storage_reader_last_consumed_offset", &[("partition", "1")]),
+                    get_gauge_value(reg, "cortex_ingest_storage_reader_buffered_fetch_records_total", &[("component", "partition-reader")]),
+                    get_gauge_value(reg, "cortex_ingest_storage_reader_buffered_fetched_records", &[]),
+                    get_gauge_value(reg, "cortex_ingest_storage_reader_buffered_fetched_bytes", &[]),
+                )
+            };
+            let (last, client_recs, recs, _) = gauges(&reg);
+            assert_eq!(last, Some(1.0));
+            assert_eq!(client_recs, Some(0.0));
+            assert_eq!(recs, Some(0.0));
 
-    let dl = Instant::now() + Duration::from_secs(3);
-    while reader.buffered_records() == 0 {
-        assert!(Instant::now() < dl);
-        tokio::time::sleep(Duration::from_millis(10)).await;
+            // Make the consumer block on the next consumption and produce more records.
+            blocked.store(true, Ordering::SeqCst);
+            produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-3", Some(1));
+            let dl = Instant::now() + Duration::from_secs(5);
+            while !waiting.load(Ordering::SeqCst) {
+                assert!(Instant::now() < dl, "consumer never received record-3 (conc {conc})");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-4", Some(1));
+
+            // We expect to have some records buffered.
+            let dl = Instant::now() + Duration::from_secs(5);
+            loop {
+                let (last, client_recs, recs, bytes) = gauges(&reg);
+                if last == Some(1.0)
+                    && client_recs == Some(exp_client_records)
+                    && recs == Some(exp_records)
+                    && bytes == Some(exp_bytes)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < dl,
+                    "conc {conc}: got last={last:?} client={client_recs:?} records={recs:?} bytes={bytes:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(reader.buffered_records(), exp_records as i64);
+
+            blocked.store(false, Ordering::SeqCst);
+            let dl = Instant::now() + Duration::from_secs(5);
+            while consumed.lock().len() < 4 {
+                assert!(Instant::now() < dl);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                *consumed.lock(),
+                vec!["record-1", "record-2", "record-3", "record-4"]
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let (last, client_recs, recs, _) = gauges(&reg);
+            assert_eq!(last, Some(3.0));
+            assert_eq!(client_recs, Some(0.0));
+            assert_eq!(recs, Some(0.0));
+
+            reader.stop().await;
+            cluster.close();
+        }
     }
-    assert!(
-        get_gauge_value(
-            &reg,
-            "cortex_ingest_storage_reader_buffered_fetched_records",
-            &[]
-        )
-        .unwrap()
-            > 0.0
-    );
-
-    blocked.store(false, Ordering::SeqCst);
-    let dl = Instant::now() + Duration::from_secs(3);
-    while consumed.lock().len() < 4 {
-        assert!(Instant::now() < dl);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(reader.buffered_records(), 0);
-
-    reader.stop().await;
-    cluster.close();
 }
 
 // Upstream: pkg/storage/ingest/reader_test.go::TestSingleClusterPartitionReader_ShouldNotPanicIfBufferedRecordsIsCalledBeforeStarting
@@ -3239,6 +3296,221 @@ async fn test_single_cluster_partition_reader_last_committed_offset() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(reader.last_committed_offset(), 2);
+
+        reader.stop().await;
+        cluster.close();
+    }
+}
+
+fn histogram_buckets(reg: &Registry, name: &str, labels: &[(&str, &str)]) -> Option<(Vec<f64>, u64)> {
+    for mf in reg.gather() {
+        if mf.get_name() != name {
+            continue;
+        }
+        for m in mf.get_metric() {
+            let ok = labels.iter().all(|(k, v)| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.get_name() == *k && l.get_value() == *v)
+            });
+            if ok {
+                let h = m.get_histogram();
+                return Some((
+                    h.get_bucket().iter().map(|b| b.get_upper_bound()).collect(),
+                    h.get_sample_count(),
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// KAFKA-3: `processNextFetches` runs `instrumentGaps(findGapsInRecords(fetches, lastSeenOffset))`,
+/// so offsets that were never fetched are counted in `missed_records_total` (both fetch paths).
+// Upstream: pkg/storage/ingest/reader.go (processNextFetches / instrumentGaps)
+#[tokio::test]
+async fn test_single_cluster_partition_reader_counts_missed_records() {
+    const TOPIC: &str = "test";
+    const PARTITION_ID: i32 = 1;
+
+    for conc in [0i64, 2] {
+        let cluster = FakeKafkaCluster::start(PARTITION_ID + 1, TOPIC).await;
+        for i in 0..6 {
+            produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, format!("record-{i}").as_bytes(), Some(1));
+        }
+        // The broker never returns offsets 2 and 3 (e.g. deleted by retention between fetches).
+        *cluster.hooks.fetch.lock() = Some(Arc::new(move |req: kafka_protocol::messages::FetchRequest| {
+            Box::pin(async move {
+                let fp = &req.topics[0].partitions[0];
+                if fp.fetch_offset < 4 {
+                    // Offsets 0..1 come in a first response, then the broker jumps to 4.
+                    let range = if fp.fetch_offset <= 1 { fp.fetch_offset..2 } else { 4..6 };
+                    let mut resp = FetchResponse::default();
+                    let mut ft = FetchableTopicResponse::default();
+                    ft.topic = req.topics[0].topic.clone();
+                    ft.topic_id = req.topics[0].topic_id;
+                    let mut pd = PartitionData::default();
+                    pd.partition_index = fp.partition;
+                    pd.high_watermark = 6;
+                    pd.log_start_offset = 0;
+                    let recs: Vec<helpers::StoredRecord> = range
+                        .map(|o| helpers::StoredRecord {
+                            offset: o,
+                            timestamp_ms: now_ms(),
+                            key: None,
+                            value: Some(Bytes::from(format!("record-{o}"))),
+                            headers: vec![("Version".to_string(), Some(Bytes::copy_from_slice(&1u32.to_be_bytes())))],
+                        })
+                        .collect();
+                    pd.records = Some(helpers::encode_stored_records(&recs));
+                    ft.partitions = vec![pd];
+                    resp.responses = vec![ft];
+                    return HookAction::Respond(resp);
+                }
+                HookAction::PassThrough
+            })
+        }));
+
+        let consumed = Arc::new(SyncMutex::new(Vec::<i64>::new()));
+        let c = Arc::clone(&consumed);
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::new();
+        let mut cfg = create_test_kafka_config(&cluster.addr, TOPIC);
+        cfg.consume_from_position_at_startup = "start".to_string();
+        cfg.fetch_concurrency_max = conc;
+        // Small fetches so that offsets 0..1 come first.
+        cfg.max_buffered_bytes = 2_000_000;
+        let reader = SingleClusterPartitionReader::new(
+            cfg,
+            PARTITION_ID,
+            "test-group",
+            Some(dir.path().join("offset.json")),
+            Arc::new(FnConsumer(move |recs: Vec<FetchedRecord>| {
+                let c = Arc::clone(&c);
+                async move {
+                    c.lock().extend(recs.iter().map(|r| r.offset));
+                    Ok(())
+                }
+            })),
+            Some(&reg),
+        )
+        .unwrap();
+        reader.start().await.unwrap();
+
+        let dl = Instant::now() + Duration::from_secs(10);
+        while !consumed.lock().contains(&5) {
+            assert!(Instant::now() < dl, "conc {conc}: consumed {:?}", consumed.lock());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let got = consumed.lock().clone();
+        let missed = get_counter_value(&reg, "cortex_ingest_storage_reader_missed_records_total", &[]);
+        assert_eq!(got, vec![0, 1, 4, 5], "conc {conc}");
+        assert_eq!(missed, 2.0, "conc {conc}");
+        reader.stop().await;
+        cluster.close();
+    }
+}
+
+/// KAFKA-4 / KAFKA-5: the startup catch-up observes the `phase="starting"` delays, the running
+/// loop the `phase="running"` ones, `receive_and_consume_delay` is observed after consumption,
+/// and the histogram buckets match `NewReaderMetrics`.
+// Upstream: pkg/storage/ingest/reader.go (NewReaderMetrics, processNextFetches)
+#[tokio::test]
+async fn test_single_cluster_partition_reader_metrics_match_upstream() {
+    const TOPIC: &str = "test";
+    const PARTITION_ID: i32 = 1;
+
+    for conc in [0i64, 2] {
+        let cluster = FakeKafkaCluster::start(PARTITION_ID + 1, TOPIC).await;
+        produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-0", Some(1));
+        produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-1", Some(1));
+
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::new();
+        let mut cfg = create_test_kafka_config(&cluster.addr, TOPIC);
+        cfg.consume_from_position_at_startup = "start".to_string();
+        cfg.fetch_concurrency_max = conc;
+        cfg.target_consumer_lag_at_startup = GoDuration::from_secs(1);
+        cfg.max_consumer_lag_at_startup = GoDuration::from_secs(2);
+        let reader = SingleClusterPartitionReader::new(
+            cfg,
+            PARTITION_ID,
+            "test-group",
+            Some(dir.path().join("offset.json")),
+            TestConsumer::new(16),
+            Some(&reg),
+        )
+        .unwrap();
+
+        // Both phases are exposed from the start (WithLabelValues in NewReaderMetrics).
+        for name in [
+            "cortex_ingest_storage_reader_receive_delay_seconds",
+            "cortex_ingest_storage_reader_receive_and_consume_delay_seconds",
+        ] {
+            for phase in ["starting", "running"] {
+                let (bounds, count) = histogram_buckets(&reg, name, &[("phase", phase)]).unwrap();
+                assert_eq!(count, 0);
+                let want: Vec<f64> = (0..18).map(|i| 0.125 * 2f64.powi(i)).collect();
+                assert_eq!(bounds, want, "{name}");
+            }
+        }
+
+        reader.start().await.unwrap();
+        for name in [
+            "cortex_ingest_storage_reader_receive_delay_seconds",
+            "cortex_ingest_storage_reader_receive_and_consume_delay_seconds",
+        ] {
+            let (_, count) = histogram_buckets(&reg, name, &[("phase", "starting")]).unwrap();
+            assert_eq!(count, 2, "{name} starting (conc {conc})");
+        }
+
+        produce_record_to_cluster(&cluster, TOPIC, PARTITION_ID, b"record-2", Some(1));
+        let dl = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (_, count) = histogram_buckets(
+                &reg,
+                "cortex_ingest_storage_reader_receive_and_consume_delay_seconds",
+                &[("phase", "running")],
+            )
+            .unwrap();
+            if count == 1 {
+                break;
+            }
+            assert!(Instant::now() < dl, "conc {conc}: running phase never observed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (bounds, count) =
+            histogram_buckets(&reg, "cortex_ingest_storage_reader_records_per_fetch", &[]).unwrap();
+        let want: Vec<f64> = (0..15).map(|i| 2f64.powi(i)).collect();
+        assert_eq!(bounds, want);
+        assert!(count >= 2);
+        // Native-only upstream histograms: no classic bucket besides +Inf.
+        for name in [
+            "cortex_ingest_storage_reader_records_batch_process_duration_seconds",
+            "cortex_ingest_storage_reader_records_batch_wait_duration_seconds",
+            "cortex_ingest_storage_reader_records_batch_fetch_max_bytes",
+            "cortex_ingest_storage_reader_estimated_bytes_per_record",
+        ] {
+            let (bounds, _) = histogram_buckets(&reg, name, &[]).unwrap();
+            assert!(bounds.is_empty(), "{name}: {bounds:?}");
+        }
+        // The concurrent fetchers observe their own series; the client path doesn't fetch
+        // through them.
+        let (_, max_bytes_count) =
+            histogram_buckets(&reg, "cortex_ingest_storage_reader_records_batch_fetch_max_bytes", &[]).unwrap();
+        assert_eq!(max_bytes_count > 0, conc > 0, "conc {conc}");
+        // kprom client metrics.
+        assert!(
+            get_counter_value(&reg, "cortex_ingest_storage_reader_fetch_records_total", &[("component", "partition-reader")])
+                >= 3.0,
+            "conc {conc}"
+        );
+        assert!(
+            get_counter_value(&reg, "cortex_ingest_storage_reader_connects_total", &[("component", "partition-reader")])
+                >= 1.0,
+            "conc {conc}"
+        );
 
         reader.stop().await;
         cluster.close();

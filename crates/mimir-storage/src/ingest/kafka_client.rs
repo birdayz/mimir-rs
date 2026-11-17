@@ -55,6 +55,7 @@ use super::kgo_retry::{
     mimir_retry_timeout, retryable_request, sharded_retry_backoff, AnyBrokerRotation,
     BrokerChoice, BrokerKey,
 };
+use super::kprom::{self, FetchBatchMetrics, KpromMetrics};
 use super::transport::{KafkaTransport, SaslAuthConfig};
 
 pub const KAFKA_OFFSET_START: i64 = -2;
@@ -155,12 +156,32 @@ struct ClusterMetadata {
     brokers: HashMap<i32, BrokerInfo>,
     /// `(topic, partition) -> leader broker id`
     partition_leaders: HashMap<(String, i32), i32>,
+    /// `(topic, partition) -> leader epoch` (`-1` when the broker does not report it).
+    partition_leader_epochs: HashMap<(String, i32), i32>,
+    /// `topic -> topic ID` (all zeros when the broker does not report it).
+    topic_ids: HashMap<String, [u8; 16]>,
     /// `topic -> sorted partition ids`
     topic_partitions: HashMap<String, Vec<i32>>,
 }
 
+/// kgo `broker.loadConnection`: requests are spread over separate connections per broker so
+/// that long-polling Fetch requests (and slow / produce requests) never delay other requests
+/// queued behind them on the same connection (brokers answer a connection's requests in order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ConnKind {
+    /// `cxnNormal`: metadata, ListOffsets, offset commit / fetch, ...
+    Normal,
+    /// `cxnProduce`.
+    Produce,
+    /// `cxnFetch`: Fetch (long poll).
+    Fetch,
+    /// `cxnSlow`: requests carrying a timeout (e.g. CreateTopics).
+    Slow,
+}
+
 struct BrokerConn {
     addr: String,
+    kind: ConnKind,
     client_id: String,
     next_corr_id: AtomicI32,
     write_tx: mpsc::Sender<Bytes>,
@@ -171,6 +192,9 @@ struct BrokerConn {
     sasl_expiry: Option<std::time::Instant>,
     /// Responses successfully read on this connection after its setup (kgo `cxn.successes`).
     successes: std::sync::atomic::AtomicU64,
+    /// kprom `node_id` label value (`kgo.NodeName`) and hooks, when the client has them.
+    node: String,
+    kprom: Option<Arc<KpromMetrics>>,
 }
 
 struct PendingGuard<'a> {
@@ -188,13 +212,28 @@ impl Drop for PendingGuard<'_> {
 }
 
 impl BrokerConn {
+    #[allow(clippy::too_many_arguments)]
     async fn connect(
         addr: String,
+        kind: ConnKind,
         client_id: String,
         transport: &KafkaTransport,
         request_timeout: Duration,
+        node: String,
+        kprom: Option<Arc<KpromMetrics>>,
     ) -> Result<Arc<Self>, KafkaClientError> {
-        let established = transport.connect(&addr, &client_id, request_timeout).await?;
+        let established = match transport.connect(&addr, &client_id, request_timeout).await {
+            Ok(e) => e,
+            Err(e) => {
+                if let Some(ref k) = kprom {
+                    k.on_broker_connect(&node, false);
+                }
+                return Err(e);
+            }
+        };
+        if let Some(ref k) = kprom {
+            k.on_broker_connect(&node, true);
+        }
 
         let (mut reader, mut writer) = established.stream.into_split();
         let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(256);
@@ -214,6 +253,7 @@ impl BrokerConn {
 
         let pending_r = Arc::clone(&pending);
         let alive_r = Arc::clone(&alive);
+        let disconnect_hook = kprom.clone().map(|k| (k, node.clone()));
         tokio::spawn(async move {
             let mut len_buf = [0u8; 4];
             loop {
@@ -235,12 +275,15 @@ impl BrokerConn {
                 }
             }
             alive_r.store(false, Ordering::SeqCst);
-            let mut map = pending_r.lock();
-            map.clear();
+            pending_r.lock().clear();
+            if let Some((k, node)) = disconnect_hook {
+                k.on_broker_disconnect(&node);
+            }
         });
 
         Ok(Arc::new(Self {
             addr,
+            kind,
             client_id,
             next_corr_id: AtomicI32::new(established.next_correlation_id),
             write_tx,
@@ -249,7 +292,33 @@ impl BrokerConn {
             alive,
             sasl_expiry: established.sasl_expiry,
             successes: std::sync::atomic::AtomicU64::new(0),
+            node,
+            kprom,
         }))
+    }
+
+    /// `send_raw` with a read deadline: a timed-out read is a kprom read error (kgo kills the
+    /// connection and reports `ReadErr` to `OnBrokerE2E`).
+    async fn send_raw_timeout<Req, Resp>(
+        &self,
+        api_key: ApiKey,
+        api_version: i16,
+        req: &Req,
+        timeout: Duration,
+    ) -> Result<Resp, KafkaClientError>
+    where
+        Req: Request + Encodable,
+        Resp: Decodable + HeaderVersion,
+    {
+        match tokio::time::timeout(timeout, self.send_raw(api_key, api_version, req)).await {
+            Ok(res) => res,
+            Err(_) => {
+                if let Some(ref k) = self.kprom {
+                    k.on_read_error(&self.node, 0);
+                }
+                Err(KafkaClientError::RequestTimeout(timeout))
+            }
+        }
     }
 
     fn is_alive(&self) -> bool {
@@ -318,12 +387,27 @@ impl BrokerConn {
             completed: false,
         };
 
+        let written = body.len();
         if self.write_tx.send(body.freeze()).await.is_err() {
+            if let Some(ref k) = self.kprom {
+                k.on_write_error(&self.node);
+            }
             return Err(KafkaClientError::ConnectionClosed);
         }
 
-        let mut resp_buf = rx.await.map_err(|_| KafkaClientError::ConnectionClosed)?;
+        let mut resp_buf = match rx.await {
+            Ok(b) => b,
+            Err(_) => {
+                if let Some(ref k) = self.kprom {
+                    k.on_read_error(&self.node, written);
+                }
+                return Err(KafkaClientError::ConnectionClosed);
+            }
+        };
         guard.completed = true;
+        if let Some(ref k) = self.kprom {
+            k.on_e2e(&self.node, written, resp_buf.len() + 4);
+        }
         let resp_header_ver = if api_key == ApiKey::ApiVersions {
             0
         } else {
@@ -375,7 +459,7 @@ pub struct KafkaClient {
     client_rack: String,
     request_timeout: Duration,
     transport: Arc<KafkaTransport>,
-    conns_by_addr: Mutex<HashMap<String, Arc<BrokerConn>>>,
+    conns_by_addr: Mutex<HashMap<(String, ConnKind), Arc<BrokerConn>>>,
     metadata: RwLock<ClusterMetadata>,
     decode_pool: OnceLock<ScopedWorkerPool>,
     /// `-ingest-storage.kafka.last-produced-offset-retry-timeout`: the `ListOffsets` retry timeout
@@ -384,6 +468,8 @@ pub struct KafkaClient {
     /// Cached controller broker ID (`-1` = unknown), as kgo's `controllerID`.
     controller_id: AtomicI32,
     any_broker: parking_lot::Mutex<AnyBrokerRotation>,
+    /// kprom client hooks (`kgo.WithHooks(metrics)`), set once by the client's owner.
+    kprom: OnceLock<Arc<KpromMetrics>>,
 }
 
 impl KafkaClient {
@@ -413,7 +499,104 @@ impl KafkaClient {
             last_produced_offset_retry_timeout: Duration::from_secs(10),
             controller_id: AtomicI32::new(-1),
             any_broker: parking_lot::Mutex::new(AnyBrokerRotation::default()),
+            kprom: OnceLock::new(),
         })
+    }
+
+    /// Installs the kprom hooks of this client (`kgo.WithHooks(kpromMetrics)`). Only the first
+    /// call has an effect; connections opened before it are not instrumented.
+    pub fn set_kprom(&self, metrics: Arc<KpromMetrics>) {
+        let _ = self.kprom.set(metrics);
+    }
+
+    pub fn kprom(&self) -> Option<&Arc<KpromMetrics>> {
+        self.kprom.get()
+    }
+
+    /// `kgo.NodeName` of the broker a connection to `addr` belongs to.
+    fn node_name_for_addr(&self, addr: &str) -> String {
+        if let Some((id, _)) = self
+            .metadata
+            .read()
+            .brokers
+            .iter()
+            .find(|(_, b)| b.addr == addr)
+        {
+            return id.to_string();
+        }
+        let idx = self.seed_brokers.iter().position(|s| s == addr).unwrap_or(0);
+        kprom::seed_node_name(idx)
+    }
+
+    /// `kgo.Client.PartitionLeader`: the cached `(leader, leader_epoch)` of a partition, or
+    /// `(-1, -1)` if it is unknown.
+    pub fn cached_partition_leader(&self, topic: &str, partition: i32) -> (i32, i32) {
+        let md = self.metadata.read();
+        let key = (topic.to_string(), partition);
+        match md.partition_leaders.get(&key) {
+            Some(&leader) => (
+                leader,
+                md.partition_leader_epochs.get(&key).copied().unwrap_or(-1),
+            ),
+            None => (-1, -1),
+        }
+    }
+
+    /// Whether `node_id` is a broker known from the last metadata response.
+    pub fn is_known_broker(&self, node_id: i32) -> bool {
+        self.metadata.read().brokers.contains_key(&node_id)
+    }
+
+    /// kadm `ListTopics(topic)` + `topics[topic].ID`: loads the topic metadata and returns its ID.
+    pub async fn topic_id(&self, topic: &str) -> Result<[u8; 16], KafkaClientError> {
+        self.refresh_metadata(&[topic]).await?;
+        self.metadata
+            .read()
+            .topic_ids
+            .get(topic)
+            .copied()
+            .ok_or_else(|| KafkaClientError::UnexpectedResponse("topic not found".to_string()))
+    }
+
+    /// Sends a `Fetch` request to the broker `node_id` (`req.RequestWith(ctx, cl.Broker(id))`),
+    /// negotiating the version up to `max_version`. Returns the response and the version used.
+    /// `UnknownBroker` if the broker is not in the current metadata.
+    pub async fn fetch_from_broker(
+        &self,
+        node_id: i32,
+        req: &FetchRequest,
+        min_version: i16,
+        max_version: i16,
+        timeout: Duration,
+    ) -> Result<(FetchResponse, i16), KafkaClientError> {
+        let addr = self.metadata.read().brokers.get(&node_id).map(|b| b.addr.clone());
+        let Some(addr) = addr else {
+            return Err(KafkaClientError::UnknownBroker);
+        };
+        let conn = self.load_conn_kind(&addr, ConnKind::Fetch).await?;
+        let ver = conn.pick_version(ApiKey::Fetch, min_version, max_version);
+        let res = conn.send_raw_timeout(ApiKey::Fetch, ver, req, timeout).await;
+        if let Err(ref e) = res {
+            if is_transport_error(e) {
+                self.drop_conn(&conn).await;
+            }
+        }
+        res.map(|r| (r, ver))
+    }
+
+    /// Decodes the record batches of a fetched partition (kgo `ProcessFetchPartition`), invoking
+    /// the kprom `OnFetchBatchRead` hook for every batch.
+    pub fn decode_fetched_partition(
+        &self,
+        raw_records: Bytes,
+        fetch_offset: i64,
+    ) -> Result<(Vec<FetchedRecord>, i64, Option<i64>), KafkaClientError> {
+        decode_fetch_records_with_pool(
+            raw_records,
+            fetch_offset,
+            || self.get_decode_pool(),
+            self.kprom.get().map(|k| k.as_ref()),
+        )
     }
 
     /// Sets the read deadline used for requests without a timeout field and for the connection
@@ -451,6 +634,11 @@ impl KafkaClient {
         &self.client_id
     }
 
+    /// `-ingest-storage.kafka.client-rack` (kgo `Rack`).
+    pub fn client_rack(&self) -> &str {
+        &self.client_rack
+    }
+
     fn get_decode_pool(&self) -> &ScopedWorkerPool {
         self.decode_pool.get_or_init(|| {
             let hw = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -483,23 +671,31 @@ impl KafkaClient {
         Ok(client)
     }
 
-    async fn get_conn_for_addr(&self, addr: &str) -> Result<Arc<BrokerConn>, KafkaClientError> {
+    async fn get_conn_for_addr(
+        &self,
+        addr: &str,
+        kind: ConnKind,
+    ) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        let key = (addr.to_string(), kind);
         {
             let mut map = self.conns_by_addr.lock().await;
-            if let Some(c) = map.get(addr) {
+            if let Some(c) = map.get(&key) {
                 if c.is_usable() {
                     return Ok(Arc::clone(c));
                 }
-                map.remove(addr);
+                map.remove(&key);
             }
         }
 
         // Connect and negotiate outside conns_by_addr lock so slow/dead brokers never block others.
         let conn = BrokerConn::connect(
             addr.to_string(),
+            kind,
             self.client_id.clone(),
             &self.transport,
             self.request_timeout,
+            self.node_name_for_addr(addr),
+            self.kprom.get().cloned(),
         )
         .await
         .map_err(|e| {
@@ -517,22 +713,23 @@ impl KafkaClient {
         })?;
 
         let mut map = self.conns_by_addr.lock().await;
-        if let Some(existing) = map.get(addr) {
+        if let Some(existing) = map.get(&key) {
             if existing.is_usable() {
                 conn.mark_dead();
                 return Ok(Arc::clone(existing));
             }
         }
-        map.insert(addr.to_string(), Arc::clone(&conn));
+        map.insert(key, Arc::clone(&conn));
         Ok(conn)
     }
 
     async fn drop_conn(&self, conn: &Arc<BrokerConn>) {
         conn.mark_dead();
         let mut map = self.conns_by_addr.lock().await;
-        if let Some(existing) = map.get(&conn.addr) {
+        let key = (conn.addr.clone(), conn.kind);
+        if let Some(existing) = map.get(&key) {
             if Arc::ptr_eq(existing, conn) {
-                map.remove(&conn.addr);
+                map.remove(&key);
             }
         }
     }
@@ -547,7 +744,15 @@ impl KafkaClient {
     /// Returns a pooled connection, dialing a new one if needed. A new connection failing with a
     /// retryable error is retried once (kgo `broker.handleReq`).
     async fn load_conn(&self, addr: &str) -> Result<Arc<BrokerConn>, KafkaClientError> {
-        load_connection_retrying_once(|| self.get_conn_for_addr(addr)).await
+        self.load_conn_kind(addr, ConnKind::Normal).await
+    }
+
+    async fn load_conn_kind(
+        &self,
+        addr: &str,
+        kind: ConnKind,
+    ) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        load_connection_retrying_once(|| self.get_conn_for_addr(addr, kind)).await
     }
 
     /// `cl.broker()`: the next "any" broker (discovered brokers, then seeds).
@@ -573,10 +778,9 @@ impl KafkaClient {
         Req: Request + Encodable,
         Resp: Decodable + HeaderVersion,
     {
-        let res = tokio::time::timeout(timeout, conn.send_raw(api_key, ver, req))
+        let res = conn
+            .send_raw_timeout(api_key, ver, req, timeout)
             .await
-            .map_err(|_| KafkaClientError::RequestTimeout(timeout))
-            .and_then(|r| r)
             .map_err(|e| {
                 // kgo handleResp: EOF before any successful response on a connection without SASL
                 // is ErrFirstReadEOF ("is SASL missing?"), which is never retried.
@@ -632,7 +836,8 @@ impl KafkaClient {
                 let req = &req;
                 async move {
                     let conn = self.load_conn(&b.addr).await?;
-                    let ver = conn.pick_version(ApiKey::Metadata, 1, 9);
+                    // v10+ carries topic IDs (kadm `ListTopics`, ConcurrentFetchers Fetch v13).
+                    let ver = conn.pick_version(ApiKey::Metadata, 1, 12);
                     self.send_on(&conn, ApiKey::Metadata, ver, req, self.request_timeout)
                         .await
                 }
@@ -692,9 +897,13 @@ impl KafkaClient {
     }
 
     async fn any_conn(&self) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        self.any_conn_kind(ConnKind::Normal).await
+    }
+
+    async fn any_conn_kind(&self, kind: ConnKind) -> Result<Arc<BrokerConn>, KafkaClientError> {
         let mut last_err = None;
         for seed in &self.seed_brokers {
-            match self.load_conn(seed).await {
+            match self.load_conn_kind(seed, kind).await {
                 Ok(c) => return Ok(c),
                 Err(e) => last_err = Some(e),
             }
@@ -702,23 +911,28 @@ impl KafkaClient {
         Err(last_err.unwrap_or(KafkaClientError::NoSeedBrokers))
     }
 
-    async fn conn_for_node(&self, node_id: i32) -> Result<Arc<BrokerConn>, KafkaClientError> {
+    async fn conn_for_node(
+        &self,
+        node_id: i32,
+        kind: ConnKind,
+    ) -> Result<Arc<BrokerConn>, KafkaClientError> {
         let addr = {
             let md = self.metadata.read();
             md.brokers.get(&node_id).map(|b| b.addr.clone())
         };
         if let Some(addr) = addr {
-            if let Ok(conn) = self.load_conn(&addr).await {
+            if let Ok(conn) = self.load_conn_kind(&addr, kind).await {
                 return Ok(conn);
             }
         }
-        self.any_conn().await
+        self.any_conn_kind(kind).await
     }
 
     async fn leader_conn(
         &self,
         topic: &str,
         partition: i32,
+        kind: ConnKind,
     ) -> Result<Arc<BrokerConn>, KafkaClientError> {
         let leader = {
             let md = self.metadata.read();
@@ -726,7 +940,7 @@ impl KafkaClient {
         };
         if let Some(node_id) = leader {
             if node_id >= 0 {
-                return self.conn_for_node(node_id).await;
+                return self.conn_for_node(node_id, kind).await;
             }
         }
         self.refresh_metadata(&[topic]).await?;
@@ -736,10 +950,10 @@ impl KafkaClient {
         };
         if let Some(node_id) = leader {
             if node_id >= 0 {
-                return self.conn_for_node(node_id).await;
+                return self.conn_for_node(node_id, kind).await;
             }
         }
-        self.any_conn().await
+        self.any_conn_kind(kind).await
     }
 
     /// Refreshes cluster & topic metadata from any reachable broker.
@@ -758,11 +972,15 @@ impl KafkaClient {
             if let Some(err) = t.error_code.err() {
                 return Err(KafkaClientError::Broker(err));
             }
+            md.topic_ids
+                .insert(topic_name.clone(), *t.topic_id.as_bytes());
             let mut pids = Vec::with_capacity(t.partitions.len());
             for p in t.partitions {
                 pids.push(p.partition_index);
                 md.partition_leaders
                     .insert((topic_name.clone(), p.partition_index), p.leader_id.0);
+                md.partition_leader_epochs
+                    .insert((topic_name.clone(), p.partition_index), p.leader_epoch);
             }
             pids.sort();
             md.topic_partitions.insert(topic_name, pids);
@@ -832,7 +1050,7 @@ impl KafkaClient {
             |b: BrokerChoice| {
                 let req = &req;
                 async move {
-                    let conn = self.load_conn(&b.addr).await?;
+                    let conn = self.load_conn_kind(&b.addr, ConnKind::Slow).await?;
                     let ver = conn.pick_version(ApiKey::CreateTopics, 0, 5);
                     self.send_on(&conn, ApiKey::CreateTopics, ver, req, read_timeout)
                         .await
@@ -1036,7 +1254,7 @@ impl KafkaClient {
     ) -> Result<FetchPartitionResult, KafkaClientError> {
         let wait_timeout = self.request_timeout.max(max_wait + Duration::from_secs(5));
         for attempt in 0..2 {
-            let conn = self.leader_conn(topic, partition).await?;
+            let conn = self.leader_conn(topic, partition, ConnKind::Fetch).await?;
             let ver = conn.pick_version(ApiKey::Fetch, 4, 12);
 
             let mut fp = FetchPartition::default();
@@ -1060,17 +1278,13 @@ impl KafkaClient {
             req.session_id = 0;
             req.session_epoch = -1;
             req.topics = vec![ft];
-            if !self.client_rack.is_empty() {
-                req.rack_id = StrBytes::from_string(self.client_rack.clone());
-            }
+            // No rack: this one-shot fetch always reads from the partition leader. Sending the
+            // rack without honouring `preferred_read_replica` makes a rack-aware broker answer
+            // with an empty redirect forever (KAFKA-1). Rack-aware consumption lives in
+            // `client_consumer.rs` (the kgo consumer path).
 
             let res: Result<FetchPartitionResult, KafkaClientError> = async {
-                let resp: FetchResponse = tokio::time::timeout(
-                    wait_timeout,
-                    conn.send_raw(ApiKey::Fetch, ver, &req),
-                )
-                .await
-                .map_err(|_| KafkaClientError::RequestTimeout(wait_timeout))??;
+                let resp: FetchResponse = conn.send_raw_timeout(ApiKey::Fetch, ver, &req, wait_timeout).await?;
 
                 if let Some(err) = resp.error_code.err() {
                     return Err(KafkaClientError::Broker(err));
@@ -1091,11 +1305,7 @@ impl KafkaClient {
                         let (decoded_records, next_fetch_offset, last_batch_end_offset) =
                             match rp.records {
                                 Some(raw_records) if !raw_records.is_empty() => {
-                                    decode_fetch_records_with_pool(
-                                        raw_records,
-                                        fetch_offset,
-                                        || self.get_decode_pool(),
-                                    )?
+                                    self.decode_fetched_partition(raw_records, fetch_offset)?
                                 }
                                 _ => (Vec::new(), fetch_offset, None),
                             };
@@ -1191,7 +1401,7 @@ impl KafkaClient {
         let payload = batch_buf.freeze();
 
         for attempt in 0..2 {
-            let conn = self.leader_conn(topic, partition).await?;
+            let conn = self.leader_conn(topic, partition, ConnKind::Produce).await?;
             let ver = conn.pick_version(ApiKey::Produce, 3, 9);
 
             let mut pp = PartitionProduceData::default();
@@ -1209,12 +1419,7 @@ impl KafkaClient {
             req.topic_data = vec![tp];
 
             let res: Result<i64, KafkaClientError> = async {
-                let resp: ProduceResponse = tokio::time::timeout(
-                    self.request_timeout,
-                    conn.send_raw(ApiKey::Produce, ver, &req),
-                )
-                .await
-                .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
+                let resp: ProduceResponse = conn.send_raw_timeout(ApiKey::Produce, ver, &req, self.request_timeout).await?;
 
                 for rt in resp.responses {
                     if rt.name.0.as_str() != topic {
@@ -1265,12 +1470,7 @@ impl KafkaClient {
         req.key = StrBytes::from_string(group_id.to_owned());
         req.key_type = 0; // GROUP
 
-        let resp: FindCoordinatorResponse = tokio::time::timeout(
-            self.request_timeout,
-            conn.send_raw(ApiKey::FindCoordinator, ver, &req),
-        )
-        .await
-        .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
+        let resp: FindCoordinatorResponse = conn.send_raw_timeout(ApiKey::FindCoordinator, ver, &req, self.request_timeout).await?;
 
         if let Some(err) = resp.error_code.err() {
             return Err(KafkaClientError::Broker(err));
@@ -1322,12 +1522,7 @@ impl KafkaClient {
             req.topics = vec![t];
 
             let res: Result<(), KafkaClientError> = async {
-                let resp: OffsetCommitResponse = tokio::time::timeout(
-                    self.request_timeout,
-                    conn.send_raw(ApiKey::OffsetCommit, ver, &req),
-                )
-                .await
-                .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
+                let resp: OffsetCommitResponse = conn.send_raw_timeout(ApiKey::OffsetCommit, ver, &req, self.request_timeout).await?;
 
                 for rt in resp.topics {
                     if rt.name.0.as_str() != topic {
@@ -1403,12 +1598,7 @@ impl KafkaClient {
             req.topics = Some(vec![t]);
 
             let res: Result<Option<i64>, KafkaClientError> = async {
-                let resp: OffsetFetchResponse = tokio::time::timeout(
-                    self.request_timeout,
-                    conn.send_raw(ApiKey::OffsetFetch, ver, &req),
-                )
-                .await
-                .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
+                let resp: OffsetFetchResponse = conn.send_raw_timeout(ApiKey::OffsetFetch, ver, &req, self.request_timeout).await?;
 
                 if let Some(err) = resp.error_code.err() {
                     if err == ResponseError::GroupIdNotFound {
@@ -1469,6 +1659,24 @@ struct V2FrameInfo {
     base_offset: i64,
     last_offset_delta: i32,
     is_control: bool,
+    /// `NumRecords` from the batch header.
+    num_records: i32,
+}
+
+/// RecordBatch v2 header layout (offsets within a frame).
+const V2_ATTRIBUTES_OFFSET: usize = 21;
+const V2_FIRST_TIMESTAMP_OFFSET: usize = 27;
+const V2_MAX_TIMESTAMP_OFFSET: usize = 35;
+const V2_NUM_RECORDS_OFFSET: usize = 57;
+/// Size of the RecordBatch v2 header preceding the records section.
+const V2_HEADER_LEN: usize = 61;
+/// Timestamp type attribute bit: set for `LogAppendTime` batches.
+const V2_TIMESTAMP_TYPE_LOG_APPEND_TIME: i16 = 0x08;
+
+fn be_i64(raw: &[u8], at: usize) -> i64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&raw[at..at + 8]);
+    i64::from_be_bytes(b)
 }
 
 fn split_record_batch_v2_frames(raw: &Bytes) -> Result<Option<Vec<V2FrameInfo>>, KafkaClientError> {
@@ -1519,40 +1727,102 @@ fn split_record_batch_v2_frames(raw: &Bytes) -> Result<Option<Vec<V2FrameInfo>>,
             }
             break;
         }
-        let base_offset = i64::from_be_bytes([
-            raw[pos],
-            raw[pos + 1],
-            raw[pos + 2],
-            raw[pos + 3],
-            raw[pos + 4],
-            raw[pos + 5],
-            raw[pos + 6],
-            raw[pos + 7],
+        let base_offset = be_i64(raw, pos);
+        let attributes = i16::from_be_bytes([
+            raw[pos + V2_ATTRIBUTES_OFFSET],
+            raw[pos + V2_ATTRIBUTES_OFFSET + 1],
         ]);
-        let attributes = i16::from_be_bytes([raw[pos + 21], raw[pos + 22]]);
         let last_offset_delta = i32::from_be_bytes([
             raw[pos + 23],
             raw[pos + 24],
             raw[pos + 25],
             raw[pos + 26],
         ]);
+        let n = pos + V2_NUM_RECORDS_OFFSET;
+        let num_records = i32::from_be_bytes([raw[n], raw[n + 1], raw[n + 2], raw[n + 3]]);
         frames.push(V2FrameInfo {
             slice: raw.slice(pos..pos + frame_len),
             base_offset,
             last_offset_delta,
             is_control: (attributes & 0x20) != 0,
+            num_records,
         });
         pos += frame_len;
     }
     Ok(Some(frames))
 }
 
+fn zigzag_varint_len(v: i64) -> usize {
+    let mut u = ((v << 1) ^ (v >> 63)) as u64;
+    let mut n = 1;
+    while u >= 0x80 {
+        u >>= 7;
+        n += 1;
+    }
+    n
+}
+
+fn nullable_bytes_len(b: Option<&Bytes>) -> usize {
+    match b {
+        Some(b) => zigzag_varint_len(b.len() as i64) + b.len(),
+        None => zigzag_varint_len(-1),
+    }
+}
+
+/// Size of a record in the (uncompressed) records section of a RecordBatch v2.
+fn encoded_record_v2_len(rec: &Record, base_offset: i64, first_timestamp: i64) -> usize {
+    let mut body = 1 // attributes
+        + zigzag_varint_len(rec.timestamp.wrapping_sub(first_timestamp))
+        + zigzag_varint_len(rec.offset.wrapping_sub(base_offset))
+        + nullable_bytes_len(rec.key.as_ref())
+        + nullable_bytes_len(rec.value.as_ref())
+        + zigzag_varint_len(rec.headers.len() as i64);
+    for (k, v) in &rec.headers {
+        body += zigzag_varint_len(k.len() as i64) + k.len() + nullable_bytes_len(v.as_ref());
+    }
+    zigzag_varint_len(body as i64) + body
+}
+
+/// Decodes one RecordBatch v2 frame, returning the records at or after `fetch_offset` and the
+/// kgo `FetchBatchMetrics` of the batch.
 fn decode_single_batch_slice(
     mut slice: Bytes,
     fetch_offset: i64,
-) -> Result<Vec<FetchedRecord>, KafkaClientError> {
+) -> Result<(Vec<FetchedRecord>, FetchBatchMetrics), KafkaClientError> {
+    let frame_len = slice.len();
+    let attributes = i16::from_be_bytes([
+        slice[V2_ATTRIBUTES_OFFSET],
+        slice[V2_ATTRIBUTES_OFFSET + 1],
+    ]);
+    let base_offset = be_i64(&slice, 0);
+    let first_timestamp = be_i64(&slice, V2_FIRST_TIMESTAMP_OFFSET);
+    let max_timestamp = be_i64(&slice, V2_MAX_TIMESTAMP_OFFSET);
+    let num_records = i32::from_be_bytes([
+        slice[V2_NUM_RECORDS_OFFSET],
+        slice[V2_NUM_RECORDS_OFFSET + 1],
+        slice[V2_NUM_RECORDS_OFFSET + 2],
+        slice[V2_NUM_RECORDS_OFFSET + 3],
+    ]);
+    let log_append_time = attributes & V2_TIMESTAMP_TYPE_LOG_APPEND_TIME != 0;
+    let compressed = attributes & 0x07 != 0;
     let batch =
         RecordBatchDecoder::decode_with_custom_compression(&mut slice, Some(decompress_record_batch))?;
+    // kgo: CompressedBytes = len(batch.Records) (the records section as sent), UncompressedBytes
+    // = its decompressed length (equal when the batch is not compressed).
+    let compressed_bytes = frame_len.saturating_sub(V2_HEADER_LEN);
+    let uncompressed_bytes = if compressed {
+        batch
+            .iter()
+            .map(|r| encoded_record_v2_len(r, base_offset, first_timestamp))
+            .sum()
+    } else {
+        compressed_bytes
+    };
+    let metrics = FetchBatchMetrics {
+        num_records: num_records.max(0) as usize,
+        uncompressed_bytes: if uncompressed_bytes == 0 { compressed_bytes } else { uncompressed_bytes },
+        compressed_bytes,
+    };
     let mut out = Vec::with_capacity(batch.len());
     for rec in batch {
         if rec.control || rec.offset < fetch_offset {
@@ -1565,19 +1835,25 @@ fn decode_single_batch_slice(
             .collect();
         out.push(FetchedRecord {
             offset: rec.offset,
-            timestamp_ms: rec.timestamp,
+            // franz-go source.go: `if batch.Attributes&0x0008 != 0 { r.Timestamp = MaxTimestamp }`
+            // (LogAppendTime batches carry the broker append time as the batch max timestamp).
+            timestamp_ms: if log_append_time { max_timestamp } else { rec.timestamp },
             key: rec.key.unwrap_or_default(),
             value: rec.value.unwrap_or_default(),
             headers,
         });
     }
-    Ok(out)
+    Ok((out, metrics))
 }
 
+/// Decodes the record batches of a fetched partition, returning
+/// `(records >= fetch_offset, next_fetch_offset, last_batch_end_offset)`. `kprom` receives the
+/// `OnFetchBatchRead` hook for every complete batch.
 pub(crate) fn decode_fetch_records_with_pool<'a>(
     mut raw_records: Bytes,
     fetch_offset: i64,
     get_pool: impl FnOnce() -> &'a ScopedWorkerPool,
+    kprom: Option<&KpromMetrics>,
 ) -> Result<(Vec<FetchedRecord>, i64, Option<i64>), KafkaClientError> {
     if raw_records.is_empty() {
         return Ok((Vec::new(), fetch_offset, None));
@@ -1592,6 +1868,16 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
                     last_batch_end_offset.map_or(batch_end, |prev| prev.max(batch_end)),
                 );
             }
+            if f.is_control {
+                if let Some(k) = kprom {
+                    let bytes = f.slice.len().saturating_sub(V2_HEADER_LEN);
+                    k.on_fetch_batch_read(FetchBatchMetrics {
+                        num_records: f.num_records.max(0) as usize,
+                        uncompressed_bytes: bytes,
+                        compressed_bytes: bytes,
+                    });
+                }
+            }
         }
         let next_fetch_offset =
             last_batch_end_offset.map_or(fetch_offset, |end| fetch_offset.max(end + 1));
@@ -1602,10 +1888,17 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
             .map(|f| f.slice)
             .collect();
 
+        let observe = |m: FetchBatchMetrics| {
+            if let Some(k) = kprom {
+                k.on_fetch_batch_read(m);
+            }
+        };
+
         if data_frames.len() > 1 {
             let pool = get_pool();
-            type BatchDecodeSlot =
-                parking_lot::Mutex<Option<Result<Vec<FetchedRecord>, KafkaClientError>>>;
+            type BatchDecodeSlot = parking_lot::Mutex<
+                Option<Result<(Vec<FetchedRecord>, FetchBatchMetrics), KafkaClientError>>,
+            >;
             let slots: Vec<BatchDecodeSlot> =
                 (0..data_frames.len()).map(|_| parking_lot::Mutex::new(None)).collect();
             let run = || {
@@ -1623,9 +1916,10 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
             }
             let mut decoded = Vec::new();
             for slot in slots {
-                let recs = slot
+                let (recs, m) = slot
                     .into_inner()
                     .expect("parallel batch slot populated")?;
+                observe(m);
                 if decoded.is_empty() {
                     decoded = recs;
                 } else {
@@ -1635,10 +1929,11 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
             return Ok((decoded, next_fetch_offset, last_batch_end_offset));
         }
         if data_frames.len() == 1 {
-            let decoded = decode_single_batch_slice(
+            let (decoded, m) = decode_single_batch_slice(
                 data_frames.into_iter().next().unwrap(),
                 fetch_offset,
             )?;
+            observe(m);
             return Ok((decoded, next_fetch_offset, last_batch_end_offset));
         }
         return Ok((Vec::new(), next_fetch_offset, last_batch_end_offset));
@@ -1729,6 +2024,71 @@ mod tests {
         buf.freeze()
     }
 
+    /// Sets the LogAppendTime attribute bit and the batch max timestamp, re-computing the CRC.
+    fn to_log_append_time(batch: &Bytes, max_timestamp: i64) -> Bytes {
+        let mut b = BytesMut::from(&batch[..]);
+        let attrs = i16::from_be_bytes([b[21], b[22]]) | V2_TIMESTAMP_TYPE_LOG_APPEND_TIME;
+        b[21..23].copy_from_slice(&attrs.to_be_bytes());
+        b[35..43].copy_from_slice(&max_timestamp.to_be_bytes());
+        let crc = crc32c::crc32c(&b[21..]);
+        b[17..21].copy_from_slice(&crc.to_be_bytes());
+        b.freeze()
+    }
+
+    // franz-go source.go processRecordBatch: LogAppendTime batches use the batch MaxTimestamp.
+    #[test]
+    fn log_append_time_batches_use_the_batch_max_timestamp() {
+        let pool = ScopedWorkerPool::new("test-decode", 1);
+        for compression in [Compression::None, Compression::Zstd] {
+            let create = encode_test_batch(&[0, 1, 2], false, compression);
+            let (recs, _, _) =
+                decode_fetch_records_with_pool(create.clone(), 0, || &pool, None).unwrap();
+            let ts: Vec<i64> = recs.iter().map(|r| r.timestamp_ms).collect();
+            assert_eq!(ts, vec![1_700_000_000_000, 1_700_000_000_001, 1_700_000_000_002]);
+
+            let appended = to_log_append_time(&create, 1_800_000_000_000);
+            let (recs, _, _) = decode_fetch_records_with_pool(appended, 1, || &pool, None).unwrap();
+            assert_eq!(recs.len(), 2);
+            assert!(recs.iter().all(|r| r.timestamp_ms == 1_800_000_000_000));
+        }
+    }
+
+    // kprom OnFetchBatchRead: one call per batch, CompressedBytes = len(batch.Records),
+    // UncompressedBytes = decompressed records length, NumRecords from the batch header.
+    #[test]
+    fn fetch_batch_metrics_match_kgo() {
+        let pool = ScopedWorkerPool::new("test-decode", 1);
+        let reg = prometheus::Registry::new();
+        let k = KpromMetrics::new("cortex_ingest_storage_reader", "partition-reader", Some(&reg));
+        let plain = encode_test_batch(&[0, 1, 2], false, Compression::None);
+        let zstd = encode_test_batch(&[3, 4, 5], false, Compression::Zstd);
+        let ctrl = encode_test_batch(&[6], true, Compression::None);
+        let mut all = BytesMut::new();
+        all.extend_from_slice(&plain);
+        all.extend_from_slice(&zstd);
+        all.extend_from_slice(&ctrl);
+        let (recs, next, _) =
+            decode_fetch_records_with_pool(all.freeze(), 1, || &pool, Some(&k)).unwrap();
+        assert_eq!(recs.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(next, 7);
+        let get = |name: &str| -> f64 {
+            reg.gather()
+                .iter()
+                .find(|mf| mf.get_name() == name)
+                .map_or(0.0, |mf| mf.get_metric()[0].get_counter().get_value())
+        };
+        assert_eq!(get("cortex_ingest_storage_reader_fetch_batches_total"), 3.0);
+        assert_eq!(get("cortex_ingest_storage_reader_fetch_records_total"), 7.0);
+        let compressed = (plain.len() - V2_HEADER_LEN) + (zstd.len() - V2_HEADER_LEN) + (ctrl.len() - V2_HEADER_LEN);
+        assert_eq!(get("cortex_ingest_storage_reader_fetch_compressed_bytes_total"), compressed as f64);
+        // The zstd batch decompresses to the same records section as the plain one would.
+        let plain_zstd_equiv = encode_test_batch(&[3, 4, 5], false, Compression::None);
+        let uncompressed = (plain.len() - V2_HEADER_LEN)
+            + (plain_zstd_equiv.len() - V2_HEADER_LEN)
+            + (ctrl.len() - V2_HEADER_LEN);
+        assert_eq!(get("cortex_ingest_storage_reader_fetch_bytes_total"), uncompressed as f64);
+    }
+
     #[test]
     fn parallel_multi_batch_zstd_decode_matches_sequential() {
         let mut combined = BytesMut::new();
@@ -1740,7 +2100,7 @@ mod tests {
         let raw = combined.freeze();
         let pool = ScopedWorkerPool::new("test-kafka-dec", 3);
         let (decoded, next_off, last_end) =
-            decode_fetch_records_with_pool(raw, 3, || &pool).unwrap();
+            decode_fetch_records_with_pool(raw, 3, || &pool, None).unwrap();
         assert_eq!(decoded.len(), 17);
         assert_eq!(decoded[0].offset, 3);
         assert_eq!(decoded[0].value, Bytes::from_static(b"payload-3-repeated-repeated-data"));
@@ -1763,7 +2123,7 @@ mod tests {
 
         let pool = ScopedWorkerPool::new("test-kafka-trunc", 2);
         let (decoded, next_off, last_end) =
-            decode_fetch_records_with_pool(combined.freeze(), 0, || &pool).unwrap();
+            decode_fetch_records_with_pool(combined.freeze(), 0, || &pool, None).unwrap();
         assert_eq!(decoded.len(), 6);
         assert_eq!(decoded.last().unwrap().offset, 5);
         assert_eq!(last_end, Some(5));
@@ -1771,9 +2131,9 @@ mod tests {
 
         // If the very first batch is truncated, an error must be returned.
         let truncated_first = b1.slice(..b1.len() - 5);
-        assert!(decode_fetch_records_with_pool(truncated_first, 0, || &pool).is_err());
+        assert!(decode_fetch_records_with_pool(truncated_first, 0, || &pool, None).is_err());
         let truncated_header = b1.slice(..10);
-        assert!(decode_fetch_records_with_pool(truncated_header, 0, || &pool).is_err());
+        assert!(decode_fetch_records_with_pool(truncated_header, 0, || &pool, None).is_err());
     }
 
     #[test]
@@ -1787,14 +2147,14 @@ mod tests {
 
         let pool = ScopedWorkerPool::new("test-kafka-ctrl", 2);
         let (decoded, next_off, last_end) =
-            decode_fetch_records_with_pool(combined.freeze(), 10, || &pool).unwrap();
+            decode_fetch_records_with_pool(combined.freeze(), 10, || &pool, None).unwrap();
         assert_eq!(decoded.len(), 2);
         assert_eq!(last_end, Some(12));
         assert_eq!(next_off, 13);
 
         // Pure control batch fetch still advances next_fetch_offset without spinning
         let (decoded_ctrl_only, next_off_ctrl, last_end_ctrl) =
-            decode_fetch_records_with_pool(ctrl, 12, || &pool).unwrap();
+            decode_fetch_records_with_pool(ctrl, 12, || &pool, None).unwrap();
         assert!(decoded_ctrl_only.is_empty());
         assert_eq!(last_end_ctrl, Some(12));
         assert_eq!(next_off_ctrl, 13);

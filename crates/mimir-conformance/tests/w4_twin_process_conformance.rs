@@ -6,7 +6,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -158,8 +157,7 @@ impl Drop for ProcessGuard {
 }
 
 fn free_tcp_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().unwrap().port()
+    mimir_conformance::free_test_port()
 }
 
 fn now_ms() -> i64 {

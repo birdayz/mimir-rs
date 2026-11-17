@@ -1557,6 +1557,7 @@ impl IngestKafkaClient {
                                         raw_records,
                                         fetch_offset,
                                         || self.get_decode_pool(),
+                                        None,
                                     )?
                                 }
                                 _ => (Vec::new(), fetch_offset, None),

@@ -195,7 +195,7 @@ async fn tls_scram_sha256_all_connection_sites() {
         let got = offsets.fetch_partitions_last_produced_offsets(&req).await.unwrap();
         assert_eq!(got[TOPIC][&0], last);
 
-        // fetcher.rs MuxConn (Metadata for the topic ID).
+        // fetcher.rs ConcurrentFetchers (Metadata for the topic ID via the shared client).
         let oc = offsets.clone();
         let start_reader = Arc::new(GenericOffsetReader::new(
             Arc::new(move || {
@@ -209,8 +209,7 @@ async fn tls_scram_sha256_all_connection_sites() {
             Duration::from_secs(1),
         ));
         let fetchers = ConcurrentFetchers::new(
-            cfg.address.0.clone(),
-            "observ-1374",
+            Arc::clone(&client),
             TOPIC,
             0,
             0,
