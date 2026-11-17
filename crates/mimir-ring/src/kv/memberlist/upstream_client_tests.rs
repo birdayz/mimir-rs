@@ -203,7 +203,9 @@ async fn test_memberlist_abort_if_join_fails_at_startup() {
         .expect("StartAndAwaitRunning must succeed: the full join runs in running()");
     // Service should fail soon after starting, since it cannot join the cluster.
     let svc = kv.service();
-    let _ = tokio::time::timeout(Duration::from_secs(5), svc.await_terminated()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), svc.await_terminated())
+        .await
+        .expect("memberlist service must terminate within 30s when join fails");
     assert_eq!(
         svc.failure_case().map(|e| e.to_string()),
         Some("failed to join memberlist cluster on startup".to_string())
