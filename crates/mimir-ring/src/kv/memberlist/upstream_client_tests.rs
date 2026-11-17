@@ -198,16 +198,16 @@ async fn test_memberlist_abort_if_join_fails_at_startup() {
     cfg.max_join_retries = 2;
     cfg.abort_if_cluster_join_fails = true;
     cfg.join_members.0 = vec![format!("127.0.0.1:{}", free_port())];
-    let res = MemberlistKv::start(cfg, vec![ring_desc_codec()], "", None).await;
-    assert!(
-        res.is_ok(),
-        "dskit reaches Running before the full join and fails the service afterwards \
-         (errFailedToJoinCluster); mimir-rs fails start() instead: {:?}",
-        res.err()
+    let kv = MemberlistKv::start(cfg, vec![ring_desc_codec()], "", None)
+        .await
+        .expect("StartAndAwaitRunning must succeed: the full join runs in running()");
+    // Service should fail soon after starting, since it cannot join the cluster.
+    let svc = kv.service();
+    let _ = tokio::time::timeout(Duration::from_secs(5), svc.await_terminated()).await;
+    assert_eq!(
+        svc.failure_case().map(|e| e.to_string()),
+        Some("failed to join memberlist cluster on startup".to_string())
     );
-    // mimir-rs has no equivalent of services.FailureCase() for MemberlistKv to assert
-    // `failed to join memberlist cluster on startup` afterwards.
-    res.unwrap().shutdown().await;
 }
 
 // Upstream: github.com/grafana/dskit/kv/memberlist/memberlist_client_test.go::TestFastJoin
@@ -447,8 +447,8 @@ async fn test_metrics_registration() {
 #[tokio::test]
 async fn test_memberlist_client_metric_names_match_dskit() {
     let reg = Registry::new();
-    // mimir-cmd passes "cortex" as the namespace; Mimir's KVConfig.MetricsNamespace is "".
-    let kv = MemberlistKv::start(test_cfg("names"), vec![ring_desc_codec()], "cortex", Some(&reg))
+    // Mimir's KVConfig.MetricsNamespace is "".
+    let kv = MemberlistKv::start(test_cfg("names"), vec![ring_desc_codec()], "", Some(&reg))
         .await
         .unwrap();
     add_ring_member(&kv, "member").await;
@@ -473,12 +473,17 @@ async fn test_memberlist_client_metric_names_match_dskit() {
 // Upstream: github.com/hashicorp/memberlist/state_test.go::TestMemberList_ProbeNode_Suspect
 #[tokio::test]
 async fn test_member_list_probe_node_suspect() {
-    let m1 = MemberlistKv::start(test_cfg("probe-1"), vec![ring_desc_codec()], "", None)
+    let opts = KvOptions {
+        probe_interval: Some(Duration::from_millis(200)),
+        ..Default::default()
+    };
+    let m1 = MemberlistKv::start_with_options(test_cfg("probe-1"), vec![ring_desc_codec()], "", None, opts)
         .await
         .unwrap();
     // A peer that was alive and then crashed (kill -9 / OOM / node loss): nothing listens.
     let dead_port = free_port();
-    m1.handle_alive(&Alive {
+    m1.alive_node(
+        &Alive {
         incarnation: 1,
         node: "crashed".to_string(),
         addr: vec![127, 0, 0, 1],
@@ -492,13 +497,17 @@ async fn test_member_list_probe_node_suspect() {
             0,
             0,
         ],
-    });
-    m1.probe().await;
+    },
+        None,
+        false,
+    );
+    let node = m1.nodes.read().map.get("crashed").cloned().unwrap();
+    m1.probe_node(&node).await;
     let state = m1
         .nodes
         .read()
-        .iter()
-        .find(|n| n.name == "crashed")
+        .map
+        .get("crashed")
         .map(|n| n.state);
     m1.shutdown().await;
     assert_eq!(
