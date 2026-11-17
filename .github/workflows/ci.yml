@@ -91,6 +91,7 @@ jobs:
           cargo +nightly miri test -p mimir-common --lib -- thread_pool labels_hash
           cargo +nightly miri test -p mimir-proto --lib -- zerocopy snappy s2 query_stream_enc
           cargo +nightly miri test -p mimir-tsdb --lib -- bstream paged_by_id hash_sorted_pairs labels:: symbols:: postings::
+          cargo +nightly miri test -p mimir-ingester --lib -- nanos_slab
 
   parity:
     name: upstream test parity
@@ -146,7 +147,7 @@ jobs:
             case "$name" in
               w7_k8s_helm_*testcontainers*) shard=docker-k8s ;;
               *testcontainers*) shard=docker ;;
-              w4_*|w5_*) shard=twin-process ;;
+              w4_*|w5_*|w10_*) shard=twin-process ;;
               *) shard=oracle ;;
             esac
             [[ "$shard" == "${{ matrix.shard }}" ]] && args+=(--test "$name")
