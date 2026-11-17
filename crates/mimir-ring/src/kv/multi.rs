@@ -18,7 +18,10 @@ use prometheus::{Counter, Gauge, GaugeVec, Opts, Registry};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use super::{BoxFuture, CasCallbackError, CasFn, CasOutcome, Codec, KvClient, KvError};
+use super::{
+    AsRegisterer, BoxFuture, CasCallbackError, CasFn, CasOutcome, Codec, KvClient, KvError,
+    Registerer,
+};
 
 #[derive(Clone)]
 pub struct NamedKvClient {
@@ -110,33 +113,26 @@ struct MultiMetrics {
 }
 
 impl MultiMetrics {
-    fn new(reg: Option<&Registry>, prefix: &str, kv_name: Option<&str>) -> Self {
-        let opts = |name: &str, help: &str| {
-            let mut o = Opts::new(format!("{prefix}{name}"), help);
-            if let Some(kv_name) = kv_name {
-                o = o.const_label("kv_name", kv_name);
-            }
-            o
-        };
+    fn new(reg: Option<&Registerer>) -> Self {
         let primary_store = GaugeVec::new(
-            opts("multikv_primary_store", "Selected primary KV store"),
+            Opts::new("multikv_primary_store", "Selected primary KV store"),
             &["store"],
         )
         .expect("valid metric");
-        let mirror_enabled = Gauge::with_opts(opts(
+        let mirror_enabled = Gauge::new(
             "multikv_mirror_enabled",
             "Is mirroring to secondary store enabled",
-        ))
+        )
         .expect("valid metric");
-        let mirror_writes = Counter::with_opts(opts(
+        let mirror_writes = Counter::new(
             "multikv_mirror_writes_total",
             "Number of mirror-writes to secondary store",
-        ))
+        )
         .expect("valid metric");
-        let mirror_failures = Counter::with_opts(opts(
+        let mirror_failures = Counter::new(
             "multikv_mirror_write_errors_total",
             "Number of failures to mirror-write to secondary store",
-        ))
+        )
         .expect("valid metric");
 
         if let Some(r) = reg {
@@ -153,19 +149,6 @@ impl MultiMetrics {
             mirror_failures,
         }
     }
-}
-
-/// Options for [`MultiKv::new_with_options`].
-#[derive(Clone, Default)]
-pub struct MultiKvOptions {
-    /// Codec of the stored values; enables mirroring of generic [`KvClient::cas`] writes.
-    pub codec: Option<Arc<dyn Codec>>,
-    /// `MultiConfig.ConfigProvider`, watched for runtime primary switches and mirroring toggles.
-    pub config_provider: Option<MultiConfigProvider>,
-    /// `kv_name` const label of the `multikv_*` metrics (`kv.RegistererWithKVName`).
-    pub kv_name: Option<String>,
-    /// Metric name prefix of the registerer (e.g. `cortex_`).
-    pub metrics_prefix: String,
 }
 
 pub struct MultiKv {
@@ -187,22 +170,47 @@ impl MultiKv {
         clients: Vec<NamedKvClient>,
         reg: Option<&Registry>,
     ) -> Arc<Self> {
-        Self::new_with_options(cfg, clients, reg, MultiKvOptions::default())
+        Self::with_registerer_and_options(
+            cfg,
+            clients,
+            None,
+            reg.map(Registerer::new).as_ref(),
+            None,
+        )
     }
 
-    /// `NewMultiClient` with the options that dskit passes outside of the YAML config.
-    pub fn new_with_options(
+    /// Go `NewMultiClient(cfg, clients, logger, reg)` with a (possibly
+    /// wrapped) Go-style registerer.
+    pub fn with_registerer(
         cfg: MultiKVConfig,
         clients: Vec<NamedKvClient>,
-        reg: Option<&Registry>,
-        opts: MultiKvOptions,
+        codec: Option<Arc<dyn Codec>>,
+        reg: Option<&Registerer>,
     ) -> Arc<Self> {
-        let MultiKvOptions {
-            codec,
-            config_provider,
-            kv_name,
-            metrics_prefix,
-        } = opts;
+        Self::with_registerer_and_options(cfg, clients, codec, reg, None)
+    }
+
+    /// `NewMultiClient`: `codec` enables mirroring of generic [`KvClient::cas`] writes, and
+    /// `config_provider` (`MultiConfig.ConfigProvider`) is watched for runtime primary switches
+    /// and mirroring toggles.
+    pub fn new_with_options<R: AsRegisterer + ?Sized>(
+        cfg: MultiKVConfig,
+        clients: Vec<NamedKvClient>,
+        reg: Option<&R>,
+        codec: Option<Arc<dyn Codec>>,
+        config_provider: Option<MultiConfigProvider>,
+    ) -> Arc<Self> {
+        let reg = reg.map(|r| r.as_registerer());
+        Self::with_registerer_and_options(cfg, clients, codec, reg.as_ref(), config_provider)
+    }
+
+    pub fn with_registerer_and_options(
+        cfg: MultiKVConfig,
+        clients: Vec<NamedKvClient>,
+        codec: Option<Arc<dyn Codec>>,
+        reg: Option<&Registerer>,
+        config_provider: Option<MultiConfigProvider>,
+    ) -> Arc<Self> {
         let m = Arc::new(Self {
             clients,
             codec,
@@ -211,7 +219,7 @@ impl MultiKv {
             primary_id: AtomicUsize::new(0),
             in_progress: Mutex::new(HashMap::new()),
             in_progress_cnt: AtomicUsize::new(0),
-            metrics: MultiMetrics::new(reg, &metrics_prefix, kv_name.as_deref()),
+            metrics: MultiMetrics::new(reg),
         });
         m.update_primary_store_gauge();
         m.update_mirror_enabled_gauge();

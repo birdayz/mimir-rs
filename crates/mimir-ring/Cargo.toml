@@ -12,6 +12,7 @@ axum = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+hickory-resolver = { workspace = true }
 md-5 = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
@@ -24,6 +25,7 @@ serde_json = { workspace = true }
 snap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
 

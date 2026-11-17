@@ -17,12 +17,11 @@ use mimir_config::{
 };
 use mimir_ring::kv::inmemory::InMemoryKv;
 use mimir_ring::kv::multi::{
-    runtime_config_provider, MultiConfigProvider, MultiKv, MultiKvOptions, MultiRuntimeConfig,
-    NamedKvClient,
+    runtime_config_provider, MultiConfigProvider, MultiKv, MultiRuntimeConfig, NamedKvClient,
 };
 use mimir_ring::kv::{
-    build_kv_client_with_options, get_typed, CasOutcome, Codec, KvClient, KvClientOptions,
-    StringCodec,
+    build_kv_client_with_multi_config_provider, get_typed, registerer_with_kv_name, CasOutcome,
+    Codec, KvClient, Registerer, StringCodec,
 };
 use prometheus::Registry;
 use tokio::sync::mpsc;
@@ -61,11 +60,8 @@ fn setup(mirror_enabled: bool, provider: Option<MultiConfigProvider>) -> Setup {
             },
         ],
         Some(&reg),
-        MultiKvOptions {
-            codec: Some(codec()),
-            config_provider: provider,
-            ..Default::default()
-        },
+        Some(codec()),
+        provider,
     );
     Setup { multi, a, b, reg }
 }
@@ -282,30 +278,23 @@ async fn runtime_config_file_flips_primary_of_multi_store() {
         ..Default::default()
     };
     let reg = Registry::new();
+    let cortex_reg = Registerer::new(&reg).wrap_with_prefix("cortex_");
     let provider = runtime_config_provider(&mgr);
-    let client = build_kv_client_with_options(
+    let client = build_kv_client_with_multi_config_provider(
         &kv_cfg,
         codec(),
         None,
-        Some(&reg),
-        KvClientOptions {
-            kv_name: Some("ingester-ring".to_string()),
-            metrics_prefix: "cortex_".to_string(),
-            multi_config_provider: Some(provider.clone()),
-        },
+        registerer_with_kv_name(Some(&cortex_reg), "ingester-ring").as_ref(),
+        Some(provider.clone()),
     )
     .unwrap();
     // A second client on the same registry (like the lifecycler) gets its own series.
-    let client2 = build_kv_client_with_options(
+    let client2 = build_kv_client_with_multi_config_provider(
         &kv_cfg,
         codec(),
         None,
-        Some(&reg),
-        KvClientOptions {
-            kv_name: Some("ingester-lifecycler".to_string()),
-            metrics_prefix: "cortex_".to_string(),
-            multi_config_provider: Some(provider),
-        },
+        registerer_with_kv_name(Some(&cortex_reg), "ingester-lifecycler").as_ref(),
+        Some(provider),
     )
     .unwrap();
     let lifecycler_primary = |r: &Registry, store: &str| {

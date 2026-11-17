@@ -1,142 +1,123 @@
 //! Memberlist gossip-based KV store and client.
 //!
 //! Ported from:
-//! - github.com/grafana/dskit/kv/memberlist/memberlist_client.go
-//! - github.com/grafana/dskit/kv/memberlist/broadcast.go
-//! - github.com/grafana/dskit/kv/memberlist/http_status_handler.go
+//! - github.com/grafana/dskit/kv/memberlist/memberlist_client.go (KV service: starting/running/
+//!   stopping, fast-join, join with retries in batches, DNS discovery, periodic rejoin, CAS,
+//!   watchers with optional delayed notifications, per-key update workers, local-state cache,
+//!   message history, obsolete entries cleanup)
+//! - github.com/grafana/dskit/kv/memberlist/broadcast.go (`ringBroadcast`)
+//! - github.com/hashicorp/memberlist (grafana fork) memberlist.go / net.go (`Join`, `resolveAddr`,
+//!   packet/stream handling, handoff queues, compression metrics)
+//!
+//! The SWIM membership state machine lives in `state.rs`.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use mimir_common::backoff::{Backoff, BackoffConfig};
-use mimir_common::services::ServiceContext;
+use mimir_common::services::{
+    basic_service, ManagedBasicService, Service, ServiceContext, ServiceError, State,
+};
 use mimir_config::server::MemberlistConfig;
 use mimir_proto::memberlistpb::KeyValuePair;
 use mimir_proto::prost::Message as _;
 use parking_lot::{Mutex, RwLock};
-use prometheus::{Counter, Gauge, Opts, Registry};
+use prometheus::Registry;
 use rand::seq::SliceRandom;
 use rand::Rng;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, error, info, warn};
 
+use super::gometrics::GoMetrics;
 use super::mergeable::Mergeable;
+use super::metrics::KvMetrics;
 use super::node_meta::{encode_node_metadata, NodeRole};
-use super::tcp_transport::{ReceivedPacket, TcpTransport};
+use super::queue::{Broadcast, TransmitLimitedQueue};
+use super::stream::{
+    default_hostname, read_msgpack_map_bytes, read_push_pull_from_stream, read_stream_header,
+    read_user_msg_from_stream,
+};
+use super::suspicion::Awareness;
+use super::tcp_transport::{MemberlistConn, ReceivedPacket, TcpTransport};
 use super::wire::{
     add_label_header, compress_payload, decode_ack_resp, decode_alive, decode_compound_message,
     decode_dead, decode_indirect_ping, decode_nack_resp, decode_ping, decode_push_pull,
-    decode_suspect, decompress_buffer, encode_ack_resp, encode_alive, encode_dead, encode_err_resp,
-    encode_nack_resp, encode_ping, encode_push_pull, make_compound_messages,
-    remove_label_header, unwrap_crc32, wrap_crc32, AckResp, Alive, CompressionType, Dead, ErrResp,
-    MessageType, NackResp, NodeStateType, Ping, PushNodeState, PushPullHeader, Suspect,
-    COMPOUND_HEADER_OVERHEAD, COMPOUND_OVERHEAD, MAX_PUSH_STATE_BYTES,
-    PROTOCOL_VERSION_2_COMPATIBLE, PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN,
+    decode_suspect, decompress_buffer, encode_ack_resp, encode_err_resp, encode_push_pull,
+    make_compound_messages, remove_label_header, unwrap_crc32, wrap_crc32, AckResp, Alive,
+    CompressionType, ErrResp, MessageType, NodeStateType, PushNodeState, COMPOUND_HEADER_OVERHEAD,
+    COMPOUND_OVERHEAD, PROTOCOL_VERSION_2_COMPATIBLE, PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN,
 };
+use super::zone_aware::ZoneAwareNodeSelection;
+use crate::dns::{DnsProvider, Provider, GOLANG_RESOLVER_TYPE};
 use crate::kv::{BoxFuture, CasFn, CasOutcome, Codec, KvClient, KvError};
 
+#[path = "state.rs"]
+mod state;
+use state::{AckHandler, NodeTable, Timing};
+
+/// dskit `maxCasRetries`.
 const MAX_CAS_RETRIES: usize = 10;
+/// dskit `noChangeDetectedRetrySleep`.
 const NO_CHANGE_DETECTED_RETRY_SLEEP: Duration = Duration::from_secs(1);
 const LENGTH_PREFIX_SIZE: usize = 4;
-const UDP_BUFFER_SIZE: usize = 10 * 1024 * 1024;
-const PUSH_PULL_SCALE_THRESHOLD: usize = 32;
+/// dskit sets `mlCfg.UDPBufferSize = 10 * 1024 * 1024`.
+pub(crate) const UDP_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+/// memberlist `DefaultLANConfig().BindPort`: dskit never overrides the memberlist config's
+/// BindPort (the TCP transport binds its own port), so default ports in `Join` addresses and
+/// in alive/indirect-ping messages with port 0 are always 7946, exactly like Go.
+const MEMBERLIST_DEFAULT_BIND_PORT: u16 = 7946;
+/// memberlist `maxPushPullRequests`.
+const MAX_PUSH_PULL_REQUESTS: usize = 128;
+/// Default watch-prefix buffer (dskit `watchPrefixBufferSize`).
+const ERR_FAILED_TO_JOIN_CLUSTER: &str = "failed to join memberlist cluster on startup";
 
 /// Snappy block encoding of empty byte slice `[]`.
 const EMPTY_SNAPPY_DATA: &[u8] = &[0x00];
 
-type MergeValueResult = (
-    Option<Box<dyn Mergeable>>,
-    usize,
-    bool,
-    Option<SystemTime>,
-);
+type MergeValueResult = (Option<Box<dyn Mergeable>>, usize, bool, Option<SystemTime>);
 
-#[derive(Clone)]
+/// dskit `ringBroadcast`.
 struct RingBroadcast {
     key: String,
-    content: HashSet<String>,
+    content: Vec<String>,
     version: usize,
     msg: Vec<u8>,
-    transmits: usize,
+    finished: Box<dyn Fn() + Send + Sync>,
 }
 
-impl RingBroadcast {
-    fn invalidates(&self, other: &RingBroadcast) -> bool {
-        if self.key != other.key || other.version >= self.version {
+impl Broadcast for RingBroadcast {
+    fn invalidates(&self, old: &dyn Broadcast) -> bool {
+        let Some(oldb) = old.as_any().downcast_ref::<RingBroadcast>() else {
+            return false;
+        };
+        if self.key != oldb.key {
             return false;
         }
-        other.content.iter().all(|c| self.content.contains(c))
-    }
-}
-
-struct TransmitQueue {
-    retransmit_mult: usize,
-    items: Mutex<Vec<RingBroadcast>>,
-}
-
-impl TransmitQueue {
-    fn new(retransmit_mult: usize) -> Self {
-        Self {
-            retransmit_mult,
-            items: Mutex::new(Vec::new()),
+        // If the old broadcast contains something the new one doesn't, it's not invalidated.
+        if !oldb.content.iter().all(|o| self.content.contains(o)) {
+            return false;
         }
+        self.version >= oldb.version
     }
-
-    fn queue_broadcast(&self, b: RingBroadcast) {
-        let mut items = self.items.lock();
-        items.retain(|existing| !b.invalidates(existing));
-        items.push(b);
+    fn message(&self) -> &[u8] {
+        &self.msg
     }
-
-    fn num_queued(&self) -> usize {
-        self.items.lock().len()
+    fn finished(&self) {
+        (self.finished)();
     }
-
-    fn get_broadcasts(&self, overhead: usize, limit: usize, num_nodes: usize) -> Vec<Vec<u8>> {
-        let mut items = self.items.lock();
-        if items.is_empty() {
-            return Vec::new();
-        }
-        let max_transmits = retransmit_limit(self.retransmit_mult, num_nodes).max(1);
-        let mut bytes_used = 0usize;
-        let mut out = Vec::new();
-        let mut i = 0;
-
-        while i < items.len() {
-            let msg_len = items[i].msg.len() + overhead;
-            if bytes_used + msg_len > limit && !out.is_empty() {
-                i += 1;
-                continue;
-            }
-            bytes_used += msg_len;
-            out.push(items[i].msg.clone());
-            items[i].transmits += 1;
-            if items[i].transmits >= max_transmits {
-                items.remove(i);
-            } else {
-                i += 1;
-            }
-            if bytes_used >= limit {
-                break;
-            }
-        }
-        out
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
-fn retransmit_limit(retransmit_mult: usize, n: usize) -> usize {
-    let node_scale = ((n + 1) as f64).log10().ceil() as usize;
-    retransmit_mult * node_scale.max(1)
-}
-
+/// Go `memberlist.NodeState` (with `Node` fields flattened; `vsn` = [PMin, PMax, PCur, DMin, DMax, DCur]).
 #[derive(Clone, Debug)]
 pub struct NodeState {
     pub name: String,
@@ -159,7 +140,7 @@ impl NodeState {
     }
 }
 
-fn format_ip_port(addr: &[u8], port: u16) -> String {
+pub(crate) fn format_ip_port(addr: &[u8], port: u16) -> String {
     let ip: IpAddr = if addr.len() == 4 {
         let a: [u8; 4] = addr.try_into().expect("4 bytes");
         IpAddr::from(a)
@@ -172,7 +153,7 @@ fn format_ip_port(addr: &[u8], port: u16) -> String {
     SocketAddr::new(ip, port).to_string()
 }
 
-fn ip_to_bytes(ip: IpAddr) -> Vec<u8> {
+pub(crate) fn ip_to_bytes(ip: IpAddr) -> Vec<u8> {
     match ip {
         IpAddr::V4(v4) => v4.octets().to_vec(),
         IpAddr::V6(v6) => v6.octets().to_vec(),
@@ -246,111 +227,160 @@ impl Drop for PrefixWatcherGuard {
     }
 }
 
-struct MemberlistMetrics {
-    received_messages: Counter,
-    invalid_messages: Counter,
-    number_of_pulls: Counter,
-    number_of_pushes: Counter,
-    cas_attempts: Counter,
-    cas_successes: Counter,
-    cas_failures: Counter,
-    members_count: Gauge,
+/// dskit `Message`: entry of the sent/received message history (`/memberlist` status page).
+#[derive(Clone, Debug)]
+pub struct HistoryMessage {
+    pub id: u64,
+    pub time: SystemTime,
+    pub size: usize,
+    pub pair: KeyValuePair,
+    pub version: usize,
+    pub changes: Vec<String>,
 }
 
-impl MemberlistMetrics {
-    fn new(reg: Option<&Registry>, ns: &str) -> Self {
-        let mk_c = |name: &str, help: &str| {
-            let full = if ns.is_empty() {
-                format!("memberlist_client_{name}")
-            } else {
-                format!("{ns}_memberlist_client_{name}")
-            };
-            let c = Counter::with_opts(Opts::new(full, help)).expect("valid counter");
-            if let Some(r) = reg {
-                let _ = r.register(Box::new(c.clone()));
-            }
-            c
-        };
-        let mk_g = |name: &str, help: &str| {
-            let full = if ns.is_empty() {
-                format!("memberlist_client_{name}")
-            } else {
-                format!("{ns}_memberlist_client_{name}")
-            };
-            let g = Gauge::with_opts(Opts::new(full, help)).expect("valid gauge");
-            if let Some(r) = reg {
-                let _ = r.register(Box::new(g.clone()));
-            }
-            g
-        };
+#[derive(Default)]
+struct MessageHistory {
+    counter: u64,
+    sent: VecDeque<HistoryMessage>,
+    sent_size: usize,
+    received: VecDeque<HistoryMessage>,
+    received_size: usize,
+}
 
+/// dskit `addMessageToBuffer`.
+fn add_message_to_buffer(
+    msgs: &mut VecDeque<HistoryMessage>,
+    size: &mut usize,
+    limit: usize,
+    msg: HistoryMessage,
+) {
+    *size += msg.size;
+    msgs.push_back(msg);
+    while !msgs.is_empty() && *size > limit {
+        if let Some(m) = msgs.pop_front() {
+            *size -= m.size;
+        }
+    }
+}
+
+/// dskit `valueUpdate`.
+struct ValueUpdate {
+    value: Bytes,
+    codec: Arc<dyn Codec>,
+    message_size: usize,
+    deleted: bool,
+    update_time: Option<SystemTime>,
+}
+
+/// memberlist `msgHandoff`.
+struct Handoff {
+    msg_type: MessageType,
+    buf: Vec<u8>,
+    from: String,
+}
+
+/// Options that dskit exposes only to tests / embedders (unexported `KVConfig` fields and the
+/// injected `DNSProvider`).
+#[derive(Clone)]
+pub struct KvOptions {
+    /// dskit `NewKV(..., dnsProvider, ...)`. `None` = Mimir's `dns.NewProvider(dns.GolangResolverType,
+    /// 0, logger, cortex_-prefixed registerer with component="memberlist")`.
+    pub dns_provider: Option<Arc<dyn DnsProvider>>,
+    /// dskit `cfg.probeInterval` (tests only): probe interval, probe timeout = interval / 2.
+    pub probe_interval: Option<Duration>,
+    /// dskit `cfg.discoverMembersBackoff`.
+    pub discover_members_backoff: BackoffConfig,
+}
+
+impl Default for KvOptions {
+    fn default() -> Self {
         Self {
-            received_messages: mk_c("messages_received_total", "Number of received messages"),
-            invalid_messages: mk_c(
-                "messages_received_invalid_total",
-                "Number of invalid received messages",
-            ),
-            number_of_pulls: mk_c("state_pulls_total", "Number of state pulls"),
-            number_of_pushes: mk_c("state_pushes_total", "Number of state pushes"),
-            cas_attempts: mk_c("cas_attempts_total", "Number of CAS attempts"),
-            cas_successes: mk_c("cas_successes_total", "Number of CAS successes"),
-            cas_failures: mk_c("cas_failures_total", "Number of CAS failures"),
-            members_count: mk_g("cluster_members_count", "Number of members in memberlist cluster"),
+            dns_provider: None,
+            probe_interval: None,
+            discover_members_backoff: BackoffConfig {
+                min_backoff: Duration::from_millis(100),
+                max_backoff: Duration::from_secs(5),
+                max_retries: 10,
+            },
         }
     }
 }
 
 /// Memberlist gossip-based KV store matching `github.com/grafana/dskit/kv/memberlist.KV`.
 pub struct MemberlistKv {
+    me: Weak<MemberlistKv>,
     cfg: MemberlistConfig,
+    metrics_namespace: String,
+    registry: Option<Registry>,
     node_name: String,
     compression_algo: CompressionType,
     codecs: RwLock<HashMap<String, Arc<dyn Codec>>>,
     node_meta: Option<Vec<u8>>,
+    dns: Arc<dyn DnsProvider>,
+    discover_backoff: BackoffConfig,
+    timing: Timing,
 
-    transport: Arc<TcpTransport>,
-    advertise_ip: IpAddr,
-    advertise_port: u16,
+    transport: OnceLock<Arc<TcpTransport>>,
+    advertise: RwLock<(IpAddr, u16)>,
 
+    // dskit KV state.
     store: Mutex<HashMap<String, ValueDesc>>,
+    local_state_cache: Mutex<HashMap<String, (usize, Vec<u8>)>>,
+    last_local_state_size: AtomicUsize,
     watchers: Mutex<HashMap<String, Vec<WatcherEntry>>>,
     prefix_watchers: Mutex<HashMap<String, Vec<PrefixWatcherEntry>>>,
+    key_notifications: Mutex<HashSet<String>>,
+    workers: Mutex<HashMap<String, mpsc::Sender<ValueUpdate>>>,
+    history: Mutex<MessageHistory>,
+    pub(crate) local_broadcasts: Arc<TransmitLimitedQueue>,
+    pub(crate) gossip_broadcasts: Arc<TransmitLimitedQueue>,
+    delegate_ready: AtomicBool,
 
-    nodes: RwLock<Vec<NodeState>>,
+    // memberlist state.
+    nodes: RwLock<NodeTable>,
+    num_nodes: AtomicU32,
     incarnation: AtomicU32,
     sequence_num: AtomicU32,
-    ack_handlers: Mutex<HashMap<u32, oneshot::Sender<AckResp>>>,
+    ack_handlers: Mutex<HashMap<u32, AckHandler>>,
+    awareness: Awareness,
+    ml_broadcasts: TransmitLimitedQueue,
+    probe_index: Mutex<usize>,
+    leave: AtomicBool,
+    leave_broadcast_tx: mpsc::Sender<()>,
+    leave_broadcast_rx: tokio::sync::Mutex<mpsc::Receiver<()>>,
+    handoff: Mutex<(VecDeque<Handoff>, VecDeque<Handoff>)>,
+    handoff_notify: Notify,
+    push_pull_req: AtomicUsize,
+    zone_select: Option<ZoneAwareNodeSelection>,
 
-    local_broadcasts: Arc<TransmitQueue>,
-    gossip_broadcasts: Arc<TransmitQueue>,
-    gossip_notify: Arc<Notify>,
-
-    running: AtomicBool,
-    leaving: AtomicBool,
     shutdown_ctx: ServiceContext,
-    probe_index: AtomicUsize,
+    service: OnceLock<Arc<ManagedBasicService>>,
+    metrics: KvMetrics,
+    go_metrics: Arc<GoMetrics>,
+}
 
-    metrics: MemberlistMetrics,
+/// Process-wide go-metrics sink (Go `metrics.NewGlobal` replaces the global sink).
+fn global_go_metrics() -> Arc<GoMetrics> {
+    static GLOBAL: OnceLock<Arc<GoMetrics>> = OnceLock::new();
+    Arc::clone(GLOBAL.get_or_init(|| Arc::new(GoMetrics::new())))
 }
 
 impl MemberlistKv {
-    /// Creates and binds a new [`MemberlistKv`] with the given config and codecs.
-    /// Call [`MemberlistKv::start`] to start background loops and join seed peers.
-    pub async fn bind(
+    /// dskit `NewKV`: creates the KV service (not started). Metrics are registered immediately.
+    pub fn new(
         cfg: MemberlistConfig,
         codecs: Vec<Arc<dyn Codec>>,
         metrics_namespace: &str,
         reg: Option<&Registry>,
-    ) -> Result<(Arc<Self>, mpsc::Receiver<ReceivedPacket>, mpsc::Receiver<TcpStream>), KvError>
-    {
+        opts: KvOptions,
+    ) -> Result<Arc<Self>, KvError> {
         let mut node_name = if cfg.node_name.is_empty() {
             default_hostname()
         } else {
             cfg.node_name.clone()
         };
         if cfg.randomize_node_name {
-            let suffix: u32 = rand::thread_rng().gen();
-            node_name = format!("{node_name}-{suffix:08x}");
+            node_name = format!("{node_name}-{}", generate_random_suffix());
         }
 
         let compression_algo = match cfg.compression_algorithm.as_str() {
@@ -358,136 +388,404 @@ impl MemberlistKv {
             _ => CompressionType::Lzw,
         };
 
-        let node_meta = if cfg.zone_aware_routing.enabled {
-            let role = NodeRole::parse(&cfg.zone_aware_routing.role)
-                .map_err(KvError::InvalidConfig)?;
-            Some(
-                encode_node_metadata(role, &cfg.zone_aware_routing.instance_availability_zone)
-                    .map_err(KvError::InvalidConfig)?,
-            )
+        let (node_meta, zone_select, push_pull_nodes) = if cfg.zone_aware_routing.enabled {
+            let role = NodeRole::parse(&cfg.zone_aware_routing.role).map_err(KvError::InvalidConfig)?;
+            let meta = encode_node_metadata(role, &cfg.zone_aware_routing.instance_availability_zone)
+                .map_err(|e| KvError::InvalidConfig(format!("failed to encode node metadata: {e}")))?;
+            let sel = ZoneAwareNodeSelection::new(
+                role,
+                &cfg.zone_aware_routing.instance_availability_zone,
+                reg,
+            );
+            // The bridge push/pulls with 2 nodes per interval (first a bridge, then a random node).
+            let ppn = if role == NodeRole::Bridge { 2 } else { 1 };
+            (Some(meta), Some(sel), ppn)
         } else {
-            None
+            (None, None, 1)
         };
 
-        info!(
-            cluster_label = %cfg.cluster_label,
-            node = %node_name,
-            "Using memberlist cluster label and node name"
-        );
+        let dns: Arc<dyn DnsProvider> = match opts.dns_provider {
+            Some(p) => p,
+            None => {
+                let mut labels = HashMap::new();
+                labels.insert("component".to_string(), "memberlist".to_string());
+                Arc::new(
+                    Provider::new(&GOLANG_RESOLVER_TYPE, 0, reg, "cortex_", labels)
+                        .map_err(|e| KvError::Other(e.to_string()))?,
+                )
+            }
+        };
 
-        let (transport, packet_rx, stream_rx) =
-            TcpTransport::bind(&cfg, metrics_namespace, reg).await?;
-        let (advertise_ip, advertise_port) =
-            transport.final_advertise_addr(&cfg.advertise_addr, cfg.advertise_port)?;
+        let d = |g: mimir_config::GoDuration| g.as_std().unwrap_or(Duration::ZERO);
+        let (probe_interval, probe_timeout) = match opts.probe_interval {
+            Some(p) if !p.is_zero() => (p, p / 2),
+            _ => (Duration::from_secs(5), Duration::from_secs(2)),
+        };
+        let timing = Timing {
+            probe_interval,
+            probe_timeout,
+            indirect_checks: 3,
+            suspicion_mult: 4,
+            suspicion_max_timeout_mult: 6,
+            awareness_max_multiplier: 8,
+            gossip_interval: d(cfg.gossip_interval),
+            gossip_nodes: cfg.gossip_nodes.max(0) as usize,
+            gossip_to_the_dead_time: d(cfg.gossip_to_dead_nodes_time),
+            dead_node_reclaim_time: d(cfg.dead_node_reclaim_time),
+            push_pull_interval: d(cfg.pull_push_interval),
+            push_pull_nodes,
+            retransmit_mult: cfg.retransmit_factor.max(0) as usize,
+            tcp_timeout: d(cfg.stream_timeout),
+            handoff_queue_depth: cfg.received_messages_queue_size.max(0) as usize,
+            queue_check_interval: Duration::from_secs(30),
+        };
 
-        let mut codec_map = HashMap::new();
-        for c in codecs {
-            codec_map.insert(c.codec_id().to_string(), c);
+        let go_metrics = global_go_metrics();
+        let (leave_tx, leave_rx) = mpsc::channel(1);
+        let retransmit_mult = timing.retransmit_mult;
+        let awareness_max = timing.awareness_max_multiplier;
+
+        let kv = Arc::new_cyclic(|me: &Weak<MemberlistKv>| {
+            let members_fn = |w: Weak<MemberlistKv>| -> Box<dyn Fn() -> usize + Send + Sync> {
+                Box::new(move || w.upgrade().map(|k| k.num_members()).unwrap_or(0))
+            };
+            let est_fn = {
+                let w = me.clone();
+                Box::new(move || w.upgrade().map(|k| k.est_num_nodes()).unwrap_or(0))
+                    as Box<dyn Fn() -> usize + Send + Sync>
+            };
+            Self {
+                me: me.clone(),
+                metrics_namespace: metrics_namespace.to_string(),
+                registry: reg.cloned(),
+                node_name,
+                compression_algo,
+                codecs: RwLock::new(
+                    codecs
+                        .into_iter()
+                        .map(|c| (c.codec_id().to_string(), c))
+                        .collect(),
+                ),
+                node_meta,
+                dns,
+                discover_backoff: opts.discover_members_backoff,
+                timing,
+                transport: OnceLock::new(),
+                advertise: RwLock::new((IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+                store: Mutex::new(HashMap::new()),
+                local_state_cache: Mutex::new(HashMap::new()),
+                last_local_state_size: AtomicUsize::new(0),
+                watchers: Mutex::new(HashMap::new()),
+                prefix_watchers: Mutex::new(HashMap::new()),
+                key_notifications: Mutex::new(HashSet::new()),
+                workers: Mutex::new(HashMap::new()),
+                history: Mutex::new(MessageHistory::default()),
+                local_broadcasts: Arc::new(TransmitLimitedQueue::new(retransmit_mult, members_fn(me.clone()))),
+                gossip_broadcasts: Arc::new(TransmitLimitedQueue::new(retransmit_mult, members_fn(me.clone()))),
+                delegate_ready: AtomicBool::new(false),
+                nodes: RwLock::new(NodeTable::default()),
+                num_nodes: AtomicU32::new(0),
+                incarnation: AtomicU32::new(0),
+                sequence_num: AtomicU32::new(0),
+                ack_handlers: Mutex::new(HashMap::new()),
+                awareness: Awareness::new(awareness_max, Arc::clone(&go_metrics)),
+                ml_broadcasts: TransmitLimitedQueue::new(retransmit_mult, est_fn),
+                probe_index: Mutex::new(0),
+                leave: AtomicBool::new(false),
+                leave_broadcast_tx: leave_tx,
+                leave_broadcast_rx: tokio::sync::Mutex::new(leave_rx),
+                handoff: Mutex::new((VecDeque::new(), VecDeque::new())),
+                handoff_notify: Notify::new(),
+                push_pull_req: AtomicUsize::new(0),
+                zone_select,
+                shutdown_ctx: ServiceContext::background(),
+                service: OnceLock::new(),
+                metrics: KvMetrics::new(metrics_namespace),
+                go_metrics: Arc::clone(&go_metrics),
+                cfg,
+            }
+        });
+
+        if let Some(r) = reg {
+            kv.metrics.register(r, metrics_namespace, Arc::downgrade(&kv));
+            go_metrics.register(r);
         }
 
-        let retransmit_mult = cfg.retransmit_factor.max(1) as usize;
-        let local_node = NodeState {
-            name: node_name.clone(),
-            addr: ip_to_bytes(advertise_ip),
-            port: advertise_port,
-            meta: node_meta.clone(),
-            incarnation: 1,
-            state: NodeStateType::Alive,
-            state_change: SystemTime::now(),
-            vsn: vec![
-                PROTOCOL_VERSION_MIN,
-                PROTOCOL_VERSION_MAX,
-                PROTOCOL_VERSION_2_COMPATIBLE,
-                0,
-                0,
-                0,
-            ],
+        let svc = {
+            let w_start = Arc::downgrade(&kv);
+            let w_run = Arc::downgrade(&kv);
+            let w_stop = Arc::downgrade(&kv);
+            basic_service(
+                Some(Box::new(move |ctx| {
+                    let w = w_start.clone();
+                    Box::pin(async move {
+                        let Some(kv) = w.upgrade() else {
+                            return Err(ServiceError::Failure("memberlist KV dropped".to_string()));
+                        };
+                        kv.starting(ctx).await.map_err(ServiceError::Failure)
+                    })
+                })),
+                Some(Box::new(move |ctx| {
+                    let w = w_run.clone();
+                    Box::pin(async move {
+                        let Some(kv) = w.upgrade() else {
+                            return Ok(());
+                        };
+                        kv.running(ctx).await.map_err(ServiceError::Failure)
+                    })
+                })),
+                Some(Box::new(move |_failure| {
+                    let w = w_stop.clone();
+                    Box::pin(async move {
+                        if let Some(kv) = w.upgrade() {
+                            kv.stopping().await;
+                        }
+                        Ok(())
+                    })
+                })),
+            )
+            .with_name("memberlist-kv")
         };
-
-        let kv = Arc::new(Self {
-            cfg,
-            node_name,
-            compression_algo,
-            codecs: RwLock::new(codec_map),
-            node_meta,
-            transport,
-            advertise_ip,
-            advertise_port,
-            store: Mutex::new(HashMap::new()),
-            watchers: Mutex::new(HashMap::new()),
-            prefix_watchers: Mutex::new(HashMap::new()),
-            nodes: RwLock::new(vec![local_node]),
-            incarnation: AtomicU32::new(1),
-            sequence_num: AtomicU32::new(0),
-            ack_handlers: Mutex::new(HashMap::new()),
-            local_broadcasts: Arc::new(TransmitQueue::new(retransmit_mult)),
-            gossip_broadcasts: Arc::new(TransmitQueue::new(retransmit_mult)),
-            gossip_notify: Arc::new(Notify::new()),
-            running: AtomicBool::new(false),
-            leaving: AtomicBool::new(false),
-            shutdown_ctx: ServiceContext::background(),
-            probe_index: AtomicUsize::new(0),
-            metrics: MemberlistMetrics::new(reg, metrics_namespace),
-        });
-        kv.metrics.members_count.set(1.0);
-
-        Ok((kv, packet_rx, stream_rx))
+        let _ = kv.service.set(svc);
+        Ok(kv)
     }
 
-    /// Starts the transport receiver tasks, gossip/push-pull/probe loops, and joins seed members.
+    /// Creates the KV, starts it and waits until it is Running (fast-join done), like
+    /// `services.StartAndAwaitRunning(ctx, NewKV(...))`.
     pub async fn start(
         cfg: MemberlistConfig,
         codecs: Vec<Arc<dyn Codec>>,
         metrics_namespace: &str,
         reg: Option<&Registry>,
     ) -> Result<Arc<Self>, KvError> {
-        let (kv, packet_rx, stream_rx) =
-            Self::bind(cfg, codecs, metrics_namespace, reg).await?;
-        kv.spawn_tasks(packet_rx, stream_rx);
-        kv.running.store(true, Ordering::Release);
+        Self::start_with_options(cfg, codecs, metrics_namespace, reg, KvOptions::default()).await
+    }
 
-        if !kv.cfg.join_members.0.is_empty() {
-            // dskit `starting()`: one bounded fast-join pass so we don't start with an empty KV store.
-            if let Err(err) = kv.fast_join_members_on_startup().await {
-                error!(%err, "failed to fast-join the memberlist cluster at startup");
-                if kv.cfg.abort_if_cluster_fast_join_fails {
-                    kv.shutdown().await;
-                    return Err(KvError::Other(format!(
-                        "failed to fast-join the memberlist cluster at startup: {err}"
-                    )));
-                }
-            }
-
-            // dskit `running()`: the retrying join must not run before the process is serving,
-            // since in K8S it may wait for DNS that only lists this pod once it is READY.
-            let join_members = kv.cfg.join_members.0.clone();
-            let max_retries = kv.cfg.max_join_retries.max(1) as usize;
-            if kv.cfg.abort_if_cluster_join_fails {
-                // ponytail: blocks startup to keep fail-fast; Go runs this in the background and fails
-                // the service instead. Move it to the background once background tasks can abort startup.
-                if let Err(err) = kv.join_members_on_startup(&join_members, max_retries).await {
-                    kv.shutdown().await;
-                    return Err(err);
-                }
-            } else {
-                let bg = Arc::clone(&kv);
-                tokio::spawn(async move {
-                    let _ = bg.join_members_on_startup(&join_members, max_retries).await;
-                });
-            }
+    pub async fn start_with_options(
+        cfg: MemberlistConfig,
+        codecs: Vec<Arc<dyn Codec>>,
+        metrics_namespace: &str,
+        reg: Option<&Registry>,
+        opts: KvOptions,
+    ) -> Result<Arc<Self>, KvError> {
+        let kv = Self::new(cfg, codecs, metrics_namespace, reg, opts)?;
+        let svc = kv.service();
+        svc.start_async(ServiceContext::background())
+            .await
+            .map_err(|e| KvError::Other(e.to_string()))?;
+        if let Err(e) = svc.await_running().await {
+            let msg = svc
+                .failure_case()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| e.to_string());
+            return Err(KvError::Other(msg));
         }
-
         Ok(kv)
     }
 
-    pub fn spawn_tasks(
+    /// The `memberlist-kv` service (dskit `KV` is a `services.Service`).
+    pub fn service(&self) -> Arc<ManagedBasicService> {
+        Arc::clone(self.service.get().expect("service initialized in new()"))
+    }
+
+    pub fn state(&self) -> State {
+        self.service.get().map(|s| s.state()).unwrap_or(State::New)
+    }
+
+    /// Stops the service (leave cluster) and waits for termination.
+    pub async fn shutdown(&self) {
+        let svc = self.service();
+        if svc.state() == State::New {
+            return;
+        }
+        svc.stop_async();
+        let _ = svc.await_terminated().await;
+    }
+
+    fn transport(&self) -> &Arc<TcpTransport> {
+        self.transport.get().expect("transport is created in starting()")
+    }
+
+    pub(crate) fn advertise(&self) -> (IpAddr, u16) {
+        *self.advertise.read()
+    }
+
+    pub(crate) fn bind_port(&self) -> u16 {
+        MEMBERLIST_DEFAULT_BIND_PORT
+    }
+
+    fn label_overhead(&self) -> usize {
+        if self.cfg.cluster_label.is_empty() {
+            0
+        } else {
+            2 + self.cfg.cluster_label.len()
+        }
+    }
+
+    pub(crate) fn store_len(&self) -> usize {
+        self.store.lock().len()
+    }
+
+    // --- service lifecycle ---------------------------------------------------------------------
+
+    /// dskit `starting`: create transport + memberlist, then fast-join.
+    async fn starting(self: Arc<Self>, ctx: ServiceContext) -> Result<(), String> {
+        if self.cfg.propagation_delay_tracker.enabled {
+            return Err(
+                "memberlist propagation delay tracker (-memberlist.propagation-delay-tracker.enabled) is not supported by mimir-rs"
+                    .to_string(),
+            );
+        }
+        info!(
+            cluster_label = %self.cfg.cluster_label,
+            node = %self.node_name,
+            "Using memberlist cluster label and node name"
+        );
+        let reg = self.registry.clone();
+        let (transport, packet_rx, stream_rx) =
+            TcpTransport::new(&self.cfg, &self.metrics_namespace, reg.as_ref())
+                .await
+                .map_err(|e| format!("failed to create transport: {e}"))?;
+        let (ip, port) = transport
+            .final_advertise_addr(&self.cfg.advertise_addr, self.cfg.advertise_port)
+            .map_err(|e| format!("failed to create memberlist: failed to get final advertise address: {e}"))?;
+        let _ = self.transport.set(transport);
+        *self.advertise.write() = (ip, port);
+
+        self.spawn_listeners(packet_rx, stream_rx);
+        self.set_alive();
+        self.schedule();
+        self.delegate_ready.store(true, Ordering::Release);
+
+        if !self.cfg.join_members.0.is_empty() {
+            if let Err(err) = self.fast_join_members_on_startup(&ctx).await {
+                error!(%err, "failed to fast-join the memberlist cluster at startup");
+                if self.cfg.abort_if_cluster_fast_join_fails {
+                    return Err(format!("failed to fast-join the memberlist cluster at startup: {err}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// dskit `running`: full join, optional periodic rejoin and obsolete entries cleanup.
+    async fn running(self: Arc<Self>, ctx: ServiceContext) -> Result<(), String> {
+        let notify_interval = self.cfg.notify_interval.as_std().unwrap_or(Duration::ZERO);
+        if !notify_interval.is_zero() {
+            let kv = Arc::clone(&self);
+            let c = ctx.clone();
+            tokio::spawn(async move {
+                let mut t = tokio::time::interval(notify_interval);
+                t.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = c.canceled() => return,
+                        _ = t.tick() => kv.send_key_notifications(),
+                    }
+                }
+            });
+        }
+
+        let ok = self.join_members_on_startup(&ctx).await;
+        if let Some(sel) = &self.zone_select {
+            sel.mark_joined();
+        }
+        if !ok && self.cfg.abort_if_cluster_join_fails {
+            return Err(ERR_FAILED_TO_JOIN_CLUSTER.to_string());
+        }
+
+        let rejoin_interval = self.cfg.rejoin_interval.as_std().unwrap_or(Duration::ZERO);
+        let rejoin_nodes = self.rejoin_seed_nodes();
+        let rejoin_enabled = !rejoin_interval.is_zero() && !rejoin_nodes.is_empty();
+        // Random initial delay in [1ns, interval] to spread rejoins of simultaneously started processes.
+        let mut next_rejoin = rejoin_enabled.then(|| {
+            tokio::time::Instant::now()
+                + Duration::from_nanos(
+                    1 + rand::thread_rng().gen_range(0..rejoin_interval.as_nanos().max(1) as u64),
+                )
+        });
+        let obsolete = self.cfg.obsolete_entries_timeout.as_std().unwrap_or(Duration::ZERO);
+        let mut obsolete_tick = (!obsolete.is_zero()).then(|| {
+            let mut t = tokio::time::interval_at(tokio::time::Instant::now() + obsolete, obsolete);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            t
+        });
+
+        loop {
+            let rejoin_sleep = async {
+                match next_rejoin {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let obsolete_fut = async {
+                match obsolete_tick.as_mut() {
+                    Some(t) => {
+                        t.tick().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = ctx.canceled() => return Ok(()),
+                _ = rejoin_sleep => {
+                    next_rejoin = Some(tokio::time::Instant::now() + rejoin_interval);
+                    // Don't retry if resolution fails, we will try again next time.
+                    match self.join_members_with_retries(&ctx, &rejoin_nodes, 1, "periodic_rejoin").await {
+                        Ok(reached) => info!(phase = "periodic_rejoin", msg = "re-joined memberlist cluster", reached_nodes = reached),
+                        Err(err) => warn!(phase = "periodic_rejoin", msg = "re-joining memberlist cluster failed", %err, next_try_in = ?rejoin_interval),
+                    }
+                }
+                _ = obsolete_fut => self.cleanup_obsolete_entries(),
+            }
+        }
+    }
+
+    /// dskit `stopping`: flush local broadcasts, leave, shut down.
+    async fn stopping(self: Arc<Self>) {
+        info!("leaving memberlist cluster");
+        if self.transport.get().is_some() {
+            let timeout = self
+                .cfg
+                .broadcast_timeout_for_local_updates_on_shutdown
+                .as_std()
+                .unwrap_or(Duration::ZERO);
+            let deadline = Instant::now() + timeout;
+            let mut msgs = self.local_broadcasts.num_queued();
+            let mut nodes = self.num_members();
+            while msgs > 0 && nodes > 1 && (timeout.is_zero() || Instant::now() < deadline) {
+                info!(count = msgs, nodes, "waiting for locally-generated broadcast messages to be sent out");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                msgs = self.local_broadcasts.num_queued();
+                nodes = self.num_members();
+            }
+            if msgs > 0 {
+                warn!(count = msgs, nodes, "locally-generated broadcast messages left the queue");
+            }
+            let leave_timeout = self.cfg.leave_timeout.as_std().unwrap_or(Duration::ZERO);
+            if let Err(err) = self.leave(leave_timeout).await {
+                error!(%err, "error when leaving memberlist cluster");
+            }
+        }
+        self.shutdown_ctx.cancel();
+        if let Some(t) = self.transport.get() {
+            t.shutdown_and_wait().await;
+        }
+        for timer in self.nodes.read().timers.values() {
+            timer.stop();
+        }
+    }
+
+    // --- transport plumbing -------------------------------------------------------------------
+
+    fn spawn_listeners(
         self: &Arc<Self>,
         mut packet_rx: mpsc::Receiver<ReceivedPacket>,
-        mut stream_rx: mpsc::Receiver<TcpStream>,
+        mut stream_rx: mpsc::Receiver<MemberlistConn>,
     ) {
-        // Packet receiver loop
+        // memberlist packetListen.
         {
-            let kv = self.clone();
+            let kv = Arc::clone(self);
             let cancel = self.shutdown_ctx.clone();
             tokio::spawn(async move {
                 loop {
@@ -501,10 +799,9 @@ impl MemberlistKv {
                 }
             });
         }
-
-        // Stream receiver loop
+        // memberlist streamListen.
         {
-            let kv = self.clone();
+            let kv = Arc::clone(self);
             let cancel = self.shutdown_ctx.clone();
             tokio::spawn(async move {
                 loop {
@@ -512,1157 +809,414 @@ impl MemberlistKv {
                         _ = cancel.canceled() => break,
                         conn = stream_rx.recv() => {
                             let Some(conn) = conn else { break };
-                            let kv_conn = kv.clone();
-                            tokio::spawn(async move {
-                                kv_conn.handle_stream_conn(conn).await;
-                            });
+                            let kv_conn = Arc::clone(&kv);
+                            tokio::spawn(async move { kv_conn.handle_conn(conn).await });
                         }
                     }
                 }
             });
         }
-
-        // Gossip loop
-        let gossip_interval: Duration = self.cfg.gossip_interval.as_std().unwrap_or(Duration::ZERO);
-        if !gossip_interval.is_zero() && self.cfg.gossip_nodes > 0 {
-            let kv = self.clone();
-            let cancel = self.shutdown_ctx.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel.canceled() => break,
-                        _ = kv.gossip_notify.notified() => {
-                            kv.gossip().await;
-                        }
-                        _ = tokio::time::sleep(gossip_interval) => {
-                            kv.gossip().await;
-                        }
-                    }
-                }
-            });
-        }
-
-        // Push/pull anti-entropy loop
-        let push_pull_interval: Duration = self.cfg.pull_push_interval.as_std().unwrap_or(Duration::ZERO);
-        if !push_pull_interval.is_zero() {
-            let kv = self.clone();
-            let cancel = self.shutdown_ctx.clone();
-            tokio::spawn(async move {
-                loop {
-                    let n = kv.est_num_nodes();
-                    let wait = push_pull_scale(push_pull_interval, n);
-                    tokio::select! {
-                        _ = cancel.canceled() => break,
-                        _ = tokio::time::sleep(wait) => {
-                            kv.push_pull().await;
-                        }
-                    }
-                }
-            });
-        }
-
-        // Probe loop
+        // memberlist packetHandler (handoff queues).
         {
-            let kv = self.clone();
-            let cancel = self.shutdown_ctx.clone();
-            let probe_interval = Duration::from_secs(5);
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel.canceled() => break,
-                        _ = tokio::time::sleep(probe_interval) => {
-                            kv.probe().await;
-                        }
-                    }
-                }
-            });
-        }
-
-        // Obsolete entries cleanup loop
-        let obsolete_timeout: Duration = self.cfg.obsolete_entries_timeout.as_std().unwrap_or(Duration::ZERO);
-        if !obsolete_timeout.is_zero() {
-            let kv = self.clone();
+            let kv = Arc::clone(self);
             let cancel = self.shutdown_ctx.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _ = cancel.canceled() => break,
-                        _ = tokio::time::sleep(obsolete_timeout) => {
-                            kv.cleanup_obsolete_entries();
-                        }
-                    }
-                }
-            });
-        }
-    }
-
-    pub fn node_name(&self) -> &str {
-        &self.node_name
-    }
-
-    pub fn node_meta(&self) -> Option<&[u8]> {
-        self.node_meta.as_deref()
-    }
-
-    pub fn listening_port(&self) -> u16 {
-        self.transport.auto_bind_port()
-    }
-
-    pub fn advertise_addr(&self) -> String {
-        self.transport.get_advertised_addr()
-    }
-
-    pub fn get_codec(&self, codec_id: &str) -> Option<Arc<dyn Codec>> {
-        self.codecs.read().get(codec_id).cloned()
-    }
-
-    pub fn register_codec(&self, codec: Arc<dyn Codec>) {
-        self.codecs
-            .write()
-            .insert(codec.codec_id().to_string(), codec);
-    }
-
-    pub fn members(&self) -> Vec<NodeState> {
-        self.nodes
-            .read()
-            .iter()
-            .filter(|n| !n.dead_or_left())
-            .cloned()
-            .collect()
-    }
-
-    fn est_num_nodes(&self) -> usize {
-        self.nodes
-            .read()
-            .iter()
-            .filter(|n| !n.dead_or_left())
-            .count()
-            .max(1)
-    }
-
-    pub async fn join_members(&self, members: &[String]) -> Result<usize, KvError> {
-        let resolved = self.resolve_members(members).await;
-        if resolved.is_empty() {
-            return Err(KvError::Other("found no nodes to join".to_string()));
-        }
-        let mut joined = 0usize;
-        let mut last_err = None;
-        for addr in resolved {
-            match self.push_pull_node(&addr, true).await {
-                Ok(()) => joined += 1,
-                Err(e) => last_err = Some(e),
-            }
-        }
-        if joined > 0 {
-            Ok(joined)
-        } else {
-            Err(last_err.unwrap_or_else(|| KvError::Other("join failed".to_string())))
-        }
-    }
-
-    /// dskit `joinMembersOnStartup` logging around [`Self::join_members_with_retries`].
-    async fn join_members_on_startup(
-        &self,
-        members: &[String],
-        max_retries: usize,
-    ) -> Result<usize, KvError> {
-        info!(
-            phase = "startup",
-            msg = "joining memberlist cluster",
-            join_members = %members.join(",")
-        );
-        let start = std::time::Instant::now();
-        match self.join_members_with_retries(members, max_retries).await {
-            Ok(reached) => {
-                info!(
-                    phase = "startup",
-                    msg = "joining memberlist cluster succeeded",
-                    reached_nodes = reached,
-                    elapsed_time = %go_elapsed(start)
-                );
-                Ok(reached)
-            }
-            Err(err) => {
-                error!(
-                    phase = "startup",
-                    msg = "joining memberlist cluster failed",
-                    err = %err,
-                    elapsed_time = %go_elapsed(start)
-                );
-                Err(err)
-            }
-        }
-    }
-
-    async fn join_members_with_retries(
-        &self,
-        members: &[String],
-        max_retries: usize,
-    ) -> Result<usize, KvError> {
-        let mut boff = Backoff::new(BackoffConfig {
-            min_backoff: self.cfg.min_join_backoff.as_std().unwrap_or(Duration::ZERO),
-            max_backoff: self.cfg.max_join_backoff.as_std().unwrap_or(Duration::ZERO),
-            max_retries,
-        });
-        let mut last_err = None;
-        while boff.ongoing() && !self.shutdown_ctx.is_canceled() {
-            match self.join_members(members).await {
-                Ok(n) if n > 0 => return Ok(n),
-                Ok(_) => {}
-                Err(e) => last_err = Some(e),
-            }
-            let err_s = last_err
-                .as_ref()
-                .map_or_else(|| "null".to_string(), ToString::to_string);
-            warn!(
-                phase = "startup",
-                msg = "joining memberlist cluster",
-                attempts = boff.num_retries() + 1,
-                max_attempts = max_retries,
-                err = %err_s
-            );
-            boff.wait().await;
-        }
-        Err(last_err.unwrap_or_else(|| KvError::Other("failed to join cluster".to_string())))
-    }
-
-    /// Ported from dskit `fastJoinMembersOnStartup`: join `retransmit_factor * ceil(log10(n+1))`
-    /// randomly chosen seed nodes, one at a time.
-    async fn fast_join_members_on_startup(&self) -> Result<(), KvError> {
-        let start_time = std::time::Instant::now();
-        // dskit `discoverMembersBackoff`.
-        let mut boff = Backoff::new(BackoffConfig {
-            min_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(5),
-            max_retries: 10,
-        });
-        let mut nodes = Vec::new();
-        while boff.ongoing() && !self.shutdown_ctx.is_canceled() {
-            nodes = self.resolve_members(&self.cfg.join_members.0).await;
-            if !nodes.is_empty() {
-                break;
-            }
-            boff.wait().await;
-        }
-        nodes.shuffle(&mut rand::thread_rng());
-
-        let retransmit_mult = self.cfg.retransmit_factor.max(1) as usize;
-        let mut to_join = retransmit_mult * ((nodes.len() as f64 + 1.0).log10().ceil() as usize);
-        info!(nodes_found = nodes.len(), to_join, "memberlist fast-join starting");
-
-        let mut joined = 0usize;
-        for addr in nodes {
-            if to_join == 0 || self.shutdown_ctx.is_canceled() {
-                break;
-            }
-            match self.push_pull_node(&addr, true).await {
-                Ok(()) => {
-                    joined += 1;
-                    to_join -= 1;
-                }
-                Err(err) => info!(node = %addr, %err, "fast-joining node failed"),
-            }
-        }
-
-        let required = self.cfg.abort_if_cluster_fast_join_fails_min_nodes.max(0) as usize;
-        if joined < required {
-            warn!(
-                joined_nodes = joined,
-                required_nodes = required,
-                elapsed_time = %go_elapsed(start_time),
-                "memberlist fast-join failed to reach minimum required seed nodes"
-            );
-            return Err(KvError::Other(format!(
-                "fast-join failed to reach minimum required seed nodes: joined {joined}, required {required}"
-            )));
-        }
-        info!(
-            joined_nodes = joined,
-            elapsed_time = %go_elapsed(start_time),
-            "memberlist fast-join finished"
-        );
-        Ok(())
-    }
-
-    async fn resolve_members(&self, members: &[String]) -> Vec<String> {
-        let default_port = self.cfg.bind_port.max(1) as u16;
-        let mut out = Vec::new();
-        for m in members {
-            let trimmed = m.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // dskit `dns.Provider` lookup types (`dns+host:port`, `dnssrv+`, `dnssrvnoa+`).
-            if let Some((qtype, name)) = trimmed.split_once('+') {
-                match qtype {
-                    "dns" => match name.rsplit_once(':') {
-                        Some((_, port)) if !port.is_empty() => match tokio::net::lookup_host(name).await {
-                            Ok(addrs) => out.extend(addrs.map(|sa| sa.to_string())),
-                            Err(err) => warn!(host = %name, %err, "failed to resolve members"),
-                        },
-                        _ => warn!("missing port in address given for dns lookup: {name}"),
-                    },
-                    // ponytail: no SRV resolver in the dependency tree; add hickory-resolver if anyone needs dnssrv+.
-                    "dnssrv" | "dnssrvnoa" => error!(member = %trimmed, "SRV lookups for memberlist join_members are not supported by mimir-rs"),
-                    _ => warn!(member = %trimmed, "unknown DNS lookup type in memberlist join_members"),
-                }
-                continue;
-            }
-            // Strip optional nodeName/ prefix.
-            let host_str = match trimmed.find('/') {
-                Some(idx) => &trimmed[idx + 1..],
-                None => trimmed,
-            };
-            let with_port = if host_str.contains(':') {
-                host_str.to_string()
-            } else {
-                format!("{host_str}:{default_port}")
-            };
-            if let Ok(sa) = with_port.parse::<SocketAddr>() {
-                out.push(sa.to_string());
-            } else if let Ok(addrs) = tokio::net::lookup_host(&with_port).await {
-                for sa in addrs {
-                    out.push(sa.to_string());
-                }
-            }
-        }
-        out
-    }
-
-    pub async fn shutdown(&self) {
-        self.leaving.store(true, Ordering::Release);
-        self.running.store(false, Ordering::Release);
-
-        info!("leaving memberlist cluster");
-
-        // Wait briefly for locally generated broadcasts to flush.
-        let timeout: Duration = self.cfg.broadcast_timeout_for_local_updates_on_shutdown.as_std().unwrap_or(Duration::ZERO);
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut next_wait_log = tokio::time::Instant::now();
-        while self.local_broadcasts.num_queued() > 0 && self.est_num_nodes() > 1 {
-            // Go logs once per 250ms wait iteration.
-            if tokio::time::Instant::now() >= next_wait_log {
-                info!(
-                    count = self.local_broadcasts.num_queued(),
-                    nodes = self.est_num_nodes(),
-                    "waiting for locally-generated broadcast messages to be sent out"
-                );
-                next_wait_log = tokio::time::Instant::now() + Duration::from_millis(250);
-            }
-            self.gossip().await;
-            if !timeout.is_zero() && tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let msgs = self.local_broadcasts.num_queued();
-        if msgs > 0 {
-            warn!(
-                count = msgs,
-                nodes = self.est_num_nodes(),
-                "locally-generated broadcast messages left the queue"
-            );
-        }
-
-        // Send Dead(from = self) to live peers so they mark us Left.
-        let dead = Dead {
-            incarnation: self.incarnation.load(Ordering::Acquire),
-            node: self.node_name.clone(),
-            from: self.node_name.clone(),
-        };
-        let dead_msg = encode_dead(&dead);
-        let peers: Vec<NodeState> = self
-            .nodes
-            .read()
-            .iter()
-            .filter(|n| n.name != self.node_name && !n.dead_or_left())
-            .cloned()
-            .collect();
-        for peer in peers {
-            let _ = self.send_raw_packet(&peer.address(), Some(&peer), dead_msg.clone()).await;
-        }
-
-        self.shutdown_ctx.cancel();
-        self.transport.shutdown();
-    }
-
-    // --- KV operations ---
-
-    pub fn list_keys(&self, prefix: &str) -> Vec<String> {
-        let store = self.store.lock();
-        store
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect()
-    }
-
-    pub fn get_value(&self, key: &str) -> Option<(Box<dyn Any + Send + Sync>, usize)> {
-        let mut desc = {
-            let store = self.store.lock();
-            store.get(key).cloned()?
-        };
-        desc.value.remove_tombstones(None);
-        Some((desc.value.into_any(), desc.version))
-    }
-
-    pub fn get_mergeable(&self, key: &str) -> Option<(Box<dyn Mergeable>, usize)> {
-        let mut desc = {
-            let store = self.store.lock();
-            store.get(key).cloned()?
-        };
-        desc.value.remove_tombstones(None);
-        Some((desc.value, desc.version))
-    }
-
-    pub async fn delete_key(&self, key: &str) -> Result<(), KvError> {
-        let existing = {
-            let store = self.store.lock();
-            store.get(key).cloned()
-        };
-        let Some(val) = existing else {
-            return Ok(());
-        };
-        if val.deleted {
-            return Ok(());
-        }
-        let codec = self
-            .get_codec(&val.codec_id)
-            .ok_or_else(|| KvError::Codec(format!("invalid codec: {}", val.codec_id)))?;
-        let mut cloned = val.value.clone_mergeable();
-        let (change, new_ver, deleted, updated) = self.merge_value_for_key(
-            key,
-            cloned.as_mut(),
-            true,
-            0,
-            &val.codec_id,
-            true,
-            Some(SystemTime::now()),
-        )?;
-        if new_ver > 0 {
-            self.notify_watchers(key);
-            if let Some(ch) = change {
-                self.broadcast_new_value(
-                    key,
-                    ch.as_ref(),
-                    new_ver,
-                    codec.as_ref(),
-                    false,
-                    deleted,
-                    updated,
-                );
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn cas_with_codec(
-        &self,
-        key: &str,
-        codec: &dyn Codec,
-        mut f: CasFn,
-    ) -> Result<(), KvError> {
-        let mut last_no_change = false;
-        let mut last_err: Option<KvError> = None;
-
-        for _ in 0..MAX_CAS_RETRIES {
-            self.metrics.cas_attempts.inc();
-
-            if last_no_change {
-                tokio::time::sleep(NO_CHANGE_DETECTED_RETRY_SLEEP).await;
-                last_no_change = false;
-            }
-
-            let (current_any, ver) = match self.get_value(key) {
-                Some((v, ver)) => (Some(v), ver),
-                None => (None, 0),
-            };
-
-            let outcome = match f(current_any.as_deref()) {
-                Ok(o) => o,
-                Err(cb_err) => {
-                    last_err = Some(cb_err.err);
-                    if !cb_err.retry {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            let incoming_any = match outcome {
-                CasOutcome::NoChange => return Ok(()),
-                CasOutcome::Update(v) => v,
-            };
-
-            // Encode then decode via codec_mergeable to turn Box<dyn Any> into Box<dyn Mergeable>,
-            // or downcast directly if it's already a Mergeable type we know? Wait: we can encode via
-            // codec.encode(incoming_any) -> decode_mergeable! Even cleaner: try encoding & decoding,
-            // OR let Codec encode and decode! Wait: encoding+decoding takes microseconds and works for ANY Codec!
-            let encoded = codec.encode(incoming_any.as_ref())?;
-            let mut incoming_mergeable = codec.decode_mergeable(&encoded)?;
-
-            match self.merge_value_for_key(
-                key,
-                incoming_mergeable.as_mut(),
-                false,
-                ver,
-                codec.codec_id(),
-                false,
-                Some(SystemTime::now()),
-            ) {
-                Ok((change, new_ver, deleted, updated)) => {
-                    if new_ver == 0 {
-                        last_no_change = true;
-                        last_err = Some(KvError::Other("no change detected".to_string()));
-                        continue;
-                    }
-                    self.metrics.cas_successes.inc();
-                    self.notify_watchers(key);
-                    if let Some(ch) = change {
-                        self.broadcast_new_value(
-                            key,
-                            ch.as_ref(),
-                            new_ver,
-                            codec,
-                            true,
-                            deleted,
-                            updated,
-                        );
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    continue;
-                }
-            }
-        }
-
-        self.metrics.cas_failures.inc();
-        Err(last_err.unwrap_or_else(|| KvError::CasFailed {
-            key: key.to_string(),
-            reason: "failed to CAS".to_string(),
-        }))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn merge_value_for_key(
-        &self,
-        key: &str,
-        incoming: &mut dyn Mergeable,
-        _incoming_requires_clone: bool,
-        cas_version: usize,
-        codec_id: &str,
-        deleted: bool,
-        update_time: Option<SystemTime>,
-    ) -> Result<MergeValueResult, KvError> {
-        let mut store = self.store.lock();
-        let curr_opt = store.get_mut(key);
-
-        if curr_opt.is_none() && deleted {
-            return Err(KvError::Other("cannot delete non-existent key".to_string()));
-        }
-
-        if let Some(curr) = curr_opt.as_ref() {
-            if cas_version > 0 && curr.version != cas_version {
-                return Err(KvError::CasFailed {
-                    key: key.to_string(),
-                    reason: "version mismatch".to_string(),
-                });
-            }
-        }
-
-        let (mut result, mut change) = if let Some(curr) = curr_opt {
-            let mut cloned_curr = curr.value.clone_mergeable();
-            let ch = cloned_curr
-                .merge(incoming, cas_version > 0)
-                .map_err(KvError::Other)?;
-            (
-                ValueDesc {
-                    value: cloned_curr,
-                    version: curr.version,
-                    codec_id: curr.codec_id.clone(),
-                    deleted: curr.deleted,
-                    update_time: curr.update_time,
-                },
-                ch,
-            )
-        } else {
-            let val = incoming.clone_mergeable();
-            let ch = val.clone_mergeable();
-            (
-                ValueDesc {
-                    value: val,
-                    version: 0,
-                    codec_id: codec_id.to_string(),
-                    deleted: false,
-                    update_time: None,
-                },
-                Some(ch),
-            )
-        };
-
-        let mut new_updated = result.update_time;
-        let mut new_deleted = result.deleted;
-        if let Some(ut) = update_time {
-            let is_newer = match new_updated {
-                None => true,
-                Some(prev) => ut > prev,
-            };
-            if is_newer && deleted {
-                new_updated = Some(ut);
-                new_deleted = deleted;
-            }
-        }
-
-        let change_empty = change
-            .as_ref()
-            .map(|c| c.merge_content().is_empty())
-            .unwrap_or(true);
-        if change_empty && result.deleted == new_deleted {
-            return Ok((None, 0, result.deleted, result.update_time));
-        }
-
-        let left_timeout: Duration = self.cfg.left_ingesters_timeout.as_std().unwrap_or(Duration::ZERO);
-        if !left_timeout.is_zero() {
-            let limit = SystemTime::now().checked_sub(left_timeout);
-            result.value.remove_tombstones(limit);
-            if let Some(ref mut ch) = change {
-                ch.remove_tombstones(limit);
-                if ch.merge_content().is_empty() {
-                    return Ok((None, 0, result.deleted, result.update_time));
-                }
-            }
-        }
-
-        if change.is_none() && result.deleted != new_deleted {
-            change = Some(result.value.clone_mergeable());
-        }
-
-        let new_version = result.version + 1;
-        result.version = new_version;
-        result.deleted = new_deleted;
-        result.update_time = new_updated;
-        result.codec_id = codec_id.to_string();
-
-        store.insert(key.to_string(), result);
-
-        Ok((change, new_version, new_deleted, new_updated))
-    }
-
-    fn merge_bytes_value_for_key(
-        &self,
-        key: &str,
-        incoming_data: &[u8],
-        codec: &dyn Codec,
-        deleted: bool,
-        update_time: Option<SystemTime>,
-    ) -> Result<MergeValueResult, KvError> {
-        let data = if incoming_data.is_empty() {
-            EMPTY_SNAPPY_DATA
-        } else {
-            incoming_data
-        };
-        let mut decoded = codec.decode_mergeable(data)?;
-        self.merge_value_for_key(
-            key,
-            decoded.as_mut(),
-            false,
-            0,
-            codec.codec_id(),
-            deleted,
-            update_time,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn broadcast_new_value(
-        &self,
-        key: &str,
-        change: &dyn Mergeable,
-        version: usize,
-        codec: &dyn Codec,
-        locally_generated: bool,
-        deleted: bool,
-        update_time: Option<SystemTime>,
-    ) {
-        if locally_generated && !self.running.load(Ordering::Acquire) {
-            // Allow broadcasting even during startup if transport is ready, unless leaving.
-            if self.leaving.load(Ordering::Acquire) {
-                warn!(key, "skipped broadcasting locally-generated update during shutdown");
-                return;
-            }
-        }
-
-        let data = match codec.encode_mergeable(change) {
-            Ok(d) => d,
-            Err(err) => {
-                error!(key, version, %err, "failed to encode change");
-                return;
-            }
-        };
-
-        let update_time_millis = update_time
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-
-        let kv_pair = KeyValuePair {
-            key: key.to_string(),
-            value: Bytes::from(data),
-            codec: codec.codec_id().to_string(),
-            deleted,
-            update_time_millis,
-        };
-        let pair_data = kv_pair.encode_to_vec();
-        let content: HashSet<String> = change.merge_content().into_iter().collect();
-
-        let b = RingBroadcast {
-            key: key.to_string(),
-            content,
-            version,
-            msg: pair_data,
-            transmits: 0,
-        };
-
-        if locally_generated {
-            self.local_broadcasts.queue_broadcast(b);
-        } else {
-            self.gossip_broadcasts.queue_broadcast(b);
-        }
-        self.gossip_notify.notify_one();
-    }
-
-    fn notify_watchers(&self, key: &str) {
-        {
-            let watchers = self.watchers.lock();
-            if let Some(list) = watchers.get(key) {
-                for w in list {
-                    w.notify.notify_one();
-                }
-            }
-        }
-        {
-            let pwatchers = self.prefix_watchers.lock();
-            for (prefix, list) in pwatchers.iter() {
-                if key.starts_with(prefix) {
-                    for pw in list {
-                        let _ = pw.tx.try_send(key.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    fn cleanup_obsolete_entries(&self) {
-        let timeout: Duration = self.cfg.obsolete_entries_timeout.as_std().unwrap_or(Duration::ZERO);
-        if timeout.is_zero() {
-            return;
-        }
-        let now = SystemTime::now();
-        let mut store = self.store.lock();
-        store.retain(|_, v| {
-            if !v.deleted {
-                return true;
-            }
-            match v.update_time {
-                Some(ut) => now.duration_since(ut).unwrap_or(Duration::ZERO) <= timeout,
-                None => true,
-            }
-        });
-    }
-
-    // --- Memberlist Delegate: LocalState, MergeRemoteState, NotifyMsg ---
-
-    pub fn local_state(&self) -> Vec<u8> {
-        self.metrics.number_of_pulls.inc();
-        let store = self.store.lock();
-        let mut buf = Vec::with_capacity(store.len() * 256);
-
-        for (key, val) in store.iter() {
-            let Some(codec) = self.get_codec(&val.codec_id) else {
-                continue;
-            };
-            let Ok(encoded) = codec.encode_mergeable(val.value.as_ref()) else {
-                continue;
-            };
-            let update_time_millis = val
-                .update_time
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-
-            let pair = KeyValuePair {
-                key: key.clone(),
-                value: Bytes::from(encoded),
-                codec: val.codec_id.clone(),
-                deleted: val.deleted,
-                update_time_millis,
-            };
-            let ser = pair.encode_to_vec();
-            buf.extend_from_slice(&(ser.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&ser);
-        }
-
-        buf
-    }
-
-    pub fn merge_remote_state(&self, mut data: &[u8]) {
-        self.metrics.number_of_pushes.inc();
-        while !data.is_empty() {
-            if data.len() < LENGTH_PREFIX_SIZE {
-                warn!("truncated KV pair length in push/pull state");
-                break;
-            }
-            let pair_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            data = &data[LENGTH_PREFIX_SIZE..];
-            if data.len() < pair_len {
-                warn!(
-                    expected = pair_len,
-                    remaining = data.len(),
-                    "truncated KV pair in push/pull state"
-                );
-                break;
-            }
-            let pair_bytes = &data[..pair_len];
-            data = &data[pair_len..];
-
-            let Ok(kv_pair) = KeyValuePair::decode(pair_bytes) else {
-                warn!("failed to decode KeyValuePair from push/pull state");
-                continue;
-            };
-            let Some(codec) = self.get_codec(&kv_pair.codec) else {
-                debug!(codec = %kv_pair.codec, key = %kv_pair.key, "unknown codec in remote state");
-                continue;
-            };
-            let ut = if kv_pair.update_time_millis > 0 {
-                Some(UNIX_EPOCH + Duration::from_millis(kv_pair.update_time_millis as u64))
-            } else {
-                None
-            };
-            match self.merge_bytes_value_for_key(
-                &kv_pair.key,
-                &kv_pair.value,
-                codec.as_ref(),
-                kv_pair.deleted,
-                ut,
-            ) {
-                Ok((change, new_ver, deleted, updated)) => {
-                    if new_ver > 0 {
-                        self.notify_watchers(&kv_pair.key);
-                        if let Some(ch) = change {
-                            self.broadcast_new_value(
-                                &kv_pair.key,
-                                ch.as_ref(),
-                                new_ver,
-                                codec.as_ref(),
-                                false,
-                                deleted,
-                                updated,
-                            );
-                        }
-                    }
-                }
-                Err(err) => {
-                    error!(key = %kv_pair.key, %err, "failed to merge remote KV pair");
-                }
-            }
-        }
-    }
-
-    pub fn notify_msg(&self, msg: &[u8]) {
-        self.metrics.received_messages.inc();
-        let Ok(kv_pair) = KeyValuePair::decode(msg) else {
-            self.metrics.invalid_messages.inc();
-            return;
-        };
-        if kv_pair.key.is_empty() {
-            self.metrics.invalid_messages.inc();
-            return;
-        }
-        let Some(codec) = self.get_codec(&kv_pair.codec) else {
-            self.metrics.invalid_messages.inc();
-            return;
-        };
-        let ut = if kv_pair.update_time_millis > 0 {
-            Some(UNIX_EPOCH + Duration::from_millis(kv_pair.update_time_millis as u64))
-        } else {
-            None
-        };
-        match self.merge_bytes_value_for_key(
-            &kv_pair.key,
-            &kv_pair.value,
-            codec.as_ref(),
-            kv_pair.deleted,
-            ut,
-        ) {
-            Ok((change, new_ver, deleted, updated)) => {
-                if new_ver > 0 {
-                    self.notify_watchers(&kv_pair.key);
-                    if let Some(ch) = change {
-                        self.broadcast_new_value(
-                            &kv_pair.key,
-                            ch.as_ref(),
-                            new_ver,
-                            codec.as_ref(),
-                            false,
-                            deleted,
-                            updated,
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                error!(key = %kv_pair.key, %err, "failed to process incoming userMsg");
-            }
-        }
-    }
-
-    fn get_broadcasts(&self, overhead: usize, limit: usize) -> Vec<Vec<u8>> {
-        let num_nodes = self.est_num_nodes();
-        let mut msgs = self
-            .local_broadcasts
-            .get_broadcasts(overhead, limit, num_nodes);
-        let used: usize = msgs.iter().map(|m| overhead + m.len()).sum();
-        if limit > used {
-            msgs.extend(
-                self.gossip_broadcasts
-                    .get_broadcasts(overhead, limit - used, num_nodes),
-            );
-        }
-        msgs
-    }
-
-    // --- Memberlist protocol handlers ---
-
-    async fn ingest_packet(&self, raw: &[u8], from: &str) {
-        let Ok((buf, label)) = remove_label_header(raw) else {
-            return;
-        };
-        if !self.cfg.cluster_label_verification_disabled && label != self.cfg.cluster_label {
-            return;
-        }
-        let Ok(buf) = unwrap_crc32(buf) else {
-            return;
-        };
-        self.handle_command(buf, from).await;
-    }
-
-    fn handle_command<'a>(
-        &'a self,
-        buf: &'a [u8],
-        from: &'a str,
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            if buf.is_empty() {
-                return;
-            }
-            let Ok(msg_type) = MessageType::try_from(buf[0]) else {
-                return;
-            };
-            let body = &buf[1..];
-            match msg_type {
-                MessageType::Compound => {
-                    if let Ok((_trunc, parts)) = decode_compound_message(body) {
-                        for part in parts {
-                            self.handle_command(part, from).await;
-                        }
-                    }
-                }
-                MessageType::Compress => {
-                    if let Ok(cp) = super::wire::decode_compressed_payload(body) {
-                        if let Ok(decomp) = decompress_buffer(cp.algo, &cp.buf) {
-                            self.handle_command(&decomp, from).await;
-                        }
-                    }
-                }
-                MessageType::Ping => {
-                    if let Ok(p) = decode_ping(body) {
-                        if !p.node.is_empty() && p.node != self.node_name {
-                            return;
-                        }
-                        let ack = encode_ack_resp(&AckResp {
-                            seq_no: p.seq_no,
-                            payload: None,
-                        });
-                        let reply_addr = if !p.source_addr.is_empty() && p.source_port > 0 {
-                            format_ip_port(&p.source_addr, p.source_port)
-                        } else {
-                            from.to_string()
-                        };
-                        let _ = self.send_raw_packet(&reply_addr, None, ack).await;
-                    }
-                }
-                MessageType::IndirectPing => {
-                    if let Ok(ind) = decode_indirect_ping(body) {
-                        let target_addr = format_ip_port(&ind.target, ind.port);
-                        let local_seq = self.sequence_num.fetch_add(1, Ordering::Relaxed) + 1;
-                        let ping = Ping {
-                            seq_no: local_seq,
-                            node: ind.node.clone(),
-                            source_addr: ip_to_bytes(self.advertise_ip),
-                            source_port: self.advertise_port,
-                            source_node: self.node_name.clone(),
-                        };
-                        let (tx, rx) = oneshot::channel();
-                        self.ack_handlers.lock().insert(local_seq, tx);
-                        let _ = self
-                            .send_raw_packet(&target_addr, None, encode_ping(&ping))
-                            .await;
-
-                        let reply_addr = if !ind.source_addr.is_empty() && ind.source_port > 0 {
-                            format_ip_port(&ind.source_addr, ind.source_port)
-                        } else {
-                            from.to_string()
-                        };
-                        if tokio::time::timeout(Duration::from_secs(2), rx)
-                            .await
-                            .is_ok()
-                        {
-                            let ack = encode_ack_resp(&AckResp {
-                                seq_no: ind.seq_no,
-                                payload: None,
-                            });
-                            let _ = self.send_raw_packet(&reply_addr, None, ack).await;
-                        } else {
-                            self.ack_handlers.lock().remove(&local_seq);
-                            if ind.nack {
-                                let nack = encode_nack_resp(&NackResp { seq_no: ind.seq_no });
-                                let _ = self.send_raw_packet(&reply_addr, None, nack).await;
+                        _ = kv.handoff_notify.notified() => {
+                            while let Some(msg) = kv.get_next_message() {
+                                kv.handle_handoff(msg);
                             }
                         }
                     }
                 }
-                MessageType::AckResp => {
-                    if let Ok(ack) = decode_ack_resp(body) {
-                        if let Some(tx) = self.ack_handlers.lock().remove(&ack.seq_no) {
-                            let _ = tx.send(ack);
+            });
+        }
+    }
+
+    /// memberlist `setAlive`: register ourselves (bootstrap alive message).
+    fn set_alive(&self) {
+        let (addr, port) = self.advertise();
+        let a = Alive {
+            incarnation: self.incarnation.fetch_add(1, Ordering::AcqRel).wrapping_add(1),
+            node: self.node_name.clone(),
+            addr: ip_to_bytes(addr),
+            port,
+            meta: self.node_meta.clone(),
+            vsn: vec![
+                PROTOCOL_VERSION_MIN,
+                PROTOCOL_VERSION_MAX,
+                PROTOCOL_VERSION_2_COMPATIBLE,
+                0,
+                0,
+                0,
+            ],
+        };
+        self.alive_node(&a, None, true);
+    }
+
+    fn get_next_message(&self) -> Option<Handoff> {
+        let mut q = self.handoff.lock();
+        q.0.pop_back().or_else(|| q.1.pop_back())
+    }
+
+    fn handle_handoff(&self, msg: Handoff) {
+        match msg.msg_type {
+            MessageType::Suspect => match decode_suspect(&msg.buf) {
+                Ok(s) => self.suspect_node(&s),
+                Err(err) => error!(%err, from = %msg.from, "memberlist: Failed to decode suspect message"),
+            },
+            MessageType::Alive => match decode_alive(&msg.buf) {
+                Ok(mut a) => {
+                    if a.port == 0 {
+                        a.port = self.bind_port();
+                    }
+                    self.alive_node(&a, None, false);
+                }
+                Err(err) => error!(%err, from = %msg.from, "memberlist: Failed to decode alive message"),
+            },
+            MessageType::Dead => match decode_dead(&msg.buf) {
+                Ok(d) => self.dead_node(&d),
+                Err(err) => error!(%err, from = %msg.from, "memberlist: Failed to decode dead message"),
+            },
+            MessageType::User => self.notify_msg(&msg.buf),
+            other => error!(?other, "memberlist: Message type not supported (packet handler)"),
+        }
+    }
+
+    /// memberlist `ingestPacket`.
+    async fn ingest_packet(&self, raw: &[u8], from: &str) {
+        let (buf, label) = match remove_label_header(raw) {
+            Ok(v) => v,
+            Err(err) => {
+                error!(%err, from, "memberlist: failed to remove packet label");
+                return;
+            }
+        };
+        let label = if self.cfg.cluster_label_verification_disabled {
+            self.cfg.cluster_label.as_str()
+        } else {
+            label
+        };
+        if label != self.cfg.cluster_label {
+            error!(label, from, "memberlist: discarding packet with unacceptable label");
+            return;
+        }
+        let buf = match unwrap_crc32(buf) {
+            Ok(b) => b,
+            Err(err) => {
+                warn!(%err, from, "memberlist: Got invalid checksum for UDP packet");
+                return;
+            }
+        };
+        self.handle_command(buf, from).await;
+    }
+
+    fn handle_command<'a>(&'a self, buf: &'a [u8], from: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if buf.is_empty() {
+                error!(from, "memberlist: missing message type byte");
+                return;
+            }
+            let Ok(msg_type) = MessageType::try_from(buf[0]) else {
+                error!(msg_type = buf[0], from, "memberlist: msg type not supported");
+                return;
+            };
+            let body = &buf[1..];
+            match msg_type {
+                MessageType::Compound => match decode_compound_message(body) {
+                    Ok((trunc, parts)) => {
+                        if trunc > 0 {
+                            warn!(trunc, from, "memberlist: Compound request had truncated messages");
+                        }
+                        for part in parts {
+                            self.handle_command(part, from).await;
                         }
                     }
-                }
-                MessageType::NackResp => {
-                    let _ = decode_nack_resp(body);
-                }
-                MessageType::Alive => {
-                    if let Ok(alive) = decode_alive(body) {
-                        self.handle_alive(&alive);
+                    Err(err) => error!(%err, from, "memberlist: Failed to decode compound request"),
+                },
+                MessageType::Compress => self.handle_compressed(body, from).await,
+                MessageType::Ping => match decode_ping(body) {
+                    Ok(p) => self.handle_ping(p, from).await,
+                    Err(err) => error!(%err, from, "memberlist: Failed to decode ping request"),
+                },
+                MessageType::IndirectPing => match decode_indirect_ping(body) {
+                    Ok(ind) => self.handle_indirect_ping(ind, from).await,
+                    Err(err) => error!(%err, from, "memberlist: Failed to decode indirect ping request"),
+                },
+                MessageType::AckResp => match decode_ack_resp(body) {
+                    Ok(ack) => self.invoke_ack_handler(&ack),
+                    Err(err) => error!(%err, from, "memberlist: Failed to decode ack response"),
+                },
+                MessageType::NackResp => match decode_nack_resp(body) {
+                    Ok(nack) => self.invoke_nack_handler(&nack),
+                    Err(err) => error!(%err, from, "memberlist: Failed to decode nack response"),
+                },
+                MessageType::Suspect | MessageType::Alive | MessageType::Dead | MessageType::User => {
+                    let dropped = {
+                        let mut q = self.handoff.lock();
+                        let queue = if msg_type == MessageType::Alive { &mut q.0 } else { &mut q.1 };
+                        if queue.len() >= self.timing.handoff_queue_depth {
+                            true
+                        } else {
+                            queue.push_back(Handoff {
+                                msg_type,
+                                buf: body.to_vec(),
+                                from: from.to_string(),
+                            });
+                            false
+                        }
+                    };
+                    if dropped {
+                        warn!(?msg_type, from, "memberlist: handler queue full, dropping message");
+                    } else {
+                        self.handoff_notify.notify_one();
                     }
                 }
-                MessageType::Suspect => {
-                    if let Ok(sus) = decode_suspect(body) {
-                        self.handle_suspect(&sus);
-                    }
-                }
-                MessageType::Dead => {
-                    if let Ok(dead) = decode_dead(body) {
-                        self.handle_dead(&dead);
-                    }
-                }
-                MessageType::User => {
-                    self.notify_msg(body);
-                }
-                _ => {}
+                other => error!(?other, from, "memberlist: msg type not supported"),
             }
         })
     }
 
-    async fn handle_stream_conn(&self, mut conn: TcpStream) {
-        let timeout: Duration = self.cfg.stream_timeout.as_std().unwrap_or(Duration::ZERO);
-        let fut = self.handle_stream_conn_inner(&mut conn);
-        if !timeout.is_zero() {
-            let _ = tokio::time::timeout(timeout, fut).await;
-        } else {
-            fut.await;
+    fn compress_labels(&self) -> &'static str {
+        match self.compression_algo {
+            CompressionType::Snappy => "snappy",
+            _ => "lzw",
         }
     }
 
-    async fn handle_stream_conn_inner(&self, conn: &mut TcpStream) {
+    fn decompress_algo(algo: CompressionType) -> &'static str {
+        match algo {
+            CompressionType::Snappy => "snappy",
+            CompressionType::Lzw => "lzw",
+            #[allow(unreachable_patterns)]
+            _ => "unknown",
+        }
+    }
+
+    /// memberlist `handleCompressed`.
+    async fn handle_compressed(&self, body: &[u8], from: &str) {
+        match super::wire::decode_compressed_payload(body) {
+            Ok(cp) => {
+                let labels = [("algo", Self::decompress_algo(cp.algo))];
+                self.go_metrics
+                    .incr_counter(&["memberlist", "decompress", "attempts_total"], 1.0, &labels);
+                match decompress_buffer(cp.algo, &cp.buf) {
+                    Ok(decomp) => self.handle_command(&decomp, from).await,
+                    Err(err) => {
+                        self.go_metrics
+                            .incr_counter(&["memberlist", "decompress", "errors_total"], 1.0, &labels);
+                        error!(%err, from, "memberlist: Failed to decompress payload");
+                    }
+                }
+            }
+            Err(err) => {
+                let labels = [("algo", "unknown")];
+                self.go_metrics
+                    .incr_counter(&["memberlist", "decompress", "attempts_total"], 1.0, &labels);
+                self.go_metrics
+                    .incr_counter(&["memberlist", "decompress", "errors_total"], 1.0, &labels);
+                error!(%err, from, "memberlist: Failed to decompress payload");
+            }
+        }
+    }
+
+    /// memberlist `compressPayload` with go-metrics accounting; returns the bytes to send.
+    fn maybe_compress(&self, msg: Vec<u8>) -> Vec<u8> {
+        if !self.cfg.compression_enabled {
+            return msg;
+        }
+        let algo = self.compress_labels();
+        self.go_metrics
+            .incr_counter(&["memberlist", "compress", "attempts_total"], 1.0, &[("algo", algo)]);
+        match compress_payload(self.compression_algo, &msg) {
+            Ok(comp) if comp.len() < msg.len() => comp,
+            Ok(_) => {
+                self.go_metrics.incr_counter(
+                    &["memberlist", "compress", "skipped_total"],
+                    1.0,
+                    &[("algo", algo), ("reason", "size_worse_than_original")],
+                );
+                msg
+            }
+            Err(err) => {
+                self.go_metrics
+                    .incr_counter(&["memberlist", "compress", "errors_total"], 1.0, &[("algo", algo)]);
+                warn!(%err, "memberlist: Failed to compress payload");
+                msg
+            }
+        }
+    }
+
+    /// memberlist `sendMsg`: piggybacks pending broadcasts on the message.
+    pub(crate) async fn send_msg(&self, addr: &str, msg: Vec<u8>) -> Result<(), KvError> {
+        let bytes_avail = UDP_BUFFER_SIZE
+            .saturating_sub(msg.len() + COMPOUND_HEADER_OVERHEAD + self.label_overhead());
+        let extra = self.get_broadcasts(COMPOUND_OVERHEAD, bytes_avail);
+        if extra.is_empty() {
+            return self.raw_send_msg_packet(addr, None, msg).await;
+        }
+        let mut msgs = Vec::with_capacity(1 + extra.len());
+        msgs.push(msg);
+        msgs.extend(extra);
+        for compound in make_compound_messages(&msgs) {
+            self.raw_send_msg_packet(addr, None, compound).await?;
+        }
+        Ok(())
+    }
+
+    /// memberlist `rawSendMsgPacket`.
+    pub(crate) async fn raw_send_msg_packet(
+        &self,
+        addr: &str,
+        node: Option<&NodeState>,
+        msg: Vec<u8>,
+    ) -> Result<(), KvError> {
+        let mut msg = self.maybe_compress(msg);
+        if node.is_some_and(|n| n.pmax() >= 5) {
+            msg = wrap_crc32(&msg);
+        }
+        self.go_metrics
+            .incr_counter(&["memberlist", "udp", "sent"], msg.len() as f64, &[]);
+        let framed = add_label_header(&msg, &self.cfg.cluster_label).map_err(KvError::Other)?;
+        self.transport().write_to(framed, addr.to_string()).await;
+        Ok(())
+    }
+
+    /// memberlist `rawSendMsgStream`.
+    async fn send_raw_stream<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        send_buf: Vec<u8>,
+        label: &str,
+    ) -> Result<(), io::Error> {
+        let send_buf = self.maybe_compress(send_buf);
+        let framed = add_label_header(&send_buf, label)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        self.go_metrics
+            .incr_counter(&["memberlist", "tcp", "sent"], framed.len() as f64, &[]);
+        writer.write_all(&framed).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    /// memberlist `handleConn`.
+    async fn handle_conn(&self, mut conn: MemberlistConn) {
+        self.go_metrics.incr_counter(&["memberlist", "tcp", "accept"], 1.0, &[]);
+        let timeout = self.timing.tcp_timeout;
+        let fut = self.handle_conn_inner(&mut conn);
+        if timeout.is_zero() {
+            fut.await;
+        } else {
+            let _ = tokio::time::timeout(timeout, fut).await;
+        }
+    }
+
+    async fn handle_conn_inner(&self, conn: &mut MemberlistConn) {
         let (read_half, mut write_half) = conn.split();
         let mut reader = BufReader::new(read_half);
 
-        let Ok((msg_type, stream_label, body_opt)) =
-            read_stream_header(&mut reader).await
-        else {
-            return;
+        let (msg_type, stream_label, body_opt) = match read_stream_header(&mut reader).await {
+            Ok(v) => v,
+            Err(err) => {
+                error!(%err, "memberlist: failed to receive");
+                return;
+            }
         };
-
-        let effective_label = if self.cfg.cluster_label_verification_disabled {
-            self.cfg.cluster_label.as_str()
+        let label = if self.cfg.cluster_label_verification_disabled {
+            self.cfg.cluster_label.clone()
         } else {
-            stream_label.as_str()
+            stream_label
         };
-        if effective_label != self.cfg.cluster_label {
+        if label != self.cfg.cluster_label {
+            error!(label, "memberlist: discarding stream with unacceptable label");
             return;
         }
 
         match msg_type {
             MessageType::PushPull => {
+                let n = self.push_pull_req.fetch_add(1, Ordering::AcqRel) + 1;
+                struct Dec<'a>(&'a AtomicUsize);
+                impl Drop for Dec<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+                let _dec = Dec(&self.push_pull_req);
+                if n >= MAX_PUSH_PULL_REQUESTS {
+                    error!("memberlist: Too many pending push/pull requests");
+                    return;
+                }
                 let res = match body_opt {
-                    Some(in_mem) => decode_push_pull(&in_mem)
-                        .map(|(j, n, s)| (j, n, s.to_vec())),
+                    Some(in_mem) => decode_push_pull(&in_mem).map(|(j, n, s)| (j, n, s.to_vec())),
                     None => read_push_pull_from_stream(&mut reader).await,
                 };
                 match res {
                     Ok((join, remote_nodes, user_state)) => {
-                        let payload = self.build_push_pull_bytes(join);
-                        if let Err(err) = self
-                            .send_raw_stream(&mut write_half, payload, effective_label)
-                            .await
-                        {
-                            warn!(%err, "failed to write push/pull local state");
+                        if let Err(err) = self.send_local_state(&mut write_half, join, &label).await {
+                            error!(%err, "memberlist: Failed to push local state");
                             return;
                         }
-                        self.merge_remote_nodes(&remote_nodes);
-                        if !user_state.is_empty() {
-                            self.merge_remote_state(&user_state);
+                        if let Err(err) = self.merge_remote_state_full(join, &remote_nodes, &user_state) {
+                            error!(%err, "memberlist: Failed push/pull merge");
                         }
                     }
                     Err(err) => {
+                        error!(%err, "memberlist: Failed to read remote state");
                         let err_msg = encode_err_resp(&ErrResp { error: err });
-                        let _ = self
-                            .send_raw_stream(&mut write_half, err_msg, effective_label)
-                            .await;
+                        let _ = self.send_raw_stream(&mut write_half, err_msg, &label).await;
                     }
                 }
             }
             MessageType::User => {
                 let res = match body_opt {
-                    Some(in_mem) => super::wire::decode_user_msg_stream(&in_mem)
-                        .map(|s| s.to_vec()),
+                    Some(in_mem) => super::wire::decode_user_msg_stream(&in_mem).map(|s| s.to_vec()),
                     None => read_user_msg_from_stream(&mut reader).await,
                 };
-                if let Ok(payload) = res {
-                    self.notify_msg(&payload);
+                match res {
+                    Ok(payload) => self.notify_msg(&payload),
+                    Err(err) => error!(%err, "memberlist: Failed to receive user message"),
                 }
             }
             MessageType::Ping => {
                 let res = match body_opt {
                     Some(in_mem) => decode_ping(&in_mem),
-                    None => read_msgpack_map_bytes(&mut reader)
-                        .await
-                        .and_then(|b| decode_ping(&b)),
+                    None => read_msgpack_map_bytes(&mut reader).await.and_then(|b| decode_ping(&b)),
                 };
-                if let Ok(p) = res {
-                    if p.node.is_empty() || p.node == self.node_name {
+                match res {
+                    Ok(p) => {
+                        if !p.node.is_empty() && p.node != self.node_name {
+                            warn!(node = %p.node, "memberlist: Got ping for unexpected node");
+                            return;
+                        }
                         let ack = encode_ack_resp(&AckResp {
                             seq_no: p.seq_no,
                             payload: None,
                         });
-                        let _ = self
-                            .send_raw_stream(&mut write_half, ack, effective_label)
-                            .await;
+                        if let Err(err) = self.send_raw_stream(&mut write_half, ack, &label).await {
+                            error!(%err, "memberlist: Failed to send ack");
+                        }
                     }
+                    Err(err) => error!(%err, "memberlist: Failed to decode ping"),
                 }
             }
-            _ => {}
+            other => error!(?other, "memberlist: Received invalid msgType"),
         }
     }
 
-    fn build_push_pull_bytes(&self, join: bool) -> Vec<u8> {
+    /// memberlist `sendLocalState`.
+    async fn send_local_state<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        join: bool,
+        label: &str,
+    ) -> Result<(), io::Error> {
         let local_nodes: Vec<PushNodeState> = self
             .nodes
             .read()
-            .iter()
+            .ordered()
+            .into_iter()
             .map(|n| PushNodeState {
                 name: n.name.clone(),
                 addr: n.addr.clone(),
@@ -1673,25 +1227,46 @@ impl MemberlistKv {
                 vsn: n.vsn.clone(),
             })
             .collect();
-        let user_data = self.local_state();
-        encode_push_pull(&local_nodes, &user_data, join)
+        self.record_node_instances(&local_nodes);
+        let user_data = self.local_state(join);
+        let payload = encode_push_pull(&local_nodes, &user_data, join);
+        if payload.len() >= 5 {
+            let more = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+            self.go_metrics
+                .set_gauge(&["memberlist", "size", "local"], more as f64, &[]);
+        }
+        self.send_raw_stream(writer, payload, label).await
     }
 
-    async fn push_pull_node(&self, addr: &str, join: bool) -> Result<(), KvError> {
-        let timeout: Duration = self.cfg.stream_timeout.as_std().unwrap_or(Duration::ZERO);
-        let mut conn = self.transport.dial_stream(addr, timeout).await?;
+    /// memberlist `mergeRemoteState`.
+    fn merge_remote_state_full(
+        &self,
+        join: bool,
+        remote_nodes: &[PushNodeState],
+        user_state: &[u8],
+    ) -> Result<(), String> {
+        self.verify_protocol(remote_nodes)?;
+        self.merge_state(remote_nodes);
+        if !user_state.is_empty() {
+            self.merge_remote_state(user_state, join);
+        }
+        Ok(())
+    }
 
-        let payload = self.build_push_pull_bytes(join);
-        let (mut read_half, mut write_half) = conn.split();
-        self.send_raw_stream(&mut write_half, payload, &self.cfg.cluster_label)
-            .await?;
+    /// memberlist `pushPullNode` (+ `sendAndReceiveState`).
+    pub(crate) async fn push_pull_node(&self, addr: &str, join: bool) -> Result<(), KvError> {
+        let started = Instant::now();
+        let timeout = self.timing.tcp_timeout;
+        let mut conn = self.transport().dial_timeout(addr, timeout).await?;
+        self.go_metrics.incr_counter(&["memberlist", "tcp", "connect"], 1.0, &[]);
+        let label = self.cfg.cluster_label.clone();
+        let (read_half, mut write_half) = conn.split();
+        self.send_local_state(&mut write_half, join, &label).await?;
 
-        let mut reader = BufReader::new(&mut read_half);
+        let mut reader = BufReader::new(read_half);
         let read_fut = async {
             let (msg_type, _label, body_opt) =
-                read_stream_header(&mut reader)
-                    .await
-                    .map_err(KvError::Other)?;
+                read_stream_header(&mut reader).await.map_err(KvError::Other)?;
             match msg_type {
                 MessageType::Err => {
                     let e = match body_opt {
@@ -1715,810 +1290,1124 @@ impl MemberlistKv {
                     Ok((remote_nodes, user_state))
                 }
                 other => Err(KvError::Other(format!(
-                    "unexpected msg_type {other:?} in push/pull response"
+                    "received invalid msgType ({}), expected pushPullMsg ({})",
+                    other as u8,
+                    MessageType::PushPull as u8
                 ))),
             }
         };
-
-        let (remote_nodes, user_state) = if !timeout.is_zero() {
+        let res = if timeout.is_zero() {
+            read_fut.await
+        } else {
             tokio::time::timeout(timeout, read_fut)
                 .await
-                .map_err(|_| KvError::Other("push/pull stream timeout".to_string()))??
+                .map_err(|_| KvError::Other("i/o timeout".to_string()))
+                .and_then(|r| r)
+        };
+        let (remote_nodes, user_state) = res?;
+        self.merge_remote_state_full(join, &remote_nodes, &user_state)
+            .map_err(KvError::Other)?;
+        self.go_metrics
+            .measure_since(&["memberlist", "pushPullNode"], started, &[]);
+        Ok(())
+    }
+
+    // --- joining -----------------------------------------------------------------------------------
+
+    /// dskit `GetRejoinSeedNodes`.
+    fn rejoin_seed_nodes(&self) -> Vec<String> {
+        if !self.cfg.rejoin_seed_nodes.0.is_empty() {
+            self.cfg.rejoin_seed_nodes.0.clone()
         } else {
-            read_fut.await?
-        };
-
-        self.merge_remote_nodes(&remote_nodes);
-        if !user_state.is_empty() {
-            self.merge_remote_state(&user_state);
+            self.cfg.join_members.0.clone()
         }
-        Ok(())
     }
 
-    async fn send_raw_stream<W: tokio::io::AsyncWrite + Unpin>(
-        &self,
-        writer: &mut W,
-        mut send_buf: Vec<u8>,
-        label: &str,
-    ) -> Result<(), io::Error> {
-        if self.cfg.compression_enabled {
-            if let Ok(comp) = compress_payload(self.compression_algo, &send_buf) {
-                if comp.len() < send_buf.len() {
-                    send_buf = comp;
+    /// memberlist `resolveAddr`.
+    async fn resolve_addr(&self, host_str: &str) -> Result<Vec<String>, String> {
+        let mut host_str = host_str;
+        if let Some(idx) = host_str.find('/') {
+            if idx == 0 {
+                return Err("empty node name provided".to_string());
+            }
+            host_str = &host_str[idx + 1..];
+        }
+        let with_port = ensure_port(host_str, self.bind_port());
+        let (host, port) = match crate::dns::split_host_port(&with_port) {
+            Some((h, p)) => (h.to_string(), p.to_string()),
+            None => return Err(format!("address {with_port}: missing port in address")),
+        };
+        let port: u16 = port.parse().map_err(|e| format!("strconv.ParseUint: parsing {port:?}: {e}"))?;
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(ip, port).to_string()]);
+        }
+        match tokio::net::lookup_host(crate::dns::join_host_port(&host, &port.to_string())).await {
+            Ok(addrs) => Ok(addrs.map(|a| a.to_string()).collect()),
+            Err(err) => Err(format!("lookup {host}: {err}")),
+        }
+    }
+
+    /// memberlist `Join`: returns the number of nodes successfully contacted.
+    async fn ml_join(&self, existing: &[String]) -> (usize, Option<String>) {
+        let mut num_success = 0;
+        let mut errs: Vec<String> = Vec::new();
+        for exist in existing {
+            let addrs = match self.resolve_addr(exist).await {
+                Ok(a) => a,
+                Err(err) => {
+                    let err = format!("failed to resolve {exist}: {err}");
+                    warn!("memberlist: {err}");
+                    errs.push(err);
+                    continue;
+                }
+            };
+            for addr in addrs {
+                match self.push_pull_node(&addr, true).await {
+                    Ok(()) => num_success += 1,
+                    Err(err) => {
+                        let err = format!("failed to join {addr}: {err}");
+                        debug!("memberlist: {err}");
+                        errs.push(err);
+                    }
                 }
             }
         }
-        let framed = add_label_header(&send_buf, label)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        writer.write_all(&framed).await?;
-        writer.flush().await?;
-        Ok(())
-    }
-
-    async fn send_raw_packet(
-        &self,
-        addr: &str,
-        node: Option<&NodeState>,
-        mut msg: Vec<u8>,
-    ) -> Result<(), KvError> {
-        if self.cfg.compression_enabled {
-            if let Ok(comp) = compress_payload(self.compression_algo, &msg) {
-                if comp.len() < msg.len() {
-                    msg = comp;
-                }
-            }
-        }
-        let pmax = node
-            .and_then(|n| n.vsn.get(1).copied())
-            .unwrap_or(PROTOCOL_VERSION_MAX);
-        if pmax >= 5 {
-            msg = wrap_crc32(&msg);
-        }
-        let framed = add_label_header(&msg, &self.cfg.cluster_label).map_err(KvError::Other)?;
-        self.transport.write_to(framed, addr.to_string()).await;
-        Ok(())
-    }
-
-    async fn gossip(&self) {
-        let peers: Vec<NodeState> = {
-            let nodes = self.nodes.read();
-            let mut candidates: Vec<NodeState> = nodes
-                .iter()
-                .filter(|n| n.name != self.node_name && !n.dead_or_left())
-                .cloned()
-                .collect();
-            let mut rng = rand::thread_rng();
-            candidates.shuffle(&mut rng);
-            candidates.truncate(self.cfg.gossip_nodes.max(1) as usize);
-            candidates
-        };
-
-        if peers.is_empty() {
-            return;
-        }
-
-        let bytes_avail = UDP_BUFFER_SIZE - COMPOUND_HEADER_OVERHEAD;
-        for peer in peers {
-            let msgs = self.get_broadcasts(COMPOUND_OVERHEAD, bytes_avail);
-            if msgs.is_empty() {
-                return;
-            }
-            // Wrap each KV broadcast in userMsg ([8][KeyValuePair bytes]).
-            let user_msgs: Vec<Vec<u8>> = msgs
-                .into_iter()
-                .map(|m| {
-                    let mut v = Vec::with_capacity(1 + m.len());
-                    v.push(MessageType::User as u8);
-                    v.extend_from_slice(&m);
-                    v
-                })
-                .collect();
-
-            if user_msgs.len() == 1 {
-                let _ = self
-                    .send_raw_packet(&peer.address(), Some(&peer), user_msgs[0].clone())
-                    .await;
-            } else {
-                for compound in make_compound_messages(&user_msgs) {
-                    let _ = self
-                        .send_raw_packet(&peer.address(), Some(&peer), compound)
-                        .await;
-                }
-            }
+        if num_success > 0 || errs.is_empty() {
+            (num_success, None)
+        } else {
+            (num_success, Some(multierror_text(&errs)))
         }
     }
 
-    async fn push_pull(&self) {
-        let peer = {
-            let nodes = self.nodes.read();
-            let live: Vec<NodeState> = nodes
-                .iter()
-                .filter(|n| n.name != self.node_name && n.state == NodeStateType::Alive)
-                .cloned()
-                .collect();
-            live.choose(&mut rand::thread_rng()).cloned()
-        };
-        if let Some(p) = peer {
-            let _ = self.push_pull_node(&p.address(), false).await;
+    /// dskit `JoinMembers`.
+    pub async fn join_members(&self, members: &[String]) -> Result<usize, KvError> {
+        if self.state() != State::Running {
+            return Err(KvError::Other("service not Running".to_string()));
+        }
+        match self.ml_join(members).await {
+            (n, None) => Ok(n),
+            (_, Some(err)) => Err(KvError::Other(err)),
         }
     }
 
-    async fn probe(&self) {
-        let target = {
-            let nodes = self.nodes.read();
+    /// dskit `fastJoinMembersOnStartup`.
+    async fn fast_join_members_on_startup(&self, ctx: &ServiceContext) -> Result<(), String> {
+        let start = Instant::now();
+        let (mut nodes, err) = self.discover_members_with_retries(ctx, &self.cfg.join_members.0).await;
+        if let Some(err) = err {
             if nodes.is_empty() {
-                return;
+                return Err(err);
             }
-            let len = nodes.len();
-            let start = self.probe_index.fetch_add(1, Ordering::Relaxed) % len;
-            let mut found = None;
-            for offset in 0..len {
-                let n = &nodes[(start + offset) % len];
-                if n.name != self.node_name && !n.dead_or_left() {
-                    found = Some(n.clone());
+        }
+        nodes.shuffle(&mut rand::thread_rng());
+        let mut to_join = self.timing.retransmit_mult as i64
+            * ((nodes.len() as f64 + 1.0).log10().ceil() as i64);
+        info!(nodes_found = nodes.len(), to_join, "memberlist fast-join starting");
+
+        let mut total_joined = 0i64;
+        let mut nodes: VecDeque<String> = nodes.into();
+        while to_join > 0 && !nodes.is_empty() && !ctx.is_canceled() {
+            let node = nodes.pop_front().expect("non-empty");
+            let (reached, err) = self.ml_join(std::slice::from_ref(&node)).await;
+            if let Some(err) = err {
+                info!(node, %err, "fast-joining node failed");
+            }
+            total_joined += reached as i64;
+            to_join -= reached as i64;
+        }
+
+        let required = self.cfg.abort_if_cluster_fast_join_fails_min_nodes;
+        if total_joined < required {
+            warn!(joined_nodes = total_joined, required_nodes = required, elapsed_time = ?start.elapsed(), "memberlist fast-join failed to reach minimum required seed nodes");
+            return Err(format!(
+                "fast-join failed to reach minimum required seed nodes: joined {total_joined}, required {required}"
+            ));
+        }
+        info!(joined_nodes = total_joined, elapsed_time = ?start.elapsed(), "memberlist fast-join finished");
+        Ok(())
+    }
+
+    /// dskit `joinMembersOnStartup`.
+    async fn join_members_on_startup(&self, ctx: &ServiceContext) -> bool {
+        let members = self.cfg.join_members.0.clone();
+        if members.is_empty() {
+            return true;
+        }
+        info!(phase = "startup", msg = "joining memberlist cluster", join_members = %members.join(","));
+        let start = Instant::now();
+        let max = self.cfg.max_join_retries.max(0) as usize;
+        match self.join_members_with_retries(ctx, &members, max, "startup").await {
+            Ok(reached) => {
+                info!(phase = "startup", msg = "joining memberlist cluster succeeded", reached_nodes = reached, elapsed_time = ?start.elapsed());
+                true
+            }
+            Err(err) => {
+                error!(phase = "startup", msg = "joining memberlist cluster failed", %err, elapsed_time = ?start.elapsed());
+                false
+            }
+        }
+    }
+
+    /// dskit `joinMembersWithRetries`. `num_attempts == 0` retries forever (dskit backoff).
+    async fn join_members_with_retries(
+        &self,
+        ctx: &ServiceContext,
+        members: &[String],
+        num_attempts: usize,
+        phase: &'static str,
+    ) -> Result<usize, String> {
+        let mut boff = Backoff::new(BackoffConfig {
+            min_backoff: self.cfg.min_join_backoff.as_std().unwrap_or(Duration::ZERO),
+            max_backoff: self.cfg.max_join_backoff.as_std().unwrap_or(Duration::ZERO),
+            max_retries: num_attempts,
+        });
+        let mut err: Option<String> = None;
+        let mut joined = 0;
+        let mut canceled = false;
+        while boff.ongoing() && !ctx.is_canceled() {
+            let (n, e) = self.join_members_in_batches(ctx, members).await;
+            joined = n;
+            err = e;
+            if joined > 0 {
+                err = None;
+                break;
+            }
+            warn!(
+                phase,
+                msg = "joining memberlist cluster",
+                attempts = boff.num_retries() + 1,
+                max_attempts = num_attempts,
+                err = err.as_deref().unwrap_or(""),
+            );
+            let delay = boff.next_delay();
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = ctx.canceled() => { canceled = true; }
+            }
+            if canceled {
+                break;
+            }
+        }
+        if err.is_none() && joined == 0 {
+            if ctx.is_canceled() || canceled {
+                err = Some("joining memberlist: context canceled".to_string());
+            } else if let Some(e) = boff.err() {
+                err = Some(format!("joining memberlist: {e}"));
+            }
+        }
+        match err {
+            Some(e) => Err(e),
+            None => Ok(joined),
+        }
+    }
+
+    /// dskit `joinMembersInBatches`.
+    async fn join_members_in_batches(&self, ctx: &ServiceContext, members: &[String]) -> (usize, Option<String>) {
+        const BATCH_SIZE: usize = 100;
+        let mut attempted: HashSet<String> = HashSet::new();
+        let mut successfully_joined = 0;
+        let mut last_err: Option<String> = None;
+        let mut nodes: Vec<String> = Vec::new();
+        let mut more = true;
+        while !ctx.is_canceled() && more {
+            let (newly, _) = self.discover_members_with_retries(ctx, members).await;
+            if !newly.is_empty() {
+                nodes = newly;
+            }
+            let mut batch = Vec::with_capacity(BATCH_SIZE);
+            more = false;
+            for n in &nodes {
+                if attempted.contains(n) {
+                    continue;
+                }
+                if batch.len() >= BATCH_SIZE {
+                    more = true;
                     break;
                 }
+                batch.push(n.clone());
+                attempted.insert(n.clone());
             }
-            found
-        };
-        let Some(node) = target else {
-            return;
-        };
-        let seq_no = self.sequence_num.fetch_add(1, Ordering::Relaxed) + 1;
-        let ping = Ping {
-            seq_no,
-            node: node.name.clone(),
-            source_addr: ip_to_bytes(self.advertise_ip),
-            source_port: self.advertise_port,
-            source_node: self.node_name.clone(),
-        };
-        let (tx, rx) = oneshot::channel();
-        self.ack_handlers.lock().insert(seq_no, tx);
-        let _ = self
-            .send_raw_packet(&node.address(), Some(&node), encode_ping(&ping))
-            .await;
-
-        if tokio::time::timeout(Duration::from_secs(2), rx).await.is_err() {
-            self.ack_handlers.lock().remove(&seq_no);
+            // dskit joinMembersBatch.
+            let mut joined_in_batch = 0;
+            let mut batch_err = None;
+            for node in &batch {
+                if ctx.is_canceled() {
+                    batch_err = Some("joining batch: context canceled".to_string());
+                    break;
+                }
+                let (reached, err) = self.ml_join(std::slice::from_ref(node)).await;
+                joined_in_batch += reached;
+                if err.is_some() {
+                    batch_err = err;
+                }
+            }
+            if joined_in_batch > 0 {
+                batch_err = None;
+            }
+            if batch_err.is_some() {
+                last_err = batch_err;
+            }
+            successfully_joined += joined_in_batch;
         }
+        if successfully_joined > 0 {
+            return (successfully_joined, None);
+        }
+        if last_err.is_none() {
+            return (0, Some("found no nodes to join".to_string()));
+        }
+        (0, last_err)
     }
 
-    fn handle_alive(&self, alive: &Alive) {
-        if self.leaving.load(Ordering::Acquire) && alive.node == self.node_name {
-            return;
+    /// dskit `discoverMembers`.
+    async fn discover_members(&self, members: &[String]) -> (Vec<String>, Option<String>) {
+        if members.is_empty() {
+            return (Vec::new(), None);
         }
-        let mut nodes = self.nodes.write();
-        if let Some(existing) = nodes.iter_mut().find(|n| n.name == alive.node) {
-            let is_local = existing.name == self.node_name;
-            if (!is_local && alive.incarnation <= existing.incarnation)
-                || (is_local && alive.incarnation < existing.incarnation)
-            {
-                return;
+        let mut ms = Vec::new();
+        let mut resolve = Vec::new();
+        for m in members {
+            if m.contains('+') {
+                resolve.push(m.clone());
+            } else {
+                ms.push(m.clone());
             }
-            if is_local {
-                let inc = self.incarnation.fetch_add(1, Ordering::AcqRel) + 1;
-                existing.incarnation = inc.max(alive.incarnation + 1);
-                return;
-            }
-            existing.incarnation = alive.incarnation;
-            existing.addr = alive.addr.clone();
-            existing.port = alive.port;
-            existing.meta = alive.meta.clone();
-            if !alive.vsn.is_empty() {
-                existing.vsn = alive.vsn.clone();
-            }
-            if existing.state != NodeStateType::Alive {
-                existing.state = NodeStateType::Alive;
-                existing.state_change = SystemTime::now();
-            }
-        } else {
-            nodes.push(NodeState {
-                name: alive.node.clone(),
-                addr: alive.addr.clone(),
-                port: alive.port,
-                meta: alive.meta.clone(),
-                incarnation: alive.incarnation,
-                state: NodeStateType::Alive,
-                state_change: SystemTime::now(),
-                vsn: alive.vsn.clone(),
-            });
-            self.metrics.members_count.set(
-                nodes.iter().filter(|n| !n.dead_or_left()).count() as f64,
-            );
         }
+        let err = self.dns.resolve(&resolve).await.err().map(|e| {
+            let e = e.to_string();
+            warn!(addrs = %resolve.join(","), err = %e, "failed to resolve members");
+            e
+        });
+        ms.extend(self.dns.addresses());
+        (ms, err)
     }
 
-    fn handle_suspect(&self, sus: &Suspect) {
-        let mut nodes = self.nodes.write();
-        let Some(existing) = nodes.iter_mut().find(|n| n.name == sus.node) else {
-            return;
-        };
-        if sus.incarnation < existing.incarnation || existing.state != NodeStateType::Alive {
+    /// dskit `discoverMembersWithRetries`.
+    async fn discover_members_with_retries(
+        &self,
+        ctx: &ServiceContext,
+        members: &[String],
+    ) -> (Vec<String>, Option<String>) {
+        let mut boff = Backoff::new(self.discover_backoff);
+        let mut last = (Vec::new(), None);
+        while boff.ongoing() && !ctx.is_canceled() {
+            last = self.discover_members(members).await;
+            if last.1.is_none() {
+                return last;
+            }
+            let delay = boff.next_delay();
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = ctx.canceled() => break,
+            }
+        }
+        last
+    }
+
+    // --- accessors ---------------------------------------------------------------------------------
+
+    pub fn node_name(&self) -> &str {
+        &self.node_name
+    }
+
+    pub fn node_meta(&self) -> Option<&[u8]> {
+        self.node_meta.as_deref()
+    }
+
+    /// dskit `GetListeningPort` (only valid once started).
+    pub fn listening_port(&self) -> u16 {
+        self.transport.get().map(|t| t.auto_bind_port()).unwrap_or(0)
+    }
+
+    pub fn advertise_addr(&self) -> String {
+        self.transport
+            .get()
+            .map(|t| t.get_advertised_addr())
+            .unwrap_or_default()
+    }
+
+    pub fn get_codec(&self, codec_id: &str) -> Option<Arc<dyn Codec>> {
+        self.codecs.read().get(codec_id).cloned()
+    }
+
+    pub fn register_codec(&self, codec: Arc<dyn Codec>) {
+        self.codecs.write().insert(codec.codec_id().to_string(), codec);
+    }
+
+    /// memberlist `Members`: nodes that are not dead or left.
+    pub fn members(&self) -> Vec<NodeState> {
+        self.nodes
+            .read()
+            .ordered()
+            .into_iter()
+            .filter(|n| !n.dead_or_left())
+            .cloned()
+            .collect()
+    }
+
+    /// All known nodes including dead/left ones not reaped yet.
+    pub fn all_nodes(&self) -> Vec<NodeState> {
+        self.nodes.read().ordered().into_iter().cloned().collect()
+    }
+
+    /// dskit `getSentAndReceivedMessages`.
+    pub fn sent_and_received_messages(&self) -> (Vec<HistoryMessage>, Vec<HistoryMessage>) {
+        let h = self.history.lock();
+        (h.sent.iter().cloned().collect(), h.received.iter().cloned().collect())
+    }
+
+    /// dskit `deleteSentReceivedMessages`.
+    pub fn delete_sent_received_messages(&self) {
+        let mut h = self.history.lock();
+        h.sent.clear();
+        h.sent_size = 0;
+        h.received.clear();
+        h.received_size = 0;
+    }
+
+    fn add_received_message(&self, mut msg: HistoryMessage) {
+        let limit = self.cfg.message_history_buffer_bytes.max(0) as usize;
+        if limit == 0 {
             return;
         }
-        if existing.name == self.node_name {
-            let new_inc = self.incarnation.fetch_add(1, Ordering::AcqRel) + 1;
-            let inc = new_inc.max(sus.incarnation + 1);
-            self.incarnation.store(inc, Ordering::Release);
-            existing.incarnation = inc;
-            let alive = Alive {
-                incarnation: inc,
-                node: existing.name.clone(),
-                addr: existing.addr.clone(),
-                port: existing.port,
-                meta: existing.meta.clone(),
-                vsn: existing.vsn.clone(),
+        let mut h = self.history.lock();
+        h.counter += 1;
+        msg.id = h.counter;
+        let MessageHistory { received, received_size, .. } = &mut *h;
+        add_message_to_buffer(received, received_size, limit, msg);
+    }
+
+    fn add_sent_message(&self, mut msg: HistoryMessage) {
+        let limit = self.cfg.message_history_buffer_bytes.max(0) as usize;
+        if limit == 0 {
+            return;
+        }
+        let mut h = self.history.lock();
+        h.counter += 1;
+        msg.id = h.counter;
+        let MessageHistory { sent, sent_size, .. } = &mut *h;
+        add_message_to_buffer(sent, sent_size, limit, msg);
+    }
+
+    // --- KV operations -----------------------------------------------------------------------------
+
+    pub fn list_keys(&self, prefix: &str) -> Vec<String> {
+        let store = self.store.lock();
+        store
+            .iter()
+            .filter(|(k, v)| k.starts_with(prefix) && !v.deleted)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    pub fn get_value(&self, key: &str) -> Option<(Box<dyn Any + Send + Sync>, usize)> {
+        let mut desc = {
+            let store = self.store.lock();
+            store.get(key).cloned()?
+        };
+        if desc.deleted {
+            return None;
+        }
+        desc.value.remove_tombstones(None);
+        Some((desc.value.into_any(), desc.version))
+    }
+
+    pub fn get_mergeable(&self, key: &str) -> Option<(Box<dyn Mergeable>, usize)> {
+        let desc = {
+            let store = self.store.lock();
+            store.get(key).cloned()?
+        };
+        Some((desc.value, desc.version))
+    }
+
+    /// dskit `Delete`.
+    pub async fn delete_key(&self, key: &str) -> Result<(), KvError> {
+        let existing = self.store.lock().get(key).cloned();
+        let Some(val) = existing else {
+            return Ok(());
+        };
+        if val.deleted {
+            return Ok(());
+        }
+        let codec = self.get_codec(&val.codec_id).ok_or_else(|| {
+            error!(key, codec = %val.codec_id, "could not mark key for deletion due to an invalid codec");
+            KvError::Codec(format!("invalid codec: {}", val.codec_id))
+        })?;
+        let mut cloned = val.value.clone_mergeable();
+        let (change, new_ver, deleted, updated) = self.merge_value_for_key(
+            key,
+            cloned.as_mut(),
+            0,
+            &val.codec_id,
+            true,
+            Some(SystemTime::now()),
+        )?;
+        if new_ver > 0 {
+            self.notify_watchers(key);
+            if let Some(ch) = change {
+                self.broadcast_new_value(key, ch.as_ref(), new_ver, codec.as_ref(), false, deleted, updated);
+            }
+        }
+        info!(key, "successfully marked key for deletion");
+        Ok(())
+    }
+
+    /// dskit `CAS`.
+    pub async fn cas_with_codec(&self, key: &str, codec: &dyn Codec, mut f: CasFn) -> Result<(), KvError> {
+        let mut last_err: Option<String> = None;
+        let mut last_was_no_change = false;
+        let mut version_mismatch = false;
+        let min_b = self.cfg.cas_retry_min_backoff.as_std().unwrap_or(Duration::ZERO);
+        let mut retry_backoff = (!min_b.is_zero()).then(|| {
+            Backoff::new(BackoffConfig {
+                min_backoff: min_b,
+                max_backoff: self.cfg.cas_retry_max_backoff.as_std().unwrap_or(Duration::ZERO),
+                max_retries: 0,
+            })
+        });
+
+        for _ in 0..MAX_CAS_RETRIES {
+            self.metrics.cas_attempts.inc();
+            if last_was_no_change {
+                tokio::time::sleep(NO_CHANGE_DETECTED_RETRY_SLEEP).await;
+            } else if last_err.is_some() {
+                if let Some(b) = retry_backoff.as_mut() {
+                    tokio::time::sleep(b.next_delay()).await;
+                }
+            }
+            last_was_no_change = false;
+            version_mismatch = false;
+
+            let (current_any, ver) = match self.get_value(key) {
+                Some((v, ver)) => (Some(v), ver),
+                None => (None, 0),
             };
-            let pkt = encode_alive(&alive);
-            let peers: Vec<NodeState> = nodes
-                .iter()
-                .filter(|n| n.name != self.node_name && !n.dead_or_left())
-                .cloned()
-                .collect();
-            drop(nodes);
-            for p in peers {
-                let tr = self.transport.clone();
-                let addr = p.address();
-                let bytes = pkt.clone();
-                tokio::spawn(async move {
-                    tr.write_to(bytes, addr).await;
-                });
+            let outcome = match f(current_any.as_deref()) {
+                Ok(o) => o,
+                Err(cb_err) => {
+                    debug!(err = %cb_err.err, retry = cb_err.retry, "CAS attempt failed");
+                    last_err = Some(format!("fn returned error: {}", cb_err.err));
+                    if !cb_err.retry {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let incoming_any = match outcome {
+                CasOutcome::NoChange => return Ok(()),
+                CasOutcome::Update(v) => v,
+            };
+            let encoded = codec.encode(incoming_any.as_ref())?;
+            let mut incoming = codec.decode_mergeable(&encoded)?;
+            match self.merge_value_for_key(
+                key,
+                incoming.as_mut(),
+                ver,
+                codec.codec_id(),
+                false,
+                Some(SystemTime::now()),
+            ) {
+                Ok((change, new_ver, deleted, updated)) => {
+                    if new_ver == 0 {
+                        last_was_no_change = true;
+                        last_err = Some("no change detected".to_string());
+                        continue;
+                    }
+                    self.metrics.cas_successes.inc();
+                    self.notify_watchers(key);
+                    if let Some(ch) = change {
+                        self.broadcast_new_value(key, ch.as_ref(), new_ver, codec, true, deleted, updated);
+                    }
+                    return Ok(());
+                }
+                Err(KvError::CasFailed { .. }) => {
+                    version_mismatch = true;
+                    last_err = Some("version mismatch".to_string());
+                }
+                Err(e) => {
+                    last_err = Some(format!("merge failed: {e}"));
+                }
             }
-            return;
         }
-        existing.incarnation = sus.incarnation;
-        existing.state = NodeStateType::Suspect;
-        existing.state_change = SystemTime::now();
+        let mut err = last_err.unwrap_or_default();
+        if version_mismatch {
+            err = format!("too many retries: {err}");
+        }
+        self.metrics.cas_failures.inc();
+        Err(KvError::Other(format!("failed to CAS-update key {key}: {err}")))
     }
 
-    fn handle_dead(&self, dead: &Dead) {
-        let mut nodes = self.nodes.write();
-        let Some(existing) = nodes.iter_mut().find(|n| n.name == dead.node) else {
-            return;
-        };
-        if dead.incarnation < existing.incarnation || existing.dead_or_left() {
-            return;
+    /// dskit `mergeValueForKey`.
+    fn merge_value_for_key(
+        &self,
+        key: &str,
+        incoming: &mut dyn Mergeable,
+        cas_version: usize,
+        codec_id: &str,
+        deleted: bool,
+        update_time: Option<SystemTime>,
+    ) -> Result<MergeValueResult, KvError> {
+        let mut store = self.store.lock();
+        let curr = store.get(key);
+
+        if curr.is_none() && deleted {
+            return Ok((None, 0, false, None));
         }
-        if existing.name == self.node_name && !self.leaving.load(Ordering::Acquire) {
-            let new_inc = self.incarnation.fetch_add(1, Ordering::AcqRel) + 1;
-            existing.incarnation = new_inc.max(dead.incarnation + 1);
-            return;
+        if cas_version > 0 && curr.map(|c| c.version).unwrap_or(0) != cas_version {
+            return Err(KvError::CasFailed {
+                key: key.to_string(),
+                reason: "version mismatch".to_string(),
+            });
         }
-        existing.incarnation = dead.incarnation;
-        existing.state = if dead.node == dead.from {
-            NodeStateType::Left
-        } else {
-            NodeStateType::Dead
+
+        let (mut result, mut change, curr_version, curr_deleted, curr_update) = match curr {
+            Some(curr) => {
+                let mut v = curr.value.clone_mergeable();
+                let ch = v.merge(incoming, cas_version > 0).map_err(KvError::Other)?;
+                (v, ch, curr.version, curr.deleted, curr.update_time)
+            }
+            None => {
+                let v = incoming.clone_mergeable();
+                let ch = Some(v.clone_mergeable());
+                (v, ch, 0, false, None)
+            }
         };
-        existing.state_change = SystemTime::now();
-        self.metrics.members_count.set(
-            nodes.iter().filter(|n| !n.dead_or_left()).count() as f64,
+
+        let mut new_updated = curr_update;
+        let mut new_deleted = curr_deleted;
+        if let Some(ut) = update_time {
+            if new_updated.is_none_or(|prev| ut > prev) && deleted {
+                new_updated = Some(ut);
+                new_deleted = deleted;
+            }
+        }
+
+        let change_empty = change.as_ref().is_none_or(|c| c.merge_content().is_empty());
+        if change_empty && curr_deleted == new_deleted {
+            return Ok((None, 0, curr_deleted, curr_update));
+        }
+
+        let left_timeout = self.cfg.left_ingesters_timeout.as_std().unwrap_or(Duration::ZERO);
+        if !left_timeout.is_zero() {
+            let limit = SystemTime::now().checked_sub(left_timeout);
+            let (total, removed) = result.remove_tombstones(limit);
+            self.metrics.store_tombstones.with_label_values(&[key]).set(total as f64);
+            self.metrics
+                .store_removed_tombstones
+                .with_label_values(&[key])
+                .inc_by(removed as f64);
+            if removed > 0 {
+                self.local_state_cache.lock().remove(key);
+            }
+            if let Some(ref mut ch) = change {
+                ch.remove_tombstones(limit);
+                if ch.merge_content().is_empty() {
+                    return Ok((None, 0, curr_deleted, curr_update));
+                }
+            }
+        }
+
+        if change.is_none() && curr_deleted != new_deleted {
+            change = Some(result.clone_mergeable());
+        }
+
+        let new_version = curr_version + 1;
+        store.insert(
+            key.to_string(),
+            ValueDesc {
+                value: result,
+                version: new_version,
+                codec_id: codec_id.to_string(),
+                deleted: new_deleted,
+                update_time: new_updated,
+            },
         );
+        Ok((change, new_version, new_deleted, new_updated))
     }
 
-    fn merge_remote_nodes(&self, remote_nodes: &[PushNodeState]) {
-        for rn in remote_nodes {
-            match rn.state {
-                NodeStateType::Alive => {
-                    self.handle_alive(&Alive {
-                        incarnation: rn.incarnation,
-                        node: rn.name.clone(),
-                        addr: rn.addr.clone(),
-                        port: rn.port,
-                        meta: rn.meta.clone(),
-                        vsn: rn.vsn.clone(),
+    fn merge_bytes_value_for_key(
+        &self,
+        key: &str,
+        incoming_data: &[u8],
+        codec: &dyn Codec,
+        deleted: bool,
+        update_time: Option<SystemTime>,
+    ) -> Result<MergeValueResult, KvError> {
+        let data = if incoming_data.is_empty() { EMPTY_SNAPPY_DATA } else { incoming_data };
+        let mut decoded = codec
+            .decode_mergeable(data)
+            .map_err(|e| KvError::Other(format!("failed to decode value: {e}")))?;
+        self.merge_value_for_key(key, decoded.as_mut(), 0, codec.codec_id(), deleted, update_time)
+    }
+
+    /// dskit `broadcastNewValue`.
+    #[allow(clippy::too_many_arguments)]
+    fn broadcast_new_value(
+        &self,
+        key: &str,
+        change: &dyn Mergeable,
+        version: usize,
+        codec: &dyn Codec,
+        locally_generated: bool,
+        deleted: bool,
+        update_time: Option<SystemTime>,
+    ) {
+        if locally_generated && self.state() != State::Running {
+            warn!(key, "skipped broadcasting of locally-generated update because memberlist KV is shutting down");
+            return;
+        }
+        let data = match codec.encode_mergeable(change) {
+            Ok(d) => d,
+            Err(err) => {
+                error!(key, version, %err, "failed to encode change");
+                self.metrics.messages_to_broadcast_dropped.inc();
+                return;
+            }
+        };
+        let kv_pair = KeyValuePair {
+            key: key.to_string(),
+            value: Bytes::from(data),
+            codec: codec.codec_id().to_string(),
+            deleted,
+            update_time_millis: update_time_millis(update_time),
+        };
+        let pair_data = kv_pair.encode_to_vec();
+        let merged_changes = change.merge_content();
+        self.add_sent_message(HistoryMessage {
+            id: 0,
+            time: SystemTime::now(),
+            size: pair_data.len(),
+            pair: kv_pair,
+            version,
+            changes: merged_changes.clone(),
+        });
+
+        let l = pair_data.len() as f64;
+        let gauge = self.metrics.messages_in_broadcast_queue_bytes.clone();
+        let b = Arc::new(RingBroadcast {
+            key: key.to_string(),
+            content: merged_changes,
+            version,
+            msg: pair_data,
+            finished: Box::new(move || gauge.sub(l)),
+        });
+        self.metrics.messages_in_broadcast_queue_bytes.add(l);
+        if locally_generated {
+            self.local_broadcasts.queue_broadcast(b);
+        } else {
+            self.gossip_broadcasts.queue_broadcast(b);
+        }
+    }
+
+    /// dskit `notifyWatchers`.
+    fn notify_watchers(&self, key: &str) {
+        let interval = self.cfg.notify_interval.as_std().unwrap_or(Duration::ZERO);
+        if interval.is_zero() {
+            self.notify_watchers_sync(key);
+            return;
+        }
+        self.key_notifications.lock().insert(key.to_string());
+    }
+
+    /// dskit `sendKeyNotifications`.
+    fn send_key_notifications(&self) {
+        let notifs = {
+            let mut n = self.key_notifications.lock();
+            if n.is_empty() {
+                return;
+            }
+            self.metrics.pending_key_notifications.set(n.len() as f64);
+            std::mem::take(&mut *n)
+        };
+        for key in notifs {
+            self.notify_watchers_sync(&key);
+        }
+    }
+
+    /// dskit `notifyWatchersSync`.
+    fn notify_watchers_sync(&self, key: &str) {
+        if let Some(list) = self.watchers.lock().get(key) {
+            for w in list {
+                w.notify.notify_one();
+            }
+        }
+        let pwatchers = self.prefix_watchers.lock();
+        for (prefix, list) in pwatchers.iter() {
+            if key.starts_with(prefix.as_str()) {
+                for pw in list {
+                    if pw.tx.try_send(key.to_string()).is_err() {
+                        self.metrics
+                            .watch_prefix_dropped_notifications
+                            .with_label_values(&[prefix])
+                            .inc();
+                        warn!(prefix, "failed to send notification to prefix watcher");
+                    }
+                }
+            }
+        }
+    }
+
+    /// dskit `cleanupObsoleteEntries`.
+    fn cleanup_obsolete_entries(&self) {
+        let timeout = self.cfg.obsolete_entries_timeout.as_std().unwrap_or(Duration::ZERO);
+        let now = SystemTime::now();
+        let mut removed = Vec::new();
+        {
+            let mut store = self.store.lock();
+            store.retain(|k, v| {
+                let since = now
+                    .duration_since(v.update_time.unwrap_or(UNIX_EPOCH))
+                    .unwrap_or(Duration::ZERO);
+                if v.deleted && since > timeout {
+                    removed.push(k.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if removed.is_empty() {
+            return;
+        }
+        {
+            let mut cache = self.local_state_cache.lock();
+            for k in &removed {
+                cache.remove(k);
+                let _ = self.metrics.local_state_cache_hits.remove_label_values(&[k]);
+                let _ = self.metrics.local_state_cache_misses.remove_label_values(&[k]);
+            }
+        }
+        let mut workers = self.workers.lock();
+        for k in &removed {
+            workers.remove(k);
+        }
+    }
+
+    // --- memberlist Delegate: LocalState, MergeRemoteState, NotifyMsg, GetBroadcasts ---------------
+
+    /// dskit `LocalState`.
+    pub fn local_state(&self, _join: bool) -> Vec<u8> {
+        if !self.delegate_ready.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.metrics.state_pulls.inc();
+        let store = self.store.lock();
+        let mut buf = Vec::with_capacity(self.last_local_state_size.load(Ordering::Relaxed));
+        let sent = SystemTime::now();
+        let cache_enabled = self.cfg.local_state_cache_enabled;
+        let mut cache = self.local_state_cache.lock();
+        for (key, val) in store.iter() {
+            let entry = if cache_enabled {
+                match cache.get(key) {
+                    Some((v, data)) if *v == val.version => {
+                        self.metrics.local_state_cache_hits.with_label_values(&[key]).inc();
+                        Some(data.clone())
+                    }
+                    _ => {
+                        let e = self.build_local_state_entry(key, val);
+                        if let Some(ref d) = e {
+                            self.metrics.local_state_cache_misses.with_label_values(&[key]).inc();
+                            cache.insert(key.clone(), (val.version, d.clone()));
+                        }
+                        e
+                    }
+                }
+            } else {
+                self.build_local_state_entry(key, val)
+            };
+            let Some(data) = entry else {
+                continue;
+            };
+            buf.extend_from_slice(&data);
+            if self.cfg.message_history_buffer_bytes > 0 {
+                if let Ok(pair) = KeyValuePair::decode(&data[LENGTH_PREFIX_SIZE..]) {
+                    self.add_sent_message(HistoryMessage {
+                        id: 0,
+                        time: sent,
+                        size: data.len() - LENGTH_PREFIX_SIZE,
+                        pair,
+                        version: val.version,
+                        changes: Vec::new(),
                     });
                 }
-                NodeStateType::Left => {
-                    self.handle_dead(&Dead {
-                        incarnation: rn.incarnation,
-                        node: rn.name.clone(),
-                        from: rn.name.clone(),
-                    });
+            }
+        }
+        self.last_local_state_size.store(buf.len(), Ordering::Relaxed);
+        self.metrics.state_pulls_bytes.inc_by(buf.len() as f64);
+        buf
+    }
+
+    /// dskit `buildLocalStateCacheEntry`.
+    fn build_local_state_entry(&self, key: &str, val: &ValueDesc) -> Option<Vec<u8>> {
+        let Some(codec) = self.get_codec(&val.codec_id) else {
+            error!(codec = %val.codec_id, key, "failed to encode remote state: unknown codec for key");
+            return None;
+        };
+        let encoded = match codec.encode_mergeable(val.value.as_ref()) {
+            Ok(e) => e,
+            Err(err) => {
+                error!(%err, "failed to encode remote state");
+                return None;
+            }
+        };
+        let pair = KeyValuePair {
+            key: key.to_string(),
+            value: Bytes::from(encoded),
+            codec: val.codec_id.clone(),
+            deleted: val.deleted,
+            update_time_millis: update_time_millis(val.update_time),
+        };
+        let ser = pair.encode_to_vec();
+        if ser.len() > u32::MAX as usize {
+            error!(key, "value too long");
+            return None;
+        }
+        let mut data = Vec::with_capacity(LENGTH_PREFIX_SIZE + ser.len());
+        data.extend_from_slice(&(ser.len() as u32).to_be_bytes());
+        data.extend_from_slice(&ser);
+        Some(data)
+    }
+
+    /// dskit `MergeRemoteState`.
+    pub fn merge_remote_state(&self, mut data: &[u8], _join: bool) {
+        if !self.delegate_ready.load(Ordering::Acquire) {
+            return;
+        }
+        let received = SystemTime::now();
+        self.metrics.state_pushes.inc();
+        self.metrics.state_pushes_bytes.inc_by(data.len() as f64);
+        let mut parse_err: Option<String> = None;
+        while !data.is_empty() {
+            if data.len() < LENGTH_PREFIX_SIZE {
+                parse_err = Some(format!("not enough data left for another KV Pair: {}", data.len()));
+                break;
+            }
+            let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            data = &data[LENGTH_PREFIX_SIZE..];
+            if data.len() < len {
+                parse_err = Some(format!(
+                    "not enough data left for next KV Pair, expected {len}, remaining {} bytes",
+                    data.len()
+                ));
+                break;
+            }
+            let kv_pair = match KeyValuePair::decode(&data[..len]) {
+                Ok(p) => p,
+                Err(err) => {
+                    parse_err = Some(format!("failed to parse KV Pair: {err}"));
+                    break;
                 }
-                NodeStateType::Dead | NodeStateType::Suspect => {
-                    self.handle_suspect(&Suspect {
-                        incarnation: rn.incarnation,
-                        node: rn.name.clone(),
-                        from: self.node_name.clone(),
-                    });
+            };
+            data = &data[len..];
+            let Some(codec) = self.get_codec(&kv_pair.codec) else {
+                error!(codec = %kv_pair.codec, key = %kv_pair.key, "failed to parse remote state: unknown codec for key");
+                continue;
+            };
+            let res = self.merge_bytes_value_for_key(
+                &kv_pair.key,
+                &kv_pair.value,
+                codec.as_ref(),
+                kv_pair.deleted,
+                update_time_from_millis(kv_pair.update_time_millis),
+            );
+            let (change, new_ver) = match &res {
+                Ok((c, v, _, _)) => (c.as_ref().map(|c| c.merge_content()).unwrap_or_default(), *v),
+                Err(_) => (Vec::new(), 0),
+            };
+            self.add_received_message(HistoryMessage {
+                id: 0,
+                time: received,
+                size: len,
+                pair: kv_pair.clone(),
+                version: new_ver,
+                changes: change,
+            });
+            match res {
+                Ok((change, new_ver, deleted, updated)) => {
+                    if new_ver > 0 {
+                        self.notify_watchers(&kv_pair.key);
+                        if let Some(ch) = change {
+                            self.broadcast_new_value(&kv_pair.key, ch.as_ref(), new_ver, codec.as_ref(), false, deleted, updated);
+                        }
+                    }
+                }
+                Err(err) => error!(key = %kv_pair.key, %err, "failed to store received value"),
+            }
+        }
+        if let Some(err) = parse_err {
+            error!(%err, "failed to parse remote state");
+        }
+    }
+
+    /// dskit `NotifyMsg`.
+    pub fn notify_msg(&self, msg: &[u8]) {
+        if !self.delegate_ready.load(Ordering::Acquire) {
+            return;
+        }
+        self.metrics.received_broadcasts.inc();
+        self.metrics.received_broadcasts_bytes.inc_by(msg.len() as f64);
+        let kv_pair = match KeyValuePair::decode(msg) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(%err, "failed to unmarshal received KV Pair");
+                self.metrics.received_broadcasts_invalid.inc();
+                return;
+            }
+        };
+        if kv_pair.key.is_empty() {
+            warn!("received an invalid KV Pair (empty key)");
+            self.metrics.received_broadcasts_invalid.inc();
+            return;
+        }
+        let Some(codec) = self.get_codec(&kv_pair.codec) else {
+            self.metrics.received_broadcasts_invalid.inc();
+            error!(codec = %kv_pair.codec, "failed to decode received value, unknown codec");
+            return;
+        };
+        let update = ValueUpdate {
+            value: kv_pair.value.clone(),
+            codec,
+            message_size: msg.len(),
+            deleted: kv_pair.deleted,
+            update_time: update_time_from_millis(kv_pair.update_time_millis),
+        };
+        if !self.enqueue_key_update(&kv_pair.key, update) {
+            self.metrics.received_broadcasts_dropped.inc();
+            warn!(key = %kv_pair.key, "notify queue full, dropping message");
+        }
+    }
+
+    /// dskit `enqueueKeyUpdate`.
+    fn enqueue_key_update(&self, key: &str, update: ValueUpdate) -> bool {
+        let mut workers = self.workers.lock();
+        let tx = match workers.get(key) {
+            Some(tx) if !tx.is_closed() => tx.clone(),
+            _ => {
+                let cap = self.cfg.processed_messages_queue_size.max(1) as usize;
+                let (tx, rx) = mpsc::channel(cap);
+                if let Some(kv) = self.self_arc() {
+                    let key = key.to_string();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move { kv.process_value_update(rx, tx2, key).await });
+                }
+                workers.insert(key.to_string(), tx.clone());
+                tx
+            }
+        };
+        tx.try_send(update).is_ok()
+    }
+
+    /// dskit `processValueUpdate`.
+    async fn process_value_update(
+        self: Arc<Self>,
+        mut rx: mpsc::Receiver<ValueUpdate>,
+        tx: mpsc::Sender<ValueUpdate>,
+        key: String,
+    ) {
+        loop {
+            let update = tokio::select! {
+                u = rx.recv() => match u { Some(u) => u, None => return },
+                _ = self.shutdown_ctx.canceled() => return,
+            };
+            let res = self.merge_bytes_value_for_key(
+                &key,
+                &update.value,
+                update.codec.as_ref(),
+                update.deleted,
+                update.update_time,
+            );
+            let (changes, version, deleted, updated) = match &res {
+                Ok((c, v, d, u)) => (c.as_ref().map(|c| c.merge_content()).unwrap_or_default(), *v, *d, *u),
+                Err(_) => (Vec::new(), 0, false, None),
+            };
+            self.add_received_message(HistoryMessage {
+                id: 0,
+                time: SystemTime::now(),
+                size: update.message_size,
+                pair: KeyValuePair {
+                    key: key.clone(),
+                    value: update.value.clone(),
+                    codec: update.codec.codec_id().to_string(),
+                    deleted,
+                    update_time_millis: update_time_millis(updated),
+                },
+                version,
+                changes,
+            });
+            match res {
+                Err(err) => error!(key, %err, "failed to store received value"),
+                Ok((change, version, deleted, updated)) => {
+                    if version > 0 {
+                        self.notify_watchers(&key);
+                        if let Some(ch) = change {
+                            self.broadcast_new_value(&key, ch.as_ref(), version, update.codec.as_ref(), false, deleted, updated);
+                        }
+                    }
+                }
+            }
+            if version == 0 && !self.store.lock().contains_key(&key) {
+                // dskit tryDeregisterKeyWorker.
+                let mut workers = self.workers.lock();
+                let same = workers.get(&key).is_some_and(|w| w.same_channel(&tx));
+                if same && tx.capacity() == tx.max_capacity() {
+                    workers.remove(&key);
+                    return;
                 }
             }
         }
     }
-}
 
-fn push_pull_scale(interval: Duration, n: usize) -> Duration {
-    if n <= PUSH_PULL_SCALE_THRESHOLD {
-        return interval;
-    }
-    let mult = ((n as f64).log2() - (PUSH_PULL_SCALE_THRESHOLD as f64).log2()).ceil() + 1.0;
-    interval.mul_f64(mult)
-}
-
-fn default_hostname() -> String {
-    #[cfg(target_os = "linux")]
-    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
-        let t = s.trim();
-        if !t.is_empty() {
-            return t.to_string();
+    /// dskit `GetBroadcasts`: locally generated updates first, then gossiped ones.
+    pub(crate) fn delegate_get_broadcasts(&self, overhead: usize, limit: usize) -> Vec<Vec<u8>> {
+        if !self.delegate_ready.load(Ordering::Acquire) {
+            return Vec::new();
         }
-    }
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string())
-}
-
-// --- Streaming MessagePack readers (never block waiting for EOF) ---
-
-async fn read_stream_header<R: AsyncRead + Unpin + Send>(
-    reader: &mut R,
-) -> Result<(MessageType, String, Option<Vec<u8>>), String> {
-    let mut b = [0u8; 1];
-    reader
-        .read_exact(&mut b)
-        .await
-        .map_err(|e| format!("read stream byte: {e}"))?;
-
-    let mut label = String::new();
-    if b[0] == MessageType::HasLabel as u8 {
-        let mut sz = [0u8; 1];
-        reader
-            .read_exact(&mut sz)
-            .await
-            .map_err(|e| format!("read label size: {e}"))?;
-        if sz[0] == 0 {
-            return Err("empty label header".to_string());
+        let mut msgs = self.local_broadcasts.get_broadcasts(overhead, limit);
+        let mut remaining = limit as i64;
+        for m in &msgs {
+            remaining -= (overhead + m.len()) as i64;
         }
-        let mut lbuf = vec![0u8; sz[0] as usize];
-        reader
-            .read_exact(&mut lbuf)
-            .await
-            .map_err(|e| format!("read label: {e}"))?;
-        label = String::from_utf8(lbuf).map_err(|e| format!("label utf8: {e}"))?;
-        reader
-            .read_exact(&mut b)
-            .await
-            .map_err(|e| format!("read msg type after label: {e}"))?;
-    }
-
-    let msg_type = MessageType::try_from(b[0])
-        .map_err(|v| format!("unsupported stream msgType {v}"))?;
-
-    if msg_type == MessageType::Compress {
-        let raw_cp = read_msgpack_map_bytes(reader).await?;
-        let cp = super::wire::decode_compressed_payload(&raw_cp)?;
-        let decomp = decompress_buffer(cp.algo, &cp.buf)?;
-        if decomp.is_empty() {
-            return Err("empty decompressed stream payload".to_string());
+        if remaining > 0 {
+            msgs.extend(self.gossip_broadcasts.get_broadcasts(overhead, remaining as usize));
         }
-        let inner_type = MessageType::try_from(decomp[0])
-            .map_err(|v| format!("unsupported inner stream msgType {v}"))?;
-        return Ok((inner_type, label, Some(decomp[1..].to_vec())));
-    }
-
-    Ok((msg_type, label, None))
-}
-
-async fn read_push_pull_from_stream<R: AsyncRead + Unpin + Send>(
-    reader: &mut R,
-) -> Result<(bool, Vec<PushNodeState>, Vec<u8>), String> {
-    let hdr_bytes = read_msgpack_map_bytes(reader).await?;
-    let hdr = parse_push_pull_header_only(&hdr_bytes)?;
-    let mut nodes = Vec::with_capacity(hdr.nodes.min(4096));
-    for _ in 0..hdr.nodes {
-        let node_bytes = read_msgpack_map_bytes(reader).await?;
-        let ns = parse_push_node_state_only(&node_bytes)?;
-        nodes.push(ns);
-    }
-    if hdr.user_state_len > MAX_PUSH_STATE_BYTES {
-        return Err(format!(
-            "user state length {} exceeds limit",
-            hdr.user_state_len
-        ));
-    }
-    let mut user_buf = vec![0u8; hdr.user_state_len];
-    if hdr.user_state_len > 0 {
-        reader
-            .read_exact(&mut user_buf)
-            .await
-            .map_err(|e| format!("read user state: {e}"))?;
-    }
-    Ok((hdr.join, nodes, user_buf))
-}
-
-async fn read_user_msg_from_stream<R: AsyncRead + Unpin + Send>(
-    reader: &mut R,
-) -> Result<Vec<u8>, String> {
-    let hdr_bytes = read_msgpack_map_bytes(reader).await?;
-    let len = parse_user_msg_len(&hdr_bytes)?;
-    if len > MAX_PUSH_STATE_BYTES {
-        return Err(format!("user msg len {len} exceeds limit"));
-    }
-    let mut out = vec![0u8; len];
-    if len > 0 {
-        reader
-            .read_exact(&mut out)
-            .await
-            .map_err(|e| format!("read user msg payload: {e}"))?;
-    }
-    Ok(out)
-}
-
-fn parse_push_pull_header_only(bytes: &[u8]) -> Result<PushPullHeader, String> {
-    // decode_push_pull with Nodes=0? No, if Nodes > 0 it expects node maps.
-    // Let's write a tiny generic msgpack header helper in wire? Or reuse decode_push_pull by patching?
-    // Even cleaner: let's add a helper right here using `read_mp_item_sync` or expose `decode_push_pull_header` in wire.rs!
-    // Since we can call a small parser directly on `bytes`:
-    let mut pos = 0usize;
-    let map_len = read_sync_map_len(bytes, &mut pos)?;
-    let mut hdr = PushPullHeader::default();
-    for _ in 0..map_len {
-        let key = read_sync_string(bytes, &mut pos)?;
-        match key.as_str() {
-            "Nodes" => hdr.nodes = read_sync_u64(bytes, &mut pos)? as usize,
-            "UserStateLen" => hdr.user_state_len = read_sync_u64(bytes, &mut pos)? as usize,
-            "Join" => hdr.join = read_sync_bool(bytes, &mut pos)?,
-            _ => skip_sync_val(bytes, &mut pos)?,
-        }
-    }
-    Ok(hdr)
-}
-
-fn parse_user_msg_len(bytes: &[u8]) -> Result<usize, String> {
-    let mut pos = 0usize;
-    let map_len = read_sync_map_len(bytes, &mut pos)?;
-    let mut len = 0usize;
-    for _ in 0..map_len {
-        let key = read_sync_string(bytes, &mut pos)?;
-        match key.as_str() {
-            "UserMsgLen" => len = read_sync_u64(bytes, &mut pos)? as usize,
-            _ => skip_sync_val(bytes, &mut pos)?,
-        }
-    }
-    Ok(len)
-}
-
-fn parse_push_node_state_only(bytes: &[u8]) -> Result<PushNodeState, String> {
-    let mut pos = 0usize;
-    let map_len = read_sync_map_len(bytes, &mut pos)?;
-    let mut ns = PushNodeState {
-        name: String::new(),
-        addr: Vec::new(),
-        port: 0,
-        meta: None,
-        incarnation: 0,
-        state: NodeStateType::Alive,
-        vsn: Vec::new(),
-    };
-    for _ in 0..map_len {
-        let key = read_sync_string(bytes, &mut pos)?;
-        match key.as_str() {
-            "Name" => ns.name = read_sync_string(bytes, &mut pos)?,
-            "Addr" => ns.addr = read_sync_bytes(bytes, &mut pos)?,
-            "Port" => ns.port = read_sync_u64(bytes, &mut pos)? as u16,
-            "Meta" => ns.meta = read_sync_opt_bytes(bytes, &mut pos)?,
-            "Incarnation" => ns.incarnation = read_sync_u64(bytes, &mut pos)? as u32,
-            "State" => {
-                let s = read_sync_u64(bytes, &mut pos)? as u8;
-                ns.state = NodeStateType::try_from(s).map_err(|v| format!("invalid state {v}"))?;
-            }
-            "Vsn" => ns.vsn = read_sync_bytes(bytes, &mut pos)?,
-            _ => skip_sync_val(bytes, &mut pos)?,
-        }
-    }
-    Ok(ns)
-}
-
-fn read_sync_map_len(b: &[u8], pos: &mut usize) -> Result<usize, String> {
-    let bd = *b.get(*pos).ok_or("eof")?;
-    *pos += 1;
-    match bd {
-        0x80..=0x8f => Ok((bd & 0x0f) as usize),
-        0xde => {
-            let s = b.get(*pos..*pos + 2).ok_or("eof")?;
-            *pos += 2;
-            Ok(u16::from_be_bytes([s[0], s[1]]) as usize)
-        }
-        0xdf => {
-            let s = b.get(*pos..*pos + 4).ok_or("eof")?;
-            *pos += 4;
-            Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize)
-        }
-        _ => Err("expected map".to_string()),
+        msgs
     }
 }
 
-fn read_sync_u64(b: &[u8], pos: &mut usize) -> Result<u64, String> {
-    let bd = *b.get(*pos).ok_or("eof")?;
-    *pos += 1;
-    match bd {
-        0x00..=0x7f => Ok(bd as u64),
-        0xcc => {
-            let v = *b.get(*pos).ok_or("eof")?;
-            *pos += 1;
-            Ok(v as u64)
-        }
-        0xcd => {
-            let s = b.get(*pos..*pos + 2).ok_or("eof")?;
-            *pos += 2;
-            Ok(u16::from_be_bytes([s[0], s[1]]) as u64)
-        }
-        0xce => {
-            let s = b.get(*pos..*pos + 4).ok_or("eof")?;
-            *pos += 4;
-            Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as u64)
-        }
-        0xcf => {
-            let s = b.get(*pos..*pos + 8).ok_or("eof")?;
-            *pos += 8;
-            Ok(u64::from_be_bytes(s.try_into().expect("8")))
-        }
-        0xd0 => {
-            let v = *b.get(*pos).ok_or("eof")? as i8;
-            *pos += 1;
-            u64::try_from(v).map_err(|_| "negative int".to_string())
-        }
-        0xd1 => {
-            let s = b.get(*pos..*pos + 2).ok_or("eof")?;
-            *pos += 2;
-            let v = i16::from_be_bytes([s[0], s[1]]);
-            u64::try_from(v).map_err(|_| "negative int".to_string())
-        }
-        0xd2 => {
-            let s = b.get(*pos..*pos + 4).ok_or("eof")?;
-            *pos += 4;
-            let v = i32::from_be_bytes([s[0], s[1], s[2], s[3]]);
-            u64::try_from(v).map_err(|_| "negative int".to_string())
-        }
-        0xd3 => {
-            let s = b.get(*pos..*pos + 8).ok_or("eof")?;
-            *pos += 8;
-            let v = i64::from_be_bytes(s.try_into().expect("8"));
-            u64::try_from(v).map_err(|_| "negative int".to_string())
-        }
-        other => Err(format!("expected uint, got 0x{other:02x}")),
+/// dskit `generateRandomSuffix`: `fmt.Sprintf("%2x", 4 random bytes)`.
+pub(crate) fn generate_random_suffix() -> String {
+    let suffix: [u8; 4] = rand::thread_rng().gen();
+    suffix.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// memberlist `ensurePort`.
+fn ensure_port(s: &str, port: u16) -> String {
+    if crate::dns::split_host_port(s).is_some() {
+        return s.to_string();
     }
+    let host = s.trim_start_matches('[').trim_end_matches(']');
+    crate::dns::join_host_port(host, &port.to_string())
 }
 
-fn read_sync_bool(b: &[u8], pos: &mut usize) -> Result<bool, String> {
-    let bd = *b.get(*pos).ok_or("eof")?;
-    *pos += 1;
-    match bd {
-        0xc2 | 0x00 => Ok(false),
-        0xc3 | 0x01 => Ok(true),
-        _ => Err("expected bool".to_string()),
+/// hashicorp/go-multierror formatting.
+fn multierror_text(errs: &[String]) -> String {
+    if errs.len() == 1 {
+        return format!("1 error occurred:\n\t* {}\n\n", errs[0]);
     }
+    let points: Vec<String> = errs.iter().map(|e| format!("* {e}")).collect();
+    format!("{} errors occurred:\n\t{}\n\n", errs.len(), points.join("\n\t"))
 }
 
-fn read_sync_opt_bytes(b: &[u8], pos: &mut usize) -> Result<Option<Vec<u8>>, String> {
-    let bd = *b.get(*pos).ok_or("eof")?;
-    *pos += 1;
-    let len = match bd {
-        0xc0 => return Ok(None),
-        0xa0..=0xbf => (bd & 0x1f) as usize,
-        0xd9 | 0xc4 => {
-            let l = *b.get(*pos).ok_or("eof")? as usize;
-            *pos += 1;
-            l
-        }
-        0xda | 0xc5 => {
-            let s = b.get(*pos..*pos + 2).ok_or("eof")?;
-            *pos += 2;
-            u16::from_be_bytes([s[0], s[1]]) as usize
-        }
-        0xdb | 0xc6 => {
-            let s = b.get(*pos..*pos + 4).ok_or("eof")?;
-            *pos += 4;
-            u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize
-        }
-        _ => return Err("expected bytes".to_string()),
-    };
-    let s = b.get(*pos..*pos + len).ok_or("eof")?;
-    *pos += len;
-    Ok(Some(s.to_vec()))
+fn update_time_millis(t: Option<SystemTime>) -> i64 {
+    t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
-fn read_sync_bytes(b: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
-    Ok(read_sync_opt_bytes(b, pos)?.unwrap_or_default())
+fn update_time_from_millis(ms: i64) -> Option<SystemTime> {
+    (ms != 0).then(|| UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64))
 }
 
-fn read_sync_string(b: &[u8], pos: &mut usize) -> Result<String, String> {
-    let bytes = read_sync_bytes(b, pos)?;
-    String::from_utf8(bytes).map_err(|e| e.to_string())
-}
-
-fn skip_sync_val(b: &[u8], pos: &mut usize) -> Result<(), String> {
-    let start = *pos;
-    let bd = *b.get(start).ok_or("eof")?;
-    *pos += 1;
-    match bd {
-        0x00..=0x7f | 0xc0..=0xc3 | 0xe0..=0xff => Ok(()),
-        0xcc | 0xd0 => {
-            *pos += 1;
-            Ok(())
-        }
-        0xcd | 0xd1 => {
-            *pos += 2;
-            Ok(())
-        }
-        0xce | 0xd2 | 0xca => {
-            *pos += 4;
-            Ok(())
-        }
-        0xcf | 0xd3 | 0xcb => {
-            *pos += 8;
-            Ok(())
-        }
-        0xa0..=0xbf => {
-            *pos += (bd & 0x1f) as usize;
-            Ok(())
-        }
-        0xd9 | 0xc4 => {
-            let n = *b.get(*pos).ok_or("eof")? as usize;
-            *pos += 1 + n;
-            Ok(())
-        }
-        0xda | 0xc5 => {
-            let s = b.get(*pos..*pos + 2).ok_or("eof")?;
-            *pos += 2 + u16::from_be_bytes([s[0], s[1]]) as usize;
-            Ok(())
-        }
-        0xdb | 0xc6 => {
-            let s = b.get(*pos..*pos + 4).ok_or("eof")?;
-            *pos += 4 + u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize;
-            Ok(())
-        }
-        _ => Err("unsupported skip".to_string()),
-    }
-}
-
-/// Reads a single complete self-delimiting MessagePack item from an async reader into a byte buffer.
-async fn read_msgpack_map_bytes<R: AsyncRead + Unpin + Send>(reader: &mut R) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(64);
-    read_mp_item(reader, &mut out).await?;
-    Ok(out)
-}
-
-fn read_mp_item<'a, R: AsyncRead + Unpin + Send>(
-    reader: &'a mut R,
-    out: &'a mut Vec<u8>,
-) -> BoxFuture<'a, Result<(), String>> {
-    Box::pin(async move {
-        let mut bd_buf = [0u8; 1];
-        reader
-            .read_exact(&mut bd_buf)
-            .await
-            .map_err(|e| format!("msgpack read: {e}"))?;
-        let bd = bd_buf[0];
-        out.push(bd);
-
-        match bd {
-            0x00..=0x7f | 0xc0..=0xc3 | 0xe0..=0xff => Ok(()),
-            0xcc | 0xd0 => read_append(reader, out, 1).await,
-            0xcd | 0xd1 => read_append(reader, out, 2).await,
-            0xce | 0xd2 | 0xca => read_append(reader, out, 4).await,
-            0xcf | 0xd3 | 0xcb => read_append(reader, out, 8).await,
-            0xa0..=0xbf => read_append(reader, out, (bd & 0x1f) as usize).await,
-            0xd9 | 0xc4 => {
-                let mut l = [0u8; 1];
-                reader.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-                out.push(l[0]);
-                read_append(reader, out, l[0] as usize).await
-            }
-            0xda | 0xc5 => {
-                let mut l = [0u8; 2];
-                reader.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-                out.extend_from_slice(&l);
-                read_append(reader, out, u16::from_be_bytes(l) as usize).await
-            }
-            0xdb | 0xc6 => {
-                let mut l = [0u8; 4];
-                reader.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-                out.extend_from_slice(&l);
-                let len = u32::from_be_bytes(l) as usize;
-                if len > MAX_PUSH_STATE_BYTES {
-                    return Err("msgpack bytes exceed max".to_string());
-                }
-                read_append(reader, out, len).await
-            }
-            0x90..=0x9f => {
-                let n = (bd & 0x0f) as usize;
-                for _ in 0..n {
-                    read_mp_item(reader, out).await?;
-                }
-                Ok(())
-            }
-            0xdc => {
-                let mut l = [0u8; 2];
-                reader.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-                out.extend_from_slice(&l);
-                let n = u16::from_be_bytes(l) as usize;
-                for _ in 0..n {
-                    read_mp_item(reader, out).await?;
-                }
-                Ok(())
-            }
-            0xdd => {
-                let mut l = [0u8; 4];
-                reader.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-                out.extend_from_slice(&l);
-                let n = u32::from_be_bytes(l) as usize;
-                for _ in 0..n {
-                    read_mp_item(reader, out).await?;
-                }
-                Ok(())
-            }
-            0x80..=0x8f => {
-                let n = (bd & 0x0f) as usize;
-                for _ in 0..n {
-                    read_mp_item(reader, out).await?;
-                    read_mp_item(reader, out).await?;
-                }
-                Ok(())
-            }
-            0xde => {
-                let mut l = [0u8; 2];
-                reader.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-                out.extend_from_slice(&l);
-                let n = u16::from_be_bytes(l) as usize;
-                for _ in 0..n {
-                    read_mp_item(reader, out).await?;
-                    read_mp_item(reader, out).await?;
-                }
-                Ok(())
-            }
-            0xdf => {
-                let mut l = [0u8; 4];
-                reader.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-                out.extend_from_slice(&l);
-                let n = u32::from_be_bytes(l) as usize;
-                for _ in 0..n {
-                    read_mp_item(reader, out).await?;
-                    read_mp_item(reader, out).await?;
-                }
-                Ok(())
-            }
-            0xd4 => read_append(reader, out, 2).await,
-            0xd5 => read_append(reader, out, 3).await,
-            0xd6 => read_append(reader, out, 5).await,
-            0xd7 => read_append(reader, out, 9).await,
-            0xd8 => read_append(reader, out, 17).await,
-            0xc7 => {
-                let mut l = [0u8; 1];
-                reader.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-                out.push(l[0]);
-                read_append(reader, out, 1 + l[0] as usize).await
-            }
-            0xc8 => {
-                let mut l = [0u8; 2];
-                reader.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-                out.extend_from_slice(&l);
-                read_append(reader, out, 1 + u16::from_be_bytes(l) as usize).await
-            }
-            0xc9 => {
-                let mut l = [0u8; 4];
-                reader.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-                out.extend_from_slice(&l);
-                read_append(reader, out, 1 + u32::from_be_bytes(l) as usize).await
-            }
-        }
-    })
-}
-
-async fn read_append<R: AsyncRead + Unpin + Send>(
-    reader: &mut R,
-    out: &mut Vec<u8>,
-    len: usize,
-) -> Result<(), String> {
-    let start = out.len();
-    out.resize(start + len, 0);
-    reader
-        .read_exact(&mut out[start..])
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// [`KvClient`] implementation backed by [`MemberlistKv`].
+/// [`KvClient`] implementation backed by [`MemberlistKv`] (dskit `memberlist.Client`).
 pub struct MemberlistKvClient {
     kv: Arc<MemberlistKv>,
     codec: Arc<dyn Codec>,
@@ -2534,26 +2423,53 @@ impl MemberlistKvClient {
         }
         Ok(Self { kv, codec })
     }
+
+    /// dskit `awaitKVRunningOrStopping`.
+    async fn await_kv_running_or_stopping(&self) -> Result<(), KvError> {
+        match self.kv.state() {
+            State::Running | State::Stopping => Ok(()),
+            State::New | State::Starting => {
+                let res = self.kv.service().await_running().await;
+                if self.kv.state() == State::Stopping {
+                    return Ok(());
+                }
+                res.map_err(|e| KvError::Other(e.to_string()))
+            }
+            s => Err(KvError::Other(format!("unexpected state: {s}"))),
+        }
+    }
 }
 
 impl KvClient for MemberlistKvClient {
     fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>, KvError>> {
-        Box::pin(async move { Ok(self.kv.list_keys(prefix)) })
+        Box::pin(async move {
+            self.await_kv_running_or_stopping().await?;
+            Ok(self.kv.list_keys(prefix))
+        })
     }
 
     fn get<'a>(
         &'a self,
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<Box<dyn Any + Send + Sync>>, KvError>> {
-        Box::pin(async move { Ok(self.kv.get_value(key).map(|(v, _)| v)) })
+        Box::pin(async move {
+            self.await_kv_running_or_stopping().await?;
+            Ok(self.kv.get_value(key).map(|(v, _)| v))
+        })
     }
 
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), KvError>> {
-        Box::pin(async move { self.kv.delete_key(key).await })
+        Box::pin(async move {
+            self.await_kv_running_or_stopping().await?;
+            self.kv.delete_key(key).await
+        })
     }
 
     fn cas<'a>(&'a self, key: &'a str, f: CasFn) -> BoxFuture<'a, Result<(), KvError>> {
-        Box::pin(async move { self.kv.cas_with_codec(key, self.codec.as_ref(), f).await })
+        Box::pin(async move {
+            self.await_kv_running_or_stopping().await?;
+            self.kv.cas_with_codec(key, self.codec.as_ref(), f).await
+        })
     }
 
     fn watch_key<'a>(
@@ -2563,28 +2479,28 @@ impl KvClient for MemberlistKvClient {
         mut f: Box<dyn FnMut(Box<dyn Any + Send + Sync>) -> bool + Send>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let notify = Arc::new(Notify::new());
-            {
-                let mut watchers = self.kv.watchers.lock();
-                watchers
-                    .entry(key.to_string())
-                    .or_default()
-                    .push(WatcherEntry {
-                        notify: notify.clone(),
-                    });
+            if self.await_kv_running_or_stopping().await.is_err() {
+                return;
             }
+            let notify = Arc::new(Notify::new());
+            self.kv
+                .watchers
+                .lock()
+                .entry(key.to_string())
+                .or_default()
+                .push(WatcherEntry {
+                    notify: notify.clone(),
+                });
             let _guard = KeyWatcherGuard {
                 kv: Arc::clone(&self.kv),
                 key: key.to_string(),
                 notify: Arc::clone(&notify),
             };
-
             if let Some((val, _)) = self.kv.get_value(key) {
                 if !f(val) {
                     return;
                 }
             }
-
             loop {
                 tokio::select! {
                     _ = cancel.canceled() => break,
@@ -2608,21 +2524,23 @@ impl KvClient for MemberlistKvClient {
         mut f: Box<dyn FnMut(&str, Box<dyn Any + Send + Sync>) -> bool + Send>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            if self.await_kv_running_or_stopping().await.is_err() {
+                return;
+            }
             let buf_size = self.kv.cfg.watch_prefix_buffer_size.max(1) as usize;
             let (tx, mut rx) = mpsc::channel(buf_size);
             let watcher_id = NEXT_PREFIX_WATCHER_ID.fetch_add(1, Ordering::Relaxed);
-            {
-                let mut pw = self.kv.prefix_watchers.lock();
-                pw.entry(prefix.to_string())
-                    .or_default()
-                    .push(PrefixWatcherEntry { id: watcher_id, tx });
-            }
+            self.kv
+                .prefix_watchers
+                .lock()
+                .entry(prefix.to_string())
+                .or_default()
+                .push(PrefixWatcherEntry { id: watcher_id, tx });
             let _guard = PrefixWatcherGuard {
                 kv: Arc::clone(&self.kv),
                 prefix: prefix.to_string(),
                 id: watcher_id,
             };
-
             loop {
                 tokio::select! {
                     _ = cancel.canceled() => break,
@@ -2641,112 +2559,10 @@ impl KvClient for MemberlistKvClient {
     }
 }
 
-/// `time.Since(start)` rendered like Go's `time.Duration.String()`.
-fn go_elapsed(start: std::time::Instant) -> String {
-    mimir_config::format_go_duration(start.elapsed().as_nanos().min(i64::MAX as u128) as i64)
-}
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::kv::StringCodec;
-
-    fn local_cfg(name: &str) -> MemberlistConfig {
-        MemberlistConfig {
-            bind_addr: vec!["127.0.0.1".to_string()],
-            bind_port: 0,
-            node_name: name.to_string(),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn test_fast_join_resolves_dns_plus_members() {
-        let codec: Arc<dyn Codec> = Arc::new(StringCodec);
-        let seed = MemberlistKv::start(local_cfg("seed"), vec![Arc::clone(&codec)], "test", None)
-            .await
-            .unwrap();
-
-        let mut cfg = local_cfg("joiner");
-        cfg.join_members.0 = vec![format!("dns+localhost:{}", seed.advertise_port)];
-        cfg.abort_if_cluster_fast_join_fails = true;
-        let joiner = MemberlistKv::start(cfg, vec![codec], "test", None)
-            .await
-            .expect("fast-join via dns+ must reach the seed");
-
-        assert!(joiner.members().iter().any(|n| n.name == seed.node_name));
-        joiner.shutdown().await;
-        seed.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_start_does_not_block_on_join_retries() {
-        // Before the fix, start() ran all join retries (1s..1m backoff, 10 attempts) inline,
-        // so nothing after it (including the HTTP server) came up while seeds were unreachable.
-        let mut cfg = local_cfg("lonely");
-        cfg.join_members.0 = vec!["127.0.0.1:1".to_string()];
-        let kv = tokio::time::timeout(
-            Duration::from_secs(3),
-            MemberlistKv::start(cfg, vec![Arc::new(StringCodec) as Arc<dyn Codec>], "test", None),
-        )
-        .await
-        .expect("start() must return while join retries continue in the background")
-        .unwrap();
-        kv.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_dropped_watchers_are_unregistered() {
-        let cfg = MemberlistConfig {
-            bind_addr: vec!["127.0.0.1".to_string()],
-            bind_port: 0,
-            node_name: "watcher-test-node".to_string(),
-            ..Default::default()
-        };
-
-        let codec: Arc<dyn Codec> = Arc::new(StringCodec);
-        let kv = MemberlistKv::start(cfg, vec![Arc::clone(&codec)], "test", None)
-            .await
-            .unwrap();
-        let client = Arc::new(MemberlistKvClient::new(Arc::clone(&kv), codec).unwrap());
-
-        let ctx1 = ServiceContext::background();
-        let ctx1_c = ctx1.clone();
-        let c1 = Arc::clone(&client);
-        let h1 = tokio::spawn(async move {
-            c1.watch_key("k1", ctx1_c, Box::new(|_| true)).await;
-        });
-
-        let ctx2 = ServiceContext::background();
-        let ctx2_c = ctx2.clone();
-        let c2 = Arc::clone(&client);
-        let h2 = tokio::spawn(async move {
-            c2.watch_prefix("pref/", ctx2_c, Box::new(|_, _| true)).await;
-        });
-
-        // Wait for both watchers to register
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let wk = kv.watchers.lock().get("k1").map_or(0, Vec::len);
-                let pw = kv.prefix_watchers.lock().get("pref/").map_or(0, Vec::len);
-                if wk == 1 && pw == 1 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-
-        // Cancel both watchers and verify both maps clean up completely
-        ctx1.cancel();
-        ctx2.cancel();
-        h1.await.unwrap();
-        h2.await.unwrap();
-
-        assert!(kv.watchers.lock().is_empty());
-        assert!(kv.prefix_watchers.lock().is_empty());
-
-        kv.shutdown().await;
-    }
-}
+#[path = "upstream_client_tests.rs"]
+mod upstream_client_tests;

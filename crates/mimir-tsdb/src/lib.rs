@@ -20,6 +20,8 @@ pub mod chunkenc;
 pub mod chunks_block;
 pub mod compact;
 pub mod db;
+#[cfg(test)]
+mod db_upstream_tests;
 pub mod encoding;
 pub mod exemplar;
 pub mod head;
@@ -28,10 +30,13 @@ pub mod index;
 pub mod labels;
 pub mod matcher;
 pub mod metadata;
+pub mod metrics;
 pub mod postings;
 pub mod postings_cache;
 pub mod querier;
 pub mod record;
+#[cfg(test)]
+mod repair_tests;
 pub mod search;
 pub mod symbols;
 pub mod tombstones;
