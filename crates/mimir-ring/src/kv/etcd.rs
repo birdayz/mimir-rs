@@ -355,7 +355,7 @@ impl KvClient for EtcdKv {
                 let resp: RangeResponse = match self.post_json("/v3/kv/range", &range_req).await {
                     Ok(r) => r,
                     Err(e) => {
-                        error!(key, %e, "error getting key from etcd");
+                        error!(key, err = %e, "error getting key from etcd");
                         last_err = Some(e);
                         continue;
                     }
@@ -377,7 +377,7 @@ impl KvClient for EtcdKv {
                     match self.codec.decode(&val_bytes) {
                         Ok(d) => Some(d),
                         Err(e) => {
-                            error!(key, %e, "error decoding etcd key");
+                            error!(key, err = %e, "error decoding etcd key");
                             last_err = Some(e);
                             continue;
                         }
@@ -427,7 +427,7 @@ impl KvClient for EtcdKv {
                 let txn_resp: TxnResponse = match self.post_json("/v3/kv/txn", &txn_req).await {
                     Ok(r) => r,
                     Err(e) => {
-                        error!(key, %e, "error CASing etcd key");
+                        error!(key, err = %e, "error CASing etcd key");
                         last_err = Some(e);
                         continue;
                     }
@@ -525,7 +525,7 @@ impl EtcdKv {
                     }
                 }
                 Err(e) => {
-                    error!(key, %e, "etcd watch error");
+                    error!(key, err = %e, "etcd watch error");
                     tokio::select! {
                         _ = cancel.canceled() => return,
                         _ = backoff.wait() => continue,
@@ -577,7 +577,7 @@ impl EtcdKv {
                                                 }
                                             }
                                             Err(e) => {
-                                                error!(key = %key_str, %e, "error decoding etcd watch event");
+                                                error!(key = %key_str, err = %e, "error decoding etcd watch event");
                                             }
                                         }
                                     }
@@ -587,7 +587,7 @@ impl EtcdKv {
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        error!(key, %e, "etcd watch stream error");
+                        error!(key, err = %e, "etcd watch stream error");
                         break;
                     }
                 }

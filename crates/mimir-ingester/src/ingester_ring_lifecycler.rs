@@ -114,7 +114,12 @@ impl BasicLifecyclerDelegate for TokenlessDelegateInner {
                 }
             }
             if !self.final_sleep.is_zero() {
-                info!(final_sleep = ?self.final_sleep, "lifecycler entering final sleep before shutdown");
+                info!(
+                    final_sleep = %mimir_config::format_go_duration(
+                        self.final_sleep.as_nanos().min(i64::MAX as u128) as i64
+                    ),
+                    "lifecycler entering final sleep before shutdown"
+                );
                 tokio::time::sleep(self.final_sleep).await;
             }
         })

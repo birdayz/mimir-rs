@@ -208,7 +208,7 @@ impl OffsetCatalogue {
                     OffsetCatalogueError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound
                 );
                 if !not_found {
-                    warn!(error = %err, dir = %self.dir.display(), "reading offset catalogue failed, will override");
+                    warn!(err = %err, dir = %self.dir.display(), "reading offset catalogue failed, will override");
                 }
                 BTreeMap::new()
             }

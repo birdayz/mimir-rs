@@ -23,7 +23,7 @@ use prometheus::{Counter, Gauge, HistogramOpts, HistogramVec, Opts, Registry};
 use rand::seq::SliceRandom;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::kv::memberlist::MemberlistKv;
 use crate::kv::{build_kv_client, BoxFuture, CasCallbackError, CasOutcome, KvClient, KvError};
@@ -1277,7 +1277,12 @@ impl Lifecycler {
                 to: target,
             });
         }
-        info!(ring = %self.ring_name, ?curr, ?target, "changing instance state");
+        info!(
+            old_state = curr.as_str_name(),
+            new_state = target.as_str_name(),
+            ring = %self.ring_name,
+            "changing instance state from"
+        );
         self.state.write().state = target;
         self.update_consul().await
     }
@@ -1287,7 +1292,7 @@ impl Lifecycler {
         if prev == read_only {
             return Ok(());
         }
-        info!(ring = %self.ring_name, read_only, "changing read-only state of instance");
+        info!(readOnly = read_only, ring = %self.ring_name, "changing read-only state of instance in the ring");
         self.set_read_only_internal(read_only, Some(SystemTime::now()));
         self.update_consul().await
     }
@@ -1346,9 +1351,11 @@ impl Lifecycler {
                 }
             }
         } else {
+            info!("not loading tokens from file, tokens file path is empty");
             Vec::new()
         };
 
+        let ring_name = self.ring_name.clone();
         let id = self.id.clone();
         let addr = self.addr.clone();
         let zone = self.zone.clone();
@@ -1383,17 +1390,39 @@ impl Lifecycler {
                         *pro_cb.lock() = (ro, ro_ts);
 
                         if inst.instance_state() == InstanceState::Joining {
+                            warn!(ring = %ring_name, "instance found in ring as JOINING, setting to PENDING");
                             inst.state = InstanceState::Pending as i32;
                             ring_desc.ingesters.insert(id.clone(), inst);
                         } else {
                             let mut toks = inst.tokens.clone();
+                            info!(
+                                state = inst.instance_state().as_str_name(),
+                                tokens = toks.len(),
+                                ring = %ring_name,
+                                readOnly = ro,
+                                readOnlyStateUpdate = %ro_ts.map_or_else(
+                                    || "0001-01-01T00:00:00Z".to_string(),
+                                    mimir_common::logging::format_rfc3339_nano_utc,
+                                ),
+                                "existing instance found in ring"
+                            );
                             if inst.instance_state() == InstanceState::Leaving {
                                 if toks.len() < num_tokens {
+                                    info!(
+                                        current_tokens = toks.len(),
+                                        desired_tokens = num_tokens,
+                                        "existing instance has too few tokens, adding difference"
+                                    );
                                     let new_toks = token_generator
                                         .generate_tokens(num_tokens - toks.len(), &ring_desc.get_tokens());
                                     toks.extend(new_toks);
                                     toks.sort_unstable();
                                 } else if toks.len() > num_tokens {
+                                    info!(
+                                        current_tokens = toks.len(),
+                                        desired_tokens = num_tokens,
+                                        "existing instance has too many tokens, removing difference"
+                                    );
                                     toks.shuffle(&mut rand::thread_rng());
                                     toks.truncate(num_tokens);
                                     toks.sort_unstable();
@@ -1422,6 +1451,7 @@ impl Lifecycler {
                         *pro_cb.lock() = (false, None);
 
                         if !tokens_from_file.is_empty() {
+                            info!(num_tokens = tokens_from_file.len(), "adding tokens from file");
                             let st = if tokens_from_file.len() >= num_tokens {
                                 InstanceState::Active
                             } else {
@@ -1441,6 +1471,7 @@ impl Lifecycler {
                             );
                             *pt_cb.lock() = Some(tokens_from_file.clone());
                         } else {
+                            info!(ring = %ring_name, "instance not found in ring, adding with no tokens");
                             let st = *ps_cb.lock();
                             ring_desc.add_ingester(
                                 &id,
@@ -1736,7 +1767,7 @@ impl Lifecycler {
                 info!("transfers are disabled");
             }
             Err(err) => {
-                error!(ring = %self.ring_name, %err, "failed to transfer chunks");
+                error!(ring = %self.ring_name, %err, "failed to transfer chunks to another instance");
                 self.metrics
                     .shutdown_duration
                     .with_label_values(&["transfer", "fail"])
@@ -1753,6 +1784,12 @@ impl Lifecycler {
                 .observe(f_start.elapsed().as_secs_f64());
         }
 
+        info!(
+            final_sleep = %mimir_config::format_go_duration(
+                self.cfg.final_sleep.as_nanos().min(i64::MAX as u128) as i64
+            ),
+            "lifecycler entering final sleep before shutdown"
+        );
         if !self.cfg.final_sleep.is_zero() {
             tokio::time::sleep(self.cfg.final_sleep).await;
         }
@@ -1785,14 +1822,20 @@ impl Lifecycler {
 
                     loop {
                         tokio::select! {
-                            _ = ctx.canceled() => break,
+                            _ = ctx.canceled() => {
+                                info!(ring = %l.ring_name, "lifecycler loop() exited gracefully");
+                                break;
+                            }
                             _ = tokio::time::sleep_until(join_deadline), if !join_fired => {
                                 join_fired = true;
+                                debug!(ring = %l.ring_name, "JoinAfter expired");
                                 if l.get_state() == InstanceState::Pending {
+                                    info!(ring = %l.ring_name, "auto-joining cluster after timeout");
                                     if !l.cfg.observe_period.is_zero() {
                                         l.auto_join(&ctx, InstanceState::Joining).await.map_err(|e| {
                                             ServiceError::failure(format!("failed to pick tokens: {e}"))
                                         })?;
+                                        info!(ring = %l.ring_name, "observing tokens before going ACTIVE");
                                         observe_deadline = Some(tokio::time::Instant::now() + l.cfg.observe_period);
                                     } else {
                                         l.auto_join(&ctx, InstanceState::Active).await.map_err(|e| {
@@ -1809,18 +1852,24 @@ impl Lifecycler {
                                 }
                             }, if observe_deadline.is_some() => {
                                 observe_deadline = None;
+                                let s = l.get_state();
+                                if s != InstanceState::Joining {
+                                    error!(state = s.as_str_name(), ring = %l.ring_name, "unexpected state while observing tokens");
+                                }
                                 if l.verify_tokens().await {
+                                    info!(ring = %l.ring_name, "token verification successful");
                                     if let Err(err) = l.change_state(InstanceState::Active).await {
                                         error!(ring = %l.ring_name, %err, "failed to set state to ACTIVE");
                                     }
                                 } else {
+                                    info!(ring = %l.ring_name, "token verification failed, observing");
                                     observe_deadline = Some(tokio::time::Instant::now() + l.cfg.observe_period);
                                 }
                             }
                             _ = hb_interval.tick(), if !hb_period.is_zero() => {
                                 l.metrics.consul_heartbeats.inc();
                                 if let Err(err) = l.update_consul().await {
-                                    error!(ring = %l.ring_name, %err, "failed to write heartbeat to KV store");
+                                    error!(ring = %l.ring_name, %err, "failed to write to the KV store, sleeping");
                                 }
                             }
                         }
@@ -1860,10 +1909,14 @@ impl Lifecycler {
                         l.unregister()
                             .await
                             .map_err(|e| ServiceError::failure(format!("unregister failed: {e}")))?;
+                        info!(ring = %l.ring_name, "instance removed from the KV store");
                     }
 
-                    if !l.cfg.tokens_file_path.is_empty() && l.clear_tokens_on_shutdown() {
-                        let _ = std::fs::remove_file(&l.cfg.tokens_file_path);
+                    if !l.cfg.tokens_file_path.is_empty()
+                        && l.clear_tokens_on_shutdown()
+                        && std::fs::remove_file(&l.cfg.tokens_file_path).is_ok()
+                    {
+                        info!(path = %l.cfg.tokens_file_path, "removed tokens file from disk");
                     }
                     Ok(())
                 })

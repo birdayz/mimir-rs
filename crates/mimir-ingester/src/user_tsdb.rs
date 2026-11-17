@@ -770,7 +770,7 @@ impl UserTsdb {
             }
             Ok(false) => false,
             Err(e) => {
-                warn!(user = %self.user_id, error = %e, "failed to check tenant deletion mark");
+                warn!(user = %self.user_id, err = %e, "failed to check tenant deletion mark");
                 false
             }
         }
@@ -894,7 +894,7 @@ impl UserTsdb {
         let limits = self.overrides.for_tenant(&self.user_id);
         let ooo_ms = (limits.out_of_order_time_window.0 / 1_000_000).max(0);
         if let Err(e) = self.db.head().set_ooo_time_window(ooo_ms) {
-            warn!(user = %self.user_id, error = %e, "failed to update OOO time window");
+            warn!(user = %self.user_id, err = %e, "failed to update OOO time window");
         }
         let max_exemplars = self.limiter.max_exemplars_per_user(&self.user_id);
         self.db.head().set_max_exemplars(max_exemplars);
@@ -1115,7 +1115,7 @@ impl UserTsdb {
                     user = %self.user_id,
                     owner_key = k,
                     owner_val = %v,
-                    error = %e,
+                    err = %e,
                     "failed to get token ranges for owned series"
                 );
                 self.trigger_recompute_owned_series(
@@ -1427,7 +1427,7 @@ impl TenantMetadataStore {
 }
 
 pub fn debug_log_push_head_error(user_id: &str, err: &HeadError) {
-    debug!(user = %user_id, error = %err, "head append error");
+    debug!(user = %user_id, err = %err, "head append error");
 }
 
 #[cfg(test)]
