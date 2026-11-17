@@ -28,6 +28,16 @@ pub fn build_date_str() -> &'static str {
     option_env!("MIMIR_BUILD_DATE").unwrap_or("unknown")
 }
 
+/// `github.com/prometheus/common/version.Info()`, logged with "Starting application".
+pub fn version_info() -> String {
+    format!(
+        "(version={}, branch={}, revision={})",
+        version_str(),
+        branch_str(),
+        revision_str()
+    )
+}
+
 pub fn go_version_str() -> String {
     format!("rustc-{}", env!("CARGO_PKG_VERSION"))
 }

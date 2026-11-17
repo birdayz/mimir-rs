@@ -537,7 +537,7 @@ impl PushErrorHandler {
 
         if !err.is_client_error() {
             self.metrics.server_err_requests.inc();
-            error!(user = tenant_id, error = %err, "server error while ingesting write request");
+            error!(user = tenant_id, err = %err, "server error while ingesting write request");
             return true;
         }
 

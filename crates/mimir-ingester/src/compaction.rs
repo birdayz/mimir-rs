@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures::StreamExt;
 use mimir_common::services::{ServiceContext, State};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -42,110 +43,148 @@ impl Ingester {
         forced_compaction_max_time: i64,
         allowed: Option<&HashSet<String>>,
     ) {
+        // Go `concurrency.ForEachUser(..., HeadCompactionConcurrency, ...)`.
+        let concurrency = self.blocks_cfg.tsdb.head_compaction_concurrency.max(1) as usize;
         let user_ids = self.get_tsdb_users();
-        for user_id in user_ids {
-            if let Some(allow) = allowed {
-                if !allow.contains(&user_id) {
-                    continue;
-                }
-            }
-            let Some(user_db) = self.get_tsdb(&user_id) else {
-                continue;
-            };
-            let head = user_db.db.head();
-            if head.num_series() == 0 {
-                continue;
-            }
-
-            self.metrics.compactions_triggered.inc();
-            let min_time_before = head.min_time();
-            let reason;
-
-            let res: Result<(), String> = if force {
-                reason = "forced";
-                self.metrics.increase_forced_compactions();
-                let r = user_db.compact_head(forced_compaction_max_time).await;
-                self.metrics.decrease_forced_compactions();
-                r
-            } else if !self.compaction_idle_timeout.is_zero()
-                && user_db.is_idle(SystemTime::now(), self.compaction_idle_timeout)
-            {
-                reason = "idle";
-                let user_max_time = head.max_time().max(head.max_ooo_time());
-                if user_max_time > i64::MIN {
-                    self.metrics.increase_forced_compactions();
-                    let r = user_db.compact_head(user_max_time).await;
-                    self.metrics.decrease_forced_compactions();
-                    r
-                } else {
-                    Ok(())
-                }
-            } else {
-                reason = "regular";
-                user_db.compact().map(|_| ()).map_err(|e| e.to_string())
-            };
-
-            user_db.update_last_series_removal();
-            if let Err(e) = res {
-                self.metrics.compactions_failed.inc();
-                warn!(user = %user_id, reason, error = %e, "TSDB blocks compaction failed");
-            } else {
-                debug!(user = %user_id, reason, "TSDB blocks compaction completed");
-            }
-
-            let min_time_after = head.min_time();
-            if min_time_before != min_time_after {
-                let r = if force && forced_compaction_max_time != i64::MAX {
-                    RECOMPUTE_OWNED_SERIES_REASON_EARLY_COMPACTION
-                } else {
-                    RECOMPUTE_OWNED_SERIES_REASON_COMPACTION
-                };
-                user_db.trigger_recompute_owned_series(r);
-            }
-        }
+        futures::stream::iter(user_ids)
+            .for_each_concurrent(concurrency, |user_id| async move {
+                self.compact_user_blocks(&user_id, force, forced_compaction_max_time, allowed)
+                    .await;
+            })
+            .await;
         self.metrics.reset_forced_compactions();
     }
 
+    async fn compact_user_blocks(
+        &self,
+        user_id: &str,
+        force: bool,
+        forced_compaction_max_time: i64,
+        allowed: Option<&HashSet<String>>,
+    ) {
+        if let Some(allow) = allowed {
+            if !allow.contains(user_id) {
+                return;
+            }
+        }
+        let Some(user_db) = self.get_tsdb(user_id) else {
+            return;
+        };
+        let head = user_db.db.head();
+        if head.num_series() == 0 {
+            return;
+        }
+
+        self.metrics.compactions_triggered.inc();
+        let min_time_before = head.min_time();
+        let reason;
+
+        let res: Result<(), String> = if force {
+            reason = "forced";
+            self.metrics.increase_forced_compactions();
+            let r = user_db.compact_head(forced_compaction_max_time).await;
+            self.metrics.decrease_forced_compactions();
+            r
+        } else if !self.compaction_idle_timeout.is_zero()
+            && user_db.is_idle(SystemTime::now(), self.compaction_idle_timeout)
+        {
+            reason = "idle";
+            let user_max_time = head.max_time().max(head.max_ooo_time());
+            if user_max_time > i64::MIN {
+                self.metrics.increase_forced_compactions();
+                let r = user_db.compact_head(user_max_time).await;
+                self.metrics.decrease_forced_compactions();
+                r
+            } else {
+                Ok(())
+            }
+        } else {
+            reason = "regular";
+            let db = Arc::clone(&user_db);
+            tokio::task::spawn_blocking(move || {
+                db.compact().map(|_| ()).map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("compaction task failed: {e}")))
+        };
+
+        user_db.update_last_series_removal();
+        if let Err(e) = res {
+            self.metrics.compactions_failed.inc();
+            warn!(user = %user_id, reason, err = %e, "TSDB blocks compaction failed");
+        } else {
+            debug!(user = %user_id, reason, "TSDB blocks compaction completed");
+        }
+
+        let min_time_after = head.min_time();
+        if min_time_before != min_time_after {
+            let r = if force && forced_compaction_max_time != i64::MAX {
+                RECOMPUTE_OWNED_SERIES_REASON_EARLY_COMPACTION
+            } else {
+                RECOMPUTE_OWNED_SERIES_REASON_COMPACTION
+            };
+            user_db.trigger_recompute_owned_series(r);
+        }
+    }
+
     pub async fn ship_blocks(&self, allowed: Option<&HashSet<String>>) {
+        // Go `concurrency.ForEachUser(..., ShipConcurrency, ...)`: the number of concurrent
+        // workers is limited to avoid syncing a lot of tenants at once.
+        let concurrency = self.blocks_cfg.tsdb.ship_concurrency.max(1) as usize;
         let user_ids = self.get_tsdb_users();
-        for user_id in user_ids {
-            if let Some(allow) = allowed {
-                if !allow.contains(&user_id) {
-                    continue;
-                }
+        futures::stream::iter(user_ids)
+            .for_each_concurrent(concurrency, |user_id| async move {
+                self.ship_user_blocks(&user_id, allowed).await;
+            })
+            .await;
+    }
+
+    async fn ship_user_blocks(&self, user_id: &str, allowed: Option<&HashSet<String>>) {
+        if let Some(allow) = allowed {
+            if !allow.contains(user_id) {
+                return;
             }
-            let Some(user_db) = self.get_tsdb(&user_id) else {
-                continue;
-            };
-            let Some(shipper) = user_db.shipper.read().clone() else {
-                continue;
-            };
+        }
+        let Some(user_db) = self.get_tsdb(user_id) else {
+            return;
+        };
+        let Some(shipper) = user_db.shipper.read().clone() else {
+            return;
+        };
 
-            let bucket_opt = self.bucket.read().clone();
-            if user_db.check_deletion_mark(bucket_opt.as_deref()).await {
-                continue;
+        let bucket_opt = self.bucket.read().clone();
+        if user_db.check_deletion_mark(bucket_opt.as_deref()).await {
+            return;
+        }
+
+        let (ok, st) = user_db.change_state(TsdbState::Active, TsdbState::ActiveShipping);
+        if !ok {
+            info!(user = %user_id, state = st.as_str(), "shipper skipped because TSDB is not active");
+            return;
+        }
+
+        let sync_res = shipper.sync().await;
+        let _ = user_db.change_state(TsdbState::ActiveShipping, TsdbState::Active);
+
+        let uploaded = match sync_res {
+            Ok(uploaded) => {
+                debug!(user = %user_id, uploaded, "shipper successfully synchronized TSDB blocks with storage");
+                uploaded
             }
-
-            let (ok, st) = user_db.change_state(TsdbState::Active, TsdbState::ActiveShipping);
-            if !ok {
-                info!(user = %user_id, state = st.as_str(), "shipper skipped because TSDB is not active");
-                continue;
+            Err(e) => {
+                let uploaded = match e {
+                    mimir_storage::shipper::ShipperError::PartialSync { shipped, .. } => shipped,
+                    _ => 0,
+                };
+                warn!(user = %user_id, uploaded, err = %e, "shipper failed to synchronize TSDB blocks with the storage");
+                uploaded
             }
-
-            let sync_res = shipper.sync().await;
-            let _ = user_db.change_state(TsdbState::ActiveShipping, TsdbState::Active);
-
-            match sync_res {
-                Ok(uploaded) => {
-                    if uploaded > 0 {
-                        if let Err(e) = user_db.update_cached_shipped_blocks() {
-                            warn!(user = %user_id, error = %e, "failed to update cached shipped blocks");
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(user = %user_id, error = %e, "shipper failed to sync TSDB blocks");
-                }
+        };
+        // The shipper meta file could be updated even if Sync() returned an error, so update
+        // the cache each time at least a block has been uploaded (Go `shipBlocks`).
+        if uploaded > 0 {
+            if let Err(e) = user_db.update_cached_shipped_blocks() {
+                warn!(user = %user_id, err = %e, "failed to update cached shipped blocks after shipper synchronisation");
             }
         }
     }
@@ -162,7 +201,7 @@ impl Ingester {
             if let Some(db) = self.get_tsdb(&user_id) {
                 if let Some(ref cat) = db.offset_catalogue {
                     if let Err(e) = cat.sync(&hw) {
-                        warn!(user = %user_id, error = %e, "offset catalogue sync failed");
+                        warn!(user = %user_id, err = %e, "offset catalogue sync failed");
                     }
                 }
             }
@@ -501,7 +540,7 @@ impl Ingester {
             let _ = db.db.compact_ooo_head();
             if let Err(e) = db.db.compact_selected_series(&refs) {
                 db.update_last_series_removal();
-                warn!(user = %user_id, error = %e, "selected series compaction failed");
+                warn!(user = %user_id, err = %e, "selected series compaction failed");
                 continue;
             }
             db.update_last_series_removal();
@@ -583,7 +622,7 @@ impl Ingester {
             .collect();
 
         if let Err(e) = user_db.close() {
-            warn!(user = %user_id, error = %e, "failed to close idle TSDB");
+            warn!(user = %user_id, err = %e, "failed to close idle TSDB");
             let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
             return TsdbCloseCheckResult::CloseFailed;
         }
@@ -598,7 +637,7 @@ impl Ingester {
             .delete_user_label_value_bytes_metrics(user_id, &label_value_bytes_names);
 
         if let Err(e) = std::fs::remove_dir_all(&dir) {
-            warn!(user = %user_id, dir = %dir.display(), error = %e, "failed to remove closed idle TSDB directory");
+            warn!(user = %user_id, dir = %dir.display(), err = %e, "failed to remove closed idle TSDB directory");
             return TsdbCloseCheckResult::DataRemovalFailed;
         }
 
@@ -1102,7 +1141,7 @@ pub fn spawn_owned_series_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> 
                                 .observe(start.elapsed().as_secs_f64());
                         }
                         Err(e) => {
-                            debug!(error = %e, "owned series ring check failed");
+                            debug!(err = %e, "owned series ring check failed");
                         }
                     }
                 }

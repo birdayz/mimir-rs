@@ -1,10 +1,12 @@
-//! Object storage bucket client abstraction wrapping `object_store` with prefix/tenant scoping.
+//! Object storage bucket client: S3 (thanos objstore/minio-go port), GCS/Azure/filesystem
+//! (`object_store`), prefix/tenant scoping, per-tenant S3 SSE and objstore operation metrics.
 //!
 //! Ported from:
 //! - github.com/grafana/mimir/pkg/storage/bucket/client.go
 //! - github.com/grafana/mimir/pkg/storage/bucket/bucket_util.go
 //! - github.com/grafana/mimir/pkg/storage/bucket/prefixed_bucket_client.go
 //! - github.com/grafana/mimir/pkg/storage/bucket/user_bucket_client.go
+//! - github.com/grafana/mimir/pkg/storage/bucket/sse_bucket_client.go
 //! - github.com/grafana/mimir/pkg/storage/bucket/filesystem/bucket_client.go
 //! - github.com/grafana/mimir/pkg/storage/bucket/s3/bucket_client.go
 //! - github.com/grafana/mimir/pkg/storage/bucket/gcs/bucket_client.go
@@ -18,16 +20,20 @@ use tokio::io::AsyncReadExt;
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use mimir_config::{BucketConfig, S3BucketLookupType};
-use object_store::aws::AmazonS3Builder;
-use object_store::azure::MicrosoftAzureBuilder;
-use object_store::gcp::GoogleCloudStorageBuilder;
+use mimir_config::BucketConfig;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
 use object_store::{GetOptions, GetRange, ObjectStore, PutPayload};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub mod azure;
+pub mod exthttp;
+pub mod gcs;
+pub mod metrics;
+pub mod s3;
+pub mod s3utils;
 
 pub const DIR_DELIM: &str = "/";
 pub const MIMIR_INTERNALS_PREFIX: &str = "__mimir_cluster";
@@ -45,20 +51,30 @@ pub enum BucketError {
     InvalidPath(String, String),
     #[error("object store error: {0}")]
     Store(#[from] object_store::Error),
+    #[error("{0}")]
+    S3(#[from] s3::S3BucketError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("configuration error: {0}")]
     Config(String),
+    #[error("{0}")]
+    Metrics(#[from] prometheus::Error),
+    /// Mimir `SSEBucketClient.getCustomS3SSEConfig` failure.
+    #[error("unable to customise S3 SSE config for tenant {user}: {reason}")]
+    TenantSse { user: String, reason: String },
 }
 
 impl BucketError {
     pub fn is_not_found(&self) -> bool {
-        matches!(
-            self,
-            BucketError::NotFound(_) | BucketError::Store(object_store::Error::NotFound { .. })
-        )
+        match self {
+            BucketError::NotFound(_) | BucketError::Store(object_store::Error::NotFound { .. }) => {
+                true
+            }
+            BucketError::S3(e) => e.is_obj_not_found(),
+            _ => false,
+        }
     }
 }
 
@@ -68,14 +84,53 @@ pub struct ObjectAttributes {
     pub last_modified_unix_secs: i64,
 }
 
+/// Per-tenant configuration consumed by the bucket client (Mimir
+/// `bucket.TenantConfigProvider`, implemented by the limits overrides).
+pub trait TenantConfigProvider: Send + Sync {
+    /// `S3SSEType(userID)`.
+    fn s3_sse_type(&self, user_id: &str) -> String;
+    /// `S3SSEKMSKeyID(userID)`.
+    fn s3_sse_kms_key_id(&self, user_id: &str) -> String;
+    /// `S3SSEKMSEncryptionContext(userID)`.
+    fn s3_sse_kms_encryption_context(&self, user_id: &str) -> String;
+}
+
+/// The ingester passes its limits overrides (`i.limits`) as the tenant config provider.
+impl TenantConfigProvider for mimir_config::Overrides {
+    fn s3_sse_type(&self, user_id: &str) -> String {
+        self.for_tenant(user_id).s3_sse_type.clone()
+    }
+    fn s3_sse_kms_key_id(&self, user_id: &str) -> String {
+        self.for_tenant(user_id).s3_sse_kms_key_id.clone()
+    }
+    fn s3_sse_kms_encryption_context(&self, user_id: &str) -> String {
+        self.for_tenant(user_id).s3_sse_kms_encryption_context.clone()
+    }
+}
+
+#[derive(Clone)]
+struct TenantSse {
+    user_id: String,
+    provider: Arc<dyn TenantConfigProvider>,
+}
+
+#[derive(Clone)]
+enum Backend {
+    Store(Arc<dyn ObjectStore>),
+    S3(Arc<s3::S3Bucket>),
+}
+
 /// Async object-storage client supporting Filesystem, S3, GCS, Azure, and InMemory backends,
-/// with composable prefix/tenant scoping (`with_prefix` / `for_user`).
+/// with composable prefix/tenant scoping (`with_prefix` / `for_user`), the objstore operation
+/// metrics (`thanos_objstore_bucket_*`) and Mimir's per-tenant S3 SSE injection.
 #[derive(Clone)]
 pub struct BucketClient {
-    store: Arc<dyn ObjectStore>,
+    backend: Backend,
     prefix: Option<String>,
     name: String,
     provider: String,
+    metrics: Option<Arc<metrics::BucketMetrics>>,
+    tenant_sse: Option<TenantSse>,
 }
 
 impl std::fmt::Debug for BucketClient {
@@ -89,14 +144,20 @@ impl std::fmt::Debug for BucketClient {
 }
 
 impl BucketClient {
+    fn from_backend(backend: Backend, name: String, provider: &str) -> Self {
+        Self {
+            backend,
+            prefix: None,
+            name,
+            provider: provider.to_string(),
+            metrics: None,
+            tenant_sse: None,
+        }
+    }
+
     /// Creates an in-memory bucket client (for tests and ephemeral workloads).
     pub fn new_in_memory(name: impl Into<String>) -> Self {
-        Self {
-            store: Arc::new(InMemory::new()),
-            prefix: None,
-            name: name.into(),
-            provider: "INMEMORY".to_string(),
-        }
+        Self::from_backend(Backend::Store(Arc::new(InMemory::new())), name.into(), "INMEMORY")
     }
 
     /// Creates a local filesystem bucket client rooted at `dir`.
@@ -104,12 +165,13 @@ impl BucketClient {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let fs = LocalFileSystem::new_with_prefix(dir)?;
-        Ok(Self {
-            store: Arc::new(fs),
-            prefix: None,
-            name: dir.to_string_lossy().into_owned(),
-            provider: "FILESYSTEM".to_string(),
-        })
+        let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        // thanos filesystem `Name()`: "fs: <absolute root dir>".
+        Ok(Self::from_backend(
+            Backend::Store(Arc::new(fs)),
+            format!("fs: {}", abs.to_string_lossy()),
+            "FILESYSTEM",
+        ))
     }
 
     /// Wraps an arbitrary `Arc<dyn ObjectStore>` (useful for decorators/fault injection in tests).
@@ -118,21 +180,28 @@ impl BucketClient {
         name: impl Into<String>,
         provider: impl Into<String>,
     ) -> Self {
-        Self {
-            store,
-            prefix: None,
-            name: name.into(),
-            provider: provider.into(),
-        }
+        Self::from_backend(Backend::Store(store), name.into(), &provider.into())
     }
 
-    /// Builds a `BucketClient` from Mimir's `BucketConfig`.
+    /// Builds a `BucketClient` from Mimir's `BucketConfig` without metrics (component
+    /// `ingester`).
     pub fn from_config(cfg: &BucketConfig) -> Result<Self, BucketError> {
+        Self::new_client(cfg, "ingester", None)
+    }
+
+    /// Mimir `bucket.NewClient(ctx, cfg, component, logger, reg)`: backend client, storage
+    /// prefix, then `thanos_objstore_bucket_*` metrics labelled with `component` (when a
+    /// registry is given).
+    pub fn new_client(
+        cfg: &BucketConfig,
+        component: &str,
+        registry: Option<&prometheus::Registry>,
+    ) -> Result<Self, BucketError> {
         cfg.validate()
             .map_err(|e| BucketError::Config(e.to_string()))?;
 
         let b = &cfg.backend_cfg;
-        let client = match b.backend.as_str() {
+        let mut client = match b.backend.as_str() {
             "filesystem" => {
                 if b.filesystem.dir.is_empty() {
                     return Err(BucketError::Config(
@@ -142,118 +211,39 @@ impl BucketClient {
                 Self::new_filesystem(&b.filesystem.dir)?
             }
             "s3" => {
-                let s3 = &b.s3;
-                let mut builder = AmazonS3Builder::from_env().with_bucket_name(&s3.bucket_name);
-                if !s3.region.is_empty() {
-                    builder = builder.with_region(&s3.region);
-                }
-                if !s3.endpoint.is_empty() {
-                    let endpoint = if s3.endpoint.starts_with("http://")
-                        || s3.endpoint.starts_with("https://")
-                    {
-                        s3.endpoint.clone()
-                    } else if s3.insecure {
-                        format!("http://{}", s3.endpoint)
-                    } else {
-                        format!("https://{}", s3.endpoint)
-                    };
-                    builder = builder.with_endpoint(endpoint);
-                }
-                if s3.insecure {
-                    builder = builder.with_allow_http(true);
-                }
-                if !s3.access_key_id.is_empty() {
-                    builder = builder.with_access_key_id(&s3.access_key_id);
-                }
-                if !s3.secret_access_key.is_empty() {
-                    builder = builder.with_secret_access_key(&s3.secret_access_key);
-                }
-                if !s3.session_token.is_empty() {
-                    builder = builder.with_token(&s3.session_token);
-                }
-                match s3.bucket_lookup_type {
-                    S3BucketLookupType::VirtualHost => {
-                        builder = builder.with_virtual_hosted_style_request(true);
-                    }
-                    S3BucketLookupType::Path => {
-                        builder = builder.with_virtual_hosted_style_request(false);
-                    }
-                    S3BucketLookupType::Auto => {}
-                }
-                let store = builder.build()?;
-                Self {
-                    store: Arc::new(store),
-                    prefix: None,
-                    name: s3.bucket_name.clone(),
-                    provider: "S3".to_string(),
-                }
+                let bucket = s3::S3Bucket::new(&b.s3, component).map_err(BucketError::Config)?;
+                Self::from_backend(
+                    Backend::S3(Arc::new(bucket)),
+                    b.s3.bucket_name.clone(),
+                    "S3",
+                )
             }
-            "gcs" => {
-                let gcs = &b.gcs;
-                let mut builder =
-                    GoogleCloudStorageBuilder::from_env().with_bucket_name(&gcs.bucket_name);
-                if !gcs.service_account.is_empty() {
-                    builder = builder.with_service_account_key(&gcs.service_account);
-                }
-                let store = builder.build()?;
-                Self {
-                    store: Arc::new(store),
-                    prefix: None,
-                    name: gcs.bucket_name.clone(),
-                    provider: "GCS".to_string(),
-                }
-            }
-            "azure" => {
-                let az = &b.azure;
-                let mut builder = MicrosoftAzureBuilder::from_env();
-                if !az.container_name.is_empty() {
-                    builder = builder.with_container_name(&az.container_name);
-                }
-                if !az.account_name.is_empty() {
-                    builder = builder.with_account(&az.account_name);
-                }
-                if !az.account_key.is_empty() {
-                    builder = builder.with_access_key(&az.account_key);
-                }
-                if !az.user_assigned_id.is_empty() {
-                    builder = builder.with_client_id(&az.user_assigned_id);
-                }
-                if !az.connection_string.is_empty() {
-                    for part in az.connection_string.split(';') {
-                        if let Some((k, v)) = part.split_once('=') {
-                            match k.trim() {
-                                "AccountName" => {
-                                    builder = builder.with_account(v.trim());
-                                }
-                                "AccountKey" => {
-                                    builder = builder.with_access_key(v.trim());
-                                }
-                                "BlobEndpoint" => {
-                                    builder = builder.with_endpoint(v.trim().to_string());
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                let store = builder.build()?;
-                Self {
-                    store: Arc::new(store),
-                    prefix: None,
-                    name: az.container_name.clone(),
-                    provider: "AZURE".to_string(),
-                }
-            }
+            "gcs" => Self::from_backend(
+                Backend::Store(gcs::new_store(&b.gcs)?),
+                b.gcs.bucket_name.clone(),
+                "GCS",
+            ),
+            "azure" => Self::from_backend(
+                Backend::Store(azure::new_store(&b.azure)?),
+                b.azure.container_name.clone(),
+                "AZURE",
+            ),
             other => {
                 return Err(BucketError::UnsupportedBackend(other.to_string()));
             }
         };
 
-        if cfg.storage_prefix.is_empty() {
-            Ok(client)
-        } else {
-            Ok(client.with_prefix(&cfg.storage_prefix))
+        if !cfg.storage_prefix.is_empty() {
+            client = client.with_prefix(&cfg.storage_prefix);
         }
+        if let Some(reg) = registry {
+            client.metrics = Some(Arc::new(metrics::BucketMetrics::register(
+                reg,
+                component,
+                &client.name,
+            )?));
+        }
+        Ok(client)
     }
 
     /// Returns a view of this bucket scoped under `<prefix>/` (matching `PrefixedBucketClient`).
@@ -267,20 +257,35 @@ impl BucketClient {
             _ => p.to_string(),
         };
         Self {
-            store: Arc::clone(&self.store),
             prefix: Some(combined),
-            name: self.name.clone(),
-            provider: self.provider.clone(),
+            ..self.clone()
         }
     }
 
-    /// Returns a tenant-scoped bucket client under `<user_id>/` (matching `NewUserBucketClient`).
+    /// Returns a tenant-scoped bucket client under `<user_id>/` (matching `NewUserBucketClient`
+    /// without a tenant config provider).
     pub fn for_user(&self, user_id: &str) -> Self {
         if user_id.is_empty() {
             self.clone()
         } else {
             self.with_prefix(user_id)
         }
+    }
+
+    /// Mimir `NewUserBucketClient(userID, bucket, cfgProvider)`: the tenant prefix plus the
+    /// `SSEBucketClient`, which injects the tenant's S3 SSE override (`s3_sse_type`,
+    /// `s3_sse_kms_key_id`, `s3_sse_kms_encryption_context`) into every upload.
+    pub fn for_user_with_config(
+        &self,
+        user_id: &str,
+        provider: Arc<dyn TenantConfigProvider>,
+    ) -> Self {
+        let mut c = self.for_user(user_id);
+        c.tenant_sse = Some(TenantSse {
+            user_id: user_id.to_string(),
+            provider,
+        });
+        c
     }
 
     pub fn name(&self) -> &str {
@@ -293,10 +298,6 @@ impl BucketClient {
 
     pub fn prefix(&self) -> Option<&str> {
         self.prefix.as_deref()
-    }
-
-    pub fn inner_store(&self) -> &Arc<dyn ObjectStore> {
-        &self.store
     }
 
     fn full_name(&self, name: &str) -> String {
@@ -328,70 +329,142 @@ impl BucketClient {
         }
     }
 
-    /// Uploads `data` as object `name`.
-    pub async fn upload(&self, name: &str, data: impl Into<Bytes>) -> Result<(), BucketError> {
-        let path = self.object_path(name)?;
-        self.store
-            .put(&path, PutPayload::from_bytes(data.into()))
-            .await?;
-        Ok(())
+    /// Mimir `SSEBucketClient.getCustomS3SSEConfig`.
+    fn tenant_sse_override(&self) -> Result<Option<s3::ServerSideEncryption>, BucketError> {
+        let Some(t) = &self.tenant_sse else {
+            return Ok(None);
+        };
+        let sse_type = t.provider.s3_sse_type(&t.user_id);
+        if sse_type.is_empty() {
+            return Ok(None);
+        }
+        s3::build_minio_sse(
+            &sse_type,
+            &t.provider.s3_sse_kms_key_id(&t.user_id),
+            &t.provider.s3_sse_kms_encryption_context(&t.user_id),
+        )
+        .map_err(|reason| BucketError::TenantSse {
+            user: t.user_id.clone(),
+            reason,
+        })
     }
 
-    /// Uploads a local file at `src_path` as object `name`, streaming files > 16 MiB via multipart upload.
+    fn timer(&self, op: &'static str) -> Option<metrics::OpTimer<'_>> {
+        self.metrics.as_deref().map(|m| m.start(op))
+    }
+
+    async fn upload_source(&self, name: &str, source: s3::UploadSource) -> Result<(), BucketError> {
+        let timer = self.timer(metrics::OP_UPLOAD);
+        let size = match &source {
+            s3::UploadSource::Bytes(b) => b.len() as u64,
+            s3::UploadSource::File { len, .. } => *len,
+        };
+        let result = async {
+            let sse = self.tenant_sse_override()?;
+            match &self.backend {
+                Backend::S3(b) => {
+                    b.upload(&self.full_name(name), source, sse).await?;
+                    Ok(())
+                }
+                Backend::Store(store) => {
+                    let path = self.object_path(name)?;
+                    store_upload(store, &path, source).await
+                }
+            }
+        }
+        .await;
+        if let Some(t) = timer {
+            // minio-go reads S3 upload bodies through io.ReaderAt, which bypasses the
+            // timingReader byte counter; the other providers read through io.Reader.
+            let transferred = match (&self.backend, &result) {
+                (Backend::S3(_), _) => 0,
+                (_, Ok(())) => size,
+                (_, Err(_)) => 0,
+            };
+            t.finish_upload(result.is_ok(), transferred);
+        }
+        result
+    }
+
+    /// Uploads `data` as object `name`.
+    pub async fn upload(&self, name: &str, data: impl Into<Bytes>) -> Result<(), BucketError> {
+        self.upload_source(name, s3::UploadSource::Bytes(data.into()))
+            .await
+    }
+
+    /// Uploads a local file at `src_path` as object `name` (objstore `UploadFile`).
     pub async fn upload_file(
         &self,
         name: &str,
         src_path: impl AsRef<Path>,
     ) -> Result<(), BucketError> {
-        const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
-        const CHUNK_SIZE: usize = 8 * 1024 * 1024;
-
         let src_path = src_path.as_ref();
         let meta = tokio::fs::metadata(src_path).await?;
-        if meta.len() <= MULTIPART_THRESHOLD {
-            let data = tokio::fs::read(src_path).await?;
-            return self.upload(name, Bytes::from(data)).await;
-        }
+        self.upload_source(
+            name,
+            s3::UploadSource::File {
+                path: src_path.to_path_buf(),
+                len: meta.len(),
+            },
+        )
+        .await
+    }
 
-        let path = self.object_path(name)?;
-        let mut file = tokio::fs::File::open(src_path).await?;
-        let mut upload = self.store.put_multipart(&path).await?;
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        loop {
-            let mut filled = 0usize;
-            while filled < buf.len() {
-                match file.read(&mut buf[filled..]).await {
-                    Ok(0) => break,
-                    Ok(n) => filled += n,
-                    Err(e) => {
-                        let _ = upload.abort().await;
-                        return Err(BucketError::Io(e));
+    async fn read_op(
+        &self,
+        op: &'static str,
+        name: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<Bytes, BucketError> {
+        let timer = self.timer(op);
+        let result: Result<Bytes, BucketError> = match &self.backend {
+            Backend::S3(b) => {
+                let full = self.full_name(name);
+                let r = match range {
+                    None => b.get(&full).await,
+                    Some((off, len)) => b.get_range(&full, off as i64, len as i64).await,
+                };
+                r.map_err(|e| {
+                    if e.is_obj_not_found() {
+                        BucketError::NotFound(name.to_string())
+                    } else {
+                        BucketError::S3(e)
                     }
+                })
+            }
+            Backend::Store(store) => async {
+                let path = self.object_path(name)?;
+                let res = match range {
+                    None => store.get(&path).await,
+                    Some((off, len)) => {
+                        let opts = GetOptions {
+                            range: Some(GetRange::Bounded(
+                                (off as usize)..((off + len) as usize),
+                            )),
+                            ..Default::default()
+                        };
+                        store.get_opts(&path, opts).await
+                    }
+                };
+                match res {
+                    Ok(res) => Ok(res.bytes().await?),
+                    Err(object_store::Error::NotFound { .. }) => {
+                        Err(BucketError::NotFound(name.to_string()))
+                    }
+                    Err(e) => Err(BucketError::Store(e)),
                 }
             }
-            if filled == 0 {
-                break;
-            }
-            let chunk = Bytes::copy_from_slice(&buf[..filled]);
-            if let Err(e) = upload.put_part(PutPayload::from_bytes(chunk)).await {
-                let _ = upload.abort().await;
-                return Err(BucketError::Store(e));
-            }
+            .await,
+        };
+        if let Some(t) = timer {
+            t.finish_read(result.as_ref().map(|b| b.len() as u64).map_err(|_| ()));
         }
-        upload.complete().await?;
-        Ok(())
+        result
     }
 
     /// Downloads the entire object `name`.
     pub async fn download(&self, name: &str) -> Result<Bytes, BucketError> {
-        let path = self.object_path(name)?;
-        match self.store.get(&path).await {
-            Ok(res) => Ok(res.bytes().await?),
-            Err(object_store::Error::NotFound { .. }) => {
-                Err(BucketError::NotFound(name.to_string()))
-            }
-            Err(e) => Err(BucketError::Store(e)),
-        }
+        self.read_op(metrics::OP_GET, name, None).await
     }
 
     /// Downloads `length` bytes starting at `offset` from object `name`.
@@ -401,73 +474,128 @@ impl BucketClient {
         offset: u64,
         length: u64,
     ) -> Result<Bytes, BucketError> {
-        let path = self.object_path(name)?;
-        let opts = GetOptions {
-            range: Some(GetRange::Bounded((offset as usize)..((offset + length) as usize))),
-            ..Default::default()
-        };
-        match self.store.get_opts(&path, opts).await {
-            Ok(res) => Ok(res.bytes().await?),
-            Err(object_store::Error::NotFound { .. }) => {
-                Err(BucketError::NotFound(name.to_string()))
-            }
-            Err(e) => Err(BucketError::Store(e)),
-        }
+        self.read_op(metrics::OP_GET_RANGE, name, Some((offset, length)))
+            .await
     }
 
     /// Returns `true` if object `name` exists in the bucket.
     pub async fn exists(&self, name: &str) -> Result<bool, BucketError> {
-        let path = self.object_path(name)?;
-        match self.store.head(&path).await {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(BucketError::Store(e)),
+        let timer = self.timer(metrics::OP_EXISTS);
+        let result = match &self.backend {
+            Backend::S3(b) => b.exists(&self.full_name(name)).await.map_err(BucketError::S3),
+            Backend::Store(store) => async {
+                let path = self.object_path(name)?;
+                match store.head(&path).await {
+                    Ok(_) => Ok(true),
+                    Err(object_store::Error::NotFound { .. }) => Ok(false),
+                    Err(e) => Err(BucketError::Store(e)),
+                }
+            }
+            .await,
+        };
+        if let Some(t) = timer {
+            t.finish_simple(result.is_ok());
         }
+        result
+    }
+
+    async fn delete_op(&self, name: &str, strict: bool) -> Result<(), BucketError> {
+        let timer = self.timer(metrics::OP_DELETE);
+        let result = match &self.backend {
+            // S3 DeleteObject succeeds for missing objects (minio-go RemoveObject).
+            Backend::S3(b) => b.delete(&self.full_name(name)).await.map_err(BucketError::S3),
+            Backend::Store(store) => async {
+                let path = self.object_path(name)?;
+                match store.delete(&path).await {
+                    Ok(()) => Ok(()),
+                    Err(object_store::Error::NotFound { .. }) if strict => {
+                        Err(BucketError::NotFound(name.to_string()))
+                    }
+                    Err(object_store::Error::NotFound { .. }) => Ok(()),
+                    Err(e) => Err(BucketError::Store(e)),
+                }
+            }
+            .await,
+        };
+        if let Some(t) = timer {
+            t.finish_simple(result.is_ok());
+        }
+        result
     }
 
     /// Deletes object `name`. Succeeds if the object does not exist (matching objstore semantics
     /// when deleting missing objects or cleaning up).
     pub async fn delete(&self, name: &str) -> Result<(), BucketError> {
-        let path = self.object_path(name)?;
-        match self.store.delete(&path).await {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(BucketError::Store(e)),
-        }
+        self.delete_op(name, false).await
     }
 
     /// Deletes object `name`, returning `BucketError::NotFound` if the object does not exist
     /// (matching Go `objstore.Bucket.Delete` for strict deletion checks such as `DeleteNoCompactMarker`).
     pub async fn delete_strict(&self, name: &str) -> Result<(), BucketError> {
-        let path = self.object_path(name)?;
-        match self.store.delete(&path).await {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => {
-                Err(BucketError::NotFound(name.to_string()))
-            }
-            Err(e) => Err(BucketError::Store(e)),
-        }
+        self.delete_op(name, true).await
     }
 
     /// Returns object metadata attributes (size and last modified unix seconds).
     pub async fn attributes(&self, name: &str) -> Result<ObjectAttributes, BucketError> {
-        let path = self.object_path(name)?;
-        match self.store.head(&path).await {
-            Ok(meta) => Ok(ObjectAttributes {
-                size: meta.size as u64,
-                last_modified_unix_secs: meta.last_modified.timestamp(),
-            }),
-            Err(object_store::Error::NotFound { .. }) => {
-                Err(BucketError::NotFound(name.to_string()))
+        let timer = self.timer(metrics::OP_ATTRIBUTES);
+        let result = match &self.backend {
+            Backend::S3(b) => b
+                .attributes(&self.full_name(name))
+                .await
+                .map(|a| ObjectAttributes {
+                    size: a.size.max(0) as u64,
+                    last_modified_unix_secs: a.last_modified.timestamp(),
+                })
+                .map_err(|e| {
+                    if e.is_obj_not_found() {
+                        BucketError::NotFound(name.to_string())
+                    } else {
+                        BucketError::S3(e)
+                    }
+                }),
+            Backend::Store(store) => async {
+                let path = self.object_path(name)?;
+                match store.head(&path).await {
+                    Ok(meta) => Ok(ObjectAttributes {
+                        size: meta.size as u64,
+                        last_modified_unix_secs: meta.last_modified.timestamp(),
+                    }),
+                    Err(object_store::Error::NotFound { .. }) => {
+                        Err(BucketError::NotFound(name.to_string()))
+                    }
+                    Err(e) => Err(BucketError::Store(e)),
+                }
             }
-            Err(e) => Err(BucketError::Store(e)),
+            .await,
+        };
+        if let Some(t) = timer {
+            t.finish_simple(result.is_ok());
         }
+        result
     }
 
-    /// Non-recursively lists immediate entries under `dir` (matching Thanos `objstore.Bucket.Iter`).
-    /// Subdirectories are returned with a trailing `/` and configured prefixes are stripped.
-    pub async fn iter_dir(&self, dir: &str) -> Result<Vec<String>, BucketError> {
+    async fn iter_op(&self, dir: &str, recursive: bool) -> Result<Vec<String>, BucketError> {
+        let timer = self.timer(metrics::OP_ITER);
+        let result = self.iter_inner(dir, recursive).await;
+        if let Some(t) = timer {
+            t.finish_iter(result.is_ok());
+        }
+        result
+    }
+
+    async fn iter_inner(&self, dir: &str, recursive: bool) -> Result<Vec<String>, BucketError> {
         let full = self.full_name(dir);
+        if let Backend::S3(b) = &self.backend {
+            let entries = b.iter(&full, recursive).await?;
+            return Ok(entries
+                .into_iter()
+                .map(|e| self.strip_prefix(&e))
+                .filter(|e| !e.is_empty())
+                .collect());
+        }
+        let Backend::Store(store) = &self.backend else {
+            unreachable!()
+        };
         let prefix = if full.is_empty() {
             None
         } else {
@@ -476,8 +604,21 @@ impl BucketClient {
                     .map_err(|e| BucketError::InvalidPath(full.clone(), e.to_string()))?,
             )
         };
-
-        let list_res = match self.store.list_with_delimiter(prefix.as_ref()).await {
+        if recursive {
+            let mut stream = store.list(prefix.as_ref());
+            let mut keys = Vec::new();
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(meta)) => keys.push(self.strip_prefix(meta.location.as_ref())),
+                    Ok(None) => break,
+                    Err(object_store::Error::NotFound { .. }) => break,
+                    Err(e) => return Err(BucketError::Store(e)),
+                }
+            }
+            keys.sort();
+            return Ok(keys);
+        }
+        let list_res = match store.list_with_delimiter(prefix.as_ref()).await {
             Ok(res) => res,
             Err(object_store::Error::NotFound { .. }) => return Ok(Vec::new()),
             Err(e) => return Err(BucketError::Store(e)),
@@ -503,38 +644,87 @@ impl BucketClient {
         Ok(entries)
     }
 
-    /// Recursively lists all object keys under `prefix` with configured prefixes stripped.
-    pub async fn list_all(&self, prefix: &str) -> Result<Vec<String>, BucketError> {
-        let full = self.full_name(prefix);
-        let path = if full.is_empty() {
-            None
-        } else {
-            Some(
-                ObjectPath::parse(&full)
-                    .map_err(|e| BucketError::InvalidPath(full.clone(), e.to_string()))?,
-            )
-        };
+    /// Non-recursively lists immediate entries under `dir` (matching Thanos `objstore.Bucket.Iter`).
+    /// Subdirectories are returned with a trailing `/` and configured prefixes are stripped.
+    pub async fn iter_dir(&self, dir: &str) -> Result<Vec<String>, BucketError> {
+        self.iter_op(dir, false).await
+    }
 
-        let mut stream = self.store.list(path.as_ref());
-        let mut keys = Vec::new();
-        while let Some(meta) = stream.try_next().await? {
-            keys.push(self.strip_prefix(meta.location.as_ref()));
-        }
-        keys.sort();
-        Ok(keys)
+    /// Recursively lists all object keys under `prefix` with configured prefixes stripped
+    /// (objstore `Iter` with `WithRecursiveIter()`).
+    pub async fn list_all(&self, prefix: &str) -> Result<Vec<String>, BucketError> {
+        self.iter_op(prefix, true).await
     }
 
     /// Recursively deletes all objects under `prefix` and returns the count of deleted objects.
-    /// Ported from `DeletePrefix` in `pkg/storage/bucket/bucket_util.go`.
-    pub async fn delete_prefix(&self, prefix: &str) -> Result<usize, BucketError> {
-        let keys = self.list_all(prefix).await?;
-        let mut deleted = 0usize;
-        for key in keys {
-            self.delete(&key).await?;
-            deleted += 1;
-        }
-        Ok(deleted)
+    /// Ported from `DeletePrefix` in `pkg/storage/bucket/bucket_util.go` (one non-recursive
+    /// `Iter` per directory level, one `Delete` per object).
+    pub fn delete_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<usize, BucketError>> {
+        Box::pin(async move {
+            let mut deleted = 0usize;
+            for name in self.iter_dir(prefix).await? {
+                if name.ends_with(DIR_DELIM) {
+                    deleted += self.delete_prefix(&name).await?;
+                    continue;
+                }
+                self.delete(&name).await?;
+                deleted += 1;
+            }
+            Ok(deleted)
+        })
     }
+}
+
+/// `object_store` upload of a byte buffer or a file (files above 16 MiB are streamed with a
+/// multipart upload in 8 MiB parts).
+async fn store_upload(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+    source: s3::UploadSource,
+) -> Result<(), BucketError> {
+    const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
+    const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+    let (src_path, len) = match source {
+        s3::UploadSource::Bytes(data) => {
+            store.put(path, PutPayload::from_bytes(data)).await?;
+            return Ok(());
+        }
+        s3::UploadSource::File { path, len } => (path, len),
+    };
+    if len <= MULTIPART_THRESHOLD {
+        let data = tokio::fs::read(&src_path).await?;
+        store.put(path, PutPayload::from_bytes(Bytes::from(data))).await?;
+        return Ok(());
+    }
+    let mut file = tokio::fs::File::open(&src_path).await?;
+    let mut upload = store.put_multipart(path).await?;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    loop {
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]).await {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => {
+                    let _ = upload.abort().await;
+                    return Err(BucketError::Io(e));
+                }
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        let chunk = Bytes::copy_from_slice(&buf[..filled]);
+        if let Err(e) = upload.put_part(PutPayload::from_bytes(chunk)).await {
+            let _ = upload.abort().await;
+            return Err(BucketError::Store(e));
+        }
+    }
+    upload.complete().await?;
+    Ok(())
 }
 
 /// Ported from `TenantDeletionMark` in `pkg/storage/tsdb/tenant_deletion_mark.go`.

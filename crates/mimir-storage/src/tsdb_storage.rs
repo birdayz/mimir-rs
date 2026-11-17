@@ -123,7 +123,7 @@ impl UsersScanner {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(err) => {
-                    warn!(user = %user_id, error = %err, "unable to check if user is owned by this shard");
+                    warn!(user = %user_id, err = %err, "unable to check if user is owned by this shard");
                 }
             }
 
@@ -134,7 +134,7 @@ impl UsersScanner {
                 }
                 Ok(false) => {}
                 Err(err) => {
-                    warn!(user = %user_id, error = %err, "unable to check if user is marked for deletion");
+                    warn!(user = %user_id, err = %err, "unable to check if user is marked for deletion");
                 }
             }
 

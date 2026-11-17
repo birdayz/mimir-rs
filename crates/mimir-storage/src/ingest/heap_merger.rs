@@ -289,7 +289,7 @@ impl HeapMerger {
                 metrics.out_of_order_emits.inc_by(ooo as f64);
             }
             Err(e) => {
-                warn!(error = %e, records = acks.len(), "downstream consumer returned error from merged batch");
+                warn!(err = %e, records = acks.len(), "downstream consumer returned error from merged batch");
             }
         }
         if let Some(start) = batch_start.take() {

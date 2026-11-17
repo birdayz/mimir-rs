@@ -79,6 +79,12 @@ func main() {
 		out, err = cmdGenTestPKI(input)
 	case "kafka-produce":
 		out, err = cmdKafkaProduce(input)
+	case "net-addr-detect":
+		out, err = cmdNetAddrDetect(input)
+	case "go-sort":
+		out, err = cmdGoSort(input)
+	case "tsdb-open-report":
+		out, err = cmdTSDBOpenReport(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}

@@ -241,16 +241,17 @@ impl Ingester {
         runtime_cfg: Option<Arc<RuntimeConfigManager>>,
         registry: Option<&Registry>,
     ) -> Result<Arc<Self>, IngesterError> {
-        let bucket = match BucketClient::from_config(&blocks_cfg.bucket) {
+        // Go newIngester: the bucket client is always created (whatever ship_interval is) and
+        // a construction error fails the ingester.
+        if blocks_cfg.bucket.backend_cfg.backend == "filesystem" {
+            warn!("-blocks-storage.backend=filesystem is for development and testing only; you should switch to an external object store for production use or use a shared filesystem");
+        }
+        let bucket = match BucketClient::new_client(&blocks_cfg.bucket, "ingester", registry) {
             Ok(b) => Some(Arc::new(b)),
             Err(e) => {
-                if blocks_cfg.tsdb.ship_interval.0 > 0 {
-                    return Err(IngesterError::Internal {
-                        message: format!("failed to create bucket client: {e}"),
-                    });
-                }
-                warn!(error = %e, "bucket client unavailable (shipping disabled)");
-                None
+                return Err(IngesterError::Internal {
+                    message: format!("failed to create the bucket client: {e}"),
+                });
             }
         };
 

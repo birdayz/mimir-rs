@@ -8,6 +8,7 @@
 pub mod http;
 pub mod model;
 pub mod replication_strategy;
+pub mod util;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -17,12 +18,14 @@ use mimir_common::services::{basic_service, ManagedBasicService, ServiceContext,
 use mimir_config::ingester::RingConfig;
 use mimir_proto::ringpb::{Desc, InstanceDesc, InstanceState};
 use parking_lot::RwLock;
-use prometheus::{Gauge, GaugeVec, Opts, Registry};
+use prometheus::{Gauge, GaugeVec, Opts};
 use thiserror::Error;
 use tracing::info;
 
 use crate::kv::memberlist::MemberlistKv;
-use crate::kv::{build_kv_client_with_kv_name, KvClient, KvError};
+use crate::kv::{
+    build_kv_client, registerer_with_kv_name, AsRegisterer, KvClient, KvError, Registerer,
+};
 use crate::prng::{shuffle_shard_expected_instances_per_zone, shuffle_shard_seed, GoRand};
 use crate::token_gen::search_token;
 
@@ -154,7 +157,7 @@ struct RingMetrics {
 }
 
 impl RingMetrics {
-    fn new(name: &str, reg: Option<&Registry>) -> Self {
+    fn new(name: &str, reg: Option<&Registerer>) -> Self {
         let mut const_labels = HashMap::new();
         const_labels.insert("name".to_string(), name.to_string());
 
@@ -215,20 +218,25 @@ pub struct Ring {
 }
 
 impl Ring {
-    /// Creates a new [`Ring`] backed by KV store from `RingConfig`.
-    pub fn new(
+    /// Creates a new [`Ring`] backed by KV store from `RingConfig` (Go `ring.New`).
+    /// The KV client registers its metrics through `reg` with
+    /// `kv_name="<name>-ring"` like dskit; the ring's own metrics
+    /// (`ring_members`, ...) are registered through `reg` too, so they carry
+    /// its prefix (Mimir: `cortex_`).
+    pub fn new<R: AsRegisterer + ?Sized>(
         cfg: &RingConfig,
         name: &str,
         key: &str,
         memberlist_kv: Option<Arc<MemberlistKv>>,
-        reg: Option<&Registry>,
+        reg: Option<&R>,
     ) -> Result<Arc<Self>, RingError> {
-        let store = build_kv_client_with_kv_name(
+        let registerer = reg.map(|r| r.as_registerer());
+        let kv_reg = registerer_with_kv_name(registerer.as_ref(), &format!("{name}-ring"));
+        let store = build_kv_client(
             &cfg.kvstore,
             ring_desc_codec(),
             memberlist_kv,
-            reg,
-            &format!("{name}-ring"),
+            kv_reg.as_ref(),
         )?;
         Self::with_store_and_strategy(
             RingSettings::from(cfg),
@@ -236,7 +244,7 @@ impl Ring {
             key,
             store,
             Arc::new(DefaultReplicationStrategy),
-            reg,
+            registerer.as_ref().map(|r| r as &dyn AsRegisterer),
         )
     }
 
@@ -246,8 +254,9 @@ impl Ring {
         key: &str,
         store: Arc<dyn KvClient>,
         strategy: Arc<dyn ReplicationStrategy>,
-        reg: Option<&Registry>,
+        reg: Option<&dyn AsRegisterer>,
     ) -> Result<Arc<Self>, RingError> {
+        let reg = reg.map(|r| r.as_registerer());
         if settings.replication_factor == 0 {
             return Err(RingError::InvalidConfig(
                 "ReplicationFactor must be greater than zero".to_string(),
@@ -277,7 +286,7 @@ impl Ring {
                 shuffled_subring_cache: HashMap::new(),
                 shuffled_subring_with_lookback_cache: HashMap::new(),
             }),
-            metrics: Some(RingMetrics::new(name, reg)),
+            metrics: Some(RingMetrics::new(name, reg.as_ref())),
         }))
     }
 
@@ -340,7 +349,7 @@ impl Ring {
                                 r.update_ring_state(*desc);
                             }
                         } else {
-                            info!(key = %r.key, "ring doesn't exist in KV store yet");
+                            info!("ring doesn't exist in KV store yet");
                         }
                     }
                     Ok(())

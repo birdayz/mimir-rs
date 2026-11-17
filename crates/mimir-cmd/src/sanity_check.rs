@@ -246,7 +246,8 @@ fn read_compartment_config(cfg: &BucketConfig, read_compartment_id: i64) -> Buck
 /// `checkObjectStoreConfig`: reads an object we don't expect to exist, just to check that the
 /// object storage replies with the expected "not found" error.
 pub async fn check_object_store_config(cfg: &BucketConfig) -> Result<(), String> {
-    let client = BucketClient::from_config(cfg).map_err(|e| format!("{ERR_OBJECT_STORAGE}: {e}"))?;
+    let client = BucketClient::new_client(cfg, "sanity-check", None)
+        .map_err(|e| format!("{ERR_OBJECT_STORAGE}: {e}"))?;
     match tokio::time::timeout(OBJECT_STORE_CHECK_TIMEOUT, client.download("sanity-check-at-startup"))
         .await
     {

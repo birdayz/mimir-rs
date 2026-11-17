@@ -13,13 +13,13 @@ use mimir_common::services::{basic_service, ManagedBasicService, ServiceContext,
 use mimir_config::ingester::PartitionRingConfig;
 use mimir_proto::ringpb::{OwnerState, PartitionRingDesc, PartitionState};
 use parking_lot::Mutex;
-use prometheus::{CounterVec, Opts, Registry};
+use prometheus::{CounterVec, Opts};
 use tracing::{info, warn};
 
 use super::model::{
     clean_partition_state_name, PartitionDescExt, PartitionRingDescExt, PartitionRingError,
 };
-use crate::kv::{CasCallbackError, CasOutcome, KvClient, KvError};
+use crate::kv::{AsRegisterer, CasCallbackError, CasOutcome, KvClient, KvError, Registerer};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionInstanceLifecyclerConfig {
@@ -115,7 +115,7 @@ struct LifecyclerMetrics {
 }
 
 impl LifecyclerMetrics {
-    fn new(ring_name: &str, reg: Option<&Registry>) -> Self {
+    fn new(ring_name: &str, reg: Option<&Registerer>) -> Self {
         let mut labels = HashMap::new();
         labels.insert("name".to_string(), ring_name.to_string());
         let reconciles_total = CounterVec::new(
@@ -165,8 +165,9 @@ impl PartitionInstanceLifecycler {
         ring_name: &str,
         ring_key: &str,
         store: Arc<dyn KvClient>,
-        reg: Option<&Registry>,
+        reg: Option<&dyn AsRegisterer>,
     ) -> Result<Arc<Self>, PartitionRingError> {
+        let reg = reg.map(|r| r.as_registerer());
         if cfg.partition_id < 0 {
             return Err(PartitionRingError::Other(format!(
                 "invalid partition ID {}: must not be negative",
@@ -193,7 +194,7 @@ impl PartitionInstanceLifecycler {
             create_partition_on_startup: AtomicBool::new(true),
             remove_owner_on_shutdown: AtomicBool::new(false),
             started: AtomicBool::new(false),
-            metrics: LifecyclerMetrics::new(ring_name, reg),
+            metrics: LifecyclerMetrics::new(ring_name, reg.as_ref()),
         }))
     }
 

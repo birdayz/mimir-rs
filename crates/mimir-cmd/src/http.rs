@@ -11,6 +11,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use mimir_common::logging::format_rfc3339_nano_utc;
+use mimir_common::services::State;
 use mimir_common::tenant::extract_tenant_id_from_http_headers;
 use mimir_config::{LimitsConfig, MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::{ingester_router, Ingester};
@@ -176,14 +177,16 @@ struct StatusPageContents {
 }
 
 async fn services_handler(AxumState(st): AxumState<AppHttpState>, headers: HeaderMap) -> Response {
-    // `servicesHandler`: every module service of `Mimir.ServiceMap` with its current state.
+    // `servicesHandler`: every module service of `Mimir.ServiceMap` with its current state. The
+    // service manager starts every module at once (each waits for its dependencies while
+    // Starting), so a module not started yet is reported as Starting.
     let svcs: Vec<RenderService> = st
         .modules
         .snapshot()
         .into_iter()
         .map(|(name, state)| RenderService {
             name,
-            status: state.to_string(),
+            status: if state == State::New { State::Starting } else { state }.to_string(),
         })
         .collect();
 

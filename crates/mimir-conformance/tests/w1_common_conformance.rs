@@ -677,7 +677,8 @@ fn errors_and_logging_conformance() {
     );
     assert_eq!(
         format_logfmt_line(&[("level", "info"), ("msg", "hello world"), ("empty", "")]),
-        "level=info msg=\"hello world\" empty=\"\"\n"
+        // go-logfmt writes empty string values unquoted (`cluster_label= node=x` in Go logs).
+        "level=info msg=\"hello world\" empty=\n"
     );
     let jline = format_json_line(&[("level", "error"), ("msg", "failed")]);
     let jval: serde_json::Value = serde_json::from_str(jline.trim()).unwrap();

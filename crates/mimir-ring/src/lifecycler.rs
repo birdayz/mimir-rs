@@ -7,7 +7,7 @@
 //! - github.com/grafana/dskit/ring/lifecycler.go
 //! - github.com/grafana/dskit/ring/lifecycler_metrics.go
 //! - github.com/grafana/dskit/ring/flush.go
-//! - github.com/grafana/dskit/ring/util.go (`GetInstanceAddr`, via `crate::netutil`)
+//! - github.com/grafana/dskit/ring/util.go (`GetInstanceAddr`, via `crate::ring::util`)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,16 +19,20 @@ use mimir_common::services::{basic_service, ManagedBasicService, ServiceContext,
 use mimir_config::ingester::RingConfig;
 use mimir_proto::ringpb::{Desc, InstanceDesc, InstanceState};
 use parking_lot::{Mutex, RwLock};
-use prometheus::{Counter, Gauge, HistogramOpts, HistogramVec, Opts, Registry};
+use prometheus::{Counter, Gauge, HistogramOpts, HistogramVec, Opts};
 use rand::seq::SliceRandom;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::kv::memberlist::MemberlistKv;
-use crate::kv::{build_kv_client_with_kv_name, BoxFuture, CasCallbackError, CasOutcome, KvClient, KvError};
+use crate::kv::{
+    build_kv_client, registerer_with_kv_name, AsRegisterer, BoxFuture, CasCallbackError,
+    CasOutcome, KvClient, KvError, Registerer,
+};
 use crate::ring::model::{ring_desc_codec, system_time_to_unix_secs, DescExt, InstanceDescExt};
 use crate::ring::replication_strategy::WRITE;
+use crate::ring::util::{get_instance_addr, get_instance_port, join_host_port};
 use crate::token_gen::{
     load_tokens_from_file, store_tokens_to_file, RandomTokenGenerator,
     SpreadMinimizingTokenGenerator, TokenGenerator,
@@ -114,33 +118,22 @@ pub struct BasicLifecyclerConfig {
     pub versions: HashMap<u64, u64>,
 }
 
-/// `instance_addr`, else the first usable address of `instance_interface_names` (dskit
-/// `ring.GetInstanceAddr`). Never falls back to loopback, which peers can't dial.
-fn instance_addr(cfg: &RingConfig) -> Result<String, LifecyclerError> {
-    crate::netutil::get_instance_addr(
-        &cfg.instance_addr,
-        &cfg.instance_interface_names,
-        cfg.instance_enable_ipv6,
-    )
-    .map_err(|e| LifecyclerError::InvalidConfig(format!("failed to get instance address: {e}")))
-}
-
 impl BasicLifecyclerConfig {
     pub fn from_ring_config_tokenless(
         cfg: &RingConfig,
         listen_port: u16,
     ) -> Result<Self, LifecyclerError> {
-        let host = instance_addr(cfg)?;
-        let port = if cfg.instance_port > 0 {
-            cfg.instance_port as u16
-        } else {
-            listen_port
-        };
-        let addr = if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
+        // pkg/ingester/ingester_ring.go ToTokenlessBasicLifecyclerConfig: the address is
+        // auto-detected from the configured interfaces when not set; failing to find one is a
+        // startup error (never fall back to loopback).
+        let host = get_instance_addr(
+            &cfg.instance_addr,
+            &cfg.instance_interface_names,
+            cfg.instance_enable_ipv6,
+        )
+        .map_err(|e| LifecyclerError::Other(e.to_string()))?;
+        let port = get_instance_port(cfg.instance_port, i64::from(listen_port));
+        let addr = join_host_port(&host, &port.to_string());
 
         Ok(Self {
             id: cfg.instance_id.clone(),
@@ -165,7 +158,7 @@ struct BasicLifecyclerMetrics {
 }
 
 impl BasicLifecyclerMetrics {
-    fn new(ring_name: &str, reg: Option<&Registry>) -> Self {
+    fn new(ring_name: &str, reg: Option<&Registerer>) -> Self {
         let mut labels = HashMap::new();
         labels.insert("name".to_string(), ring_name.to_string());
 
@@ -231,13 +224,14 @@ impl BasicLifecycler {
         ring_key: &str,
         store: Arc<dyn KvClient>,
         delegate: Arc<dyn BasicLifecyclerDelegate>,
-        reg: Option<&Registry>,
+        reg: Option<&dyn AsRegisterer>,
     ) -> Arc<Self> {
+        let reg = reg.map(|r| r.as_registerer());
         let token_generator = cfg
             .token_generator
             .clone()
             .unwrap_or_else(|| Arc::new(RandomTokenGenerator::new()));
-        let metrics = BasicLifecyclerMetrics::new(ring_name, reg);
+        let metrics = BasicLifecyclerMetrics::new(ring_name, reg.as_ref());
         metrics.tokens_to_own.set(cfg.num_tokens as f64);
 
         Arc::new(Self {
@@ -910,12 +904,16 @@ pub struct LifecyclerConfig {
 
 impl LifecyclerConfig {
     pub fn from_ring_config(cfg: &RingConfig, listen_port: u16) -> Result<Self, LifecyclerError> {
-        let addr = instance_addr(cfg)?;
-        let port = if cfg.instance_port > 0 {
-            cfg.instance_port as u16
-        } else {
-            listen_port
-        };
+        // dskit ring.NewLifecycler: GetInstanceAddr(cfg.Addr, cfg.InfNames, logger,
+        // cfg.EnableInet6) (ToLifecyclerConfig sets InfNames = InstanceInterfaceNames).
+        // Failing to find an address is a startup error (never fall back to loopback).
+        let addr = get_instance_addr(
+            &cfg.instance_addr,
+            &cfg.instance_interface_names,
+            cfg.instance_enable_ipv6,
+        )
+        .map_err(|e| LifecyclerError::Other(e.to_string()))?;
+        let port = get_instance_port(cfg.instance_port, i64::from(listen_port)) as u16;
 
         let token_generator: Arc<dyn TokenGenerator> =
             if cfg.token_generation_strategy == "spread-minimizing" {
@@ -960,7 +958,7 @@ struct LifecyclerMetrics {
 }
 
 impl LifecyclerMetrics {
-    fn new(ring_name: &str, reg: Option<&Registry>) -> Self {
+    fn new(ring_name: &str, reg: Option<&Registerer>) -> Self {
         let mut labels = HashMap::new();
         labels.insert("name".to_string(), ring_name.to_string());
 
@@ -1051,8 +1049,12 @@ pub struct Lifecycler {
 }
 
 impl Lifecycler {
+    /// Go `ring.NewLifecycler`. `reg` is the Go registerer (Mimir's ingester
+    /// passes `cortex_`-prefixed); the KV client registers its metrics with
+    /// `kv_name="<ring_name>-lifecycler"` like dskit. The lifecycler's own
+    /// metrics are registered through `reg` too (and thus carry its prefix).
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new<R: AsRegisterer + ?Sized>(
         ring_cfg: &RingConfig,
         listen_port: u16,
         flush_transferer: Option<Arc<dyn FlushTransferer>>,
@@ -1060,15 +1062,16 @@ impl Lifecycler {
         ring_key: &str,
         flush_on_shutdown: bool,
         memberlist_kv: Option<Arc<MemberlistKv>>,
-        reg: Option<&Registry>,
+        reg: Option<&R>,
     ) -> Result<Arc<Self>, LifecyclerError> {
-        // Suffix all client names with "-lifecycler" to denote this kv client is used by the lifecycler.
-        let store = build_kv_client_with_kv_name(
+        let registerer = reg.map(|r| r.as_registerer());
+        let kv_reg =
+            registerer_with_kv_name(registerer.as_ref(), &format!("{ring_name}-lifecycler"));
+        let store = build_kv_client(
             &ring_cfg.kvstore,
             ring_desc_codec(),
             memberlist_kv,
-            reg,
-            &format!("{ring_name}-lifecycler"),
+            kv_reg.as_ref(),
         )?;
         let cfg = LifecyclerConfig::from_ring_config(ring_cfg, listen_port)?;
         Ok(Self::with_store(
@@ -1078,7 +1081,7 @@ impl Lifecycler {
             ring_name,
             ring_key,
             flush_on_shutdown,
-            reg,
+            registerer.as_ref().map(|r| r as &dyn AsRegisterer),
         ))
     }
 
@@ -1089,13 +1092,11 @@ impl Lifecycler {
         ring_name: &str,
         ring_key: &str,
         flush_on_shutdown: bool,
-        reg: Option<&Registry>,
+        reg: Option<&dyn AsRegisterer>,
     ) -> Arc<Self> {
-        let full_addr = if cfg.addr.contains(':') {
-            cfg.addr.clone()
-        } else {
-            format!("{}:{}", cfg.addr, cfg.port)
-        };
+        let reg = reg.map(|r| r.as_registerer());
+        // net.JoinHostPort(addr, strconv.Itoa(port)).
+        let full_addr = join_host_port(&cfg.addr, &cfg.port.to_string());
         let token_generator = cfg
             .token_generator
             .clone()
@@ -1132,7 +1133,7 @@ impl Lifecycler {
             }),
             token_generator,
             can_join_timeout: Duration::from_secs(5 * 60),
-            metrics: LifecyclerMetrics::new(ring_name, reg),
+            metrics: LifecyclerMetrics::new(ring_name, reg.as_ref()),
             cfg,
             flush_transferer: RwLock::new(
                 flush_transferer.unwrap_or_else(|| Arc::new(NoopFlushTransferer)),
@@ -1306,7 +1307,12 @@ impl Lifecycler {
                 to: target,
             });
         }
-        info!(ring = %self.ring_name, ?curr, ?target, "changing instance state");
+        info!(
+            old_state = curr.as_str_name(),
+            new_state = target.as_str_name(),
+            ring = %self.ring_name,
+            "changing instance state from"
+        );
         self.state.write().state = target;
         self.update_consul().await
     }
@@ -1316,7 +1322,7 @@ impl Lifecycler {
         if prev == read_only {
             return Ok(());
         }
-        info!(ring = %self.ring_name, read_only, "changing read-only state of instance");
+        info!(readOnly = read_only, ring = %self.ring_name, "changing read-only state of instance in the ring");
         self.set_read_only_internal(read_only, Some(SystemTime::now()));
         self.update_consul().await
     }
@@ -1375,9 +1381,11 @@ impl Lifecycler {
                 }
             }
         } else {
+            info!("not loading tokens from file, tokens file path is empty");
             Vec::new()
         };
 
+        let ring_name = self.ring_name.clone();
         let id = self.id.clone();
         let addr = self.addr.clone();
         let zone = self.zone.clone();
@@ -1412,17 +1420,39 @@ impl Lifecycler {
                         *pro_cb.lock() = (ro, ro_ts);
 
                         if inst.instance_state() == InstanceState::Joining {
+                            warn!(ring = %ring_name, "instance found in ring as JOINING, setting to PENDING");
                             inst.state = InstanceState::Pending as i32;
                             ring_desc.ingesters.insert(id.clone(), inst);
                         } else {
                             let mut toks = inst.tokens.clone();
+                            info!(
+                                state = inst.instance_state().as_str_name(),
+                                tokens = toks.len(),
+                                ring = %ring_name,
+                                readOnly = ro,
+                                readOnlyStateUpdate = %ro_ts.map_or_else(
+                                    || "0001-01-01T00:00:00Z".to_string(),
+                                    mimir_common::logging::format_rfc3339_nano_utc,
+                                ),
+                                "existing instance found in ring"
+                            );
                             if inst.instance_state() == InstanceState::Leaving {
                                 if toks.len() < num_tokens {
+                                    info!(
+                                        current_tokens = toks.len(),
+                                        desired_tokens = num_tokens,
+                                        "existing instance has too few tokens, adding difference"
+                                    );
                                     let new_toks = token_generator
                                         .generate_tokens(num_tokens - toks.len(), &ring_desc.get_tokens());
                                     toks.extend(new_toks);
                                     toks.sort_unstable();
                                 } else if toks.len() > num_tokens {
+                                    info!(
+                                        current_tokens = toks.len(),
+                                        desired_tokens = num_tokens,
+                                        "existing instance has too many tokens, removing difference"
+                                    );
                                     toks.shuffle(&mut rand::thread_rng());
                                     toks.truncate(num_tokens);
                                     toks.sort_unstable();
@@ -1451,6 +1481,7 @@ impl Lifecycler {
                         *pro_cb.lock() = (false, None);
 
                         if !tokens_from_file.is_empty() {
+                            info!(num_tokens = tokens_from_file.len(), "adding tokens from file");
                             let st = if tokens_from_file.len() >= num_tokens {
                                 InstanceState::Active
                             } else {
@@ -1470,6 +1501,7 @@ impl Lifecycler {
                             );
                             *pt_cb.lock() = Some(tokens_from_file.clone());
                         } else {
+                            info!(ring = %ring_name, "instance not found in ring, adding with no tokens");
                             let st = *ps_cb.lock();
                             ring_desc.add_ingester(
                                 &id,
@@ -1766,7 +1798,7 @@ impl Lifecycler {
                 info!("transfers are disabled");
             }
             Err(err) => {
-                error!(ring = %self.ring_name, %err, "failed to transfer chunks");
+                error!(ring = %self.ring_name, %err, "failed to transfer chunks to another instance");
                 self.metrics
                     .shutdown_duration
                     .with_label_values(&["transfer", "fail"])
@@ -1783,8 +1815,12 @@ impl Lifecycler {
                 .observe(f_start.elapsed().as_secs_f64());
         }
 
-        // Sleep so the shutdownDuration metric can be collected.
-        info!(final_sleep = ?self.cfg.final_sleep, "lifecycler entering final sleep before shutdown");
+        info!(
+            final_sleep = %mimir_config::format_go_duration(
+                self.cfg.final_sleep.as_nanos().min(i64::MAX as u128) as i64
+            ),
+            "lifecycler entering final sleep before shutdown"
+        );
         if !self.cfg.final_sleep.is_zero() {
             tokio::time::sleep(self.cfg.final_sleep).await;
         }
@@ -1817,14 +1853,20 @@ impl Lifecycler {
 
                     loop {
                         tokio::select! {
-                            _ = ctx.canceled() => break,
+                            _ = ctx.canceled() => {
+                                info!(ring = %l.ring_name, "lifecycler loop() exited gracefully");
+                                break;
+                            }
                             _ = tokio::time::sleep_until(join_deadline), if !join_fired => {
                                 join_fired = true;
+                                debug!(ring = %l.ring_name, "JoinAfter expired");
                                 if l.get_state() == InstanceState::Pending {
+                                    info!(ring = %l.ring_name, "auto-joining cluster after timeout");
                                     if !l.cfg.observe_period.is_zero() {
                                         l.auto_join(&ctx, InstanceState::Joining).await.map_err(|e| {
                                             ServiceError::failure(format!("failed to pick tokens: {e}"))
                                         })?;
+                                        info!(ring = %l.ring_name, "observing tokens before going ACTIVE");
                                         observe_deadline = Some(tokio::time::Instant::now() + l.cfg.observe_period);
                                     } else {
                                         l.auto_join(&ctx, InstanceState::Active).await.map_err(|e| {
@@ -1841,18 +1883,24 @@ impl Lifecycler {
                                 }
                             }, if observe_deadline.is_some() => {
                                 observe_deadline = None;
+                                let s = l.get_state();
+                                if s != InstanceState::Joining {
+                                    error!(state = s.as_str_name(), ring = %l.ring_name, "unexpected state while observing tokens");
+                                }
                                 if l.verify_tokens().await {
+                                    info!(ring = %l.ring_name, "token verification successful");
                                     if let Err(err) = l.change_state(InstanceState::Active).await {
                                         error!(ring = %l.ring_name, %err, "failed to set state to ACTIVE");
                                     }
                                 } else {
+                                    info!(ring = %l.ring_name, "token verification failed, observing");
                                     observe_deadline = Some(tokio::time::Instant::now() + l.cfg.observe_period);
                                 }
                             }
                             _ = hb_interval.tick(), if !hb_period.is_zero() => {
                                 l.metrics.consul_heartbeats.inc();
                                 if let Err(err) = l.update_consul().await {
-                                    error!(ring = %l.ring_name, %err, "failed to write heartbeat to KV store");
+                                    error!(ring = %l.ring_name, %err, "failed to write to the KV store, sleeping");
                                 }
                             }
                         }
@@ -1892,10 +1940,14 @@ impl Lifecycler {
                         l.unregister()
                             .await
                             .map_err(|e| ServiceError::failure(format!("unregister failed: {e}")))?;
+                        info!(ring = %l.ring_name, "instance removed from the KV store");
                     }
 
-                    if !l.cfg.tokens_file_path.is_empty() && l.clear_tokens_on_shutdown() {
-                        let _ = std::fs::remove_file(&l.cfg.tokens_file_path);
+                    if !l.cfg.tokens_file_path.is_empty()
+                        && l.clear_tokens_on_shutdown()
+                        && std::fs::remove_file(&l.cfg.tokens_file_path).is_ok()
+                    {
+                        info!(path = %l.cfg.tokens_file_path, "removed tokens file from disk");
                     }
                     Ok(())
                 })
@@ -1908,3 +1960,80 @@ impl Lifecycler {
 /// Unused helper placeholder kept private to satisfy channel signature if needed later.
 #[allow(dead_code)]
 async fn _unused_oneshot_helper(_tx: oneshot::Sender<()>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv::inmemory::InMemoryKv;
+
+    fn lifecycler_addr(cfg: &RingConfig, listen_port: u16) -> Result<String, LifecyclerError> {
+        let lc_cfg = LifecyclerConfig::from_ring_config(cfg, listen_port)?;
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(ring_desc_codec()));
+        Ok(Lifecycler::with_store(lc_cfg, kv, None, "ingester", "ring", false, None)
+            .addr
+            .clone())
+    }
+
+    /// dskit `NewLifecycler` / mimir `ToTokenlessBasicLifecyclerConfig` register
+    /// `net.JoinHostPort(addr, port)`: IPv6 hosts are bracketed and always get the port.
+    #[test]
+    fn instance_addr_uses_join_host_port() {
+        for (addr, port, listen, want) in [
+            ("1.2.3.4", 0, 9095, "1.2.3.4:9095"),
+            ("1.2.3.4", 1111, 9095, "1.2.3.4:1111"),
+            ("fc99::9a", 0, 9095, "[fc99::9a]:9095"),
+            ("2001:db8::1", 1111, 9095, "[2001:db8::1]:1111"),
+            ("ingester-0.ingester.svc", 0, 9095, "ingester-0.ingester.svc:9095"),
+        ] {
+            let cfg = RingConfig {
+                instance_addr: addr.to_string(),
+                instance_port: port,
+                ..Default::default()
+            };
+            assert_eq!(lifecycler_addr(&cfg, listen).unwrap(), want, "classic {addr}");
+            let basic = BasicLifecyclerConfig::from_ring_config_tokenless(&cfg, listen).unwrap();
+            assert_eq!(basic.addr, want, "tokenless {addr}");
+        }
+    }
+
+    /// No instance_addr and no usable interface: Go fails `NewLifecycler` /
+    /// `ToTokenlessBasicLifecyclerConfig` with the netutil error; never registers 127.0.0.1.
+    #[test]
+    fn missing_interface_is_a_startup_error() {
+        let cfg = RingConfig {
+            instance_addr: String::new(),
+            instance_interface_names: vec!["mimir-no-such-if0".to_string()],
+            ..Default::default()
+        };
+        let want = "no useable address found for interfaces [mimir-no-such-if0]";
+        let err = LifecyclerConfig::from_ring_config(&cfg, 9095).err().expect("must fail");
+        assert_eq!(err.to_string(), want);
+        let err = BasicLifecyclerConfig::from_ring_config_tokenless(&cfg, 9095)
+            .err()
+            .expect("must fail");
+        assert_eq!(err.to_string(), want);
+    }
+
+    /// Without instance_addr the address is auto-detected from the interfaces (never loopback).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_detected_addr_is_never_loopback() {
+        let cfg = RingConfig {
+            instance_addr: String::new(),
+            instance_interface_names: vec!["lo".to_string()],
+            ..Default::default()
+        };
+        // `lo` only has loopback addresses, which filterBestIP never selects.
+        let err = LifecyclerConfig::from_ring_config(&cfg, 9095).err().expect("must fail");
+        assert_eq!(err.to_string(), "no useable address found for interfaces [lo]");
+
+        let cfg = RingConfig { instance_addr: String::new(), ..Default::default() };
+        if let Ok(expected) = mimir_common::netutil::get_first_address_of(
+            &cfg.instance_interface_names,
+            false,
+        ) {
+            assert_eq!(lifecycler_addr(&cfg, 9095).unwrap(), format!("{expected}:9095"));
+            assert!(!expected.starts_with("127."));
+        }
+    }
+}

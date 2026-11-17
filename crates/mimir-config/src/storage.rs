@@ -114,17 +114,16 @@ impl S3SSEConfig {
                 "unsupported S3 SSE type".to_string(),
             ));
         }
-        if !self.kms_encryption_context.is_empty() {
-            let parsed: Result<serde_json::Value, _> =
-                serde_json::from_str(&self.kms_encryption_context);
-            match parsed {
-                Ok(serde_json::Value::Object(_)) => {}
-                _ => {
-                    return Err(ConfigError::Validation(
-                        "invalid S3 SSE encryption context".to_string(),
-                    ));
-                }
-            }
+        // parseKMSEncryptionContext: json.Unmarshal into map[string]string ("null" is valid).
+        if !self.kms_encryption_context.is_empty()
+            && serde_json::from_str::<Option<std::collections::BTreeMap<String, String>>>(
+                &self.kms_encryption_context,
+            )
+            .is_err()
+        {
+            return Err(ConfigError::Validation(
+                "invalid S3 SSE encryption context".to_string(),
+            ));
         }
         Ok(())
     }
@@ -134,6 +133,40 @@ impl S3SSEConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct S3TraceConfig {
     pub enabled: bool,
+}
+
+/// aws-sdk-go-v2 `types.StorageClass.Values()` (Mimir `supportedStorageClasses`).
+pub const S3_SUPPORTED_STORAGE_CLASSES: &[&str] = &[
+    "STANDARD",
+    "REDUCED_REDUNDANCY",
+    "STANDARD_IA",
+    "ONEZONE_IA",
+    "INTELLIGENT_TIERING",
+    "GLACIER",
+    "DEEP_ARCHIVE",
+    "OUTPOSTS",
+    "GLACIER_IR",
+    "SNOW",
+    "EXPRESS_ONEZONE",
+    "FSX_OPENZFS",
+    "FSX_ONTAP",
+];
+
+/// Mimir `util.IsValidURL`: `url.Parse` succeeds with a non-empty scheme and host.
+fn is_valid_url(endpoint: &str) -> bool {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    let scheme_ok = scheme
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    scheme_ok && !host.is_empty() && !host.contains(' ')
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,7 +264,32 @@ impl S3Config {
                 ));
             }
         }
+        if !self.sts_endpoint.is_empty() && !is_valid_url(&self.sts_endpoint) {
+            return Err(ConfigError::Validation(
+                "sts-endpoint must be a valid url".to_string(),
+            ));
+        }
+        if !self.storage_class.is_empty()
+            && !S3_SUPPORTED_STORAGE_CLASSES.contains(&self.storage_class.as_str())
+        {
+            return Err(ConfigError::Validation(format!(
+                "unsupported S3 storage class (supported values: {})",
+                S3_SUPPORTED_STORAGE_CLASSES.join(", ")
+            )));
+        }
         self.sse.validate()
+    }
+
+    /// See [`StorageBackendConfig::validate_mimir_rs_support`]. The S3 client is built without
+    /// HTTP/2 support, so `http.force_attempt_http2: true` cannot be honoured.
+    pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        if self.http.force_attempt_http2 {
+            return Err(ConfigError::Validation(
+                "http.force_attempt_http2 is not supported by mimir-rs for the s3 backend"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -271,6 +329,38 @@ impl GCSConfig {
         f.bool_var(&format!("{prefix}gcs.enable-upload-retries"), self.enable_upload_retries, "Enable automatic retries for GCS uploads.", move |t| &get(t).enable_upload_retries, move |t| &mut get_mut(t).enable_upload_retries);
         f.i64_var(&format!("{prefix}gcs.max-retries"), self.max_retries, "Maximum number of attempts for GCS operations.", move |t| &get(t).max_retries, move |t| &mut get_mut(t).max_retries);
         self.http.register_flags_into(&format!("{prefix}gcs."), f, move |t| &get(t).http, move |t| &mut get_mut(t).http);
+    }
+
+    /// See [`StorageBackendConfig::validate_mimir_rs_support`].
+    ///
+    /// Rejects `http.*` settings object_store 0.11 cannot honour and `service_account` JSON
+    /// credential types mimir-rs cannot use (Go `google.CredentialsFromJSON` also accepts
+    /// `external_account`, `external_account_authorized_user`, `impersonated_service_account`,
+    /// `gdch_service_account` and OAuth client JSON). Malformed JSON is left to bucket client
+    /// construction, which fails like Go.
+    pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        validate_bucket_http_mimir_rs_support(&self.http, "gcs")?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&self.service_account) {
+            let kind = if v.get("web").is_some() || v.get("installed").is_some() {
+                Some("OAuth client (client_credentials.json \"web\"/\"installed\")".to_string())
+            } else {
+                match v.get("type").and_then(|t| t.as_str()) {
+                    Some(
+                        t @ ("external_account"
+                        | "external_account_authorized_user"
+                        | "impersonated_service_account"
+                        | "gdch_service_account"),
+                    ) => Some(format!("{t:?}")),
+                    _ => None,
+                }
+            };
+            if let Some(kind) = kind {
+                return Err(ConfigError::Validation(format!(
+                    "gcs.service_account: GCS credential type {kind} is not supported by mimir-rs for the gcs backend"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -321,6 +411,37 @@ impl AzureConfig {
         f.string_var(&format!("{prefix}azure.user-assigned-id"), &self.user_assigned_id, "User assigned managed identity.", move |t| &get(t).user_assigned_id, move |t| &mut get_mut(t).user_assigned_id);
         self.http.register_flags_into(&format!("{prefix}azure."), f, move |t| &get(t).http, move |t| &mut get_mut(t).http);
     }
+
+    /// See [`StorageBackendConfig::validate_mimir_rs_support`].
+    pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        validate_bucket_http_mimir_rs_support(&self.http, "azure")
+    }
+}
+
+/// Rejects bucket `http.*` settings that the object_store 0.11 HTTP client used by mimir-rs for
+/// the azure/gcs backends cannot honour (Go thanos `exthttp.DefaultTransport` supports them).
+fn validate_bucket_http_mimir_rs_support(
+    http: &BucketHTTPConfig,
+    backend: &str,
+) -> Result<(), ConfigError> {
+    let unsupported = |setting: &str| {
+        Err(ConfigError::Validation(format!(
+            "{backend}.http.{setting} is not supported by mimir-rs for the {backend} backend"
+        )))
+    };
+    if !http.tls_cert_path.is_empty() {
+        return unsupported("tls_cert_path (client certificate)");
+    }
+    if !http.tls_key_path.is_empty() {
+        return unsupported("tls_key_path (client certificate key)");
+    }
+    if !http.tls_server_name.is_empty() {
+        return unsupported("tls_server_name");
+    }
+    if http.max_connections_per_host != 0 {
+        return unsupported("max_connections_per_host");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +614,21 @@ impl StorageBackendConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_with_extra_backends(&[])
+    }
+
+    /// Rejects configurations of the selected backend that mimir-rs cannot honour (instead of
+    /// silently ignoring them). Called for the blocks storage bucket when the ingester is
+    /// enabled; Go has no equivalent because it supports every setting.
+    pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        match self.backend.as_str() {
+            "swift" => Err(ConfigError::Validation(
+                "the swift storage backend is not supported by mimir-rs".to_string(),
+            )),
+            "s3" => self.s3.validate_mimir_rs_support(),
+            "gcs" => self.gcs.validate_mimir_rs_support(),
+            "azure" => self.azure.validate_mimir_rs_support(),
+            _ => Ok(()),
+        }
     }
 
     /// Returns the flag suffixes relative to `<prefix>` belonging to `StorageBackendConfig`.
@@ -1426,7 +1562,7 @@ impl TSDBConfig {
         f.i64_var("blocks-storage.tsdb.early-head-compaction-min-in-memory-series", self.early_head_compaction_min_in_memory_series, "Minimum in-memory series to trigger early head compaction.", move |t| &get(t).early_head_compaction_min_in_memory_series, move |t| &mut get_mut(t).early_head_compaction_min_in_memory_series);
         f.i64_var("blocks-storage.tsdb.early-head-compaction-min-estimated-series-reduction-percentage", self.early_head_compaction_min_estimated_series_reduction_percentage, "Minimum estimated series reduction percentage (0-100).", move |t| &get(t).early_head_compaction_min_estimated_series_reduction_percentage, move |t| &mut get_mut(t).early_head_compaction_min_estimated_series_reduction_percentage);
         f.bool_var("blocks-storage.tsdb.timely-head-compaction-enabled", self.timely_head_compaction_enabled, "Allows head compaction to happen when the min block range can no longer be appended.", move |t| &get(t).timely_head_compaction_enabled, move |t| &mut get_mut(t).timely_head_compaction_enabled);
-        f.bool_var("blocks-storage.tsdb.bigger-out-of-order-blocks-for-old-samples", self.bigger_out_of_order_blocks_for_old_samples, "When enabled, ingester produces 24h blocks for out-of-order data.", move |t| &get(t).bigger_out_of_order_blocks_for_old_samples, move |t| &mut get_mut(t).bigger_out_of_order_blocks_for_old_samples);
+        f.bool_var("blocks-storage.tsdb.bigger-out-of-order-blocks-for-old-samples", self.bigger_out_of_order_blocks_for_old_samples, "When enabled, ingester produces 24h blocks for out-of-order data that is before the current day, instead of the usual 2h blocks.", move |t| &get(t).bigger_out_of_order_blocks_for_old_samples, move |t| &mut get_mut(t).bigger_out_of_order_blocks_for_old_samples);
         self.index_lookup_planning
             .register_flags_into("blocks-storage.tsdb.index-lookup-planning.", f, move |t| &get(t).index_lookup_planning, move |t| &mut get_mut(t).index_lookup_planning);
         f.bool_var("blocks-storage.tsdb.offset-catalogue.enabled", self.offset_catalogue.enabled, "Controls the maintaining of kafka offset catalogue per block.", move |t| &get(t).offset_catalogue.enabled, move |t| &mut get_mut(t).offset_catalogue.enabled);
@@ -1493,7 +1629,29 @@ impl TSDBConfig {
                 "early compaction minimum series reduction percentage must be a value between 0 and 100 (included)".to_string(),
             ));
         }
-        self.index_lookup_planning.validate()
+        self.index_lookup_planning.validate()?;
+        self.validate_mimir_rs_support()
+    }
+
+    /// Settings Go accepts that mimir-rs does not implement yet: rejected explicitly instead
+    /// of being silently ignored (tracked in PORT_STATUS.md).
+    fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        if self.block_ranges_period.len() > 1 {
+            return Err(ConfigError::Validation(
+                "mimir-rs: -blocks-storage.tsdb.block-ranges-period with more than one range (local leveled compaction of TSDB blocks) is not supported yet".to_string(),
+            ));
+        }
+        if self.head_chunks_end_time_variance != 0.0 {
+            return Err(ConfigError::Validation(
+                "mimir-rs: -blocks-storage.tsdb.head-chunks-end-time-variance other than 0 is not supported yet".to_string(),
+            ));
+        }
+        if self.memory_snapshot_on_shutdown {
+            return Err(ConfigError::Validation(
+                "mimir-rs: -blocks-storage.tsdb.memory-snapshot-on-shutdown=true (TSDB chunk snapshots) is not supported yet".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

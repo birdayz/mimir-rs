@@ -5,9 +5,17 @@
 //! - github.com/grafana/mimir/pkg/util/validation/limits.go (`TenantLimits`, `Overrides`)
 //! - github.com/grafana/dskit/runtimeconfig/manager.go
 //! - github.com/grafana/dskit/runtimeconfig/config_source.go
+//! - github.com/grafana/dskit/runtimeconfig/provider.go (see `provider` submodule)
+
+mod merge;
+mod provider;
+
+pub use provider::{
+    is_url, sanitize_url_for_metrics, RuntimeConfigHttpObserver, CLUSTER_VALIDATION_LABEL_HEADER,
+    RUNTIME_CONFIG_USER_AGENT,
+};
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -15,13 +23,15 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_yaml::{Deserializer as YamlDeserializer, Value};
+use serde_yaml::{Deserializer as YamlDeserializer, Mapping, Value};
 
 use crate::error::ConfigError;
 use crate::ingester::InstanceLimits;
 use crate::limits::LimitsConfig;
 use crate::server::RuntimeConfigConfig;
-use crate::sha256::sha256_hex;
+use crate::sha256::{sha256, sha256_hex};
+
+use self::provider::{HttpFetcher, Provider};
 
 /// `kv.MultiRuntimeConfig` from `dskit/kv/multi.go`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,11 +75,27 @@ enum FailurePolicy {
     OptionalKeepLastValueOnFailure,
 }
 
-#[derive(Clone, Debug)]
+/// `configSource` from `dskit/runtimeconfig/manager.go`.
 struct ConfigSource {
     path: String,
     policy: FailurePolicy,
-    last_bytes: Option<Vec<u8>>,
+    /// How this source identifies itself in metrics (`assignSourceIDs`).
+    source_id: String,
+    provider: Provider,
+    /// Bytes last applied from this source (only kept for keep-last-value sources).
+    last_value: Option<Vec<u8>>,
+    /// Digest of the bytes this source contributed to the last applied merge; `None` when it
+    /// contributed nothing.
+    last_digest: Option<[u8; 32]>,
+}
+
+/// Mimir's `-runtime-config.loader` (`pkg/mimir/runtime_config.go`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoaderKind {
+    /// `Config.Loader`: the merged map is marshalled to YAML and decoded strictly.
+    Yaml,
+    /// `Config.MapLoader`: the merged map is decoded directly (mapstructure).
+    Map,
 }
 
 fn parse_config_source(entry: &str) -> Result<ConfigSource, ConfigError> {
@@ -100,15 +126,45 @@ fn parse_config_source(entry: &str) -> Result<ConfigSource, ConfigError> {
 
     if policies.len() > 1 {
         return Err(ConfigError::RuntimeConfig(format!(
-            "runtime config source {entry:?} has more than one parameter"
+            "runtime config source {entry:?} has more than one parameter, specify only one of \"optional-on-startup\" and \"optional-keep-last-value-on-failure\""
         )));
     }
 
     Ok(ConfigSource {
         path: path.to_string(),
         policy: policies.into_iter().next().unwrap_or(FailurePolicy::Strict),
-        last_bytes: None,
+        source_id: String::new(),
+        provider: Provider::File,
+        last_value: None,
+        last_digest: None,
     })
+}
+
+/// `assignSourceIDs` from `dskit/runtimeconfig/config_source.go`.
+fn assign_source_ids(sources: &mut [ConfigSource]) -> Result<(), ConfigError> {
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    for src in sources.iter_mut() {
+        src.source_id = if is_url(&src.path) {
+            sanitize_url_for_metrics(&src.path)
+        } else {
+            src.path.clone()
+        };
+        *occurrences.entry(src.source_id.clone()).or_default() += 1;
+    }
+    let mut taken: HashMap<String, usize> = HashMap::new();
+    for i in 0..sources.len() {
+        if occurrences[&sources[i].source_id] > 1 {
+            sources[i].source_id = format!("{}#{i}", sources[i].source_id);
+        }
+        if let Some(&j) = taken.get(&sources[i].source_id) {
+            return Err(ConfigError::RuntimeConfig(format!(
+                "runtime config sources {:?} and {:?} both report as {:?} in metrics, rename one of them",
+                sources[j].path, sources[i].path, sources[i].source_id
+            )));
+        }
+        taken.insert(sources[i].source_id.clone(), i);
+    }
+    Ok(())
 }
 
 /// Deep-merges `src` YAML mapping onto `dst` (matching `dskit/runtimeconfig` left-to-right merge).
@@ -177,11 +233,30 @@ struct RawRuntimeConfigCheck {
     distributor_limits: Option<Value>,
 }
 
+/// Rewrites scalar keys of the `overrides` mapping to strings, as yaml.v3 does when decoding
+/// into `map[string]*validation.Limits` (e.g. `overrides: {12345: ...}` -> tenant `"12345"`).
+fn stringify_override_keys(mut root: Value) -> Value {
+    if let Some(Value::Mapping(overrides)) = root
+        .as_mapping_mut()
+        .and_then(|m| m.get_mut(Value::String("overrides".to_string())))
+    {
+        if !overrides.keys().all(|k| matches!(k, Value::String(_))) {
+            let taken = std::mem::take(overrides);
+            for (k, v) in taken {
+                let key = merge::scalar_key_to_string(&k).map(Value::String).unwrap_or(k);
+                overrides.insert(key, v);
+            }
+        }
+    }
+    root
+}
+
 fn parse_runtime_config_value(
     root: Value,
     default_limits: &LimitsConfig,
     default_ingester_limits: &InstanceLimits,
 ) -> Result<RuntimeConfigValues, ConfigError> {
+    let root = stringify_override_keys(root);
     let root_map = root.as_mapping().ok_or_else(|| {
         ConfigError::RuntimeConfig("expected YAML mapping at runtime config root".to_string())
     })?;
@@ -231,9 +306,12 @@ fn parse_runtime_config_value(
                     .map_err(|e| ConfigError::RuntimeConfig(e.to_string()))?;
 
             for (tenant_k, tenant_v) in overrides_map {
-                let tenant_id = tenant_k.as_str().ok_or_else(|| {
+                // yaml.v3 decodes any scalar key (e.g. an unquoted numeric tenant ID) into the
+                // `map[string]*Limits` key as its string form.
+                let tenant_id = merge::scalar_key_to_string(tenant_k).ok_or_else(|| {
                     ConfigError::RuntimeConfig("tenant ID key must be a string".to_string())
                 })?;
+                let tenant_id = tenant_id.as_str();
 
                 let mut merged = base_limits_val.clone();
                 if let Value::Mapping(ref tenant_map) = tenant_v {
@@ -286,14 +364,18 @@ fn parse_runtime_config_value(
     Ok(out)
 }
 
-/// Manages loading and periodic hot-reloading of `runtime_config.file` YAML files.
+/// Manages loading and periodic hot-reloading of `runtime_config.file` sources (local files and
+/// HTTP/HTTPS URLs), like `dskit/runtimeconfig.Manager`.
 pub struct RuntimeConfigManager {
     cfg: RuntimeConfigConfig,
+    loader: LoaderKind,
     default_limits: Arc<LimitsConfig>,
     default_ingester_limits: InstanceLimits,
     sources: RwLock<Vec<ConfigSource>>,
     current: RwLock<Arc<RuntimeConfigValues>>,
     last_hash: RwLock<Option<String>>,
+    listeners: parking_lot::Mutex<Vec<tokio::sync::mpsc::Sender<Arc<RuntimeConfigValues>>>>,
+    http_observer: Arc<RwLock<Option<Arc<dyn RuntimeConfigHttpObserver>>>>,
     stop_flag: Arc<AtomicBool>,
     reloader: Option<JoinHandle<()>>,
 }
@@ -305,12 +387,16 @@ impl RuntimeConfigManager {
         default_limits: LimitsConfig,
         default_ingester_limits: InstanceLimits,
     ) -> Result<Arc<Self>, ConfigError> {
-        if !cfg.loader.is_empty() && cfg.loader != "yaml" && cfg.loader != "map" {
-            return Err(ConfigError::RuntimeConfig(format!(
-                "invalid runtime config loader {:?}: supported values are \"map\" and \"yaml\"",
-                cfg.loader
-            )));
-        }
+        // pkg/mimir/runtime_config.go:NewRuntimeManager.
+        let loader = match cfg.loader.as_str() {
+            "map" => LoaderKind::Map,
+            "yaml" | "" => LoaderKind::Yaml,
+            other => {
+                return Err(ConfigError::RuntimeConfig(format!(
+                    "invalid runtime config loader {other:?}: supported values are \"map\" and \"yaml\""
+                )))
+            }
+        };
 
         let mut sources = Vec::with_capacity(cfg.file.0.len());
         for entry in &cfg.file.0 {
@@ -318,19 +404,41 @@ impl RuntimeConfigManager {
                 sources.push(parse_config_source(entry)?);
             }
         }
+        assign_source_ids(&mut sources)?;
+
+        // dskit builds one HTTP client shared by all URL sources, only if there is one.
+        let http_observer: Arc<RwLock<Option<Arc<dyn RuntimeConfigHttpObserver>>>> =
+            Arc::new(RwLock::new(None));
+        let mut http: Option<Arc<HttpFetcher>> = None;
+        for src in &mut sources {
+            if is_url(&src.path) {
+                if http.is_none() {
+                    http = Some(HttpFetcher::new(&cfg, Arc::clone(&http_observer))?);
+                }
+                src.provider = Provider::Http(Arc::clone(http.as_ref().expect("set above")));
+            }
+        }
 
         let mgr = Arc::new(Self {
             cfg,
+            loader,
             default_limits: Arc::new(default_limits),
             default_ingester_limits,
             sources: RwLock::new(sources),
             current: RwLock::new(Arc::new(RuntimeConfigValues::default())),
             last_hash: RwLock::new(None),
+            listeners: parking_lot::Mutex::new(Vec::new()),
+            http_observer,
             stop_flag: Arc::new(AtomicBool::new(false)),
             reloader: None,
         });
 
-        mgr.load_internal(true)?;
+        mgr.load_internal(true).map_err(|e| match e {
+            ConfigError::RuntimeConfig(msg) => {
+                ConfigError::RuntimeConfig(format!("failed to load runtime config: {msg}"))
+            }
+            other => other,
+        })?;
         Ok(mgr)
     }
 
@@ -355,12 +463,14 @@ impl RuntimeConfigManager {
         })
     }
 
-    /// Signals any background reloader to stop.
+    /// Signals any background reloader to stop and closes all listener channels
+    /// (`Manager.stopping`).
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Relaxed);
+        self.listeners.lock().clear();
     }
 
-    /// Reloads runtime configuration files from disk immediately.
+    /// Reloads runtime configuration sources immediately.
     pub fn reload(&self) -> Result<(), ConfigError> {
         self.load_internal(false)
     }
@@ -370,7 +480,12 @@ impl RuntimeConfigManager {
         Arc::clone(&self.current.read())
     }
 
-    /// Returns the SHA-256 hex digest of the last loaded merged runtime config bytes, if any.
+    /// Returns the hex SHA-256 of the currently active runtime config, if any was loaded.
+    ///
+    /// With `loader: map` this is exactly dskit's value (hash over every contributing source's
+    /// name length, name and digest). With `loader: yaml` dskit hashes Go's `yaml.Marshal` of the
+    /// merged map; here the merged map is serialized by `serde_yaml`, so the value differs from
+    /// Go's although it changes exactly when the merged config changes.
     pub fn config_hash(&self) -> Option<String> {
         self.last_hash.read().clone()
     }
@@ -385,6 +500,24 @@ impl RuntimeConfigManager {
         self.current.read().multi_kv_config.clone()
     }
 
+    /// `Manager.CreateListenerChannel`: returns a channel receiving every newly applied config.
+    /// If the channel buffer is full the update is discarded for that listener; the channel is
+    /// closed when the manager stops. Dropping the receiver unsubscribes.
+    pub fn create_listener_channel(
+        &self,
+        buffer: usize,
+    ) -> tokio::sync::mpsc::Receiver<Arc<RuntimeConfigValues>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer.max(1));
+        self.listeners.lock().push(tx);
+        rx
+    }
+
+    /// Installs the observer notified about runtime-config HTTP requests (request duration per
+    /// URL/status and cluster-validation rejections).
+    pub fn set_http_observer(&self, observer: Arc<dyn RuntimeConfigHttpObserver>) {
+        *self.http_observer.write() = Some(observer);
+    }
+
     /// Builds an `Overrides` handle backed by this manager.
     pub fn overrides(self: &Arc<Self>) -> Overrides {
         Overrides::with_manager(Arc::clone(&self.default_limits), Arc::clone(self))
@@ -395,90 +528,167 @@ impl RuntimeConfigManager {
         *self.current.write() = Arc::new(values);
     }
 
+    /// `Manager.callListeners`: non-blocking send; full or closed channels are skipped
+    /// (closed ones are dropped).
+    fn call_listeners(&self, values: &Arc<RuntimeConfigValues>) {
+        self.listeners.lock().retain(|tx| {
+            !matches!(
+                tx.try_send(Arc::clone(values)),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            )
+        });
+    }
+
+    /// `Manager.loadConfig`.
     fn load_internal(&self, initial: bool) -> Result<(), ConfigError> {
         let mut sources = self.sources.write();
         if sources.is_empty() {
             return Ok(());
         }
 
-        let mut merged_doc: Option<Value> = None;
-        let mut combined_bytes = Vec::new();
+        struct Loaded {
+            raw: Option<Vec<u8>>,
+            read_ok: bool,
+            digest: Option<[u8; 32]>,
+        }
+        let mut loaded = Vec::with_capacity(sources.len());
 
-        for src in sources.iter_mut() {
-            let read_res = std::fs::read(Path::new(&src.path));
-            let bytes = match read_res {
-                Ok(b) => {
-                    if src.policy == FailurePolicy::OptionalKeepLastValueOnFailure {
-                        src.last_bytes = Some(b.clone());
-                    }
-                    b
+        for src in sources.iter() {
+            match src.provider.read(&src.path, &src.source_id) {
+                Ok(buf) => {
+                    let digest = sha256(&buf);
+                    loaded.push(Loaded {
+                        raw: Some(buf),
+                        read_ok: true,
+                        digest: Some(digest),
+                    });
                 }
                 Err(err) => {
+                    let err = format!("read {:?}: {err}", src.path);
                     let tolerate = match src.policy {
                         FailurePolicy::Strict => false,
                         FailurePolicy::OptionalOnStartup => initial,
                         FailurePolicy::OptionalKeepLastValueOnFailure => true,
                     };
                     if !tolerate {
-                        return Err(ConfigError::RuntimeConfig(format!(
-                            "failed to read runtime config {}: {err}",
-                            src.path
-                        )));
+                        return Err(ConfigError::RuntimeConfig(err));
                     }
-                    if src.policy == FailurePolicy::OptionalKeepLastValueOnFailure {
-                        if let Some(ref prev) = src.last_bytes {
-                            prev.clone()
-                        } else {
-                            continue;
+                    match (&src.policy, &src.last_value) {
+                        (FailurePolicy::OptionalKeepLastValueOnFailure, Some(prev)) => {
+                            loaded.push(Loaded {
+                                raw: Some(prev.clone()),
+                                read_ok: false,
+                                digest: Some(sha256(prev)),
+                            })
                         }
-                    } else {
-                        continue;
-                    }
-                }
-            };
-
-            combined_bytes.extend_from_slice(&bytes);
-
-            let mut docs = Vec::new();
-            for doc in YamlDeserializer::from_slice(&bytes) {
-                let mut val = Value::deserialize(doc)
-                    .map_err(|e| ConfigError::RuntimeConfig(format!("YAML parse error: {e}")))?;
-                val.apply_merge()
-                    .map_err(|e| ConfigError::RuntimeConfig(format!("YAML merge error: {e}")))?;
-                docs.push(val);
-            }
-            if docs.len() > 1 {
-                return Err(ConfigError::RuntimeConfig(
-                    "the provided runtime configuration contains multiple documents".to_string(),
-                ));
-            }
-            if let Some(val) = docs.into_iter().next() {
-                if !val.is_null() {
-                    match &mut merged_doc {
-                        None => merged_doc = Some(val),
-                        Some(existing) => merge_yaml_values(existing, val),
+                        _ => loaded.push(Loaded {
+                            raw: None,
+                            read_ok: false,
+                            digest: None,
+                        }),
                     }
                 }
             }
         }
 
-        let new_hash = sha256_hex(&combined_bytes);
-        if self.last_hash.read().as_deref() == Some(new_hash.as_str()) {
+        // Skip the rebuild when nothing changed, but never on the initial load.
+        if !initial
+            && sources
+                .iter()
+                .zip(&loaded)
+                .all(|(src, l)| src.last_digest == l.digest)
+        {
             return Ok(());
         }
 
-        let values = match merged_doc {
-            None => RuntimeConfigValues::default(),
-            Some(root) => parse_runtime_config_value(
-                root,
-                &self.default_limits,
-                &self.default_ingester_limits,
-            )?,
+        let mut merged = Mapping::new();
+        for (src, l) in sources.iter().zip(&loaded) {
+            let Some(raw) = &l.raw else { continue };
+            let file = merge::unmarshal_maybe_gzipped(&src.path, raw).map_err(|e| {
+                ConfigError::RuntimeConfig(format!("unmarshal {:?}: {e}", src.path))
+            })?;
+            merged = merge::merge_config_maps(&merged, &file, "").map_err(|e| {
+                ConfigError::RuntimeConfig(format!(
+                    "can't merge {:?} on top of the previous providers: {e}",
+                    src.path
+                ))
+            })?;
+        }
+
+        let (values, hash) = match self.loader {
+            LoaderKind::Map => {
+                // No merged bytes to hash: hash name length, name and digest of every source
+                // that contributed.
+                let mut buf = Vec::new();
+                for (src, l) in sources.iter().zip(&loaded) {
+                    let Some(digest) = l.digest else { continue };
+                    buf.extend_from_slice(&(src.path.len() as u64).to_be_bytes());
+                    buf.extend_from_slice(src.path.as_bytes());
+                    buf.extend_from_slice(&digest);
+                }
+                let hash = sha256_hex(&buf);
+                let values = self
+                    .decode_map(merged)
+                    .map_err(|e| ConfigError::RuntimeConfig(format!("load file: {e}")))?;
+                (values, hash)
+            }
+            LoaderKind::Yaml => {
+                let root = Value::Mapping(merged);
+                let marshalled = serde_yaml::to_string(&root)
+                    .map_err(|e| ConfigError::RuntimeConfig(format!("marshal file: {e}")))?;
+                let hash = sha256_hex(marshalled.as_bytes());
+                let values = parse_runtime_config_value(
+                    root,
+                    &self.default_limits,
+                    &self.default_ingester_limits,
+                )
+                .map_err(|e| ConfigError::RuntimeConfig(format!("load file: {}", strip_rc(e))))?;
+                (values, hash)
+            }
         };
 
-        *self.current.write() = Arc::new(values);
-        *self.last_hash.write() = Some(new_hash);
+        let values = Arc::new(values);
+        *self.current.write() = Arc::clone(&values);
+        self.call_listeners(&values);
+        *self.last_hash.write() = Some(hash);
+
+        // Preserve per-source merge state for the next load.
+        for (src, l) in sources.iter_mut().zip(loaded) {
+            src.last_digest = l.digest;
+            if l.read_ok && src.policy == FailurePolicy::OptionalKeepLastValueOnFailure {
+                src.last_value = l.raw;
+            }
+        }
         Ok(())
+    }
+
+    /// `runtimeConfigLoader.loadFromMap`: decodes the merged map directly. The decoding of each
+    /// field is shared with the YAML loader (upstream keeps both loaders equivalent, see
+    /// `runtime_config_mapstructure_equivalence_test.go`); what differs is that there is no YAML
+    /// round trip, so mapstructure sees `overrides` keys with their original types and rejects
+    /// non-string tenant IDs.
+    fn decode_map(&self, merged: Mapping) -> Result<RuntimeConfigValues, String> {
+        if let Some(Value::Mapping(overrides)) = merged.get("overrides") {
+            if let Some(bad) = overrides.keys().find(|k| !matches!(k, Value::String(_))) {
+                return Err(format!(
+                    "decoding failed due to the following error(s):\n\n'overrides[<interface {{}} Value>]' expected type 'string', got unconvertible type '{}'",
+                    merge::go_type_name(Some(bad))
+                ));
+            }
+        }
+        parse_runtime_config_value(
+            Value::Mapping(merged),
+            &self.default_limits,
+            &self.default_ingester_limits,
+        )
+        .map_err(strip_rc)
+    }
+}
+
+fn strip_rc(e: ConfigError) -> String {
+    match e {
+        ConfigError::RuntimeConfig(msg) => msg,
+        other => other.to_string(),
     }
 }
 

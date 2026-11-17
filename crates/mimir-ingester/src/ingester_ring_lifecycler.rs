@@ -9,13 +9,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use mimir_common::services::ManagedBasicService;
 use mimir_proto::ringpb::{Desc, InstanceDesc, InstanceState};
-use mimir_ring::kv::{BoxFuture, KvClient};
+use mimir_ring::kv::{AsRegisterer, BoxFuture, KvClient};
 use mimir_ring::lifecycler::{
     BasicLifecycler, BasicLifecyclerConfig, BasicLifecyclerDelegate, FlushTransferer,
     LeaveOnStoppingDelegate, Lifecycler, LifecyclerError,
 };
 use parking_lot::{Mutex, RwLock};
-use prometheus::Registry;
 use tracing::info;
 
 /// Callback to `Ingester.Flush()` (compact + offset catalogue sync + ship), awaited on shutdown.
@@ -146,7 +145,12 @@ impl BasicLifecyclerDelegate for TokenlessDelegateInner {
                 }
             }
             if !self.final_sleep.is_zero() {
-                info!(final_sleep = ?self.final_sleep, "lifecycler entering final sleep before shutdown");
+                info!(
+                    final_sleep = %mimir_config::format_go_duration(
+                        self.final_sleep.as_nanos().min(i64::MAX as u128) as i64
+                    ),
+                    "lifecycler entering final sleep before shutdown"
+                );
                 tokio::time::sleep(self.final_sleep).await;
             }
         })
@@ -182,7 +186,7 @@ impl TokenlessLifecycler {
         final_sleep: Duration,
         flush_on_shutdown: bool,
         flush: Option<FlushFn>,
-        reg: Option<&Registry>,
+        reg: Option<&dyn AsRegisterer>,
     ) -> Arc<Self> {
         let flush_flag = Arc::new(AtomicBool::new(flush_on_shutdown));
         let flush = Arc::new(RwLock::new(flush));

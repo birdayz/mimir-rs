@@ -68,7 +68,7 @@ impl OffsetFile {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => {
-                error!(file = %self.file_path.display(), error = %e, "failed to read offset file");
+                error!(file = %self.file_path.display(), err = %e, "failed to read offset file");
                 return None;
             }
         };
@@ -76,7 +76,7 @@ impl OffsetFile {
         let parsed: OffsetFileData = match serde_json::from_slice(&data) {
             Ok(p) => p,
             Err(e) => {
-                error!(file = %self.file_path.display(), error = %e, "failed to parse offset file");
+                error!(file = %self.file_path.display(), err = %e, "failed to parse offset file");
                 return None;
             }
         };

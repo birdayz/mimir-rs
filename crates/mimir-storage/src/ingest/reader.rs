@@ -1399,7 +1399,7 @@ impl SingleClusterPartitionReader {
                                 Err(e) => {
                                     warn!(
                                         partition = partition_id,
-                                        error = %e,
+                                        err = %e,
                                         "failed to resolve partition start offset after OffsetOutOfRange"
                                     );
                                 }
@@ -1415,7 +1415,7 @@ impl SingleClusterPartitionReader {
                         }
                         Err(err) => {
                             fetch_metrics.fetches_errors.inc();
-                            warn!(partition = partition_id, error = %err, "kafka fetch error");
+                            warn!(partition = partition_id, err = %err, "kafka fetch error");
                             tokio::select! {
                                 _ = fetch_stop_rx.changed() => {
                                     if *fetch_stop_rx.borrow() {
@@ -1503,7 +1503,7 @@ impl SingleClusterPartitionReader {
                             Err(err) => {
                                 error!(
                                     partition = partition_id,
-                                    error = %err,
+                                    err = %err,
                                     "error consuming Kafka batch; retrying"
                                 );
                                 if *stop_rx.borrow() {
@@ -1743,7 +1743,7 @@ impl SingleClusterPartitionReader {
                                 }
 
                                 while let Err(e) = self.consumer.consume(batch.records.clone()).await {
-                                    error!(partition = self.partition_id, error = %e, "error consuming startup batch; retrying");
+                                    error!(partition = self.partition_id, err = %e, "error consuming startup batch; retrying");
                                     if *stop_rx.borrow() {
                                         return Err(ReaderError::Canceled);
                                     }
@@ -1796,7 +1796,7 @@ impl SingleClusterPartitionReader {
                         self.metrics.fetches_errors.inc();
                         warn!(
                             partition = self.partition_id,
-                            error = %err,
+                            err = %err,
                             "kafka fetch error during startup lag catchup"
                         );
                         tokio::time::sleep(Duration::from_millis(50)).await;

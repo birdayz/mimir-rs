@@ -518,3 +518,34 @@ fn test_kafka_config_validate_tls() {
     cfg.tls_min_version = "VersionTLS13".to_string();
     cfg.validate().unwrap();
 }
+
+/// pkg/ingester/ingester_ring.go:140 computes the `instance_interface_names` default at flag
+/// registration time (`netutil.PrivateNetworkInterfacesWithFallback([eth0 en0])`), while
+/// `-help` shows the `doc:"default=[<private network interfaces>]"` placeholder, unquoted,
+/// with type "string" (`*flagext.StringSlice`).
+#[test]
+fn instance_interface_names_default_and_help() {
+    let cfg = mimir_config::MimirConfig::default();
+    assert_eq!(
+        cfg.ingester.ring.instance_interface_names,
+        mimir_common::netutil::default_instance_interface_names()
+    );
+    assert!(!cfg.ingester.ring.instance_interface_names.is_empty());
+
+    let mut fs = mimir_config::FlagSet::new();
+    cfg.register_flags(&mut fs);
+    let usage = fs.format_usage("mimir", true);
+    for flag in [
+        "ingester.ring.instance-interface-names",
+        "distributor.ring.instance-interface-names",
+        "store-gateway.sharding-ring.instance-interface-names",
+    ] {
+        let mut lines = usage.lines().skip_while(|l| *l != format!("  -{flag} string"));
+        assert!(lines.next().is_some(), "-{flag} string missing from usage");
+        let help = lines.next().unwrap();
+        assert!(
+            help.ends_with(" (default [<private network interfaces>])"),
+            "-{flag}: {help}"
+        );
+    }
+}

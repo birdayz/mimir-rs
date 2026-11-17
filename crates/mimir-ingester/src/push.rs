@@ -1204,7 +1204,7 @@ impl Ingester {
         self.metrics.ingested_metadata.inc_by(ingested as f64);
         self.metrics.ingested_metadata_fail.inc_by(failed as f64);
         if let Some(err) = first_err {
-            warn!(user = %user_id, error = %err, "failed to ingest some metadata");
+            warn!(user = %user_id, err = %err, "failed to ingest some metadata");
         }
         ingested
     }

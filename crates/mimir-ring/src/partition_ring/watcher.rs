@@ -8,12 +8,12 @@ use std::sync::Arc;
 use mimir_common::services::{basic_service, ManagedBasicService, ServiceContext, ServiceError};
 use mimir_proto::ringpb::{PartitionRingDesc, PartitionTokenScheme};
 use parking_lot::Mutex;
-use prometheus::{Gauge, GaugeVec, Opts, Registry};
+use prometheus::{Gauge, GaugeVec, Opts};
 use tracing::{info, warn};
 
 use super::model::{clean_partition_state_name, PartitionRingDescExt, PartitionRingError};
 use super::ring::{PartitionRing, PartitionRingOptions};
-use crate::kv::KvClient;
+use crate::kv::{AsRegisterer, KvClient, Registerer};
 
 pub trait PartitionRingWatcherDelegate: Send + Sync {
     fn on_partition_ring_changed(
@@ -30,7 +30,7 @@ struct WatcherMetrics {
 }
 
 impl WatcherMetrics {
-    fn new(name: &str, reg: Option<&Registry>) -> Self {
+    fn new(name: &str, reg: Option<&Registerer>) -> Self {
         let mut const_labels = HashMap::new();
         const_labels.insert("name".to_string(), name.to_string());
 
@@ -92,8 +92,9 @@ impl PartitionRingWatcher {
         key: &str,
         kv: Arc<dyn KvClient>,
         opts: PartitionRingOptions,
-        reg: Option<&Registry>,
+        reg: Option<&dyn AsRegisterer>,
     ) -> Arc<Self> {
+        let reg = reg.map(|r| r.as_registerer());
         let empty = PartitionRing::with_options(PartitionRingDesc::default(), opts.clone())
             .expect("empty partition ring is always valid");
         Arc::new(Self {
@@ -102,7 +103,7 @@ impl PartitionRingWatcher {
             delegate: Mutex::new(None),
             ring: Mutex::new(empty),
             opts,
-            metrics: WatcherMetrics::new(name, reg),
+            metrics: WatcherMetrics::new(name, reg.as_ref()),
         })
     }
 
@@ -195,7 +196,7 @@ impl PartitionRingWatcher {
                             .map(|b| *b)
                             .unwrap_or_default(),
                         None => {
-                            info!(key = %w.key, "partition ring doesn't exist in KV store yet");
+                            info!("partition ring doesn't exist in KV store yet");
                             PartitionRingDesc::default()
                         }
                     };

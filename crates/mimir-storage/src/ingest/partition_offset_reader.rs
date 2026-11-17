@@ -85,7 +85,7 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
                         let req_seq = issued_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         let res = (fetch_fn)().await;
                         if let Err(ref e) = res {
-                            warn!(error = %e, "failed to fetch the last produced offset");
+                            warn!(err = %e, "failed to fetch the last produced offset");
                         }
                         *last_result.write() = Some(res.clone());
                         let tx = next_waiter_tx.lock().await;
@@ -101,7 +101,7 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
         let req_seq = self.issued_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let res = (self.fetch_fn)().await;
         if let Err(ref e) = res {
-            warn!(error = %e, "failed to fetch the last produced offset");
+            warn!(err = %e, "failed to fetch the last produced offset");
         }
         *self.last_result.write() = Some(res.clone());
         let tx = self.next_waiter_tx.lock().await;

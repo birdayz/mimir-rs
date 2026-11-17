@@ -64,6 +64,7 @@ pub use storage::{
     IndexCacheConfig, IndexHeaderCacheConfig, IndexHeaderConfig, IndexLookupPlanningConfig,
     IngestStorageConfig, KafkaConfig, MemcachedClientConfig, MetadataCacheConfig, MigrationConfig,
     OffsetCatalogueConfig, OrderedConsumptionConfig, S3Config, S3SSEConfig, S3TraceConfig,
+    S3_SUPPORTED_STORAGE_CLASSES,
     StorageBackendConfig, SwiftConfig, TSDBConfig,
 };
 pub use types::{

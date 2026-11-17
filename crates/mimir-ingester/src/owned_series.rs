@@ -309,7 +309,7 @@ impl OwnedSeriesService {
                                         s.update_all_tenants(ring_changed);
                                     }
                                     Err(e) => {
-                                        debug!(error = %e, "can't check ring for updates");
+                                        debug!(err = %e, "can't check ring for updates");
                                     }
                                 }
                             }
