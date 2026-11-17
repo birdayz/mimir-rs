@@ -166,7 +166,7 @@ fn series_limit(mgr: &RuntimeConfigManager, tenant: &str) -> Option<i64> {
     mgr.get_config()
         .overrides
         .get(tenant)
-        .map(|l| l.max_global_series_per_user)
+        .and_then(|l| l.as_ref().map(|l| l.max_global_series_per_user))
 }
 
 fn overrides(tenant: &str, v: i64) -> String {
@@ -502,14 +502,14 @@ fn listeners_receive_new_configs_and_unchanged_sources_skip_rebuild() {
     mgr.reload().unwrap();
     let got = rx.try_recv().unwrap();
     assert_eq!(got.multi_kv_config.primary, "memberlist");
-    assert_eq!(got.overrides["t1"].max_global_series_per_user, 2);
+    assert_eq!(got.overrides["t1"].as_ref().unwrap().max_global_series_per_user, 2);
 
     // Buffer full: further updates are dropped, not blocking.
     std::fs::write(&f, overrides("t1", 3)).unwrap();
     mgr.reload().unwrap();
     std::fs::write(&f, overrides("t1", 4)).unwrap();
     mgr.reload().unwrap();
-    assert_eq!(rx.try_recv().unwrap().overrides["t1"].max_global_series_per_user, 3);
+    assert_eq!(rx.try_recv().unwrap().overrides["t1"].as_ref().unwrap().max_global_series_per_user, 3);
     assert!(rx.try_recv().is_err());
 
     // Stop closes listener channels.

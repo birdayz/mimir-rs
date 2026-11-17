@@ -399,8 +399,12 @@ async fn runtime_config_handler(
             let mut default_overrides = Mapping::new();
             let default_limit_val =
                 serde_yaml::to_value(&st.config.limits).unwrap_or(Value::Mapping(Mapping::new()));
-            for tenant in cfg.overrides.keys() {
-                default_overrides.insert(Value::String(tenant.clone()), default_limit_val.clone());
+            // Go only seeds defaults for non-nil tenant limits, so `t: null` shows in the diff.
+            for (tenant, limits) in &cfg.overrides {
+                if limits.is_some() {
+                    default_overrides
+                        .insert(Value::String(tenant.clone()), default_limit_val.clone());
+                }
             }
             let mut default_root = Mapping::new();
             default_root.insert(
@@ -433,7 +437,12 @@ fn runtime_config_to_yaml(cfg: &mimir_config::RuntimeConfigValues) -> Value {
     let mut root = Mapping::new();
     let mut overrides_map = Mapping::new();
     for (k, v) in &cfg.overrides {
-        if let Ok(val) = serde_yaml::to_value(v.as_ref()) {
+        // A nil `*validation.Limits` marshals as `null`.
+        let val = match v {
+            Some(limits) => serde_yaml::to_value(limits.as_ref()),
+            None => Ok(Value::Null),
+        };
+        if let Ok(val) = val {
             overrides_map.insert(Value::String(k.clone()), val);
         }
     }

@@ -44,7 +44,9 @@ pub struct MultiRuntimeConfig {
 /// Top-level `runtime_config` YAML structure (`pkg/mimir/runtime_config.go:runtimeConfigValues`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeConfigValues {
-    pub overrides: BTreeMap<String, Arc<LimitsConfig>>,
+    /// Go `TenantLimits map[string]*validation.Limits`: a `null` tenant entry is kept as `None`
+    /// (rendered as `t: null` by `/runtime_config`) and resolves to the default limits.
+    pub overrides: BTreeMap<String, Option<Arc<LimitsConfig>>>,
     pub multi_kv_config: MultiRuntimeConfig,
     pub ingester_limits: Option<InstanceLimits>,
     pub distributor_limits: Option<DistributorInstanceLimits>,
@@ -313,6 +315,13 @@ fn parse_runtime_config_value(
                 })?;
                 let tenant_id = tenant_id.as_str();
 
+                // yaml.v3 decodes `t: null` into a nil `*validation.Limits`; Go keeps the nil
+                // map entry (skipped by validation, falling back to defaults on lookup).
+                if tenant_v.is_null() {
+                    out.overrides.insert(tenant_id.to_string(), None);
+                    continue;
+                }
+
                 let mut merged = base_limits_val.clone();
                 if let Value::Mapping(ref tenant_map) = tenant_v {
                     // For `active_series_custom_trackers` and `active_series_additional_custom_trackers`,
@@ -356,7 +365,7 @@ fn parse_runtime_config_value(
                 })?;
 
                 out.overrides
-                    .insert(tenant_id.to_string(), Arc::new(limits));
+                    .insert(tenant_id.to_string(), Some(Arc::new(limits)));
             }
         }
     }
@@ -922,7 +931,7 @@ impl Overrides {
     pub fn for_tenant(&self, tenant_id: &str) -> Arc<LimitsConfig> {
         if let Some(ref mgr) = self.manager {
             let cfg = mgr.get_config();
-            if let Some(limits) = cfg.overrides.get(tenant_id) {
+            if let Some(Some(limits)) = cfg.overrides.get(tenant_id) {
                 return Arc::clone(limits);
             }
         } else {
@@ -1032,9 +1041,48 @@ mod secret_tests {
             &InstanceLimits::default(),
         )
         .unwrap();
-        let t1 = out.overrides.get("t1").unwrap();
+        let t1 = out.overrides.get("t1").unwrap().as_ref().unwrap();
         assert_eq!(t1.ruler_alertmanager_client_config.basic_auth_password, "pw");
         let rendered = serde_yaml::to_string(t1.as_ref()).unwrap();
         assert!(rendered.contains("basic_auth_password: '********'"));
+    }
+}
+
+#[cfg(test)]
+mod null_override_tests {
+    use super::*;
+
+    /// Go `TenantLimits map[string]*validation.Limits` keeps `t: null` as a nil entry that
+    /// `Overrides` resolves to the default limits.
+    #[test]
+    fn null_tenant_override_is_kept_and_falls_back_to_defaults() {
+        let defaults = LimitsConfig {
+            max_global_series_per_user: 42,
+            ..Default::default()
+        };
+        let out = parse_runtime_config_yaml(
+            b"overrides:\n  t_null: null\n  t1:\n    max_global_series_per_user: 5\n",
+            &defaults,
+            &InstanceLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(out.overrides.len(), 2);
+        assert!(out.overrides["t_null"].is_none());
+        assert_eq!(
+            out.overrides["t1"].as_ref().unwrap().max_global_series_per_user,
+            5
+        );
+
+        let mgr = RuntimeConfigManager::new(
+            RuntimeConfigConfig::default(),
+            defaults,
+            InstanceLimits::default(),
+        )
+        .unwrap();
+        mgr.set_values_for_tests(out);
+        let overrides = mgr.overrides();
+        assert_eq!(overrides.max_global_series_per_user("t_null"), 42);
+        assert_eq!(overrides.max_global_series_per_user("t1"), 5);
+        assert_eq!(overrides.max_global_series_per_user("other"), 42);
     }
 }
