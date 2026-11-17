@@ -416,6 +416,8 @@ async fn runtime_config_handler(
                 serde_yaml::to_value(mimir_config::MultiRuntimeConfig::default())
                     .unwrap_or(Value::Mapping(Mapping::new())),
             );
+            default_root.insert(Value::String("ingester_limits".to_string()), Value::Null);
+            default_root.insert(Value::String("distributor_limits".to_string()), Value::Null);
             diff_yaml_values(&Value::Mapping(default_root), &actual_val)
                 .unwrap_or_else(|| Value::Mapping(Mapping::new()))
         }
@@ -453,15 +455,21 @@ fn runtime_config_to_yaml(cfg: &mimir_config::RuntimeConfigValues) -> Value {
     if let Ok(multi_val) = serde_yaml::to_value(&cfg.multi_kv_config) {
         root.insert(Value::String("multi_kv_config".to_string()), multi_val);
     }
-    if let Some(ref ing) = cfg.ingester_limits {
-        if let Ok(v) = serde_yaml::to_value(ing) {
-            root.insert(Value::String("ingester_limits".to_string()), v);
-        }
+    // Nil `*ingester.InstanceLimits` / `*distributor.InstanceLimits` (no `omitempty`) marshal
+    // as `null`.
+    let ingester_limits = match cfg.ingester_limits {
+        Some(ref ing) => serde_yaml::to_value(ing).ok(),
+        None => Some(Value::Null),
+    };
+    if let Some(v) = ingester_limits {
+        root.insert(Value::String("ingester_limits".to_string()), v);
     }
-    if let Some(ref dist) = cfg.distributor_limits {
-        if let Ok(v) = serde_yaml::to_value(dist) {
-            root.insert(Value::String("distributor_limits".to_string()), v);
-        }
+    let distributor_limits = match cfg.distributor_limits {
+        Some(ref dist) => serde_yaml::to_value(dist).ok(),
+        None => Some(Value::Null),
+    };
+    if let Some(v) = distributor_limits {
+        root.insert(Value::String("distributor_limits".to_string()), v);
     }
     Value::Mapping(root)
 }
