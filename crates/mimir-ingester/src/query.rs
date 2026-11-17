@@ -643,6 +643,7 @@ impl Ingester {
                 Some(Ok(mut inline_series)) => {
                     self.observe_block_select_stats(
                         user_id,
+                        &db,
                         &select_stats,
                         shard.is_some(),
                         &matchers,
@@ -671,7 +672,10 @@ impl Ingester {
                         } else {
                             db_c.db.chunk_querier(start_ts, end_ts)
                         }
-                        .with_select_stats(Arc::clone(&select_stats));
+                        .with_filtered_select_stats(
+                            Arc::clone(&select_stats),
+                            shard_stats_filter(shard),
+                        );
                         let prepared = match prepared_opt {
                             Some(p) => p,
                             None => match cq_b.prepare_select(&matchers) {
@@ -788,6 +792,7 @@ impl Ingester {
                         );
                         ingester.observe_block_select_stats(
                             &user_c,
+                            &db_c,
                             &select_stats,
                             shard.is_some(),
                             &matchers,
@@ -795,19 +800,21 @@ impl Ingester {
 
                         match res {
                             Ok(()) => {
-                                if !receiver_closed && !chunks_batch.is_empty() {
-                                    let _ = tx.blocking_send(Ok(ingesterpb::QueryStreamResponse {
-                                        streaming_series: Vec::new(),
-                                        is_end_of_series_stream: false,
-                                        streaming_series_chunks: chunks_batch,
-                                    }));
+                                if !receiver_closed {
+                                    if !chunks_batch.is_empty() {
+                                        let _ = tx.blocking_send(Ok(ingesterpb::QueryStreamResponse {
+                                            streaming_series: Vec::new(),
+                                            is_end_of_series_stream: false,
+                                            streaming_series_chunks: chunks_batch,
+                                        }));
+                                    }
+                                    ingester
+                                        .metrics
+                                        .queried_series
+                                        .with_label_values(&["merged_blocks"])
+                                        .observe(num_series as f64);
+                                    ingester.metrics.queried_samples.observe(num_samples as f64);
                                 }
-                                ingester
-                                    .metrics
-                                    .queried_series
-                                    .with_label_values(&["merged_blocks"])
-                                    .observe(num_series as f64);
-                                ingester.metrics.queried_samples.observe(num_samples as f64);
                             }
                             Err(e) => {
                                 let err = IngesterError::Internal {
@@ -1028,6 +1035,7 @@ impl Ingester {
     pub(crate) fn observe_block_select_stats(
         &self,
         user_id: &str,
+        db: &UserTsdb,
         sink: &BlockSelectStatsSink,
         sharded: bool,
         matchers: &[LabelMatcher],
@@ -1052,10 +1060,33 @@ impl Ingester {
                 && !has_metric_name);
             (sharded || force) && shared_key_ok
         };
+        let head_min_time = db.db.head().min_time();
+        let block_range = db.db.head().options().chunk_range_ms.max(1);
         let index = self.metrics.queried_series.with_label_values(&["single_block_index"]);
         let filter = self.metrics.queried_series.with_label_values(&["single_block_filter"]);
         let lp = &self.lookup_plan_metrics;
         for mut st in stats {
+            if st.head {
+                self.metrics.queried_blocks.with_label_values(&["0"]).inc();
+            } else if head_min_time == i64::MAX {
+                self.metrics
+                    .queried_blocks
+                    .with_label_values(&["unknown"])
+                    .inc();
+            } else {
+                let gen = ((head_min_time - st.block_min_time) / block_range).max(1);
+                if gen > 100 {
+                    self.metrics
+                        .queried_blocks
+                        .with_label_values(&["100+"])
+                        .inc();
+                } else {
+                    self.metrics
+                        .queried_blocks
+                        .with_label_values(&[&gen.to_string()])
+                        .inc();
+                }
+            }
             if !postings_tracked(st.head) {
                 st.selected_postings = 0;
             }
@@ -1175,7 +1206,7 @@ impl Ingester {
                     message: format!("selecting series from ChunkQuerier: {e}"),
                 })?
         };
-        self.observe_block_select_stats(user_id, &select_stats, shard.is_some(), matchers);
+        self.observe_block_select_stats(user_id, db, &select_stats, shard.is_some(), matchers);
 
         if let Some((shard_idx, shard_count)) = shard {
             chunk_series.retain(|cs| labels_stable_hash(&cs.labels) % shard_count == shard_idx);

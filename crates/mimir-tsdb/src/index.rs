@@ -945,8 +945,19 @@ impl IndexReader {
         F: FnMut(&str, u64) -> Result<bool, IndexError>,
     {
         let table_start = self.toc.postings_table as usize;
-        // Skip 4B length + 4B count header via relative offset already anchored at table payload start.
-        let mut dec = Decbuf::new(&self.mmap[table_start + 4..]);
+        if table_start + 4 > self.mmap.len() {
+            return Err(IndexError::Encoding(EncodingError::InvalidSize));
+        }
+        let payload_len =
+            u32::from_be_bytes(self.mmap[table_start..table_start + 4].try_into().unwrap())
+                as usize;
+        let payload_start = table_start + 4;
+        let payload_end = payload_start.saturating_add(payload_len);
+        if payload_end > self.mmap.len() {
+            return Err(IndexError::Encoding(EncodingError::InvalidSize));
+        }
+        // Skip 4B length header via relative offset already anchored at table payload start.
+        let mut dec = Decbuf::new(&self.mmap[payload_start..payload_end]);
         dec.skip(start_rel_off)?;
         let mut prefix_skip: Option<usize> = None;
         while !dec.is_empty() {
@@ -1009,10 +1020,10 @@ impl IndexReader {
                 if vi >= sorted_vals.len() {
                     return Ok(false);
                 }
-                if let Some(next_v) = next_anchor {
-                    if sorted_vals[vi] >= next_v {
-                        return Ok(false);
-                    }
+                match next_anchor {
+                    None => return Ok(false),
+                    Some(next_v) if sorted_vals[vi] >= next_v => return Ok(false),
+                    Some(_) => {}
                 }
                 Ok(true)
             })?;
@@ -1423,5 +1434,40 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, IndexError::InvalidChunkOrder(_)));
+    }
+
+    #[test]
+    fn postings_stops_at_last_anchor_without_overrunning_into_next_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx_path = dir.path().join(INDEX_FILENAME);
+        let l1 = Labels::from_pairs([("__name__", "m_all"), ("i", "s0")]);
+        let syms = ["", "__name__", "i", "m_all", "s0"];
+        {
+            let mut w = IndexWriter::new(&idx_path).unwrap();
+            for s in syms {
+                w.add_symbol(s).unwrap();
+            }
+            w.add_series(
+                0,
+                &l1,
+                &[ChunkMeta {
+                    ref_id: 8,
+                    min_time: 1000,
+                    max_time: 2000,
+                    chunk: None,
+                }],
+            )
+            .unwrap();
+            w.close().unwrap();
+        }
+        let r = IndexReader::open(&idx_path).unwrap();
+        // Querying an existing value plus lexicographically larger missing values must not overrun
+        // from `__name__` into label `i` inside the postings offset table.
+        let p = r
+            .postings("__name__", &["m_all", "m_blk1_only", "m_head_only"])
+            .unwrap();
+        assert_eq!(p.len(), 1);
+        let (decoded, _) = r.series(p[0]).unwrap();
+        assert_eq!(decoded, l1);
     }
 }

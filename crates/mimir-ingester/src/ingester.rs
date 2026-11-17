@@ -362,7 +362,8 @@ impl Ingester {
         let shipper_metrics = ShipperMetrics::new(registry);
         let shared_tsdb_metrics = crate::user_tsdb::SharedTsdbMetrics::new(registry);
         let tsdb_metrics = TSDBMetrics::new("cortex_ingester_", registry);
-        let owned_series_metrics = OwnedSeriesMetrics::new(registry);
+        let owned_series_metrics =
+            OwnedSeriesMetrics::new(owned_series_strategy.as_ref().and(registry));
 
         let ignored_series_limit_metrics = cfg
             .ignore_series_limit_for_metric_names
