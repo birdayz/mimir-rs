@@ -2970,4 +2970,39 @@ mod tests {
             assert_eq!(via_trait, generic, "trait fast-path mismatch for {ms:?}");
         }
     }
+
+    #[test]
+    fn add_batches_unordered_parallel_disjoint_scratch_miri() {
+        let mut syms = SymbolTable::new();
+        let p = MemPostings::new_unordered();
+        let pool = mimir_common::thread_pool::ScopedWorkerPool::new("miri-postings", 2);
+
+        // 4 batches * 80 series = 320 >= 256 to exercise the parallel MutScratchPtr path.
+        let mut batches: Vec<Vec<(u64, SymbolLabels)>> = Vec::with_capacity(4);
+        for b in 0..4usize {
+            let mut batch = Vec::with_capacity(80);
+            for i in 0..80usize {
+                let ref_id = (b * 80 + i + 1) as u64;
+                let shard = format!("s-{}", i % 16);
+                let lbls = SymbolLabels::from_pairs(
+                    &mut syms,
+                    [
+                        ("__name__", "parallel_req_total"),
+                        ("batch", &format!("b-{b}")),
+                        ("shard", &shard),
+                    ],
+                );
+                batch.push((ref_id, lbls));
+            }
+            batches.push(batch);
+        }
+
+        p.add_batches_unordered_parallel(&batches, &pool);
+        p.ensure_order();
+
+        assert_eq!(p.all_postings().len(), 320);
+        let nid = syms.get("__name__").unwrap();
+        let vid = syms.get("parallel_req_total").unwrap();
+        assert_eq!(p.postings_len(nid, vid), 320);
+    }
 }

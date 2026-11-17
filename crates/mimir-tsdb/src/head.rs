@@ -11801,6 +11801,40 @@ mod tests {
     }
 
     #[test]
+    fn paged_by_id_overwrite_and_drop_non_empty() {
+        let stripes = StripeSeries::new(16);
+        for id in [1u64, 2, 3, BY_ID_PAGE_SIZE as u64 + 1] {
+            let lbl = Labels::from_pairs([("__name__", "m"), ("id", &id.to_string())]);
+            let e = Arc::new(SeriesEntry::new(id, lbl.hash(), lbl, 0));
+            stripes.insert(e);
+        }
+        // Overwrite id=1 to exercise non-empty slot overwrite (live_counts must remain accurate).
+        let lbl1_new = Labels::from_pairs([("__name__", "m_new"), ("id", "1")]);
+        let e1_new = Arc::new(SeriesEntry::new(1, lbl1_new.hash(), lbl1_new, 0));
+        e1_new.set_active_cache(0x1234);
+        stripes.insert(e1_new);
+        assert_eq!(stripes.active_cache_for_id(1), 0x1234);
+        assert_eq!(stripes.allocated_page_count(), 2);
+        // Drop stripes while pages and dirs are still populated.
+    }
+
+    #[test]
+    fn hash_sorted_pairs_stack_and_heap_spill() {
+        let small = [("__name__", "up"), ("job", "api")];
+        assert_eq!(
+            hash_sorted_pairs(&small),
+            Labels::from_sorted_slice(&small).hash()
+        );
+        // Exceed 512-byte stack buffer to exercise MaybeUninit -> Vec spill path.
+        let big_val = "x".repeat(600);
+        let big = [("__name__", "big_metric"), ("payload", big_val.as_str())];
+        assert_eq!(
+            hash_sorted_pairs(&big),
+            Labels::from_sorted_slice(&big).hash()
+        );
+    }
+
+    #[test]
     fn series_final_chunks_only_and_active_cache_for_id() {
         let dir = tempfile::tempdir().unwrap();
         let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();

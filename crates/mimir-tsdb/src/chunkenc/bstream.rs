@@ -434,7 +434,7 @@ impl<'a> BitReader<'a> {
         let mut v = (self.buffer & mask1) << rem;
         self.valid = 0;
 
-        if !self.load_next_buffer(rem) {
+        if !self.load_next_buffer(rem) || self.valid < rem {
             return Err(ChunkError::UnexpectedEof);
         }
 
@@ -561,5 +561,17 @@ mod tests {
         assert_eq!(next_bitstream_capacity(2_863_311_510), u32::MAX as usize);
         assert_eq!(next_bitstream_capacity(u32::MAX as usize), u32::MAX as usize);
         assert!(next_bitstream_capacity(2_000_000_000) <= u32::MAX as usize);
+    }
+
+    #[test]
+    fn read_bits_partial_tail_buffer_returns_eof_without_underflow() {
+        // 3 bytes total: read 16 bits leaving 8 valid bits, then request 64 bits with only
+        // 1 byte (8 bits) remaining in stream -> must return UnexpectedEof without underflow.
+        let mut br = BitReader::new(&[0xaa, 0xbb, 0xcc]);
+        assert_eq!(br.read_bits(16).unwrap(), 0xaabb);
+        // Only 8 bits remain in the stream while valid == 0 or valid > 0:
+        let mut br2 = BitReader::new(&[0xaa, 0xbb, 0xcc]);
+        assert_eq!(br2.read_bits(8).unwrap(), 0xaa);
+        assert!(matches!(br2.read_bits(64), Err(ChunkError::UnexpectedEof)));
     }
 }
