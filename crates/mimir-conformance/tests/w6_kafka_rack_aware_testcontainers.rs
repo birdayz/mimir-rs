@@ -924,11 +924,12 @@ async fn run_scenario(
             ));
         }
     } else {
-        // Go logs that the rack has no effect. (Rust emits the same warning through `tracing`;
-        // the binary's log output is tracked separately as finding F5, so it is not compared.)
+        // With concurrent fetching both log that the rack has no effect.
         let warn = "the configured Kafka client rack has no effect because concurrent fetching is enabled";
         if !go.proc.log_text().contains(warn) {
             errs.push("harness: Go did not warn that the client rack has no effect".to_string());
+        } else if !rust.proc.log_text().contains(warn) {
+            errs.push("Rust did not warn that the client rack has no effect (Go did)".to_string());
         }
     }
 
