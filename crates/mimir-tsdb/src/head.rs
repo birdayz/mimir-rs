@@ -56,7 +56,7 @@ use crate::record::{
     DecodedRecord, MetricType, RecordDecoder, RecordEncoder, RecordError, RefExemplar,
     RefFloatHistogramSample, RefHistogramSample, RefMetadata, RefMmapMarker, RefSample, RefSeries,
 };
-use crate::symbols::{SymbolId, SymbolTable};
+use crate::symbols::{SymbolId, SymbolTable, SymbolTableError};
 use crate::tombstones::{is_completely_deleted, Interval, MemTombstones};
 use crate::wlog::{
     create_checkpoint, decompress_record_into, delete_checkpoints,
@@ -69,6 +69,7 @@ pub const DEFAULT_BLOCK_DURATION_MS: i64 = 2 * 60 * 60 * 1000; // 2h
 pub const DEFAULT_SAMPLES_PER_CHUNK: usize = 120;
 pub const DEFAULT_STRIPE_SIZE: usize = 16384;
 pub const DEFAULT_MAX_EXEMPLARS: usize = 100_000;
+const DEFAULT_SYMBOL_GC_ARENA_GROWTH_BYTES: u64 = 128 * 1024 * 1024;
 pub const DEFAULT_OOO_CAP_MAX: usize = 32;
 
 #[derive(Debug, Error)]
@@ -89,6 +90,8 @@ pub enum HeadError {
     Exemplar(#[from] ExemplarError),
     #[error("metadata error: {0}")]
     Metadata(#[from] MetadataError),
+    #[error("symbol table error: {0}")]
+    SymbolTable(#[from] SymbolTableError),
     #[error("invalid head option: {0}")]
     InvalidOption(String),
     #[error("{0}")]
@@ -506,6 +509,11 @@ impl SeriesEntry {
             pending_commits: AtomicU32::new(init_pending),
             inner: Mutex::new(SeriesState::new()),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn new_for_test(ref_id: u64, hash: u64, labels: Labels) -> Self {
+        Self::new(ref_id, hash, labels, 0)
     }
 
     #[inline(always)]
@@ -2904,6 +2912,8 @@ pub struct Head {
     closed: AtomicBool,
     has_any_metadata: AtomicBool,
     deleted_series_since_symbol_gc: AtomicU64,
+    symbol_arena_baseline_bytes: AtomicU64,
+    symbol_gc_arena_growth_threshold: AtomicU64,
     wal_expiries: Mutex<HashMap<u64, i64>>,
     wbl_pinned_refs: Mutex<HashSet<u64>>,
     appender_pool: Mutex<Vec<AppenderScratch>>,
@@ -3023,6 +3033,8 @@ impl Head {
             closed: AtomicBool::new(false),
             has_any_metadata: AtomicBool::new(false),
             deleted_series_since_symbol_gc: AtomicU64::new(0),
+            symbol_arena_baseline_bytes: AtomicU64::new(0),
+            symbol_gc_arena_growth_threshold: AtomicU64::new(DEFAULT_SYMBOL_GC_ARENA_GROWTH_BYTES),
             wal_expiries: Mutex::new(HashMap::new()),
             wbl_pinned_refs: Mutex::new(HashSet::new()),
             appender_pool: Mutex::new(Vec::new()),
@@ -3160,6 +3172,8 @@ impl Head {
         if self.initialized() && self.min_time() < effective_mvt {
             self.min_time.store(effective_mvt, Ordering::Relaxed);
         }
+        self.symbol_arena_baseline_bytes
+            .store(self.symbols.read().bytes_len() as u64, Ordering::Release);
         Ok(())
     }
 
@@ -3340,15 +3354,38 @@ impl Head {
         (syms.len(), syms.bytes_len())
     }
 
-    /// Reclaims dead interned strings from `Head.symbols` (`SymbolTable`) after series churn.
+    #[doc(hidden)]
+    pub fn set_symbol_gc_arena_growth_threshold_for_test(&self, bytes: u64) {
+        self.symbol_gc_arena_growth_threshold
+            .store(bytes.max(1), Ordering::Release);
+    }
+
+    #[inline]
+    fn symbol_arena_grew_past_gc_threshold(&self) -> bool {
+        let sym_bytes = self.symbols.read().bytes_len() as u64;
+        let baseline = self.symbol_arena_baseline_bytes.load(Ordering::Acquire);
+        let threshold = self.symbol_gc_arena_growth_threshold.load(Ordering::Acquire);
+        sym_bytes.saturating_sub(baseline) >= threshold
+    }
+
+    /// Reclaims dead interned strings from `Head.symbols` (`SymbolTable`) after series churn
+    /// or whenever the symbol arena grew by at least 128 MiB since the last GC baseline.
     fn maybe_gc_symbols(&self) {
         let deleted = self.deleted_series_since_symbol_gc.load(Ordering::Acquire);
         let num_series = self.num_series();
-        let should_check = if num_series == 0 {
-            deleted > 0 && self.symbols.read().len() > 64
-        } else {
-            deleted >= (num_series / 2).max(1024)
+        let (sym_len, sym_bytes) = {
+            let syms = self.symbols.read();
+            (syms.len(), syms.bytes_len() as u64)
         };
+        let baseline_bytes = self.symbol_arena_baseline_bytes.load(Ordering::Acquire);
+        let arena_threshold = self.symbol_gc_arena_growth_threshold.load(Ordering::Acquire);
+        let arena_grew = sym_bytes.saturating_sub(baseline_bytes) >= arena_threshold;
+        let should_check = arena_grew
+            || if num_series == 0 {
+                deleted > 0 && sym_len > 64
+            } else {
+                deleted >= (num_series / 2).max(1024)
+            };
         if !should_check {
             return;
         }
@@ -3359,6 +3396,8 @@ impl Head {
         if self.num_series() == 0 && self.postings.is_all_empty() {
             self.postings.clear_and_shrink();
             *syms = SymbolTable::new();
+            self.symbol_arena_baseline_bytes
+                .store(syms.bytes_len() as u64, Ordering::Release);
             self.deleted_series_since_symbol_gc
                 .store(0, Ordering::Release);
             return;
@@ -3366,6 +3405,8 @@ impl Head {
 
         let old_len = syms.len();
         if old_len <= 1 {
+            self.symbol_arena_baseline_bytes
+                .store(syms.bytes_len() as u64, Ordering::Release);
             self.deleted_series_since_symbol_gc
                 .store(0, Ordering::Release);
             return;
@@ -3395,20 +3436,33 @@ impl Head {
             }
         }
 
-        let live_count = used.iter().filter(|&&u| u).count();
-        if live_count * 4 < old_len * 3 || (old_len > 4096 && live_count + 1024 < old_len) {
-            let mut live_bytes = 0usize;
-            for (i, &is_used) in used.iter().enumerate().skip(1) {
-                if is_used {
-                    live_bytes += syms.resolve(SymbolId(i as u32)).len();
+        let old_bytes = syms.bytes_len();
+        let mut live_count = 1usize;
+        let mut live_bytes = 0usize;
+        for (i, &is_used) in used.iter().enumerate().skip(1) {
+            if is_used {
+                live_count += 1;
+                if let Some(s) = syms.try_resolve(SymbolId(i as u32)) {
+                    live_bytes += s.len();
                 }
             }
+        }
+
+        let min_reclaim_bytes = (arena_threshold as usize / 8).max(1024);
+        let should_compact = live_count * 4 < old_len * 3
+            || (old_len > 4096 && live_count + 1024 < old_len)
+            || live_bytes * 4 < old_bytes * 3
+            || old_bytes.saturating_sub(live_bytes) >= min_reclaim_bytes;
+        if should_compact {
             let mut new_syms = SymbolTable::with_capacity(live_count, live_bytes);
             let mut remap = vec![SymbolId::EMPTY; old_len];
             for (i, &is_used) in used.iter().enumerate().skip(1) {
                 if is_used {
-                    let s = syms.resolve(SymbolId(i as u32));
-                    remap[i] = new_syms.intern(s);
+                    if let Some(s) = syms.try_resolve(SymbolId(i as u32)) {
+                        if let Ok(id) = new_syms.try_intern(s) {
+                            remap[i] = id;
+                        }
+                    }
                 }
             }
 
@@ -3426,6 +3480,8 @@ impl Head {
             }
             *syms = new_syms;
         }
+        self.symbol_arena_baseline_bytes
+            .store(syms.bytes_len() as u64, Ordering::Release);
         self.deleted_series_since_symbol_gc
             .store(0, Ordering::Release);
     }
@@ -3435,23 +3491,23 @@ impl Head {
         metric_type: MetricType,
         unit: &str,
         help: &str,
-    ) -> CompactSeriesMetadata {
+    ) -> Result<CompactSeriesMetadata, HeadError> {
         {
             let syms = self.symbols.read();
             if let (Some(u), Some(h)) = (syms.get(unit), syms.get(help)) {
-                return CompactSeriesMetadata {
+                return Ok(CompactSeriesMetadata {
                     metric_type,
                     unit: u,
                     help: h,
-                };
+                });
             }
         }
         let mut syms = self.symbols.write();
-        CompactSeriesMetadata {
+        Ok(CompactSeriesMetadata {
             metric_type,
-            unit: syms.intern(unit),
-            help: syms.intern(help),
-        }
+            unit: syms.try_intern(unit)?,
+            help: syms.try_intern(help)?,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3829,7 +3885,7 @@ impl Head {
                         };
                         let metric_type = MetricType::from_u8(m.metric_type);
                         let compact_meta =
-                            self.intern_metadata_symbols(metric_type, &m.unit, &m.help);
+                            self.intern_metadata_symbols(metric_type, &m.unit, &m.help)?;
                         self.has_any_metadata.store(true, Ordering::Release);
                         let mut st = entry.inner.lock();
                         st.set_metadata(compact_meta);
@@ -4180,6 +4236,8 @@ impl Head {
                 let postings_ptr = MutPtr(out_postings.as_mut_ptr());
                 let attach_ptr = MutPtr(out_attach.as_mut_ptr());
                 let created_ptr = MutPtr(out_created.as_mut_ptr());
+                let mut out_err: Vec<Option<HeadError>> = (0..workers).map(|_| None).collect();
+                let err_ptr = MutPtr(out_err.as_mut_ptr());
                 let cb_opt = self.lifecycle_callback.read().clone();
 
                 series_pool.scoped_execute(workers, |w| {
@@ -4192,6 +4250,7 @@ impl Head {
                     let w_postings = unsafe { postings_ptr.get(w) };
                     let w_attach = unsafe { attach_ptr.get(w) };
                     let w_created = unsafe { created_ptr.get(w) };
+                    let w_err = unsafe { err_ptr.get(w) };
 
                     for (rs, hash, mmc, ooo_mmc) in shard {
                         if let Some(existing) =
@@ -4203,7 +4262,13 @@ impl Head {
                             }
                             continue;
                         }
-                        let symbol_labels = self.intern_labels_read_first(&rs.labels);
+                        let symbol_labels = match self.intern_labels_read_first(&rs.labels) {
+                            Ok(sl) => sl,
+                            Err(e) => {
+                                *w_err = Some(e);
+                                return;
+                            }
+                        };
                         let entry = Arc::new(SeriesEntry::new(rs.ref_id, hash, rs.labels, 0));
                         self.series.insert(Arc::clone(&entry));
                         w_postings.push((rs.ref_id, symbol_labels));
@@ -4216,6 +4281,10 @@ impl Head {
                         }
                     }
                 });
+
+                if let Some(err) = out_err.into_iter().flatten().next() {
+                    return Err(err);
+                }
 
                 for mvec in out_multi_ref {
                     for (k, v) in mvec {
@@ -4474,7 +4543,7 @@ impl Head {
                                                 metric_type,
                                                 &m.unit,
                                                 &m.help,
-                                            );
+                                            )?;
                                             self.has_any_metadata.store(true, Ordering::Release);
                                             let mut st = entry.inner.lock();
                                             st.set_metadata(compact_meta);
@@ -4926,6 +4995,11 @@ impl Head {
         *self.lifecycle_callback.write() = cb;
     }
 
+    /// Clears the series lifecycle callback (breaks reference chains on tenant unload).
+    pub fn clear_lifecycle_callback(&self) {
+        *self.lifecycle_callback.write() = None;
+    }
+
     /// Zero-allocation series lookup by sorted `(&str, &str)` pairs.
     pub fn get_ref_by_sorted_pairs(&self, pairs: &[(&str, &str)]) -> Option<u64> {
         let hash = hash_sorted_pairs(pairs);
@@ -5235,7 +5309,7 @@ impl Head {
             cb.pre_creation(pairs)?;
         }
 
-        let symbol_labels = self.intern_sorted_pairs_read_first(pairs);
+        let symbol_labels = self.intern_sorted_pairs_read_first(pairs)?;
         let metric_name = pairs
             .iter()
             .find(|&&(k, _)| k == METRIC_NAME)
@@ -5282,7 +5356,7 @@ impl Head {
             cb.pre_creation(&pairs_tmp)?;
         }
 
-        let symbol_labels = self.intern_encoded_labels_read_first(encoded_labels);
+        let symbol_labels = self.intern_encoded_labels_read_first(encoded_labels)?;
         let labels = Labels::from_raw_stringlabels_bytes(Bytes::copy_from_slice(encoded_labels));
         let ref_id = self.last_series_id.fetch_add(1, Ordering::AcqRel) + 1;
         let entry = Arc::new(SeriesEntry::new(ref_id, hash, labels, init_pending));
@@ -5303,7 +5377,10 @@ impl Head {
         Ok((entry, true))
     }
 
-    fn intern_encoded_labels_read_first(&self, encoded_labels: &[u8]) -> SymbolLabels {
+    fn intern_encoded_labels_read_first(
+        &self,
+        encoded_labels: &[u8],
+    ) -> Result<SymbolLabels, HeadError> {
         let mut missing = false;
         let mut resolved: SmallVec<[(Option<SymbolId>, Option<SymbolId>); 24]> = SmallVec::new();
         {
@@ -5320,7 +5397,7 @@ impl Head {
         let interned: SmallVec<[(SymbolId, SymbolId); 8]> = if !missing {
             resolved
                 .into_iter()
-                .map(|(k, v)| (k.unwrap(), v.unwrap()))
+                .filter_map(|(k, v)| Some((k?, v?)))
                 .collect()
         } else {
             let mut syms = self.symbols.write();
@@ -5328,20 +5405,23 @@ impl Head {
             for ((k, v), (kid, vid)) in iter_stringlabels(encoded_labels).zip(resolved) {
                 let kf = match kid {
                     Some(id) => id,
-                    None => syms.intern(k),
+                    None => syms.try_intern(k)?,
                 };
                 let vf = match vid {
                     Some(id) => id,
-                    None => syms.intern(v),
+                    None => syms.try_intern(v)?,
                 };
                 out.push((kf, vf));
             }
             out
         };
-        SymbolLabels::from_sorted_ids(interned)
+        Ok(SymbolLabels::from_sorted_ids(interned))
     }
 
-    fn intern_sorted_pairs_read_first(&self, pairs: &[(&str, &str)]) -> SymbolLabels {
+    fn intern_sorted_pairs_read_first(
+        &self,
+        pairs: &[(&str, &str)],
+    ) -> Result<SymbolLabels, HeadError> {
         let mut missing = false;
         let mut resolved: SmallVec<[(Option<SymbolId>, Option<SymbolId>); 24]> =
             SmallVec::with_capacity(pairs.len());
@@ -5359,7 +5439,7 @@ impl Head {
         let interned: SmallVec<[(SymbolId, SymbolId); 8]> = if !missing {
             resolved
                 .into_iter()
-                .map(|(k, v)| (k.unwrap(), v.unwrap()))
+                .filter_map(|(k, v)| Some((k?, v?)))
                 .collect()
         } else {
             let mut syms = self.symbols.write();
@@ -5368,20 +5448,20 @@ impl Head {
                 let (kid, vid) = resolved[i];
                 let kf = match kid {
                     Some(id) => id,
-                    None => syms.intern(k),
+                    None => syms.try_intern(k)?,
                 };
                 let vf = match vid {
                     Some(id) => id,
-                    None => syms.intern(v),
+                    None => syms.try_intern(v)?,
                 };
                 out.push((kf, vf));
             }
             out
         };
-        SymbolLabels::from_sorted_ids(interned)
+        Ok(SymbolLabels::from_sorted_ids(interned))
     }
 
-    fn intern_labels_read_first(&self, labels: &Labels) -> SymbolLabels {
+    fn intern_labels_read_first(&self, labels: &Labels) -> Result<SymbolLabels, HeadError> {
         let mut missing = false;
         let mut resolved: SmallVec<[(Option<SymbolId>, Option<SymbolId>); 24]> =
             SmallVec::new();
@@ -5399,7 +5479,7 @@ impl Head {
         let interned: SmallVec<[(SymbolId, SymbolId); 8]> = if !missing {
             resolved
                 .into_iter()
-                .map(|(k, v)| (k.unwrap(), v.unwrap()))
+                .filter_map(|(k, v)| Some((k?, v?)))
                 .collect()
         } else {
             let mut syms = self.symbols.write();
@@ -5407,17 +5487,17 @@ impl Head {
             for ((k, v), (kid, vid)) in labels.iter().zip(resolved) {
                 let kf = match kid {
                     Some(id) => id,
-                    None => syms.intern(k),
+                    None => syms.try_intern(k)?,
                 };
                 let vf = match vid {
                     Some(id) => id,
-                    None => syms.intern(v),
+                    None => syms.try_intern(v)?,
                 };
                 out.push((kf, vf));
             }
             out
         };
-        SymbolLabels::from_sorted_ids(interned)
+        Ok(SymbolLabels::from_sorted_ids(interned))
     }
 
     fn replay_wal_series_batch<F>(
@@ -5451,7 +5531,11 @@ impl Head {
                 continue;
             }
 
-            let symbol_labels = SymbolLabels::from_labels(&mut syms, &rs.labels);
+            let mut interned: SmallVec<[(SymbolId, SymbolId); 8]> = SmallVec::new();
+            for (k, v) in rs.labels.iter() {
+                interned.push((syms.try_intern(k)?, syms.try_intern(v)?));
+            }
+            let symbol_labels = SymbolLabels::from_sorted_ids(interned);
             let entry = Arc::new(SeriesEntry::new(
                 rs.ref_id,
                 hash,
@@ -5506,7 +5590,7 @@ impl Head {
             Some(i) => i,
             None => self.last_series_id.fetch_add(1, Ordering::AcqRel) + 1,
         };
-        let symbol_labels = self.intern_labels_read_first(labels);
+        let symbol_labels = self.intern_labels_read_first(labels)?;
         let entry = Arc::new(SeriesEntry::new(ref_id, hash, labels.clone(), 0));
         self.series.insert(Arc::clone(&entry));
         pending_postings.push((ref_id, symbol_labels));
@@ -5543,7 +5627,7 @@ impl Head {
             Some(i) => i,
             None => self.last_series_id.fetch_add(1, Ordering::AcqRel) + 1,
         };
-        let symbol_labels = self.intern_labels_read_first(labels);
+        let symbol_labels = self.intern_labels_read_first(labels)?;
         let metric_name = labels.get(METRIC_NAME);
         let entry = Arc::new(SeriesEntry::new(ref_id, hash, labels.clone(), 0));
         self.series.insert(Arc::clone(&entry));
@@ -6790,6 +6874,9 @@ impl Head {
     fn truncate_memory_inner(&self, mint: i64) -> Result<(), HeadError> {
         let initialized = self.initialized();
         if initialized && self.min_time() >= mint {
+            if self.symbol_arena_grew_past_gc_threshold() {
+                self.maybe_gc_symbols();
+            }
             return Ok(());
         }
 
@@ -7637,6 +7724,7 @@ impl Head {
         if let Some(wbl) = self.wbl.lock().take() {
             wbl.close()?;
         }
+        *self.chunk_reader.write() = None;
         Ok(())
     }
 }
@@ -9357,8 +9445,8 @@ impl<'a> HeadAppender<'a> {
                 let mut syms = self.head.symbols.write();
                 let compact_meta = CompactSeriesMetadata {
                     metric_type: pm.metric_type,
-                    unit: syms.intern(&pm.unit),
-                    help: syms.intern(&pm.help),
+                    unit: syms.try_intern(&pm.unit)?,
+                    help: syms.try_intern(&pm.help)?,
                 };
                 self.head.has_any_metadata.store(true, Ordering::Release);
                 let mut st = pm.entry.inner.lock();
@@ -11893,5 +11981,54 @@ mod tests {
         head.close().unwrap();
         let reopened = Head::open(dir.path(), opts, i64::MIN).unwrap();
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn symbol_gc_triggers_on_arena_growth_from_metadata_churn_without_series_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+        head.set_symbol_gc_arena_growth_threshold_for_test(512 * 1024);
+
+        let pairs = [("__name__", "meta_churn_metric"), ("job", "api")];
+        {
+            let mut app = head.appender();
+            app.append_float(None, &pairs, 1_000, 1.0).unwrap();
+            app.commit().unwrap();
+        }
+
+        // Churn 1 MiB of metadata help strings on the single live series (0 deleted series!).
+        for i in 0..256 {
+            let help = format!("help-{i:04}-{}", "x".repeat(4096));
+            let mut app = head.appender();
+            app.update_metadata(
+                None,
+                &pairs,
+                "meta_churn_metric",
+                MetricType::Gauge,
+                "bytes",
+                &help,
+            )
+            .unwrap();
+            app.commit().unwrap();
+        }
+
+        let (syms_before, bytes_before) = head.symbol_table_stats();
+        assert!(bytes_before >= 1_000_000, "bytes_before={bytes_before}");
+        assert_eq!(head.num_series(), 1);
+
+        // Even though mint <= head.min_time() and deleted_series == 0, truncate_memory
+        // must notice arena growth >= threshold and reclaim the 255 dead help strings.
+        head.truncate_memory(500).unwrap();
+
+        let (syms_after, bytes_after) = head.symbol_table_stats();
+        assert!(
+            syms_after < syms_before / 2,
+            "expected symbol count shrink: {syms_before} -> {syms_after}"
+        );
+        assert!(
+            bytes_after < 16_384,
+            "expected symbol arena bytes shrink: {bytes_before} -> {bytes_after}"
+        );
+        head.close().unwrap();
     }
 }

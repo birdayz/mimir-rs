@@ -472,10 +472,11 @@ impl Tsdb {
         self.inner.head.exemplars().select(start, end, matcher_sets)
     }
 
-    /// Stops the background reload/mmap loop and flushes & closes Head.
+    /// Stops the background reload/mmap loop, flushes & closes Head, and drops all block mmaps.
     pub fn close(&self) -> Result<(), TsdbError> {
         self.stop_background_loop();
         self.inner.head.close()?;
+        self.inner.blocks.write().clear();
         Ok(())
     }
 }

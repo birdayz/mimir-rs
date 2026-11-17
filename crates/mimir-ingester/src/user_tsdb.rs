@@ -568,9 +568,10 @@ impl UserTsdb {
         };
 
         let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
-        let db_for_fn = Arc::clone(&db);
-        *lifecycle_adapter.num_series_fn.write() =
-            Some(Arc::new(move || db_for_fn.head().num_series()));
+        let weak_db = Arc::downgrade(&db);
+        *lifecycle_adapter.num_series_fn.write() = Some(Arc::new(move || {
+            weak_db.upgrade().map_or(0, |d| d.head().num_series())
+        }));
 
         // Compact ready blocks after WAL replay
         let _ = db.compact()?;
@@ -1221,7 +1222,10 @@ impl UserTsdb {
 
     pub fn close(&self) -> Result<(), TsdbError> {
         self.lifecycle_adapter.limiter_slot.write().take();
-        self.db.close()
+        let res = self.db.close();
+        self.lifecycle_adapter.num_series_fn.write().take();
+        self.db.head().clear_lifecycle_callback();
+        res
     }
 }
 

@@ -1375,6 +1375,16 @@ impl Manager {
         }
     }
 
+    /// Evicts per-tenant cached limit configuration when a tenant TSDB is unloaded.
+    pub fn remove_tenant(&self, user_id: &str) {
+        self.config_cache.write().remove(user_id);
+    }
+
+    #[doc(hidden)]
+    pub fn debug_has_cached_config(&self, user_id: &str) -> bool {
+        self.config_cache.read().contains_key(user_id)
+    }
+
     /// Cleanup inactivity timeout (`-cost-attribution.eviction-interval`).
     pub fn inactive_timeout(&self) -> Duration {
         self.inactive_timeout
