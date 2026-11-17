@@ -877,20 +877,34 @@ impl KafkaClient {
         if resp.controller_id.0 >= 0 {
             self.controller_id.store(resp.controller_id.0, Ordering::SeqCst);
         }
-        let mut md = self.metadata.write();
-        md.brokers = resp
-            .brokers
-            .iter()
-            .map(|b| {
-                (
-                    b.node_id.0,
-                    BrokerInfo {
-                        addr: format!("{}:{}", b.host.as_str(), b.port),
-                    },
-                )
-            })
-            .collect();
-        drop(md);
+        let live_addrs: std::collections::HashSet<String> = {
+            let mut md = self.metadata.write();
+            md.brokers = resp
+                .brokers
+                .iter()
+                .map(|b| {
+                    (
+                        b.node_id.0,
+                        BrokerInfo {
+                            addr: format!("{}:{}", b.host.as_str(), b.port),
+                        },
+                    )
+                })
+                .collect();
+            md.brokers.values().map(|b| b.addr.clone()).collect()
+        };
+
+        if !live_addrs.is_empty() {
+            let mut conns = self.conns_by_addr.lock().await;
+            conns.retain(|(addr, _), conn| {
+                let keep = live_addrs.contains(addr)
+                    || self.seed_brokers.iter().any(|seed| seed == addr);
+                if !keep {
+                    conn.mark_dead();
+                }
+                keep
+            });
+        }
         Ok(resp)
     }
 
@@ -2650,5 +2664,138 @@ mod tests {
         let crc = crc32c::crc32c(&neg_count[V2_ATTRIBUTES_OFFSET..]);
         neg_count[17..21].copy_from_slice(&crc.to_be_bytes());
         assert!(decode_single_batch_slice(neg_count.freeze(), 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_prunes_stale_broker_conns_but_keeps_seed_brokers() {
+        use kafka_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+        use kafka_protocol::messages::metadata_response::MetadataResponseBroker;
+        use kafka_protocol::messages::ApiVersionsRequest;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let advertised_port = Arc::new(AtomicI32::new(addr.port() as i32));
+        let adv_c = Arc::clone(&advertised_port);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let adv = Arc::clone(&adv_c);
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = stream.into_split();
+                    let mut len_buf = [0u8; 4];
+                    while rd.read_exact(&mut len_buf).await.is_ok() {
+                        let sz = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; sz];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = Bytes::from(payload);
+                        let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let Ok(api_key) = ApiKey::try_from(key_i16) else {
+                            break;
+                        };
+                        let hdr_ver = match api_key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                            ApiKey::Metadata => MetadataRequest::header_version(ver),
+                            _ => break,
+                        };
+                        let Ok(req_hdr) = RequestHeader::decode(&mut buf, hdr_ver) else {
+                            break;
+                        };
+                        let mut out = BytesMut::new();
+                        out.put_u32(0);
+                        let resp_hdr_ver = api_key.response_header_version(ver);
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr.encode(&mut out, resp_hdr_ver).unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut resp = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [(ApiKey::ApiVersions as i16, 0, 3), (ApiKey::Metadata as i16, 1, 12)] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    resp.api_keys.push(av);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                let mut resp = MetadataResponse::default();
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = adv.load(Ordering::SeqCst);
+                                resp.brokers.push(b);
+                                resp.controller_id = BrokerId(0);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = KafkaClient::new(
+            vec![addr.to_string()],
+            "test-client",
+            "",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        // Insert a stale non-seed broker connection and a seed broker connection.
+        let make_dummy_conn = |b_addr: &str| {
+            let (tx, _rx) = mpsc::channel(1);
+            Arc::new(BrokerConn {
+                addr: b_addr.to_string(),
+                kind: ConnKind::Normal,
+                client_id: "test".to_string(),
+                next_corr_id: AtomicI32::new(1),
+                write_tx: tx,
+                pending: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                api_versions: RwLock::new(HashMap::new()),
+                alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                sasl_expiry: None,
+                successes: std::sync::atomic::AtomicU64::new(0),
+                node: "99".to_string(),
+                kprom: None,
+            })
+        };
+
+        let stale_conn = make_dummy_conn("10.0.0.99:9092");
+        {
+            let mut map = client.conns_by_addr.lock().await;
+            map.insert(("10.0.0.99:9092".to_string(), ConnKind::Normal), Arc::clone(&stale_conn));
+        }
+
+        // First metadata response advertises port 19092 (different from seed), so seed is kept
+        // because it's in seed_brokers, and 10.0.0.99:9092 is pruned and marked dead.
+        advertised_port.store(19092, Ordering::SeqCst);
+        client.fetch_metadata(Some(&[]), 1).await.unwrap();
+
+        assert!(!stale_conn.is_alive(), "pruned stale conn must be marked dead");
+        {
+            let map = client.conns_by_addr.lock().await;
+            assert!(!map.contains_key(&("10.0.0.99:9092".to_string(), ConnKind::Normal)));
+            assert!(map.contains_key(&(addr.to_string(), ConnKind::Normal)));
+        }
+
+        srv.abort();
     }
 }

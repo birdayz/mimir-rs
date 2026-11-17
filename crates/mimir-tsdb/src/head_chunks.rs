@@ -5,8 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use memmap2::{Mmap, MmapOptions};
 use thiserror::Error;
@@ -149,6 +150,22 @@ fn repair_last_chunk_file(files: &mut BTreeMap<usize, PathBuf>) -> Result<(), He
     Ok(())
 }
 
+/// Fault-injection decision for testing `ENOSPC`/`EIO` write rollbacks.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum WriteFaultAction {
+    PassThrough,
+    PartialThenError {
+        prefix_len: usize,
+        err_kind: io::ErrorKind,
+    },
+    Error(io::ErrorKind),
+}
+
+/// Fault-injection hook invoked per write call with the slice length being written.
+#[doc(hidden)]
+pub type WriteFaultHook = Arc<dyn Fn(usize) -> WriteFaultAction + Send + Sync>;
+
 /// Writer for Prometheus `chunks_head/000001`, `000002`, ... files.
 pub struct HeadChunksWriter {
     dir: PathBuf,
@@ -157,9 +174,13 @@ pub struct HeadChunksWriter {
     queue_metrics: Option<crate::metrics::ChunkWriteQueueMetrics>,
     seq: usize,
     offset: usize,
-    cur_writer: Option<BufWriter<File>>,
+    file_offset: usize,
+    cur_file: Option<File>,
+    write_buf: Vec<u8>,
+    record_buf: Vec<u8>,
     cut_on_next_chunk: bool,
     closed: bool,
+    fault_hook: Option<WriteFaultHook>,
 }
 
 impl HeadChunksWriter {
@@ -194,16 +215,80 @@ impl HeadChunksWriter {
             queue_metrics: None,
             seq,
             offset: 0,
-            cur_writer: None,
+            file_offset: 0,
+            cur_file: None,
+            write_buf: Vec::new(),
+            record_buf: Vec::new(),
             cut_on_next_chunk: false,
             closed: false,
+            fault_hook: None,
         })
     }
 
-    fn entry_len(data_len: usize) -> usize {
-        let mut len_buf = [0u8; 10];
-        let ulen = put_uvarint(&mut len_buf, data_len as u64);
-        SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE + CHUNK_ENCODING_SIZE + ulen + data_len + CRC_SIZE
+    /// Installs or clears a write fault-injection hook (used by durability tests).
+    #[doc(hidden)]
+    pub fn set_write_fault_hook(&mut self, hook: Option<WriteFaultHook>) {
+        self.fault_hook = hook;
+    }
+
+    fn write_all_with_hook(
+        file: &mut File,
+        hook: Option<&WriteFaultHook>,
+        buf: &[u8],
+    ) -> io::Result<()> {
+        let mut written = 0usize;
+        while written < buf.len() {
+            let slice = &buf[written..];
+            let res = match hook {
+                None => file.write(slice),
+                Some(h) => match h(slice.len()) {
+                    WriteFaultAction::PassThrough => file.write(slice),
+                    WriteFaultAction::PartialThenError {
+                        prefix_len,
+                        err_kind,
+                    } => {
+                        let p = prefix_len.min(slice.len());
+                        if p > 0 {
+                            file.write_all(&slice[..p])?;
+                        }
+                        Err(io::Error::new(err_kind, "injected head chunks write fault"))
+                    }
+                    WriteFaultAction::Error(err_kind) => {
+                        Err(io::Error::new(err_kind, "injected head chunks write fault"))
+                    }
+                },
+            };
+            match res {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write whole head chunk buffer",
+                    ));
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_write_buf(&mut self) -> Result<(), HeadChunksError> {
+        if self.write_buf.is_empty() {
+            return Ok(());
+        }
+        let Some(ref mut file) = self.cur_file else {
+            return Ok(());
+        };
+        let saved_pos = self.file_offset as u64;
+        if let Err(e) = Self::write_all_with_hook(file, self.fault_hook.as_ref(), &self.write_buf) {
+            let _ = file.set_len(saved_pos);
+            let _ = file.seek(SeekFrom::Start(saved_pos));
+            return Err(HeadChunksError::Io(e));
+        }
+        self.file_offset += self.write_buf.len();
+        self.write_buf.clear();
+        Ok(())
     }
 
     pub fn cut_new_file(&mut self) -> Result<(), HeadChunksError> {
@@ -211,8 +296,8 @@ impl HeadChunksWriter {
             return Err(HeadChunksError::Closed);
         }
         self.finalize_current()?;
-        self.seq += 1;
-        let path = head_chunk_file_path(&self.dir, self.seq);
+        let next_seq = self.seq + 1;
+        let path = head_chunk_file_path(&self.dir, next_seq);
         let mut f = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -222,20 +307,30 @@ impl HeadChunksWriter {
         let mut hdr = [0u8; HEAD_CHUNK_FILE_HEADER_SIZE];
         hdr[..MAGIC_CHUNKS_SIZE].copy_from_slice(&MAGIC_HEAD_CHUNKS.to_be_bytes());
         hdr[MAGIC_CHUNKS_SIZE] = HEAD_CHUNKS_FORMAT_V1;
-        f.write_all(&hdr)?;
-        f.flush()?;
+        if let Err(e) = Self::write_all_with_hook(&mut f, self.fault_hook.as_ref(), &hdr)
+            .and_then(|()| f.flush())
+        {
+            drop(f);
+            let _ = fs::remove_file(&path);
+            return Err(HeadChunksError::Io(e));
+        }
 
-        self.cur_writer = Some(BufWriter::with_capacity(self.write_buffer_size, f));
+        self.seq = next_seq;
+        self.cur_file = Some(f);
+        self.file_offset = HEAD_CHUNK_FILE_HEADER_SIZE;
         self.offset = HEAD_CHUNK_FILE_HEADER_SIZE;
+        self.write_buf.clear();
         self.cut_on_next_chunk = false;
         Ok(())
     }
 
     fn finalize_current(&mut self) -> Result<(), HeadChunksError> {
-        if let Some(mut w) = self.cur_writer.take() {
-            w.flush()?;
-            let file = w.into_inner().map_err(|e| e.into_error())?;
-            file.sync_all()?;
+        if self.cur_file.is_some() {
+            self.flush_write_buf()?;
+            if let Some(ref file) = self.cur_file {
+                file.sync_all()?;
+            }
+            self.cur_file = None;
         }
         Ok(())
     }
@@ -254,17 +349,6 @@ impl HeadChunksWriter {
         }
 
         let data = chunk.as_bytes();
-        let needed = Self::entry_len(data.len());
-
-        if self.cut_on_next_chunk
-            || self.cur_writer.is_none()
-            || self.offset + needed > self.max_file_size
-        {
-            self.cut_on_next_chunk = false;
-            self.cut_new_file()?;
-        }
-
-        let chunk_offset = self.offset;
         let mut meta_buf = [0u8; MAX_HEAD_CHUNK_META_SIZE];
         meta_buf[0..8].copy_from_slice(&series_ref.to_be_bytes());
         meta_buf[8..16].copy_from_slice(&mint.to_be_bytes());
@@ -280,12 +364,44 @@ impl HeadChunksWriter {
         let crc = crc32c::crc32c(&meta_buf[..hdr_len]);
         let crc = crc32c::crc32c_append(crc, data);
 
-        let w = self.cur_writer.as_mut().unwrap();
-        w.write_all(&meta_buf[..hdr_len])?;
-        w.write_all(data)?;
-        w.write_all(&crc.to_be_bytes())?;
+        self.record_buf.clear();
+        self.record_buf.reserve(hdr_len + data.len() + CRC_SIZE);
+        self.record_buf.extend_from_slice(&meta_buf[..hdr_len]);
+        self.record_buf.extend_from_slice(data);
+        self.record_buf.extend_from_slice(&crc.to_be_bytes());
+        let needed = self.record_buf.len();
 
-        self.offset += needed;
+        if self.cut_on_next_chunk
+            || self.cur_file.is_none()
+            || self.offset + needed > self.max_file_size
+        {
+            self.cut_new_file()?;
+        }
+
+        let chunk_offset = self.offset;
+        if self.write_buf.len() + needed > self.write_buffer_size {
+            self.flush_write_buf()?;
+            if needed >= self.write_buffer_size {
+                let file = self.cur_file.as_mut().ok_or(HeadChunksError::Closed)?;
+                let saved_pos = self.offset as u64;
+                if let Err(e) =
+                    Self::write_all_with_hook(file, self.fault_hook.as_ref(), &self.record_buf)
+                {
+                    let _ = file.set_len(saved_pos);
+                    let _ = file.seek(SeekFrom::Start(saved_pos));
+                    return Err(HeadChunksError::Io(e));
+                }
+                self.file_offset += needed;
+                self.offset += needed;
+            } else {
+                self.write_buf.extend_from_slice(&self.record_buf);
+                self.offset += needed;
+            }
+        } else {
+            self.write_buf.extend_from_slice(&self.record_buf);
+            self.offset += needed;
+        }
+
         if let Some(m) = self.queue_metrics.as_ref() {
             m.adds.inc();
             m.completed.inc();
@@ -299,18 +415,15 @@ impl HeadChunksWriter {
     }
 
     pub fn flush(&mut self) -> Result<(), HeadChunksError> {
-        if let Some(w) = self.cur_writer.as_mut() {
-            w.flush()?;
-        }
-        Ok(())
+        self.flush_write_buf()
     }
 
     pub fn has_active_file(&self) -> bool {
-        self.cur_writer.is_some()
+        self.cur_file.is_some()
     }
 
     pub fn cur_file_has_chunks(&self) -> bool {
-        self.cur_writer.is_some() && self.offset > HEAD_CHUNK_FILE_HEADER_SIZE
+        self.cur_file.is_some() && self.offset > HEAD_CHUNK_FILE_HEADER_SIZE
     }
 
     pub fn cut_file_on_next_chunk(&mut self) {
