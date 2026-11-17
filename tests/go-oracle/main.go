@@ -91,6 +91,8 @@ func main() {
 		out, err = cmdMemberlistStatusPage(input)
 	case "memberlist-format-value":
 		out, err = cmdMemberlistFormatValue(input)
+	case "grpc-health-probe":
+		out, err = cmdGrpcHealthProbe(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}

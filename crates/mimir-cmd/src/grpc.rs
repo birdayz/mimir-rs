@@ -20,6 +20,7 @@ use mimir_common::grpc_log::{GrpcErrorLog, GrpcErrorLogEntry};
 use mimir_proto::grpcutilpb::{extract_http_response, status_with_http_response};
 use mimir_proto::httpgrpcpb;
 use mimir_proto::httpgrpcpb::http_server::Http;
+use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
 use tower::ServiceExt;
 
@@ -56,6 +57,10 @@ const NOT_SERVING_STATUS: i32 = 2;
 pub struct HealthService {
     shutdown_requested: Arc<AtomicBool>,
     modules: Arc<ModuleStates>,
+    accept_compression: Vec<CompressionEncoding>,
+    send_compression: Option<CompressionEncoding>,
+    max_decoding_message_size: Option<usize>,
+    max_encoding_message_size: Option<usize>,
 }
 
 impl HealthService {
@@ -63,7 +68,48 @@ impl HealthService {
         Self {
             shutdown_requested,
             modules,
+            accept_compression: Vec::new(),
+            send_compression: None,
+            max_decoding_message_size: None,
+            max_encoding_message_size: None,
         }
+    }
+
+    pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+        self.accept_compression.push(encoding);
+        self
+    }
+
+    pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+        self.send_compression = Some(encoding);
+        self
+    }
+
+    pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+        self.max_decoding_message_size = Some(limit);
+        self
+    }
+
+    pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+        self.max_encoding_message_size = Some(limit);
+        self
+    }
+
+    fn configure_grpc<C: tonic::codec::Codec>(&self, codec: C) -> tonic::server::Grpc<C> {
+        let mut grpc = tonic::server::Grpc::new(codec);
+        for enc in &self.accept_compression {
+            grpc = grpc.accept_compressed(*enc);
+        }
+        if let Some(enc) = self.send_compression {
+            grpc = grpc.send_compressed(enc);
+        }
+        if let Some(lim) = self.max_decoding_message_size {
+            grpc = grpc.max_decoding_message_size(lim);
+        }
+        if let Some(lim) = self.max_encoding_message_size {
+            grpc = grpc.max_encoding_message_size(lim);
+        }
+        grpc
     }
 
     /// `grpcutil.NewHealthCheckFrom(WithShutdownRequested(..), WithManager(sm))`.
@@ -120,7 +166,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for HealthService {
                     }
                 }
                 Box::pin(async move {
-                    let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                    let mut grpc = this.configure_grpc(tonic::codec::ProstCodec::default());
                     Ok(grpc.unary(CheckSvc(this), req).await)
                 })
             }
@@ -150,7 +196,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for HealthService {
                     }
                 }
                 Box::pin(async move {
-                    let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                    let mut grpc = this.configure_grpc(tonic::codec::ProstCodec::default());
                     Ok(grpc.server_streaming(WatchSvc, req).await)
                 })
             }
@@ -176,7 +222,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for HealthService {
                     }
                 }
                 Box::pin(async move {
-                    let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                    let mut grpc = this.configure_grpc(tonic::codec::ProstCodec::default());
                     Ok(grpc.unary(ListSvc(this), req).await)
                 })
             }
@@ -624,5 +670,136 @@ mod tests {
         let log = GrpcErrorLog::default();
         let _ = call_bridge(router, get_req("/loud"), false, Some(log.clone())).await;
         assert!(log.take().is_none(), "plain errors are logged by the interceptor");
+    }
+
+    async fn call_health(
+        svc: mimir_ingester::grpc::SnappyDecompressService<HealthService>,
+        path: &str,
+        body: Vec<u8>,
+        encoding: Option<&str>,
+    ) -> http::Response<tonic::body::BoxBody> {
+        let mut b = http::Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(http::header::CONTENT_TYPE, "application/grpc");
+        let framed = match encoding {
+            None => mimir_proto::snappy::encode_grpc_frame(&body, false).unwrap(),
+            Some("snappy") => {
+                b = b.header("grpc-encoding", "snappy");
+                mimir_proto::snappy::encode_grpc_frame(&body, true).unwrap()
+            }
+            Some("gzip") => {
+                use flate2::{write::GzEncoder, Compression};
+                use std::io::Write;
+                b = b.header("grpc-encoding", "gzip");
+                let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+                enc.write_all(&body).unwrap();
+                let gz = enc.finish().unwrap();
+                let mut out = Vec::with_capacity(5 + gz.len());
+                out.push(1);
+                out.extend_from_slice(&(gz.len() as u32).to_be_bytes());
+                out.extend_from_slice(&gz);
+                Bytes::from(out)
+            }
+            Some("s2") => {
+                b = b.header("grpc-encoding", "s2");
+                // S2 uncompressed chunk inside S2 stream framing.
+                let crc = mimir_proto::s2::masked_crc32c(&body);
+                let mut s2 = Vec::with_capacity(18 + body.len());
+                s2.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+                let chunk_len = 4 + body.len();
+                s2.push(0x01);
+                s2.push((chunk_len & 0xff) as u8);
+                s2.push(((chunk_len >> 8) & 0xff) as u8);
+                s2.push(((chunk_len >> 16) & 0xff) as u8);
+                s2.extend_from_slice(&crc.to_le_bytes());
+                s2.extend_from_slice(&body);
+                let mut out = Vec::with_capacity(5 + s2.len());
+                out.push(1);
+                out.extend_from_slice(&(s2.len() as u32).to_be_bytes());
+                out.extend_from_slice(&s2);
+                Bytes::from(out)
+            }
+            Some(other) => panic!("unsupported test encoding {other}"),
+        };
+        let req = b
+            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(framed))))
+            .unwrap();
+        svc.oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_service_accepts_identity_gzip_snappy_and_s2() {
+        use crate::modules::StateCell;
+        use http_body_util::BodyExt;
+        use mimir_common::services::State;
+        use tonic::codec::CompressionEncoding;
+
+        let modules = ModuleStates::new();
+        let server_state = StateCell::new(State::Running);
+        modules.add("server", server_state.state_fn());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let svc = mimir_ingester::grpc::SnappyDecompressService::new(
+            HealthService::new(Arc::clone(&shutdown), Arc::clone(&modules))
+                .max_decoding_message_size(4 << 20)
+                .max_encoding_message_size(4 << 20)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd),
+            4 << 20,
+        );
+
+        for enc in [None, Some("gzip"), Some("snappy"), Some("s2")] {
+            // Check
+            let req_bytes = HealthCheckRequest {
+                service: String::new(),
+            }
+            .encode_to_vec();
+            let resp = call_health(
+                svc.clone(),
+                "/grpc.health.v1.Health/Check",
+                req_bytes.clone(),
+                enc,
+            )
+            .await;
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(body.len() >= 5, "enc={enc:?}");
+            let check = HealthCheckResponse::decode(&body[5..]).unwrap();
+            assert_eq!(check.status, SERVING_STATUS, "enc={enc:?}");
+
+            // List
+            let resp = call_health(
+                svc.clone(),
+                "/grpc.health.v1.Health/List",
+                HealthListRequest {}.encode_to_vec(),
+                enc,
+            )
+            .await;
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let list = HealthListResponse::decode(&body[5..]).unwrap();
+            assert_eq!(
+                list.statuses.get("server").map(|r| r.status),
+                Some(SERVING_STATUS),
+                "enc={enc:?}"
+            );
+
+            // Watch -> Unimplemented("Watching is not supported"), NOT unsupported compression.
+            let resp = call_health(svc.clone(), "/grpc.health.v1.Health/Watch", req_bytes, enc).await;
+            let st = tonic::Status::from_header_map(resp.headers()).expect("watch status");
+            assert_eq!(st.code(), tonic::Code::Unimplemented, "enc={enc:?}");
+            assert_eq!(st.message(), "Watching is not supported", "enc={enc:?}");
+        }
+
+        // Shutdown flips Check to NOT_SERVING.
+        shutdown.store(true, Ordering::Release);
+        let resp = call_health(
+            svc,
+            "/grpc.health.v1.Health/Check",
+            HealthCheckRequest::default().encode_to_vec(),
+            Some("gzip"),
+        )
+        .await;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let check = HealthCheckResponse::decode(&body[5..]).unwrap();
+        assert_eq!(check.status, NOT_SERVING_STATUS);
     }
 }

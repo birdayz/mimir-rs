@@ -737,7 +737,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     ));
 
     let health_svc = SnappyDecompressService::new(
-        HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules)),
+        HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules))
+            .max_decoding_message_size(max_recv)
+            .max_encoding_message_size(max_send)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd),
         max_recv,
     );
 

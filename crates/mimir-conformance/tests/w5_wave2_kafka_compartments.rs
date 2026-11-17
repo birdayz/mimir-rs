@@ -459,27 +459,33 @@ async fn compartments_read_and_write_compartments() {
     let topic = "ingest-rc-1";
     // Each write compartment is its own Kafka cluster: `127.0.0.1:<prefix><write-compartment-id>`
     // resolves to two brokers on consecutive ports ending in 0 and 1.
-    let (prefix, brokers) = loop {
-        let p = mimir_conformance::free_test_port();
-        let base = p - p % 10;
-        if base < 15_000 {
-            continue;
+    // Use 32000..32700 so ports never collide with free_test_port() (15000..32000) and stay
+    // below Linux's default ephemeral range (32768..60999).
+    let (prefix, brokers) = {
+        const PREFIX_LOW: u16 = 3200;
+        const PREFIX_SPAN: u16 = 70; // 32000..32700
+        let start = (std::process::id() as u16) % PREFIX_SPAN;
+        let mut chosen = None;
+        for step in 0..PREFIX_SPAN {
+            let candidate_prefix = PREFIX_LOW + (start + step) % PREFIX_SPAN;
+            let base = candidate_prefix * 10;
+            let spawn = |wc: u16, name: &str| {
+                SpawnedKfakeBroker::spawn_with_port(
+                    &KfakeBrokerRequest {
+                        topic: topic.to_string(),
+                        partitions: 1,
+                        compression: None,
+                        records: vec![record("t-comp", 2, vec![series(name, ts, 77.0)], vec![])],
+                    },
+                    Some(base + wc),
+                )
+            };
+            if let (Ok(b0), Ok(b1)) = (spawn(0, "comp_metric_wc0"), spawn(1, "comp_metric_wc1")) {
+                chosen = Some((candidate_prefix, [b0, b1]));
+                break;
+            }
         }
-        let spawn = |wc: u16, name: &str| {
-            SpawnedKfakeBroker::spawn_with_port(
-                &KfakeBrokerRequest {
-                    topic: topic.to_string(),
-                    partitions: 1,
-                    compression: None,
-                    records: vec![record("t-comp", 2, vec![series(name, ts, 77.0)], vec![])],
-                },
-                Some(base + wc),
-            )
-        };
-        let (Ok(b0), Ok(b1)) = (spawn(0, "comp_metric_wc0"), spawn(1, "comp_metric_wc1")) else {
-            continue;
-        };
-        break (base / 10, [b0, b1]);
+        chosen.expect("free consecutive broker ports in 32000..32700")
     };
     let address = format!("127.0.0.1:{prefix}<write-compartment-id>");
     let last_offsets: Vec<i64> = brokers.iter().map(|b| b.offsets()[0].end_offset - 1).collect();
