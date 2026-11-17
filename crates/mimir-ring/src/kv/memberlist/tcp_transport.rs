@@ -16,7 +16,7 @@
 //! lazily on the first `Read`), so a failing handshake is logged as `failed to read message type`.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -423,6 +423,59 @@ fn dial_error(addr: &str, err: io::Error) -> io::Error {
     io::Error::new(err.kind(), text)
 }
 
+/// Go `net.ListenTCP("tcp", &net.TCPAddr{IP: ip, Port: port})` (and `tls.Listen("tcp", ...)`,
+/// which resolves to the same call) on Linux:
+/// - `favoriteAddrFamily`: a wildcard address (`0.0.0.0`, the default, or `::`) with network
+///   `tcp` listens on an `AF_INET6` socket with `IPV6_V6ONLY=0`, i.e. dual-stack `[::]:port`
+///   accepting both IPv4 (as IPv4-mapped) and IPv6 peers. Hosts without IPv6 support
+///   (`supportsIPv4map() == false`) get a plain `AF_INET` wildcard socket instead.
+/// - any other address binds exactly that address (IPv4-mapped IPv6 literals as IPv4).
+/// - `SO_REUSEADDR` is set and the backlog is `/proc/sys/net/core/somaxconn`
+///   (`maxListenerBacklog`).
+fn go_listen_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
+    let listener = if addr.ip().is_unspecified() {
+        let v6 = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), addr.port());
+        match bind_listen_socket(v6, false) {
+            Ok(l) => l,
+            // No IPv6 on this host: Go then listens on the address' own family.
+            Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+                bind_listen_socket(addr, false)?
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        // Go treats IPv4-mapped IPv6 literals (`::ffff:a.b.c.d`) as IPv4 (`family()`), and
+        // never sets IPV6_V6ONLY for a specific address.
+        let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+        bind_listen_socket(addr, false)?
+    };
+    TcpListener::from_std(listener)
+}
+
+fn bind_listen_socket(addr: SocketAddr, v6_only: bool) -> io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(v6_only)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SockAddr::from(addr))?;
+    socket.listen(somaxconn())?;
+    Ok(socket.into())
+}
+
+/// Go `maxListenerBacklog` on Linux.
+fn somaxconn() -> i32 {
+    std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|n| *n > 0)
+        .map(|n| n.min(65535))
+        .unwrap_or(128)
+}
+
 fn prefixed(prefix: &str, err: io::Error) -> io::Error {
     io::Error::new(err.kind(), format!("{prefix}: {err}"))
 }
@@ -500,7 +553,7 @@ impl TcpTransport {
                 )
             })?;
             let sock = SocketAddr::new(ip, port);
-            let listener = TcpListener::bind(sock).await.map_err(|e| {
+            let listener = go_listen_tcp(sock).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -1019,3 +1072,77 @@ fn hex_lower(b: &[u8]) -> String {
     s
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host_has_ipv6_loopback() -> bool {
+        std::net::TcpListener::bind("[::1]:0").is_ok()
+    }
+
+    async fn transport(bind_addr: &[&str]) -> Arc<TcpTransport> {
+        let cfg = MemberlistConfig {
+            bind_addr: bind_addr.iter().map(|s| s.to_string()).collect(),
+            bind_port: 0,
+            ..Default::default()
+        };
+        let (tr, _packets, _streams) = TcpTransport::new(&cfg, "test", None).await.unwrap();
+        tr
+    }
+
+    /// Go `net.ListenTCP("tcp", 0.0.0.0:port)` on Linux listens dual-stack on `[::]` with
+    /// IPV6_V6ONLY=0, so peers can reach the default (`0.0.0.0` / empty) bind address over IPv4
+    /// and IPv6.
+    #[tokio::test]
+    async fn default_and_wildcard_bind_addr_listen_dual_stack_like_go() {
+        if !host_has_ipv6_loopback() {
+            eprintln!("SKIPPED: host has no IPv6 loopback");
+            return;
+        }
+        for bind in [&[][..], &["0.0.0.0"][..], &["::"][..]] {
+            let tr = transport(bind).await;
+            let port = tr.auto_bind_port();
+            assert!(tr.local_addrs[0].is_ipv6(), "{bind:?}: {}", tr.local_addrs[0]);
+            TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            TcpStream::connect(("::1", port)).await.unwrap();
+            tr.shutdown_and_wait().await;
+        }
+    }
+
+    /// A specific address binds exactly that address (no dual-stack).
+    #[tokio::test]
+    async fn specific_bind_addr_is_single_stack() {
+        let tr = transport(&["127.0.0.1"]).await;
+        let port = tr.auto_bind_port();
+        assert_eq!(tr.local_addrs[0], SocketAddr::from(([127, 0, 0, 1], port)));
+        TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        if host_has_ipv6_loopback() {
+            assert!(TcpStream::connect(("::1", port)).await.is_err());
+        }
+        tr.shutdown_and_wait().await;
+
+        // IPv4-mapped IPv6 literal: Go binds it as IPv4.
+        let tr = transport(&["::ffff:127.0.0.1"]).await;
+        assert!(tr.local_addrs[0].is_ipv4(), "{}", tr.local_addrs[0]);
+        tr.shutdown_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn bind_error_text_matches_go() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let cfg = MemberlistConfig {
+            bind_addr: vec!["127.0.0.1".to_string()],
+            bind_port: i64::from(port),
+            ..Default::default()
+        };
+        let err = TcpTransport::new(&cfg, "test", None).await.err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "failed to start TCP listener on \"127.0.0.1\" port {port}: listen tcp 127.0.0.1:{port}: bind: address already in use"
+            )
+        );
+    }
+}

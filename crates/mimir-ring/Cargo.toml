@@ -13,6 +13,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 hickory-resolver = { workspace = true }
+libc = { workspace = true }
 md-5 = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
@@ -23,6 +24,7 @@ rmp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snap = { workspace = true }
+socket2 = { version = "0.5", features = ["all"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
