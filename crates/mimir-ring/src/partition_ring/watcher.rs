@@ -184,7 +184,7 @@ impl PartitionRingWatcher {
                             .map(|b| *b)
                             .unwrap_or_default(),
                         None => {
-                            info!(key = %w.key, "partition ring doesn't exist in KV store yet");
+                            info!("partition ring doesn't exist in KV store yet");
                             PartitionRingDesc::default()
                         }
                     };

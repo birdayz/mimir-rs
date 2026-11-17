@@ -369,6 +369,12 @@ impl MemberlistKv {
             None
         };
 
+        info!(
+            cluster_label = %cfg.cluster_label,
+            node = %node_name,
+            "Using memberlist cluster label and node name"
+        );
+
         let (transport, packet_rx, stream_rx) =
             TcpTransport::bind(&cfg, metrics_namespace, reg).await?;
         let (advertise_ip, advertise_port) =
@@ -459,16 +465,14 @@ impl MemberlistKv {
             if kv.cfg.abort_if_cluster_join_fails {
                 // ponytail: blocks startup to keep fail-fast; Go runs this in the background and fails
                 // the service instead. Move it to the background once background tasks can abort startup.
-                if let Err(err) = kv.join_members_with_retries(&join_members, max_retries).await {
+                if let Err(err) = kv.join_members_on_startup(&join_members, max_retries).await {
                     kv.shutdown().await;
                     return Err(err);
                 }
             } else {
                 let bg = Arc::clone(&kv);
                 tokio::spawn(async move {
-                    if let Err(err) = bg.join_members_with_retries(&join_members, max_retries).await {
-                        warn!(%err, "failed to join memberlist cluster on startup");
-                    }
+                    let _ = bg.join_members_on_startup(&join_members, max_retries).await;
                 });
             }
         }
@@ -656,6 +660,40 @@ impl MemberlistKv {
         }
     }
 
+    /// dskit `joinMembersOnStartup` logging around [`Self::join_members_with_retries`].
+    async fn join_members_on_startup(
+        &self,
+        members: &[String],
+        max_retries: usize,
+    ) -> Result<usize, KvError> {
+        info!(
+            phase = "startup",
+            msg = "joining memberlist cluster",
+            join_members = %members.join(",")
+        );
+        let start = std::time::Instant::now();
+        match self.join_members_with_retries(members, max_retries).await {
+            Ok(reached) => {
+                info!(
+                    phase = "startup",
+                    msg = "joining memberlist cluster succeeded",
+                    reached_nodes = reached,
+                    elapsed_time = %go_elapsed(start)
+                );
+                Ok(reached)
+            }
+            Err(err) => {
+                error!(
+                    phase = "startup",
+                    msg = "joining memberlist cluster failed",
+                    err = %err,
+                    elapsed_time = %go_elapsed(start)
+                );
+                Err(err)
+            }
+        }
+    }
+
     async fn join_members_with_retries(
         &self,
         members: &[String],
@@ -673,6 +711,16 @@ impl MemberlistKv {
                 Ok(_) => {}
                 Err(e) => last_err = Some(e),
             }
+            let err_s = last_err
+                .as_ref()
+                .map_or_else(|| "null".to_string(), ToString::to_string);
+            warn!(
+                phase = "startup",
+                msg = "joining memberlist cluster",
+                attempts = boff.num_retries() + 1,
+                max_attempts = max_retries,
+                err = %err_s
+            );
             boff.wait().await;
         }
         Err(last_err.unwrap_or_else(|| KvError::Other("failed to join cluster".to_string())))
@@ -681,6 +729,7 @@ impl MemberlistKv {
     /// Ported from dskit `fastJoinMembersOnStartup`: join `retransmit_factor * ceil(log10(n+1))`
     /// randomly chosen seed nodes, one at a time.
     async fn fast_join_members_on_startup(&self) -> Result<(), KvError> {
+        let start_time = std::time::Instant::now();
         // dskit `discoverMembersBackoff`.
         let mut boff = Backoff::new(BackoffConfig {
             min_backoff: Duration::from_millis(100),
@@ -717,11 +766,21 @@ impl MemberlistKv {
 
         let required = self.cfg.abort_if_cluster_fast_join_fails_min_nodes.max(0) as usize;
         if joined < required {
+            warn!(
+                joined_nodes = joined,
+                required_nodes = required,
+                elapsed_time = %go_elapsed(start_time),
+                "memberlist fast-join failed to reach minimum required seed nodes"
+            );
             return Err(KvError::Other(format!(
                 "fast-join failed to reach minimum required seed nodes: joined {joined}, required {required}"
             )));
         }
-        info!(joined_nodes = joined, "memberlist fast-join finished");
+        info!(
+            joined_nodes = joined,
+            elapsed_time = %go_elapsed(start_time),
+            "memberlist fast-join finished"
+        );
         Ok(())
     }
 
@@ -774,15 +833,35 @@ impl MemberlistKv {
         self.leaving.store(true, Ordering::Release);
         self.running.store(false, Ordering::Release);
 
+        info!("leaving memberlist cluster");
+
         // Wait briefly for locally generated broadcasts to flush.
         let timeout: Duration = self.cfg.broadcast_timeout_for_local_updates_on_shutdown.as_std().unwrap_or(Duration::ZERO);
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut next_wait_log = tokio::time::Instant::now();
         while self.local_broadcasts.num_queued() > 0 && self.est_num_nodes() > 1 {
+            // Go logs once per 250ms wait iteration.
+            if tokio::time::Instant::now() >= next_wait_log {
+                info!(
+                    count = self.local_broadcasts.num_queued(),
+                    nodes = self.est_num_nodes(),
+                    "waiting for locally-generated broadcast messages to be sent out"
+                );
+                next_wait_log = tokio::time::Instant::now() + Duration::from_millis(250);
+            }
             self.gossip().await;
             if !timeout.is_zero() && tokio::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let msgs = self.local_broadcasts.num_queued();
+        if msgs > 0 {
+            warn!(
+                count = msgs,
+                nodes = self.est_num_nodes(),
+                "locally-generated broadcast messages left the queue"
+            );
         }
 
         // Send Dead(from = self) to live peers so they mark us Left.
@@ -2560,6 +2639,11 @@ impl KvClient for MemberlistKvClient {
             }
         })
     }
+}
+
+/// `time.Since(start)` rendered like Go's `time.Duration.String()`.
+fn go_elapsed(start: std::time::Instant) -> String {
+    mimir_config::format_go_duration(start.elapsed().as_nanos().min(i64::MAX as u128) as i64)
 }
 
 #[cfg(test)]

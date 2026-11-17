@@ -13,7 +13,7 @@ pub mod grpc;
 pub mod http;
 pub mod metrics;
 
-pub use app::run_mimir;
+pub use app::{init_logging, run_mimir};
 pub use cli::{
     diff_yaml_values, dump_yaml, effective_config_yaml, parse_cli_for_run, run_cli_test_mode,
     CliOutcome,

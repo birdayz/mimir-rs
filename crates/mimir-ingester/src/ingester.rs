@@ -227,7 +227,7 @@ impl Ingester {
                         message: format!("failed to create bucket client: {e}"),
                     });
                 }
-                warn!(error = %e, "bucket client unavailable (shipping disabled)");
+                warn!(err = %e, "bucket client unavailable (shipping disabled)");
                 None
             }
         };
@@ -952,7 +952,7 @@ impl Ingester {
             if let Some((_, db)) = self.tsdbs.remove(&k) {
                 let tracker_names = db.active_series.current_matcher_names();
                 if let Err(e) = db.close() {
-                    warn!(user = %k, error = %e, "unable to close TSDB");
+                    warn!(user = %k, err = %e, "unable to close TSDB");
                 }
                 self.tsdb_metrics.remove_registry_for_tenant(&k);
                 self.metrics.mem_users.dec();

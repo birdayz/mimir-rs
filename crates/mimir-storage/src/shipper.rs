@@ -478,7 +478,7 @@ impl Shipper {
         let shipped_blocks = match read_shipped_blocks(&self.dir) {
             Ok(m) => m,
             Err(err) => {
-                warn!(error = %err, dir = %self.dir.display(), "reading shipper meta file failed, will override it");
+                warn!(err = %err, dir = %self.dir.display(), "reading shipper meta file failed, will override it");
                 HashMap::new()
             }
         };
@@ -515,7 +515,7 @@ impl Shipper {
 
             info!(block = %m.ulid, "uploading new block to long-term storage");
             if let Err(err) = self.upload_block(&mut m).await {
-                error!(block = %m.ulid, error = %err, "uploading new block to long-term storage failed");
+                error!(block = %m.ulid, err = %err, "uploading new block to long-term storage failed");
                 upload_errs += 1;
                 continue;
             }
@@ -532,7 +532,7 @@ impl Shipper {
         }
 
         if let Err(err) = write_shipper_meta_file(&self.dir, &meta) {
-            warn!(error = %err, dir = %self.dir.display(), "updating shipper meta file failed");
+            warn!(err = %err, dir = %self.dir.display(), "updating shipper meta file failed");
         }
 
         if upload_errs > 0 {
