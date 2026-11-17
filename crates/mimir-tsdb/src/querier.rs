@@ -123,7 +123,13 @@ impl PreparedChunkSelect {
 pub struct BlockSelectStats {
     pub selected_postings: u64,
     pub series: u64,
+    /// Whether these are the Head's stats (vs. a persisted block's).
+    pub head: bool,
 }
+
+/// Restricts which returned series [`BlockSelectStats::series`] counts (e.g. the query shard,
+/// applied by the caller after the select).
+pub type SeriesStatsFilter = Arc<dyn Fn(&Labels) -> bool + Send + Sync>;
 
 /// Collects one [`BlockSelectStats`] per block querier of every chunk select it is attached to.
 pub type BlockSelectStatsSink = Arc<parking_lot::Mutex<Vec<BlockSelectStats>>>;
@@ -136,6 +142,7 @@ pub struct TsdbQuerier<'a> {
     mint: i64,
     maxt: i64,
     select_stats: Option<BlockSelectStatsSink>,
+    select_stats_filter: Option<SeriesStatsFilter>,
 }
 
 impl<'a> TsdbQuerier<'a> {
@@ -158,6 +165,7 @@ impl<'a> TsdbQuerier<'a> {
             mint,
             maxt,
             select_stats: None,
+            select_stats_filter: None,
         }
     }
 
@@ -174,12 +182,19 @@ impl<'a> TsdbQuerier<'a> {
             mint,
             maxt,
             select_stats: None,
+            select_stats_filter: None,
         }
     }
 
     /// Records per block querier [`BlockSelectStats`] of chunk selects into `sink`.
-    pub fn set_select_stats(&mut self, sink: BlockSelectStatsSink) {
+    pub fn set_select_stats(&mut self, sink: BlockSelectStatsSink, filter: Option<SeriesStatsFilter>) {
         self.select_stats = Some(sink);
+        self.select_stats_filter = filter;
+    }
+
+    /// Whether a returned series counts towards [`BlockSelectStats::series`].
+    fn counts_for_stats(&self, labels: &Labels) -> bool {
+        self.select_stats.is_some() && self.select_stats_filter.as_ref().is_none_or(|f| f(labels))
     }
 
     /// Reports the per-source stats of one chunk select: the Head (if queried), every block with
@@ -194,7 +209,7 @@ impl<'a> TsdbQuerier<'a> {
             return;
         };
         let mut g = sink.lock();
-        g.extend(head);
+        g.extend(head.map(|h| BlockSelectStats { head: true, ..h }));
         g.extend_from_slice(blocks);
         g.extend(std::iter::repeat_n(BlockSelectStats::default(), empty_blocks));
     }
@@ -493,7 +508,8 @@ impl<'a> TsdbQuerier<'a> {
             self.record_select_stats(
                 Some(BlockSelectStats {
                     selected_postings: refs.len() as u64,
-                    series: out.len() as u64,
+                    series: out.iter().filter(|s| self.counts_for_stats(&s.labels)).count() as u64,
+                    head: true,
                 }),
                 &[],
                 empty_blocks,
@@ -529,10 +545,11 @@ impl<'a> TsdbQuerier<'a> {
             let mut stats = BlockSelectStats {
                 selected_postings: refs.len() as u64,
                 series: 0,
+                head: false,
             };
             for &r in refs.iter() {
                 if let Some((labels, chks, tombs)) = head.series_chunks(r, mint, maxt)? {
-                    if !chks.is_empty() {
+                    if !chks.is_empty() && self.counts_for_stats(&labels) {
                         stats.series += 1;
                     }
                     let entry = per_series.entry(labels).or_insert_with(|| SeriesSources {
@@ -555,6 +572,7 @@ impl<'a> TsdbQuerier<'a> {
             let mut stats = BlockSelectStats {
                 selected_postings: refs.len() as u64,
                 series: 0,
+                head: false,
             };
             for &r in refs.iter() {
                 let (labels, chks) = idx.series(r)?;
@@ -574,7 +592,9 @@ impl<'a> TsdbQuerier<'a> {
                     loaded.push((cm, tombs.clone()));
                 }
                 if !loaded.is_empty() {
-                    stats.series += 1;
+                    if self.counts_for_stats(&labels) {
+                        stats.series += 1;
+                    }
                     let entry = per_series.entry(labels).or_insert_with(|| SeriesSources {
                         head: Vec::new(),
                         blocks: Vec::new(),
@@ -798,6 +818,7 @@ impl<'a> TsdbQuerier<'a> {
                 head.and(selected_postings).map(|selected_postings| BlockSelectStats {
                     selected_postings,
                     series: entries.len() as u64,
+                    head: true,
                 }),
                 &[],
                 empty_blocks,
@@ -869,6 +890,7 @@ impl<'a> TsdbQuerier<'a> {
             let mut stats = BlockSelectStats {
                 selected_postings: refs.len() as u64,
                 series: 0,
+                head: false,
             };
             for &r in refs.iter() {
                 if let Some((labels, ivs, _had_slow)) =
@@ -899,6 +921,7 @@ impl<'a> TsdbQuerier<'a> {
             let mut stats = BlockSelectStats {
                 selected_postings: refs.len() as u64,
                 series: 0,
+                head: false,
             };
             for &r in refs.iter() {
                 let (labels, chks) = idx.series(r)?;
@@ -1342,7 +1365,18 @@ impl<'a> TsdbChunkQuerier<'a> {
 
     /// Records per block querier [`BlockSelectStats`] of every chunk select into `sink`.
     pub fn with_select_stats(mut self, sink: BlockSelectStatsSink) -> Self {
-        self.inner.set_select_stats(sink);
+        self.inner.set_select_stats(sink, None);
+        self
+    }
+
+    /// Like [`Self::with_select_stats`], counting only returned series accepted by `filter`
+    /// (the lazy streaming path applies its own series filter instead).
+    pub fn with_filtered_select_stats(
+        mut self,
+        sink: BlockSelectStatsSink,
+        filter: Option<SeriesStatsFilter>,
+    ) -> Self {
+        self.inner.set_select_stats(sink, filter);
         self
     }
 

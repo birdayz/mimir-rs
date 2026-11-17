@@ -24,6 +24,8 @@ pub struct TrackedBody<B> {
     on_done: Option<DoneCallback>,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     deadline_msg: &'static str,
+    /// Builds the deadline error instead of `deadline_msg` (e.g. an `h2` reset reason).
+    deadline_err: Option<fn() -> BoxError>,
 }
 
 impl<B> TrackedBody<B> {
@@ -34,6 +36,7 @@ impl<B> TrackedBody<B> {
             on_done: None,
             deadline: None,
             deadline_msg: "",
+            deadline_err: None,
         }
     }
 
@@ -50,6 +53,13 @@ impl<B> TrackedBody<B> {
     pub fn deadline(mut self, at: Option<Instant>, msg: &'static str) -> Self {
         self.deadline = at.map(|at| Box::pin(tokio::time::sleep_until(at.into())));
         self.deadline_msg = msg;
+        self
+    }
+
+    /// Like [`Self::deadline`], failing the body with `err()` once `at` has passed.
+    pub fn deadline_with(mut self, at: Option<Instant>, err: fn() -> BoxError) -> Self {
+        self.deadline = at.map(|at| Box::pin(tokio::time::sleep_until(at.into())));
+        self.deadline_err = Some(err);
         self
     }
 
@@ -101,7 +111,11 @@ where
                 if let Some(d) = this.deadline.as_mut() {
                     if d.as_mut().poll(cx).is_ready() {
                         this.finish(false);
-                        return Poll::Ready(Some(Err(this.deadline_msg.into())));
+                        let err = match this.deadline_err {
+                            Some(f) => f(),
+                            None => this.deadline_msg.into(),
+                        };
+                        return Poll::Ready(Some(Err(err)));
                     }
                 }
                 Poll::Pending

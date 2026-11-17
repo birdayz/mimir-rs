@@ -404,6 +404,23 @@ fn record_push_error(ingester: &Ingester, log: Option<&GrpcErrorLog>, e: &Ingest
     }
 }
 
+/// `mapReadErrorToErrorWithStatus` plus what dskit's log / instrumentation interceptors make
+/// of the Go error: `ErrorWithStatus` is logged as its message; an error wrapping
+/// `context.DeadlineExceeded` is returned as-is (sent as `DeadlineExceeded`, labelled `Unknown`).
+fn read_error_status(ext: &http::Extensions, e: IngesterError) -> Status {
+    if let Some(log) = ext.get::<GrpcErrorLog>() {
+        log.set(GrpcErrorLogEntry {
+            err: e.to_string(),
+            keep: true,
+            reason: None,
+        });
+        if e.is_deadline_exceeded() {
+            log.set_instrumentation_code(tonic::Code::Unknown as i32);
+        }
+    }
+    e.map_read_error_to_status()
+}
+
 /// dskit `middleware.ServerUserHeaderInterceptor` (multitenancy enabled): exactly one
 /// `x-scope-orgid` metadata value, else `user.ErrNoOrgID` (`codes.Unknown`).
 #[allow(clippy::result_large_err)]
@@ -425,9 +442,19 @@ fn tenant_from_req<T>(ingester: &Ingester, req: &Request<T>) -> Result<String, S
         return Ok(ingester.no_auth_tenant());
     }
     check_org_id_header(ingester, req)?;
-    extract_tenant_id_from_grpc_metadata(req.metadata()).map_err(|e| match e {
-        TenantError::NoOrgID => Status::unknown(e.to_string()),
-        e => Status::internal(e.to_string()),
+    extract_tenant_id_from_grpc_metadata(req.metadata()).map_err(|e| {
+        // Plain Go errors: logged as their text.
+        if let Some(log) = req.extensions().get::<GrpcErrorLog>() {
+            log.set(GrpcErrorLogEntry {
+                err: e.to_string(),
+                keep: true,
+                reason: None,
+            });
+        }
+        match e {
+            TenantError::NoOrgID => Status::unknown(e.to_string()),
+            e => Status::internal(e.to_string()),
+        }
     })
 }
 
@@ -459,12 +486,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<ingesterpb::QueryRequest>,
     ) -> Result<Response<Self::QueryStreamStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let stream = self
             .ingester
             .handle_query_stream_bimodal(&md, &user_id, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(stream))
     }
 
@@ -473,12 +500,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<ingesterpb::ExemplarQueryRequest>,
     ) -> Result<Response<ingesterpb::ExemplarQueryResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let resp = self
             .ingester
             .handle_query_exemplars(&md, &user_id, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(resp))
     }
 
@@ -487,12 +514,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<ingesterpb::LabelValuesRequest>,
     ) -> Result<Response<ingesterpb::LabelValuesResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let resp = self
             .ingester
             .handle_label_values(&md, &user_id, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(resp))
     }
 
@@ -501,12 +528,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<ingesterpb::LabelNamesRequest>,
     ) -> Result<Response<ingesterpb::LabelNamesResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let resp = self
             .ingester
             .handle_label_names(&md, &user_id, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(resp))
     }
 
@@ -515,12 +542,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<ingesterpb::UserStatsRequest>,
     ) -> Result<Response<ingesterpb::UserStatsResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let resp = self
             .ingester
             .handle_user_stats(&md, &user_id, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(resp))
     }
 
@@ -530,12 +557,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::UsersStatsResponse>, Status> {
         // Not in Mimir's noGRPCAuthOn list: the org ID header is required (but not parsed).
         check_org_id_header(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let resp = self
             .ingester
             .handle_all_user_stats(&md, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(resp))
     }
 
@@ -544,12 +571,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<ingesterpb::MetricsForLabelMatchersRequest>,
     ) -> Result<Response<ingesterpb::MetricsForLabelMatchersResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let resp = self
             .ingester
             .handle_metrics_for_label_matchers(&md, &user_id, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(resp))
     }
 
@@ -558,12 +585,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<ingesterpb::MetricsMetadataRequest>,
     ) -> Result<Response<ingesterpb::MetricsMetadataResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let resp = self
             .ingester
             .handle_metrics_metadata(&md, &user_id, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(resp))
     }
 
@@ -576,12 +603,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<ingesterpb::LabelNamesAndValuesRequest>,
     ) -> Result<Response<Self::LabelNamesAndValuesStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let items = self
             .ingester
             .handle_label_names_and_values(&md, &user_id, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(vec_to_stream(items)))
     }
 
@@ -598,12 +625,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<ingesterpb::LabelValuesCardinalityRequest>,
     ) -> Result<Response<Self::LabelValuesCardinalityStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let items = self
             .ingester
             .handle_label_values_cardinality(&md, &user_id, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(vec_to_stream(items)))
     }
 
@@ -615,12 +642,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         request: Request<ingesterpb::ActiveSeriesRequest>,
     ) -> Result<Response<Self::ActiveSeriesStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let stream = self
             .ingester
             .handle_active_series_rx(&md, &user_id, inner)
             .await
-            .map_err(|e| e.map_read_error_to_status())?;
+            .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -637,12 +664,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
             build_search_hints(r.filter.as_ref(), r.ordering, r.limit, &r.matchers)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let items = self
             .ingester
             .handle_search_label_names_with_hints(&md, &user_id, inner, hints, matchers)
             .await
-            .map_err(|e: IngesterError| e.map_read_error_to_status())?;
+            .map_err(|e: IngesterError| read_error_status(&ext, e))?;
         Ok(Response::new(vec_to_stream(items)))
     }
 
@@ -659,12 +686,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
             build_search_hints(r.filter.as_ref(), r.ordering, r.limit, &r.matchers)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let user_id = tenant_from_req(&self.ingester, &request)?;
-        let (md, _, inner) = request.into_parts();
+        let (md, ext, inner) = request.into_parts();
         let items = self
             .ingester
             .handle_search_label_values_with_hints(&md, &user_id, inner, hints, matchers)
             .await
-            .map_err(|e: IngesterError| e.map_read_error_to_status())?;
+            .map_err(|e: IngesterError| read_error_status(&ext, e))?;
         Ok(Response::new(vec_to_stream(items)))
     }
 }

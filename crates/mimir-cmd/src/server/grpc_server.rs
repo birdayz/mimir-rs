@@ -32,7 +32,7 @@ use http_body::Frame;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use mimir_common::grpc_deadline;
-use mimir_common::grpc_log::GrpcErrorLog;
+use mimir_common::grpc_log::{GrpcErrorLog, GrpcErrorLogEntry};
 use mimir_common::logging::{LogLevel, Logger};
 use mimir_config::GoDuration;
 use parking_lot::Mutex;
@@ -278,7 +278,6 @@ fn check_org_id(headers: &http::HeaderMap, method: &str) -> Option<tonic::Status
 struct RpcGuard {
     method: String,
     begin: Instant,
-    deadline: Option<tokio::time::Instant>,
     conn: Arc<Conn>,
     stream_tracker: Option<Arc<super::metrics::StreamTracker>>,
     inflight: Option<prometheus::Gauge>,
@@ -299,17 +298,22 @@ impl RpcGuard {
         let code = match code {
             Some(c) => c,
             None if completed => 0,
-            // Torn down by the expiry of the request's own deadline.
-            None if self.deadline.is_some_and(|d| tokio::time::Instant::now() >= d) => 4,
-            // A stream torn down before its status was sent was canceled by the client.
+            // A stream torn down before its status was sent (client reset, or the request
+            // deadline expired) is a canceled handler context in grpc-go.
             None => 1,
         };
         let elapsed = self.begin.elapsed();
+        // dskit derives the label from the handler's Go error, which may differ from the code
+        // grpc-go sends (e.g. a wrapped context.DeadlineExceeded is labelled Unknown).
+        let label_code = match self.error_log.instrumentation_code() {
+            Some(c) if code != 0 => c,
+            _ => code,
+        };
         self.duration_vec
             .with_label_values(&[
                 "gRPC",
                 &self.method,
-                &grpc_status_label(code, self.report_grpc_status),
+                &grpc_status_label(label_code, self.report_grpc_status),
                 "false",
             ])
             .observe(elapsed.as_secs_f64());
@@ -421,7 +425,6 @@ where
     let guard = RpcGuard {
         method: method.clone(),
         begin,
-        deadline,
         conn,
         stream_tracker,
         inflight,
@@ -441,11 +444,19 @@ where
 
     // Interceptor order (dskit server.New): ..., Mimir's GRPCMiddleware (multitenant auth), then
     // cluster validation (unary RPCs only, never health checks).
-    let rejection = cfg
+    let auth_rejection = cfg
         .multitenancy_enabled
         .then(|| check_org_id(req.headers(), &method))
-        .flatten()
-        .or_else(|| {
+        .flatten();
+    if auth_rejection.is_some() {
+        // `user.ErrNoOrgID` is a plain Go error: logged as its text.
+        guard.error_log.set(GrpcErrorLogEntry {
+            err: "no org id".to_string(),
+            keep: true,
+            reason: None,
+        });
+    }
+    let rejection = auth_rejection.or_else(|| {
             cfg.cluster_validation.as_ref().and_then(|cv| {
                 if STREAMING_METHODS.contains(&method.as_str())
                     || method.starts_with("/grpc.health.v1.Health/")
@@ -475,13 +486,12 @@ where
         None => {
             let call = routes.oneshot(req);
             let res = match deadline {
-                // The handler sees the deadline (`grpc_deadline::current`) and fails on its own
-                // where it waits (e.g. strong read consistency); otherwise it is abandoned here.
-                Some(d) => tokio::time::timeout_at(d, grpc_deadline::scope(d, call))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Ok(tonic::Status::deadline_exceeded("context deadline exceeded").into_http())
-                    }),
+                // grpc-go: at the deadline the stream is closed with RST_STREAM(CANCEL) and the
+                // handler's context is canceled; dropping the handler future cancels its waits.
+                Some(d) => match tokio::time::timeout_at(d, call).await {
+                    Ok(r) => r,
+                    Err(_) => return Ok(reset_stream_response()),
+                },
                 None => call.await,
             };
             match res {
@@ -531,16 +541,43 @@ where
         let mut guard = guard;
         guard.finish(completed);
     });
-    // grpc-go closes the stream (RST_STREAM) when the deadline expires mid-response.
+    // grpc-go closes the stream (RST_STREAM CANCEL) when the deadline expires mid-response.
     let body_deadline = deadline.map(tokio::time::Instant::into_std);
     Ok(resp.map(|b| {
         tonic::body::boxed(
             TrackedBody::new(b)
                 .on_frame(on_frame)
                 .on_done(on_done)
-                .deadline(body_deadline, "context deadline exceeded"),
+                .deadline_with(body_deadline, cancel_stream_error),
         )
     }))
+}
+
+/// The error making hyper reset the HTTP/2 stream with `RST_STREAM(CANCEL)`.
+fn cancel_stream_error() -> super::body::BoxError {
+    Box::new(h2::Error::from(h2::Reason::CANCEL))
+}
+
+/// A response whose body immediately fails with [`cancel_stream_error`]: the stream is reset
+/// like grpc-go does when the request deadline expires before the handler responded.
+fn reset_stream_response() -> GrpcResponse {
+    struct ResetBody;
+    impl http_body::Body for ResetBody {
+        type Data = Bytes;
+        type Error = super::body::BoxError;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            std::task::Poll::Ready(Some(Err(cancel_stream_error())))
+        }
+    }
+    let mut resp = hyper::Response::new(tonic::body::boxed(ResetBody));
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    resp
 }
 
 fn percent_decode(s: &str) -> String {
@@ -668,14 +705,7 @@ mod tests {
                 if req.uri().path() == "/test.Hanging/Fast" {
                     return Ok(tonic::Status::ok("").into_http());
                 }
-                // Observe the request deadline like a context-aware Go handler would.
-                match grpc_deadline::current() {
-                    Some(d) => {
-                        tokio::time::sleep_until(d).await;
-                        Ok(tonic::Status::deadline_exceeded("handler saw deadline").into_http())
-                    }
-                    None => std::future::pending().await,
-                }
+                std::future::pending().await
             })
         }
     }
@@ -817,17 +847,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_timeout_is_enforced_and_visible_to_handlers() {
+    async fn grpc_timeout_resets_the_stream_like_grpc_go() {
+        use http_body_util::BodyExt;
+
         let fx = fixture(false);
         let route = "/test.Hanging/Wait";
         let started = Instant::now();
         let resp = fx.call(route, &[("grpc-timeout", "100m")]).await.unwrap();
-        assert_eq!(drain(resp).await.as_deref(), Some("4"));
         assert!(started.elapsed() >= Duration::from_millis(100));
         assert!(started.elapsed() < Duration::from_secs(5));
+        // The handler was dropped (its waits canceled): nothing is in flight any more.
         assert_eq!(fx.gauge("cortex_inflight_requests", route), 0.0);
-        assert_eq!(fx.duration_count(route, "DeadlineExceeded"), 1.0);
         assert_eq!(fx.conn.active.load(Ordering::Acquire), 0);
+        // RST_STREAM(CANCEL) instead of a status; recorded as a canceled RPC.
+        let Err(err) = resp.into_body().collect().await else {
+            panic!("expected a stream reset");
+        };
+        // hyper picks the reset reason from the h2::Error in the body error's source chain.
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+        let mut reason = None;
+        while let Some(e) = source {
+            if let Some(h2e) = e.downcast_ref::<h2::Error>() {
+                reason = h2e.reason();
+                break;
+            }
+            source = e.source();
+        }
+        assert_eq!(reason, Some(h2::Reason::CANCEL));
+        assert_eq!(fx.duration_count(route, "Canceled"), 1.0);
     }
 
     #[tokio::test]

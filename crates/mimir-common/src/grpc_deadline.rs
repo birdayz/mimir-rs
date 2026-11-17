@@ -2,22 +2,11 @@
 //!
 //! Ported from:
 //! - google.golang.org/grpc/internal/transport/http_util.go (`decodeTimeout`)
-//! - google.golang.org/grpc/internal/transport/http2_server.go (`operateHeaders`: the stream
-//!   context gets `context.WithTimeout(ctx, timeout)`; malformed values abort the stream with
-//!   `codes.Internal` "malformed grpc-timeout: ...")
-//!
-//! In Go handlers observe the deadline through their `context.Context`. Here the gRPC server runs
-//! each RPC's handler future inside [`scope`], so code waiting on external progress (e.g. strong
-//! read consistency) can bound its wait with [`current`] and fail like `ctx.Err()` would.
+//! - google.golang.org/grpc/internal/transport/http2_server.go (`operateHeaders`: malformed
+//!   values abort the stream with `codes.Internal` "malformed grpc-timeout: ..."; at the deadline
+//!   the stream is reset with `RST_STREAM(CANCEL)` and the handler's context is canceled)
 
-use std::future::Future;
 use std::time::Duration;
-
-use tokio::time::Instant;
-
-tokio::task_local! {
-    static DEADLINE: Instant;
-}
 
 /// Go `decodeTimeout`: `<1..8 digits><unit>` with units `H`, `M`, `S`, `m`, `u`, `n`.
 pub fn decode_timeout(s: &str) -> Result<Duration, String> {
@@ -53,16 +42,6 @@ pub fn decode_timeout(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_nanos(nanos as u64))
 }
 
-/// Runs `fut` with `deadline` visible to [`current`].
-pub async fn scope<F: Future>(deadline: Instant, fut: F) -> F::Output {
-    DEADLINE.scope(deadline, fut).await
-}
-
-/// The deadline of the gRPC request being served by the current task, if any.
-pub fn current() -> Option<Instant> {
-    DEADLINE.try_with(|d| *d).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,12 +75,5 @@ mod tests {
             decode_timeout("1"),
             Err("transport: timeout string is too short: \"1\"".to_string())
         );
-    }
-
-    #[tokio::test]
-    async fn scope_exposes_deadline() {
-        assert_eq!(current(), None);
-        let d = Instant::now() + Duration::from_secs(5);
-        assert_eq!(scope(d, async { current() }).await, Some(d));
     }
 }
