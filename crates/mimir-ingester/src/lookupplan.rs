@@ -62,6 +62,20 @@ impl Default for CostConfig {
     }
 }
 
+impl From<&mimir_config::IndexLookupPlanningConfig> for CostConfig {
+    /// The inlined `lookupplan.CostConfig` of `-blocks-storage.tsdb.index-lookup-planning.*`.
+    fn from(c: &mimir_config::IndexLookupPlanningConfig) -> Self {
+        Self {
+            retrieved_posting_cost: c.retrieved_posting_cost,
+            retrieved_series_cost: c.retrieved_series_cost,
+            retrieved_posting_list_cost: c.retrieved_posting_list_cost,
+            min_series_per_block_for_query_planning: c.min_series_per_block_for_query_planning,
+            label_cardinality_for_larger_sketch: c.label_cardinality_for_larger_sketch,
+            label_cardinality_for_smaller_sketch: c.label_cardinality_for_smaller_sketch,
+        }
+    }
+}
+
 impl CostConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.label_cardinality_for_smaller_sketch > self.label_cardinality_for_larger_sketch {
@@ -453,6 +467,48 @@ impl BlockIndexReader for IndexReader {
     fn postings_count(&self, name: &str, value: &str) -> Result<u64, String> {
         let p = self.postings(name, &[value]).map_err(|e| e.to_string())?;
         Ok(p.len() as u64)
+    }
+}
+
+/// Prometheus `Head.Meta().ULID`: the bytes `"______head______"`.
+pub const HEAD_ULID: Ulid = Ulid::from_bytes(*b"______head______");
+
+/// `Head.Meta()` as seen by the planner: the fixed head ULID and the current series count.
+pub fn head_planning_meta(head: &mimir_tsdb::head::Head) -> PlanningBlockMeta {
+    PlanningBlockMeta {
+        ulid: HEAD_ULID,
+        num_series: head.num_series(),
+    }
+}
+
+/// `Head.Index()` for statistics generation.
+pub struct HeadIndexReader<'a>(pub &'a mimir_tsdb::head::Head);
+
+impl BlockIndexReader for HeadIndexReader<'_> {
+    fn all_postings_count(&self) -> Result<u64, String> {
+        Ok(self.0.num_series())
+    }
+
+    fn label_names(&self) -> Result<Vec<String>, String> {
+        self.0.label_names(&[]).map_err(|e| e.to_string())
+    }
+
+    fn label_values(&self, name: &str) -> Result<Vec<String>, String> {
+        self.0.label_values(name, &[]).map_err(|e| e.to_string())
+    }
+
+    fn postings_for_all_values_count(&self, name: &str) -> Result<u64, String> {
+        // Every series has at most one value per label name: the union of the per-value
+        // postings is their sum.
+        let values = self.0.label_values(name, &[]).map_err(|e| e.to_string())?;
+        Ok(values
+            .iter()
+            .map(|v| self.0.postings_length(name, v) as u64)
+            .sum())
+    }
+
+    fn postings_count(&self, name: &str, value: &str) -> Result<u64, String> {
+        Ok(self.0.postings_length(name, value) as u64)
     }
 }
 

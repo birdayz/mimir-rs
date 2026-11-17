@@ -116,6 +116,18 @@ impl PreparedChunkSelect {
     }
 }
 
+/// Postings selected from the index and series returned by one block querier (the Head or one
+/// persisted block) for a chunk `Select`: what Mimir's `statsTrackingChunkSeriesSet` reports as
+/// `cortex_ingester_queried_series{stage="single_block_index"|"single_block_filter"}`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockSelectStats {
+    pub selected_postings: u64,
+    pub series: u64,
+}
+
+/// Collects one [`BlockSelectStats`] per block querier of every chunk select it is attached to.
+pub type BlockSelectStatsSink = Arc<parking_lot::Mutex<Vec<BlockSelectStats>>>;
+
 /// Unified read view over `Head` and overlapping `Block`s for `[mint, maxt]`.
 pub struct TsdbQuerier<'a> {
     head: Option<&'a Head>,
@@ -123,6 +135,7 @@ pub struct TsdbQuerier<'a> {
     blocks_lock: Option<&'a RwLock<Vec<Arc<Block>>>>,
     mint: i64,
     maxt: i64,
+    select_stats: Option<BlockSelectStatsSink>,
 }
 
 impl<'a> TsdbQuerier<'a> {
@@ -144,6 +157,7 @@ impl<'a> TsdbQuerier<'a> {
             blocks_lock: None,
             mint,
             maxt,
+            select_stats: None,
         }
     }
 
@@ -159,7 +173,30 @@ impl<'a> TsdbQuerier<'a> {
             blocks_lock: Some(blocks_lock),
             mint,
             maxt,
+            select_stats: None,
         }
+    }
+
+    /// Records per block querier [`BlockSelectStats`] of chunk selects into `sink`.
+    pub fn set_select_stats(&mut self, sink: BlockSelectStatsSink) {
+        self.select_stats = Some(sink);
+    }
+
+    /// Reports the per-source stats of one chunk select: the Head (if queried), every block with
+    /// matching postings, and `0/0` for overlapping blocks without any.
+    fn record_select_stats(
+        &self,
+        head: Option<BlockSelectStats>,
+        blocks: &[BlockSelectStats],
+        empty_blocks: usize,
+    ) {
+        let Some(sink) = &self.select_stats else {
+            return;
+        };
+        let mut g = sink.lock();
+        g.extend(head);
+        g.extend_from_slice(blocks);
+        g.extend(std::iter::repeat_n(BlockSelectStats::default(), empty_blocks));
     }
 
     fn effective_blocks<'b>(
@@ -380,8 +417,13 @@ impl<'a> TsdbQuerier<'a> {
         let maxt = prepared.maxt;
         let unordered = prepared.unordered;
 
+        let empty_blocks = prepared
+            .overlapping_blocks
+            .len()
+            .saturating_sub(prepared.block_refs.len());
         if prepared.block_refs.is_empty() {
             let (Some(head), Some(refs)) = (head, prepared.head_refs) else {
+                self.record_select_stats(None, &[], empty_blocks);
                 return Ok(Vec::new());
             };
             let mut out = Vec::with_capacity(refs.len());
@@ -448,6 +490,14 @@ impl<'a> TsdbQuerier<'a> {
                     }
                 }
             }
+            self.record_select_stats(
+                Some(BlockSelectStats {
+                    selected_postings: refs.len() as u64,
+                    series: out.len() as u64,
+                }),
+                &[],
+                empty_blocks,
+            );
             if sort_series {
                 out.sort_by(|a, b| a.labels.cmp(&b.labels));
             }
@@ -474,9 +524,17 @@ impl<'a> TsdbQuerier<'a> {
         let mut per_series: hashbrown::HashMap<Labels, SeriesSources> =
             hashbrown::HashMap::with_capacity(est);
 
+        let mut head_stats = None;
         if let (Some(head), Some(refs)) = (head, prepared.head_refs) {
+            let mut stats = BlockSelectStats {
+                selected_postings: refs.len() as u64,
+                series: 0,
+            };
             for &r in refs.iter() {
                 if let Some((labels, chks, tombs)) = head.series_chunks(r, mint, maxt)? {
+                    if !chks.is_empty() {
+                        stats.series += 1;
+                    }
                     let entry = per_series.entry(labels).or_insert_with(|| SeriesSources {
                         head: Vec::new(),
                         blocks: Vec::new(),
@@ -486,12 +544,18 @@ impl<'a> TsdbQuerier<'a> {
                     }
                 }
             }
+            head_stats = Some(stats);
         }
 
+        let mut block_stats: SmallVec<[BlockSelectStats; 4]> = SmallVec::new();
         for (blk, refs) in prepared.block_refs {
             let idx = blk.index();
             let chkr = blk.chunks();
             let tombr = blk.tombstones();
+            let mut stats = BlockSelectStats {
+                selected_postings: refs.len() as u64,
+                series: 0,
+            };
             for &r in refs.iter() {
                 let (labels, chks) = idx.series(r)?;
                 let tombs = tombr.get(r);
@@ -510,6 +574,7 @@ impl<'a> TsdbQuerier<'a> {
                     loaded.push((cm, tombs.clone()));
                 }
                 if !loaded.is_empty() {
+                    stats.series += 1;
                     let entry = per_series.entry(labels).or_insert_with(|| SeriesSources {
                         head: Vec::new(),
                         blocks: Vec::new(),
@@ -517,7 +582,9 @@ impl<'a> TsdbQuerier<'a> {
                     entry.blocks.extend(loaded);
                 }
             }
+            block_stats.push(stats);
         }
+        self.record_select_stats(head_stats, &block_stats, empty_blocks);
 
         let merge_or_collect = |items: Vec<(ChunkMeta, Vec<Interval>)>,
                                 allow_non_overlapping_raw: bool|
@@ -640,6 +707,10 @@ impl<'a> TsdbQuerier<'a> {
         let mint = prepared.mint;
         let maxt = prepared.maxt;
         let unordered = prepared.unordered;
+        let empty_blocks = prepared
+            .overlapping_blocks
+            .len()
+            .saturating_sub(prepared.block_refs.len());
 
         let merge_or_collect = |items: Vec<(ChunkMeta, Vec<Interval>)>,
                                 allow_non_overlapping_raw: bool|
@@ -702,6 +773,7 @@ impl<'a> TsdbQuerier<'a> {
         };
 
         if prepared.block_refs.is_empty() {
+            let selected_postings = prepared.head_refs.as_ref().map(|r| r.len() as u64);
             let mut entries: Vec<LazySeriesEntry> = match (head, prepared.head_refs) {
                 (Some(h), Some(refs)) => {
                     let mut v = Vec::with_capacity(refs.len());
@@ -722,6 +794,14 @@ impl<'a> TsdbQuerier<'a> {
                 }
                 _ => Vec::new(),
             };
+            self.record_select_stats(
+                head.and(selected_postings).map(|selected_postings| BlockSelectStats {
+                    selected_postings,
+                    series: entries.len() as u64,
+                }),
+                &[],
+                empty_blocks,
+            );
 
             if sort_series && entries.len() > 1 {
                 entries.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
@@ -784,11 +864,19 @@ impl<'a> TsdbQuerier<'a> {
         let mut per_series: hashbrown::HashMap<Labels, MultiMeta> =
             hashbrown::HashMap::with_capacity(est);
 
+        let mut head_stats = None;
         if let (Some(h), Some(refs)) = (head, prepared.head_refs) {
+            let mut stats = BlockSelectStats {
+                selected_postings: refs.len() as u64,
+                series: 0,
+            };
             for &r in refs.iter() {
                 if let Some((labels, ivs, _had_slow)) =
                     h.series_chunk_metas_no_bytes(r, mint, maxt, series_filter)?
                 {
+                    if !ivs.is_empty() {
+                        stats.series += 1;
+                    }
                     let entry = per_series.entry(labels).or_insert_with(|| MultiMeta {
                         sources: SmallVec::new(),
                         head_ivs: SmallVec::new(),
@@ -799,13 +887,19 @@ impl<'a> TsdbQuerier<'a> {
                     entry.head_ivs.extend(ivs);
                 }
             }
+            head_stats = Some(stats);
         }
 
+        let mut block_stats: SmallVec<[BlockSelectStats; 4]> = SmallVec::new();
         for (b_idx, (blk, refs)) in prepared.block_refs.iter().enumerate() {
             let idx = blk.index();
             let tombr = blk.tombstones();
             let blk_has_any_tombs = tombr.has_any();
             let src_tag = 1u16 + (b_idx as u16);
+            let mut stats = BlockSelectStats {
+                selected_postings: refs.len() as u64,
+                series: 0,
+            };
             for &r in refs.iter() {
                 let (labels, chks) = idx.series(r)?;
                 if let Some(pred) = series_filter {
@@ -838,6 +932,7 @@ impl<'a> TsdbQuerier<'a> {
                     local_ivs.push((cm.min_time, cm.max_time));
                 }
                 if !local_ivs.is_empty() {
+                    stats.series += 1;
                     let entry = per_series.entry(labels).or_insert_with(|| MultiMeta {
                         sources: SmallVec::new(),
                         head_ivs: SmallVec::new(),
@@ -851,7 +946,9 @@ impl<'a> TsdbQuerier<'a> {
                     }
                 }
             }
+            block_stats.push(stats);
         }
+        self.record_select_stats(head_stats, &block_stats, empty_blocks);
 
         let load_multi_chunks = |srcs: &[(u16, u64)]| -> Result<Vec<ChunkMeta>, QuerierError> {
             let mut head_items: Vec<(ChunkMeta, Vec<Interval>)> = Vec::new();
@@ -1241,6 +1338,12 @@ impl<'a> TsdbChunkQuerier<'a> {
             inner: TsdbQuerier::with_blocks_lock(head, blocks_lock, mint, maxt),
             unordered: true,
         }
+    }
+
+    /// Records per block querier [`BlockSelectStats`] of every chunk select into `sink`.
+    pub fn with_select_stats(mut self, sink: BlockSelectStatsSink) -> Self {
+        self.inner.set_select_stats(sink);
+        self
     }
 
     pub fn select_adaptive(

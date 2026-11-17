@@ -124,6 +124,8 @@ pub struct Ingester {
     pub runtime_cfg: Option<Arc<RuntimeConfigManager>>,
 
     pub registry: Option<Registry>,
+    /// `lookupplan.NewMetrics(registerer)`: `cortex_tsdb_index_lookup_planning_*`.
+    pub lookup_plan_metrics: crate::lookupplan::Metrics,
     pub metrics: Arc<IngesterMetrics>,
     pub tsdb_metrics: Arc<TSDBMetrics>,
     pub shipper_metrics: ShipperMetrics,
@@ -435,6 +437,7 @@ impl Ingester {
             overrides,
             runtime_cfg,
             registry: registry.cloned(),
+            lookup_plan_metrics: crate::lookupplan::Metrics::new(registry),
             metrics,
             tsdb_metrics,
             shipper_metrics,
@@ -789,6 +792,14 @@ impl Ingester {
         *self.utilization_based_limiter.write() = limiter;
     }
 
+    /// `generateHeadStatisticsForAllUsers`.
+    pub fn generate_head_statistics_for_all_users(&self) {
+        let dbs: Vec<Arc<UserTsdb>> = self.tsdbs.iter().map(|e| Arc::clone(e.value())).collect();
+        for db in dbs {
+            db.generate_head_statistics();
+        }
+    }
+
     pub fn get_tsdb(&self, user_id: &str) -> Option<Arc<UserTsdb>> {
         self.tsdbs.get(user_id).map(|v| Arc::clone(v.value()))
     }
@@ -878,6 +889,18 @@ impl Ingester {
         .map_err(|e| IngesterError::Internal {
             message: format!("failed to open TSDB for user {user_id}: {e}"),
         })?;
+        let planning = &self.blocks_cfg.tsdb.index_lookup_planning;
+        if planning.index_lookup_planning_enabled {
+            db.set_planner_provider(Arc::new(crate::lookupplan::PlannerProvider::new(Arc::new(
+                crate::lookupplan::PlannerFactory::new(
+                    self.lookup_plan_metrics.for_user(user_id),
+                    crate::lookupplan::StatisticsGenerator::new(),
+                    planning.into(),
+                ),
+            ))));
+            // Initial statistics only once the TSDB has been opened and its WAL replayed.
+            db.generate_head_statistics();
+        }
         self.tsdb_metrics
             .set_registry_for_tenant(user_id, tsdb_prom_reg);
         Ok(db)
@@ -1540,6 +1563,35 @@ impl Ingester {
                         tokio::select! {
                             _ = sctx.canceled() => break,
                             _ = ticker.tick() => ing.apply_tsdb_settings(),
+                        }
+                    }
+                }));
+            }
+
+            // `statisticsService`: a timer service regenerating every tenant's head statistics.
+            let planning = &self.blocks_cfg.tsdb.index_lookup_planning;
+            if let Some(period) = planning
+                .index_lookup_planning_enabled
+                .then(|| planning.statistics_collection_frequency.as_std())
+                .flatten()
+                .filter(|p| !p.is_zero())
+            {
+                let ing = Arc::clone(self);
+                let sctx = ctx.child();
+                tasks.push(tokio::spawn(async move {
+                    let start = tokio::time::Instant::now() + period;
+                    let mut ticker = tokio::time::interval_at(start, period);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = sctx.canceled() => break,
+                            _ = ticker.tick() => {
+                                let ing = Arc::clone(&ing);
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    ing.generate_head_statistics_for_all_users();
+                                })
+                                .await;
+                            }
                         }
                     }
                 }));
