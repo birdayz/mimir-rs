@@ -1708,6 +1708,32 @@ impl StripeSeries {
         }
         out
     }
+
+    fn shrink_oversized_stripes(&self) {
+        for stripe in &self.stripes {
+            let mut s = stripe.write();
+            if s.by_id.is_empty() {
+                if s.by_id.capacity() > 0 {
+                    s.by_id = FastU64Map::default();
+                }
+            } else {
+                let id_len = s.by_id.len();
+                if s.by_id.capacity() > (id_len * 4).max(64) {
+                    s.by_id.shrink_to(id_len * 2);
+                }
+            }
+            if s.by_hash.is_empty() {
+                if s.by_hash.capacity() > 0 {
+                    s.by_hash = HashTable::new();
+                }
+            } else {
+                let hash_len = s.by_hash.len();
+                if s.by_hash.capacity() > (hash_len * 4).max(64) {
+                    s.by_hash.shrink_to(hash_len * 2, |&(h, _)| h);
+                }
+            }
+        }
+    }
 }
 
 /// Series chunks + tombstones returned by [`Head::series_chunks`].
@@ -1999,6 +2025,8 @@ pub struct Head {
     num_series: AtomicU64,
     last_wal_truncation_time: AtomicI64,
     closed: AtomicBool,
+    has_any_metadata: AtomicBool,
+    deleted_series_since_symbol_gc: AtomicU64,
     wal_expiries: Mutex<HashMap<u64, i64>>,
     wbl_pinned_refs: Mutex<HashSet<u64>>,
     appender_pool: Mutex<Vec<AppenderScratch>>,
@@ -2116,6 +2144,8 @@ impl Head {
             num_series: AtomicU64::new(0),
             last_wal_truncation_time: AtomicI64::new(i64::MIN),
             closed: AtomicBool::new(false),
+            has_any_metadata: AtomicBool::new(false),
+            deleted_series_since_symbol_gc: AtomicU64::new(0),
             wal_expiries: Mutex::new(HashMap::new()),
             wbl_pinned_refs: Mutex::new(HashSet::new()),
             appender_pool: Mutex::new(Vec::new()),
@@ -2153,8 +2183,7 @@ impl Head {
             chunk_writer.set_queue_metrics(m);
         }
         *head.chunk_writer.lock() = Some(chunk_writer);
-        let chunk_reader = HeadChunksReader::open_no_repair(&chunks_dir)?;
-        *head.chunk_reader.write() = Some(chunk_reader);
+        head.refresh_chunk_reader()?;
 
         Ok(head)
     }
@@ -2237,8 +2266,7 @@ impl Head {
                             })?;
                             tracing::info!("Successfully repaired WBL");
                         }
-                        let refreshed = HeadChunksReader::open_no_repair(chunks_dir)?;
-                        *self.chunk_reader.write() = Some(refreshed);
+                        self.refresh_chunk_reader()?;
                         self.promote_all_pending_ooo_mmapped();
                     }
                 }
@@ -2415,6 +2443,115 @@ impl Head {
                 partial
             }
         }
+    }
+
+    fn refresh_chunk_reader(&self) -> Result<(), HeadChunksError> {
+        let mut guard = self.chunk_reader.write();
+        match *guard {
+            Some(ref mut reader) => reader.refresh_in_place(),
+            None => {
+                let reader = HeadChunksReader::open_no_repair(self.dir.join("chunks_head"))?;
+                *guard = Some(reader);
+                Ok(())
+            }
+        }
+    }
+
+    /// Returns `(num_symbols, arena_bytes)` for the Head's interned symbol table.
+    pub fn symbol_table_stats(&self) -> (usize, usize) {
+        let syms = self.symbols.read();
+        (syms.len(), syms.bytes_len())
+    }
+
+    /// Reclaims dead interned strings from `Head.symbols` (`SymbolTable`) after series churn.
+    fn maybe_gc_symbols(&self) {
+        let deleted = self.deleted_series_since_symbol_gc.load(Ordering::Acquire);
+        let num_series = self.num_series();
+        let should_check = if num_series == 0 {
+            deleted > 0 && self.symbols.read().len() > 64
+        } else {
+            deleted >= (num_series / 2).max(1024)
+        };
+        if !should_check {
+            return;
+        }
+
+        let _creation_guard = self.series_creation_mtx.lock();
+        let mut syms = self.symbols.write();
+
+        if self.num_series() == 0 && self.postings.is_all_empty() {
+            self.postings.clear_and_shrink();
+            *syms = SymbolTable::new();
+            self.deleted_series_since_symbol_gc
+                .store(0, Ordering::Release);
+            return;
+        }
+
+        let old_len = syms.len();
+        if old_len <= 1 {
+            self.deleted_series_since_symbol_gc
+                .store(0, Ordering::Release);
+            return;
+        }
+
+        let mut used = vec![false; old_len];
+        used[0] = true; // SymbolId::EMPTY
+        self.postings.collect_live_symbols(&mut used);
+
+        let has_meta = self.has_any_metadata.load(Ordering::Acquire);
+        if has_meta {
+            for stripe in &self.series.stripes {
+                let entries: Vec<Arc<SeriesEntry>> =
+                    stripe.read().by_id.values().cloned().collect();
+                for e in entries {
+                    let st = e.inner.lock();
+                    if let Some(m) = st.metadata {
+                        if let Some(slot) = used.get_mut(m.unit.0 as usize) {
+                            *slot = true;
+                        }
+                        if let Some(slot) = used.get_mut(m.help.0 as usize) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let live_count = used.iter().filter(|&&u| u).count();
+        if live_count * 4 < old_len * 3 || (old_len > 4096 && live_count + 1024 < old_len) {
+            let mut live_bytes = 0usize;
+            for (i, &is_used) in used.iter().enumerate().skip(1) {
+                if is_used {
+                    live_bytes += syms.resolve(SymbolId(i as u32)).len();
+                }
+            }
+            let mut new_syms = SymbolTable::with_capacity(live_count, live_bytes);
+            let mut remap = vec![SymbolId::EMPTY; old_len];
+            for (i, &is_used) in used.iter().enumerate().skip(1) {
+                if is_used {
+                    let s = syms.resolve(SymbolId(i as u32));
+                    remap[i] = new_syms.intern(s);
+                }
+            }
+
+            self.postings.remap_symbols(&remap);
+            if has_meta {
+                for stripe in &self.series.stripes {
+                    let entries: Vec<Arc<SeriesEntry>> =
+                        stripe.read().by_id.values().cloned().collect();
+                    for e in entries {
+                        let mut st = e.inner.lock();
+                        if let Some(ref mut m) = st.metadata {
+                            m.unit = remap[m.unit.0 as usize];
+                            m.help = remap[m.help.0 as usize];
+                        }
+                    }
+                }
+            }
+            *syms = new_syms;
+        }
+        self.deleted_series_since_symbol_gc
+            .store(0, Ordering::Release);
     }
 
     fn intern_metadata_symbols(
@@ -2818,6 +2955,7 @@ impl Head {
                         let metric_type = MetricType::from_u8(m.metric_type);
                         let compact_meta =
                             self.intern_metadata_symbols(metric_type, &m.unit, &m.help);
+                        self.has_any_metadata.store(true, Ordering::Release);
                         let mut st = entry.inner.lock();
                         st.metadata = Some(compact_meta);
                     }
@@ -3468,6 +3606,7 @@ impl Head {
                                                 &m.unit,
                                                 &m.help,
                                             );
+                                            self.has_any_metadata.store(true, Ordering::Release);
                                             let mut st = entry.inner.lock();
                                             st.metadata = Some(compact_meta);
                                         }
@@ -4642,6 +4781,8 @@ impl Head {
 
         let removed_count = deleted.len();
         self.num_series.fetch_sub(removed_count as u64, Ordering::Relaxed);
+        self.deleted_series_since_symbol_gc
+            .fetch_add(removed_count as u64, Ordering::Release);
         if let Some(ref g) = self.series_gauge {
             g.sub(removed_count as f64);
         }
@@ -4649,7 +4790,13 @@ impl Head {
             c.inc_by(removed_count as f64);
         }
         self.metrics.chunks_removed(chunks_removed);
-        self.postings.delete(&deleted, &affected);
+        {
+            // Keep `symbols` read-locked until `postings.delete` finishes so a concurrent
+            // `maybe_gc_symbols` cannot remap `SymbolId`s between lookup and deletion.
+            let syms = self.symbols.read();
+            let _ = &*syms;
+            self.postings.delete(&deleted, &affected);
+        }
         drop(affected);
         if entries_len > 64 {
             self.postings_cache.invalidate_all();
@@ -4686,13 +4833,11 @@ impl Head {
         };
         let mut affected_set: hashbrown::HashSet<(SymbolId, SymbolId)> =
             hashbrown::HashSet::with_capacity(entries_len.min(65536));
-        {
-            let syms = self.symbols.read();
-            for (e, _) in &entries {
-                for (k, v) in e.labels.iter() {
-                    if let (Some(nid), Some(vid)) = (syms.get(k), syms.get(v)) {
-                        affected_set.insert((nid, vid));
-                    }
+        let syms_guard = self.symbols.read();
+        for (e, _) in &entries {
+            for (k, v) in e.labels.iter() {
+                if let (Some(nid), Some(vid)) = (syms_guard.get(k), syms_guard.get(v)) {
+                    affected_set.insert((nid, vid));
                 }
             }
         }
@@ -4714,6 +4859,8 @@ impl Head {
 
         let removed_count = deleted.len();
         self.num_series.fetch_sub(removed_count as u64, Ordering::Relaxed);
+        self.deleted_series_since_symbol_gc
+            .fetch_add(removed_count as u64, Ordering::Release);
         if let Some(ref g) = self.series_gauge {
             g.sub(removed_count as f64);
         }
@@ -4721,6 +4868,7 @@ impl Head {
             c.inc_by(removed_count as f64);
         }
         self.postings.delete(&deleted, &affected);
+        drop(syms_guard);
         drop(affected);
         if entries_len > 64 {
             self.postings_cache.invalidate_all();
@@ -4836,8 +4984,7 @@ impl Head {
             }
             // Refresh mmap reader BEFORE exposing new mmapped_chunks on series state,
             // so concurrent readers never observe a ChunkDiskMapperRef not yet in chunk_reader.
-            let reader = HeadChunksReader::open_no_repair(self.dir.join("chunks_head"))?;
-            *self.chunk_reader.write() = Some(reader);
+            self.refresh_chunk_reader()?;
             for (entry, mmapped) in pending {
                 let mut st = entry.inner.lock();
                 let mut matched = 0usize;
@@ -5056,8 +5203,7 @@ impl Head {
         }
 
         if mmapped_any {
-            let reader = HeadChunksReader::open_no_repair(self.dir.join("chunks_head"))?;
-            *self.chunk_reader.write() = Some(reader);
+            self.refresh_chunk_reader()?;
             for entry in pending_entries {
                 let mut st = entry.inner.lock();
                 if let Some(ref mut ooo) = st.ooo {
@@ -5373,8 +5519,7 @@ impl Head {
         }
 
         if mmapped_any {
-            let reader = HeadChunksReader::open_no_repair(self.dir.join("chunks_head"))?;
-            *self.chunk_reader.write() = Some(reader);
+            self.refresh_chunk_reader()?;
             for entry in pending_entries {
                 let mut st = entry.inner.lock();
                 if let Some(ref mut ooo) = st.ooo {
@@ -5614,6 +5759,8 @@ impl Head {
 
         if !to_delete.is_empty() {
             self.finish_deleted_series_cleanup(to_delete);
+            self.series.shrink_oversized_stripes();
+            self.maybe_gc_symbols();
         }
 
         self.truncate_chunks_head(min_mmap_seq)?;
@@ -5638,10 +5785,9 @@ impl Head {
             }
         };
         if min_mmap_seq > 1 {
-            let reader_opt = self.chunk_reader.write().take();
-            if let Some(reader) = reader_opt {
-                let truncated = reader.truncate_except(min_mmap_seq, active_seq)?;
-                *self.chunk_reader.write() = Some(truncated);
+            let mut guard = self.chunk_reader.write();
+            if let Some(ref mut reader) = *guard {
+                reader.truncate_in_place_except(min_mmap_seq, active_seq)?;
             }
         }
         Ok(())
@@ -5801,6 +5947,8 @@ impl Head {
                 wal.log(&[&rec])?;
             }
             self.finish_deleted_series_cleanup(to_delete);
+            self.series.shrink_oversized_stripes();
+            self.maybe_gc_symbols();
         }
         Ok(())
     }
@@ -5891,6 +6039,8 @@ impl Head {
         self.min_ooo_time.store(min_ooo_time, Ordering::Release);
 
         self.truncate_chunks_head(min_mmap_seq)?;
+        self.series.shrink_oversized_stripes();
+        self.maybe_gc_symbols();
         Ok(())
     }
 
@@ -5900,6 +6050,8 @@ impl Head {
             self.gc_collect_and_unlink(mint);
         if !to_delete.is_empty() {
             self.finish_deleted_series_cleanup(to_delete);
+            self.series.shrink_oversized_stripes();
+            self.maybe_gc_symbols();
         }
         self.tombstones.truncate_before(mint);
         if actual_mint != i64::MAX && self.initialized() && actual_mint > self.min_time() {
@@ -6085,8 +6237,11 @@ impl Head {
             // tracking expired series.
             let mut exp = self.wal_expiries.lock();
             exp.retain(|_, &mut ku| ku >= mint);
+            let exp_len = exp.len();
             if exp.is_empty() {
                 exp.shrink_to_fit();
+            } else if exp.capacity() > (exp_len * 4).max(1024) {
+                exp.shrink_to(exp_len * 2);
             }
         }
         self.metrics.checkpoint_delete_total.inc();
@@ -6686,7 +6841,9 @@ struct PendingExemplar {
 #[derive(Clone)]
 struct PendingMetadata {
     entry: Arc<SeriesEntry>,
-    meta: CompactSeriesMetadata,
+    metric_type: MetricType,
+    unit: String,
+    help: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6896,8 +7053,26 @@ impl<'a> HeadAppender<'a> {
         self.floats_committed = 0;
         self.hists_committed = 0;
         self.fhists_committed = 0;
+        if self.series_refs.capacity() > 16_384 {
+            self.series_refs = Vec::new();
+        }
+        if self.created_series.capacity() > 16_384 {
+            self.created_series = Vec::new();
+        }
         if self.floats.capacity() > 16_384 {
             self.floats = Vec::new();
+        }
+        if self.histograms.capacity() > 16_384 {
+            self.histograms = Vec::new();
+        }
+        if self.float_histograms.capacity() > 16_384 {
+            self.float_histograms = Vec::new();
+        }
+        if self.exemplars.capacity() > 16_384 {
+            self.exemplars = Vec::new();
+        }
+        if self.metadata.capacity() > 16_384 {
+            self.metadata = Vec::new();
         }
         if self.batch_last_sample.capacity() > 16_384 {
             self.batch_last_sample = FastU64Map::default();
@@ -8240,17 +8415,26 @@ impl<'a> HeadAppender<'a> {
             return Err(HeadError::AppenderClosed);
         }
         let mut cur_ref = series_ref;
-        let compact_meta = self.head.intern_metadata_symbols(metric_type, unit, help);
         let (entry, changed) = loop {
             let e = self.resolve_sorted_pairs(cur_ref, pairs)?;
-            let st = e.inner.lock();
-            if e.is_gced() {
-                drop(st);
-                cur_ref = None;
-                continue;
-            }
-            let ch = st.metadata != Some(compact_meta);
-            drop(st);
+            let prev_meta = {
+                let st = e.inner.lock();
+                if e.is_gced() {
+                    drop(st);
+                    cur_ref = None;
+                    continue;
+                }
+                st.metadata
+            };
+            let ch = match prev_meta {
+                Some(m) => {
+                    let syms = self.head.symbols.read();
+                    m.metric_type != metric_type
+                        || syms.try_resolve(m.unit) != Some(unit)
+                        || syms.try_resolve(m.help) != Some(help)
+                }
+                None => true,
+            };
             break (e, ch);
         };
         let ref_id = entry.ref_id;
@@ -8268,7 +8452,9 @@ impl<'a> HeadAppender<'a> {
         if changed {
             self.metadata.push(PendingMetadata {
                 entry,
-                meta: compact_meta,
+                metric_type,
+                unit: unit.to_string(),
+                help: help.to_string(),
             });
         }
         Ok(ref_id)
@@ -8301,8 +8487,31 @@ impl<'a> HeadAppender<'a> {
             }
         }
         for pm in self.metadata.drain(..) {
-            let mut st = pm.entry.inner.lock();
-            st.metadata = Some(pm.meta);
+            let mut applied = false;
+            {
+                let syms = self.head.symbols.read();
+                if let (Some(u), Some(h)) = (syms.get(&pm.unit), syms.get(&pm.help)) {
+                    self.head.has_any_metadata.store(true, Ordering::Release);
+                    let mut st = pm.entry.inner.lock();
+                    st.metadata = Some(CompactSeriesMetadata {
+                        metric_type: pm.metric_type,
+                        unit: u,
+                        help: h,
+                    });
+                    applied = true;
+                }
+            }
+            if !applied {
+                let mut syms = self.head.symbols.write();
+                let compact_meta = CompactSeriesMetadata {
+                    metric_type: pm.metric_type,
+                    unit: syms.intern(&pm.unit),
+                    help: syms.intern(&pm.help),
+                };
+                self.head.has_any_metadata.store(true, Ordering::Release);
+                let mut st = pm.entry.inner.lock();
+                st.metadata = Some(compact_meta);
+            }
         }
 
         let mut in_order_mint = i64::MAX;
@@ -8910,8 +9119,7 @@ impl<'a> HeadAppender<'a> {
             if let Some(ref mut cw) = *self.head.chunk_writer.lock() {
                 cw.flush()?;
             }
-            let reader = HeadChunksReader::open_no_repair(self.head.dir.join("chunks_head"))?;
-            *self.head.chunk_reader.write() = Some(reader);
+            self.head.refresh_chunk_reader()?;
             for entry in pending_ooo_promote {
                 let mut st = entry.inner.lock();
                 if let Some(ref mut ooo) = st.ooo {
@@ -9018,15 +9226,14 @@ impl<'a> HeadAppender<'a> {
             recs.push(enc.series(&self.series_refs, Vec::new()));
         }
         if !self.metadata.is_empty() {
-            let syms = self.head.symbols.read();
             let metas: Vec<RefMetadata> = self
                 .metadata
                 .iter()
                 .map(|m| RefMetadata {
                     ref_id: m.entry.ref_id,
-                    metric_type: m.meta.metric_type as u8,
-                    unit: syms.resolve(m.meta.unit).to_string(),
-                    help: syms.resolve(m.meta.help).to_string(),
+                    metric_type: m.metric_type as u8,
+                    unit: m.unit.clone(),
+                    help: m.help.clone(),
                 })
                 .collect();
             recs.push(enc.metadata(&metas, Vec::new()));
@@ -10236,6 +10443,89 @@ mod tests {
         assert!(h_chks
             .iter()
             .all(|c| c.chunk.as_ref().unwrap().encoding() == Encoding::HistogramSt));
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn symbol_table_gc_reclaims_churn_and_preserves_metadata_and_postings() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+
+        // Create 100 kept series with metadata, plus 2,000 old ephemeral series with metadata.
+        {
+            let mut app = head.appender();
+            for i in 0..100 {
+                let name = format!("kept_metric_{i}");
+                let pairs = [("__name__", name.as_str()), ("env", "prod")];
+                app.append_float(None, &pairs, 10_000, i as f64).unwrap();
+                app.update_metadata(
+                    None,
+                    &pairs,
+                    &name,
+                    MetricType::Counter,
+                    "seconds",
+                    "kept help string",
+                )
+                .unwrap();
+            }
+            for i in 0..2_000 {
+                let name = format!("old_churn_{i}");
+                let pod = format!("pod-{i}");
+                let pairs = [("__name__", name.as_str()), ("pod", pod.as_str())];
+                app.append_float(None, &pairs, 1_000, i as f64).unwrap();
+                app.update_metadata(
+                    None,
+                    &pairs,
+                    &name,
+                    MetricType::Gauge,
+                    "bytes",
+                    &format!("ephemeral help {i}"),
+                )
+                .unwrap();
+            }
+            app.commit().unwrap();
+        }
+
+        let (syms_before, bytes_before) = head.symbol_table_stats();
+        assert!(syms_before > 4_000, "expected >4000 symbols, got {syms_before}");
+
+        // Truncate before t=5_000: all 2,000 ephemeral series are GCed and symbols compacted.
+        head.truncate_memory(5_000).unwrap();
+
+        let (syms_after, bytes_after) = head.symbol_table_stats();
+        assert!(
+            syms_after < 500,
+            "expected SymbolTable GC to drop symbols from {syms_before} to <500, got {syms_after}"
+        );
+        assert!(
+            bytes_after < bytes_before / 4,
+            "expected SymbolTable bytes to shrink: {bytes_before} -> {bytes_after}"
+        );
+
+        // Verify MemPostings lookups & SeriesState metadata survived symbol remapping.
+        assert_eq!(head.num_series(), 100);
+        let prod_refs = head.postings_for_label_value("env", "prod");
+        assert_eq!(prod_refs.len(), 100);
+        for i in 0..100 {
+            let name = format!("kept_metric_{i}");
+            let entry = head
+                .get_entry_by_sorted_pairs(&[("__name__", name.as_str()), ("env", "prod")])
+                .unwrap();
+            let meta = {
+                let syms = head.symbols.read();
+                let st = entry.inner.lock();
+                let m = st.metadata.unwrap();
+                (
+                    m.metric_type,
+                    syms.resolve(m.unit).to_string(),
+                    syms.resolve(m.help).to_string(),
+                )
+            };
+            assert_eq!(meta.0, MetricType::Counter);
+            assert_eq!(meta.1, "seconds");
+            assert_eq!(meta.2, "kept help string");
+        }
+        assert!(head.postings_for_label_value("pod", "pod-0").is_empty());
         head.close().unwrap();
     }
 }

@@ -258,6 +258,20 @@ impl std::fmt::Debug for PostingsForMatchersCache {
     }
 }
 
+impl Drop for PostingsForMatchersCache {
+    fn drop(&mut self) {
+        if let Some(ref m) = self.metrics {
+            let inner = self.inner.get_mut();
+            if !inner.table.is_empty() {
+                m.entries.sub(inner.table.len() as f64);
+            }
+            if inner.total_bytes > 0 {
+                m.bytes.sub(inner.total_bytes as f64);
+            }
+        }
+    }
+}
+
 impl PostingsForMatchersCache {
     pub fn new(config: PostingsForMatchersCacheConfig) -> Self {
         let metric_versions = if config.enable_invalidation {
@@ -841,5 +855,10 @@ mod tests {
         a.get_or_compute(&[], ok(vec![])).unwrap();
         assert_eq!(sample(&reg, &format!("{p}requests_total"), None), 5.0);
         assert_eq!(sample(&reg, &format!("{p}misses_total"), None), 4.0);
+
+        // Dropping `b` subtracts its remaining entries & bytes from shared gauges.
+        drop(b);
+        assert_eq!(sample(&reg, &format!("{p}entries_total"), None), 0.0);
+        assert_eq!(sample(&reg, &format!("{p}bytes_total"), None), 0.0);
     }
 }

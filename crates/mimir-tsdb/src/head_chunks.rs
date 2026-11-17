@@ -374,38 +374,87 @@ impl HeadChunksReader {
             }
             prev_seq = Some(seq);
 
-            let file = File::open(&path)?;
-            // SAFETY: files are opened read-only for mmap inspection of persisted head chunks.
-            let mmap = unsafe { MmapOptions::new().map(&file)? };
-
-            // Header validation errors are NOT `CorruptionErr` in Go
-            // (`openMMapFiles` returns plain `fmt.Errorf`), so they are fatal for
-            // `NewHead` and never trigger the m-map chunk repair path.
-            if mmap.len() < HEAD_CHUNK_FILE_HEADER_SIZE {
-                return Err(HeadChunksError::InvalidFile {
-                    path: path.clone(),
-                    message: "invalid head chunk file header: invalid size".to_string(),
-                });
-            }
-            let magic = u32::from_be_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]);
-            if magic != MAGIC_HEAD_CHUNKS {
-                return Err(HeadChunksError::InvalidFile {
-                    path: path.clone(),
-                    message: format!("invalid magic number {magic:x}"),
-                });
-            }
-            let version = mmap[MAGIC_CHUNKS_SIZE];
-            if version != HEAD_CHUNKS_FORMAT_V1 {
-                return Err(HeadChunksError::InvalidFile {
-                    path: path.clone(),
-                    message: format!("invalid chunk format version {version}"),
-                });
-            }
-
+            let mmap = Self::map_and_validate_file(&path)?;
             files.insert(seq, mmap);
         }
 
         Ok(Self { dir, files })
+    }
+
+    fn map_and_validate_file(path: &Path) -> Result<Mmap, HeadChunksError> {
+        let file = File::open(path)?;
+        // SAFETY: files are opened read-only for mmap inspection of persisted head chunks.
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+
+        // Header validation errors are NOT `CorruptionErr` in Go
+        // (`openMMapFiles` returns plain `fmt.Errorf`), so they are fatal for
+        // `NewHead` and never trigger the m-map chunk repair path.
+        if mmap.len() < HEAD_CHUNK_FILE_HEADER_SIZE {
+            return Err(HeadChunksError::InvalidFile {
+                path: path.to_path_buf(),
+                message: "invalid head chunk file header: invalid size".to_string(),
+            });
+        }
+        let magic = u32::from_be_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]);
+        if magic != MAGIC_HEAD_CHUNKS {
+            return Err(HeadChunksError::InvalidFile {
+                path: path.to_path_buf(),
+                message: format!("invalid magic number {magic:x}"),
+            });
+        }
+        let version = mmap[MAGIC_CHUNKS_SIZE];
+        if version != HEAD_CHUNKS_FORMAT_V1 {
+            return Err(HeadChunksError::InvalidFile {
+                path: path.to_path_buf(),
+                message: format!("invalid chunk format version {version}"),
+            });
+        }
+        Ok(mmap)
+    }
+
+    /// Refreshes mapped segments in place without repairing/deleting files on disk.
+    /// Immutable segments below the previous tail are retained without re-mapping;
+    /// the previous tail is re-mapped if its file length grew, and new segments are mapped.
+    pub fn refresh_in_place(&mut self) -> Result<(), HeadChunksError> {
+        let paths = list_chunk_files(&self.dir)?;
+        let prev_tail_seq = self.files.keys().next_back().copied();
+
+        let stale_seqs: Vec<usize> = self
+            .files
+            .keys()
+            .copied()
+            .filter(|seq| !paths.contains_key(seq))
+            .collect();
+        for seq in stale_seqs {
+            self.files.remove(&seq);
+        }
+
+        let mut prev_seq: Option<usize> = None;
+        for (seq, path) in paths {
+            if let Some(prev) = prev_seq {
+                if seq != prev + 1 {
+                    return Err(HeadChunksError::NonSequentialFiles { prev, next: seq });
+                }
+            }
+            prev_seq = Some(seq);
+
+            if let Some(existing) = self.files.get(&seq) {
+                if prev_tail_seq == Some(seq) {
+                    let disk_len = fs::metadata(&path)?.len() as usize;
+                    if disk_len != existing.len() {
+                        self.files.remove(&seq);
+                        let mmap = Self::map_and_validate_file(&path)?;
+                        self.files.insert(seq, mmap);
+                    }
+                }
+                continue;
+            }
+
+            let mmap = Self::map_and_validate_file(&path)?;
+            self.files.insert(seq, mmap);
+        }
+
+        Ok(())
     }
 
     #[inline]
@@ -622,18 +671,18 @@ impl HeadChunksReader {
         Ok(out)
     }
 
-    /// Deletes all head chunk files with sequence `< before_seq`.
-    pub fn truncate(self, before_seq: usize) -> Result<Self, HeadChunksError> {
-        self.truncate_except(before_seq, None)
+    /// Unmaps and deletes all head chunk files with sequence `< before_seq` in place.
+    pub fn truncate_in_place(&mut self, before_seq: usize) -> Result<(), HeadChunksError> {
+        self.truncate_in_place_except(before_seq, None)
     }
 
-    /// Deletes all head chunk files with sequence `< before_seq` except `active_seq`
-    /// (`ChunkDiskMapper.Truncate` in Go `head_chunks.go`).
-    pub fn truncate_except(
-        mut self,
+    /// Unmaps and deletes all head chunk files with sequence `< before_seq` except `active_seq`
+    /// in place (`ChunkDiskMapper.Truncate` in Go `head_chunks.go`).
+    pub fn truncate_in_place_except(
+        &mut self,
         before_seq: usize,
         active_seq: Option<usize>,
-    ) -> Result<Self, HeadChunksError> {
+    ) -> Result<(), HeadChunksError> {
         let to_remove: Vec<usize> = self
             .files
             .keys()
@@ -642,6 +691,7 @@ impl HeadChunksReader {
             .filter(|&seq| Some(seq) != active_seq)
             .collect();
         for seq in to_remove {
+            // Drop Mmap before unlinking so /proc/self/maps never retains `(deleted)` mappings.
             self.files.remove(&seq);
             let p = head_chunk_file_path(&self.dir, seq);
             match fs::remove_file(p) {
@@ -650,6 +700,12 @@ impl HeadChunksReader {
                 Err(e) => return Err(HeadChunksError::Io(e)),
             }
         }
+        Ok(())
+    }
+
+    /// Deletes all head chunk files with sequence `< before_seq`.
+    pub fn truncate(mut self, before_seq: usize) -> Result<Self, HeadChunksError> {
+        self.truncate_in_place(before_seq)?;
         Ok(self)
     }
 }
