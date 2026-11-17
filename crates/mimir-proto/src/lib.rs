@@ -25,6 +25,7 @@ pub use grpcutilpb::google_rpc;
 pub mod httpgrpcpb;
 pub mod ingesterpb;
 pub mod memberlistpb;
+pub mod query_stream_enc;
 pub mod ref_leaks;
 pub mod ringpb;
 pub mod s2;

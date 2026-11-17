@@ -39,7 +39,8 @@ impl IngesterService {
         IngesterZeroCopyServer {
             inner: ingesterpb::ingester_server::IngesterServer::new(self),
             ingester,
-            accept_compression: Vec::new(),
+            accept_compression: [None; 4],
+            accept_compression_len: 0,
             send_compression: None,
             max_decoding_message_size: None,
             max_encoding_message_size: None,
@@ -101,7 +102,8 @@ impl Codec for RawPushCodec {
 pub struct IngesterZeroCopyServer {
     inner: ingesterpb::ingester_server::IngesterServer<IngesterService>,
     ingester: Arc<Ingester>,
-    accept_compression: Vec<CompressionEncoding>,
+    accept_compression: [Option<CompressionEncoding>; 4],
+    accept_compression_len: u8,
     send_compression: Option<CompressionEncoding>,
     max_decoding_message_size: Option<usize>,
     max_encoding_message_size: Option<usize>,
@@ -109,7 +111,11 @@ pub struct IngesterZeroCopyServer {
 
 impl IngesterZeroCopyServer {
     pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-        self.accept_compression.push(encoding);
+        let idx = self.accept_compression_len as usize;
+        if idx < self.accept_compression.len() {
+            self.accept_compression[idx] = Some(encoding);
+            self.accept_compression_len += 1;
+        }
         self.inner = self.inner.accept_compressed(encoding);
         self
     }
@@ -169,6 +175,53 @@ fn custom_grpc_encoding(headers: &http::HeaderMap) -> Option<CustomGrpcEncoding>
     }
 }
 
+const MAX_TLS_SCRATCH_CAP: usize = 2 * 1024 * 1024;
+const GRPC_ACCEPT_ENCODING_VALUE: &str = "snappy,s2,gzip,identity";
+
+thread_local! {
+    static RAW_BODY_SCRATCH: std::cell::RefCell<Option<BytesMut>> =
+        const { std::cell::RefCell::new(None) };
+    static DECOMP_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct PooledBytesMut(Option<BytesMut>);
+
+impl PooledBytesMut {
+    fn take_or_new(cap: usize) -> Self {
+        let buf = RAW_BODY_SCRATCH
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_else(|| BytesMut::with_capacity(cap));
+        Self(Some(buf))
+    }
+}
+
+impl Drop for PooledBytesMut {
+    fn drop(&mut self) {
+        if let Some(mut buf) = self.0.take() {
+            if buf.capacity() <= MAX_TLS_SCRATCH_CAP {
+                buf.clear();
+                let _ = RAW_BODY_SCRATCH.try_with(|cell| {
+                    if let Ok(mut slot) = cell.try_borrow_mut() {
+                        *slot = Some(buf);
+                    }
+                });
+            }
+        }
+    }
+}
+
+struct VecResetGuard<'a>(&'a mut Vec<u8>);
+
+impl Drop for VecResetGuard<'_> {
+    fn drop(&mut self) {
+        self.0.clear();
+        if self.0.capacity() > MAX_TLS_SCRATCH_CAP {
+            self.0.shrink_to(256 * 1024);
+        }
+    }
+}
+
 #[allow(clippy::result_large_err)]
 async fn decompress_custom_grpc_request(
     req: http::Request<tonic::body::BoxBody>,
@@ -176,115 +229,178 @@ async fn decompress_custom_grpc_request(
     max_decode_len: usize,
 ) -> Result<http::Request<tonic::body::BoxBody>, Status> {
     let (mut parts, mut body) = req.into_parts();
-    let mut raw_body = BytesMut::new();
+    let max_wire_len = max_decode_len.saturating_add(5);
+    let mut single_chunk: Option<Bytes> = None;
+    let mut multi_buf: Option<PooledBytesMut> = None;
+
     while let Some(frame_res) =
         futures::future::poll_fn(|cx| hyper::body::Body::poll_frame(Pin::new(&mut body), cx)).await
     {
         let frame = frame_res.map_err(|s| Status::internal(format!("reading gRPC body: {s}")))?;
         if let Ok(data) = frame.into_data() {
-            if raw_body.len().saturating_add(data.len()) > max_decode_len.saturating_add(5) {
-                return Err(Status::resource_exhausted(format!(
-                    "grpc: received message larger than max ({} vs. {max_decode_len})",
-                    raw_body.len().saturating_add(data.len()).saturating_sub(5)
-                )));
+            if data.is_empty() {
+                continue;
             }
-            raw_body.extend_from_slice(&data);
+            if let Some(ref mut pooled) = multi_buf {
+                if let Some(buf) = pooled.0.as_mut() {
+                    if buf.len().saturating_add(data.len()) > max_wire_len {
+                        return Err(Status::resource_exhausted(format!(
+                            "grpc: received message larger than max ({} vs. {max_decode_len})",
+                            buf.len().saturating_add(data.len()).saturating_sub(5)
+                        )));
+                    }
+                    buf.extend_from_slice(&data);
+                }
+            } else if let Some(first) = single_chunk.take() {
+                let total = first.len().saturating_add(data.len());
+                if total > max_wire_len {
+                    return Err(Status::resource_exhausted(format!(
+                        "grpc: received message larger than max ({} vs. {max_decode_len})",
+                        total.saturating_sub(5)
+                    )));
+                }
+                let mut pooled = PooledBytesMut::take_or_new(total.max(4096));
+                if let Some(buf) = pooled.0.as_mut() {
+                    buf.extend_from_slice(&first);
+                    buf.extend_from_slice(&data);
+                }
+                multi_buf = Some(pooled);
+            } else {
+                if data.len() > max_wire_len {
+                    return Err(Status::resource_exhausted(format!(
+                        "grpc: received message larger than max ({} vs. {max_decode_len})",
+                        data.len().saturating_sub(5)
+                    )));
+                }
+                single_chunk = Some(data);
+            }
         }
     }
 
-    let mut out = Vec::with_capacity(
-        raw_body
-            .len()
-            .saturating_mul(2)
-            .min(max_decode_len.saturating_add(5)),
-    );
-    let mut pos = 0usize;
-    let slice = &raw_body[..];
-    while pos < slice.len() {
-        if slice.len() - pos < 5 {
-            return Err(Status::internal("truncated gRPC compressed frame header"));
-        }
-        let flag = slice[pos];
-        let len = u32::from_be_bytes([
-            slice[pos + 1],
-            slice[pos + 2],
-            slice[pos + 3],
-            slice[pos + 4],
-        ]) as usize;
-        pos += 5;
-        let end = pos
-            .checked_add(len)
-            .ok_or_else(|| Status::internal("gRPC compressed frame length overflow"))?;
-        let payload = slice
-            .get(pos..end)
-            .ok_or_else(|| Status::internal("truncated gRPC compressed frame payload"))?;
-        pos = end;
-
-        match flag {
-            0 => {
-                if len > max_decode_len {
-                    return Err(Status::resource_exhausted(format!(
-                        "grpc: received message larger than max ({len} vs. {max_decode_len})"
-                    )));
-                }
-                out.push(0);
-                out.extend_from_slice(&(len as u32).to_be_bytes());
-                out.extend_from_slice(payload);
-            }
-            1 => {
-                let hdr_pos = out.len();
-                out.extend_from_slice(&[0u8; 5]);
-                let map_decomp_err = |codec: &str, e: std::io::Error| -> Status {
-                    if e.get_ref()
-                        .is_some_and(|r| r.is::<mimir_proto::snappy::DecompressLimitExceeded>())
-                    {
-                        Status::resource_exhausted(format!(
-                            "grpc: received message after decompression larger than max {max_decode_len}"
-                        ))
-                    } else {
-                        Status::internal(format!("{codec} decompression failed: {e}"))
-                    }
-                };
-                match encoding {
-                    CustomGrpcEncoding::Snappy => {
-                        mimir_proto::snappy::decompress_framed_bounded_into(
-                            payload,
-                            &mut out,
-                            max_decode_len,
-                        )
-                        .map_err(|e| map_decomp_err("snappy", e))?;
-                    }
-                    CustomGrpcEncoding::S2 => {
-                        mimir_proto::s2::decompress_framed_into(
-                            payload,
-                            &mut out,
-                            max_decode_len,
-                        )
-                        .map_err(|e| map_decomp_err("s2", e))?;
-                    }
-                }
-                let dec_len = out.len() - (hdr_pos + 5);
-                if dec_len > max_decode_len {
-                    return Err(Status::resource_exhausted(format!(
-                        "grpc: received message after decompression larger than max {max_decode_len}"
-                    )));
-                }
-                out[hdr_pos + 1..hdr_pos + 5].copy_from_slice(&(dec_len as u32).to_be_bytes());
-            }
-            other => {
-                return Err(Status::internal(format!(
-                    "invalid gRPC compression flag {other}"
-                )));
+    let out_bytes: Bytes = if let Some(single) = single_chunk {
+        if single.len() >= 5 && single[0] == 0 {
+            let len = u32::from_be_bytes([single[1], single[2], single[3], single[4]]) as usize;
+            if 5usize.checked_add(len) == Some(single.len()) && len <= max_decode_len {
+                parts.headers.remove("grpc-encoding");
+                parts.headers.remove(http::header::CONTENT_LENGTH);
+                return Ok(http::Request::from_parts(
+                    parts,
+                    tonic::body::BoxBody::new(SingleChunkBody(Some(single))),
+                ));
             }
         }
-    }
+        decompress_frames_slice(&single, encoding, max_decode_len)?
+    } else if let Some(ref pooled) = multi_buf {
+        let slice = pooled.0.as_deref().unwrap_or(&[]);
+        decompress_frames_slice(slice, encoding, max_decode_len)?
+    } else {
+        Bytes::new()
+    };
 
     parts.headers.remove("grpc-encoding");
     parts.headers.remove(http::header::CONTENT_LENGTH);
     Ok(http::Request::from_parts(
         parts,
-        tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(out)))),
+        tonic::body::BoxBody::new(SingleChunkBody(Some(out_bytes))),
     ))
+}
+
+#[allow(clippy::result_large_err)]
+fn decompress_frames_slice(
+    slice: &[u8],
+    encoding: CustomGrpcEncoding,
+    max_decode_len: usize,
+) -> Result<Bytes, Status> {
+    if slice.is_empty() {
+        return Ok(Bytes::new());
+    }
+    DECOMP_SCRATCH.with(|cell| {
+        let mut scratch_ref = cell.borrow_mut();
+        let guard = VecResetGuard(&mut scratch_ref);
+        let out = &mut *guard.0;
+
+        let mut pos = 0usize;
+        while pos < slice.len() {
+            if slice.len() - pos < 5 {
+                return Err(Status::internal("truncated gRPC compressed frame header"));
+            }
+            let flag = slice[pos];
+            let len = u32::from_be_bytes([
+                slice[pos + 1],
+                slice[pos + 2],
+                slice[pos + 3],
+                slice[pos + 4],
+            ]) as usize;
+            pos += 5;
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| Status::internal("gRPC compressed frame length overflow"))?;
+            let payload = slice
+                .get(pos..end)
+                .ok_or_else(|| Status::internal("truncated gRPC compressed frame payload"))?;
+            pos = end;
+
+            match flag {
+                0 => {
+                    if len > max_decode_len {
+                        return Err(Status::resource_exhausted(format!(
+                            "grpc: received message larger than max ({len} vs. {max_decode_len})"
+                        )));
+                    }
+                    out.push(0);
+                    out.extend_from_slice(&(len as u32).to_be_bytes());
+                    out.extend_from_slice(payload);
+                }
+                1 => {
+                    let hdr_pos = out.len();
+                    out.extend_from_slice(&[0u8; 5]);
+                    let map_decomp_err = |codec: &str, e: std::io::Error| -> Status {
+                        if e.get_ref()
+                            .is_some_and(|r| r.is::<mimir_proto::snappy::DecompressLimitExceeded>())
+                        {
+                            Status::resource_exhausted(format!(
+                                "grpc: received message after decompression larger than max {max_decode_len}"
+                            ))
+                        } else {
+                            Status::internal(format!("{codec} decompression failed: {e}"))
+                        }
+                    };
+                    match encoding {
+                        CustomGrpcEncoding::Snappy => {
+                            mimir_proto::snappy::decompress_framed_bounded_into(
+                                payload,
+                                out,
+                                max_decode_len,
+                            )
+                            .map_err(|e| map_decomp_err("snappy", e))?;
+                        }
+                        CustomGrpcEncoding::S2 => {
+                            mimir_proto::s2::decompress_framed_into(
+                                payload,
+                                out,
+                                max_decode_len,
+                            )
+                            .map_err(|e| map_decomp_err("s2", e))?;
+                        }
+                    }
+                    let dec_len = out.len() - (hdr_pos + 5);
+                    if dec_len > max_decode_len {
+                        return Err(Status::resource_exhausted(format!(
+                            "grpc: received message after decompression larger than max {max_decode_len}"
+                        )));
+                    }
+                    out[hdr_pos + 1..hdr_pos + 5].copy_from_slice(&(dec_len as u32).to_be_bytes());
+                }
+                other => {
+                    return Err(Status::internal(format!(
+                        "invalid gRPC compression flag {other}"
+                    )));
+                }
+            }
+        }
+
+        Ok(Bytes::copy_from_slice(out))
+    })
 }
 
 /// Accepts `grpc-encoding: snappy` and `grpc-encoding: s2` requests for any wrapped gRPC service:
@@ -362,71 +478,91 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
     fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
         let custom_enc = custom_grpc_encoding(req.headers());
         let max_decode_len = self.max_decoding_message_size.unwrap_or(4 * 1024 * 1024);
+        let is_push = req.uri().path() == "/cortex.Ingester/Push";
 
-        if req.uri().path() == "/cortex.Ingester/Push" {
-            struct RawPushSvc(Arc<Ingester>);
-            impl tonic::server::UnaryService<Bytes> for RawPushSvc {
-                type Response = cortexpb::WriteResponse;
-                type Future = Pin<
-                    Box<
-                        dyn Future<Output = Result<Response<Self::Response>, Status>>
-                            + Send
-                            + 'static,
-                    >,
-                >;
+        let ingester = Arc::clone(&self.ingester);
+        let accept_compression = self.accept_compression;
+        let accept_compression_len = self.accept_compression_len as usize;
+        let send_compression = self.send_compression;
+        let max_decoding_message_size = self.max_decoding_message_size;
+        let max_encoding_message_size = self.max_encoding_message_size;
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
-                fn call(&mut self, request: Request<Bytes>) -> Self::Future {
-                    let ingester = Arc::clone(&self.0);
-                    Box::pin(async move {
-                        let user_id = tenant_from_req(&ingester, &request)?;
-                        let (_, extensions, raw) = request.into_parts();
-                        if let Err(e) = ingester.push_grpc_raw(&user_id, raw).await {
-                            record_push_error(&ingester, extensions.get::<GrpcErrorLog>(), &e);
-                            return Err(e.map_push_error_to_grpc_server_status());
-                        }
-                        Ok(Response::new(cortexpb::WriteResponse {}))
-                    })
-                }
-            }
-
-            let mut grpc = tonic::server::Grpc::new(RawPushCodec);
-            for enc in &self.accept_compression {
-                grpc = grpc.accept_compressed(*enc);
-            }
-            if let Some(enc) = self.send_compression {
-                grpc = grpc.send_compressed(enc);
-            }
-            if let Some(lim) = self.max_decoding_message_size {
-                grpc = grpc.max_decoding_message_size(lim);
-            }
-            if let Some(lim) = self.max_encoding_message_size {
-                grpc = grpc.max_encoding_message_size(lim);
-            }
-            let ingester = Arc::clone(&self.ingester);
-            Box::pin(async move {
-                let req = if let Some(encoding) = custom_enc {
-                    match decompress_custom_grpc_request(req, encoding, max_decode_len).await {
-                        Ok(r) => r,
-                        Err(status) => return Ok(status.into_http()),
-                    }
-                } else {
-                    req
-                };
-                Ok(grpc.unary(RawPushSvc(ingester), req).await)
-            })
-        } else if let Some(encoding) = custom_enc {
-            let mut inner = self.inner.clone();
-            Box::pin(async move {
-                let req = match decompress_custom_grpc_request(req, encoding, max_decode_len).await
-                {
+        Box::pin(async move {
+            let req = if let Some(encoding) = custom_enc {
+                match decompress_custom_grpc_request(req, encoding, max_decode_len).await {
                     Ok(r) => r,
-                    Err(status) => return Ok(status.into_http()),
-                };
-                inner.call(req).await
-            })
-        } else {
-            Box::pin(self.inner.call(req))
-        }
+                    Err(status) => {
+                        let mut resp = status.into_http();
+                        resp.headers_mut().insert(
+                            "grpc-accept-encoding",
+                            http::HeaderValue::from_static(GRPC_ACCEPT_ENCODING_VALUE),
+                        );
+                        return Ok(resp);
+                    }
+                }
+            } else {
+                req
+            };
+
+            let mut resp = if is_push {
+                struct RawPushSvc(Arc<Ingester>);
+                impl tonic::server::UnaryService<Bytes> for RawPushSvc {
+                    type Response = cortexpb::WriteResponse;
+                    type Future = Pin<
+                        Box<
+                            dyn Future<Output = Result<Response<Self::Response>, Status>>
+                                + Send
+                                + 'static,
+                        >,
+                    >;
+
+                    fn call(&mut self, request: Request<Bytes>) -> Self::Future {
+                        let ingester = Arc::clone(&self.0);
+                        Box::pin(async move {
+                            let user_id = tenant_from_req(&ingester, &request)?;
+                            let (_, extensions, raw) = request.into_parts();
+                            if let Err(e) = ingester.push_grpc_raw(&user_id, raw).await {
+                                record_push_error(
+                                    &ingester,
+                                    extensions.get::<GrpcErrorLog>(),
+                                    &e,
+                                );
+                                return Err(e.map_push_error_to_grpc_server_status());
+                            }
+                            Ok(Response::new(cortexpb::WriteResponse {}))
+                        })
+                    }
+                }
+
+                let mut push_grpc = tonic::server::Grpc::new(RawPushCodec);
+                for enc in accept_compression[..accept_compression_len]
+                    .iter()
+                    .flatten()
+                {
+                    push_grpc = push_grpc.accept_compressed(*enc);
+                }
+                if let Some(enc) = send_compression {
+                    push_grpc = push_grpc.send_compressed(enc);
+                }
+                if let Some(lim) = max_decoding_message_size {
+                    push_grpc = push_grpc.max_decoding_message_size(lim);
+                }
+                if let Some(lim) = max_encoding_message_size {
+                    push_grpc = push_grpc.max_encoding_message_size(lim);
+                }
+                push_grpc.unary(RawPushSvc(ingester), req).await
+            } else {
+                inner.call(req).await?
+            };
+
+            resp.headers_mut().insert(
+                "grpc-accept-encoding",
+                http::HeaderValue::from_static(GRPC_ACCEPT_ENCODING_VALUE),
+            );
+            Ok(resp)
+        })
     }
 }
 
@@ -882,6 +1018,102 @@ mod tests {
 
         let db = ing.get_tsdb("tenant-snappy").expect("tenant tsdb created");
         assert_eq!(db.db.head().num_series(), 1);
+        assert_eq!(
+            resp.headers()
+                .get("grpc-accept-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("snappy,s2,gzip,identity")
+        );
+
+        // Also verify QueryStream & LabelValues with grpc-encoding: snappy (and multi-chunk body)
+        struct MultiChunkBody(std::collections::VecDeque<Bytes>);
+        impl hyper::body::Body for MultiChunkBody {
+            type Data = Bytes;
+            type Error = Status;
+            #[allow(clippy::result_large_err)]
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(
+                    self.0
+                        .pop_front()
+                        .map(|b| Ok(hyper::body::Frame::data(b))),
+                )
+            }
+        }
+
+        let q_req = ingesterpb::QueryRequest {
+            start_timestamp_ms: 1_699_999_000_000,
+            end_timestamp_ms: 1_700_001_000_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__name__".into(),
+                value: "snappy_push_metric".into(),
+            }],
+            streaming_chunks_batch_size: 0,
+        };
+        let q_framed = mimir_proto::snappy::encode_grpc_frame(&q_req.encode_to_vec(), true).unwrap();
+        let mid = q_framed.len() / 2;
+        let q_chunks = MultiChunkBody(std::collections::VecDeque::from([
+            q_framed.slice(..mid),
+            q_framed.slice(mid..),
+        ]));
+        let q_http = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/cortex.Ingester/QueryStream")
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-encoding", "snappy")
+            .header("x-scope-orgid", "tenant-snappy")
+            .body(tonic::body::BoxBody::new(q_chunks))
+            .unwrap();
+        let svc2 = IngesterService::new(Arc::clone(&ing))
+            .into_server()
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd);
+        let q_resp = svc2.oneshot(q_http).await.unwrap();
+        assert_eq!(q_resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            q_resp
+                .headers()
+                .get("grpc-accept-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("snappy,s2,gzip,identity")
+        );
+        if let Some(gs) = q_resp.headers().get("grpc-status") {
+            assert_eq!(gs, "0", "unexpected QueryStream grpc-status: {gs:?}");
+        }
+
+        let lv_req = ingesterpb::LabelValuesRequest {
+            label_name: "__name__".into(),
+            start_timestamp_ms: 1_699_999_000_000,
+            end_timestamp_ms: 1_700_001_000_000,
+            matchers: None,
+            limit: 0,
+        };
+        let lv_framed =
+            mimir_proto::snappy::encode_grpc_frame(&lv_req.encode_to_vec(), false).unwrap();
+        let lv_http = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/cortex.Ingester/LabelValues")
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-encoding", "s2")
+            .header("x-scope-orgid", "tenant-snappy")
+            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(lv_framed))))
+            .unwrap();
+        let svc3 = IngesterService::new(Arc::clone(&ing))
+            .into_server()
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd);
+        let lv_resp = svc3.oneshot(lv_http).await.unwrap();
+        assert_eq!(lv_resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            lv_resp
+                .headers()
+                .get("grpc-accept-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("snappy,s2,gzip,identity")
+        );
     }
 
     fn test_ingester(tmp: &std::path::Path, multitenancy: bool) -> Arc<Ingester> {
@@ -1049,6 +1281,12 @@ mod tests {
                 status.message(),
                 format!("grpc: received message after decompression larger than max {max_decode_len}"),
                 "encoding={enc}"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get("grpc-accept-encoding")
+                    .and_then(|v| v.to_str().ok()),
+                Some("snappy,s2,gzip,identity")
             );
         }
     }

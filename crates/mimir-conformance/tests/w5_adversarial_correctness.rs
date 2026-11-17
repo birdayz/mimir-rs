@@ -31,7 +31,8 @@ use mimir_common::block_on_for_tests;
 use mimir_common::tenant::LOWER_ORG_ID_HEADER_NAME;
 use mimir_conformance::oracle::{
     ensure_go_oracle_built, ensure_rust_mimir_release_built, go_mimir_bin, invoke_oracle,
-    rust_mimir_release_bin, HttpGrpcCallRequest, HttpGrpcCallResponse,
+    rust_mimir_release_bin, GrpcIngesterCheckRequest, GrpcIngesterCheckResponse,
+    HttpGrpcCallRequest, HttpGrpcCallResponse,
 };
 use mimir_proto::cortexpb;
 use mimir_proto::grpcutilpb;
@@ -1539,5 +1540,71 @@ fn twin_process_adversarial_edge_cases_parity() {
         rust_proc2.send_sigterm();
         let exit2 = rust_proc2.wait_for_exit(Duration::from_secs(15));
         assert_eq!(exit2.code(), Some(0));
+    });
+}
+
+#[test]
+fn w5_go_ingester_client_compression_modes_snappy_s2_gzip_identity() {
+    let _ = ensure_go_oracle_built().expect("go-oracle build");
+    let rust_bin = ensure_rust_mimir_release_built().expect("rust mimir release build");
+
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("rust");
+    let tsdb_dir = work.join("tsdb");
+    let bucket_dir = work.join("blocks");
+    fs::create_dir_all(&tsdb_dir).unwrap();
+    fs::create_dir_all(&bucket_dir).unwrap();
+    let http_port = free_tcp_port();
+    let grpc_port = free_tcp_port();
+    let cfg_path = work.join("mimir.yaml");
+    write_ingester_yaml(
+        &cfg_path,
+        http_port,
+        grpc_port,
+        &tsdb_dir,
+        &bucket_dir,
+        true,
+        "fake",
+        "",
+    );
+    let args = vec![
+        "-target=ingester".to_string(),
+        format!("-config.file={}", cfg_path.display()),
+    ];
+    let mut proc_guard = ProcessGuard::spawn("rust-comp", &rust_bin, &args, &work);
+    let http_client = reqwest::Client::new();
+
+    block_on_for_tests(async {
+        wait_for_ready(&http_client, http_port, &mut proc_guard).await;
+
+        let now = now_ms();
+        let grpc_addr = format!("127.0.0.1:{grpc_port}");
+        for (idx, comp) in ["", "gzip", "snappy", "s2"].into_iter().enumerate() {
+            let metric_name = format!(
+                "go_client_comp_{}",
+                if comp.is_empty() { "identity" } else { comp }
+            );
+            let resp: GrpcIngesterCheckResponse = invoke_oracle(
+                "grpc-ingester-check",
+                &GrpcIngesterCheckRequest {
+                    grpc_addr: grpc_addr.clone(),
+                    tenant: format!("tenant-comp-{idx}"),
+                    compression: comp.to_string(),
+                    metric_name: metric_name.clone(),
+                    timestamp_ms: now - 5_000,
+                    value: 100.0 + idx as f64,
+                },
+            )
+            .unwrap_or_else(|e| panic!("grpc-ingester-check failed for compression={comp:?}: {e}"));
+
+            assert_eq!(resp.series_count, 1, "compression={comp:?}");
+            assert_eq!(resp.chunks_count, 1, "compression={comp:?}");
+            assert_eq!(resp.label_values, vec![metric_name], "compression={comp:?}");
+            assert_eq!(resp.cardinality_count, 1, "compression={comp:?}");
+        }
+
+        proc_guard.send_sigterm();
+        let exit = proc_guard.wait_for_exit(Duration::from_secs(15));
+        assert_eq!(exit.code(), Some(0));
     });
 }

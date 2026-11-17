@@ -15,10 +15,14 @@ import (
 	"time"
 
 	kitlog "github.com/go-kit/log"
+	"github.com/grafana/dskit/grpcclient"
 	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/kv/consul"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/user"
+	ingclient "github.com/grafana/mimir/pkg/ingester/client"
+	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/storage/ingest"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -661,5 +665,143 @@ func cmdHttpGrpcCall(input []byte) (*httpgrpcCallOut, error) {
 		Code:    resp.Code,
 		Headers: httpgrpcHeadersToMap(resp.Headers),
 		BodyB64: base64.StdEncoding.EncodeToString(resp.Body),
+	}, nil
+}
+
+// --- grpc-ingester-check ---
+
+type grpcIngesterCheckIn struct {
+	GrpcAddr    string  `json:"grpc_addr"`
+	Tenant      string  `json:"tenant"`
+	Compression string  `json:"compression"`
+	MetricName  string  `json:"metric_name"`
+	TimestampMs int64   `json:"timestamp_ms"`
+	Value       float64 `json:"value"`
+}
+
+type grpcIngesterCheckOut struct {
+	SeriesCount      int      `json:"series_count"`
+	ChunksCount      int      `json:"chunks_count"`
+	LabelValues      []string `json:"label_values"`
+	CardinalityCount uint64   `json:"cardinality_count"`
+}
+
+func cmdGrpcIngesterCheck(input []byte) (*grpcIngesterCheckOut, error) {
+	var in grpcIngesterCheckIn
+	if err := json.Unmarshal(input, &in); err != nil {
+		return nil, err
+	}
+
+	var cfg ingclient.Config
+	cfg.GRPCClientConfig = grpcclient.Config{
+		MaxRecvMsgSize:          100 << 20,
+		MaxSendMsgSize:          100 << 20,
+		GRPCCompression:         in.Compression,
+		ConnectTimeout:          5 * time.Second,
+		ConnectBackoffBaseDelay: time.Second,
+		ConnectBackoffMaxDelay:  5 * time.Second,
+		KeepaliveTime:           20 * time.Second,
+		KeepaliveTimeout:        10 * time.Second,
+	}
+	metrics := ingclient.NewMetrics(prometheus.NewRegistry())
+	cl, err := ingclient.MakeIngesterClient(ring.InstanceDesc{
+		Addr: in.GrpcAddr,
+		Zone: "zone-a",
+	}, cfg, metrics, kitlog.NewNopLogger())
+	if err != nil {
+		return nil, fmt.Errorf("MakeIngesterClient(%s): %w", in.Compression, err)
+	}
+	defer func() { _ = cl.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ctx = user.InjectOrgID(ctx, in.Tenant)
+
+	writeReq := &mimirpb.WriteRequest{
+		Timeseries: []mimirpb.PreallocTimeseries{
+			{
+				TimeSeries: &mimirpb.TimeSeries{
+					Labels: []mimirpb.LabelAdapter{
+						{Name: "__name__", Value: in.MetricName},
+						{Name: "compression", Value: in.Compression},
+					},
+					Samples: []mimirpb.Sample{
+						{TimestampMs: in.TimestampMs, Value: in.Value},
+					},
+				},
+			},
+		},
+	}
+	if _, err := cl.Push(ctx, writeReq); err != nil {
+		return nil, fmt.Errorf("Push(%s): %w", in.Compression, err)
+	}
+
+	matchers := []*ingclient.LabelMatcher{
+		{Type: ingclient.EQUAL, Name: "__name__", Value: in.MetricName},
+	}
+
+	qStream, err := cl.QueryStream(ctx, &ingclient.QueryRequest{
+		StartTimestampMs: in.TimestampMs - 60_000,
+		EndTimestampMs:   in.TimestampMs + 60_000,
+		Matchers:         matchers,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("QueryStream(%s): %w", in.Compression, err)
+	}
+	seriesCount := 0
+	chunksCount := 0
+	for {
+		resp, err := qStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("QueryStream Recv(%s): %w", in.Compression, err)
+		}
+		seriesCount += len(resp.StreamingSeries)
+		for _, sc := range resp.StreamingSeriesChunks {
+			chunksCount += len(sc.Chunks)
+		}
+	}
+
+	lvResp, err := cl.LabelValues(ctx, &ingclient.LabelValuesRequest{
+		LabelName:        "__name__",
+		StartTimestampMs: in.TimestampMs - 60_000,
+		EndTimestampMs:   in.TimestampMs + 60_000,
+		Matchers:         &ingclient.LabelMatchers{Matchers: matchers},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("LabelValues(%s): %w", in.Compression, err)
+	}
+
+	lvcStream, err := cl.LabelValuesCardinality(ctx, &ingclient.LabelValuesCardinalityRequest{
+		LabelNames:  []string{"__name__"},
+		Matchers:    matchers,
+		CountMethod: ingclient.ACTIVE,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("LabelValuesCardinality(%s): %w", in.Compression, err)
+	}
+	var cardCount uint64
+	for {
+		resp, err := lvcStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("LabelValuesCardinality Recv(%s): %w", in.Compression, err)
+		}
+		for _, item := range resp.Items {
+			if item.LabelName == "__name__" {
+				cardCount += item.LabelValueSeries[in.MetricName]
+			}
+		}
+	}
+
+	return &grpcIngesterCheckOut{
+		SeriesCount:      seriesCount,
+		ChunksCount:      chunksCount,
+		LabelValues:      lvResp.LabelValues,
+		CardinalityCount: cardCount,
 	}, nil
 }
