@@ -9,7 +9,7 @@
 
 pub mod app;
 pub mod cli;
-pub mod expfmt;
+pub use mimir_ingester::expfmt;
 pub mod grpc;
 pub mod http;
 pub mod memberlist_status;

@@ -515,18 +515,19 @@ async fn user_registry_handler(
         return go_http_error(StatusCode::NOT_FOUND, "user registry not found");
     };
     let families = reg.gather();
-    let encoder = prometheus::TextEncoder::new();
-    match encoder.encode_to_string(&families) {
-        Ok(body) => (
-            StatusCode::OK,
-            // promhttp's negotiated text format (`expfmt.Negotiate` with underscore escaping).
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
-            )],
-            body,
-        )
-            .into_response(),
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = crate::expfmt::negotiate_with_options(accept, false);
+    match crate::expfmt::encode(&families, &format) {
+        Ok(body) => {
+            let mut resp = Response::new(axum::body::Body::from(body));
+            *resp.status_mut() = StatusCode::OK;
+            resp.headers_mut()
+                .insert(header::VARY, axum::http::HeaderValue::from_static("Accept"));
+            if let Ok(ct) = axum::http::HeaderValue::from_str(&format.content_type) {
+                resp.headers_mut().insert(header::CONTENT_TYPE, ct);
+            }
+            resp
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
