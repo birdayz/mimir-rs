@@ -2503,6 +2503,14 @@ pub fn register_extra_flags<T: 'static>(
                         .unwrap_or_else(|| def_for_get.clone())
                 },
             );
+            if field.name == "instance_interface_names" {
+                // `*flagext.StringSlice` with `doc:"default=[<private network interfaces>]"`.
+                f.set_usage_default(
+                    field.flag,
+                    "string",
+                    crate::ingester::PRIVATE_NETWORK_INTERFACES_DOC_DEFAULT,
+                );
+            }
         }
         for sub in block.blocks {
             walk(sub, f, get, get_mut);

@@ -7,6 +7,9 @@
 //! - github.com/grafana/dskit/backoff
 //! - github.com/grafana/dskit/limiter
 //! - github.com/grafana/dskit/crypto/tls
+//! - github.com/grafana/dskit/netutil
+//! - github.com/hashicorp/go-sockaddr (GetPrivateIP)
+//! - Go stdlib sort (sort.Sort / pdqsort)
 //! - github.com/grafana/mimir/pkg/util/log
 //! - github.com/grafana/mimir/pkg/util/globalerror
 //! - github.com/grafana/mimir/pkg/util/activitytracker
@@ -18,11 +21,14 @@
 pub mod activitytracker;
 pub mod backoff;
 pub mod errors;
+pub mod gosort;
 pub mod labels_hash;
 pub mod limiter;
+pub mod netutil;
 pub mod logging;
 pub mod services;
 pub mod shutdownmarker;
+pub mod sockaddr;
 pub mod tenant;
 pub mod thread_pool;
 pub mod tls;

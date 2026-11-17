@@ -7,7 +7,7 @@
 //! - github.com/grafana/dskit/ring/lifecycler.go
 //! - github.com/grafana/dskit/ring/lifecycler_metrics.go
 //! - github.com/grafana/dskit/ring/flush.go
-//! - github.com/grafana/dskit/ring/util.go (`GetInstanceAddr`, via `crate::netutil`)
+//! - github.com/grafana/dskit/ring/util.go (`GetInstanceAddr`, via `crate::ring::util`)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,6 +29,7 @@ use crate::kv::memberlist::MemberlistKv;
 use crate::kv::{build_kv_client, BoxFuture, CasCallbackError, CasOutcome, KvClient, KvError};
 use crate::ring::model::{ring_desc_codec, system_time_to_unix_secs, DescExt, InstanceDescExt};
 use crate::ring::replication_strategy::WRITE;
+use crate::ring::util::{get_instance_addr, get_instance_port, join_host_port};
 use crate::token_gen::{
     load_tokens_from_file, store_tokens_to_file, RandomTokenGenerator,
     SpreadMinimizingTokenGenerator, TokenGenerator,
@@ -110,33 +111,22 @@ pub struct BasicLifecyclerConfig {
     pub versions: HashMap<u64, u64>,
 }
 
-/// `instance_addr`, else the first usable address of `instance_interface_names` (dskit
-/// `ring.GetInstanceAddr`). Never falls back to loopback, which peers can't dial.
-fn instance_addr(cfg: &RingConfig) -> Result<String, LifecyclerError> {
-    crate::netutil::get_instance_addr(
-        &cfg.instance_addr,
-        &cfg.instance_interface_names,
-        cfg.instance_enable_ipv6,
-    )
-    .map_err(|e| LifecyclerError::InvalidConfig(format!("failed to get instance address: {e}")))
-}
-
 impl BasicLifecyclerConfig {
     pub fn from_ring_config_tokenless(
         cfg: &RingConfig,
         listen_port: u16,
     ) -> Result<Self, LifecyclerError> {
-        let host = instance_addr(cfg)?;
-        let port = if cfg.instance_port > 0 {
-            cfg.instance_port as u16
-        } else {
-            listen_port
-        };
-        let addr = if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
+        // pkg/ingester/ingester_ring.go ToTokenlessBasicLifecyclerConfig: the address is
+        // auto-detected from the configured interfaces when not set; failing to find one is a
+        // startup error (never fall back to loopback).
+        let host = get_instance_addr(
+            &cfg.instance_addr,
+            &cfg.instance_interface_names,
+            cfg.instance_enable_ipv6,
+        )
+        .map_err(|e| LifecyclerError::Other(e.to_string()))?;
+        let port = get_instance_port(cfg.instance_port, i64::from(listen_port));
+        let addr = join_host_port(&host, &port.to_string());
 
         Ok(Self {
             id: cfg.instance_id.clone(),
@@ -906,12 +896,16 @@ pub struct LifecyclerConfig {
 
 impl LifecyclerConfig {
     pub fn from_ring_config(cfg: &RingConfig, listen_port: u16) -> Result<Self, LifecyclerError> {
-        let addr = instance_addr(cfg)?;
-        let port = if cfg.instance_port > 0 {
-            cfg.instance_port as u16
-        } else {
-            listen_port
-        };
+        // dskit ring.NewLifecycler: GetInstanceAddr(cfg.Addr, cfg.InfNames, logger,
+        // cfg.EnableInet6) (ToLifecyclerConfig sets InfNames = InstanceInterfaceNames).
+        // Failing to find an address is a startup error (never fall back to loopback).
+        let addr = get_instance_addr(
+            &cfg.instance_addr,
+            &cfg.instance_interface_names,
+            cfg.instance_enable_ipv6,
+        )
+        .map_err(|e| LifecyclerError::Other(e.to_string()))?;
+        let port = get_instance_port(cfg.instance_port, i64::from(listen_port)) as u16;
 
         let token_generator: Arc<dyn TokenGenerator> =
             if cfg.token_generation_strategy == "spread-minimizing" {
@@ -1080,11 +1074,8 @@ impl Lifecycler {
         flush_on_shutdown: bool,
         reg: Option<&Registry>,
     ) -> Arc<Self> {
-        let full_addr = if cfg.addr.contains(':') {
-            cfg.addr.clone()
-        } else {
-            format!("{}:{}", cfg.addr, cfg.port)
-        };
+        // net.JoinHostPort(addr, strconv.Itoa(port)).
+        let full_addr = join_host_port(&cfg.addr, &cfg.port.to_string());
         let token_generator = cfg
             .token_generator
             .clone()
@@ -1885,3 +1876,80 @@ impl Lifecycler {
 /// Unused helper placeholder kept private to satisfy channel signature if needed later.
 #[allow(dead_code)]
 async fn _unused_oneshot_helper(_tx: oneshot::Sender<()>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv::inmemory::InMemoryKv;
+
+    fn lifecycler_addr(cfg: &RingConfig, listen_port: u16) -> Result<String, LifecyclerError> {
+        let lc_cfg = LifecyclerConfig::from_ring_config(cfg, listen_port)?;
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(ring_desc_codec()));
+        Ok(Lifecycler::with_store(lc_cfg, kv, None, "ingester", "ring", false, None)
+            .addr
+            .clone())
+    }
+
+    /// dskit `NewLifecycler` / mimir `ToTokenlessBasicLifecyclerConfig` register
+    /// `net.JoinHostPort(addr, port)`: IPv6 hosts are bracketed and always get the port.
+    #[test]
+    fn instance_addr_uses_join_host_port() {
+        for (addr, port, listen, want) in [
+            ("1.2.3.4", 0, 9095, "1.2.3.4:9095"),
+            ("1.2.3.4", 1111, 9095, "1.2.3.4:1111"),
+            ("fc99::9a", 0, 9095, "[fc99::9a]:9095"),
+            ("2001:db8::1", 1111, 9095, "[2001:db8::1]:1111"),
+            ("ingester-0.ingester.svc", 0, 9095, "ingester-0.ingester.svc:9095"),
+        ] {
+            let cfg = RingConfig {
+                instance_addr: addr.to_string(),
+                instance_port: port,
+                ..Default::default()
+            };
+            assert_eq!(lifecycler_addr(&cfg, listen).unwrap(), want, "classic {addr}");
+            let basic = BasicLifecyclerConfig::from_ring_config_tokenless(&cfg, listen).unwrap();
+            assert_eq!(basic.addr, want, "tokenless {addr}");
+        }
+    }
+
+    /// No instance_addr and no usable interface: Go fails `NewLifecycler` /
+    /// `ToTokenlessBasicLifecyclerConfig` with the netutil error; never registers 127.0.0.1.
+    #[test]
+    fn missing_interface_is_a_startup_error() {
+        let cfg = RingConfig {
+            instance_addr: String::new(),
+            instance_interface_names: vec!["mimir-no-such-if0".to_string()],
+            ..Default::default()
+        };
+        let want = "no useable address found for interfaces [mimir-no-such-if0]";
+        let err = LifecyclerConfig::from_ring_config(&cfg, 9095).err().expect("must fail");
+        assert_eq!(err.to_string(), want);
+        let err = BasicLifecyclerConfig::from_ring_config_tokenless(&cfg, 9095)
+            .err()
+            .expect("must fail");
+        assert_eq!(err.to_string(), want);
+    }
+
+    /// Without instance_addr the address is auto-detected from the interfaces (never loopback).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_detected_addr_is_never_loopback() {
+        let cfg = RingConfig {
+            instance_addr: String::new(),
+            instance_interface_names: vec!["lo".to_string()],
+            ..Default::default()
+        };
+        // `lo` only has loopback addresses, which filterBestIP never selects.
+        let err = LifecyclerConfig::from_ring_config(&cfg, 9095).err().expect("must fail");
+        assert_eq!(err.to_string(), "no useable address found for interfaces [lo]");
+
+        let cfg = RingConfig { instance_addr: String::new(), ..Default::default() };
+        if let Ok(expected) = mimir_common::netutil::get_first_address_of(
+            &cfg.instance_interface_names,
+            false,
+        ) {
+            assert_eq!(lifecycler_addr(&cfg, 9095).unwrap(), format!("{expected}:9095"));
+            assert!(!expected.starts_with("127."));
+        }
+    }
+}

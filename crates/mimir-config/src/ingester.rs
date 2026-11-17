@@ -20,6 +20,10 @@ use crate::error::ConfigError;
 use crate::flags::FlagSet;
 use crate::types::{HumanBytes, StringSliceCSV};
 
+/// `doc:"default=[<private network interfaces>]"` of every `instance_interface_names` field
+/// (e.g. pkg/ingester/ingester_ring.go:53), shown by `-help` instead of the computed value.
+pub const PRIVATE_NETWORK_INTERFACES_DOC_DEFAULT: &str = "[<private network interfaces>]";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClusterValidationConfig {
@@ -276,7 +280,8 @@ impl Default for RingConfig {
             tokens_file_path: String::new(),
             num_tokens: 128,
             instance_id: default_hostname(),
-            instance_interface_names: vec!["eth0".to_string(), "en0".to_string()],
+            // pkg/ingester/ingester_ring.go:140: computed at flag registration time.
+            instance_interface_names: mimir_common::netutil::default_instance_interface_names(),
             instance_port: 0,
             instance_addr: String::new(),
             instance_enable_ipv6: false,
@@ -312,6 +317,8 @@ impl RingConfig {
         f.i64_var(&format!("{prefix}num-tokens"), self.num_tokens, "Number of tokens for each ingester.", move |t| &get(t).num_tokens, move |t| &mut get_mut(t).num_tokens);
         f.string_var(&format!("{prefix}instance-id"), &self.instance_id, "Instance ID to register in the ring.", move |t| &get(t).instance_id, move |t| &mut get_mut(t).instance_id);
         f.string_slice_var(&format!("{prefix}instance-interface-names"), &self.instance_interface_names, "List of network interface names to look up when finding the instance IP address.", move |t| &get(t).instance_interface_names, move |t| &mut get_mut(t).instance_interface_names);
+        // `doc:"default=[<private network interfaces>]"`; `*flagext.StringSlice` renders as "string".
+        f.set_usage_default(&format!("{prefix}instance-interface-names"), "string", PRIVATE_NETWORK_INTERFACES_DOC_DEFAULT);
         f.i64_var(&format!("{prefix}instance-port"), self.instance_port, "Port to advertise in the ring (defaults to -server.grpc-listen-port).", move |t| &get(t).instance_port, move |t| &mut get_mut(t).instance_port);
         f.string_var(&format!("{prefix}instance-addr"), &self.instance_addr, "IP address to advertise in the ring. Default is auto-detected.", move |t| &get(t).instance_addr, move |t| &mut get_mut(t).instance_addr);
         f.bool_var(&format!("{prefix}instance-enable-ipv6"), self.instance_enable_ipv6, "Enable using an IPv6 instance address.", move |t| &get(t).instance_enable_ipv6, move |t| &mut get_mut(t).instance_enable_ipv6);
