@@ -19,6 +19,7 @@ pub mod limits;
 pub mod mimir;
 pub mod runtime_config;
 pub mod schema;
+pub mod secret;
 pub mod server;
 pub mod sha256;
 pub mod storage;

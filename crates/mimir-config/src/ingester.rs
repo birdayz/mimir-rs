@@ -42,6 +42,7 @@ impl ClusterValidationConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ConsulConfig {
     pub host: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub acl_token: String,
     pub http_client_timeout: GoDuration,
     pub consistent_reads: bool,
@@ -97,6 +98,7 @@ pub struct EtcdConfig {
     pub tls_cipher_suites: String,
     pub tls_min_version: String,
     pub username: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub password: String,
 }
 

@@ -142,8 +142,10 @@ pub struct S3Config {
     pub endpoint: String,
     pub region: String,
     pub bucket_name: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub secret_access_key: String,
     pub access_key_id: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub session_token: String,
     pub insecure: bool,
     pub signature_version: String,
@@ -237,6 +239,7 @@ impl S3Config {
 #[serde(default, deny_unknown_fields)]
 pub struct GCSConfig {
     pub bucket_name: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub service_account: String,
     pub enable_upload_retries: bool,
     pub max_retries: i64,
@@ -275,7 +278,9 @@ impl GCSConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AzureConfig {
     pub account_name: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub account_key: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub connection_string: String,
     pub container_name: String,
     pub endpoint_suffix: String,
@@ -323,6 +328,7 @@ impl AzureConfig {
 pub struct SwiftConfig {
     pub application_credential_id: String,
     pub application_credential_name: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub application_credential_secret: String,
     pub auth_version: i64,
     pub auth_url: String,
@@ -330,6 +336,7 @@ pub struct SwiftConfig {
     pub user_domain_name: String,
     pub user_domain_id: String,
     pub user_id: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub password: String,
     pub domain_id: String,
     pub domain_name: String,
@@ -1619,15 +1626,20 @@ pub struct KafkaConfig {
     // SASL
     pub sasl_mechanism: SASLMechanism,
     pub sasl_username: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub sasl_password: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub sasl_oauthbearer_token: String,
     pub sasl_oauthbearer_zid: String,
     pub sasl_oauthbearer_extensions: LimitsMap<String>,
     pub sasl_oauthbearer_file_path: String,
     pub sasl_oauthbearer_http_socket_path: String,
     pub sasl_oauthbearer_http_socket_timeout: GoDuration,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub sasl_msk_iam_access_key: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub sasl_msk_iam_secret_key: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub sasl_msk_iam_session_token: String,
     pub sasl_msk_iam_user_agent: String,
     pub sasl_msk_iam_file_path: String,
