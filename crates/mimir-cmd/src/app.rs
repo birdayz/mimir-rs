@@ -143,6 +143,8 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
     register_global_metrics(&registry, outcome.config_hash_sha256.as_deref())
         .context("registering global Prometheus metrics")?;
+    crate::metrics::register_process_collector(&registry)
+        .context("registering process collector")?;
 
     let version = version_info();
     logger.log(

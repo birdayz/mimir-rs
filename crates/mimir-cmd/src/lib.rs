@@ -9,9 +9,11 @@
 
 pub mod app;
 pub mod cli;
+pub mod expfmt;
 pub mod grpc;
 pub mod http;
 pub mod metrics;
+pub mod process_collector;
 
 pub use app::{init_logging, run_mimir};
 pub use cli::{

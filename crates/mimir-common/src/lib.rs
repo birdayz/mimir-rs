@@ -17,6 +17,7 @@
 //! - github.com/grafana/mimir/pkg/util/reactivelimiter
 //! - github.com/grafana/mimir/pkg/distributor/validate.go
 //! - github.com/prometheus/prometheus/model/labels
+//! - github.com/prometheus/client_golang/prometheus/histogram.go (native histograms)
 
 pub mod activitytracker;
 pub mod backoff;
@@ -26,6 +27,7 @@ pub mod labels_hash;
 pub mod limiter;
 pub mod netutil;
 pub mod logging;
+pub mod native_histogram;
 pub mod services;
 pub mod shutdownmarker;
 pub mod sockaddr;

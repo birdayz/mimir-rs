@@ -16,7 +16,7 @@ use mimir_common::tenant::extract_tenant_id_from_http_headers;
 use mimir_config::{LimitsConfig, MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::{ingester_router, Ingester};
 use mimir_ring::kv::memberlist::MemberlistKv;
-use prometheus::{Encoder, Registry, TextEncoder};
+use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
@@ -63,7 +63,20 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     }
 
     if register_instrumentation {
-        router = router.route("/metrics", get(metrics_handler));
+        let cache = Arc::new(MetricsCache::new(
+            state
+                .config
+                .server
+                .metrics_cache_duration
+                .as_std()
+                .unwrap_or_default(),
+        ));
+        router = router.route(
+            "/metrics",
+            get(move |st: AxumState<AppHttpState>, headers: HeaderMap| {
+                metrics_handler(st, headers, Arc::clone(&cache))
+            }),
+        );
     }
     if has_memberlist {
         router = router.route("/memberlist", get(memberlist_handler));
@@ -143,23 +156,86 @@ async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
         .into_response()
 }
 
-async fn metrics_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
-    let metric_families = st.registry.gather();
-    let encoder = TextEncoder::new();
-    let mut buf = Vec::with_capacity(4096);
-    if let Err(err) = encoder.encode(&metric_families, &mut buf) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("error encoding metrics: {err}"),
-        )
-            .into_response();
+/// dskit `registerInstrumentation`: `promhttp.HandlerFor(gatherer, HandlerOpts{EnableOpenMetrics:
+/// true})` (wrapped by `metrics.CachedHandlerFor` when `-server.metrics-cache-duration` > 0):
+/// content negotiation (OpenMetrics 1.0.0/0.0.1, delimited protobuf, text 0.0.4), `Vary` headers
+/// and gzip response compression.
+async fn metrics_handler(
+    AxumState(st): AxumState<AppHttpState>,
+    headers: HeaderMap,
+    cache: Arc<MetricsCache>,
+) -> Response {
+    let header_str = |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+    let format = crate::expfmt::negotiate(header_str(header::ACCEPT));
+    let families = cache.gather(&st.registry);
+    let body = match crate::expfmt::encode(&families, &format) {
+        Ok(b) => b,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("An error has occurred while serving metrics:\n\n{err}\n"),
+            )
+                .into_response();
+        }
+    };
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::VARY, "Accept")
+        .header(header::VARY, "Accept-Encoding")
+        .header(header::CONTENT_TYPE, format.content_type);
+    let body = match crate::expfmt::negotiate_content_encoding(header_str(header::ACCEPT_ENCODING)) {
+        Some("gzip") => {
+            builder = builder.header(header::CONTENT_ENCODING, "gzip");
+            gzip_bytes(&body)
+        }
+        // Go fails to build a writer for an unacceptable encoding and falls back to identity.
+        _ => body,
+    };
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+pub(crate) fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut enc = flate2::write::GzEncoder::new(
+        Vec::with_capacity(data.len() / 4 + 64),
+        flate2::Compression::default(),
+    );
+    let _ = enc.write_all(data);
+    enc.finish().unwrap_or_default()
+}
+
+/// dskit `metrics.CachedHandlerFor`: reuses the gathered metric families for
+/// `-server.metrics-cache-duration` (0 disables caching).
+pub struct MetricsCache {
+    duration: std::time::Duration,
+    cached: parking_lot::Mutex<Option<(std::time::Instant, Arc<Vec<prometheus::proto::MetricFamily>>)>>,
+}
+
+impl MetricsCache {
+    pub fn new(duration: std::time::Duration) -> Self {
+        Self {
+            duration,
+            cached: parking_lot::Mutex::new(None),
+        }
     }
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, encoder.format_type().to_string())],
-        buf,
-    )
-        .into_response()
+
+    fn gather(&self, registry: &Registry) -> Arc<Vec<prometheus::proto::MetricFamily>> {
+        if self.duration.is_zero() {
+            return Arc::new(registry.gather());
+        }
+        let mut cached = self.cached.lock();
+        if let Some((at, ref fams)) = *cached {
+            if at.elapsed() < self.duration {
+                return Arc::clone(fams);
+            }
+        }
+        let fams = Arc::new(registry.gather());
+        *cached = Some((std::time::Instant::now(), Arc::clone(&fams)));
+        fams
+    }
 }
 
 #[derive(Serialize)]
