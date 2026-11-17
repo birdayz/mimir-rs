@@ -636,6 +636,11 @@ impl MemberlistKv {
                     .to_string(),
             );
         }
+        info!(
+            cluster_label = %self.cfg.cluster_label,
+            node = %self.node_name,
+            "Using memberlist cluster label and node name"
+        );
         let reg = self.registry.clone();
         let (transport, packet_rx, stream_rx) =
             TcpTransport::new(&self.cfg, &self.metrics_namespace, reg.as_ref())
@@ -726,9 +731,9 @@ impl MemberlistKv {
                 _ = rejoin_sleep => {
                     next_rejoin = Some(tokio::time::Instant::now() + rejoin_interval);
                     // Don't retry if resolution fails, we will try again next time.
-                    match self.join_members_with_retries(&ctx, &rejoin_nodes, 1).await {
-                        Ok(reached) => info!(phase = "periodic_rejoin", reached_nodes = reached, "re-joined memberlist cluster"),
-                        Err(err) => warn!(phase = "periodic_rejoin", %err, next_try_in = ?rejoin_interval, "re-joining memberlist cluster failed"),
+                    match self.join_members_with_retries(&ctx, &rejoin_nodes, 1, "periodic_rejoin").await {
+                        Ok(reached) => info!(phase = "periodic_rejoin", msg = "re-joined memberlist cluster", reached_nodes = reached),
+                        Err(err) => warn!(phase = "periodic_rejoin", msg = "re-joining memberlist cluster failed", %err, next_try_in = ?rejoin_interval),
                     }
                 }
                 _ = obsolete_fut => self.cleanup_obsolete_entries(),
@@ -1428,16 +1433,16 @@ impl MemberlistKv {
         if members.is_empty() {
             return true;
         }
-        info!(phase = "startup", join_members = %members.join(","), "joining memberlist cluster");
+        info!(phase = "startup", msg = "joining memberlist cluster", join_members = %members.join(","));
         let start = Instant::now();
         let max = self.cfg.max_join_retries.max(0) as usize;
-        match self.join_members_with_retries(ctx, &members, max).await {
+        match self.join_members_with_retries(ctx, &members, max, "startup").await {
             Ok(reached) => {
-                info!(phase = "startup", reached_nodes = reached, elapsed_time = ?start.elapsed(), "joining memberlist cluster succeeded");
+                info!(phase = "startup", msg = "joining memberlist cluster succeeded", reached_nodes = reached, elapsed_time = ?start.elapsed());
                 true
             }
             Err(err) => {
-                error!(phase = "startup", %err, elapsed_time = ?start.elapsed(), "joining memberlist cluster failed");
+                error!(phase = "startup", msg = "joining memberlist cluster failed", %err, elapsed_time = ?start.elapsed());
                 false
             }
         }
@@ -1449,6 +1454,7 @@ impl MemberlistKv {
         ctx: &ServiceContext,
         members: &[String],
         num_attempts: usize,
+        phase: &'static str,
     ) -> Result<usize, String> {
         let mut boff = Backoff::new(BackoffConfig {
             min_backoff: self.cfg.min_join_backoff.as_std().unwrap_or(Duration::ZERO),
@@ -1466,7 +1472,13 @@ impl MemberlistKv {
                 err = None;
                 break;
             }
-            warn!(attempts = boff.num_retries() + 1, max_attempts = num_attempts, err = ?err, "joining memberlist cluster");
+            warn!(
+                phase,
+                msg = "joining memberlist cluster",
+                attempts = boff.num_retries() + 1,
+                max_attempts = num_attempts,
+                err = err.as_deref().unwrap_or(""),
+            );
             let delay = boff.next_delay();
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}

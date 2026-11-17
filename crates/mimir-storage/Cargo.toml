@@ -17,6 +17,11 @@ futures = { workspace = true }
 kafka-protocol = { workspace = true }
 lz4_flex = { workspace = true }
 object_store = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+quick-xml = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
 ring = { workspace = true }

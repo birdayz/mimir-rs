@@ -292,7 +292,7 @@ pub async fn handle_kafka_fetch_err(
                             }
                         }
                         Some(Err(e)) => {
-                            error!(error = %e, "failed to find start offset to readjust on OffsetOutOfRange; retrying same records range");
+                            error!(err = %e, "failed to find start offset to readjust on OffsetOutOfRange; retrying same records range");
                         }
                         None => {
                             error!("start offset not yet cached on OffsetOutOfRange; retrying same records range");
@@ -338,7 +338,7 @@ pub async fn handle_kafka_fetch_err(
                 long_backoff.wait().await;
             } else {
                 error!(
-                    error = %msg,
+                    err = %msg,
                     "received an error we're not prepared to handle; this shouldn't happen; please report this as a bug"
                 );
                 long_backoff.wait().await;
@@ -346,7 +346,7 @@ pub async fn handle_kafka_fetch_err(
         }
         KafkaFetchError::Broker(other) => {
             error!(
-                error = %other,
+                err = %other,
                 "received an error we're not prepared to handle; this shouldn't happen; please report this as a bug"
             );
             long_backoff.wait().await;

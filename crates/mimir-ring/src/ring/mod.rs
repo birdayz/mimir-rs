@@ -346,7 +346,7 @@ impl Ring {
                                 r.update_ring_state(*desc);
                             }
                         } else {
-                            info!(key = %r.key, "ring doesn't exist in KV store yet");
+                            info!("ring doesn't exist in KV store yet");
                         }
                     }
                     Ok(())

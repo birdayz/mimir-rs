@@ -1,24 +1,27 @@
 //! Multi-backend KV client with runtime primary switchover and mirroring.
 //!
-//! Ported from github.com/grafana/dskit/kv/multi.go
+//! Ported from:
+//! - github.com/grafana/dskit/kv/multi.go
+//! - github.com/grafana/mimir/pkg/mimir/runtime_config.go (`multiClientRuntimeConfigChannel`)
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use mimir_common::services::ServiceContext;
 use mimir_config::ingester::MultiKVConfig;
+use mimir_config::RuntimeConfigManager;
 use parking_lot::Mutex;
 use prometheus::{Counter, Gauge, GaugeVec, Opts, Registry};
-use tracing::{info, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
-use super::{BoxFuture, CasCallbackError, CasFn, CasOutcome, Codec, KvClient, KvError, Registerer};
-
-/// Value written to the primary store, encoded with the mirror codec (or the
-/// encoding error).
-type EncodedMirrorValue = Result<Vec<u8>, String>;
+use super::{
+    AsRegisterer, BoxFuture, CasCallbackError, CasFn, CasOutcome, Codec, KvClient, KvError,
+    Registerer,
+};
 
 #[derive(Clone)]
 pub struct NamedKvClient {
@@ -26,10 +29,75 @@ pub struct NamedKvClient {
     pub client: Arc<dyn KvClient>,
 }
 
-#[derive(Clone, Debug, Default)]
+/// `kv.MultiRuntimeConfig`: values that can change at runtime (via runtime config).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MultiRuntimeConfig {
+    /// Primary store; empty values are ignored.
     pub primary_store: String,
+    /// Mirroring enabled or not; `None` = no change.
     pub mirroring: Option<bool>,
+}
+
+impl From<&mimir_config::MultiRuntimeConfig> for MultiRuntimeConfig {
+    fn from(c: &mimir_config::MultiRuntimeConfig) -> Self {
+        Self {
+            primary_store: c.primary.clone(),
+            mirroring: c.mirror_enabled,
+        }
+    }
+}
+
+/// `MultiConfig.ConfigProvider`: returns a channel with `MultiRuntimeConfig` updates.
+pub type MultiConfigProvider = Arc<dyn Fn() -> mpsc::Receiver<MultiRuntimeConfig> + Send + Sync>;
+
+/// `multiClientRuntimeConfigChannel` (pkg/mimir/runtime_config.go): a provider that pushes the
+/// current `multi_kv_config` and then every value applied by the runtime config manager.
+pub fn runtime_config_provider(manager: &Arc<RuntimeConfigManager>) -> MultiConfigProvider {
+    let manager = Arc::clone(manager);
+    Arc::new(move || {
+        let (out_tx, out_rx) = mpsc::channel(1);
+        // Push the initial config.
+        let _ = out_tx.try_send(MultiRuntimeConfig::from(&manager.get_config().multi_kv_config));
+
+        let mut ch = manager.create_listener_channel(1);
+        let forward = async move {
+            while let Some(val) = ch.recv().await {
+                if out_tx
+                    .send(MultiRuntimeConfig::from(&val.multi_kv_config))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        };
+        spawn_background("multikv-runtime-config", forward);
+        out_rx
+    })
+}
+
+/// Spawns `fut` on the current Tokio runtime, or on a dedicated thread when there is none.
+fn spawn_background<F>(name: &str, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => {
+            h.spawn(fut);
+        }
+        Err(_) => {
+            let _ = std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(move || {
+                    if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        rt.block_on(fut);
+                    }
+                });
+        }
+    }
 }
 
 struct InProgressWatch {
@@ -85,16 +153,15 @@ impl MultiMetrics {
 
 pub struct MultiKv {
     clients: Vec<NamedKvClient>,
+    /// Codec of the stored values, used to hand the value written to the primary over to the
+    /// secondary stores when mirroring (Go passes the same `interface{}` value).
+    codec: Option<Arc<dyn Codec>>,
     mirror_timeout: Duration,
     mirroring_enabled: AtomicBool,
     primary_id: AtomicUsize,
     in_progress: Mutex<HashMap<usize, InProgressWatch>>,
     in_progress_cnt: AtomicUsize,
     metrics: MultiMetrics,
-    /// Codec used to copy the value written to the primary store into the
-    /// secondary stores when mirroring through the generic [`KvClient::cas`]
-    /// (Go hands the same `interface{}` value to every store).
-    mirror_codec: Option<Arc<dyn Codec>>,
 }
 
 impl MultiKv {
@@ -103,32 +170,91 @@ impl MultiKv {
         clients: Vec<NamedKvClient>,
         reg: Option<&Registry>,
     ) -> Arc<Self> {
-        Self::with_registerer(cfg, clients, None, reg.map(Registerer::new).as_ref())
+        Self::with_registerer_and_options(
+            cfg,
+            clients,
+            None,
+            reg.map(Registerer::new).as_ref(),
+            None,
+        )
     }
 
     /// Go `NewMultiClient(cfg, clients, logger, reg)` with a (possibly
-    /// wrapped) Go-style registerer. When `mirror_codec` is set, the generic
-    /// [`KvClient::cas`] mirrors the written value to the secondary stores
-    /// like Go `MultiClient.CAS`.
+    /// wrapped) Go-style registerer.
     pub fn with_registerer(
         cfg: MultiKVConfig,
         clients: Vec<NamedKvClient>,
-        mirror_codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn Codec>>,
         reg: Option<&Registerer>,
+    ) -> Arc<Self> {
+        Self::with_registerer_and_options(cfg, clients, codec, reg, None)
+    }
+
+    /// `NewMultiClient`: `codec` enables mirroring of generic [`KvClient::cas`] writes, and
+    /// `config_provider` (`MultiConfig.ConfigProvider`) is watched for runtime primary switches
+    /// and mirroring toggles.
+    pub fn new_with_options<R: AsRegisterer + ?Sized>(
+        cfg: MultiKVConfig,
+        clients: Vec<NamedKvClient>,
+        reg: Option<&R>,
+        codec: Option<Arc<dyn Codec>>,
+        config_provider: Option<MultiConfigProvider>,
+    ) -> Arc<Self> {
+        let reg = reg.map(|r| r.as_registerer());
+        Self::with_registerer_and_options(cfg, clients, codec, reg.as_ref(), config_provider)
+    }
+
+    pub fn with_registerer_and_options(
+        cfg: MultiKVConfig,
+        clients: Vec<NamedKvClient>,
+        codec: Option<Arc<dyn Codec>>,
+        reg: Option<&Registerer>,
+        config_provider: Option<MultiConfigProvider>,
     ) -> Arc<Self> {
         let m = Arc::new(Self {
             clients,
+            codec,
             mirror_timeout: cfg.mirror_timeout.as_std().unwrap_or(Duration::ZERO),
             mirroring_enabled: AtomicBool::new(cfg.mirror_enabled),
             primary_id: AtomicUsize::new(0),
             in_progress: Mutex::new(HashMap::new()),
             in_progress_cnt: AtomicUsize::new(0),
             metrics: MultiMetrics::new(reg),
-            mirror_codec,
         });
         m.update_primary_store_gauge();
         m.update_mirror_enabled_gauge();
+
+        if let Some(provider) = config_provider {
+            let rx = provider();
+            spawn_background("multikv-watch-config", Self::watch_config_channel(Arc::downgrade(&m), rx));
+        }
         m
+    }
+
+    /// `watchConfigChannel`: applies every received runtime config until the channel closes or
+    /// the client is dropped.
+    async fn watch_config_channel(this: Weak<Self>, mut rx: mpsc::Receiver<MultiRuntimeConfig>) {
+        while let Some(cfg) = rx.recv().await {
+            let Some(m) = this.upgrade() else { return };
+            if let Err(err) = m.apply_runtime_config(cfg.clone()) {
+                error!(
+                    component = "multikv",
+                    primary = %cfg.primary_store,
+                    %err,
+                    "failed to switch primary KV store"
+                );
+            }
+        }
+    }
+
+    /// Name of the current primary store.
+    pub fn primary_store(&self) -> &str {
+        &self.get_primary_client().1.name
+    }
+
+    /// Whether writes are currently mirrored to the secondary store.
+    pub fn mirroring_enabled(&self) -> bool {
+        self.mirroring_enabled.load(Ordering::Acquire)
     }
 
     pub fn apply_runtime_config(&self, cfg: MultiRuntimeConfig) -> Result<(), KvError> {
@@ -153,7 +279,7 @@ impl MultiKv {
             .clients
             .iter()
             .position(|c| c.name == store)
-            .ok_or_else(|| KvError::InvalidConfig(format!("KV store not found: {store}")))?;
+            .ok_or_else(|| KvError::Other("KV store not found".to_string()))?;
 
         let prev = self.primary_id.swap(new_ix, Ordering::AcqRel);
         if prev == new_ix {
@@ -215,6 +341,48 @@ impl MultiKv {
 }
 
 impl MultiKv {
+    /// `writeToSecondary`: stores the value written to the primary in every other store
+    /// (single attempt, bounded by `mirror_timeout` when > 0).
+    async fn write_to_secondary(
+        &self,
+        primary: &NamedKvClient,
+        key: &str,
+        codec: &Arc<dyn Codec>,
+        bytes: Vec<u8>,
+    ) {
+        let bytes = Arc::new(bytes);
+        for kv in &self.clients {
+            if kv.name == primary.name {
+                continue;
+            }
+            self.metrics.mirror_writes.inc();
+            let (b, c) = (Arc::clone(&bytes), Arc::clone(codec));
+            let sec_cb: CasFn = Box::new(move |_| {
+                c.decode(&b)
+                    .map(CasOutcome::Update)
+                    .map_err(CasCallbackError::fatal)
+            });
+            let fut = kv.client.cas(key, sec_cb);
+            let r = if !self.mirror_timeout.is_zero() {
+                match tokio::time::timeout(self.mirror_timeout, fut).await {
+                    Ok(r) => r,
+                    Err(_) => Err(KvError::Other("context deadline exceeded".to_string())),
+                }
+            } else {
+                fut.await
+            };
+            match r {
+                Err(err) => {
+                    self.metrics.mirror_failures.inc();
+                    warn!(component = "multikv", key, %err, primary = %primary.name, secondary = %kv.name, "failed to update value in secondary store");
+                }
+                Ok(()) => {
+                    debug!(component = "multikv", key, primary = %primary.name, secondary = %kv.name, "stored updated value to secondary store");
+                }
+            }
+        }
+    }
+
     /// CAS helper that can mirror a known-clonable value to secondary stores when mirroring is enabled.
     pub async fn cas_with_mirror_clone<T, F>(
         &self,
@@ -308,78 +476,36 @@ impl KvClient for MultiKv {
     fn cas<'a>(&'a self, key: &'a str, mut f: CasFn) -> BoxFuture<'a, Result<(), KvError>> {
         Box::pin(async move {
             let (_, primary) = self.get_primary_client();
-            let Some(codec) = self.mirror_codec.clone() else {
+
+            // Go keeps the last value returned by `f` and, if mirroring is enabled after a
+            // successful CAS, writes it to every secondary. Values are `Box<dyn Any>` here, so
+            // the value is captured in its codec encoding (only when it can be mirrored).
+            let Some(codec) = self.codec.clone().filter(|_| self.mirroring_enabled()) else {
                 return primary.client.cas(key, f).await;
             };
-            if !self.mirroring_enabled.load(Ordering::Acquire) {
-                return primary.client.cas(key, f).await;
-            }
-
-            // Capture the last value handed to the primary store (encoded, so
-            // it can be re-created for each secondary store).
-            let updated: Arc<Mutex<Option<EncodedMirrorValue>>> = Arc::new(Mutex::new(None));
-            let updated_cb = updated.clone();
-            let enc_codec = codec.clone();
-            let cb: CasFn = Box::new(move |cur| {
-                let out = f(cur)?;
+            let updated: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+            let updated_cb = Arc::clone(&updated);
+            let cb_codec = Arc::clone(&codec);
+            let wrapped: CasFn = Box::new(move |cur| {
+                let out = f(cur);
                 *updated_cb.lock() = match &out {
-                    CasOutcome::NoChange => None,
-                    CasOutcome::Update(v) => {
-                        Some(enc_codec.encode(v.as_ref()).map_err(|e| e.to_string()))
-                    }
+                    Ok(CasOutcome::Update(v)) => match cb_codec.encode(v.as_ref()) {
+                        Ok(b) => Some(b),
+                        Err(err) => {
+                            warn!(component = "multikv", %err, "failed to encode value for mirroring");
+                            None
+                        }
+                    },
+                    _ => None,
                 };
-                Ok(out)
+                out
             });
 
-            let res = primary.client.cas(key, cb).await;
-            if res.is_ok() && self.mirroring_enabled.load(Ordering::Acquire) {
-                let maybe = updated.lock().take();
-                if let Some(encoded) = maybe {
-                    for kv in &self.clients {
-                        if kv.name == primary.name {
-                            continue;
-                        }
-                        self.metrics.mirror_writes.inc();
-                        let value = match &encoded {
-                            Ok(bytes) => codec.decode(bytes),
-                            Err(e) => Err(KvError::Codec(e.clone())),
-                        };
-                        let r = match value {
-                            Err(e) => Err(e),
-                            Ok(value) => {
-                                let mut value = Some(value);
-                                // try once
-                                let sec_cb: CasFn = Box::new(move |_| {
-                                    value.take().map(CasOutcome::Update).ok_or_else(|| {
-                                        CasCallbackError::fatal(KvError::UnexpectedState(
-                                            "mirror value already consumed".to_string(),
-                                        ))
-                                    })
-                                });
-                                let fut = kv.client.cas(key, sec_cb);
-                                if !self.mirror_timeout.is_zero() {
-                                    match tokio::time::timeout(self.mirror_timeout, fut).await {
-                                        Ok(r) => r,
-                                        Err(_) => Err(KvError::Other(
-                                            "context deadline exceeded".to_string(),
-                                        )),
-                                    }
-                                } else {
-                                    fut.await
-                                }
-                            }
-                        };
-                        if let Err(err) = r {
-                            self.metrics.mirror_failures.inc();
-                            warn!(
-                                key,
-                                primary = %primary.name,
-                                secondary = %kv.name,
-                                %err,
-                                "failed to update value in secondary store"
-                            );
-                        }
-                    }
+            let res = primary.client.cas(key, wrapped).await;
+            let value = updated.lock().take();
+            if res.is_ok() && self.mirroring_enabled() {
+                if let Some(bytes) = value {
+                    self.write_to_secondary(primary, key, &codec, bytes).await;
                 }
             }
             res

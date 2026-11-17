@@ -341,8 +341,20 @@ pub fn build_kv_client<R: AsRegisterer + ?Sized>(
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
     reg: Option<&R>,
 ) -> Result<Arc<dyn KvClient>, KvError> {
+    build_kv_client_with_multi_config_provider(cfg, codec, memberlist_kv, reg, None)
+}
+
+/// Like [`build_kv_client`], with `MultiConfig.ConfigProvider` set: a `multi` store watches
+/// the provider for runtime `multi_kv_config` changes (primary switch, mirroring toggle).
+pub fn build_kv_client_with_multi_config_provider<R: AsRegisterer + ?Sized>(
+    cfg: &KVStoreConfig,
+    codec: Arc<dyn Codec>,
+    memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
+    reg: Option<&R>,
+    multi_config_provider: Option<multi::MultiConfigProvider>,
+) -> Result<Arc<dyn KvClient>, KvError> {
     let reg = reg.map(|r| r.as_registerer());
-    create_client(
+    create_client_with_multi_provider(
         &cfg.store,
         &cfg.prefix,
         cfg,
@@ -350,6 +362,7 @@ pub fn build_kv_client<R: AsRegisterer + ?Sized>(
         memberlist_kv,
         Role::Primary,
         reg.as_ref(),
+        multi_config_provider,
     )
 }
 
@@ -362,6 +375,20 @@ pub fn create_client(
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
     role: Role,
     reg: Option<&Registerer>,
+) -> Result<Arc<dyn KvClient>, KvError> {
+    create_client_with_multi_provider(backend, prefix, cfg, codec, memberlist_kv, role, reg, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_client_with_multi_provider(
+    backend: &str,
+    prefix: &str,
+    cfg: &KVStoreConfig,
+    codec: Arc<dyn Codec>,
+    memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
+    role: Role,
+    reg: Option<&Registerer>,
+    multi_config_provider: Option<multi::MultiConfigProvider>,
 ) -> Result<Arc<dyn KvClient>, KvError> {
     let base: Arc<dyn KvClient> = match backend {
         "inmemory" => Arc::new(inmemory::InMemoryKv::shared_with_codec(codec)),
@@ -411,7 +438,7 @@ pub fn create_client(
                 Role::Secondary,
                 reg,
             )?;
-            multi::MultiKv::with_registerer(
+            multi::MultiKv::with_registerer_and_options(
                 cfg.multi.clone(),
                 vec![
                     multi::NamedKvClient {
@@ -425,6 +452,7 @@ pub fn create_client(
                 ],
                 Some(codec),
                 reg,
+                multi_config_provider,
             )
         }
         // This case is for testing. The mock KV client does not do anything internally.

@@ -88,7 +88,7 @@ impl Ingester {
             user_db.update_last_series_removal();
             if let Err(e) = res {
                 self.metrics.compactions_failed.inc();
-                warn!(user = %user_id, reason, error = %e, "TSDB blocks compaction failed");
+                warn!(user = %user_id, reason, err = %e, "TSDB blocks compaction failed");
             } else {
                 debug!(user = %user_id, reason, "TSDB blocks compaction completed");
             }
@@ -139,12 +139,12 @@ impl Ingester {
                 Ok(uploaded) => {
                     if uploaded > 0 {
                         if let Err(e) = user_db.update_cached_shipped_blocks() {
-                            warn!(user = %user_id, error = %e, "failed to update cached shipped blocks");
+                            warn!(user = %user_id, err = %e, "failed to update cached shipped blocks");
                         }
                     }
                 }
                 Err(e) => {
-                    warn!(user = %user_id, error = %e, "shipper failed to sync TSDB blocks");
+                    warn!(user = %user_id, err = %e, "shipper failed to sync TSDB blocks");
                 }
             }
         }
@@ -162,7 +162,7 @@ impl Ingester {
             if let Some(db) = self.get_tsdb(&user_id) {
                 if let Some(ref cat) = db.offset_catalogue {
                     if let Err(e) = cat.sync(&hw) {
-                        warn!(user = %user_id, error = %e, "offset catalogue sync failed");
+                        warn!(user = %user_id, err = %e, "offset catalogue sync failed");
                     }
                 }
             }
@@ -501,7 +501,7 @@ impl Ingester {
             let _ = db.db.compact_ooo_head();
             if let Err(e) = db.db.compact_selected_series(&refs) {
                 db.update_last_series_removal();
-                warn!(user = %user_id, error = %e, "selected series compaction failed");
+                warn!(user = %user_id, err = %e, "selected series compaction failed");
                 continue;
             }
             db.update_last_series_removal();
@@ -583,7 +583,7 @@ impl Ingester {
             .collect();
 
         if let Err(e) = user_db.close() {
-            warn!(user = %user_id, error = %e, "failed to close idle TSDB");
+            warn!(user = %user_id, err = %e, "failed to close idle TSDB");
             let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
             return TsdbCloseCheckResult::CloseFailed;
         }
@@ -598,7 +598,7 @@ impl Ingester {
             .delete_user_label_value_bytes_metrics(user_id, &label_value_bytes_names);
 
         if let Err(e) = std::fs::remove_dir_all(&dir) {
-            warn!(user = %user_id, dir = %dir.display(), error = %e, "failed to remove closed idle TSDB directory");
+            warn!(user = %user_id, dir = %dir.display(), err = %e, "failed to remove closed idle TSDB directory");
             return TsdbCloseCheckResult::DataRemovalFailed;
         }
 
@@ -1102,7 +1102,7 @@ pub fn spawn_owned_series_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> 
                                 .observe(start.elapsed().as_secs_f64());
                         }
                         Err(e) => {
-                            debug!(error = %e, "owned series ring check failed");
+                            debug!(err = %e, "owned series ring check failed");
                         }
                     }
                 }

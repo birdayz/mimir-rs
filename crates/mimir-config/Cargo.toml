@@ -7,11 +7,15 @@ license.workspace = true
 [dependencies]
 mimir-common = { path = "../mimir-common" }
 mimir-proto = { path = "../mimir-proto" }
+flate2 = { workspace = true }
 parking_lot = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true }
