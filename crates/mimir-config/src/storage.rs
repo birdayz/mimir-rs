@@ -272,6 +272,38 @@ impl GCSConfig {
         f.i64_var(&format!("{prefix}gcs.max-retries"), self.max_retries, "Maximum number of attempts for GCS operations.", move |t| &get(t).max_retries, move |t| &mut get_mut(t).max_retries);
         self.http.register_flags_into(&format!("{prefix}gcs."), f, move |t| &get(t).http, move |t| &mut get_mut(t).http);
     }
+
+    /// See [`StorageBackendConfig::validate_mimir_rs_support`].
+    ///
+    /// Rejects `http.*` settings object_store 0.11 cannot honour and `service_account` JSON
+    /// credential types mimir-rs cannot use (Go `google.CredentialsFromJSON` also accepts
+    /// `external_account`, `external_account_authorized_user`, `impersonated_service_account`,
+    /// `gdch_service_account` and OAuth client JSON). Malformed JSON is left to bucket client
+    /// construction, which fails like Go.
+    pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        validate_bucket_http_mimir_rs_support(&self.http, "gcs")?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&self.service_account) {
+            let kind = if v.get("web").is_some() || v.get("installed").is_some() {
+                Some("OAuth client (client_credentials.json \"web\"/\"installed\")".to_string())
+            } else {
+                match v.get("type").and_then(|t| t.as_str()) {
+                    Some(
+                        t @ ("external_account"
+                        | "external_account_authorized_user"
+                        | "impersonated_service_account"
+                        | "gdch_service_account"),
+                    ) => Some(format!("{t:?}")),
+                    _ => None,
+                }
+            };
+            if let Some(kind) = kind {
+                return Err(ConfigError::Validation(format!(
+                    "gcs.service_account: GCS credential type {kind} is not supported by mimir-rs for the gcs backend"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +353,37 @@ impl AzureConfig {
         f.string_var(&format!("{prefix}azure.user-assigned-id"), &self.user_assigned_id, "User assigned managed identity.", move |t| &get(t).user_assigned_id, move |t| &mut get_mut(t).user_assigned_id);
         self.http.register_flags_into(&format!("{prefix}azure."), f, move |t| &get(t).http, move |t| &mut get_mut(t).http);
     }
+
+    /// See [`StorageBackendConfig::validate_mimir_rs_support`].
+    pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        validate_bucket_http_mimir_rs_support(&self.http, "azure")
+    }
+}
+
+/// Rejects bucket `http.*` settings that the object_store 0.11 HTTP client used by mimir-rs for
+/// the azure/gcs backends cannot honour (Go thanos `exthttp.DefaultTransport` supports them).
+fn validate_bucket_http_mimir_rs_support(
+    http: &BucketHTTPConfig,
+    backend: &str,
+) -> Result<(), ConfigError> {
+    let unsupported = |setting: &str| {
+        Err(ConfigError::Validation(format!(
+            "{backend}.http.{setting} is not supported by mimir-rs for the {backend} backend"
+        )))
+    };
+    if !http.tls_cert_path.is_empty() {
+        return unsupported("tls_cert_path (client certificate)");
+    }
+    if !http.tls_key_path.is_empty() {
+        return unsupported("tls_key_path (client certificate key)");
+    }
+    if !http.tls_server_name.is_empty() {
+        return unsupported("tls_server_name");
+    }
+    if http.max_connections_per_host != 0 {
+        return unsupported("max_connections_per_host");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
