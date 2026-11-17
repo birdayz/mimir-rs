@@ -23,6 +23,11 @@ base64 = { workspace = true }
 quick-xml = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
+chrono = { workspace = true }
+md-5 = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-pki-types = { workspace = true }
+hex = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
 ring = { workspace = true }

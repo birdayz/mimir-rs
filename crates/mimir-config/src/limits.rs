@@ -8,6 +8,7 @@
 //! - github.com/grafana/mimir/pkg/costattribution/costattributionmodel/*
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -545,6 +546,21 @@ impl Default for LimitsConfig {
 }
 
 impl LimitsConfig {
+    /// Effective partitions shard size for writes: the write shard size when set (> 0), clamped to
+    /// the read shard size; otherwise the read shard size
+    /// (Go: `Overrides.EffectiveIngestionPartitionsTenantWriteShardSize`).
+    pub fn effective_ingestion_partitions_tenant_write_shard_size(&self) -> i64 {
+        let read = self.ingestion_partitions_tenant_shard_size;
+        let write = self.ingestion_partitions_tenant_write_shard_size;
+        if write <= 0 {
+            return read;
+        }
+        if read > 0 && write > read {
+            return read;
+        }
+        write
+    }
+
     pub fn register_flags_into<T: 'static>(
         &self,
         f: &mut FlagSet<T>,
@@ -618,16 +634,41 @@ impl LimitsConfig {
             "{}",
             "Additional active series metrics, matching the provided matchers.",
             move |t, s| {
-                let map = &mut get_mut(t).active_series_custom_trackers;
-                for part in s.split(';') {
-                    let part = part.trim();
-                    if part.is_empty() {
-                        continue;
-                    }
-                    let (k, v) = part.split_once(':').ok_or_else(|| {
-                        ConfigError::Flag(format!("invalid active-series-custom-tracker {part:?}"))
+                // Go: CustomTrackersConfig.Set + customTrackerFlagValueToMap.
+                if s.trim().is_empty() {
+                    return Ok(());
+                }
+                let mut source = BTreeMap::new();
+                for (i, p) in s.split(';').enumerate() {
+                    let (name, matcher) = p.split_once(':').ok_or_else(|| {
+                        ConfigError::Flag(format!(
+                            "value should be <name>:<matcher>[;<name>:<matcher>]*, but colon was not found in the value {i}: {p:?}"
+                        ))
                     })?;
-                    map.insert(k.to_string(), v.to_string());
+                    let (name, matcher) = (name.trim(), matcher.trim());
+                    if name.is_empty() || matcher.is_empty() {
+                        return Err(ConfigError::Flag(format!(
+                            "semicolon-separated values should be <name>:<matcher>, but one of the sides was empty in the value {i}: {p:?}"
+                        )));
+                    }
+                    if source.contains_key(name) {
+                        return Err(ConfigError::Flag(format!(
+                            "matcher {name:?} for active series custom trackers is provided twice"
+                        )));
+                    }
+                    source.insert(name.to_string(), matcher.to_string());
+                }
+                if let Some(v) = CUSTOM_TRACKERS_VALIDATOR.get() {
+                    v(&source).map_err(ConfigError::Flag)?;
+                }
+                let map = &mut get_mut(t).active_series_custom_trackers;
+                for (name, matcher) in source {
+                    if map.contains_key(&name) {
+                        return Err(ConfigError::Flag(format!(
+                            "matcher {name:?} for active series custom trackers is provided more than once"
+                        )));
+                    }
+                    map.insert(name, matcher);
                 }
                 Ok(())
             },
@@ -929,6 +970,12 @@ impl LimitsConfig {
                 "cost_attribution_labels_structured and cost_attribution_trackers are mutually exclusive; use cost_attribution_trackers only".to_string(),
             ));
         }
+        if let Some(v) = CUSTOM_TRACKERS_VALIDATOR.get() {
+            v(&self.active_series_custom_trackers).map_err(ConfigError::Validation)?;
+            v(&self.active_series_additional_custom_trackers).map_err(ConfigError::Validation)?;
+        }
+        validate_cost_attribution_trackers(&self.cost_attribution_trackers)?;
+        validate_cost_attribution_trackers(&self.additional_cost_attribution_trackers)?;
 
         if self.early_head_compaction_min_estimated_series_reduction_percentage < 0
             || self.early_head_compaction_min_estimated_series_reduction_percentage > 100
@@ -985,6 +1032,70 @@ impl LimitsConfig {
 
         Ok(())
     }
+}
+
+/// Ported from `costattributionmodel.TrackerConfigs.Validate` / `Labels.Validate` / `Label.Validate`.
+fn validate_cost_attribution_trackers(tc: &CostAttributionTrackerConfigs) -> Result<(), ConfigError> {
+    let label_str = |l: &CostAttributionLabel| format!("{}:{}", l.input, l.output);
+    for (name, cfg) in tc {
+        if name.is_empty() {
+            return Err(ConfigError::Validation(
+                "cost attribution tracker name must not be empty".to_string(),
+            ));
+        }
+        let mut outputs = std::collections::HashSet::new();
+        for l in &cfg.labels {
+            let err = if l.input.is_empty() {
+                Some(format!(
+                    "cost attribution input label must not be empty: {:?}",
+                    label_str(l)
+                ))
+            } else if l.output.starts_with("__") {
+                Some(format!(
+                    "invalid cost attribution output label: {:?}",
+                    label_str(l)
+                ))
+            } else {
+                let out = if l.output.is_empty() { &l.input } else { &l.output };
+                (!outputs.insert(out.clone()))
+                    .then(|| format!("duplicate output label: {:?}", label_str(l)))
+            };
+            if let Some(e) = err {
+                return Err(ConfigError::Validation(format!(
+                    "cost attribution tracker {name:?}: {e}"
+                )));
+            }
+        }
+        if cfg.labels.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "cost attribution tracker {name:?} must have at least one label"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validates an active series custom trackers map (`name -> matchers`), returning the Go
+/// `NewCustomTrackersConfig` error on invalid matchers.
+pub type CustomTrackersValidator = fn(&BTreeMap<String, String>) -> Result<(), String>;
+
+static CUSTOM_TRACKERS_VALIDATOR: OnceLock<CustomTrackersValidator> = OnceLock::new();
+
+/// Installs the matcher validator used by [`LimitsConfig::validate`] for
+/// `active_series_custom_trackers` / `active_series_additional_custom_trackers`. The matcher
+/// parser lives in `mimir-ingester` (`activeseries/model`), so the binary wires it at startup;
+/// Go fails config (and runtime config) loading on invalid matchers in `UnmarshalYAML`.
+pub fn set_active_series_custom_trackers_validator(f: CustomTrackersValidator) {
+    let _ = CUSTOM_TRACKERS_VALIDATOR.set(f);
+}
+
+/// YAML-decode-time custom trackers validation (Go: `CustomTrackersConfig.UnmarshalYAML`).
+pub(crate) fn validate_custom_trackers_yaml(l: &LimitsConfig) -> Result<(), ConfigError> {
+    if let Some(v) = CUSTOM_TRACKERS_VALIDATOR.get() {
+        v(&l.active_series_custom_trackers).map_err(ConfigError::Yaml)?;
+        v(&l.active_series_additional_custom_trackers).map_err(ConfigError::Yaml)?;
+    }
+    Ok(())
 }
 
 fn next_power_of_two(n: i64) -> i64 {

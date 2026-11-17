@@ -620,7 +620,12 @@ impl<T> FlagSet<T> {
                     )));
                 };
                 (entry.setter)(target, v).map_err(|e| {
-                    ConfigError::Flag(format!("invalid value {v:?} for flag -{name}: {e}"))
+                    // Go's flag package prints the flag.Value.Set error verbatim.
+                    let msg = match e {
+                        ConfigError::Flag(m) => m,
+                        other => other.to_string(),
+                    };
+                    ConfigError::Flag(format!("invalid value {v:?} for flag -{name}: {msg}"))
                 })?;
             }
 
