@@ -962,3 +962,68 @@ async fn test_tokenless_lifecycler_removes_pre_existing_tokens() {
     ring_svc.stop_async();
     let _ = ring_svc.await_terminated().await;
 }
+
+/// Returns the sample count of `shutdown_duration_seconds{op, status}`.
+fn shutdown_duration_count(reg: &Registry, op: &str, status: &str) -> u64 {
+    reg.gather()
+        .iter()
+        .filter(|mf| mf.get_name() == "shutdown_duration_seconds")
+        .flat_map(|mf| mf.get_metric().iter())
+        .filter(|m| {
+            let l = m.get_label();
+            l.iter().any(|p| p.get_name() == "op" && p.get_value() == op)
+                && l.iter().any(|p| p.get_name() == "status" && p.get_value() == status)
+        })
+        .map(|m| m.get_histogram().get_sample_count())
+        .sum()
+}
+
+// The Ingester is the lifecycler's FlushTransferer (pkg/ingester/ingester.go `ring.NewLifecycler(
+// ..., i, ...)`): on shutdown the lifecycler switches to LEAVING, then calls Ingester.Flush()
+// (TransferOut is disabled), which compacts and ships the head, then unregisters.
+#[tokio::test]
+async fn test_ingester_flushes_through_lifecycler_on_shutdown() {
+    use compaction_ring_helpers::{
+        default_ingester_test_config, prepare_ingester_with_blocks_storage,
+        push_series_to_ingester, start_and_wait_healthy,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = default_ingester_test_config(tmp.path());
+    cfg.blocks.tsdb.flush_blocks_on_shutdown = true;
+    cfg.blocks.tsdb.ship_interval = GoDuration::from_secs(3600);
+    let bucket_dir = tmp.path().join("bucket");
+    let ring_kv = Arc::clone(&cfg.ring_kv);
+    let reg = Registry::new();
+    let (ing, ring, ring_svc) = prepare_ingester_with_blocks_storage(cfg, None, Some(&reg)).await;
+    start_and_wait_healthy(&ing, &ring).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    push_series_to_ingester(&ing, "user-1", &[(&[("__name__", "test_metric")], &[(now, 1.0)])])
+        .await
+        .unwrap();
+
+    ing.stop().await.unwrap();
+
+    assert_eq!(shutdown_duration_count(&reg, "flush", "success"), 1);
+    assert_eq!(shutdown_duration_count(&reg, "transfer", "success"), 0);
+    assert_eq!(shutdown_duration_count(&reg, "transfer", "fail"), 0);
+
+    // The head was compacted and shipped to the bucket by the lifecycler-driven flush.
+    let user_bucket = bucket_dir.join("user-1");
+    let shipped: Vec<_> = std::fs::read_dir(&user_bucket)
+        .map(|rd| rd.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(!shipped.is_empty(), "no block shipped to {}", user_bucket.display());
+
+    // unregister_on_shutdown defaults to true: the instance left the ring after the flush.
+    assert!(get_instance_state_in_ring(ring_kv.as_ref(), INGEST_RING_KEY, "localhost")
+        .await
+        .is_none());
+
+    ring_svc.stop_async();
+    let _ = ring_svc.await_terminated().await;
+}
