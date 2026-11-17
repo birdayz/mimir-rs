@@ -18,10 +18,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 ARG revision=unknown
+# Optional cap on cargo parallelism (e.g. --build-arg BUILD_JOBS=6); unset = cargo default.
+ARG BUILD_JOBS
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
-    MIMIR_REVISION="${revision}" cargo build --locked --release -p mimir-cmd \
+    MIMIR_REVISION="${revision}" cargo build --locked --release -p mimir-cmd ${BUILD_JOBS:+--jobs ${BUILD_JOBS}} \
       --config 'profile.release.lto="fat"' \
       --config 'profile.release.codegen-units=1' \
       --config 'profile.release.debug=false' \

@@ -12,6 +12,7 @@ pub mod cli;
 pub mod expfmt;
 pub mod grpc;
 pub mod http;
+pub mod memberlist_status;
 pub mod metrics;
 pub mod pprof;
 pub mod process_collector;

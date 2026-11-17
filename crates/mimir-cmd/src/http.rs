@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use axum::extract::{Query, State as AxumState};
+use axum::extract::{Query, RawQuery, State as AxumState};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get};
@@ -15,12 +15,13 @@ use mimir_common::services::{Service, State};
 use mimir_common::tenant::extract_tenant_id_from_http_headers;
 use mimir_config::{LimitsConfig, MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::{ingester_router, Ingester};
-use mimir_ring::kv::memberlist::MemberlistKv;
+use mimir_ring::kv::memberlist::{http_status, MemberlistKv};
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
 use crate::cli::{diff_yaml_values, effective_config_yaml};
+use crate::memberlist_status::render_memberlist_status_page;
 use crate::metrics::{branch_str, go_version_str, revision_str, version_str};
 
 #[derive(Clone)]
@@ -45,7 +46,9 @@ pub struct AppHttpState {
 /// Builds the full Axum HTTP router (with `server.http_path_prefix` honored).
 pub fn build_http_router(state: AppHttpState) -> Router {
     let register_instrumentation = state.config.server.register_instrumentation;
-    let has_memberlist = state.memberlist_kv.is_some();
+    // Go registers /memberlist whenever the memberlist-kv module is initialised (a dependency of
+    // the ingester ring); it answers "This instance doesn't use memberlist." without a KV.
+    let has_memberlist = state.memberlist_kv.is_some() || state.ingester.is_some();
     let ingester_opt = state.ingester.clone();
     let path_prefix = state.config.server.http_path_prefix.trim_end_matches('/').to_string();
 
@@ -658,78 +661,30 @@ async fn status_flags_handler() -> Response {
     .into_response()
 }
 
-#[derive(Serialize)]
-struct MemberlistMemberJson {
-    name: String,
-    addr: String,
-    state: String,
-    incarnation: u32,
-}
-
-#[derive(Serialize)]
-struct MemberlistStatusJson {
-    node_name: String,
-    advertise_addr: String,
-    keys_count: usize,
-    members: Vec<MemberlistMemberJson>,
-}
-
+/// Mimir `memberlistStatusHandler(kvs)` = dskit `HTTPStatusHandler` with Mimir's page template.
 async fn memberlist_handler(
     AxumState(st): AxumState<AppHttpState>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    let Some(ref ml) = st.memberlist_kv else {
-        return (StatusCode::NOT_FOUND, "memberlist KV is not enabled").into_response();
-    };
-
-    let members_raw = ml.members();
-    let keys_count = ml.list_keys("").len();
-    let mut members: Vec<MemberlistMemberJson> = members_raw
-        .into_iter()
-        .map(|m| MemberlistMemberJson {
-            name: m.name.clone(),
-            addr: m.address(),
-            state: format!("{:?}", m.state),
-            incarnation: m.incarnation,
-        })
-        .collect();
-    members.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let accepts_json = headers
+    let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.contains("application/json"));
-
-    if accepts_json {
-        return Json(MemberlistStatusJson {
-            node_name: ml.node_name().to_string(),
-            advertise_addr: ml.advertise_addr(),
-            keys_count,
-            members,
-        })
-        .into_response();
-    }
-
-    let mut html = format!(
-        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Memberlist Status</title></head>\
-         <body><h1>Memberlist Status</h1>\
-         <p>Node: {} ({})</p><p>KV keys: {}</p>\
-         <table border=\"1\"><thead><tr><th>Name</th><th>Address</th><th>State</th><th>Incarnation</th></tr></thead><tbody>",
-        html_escape(ml.node_name()),
-        html_escape(&ml.advertise_addr()),
-        keys_count
+        .unwrap_or_default();
+    let res = http_status::serve_http(
+        st.memberlist_kv.as_deref(),
+        query.as_deref(),
+        accept,
+        render_memberlist_status_page,
     );
-    for m in members {
-        html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            html_escape(&m.name),
-            html_escape(&m.addr),
-            html_escape(&m.state),
-            m.incarnation
-        ));
+    let mut resp = Response::new(axum::body::Body::from(res.body));
+    *resp.status_mut() = StatusCode::from_u16(res.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    for (name, value) in res.headers {
+        if let Ok(v) = header::HeaderValue::from_str(&value) {
+            resp.headers_mut().insert(name, v);
+        }
     }
-    html.push_str("</tbody></table></body></html>");
-    Html(html).into_response()
+    resp
 }
 
 async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
@@ -799,7 +754,7 @@ async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
         ));
     }
 
-    if st.memberlist_kv.is_some() {
+    if st.memberlist_kv.is_some() || st.ingester.is_some() {
         html.push_str("<h2>Memberlist</h2><ul>");
         html.push_str(&format!(
             "<li><a href=\"{}\">Status</a></li></ul>",

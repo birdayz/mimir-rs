@@ -1,0 +1,87 @@
+# Values for scripts/k3d-helm-e2e.sh: upstream mimir-distributed chart, trimmed to
+# fit a laptop-sized k3d cluster. Everything not listed here is the chart default
+# (ingest storage + built-in Kafka, zone-aware ingesters, rollout-operator, minio).
+# The ingester image is overridden per MODE by the script (--set / post-renderer),
+# never here.
+
+# Components the ingester e2e does not need.
+alertmanager:
+  enabled: false
+ruler:
+  enabled: false
+overrides_exporter:
+  enabled: false
+gateway:
+  enabled: false
+
+distributor:
+  replicas: 1
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+
+querier:
+  replicas: 1
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+
+query_frontend:
+  replicas: 1
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+
+query_scheduler:
+  replicas: 1
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+
+compactor:
+  replicas: 1
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+
+store_gateway:
+  replicas: 1
+  zoneAwareReplication:
+    enabled: false
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+
+# Zone-aware ingesters, one replica per zone, each zone pinned to the k3d agent
+# node labelled with the matching topology.kubernetes.io/zone.
+ingester:
+  replicas: 3
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+  persistentVolume:
+    size: 1Gi
+  zoneAwareReplication:
+    enabled: true
+    zones:
+      - name: zone-a
+        nodeSelector:
+          topology.kubernetes.io/zone: zone-a
+        prepareDownscale: true
+      - name: zone-b
+        nodeSelector:
+          topology.kubernetes.io/zone: zone-b
+        prepareDownscale: true
+      - name: zone-c
+        nodeSelector:
+          topology.kubernetes.io/zone: zone-c
+        prepareDownscale: true
+
+kafka:
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+  persistence:
+    size: 1Gi
+
+minio:
+  persistence:
+    size: 1Gi
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+
+rollout_operator:
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
