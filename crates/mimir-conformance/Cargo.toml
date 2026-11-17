@@ -34,4 +34,5 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
-testcontainers = { workspace = true }
+serde_yaml = { workspace = true }
+testcontainers = { workspace = true, features = ["docker-compose"] }

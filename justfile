@@ -34,6 +34,10 @@ test-crate crate *args:
 conformance-kafka-tls *args:
     ./scripts/build-go-oracle.sh && cargo test -p mimir-conformance --test w6_kafka_tls_sasl_testcontainers {{args}} -- --nocapture --test-threads 3
 
+# Kubernetes/Helm-faithful Go vs Rust differential suite (docker compose; one cluster at a time).
+conformance-k8s *args:
+    ./scripts/build-go-oracle.sh && cargo test -p mimir-conformance --test w7_k8s_helm_memberlist_testcontainers {{args}} -- --nocapture --test-threads 1
+
 conformance *args:
     ./scripts/build-go-oracle.sh && cargo test -p mimir-conformance {{args}}
 
