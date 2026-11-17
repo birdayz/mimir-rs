@@ -17,10 +17,11 @@ use mimir_config::{
 };
 use mimir_ring::kv::inmemory::InMemoryKv;
 use mimir_ring::kv::multi::{
-    runtime_config_provider, MultiConfigProvider, MultiKv, MultiRuntimeConfig, NamedKvClient,
+    runtime_config_provider, MultiConfigProvider, MultiKv, MultiKvOptions, MultiRuntimeConfig,
+    NamedKvClient,
 };
 use mimir_ring::kv::{
-    build_kv_client_with_multi_config_provider, get_typed, CasOutcome, Codec, KvClient,
+    build_kv_client_with_options, get_typed, CasOutcome, Codec, KvClient, KvClientOptions,
     StringCodec,
 };
 use prometheus::Registry;
@@ -60,8 +61,11 @@ fn setup(mirror_enabled: bool, provider: Option<MultiConfigProvider>) -> Setup {
             },
         ],
         Some(&reg),
-        Some(codec()),
-        provider,
+        MultiKvOptions {
+            codec: Some(codec()),
+            config_provider: provider,
+            ..Default::default()
+        },
     );
     Setup { multi, a, b, reg }
 }
@@ -278,19 +282,49 @@ async fn runtime_config_file_flips_primary_of_multi_store() {
         ..Default::default()
     };
     let reg = Registry::new();
-    let client = build_kv_client_with_multi_config_provider(
+    let provider = runtime_config_provider(&mgr);
+    let client = build_kv_client_with_options(
         &kv_cfg,
         codec(),
         None,
         Some(&reg),
-        Some(runtime_config_provider(&mgr)),
+        KvClientOptions {
+            kv_name: Some("ingester-ring".to_string()),
+            metrics_prefix: "cortex_".to_string(),
+            multi_config_provider: Some(provider.clone()),
+        },
     )
     .unwrap();
+    // A second client on the same registry (like the lifecycler) gets its own series.
+    let client2 = build_kv_client_with_options(
+        &kv_cfg,
+        codec(),
+        None,
+        Some(&reg),
+        KvClientOptions {
+            kv_name: Some("ingester-lifecycler".to_string()),
+            metrics_prefix: "cortex_".to_string(),
+            multi_config_provider: Some(provider),
+        },
+    )
+    .unwrap();
+    let lifecycler_primary = |r: &Registry, store: &str| {
+        r.gather()
+            .into_iter()
+            .filter(|mf| mf.get_name() == "cortex_multikv_primary_store")
+            .flat_map(|mf| mf.get_metric().to_vec())
+            .find(|m| {
+                let l = m.get_label();
+                l.iter().any(|l| l.get_name() == "kv_name" && l.get_value() == "ingester-lifecycler")
+                    && l.iter().any(|l| l.get_name() == "store" && l.get_value() == store)
+            })
+            .map(|m| m.get_gauge().get_value())
+    };
 
     // Initial runtime value (mirror_enabled: true) is pushed on creation.
     let r = reg.clone();
-    eventually(move || gauge(&r, "multikv_mirror_enabled", None) == 1.0).await;
-    assert_eq!(gauge(&reg, "multikv_primary_store", Some(("store", "inmemory"))), 1.0);
+    eventually(move || gauge(&r, "cortex_multikv_mirror_enabled", Some(("kv_name", "ingester-ring"))) == 1.0).await;
+    assert_eq!(gauge(&reg, "cortex_multikv_primary_store", Some(("store", "inmemory"))), 1.0);
 
     std::fs::write(
         &file,
@@ -300,17 +334,21 @@ async fn runtime_config_file_flips_primary_of_multi_store() {
     mgr.reload().unwrap();
     let r = reg.clone();
     eventually(move || {
-        gauge(&r, "multikv_primary_store", Some(("store", "consul"))) == 1.0
-            && gauge(&r, "multikv_mirror_enabled", None) == 0.0
+        gauge(&r, "cortex_multikv_primary_store", Some(("store", "consul"))) == 1.0
+            && gauge(&r, "cortex_multikv_mirror_enabled", None) == 0.0
+            && lifecycler_primary(&r, "consul") == Some(1.0)
     })
     .await;
-    assert_eq!(gauge(&reg, "multikv_primary_store", Some(("store", "inmemory"))), 0.0);
+    assert_eq!(gauge(&reg, "cortex_multikv_primary_store", Some(("store", "inmemory"))), 0.0);
 
     // And back.
     std::fs::write(&file, "multi_kv_config:\n  primary: inmemory\n").unwrap();
     mgr.reload().unwrap();
     let r = reg.clone();
-    eventually(move || gauge(&r, "multikv_primary_store", Some(("store", "inmemory"))) == 1.0)
-        .await;
-    drop(client);
+    eventually(move || {
+        gauge(&r, "cortex_multikv_primary_store", Some(("store", "inmemory"))) == 1.0
+            && lifecycler_primary(&r, "inmemory") == Some(1.0)
+    })
+    .await;
+    drop((client, client2));
 }

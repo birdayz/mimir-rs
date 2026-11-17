@@ -322,17 +322,30 @@ pub fn build_kv_client(
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
     reg: Option<&prometheus::Registry>,
 ) -> Result<Arc<dyn KvClient>, KvError> {
-    build_kv_client_with_multi_config_provider(cfg, codec, memberlist_kv, reg, None)
+    build_kv_client_with_options(cfg, codec, memberlist_kv, reg, KvClientOptions::default())
 }
 
-/// Like [`build_kv_client`], with `MultiConfig.ConfigProvider` set: a `multi` store watches
-/// the provider for runtime `multi_kv_config` changes (primary switch, mirroring toggle).
-pub fn build_kv_client_with_multi_config_provider(
+/// Per-client options of `kv.NewClient` that are not part of the YAML config.
+#[derive(Clone, Default)]
+pub struct KvClientOptions {
+    /// `kv.RegistererWithKVName`: value of the `kv_name` label on the client's metrics
+    /// (currently applied to the `multikv_*` metrics).
+    pub kv_name: Option<String>,
+    /// Metric name prefix of the registerer the client is created with (e.g. `cortex_` for
+    /// `prometheus.WrapRegistererWithPrefix("cortex_", ...)`).
+    pub metrics_prefix: String,
+    /// `MultiConfig.ConfigProvider`: a `multi` store watches it for runtime
+    /// `multi_kv_config` changes (primary switch, mirroring toggle).
+    pub multi_config_provider: Option<multi::MultiConfigProvider>,
+}
+
+/// Like [`build_kv_client`], with [`KvClientOptions`].
+pub fn build_kv_client_with_options(
     cfg: &KVStoreConfig,
     codec: Arc<dyn Codec>,
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
     reg: Option<&prometheus::Registry>,
-    multi_config_provider: Option<multi::MultiConfigProvider>,
+    opts: KvClientOptions,
 ) -> Result<Arc<dyn KvClient>, KvError> {
     let client = create_client(
         &cfg.store,
@@ -341,7 +354,7 @@ pub fn build_kv_client_with_multi_config_provider(
         codec,
         memberlist_kv,
         reg,
-        multi_config_provider,
+        opts,
     )?;
     Ok(client)
 }
@@ -353,7 +366,7 @@ fn create_client(
     codec: Arc<dyn Codec>,
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
     reg: Option<&prometheus::Registry>,
-    multi_config_provider: Option<multi::MultiConfigProvider>,
+    opts: KvClientOptions,
 ) -> Result<Arc<dyn KvClient>, KvError> {
     let base: Arc<dyn KvClient> = match backend {
         "inmemory" => Arc::new(inmemory::InMemoryKv::shared_with_codec(codec)),
@@ -388,7 +401,7 @@ fn create_client(
                 codec.clone(),
                 memberlist_kv.clone(),
                 reg,
-                None,
+                KvClientOptions::default(),
             )?;
             let secondary = create_client(
                 &cfg.multi.secondary,
@@ -397,7 +410,7 @@ fn create_client(
                 codec.clone(),
                 memberlist_kv,
                 reg,
-                None,
+                KvClientOptions::default(),
             )?;
             multi::MultiKv::new_with_options(
                 cfg.multi.clone(),
@@ -412,8 +425,12 @@ fn create_client(
                     },
                 ],
                 reg,
-                Some(codec),
-                multi_config_provider,
+                multi::MultiKvOptions {
+                    codec: Some(codec),
+                    config_provider: opts.multi_config_provider,
+                    kv_name: opts.kv_name,
+                    metrics_prefix: opts.metrics_prefix,
+                },
             )
         }
         other => {

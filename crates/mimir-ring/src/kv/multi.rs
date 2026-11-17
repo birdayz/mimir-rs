@@ -110,26 +110,33 @@ struct MultiMetrics {
 }
 
 impl MultiMetrics {
-    fn new(reg: Option<&Registry>) -> Self {
+    fn new(reg: Option<&Registry>, prefix: &str, kv_name: Option<&str>) -> Self {
+        let opts = |name: &str, help: &str| {
+            let mut o = Opts::new(format!("{prefix}{name}"), help);
+            if let Some(kv_name) = kv_name {
+                o = o.const_label("kv_name", kv_name);
+            }
+            o
+        };
         let primary_store = GaugeVec::new(
-            Opts::new("multikv_primary_store", "Selected primary KV store"),
+            opts("multikv_primary_store", "Selected primary KV store"),
             &["store"],
         )
         .expect("valid metric");
-        let mirror_enabled = Gauge::new(
+        let mirror_enabled = Gauge::with_opts(opts(
             "multikv_mirror_enabled",
             "Is mirroring to secondary store enabled",
-        )
+        ))
         .expect("valid metric");
-        let mirror_writes = Counter::new(
+        let mirror_writes = Counter::with_opts(opts(
             "multikv_mirror_writes_total",
             "Number of mirror-writes to secondary store",
-        )
+        ))
         .expect("valid metric");
-        let mirror_failures = Counter::new(
+        let mirror_failures = Counter::with_opts(opts(
             "multikv_mirror_write_errors_total",
             "Number of failures to mirror-write to secondary store",
-        )
+        ))
         .expect("valid metric");
 
         if let Some(r) = reg {
@@ -146,6 +153,19 @@ impl MultiMetrics {
             mirror_failures,
         }
     }
+}
+
+/// Options for [`MultiKv::new_with_options`].
+#[derive(Clone, Default)]
+pub struct MultiKvOptions {
+    /// Codec of the stored values; enables mirroring of generic [`KvClient::cas`] writes.
+    pub codec: Option<Arc<dyn Codec>>,
+    /// `MultiConfig.ConfigProvider`, watched for runtime primary switches and mirroring toggles.
+    pub config_provider: Option<MultiConfigProvider>,
+    /// `kv_name` const label of the `multikv_*` metrics (`kv.RegistererWithKVName`).
+    pub kv_name: Option<String>,
+    /// Metric name prefix of the registerer (e.g. `cortex_`).
+    pub metrics_prefix: String,
 }
 
 pub struct MultiKv {
@@ -167,19 +187,22 @@ impl MultiKv {
         clients: Vec<NamedKvClient>,
         reg: Option<&Registry>,
     ) -> Arc<Self> {
-        Self::new_with_options(cfg, clients, reg, None, None)
+        Self::new_with_options(cfg, clients, reg, MultiKvOptions::default())
     }
 
-    /// `NewMultiClient`: `codec` enables mirroring of generic [`KvClient::cas`] writes, and
-    /// `config_provider` (`MultiConfig.ConfigProvider`) is watched for runtime primary switches
-    /// and mirroring toggles.
+    /// `NewMultiClient` with the options that dskit passes outside of the YAML config.
     pub fn new_with_options(
         cfg: MultiKVConfig,
         clients: Vec<NamedKvClient>,
         reg: Option<&Registry>,
-        codec: Option<Arc<dyn Codec>>,
-        config_provider: Option<MultiConfigProvider>,
+        opts: MultiKvOptions,
     ) -> Arc<Self> {
+        let MultiKvOptions {
+            codec,
+            config_provider,
+            kv_name,
+            metrics_prefix,
+        } = opts;
         let m = Arc::new(Self {
             clients,
             codec,
@@ -188,7 +211,7 @@ impl MultiKv {
             primary_id: AtomicUsize::new(0),
             in_progress: Mutex::new(HashMap::new()),
             in_progress_cnt: AtomicUsize::new(0),
-            metrics: MultiMetrics::new(reg),
+            metrics: MultiMetrics::new(reg, &metrics_prefix, kv_name.as_deref()),
         });
         m.update_primary_store_gauge();
         m.update_mirror_enabled_gauge();
