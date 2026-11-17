@@ -8,8 +8,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+#[doc(hidden)]
+pub use crate::head_chunks::{WriteFaultAction, WriteFaultHook};
 
 use thiserror::Error;
 
@@ -234,6 +237,15 @@ impl Page {
 struct OpenSegment {
     file: File,
     index: usize,
+    file_len: u64,
+}
+
+struct WlogSnapshot {
+    file_pos: u64,
+    done_pages: usize,
+    page_alloc: usize,
+    page_flushed: usize,
+    tail_len: usize,
 }
 
 /// Prometheus TSDB WAL / WBL writer with 32 KiB page framing, Snappy/Zstd compression,
@@ -247,6 +259,8 @@ pub struct WlogWriter {
     compress: CompressionType,
     closed: bool,
     comp_buf: Vec<u8>,
+    rollback_page_buf: Vec<u8>,
+    fault_hook: Option<WriteFaultHook>,
     metrics: Option<crate::metrics::WlogMetrics>,
 }
 
@@ -272,7 +286,7 @@ impl WlogWriter {
         };
 
         let seg = Self::create_segment(&dir, write_segment_index)?;
-        let done_pages = (seg.file.metadata()?.len() as usize) / PAGE_SIZE;
+        let done_pages = (seg.file_len as usize) / PAGE_SIZE;
 
         Ok(Self {
             dir,
@@ -283,8 +297,16 @@ impl WlogWriter {
             compress,
             closed: false,
             comp_buf: Vec::new(),
+            rollback_page_buf: Vec::new(),
+            fault_hook: None,
             metrics: None,
         })
+    }
+
+    /// Installs or clears a write fault-injection hook (used by durability tests).
+    #[doc(hidden)]
+    pub fn set_write_fault_hook(&mut self, hook: Option<WriteFaultHook>) {
+        self.fault_hook = hook;
     }
 
     fn create_segment(dir: &Path, index: usize) -> Result<OpenSegment, WlogError> {
@@ -293,7 +315,44 @@ impl WlogWriter {
             .create(true)
             .append(true)
             .open(&path)?;
-        Ok(OpenSegment { file, index })
+        let file_len = file.metadata()?.len();
+        Ok(OpenSegment {
+            file,
+            index,
+            file_len,
+        })
+    }
+
+    fn take_snapshot(&mut self) -> Result<WlogSnapshot, WlogError> {
+        let seg = self.segment.as_ref().ok_or(WlogError::Closed)?;
+        let tail_len = self.page.alloc.saturating_sub(self.page.flushed);
+        self.rollback_page_buf.clear();
+        if tail_len > 0 {
+            self.rollback_page_buf
+                .extend_from_slice(&self.page.buf[self.page.flushed..self.page.alloc]);
+        }
+        Ok(WlogSnapshot {
+            file_pos: seg.file_len,
+            done_pages: self.done_pages,
+            page_alloc: self.page.alloc,
+            page_flushed: self.page.flushed,
+            tail_len,
+        })
+    }
+
+    fn rollback_snapshot(&mut self, snap: WlogSnapshot) {
+        if let Some(seg) = self.segment.as_mut() {
+            let _ = seg.file.set_len(snap.file_pos);
+            let _ = seg.file.seek(SeekFrom::Start(snap.file_pos));
+            seg.file_len = snap.file_pos;
+        }
+        self.done_pages = snap.done_pages;
+        self.page.alloc = snap.page_alloc;
+        self.page.flushed = snap.page_flushed;
+        if snap.tail_len > 0 {
+            self.page.buf[snap.page_flushed..snap.page_alloc]
+                .copy_from_slice(&self.rollback_page_buf[..snap.tail_len]);
+        }
     }
 
     #[inline]
@@ -348,7 +407,28 @@ impl WlogWriter {
             self.page.alloc = PAGE_SIZE;
         }
         while self.page.flushed < self.page.alloc {
-            match seg.file.write(&self.page.buf[self.page.flushed..self.page.alloc]) {
+            let slice = &self.page.buf[self.page.flushed..self.page.alloc];
+            let write_res = match self.fault_hook.as_ref() {
+                None => seg.file.write(slice),
+                Some(hook) => match hook(slice.len()) {
+                    WriteFaultAction::PassThrough => seg.file.write(slice),
+                    WriteFaultAction::PartialThenError {
+                        prefix_len,
+                        err_kind,
+                    } => {
+                        let p = prefix_len.min(slice.len());
+                        if p > 0 {
+                            seg.file.write_all(&slice[..p])?;
+                            seg.file_len += p as u64;
+                        }
+                        Err(io::Error::new(err_kind, "injected WAL write fault"))
+                    }
+                    WriteFaultAction::Error(err_kind) => {
+                        Err(io::Error::new(err_kind, "injected WAL write fault"))
+                    }
+                },
+            };
+            match write_res {
                 Ok(0) => {
                     return Err(WlogError::Io(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -357,6 +437,7 @@ impl WlogWriter {
                 }
                 Ok(n) => {
                     self.page.flushed += n;
+                    seg.file_len += n as u64;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(WlogError::Io(e)),
@@ -378,15 +459,20 @@ impl WlogWriter {
             return Err(WlogError::Closed);
         }
         if self.page.alloc > 0 {
-            self.flush_page(true)?;
+            let snap = self.take_snapshot()?;
+            if let Err(e) = self.flush_page(true) {
+                self.rollback_snapshot(snap);
+                return Err(e);
+            }
         }
-        let prev = self.segment.take().ok_or(WlogError::Closed)?;
-        let next_idx = prev.index + 1;
-        Self::fsync_file(self.metrics.as_ref(), &prev.file)?;
-        drop(prev);
+        let next_idx = {
+            let prev = self.segment.as_ref().ok_or(WlogError::Closed)?;
+            Self::fsync_file(self.metrics.as_ref(), &prev.file)?;
+            prev.index + 1
+        };
 
         let next = Self::create_segment(&self.dir, next_idx)?;
-        self.done_pages = (next.file.metadata()?.len() as usize) / PAGE_SIZE;
+        self.done_pages = (next.file_len as usize) / PAGE_SIZE;
         self.segment = Some(next);
         self.set_current_segment_metric(next_idx);
         Ok(next_idx)
@@ -459,7 +545,11 @@ impl WlogWriter {
         is_final: bool,
     ) -> Result<(), WlogError> {
         if self.page.full() {
-            self.flush_page(true)?;
+            let snap = self.take_snapshot()?;
+            if let Err(e) = self.flush_page(true) {
+                self.rollback_snapshot(snap);
+                return Err(e);
+            }
         }
 
         let payload_len = payload.len();
@@ -474,47 +564,60 @@ impl WlogWriter {
             self.next_segment()?;
         }
 
-        let mut offset = 0usize;
-        let mut part_idx = 0usize;
-        while part_idx == 0 || offset < payload_len {
-            let max_part = PAGE_SIZE - self.page.alloc - RECORD_HEADER_SIZE;
-            let part_len = (payload_len - offset).min(max_part);
+        // Snapshot before touching Page or writing any fragment of this record
+        // so mid-record ENOSPC/EIO (including multi-page REC_FIRST -> REC_MIDDLE)
+        // cleanly truncates back and restores Page state with zero orphan REC_FIRST.
+        let snap = self.take_snapshot()?;
+        let write_res = (|| -> Result<(), WlogError> {
+            let mut offset = 0usize;
+            let mut part_idx = 0usize;
+            while part_idx == 0 || offset < payload_len {
+                let max_part = PAGE_SIZE - self.page.alloc - RECORD_HEADER_SIZE;
+                let part_len = (payload_len - offset).min(max_part);
 
-            let is_last = offset + part_len == payload_len;
-            let mut typ = match (part_idx == 0, is_last) {
-                (true, true) => REC_FULL,
-                (false, true) => REC_LAST,
-                (true, false) => REC_FIRST,
-                (false, false) => REC_MIDDLE,
-            };
+                let is_last = offset + part_len == payload_len;
+                let mut typ = match (part_idx == 0, is_last) {
+                    (true, true) => REC_FULL,
+                    (false, true) => REC_LAST,
+                    (true, false) => REC_FIRST,
+                    (false, false) => REC_MIDDLE,
+                };
 
-            match used_comp {
-                CompressionType::None => {}
-                CompressionType::Snappy => typ |= SNAPPY_MASK,
-                CompressionType::Zstd => typ |= ZSTD_MASK,
+                match used_comp {
+                    CompressionType::None => {}
+                    CompressionType::Snappy => typ |= SNAPPY_MASK,
+                    CompressionType::Zstd => typ |= ZSTD_MASK,
+                }
+
+                let part = &payload[offset..offset + part_len];
+                let crc = crc32c::crc32c(part);
+                let hdr_pos = self.page.alloc;
+                self.page.buf[hdr_pos] = typ;
+                self.page.buf[hdr_pos + 1..hdr_pos + 3]
+                    .copy_from_slice(&(part_len as u16).to_be_bytes());
+                self.page.buf[hdr_pos + 3..hdr_pos + 7].copy_from_slice(&crc.to_be_bytes());
+                self.page.buf[hdr_pos + RECORD_HEADER_SIZE..hdr_pos + RECORD_HEADER_SIZE + part_len]
+                    .copy_from_slice(part);
+                self.page.alloc += RECORD_HEADER_SIZE + part_len;
+
+                if self.page.full() {
+                    self.flush_page(true)?;
+                }
+
+                offset += part_len;
+                part_idx += 1;
             }
 
-            let part = &payload[offset..offset + part_len];
-            let crc = crc32c::crc32c(part);
-            let hdr_pos = self.page.alloc;
-            self.page.buf[hdr_pos] = typ;
-            self.page.buf[hdr_pos + 1..hdr_pos + 3]
-                .copy_from_slice(&(part_len as u16).to_be_bytes());
-            self.page.buf[hdr_pos + 3..hdr_pos + 7].copy_from_slice(&crc.to_be_bytes());
-            self.page.buf[hdr_pos + RECORD_HEADER_SIZE..hdr_pos + RECORD_HEADER_SIZE + part_len]
-                .copy_from_slice(part);
-            self.page.alloc += RECORD_HEADER_SIZE + part_len;
-
-            if self.page.full() {
-                self.flush_page(true)?;
+            if is_final && self.page.alloc > 0 {
+                self.flush_page(false)?;
             }
 
-            offset += part_len;
-            part_idx += 1;
-        }
+            Ok(())
+        })();
 
-        if is_final && self.page.alloc > 0 {
-            self.flush_page(false)?;
+        if let Err(e) = write_res {
+            self.rollback_snapshot(snap);
+            return Err(e);
         }
 
         Ok(())
@@ -570,11 +673,16 @@ impl WlogWriter {
         }
         if self.segment.is_some() {
             if self.page.alloc > 0 {
-                self.flush_page(true)?;
+                let snap = self.take_snapshot()?;
+                if let Err(e) = self.flush_page(true) {
+                    self.rollback_snapshot(snap);
+                    return Err(e);
+                }
             }
-            if let Some(seg) = self.segment.take() {
+            if let Some(ref seg) = self.segment {
                 Self::fsync_file(self.metrics.as_ref(), &seg.file)?;
             }
+            self.segment = None;
         }
         self.closed = true;
         Ok(())

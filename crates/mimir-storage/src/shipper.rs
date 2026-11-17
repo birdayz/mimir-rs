@@ -994,7 +994,10 @@ pub async fn delete_no_compact_marker(
 }
 
 pub(crate) fn atomic_write_file(target: &Path, data: &[u8]) -> std::io::Result<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let parent = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
     fs::create_dir_all(parent)?;
     let tmp = target.with_extension(format!(
         "{}.tmp",
@@ -1003,14 +1006,21 @@ pub(crate) fn atomic_write_file(target: &Path, data: &[u8]) -> std::io::Result<(
             .and_then(|e| e.to_str())
             .unwrap_or("file")
     ));
-    {
+    let write_res = (|| -> std::io::Result<()> {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, target)?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, target)?;
-    if let Ok(dir_file) = fs::File::open(parent) {
-        let _ = dir_file.sync_all();
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
 }
@@ -1351,5 +1361,20 @@ mod tests {
         let shipped = shipper.sync().await.unwrap();
         assert_eq!(shipped, 1);
         assert_eq!(store.put_order.lock().len(), 3);
+    }
+
+    #[test]
+    fn atomic_write_file_cleans_up_tmp_on_rename_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("kafka-offset.json");
+        // Make target a non-empty directory so rename(&tmp, &target) fails with EISDIR.
+        fs::create_dir_all(target.join("blocker")).unwrap();
+
+        let err = atomic_write_file(&target, b"{}").unwrap_err();
+        assert!(err.raw_os_error().is_some());
+        assert!(
+            !dir.path().join("kafka-offset.json.tmp").exists(),
+            "orphan .tmp file must be removed on error"
+        );
     }
 }
