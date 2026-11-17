@@ -167,7 +167,7 @@ IMAGES=(
   docker.io/prom/prometheus:v3.5.0
   docker.io/curlimages/curl:8.15.0
 )
-[[ $MODE != go ]] && IMAGES+=("$RUST_IMAGE")
+if [[ $MODE != go ]]; then IMAGES+=("$RUST_IMAGE"); fi
 for img in "${IMAGES[@]}"; do
   docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null
 done
@@ -313,7 +313,7 @@ check_ring() {
         (.shards[] | select(.id as $id | ($want | map(.name) | index($id)) == null)
           | "EXTRA \(.id) \(.state) \(.address) \(.zone)")' <<<"$ring")
     echo "$out" | sed "s|^|$viewer: |"
-    grep -qvE '^OK ' <<<"$out" && bad=1
+    if grep -qvE '^OK ' <<<"$out"; then bad=1; fi
   done
   return $bad
 }
@@ -423,7 +423,7 @@ check_memberlist() {
       echo "OK $p sees all $(wc -w <<<"$view") members at their pod IPs"
     fi
   done <<<"$users"
-  [[ -n $expected ]] && echo "expected members: $expected"
+  if [[ -n $expected ]]; then echo "expected members: $expected"; fi
   return $bad
 }
 log "d. checking memberlist membership on every memberlist pod"
@@ -451,8 +451,8 @@ fi
 # d3 (report-only): incarnation numbers, where the JSON exposes them. Go nodes
 # only bump their incarnation to refute suspicion, so it stays 1 in a healthy cluster.
 for f in "$OUT_DIR"/memberlist-initial-*.json; do
-  inc=$(memberlist_members <"$f" 2>/dev/null | awk -F'\t' '$3 != "-" {printf "%s=%s ", $1, $3}')
-  [[ -n $inc ]] && info "d3. incarnations seen by $(basename "$f" .json | sed 's/^memberlist-initial-//'): $inc"
+  inc=$({ memberlist_members <"$f" 2>/dev/null || true; } | awk -F'\t' '$3 != "-" {printf "%s=%s ", $1, $3}')
+  if [[ -n $inc ]]; then info "d3. incarnations seen by $(basename "$f" .json | sed 's/^memberlist-initial-//'): $inc"; fi
 done
 
 ###############################################################################
@@ -464,7 +464,7 @@ DIST_URL=http://$RELEASE-distributor.$NS.svc:8080
 promq() {
   local cons=$1 ep=$2; shift 2
   local hdr=(-H "X-Scope-OrgID: $TENANT")
-  [[ $cons == strong ]] && hdr+=(-H "X-Read-Consistency: strong")
+  if [[ $cons == strong ]]; then hdr+=(-H "X-Read-Consistency: strong"); fi
   incurl "${hdr[@]}" -G "$QF_URL/$ep" "$@"
 }
 ingester_metric() { # <pod> <metric> -> sum of all series of that metric (0 if absent)
@@ -487,7 +487,7 @@ if [[ $got == "$n_targets" ]]; then
   pass "e1. query-frontend instant query: count(up==1) = $got = number of http-metrics targets"
 else
   fail "e1. count(up==1) = $got, expected $n_targets scrape targets"
-  echo "$r" | head -c 1000 | evidence
+  head -c 1000 <<<"$r" | evidence
 fi
 
 # Range query over the last 3 minutes: every series must have >= 3 points.
@@ -524,13 +524,13 @@ for i in $(seq 1 15); do
     done
   done
 done
-distinct=$(grep -v '^ERROR' "$answers" | sort -u | wc -l)
+distinct=$({ grep -v '^ERROR' "$answers" || true; } | sort -u | wc -l)
 empty=$(grep -c '=> \[\]$' "$answers" || true)
 if ((qerr == 0 && distinct == 3 && empty == 0)); then
   pass "e3. 90 instant queries (eventual+strong) at fixed time all succeeded, non-empty and identical per query"
 else
   fail "e3. consistency: errors=$qerr distinct_answers=$distinct (want 3) empty=$empty"
-  sort "$answers" | uniq -c | head -c 3000 | evidence
+  sort "$answers" | uniq -c >"$answers.counts"; head -c 3000 "$answers.counts" | evidence
 fi
 
 # Read-your-writes with strong consistency: push via OTLP JSON, read immediately.
@@ -630,7 +630,7 @@ if ((nerr == 0 && nq > 10)); then
   pass "f2. $nq queries during/after the rollout, 0 errors"
 else
   fail "f2. $nerr/$nq queries failed during/after the rollout"
-  grep ERROR "$qlog" | head -20 | evidence
+  awk '/ERROR/ && n++ < 20' "$qlog" | evidence
 fi
 
 INGESTERS=$(ingesters_tsv)
@@ -682,9 +682,9 @@ grep -ohE '\b[a-z][a-z0-9_]*_[a-z0-9_]+' "$MIXIN_DASHBOARDS"/*.json | sort -u >"
 GO_REF=$WORK/go-ingester-metrics.txt
 while IFS=$'\t' read -r p ip zone impl img; do
   { incurl "http://$ip:8080/metrics" || true; } | sample_names >"$OUT_DIR/metrics-$p.txt"
-  [[ $impl == go ]] && cp "$OUT_DIR/metrics-$p.txt" "$GO_REF.tmp"
+  if [[ $impl == go ]]; then cp "$OUT_DIR/metrics-$p.txt" "$GO_REF.tmp"; fi
 done <<<"$INGESTERS"
-[[ -f $GO_REF.tmp ]] && mv "$GO_REF.tmp" "$GO_REF"
+if [[ -f $GO_REF.tmp ]]; then mv "$GO_REF.tmp" "$GO_REF"; fi
 if [[ $MODE == go ]]; then
   info "g. Go ingester metric names saved to $GO_REF ($(wc -l <"$GO_REF") names) as reference for mixed/rust"
 elif [[ -f $GO_REF ]]; then
