@@ -150,6 +150,8 @@ pub struct HeadOptions {
     pub head_chunks_write_buffer_size: usize,
     /// Go `Options.TimelyCompaction` (Mimir `timely_head_compaction_enabled`, default off).
     pub timely_compaction: bool,
+    /// Mimir `head_postings_for_matchers_cache_{ttl,max_bytes,versions}`.
+    pub postings_cache: PostingsForMatchersCacheConfig,
     pub metadata_limits: MetadataLimits,
     pub series_lifecycle_callback: Option<Arc<dyn SeriesLifecycleCallback>>,
     pub registry: Option<Arc<prometheus::Registry>>,
@@ -184,6 +186,7 @@ impl std::fmt::Debug for HeadOptions {
                 &self.head_chunks_write_buffer_size,
             )
             .field("timely_compaction", &self.timely_compaction)
+            .field("postings_cache", &self.postings_cache)
             .field("metadata_limits", &self.metadata_limits)
             .field(
                 "series_lifecycle_callback",
@@ -214,6 +217,10 @@ impl Default for HeadOptions {
             head_chunks_write_queue_size: 0,
             head_chunks_write_buffer_size: crate::head_chunks::DEFAULT_WRITE_BUFFER_SIZE,
             timely_compaction: false,
+            postings_cache: PostingsForMatchersCacheConfig {
+                enable_invalidation: true,
+                ..Default::default()
+            },
             metadata_limits: MetadataLimits::default(),
             series_lifecycle_callback: None,
             registry: None,
@@ -2038,8 +2045,11 @@ impl Head {
             postings: MemPostings::new_unordered(),
             postings_cache: PostingsForMatchersCache::new(
                 PostingsForMatchersCacheConfig {
+                    // Rust caches every head PostingsForMatchers call (Go only caches
+                    // concurrent / query-sharding calls unless `force`), so entries are
+                    // always invalidated on postings changes to keep Go's uncached results.
                     enable_invalidation: true,
-                    ..Default::default()
+                    ..opts.postings_cache.clone()
                 },
                 opts.registry.as_deref(),
             ),

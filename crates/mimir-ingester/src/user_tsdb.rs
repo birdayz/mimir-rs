@@ -23,6 +23,7 @@ use mimir_tsdb::db::{BlocksToDeleteFn, Tsdb, TsdbError, TsdbOptions};
 use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::metadata::MetadataLimits;
+use mimir_tsdb::postings_cache::PostingsForMatchersCacheConfig;
 use mimir_tsdb::record::MetricType;
 use mimir_tsdb::wlog::CompressionType;
 use parking_lot::{Mutex, RwLock};
@@ -427,6 +428,18 @@ impl UserTsdb {
             head_chunks_write_buffer_size: blocks_cfg.tsdb.head_chunks_write_buffer_size_bytes.max(0)
                 as usize,
             timely_compaction: blocks_cfg.tsdb.timely_head_compaction_enabled,
+            // Go `headPostingsForMatchersCacheFactory` (MaxItems: math.MaxInt).
+            postings_cache: PostingsForMatchersCacheConfig {
+                ttl: Duration::from_nanos(
+                    blocks_cfg.tsdb.head_postings_for_matchers_cache_ttl.as_nanos().max(0) as u64,
+                ),
+                max_items: usize::MAX,
+                max_bytes: blocks_cfg.tsdb.head_postings_for_matchers_cache_max_bytes.max(0)
+                    as usize,
+                enable_invalidation: true,
+                num_metric_versions: blocks_cfg.tsdb.head_postings_for_matchers_cache_versions.max(0)
+                    as usize,
+            },
             metadata_limits: MetadataLimits {
                 max_metrics_with_metadata_per_user: limiter.max_metadata_per_user(&user_id),
                 max_metadata_per_metric: limiter.max_metadata_per_metric(&user_id),
@@ -481,6 +494,17 @@ impl UserTsdb {
             enable_bigger_ooo_block_for_old_samples: blocks_cfg
                 .tsdb
                 .bigger_out_of_order_blocks_for_old_samples,
+            // Go `blockPostingsForMatchersCacheFactory` (no invalidation, MaxItems: math.MaxInt).
+            block_postings_cache: PostingsForMatchersCacheConfig {
+                ttl: Duration::from_nanos(
+                    blocks_cfg.tsdb.block_postings_for_matchers_cache_ttl.as_nanos().max(0) as u64,
+                ),
+                max_items: usize::MAX,
+                max_bytes: blocks_cfg.tsdb.block_postings_for_matchers_cache_max_bytes.max(0)
+                    as usize,
+                enable_invalidation: false,
+                num_metric_versions: 0,
+            },
         };
 
         let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
@@ -509,14 +533,23 @@ impl UserTsdb {
         let shipper: Option<Arc<dyn BlockShipper>> = if shipping_enabled {
             bucket.map(|b| {
                 let ooo_ext = tenant_limits.out_of_order_blocks_external_label_enabled;
-                Arc::new(Shipper::new_for_user(
-                    &user_id,
-                    &udir,
-                    b,
-                    SourceType::Receive,
-                    ooo_ext,
-                    shipper_metrics,
-                )) as Arc<dyn BlockShipper>
+                let ooo_overrides = overrides.clone();
+                let ooo_user = user_id.clone();
+                Arc::new(
+                    Shipper::new_for_user(
+                        &user_id,
+                        &udir,
+                        b,
+                        SourceType::Receive,
+                        ooo_ext,
+                        shipper_metrics,
+                    )
+                    .with_out_of_order_external_label_provider(Arc::new(move || {
+                        ooo_overrides
+                            .for_tenant(&ooo_user)
+                            .out_of_order_blocks_external_label_enabled
+                    })),
+                ) as Arc<dyn BlockShipper>
             })
         } else {
             None

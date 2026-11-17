@@ -21,6 +21,7 @@ use crate::exemplar::{CircularExemplarStorage, ExemplarQueryResult};
 use crate::head::{range_for_timestamp, Head, HeadAppender, HeadError, HeadOptions};
 use crate::matcher::LabelMatcher;
 use crate::metrics::{counter, gauge};
+use crate::postings_cache::PostingsForMatchersCacheConfig;
 use crate::querier::{TsdbChunkQuerier, TsdbQuerier};
 
 /// Go `tmpForDeletionBlockDirSuffix`.
@@ -66,6 +67,8 @@ pub struct TsdbOptions {
     pub blocks_to_delete: Option<BlocksToDeleteFn>,
     /// Go `Options.EnableBiggerOOOBlockForOldSamples`.
     pub enable_bigger_ooo_block_for_old_samples: bool,
+    /// Per-block `PostingsForMatchersCache` (Mimir `block_postings_for_matchers_cache_*`).
+    pub block_postings_cache: PostingsForMatchersCacheConfig,
 }
 
 impl std::fmt::Debug for TsdbOptions {
@@ -86,6 +89,7 @@ impl std::fmt::Debug for TsdbOptions {
                 "enable_bigger_ooo_block_for_old_samples",
                 &self.enable_bigger_ooo_block_for_old_samples,
             )
+            .field("block_postings_cache", &self.block_postings_cache)
             .finish()
     }
 }
@@ -99,6 +103,7 @@ impl Default for TsdbOptions {
             retention_duration_ms: 0,
             blocks_to_delete: None,
             enable_bigger_ooo_block_for_old_samples: false,
+            block_postings_cache: PostingsForMatchersCacheConfig::default(),
         }
     }
 }
@@ -339,7 +344,7 @@ impl Tsdb {
         metrics: &DbMetrics,
         loaded: &[Arc<Block>],
     ) -> Result<Vec<Arc<Block>>, TsdbError> {
-        let (loadable, mut corrupted) = Self::open_blocks(dir, loaded)?;
+        let (loadable, mut corrupted) = Self::open_blocks(dir, loaded, &opts.block_postings_cache)?;
 
         let default_fn =
             |blocks: &[Arc<Block>]| Self::default_blocks_to_delete(opts, metrics, blocks);
@@ -400,6 +405,7 @@ impl Tsdb {
     fn open_blocks(
         dir: &Path,
         loaded: &[Arc<Block>],
+        postings_cache: &PostingsForMatchersCacheConfig,
     ) -> Result<(Vec<Arc<Block>>, HashMap<Ulid, BlockError>), TsdbError> {
         let mut bdirs: Vec<PathBuf> = Vec::new();
         for entry in fs::read_dir(dir)? {
@@ -437,7 +443,7 @@ impl Tsdb {
         let mut corrupted = HashMap::new();
         if to_open.len() <= 1 {
             for (uid, bdir) in to_open {
-                match Block::open(&bdir) {
+                match Block::open_with_postings_cache(&bdir, postings_cache.clone()) {
                     Ok(b) => blocks.push(Arc::new(b)),
                     Err(e) => {
                         corrupted.insert(uid, e);
@@ -462,7 +468,8 @@ impl Tsdb {
                     let Some((uid, ref bdir)) = to_open.get(idx) else {
                         break;
                     };
-                    let res = Block::open(bdir).map(Arc::new);
+                    let res = Block::open_with_postings_cache(bdir, postings_cache.clone())
+                        .map(Arc::new);
                     results.lock().push((*uid, res));
                 });
             }

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -426,6 +427,9 @@ pub struct Shipper {
     pub bucket: BucketClient,
     pub source: SourceType,
     pub out_of_order_external_label_enabled: bool,
+    /// Go `cfgProvider.OutOfOrderBlocksExternalLabelEnabled(userID)`: consulted at every
+    /// upload so runtime-config changes apply; falls back to the static flag when unset.
+    pub out_of_order_external_label_provider: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub metrics: ShipperMetrics,
 }
 
@@ -447,8 +451,19 @@ impl Shipper {
             bucket,
             source,
             out_of_order_external_label_enabled,
+            out_of_order_external_label_provider: None,
             metrics,
         }
+    }
+
+    /// Reads the per-tenant `out_of_order_blocks_external_label_enabled` limit at each
+    /// upload (runtime overrides), like Go's shipper `cfgProvider`.
+    pub fn with_out_of_order_external_label_provider(
+        mut self,
+        provider: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        self.out_of_order_external_label_provider = Some(provider);
+        self
     }
 
     /// Creates a `Shipper` whose bucket client is scoped to `<user_id>/...`.
@@ -553,7 +568,11 @@ impl Shipper {
         meta.thanos.downsample.resolution = 0;
         meta.thanos.segment_files = get_segment_files(&block_dir);
 
-        if meta.compaction.from_out_of_order() && self.out_of_order_external_label_enabled {
+        let ooo_label_enabled = match self.out_of_order_external_label_provider.as_ref() {
+            Some(provider) => provider(),
+            None => self.out_of_order_external_label_enabled,
+        };
+        if meta.compaction.from_out_of_order() && ooo_label_enabled {
             meta.thanos.labels.insert(
                 OUT_OF_ORDER_EXTERNAL_LABEL.to_string(),
                 OUT_OF_ORDER_EXTERNAL_LABEL_VALUE.to_string(),
@@ -1087,6 +1106,58 @@ mod tests {
         // Local meta.json was NOT mutated.
         let local_meta = BlockMeta::read_from_dir(blocks_dir.path().join(id4.to_string())).unwrap();
         assert!(local_meta.thanos.labels.is_empty());
+    }
+
+    /// Go shipper reads `OutOfOrderBlocksExternalLabelEnabled(userID)` from the runtime
+    /// config provider at every upload, so a runtime override change applies without
+    /// reopening the TSDB.
+    #[tokio::test]
+    async fn test_shipper_ooo_external_label_follows_runtime_provider() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let blocks_dir = tempfile::tempdir().unwrap();
+        let bkt_dir = tempfile::tempdir().unwrap();
+        let bkt = BucketClient::new_filesystem(bkt_dir.path()).unwrap();
+        let enabled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&enabled);
+        let shipper = Shipper::new(
+            "tenant-a",
+            blocks_dir.path(),
+            bkt.for_user("tenant-a"),
+            SourceType::Receive,
+            true, // static flag at creation; the provider wins.
+            ShipperMetrics::new(None),
+        )
+        .with_out_of_order_external_label_provider(Arc::new(move || flag.load(Ordering::SeqCst)));
+
+        let remote_label = |id: Ulid| {
+            let bkt = bkt.clone();
+            async move {
+                let raw = bkt
+                    .download(&format!("tenant-a/{id}/{META_FILENAME}"))
+                    .await
+                    .unwrap();
+                let m: BlockMeta = serde_json::from_slice(&raw).unwrap();
+                m.thanos.labels.get(OUT_OF_ORDER_EXTERNAL_LABEL).cloned()
+            }
+        };
+
+        let id1 = Ulid::from_parts(1000, 1);
+        let mut m1 = make_meta(id1, 1000, 2000, 10);
+        m1.compaction.set_out_of_order();
+        create_test_block(blocks_dir.path(), id1, &m1);
+        assert_eq!(shipper.sync().await.unwrap(), 1);
+        assert_eq!(remote_label(id1).await, None);
+
+        enabled.store(true, Ordering::SeqCst);
+        let id2 = Ulid::from_parts(2000, 2);
+        let mut m2 = make_meta(id2, 2000, 3000, 10);
+        m2.compaction.set_out_of_order();
+        create_test_block(blocks_dir.path(), id2, &m2);
+        assert_eq!(shipper.sync().await.unwrap(), 1);
+        assert_eq!(
+            remote_label(id2).await,
+            Some(OUT_OF_ORDER_EXTERNAL_LABEL_VALUE.to_string())
+        );
     }
 
     #[tokio::test]

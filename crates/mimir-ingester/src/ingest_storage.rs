@@ -161,7 +161,14 @@ impl PreCommitNotifier for IngesterStorageAdapter {
     fn notify_pre_commit(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
-        Box::pin(async move { self.0.notify_pre_commit().map_err(|e| e.to_string()) })
+        // The fsyncs are blocking: run them on the blocking pool, not on the reader task.
+        let ingester = Arc::clone(&self.0);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ingester.notify_pre_commit())
+                .await
+                .map_err(|e| format!("fsync task failed: {e}"))?
+                .map_err(|e| e.to_string())
+        })
     }
 }
 
