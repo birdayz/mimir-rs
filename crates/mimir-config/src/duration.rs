@@ -224,13 +224,14 @@ impl<'de> Deserialize<'de> for ModelDuration {
 /// Parses a duration using Go `time.ParseDuration` rules (`ns`, `us`, `µs`, `μs`, `ms`, `s`, `m`, `h`).
 pub fn parse_go_duration(s: &str) -> Result<i64, ConfigError> {
     let orig = s;
-    let err = |reason: &str| ConfigError::Duration {
+    // Go `time.parseDurationError.Error()`: `time: <message> "<orig>"`.
+    let err = |message: &str| ConfigError::Duration {
         input: orig.to_string(),
-        reason: reason.to_string(),
+        reason: format!("time: {message} {orig:?}"),
     };
 
     if s.is_empty() {
-        return Err(err("empty duration"));
+        return Err(err("invalid duration"));
     }
 
     let (neg, mut rest) = if let Some(r) = s.strip_prefix('-') {
@@ -280,11 +281,11 @@ pub fn parse_go_duration(s: &str) -> Result<i64, ConfigError> {
             "s" => 1_000_000_000,
             "m" => 60 * 1_000_000_000,
             "h" => 3_600 * 1_000_000_000,
-            _ => return Err(err(&format!("unknown unit {unit_str:?}"))),
+            _ => return Err(err(&format!("unknown unit {unit_str:?} in duration"))),
         };
 
         if v > (1u64 << 63) / unit {
-            return Err(err("duration overflow"));
+            return Err(err("invalid duration"));
         }
         let mut add = v * unit;
         if f > 0 {
@@ -292,13 +293,13 @@ pub fn parse_go_duration(s: &str) -> Result<i64, ConfigError> {
             let frac_val = ((f as f64) * ((unit as f64) / scale)) as u64;
             let n = add.wrapping_add(frac_val);
             if n < add || n > (1u64 << 63) {
-                return Err(err("duration overflow"));
+                return Err(err("invalid duration"));
             }
             add = n;
         }
         let next = d.wrapping_add(add);
         if next < d || next > (1u64 << 63) {
-            return Err(err("duration overflow"));
+            return Err(err("invalid duration"));
         }
         d = next;
     }
@@ -311,7 +312,7 @@ pub fn parse_go_duration(s: &str) -> Result<i64, ConfigError> {
     }
 
     if d > i64::MAX as u64 {
-        return Err(err("duration overflow"));
+        return Err(err("invalid duration"));
     }
     Ok(d as i64)
 }
@@ -369,9 +370,13 @@ fn parse_leading_number(s: &str) -> Option<(u64, u64, f64, &str)> {
 /// Parses a duration using Prometheus `model.ParseDuration` rules (`y`, `w`, `d`, `h`, `m`, `s`, `ms`).
 pub fn parse_model_duration(s: &str) -> Result<i64, ConfigError> {
     let orig = s;
+    // Messages of prometheus/common/model.ParseDuration.
     let err = |reason: &str| ConfigError::Duration {
         input: orig.to_string(),
-        reason: reason.to_string(),
+        reason: match reason {
+            "not a valid duration string" => format!("not a valid duration string: {orig:?}"),
+            other => other.to_string(),
+        },
     };
 
     match s {
@@ -417,7 +422,7 @@ pub fn parse_model_duration(s: &str) -> Result<i64, ConfigError> {
             "d" => (3, 24 * 3_600 * 1_000_000_000),
             "w" => (2, 7 * 24 * 3_600 * 1_000_000_000),
             "y" => (1, 365 * 24 * 3_600 * 1_000_000_000),
-            _ => return Err(err(&format!("unknown unit {u:?}"))),
+            _ => return Err(err(&format!("unknown unit {u:?} in duration {orig:?}"))),
         };
 
         if pos <= last_unit_pos {

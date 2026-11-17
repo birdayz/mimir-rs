@@ -31,7 +31,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -105,11 +104,7 @@ fn ensure_fresh_rust_binary() {
 }
 
 fn free_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .unwrap()
-        .port()
+    mimir_conformance::free_test_port()
 }
 
 fn now_ms() -> i64 {

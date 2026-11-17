@@ -1100,7 +1100,7 @@ async fn create_concurrent_fetchers(
     let reg = Registry::new();
     let cfg = make_test_kafka_cfg(&cluster.addr, topic);
     let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
-    let offset_client = PartitionOffsetClient::with_config(client, &cfg, Some(&reg));
+    let offset_client = PartitionOffsetClient::with_config(Arc::clone(&client), &cfg, Some(&reg));
 
     let oc = offset_client.clone();
     let t = topic.to_string();
@@ -1119,8 +1119,7 @@ async fn create_concurrent_fetchers(
     start_offsets_reader.start().await;
 
     let f = ConcurrentFetchers::new(
-        vec![cluster.addr.clone()],
-        "test-fetcher",
+        client,
         topic,
         partition_id,
         start_offset,
@@ -1374,14 +1373,13 @@ async fn test_concurrent_fetchers() {
         let reg = Registry::new();
         let cfg = make_test_kafka_cfg(&cluster.addr, TOPIC);
         let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
-        let oc = PartitionOffsetClient::with_config(client, &cfg, Some(&reg));
+        let oc = PartitionOffsetClient::with_config(Arc::clone(&client), &cfg, Some(&reg));
         let start_offsets_reader = Arc::new(GenericOffsetReader::new(
             Arc::new(|| Box::pin(async { Ok(0) })),
             Duration::from_secs(1),
         ));
         let err = ConcurrentFetchers::new(
-            vec![cluster.addr.clone()],
-            "test",
+            client,
             TOPIC,
             PID,
             0,

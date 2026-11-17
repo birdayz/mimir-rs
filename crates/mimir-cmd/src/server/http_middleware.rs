@@ -1,0 +1,466 @@
+//! HTTP middleware chain of the dskit server.
+//!
+//! Ported from:
+//! - github.com/grafana/dskit/server/server.go (`BuildHTTPMiddleware`: `RouteInjector`, `Tracer`,
+//!   `Log`, `Instrument`, then `ClusterValidationMiddleware` when enabled)
+//! - github.com/grafana/dskit/middleware/route_injector.go (`getRouteName`, `MakeLabelValue`;
+//!   unmatched requests are reported as `other`)
+//! - github.com/grafana/dskit/middleware/instrument.go (`cortex_request_duration_seconds`,
+//!   `cortex_request_message_bytes`, `cortex_response_message_bytes`, `cortex_inflight_requests`,
+//!   `IsWSHandshakeRequest`)
+//! - github.com/grafana/dskit/middleware/logging.go (`Log` with Mimir's
+//!   `DisableRequestSuccessLog = true`)
+//! - github.com/grafana/dskit/middleware/source_ips.go (`SourceIPExtractor`)
+//! - github.com/grafana/dskit/middleware/http_cluster.go (`ClusterValidationMiddleware`)
+//!
+//! The dskit HTTP middleware only wraps requests served by the HTTP server
+//! ([`super::http_server::ServedOverHttp`]); requests arriving over `httpgrpc.HTTP/Handle` hit the
+//! router directly, as in dskit.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::body::Body;
+use axum::extract::{MatchedPath, Request, State};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use http::{header, HeaderMap, StatusCode};
+use http_body::Frame;
+use mimir_common::logging::{LogLevel, Logger};
+use mimir_config::GoDuration;
+use parking_lot::Mutex;
+use regex::Regex;
+
+use super::body::TrackedBody;
+use super::http_server::ServedOverHttp;
+use super::metrics::{make_label_value, ServerMetrics};
+
+/// Marker extension on 405 responses produced by the router's method-mismatch fallback (as
+/// opposed to handlers answering 405 themselves): gorilla/mux reports such requests as unmatched.
+#[derive(Clone, Copy, Debug)]
+pub struct MethodMismatch;
+
+/// Router fallback for a known path with a method it does not serve (gorilla/mux
+/// `methodNotAllowedHandler`: empty 405).
+pub async fn method_not_allowed() -> Response {
+    let mut resp = StatusCode::METHOD_NOT_ALLOWED.into_response();
+    resp.extensions_mut().insert(MethodMismatch);
+    resp
+}
+
+/// Header names logged requests never include (`middleware.AlwaysExcludedHeaders`).
+const ALWAYS_EXCLUDED_HEADERS: &[&str] = &[
+    "Cookie",
+    "X-Csrf-Token",
+    "Authorization",
+    "X-Grafana-Id",
+    "X-Access-Token",
+];
+
+/// dskit `SourceIPExtractor`.
+#[derive(Clone)]
+pub struct SourceIps {
+    /// Custom header and the regex extracting addresses from it.
+    custom: Option<(String, Regex)>,
+    extract_all_hosts: bool,
+}
+
+impl SourceIps {
+    /// `middleware.NewSourceIPs`.
+    pub fn new(header: &str, regex: &str, extract_all_hosts: bool) -> anyhow::Result<Self> {
+        if header.is_empty() != regex.is_empty() {
+            anyhow::bail!("either both a header field and a regex have to be given or neither");
+        }
+        let custom = if regex.is_empty() {
+            None
+        } else {
+            let re = Regex::new(regex).map_err(|_| anyhow::anyhow!("invalid regex given"))?;
+            Some((header.to_string(), re))
+        };
+        Ok(Self {
+            custom,
+            extract_all_hosts,
+        })
+    }
+
+    fn extract_header(&self, h: &str, re: &Regex) -> Vec<String> {
+        let mut out = Vec::new();
+        for caps in re.captures_iter(h) {
+            if let Some(m) = caps.get(1) {
+                out.push(m.as_str().to_string());
+            }
+            if !self.extract_all_hosts {
+                break;
+            }
+        }
+        out
+    }
+
+    fn get_ip(&self, headers: &HeaderMap) -> Vec<String> {
+        let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        if let Some((header, re)) = &self.custom {
+            let h = get(header);
+            if h.is_empty() {
+                return Vec::new();
+            }
+            return self.extract_header(&h, re);
+        }
+        static FORWARDED: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        static XFF: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        let fwd = get("Forwarded");
+        if !fwd.is_empty() {
+            let re = FORWARDED.get_or_init(|| Regex::new(r#"(?i)(?:for=)(?: *"?([^;,]+)"? *)"#).expect("valid"));
+            return self.extract_header(&fwd, re);
+        }
+        let real = get("X-Real-IP");
+        if !real.is_empty() {
+            return vec![real];
+        }
+        let xff = get("X-Forwarded-For").replace(' ', "");
+        if !xff.is_empty() {
+            let re = XFF.get_or_init(|| Regex::new(r#"(?: *"?([^,]+)"? *)"#).expect("valid"));
+            return self.extract_header(&xff, re);
+        }
+        Vec::new()
+    }
+
+    /// `SourceIPExtractor.Get`.
+    pub fn get(&self, headers: &HeaderMap, remote: &str) -> String {
+        let hosts: Vec<String> = self.get_ip(headers).iter().map(|a| extract_host(a)).collect();
+        let fwd = hosts.join(", ");
+        if fwd.is_empty() {
+            if remote.is_empty() {
+                return String::new();
+            }
+            return extract_host(remote);
+        }
+        if remote.is_empty() {
+            return fwd;
+        }
+        let remote_ip = extract_host(remote);
+        if fwd == remote_ip {
+            return remote_ip;
+        }
+        format!("{fwd}, {remote_ip}")
+    }
+}
+
+fn extract_host(address: &str) -> String {
+    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+        return ip.to_string();
+    }
+    if let Ok(sa) = address.parse::<std::net::SocketAddr>() {
+        return sa.ip().to_string();
+    }
+    match address.rsplit_once(':') {
+        Some((h, _)) if !h.is_empty() => h.trim_start_matches('[').trim_end_matches(']').to_string(),
+        _ => address.to_string(),
+    }
+}
+
+/// dskit `ClusterValidationMiddleware` configuration.
+#[derive(Clone)]
+pub struct HttpClusterValidation {
+    pub allowed: Vec<String>,
+    pub soft: bool,
+    pub excluded_path: Regex,
+    pub excluded_user_agent: Option<Regex>,
+}
+
+impl HttpClusterValidation {
+    pub fn new(allowed: Vec<String>, soft: bool, excluded_paths: &[String], excluded_uas: &[String]) -> anyhow::Result<Self> {
+        if allowed.is_empty() {
+            anyhow::bail!("no cluster labels provided");
+        }
+        let mut re = String::from(".*/(metrics|debug/pprof.*|ready");
+        for p in excluded_paths {
+            re.push('|');
+            re.push_str(&regex::escape(p));
+        }
+        re.push(')');
+        let excluded_user_agent = if excluded_uas.is_empty() {
+            None
+        } else {
+            Some(Regex::new(&format!("({})", excluded_uas.join("|")))?)
+        };
+        Ok(Self {
+            allowed,
+            soft,
+            excluded_path: Regex::new(&re)?,
+            excluded_user_agent,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct HttpMiddlewareConfig {
+    pub metrics: ServerMetrics,
+    pub logger: Arc<dyn Logger>,
+    pub log_request_headers: bool,
+    pub log_request_at_info_level: bool,
+    pub log_source_ips: Option<SourceIps>,
+    pub exclude_headers: Vec<String>,
+    pub cluster_validation: Option<HttpClusterValidation>,
+}
+
+/// Route name for metrics: the matched route template through `MakeLabelValue`; prefix routes
+/// (`/*rest` in axum) are named after their prefix, as gorilla/mux `PathPrefix` templates are.
+fn route_name(req: &Request) -> Option<String> {
+    let p = req.extensions().get::<MatchedPath>()?.as_str();
+    let mut p = match p.rfind("/*") {
+        Some(i) => &p[..i],
+        None => p,
+    };
+    // dskit registers `/debug/pprof/cmdline` as its own route and everything else under the
+    // `/debug/pprof` PathPrefix route.
+    const PPROF: &str = "/debug/pprof";
+    if let Some(i) = p.find(PPROF) {
+        if &p[i + PPROF.len()..] != "/cmdline" {
+            p = &p[..i + PPROF.len()];
+        }
+    }
+    Some(make_label_value(&p.replace(':', "")))
+}
+
+fn is_ws_handshake(headers: &HeaderMap) -> bool {
+    let get = |n: header::HeaderName| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+    get(header::UPGRADE) == "websocket" && get(header::CONNECTION).split(',').any(|p| p.trim() == "upgrade")
+}
+
+fn dump_headers(headers: &HeaderMap, exclude: &[String]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut keys: Vec<String> = headers
+        .keys()
+        .map(|k| crate::grpc::http_canonical_header_key(k.as_str()))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    for k in keys {
+        if ALWAYS_EXCLUDED_HEADERS.contains(&k.as_str()) || exclude.contains(&k) {
+            continue;
+        }
+        for v in headers.get_all(k.as_str()) {
+            lines.push(format!("{k}: {}", String::from_utf8_lossy(v.as_bytes())));
+        }
+    }
+    lines.iter().map(|l| format!("{l}; ")).collect()
+}
+
+/// The dskit HTTP middleware chain (`Log` + `Instrument` + cluster validation).
+pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>, req: Request, next: Next) -> Response {
+    let Some(served) = req.extensions().get::<ServedOverHttp>().copied() else {
+        return next.run(req).await;
+    };
+    let begin = Instant::now();
+    let method = req.method().as_str().to_string();
+    let matched_route = route_name(&req);
+    let route = matched_route.clone().unwrap_or_else(|| "other".to_string());
+    let uri = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| req.uri().to_string());
+    let ws = is_ws_handshake(req.headers());
+    let remote = served.remote_addr.to_string();
+    let source_ips = cfg.log_source_ips.as_ref().map(|s| s.get(req.headers(), &remote));
+    let headers_dump = cfg.log_request_headers.then(|| dump_headers(req.headers(), &cfg.exclude_headers));
+
+    let inflight = cfg.metrics.inflight_requests.with_label_values(&[&method, &route]);
+    inflight.inc();
+
+    let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (parts, body) = req.into_parts();
+    let read_c = Arc::clone(&read);
+    let body = Body::new(TrackedBody::new(body).on_frame(Box::new(move |f: &Frame<Bytes>| {
+        if let Some(d) = f.data_ref() {
+            read_c.fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    })));
+    let req = Request::from_parts(parts, body);
+
+    let resp = match &cfg.cluster_validation {
+        Some(cv) => match check_cluster(&req, cv, matched_route.as_deref(), &cfg) {
+            Some(rejection) => rejection,
+            None => next.run(req).await,
+        },
+        None => next.run(req).await,
+    };
+
+    let status = resp.status();
+    // gorilla/mux reports a method mismatch as an unmatched route.
+    let route = if resp.extensions().get::<MethodMismatch>().is_some() {
+        "other".to_string()
+    } else {
+        route
+    };
+    let code = status.as_u16();
+    let capture_body = !(100..500).contains(&code) && code != 502 && code != 503 && !(200..300).contains(&code);
+    let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let (w, cap) = (Arc::clone(&written), Arc::clone(&captured));
+    let on_frame = Box::new(move |f: &Frame<Bytes>| {
+        if let Some(d) = f.data_ref() {
+            w.fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if capture_body {
+                let mut c = cap.lock();
+                let room = 4096usize.saturating_sub(c.len());
+                c.extend_from_slice(&d[..d.len().min(room)]);
+            }
+        }
+    });
+    let m = cfg.metrics.clone();
+    let cfg2 = Arc::clone(&cfg);
+    let on_done = Box::new(move |_completed: bool| {
+        let elapsed = begin.elapsed();
+        m.received_message_size
+            .with_label_values(&[&method, &route])
+            .observe(read.load(std::sync::atomic::Ordering::Relaxed) as f64);
+        m.sent_message_size
+            .with_label_values(&[&method, &route])
+            .observe(written.load(std::sync::atomic::Ordering::Relaxed) as f64);
+        m.request_duration
+            .with_label_values(&[&method, &route, &code.to_string(), &ws.to_string()])
+            .observe(elapsed.as_secs_f64());
+        inflight.dec();
+        log_request(&cfg2, &method, &uri, code, elapsed, ws, &captured.lock(), source_ips.as_deref(), headers_dump.as_deref());
+    });
+    let (parts, body) = resp.into_parts();
+    Response::from_parts(parts, Body::new(TrackedBody::new(body).on_frame(on_frame).on_done(on_done)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_request(
+    cfg: &HttpMiddlewareConfig,
+    method: &str,
+    uri: &str,
+    code: u16,
+    elapsed: std::time::Duration,
+    ws: bool,
+    body: &[u8],
+    source_ips: Option<&str>,
+    headers: Option<&str>,
+) {
+    // Mimir sets DisableRequestSuccessLog.
+    if (200..300).contains(&code) {
+        return;
+    }
+    let dur = GoDuration(elapsed.as_nanos() as i64).to_string();
+    let (level, msg) = if (100..500).contains(&code) || code == 502 || code == 503 {
+        let lvl = if cfg.log_request_at_info_level { LogLevel::Info } else { LogLevel::Debug };
+        let msg = match headers {
+            Some(h) => format!("{method} {uri} ({code}) {dur} ws: {ws}; {h}"),
+            None => format!("{method} {uri} ({code}) {dur}"),
+        };
+        (lvl, msg)
+    } else {
+        let b = String::from_utf8_lossy(body);
+        let msg = match headers {
+            Some(h) => format!("{method} {uri} ({code}) {dur} Response: {b} ws: {ws}; {h}"),
+            None => format!("{method} {uri} ({code}) {dur} Response: {b}"),
+        };
+        (LogLevel::Warn, msg)
+    };
+    let mut kvs: Vec<(&str, &str)> = Vec::new();
+    if let Some(ips) = source_ips.filter(|s| !s.is_empty()) {
+        kvs.push(("sourceIPs", ips));
+    }
+    kvs.push(("msg", &msg));
+    cfg.logger.log(level, &kvs);
+}
+
+fn check_cluster(
+    req: &Request,
+    cv: &HttpClusterValidation,
+    route: Option<&str>,
+    cfg: &HttpMiddlewareConfig,
+) -> Option<Response> {
+    let path = req.uri().path();
+    if cv.excluded_path.is_match(path) {
+        return None;
+    }
+    let get = |n: &str| req.headers().get(n).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    if let Some(re) = &cv.excluded_user_agent {
+        if re.is_match(&get("User-Agent")) {
+            return None;
+        }
+    }
+    let route = route.unwrap_or("<unknown-route>").to_string();
+    let values: Vec<String> = req
+        .headers()
+        .get_all("X-Cluster")
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect();
+    let expected = format!("[{}]", cv.allowed.join(" "));
+    let first = cv.allowed.first().cloned().unwrap_or_default();
+    let soft = cv.soft.to_string();
+    let base: Vec<(String, String)> = vec![
+        ("path".into(), path.to_string()),
+        ("method".into(), req.method().to_string()),
+        ("cluster_validation_labels".into(), expected.clone()),
+        ("soft_validation".into(), soft),
+        ("tenant".into(), get("X-Scope-OrgID")),
+        ("user_agent".into(), get("User-Agent")),
+        ("host".into(), req.uri().host().map(|h| h.to_string()).unwrap_or_else(|| get("Host"))),
+        (
+            "client_address".into(),
+            req.extensions().get::<ServedOverHttp>().map(|s| s.remote_addr.to_string()).unwrap_or_default(),
+        ),
+    ];
+    let log = |extra: Vec<(&str, String)>| {
+        let mut kvs: Vec<(&str, &str)> = base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        for (k, v) in &extra {
+            kvs.push((k, v.as_str()));
+        }
+        cfg.logger.log(LogLevel::Warn, &kvs);
+    };
+    let err = if values.len() > 1 {
+        cfg.metrics.invalid_cluster_requests.with_label_values(&["http", &route, &first, ""]).inc();
+        let e = format!(
+            "request header should contain exactly 1 value for key \"X-Cluster\", but it contains [{}]",
+            values.join(" ")
+        );
+        log(vec![("msg", "detected error during cluster validation label extraction".into()), ("err", e.clone())]);
+        format!("rejected request: {e}")
+    } else {
+        match values.first().filter(|v| !v.is_empty()) {
+            Some(c) if cv.allowed.iter().any(|a| a == c) => return None,
+            Some(c) => {
+                cfg.metrics.invalid_cluster_requests.with_label_values(&["http", &route, &first, c]).inc();
+                log(vec![
+                    ("msg", "request with wrong cluster validation label".into()),
+                    ("request_cluster_validation_label", c.clone()),
+                ]);
+                format!("rejected request with wrong cluster validation label {c:?} - it should be one of {expected}")
+            }
+            None => {
+                cfg.metrics.invalid_cluster_requests.with_label_values(&["http", &route, &first, ""]).inc();
+                log(vec![("msg", "request with no cluster validation label".into())]);
+                format!("rejected request with empty cluster validation label - it should be one of {expected}")
+            }
+        }
+    };
+    if cv.soft {
+        return None;
+    }
+    let body = serde_json::json!({"cluster_validation_error_message": err, "route": route}).to_string();
+    Some((StatusCode::NETWORK_AUTHENTICATION_REQUIRED, [(header::CONTENT_TYPE, "application/json")], body).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_ips_like_dskit() {
+        let s = SourceIps::new("", "", false).unwrap();
+        let mut h = HeaderMap::new();
+        assert_eq!(s.get(&h, "1.2.3.4:5678"), "1.2.3.4");
+        h.insert("X-Forwarded-For", "10.0.0.1, 10.0.0.2".parse().unwrap());
+        assert_eq!(s.get(&h, "1.2.3.4:5678"), "10.0.0.1, 1.2.3.4");
+        let all = SourceIps::new("", "", true).unwrap();
+        assert_eq!(all.get(&h, "1.2.3.4:5678"), "10.0.0.1, 10.0.0.2, 1.2.3.4");
+        assert!(SourceIps::new("X", "", false).is_err());
+    }
+}

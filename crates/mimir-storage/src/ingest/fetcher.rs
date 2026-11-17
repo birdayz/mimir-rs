@@ -3,36 +3,27 @@
 //!
 //! Ported from github.com/grafana/mimir/pkg/storage/ingest/fetcher.go
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use kafka_protocol::error::{ParseResponseErrorCode, ResponseError};
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
-use kafka_protocol::messages::{
-    ApiKey, BrokerId, FetchRequest, FetchResponse, MetadataRequest, MetadataResponse,
-    RequestHeader, ResponseHeader, TopicName,
-};
-use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
-use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
-use kafka_protocol::records::RecordBatchDecoder;
+use kafka_protocol::messages::{BrokerId, FetchRequest, FetchResponse, TopicName};
+use kafka_protocol::protocol::StrBytes;
 use mimir_common::backoff::{Backoff, BackoffConfig};
 use parking_lot::Mutex as SyncMutex;
 use prometheus::{Counter, Histogram, HistogramOpts, Opts, Registry};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error};
 
-use super::compression::decompress_record_batch;
-use super::kafka_client::{FetchedRecord, KAFKA_OFFSET_END, KAFKA_OFFSET_START};
+use super::kafka_client::{FetchedRecord, KafkaClient, KafkaClientError, KAFKA_OFFSET_END, KAFKA_OFFSET_START};
 use super::partition_offset_client::PartitionOffsetClient;
-use super::transport::KafkaTransport;
 use super::partition_offset_reader::GenericOffsetReader;
 
 pub const UNKNOWN_BROKER: &str = "unknown broker";
@@ -356,6 +347,8 @@ pub async fn handle_kafka_fetch_err(
     Ok(fw)
 }
 
+/// The [`ReaderMetrics`](super::reader::ReaderMetrics) series owned by `ConcurrentFetchers`
+/// (`fetchMaxBytes`, `fetchWaitDuration`, `fetchedDiscardedRecordBytes` in `reader.go`).
 #[derive(Clone)]
 pub struct FetcherMetrics {
     pub fetch_max_bytes: Histogram,
@@ -363,21 +356,34 @@ pub struct FetcherMetrics {
     pub fetched_discarded_record_bytes: Counter,
 }
 
+/// Classic buckets of a client_golang histogram that only sets `NativeHistogramBucketFactor`
+/// (no `Buckets`): it has no classic bucket, so the text exposition only carries `le="+Inf"`.
+/// The prometheus crate drops a trailing `+Inf` bound and keeps the implicit one.
+pub(crate) fn native_only_buckets() -> Vec<f64> {
+    vec![f64::INFINITY]
+}
+
 impl FetcherMetrics {
     pub fn new(registry: Option<&Registry>) -> Self {
-        let fetch_max_bytes = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_reader_records_batch_fetch_max_bytes",
-            "MaxBytes requested in Fetch requests.",
-        ))
+        let fetch_max_bytes = Histogram::with_opts(
+            HistogramOpts::new(
+                "cortex_ingest_storage_reader_records_batch_fetch_max_bytes",
+                "The distribution of MaxBytes specified in the Fetch requests sent to Kafka.",
+            )
+            .buckets(native_only_buckets()),
+        )
         .expect("valid metric");
-        let fetch_wait_duration = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_reader_fetch_wait_duration_seconds",
-            "Time spent waiting for ordered fetch results.",
-        ))
+        let fetch_wait_duration = Histogram::with_opts(
+            HistogramOpts::new(
+                "cortex_ingest_storage_reader_records_batch_wait_duration_seconds",
+                "How long a consumer spent waiting for a batch of records from the Kafka client. If fetching is faster than processing, then this will be close to 0.",
+            )
+            .buckets(native_only_buckets()),
+        )
         .expect("valid metric");
         let fetched_discarded_record_bytes = Counter::with_opts(Opts::new(
-            "cortex_ingest_storage_reader_fetched_discarded_record_bytes_total",
-            "Total bytes of fetched records discarded because they were already returned.",
+            "cortex_ingest_storage_reader_fetched_discarded_bytes_total",
+            "Total number of uncompressed bytes of records discarded from because they were already consumed. A higher rate means that the concurrent fetching estimations are less accurate.",
         ))
         .expect("valid metric");
 
@@ -395,233 +401,97 @@ impl FetcherMetrics {
     }
 }
 
-/// Raw TCP broker connection for `ConcurrentFetchers`, supporting Fetch v13 (topicID) and Metadata.
-struct FetchBrokerClient {
-    seed_addrs: Vec<String>,
-    client_id: String,
-    transport: Arc<KafkaTransport>,
-    request_timeout: Duration,
-    topic_name: String,
-    topic_template: SyncMutex<Option<FetchTopic>>,
-    state: Mutex<Option<FetchBrokerState>>,
+/// Keeps the reader client's cluster metadata fresh like kgo does for a consumed partition:
+/// a periodic refresh every `DefaultMetadataRefreshInterval` (`MetadataMinAge` =
+/// `MetadataMaxAge` = 10s in `commonKafkaClientOptions`) plus asynchronous forced refreshes
+/// (`ForceMetadataRefresh`), at most one request in flight at a time.
+pub struct PartitionMetadataRefresher {
+    client: Arc<KafkaClient>,
+    topic: String,
+    in_flight: Arc<AtomicBool>,
 }
 
-struct FetchBrokerState {
-    conn: Arc<MuxConn>,
-}
+/// `DefaultMetadataRefreshInterval` (`writer_client.go`).
+pub const DEFAULT_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-struct MuxConn {
-    client_id: String,
-    next_corr_id: AtomicI32,
-    write_tx: mpsc::Sender<Bytes>,
-    pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>>,
-    alive: Arc<std::sync::atomic::AtomicBool>,
-    /// SASL session expiry: past it the connection is replaced instead of reused.
-    sasl_expiry: Option<std::time::Instant>,
-}
-
-impl MuxConn {
-    async fn connect(
-        addr: &str,
-        client_id: String,
-        transport: &KafkaTransport,
-        request_timeout: Duration,
-    ) -> Result<Arc<Self>, String> {
-        let established = transport
-            .connect(addr, &client_id, request_timeout)
-            .await
-            .map_err(|e| format!("connect error to {addr}: {e}"))?;
-
-        let (mut reader, mut writer) = established.stream.into_split();
-        let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(256);
-        let pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>> =
-            Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-
-        let alive_w = Arc::clone(&alive);
-        tokio::spawn(async move {
-            while let Some(frame) = write_rx.recv().await {
-                if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
-                    break;
-                }
-            }
-            alive_w.store(false, Ordering::SeqCst);
-        });
-
-        let pending_r = Arc::clone(&pending);
-        let alive_r = Arc::clone(&alive);
-        tokio::spawn(async move {
-            loop {
-                let mut len_buf = [0u8; 4];
-                if reader.read_exact(&mut len_buf).await.is_err() {
-                    break;
-                }
-                let frame_len = i32::from_be_bytes(len_buf) as usize;
-                if !(4..=256 * 1024 * 1024).contains(&frame_len) {
-                    break;
-                }
-                let mut body = vec![0u8; frame_len];
-                if reader.read_exact(&mut body).await.is_err() {
-                    break;
-                }
-                let corr_id = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-                let tx = pending_r.lock().remove(&corr_id);
-                if let Some(tx) = tx {
-                    let _ = tx.send(Bytes::from(body));
-                }
-            }
-            alive_r.store(false, Ordering::SeqCst);
-            let drained: Vec<_> = pending_r.lock().drain().map(|(_, v)| v).collect();
-            for tx in drained {
-                drop(tx);
-            }
-        });
-
-        Ok(Arc::new(Self {
-            client_id,
-            next_corr_id: AtomicI32::new(established.next_correlation_id),
-            write_tx,
-            pending,
-            alive,
-            sasl_expiry: established.sasl_expiry,
-        }))
-    }
-
-    /// Alive and its SASL session (if any) has not expired: may be handed out for new requests.
-    fn is_usable(&self) -> bool {
-        self.alive.load(Ordering::SeqCst)
-            && self
-                .sasl_expiry
-                .is_none_or(|e| std::time::Instant::now() < e)
-    }
-
-    async fn send<Req: Request + Encodable, Resp: Decodable + HeaderVersion>(
-        &self,
-        api_key: ApiKey,
-        ver: i16,
-        req: &Req,
-        timeout: Duration,
-    ) -> Result<Resp, KafkaFetchError> {
-        if !self.alive.load(Ordering::SeqCst) {
-            return Err(KafkaFetchError::Other(
-                "use of closed network connection".to_string(),
-            ));
-        }
-        let corr_id = self.next_corr_id.fetch_add(1, Ordering::SeqCst);
-        let req_header_ver = Req::header_version(ver);
-        let mut hdr = RequestHeader::default();
-        hdr.request_api_key = api_key as i16;
-        hdr.request_api_version = ver;
-        hdr.correlation_id = corr_id;
-        hdr.client_id = Some(StrBytes::from_string(self.client_id.clone()));
-
-        let mut payload = bytes::BytesMut::new();
-        hdr.encode(&mut payload, req_header_ver)
-            .map_err(|e| KafkaFetchError::Other(e.to_string()))?;
-        req.encode(&mut payload, ver)
-            .map_err(|e| KafkaFetchError::Other(e.to_string()))?;
-
-        let mut frame = bytes::BytesMut::with_capacity(4 + payload.len());
-        frame.extend_from_slice(&(payload.len() as i32).to_be_bytes());
-        frame.extend_from_slice(&payload);
-
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(corr_id, tx);
-        if self.write_tx.send(frame.freeze()).await.is_err() {
-            self.pending.lock().remove(&corr_id);
-            return Err(KafkaFetchError::Other(
-                "use of closed network connection".to_string(),
-            ));
-        }
-
-        let mut resp_buf = tokio::time::timeout(timeout, rx)
-            .await
-            .map_err(|_| {
-                self.pending.lock().remove(&corr_id);
-                KafkaFetchError::Other("i/o timeout".to_string())
-            })?
-            .map_err(|_| KafkaFetchError::Other("use of closed network connection".to_string()))?;
-
-        let resp_header_ver = Resp::header_version(ver);
-        let _hdr = ResponseHeader::decode(&mut resp_buf, resp_header_ver)
-            .map_err(|e| KafkaFetchError::Other(e.to_string()))?;
-        Resp::decode(&mut resp_buf, ver).map_err(|e| KafkaFetchError::Other(e.to_string()))
-    }
-}
-
-impl FetchBrokerClient {
-    async fn conn(&self) -> Result<Arc<MuxConn>, KafkaFetchError> {
-        let mut guard = self.state.lock().await;
-        if let Some(ref st) = *guard {
-            if st.conn.is_usable() {
-                return Ok(Arc::clone(&st.conn));
-            }
-        }
-        for addr in &self.seed_addrs {
-            if let Ok(conn) = MuxConn::connect(
-                addr,
-                self.client_id.clone(),
-                &self.transport,
-                self.request_timeout,
-            )
-            .await
-            {
-                *guard = Some(FetchBrokerState {
-                    conn: Arc::clone(&conn),
-                });
-                return Ok(conn);
-            }
-        }
-        Err(KafkaFetchError::Other(UNKNOWN_BROKER.to_string()))
-    }
-
-    async fn fetch_metadata(&self) -> Result<[u8; 16], String> {
-        let conn = self.conn().await.map_err(|e| format!("failed to find topic ID: {e}"))?;
-        let mut req = MetadataRequest::default();
-        req.allow_auto_topic_creation = false;
-        let mut mt = MetadataRequestTopic::default();
-        mt.name = Some(TopicName(StrBytes::from_string(self.topic_name.clone())));
-        req.topics = Some(vec![mt]);
-
-        let resp: MetadataResponse = conn
-            .send(ApiKey::Metadata, 10, &req, self.request_timeout)
-            .await
-            .map_err(|e| format!("failed to find topic ID: {e}"))?;
-
-        for t in resp.topics {
-            let matches_name = t
-                .name
-                .as_ref()
-                .map(|n| n.0.as_str() == self.topic_name)
-                .unwrap_or(false);
-            if !matches_name {
-                continue;
-            }
-            if let Some(err) = t.error_code.err() {
-                return Err(format!("failed to find topic ID: {err}"));
-            }
-            let bytes = *t.topic_id.as_bytes();
-            let ft = FetchTopic::default()
-                .with_topic(TopicName(StrBytes::from_string(self.topic_name.clone())))
-                .with_topic_id(t.topic_id);
-            *self.topic_template.lock() = Some(ft);
-            return Ok(bytes);
-        }
-        Err("failed to find topic ID: topic not found".to_string())
-    }
-}
-
-impl MetadataRefresher for FetchBrokerClient {
-    fn force_metadata_refresh(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let _ = self.fetch_metadata().await;
+impl PartitionMetadataRefresher {
+    pub fn new(client: Arc<KafkaClient>, topic: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            client,
+            topic: topic.into(),
+            in_flight: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Triggers an asynchronous metadata refresh unless one is already running.
+    pub fn trigger(&self) {
+        if self.in_flight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let client = Arc::clone(&self.client);
+        let topic = self.topic.clone();
+        let in_flight = Arc::clone(&self.in_flight);
+        tokio::spawn(async move {
+            if let Err(e) = client.refresh_metadata(&[topic.as_str()]).await {
+                debug!(topic = %topic, err = %e, "metadata refresh failed");
+            }
+            in_flight.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Runs the periodic refresh until `stop_rx` flips to `true`.
+    pub fn spawn_periodic(self: &Arc<Self>, mut stop_rx: watch::Receiver<bool>) -> JoinHandle<()> {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(DEFAULT_METADATA_REFRESH_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            return;
+                        }
+                    }
+                    _ = ticker.tick() => this.trigger(),
+                }
+            }
+        })
+    }
+}
+
+impl MetadataRefresher for PartitionMetadataRefresher {
+    fn force_metadata_refresh(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.trigger();
+        Box::pin(std::future::ready(()))
+    }
+}
+
+/// Maps a client error of a Fetch request to the franz-go error the upstream handlers match on
+/// (`handleKafkaFetchErr` matches some errors by their kgo message).
+pub(crate) fn kafka_fetch_error_from_client(err: KafkaClientError) -> KafkaFetchError {
+    match err {
+        KafkaClientError::Broker(e) => KafkaFetchError::Broker(e),
+        KafkaClientError::UnknownBroker => KafkaFetchError::Other(format!(
+            "fetching from kafka: {UNKNOWN_BROKER}"
+        )),
+        // The connection died: kgo fails the request with errChosenBrokerDead and a new
+        // connection is dialed on the next attempt.
+        KafkaClientError::ConnectionClosed | KafkaClientError::ChosenBrokerDead => {
+            KafkaFetchError::Other(format!("fetching from kafka: {CHOSEN_BROKER_DIED}"))
+        }
+        KafkaClientError::RequestTimeout(_) | KafkaClientError::ConnectTimeout { .. } => {
+            KafkaFetchError::Other("fetching from kafka: i/o timeout".to_string())
+        }
+        KafkaClientError::FirstReadEof(_) => KafkaFetchError::FirstReadEOF,
+        other => KafkaFetchError::Other(format!("fetching from kafka: {other}")),
     }
 }
 
 /// Concurrent Kafka partition fetcher maintaining ordered record delivery across parallel workers.
 pub struct ConcurrentFetchers {
-    broker: Arc<FetchBrokerClient>,
+    client: Arc<KafkaClient>,
+    refresher: Arc<PartitionMetadataRefresher>,
     topic_name: String,
     topic_id: [u8; 16],
     partition_id: i32,
@@ -646,11 +516,16 @@ pub struct ConcurrentFetchers {
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Fetch request version: v13 (topic IDs) like upstream, lowered when the broker or the
+/// metadata cannot do topic IDs.
+const CONCURRENT_FETCH_VERSION: i16 = 13;
+
 impl ConcurrentFetchers {
+    /// `NewConcurrentFetchers`. `start_offset` can be `KAFKA_OFFSET_START`, `KAFKA_OFFSET_END`
+    /// or a specific offset.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        seed_addrs: Vec<String>,
-        client_id: impl Into<String>,
+        client: Arc<KafkaClient>,
         topic: impl Into<String>,
         partition_id: i32,
         start_offset: i64,
@@ -665,10 +540,10 @@ impl ConcurrentFetchers {
         metrics: FetcherMetrics,
     ) -> Result<Self, String> {
         if fetch_backoff_config.max_backoff.is_zero() {
-            return Err("fetch_backoff_config.max_backoff has not been set".to_string());
+            return Err("fetchBackoffConfig.MaxBackoff has not been set".to_string());
         }
         if fetch_backoff_config.max_retries != 0 {
-            return Err("fetch_backoff_config.max_retries must be 0".to_string());
+            return Err("fetchBackoffConfig.MaxRetries must be 0".to_string());
         }
 
         let topic_name = topic.into();
@@ -678,11 +553,12 @@ impl ConcurrentFetchers {
                 .await
                 .map_err(|e| format!("resolving offset to start consuming from: {e}"))?,
             KAFKA_OFFSET_END => {
-                let last = offset_reader
+                // End (-1) means "ignore all existing records": start from the next one.
+                offset_reader
                     .fetch_partition_last_produced_offset(&topic_name, partition_id)
                     .await
-                    .map_err(|e| format!("resolving offset to start consuming from: {e}"))?;
-                last + 1
+                    .map_err(|e| format!("resolving offset to start consuming from: {e}"))?
+                    + 1
             }
             other => other,
         };
@@ -693,24 +569,18 @@ impl ConcurrentFetchers {
             max_buffered_bytes_limit
         };
 
-        let broker = Arc::new(FetchBrokerClient {
-            seed_addrs,
-            client_id: client_id.into(),
-            // Dial, TLS and SASL settings of the offset client's Kafka client (same KafkaConfig).
-            transport: Arc::clone(offset_reader.kafka_client().transport()),
-            request_timeout: Duration::from_secs(10).max(min_bytes_wait_time + Duration::from_secs(5)),
-            topic_name: topic_name.clone(),
-            topic_template: SyncMutex::new(None),
-            state: Mutex::new(None),
-        });
-
-        let topic_id = broker.fetch_metadata().await?;
+        // kadm ListTopics(topic): the topic must exist and report no error.
+        let topic_id = client
+            .topic_id(&topic_name)
+            .await
+            .map_err(|e| format!("failed to find topic ID: {e}"))?;
 
         let (ordered_tx, ordered_rx) = mpsc::channel(1);
         let (stop_tx, _) = watch::channel(false);
 
         Ok(Self {
-            broker,
+            refresher: PartitionMetadataRefresher::new(Arc::clone(&client), topic_name.clone()),
+            client,
             topic_name,
             topic_id,
             partition_id,
@@ -725,7 +595,7 @@ impl ConcurrentFetchers {
             metrics,
             buffered_fetched_records: Arc::new(AtomicI64::new(0)),
             buffered_fetched_bytes: Arc::new(AtomicI64::new(0)),
-            estimated_bytes_per_record: Arc::new(AtomicI64::new(INITIAL_BYTES_PER_RECORD as i64)),
+            estimated_bytes_per_record: Arc::new(AtomicI64::new(0)),
             last_returned_offset: Arc::new(AtomicI64::new(resolved_start - 1)),
             ordered_rx: Mutex::new(ordered_rx),
             ordered_tx,
@@ -742,6 +612,11 @@ impl ConcurrentFetchers {
         self.partition_id
     }
 
+    /// The resolved offset fetching starts from.
+    pub fn start_offset(&self) -> i64 {
+        self.start_offset
+    }
+
     pub fn buffered_records(&self) -> i64 {
         self.buffered_fetched_records.load(Ordering::SeqCst)
     }
@@ -754,7 +629,20 @@ impl ConcurrentFetchers {
         self.estimated_bytes_per_record.load(Ordering::SeqCst)
     }
 
-    /// Starts the coordinator and worker tasks.
+    fn worker_ctx(&self) -> WorkerCtx {
+        WorkerCtx {
+            client: Arc::clone(&self.client),
+            refresher: Arc::clone(&self.refresher),
+            topic_name: self.topic_name.clone(),
+            topic_id: self.topic_id,
+            partition_id: self.partition_id,
+            min_bytes_wait_time: self.min_bytes_wait_time,
+            track_compressed_bytes: self.track_compressed_bytes,
+            metrics: self.metrics.clone(),
+        }
+    }
+
+    /// Starts the coordinator and worker tasks (`ConcurrentFetchers.start`).
     pub async fn start(&self) {
         let mut guard = self.task.lock().await;
         if guard.is_some() {
@@ -762,238 +650,114 @@ impl ConcurrentFetchers {
         }
 
         let concurrency = self.start_concurrency;
-        let max_bytes_per_fetcher = (self.max_buffered_bytes_limit / concurrency as i32).max(1);
+        let max_bytes_per_fetcher = self.max_buffered_bytes_limit / concurrency as i32;
+        tracing::info!(
+            partition = self.partition_id,
+            start_offset = self.start_offset,
+            concurrency,
+            max_bytes_per_fetch_request = max_bytes_per_fetcher,
+            "starting concurrent fetchers"
+        );
+
+        // HWM is updated by the fetchers. A value of 0 is the same as there not being any
+        // produced records; it doesn't prevent progress because there is always at least one
+        // inflight fetchWant.
         let high_watermark = Arc::new(AtomicI64::new(0));
         let (wants_tx, wants_rx) = mpsc::channel::<(FetchWant, mpsc::Sender<FetchResult>)>(1);
         let wants_rx = Arc::new(Mutex::new(wants_rx));
 
-        let mut worker_handles = Vec::with_capacity(concurrency);
+        let mut worker_handles = Vec::with_capacity(concurrency + 1);
+        worker_handles.push(self.refresher.spawn_periodic(self.stop_tx.subscribe()));
         for _ in 0..concurrency {
+            let ctx = self.worker_ctx();
             let rx = Arc::clone(&wants_rx);
-            let broker = Arc::clone(&self.broker);
-            let topic_name = self.topic_name.clone();
-            let topic_id = self.topic_id;
-            let partition_id = self.partition_id;
-            let track_compressed = self.track_compressed_bytes;
-            let min_wait = self.min_bytes_wait_time;
             let range_policy = self.range_error_policy;
             let start_offsets_reader = Arc::clone(&self.start_offsets_reader);
             let backoff_cfg = self.fetch_backoff_config;
-            let metrics = self.metrics.clone();
             let buffered_recs = Arc::clone(&self.buffered_fetched_records);
             let hwm = Arc::clone(&high_watermark);
-            let mut stop_rx = self.stop_tx.subscribe();
-
-            let h = tokio::spawn(async move {
-                loop {
-                    if *stop_rx.borrow() {
-                        break;
-                    }
-                    let item = {
-                        let mut locked = rx.lock().await;
-                        tokio::select! {
-                            biased;
-                            _ = stop_rx.changed() => None,
-                            res = locked.recv() => res,
-                        }
-                    };
-                    let Some((mut fw, res_tx)) = item else {
-                        break;
-                    };
-
-                    let backoff_waiter = BackoffWaiter(SyncMutex::new(Backoff::new(backoff_cfg)));
-                    let mut buffered = FetchResult::empty(partition_id);
-
-                    while fw.end_offset > fw.start_offset {
-                        if *stop_rx.borrow() {
-                            break;
-                        }
-                        let single = tokio::select! {
-                            biased;
-                            _ = stop_rx.changed() => break,
-                            s = fetch_single_inner(
-                                &broker,
-                                &topic_name,
-                                topic_id,
-                                partition_id,
-                                &fw,
-                                min_wait,
-                                track_compressed,
-                                &metrics,
-                            ) => s,
-                        };
-
-                        if let Some(ref err) = single.err {
-                            match handle_kafka_fetch_err(
-                                Some(err),
-                                fw.clone(),
-                                &backoff_waiter,
-                                range_policy,
-                                &start_offsets_reader,
-                                broker.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(adjusted) => {
-                                    fw = adjusted;
-                                }
-                                Err(fatal) => {
-                                    let _ = tokio::select! {
-                                        biased;
-                                        _ = stop_rx.changed() => Ok(()),
-                                        sent = res_tx.send(FetchResult::error(partition_id, Some(fatal))) => sent.map_err(|_| ()),
-                                    };
-                                    break;
-                                }
-                            }
-                        } else {
-                            buffered_recs.fetch_add(single.records.len() as i64, Ordering::SeqCst);
-                            if single.high_watermark >= 0 {
-                                cas_hwm(&hwm, single.high_watermark);
-                            }
-                            buffered = single.merge(buffered);
-                        }
-
-                        if buffered.records.is_empty() {
-                            continue;
-                        }
-
-                        let last_off = buffered.records.last().unwrap().offset;
-                        fw.start_offset = last_off + 1;
-                        fw = fw.update_bytes_per_record(buffered.fetched_bytes, buffered.records.len());
-
-                        // Reset backoff after progress.
-                        backoff_waiter.0.lock().reset();
-
-                        match res_tx.try_send(buffered) {
-                            Ok(()) => {
-                                buffered = FetchResult::empty(partition_id);
-                            }
-                            Err(mpsc::error::TrySendError::Full(b)) => {
-                                if fw.start_offset >= fw.end_offset {
-                                    tokio::select! {
-                                        biased;
-                                        _ = stop_rx.changed() => break,
-                                        _ = res_tx.send(b) => {}
-                                    }
-                                    buffered = FetchResult::empty(partition_id);
-                                } else {
-                                    buffered = b;
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                break;
-                            }
-                        }
-                    }
-                    drop(res_tx);
-                }
-            });
-            worker_handles.push(h);
+            let stop_rx = self.stop_tx.subscribe();
+            worker_handles.push(tokio::spawn(run_worker(
+                ctx,
+                rx,
+                range_policy,
+                start_offsets_reader,
+                backoff_cfg,
+                buffered_recs,
+                hwm,
+                stop_rx,
+            )));
         }
 
         let start_offset = self.start_offset;
         let max_buffered_bytes_limit = self.max_buffered_bytes_limit;
-        let buffered_bytes = Arc::clone(&self.buffered_fetched_bytes);
+        let inflight_bytes = Arc::clone(&self.buffered_fetched_bytes);
         let est_bpr = Arc::clone(&self.estimated_bytes_per_record);
         let ordered_tx = self.ordered_tx.clone();
         let mut stop_rx = self.stop_tx.subscribe();
 
         let coord = tokio::spawn(async move {
-            let mut next_fetch = FetchWant::from_offset(
-                start_offset,
-                max_bytes_per_fetcher,
-                INITIAL_BYTES_PER_RECORD,
-            );
+            // nextFetch is the next records fetch operation we want to issue to one of the
+            // running workers.
+            let mut next_fetch =
+                FetchWant::from_offset(start_offset, max_bytes_per_fetcher, INITIAL_BYTES_PER_RECORD);
+            // inflight: all fetchWants currently in flight, in the order their results must be
+            // returned to PollFetches().
             let mut inflight: VecDeque<(FetchWant, mpsc::Receiver<FetchResult>)> = VecDeque::new();
-            let mut ready_result: Option<FetchResult> = None;
+            // The next ordered result ready to be polled (`readyBufferedResults != nil`).
+            let mut ready: Option<FetchResult> = None;
 
             loop {
-                est_bpr.store(next_fetch.estimated_bytes_per_record as i64, Ordering::SeqCst);
-
                 if *stop_rx.borrow() {
                     break;
                 }
-
-                let would_exceed = buffered_bytes.load(Ordering::SeqCst)
-                    + (next_fetch.max_bytes() as i64)
-                    > (max_buffered_bytes_limit as i64);
-                let can_dispatch = inflight.is_empty()
+                let refill = ready.is_none() && !inflight.is_empty();
+                let would_exceed = inflight_bytes.load(Ordering::SeqCst)
+                    + next_fetch.max_bytes() as i64
+                    > max_buffered_bytes_limit as i64;
+                // Dispatch only fetches of existing offsets (or when nothing is in flight, so the
+                // HWM can be updated) and without exceeding the buffered bytes limit.
+                let dispatch = inflight.is_empty()
                     || (!would_exceed && next_fetch.start_offset <= high_watermark.load(Ordering::SeqCst));
 
-                if let Some(res_to_send) = ready_result.take() {
-                    tokio::select! {
-                        biased;
-                        _ = stop_rx.changed() => break,
-                        sent = ordered_tx.send(res_to_send) => {
-                            if sent.is_err() {
-                                break;
-                            }
+                // Periodically update our estimation, so it's exported as a metric.
+                est_bpr.store(next_fetch.estimated_bytes_per_record as i64, Ordering::SeqCst);
+
+                let front_rx = inflight.front_mut().map(|(_, rx)| rx);
+                tokio::select! {
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            break;
                         }
                     }
-                    continue;
-                }
-
-                if can_dispatch && inflight.len() < concurrency {
-                    let (res_tx, res_rx) = mpsc::channel(1);
-                    let fw_to_send = next_fetch.clone();
-                    tokio::select! {
-                        biased;
-                        _ = stop_rx.changed() => break,
-                        sent = wants_tx.send((fw_to_send.clone(), res_tx)) => {
-                            if sent.is_err() {
-                                break;
-                            }
-                            buffered_bytes.fetch_add(fw_to_send.max_bytes() as i64, Ordering::SeqCst);
-                            inflight.push_back((fw_to_send, res_rx));
-                            next_fetch = next_fetch.next();
-                            continue;
-                        }
-                        maybe_res = async {
-                            match inflight.front_mut() {
-                                Some((_, rx)) => rx.recv().await,
-                                None => std::future::pending().await,
-                            }
-                        } => {
-                            match maybe_res {
-                                Some(res) => {
-                                    if res.err.is_none() && !res.records.is_empty() {
-                                        next_fetch = next_fetch.update_bytes_per_record(res.fetched_bytes, res.records.len());
-                                    }
-                                    ready_result = Some(res);
-                                }
-                                None => {
-                                    if let Some((fw, _)) = inflight.pop_front() {
-                                        buffered_bytes.fetch_sub(fw.max_bytes() as i64, Ordering::SeqCst);
-                                    }
+                    permit = wants_tx.reserve(), if dispatch => {
+                        let Ok(permit) = permit else { break };
+                        let (res_tx, res_rx) = mpsc::channel(1);
+                        permit.send((next_fetch.clone(), res_tx));
+                        inflight_bytes.fetch_add(next_fetch.max_bytes() as i64, Ordering::SeqCst);
+                        inflight.push_back((next_fetch.clone(), res_rx));
+                        next_fetch = next_fetch.next();
+                    }
+                    res = async { front_rx.expect("refill requires an inflight want").recv().await }, if refill => {
+                        match res {
+                            None => {
+                                // The worker is done with this want: removeNextResult(). The
+                                // MaxBytes counted is the one at dispatch time.
+                                if let Some((fw, _)) = inflight.pop_front() {
+                                    inflight_bytes.fetch_sub(fw.max_bytes() as i64, Ordering::SeqCst);
                                 }
                             }
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some((_, rx)) = inflight.front_mut() {
-                    let maybe_res = tokio::select! {
-                        biased;
-                        _ = stop_rx.changed() => break,
-                        r = rx.recv() => r,
-                    };
-                    match maybe_res {
-                        Some(res) => {
-                            if res.err.is_none() && !res.records.is_empty() {
-                                next_fetch = next_fetch.update_bytes_per_record(res.fetched_bytes, res.records.len());
-                            }
-                            ready_result = Some(res);
-                        }
-                        None => {
-                            if let Some((fw, _)) = inflight.pop_front() {
-                                buffered_bytes.fetch_sub(fw.max_bytes() as i64, Ordering::SeqCst);
+                            Some(result) => {
+                                next_fetch = next_fetch
+                                    .update_bytes_per_record(result.fetched_bytes, result.records.len());
+                                ready = Some(result);
                             }
                         }
                     }
-                } else {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    permit = ordered_tx.reserve(), if ready.is_some() => {
+                        let Ok(permit) = permit else { break };
+                        permit.send(ready.take().expect("checked"));
+                    }
                 }
             }
 
@@ -1006,6 +770,7 @@ impl ConcurrentFetchers {
         *guard = Some(coord);
     }
 
+    /// `Stop`: buffered records are intentionally dropped.
     pub async fn stop(&self) {
         let _ = self.stop_tx.send(true);
         if let Some(h) = self.task.lock().await.take() {
@@ -1013,23 +778,29 @@ impl ConcurrentFetchers {
         }
         self.buffered_fetched_records.store(0, Ordering::SeqCst);
         self.buffered_fetched_bytes.store(0, Ordering::SeqCst);
+        tracing::info!(
+            partition = self.partition_id,
+            last_returned_offset = self.last_returned_offset.load(Ordering::SeqCst),
+            "stopped concurrent fetchers"
+        );
     }
 
-    /// Polls the next ordered fetch batch, skipping any records already returned (`<= last_returned_offset`).
-    /// Returns `None` if `timeout` elapses or the fetcher is stopped.
-    pub async fn poll_fetches(&self, timeout: Duration) -> Option<FetchResult> {
+    /// `PollFetches`: the next ordered fetch, skipping records already returned
+    /// (`<= lastReturnedOffset`). Returns `None` once `cancel` completes first.
+    pub async fn poll_fetches_until<F: Future>(&self, cancel: F) -> Option<FetchResult> {
+        let wait_start = std::time::Instant::now();
         let mut rx = self.ordered_rx.lock().await;
-        let fut = rx.recv();
-        let res = if timeout.is_zero() {
-            fut.await
-        } else {
-            tokio::time::timeout(timeout, fut).await.ok()?
+        let mut f = tokio::select! {
+            biased;
+            res = rx.recv() => res?,
+            _ = cancel => return None,
         };
-        let mut f = res?;
+        drop(rx);
 
-        let raw_len = f.records.len() as i64;
+        // Decrease by the number of actually buffered records, not by the number returned
+        // (which can be lower if some records are discarded because already returned).
         self.buffered_fetched_records
-            .fetch_sub(raw_len, Ordering::SeqCst);
+            .fetch_sub(f.records.len() as i64, Ordering::SeqCst);
 
         let last_ret = self.last_returned_offset.load(Ordering::SeqCst);
         let first_new = f
@@ -1037,11 +808,22 @@ impl ConcurrentFetchers {
             .iter()
             .position(|r| r.offset > last_ret)
             .unwrap_or(f.records.len());
+
+        // recordOrderedFetchTelemetry
+        self.metrics
+            .fetch_wait_duration
+            .observe(wait_start.elapsed().as_secs_f64());
+        let discarded_bytes: usize = f.records[..first_new].iter().map(|r| r.value.len()).sum();
+        self.metrics
+            .fetched_discarded_record_bytes
+            .inc_by(discarded_bytes as f64);
         if first_new > 0 {
-            let discarded_bytes: usize = f.records[..first_new].iter().map(|r| r.value.len()).sum();
-            self.metrics
-                .fetched_discarded_record_bytes
-                .inc_by(discarded_bytes as f64);
+            debug!(
+                skipped_records_count = first_new,
+                first_skipped_offset = f.records[0].offset,
+                last_skipped_offset = f.records[first_new - 1].offset,
+                "skipped records because it is already returned"
+            );
             f.records.drain(..first_new);
         }
         if let Some(last) = f.records.last() {
@@ -1050,22 +832,21 @@ impl ConcurrentFetchers {
         Some(f)
     }
 
-    /// Issues a single Fetch request for `fw` without starting the background worker loop.
-    pub async fn fetch_single(&self, fw: &FetchWant) -> FetchResult {
-        fetch_single_inner(
-            &self.broker,
-            &self.topic_name,
-            self.topic_id,
-            self.partition_id,
-            fw,
-            self.min_bytes_wait_time,
-            self.track_compressed_bytes,
-            &self.metrics,
-        )
-        .await
+    /// `PollFetches` bounded by `timeout` (zero = wait forever).
+    pub async fn poll_fetches(&self, timeout: Duration) -> Option<FetchResult> {
+        if timeout.is_zero() {
+            self.poll_fetches_until(std::future::pending::<()>()).await
+        } else {
+            self.poll_fetches_until(tokio::time::sleep(timeout)).await
+        }
     }
 
-    /// Issues a single Fetch request that returns early if `cancel_rx` fires.
+    /// `fetchSingle`: one Fetch request for `fw` to the partition leader.
+    pub async fn fetch_single(&self, fw: &FetchWant) -> FetchResult {
+        self.worker_ctx().fetch_single(fw).await
+    }
+
+    /// `fetchSingle` with a canceled context: returns an empty, non-error result.
     pub async fn fetch_single_cancellable(
         &self,
         fw: &FetchWant,
@@ -1081,194 +862,324 @@ impl ConcurrentFetchers {
         }
     }
 
-    /// Parses and validates a raw `FetchResponse`.
+    /// `parseFetchResponse` of a v13 (topic ID) response.
     pub fn parse_fetch_response(&self, start_offset: i64, resp: &FetchResponse) -> FetchResult {
-        parse_fetch_response_inner(
-            &self.topic_name,
-            self.topic_id,
-            self.partition_id,
-            start_offset,
-            self.track_compressed_bytes,
-            resp,
-        )
+        self.worker_ctx()
+            .parse_fetch_response(start_offset, resp, CONCURRENT_FETCH_VERSION)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn fetch_single_inner(
-    broker: &FetchBrokerClient,
-    topic_name: &str,
+/// What a worker needs to issue and parse Fetch requests.
+struct WorkerCtx {
+    client: Arc<KafkaClient>,
+    refresher: Arc<PartitionMetadataRefresher>,
+    topic_name: String,
     topic_id: [u8; 16],
     partition_id: i32,
-    fw: &FetchWant,
     min_bytes_wait_time: Duration,
     track_compressed_bytes: bool,
-    metrics: &FetcherMetrics,
-) -> FetchResult {
-    let conn = match broker.conn().await {
-        Ok(c) => c,
-        Err(e) => return FetchResult::error(partition_id, Some(e)),
-    };
-
-    let mut fp = FetchPartition::default();
-    fp.partition = partition_id;
-    fp.current_leader_epoch = -1;
-    fp.fetch_offset = fw.start_offset;
-    fp.partition_max_bytes = fw.max_bytes();
-
-    let mut ft = broker
-        .topic_template
-        .lock()
-        .clone()
-        .unwrap_or_else(|| FetchTopic::default().with_topic(TopicName(StrBytes::from_string(topic_name.to_string()))));
-    ft.partitions = vec![fp];
-
-    let mut req = FetchRequest::default();
-    req.replica_id = BrokerId(-1);
-    req.min_bytes = 1;
-    req.max_wait_ms = min_bytes_wait_time.as_millis().min(i32::MAX as u128) as i32;
-    req.max_bytes = fw.max_bytes();
-    req.isolation_level = 0;
-    req.session_id = 0;
-    req.session_epoch = -1;
-    req.topics = vec![ft];
-
-    metrics.fetch_max_bytes.observe(req.max_bytes as f64);
-
-    match conn.send::<FetchRequest, FetchResponse>(ApiKey::Fetch, 13, &req, broker.request_timeout).await {
-        Ok(resp) => parse_fetch_response_inner(
-            topic_name,
-            topic_id,
-            partition_id,
-            fw.start_offset,
-            track_compressed_bytes,
-            &resp,
-        ),
-        Err(e) => FetchResult::error(partition_id, Some(e)),
-    }
+    metrics: FetcherMetrics,
 }
 
-fn parse_fetch_response_inner(
-    _topic_name: &str,
-    expected_topic_id: [u8; 16],
-    expected_partition_id: i32,
-    start_offset: i64,
-    track_compressed_bytes: bool,
-    resp: &FetchResponse,
-) -> FetchResult {
-    if resp.error_code != 0 {
-        return FetchResult::error(
-            expected_partition_id,
-            Some(KafkaFetchError::Other(format!(
-                "received error code {}",
-                resp.error_code
-            ))),
-        );
+impl WorkerCtx {
+    async fn fetch_single(&self, fw: &FetchWant) -> FetchResult {
+        let fetch_start = std::time::Instant::now();
+        let res = self.fetch_single_inner(fw).await;
+        log_completed_fetch(&res, fetch_start, fw);
+        res
     }
 
-    if resp.responses.len() != 1 {
-        return FetchResult::error(
-            expected_partition_id,
-            Some(KafkaFetchError::Other(format!(
-                "unexpected number of topics in the Fetch response (expected: 1 got: {})",
-                resp.responses.len()
-            ))),
-        );
-    }
+    async fn fetch_single_inner(&self, fw: &FetchWant) -> FetchResult {
+        // Lookup the leader broker for the topic partition.
+        let (leader_id, leader_epoch) = self
+            .client
+            .cached_partition_leader(&self.topic_name, self.partition_id);
+        if leader_id == -1 && leader_epoch == -1 {
+            return FetchResult::error(self.partition_id, Some(KafkaFetchError::UnknownPartitionLeader));
+        }
 
-    let topic_resp = &resp.responses[0];
-    if *topic_resp.topic_id.as_bytes() != expected_topic_id {
-        return FetchResult::error(
-            expected_partition_id,
-            Some(KafkaFetchError::Other(format!(
-                "unexpected topic ID in the Fetch response (expected: {:?} got: {:?})",
-                expected_topic_id,
-                topic_resp.topic_id.as_bytes()
-            ))),
-        );
-    }
+        let max_bytes = fw.max_bytes();
+        let mut fp = FetchPartition::default();
+        fp.partition = self.partition_id;
+        fp.current_leader_epoch = leader_epoch;
+        fp.fetch_offset = fw.start_offset;
+        fp.last_fetched_epoch = -1;
+        fp.log_start_offset = -1;
+        fp.partition_max_bytes = max_bytes;
 
-    if topic_resp.partitions.len() != 1 {
-        return FetchResult::error(
-            expected_partition_id,
-            Some(KafkaFetchError::Other(format!(
-                "unexpected number of partitions in the Fetch response (expected: 1 got: {})",
-                topic_resp.partitions.len()
-            ))),
-        );
-    }
+        let mut ft = FetchTopic::default();
+        ft.topic = TopicName(StrBytes::from_string(self.topic_name.clone()));
+        ft.topic_id = uuid::Uuid::from_bytes(self.topic_id);
+        ft.partitions = vec![fp];
 
-    let part_resp = &topic_resp.partitions[0];
-    if part_resp.partition_index != expected_partition_id {
-        return FetchResult::error(
-            expected_partition_id,
-            Some(KafkaFetchError::Other(format!(
-                "unexpected partition ID in the Fetch response (expected: {} got: {})",
-                expected_partition_id, part_resp.partition_index
-            ))),
-        );
-    }
+        let mut req = FetchRequest::default();
+        req.replica_id = BrokerId(-1);
+        // Warpstream ignores MinBytes: MaxWaitMillis is always waited.
+        req.min_bytes = 1;
+        req.max_wait_ms = self.min_bytes_wait_time.as_millis().min(i32::MAX as u128) as i32;
+        req.max_bytes = max_bytes;
+        req.isolation_level = 0;
+        req.session_id = 0;
+        req.session_epoch = -1;
+        // No rack: ConcurrentFetchers always reads from the partition leader.
+        req.topics = vec![ft];
 
-    if let Some(err) = part_resp.error_code.err() {
-        return FetchResult::error(expected_partition_id, Some(KafkaFetchError::Broker(err)));
-    }
+        self.metrics.fetch_max_bytes.observe(req.max_bytes as f64);
 
-    let mut records = Vec::new();
-    let mut raw_len = 0usize;
-    if let Some(ref raw) = part_resp.records {
-        raw_len = raw.len();
-        if !raw.is_empty() {
-            let mut slice = raw.clone();
-            match RecordBatchDecoder::decode_with_custom_compression(
-                &mut slice,
-                Some(decompress_record_batch),
-            ) {
-                Ok(batch) => {
-                    for rec in batch {
-                        if rec.control || rec.offset < start_offset {
-                            continue;
-                        }
-                        let headers = rec
-                            .headers
-                            .into_iter()
-                            .map(|(k, v)| (k.as_str().to_owned(), v.unwrap_or_default()))
-                            .collect();
-                        records.push(FetchedRecord {
-                            offset: rec.offset,
-                            timestamp_ms: rec.timestamp,
-                            key: rec.key.unwrap_or_default(),
-                            value: rec.value.unwrap_or_default(),
-                            headers,
-                        });
-                    }
-                }
-                Err(e) => {
-                    return FetchResult::error(
-                        expected_partition_id,
-                        Some(KafkaFetchError::Other(format!("decode batch: {e}"))),
-                    );
-                }
-            }
+        // Topic IDs are only usable with v13+; without a known topic ID stay on v12.
+        let max_version = if self.topic_id == [0u8; 16] {
+            12
+        } else {
+            CONCURRENT_FETCH_VERSION
+        };
+        // kgo read deadline: MaxWait + RequestTimeoutOverhead (10s).
+        let timeout = self.min_bytes_wait_time + super::kgo_retry::DEFAULT_REQUEST_TIMEOUT_OVERHEAD;
+        match self
+            .client
+            .fetch_from_broker(leader_id, &req, 4, max_version, timeout)
+            .await
+        {
+            Ok((resp, version)) => self.parse_fetch_response(fw.start_offset, &resp, version),
+            Err(e) => FetchResult::error(self.partition_id, Some(kafka_fetch_error_from_client(e))),
         }
     }
 
-    let fetched_bytes = if track_compressed_bytes {
-        raw_len
-    } else {
-        records.iter().map(|r| r.value.len()).sum()
-    };
+    /// `parseFetchResponse`. Guarantees no record is returned together with an error.
+    fn parse_fetch_response(&self, start_offset: i64, resp: &FetchResponse, version: i16) -> FetchResult {
+        // PreferredReadReplica is ignored: no rack is sent, so the broker has no recommended
+        // replica for us.
+        let pid = self.partition_id;
+        let err = |msg: String| FetchResult::error(pid, Some(KafkaFetchError::Other(msg)));
+        if resp.error_code != 0 {
+            return err(format!("received error code {}", resp.error_code));
+        }
+        if resp.responses.len() != 1 {
+            return err(format!(
+                "unexpected number of topics in the Fetch response (expected: 1 got: {})",
+                resp.responses.len()
+            ));
+        }
+        let topic_resp = &resp.responses[0];
+        if version >= 13 {
+            if *topic_resp.topic_id.as_bytes() != self.topic_id {
+                return err(format!(
+                    "unexpected topic ID in the Fetch response (expected: {} got {})",
+                    uuid_string(&self.topic_id),
+                    uuid_string(topic_resp.topic_id.as_bytes())
+                ));
+            }
+        } else if topic_resp.topic.0.as_str() != self.topic_name {
+            return err(format!(
+                "unexpected topic in the Fetch response (expected: {} got {})",
+                self.topic_name,
+                topic_resp.topic.0.as_str()
+            ));
+        }
+        if topic_resp.partitions.len() != 1 {
+            return err(format!(
+                "unexpected number of partitions in the Fetch response (expected: 1 got: {})",
+                topic_resp.partitions.len()
+            ));
+        }
+        let part_resp = &topic_resp.partitions[0];
+        if part_resp.partition_index != pid {
+            return err(format!(
+                "unexpected partition ID in the Fetch response (expected: {} got {})",
+                pid, part_resp.partition_index
+            ));
+        }
+        if let Some(e) = part_resp.error_code.err() {
+            return FetchResult::error(pid, Some(KafkaFetchError::Broker(e)));
+        }
 
-    FetchResult {
-        partition: expected_partition_id,
-        records,
-        high_watermark: part_resp.high_watermark,
-        log_start_offset: part_resp.log_start_offset,
-        fetched_bytes,
-        err: None,
+        let raw = part_resp.records.clone().unwrap_or_default();
+        let raw_len = raw.len();
+        let records = if raw.is_empty() {
+            Vec::new()
+        } else {
+            match self.client.decode_fetched_partition(raw, start_offset) {
+                Ok((records, _, _)) => records,
+                Err(e) => return err(format!("decode batch: {e}")),
+            }
+        };
+
+        let fetched_bytes = if self.track_compressed_bytes {
+            raw_len
+        } else {
+            records.iter().map(|r| r.value.len()).sum()
+        };
+
+        FetchResult {
+            partition: pid,
+            records,
+            high_watermark: part_resp.high_watermark,
+            log_start_offset: part_resp.log_start_offset,
+            fetched_bytes,
+            err: None,
+        }
     }
 }
 
-fn cas_hwm(hwm: &AtomicI64, new_hwm: i64) {
+fn uuid_string(b: &[u8; 16]) -> String {
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+/// `fetchResult.logCompletedFetch`.
+fn log_completed_fetch(fr: &FetchResult, fetch_start: std::time::Instant, fw: &FetchWant) {
+    let got = fr.records.len() as i64;
+    let asked = fw.end_offset - fw.start_offset;
+    let first_ts = fr.records.first().map(|r| r.timestamp_ms);
+    let last_ts = fr.records.last().map(|r| r.timestamp_ms);
+    match &fr.err {
+        None | Some(KafkaFetchError::Broker(ResponseError::OffsetOutOfRange)) => debug!(
+            duration = ?fetch_start.elapsed(),
+            start_offset = fw.start_offset,
+            end_offset = fw.end_offset,
+            asked_records = asked,
+            got_records = got,
+            diff_records = asked - got,
+            asked_bytes = fw.max_bytes(),
+            got_bytes = fr.fetched_bytes,
+            first_timestamp = ?first_ts,
+            last_timestamp = ?last_ts,
+            hwm = fr.high_watermark,
+            lso = fr.log_start_offset,
+            err = ?fr.err,
+            "{}",
+            if fr.err.is_none() { "fetched records" } else { "received an error while fetching records; will retry after processing received records (if any)" }
+        ),
+        Some(e) => error!(
+            duration = ?fetch_start.elapsed(),
+            start_offset = fw.start_offset,
+            end_offset = fw.end_offset,
+            asked_records = asked,
+            got_records = got,
+            asked_bytes = fw.max_bytes(),
+            hwm = fr.high_watermark,
+            lso = fr.log_start_offset,
+            err = %e,
+            "received an error while fetching records; will retry after processing received records (if any)"
+        ),
+    }
+}
+
+/// The workers' shared end of the `wants` channel: a fetchWant and where to send its results.
+type WantsRx = mpsc::Receiver<(FetchWant, mpsc::Sender<FetchResult>)>;
+
+/// `ConcurrentFetchers.run`: one worker servicing fetchWants until the wants channel closes.
+#[allow(clippy::too_many_arguments)]
+async fn run_worker(
+    ctx: WorkerCtx,
+    wants_rx: Arc<Mutex<WantsRx>>,
+    range_policy: RangeErrorPolicy,
+    start_offsets_reader: Arc<GenericOffsetReader<i64>>,
+    backoff_cfg: BackoffConfig,
+    buffered_recs: Arc<AtomicI64>,
+    hwm: Arc<AtomicI64>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    // One backoff per worker, shared by all its fetchWants (reset on any received record).
+    let err_backoff = BackoffWaiter(SyncMutex::new(Backoff::new(backoff_cfg)));
+    let partition_id = ctx.partition_id;
+    loop {
+        if *stop_rx.borrow() {
+            return;
+        }
+        let item = {
+            let mut locked = wants_rx.lock().await;
+            tokio::select! {
+                biased;
+                _ = stop_rx.changed() => None,
+                res = locked.recv() => res,
+            }
+        };
+        let Some((mut w, result_tx)) = item else {
+            return;
+        };
+
+        // The buffered fetchResult not yet sent to the result channel.
+        let mut buffered = FetchResult::empty(partition_id);
+
+        while w.end_offset > w.start_offset {
+            let res = tokio::select! {
+                biased;
+                _ = stop_rx.changed() => return,
+                res = ctx.fetch_single(&w) => res,
+            };
+
+            if let Some(ref err) = res.err {
+                // We got an error: handle it and discard this fetch result content.
+                match handle_kafka_fetch_err(
+                    Some(err),
+                    w.clone(),
+                    &err_backoff,
+                    range_policy,
+                    &start_offsets_reader,
+                    ctx.refresher.as_ref(),
+                )
+                .await
+                {
+                    Ok(adjusted) => w = adjusted,
+                    Err(fatal) => {
+                        tracing::warn!(partition = partition_id, error = %fatal, "failed to handle Kafka fetch error");
+                        tokio::select! {
+                            biased;
+                            _ = stop_rx.changed() => return,
+                            _ = result_tx.send(FetchResult::error(partition_id, Some(fatal))) => {}
+                        }
+                        // Break out of the retry loop, but continue servicing the wants.
+                        break;
+                    }
+                }
+            } else {
+                // Count buffered records as soon as they are fetched.
+                buffered_recs.fetch_add(res.records.len() as i64, Ordering::SeqCst);
+                if res.high_watermark >= 0 {
+                    cas_hwm(&hwm, res.high_watermark);
+                }
+                // Keep non-mergeable fields from res: the last response is the most updated.
+                buffered = res.merge(buffered);
+            }
+
+            if buffered.records.is_empty() {
+                if *stop_rx.borrow() {
+                    return;
+                }
+                continue;
+            }
+
+            // The next attempt is from the last record onwards.
+            w.start_offset = buffered.records.last().expect("non-empty").offset + 1;
+            w = w.update_bytes_per_record(buffered.fetched_bytes, buffered.records.len());
+
+            // Any received record means some success: reset the backoff.
+            err_backoff.0.lock().reset();
+
+            match result_tx.try_send(buffered) {
+                Ok(()) => buffered = FetchResult::empty(partition_id),
+                Err(mpsc::error::TrySendError::Full(b)) => {
+                    if w.start_offset >= w.end_offset {
+                        // The whole want is fetched: we definitely have to wait to send now.
+                        tokio::select! {
+                            biased;
+                            _ = stop_rx.changed() => return,
+                            _ = result_tx.send(b) => {}
+                        }
+                        buffered = FetchResult::empty(partition_id);
+                    } else {
+                        buffered = b;
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            }
+        }
+        // Closing the result channel tells the coordinator this want is done.
+        drop(result_tx);
+    }
+}
+
+pub(crate) fn cas_hwm(hwm: &AtomicI64, new_hwm: i64) {
     let mut cur = hwm.load(Ordering::SeqCst);
     while cur < new_hwm {
         match hwm.compare_exchange_weak(cur, new_hwm, Ordering::SeqCst, Ordering::SeqCst) {

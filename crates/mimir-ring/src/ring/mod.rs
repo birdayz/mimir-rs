@@ -55,6 +55,9 @@ pub enum RingError {
     TooFewReplicas(String),
     #[error("invalid ring config: {0}")]
     InvalidConfig(String),
+    /// `dskit/ring.NewWithStoreClientAndStrategy`: `ReplicationFactor must be greater than zero: %d`.
+    #[error("ReplicationFactor must be greater than zero: {0}")]
+    InvalidReplicationFactor(i64),
     #[error("KV error: {0}")]
     Kv(#[from] KvError),
 }
@@ -230,6 +233,9 @@ impl Ring {
         memberlist_kv: Option<Arc<MemberlistKv>>,
         reg: Option<&R>,
     ) -> Result<Arc<Self>, RingError> {
+        if cfg.replication_factor <= 0 {
+            return Err(RingError::InvalidReplicationFactor(cfg.replication_factor));
+        }
         let registerer = reg.map(|r| r.as_registerer());
         let kv_reg = registerer_with_kv_name(registerer.as_ref(), &format!("{name}-ring"));
         let store = build_kv_client(
@@ -258,9 +264,7 @@ impl Ring {
     ) -> Result<Arc<Self>, RingError> {
         let reg = reg.map(|r| r.as_registerer());
         if settings.replication_factor == 0 {
-            return Err(RingError::InvalidConfig(
-                "ReplicationFactor must be greater than zero".to_string(),
-            ));
+            return Err(RingError::InvalidReplicationFactor(0));
         }
         Ok(Arc::new(Self {
             key: key.to_string(),
@@ -297,9 +301,7 @@ impl Ring {
         strategy: Arc<dyn ReplicationStrategy>,
     ) -> Result<Arc<Self>, RingError> {
         if settings.replication_factor == 0 {
-            return Err(RingError::InvalidConfig(
-                "ReplicationFactor must be greater than zero".to_string(),
-            ));
+            return Err(RingError::InvalidReplicationFactor(0));
         }
         let ring = Arc::new(Self {
             key: String::new(),
@@ -1360,4 +1362,27 @@ fn should_include_readonly_in_shard(
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod new_ring_tests {
+    use super::*;
+
+    // dskit/ring/ring.go NewWithStoreClientAndStrategy: ReplicationFactor <= 0 is rejected.
+    #[test]
+    fn rejects_non_positive_replication_factor() {
+        for rf in [0, -1] {
+            let mut cfg = RingConfig::default();
+            cfg.kvstore.store = "inmemory".to_string();
+            cfg.replication_factor = rf;
+            let err = match Ring::new::<prometheus::Registry>(&cfg, "ingester", "ring", None, None) {
+                Ok(_) => panic!("expected error for replication factor {rf}"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.to_string(),
+                format!("ReplicationFactor must be greater than zero: {rf}")
+            );
+        }
+    }
 }

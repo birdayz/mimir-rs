@@ -37,6 +37,9 @@ pub fn parse_cli_for_run(prog_name: &str, args: &[String]) -> CliOutcome {
 }
 
 fn execute_cli_inner(prog_name: &str, args: &[String], test_mode: bool) -> CliOutcome {
+    mimir_config::limits::set_active_series_custom_trackers_validator(
+        mimir_ingester::active_series::validate_custom_trackers,
+    );
     match parse_cli_and_load_config(prog_name, args) {
         Err(ConfigError::Flag(msg)) => CliOutcome {
             stdout: String::new(),

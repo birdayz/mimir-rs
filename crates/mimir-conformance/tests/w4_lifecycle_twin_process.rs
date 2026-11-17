@@ -13,7 +13,6 @@
 //!
 //! Needs only the two binaries and loopback networking (no Docker).
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,10 +28,6 @@ use mimir_proto::ingesterpb::ingester_client::IngesterClient;
 use tonic::metadata::MetadataValue;
 
 const BOTH: [Impl; 2] = [Impl::Go, Impl::Rust];
-
-/// Modules Go runs for `-target=ingester` that mimir-rs doesn't implement yet (tracked in
-/// PORT_STATUS.md); every other module must exist with the same state.
-const KNOWN_MISSING_MODULES: &[&str] = &["active-groups-cleanup-service"];
 
 struct Ports {
     http: u16,
@@ -227,13 +222,6 @@ fn lc5_sanity_check_unreachable_object_storage_blocks_serving() {
 // LC-12 / LC-13: /services, /ready and gRPC health follow the module states
 // ---------------------------------------------------------------------------------------------
 
-fn comparable_services(mut s: BTreeMap<String, String>) -> BTreeMap<String, String> {
-    for m in KNOWN_MISSING_MODULES {
-        s.remove(*m);
-    }
-    s
-}
-
 #[test]
 fn lc13_services_ready_and_grpc_health_follow_module_states() {
     block_on_for_tests(async {
@@ -272,8 +260,7 @@ fn lc13_services_ready_and_grpc_health_follow_module_states() {
             let (label, out) = snapshot("running").await;
             let (_, go_svcs, go_ready, go_health) = &out[0];
             let (_, rs_svcs, rs_ready, rs_health) = &out[1];
-            assert_eq!(comparable_services(go_svcs.clone()), comparable_services(rs_svcs.clone()), "{label}: /services");
-            assert!(rs_svcs.keys().all(|k| go_svcs.contains_key(k)), "{label}: extra Rust modules {rs_svcs:?}");
+            assert_eq!(go_svcs, rs_svcs, "{label}: /services");
             assert_eq!(go_ready, rs_ready, "{label}: /ready");
             assert_eq!(go_health, rs_health, "{label}: gRPC health");
             assert_eq!(*go_health, 1, "{label}: SERVING");
@@ -293,7 +280,7 @@ fn lc13_services_ready_and_grpc_health_follow_module_states() {
         let (_, rs_svcs, rs_ready, rs_health) = &out[1];
         assert_eq!(go_svcs.get("ingester-service").map(String::as_str), Some("Terminated"));
         assert_eq!(go_svcs.get("usage-stats").map(String::as_str), Some("Running"));
-        assert_eq!(comparable_services(go_svcs.clone()), comparable_services(rs_svcs.clone()), "{label}: /services");
+        assert_eq!(go_svcs, rs_svcs, "{label}: /services");
         assert_eq!(go_ready.0, 503);
         // Go lists not-Running modules in map order: compare the set of lines.
         let lines = |s: &str| {

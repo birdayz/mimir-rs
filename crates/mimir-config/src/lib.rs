@@ -14,6 +14,7 @@ pub mod duration;
 pub mod env;
 pub mod error;
 pub mod flags;
+pub mod help;
 pub mod ingester;
 pub mod limits;
 pub mod mimir;
@@ -24,6 +25,8 @@ pub mod server;
 pub mod sha256;
 pub mod storage;
 pub mod types;
+pub mod yaml_v3_emit;
+pub mod yaml_v3;
 
 pub use duration::{
     format_go_duration, format_model_duration, parse_duration, parse_go_duration,
@@ -32,7 +35,7 @@ pub use duration::{
 pub use env::{expand_environment_variables, expand_environment_variables_with};
 pub use error::{CliAction, ConfigError};
 pub use flags::{
-    format_modules, format_version, is_targetable_module, parse_config_file_parameter, FlagSet,
+    format_modules, format_version, go_version_str, is_targetable_module, parse_config_file_parameter, FlagSet,
     MainFlags, USER_VISIBLE_MODULES,
 };
 pub use ingester::{
@@ -48,8 +51,9 @@ pub use limits::{
 };
 pub use mimir::{parse_cli_and_load_config, CommonConfig, LoadedConfig, MimirConfig};
 pub use runtime_config::{
-    parse_runtime_config_yaml, DistributorInstanceLimits, MultiRuntimeConfig, Overrides,
-    RuntimeConfigManager, RuntimeConfigValues,
+    parse_runtime_config_yaml, runtime_config_source_ids, DistributorInstanceLimits,
+    MultiRuntimeConfig, Overrides, RuntimeConfigLoadEvent, RuntimeConfigManager,
+    RuntimeConfigObserver, RuntimeConfigSourceStatus, RuntimeConfigValues,
 };
 pub use server::{
     ActivityTrackerConfig, ClusterValidationProtocolConfig, ClusterValidationProtocolConfigForHTTP,

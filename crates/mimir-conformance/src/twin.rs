@@ -4,10 +4,8 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -65,28 +63,11 @@ pub fn binary(which: Impl) -> PathBuf {
     }
 }
 
-/// Hands out `n` distinct free TCP ports below Linux's ephemeral range (32768..60999), so an
-/// outgoing connection of another process can't grab a port between the check and the bind.
+/// Hands out `n` distinct free TCP ports from [`crate::free_test_port`] (`15000..32000`,
+/// below Linux's ephemeral range), so an outgoing connection of another process can't grab a
+/// port between the check and the bind.
 pub fn free_tcp_ports(n: usize) -> Vec<u16> {
-    const LOW: u32 = 33_000 - 12_000;
-    const SPAN: u32 = 11_000;
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let offset = (std::process::id() * 619) % SPAN;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..SPAN {
-        if out.len() == n {
-            break;
-        }
-        let port = (LOW + (offset + NEXT.fetch_add(1, Ordering::Relaxed)) % SPAN) as u16;
-        let free = ["127.0.0.1", "0.0.0.0"]
-            .iter()
-            .all(|host| StdTcpListener::bind((*host, port)).is_ok());
-        if free {
-            out.push(port);
-        }
-    }
-    assert_eq!(out.len(), n, "no free TCP ports left");
-    out
+    (0..n).map(|_| crate::free_test_port()).collect()
 }
 
 /// A child process with stdout+stderr captured; killed and reaped on drop.

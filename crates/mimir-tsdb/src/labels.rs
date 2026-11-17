@@ -486,6 +486,7 @@ impl fmt::Display for Labels {
 }
 
 /// Iterator over `(name, value)` pairs inside [`Labels`].
+#[derive(Clone)]
 pub struct LabelsIter<'a> {
     data: &'a [u8],
     pos: usize,

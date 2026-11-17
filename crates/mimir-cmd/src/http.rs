@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use axum::extract::{Query, State as AxumState};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get};
 use axum::{Json, Router};
 use mimir_common::logging::format_rfc3339_nano_utc;
 use mimir_common::services::State;
@@ -16,7 +16,7 @@ use mimir_common::tenant::extract_tenant_id_from_http_headers;
 use mimir_config::{LimitsConfig, MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::{ingester_router, Ingester};
 use mimir_ring::kv::memberlist::MemberlistKv;
-use prometheus::{Encoder, Registry, TextEncoder};
+use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
@@ -36,6 +36,9 @@ pub struct AppHttpState {
     pub memberlist_kv: Option<Arc<MemberlistKv>>,
     /// Module services of the configured targets (Go `Mimir.ServiceMap`) and their states.
     pub modules: Arc<ModuleStates>,
+    /// `(cost_attribution_registry_path, registry)` when cost attribution is enabled
+    /// (Go: `API.RegisterCostAttribution`).
+    pub cost_attribution_registry: Option<(String, Registry)>,
 }
 
 /// Builds the full Axum HTTP router (with `server.http_path_prefix` honored).
@@ -46,8 +49,10 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     let path_prefix = state.config.server.http_path_prefix.trim_end_matches('/').to_string();
     let shutdown_requested = Arc::clone(&state.shutdown_requested);
 
+    // `/ready` and `/metrics` are registered without a method restriction (Go
+    // `Server.HTTP.Path("/ready")`, dskit `router.Handle("/metrics", ...)`).
     let mut router = Router::new()
-        .route("/ready", get(ready_handler))
+        .route("/ready", any(ready_handler))
         .route("/services", get(services_handler))
         .route("/config", get(config_handler))
         .route("/runtime_config", get(runtime_config_handler))
@@ -55,7 +60,14 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         .route("/api/v1/status/buildinfo", get(buildinfo_handler))
         .route("/api/v1/status/config", get(status_config_handler))
         .route("/api/v1/status/flags", get(status_flags_handler))
-        .route("/debug/pprof/profile", get(pprof_profile_handler));
+        // dskit registerInstrumentation: `/debug/pprof/cmdline` is NotFound, everything else under
+        // `/debug/pprof` goes to Go's net/http/pprof handlers (any method).
+        .route("/debug/pprof/cmdline", any(not_found_handler))
+        .route("/debug/pprof/profile", any(crate::pprof::profile_handler))
+        .route("/debug/pprof/symbol", any(crate::pprof::symbol_handler))
+        .route("/debug/pprof", any(crate::pprof::index_redirect_handler))
+        .route("/debug/pprof/", any(crate::pprof::index_handler))
+        .route("/debug/pprof/*name", any(crate::pprof::unknown_profile_handler));
 
     let has_prefix = !path_prefix.is_empty() && path_prefix != "/";
     if !has_prefix {
@@ -63,10 +75,33 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     }
 
     if register_instrumentation {
-        router = router.route("/metrics", get(metrics_handler));
+        let cache = Arc::new(MetricsCache::new(
+            state
+                .config
+                .server
+                .metrics_cache_duration
+                .as_std()
+                .unwrap_or_default(),
+        ));
+        router = router.route(
+            "/metrics",
+            any(move |st: AxumState<AppHttpState>, headers: HeaderMap| {
+                metrics_handler(st, headers, Arc::clone(&cache))
+            }),
+        );
     }
     if has_memberlist {
         router = router.route("/memberlist", get(memberlist_handler));
+    }
+    if let Some((path, reg)) = state.cost_attribution_registry.clone() {
+        let path = if path.starts_with('/') { path } else { format!("/{path}") };
+        router = router.route(
+            &path,
+            any(move |headers: HeaderMap| {
+                let reg = reg.clone();
+                async move { encode_families(&reg.gather(), &headers) }
+            }),
+        );
     }
 
     let state_for_root = state.clone();
@@ -75,6 +110,16 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     if let Some(ing) = ingester_opt {
         app = app.merge(ingester_router(ing));
     }
+
+    // pkg/api/api.go newRoute: `gziphandler.GzipHandler` on every gzip-enabled route.
+    let gzip = crate::server::gzip::GzipConfig {
+        level: state_for_root.config.api_response_compression_level().unwrap_or(-1),
+    };
+    app = app
+        .route_layer(axum::middleware::from_fn_with_state(gzip, crate::server::gzip::gzip_handler))
+        // gorilla/mux answers a known path with an unsupported method with an empty 405 and
+        // reports it as an unmatched route.
+        .method_not_allowed_fallback(crate::server::http_middleware::method_not_allowed);
 
     let router = if has_prefix {
         let normalized = if path_prefix.starts_with('/') {
@@ -89,8 +134,10 @@ pub fn build_http_router(state: AppHttpState) -> Router {
                 get(index_handler).with_state(state_for_root),
             )
             .nest(&normalized, app)
+            .fallback(not_found_handler)
     } else {
-        app
+        // gorilla/mux NotFoundHandler default: http.NotFound.
+        app.fallback(not_found_handler)
     };
 
     // Go disables HTTP keep-alives as soon as a shutdown signal is received
@@ -108,6 +155,19 @@ pub fn build_http_router(state: AppHttpState) -> Router {
             resp
         }
     }))
+}
+
+/// `http.NotFoundHandler()` (`http.Error(w, "404 page not found", 404)`).
+pub async fn not_found_handler() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        "404 page not found\n",
+    )
+        .into_response()
 }
 
 async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
@@ -145,23 +205,93 @@ async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
         .into_response()
 }
 
-async fn metrics_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
-    let metric_families = st.registry.gather();
-    let encoder = TextEncoder::new();
-    let mut buf = Vec::with_capacity(4096);
-    if let Err(err) = encoder.encode(&metric_families, &mut buf) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("error encoding metrics: {err}"),
-        )
-            .into_response();
+/// dskit `registerInstrumentation`: `promhttp.HandlerFor(gatherer, HandlerOpts{EnableOpenMetrics:
+/// true})` (wrapped by `metrics.CachedHandlerFor` when `-server.metrics-cache-duration` > 0):
+/// content negotiation (OpenMetrics 1.0.0/0.0.1, delimited protobuf, text 0.0.4), `Vary` headers
+/// and gzip response compression.
+async fn metrics_handler(
+    AxumState(st): AxumState<AppHttpState>,
+    headers: HeaderMap,
+    cache: Arc<MetricsCache>,
+) -> Response {
+    let families = cache.gather(&st.registry);
+    encode_families(&families, &headers)
+}
+
+fn encode_families(
+    families: &[prometheus::proto::MetricFamily],
+    headers: &HeaderMap,
+) -> Response {
+    let header_str = |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+    let format = crate::expfmt::negotiate(header_str(header::ACCEPT));
+    let body = match crate::expfmt::encode(families, &format) {
+        Ok(b) => b,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("An error has occurred while serving metrics:\n\n{err}\n"),
+            )
+                .into_response();
+        }
+    };
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::VARY, "Accept")
+        .header(header::VARY, "Accept-Encoding")
+        .header(header::CONTENT_TYPE, format.content_type);
+    let body = match crate::expfmt::negotiate_content_encoding(header_str(header::ACCEPT_ENCODING)) {
+        Some("gzip") => {
+            builder = builder.header(header::CONTENT_ENCODING, "gzip");
+            gzip_bytes(&body)
+        }
+        // Go fails to build a writer for an unacceptable encoding and falls back to identity.
+        _ => body,
+    };
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+pub(crate) fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut enc = flate2::write::GzEncoder::new(
+        Vec::with_capacity(data.len() / 4 + 64),
+        flate2::Compression::default(),
+    );
+    let _ = enc.write_all(data);
+    enc.finish().unwrap_or_default()
+}
+
+/// dskit `metrics.CachedHandlerFor`: reuses the gathered metric families for
+/// `-server.metrics-cache-duration` (0 disables caching).
+pub struct MetricsCache {
+    duration: std::time::Duration,
+    cached: parking_lot::Mutex<Option<(std::time::Instant, Arc<Vec<prometheus::proto::MetricFamily>>)>>,
+}
+
+impl MetricsCache {
+    pub fn new(duration: std::time::Duration) -> Self {
+        Self {
+            duration,
+            cached: parking_lot::Mutex::new(None),
+        }
     }
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, encoder.format_type().to_string())],
-        buf,
-    )
-        .into_response()
+
+    fn gather(&self, registry: &Registry) -> Arc<Vec<prometheus::proto::MetricFamily>> {
+        if self.duration.is_zero() {
+            return Arc::new(registry.gather());
+        }
+        let mut cached = self.cached.lock();
+        if let Some((at, ref fams)) = *cached {
+            if at.elapsed() < self.duration {
+                return Arc::clone(fams);
+            }
+        }
+        let fams = Arc::new(registry.gather());
+        *cached = Some((std::time::Instant::now(), Arc::clone(&fams)));
+        fams
+    }
 }
 
 #[derive(Serialize)]
@@ -403,40 +533,56 @@ struct BuildInfoData {
     features: BuildInfoFeatures,
 }
 
+/// Go `version.BuildInfoFeatures` (field order is the JSON order).
 #[derive(Serialize)]
 struct BuildInfoFeatures {
+    ruler_config_api: String,
     alertmanager_config_api: String,
     query_sharding: String,
-    ruler_config_api: String,
     federated_rules: String,
     ingest_storage: String,
 }
 
-async fn buildinfo_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
-    let extra_bool = |section: &str, key: &str| -> bool {
-        st.config
-            .extra_sections
-            .get(section)
-            .and_then(|v| v.get(key))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+/// A boolean option of a block mimir-rs keeps as an extra section: the CLI flag wins over the
+/// YAML value, which wins over the flag default (Go flag registration + YAML + flag parsing).
+fn extra_section_bool(cfg: &MimirConfig, path: &[&str], flag: &str, default: bool) -> bool {
+    if let Some(v) = cfg.extra_cli_flag_value(flag) {
+        // strconv.ParseBool (the value was validated when the flag was parsed).
+        return matches!(v, "1" | "t" | "T" | "TRUE" | "true" | "True");
+    }
+    let Some((section, rest)) = path.split_first() else {
+        return default;
     };
-    let query_sharding = st
-        .config
-        .extra_sections
-        .get("frontend")
-        .and_then(|v| v.get("query_sharding_total_shards"))
-        .and_then(Value::as_i64)
-        .is_some_and(|n| n > 0);
-    let federated_rules = st
-        .config
-        .extra_sections
-        .get("ruler")
-        .and_then(|v| v.get("tenant_federation"))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let mut v = cfg.extra_sections.get(*section);
+    for key in rest {
+        v = v.and_then(|v| v.get(*key));
+    }
+    v.and_then(Value::as_bool).unwrap_or(default)
+}
 
+/// pkg/mimir/modules.go `initAPI` (`version.BuildInfoHandler("Grafana Mimir", ...)`).
+async fn buildinfo_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
+    let cfg = &st.config;
+    let features = BuildInfoFeatures {
+        ruler_config_api: extra_section_bool(cfg, &["ruler", "enable_api"], "ruler.enable-api", true).to_string(),
+        alertmanager_config_api: extra_section_bool(cfg, &["alertmanager", "enable_api"], "alertmanager.enable-api", true)
+            .to_string(),
+        query_sharding: extra_section_bool(
+            cfg,
+            &["frontend", "parallelize_shardable_queries"],
+            "query-frontend.parallelize-shardable-queries",
+            true,
+        )
+        .to_string(),
+        federated_rules: extra_section_bool(
+            cfg,
+            &["ruler", "tenant_federation", "enabled"],
+            "ruler.tenant-federation.enabled",
+            false,
+        )
+        .to_string(),
+        ingest_storage: cfg.ingest_storage.enabled.to_string(),
+    };
     Json(BuildInfoResponse {
         status: "success",
         data: BuildInfoData {
@@ -445,13 +591,7 @@ async fn buildinfo_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
             revision: revision_str(),
             branch: branch_str(),
             go_version: go_version_str(),
-            features: BuildInfoFeatures {
-                alertmanager_config_api: extra_bool("alertmanager", "enable_api").to_string(),
-                query_sharding: query_sharding.to_string(),
-                ruler_config_api: extra_bool("ruler", "enable_api").to_string(),
-                federated_rules: federated_rules.to_string(),
-                ingest_storage: st.config.ingest_storage.enabled.to_string(),
-            },
+            features,
         },
     })
     .into_response()
@@ -649,127 +789,4 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-}
-
-#[derive(Deserialize)]
-struct PprofQuery {
-    seconds: Option<u64>,
-    frequency: Option<i32>,
-    format: Option<String>,
-}
-
-#[cfg(unix)]
-async fn pprof_profile_handler(Query(q): Query<PprofQuery>) -> Response {
-    use std::collections::{HashMap, HashSet};
-    use std::fmt::Write as _;
-    use std::time::Duration;
-
-    let _ = q.format;
-    let seconds = q.seconds.unwrap_or(30).clamp(1, 300);
-    let frequency = q.frequency.unwrap_or(999).clamp(10, 4000);
-
-    let guard = match pprof::ProfilerGuardBuilder::default()
-        .frequency(frequency)
-        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-        .build()
-    {
-        Ok(g) => g,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to start cpu profiler: {e}\n"),
-            )
-                .into_response();
-        }
-    };
-
-    tokio::time::sleep(Duration::from_secs(seconds)).await;
-
-    let report = match guard.report().build() {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to build cpu profile report: {e}\n"),
-            )
-                .into_response();
-        }
-    };
-
-    let mut total_samples: isize = 0;
-    let mut flat_counts: HashMap<String, isize> = HashMap::new();
-    let mut cum_counts: HashMap<String, isize> = HashMap::new();
-    let mut stacks: Vec<(isize, String)> = Vec::new();
-
-    for (frames, count) in &report.data {
-        let count = *count;
-        if count <= 0 {
-            continue;
-        }
-        total_samples += count;
-
-        let mut seen_in_stack = HashSet::new();
-        let mut stack_syms: Vec<String> = Vec::new();
-        for group in &frames.frames {
-            for sym in group {
-                let name = sym.name();
-                if stack_syms.is_empty() {
-                    *flat_counts.entry(name.clone()).or_insert(0) += count;
-                }
-                if seen_in_stack.insert(name.clone()) {
-                    *cum_counts.entry(name.clone()).or_insert(0) += count;
-                }
-                stack_syms.push(name);
-            }
-        }
-        if stack_syms.is_empty() {
-            *flat_counts.entry("<unknown>".to_string()).or_insert(0) += count;
-            stack_syms.push("<unknown>".to_string());
-        }
-        stacks.push((count, stack_syms.join("; ")));
-    }
-
-    let mut flat_vec: Vec<(String, isize)> = flat_counts.into_iter().collect();
-    flat_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
-    let mut cum_vec: Vec<(String, isize)> = cum_counts.into_iter().collect();
-    cum_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
-    stacks.sort_by_key(|a| std::cmp::Reverse(a.0));
-
-    let denom = (total_samples.max(1)) as f64;
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "CPU profile: duration={seconds}s frequency={frequency}Hz total_samples={total_samples}"
-    );
-    let _ = writeln!(out, "\n=== Top 30 Flat (Self) ===");
-    for (name, c) in flat_vec.iter().take(30) {
-        let pct = (*c as f64) * 100.0 / denom;
-        let _ = writeln!(out, "{c:>8} ({pct:>5.2}%)  {name}");
-    }
-    let _ = writeln!(out, "\n=== Top 30 Cumulative ===");
-    for (name, c) in cum_vec.iter().take(30) {
-        let pct = (*c as f64) * 100.0 / denom;
-        let _ = writeln!(out, "{c:>8} ({pct:>5.2}%)  {name}");
-    }
-    let _ = writeln!(out, "\n=== Top 20 Hot Stacks (leaf -> root) ===");
-    for (c, s) in stacks.iter().take(20) {
-        let pct = (*c as f64) * 100.0 / denom;
-        let _ = writeln!(out, "{c:>8} ({pct:>5.2}%)  {s}");
-    }
-
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        out,
-    )
-        .into_response()
-}
-
-#[cfg(not(unix))]
-async fn pprof_profile_handler(Query(_q): Query<PprofQuery>) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "CPU profiling is only supported on Unix targets\n",
-    )
-        .into_response()
 }

@@ -144,6 +144,10 @@ pub struct Ingester {
     pub reactive_limiter: IngesterReactiveLimiter,
     pub inflight_limiter: InflightLimiter,
     pub utilization_based_limiter: RwLock<Option<Arc<dyn UtilizationBasedLimiter>>>,
+    /// Concrete read-path utilization limiter service (Go: `NewUtilizationBasedLimiter`).
+    utilization_limiter_svc: Option<Arc<crate::utilization::UtilizationBasedLimiter>>,
+    /// Shared tenant-fair compute worker pool (Go: `computeWorkerPool`, name `ingester-compute`).
+    pub compute_worker_pool: Arc<crate::workerpool::Pool>,
 
     pub tsdbs: DashMap<String, Arc<UserTsdb>>,
     pub users_metadata: DashMap<String, Arc<TenantMetadataStore>>,
@@ -198,6 +202,8 @@ pub struct Ingester {
     weak_self: Arc<Mutex<Option<Weak<Ingester>>>>,
     multitenancy_enabled: AtomicBool,
     no_auth_tenant: RwLock<String>,
+    cost_attribution_mgr: RwLock<Option<Arc<crate::costattribution::Manager>>>,
+    active_groups: RwLock<Option<Arc<crate::active_groups::ActiveGroupsCleanupService>>>,
 }
 
 impl Ingester {
@@ -321,11 +327,29 @@ impl Ingester {
             registry,
         );
         let reactive_limiter = IngesterReactiveLimiter::new(
+            &cfg.rejection_prioritizer,
             &cfg.push_reactive_limiter,
             &cfg.read_reactive_limiter,
             registry,
         )
         .map_err(|message| IngesterError::Internal { message })?;
+
+        let utilization_limiter_svc = (cfg.read_path_cpu_utilization_limit > 0.0
+            || cfg.read_path_memory_utilization_limit > 0)
+            .then(|| {
+                crate::utilization::UtilizationBasedLimiter::new(
+                    cfg.read_path_cpu_utilization_limit,
+                    cfg.read_path_memory_utilization_limit,
+                    true,
+                    "cortex_ingester_",
+                    registry,
+                )
+            });
+        let compute_worker_pool =
+            crate::workerpool::Pool::new(cfg.compute_workers, "ingester-compute", registry)
+                .map_err(|e| IngesterError::Internal {
+                    message: format!("creating ingester compute worker pool: {e}"),
+                })?;
 
         let shipper_metrics = ShipperMetrics::new(registry);
         let tsdb_metrics = TSDBMetrics::new("cortex_ingester_", registry);
@@ -428,7 +452,13 @@ impl Ingester {
             circuit_breaker,
             reactive_limiter,
             inflight_limiter: InflightLimiter::new(),
-            utilization_based_limiter: RwLock::new(None),
+            utilization_based_limiter: RwLock::new(
+                utilization_limiter_svc
+                    .clone()
+                    .map(|l| l as Arc<dyn UtilizationBasedLimiter>),
+            ),
+            utilization_limiter_svc,
+            compute_worker_pool,
             tsdbs: DashMap::new(),
             users_metadata: DashMap::new(),
             tsdb_create_mtx: Mutex::new(()),
@@ -473,6 +503,8 @@ impl Ingester {
             weak_self: Arc::clone(&weak_slot),
             multitenancy_enabled: AtomicBool::new(true),
             no_auth_tenant: RwLock::new("fake".to_string()),
+            cost_attribution_mgr: RwLock::new(None),
+            active_groups: RwLock::new(None),
         });
 
         *weak_slot.lock() = Some(Arc::downgrade(&ingester));
@@ -549,6 +581,35 @@ impl Ingester {
         f: Arc<dyn Fn() -> Option<InstanceLimits> + Send + Sync>,
     ) {
         *self.instance_limits_fn.write() = Some(f);
+    }
+
+    /// Wires the cost attribution manager (Go: `costAttributionMgr` passed to `ingester.New`).
+    /// `None` disables cost attribution tracking.
+    pub fn set_cost_attribution_manager(&self, mgr: Option<Arc<crate::costattribution::Manager>>) {
+        *self.cost_attribution_mgr.write() = mgr;
+    }
+
+    pub fn cost_attribution_manager(&self) -> Option<Arc<crate::costattribution::Manager>> {
+        self.cost_attribution_mgr.read().clone()
+    }
+
+    /// Wires the active groups cleanup service used for `-validation.separate-metrics-group-label`
+    /// and registers the per-group metrics cleanup (Go: `ActiveGroupsCleanupService.Register(i)`).
+    pub fn set_active_groups_cleanup_service(
+        &self,
+        svc: Option<Arc<crate::active_groups::ActiveGroupsCleanupService>>,
+    ) {
+        if let Some(ref s) = svc {
+            let metrics = Arc::clone(&self.metrics);
+            s.register(Box::new(move |user, group| {
+                metrics.discarded.delete_label_values(user, group);
+            }));
+        }
+        *self.active_groups.write() = svc;
+    }
+
+    pub(crate) fn active_groups(&self) -> Option<Arc<crate::active_groups::ActiveGroupsCleanupService>> {
+        self.active_groups.read().clone()
     }
 
     pub fn set_multitenancy(&self, enabled: bool, no_auth_tenant: impl Into<String>) {
@@ -811,6 +872,8 @@ impl Ingester {
             self.ignored_series_limit_metrics.clone(),
             self.ingest_partition_id,
             owned_shard_size,
+            self.cost_attribution_manager()
+                .and_then(|m| m.active_series_tracker(user_id)),
         )
         .map_err(|e| IngesterError::Internal {
             message: format!("failed to open TSDB for user {user_id}: {e}"),
@@ -1415,8 +1478,37 @@ impl Ingester {
         }
 
         // Start post-lifecycler services (shipping, idle TSDB closer, TSDB settings, partition lifecycler).
+        self.compute_worker_pool
+            .start()
+            .map_err(|message| IngesterError::Internal { message })?;
+        if let Some(ref l) = self.utilization_limiter_svc {
+            l.starting()
+                .map_err(|message| IngesterError::Internal { message })?;
+        }
         {
             let mut new_tasks = Vec::new();
+            if let Some(ref l) = self.utilization_limiter_svc {
+                let sctx = ctx.child();
+                new_tasks.push(self.watch_subservice_task(
+                    "ingester-utilization-limiter",
+                    tokio::spawn(Arc::clone(l).run(async move {
+                        sctx.canceled().await;
+                    })),
+                ));
+            }
+            if let Some(ref p) = self.reactive_limiter.prioritizer {
+                let sctx = ctx.child();
+                new_tasks.push(self.watch_subservice_task(
+                    "ingester-reactive-limiter-calibration",
+                    tokio::spawn(IngesterReactiveLimiter::run_calibration(
+                        Arc::clone(p),
+                        self.reactive_limiter.calibration_interval,
+                        async move {
+                            sctx.canceled().await;
+                        },
+                    )),
+                ));
+            }
             if self.blocks_cfg.tsdb.ship_interval.0 > 0 {
                 let (ship_tx, ship_rx) = mpsc::channel(16);
                 *self.ship_tx.write() = Some(ship_tx);
@@ -1537,6 +1629,8 @@ impl Ingester {
         for t in tasks {
             let _ = t.await;
         }
+        let pool = Arc::clone(&self.compute_worker_pool);
+        let _ = tokio::task::spawn_blocking(move || pool.stop()).await;
 
         // 4. Stop the partition lifecycler (part of Go's subservicesAfterIngesterRingLifecycler,
         // stopped before the ingester ring lifecycler).

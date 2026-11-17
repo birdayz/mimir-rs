@@ -230,6 +230,7 @@ fn test_binary_logs_tracing_events_in_go_logfmt_through_sigterm() {
             "level=info msg=\"instance not found in ring, adding with no tokens\" ring=ingester",
             "level=info msg=\"Application started\"",
             "level=info msg=\"=== received SIGINT/SIGTERM ===\\n*** exiting\"",
+            "level=info msg=\"module stopped\" module=active-groups-cleanup-service",
             "level=info msg=\"lifecycler loop() exited gracefully\" ring=ingester",
             "level=info msg=\"changing instance state from\" old_state=ACTIVE new_state=LEAVING ring=ingester",
             "level=info msg=\"lifecycler entering final sleep before shutdown\" final_sleep=0s",

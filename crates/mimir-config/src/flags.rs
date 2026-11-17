@@ -176,10 +176,7 @@ impl<T> FlagSet<T> {
             default_val.to_string(),
             usage,
             move |t, s| {
-                let v: i64 = s
-                    .parse()
-                    .map_err(|_| ConfigError::Flag("parse error".to_string()))?;
-                *get_mut(t) = v;
+                *get_mut(t) = go_parse_int(s)?;
                 Ok(())
             },
             move |t| (*get(t)).to_string(),
@@ -201,10 +198,7 @@ impl<T> FlagSet<T> {
             default_val.to_string(),
             usage,
             move |t, s| {
-                let v: u64 = s
-                    .parse()
-                    .map_err(|_| ConfigError::Flag("parse error".to_string()))?;
-                *get_mut(t) = v;
+                *get_mut(t) = go_parse_uint(s)?;
                 Ok(())
             },
             move |t| (*get(t)).to_string(),
@@ -226,10 +220,7 @@ impl<T> FlagSet<T> {
             default_val.to_string(),
             usage,
             move |t, s| {
-                let v: f64 = s
-                    .parse()
-                    .map_err(|_| ConfigError::Flag("parse error".to_string()))?;
-                *get_mut(t) = v;
+                *get_mut(t) = go_parse_float(s)?;
                 Ok(())
             },
             move |t| (*get(t)).to_string(),
@@ -251,7 +242,8 @@ impl<T> FlagSet<T> {
             default_val.to_string(),
             usage,
             move |t, s| {
-                *get_mut(t) = s.parse()?;
+                // flag.durationValue.Set maps every time.ParseDuration error to errParse.
+                *get_mut(t) = s.parse().map_err(|_| parse_error())?;
                 Ok(())
             },
             move |t| (*get(t)).to_string(),
@@ -603,10 +595,21 @@ impl<T> FlagSet<T> {
             })?;
 
             if entry.is_bool {
-                let v = if has_value { value } else { "true" };
-                (entry.setter)(target, v).map_err(|e| {
-                    ConfigError::Flag(format!("invalid boolean value {v:?} for -{name}: {e}"))
-                })?;
+                if has_value {
+                    (entry.setter)(target, value).map_err(|_| {
+                        // flag.boolValue.Set maps every strconv.ParseBool error to errParse.
+                        ConfigError::Flag(format!(
+                            "invalid boolean value {value:?} for -{name}: parse error"
+                        ))
+                    })?;
+                } else {
+                    (entry.setter)(target, "true").map_err(|e| {
+                        ConfigError::Flag(format!(
+                            "invalid boolean flag {name}: {}",
+                            flag_set_error_text(&e)
+                        ))
+                    })?;
+                }
             } else {
                 let v = if has_value {
                     value
@@ -620,7 +623,10 @@ impl<T> FlagSet<T> {
                     )));
                 };
                 (entry.setter)(target, v).map_err(|e| {
-                    ConfigError::Flag(format!("invalid value {v:?} for flag -{name}: {e}"))
+                    ConfigError::Flag(format!(
+                        "invalid value {v:?} for flag -{name}: {}",
+                        flag_set_error_text(&e)
+                    ))
                 })?;
             }
 
@@ -629,42 +635,133 @@ impl<T> FlagSet<T> {
         Ok(&args[idx..])
     }
 
-    /// Formats usage output matching Go `flag.FlagSet.PrintDefaults()` / `usage.Usage`.
-    pub fn format_usage(&self, prog_name: &str, _all: bool) -> String {
-        let mut out = format!("Usage of {prog_name}:\n");
-        for entry in self.flags.values() {
-            if entry.usage.is_empty() && entry.name != "h" && entry.name != "help" {
-                continue;
-            }
-            let mut line = format!("  -{}", entry.name);
-            if !entry.type_name.is_empty() {
-                let _ = write!(line, " {}", entry.type_name);
-            }
-            out.push_str(&line);
-            out.push('\n');
-            if !entry.usage.is_empty() {
-                out.push_str("    \t");
-                out.push_str(&entry.usage.replace('\n', "\n    \t"));
-                if !is_zero_default(&entry.default_str, entry.is_bool) {
-                    if entry.type_name == "string" && !entry.usage_default_unquoted {
-                        let _ = write!(out, " (default {:?})", entry.default_str);
-                    } else {
-                        let _ = write!(out, " (default {})", entry.default_str);
-                    }
-                }
-                out.push('\n');
-            }
-        }
-        out
+    /// Formats `-help` / `-help-all` output matching `pkg/util/usage/usage.go:Usage`
+    /// (see [`crate::help`]), restricted to the flags registered in this set.
+    pub fn format_usage(&self, prog_name: &str, all: bool) -> String {
+        crate::help::format_usage(prog_name, all, |name| self.flags.contains_key(name))
+    }
+
+    /// Names of all registered flags.
+    pub fn flag_names(&self) -> impl Iterator<Item = &str> {
+        self.flags.keys().map(String::as_str)
     }
 }
 
-fn is_zero_default(s: &str, is_bool: bool) -> bool {
-    if is_bool {
-        s == "false" || s.is_empty()
-    } else {
-        matches!(s, "" | "0" | "0s" | "false" | "[]" | "{}")
+/// Text of a `flag.Value.Set` error as Go prints it (`%v`), without the Rust-side
+/// `ConfigError` display prefix.
+fn flag_set_error_text(e: &ConfigError) -> String {
+    match e {
+        ConfigError::Flag(msg) => msg.clone(),
+        other => other.to_string(),
     }
+}
+
+/// Go `flag` package `errParse`.
+fn parse_error() -> ConfigError {
+    ConfigError::Flag("parse error".to_string())
+}
+
+/// Go `flag` package `errRange`.
+fn range_error() -> ConfigError {
+    ConfigError::Flag("value out of range".to_string())
+}
+
+/// Go `strconv.underscoreOK`: underscores must separate digits (a base prefix counts as a
+/// digit), never doubled or trailing.
+fn go_underscore_ok(s: &str) -> bool {
+    let s = s.strip_prefix(['-', '+']).unwrap_or(s);
+    let b = s.as_bytes();
+    let mut saw = b'^';
+    let mut i = 0;
+    let mut hex = false;
+    if b.len() >= 2 && b[0] == b'0' && matches!(b[1].to_ascii_lowercase(), b'b' | b'o' | b'x') {
+        i = 2;
+        saw = b'0';
+        hex = b[1].eq_ignore_ascii_case(&b'x');
+    }
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_digit() || (hex && (b'a'..=b'f').contains(&c.to_ascii_lowercase())) {
+            saw = b'0';
+        } else if c == b'_' {
+            if saw != b'0' {
+                return false;
+            }
+            saw = b'_';
+        } else {
+            if saw == b'_' {
+                return false;
+            }
+            saw = b'!';
+        }
+        i += 1;
+    }
+    saw != b'_'
+}
+
+/// Splits Go `strconv.ParseInt(s, 0, 64)` input into (negative, base, digits), handling the
+/// sign, `0x`/`0o`/`0b`/leading-`0` prefixes and `_` separators.
+fn go_int_literal(s: &str, allow_sign: bool) -> Option<(bool, u32, String)> {
+    let (neg, body) = match s.as_bytes().first() {
+        Some(b'-') if allow_sign => (true, &s[1..]),
+        Some(b'+') if allow_sign => (false, &s[1..]),
+        _ => (false, s),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let lower = body.to_ascii_lowercase();
+    let (base, digits) = if let Some(d) = lower.strip_prefix("0x") {
+        (16, d)
+    } else if let Some(d) = lower.strip_prefix("0o") {
+        (8, d)
+    } else if let Some(d) = lower.strip_prefix("0b") {
+        (2, d)
+    } else if lower.len() > 1 && lower.starts_with('0') {
+        (8, &lower[1..])
+    } else {
+        (10, lower.as_str())
+    };
+    if digits.contains('_') && !go_underscore_ok(body) {
+        return None;
+    }
+    let digits: String = digits.chars().filter(|c| *c != '_').collect();
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(base)) {
+        return None;
+    }
+    Some((neg, base, digits))
+}
+
+/// Go `flag.IntVar`/`Int64Var` parsing (`strconv.ParseInt(s, 0, 64)` + `numError`).
+pub fn go_parse_int(s: &str) -> Result<i64, ConfigError> {
+    let (neg, base, digits) = go_int_literal(s, true).ok_or_else(parse_error)?;
+    let mag = u128::from_str_radix(&digits, base).map_err(|_| range_error())?;
+    let v: i128 = if neg { -(mag as i128) } else { mag as i128 };
+    i64::try_from(v).map_err(|_| range_error())
+}
+
+/// Go `flag.UintVar`/`Uint64Var` parsing (`strconv.ParseUint(s, 0, 64)` + `numError`).
+pub fn go_parse_uint(s: &str) -> Result<u64, ConfigError> {
+    let (_, base, digits) = go_int_literal(s, false).ok_or_else(parse_error)?;
+    let mag = u128::from_str_radix(&digits, base).map_err(|_| range_error())?;
+    u64::try_from(mag).map_err(|_| range_error())
+}
+
+/// Go `flag.Float64Var` parsing (`strconv.ParseFloat(s, 64)` + `numError`).
+pub fn go_parse_float(s: &str) -> Result<f64, ConfigError> {
+    let lower = s.to_ascii_lowercase();
+    let unsigned = lower.trim_start_matches(['+', '-']);
+    if matches!(unsigned, "inf" | "infinity" | "nan") {
+        return s.parse::<f64>().map_err(|_| parse_error());
+    }
+    if s.contains('_') && !go_underscore_ok(s) {
+        return Err(parse_error());
+    }
+    let v: f64 = s.replace('_', "").parse().map_err(|_| parse_error())?;
+    if v.is_infinite() {
+        return Err(range_error());
+    }
+    Ok(v)
 }
 
 /// Scans `args` for `-config.file` and `-config.expand-env` before full flag parsing,
@@ -818,20 +915,31 @@ impl MainFlags {
     }
 }
 
-/// Formats `-version` output matching `pkg/util/version/info.go`.
+/// Toolchain version reported where Go reports `runtime.Version()` (`version.GoVersion`):
+/// the `go version:` line of `-version`. Rust builds report the compiler, e.g. `rustc1.86.0`
+/// (captured by `build.rs`), mirroring Go's `go1.25.3` format.
+pub fn go_version_str() -> &'static str {
+    env!("MIMIR_RUSTC_VERSION")
+}
+
+/// Formats `-version` output matching `version.Print("Mimir")` in `pkg/util/version/info.go`.
 pub fn format_version() -> String {
     let version = option_env!("MIMIR_VERSION").unwrap_or("unknown");
     let branch = option_env!("MIMIR_BRANCH").unwrap_or("unknown");
     let revision = option_env!("MIMIR_REVISION").unwrap_or("unknown");
+    // runtime.GOOS + "/" + runtime.GOARCH
     let os = std::env::consts::OS;
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
+        "x86" => "386",
+        "powerpc64" => "ppc64",
+        "loongarch64" => "loong64",
         other => other,
     };
     format!(
-        "Mimir, version {version} (branch: {branch}, revision: {revision})\n  mimir-rs:         {}\n  platform:         {os}/{arch}",
-        env!("CARGO_PKG_VERSION")
+        "Mimir, version {version} (branch: {branch}, revision: {revision})\n  go version:       {}\n  platform:         {os}/{arch}",
+        go_version_str()
     )
 }
 
@@ -1007,6 +1115,58 @@ mod tests {
         assert!(t.expand_env);
         assert!(fs.is_set("target"));
         assert!(fs.is_set("config.expand-env"));
+    }
+
+    // Go strconv.ParseInt(s, 0, 64) / ParseUint / ParseFloat + flag.numError.
+    #[test]
+    fn go_numeric_flag_parsing() {
+        assert_eq!(go_parse_int("0x1F").unwrap(), 31);
+        assert_eq!(go_parse_int("-0o17").unwrap(), -15);
+        assert_eq!(go_parse_int("017").unwrap(), 15);
+        assert_eq!(go_parse_int("0b101").unwrap(), 5);
+        assert_eq!(go_parse_int("1_000").unwrap(), 1000);
+        assert_eq!(go_parse_int("+7").unwrap(), 7);
+        for bad in ["", "abc", "1__0", "1_", "_1", "08", "0x", "1.5"] {
+            assert_eq!(go_parse_int(bad).unwrap_err().to_string(), "invalid flag: parse error", "{bad}");
+        }
+        assert_eq!(
+            go_parse_int("99999999999999999999").unwrap_err().to_string(),
+            "invalid flag: value out of range"
+        );
+        assert!(go_parse_uint("-1").is_err());
+        assert_eq!(go_parse_uint("18446744073709551615").unwrap(), u64::MAX);
+        assert_eq!(go_parse_float("1e3").unwrap(), 1000.0);
+        assert_eq!(go_parse_float("1_000.5").unwrap(), 1000.5);
+        assert!(go_parse_float("+Inf").unwrap().is_infinite());
+        assert_eq!(go_parse_float("1e400").unwrap_err().to_string(), "invalid flag: value out of range");
+    }
+
+    // Go flag.FlagSet.parseOne error texts.
+    #[test]
+    fn flag_value_error_texts_match_go() {
+        let mut t = TestTarget::default();
+        let mut fs: FlagSet<TestTarget> = FlagSet::new();
+        fs.i64_var("port", 0, "", |x| &x.port, |x| &mut x.port);
+        fs.bool_var("push", false, "", |x| &x.push_enabled, |x| &mut x.push_enabled);
+        let err = fs.parse(&mut t, &["-port=abc".to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), "invalid flag: invalid value \"abc\" for flag -port: parse error");
+        let err = fs.parse(&mut t, &["-push=maybe".to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), "invalid flag: invalid boolean value \"maybe\" for -push: parse error");
+        let err = fs.parse(&mut t, &["-port".to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), "invalid flag: flag needs an argument: -port");
+    }
+
+    // pkg/util/version/info.go Print("Mimir").
+    #[test]
+    fn version_output_format() {
+        let out = format_version();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("Mimir, version "));
+        assert!(lines[0].contains(" (branch: ") && lines[0].contains(", revision: "));
+        assert_eq!(lines[1], format!("  go version:       {}", go_version_str()));
+        assert!(lines[2].starts_with("  platform:         "));
+        assert!(go_version_str().starts_with("rustc"));
     }
 
     #[test]

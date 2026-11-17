@@ -12,7 +12,7 @@ use serde_yaml::{Mapping, Value};
 
 use crate::duration::GoDuration;
 use crate::env::expand_environment_variables;
-use crate::error::{CliAction, ConfigError};
+use crate::error::{go_path_error, CliAction, ConfigError};
 use crate::flags::{is_targetable_module, parse_config_file_parameter, FlagSet, MainFlags};
 use crate::ingester::{ClusterValidationConfig, IngesterClientConfig, IngesterConfig};
 use crate::limits::LimitsConfig;
@@ -431,7 +431,13 @@ impl MimirConfig {
         path: &Path,
         expand_env: bool,
     ) -> Result<String, ConfigError> {
-        let raw = std::fs::read(path)?;
+        use std::io::Read as _;
+        let shown = path.display().to_string();
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| ConfigError::ReadConfigFile(go_path_error("open", &shown, &e)))?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|e| ConfigError::ReadConfigFile(go_path_error("read", &shown, &e)))?;
         self.load_config_from_bytes(&raw, expand_env)
     }
 
@@ -450,6 +456,10 @@ impl MimirConfig {
         } else {
             raw_bytes
         };
+
+        // Go decodes with yaml.v3 `KnownFields(true)`: reject exactly what it rejects, with its
+        // error texts (all decode errors, in document order), before building values with serde.
+        crate::yaml_v3::check_config_document(bytes_to_parse).map_err(ConfigError::Yaml)?;
 
         let mut root: Value = serde_yaml::from_slice(bytes_to_parse)
             .map_err(|e| ConfigError::Yaml(e.to_string()))?;
@@ -546,6 +556,8 @@ impl MimirConfig {
 
         let core: CoreMimirConfig = serde_yaml::from_value(merged_core)
             .map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        // Go fails in CustomTrackersConfig.UnmarshalYAML (i.e. while parsing the file).
+        crate::limits::validate_custom_trackers_yaml(&core.limits)?;
 
         self.apply_core(core);
         self.extra_sections = extras;
@@ -695,8 +707,12 @@ impl MimirConfig {
 
         self.server.validate()?;
         self.validate_filesystem_paths()?;
-        self.ingest_storage.validate()?;
-        self.compartments.validate()?;
+        self.ingest_storage
+            .validate()
+            .map_err(wrap_validation("invalid ingest storage config"))?;
+        self.compartments
+            .validate()
+            .map_err(wrap_validation("invalid compartments config"))?;
 
         if self.compartments.enabled {
             if !self.ingest_storage.enabled {
@@ -757,16 +773,21 @@ impl MimirConfig {
             ));
         }
 
-        self.memberlist.validate()?;
+        self.memberlist
+            .validate()
+            .map_err(wrap_validation("invalid memberlist config"))?;
         self.blocks_storage
-            .validate(self.ingester.active_series.active_series_metrics_enabled)?;
+            .validate(self.ingester.active_series.active_series_metrics_enabled)
+            .map_err(wrap_validation("invalid TSDB config"))?;
         if self.is_ingester_enabled() {
             self.blocks_storage
                 .bucket
                 .backend_cfg
                 .validate_mimir_rs_support()?;
         }
-        self.ingester_client.validate()?;
+        self.ingester_client
+            .validate()
+            .map_err(wrap_validation("invalid ingester_client config"))?;
 
         if let Err(err) = self.ingester.validate(
             self.compartments.enabled,
@@ -775,14 +796,40 @@ impl MimirConfig {
             // Only fail on spread-minimizing error if ingester is targeted.
             let is_spread_min = err.to_string().contains("spread-minimizing");
             if self.is_ingester_enabled() || !is_spread_min {
-                return Err(err);
+                return Err(wrap_validation("invalid ingester config")(err));
             }
         }
 
-        self.usage_stats.validate()?;
+        self.usage_stats
+            .validate()
+            .map_err(wrap_validation("invalid usage stats config"))?;
+
+        // pkg/api/api.go Config.Validate.
+        let level = self.api_response_compression_level()?;
+        if !(1..=9).contains(&level) && level != -1 {
+            return Err(wrap_validation("invalid API config")(ConfigError::Validation(format!(
+                "invalid gzip compression level: {level}, must be between 1 and 9 or -1 for default compression level"
+            ))));
+        }
+
         self.limits.validate()?;
 
         Ok(())
+    }
+
+    /// `api.response_compression_level` / `-http.response-compression-level` (default
+    /// `gzip.DefaultCompression` = -1). The `api` block is kept as an extra section.
+    pub fn api_response_compression_level(&self) -> Result<i64, ConfigError> {
+        if let Some(v) = self.extra_cli_flag_value("http.response-compression-level") {
+            // Already type-checked when the flag was parsed.
+            return crate::flags::go_parse_int(v);
+        }
+        Ok(self
+            .extra_sections
+            .get("api")
+            .and_then(|api| api.get("response_compression_level"))
+            .and_then(Value::as_i64)
+            .unwrap_or(-1))
     }
 
     fn validate_filesystem_paths(&self) -> Result<(), ConfigError> {
@@ -864,6 +911,14 @@ impl MimirConfig {
         }
 
         Ok(())
+    }
+}
+
+/// `errors.Wrap(err, prefix)` as used by `pkg/mimir/mimir.go:Config.Validate`.
+fn wrap_validation(prefix: &'static str) -> impl FnOnce(ConfigError) -> ConfigError {
+    move |err| match err {
+        ConfigError::Validation(msg) => ConfigError::Validation(format!("{prefix}: {msg}")),
+        other => ConfigError::Validation(format!("{prefix}: {other}")),
     }
 }
 
@@ -1166,39 +1221,15 @@ pub struct LoadedConfig {
     pub usage_text: Option<String>,
 }
 
-/// Runs the full `cmd/mimir/main.go` startup config pipeline:
-/// 1) Struct defaults
-/// 2) Pre-scan `-config.file` & `-config.expand-env`, load YAML (computing SHA-256 pre-expansion)
-/// 3) Parse CLI flags (overriding YAML)
-/// 4) Handle `-help`/`-help-all`/`-version`/`-print.config`/`-modules`
-/// 5) `inherit_common_flag_values`
-/// 6) `validate()`
-pub fn parse_cli_and_load_config(
-    prog_name: &str,
-    args: &[String],
-) -> Result<LoadedConfig, ConfigError> {
-    struct CliTarget {
-        cfg: MimirConfig,
-        main_flags: MainFlags,
-    }
+/// Flag target of the `cmd/mimir/main.go` command line (`mimir.Config` + `mainFlags`).
+struct CliTarget {
+    cfg: MimirConfig,
+    main_flags: MainFlags,
+}
 
-    let mut state = CliTarget {
-        cfg: MimirConfig::default(),
-        main_flags: MainFlags::default(),
-    };
-
-    let (config_file, expand_env) = parse_config_file_parameter(args);
-
-    let config_hash_sha256 = if !config_file.is_empty() {
-        Some(
-            state
-                .cfg
-                .load_config_from_file(Path::new(&config_file), expand_env)?,
-        )
-    } else {
-        None
-    };
-
+/// Registers every command-line flag like `main()`: `cfg.RegisterFlags`, the ignored
+/// `-config.file` / `-config.expand-env`, and `mainFlags.registerFlags`.
+fn build_cli_flag_set(state: &CliTarget) -> FlagSet<CliTarget> {
     let mut fs: FlagSet<CliTarget> = FlagSet::new();
     state
         .cfg
@@ -1215,6 +1246,54 @@ pub fn parse_cli_and_load_config(
         |t| &t.main_flags,
         |t| &mut t.main_flags,
     );
+    fs
+}
+
+/// Names of all flags accepted on the `mimir` command line.
+pub fn cli_flag_names() -> Vec<String> {
+    let state = CliTarget {
+        cfg: MimirConfig::default(),
+        main_flags: MainFlags::default(),
+    };
+    build_cli_flag_set(&state)
+        .flag_names()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Runs the full `cmd/mimir/main.go` startup config pipeline:
+/// 1) Struct defaults
+/// 2) Pre-scan `-config.file` & `-config.expand-env`, load YAML (computing SHA-256 pre-expansion)
+/// 3) Parse CLI flags (overriding YAML)
+/// 4) Handle `-help`/`-help-all`/`-version`/`-print.config`/`-modules`
+/// 5) `inherit_common_flag_values`
+/// 6) `validate()`
+pub fn parse_cli_and_load_config(
+    prog_name: &str,
+    args: &[String],
+) -> Result<LoadedConfig, ConfigError> {
+    let mut state = CliTarget {
+        cfg: MimirConfig::default(),
+        main_flags: MainFlags::default(),
+    };
+
+    let (config_file, expand_env) = parse_config_file_parameter(args);
+
+    let config_hash_sha256 = if !config_file.is_empty() {
+        Some(
+            state
+                .cfg
+                .load_config_from_file(Path::new(&config_file), expand_env)
+                .map_err(|e| ConfigError::LoadConfig {
+                    path: config_file.clone(),
+                    source: Box::new(e),
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let mut fs = build_cli_flag_set(&state);
 
     fs.parse(&mut state, args)?;
 
@@ -1265,6 +1344,51 @@ pub fn parse_cli_and_load_config(
 #[cfg(test)]
 mod yaml_defaults_tests {
     use super::*;
+
+    // Flags that Go registers but hides from -help-all (configdoc hidden overrides,
+    // `doc:"hidden"` structs/fields, or `deprecated` placeholder values).
+    const GO_HIDDEN_FLAGS: &[&str] = &[
+        "blocks-storage.tsdb.block-ranges-period",
+        "compactor.read-compartment-id",
+        "compartments.enabled",
+        "compartments.read.num-compartments",
+        "compartments.write.num-compartments",
+        "distributor.active-series-limit-response-code",
+        "distributor.influx-endpoint-enabled",
+        "distributor.ingestion-artificial-delay",
+        "distributor.max-active-series-per-user",
+        "distributor.max-influx-request-size",
+        "distributor.otel-start-time-quiet-zero",
+        "distributor.write-compartment-id",
+        "ingester.push-grpc-method-enabled",
+        "ingester.read-compartment-id",
+        "server.grpc.recv-buffer-pools-enabled",
+        "server.grpc.stats-tracking-enabled",
+        "store-gateway.read-compartment-id",
+    ];
+
+    // Every flag Go documents in -help-all must be accepted by Rust, and Rust must not
+    // accept flags Go doesn't register (hidden ones aside).
+    #[test]
+    fn cli_flags_match_go_help_all() {
+        let rust: std::collections::BTreeSet<String> = cli_flag_names().into_iter().collect();
+        let go: std::collections::BTreeSet<String> = crate::help::documented_flag_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let missing: Vec<_> = go.difference(&rust).collect();
+        assert!(missing.is_empty(), "Go flags not registered in Rust: {missing:?}");
+        let extra: Vec<_> = rust
+            .difference(&go)
+            .filter(|n| {
+                !GO_HIDDEN_FLAGS.contains(&n.as_str())
+                    && !n.starts_with("block-builder")
+                    && !n.starts_with("usage-tracker.")
+                    && !n.starts_with("distributor.usage-tracker-client.")
+            })
+            .collect();
+        assert!(extra.is_empty(), "Rust flags unknown to Go -help-all: {extra:?}");
+    }
 
     // The YAML document is merged onto the serialized current config, which therefore must
     // round-trip losslessly through serde (secrets revealed).
