@@ -2615,8 +2615,38 @@ fn report_variants(runs: Vec<VariantRun>) -> Vec<Report> {
             } else {
                 r.errors.clone()
             };
+            let mut details = r.details.clone();
             if r.variant != Variant::Go {
                 if let Some(g) = &go_facts {
+                    // Informational: every Go series family (not only mixin-referenced ones,
+                    // Go-runtime `go_*` excluded) that no Rust pod exposes.
+                    let family = |n: &str| {
+                        n.trim_end_matches("_bucket")
+                            .trim_end_matches("_sum")
+                            .trim_end_matches("_count")
+                            .to_string()
+                    };
+                    let go_series = union_series(
+                        &g.series,
+                        &g.series.keys().map(|h| (h.clone(), Side::Go)).collect(),
+                        Side::Go,
+                    );
+                    let rust_series = union_series(&r.facts.series, &r.sides, Side::Rust);
+                    if !rust_series.is_empty() {
+                        let rust_fams: BTreeSet<String> =
+                            rust_series.keys().map(|n| family(n)).collect();
+                        let missing: BTreeSet<String> = go_series
+                            .keys()
+                            .map(|n| family(n))
+                            .filter(|f| !f.starts_with("go_") && !rust_fams.contains(f))
+                            .collect();
+                        let _ = write!(
+                            details,
+                            "\n    informational: {} Go series families absent on all Rust pods: {missing:?}",
+                            missing.len()
+                        );
+                    }
+
                     errors.extend(
                         compare_facts(g, &r.facts, &r.sides)
                             .into_iter()
@@ -2634,7 +2664,7 @@ fn report_variants(runs: Vec<VariantRun>) -> Vec<Report> {
                         .collect::<Vec<_>>()
                 ),
                 errors,
-                details: r.details,
+                details,
             }
         })
         .collect()
