@@ -12,6 +12,7 @@ pub mod circuit_breaker;
 pub mod compaction;
 pub mod costattribution;
 pub mod errors;
+pub mod expfmt;
 pub mod grpc;
 pub mod http;
 pub mod ingest_storage;

@@ -428,13 +428,11 @@ impl Ingester {
 
         let head_compaction_interval_jitter_enabled =
             blocks_cfg.tsdb.head_compaction_interval_jitter_enabled;
-        let close_idle_tsdb_interval = Duration::from_nanos(
-            blocks_cfg
-                .tsdb
-                .close_idle_tsdb_interval
-                .as_nanos()
-                .max(0) as u64,
-        );
+        let close_idle_tsdb_interval = if blocks_cfg.tsdb.close_idle_tsdb_interval.0 <= 0 {
+            Duration::from_secs(5 * 60)
+        } else {
+            Duration::from_nanos(blocks_cfg.tsdb.close_idle_tsdb_interval.as_nanos() as u64)
+        };
         let flush_on_shutdown = AtomicBool::new(blocks_cfg.tsdb.flush_blocks_on_shutdown);
         usagestats::get_int(REPLICATION_FACTOR_STATS_NAME).set(cfg.ring.replication_factor);
         usagestats::get_string(RING_STORE_STATS_NAME).set(&cfg.ring.kvstore.store);

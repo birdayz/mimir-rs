@@ -879,7 +879,8 @@ activity_tracker:
     assert_eq!(index_resp.status().as_u16(), 200);
     let index_body = index_resp.text().await.unwrap();
     assert!(index_body.contains("Grafana Mimir Admin"));
-    assert!(index_body.contains("/mimir/ingester/ring"));
+    assert!(index_body.contains(r#"href="ingester/ring""#));
+    assert!(!index_body.contains("/mimir/ingester/ring"));
 
     // Trigger /mimir/ingester/shutdown: stops Ingester (204) while keeping HTTP/gRPC alive until SIGTERM
     let shutdown_resp = client
