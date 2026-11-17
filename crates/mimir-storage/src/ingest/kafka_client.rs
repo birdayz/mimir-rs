@@ -1378,7 +1378,7 @@ impl KafkaClient {
                     producer_epoch: NO_PRODUCER_EPOCH,
                     timestamp_type: TimestampType::Creation,
                     offset: i as i64,
-                    sequence: NO_SEQUENCE,
+                    sequence: (i as i32).wrapping_add(NO_SEQUENCE),
                     timestamp: r.timestamp_ms.unwrap_or(now_ms),
                     key: r.key,
                     value: r.value,
@@ -2158,5 +2158,43 @@ mod tests {
         assert!(decoded_ctrl_only.is_empty());
         assert_eq!(last_end_ctrl, Some(12));
         assert_eq!(next_off_ctrl, 13);
+    }
+
+    #[test]
+    fn multi_record_produce_encodes_single_record_batch() {
+        let records: Vec<Record> = (0..5i64)
+            .map(|i| Record {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                producer_id: NO_PRODUCER_ID,
+                producer_epoch: NO_PRODUCER_EPOCH,
+                timestamp_type: TimestampType::Creation,
+                offset: i,
+                sequence: (i as i32).wrapping_add(NO_SEQUENCE),
+                timestamp: 1_700_000_000_000,
+                key: Some(Bytes::from_static(b"k")),
+                value: Some(Bytes::from(format!("val-{i}"))),
+                headers: IndexMap::new(),
+            })
+            .collect();
+        let mut buf = BytesMut::new();
+        let opts = RecordEncodeOptions {
+            version: 2,
+            compression: Compression::Zstd,
+        };
+        RecordBatchEncoder::encode_with_custom_compression(
+            &mut buf,
+            records.iter(),
+            &opts,
+            Some(compress_record_batch),
+        )
+        .unwrap();
+        let raw = buf.freeze();
+        // Verify batch length header spans the entire encoded buffer (single RecordBatch).
+        let batch_len = i32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+        assert_eq!(12 + batch_len, raw.len());
+        let last_offset_delta = i32::from_be_bytes([raw[23], raw[24], raw[25], raw[26]]);
+        assert_eq!(last_offset_delta, 4);
     }
 }

@@ -173,13 +173,15 @@ impl OpTimer<'_> {
         self.observe_duration();
     }
 
-    /// `Get` / `GetRange`: on error the failure and duration are recorded; on success the
-    /// `timingReader` records fetched/transferred bytes and the duration when the body has been
-    /// read and closed.
-    pub fn finish_read(&self, result: Result<u64, ()>) {
+    /// `Get` / `GetRange`: on error the failure (unless expected) and duration are recorded; on
+    /// success the `timingReader` records fetched/transferred bytes and the duration when the body
+    /// has been read and closed.
+    pub fn finish_read(&self, result: Result<u64, ()>, expected_failure: bool) {
         match result {
             Err(()) => {
-                self.failed();
+                if !expected_failure {
+                    self.failed();
+                }
                 self.observe_duration();
             }
             Ok(n) => {

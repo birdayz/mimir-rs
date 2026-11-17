@@ -1389,7 +1389,7 @@ impl IngestKafkaClient {
                     producer_epoch: NO_PRODUCER_EPOCH,
                     timestamp_type: TimestampType::Creation,
                     offset: i as i64,
-                    sequence: NO_SEQUENCE,
+                    sequence: (i as i32).wrapping_add(NO_SEQUENCE),
                     timestamp: r.timestamp_ms.unwrap_or(now_ms),
                     key: r.key,
                     value: r.value,
