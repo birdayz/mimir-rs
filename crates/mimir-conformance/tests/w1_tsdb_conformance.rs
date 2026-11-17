@@ -1229,3 +1229,102 @@ fn rust_wal_read_by_real_go_tsdb() {
         "rust2go"
     );
 }
+
+#[derive(serde::Serialize)]
+struct RegexMatcherErrorsRequest<'a> {
+    patterns: &'a [String],
+}
+
+#[derive(serde::Deserialize)]
+struct RegexMatcherErrorsResponse {
+    errors: Vec<String>,
+}
+
+/// Every regex Prometheus `labels.NewMatcher(MatchRegexp, ...)` rejects (Go `regexp/syntax`)
+/// is rejected by `LabelMatcher::new` with the byte-identical error text (it reaches clients as
+/// the gRPC status message of read RPCs). Corpus: all strings of up to 3 characters over a
+/// metacharacter-heavy alphabet plus deterministic pseudo-random longer ones and hand-picked
+/// cases.
+#[test]
+fn regex_matcher_errors_match_go_regexp_syntax() {
+    const ALPHABET: &[&str] = &[
+        "(", ")", "[", "]", "{", "}", "*", "+", "?", "|", "\\", "a", "1", ",", "-", "^", ":",
+        "P", "<", ">", "x", "p", "Q", "E", "0", "=", "}", "é",
+    ];
+    let mut patterns: Vec<String> = vec![String::new()];
+    let mut frontier = vec![String::new()];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for p in &frontier {
+            for a in ALPHABET {
+                next.push(format!("{p}{a}"));
+            }
+        }
+        patterns.extend(next.iter().cloned());
+        frontier = next;
+    }
+    let tokens: &[&str] = &[
+        "(", ")", "(?:", "(?i)", "(?P<n>", "(?<n>", "[", "]", "[^", "[:alpha:]", "[:foo:]", "{2}",
+        "{1,}", "{2,1}", "{1001}", "{500}", "{3}", "*", "+?", "?", "|", "\\d", "\\pL", "\\p{Greek}",
+        "\\p{Foo}", "\\x{41}", "\\x4", "\\Q", "\\E", "\\b", "\\z", "\\C", "a", "z-a", "a-z", "-",
+        ".", "^", "$", "é",
+    ];
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..20_000 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let n = 2 + (seed >> 60) as usize % 6;
+        let mut s = String::new();
+        let mut x = seed;
+        for _ in 0..n {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s.push_str(tokens[(x >> 33) as usize % tokens.len()]);
+        }
+        patterns.push(s);
+    }
+    for p in [
+        "(a{2}){500}", "(a{500}){3}", "((a{2}){2}){251}", "a{100000000}", "(?P=n)", "(?i-)",
+        "(?--i)", "\\x{110000}", "[\\b]", "a{,2}", "x{1001", "[]a]", "[-a]", "[a-]", "\\p{^Greek}",
+        "\\p{lower_case_letter}", "(?U)a+", "a\\Qb*\\E+", "\\Qab", "[[:^word:]\\d-z]",
+        "\\p{Letter}", "\\p{Old_Italic}", "\\p{greek}", "\\pl", "\\p{LC}", "\\p{Lc}", "(?<n>a)",
+    ] {
+        patterns.push(p.to_string());
+    }
+
+    let resp: RegexMatcherErrorsResponse =
+        invoke_oracle("regex-matcher-errors", &RegexMatcherErrorsRequest { patterns: &patterns })
+            .expect("go-oracle regex-matcher-errors");
+    assert_eq!(resp.errors.len(), patterns.len());
+
+    let mut mismatches = Vec::new();
+    let mut rust_only_rejects = Vec::new();
+    let mut go_errors = 0usize;
+    for (p, go) in patterns.iter().zip(&resp.errors) {
+        let rust = match LabelMatcher::new(MatchType::RegexMatch, "x", p.as_str()) {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        if go.is_empty() {
+            if !rust.is_empty() {
+                rust_only_rejects.push(format!("{p:?}: {rust}"));
+            }
+        } else {
+            go_errors += 1;
+            if &rust != go {
+                mismatches.push(format!("{p:?}:\n    go:   {go}\n    rust: {rust}"));
+            }
+        }
+    }
+    assert!(go_errors > 1000, "corpus must exercise Go errors ({go_errors})");
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} Go-rejected patterns differ:\n{}",
+        mismatches.len(),
+        go_errors,
+        mismatches.iter().take(60).cloned().collect::<Vec<_>>().join("\n")
+    );
+    eprintln!(
+        "{} Go-valid patterns rejected by the Rust regex engine:\n{}",
+        rust_only_rejects.len(),
+        rust_only_rejects.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
+    );
+}

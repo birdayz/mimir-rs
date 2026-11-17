@@ -85,6 +85,8 @@ func main() {
 		out, err = cmdGoSort(input)
 	case "tsdb-open-report":
 		out, err = cmdTSDBOpenReport(input)
+	case "regex-matcher-errors":
+		out, err = cmdRegexMatcherErrors(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}

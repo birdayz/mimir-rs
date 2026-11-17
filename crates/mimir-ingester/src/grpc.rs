@@ -10,7 +10,7 @@ use axum::http;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{Future, Stream};
 use mimir_common::grpc_log::{GrpcErrorLog, GrpcErrorLogEntry};
-use mimir_common::tenant::extract_tenant_id_from_grpc_metadata;
+use mimir_common::tenant::{extract_org_id_from_grpc_metadata, parse_single_tenant_id};
 use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb;
 use mimir_proto::prost::Message;
@@ -328,18 +328,25 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
     }
 }
 
+/// The org ID the gRPC auth middleware puts in the request context (Mimir
+/// `noauth.SetupAuthMiddleware`): with multitenancy enabled dskit
+/// `ServerUserHeaderInterceptor` requires exactly one `x-scope-orgid` value (else `codes.Unknown`
+/// `no org id`); with multitenancy disabled the header is ignored and `no_auth_tenant` injected.
+#[allow(clippy::result_large_err)]
+fn org_id_from_req<T>(ingester: &Ingester, req: &Request<T>) -> Result<String, Status> {
+    if !ingester.is_multitenancy_enabled() {
+        return Ok(ingester.no_auth_tenant());
+    }
+    extract_org_id_from_grpc_metadata(req.metadata()).map_err(|e| Status::unknown(e.to_string()))
+}
+
+/// [`org_id_from_req`] + dskit `tenant.TenantID` in the handler: invalid or multiple (`a|b`)
+/// tenant IDs are plain errors that Mimir's `mapReadErrorToErrorWithStatus` (read RPCs) and the
+/// Push path both return as `codes.Internal` with the error text.
 #[allow(clippy::result_large_err)]
 fn tenant_from_req<T>(ingester: &Ingester, req: &Request<T>) -> Result<String, Status> {
-    match extract_tenant_id_from_grpc_metadata(req.metadata()) {
-        Ok(id) => Ok(id),
-        Err(mimir_common::tenant::TenantError::NoOrgID) if !ingester.is_multitenancy_enabled() => {
-            Ok(ingester.no_auth_tenant())
-        }
-        Err(mimir_common::tenant::TenantError::NoOrgID) => {
-            Err(Status::unknown(mimir_common::tenant::TenantError::NoOrgID.to_string()))
-        }
-        Err(e) => Err(Status::invalid_argument(e.to_string())),
-    }
+    let org_id = org_id_from_req(ingester, req)?;
+    parse_single_tenant_id(&org_id).map_err(|e| Status::internal(e.to_string()))
 }
 
 fn vec_to_stream<T: Send + 'static>(
@@ -454,6 +461,8 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::UserStatsRequest>,
     ) -> Result<Response<ingesterpb::UsersStatsResponse>, Status> {
+        // Not per-tenant, but still behind the gRPC auth middleware.
+        org_id_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let resp = self
             .ingester
@@ -555,11 +564,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::SearchLabelNamesRequest>,
     ) -> Result<Response<Self::SearchLabelNamesStream>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let items = self
             .ingester
-            .handle_search_label_names(&md, &user_id, inner)
+            .handle_search_label_names(&md, &org_id, inner)
             .await
             .map_err(|e: IngesterError| e.map_read_error_to_status())?;
         Ok(Response::new(vec_to_stream(items)))
@@ -572,11 +581,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::SearchLabelValuesRequest>,
     ) -> Result<Response<Self::SearchLabelValuesStream>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let items = self
             .ingester
-            .handle_search_label_values(&md, &user_id, inner)
+            .handle_search_label_values(&md, &org_id, inner)
             .await
             .map_err(|e: IngesterError| e.map_read_error_to_status())?;
         Ok(Response::new(vec_to_stream(items)))
@@ -620,6 +629,26 @@ mod tests {
         // Custom no_auth_tenant
         ing.set_multitenancy(false, "anonymous");
         assert_eq!(tenant_from_req(&ing, &req).unwrap(), "anonymous");
+
+        // Multitenancy disabled: Mimir's noauth middleware injects no_auth_tenant and ignores
+        // the header entirely.
+        let mut with_header = Request::new(());
+        with_header
+            .metadata_mut()
+            .insert("x-scope-orgid", "a|b".parse().unwrap());
+        assert_eq!(tenant_from_req(&ing, &with_header).unwrap(), "anonymous");
+
+        // Multitenancy enabled: `a|b` passes the interceptor and fails tenant.TenantID in the
+        // handler (plain error -> codes.Internal); repeated headers fail the interceptor.
+        ing.set_multitenancy(true, "anonymous");
+        let err = tenant_from_req(&ing, &with_header).unwrap_err();
+        assert_eq!((err.code(), err.message()), (tonic::Code::Internal, "multiple org IDs present"));
+        assert_eq!(org_id_from_req(&ing, &with_header).unwrap(), "a|b");
+        with_header
+            .metadata_mut()
+            .append("x-scope-orgid", "a|b".parse().unwrap());
+        let err = org_id_from_req(&ing, &with_header).unwrap_err();
+        assert_eq!((err.code(), err.message()), (tonic::Code::Unknown, "no org id"));
     }
 
     #[tokio::test]

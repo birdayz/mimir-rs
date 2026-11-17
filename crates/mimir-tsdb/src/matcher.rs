@@ -16,6 +16,10 @@ const MIN_EQUAL_MULTI_STRING_MATCHER_MAP_THRESHOLD: usize = 16;
 
 #[derive(Debug, Error)]
 pub enum MatcherError {
+    /// Go `regexp/syntax` parse error (`error parsing regexp: <code>: `<expr>``).
+    #[error("{0}")]
+    GoSyntax(#[from] crate::go_regexp_syntax::GoSyntaxError),
+    /// A pattern Go accepts but the Rust `regex` crate cannot compile.
     #[error("invalid regex pattern {pattern:?}: {reason}")]
     InvalidRegex {
         pattern: String,
@@ -304,6 +308,10 @@ impl FastRegexMatcher {
                 contains: Vec::new(),
             });
         }
+
+        // Go `syntax.Parse(v, syntax.Perl|syntax.DotNL)`: reject exactly what Go rejects, with
+        // Go's error text.
+        crate::go_regexp_syntax::check(pattern)?;
 
         // Parse with Perl + DotNL (matching Go `syntax.Perl | syntax.DotNL`) first so any
         // syntax error (like unbalanced parens) is caught before wrapping in `\A(?s:...)\z`.
