@@ -428,7 +428,16 @@ fn org_id_from_req<T>(ingester: &Ingester, req: &Request<T>) -> Result<String, S
     if !ingester.is_multitenancy_enabled() {
         return Ok(ingester.no_auth_tenant());
     }
-    extract_org_id_from_grpc_metadata(req.metadata()).map_err(|e| Status::unknown(e.to_string()))
+    extract_org_id_from_grpc_metadata(req.metadata()).map_err(|e| {
+        if let Some(log) = req.extensions().get::<GrpcErrorLog>() {
+            log.set(GrpcErrorLogEntry {
+                err: e.to_string(),
+                keep: true,
+                reason: None,
+            });
+        }
+        Status::unknown(e.to_string())
+    })
 }
 
 /// dskit `tenant.TenantID` in the handler: invalid or multiple (`a|b`) tenant IDs are plain

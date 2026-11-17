@@ -456,6 +456,32 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert_eq!(body, "invalid locked value: strconv.ParseBool: parsing \"yes\": invalid syntax\n");
 
+        let (code, body) = post(
+            &app,
+            "/ingester/partition-ring?action=state_change_lock&partition_id=7&locked=true",
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            "failed to lock partition state change: the partition does not exist\n"
+        );
+
+        let (code, body) = post(
+            &app,
+            "/ingester/partition-ring?action=change_state&partition_id=7&partition_state=PartitionInactive",
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            "failed to change partition state: the partition does not exist\n"
+        );
+
         // Unknown / missing action: plain redirect.
         let (code, _) = post(&app, "/ingester/partition-ring", None, "").await;
         assert_eq!(code, StatusCode::FOUND);

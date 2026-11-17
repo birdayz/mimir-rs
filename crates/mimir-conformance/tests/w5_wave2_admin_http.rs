@@ -324,11 +324,7 @@ async fn classic_observations(port: u16, grpc: u16, ts: i64) -> Vec<(String, Str
 
     // W2-12 after flushing: blocks and uploads are listed.
     let r = call(&c, port, "GET", "/ingester/tsdb/t-flush-only", &[("Accept", "application/json")], None).await;
-    let mut v = normalize_tsdb_json(&r.body);
-    // KNOWN DIVERGENCE (mimir-tsdb, outside this test's scope): Go's `Head.truncateMemory`
-    // raises `minOOOTime` to `headMaxt - OutOfOrderTimeWindow` after a compaction
-    // (prometheus/tsdb/head.go), the Rust head keeps `math.MaxInt64`.
-    v["Head"]["MinOOOTime"] = Value::from("<known-divergence>");
+    let v = normalize_tsdb_json(&r.body);
     rec("tsdb[t-flush-only].json after flush", v.to_string());
     let r = call(&c, port, "GET", "/ingester/tenants", &[("Accept", "application/json")], None).await;
     let mut v: Value = serde_json::from_str(&strip_now(&r.body)).unwrap();
@@ -432,11 +428,7 @@ async fn twin_process_wave2_partition_ring_editor_inmemory() {
             ("missing", "/ingester/partition-ring?action=state_change_lock&partition_id=7&locked=true"),
         ] {
             let r = call(&c, http, "POST", path, &[], None).await;
-            // KNOWN DIVERGENCE (partition_ring/lifecycler.rs `PartitionRingEditor`, outside this
-            // test's scope): Go reports `ring.ErrPartitionDoesNotExist` ("the partition does not
-            // exist"), Rust prefixes the KV error ("key not found: partition does not exist").
-            let body = if name == "missing" { String::new() } else { r.body };
-            out.push((name.into(), format!("{} {} {body:?}", r.status, r.content_type)));
+            out.push((name.into(), format!("{} {} {:?}", r.status, r.content_type, r.body)));
         }
 
         let r = call(&c, http, "GET", "/ingester/partition-ring", &[("Accept", "application/json")], None).await;

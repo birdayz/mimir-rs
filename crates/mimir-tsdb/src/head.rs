@@ -5422,6 +5422,7 @@ impl Head {
     /// cleans up empty series and unused `chunks_head` files.
     pub fn clear_ooo_data_before(&self, maxt_inclusive: i64) -> Result<(), HeadError> {
         let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
+        let head_maxt = self.max_time();
         let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
         let mut to_delete: Vec<(Arc<SeriesEntry>, i64)> = Vec::new();
         let mut min_mmap_seq = usize::MAX;
@@ -5522,7 +5523,12 @@ impl Head {
             }
         }
 
-        self.min_ooo_time.store(rem_ooo_mint, Ordering::Release);
+        let ooo_window = self.ooo_time_window_ms.load(Ordering::Acquire);
+        let mut min_ooo_time = rem_ooo_mint;
+        if head_maxt.wrapping_sub(ooo_window) < min_ooo_time {
+            min_ooo_time = head_maxt.wrapping_sub(ooo_window);
+        }
+        self.min_ooo_time.store(min_ooo_time, Ordering::Release);
         self.max_ooo_time.store(rem_ooo_maxt, Ordering::Release);
 
         let cut_seg_opt = self.ooo_compact_wbl_cut_seg.lock().take();
@@ -5757,7 +5763,9 @@ impl Head {
 
         self.metrics.head_truncate_total.inc();
         let gc_start = Instant::now();
-        let (to_delete, actual_mint, min_mmap_seq) = self.gc_collect_and_unlink(mint);
+        let head_maxt = self.max_time();
+        let (to_delete, actual_mint, mut min_ooo_time, min_mmap_seq) =
+            self.gc_collect_and_unlink(mint);
 
         if !to_delete.is_empty() {
             // Log tombstones to WAL in bounded chunks after atomic unlink.
@@ -5795,6 +5803,14 @@ impl Head {
             let clamped = actual_mint.min(self.appendable_min_valid_time());
             self.min_valid_time.store(clamped, Ordering::Release);
         }
+        // Go `Head.truncateSeriesAndChunkDiskMapper` (`prometheus/tsdb/head.go:1994-2000`):
+        // if the allowed OOO window is lower than the min OOO time seen during GC, clamp
+        // `min_ooo_time` down to `head_maxt - ooo_window`.
+        let ooo_window = self.ooo_time_window_ms.load(Ordering::Acquire);
+        if head_maxt.wrapping_sub(ooo_window) < min_ooo_time {
+            min_ooo_time = head_maxt.wrapping_sub(ooo_window);
+        }
+        self.min_ooo_time.store(min_ooo_time, Ordering::Release);
 
         let (has_active, active_seq) = {
             let w = self.chunk_writer.lock();
@@ -5818,7 +5834,8 @@ impl Head {
 
     /// Garbage-collects chunks `< mint` and empty series (used on startup after WAL/WBL replay).
     pub fn gc(&self, mint: i64) -> Result<(), HeadError> {
-        let (to_delete, actual_mint, min_mmap_seq) = self.gc_collect_and_unlink(mint);
+        let (to_delete, actual_mint, _min_ooo_time, min_mmap_seq) =
+            self.gc_collect_and_unlink(mint);
         if !to_delete.is_empty() {
             self.finish_deleted_series_cleanup(to_delete);
         }
@@ -5846,14 +5863,18 @@ impl Head {
         Ok(())
     }
 
-    fn gc_collect_and_unlink(&self, mint: i64) -> (Vec<(Arc<SeriesEntry>, i64)>, i64, usize) {
+    fn gc_collect_and_unlink(&self, mint: i64) -> (Vec<(Arc<SeriesEntry>, i64)>, i64, i64, usize) {
         let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
         let mut to_delete: Vec<(Arc<SeriesEntry>, i64)> = Vec::new();
         let mut actual_mint = i64::MAX;
+        let mut min_ooo_time = i64::MAX;
         let mut min_mmap_seq = usize::MAX;
         let mut chunks_removed = 0u64;
 
-        let record_refs = |st: &SeriesState, actual_mint: &mut i64, min_mmap_seq: &mut usize| {
+        let record_refs = |st: &SeriesState,
+                           actual_mint: &mut i64,
+                           min_ooo_time: &mut i64,
+                           min_mmap_seq: &mut usize| {
             let sm = st.min_time();
             if sm < *actual_mint {
                 *actual_mint = sm;
@@ -5866,10 +5887,15 @@ impl Head {
                 for mc in &ooo.ooo_mmapped_chunks {
                     let (seq, _) = mc.ref_id.unpack();
                     *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
+                    *min_ooo_time = (*min_ooo_time).min(mc.min_time);
                 }
                 for (mc, _) in &ooo.ooo_pending_mmapped {
                     let (seq, _) = mc.ref_id.unpack();
                     *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
+                    *min_ooo_time = (*min_ooo_time).min(mc.min_time);
+                }
+                if let Some(ref ohc) = ooo.ooo_head_chunk {
+                    *min_ooo_time = (*min_ooo_time).min(ohc.min_time);
                 }
             }
         };
@@ -5888,7 +5914,7 @@ impl Head {
                 if entry.pending_commits_count() > 0 {
                     // Always include in-flight series' chunks_head sequence numbers and min_time
                     // so chunk files referenced by pending commits are NEVER deleted.
-                    record_refs(&st, &mut actual_mint, &mut min_mmap_seq);
+                    record_refs(&st, &mut actual_mint, &mut min_ooo_time, &mut min_mmap_seq);
                     continue;
                 }
 
@@ -5933,12 +5959,12 @@ impl Head {
                     continue;
                 }
 
-                record_refs(&st, &mut actual_mint, &mut min_mmap_seq);
+                record_refs(&st, &mut actual_mint, &mut min_ooo_time, &mut min_mmap_seq);
             }
         }
 
         self.metrics.chunks_removed(chunks_removed);
-        (to_delete, actual_mint, min_mmap_seq)
+        (to_delete, actual_mint, min_ooo_time, min_mmap_seq)
     }
 
     /// Go `Head.truncateWAL`: checkpoints the lower two thirds of the WAL segments and
@@ -9412,5 +9438,53 @@ mod tests {
         head.truncate_memory(5_000).unwrap();
         assert!(head.get_entry_by_sorted_pairs(&pairs).is_none());
         head.close().unwrap();
+    }
+
+    #[test]
+    fn truncate_memory_updates_min_ooo_time_like_go() {
+        // Without OOO window (`ooo_time_window_ms = 0`), `truncateMemory` sets `minOOOTime` to
+        // `headMaxt - 0 == headMaxt` (`prometheus/tsdb/head.go:1994-2000`).
+        let dir = tempfile::tempdir().unwrap();
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+        // Uninitialized head truncation (startup before WAL replay) leaves `min_ooo_time` untouched.
+        head.truncate_memory(500).unwrap();
+        assert_eq!(head.min_ooo_time(), i64::MAX);
+
+        let pairs = [("__name__", "m")];
+        let mut app = head.appender();
+        app.append_float(None, &pairs, 1_000, 1.0).unwrap();
+        app.commit().unwrap();
+        assert_eq!(head.min_ooo_time(), i64::MAX);
+
+        head.truncate_memory(1_001).unwrap();
+        assert_eq!(head.max_time(), 1_001);
+        assert_eq!(head.min_ooo_time(), 1_001);
+        head.close().unwrap();
+
+        // With `ooo_time_window_ms > 0`: `min_ooo_time = min(gc_min_ooo, head_maxt - ooo_window)`.
+        let dir2 = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 600,
+            ..HeadOptions::default()
+        };
+        let head2 = Head::open(dir2.path(), opts, i64::MIN).unwrap();
+        let mut app = head2.appender();
+        app.append_float(None, &pairs, 2_000, 1.0).unwrap();
+        app.commit().unwrap();
+        head2.truncate_memory(2_001).unwrap();
+        assert_eq!(head2.min_ooo_time(), 2_001 - 600);
+
+        // If an existing OOO chunk has `min_time < head_maxt - ooo_window`, keep its `min_time`.
+        let mut app = head2.appender();
+        app.append_float(None, &pairs, 2_500, 2.0).unwrap();
+        app.commit().unwrap();
+        let mut app = head2.appender();
+        app.append_float(None, &pairs, 2_000, 3.0).unwrap(); // OOO within [2500-600, 2500)
+        app.commit().unwrap();
+        head2.set_ooo_time_window(100).unwrap();
+        head2.truncate_memory(2_100).unwrap();
+        // `gc` sees `oooHeadChunk.minTime = 2000` < `2500 - 100 = 2400`, so `2000` wins.
+        assert_eq!(head2.min_ooo_time(), 2_000);
+        head2.close().unwrap();
     }
 }

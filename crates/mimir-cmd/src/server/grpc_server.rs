@@ -84,6 +84,8 @@ const STREAMING_METHODS: &[&str] = &[
     "/cortex.Ingester/LabelNamesAndValues",
     "/cortex.Ingester/LabelValuesCardinality",
     "/cortex.Ingester/ActiveSeries",
+    "/cortex.Ingester/SearchLabelNames",
+    "/cortex.Ingester/SearchLabelValues",
     "/grpc.health.v1.Health/Watch",
 ];
 

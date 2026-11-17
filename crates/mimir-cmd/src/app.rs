@@ -736,7 +736,10 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         max_recv,
     ));
 
-    let health_svc = HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules));
+    let health_svc = SnappyDecompressService::new(
+        HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules)),
+        max_recv,
+    );
 
     let mut grpc_routes = tonic::service::Routes::new(health_svc).add_service(http_grpc_svc);
 
