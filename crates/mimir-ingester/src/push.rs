@@ -269,12 +269,13 @@ impl Drop for ResolvedEntriesGuard {
     }
 }
 
-struct PairsScratchGuard {
+struct PairsScratchGuard<'a> {
     from_tls: bool,
     vec: Vec<(&'static str, &'static str)>,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl PairsScratchGuard {
+impl<'a> PairsScratchGuard<'a> {
     fn take() -> Self {
         let taken = PAIRS_SCRATCH.with(|cell| {
             cell.try_borrow_mut()
@@ -290,23 +291,25 @@ impl PairsScratchGuard {
                 Self {
                     from_tls: true,
                     vec,
+                    _marker: std::marker::PhantomData,
                 }
             }
             None => Self {
                 from_tls: false,
                 vec: Vec::with_capacity(32),
+                _marker: std::marker::PhantomData,
             },
         }
     }
 
     #[inline]
-    fn as_mut_pairs<'a>(&mut self) -> &mut Vec<(&'a str, &'a str)> {
+    fn as_mut_pairs(&mut self) -> &mut Vec<(&'a str, &'a str)> {
         // SAFETY: `self.vec` is empty when taken and cleared on Drop before `'a` ends.
         unsafe { &mut *(&mut self.vec as *mut Vec<(&'static str, &'static str)>).cast() }
     }
 }
 
-impl Drop for PairsScratchGuard {
+impl Drop for PairsScratchGuard<'_> {
     fn drop(&mut self) {
         self.vec.clear();
         if self.from_tls {
@@ -332,6 +335,8 @@ pub(crate) fn fast_utf8_str(b: &[u8]) -> Result<&str, std::str::Utf8Error> {
     }
 }
 
+pub(crate) type ConvertedExemplarResult = Result<(i64, f64, Labels, String), IngesterError>;
+
 pub(crate) struct PrehashedSeriesItem<'a> {
     pub encoded_labels: &'a [u8],
     pub samples: &'a [cortexpb::Sample],
@@ -340,7 +345,14 @@ pub(crate) struct PrehashedSeriesItem<'a> {
     pub labels_sorted_unique: bool,
     pub bad_utf8: bool,
     pub histograms: &'a [ConvertedHistogram],
-    pub exemplars: &'a [(i64, f64, Labels, String)],
+    pub exemplars: &'a [ConvertedExemplarResult],
+}
+
+#[inline]
+fn rollback_appender(user_id: &str, app: mimir_tsdb::head::HeadAppender<'_>) {
+    if let Err(err) = app.rollback() {
+        tracing::warn!(user = %user_id, err = %err, "failed to rollback appender on error");
+    }
 }
 
 pub(crate) fn convert_borrowed_histogram(h: &BorrowedHistogramView<'_>) -> ConvertedHistogram {
@@ -839,7 +851,7 @@ impl Ingester {
             label_bytes_arena: Vec<u8>,
             samples_arena: Vec<cortexpb::Sample>,
             histograms_arena: Vec<ConvertedHistogram>,
-            exemplars_arena: Vec<(i64, f64, Labels, String)>,
+            exemplars_arena: Vec<Result<(i64, f64, Labels, String), IngesterError>>,
             series_metas: Vec<ClassicSeriesMeta>,
         }
 
@@ -889,9 +901,9 @@ impl Ingester {
             let s = &mut *guard.0;
 
             let mut min_ts = i64::MAX;
+            let mut all_sorted_unique = true;
             let mut all_sorted_have_metric_name = true;
             let mut bad_utf8 = false;
-            let mut exemplar_err: Option<IngesterError> = None;
 
             let ClassicPushScratch {
                 ref mut wr_scratch,
@@ -911,8 +923,9 @@ impl Ingester {
                 |series| {
                     if series.bad_utf8 {
                         bad_utf8 = true;
-                    } else if series.labels_sorted_unique
-                        && !iter_stringlabels(series.encoded_labels).any(|(k, _)| k == "__name__")
+                    } else if !series.labels_sorted_unique {
+                        all_sorted_unique = false;
+                    } else if !iter_stringlabels(series.encoded_labels).any(|(k, _)| k == "__name__")
                     {
                         all_sorted_have_metric_name = false;
                     }
@@ -930,18 +943,12 @@ impl Ingester {
                     let ex_start = exemplars_arena.len() as u32;
                     let mut ex_len = 0u32;
                     for ex in series.exemplars() {
-                        match convert_borrowed_exemplar(&ex) {
-                            Ok(conv) => {
-                                min_ts = min_ts.min(conv.0);
-                                exemplars_arena.push(conv);
-                                ex_len += 1;
-                            }
-                            Err(e) => {
-                                if exemplar_err.is_none() {
-                                    exemplar_err = Some(e.with_user(user_id, 0));
-                                }
-                            }
+                        let res = convert_borrowed_exemplar(&ex);
+                        if let Ok(ref conv) = res {
+                            min_ts = min_ts.min(conv.0);
                         }
+                        exemplars_arena.push(res);
+                        ex_len += 1;
                     }
 
                     series_metas.push(ClassicSeriesMeta {
@@ -996,9 +1003,6 @@ impl Ingester {
                 }
                 .with_user(user_id, 0));
             }
-            if let Some(err) = exemplar_err {
-                return Err(err);
-            }
 
             let ts_len = series_metas.len();
             if ts_len == 0 {
@@ -1040,6 +1044,7 @@ impl Ingester {
             }
 
             if ts_len >= CLASSIC_PUSH_SHARD_THRESHOLD
+                && all_sorted_unique
                 && all_sorted_have_metric_name
                 && !self.verify_ring_ownership.load(Ordering::Relaxed)
                 && self
@@ -1493,6 +1498,21 @@ impl Ingester {
         };
 
         let head = db.db.head();
+        let user_series_limit = db.limiter.max_series_per_user(user_id, 0);
+        let metric_series_limit = db.limiter.max_series_per_metric(user_id);
+        let may_cross_user_limit = user_series_limit < usize::MAX
+            && (head.num_series() as usize).saturating_add(items.len()) > user_series_limit;
+        let may_cross_metric_limit = metric_series_limit < usize::MAX;
+        if !head.initialized() || may_cross_user_limit || may_cross_metric_limit {
+            return self.ingest_prehashed_shard_batch_with_lock(
+                user_id,
+                &db,
+                lock_guard,
+                source,
+                items,
+            );
+        }
+
         let min_append_time_available = head.initialized();
         let min_append_time = head.appendable_min_valid_time();
         let max_exemplars = self.limiter.max_exemplars_per_user(user_id);
@@ -1932,17 +1952,30 @@ impl Ingester {
 
                 if ex_count > 0 && max_exemplars > 0 {
                     if series_ref.is_none() {
-                        let (ex_ts, _, _, ex_str) = &item.exemplars[0];
-                        let s_str = make_series_str(encoded_labels);
-                        record_partial(
-                            IngesterError::exemplar_missing_series(*ex_ts, s_str, ex_str.clone()),
-                            None,
-                        );
+                        if let Some(Ok((ex_ts, _, _, ex_str))) = item.exemplars.first() {
+                            let s_str = make_series_str(encoded_labels);
+                            record_partial(
+                                IngesterError::exemplar_missing_series(
+                                    *ex_ts,
+                                    s_str,
+                                    ex_str.clone(),
+                                ),
+                                None,
+                            );
+                        }
                         stats.failed_exemplars += ex_count;
                     } else {
                         let pairs = lazy_pairs.as_slice();
                         let mut out_of_order_exemplars = 0usize;
-                        for (ex_ts, ex_val, ex_labels, ex_str) in item.exemplars {
+                        for ex_res in item.exemplars {
+                            let (ex_ts, ex_val, ex_labels, ex_str) = match ex_res {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    stats.failed_exemplars += 1;
+                                    record_partial(e.clone(), None);
+                                    continue;
+                                }
+                            };
                             let ex_ts = *ex_ts;
                             if ex_ts > max_timestamp_ms {
                                 stats.failed_exemplars += 1;
@@ -2022,7 +2055,7 @@ impl Ingester {
             }
 
             if let Some(err) = hard_err {
-                drop(app);
+                rollback_appender(user_id, app);
                 *shard_slots[s_idx].lock() = Some(Err(err));
             } else {
                 *shard_slots[s_idx].lock() = Some(Ok(PreparedShard {
@@ -2061,7 +2094,11 @@ impl Ingester {
             }
         }
         if let Some(err) = first_hard_err {
-            drop(prepared);
+            for slot in prepared {
+                if let Some(ps) = slot.into_inner() {
+                    rollback_appender(user_id, ps.app);
+                }
+            }
             drop(lock_guard);
             return Err(err);
         }
@@ -2169,7 +2206,6 @@ impl Ingester {
         min_ts: i64,
         items: &[PrehashedSeriesItem<'_>],
     ) -> Result<(), IngesterError> {
-
         let db = self.get_or_create_tsdb(user_id).map_err(|e| {
             let wrapped = e.with_user(user_id, 0);
             if wrapped.error_cause() == cortexpb::ErrorCause::InstanceLimit {
@@ -2181,7 +2217,17 @@ impl Ingester {
         let lock_guard = db
             .acquire_append_lock(min_ts)
             .map_err(|e| e.with_user(user_id, 0))?;
+        self.ingest_prehashed_shard_batch_with_lock(user_id, &db, lock_guard, source, items)
+    }
 
+    fn ingest_prehashed_shard_batch_with_lock<'a>(
+        &self,
+        user_id: &str,
+        db: &Arc<crate::user_tsdb::UserTsdb>,
+        lock_guard: crate::user_tsdb::AppendLockGuard<'a>,
+        source: cortexpb::write_request::SourceEnum,
+        items: &[PrehashedSeriesItem<'_>],
+    ) -> Result<(), IngesterError> {
         let start_append = SystemTime::now();
         let start_append_ms = start_append
             .duration_since(UNIX_EPOCH)
@@ -2268,7 +2314,7 @@ impl Ingester {
                 }
             }
             if item.bad_utf8 {
-                drop(app);
+                rollback_appender(user_id, app);
                 drop(lock_guard);
                 return Err(IngesterError::BadRequest {
                     message: "invalid UTF-8 in label".to_string(),
@@ -2367,7 +2413,7 @@ impl Ingester {
                 && verify_ownership
                 && !self.check_ring_ownership_iter(user_id, iter_stringlabels(encoded_labels))
             {
-                drop(app);
+                rollback_appender(user_id, app);
                 drop(lock_guard);
                 return Err(IngesterError::Internal {
                     message: format!(
@@ -2435,7 +2481,7 @@ impl Ingester {
                                 &mut make_series_str,
                                 &mut record_partial,
                             ) {
-                                drop(app);
+                                rollback_appender(user_id, app);
                                 drop(lock_guard);
                                 return Err(e.with_user(user_id, 0));
                             }
@@ -2484,7 +2530,7 @@ impl Ingester {
                             &mut make_series_str,
                             &mut record_partial,
                         ) {
-                            drop(app);
+                            rollback_appender(user_id, app);
                             drop(lock_guard);
                             return Err(e.with_user(user_id, 0));
                         }
@@ -2572,7 +2618,7 @@ impl Ingester {
                                     &mut make_series_str,
                                     &mut record_partial,
                                 ) {
-                                    drop(app);
+                                    rollback_appender(user_id, app);
                                     drop(lock_guard);
                                     return Err(e.with_user(user_id, 0));
                                 }
@@ -2623,7 +2669,7 @@ impl Ingester {
                                 &mut make_series_str,
                                 &mut record_partial,
                             ) {
-                                drop(app);
+                                rollback_appender(user_id, app);
                                 drop(lock_guard);
                                 return Err(e.with_user(user_id, 0));
                             }
@@ -2651,17 +2697,30 @@ impl Ingester {
 
             if ex_count > 0 && max_exemplars > 0 {
                 if series_ref.is_none() {
-                    let (ex_ts, _, _, ex_str) = &item.exemplars[0];
-                    let s_str = make_series_str(encoded_labels);
-                    record_partial(
-                        IngesterError::exemplar_missing_series(*ex_ts, s_str, ex_str.clone()),
-                        None,
-                    );
+                    if let Some(Ok((ex_ts, _, _, ex_str))) = item.exemplars.first() {
+                        let s_str = make_series_str(encoded_labels);
+                        record_partial(
+                            IngesterError::exemplar_missing_series(
+                                *ex_ts,
+                                s_str,
+                                ex_str.clone(),
+                            ),
+                            None,
+                        );
+                    }
                     stats.failed_exemplars += ex_count;
                 } else {
                     let pairs = lazy_pairs.as_slice();
                     let mut out_of_order_exemplars = 0usize;
-                    for (ex_ts, ex_val, ex_labels, ex_str) in item.exemplars {
+                    for ex_res in item.exemplars {
+                        let (ex_ts, ex_val, ex_labels, ex_str) = match ex_res {
+                            Ok(v) => v,
+                            Err(e) => {
+                                stats.failed_exemplars += 1;
+                                record_partial(e.clone(), None);
+                                continue;
+                            }
+                        };
                         let ex_ts = *ex_ts;
                         if ex_ts > max_timestamp_ms {
                             stats.failed_exemplars += 1;
@@ -2786,7 +2845,7 @@ impl Ingester {
             items.first().map(|it| iter_stringlabels(it.encoded_labels)),
         );
         let group = self.update_active_group(user_id, request_group, start_append);
-        self.record_discarded_metrics(user_id, &group, &stats, source, &db);
+        self.record_discarded_metrics(user_id, &group, &stats, source, db);
 
         if let Some((partial, sampler_kind)) = first_partial {
             let err = if let Some(kind) = sampler_kind {
@@ -2879,6 +2938,7 @@ impl Ingester {
             }
 
             if let Err(e) = ts.fill_pairs(pairs) {
+                rollback_appender(user_id, app);
                 return Err(e.with_user(user_id, 0));
             }
             if first_series {
@@ -2986,6 +3046,7 @@ impl Ingester {
             }
 
             if series_ref.is_none() && verify_ownership && !self.check_ring_ownership(user_id, pairs) {
+                rollback_appender(user_id, app);
                 return Err(IngesterError::Internal {
                     message: format!(
                         "series {} is not owned by this ingester",
@@ -3040,7 +3101,7 @@ impl Ingester {
                             | HeadError::OutOfOrderSample,
                         ) => {}
                         Err(err) => {
-                            handle_head_append_error(
+                            match handle_head_append_error(
                                 err,
                                 created_ts,
                                 pairs.as_slice(),
@@ -3050,7 +3111,13 @@ impl Ingester {
                                 &mut stats,
                                 &mut make_series_str,
                                 &mut record_partial,
-                            ).map_err(|e| e.with_user(user_id, 0))?;
+                            ) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    rollback_appender(user_id, app);
+                                    return Err(e.with_user(user_id, 0));
+                                }
+                            }
                         }
                     }
                     ingest_created_ts = false;
@@ -3070,7 +3137,7 @@ impl Ingester {
                         stats.succeeded_samples += 1;
                     }
                     Err(err) => {
-                        handle_head_append_error(
+                        match handle_head_append_error(
                             err,
                             s.timestamp_ms,
                             pairs.as_slice(),
@@ -3080,7 +3147,13 @@ impl Ingester {
                             &mut stats,
                             &mut make_series_str,
                             &mut record_partial,
-                        ).map_err(|e| e.with_user(user_id, 0))?;
+                        ) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                rollback_appender(user_id, app);
+                                return Err(e.with_user(user_id, 0));
+                            }
+                        }
                     }
                 }
             }
@@ -3143,7 +3216,7 @@ impl Ingester {
                                 | HeadError::OutOfOrderSample,
                             ) => {}
                             Err(err) => {
-                                handle_head_append_error(
+                                match handle_head_append_error(
                                     err,
                                     created_ts,
                                     pairs.as_slice(),
@@ -3153,7 +3226,13 @@ impl Ingester {
                                     &mut stats,
                                     &mut make_series_str,
                                     &mut record_partial,
-                                ).map_err(|e| e.with_user(user_id, 0))?;
+                                ) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    rollback_appender(user_id, app);
+                                    return Err(e.with_user(user_id, 0));
+                                }
+                            }
                             }
                         }
                         ingest_created_ts = false;
@@ -3190,7 +3269,7 @@ impl Ingester {
                             }
                         }
                         Err(err) => {
-                            handle_head_append_error(
+                            match handle_head_append_error(
                                 err,
                                 h_ts,
                                 pairs.as_slice(),
@@ -3200,7 +3279,13 @@ impl Ingester {
                                 &mut stats,
                                 &mut make_series_str,
                                 &mut record_partial,
-                            ).map_err(|e| e.with_user(user_id, 0))?;
+                            ) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    rollback_appender(user_id, app);
+                                    return Err(e.with_user(user_id, 0));
+                                }
+                            }
                         }
                     }
                 }
@@ -3928,5 +4013,181 @@ mod wave3_tests {
                 .get(),
             2.0
         );
+    }
+
+    #[test]
+    fn push_rollback_persists_new_series_for_subsequent_push_and_wal_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        {
+            let mut ing_cfg = mimir_config::IngesterConfig::default();
+            ing_cfg.ring.instance_id = "test-rb".to_string();
+            let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+            blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().to_string();
+            blocks_cfg.tsdb.wal_compression_enabled = false;
+            let ing = Ingester::new(
+                ing_cfg,
+                blocks_cfg,
+                mimir_config::IngestStorageConfig::default(),
+                mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            ing.set_state_for_test(mimir_common::services::State::Running);
+
+            // Batch 1 (sharded >= 256 series): creates s_new (idx 0..300) and triggers hard error
+            // (MissingMetricName) at idx 300, rolling back the whole batch.
+            let mut batch1 = Vec::with_capacity(301);
+            for i in 0..301 {
+                let labels = if i == 300 {
+                    vec![lp("job", "missing_metric_name")]
+                } else {
+                    vec![lp("__name__", "rb_replay_metric"), lp("id", &format!("{i:04}"))]
+                };
+                batch1.push(cortexpb::TimeSeries {
+                    labels,
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: now - 10_000,
+                        value: 1.0,
+                    }],
+                    ..Default::default()
+                });
+            }
+            let req1 = cortexpb::WriteRequest {
+                timeseries: batch1,
+                ..Default::default()
+            };
+            ing.push_grpc_raw_sync(
+                "tenant-rb-wal",
+                &mimir_proto::prost::Message::encode_to_vec(&req1),
+            )
+            .unwrap_err();
+
+            // Batch 2: pushes valid samples to the first newly created series s_new.
+            let req2 = cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![lp("__name__", "rb_replay_metric"), lp("id", "0000")],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: now,
+                        value: 77.5,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            ing.push_grpc_raw_sync(
+                "tenant-rb-wal",
+                &mimir_proto::prost::Message::encode_to_vec(&req2),
+            )
+            .unwrap();
+
+            mimir_common::block_on_for_tests(ing.close_all_tsdbs());
+        }
+
+        // Reopen TSDB directly from WAL on disk and assert s_new + Batch 2 sample survived!
+        let user_dir = tmp.path().join("tenant-rb-wal");
+        let reopened = mimir_tsdb::db::Tsdb::open(
+            &user_dir,
+            mimir_tsdb::db::TsdbOptions::default(),
+        )
+        .unwrap();
+        let m = mimir_tsdb::matcher::LabelMatcher::new(
+            mimir_tsdb::matcher::MatchType::Equal,
+            "id",
+            "0000",
+        )
+        .unwrap();
+        let series = reopened
+            .chunk_querier(0, i64::MAX)
+            .select(false, &[m])
+            .unwrap();
+        assert_eq!(series.len(), 1, "s_new must survive WAL replay");
+        let vals: Vec<(i64, f64)> = series[0]
+            .chunks
+            .iter()
+            .flat_map(|c| mimir_tsdb::compact::decode_chunk_samples(c.chunk.as_ref().unwrap()).unwrap())
+            .map(|s| {
+                let mimir_tsdb::compact::SampleValue::Float(v) = s.value else {
+                    panic!("expected float");
+                };
+                (s.t, v)
+            })
+            .collect();
+        assert_eq!(vals, vec![(now, 77.5)]);
+    }
+
+    #[test]
+    fn push_raw_invalid_utf8_exemplar_commits_valid_samples_and_returns_partial_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-ex".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().to_string();
+        let limits = mimir_config::LimitsConfig {
+            max_global_exemplars_per_user: 100,
+            ..Default::default()
+        };
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(limits),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("__name__", "ex_utf8_metric")],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: now,
+                    value: 12.25,
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![cortexpb::LabelPair {
+                        name: bytes::Bytes::from_static(b"trace_id"),
+                        value: bytes::Bytes::from_static(&[0xff, 0xfe]),
+                    }],
+                    value: 1.0,
+                    timestamp_ms: now,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = ing
+            .push_grpc_raw_sync("t-ex-utf8", &mimir_proto::prost::Message::encode_to_vec(&req))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid UTF-8"),
+            "unexpected error: {err}"
+        );
+        let db = ing.get_tsdb("t-ex-utf8").unwrap();
+        assert_eq!(db.db.head().num_series(), 1, "valid sample must still commit");
+        assert_eq!(
+            db.ingested_samples_counter(&ing.metrics.ingested_samples)
+                .get(),
+            1.0
+        );
+        assert_eq!(ing.metrics.ingested_exemplars_fail.get(), 1.0);
     }
 }

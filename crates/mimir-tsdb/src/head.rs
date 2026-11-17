@@ -843,6 +843,7 @@ impl SeriesState {
         self.active_chunk = None;
         self.active_min_time = i64::MAX;
         self.active_max_time_delta = ACTIVE_DELTA_NONE;
+        self.next_at_delta = ACTIVE_DELTA_NONE;
         if let Some(ref mut c) = self.cold {
             c.extra_head_chunks.clear();
             c.extra_head_chunks.shrink_to_fit();
@@ -860,6 +861,7 @@ impl SeriesState {
             self.active_chunk = None;
             self.active_min_time = i64::MAX;
             self.active_max_time_delta = ACTIVE_DELTA_NONE;
+            self.next_at_delta = ACTIVE_DELTA_NONE;
             removed += 1;
             if let Some(ref mut c) = self.cold {
                 if let Some(promoted) = c.extra_head_chunks.pop() {
@@ -983,7 +985,22 @@ impl SeriesState {
     }
 
     #[inline]
+    fn clear_last_sample(&mut self) {
+        if self.last_sample_kind() >= 2 {
+            if let Some(ref mut c) = self.cold {
+                c.last_hist = LastColdSample::None;
+            }
+        }
+        self.flags &= !LAST_SAMPLE_KIND_MASK;
+    }
+
+    #[inline]
     fn set_last_sample_float(&mut self, v: f64) {
+        if self.last_sample_kind() >= 2 {
+            if let Some(ref mut c) = self.cold {
+                c.last_hist = LastColdSample::None;
+            }
+        }
         self.flags = (self.flags & !LAST_SAMPLE_KIND_MASK) | (1 << LAST_SAMPLE_KIND_SHIFT);
         self.last_float_bits = v.to_bits();
     }
@@ -2074,8 +2091,7 @@ impl PagedById {
     }
 
     #[cfg(test)]
-    fn allocated_page_count(&self) -> usize {
-        let _g = self.alloc_mtx.lock();
+    unsafe fn allocated_page_count_under_shrink_lock(&self) -> usize {
         let mut count = 0usize;
         for dir_atomic in &self.dirs {
             let dir_ptr = dir_atomic.load(Ordering::Acquire);
@@ -2587,6 +2603,13 @@ impl StripeSeries {
             let mut s = stripe.write();
             Self::shrink_one_stripe(&mut s);
         }
+    }
+    #[cfg(test)]
+    fn allocated_page_count(&self) -> usize {
+        let _g = self.shrink_mtx.lock();
+        // SAFETY: `shrink_mtx` prevents `shrink_empty_pages_under_all_stripe_locks` from
+        // freeing any `ByIdPageDir` concurrently.
+        unsafe { self.by_id_pages.allocated_page_count_under_shrink_lock() }
     }
 }
 
@@ -3848,8 +3871,8 @@ impl Head {
     ) -> Result<(), HeadError> {
         enum WalSampleJob {
             Float(RefSample),
-            Histogram(RefHistogramSample),
-            FloatHistogram(RefFloatHistogramSample),
+            Histogram(Box<RefHistogramSample>),
+            FloatHistogram(Box<RefFloatHistogramSample>),
         }
 
         enum WalWorkerMsg {
@@ -3870,10 +3893,10 @@ impl Head {
             Other(DecodedRecord),
         }
 
-        const WAL_SHARD_BATCH_MAX: usize = 5000;
+        const WAL_SHARD_BATCH_MAX: usize = 2048;
         const WAL_DECODE_BATCH_RECORDS: usize = 64;
-        const WAL_DECODE_BATCH_BYTES: usize = 1024 * 1024;
-        const WAL_SERIES_PARALLEL_BATCH_MAX: usize = 32_768;
+        const WAL_DECODE_BATCH_BYTES: usize = 512 * 1024;
+        const WAL_SERIES_PARALLEL_BATCH_MAX: usize = 16_384;
 
         let max_threads = std::thread::available_parallelism()
             .map_or(8, |n| n.get())
@@ -3892,11 +3915,11 @@ impl Head {
 
         // Channel capacity > dec_workers * dec_queue_cap ensures zero deadlock when reordering.
         let (decoded_tx, decoded_rx) =
-            std::sync::mpsc::sync_channel::<Result<DecodedBatch, HeadError>>(dec_workers * 6);
+            std::sync::mpsc::sync_channel::<Result<DecodedBatch, HeadError>>(dec_workers * 2 + 1);
         let mut dec_txs = Vec::with_capacity(dec_workers);
         let mut dec_rxs = Vec::with_capacity(dec_workers);
         for _ in 0..dec_workers {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<RawBatch>(4);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<RawBatch>(1);
             dec_txs.push(tx);
             dec_rxs.push(rx);
         }
@@ -3904,7 +3927,7 @@ impl Head {
         let mut worker_txs = Vec::with_capacity(workers);
         let mut worker_rxs = Vec::with_capacity(workers);
         for _ in 0..workers {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<WalWorkerMsg>(64);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<WalWorkerMsg>(16);
             worker_txs.push(tx);
             worker_rxs.push(rx);
         }
@@ -4052,7 +4075,7 @@ impl Head {
                                         WalSampleJob::Histogram(hs) => {
                                             if let Some(entry) = self.series.get_by_id(hs.ref_id) {
                                                 self.replay_one_histogram(
-                                                    &entry, hs, &mut mint, &mut maxt,
+                                                    &entry, *hs, &mut mint, &mut maxt,
                                                 )?;
                                             } else {
                                                 unknown.miss(&unknown.histograms, hs.ref_id);
@@ -4061,7 +4084,7 @@ impl Head {
                                         WalSampleJob::FloatHistogram(fhs) => {
                                             if let Some(entry) = self.series.get_by_id(fhs.ref_id) {
                                                 self.replay_one_float_histogram(
-                                                    &entry, fhs, &mut mint, &mut maxt,
+                                                    &entry, *fhs, &mut mint, &mut maxt,
                                                 )?;
                                             } else {
                                                 unknown.miss(&unknown.histograms, fhs.ref_id);
@@ -4336,7 +4359,8 @@ impl Head {
                                                 hs.ref_id = mapped;
                                             }
                                             let idx = (hs.ref_id as usize) % workers;
-                                            job_shards[idx].push(WalSampleJob::Histogram(hs));
+                                            job_shards[idx]
+                                                .push(WalSampleJob::Histogram(Box::new(hs)));
                                             if job_shards[idx].len() >= WAL_SHARD_BATCH_MAX {
                                                 let batch = std::mem::take(&mut job_shards[idx]);
                                                 if worker_txs[idx]
@@ -4359,7 +4383,9 @@ impl Head {
                                                 fhs.ref_id = mapped;
                                             }
                                             let idx = (fhs.ref_id as usize) % workers;
-                                            job_shards[idx].push(WalSampleJob::FloatHistogram(fhs));
+                                            job_shards[idx].push(WalSampleJob::FloatHistogram(
+                                                Box::new(fhs),
+                                            ));
                                             if job_shards[idx].len() >= WAL_SHARD_BATCH_MAX {
                                                 let batch = std::mem::take(&mut job_shards[idx]);
                                                 if worker_txs[idx]
@@ -6917,6 +6943,9 @@ impl Head {
                     st.invalidate_xor_state();
                     st.invalidate_xor2_state();
                     st.clear_hist_state();
+                    if st.mmapped().is_empty() {
+                        st.clear_last_sample();
+                    }
                 }
 
                 let has_ooo = st.ooo().is_some_and(|o| {
@@ -9984,6 +10013,10 @@ impl<'a> HeadAppender<'a> {
 
     /// Rolls back buffered samples/exemplars while still logging newly created series declarations to WAL.
     pub fn rollback(mut self) -> Result<(), HeadError> {
+        self.rollback_inner()
+    }
+
+    fn rollback_inner(&mut self) -> Result<(), HeadError> {
         if self.closed {
             return Err(HeadError::AppenderClosed);
         }
@@ -10196,11 +10229,16 @@ impl<'a> HeadAppender<'a> {
 impl Drop for HeadAppender<'_> {
     fn drop(&mut self) {
         if !self.closed {
-            self.closed = true;
-            self.head.metrics.active_appenders.dec();
+            if let Err(err) = self.rollback_inner() {
+                tracing::warn!(
+                    err = %err,
+                    "failed to persist newly created series on HeadAppender drop"
+                );
+            }
+        } else {
+            self.release_remaining_pending_commits();
+            self.return_scratch();
         }
-        self.release_remaining_pending_commits();
-        self.return_scratch();
     }
 }
 
@@ -11647,7 +11685,7 @@ mod tests {
         }
 
         // 3 paged pages (id=1, id=4096, id=MAX_PAGED_SERIES_ID-1) + 2 overflow entries.
-        assert_eq!(stripes.by_id_pages.allocated_page_count(), 3);
+        assert_eq!(stripes.allocated_page_count(), 3);
         for &id in &ids {
             let got = stripes.get_by_id(id).expect("series must exist");
             assert_eq!(got.ref_id, id);
@@ -11660,14 +11698,14 @@ mod tests {
         stripes.remove(&entries[1]);
         assert!(stripes.get_by_id(ids[1]).is_none());
         stripes.shrink_oversized_stripes();
-        assert_eq!(stripes.by_id_pages.allocated_page_count(), 2);
+        assert_eq!(stripes.allocated_page_count(), 2);
 
         // Remove remaining paged entries + overflow entries and shrink -> 0 pages allocated.
         for e in entries.iter().filter(|e| e.ref_id != ids[1]) {
             stripes.remove(e);
         }
         stripes.shrink_oversized_stripes();
-        assert_eq!(stripes.by_id_pages.allocated_page_count(), 0);
+        assert_eq!(stripes.allocated_page_count(), 0);
         for &id in &ids {
             assert!(stripes.get_by_id(id).is_none());
         }
@@ -11749,5 +11787,62 @@ mod tests {
         assert_eq!(chks[0].min_time, t0);
         assert_eq!(chks[0].max_time, t1);
         head.close().unwrap();
+    }
+
+    #[test]
+    fn head_rollback_and_drop_persist_created_series_refs_across_wal_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let s_rb = [("__name__", "rb_metric"), ("kind", "explicit_rollback")];
+        let s_drop = [("__name__", "rb_metric"), ("kind", "implicit_drop")];
+
+        {
+            let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+
+            // Batch 1a: creates s_rb then explicitly rolls back.
+            let mut app1 = head.appender();
+            app1.append_float(None, &s_rb, 1_000, 10.0).unwrap();
+            app1.rollback().unwrap();
+
+            // Batch 1b: creates s_drop then drops without commit/rollback.
+            {
+                let mut app2 = head.appender();
+                app2.append_float(None, &s_drop, 1_000, 20.0).unwrap();
+            }
+
+            // Batch 2: appends valid samples to both already-created series and commits.
+            let mut app3 = head.appender();
+            app3.append_float(None, &s_rb, 2_000, 42.0).unwrap();
+            app3.append_float(None, &s_drop, 2_000, 84.0).unwrap();
+            app3.commit().unwrap();
+            head.close().unwrap();
+        }
+
+        // Reopen from WAL and verify both series + Batch 2 samples survive 100% (Batch 1 discarded).
+        let reopened = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+        let e_rb = reopened
+            .get_entry_by_sorted_pairs(&s_rb)
+            .expect("s_rb must survive WAL replay");
+        let e_drop = reopened
+            .get_entry_by_sorted_pairs(&s_drop)
+            .expect("s_drop must survive WAL replay");
+
+        let read_samples = |ref_id: u64| -> Vec<(i64, f64)> {
+            let (_, chks) = reopened
+                .series_final_chunks(ref_id, i64::MIN, i64::MAX)
+                .unwrap()
+                .unwrap();
+            chks.into_iter()
+                .flat_map(|c| crate::compact::decode_chunk_samples(c.chunk.as_ref().unwrap()).unwrap())
+                .map(|s| {
+                    let crate::compact::SampleValue::Float(v) = s.value else {
+                        panic!("expected float");
+                    };
+                    (s.t, v)
+                })
+                .collect()
+        };
+        assert_eq!(read_samples(e_rb.ref_id), vec![(2_000, 42.0)]);
+        assert_eq!(read_samples(e_drop.ref_id), vec![(2_000, 84.0)]);
+        reopened.close().unwrap();
     }
 }

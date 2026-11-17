@@ -2621,7 +2621,8 @@ impl ActiveSeries {
         usize,
         Vec<usize>,
     ) {
-        let n = self.config_mtx.read().0.matcher_names().len();
+        let cfg_guard = self.config_mtx.read();
+        let n = cfg_guard.0.matcher_names().len();
         let mut total = 0usize;
         let mut matching = vec![0usize; n];
         let mut otlp = 0usize;

@@ -214,7 +214,7 @@ struct WorkerArena {
     label_bytes_arena: Vec<u8>,
     samples_arena: Vec<cortexpb::Sample>,
     histograms_arena: Vec<ConvertedHistogram>,
-    exemplars_arena: Vec<(i64, f64, Labels, String)>,
+    exemplars_arena: Vec<Result<(i64, f64, Labels, String), crate::errors::IngesterError>>,
     shard_buckets: Vec<Vec<ShardSeriesItem>>,
     metadata: MetadataStash,
     empty_tenant_errors: usize,
@@ -370,16 +370,19 @@ impl Drop for ArenaPoolGuard<'_> {
             a.wr_scratch.clear();
             for b in &mut a.shard_buckets {
                 b.clear();
+                if b.capacity() > 2048 {
+                    b.shrink_to(512);
+                }
             }
             a.metadata.clear();
-            if a.metadata.bytes.capacity() > 1024 * 1024 {
+            if a.metadata.bytes.capacity() > 256 * 1024 {
                 a.metadata.bytes = Vec::new();
             }
             // Prevent retaining outlier allocations after massive spikes.
-            if a.label_bytes_arena.capacity() > 4 * 1024 * 1024 {
+            if a.label_bytes_arena.capacity() > 512 * 1024 {
                 a.label_bytes_arena = Vec::with_capacity(65_536);
             }
-            if a.samples_arena.capacity() > 65_536 {
+            if a.samples_arena.capacity() > 16_384 {
                 a.samples_arena = Vec::with_capacity(512);
             }
         }
@@ -645,7 +648,8 @@ impl IngesterShardedBatchConsumer {
                 invalid_tenant_indices,
                 total_series,
             } = arena;
-            let mut tmp_ex: Vec<(i64, f64, Labels, String)> = Vec::new();
+            let mut tmp_ex: Vec<Result<(i64, f64, Labels, String), crate::errors::IngesterError>> =
+                Vec::new();
             let mut bucket_bases = [0usize; 16];
             for (local_i, rec) in slice.iter().enumerate() {
                 let tenant_idx = tids[local_i];
@@ -706,22 +710,17 @@ impl IngesterShardedBatchConsumer {
 
                             let ex_start = exemplars_arena.len() as u32;
                             let mut ex_len = 0u32;
-                            let mut bad_utf8 = false;
                             if ts.exemplars_len() > 0 {
                                 tmp_ex.clear();
                                 for ex in ts.exemplars() {
-                                    if let Ok(conv) = convert_borrowed_exemplar(&ex) {
+                                    let res = convert_borrowed_exemplar(&ex);
+                                    if let Ok(ref conv) = res {
                                         min_ts = min_ts.min(conv.0);
-                                        tmp_ex.push(conv);
-                                        ex_len += 1;
-                                    } else {
-                                        bad_utf8 = true;
-                                        break;
                                     }
+                                    tmp_ex.push(res);
+                                    ex_len += 1;
                                 }
-                                if !bad_utf8 {
-                                    exemplars_arena.append(&mut tmp_ex);
-                                }
+                                exemplars_arena.append(&mut tmp_ex);
                             }
 
                             let shard = shard_for(tenant_idx, prom_hash);
@@ -733,7 +732,7 @@ impl IngesterShardedBatchConsumer {
                                 source: ts.source,
                                 skip_label_validation: ts.skip_label_validation,
                                 labels_sorted_unique: ts.labels_sorted_unique,
-                                bad_utf8,
+                                bad_utf8: false,
                                 prom_hash,
                                 label_bytes_start,
                                 label_bytes_len,
@@ -897,18 +896,14 @@ impl IngesterShardedBatchConsumer {
                     if ts.exemplars().len() > 0 {
                         tmp_ex.clear();
                         for ex in ts.exemplars() {
-                            if let Ok(conv) = convert_borrowed_exemplar(&ex) {
+                            let res = convert_borrowed_exemplar(&ex);
+                            if let Ok(ref conv) = res {
                                 min_ts = min_ts.min(conv.0);
-                                tmp_ex.push(conv);
-                                ex_len += 1;
-                            } else {
-                                bad_utf8 = true;
-                                break;
                             }
+                            tmp_ex.push(res);
+                            ex_len += 1;
                         }
-                        if !bad_utf8 {
-                            exemplars_arena.append(&mut tmp_ex);
-                        }
+                        exemplars_arena.append(&mut tmp_ex);
                     }
 
                     let shard = shard_for(tenant_idx, prom_hash);

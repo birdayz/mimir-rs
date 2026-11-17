@@ -1125,6 +1125,8 @@ impl Ingester {
 
         // Update the usage statistics once all TSDBs have been opened.
         self.update_usage_stats();
+        // Return transient WAL-replay / initial-compaction dirty pages across arenas to the OS.
+        mimir_common::purge_allocator_arenas();
 
         self.metrics
             .open_existing_tsdb

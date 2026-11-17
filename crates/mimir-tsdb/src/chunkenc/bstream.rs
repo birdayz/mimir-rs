@@ -25,9 +25,14 @@ const fn next_bitstream_capacity(cur_cap: usize) -> usize {
     } else if cur_cap < 256 {
         256
     } else {
-        // 1.5x growth above 256 bytes, rounded up to 32-byte alignment.
-        let next = cur_cap + (cur_cap >> 1);
-        next.saturating_add(31) & !31
+        // 1.5x growth above 256 bytes, rounded up to 32-byte alignment, capped at `u32::MAX`.
+        let next = cur_cap.saturating_add(cur_cap >> 1);
+        let aligned = next.saturating_add(31) & !31;
+        if aligned > u32::MAX as usize {
+            u32::MAX as usize
+        } else {
+            aligned
+        }
     }
 }
 
@@ -57,8 +62,14 @@ impl Drop for VecGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: `Vec::as_mut_ptr` is always non-null (dangling when capacity == 0).
         self.bs.ptr = unsafe { NonNull::new_unchecked(self.vec.as_mut_ptr()) };
-        self.bs.len = u32::try_from(self.vec.len()).unwrap_or(u32::MAX);
-        self.bs.cap = u32::try_from(self.vec.capacity()).unwrap_or(u32::MAX);
+        let Ok(len) = u32::try_from(self.vec.len()) else {
+            std::process::abort();
+        };
+        let Ok(cap) = u32::try_from(self.vec.capacity()) else {
+            std::process::abort();
+        };
+        self.bs.len = len;
+        self.bs.cap = cap;
     }
 }
 
@@ -129,8 +140,9 @@ impl BitStream {
             stream.shrink_to_fit();
         }
         assert!(
-            stream.capacity() <= u32::MAX as usize,
-            "BitStream capacity {} exceeds u32::MAX",
+            stream.len() <= u32::MAX as usize && stream.capacity() <= u32::MAX as usize,
+            "BitStream length/capacity ({}/{}) exceeds u32::MAX",
+            stream.len(),
             stream.capacity()
         );
         let mut v = ManuallyDrop::new(stream);
@@ -177,10 +189,16 @@ impl BitStream {
     #[cold]
     #[inline(never)]
     fn grow_and_push(&mut self, byte: u8) {
+        assert!(self.len < u32::MAX, "BitStream length exceeds u32::MAX");
         let target_cap = next_bitstream_capacity(self.cap as usize);
         let additional = target_cap.saturating_sub(self.len as usize).max(1);
         self.with_vec(|v| {
             v.reserve_exact(additional);
+            assert!(
+                v.capacity() <= u32::MAX as usize,
+                "BitStream capacity {} exceeds u32::MAX",
+                v.capacity()
+            );
             v.push(byte);
         });
     }
@@ -536,5 +554,12 @@ mod tests {
         assert!(caps.contains(&256), "caps={caps:?}");
         assert!(caps.contains(&384), "caps={caps:?}");
         assert!(!caps.contains(&512), "caps={caps:?}");
+    }
+
+    #[test]
+    fn next_bitstream_capacity_clamps_to_u32_max() {
+        assert_eq!(next_bitstream_capacity(2_863_311_510), u32::MAX as usize);
+        assert_eq!(next_bitstream_capacity(u32::MAX as usize), u32::MAX as usize);
+        assert!(next_bitstream_capacity(2_000_000_000) <= u32::MAX as usize);
     }
 }

@@ -1686,9 +1686,6 @@ struct V2FrameInfo {
     slice: Bytes,
     base_offset: i64,
     last_offset_delta: i32,
-    is_control: bool,
-    /// `NumRecords` from the batch header.
-    num_records: i32,
 }
 
 /// RecordBatch v2 header layout (offsets within a frame).
@@ -1756,24 +1753,16 @@ fn split_record_batch_v2_frames(raw: &Bytes) -> Result<Option<Vec<V2FrameInfo>>,
             break;
         }
         let base_offset = be_i64(raw, pos);
-        let attributes = i16::from_be_bytes([
-            raw[pos + V2_ATTRIBUTES_OFFSET],
-            raw[pos + V2_ATTRIBUTES_OFFSET + 1],
-        ]);
         let last_offset_delta = i32::from_be_bytes([
             raw[pos + 23],
             raw[pos + 24],
             raw[pos + 25],
             raw[pos + 26],
         ]);
-        let n = pos + V2_NUM_RECORDS_OFFSET;
-        let num_records = i32::from_be_bytes([raw[n], raw[n + 1], raw[n + 2], raw[n + 3]]);
         frames.push(V2FrameInfo {
             slice: raw.slice(pos..pos + frame_len),
             base_offset,
             last_offset_delta,
-            is_control: (attributes & 0x20) != 0,
-            num_records,
         });
         pos += frame_len;
     }
@@ -2136,25 +2125,14 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
                     last_batch_end_offset.map_or(batch_end, |prev| prev.max(batch_end)),
                 );
             }
-            if f.is_control {
-                if let Some(k) = kprom {
-                    let bytes = f.slice.len().saturating_sub(V2_HEADER_LEN);
-                    k.on_fetch_batch_read(FetchBatchMetrics {
-                        num_records: f.num_records.max(0) as usize,
-                        uncompressed_bytes: bytes,
-                        compressed_bytes: bytes,
-                    });
-                }
-            }
         }
         let next_fetch_offset =
             last_batch_end_offset.map_or(fetch_offset, |end| fetch_offset.max(end + 1));
 
-        let data_frames: Vec<Bytes> = frames
-            .into_iter()
-            .filter(|f| !f.is_control)
-            .map(|f| f.slice)
-            .collect();
+        // Verify CRC32C and decode EVERY frame (including `is_control` batches) inside
+        // `decode_single_batch_slice` so a bit-flip setting `attributes & 0x20` on a data
+        // batch cannot bypass CRC32C and silently drop records.
+        let all_frames: Vec<Bytes> = frames.into_iter().map(|f| f.slice).collect();
 
         let observe = |m: FetchBatchMetrics| {
             if let Some(k) = kprom {
@@ -2162,16 +2140,16 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
             }
         };
 
-        if data_frames.len() > 1 {
+        if all_frames.len() > 1 {
             let pool = get_pool();
             type BatchDecodeSlot = parking_lot::Mutex<
                 Option<Result<(Vec<FetchedRecord>, FetchBatchMetrics), KafkaClientError>>,
             >;
             let slots: Vec<BatchDecodeSlot> =
-                (0..data_frames.len()).map(|_| parking_lot::Mutex::new(None)).collect();
+                (0..all_frames.len()).map(|_| parking_lot::Mutex::new(None)).collect();
             let run = || {
-                pool.scoped_execute(data_frames.len(), |idx| {
-                    let res = decode_single_batch_slice(data_frames[idx].clone(), fetch_offset);
+                pool.scoped_execute(all_frames.len(), |idx| {
+                    let res = decode_single_batch_slice(all_frames[idx].clone(), fetch_offset);
                     *slots[idx].lock() = Some(res);
                 });
             };
@@ -2196,9 +2174,9 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
             }
             return Ok((decoded, next_fetch_offset, last_batch_end_offset));
         }
-        if data_frames.len() == 1 {
+        if all_frames.len() == 1 {
             let (decoded, m) = decode_single_batch_slice(
-                data_frames.into_iter().next().unwrap(),
+                all_frames.into_iter().next().unwrap(),
                 fetch_offset,
             )?;
             observe(m);
@@ -2375,6 +2353,22 @@ mod tests {
         assert_eq!(decoded.last().unwrap().offset, 19);
         assert_eq!(last_end, Some(19));
         assert_eq!(next_off, 20);
+    }
+
+    #[test]
+    fn bit_flip_into_control_attribute_fails_crc32c() {
+        let pool = ScopedWorkerPool::new("test-crc-control", 1);
+        let batch = encode_test_batch(&[0, 1, 2], false, Compression::None);
+        let mut corrupted = BytesMut::from(&batch[..]);
+        // Flip bit 0x20 (control batch flag) in the low byte of attributes (offset 22)
+        // without updating the batch CRC32C.
+        corrupted[V2_ATTRIBUTES_OFFSET + 1] ^= 0x20;
+        let err = decode_fetch_records_with_pool(corrupted.freeze(), 0, || &pool, None)
+            .expect_err("corrupted attributes must fail CRC32C");
+        assert!(
+            err.to_string().contains("Cyclic redundancy check failed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

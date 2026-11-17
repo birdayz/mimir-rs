@@ -672,13 +672,14 @@ fn write_st_marker(buf: &mut Encbuf, st: i64, first_st: i64, prev_st: i64) {
 
 pub fn decode_labels(dec: &mut Decbuf<'_>) -> Result<Labels, EncodingError> {
     let n = dec.uvarint()?;
-    let mut pairs = Vec::with_capacity(n.min(256));
+    let mut pairs: smallvec::SmallVec<[(&str, &str); 24]> =
+        smallvec::SmallVec::with_capacity(n.min(256));
     for _ in 0..n {
         let name = dec.uvarint_str()?;
         let value = dec.uvarint_str()?;
         pairs.push((name, value));
     }
-    Ok(Labels::from_sorted_pairs(pairs))
+    Ok(Labels::from_sorted_slice(&pairs))
 }
 
 pub fn encode_labels(buf: &mut Encbuf, labels: &Labels) {

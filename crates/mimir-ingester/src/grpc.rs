@@ -203,6 +203,134 @@ impl hyper::body::Body for SingleChunkBody {
     }
 }
 
+struct SnappyCompressBody {
+    inner: tonic::body::BoxBody,
+    in_buf: BytesMut,
+    comp_buf: Vec<u8>,
+    pending_trailers: Option<http::HeaderMap>,
+    done: bool,
+}
+
+impl SnappyCompressBody {
+    fn new(inner: tonic::body::BoxBody) -> Self {
+        Self {
+            inner,
+            in_buf: BytesMut::new(),
+            comp_buf: Vec::new(),
+            pending_trailers: None,
+            done: false,
+        }
+    }
+
+    fn drain_complete_frames(&mut self) -> Option<Bytes> {
+        let mut out = BytesMut::new();
+        while self.in_buf.len() >= 5 {
+            let flag = self.in_buf[0];
+            let len = u32::from_be_bytes([
+                self.in_buf[1],
+                self.in_buf[2],
+                self.in_buf[3],
+                self.in_buf[4],
+            ]) as usize;
+            let Some(frame_end) = 5usize.checked_add(len) else {
+                break;
+            };
+            if self.in_buf.len() < frame_end {
+                break;
+            }
+            if flag == 0 {
+                self.comp_buf.clear();
+                if mimir_proto::snappy::compress_framed_into(
+                    &self.in_buf[5..frame_end],
+                    &mut self.comp_buf,
+                )
+                .is_ok()
+                {
+                    if let Ok(comp_len) = u32::try_from(self.comp_buf.len()) {
+                        out.reserve(5 + self.comp_buf.len());
+                        out.put_u8(1);
+                        out.put_u32(comp_len);
+                        out.extend_from_slice(&self.comp_buf);
+                        self.in_buf.advance(frame_end);
+                        continue;
+                    }
+                }
+            }
+            out.extend_from_slice(&self.in_buf[..frame_end]);
+            self.in_buf.advance(frame_end);
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out.freeze())
+        }
+    }
+}
+
+impl hyper::body::Body for SnappyCompressBody {
+    type Data = Bytes;
+    type Error = Status;
+
+    #[allow(clippy::result_large_err)]
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(trailers) = self.pending_trailers.take() {
+            self.done = true;
+            return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+        }
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            if let Some(chunk) = self.drain_complete_frames() {
+                return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
+            }
+            match Pin::new(&mut self.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.done = true;
+                    if !self.in_buf.is_empty() {
+                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                            self.in_buf.split().freeze(),
+                        ))));
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => {
+                        if !data.is_empty() {
+                            self.in_buf.extend_from_slice(&data);
+                        }
+                    }
+                    Err(other) => {
+                        if let Ok(trailers) = other.into_trailers() {
+                            if !self.in_buf.is_empty() {
+                                self.pending_trailers = Some(trailers);
+                                return Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                                    self.in_buf.split().freeze(),
+                                ))));
+                            }
+                            self.done = true;
+                            return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CustomGrpcEncoding {
     Snappy,
@@ -526,6 +654,41 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
         let path = req.uri().path();
         let is_push = path == "/cortex.Ingester/Push";
         let is_query_stream = path == "/cortex.Ingester/QueryStream";
+        let qs_echo_encoding = if is_query_stream && self.send_compression.is_none() {
+            let req_enc = req
+                .headers()
+                .get("grpc-encoding")
+                .and_then(|v| v.to_str().ok());
+            let accepts = req
+                .headers()
+                .get("grpc-accept-encoding")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let client_accepts = |name: &str| {
+                accepts
+                    .split(',')
+                    .any(|s| s.trim().eq_ignore_ascii_case(name))
+            };
+            req_enc.and_then(|enc| {
+                if enc.eq_ignore_ascii_case("gzip") && client_accepts("gzip") {
+                    Some("gzip")
+                } else if enc.eq_ignore_ascii_case("zstd") && client_accepts("zstd") {
+                    Some("zstd")
+                } else if enc.eq_ignore_ascii_case(mimir_proto::snappy::SNAPPY_ENCODING_NAME)
+                    && client_accepts(mimir_proto::snappy::SNAPPY_ENCODING_NAME)
+                {
+                    Some(mimir_proto::snappy::SNAPPY_ENCODING_NAME)
+                } else if enc.eq_ignore_ascii_case(mimir_proto::s2::S2_ENCODING_NAME)
+                    && client_accepts(mimir_proto::s2::S2_ENCODING_NAME)
+                {
+                    Some(mimir_proto::s2::S2_ENCODING_NAME)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
 
         let ingester = Arc::clone(&self.ingester);
         let accept_compression = self.accept_compression;
@@ -634,7 +797,26 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 {
                     qs_grpc = qs_grpc.accept_compressed(*enc);
                 }
-                if let Some(enc) = send_compression {
+                let effective_tonic_send = send_compression.or_else(|| match qs_echo_encoding {
+                    Some("gzip")
+                        if accept_compression[..accept_compression_len]
+                            .iter()
+                            .flatten()
+                            .any(|e| *e == CompressionEncoding::Gzip) =>
+                    {
+                        Some(CompressionEncoding::Gzip)
+                    }
+                    Some("zstd")
+                        if accept_compression[..accept_compression_len]
+                            .iter()
+                            .flatten()
+                            .any(|e| *e == CompressionEncoding::Zstd) =>
+                    {
+                        Some(CompressionEncoding::Zstd)
+                    }
+                    _ => None,
+                });
+                if let Some(enc) = effective_tonic_send {
                     qs_grpc = qs_grpc.send_compressed(enc);
                 }
                 if let Some(lim) = max_decoding_message_size {
@@ -643,9 +825,29 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 if let Some(lim) = max_encoding_message_size {
                     qs_grpc = qs_grpc.max_encoding_message_size(lim);
                 }
-                qs_grpc
+                let qs_resp = qs_grpc
                     .server_streaming(RawQueryStreamSvc(ingester), req)
-                    .await
+                    .await;
+                if let Some(custom_resp_enc @ ("snappy" | "s2")) = qs_echo_encoding {
+                    if qs_resp.status() == http::StatusCode::OK
+                        && !qs_resp.headers().contains_key("grpc-status")
+                        && qs_resp.headers().get("grpc-encoding").is_none()
+                    {
+                        let (mut parts, body) = qs_resp.into_parts();
+                        parts.headers.insert(
+                            "grpc-encoding",
+                            http::HeaderValue::from_static(custom_resp_enc),
+                        );
+                        http::Response::from_parts(
+                            parts,
+                            tonic::body::BoxBody::new(SnappyCompressBody::new(body)),
+                        )
+                    } else {
+                        qs_resp
+                    }
+                } else {
+                    qs_resp
+                }
             } else {
                 inner.call(req).await?
             };
