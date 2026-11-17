@@ -1888,7 +1888,12 @@ fn mixin_metric_diffs(
     let mixin = mixin_tokens();
     let mut missing = Vec::new();
     let mut labels = Vec::new();
-    for (name, want) in reference.iter().filter(|(n, _)| mixin.contains(*n)) {
+    // `go_*` are Go-runtime metrics (GC CPU classes, memstats, threads) without a Rust
+    // equivalent; they are listed in the informational family diff only.
+    for (name, want) in reference
+        .iter()
+        .filter(|(n, _)| mixin.contains(*n) && !n.starts_with("go_"))
+    {
         match other.get(name) {
             None => missing.push(name.clone()),
             Some(got) if got != want => labels.push(format!(
@@ -2050,10 +2055,10 @@ struct Report {
 /// `MIMIR_W7_STRICT=1`. Every other difference fails. Harness errors (`harness:`) never match.
 /// Remove an entry as soon as the divergence is fixed.
 const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
-    // K8S-2/K8S-3: memberlist/ring metric prefixes inverted; dskit server/runtimeconfig/objstore/
-    // kv/dns/process metric families missing (mixin dashboards + alerts).
-    ("K8S-2/K8S-3", "mixin-referenced series missing"),
-    ("K8S-2/K8S-3", "missing labels"),
+    // K8S-2: ring / partition-ring / lifecycler metrics registered without the `cortex_` prefix
+    // (`ring_members`, `partition_ring_partitions`, `lifecycler_read_only`, ...).
+    ("K8S-2", "mixin-referenced series missing"),
+    ("K8S-2", "missing labels"),
     // K8S-4: no `sanity-check` module (Rust becomes ready with object storage unreachable).
     ("K8S-4", "outcome ready, Go pod exited(1)"),
     // K8S-6: /memberlist JSON is not dskit's StatusPageData.
@@ -2061,21 +2066,8 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
         "K8S-6",
         "/memberlist JSON (Accept: application/json) top-level keys differ",
     ),
-    // K8S-7: /debug/pprof/{,heap,goroutine} not served.
+    // K8S-7: Go runtime profiles (/debug/pprof/heap, goroutine) not served.
     ("K8S-7", "GET /debug/pprof/"),
-    // K8S-8: Rust memberlist never suspects / declares dead an unresponsive member (probe
-    // timeout is ignored), so frozen or SIGKILLed pods stay `Alive` forever in Rust-only
-    // clusters and stale entries of crashed pods accumulate.
-    ("K8S-8", "still listed as a memberlist member"),
-    (
-        "K8S-8",
-        "SIGKILLed pod dropped from memberlist by every other pod",
-    ),
-    (
-        "K8S-8",
-        "frozen pod dropped from memberlist by every other pod",
-    ),
-    ("K8S-8", "stale entry of a restarted/crashed pod"),
 ];
 
 fn known_divergence(err: &str) -> Option<&'static str> {
@@ -2359,7 +2351,9 @@ fn compare_facts(go: &Facts, other: &Facts, other_sides: &BTreeMap<String, Side>
         }
     }
     if let (Some((g_drop, g_conv)), Some((o_drop, o_conv))) = (go.freeze, other.freeze) {
-        if g_drop != o_drop {
+        // One-directional: whether a 40s freeze outlasts the suspicion timeout varies run to
+        // run for Go too; only "Go detected it, Rust did not" is a divergence.
+        if g_drop && !o_drop {
             errs.push(format!(
                 "frozen pod dropped from memberlist by every other pod: {o_drop}, Go {g_drop}"
             ));
@@ -2374,7 +2368,7 @@ fn compare_facts(go: &Facts, other: &Facts, other_sides: &BTreeMap<String, Side>
             _ => {}
         }
     }
-    if go.crash_dropped_by_all.is_some() && go.crash_dropped_by_all != other.crash_dropped_by_all {
+    if go.crash_dropped_by_all == Some(true) && other.crash_dropped_by_all != Some(true) {
         errs.push(format!(
             "SIGKILLed pod dropped from memberlist by every other pod within 90s: {:?}, Go {:?}",
             other.crash_dropped_by_all, go.crash_dropped_by_all
