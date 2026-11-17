@@ -5,6 +5,8 @@
 use std::any::Any;
 use std::time::SystemTime;
 
+use super::gofmt::GoJson;
+
 /// Values stored in [`super::MemberlistKv`] must implement `Mergeable` so state from
 /// concurrent CAS updates and gossip/push-pull syncs converges deterministically.
 pub trait Mergeable: Send + Sync {
@@ -30,6 +32,14 @@ pub trait Mergeable: Send + Sync {
 
     /// Deep-clones this value as a boxed [`Mergeable`].
     fn clone_mergeable(&self) -> Box<dyn Mergeable>;
+
+    /// Go `encoding/json` encoding of the gogo-generated value (`json:"..."` tags), as used by
+    /// dskit's `/memberlist` `formatValue` (`format=json` / `json-pretty`).
+    fn to_go_json(&self) -> GoJson;
+
+    /// Go `fmt.Sprintf("%#v", value)` of the pointer value (gogo `GoString()`), as used by dskit's
+    /// `/memberlist` `formatValue` for any other format.
+    fn go_string(&self) -> String;
 
     fn as_any(&self) -> &(dyn Any + Send + Sync);
     fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync);

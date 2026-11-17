@@ -12,6 +12,7 @@ use mimir_proto::ringpb::{
 };
 use thiserror::Error;
 
+use crate::kv::memberlist::gofmt::{go_sharp_v_str, go_sharp_v_u32_slice, GoJson};
 use crate::kv::memberlist::Mergeable;
 use crate::kv::{Codec, ProtoSnappyCodec};
 use crate::ring::model::{future_timestamp_limit, local_merge_timestamp, system_time_to_unix_secs};
@@ -443,6 +444,124 @@ impl PartitionRingDescExt for PartitionRingDesc {
     }
 }
 
+/// Go `encoding/json` of `ring.PartitionRingDesc` (gogo `json:"partitions"`, `json:"owners"`;
+/// nested fields `omitempty`; `map[int32]` keys sorted as strings like Go).
+pub fn partition_ring_desc_to_go_json(d: &PartitionRingDesc) -> GoJson {
+    let partitions = if d.partitions.is_empty() {
+        GoJson::Null
+    } else {
+        GoJson::sorted_map(
+            d.partitions
+                .iter()
+                .map(|(k, p)| (k.to_string(), partition_desc_to_go_json(p)))
+                .collect(),
+        )
+    };
+    let owners = if d.owners.is_empty() {
+        GoJson::Null
+    } else {
+        GoJson::sorted_map(
+            d.owners
+                .iter()
+                .map(|(k, o)| (k.clone(), owner_desc_to_go_json(o)))
+                .collect(),
+        )
+    };
+    GoJson::Object(vec![
+        ("partitions".into(), partitions),
+        ("owners".into(), owners),
+    ])
+}
+
+fn partition_desc_to_go_json(p: &PartitionDesc) -> GoJson {
+    let mut f: Vec<(String, GoJson)> = Vec::new();
+    if p.id != 0 {
+        f.push(("id".into(), GoJson::int(p.id)));
+    }
+    if !p.tokens.is_empty() {
+        f.push((
+            "tokens".into(),
+            GoJson::Array(p.tokens.iter().map(|t| GoJson::int(*t)).collect()),
+        ));
+    }
+    if p.state != 0 {
+        f.push(("state".into(), GoJson::int(p.state)));
+    }
+    if p.state_timestamp != 0 {
+        f.push(("stateTimestamp".into(), GoJson::int(p.state_timestamp)));
+    }
+    if p.state_change_locked {
+        f.push(("stateChangeLocked".into(), GoJson::Bool(true)));
+    }
+    if p.state_change_locked_timestamp != 0 {
+        f.push((
+            "stateChangeLockedTimestamp".into(),
+            GoJson::int(p.state_change_locked_timestamp),
+        ));
+    }
+    if p.token_scheme != 0 {
+        f.push(("tokenScheme".into(), GoJson::int(p.token_scheme)));
+    }
+    GoJson::Object(f)
+}
+
+fn owner_desc_to_go_json(o: &OwnerDesc) -> GoJson {
+    let mut f: Vec<(String, GoJson)> = Vec::new();
+    if o.owned_partition != 0 {
+        f.push(("ownedPartition".into(), GoJson::int(o.owned_partition)));
+    }
+    if o.state != 0 {
+        f.push(("state".into(), GoJson::int(o.state)));
+    }
+    if o.updated_timestamp != 0 {
+        f.push(("updatedTimestamp".into(), GoJson::int(o.updated_timestamp)));
+    }
+    GoJson::Object(f)
+}
+
+/// Go `fmt.Sprintf("%#v", *ring.PartitionRingDesc)` (gogo `GoString`; map values use Go's default
+/// `%#v`).
+pub fn partition_ring_desc_go_string(d: &PartitionRingDesc) -> String {
+    let mut s = String::from("&ring.PartitionRingDesc{");
+    if !d.partitions.is_empty() {
+        let mut keys: Vec<i32> = d.partitions.keys().copied().collect();
+        keys.sort_unstable();
+        s.push_str("Partitions: map[int32]PartitionDesc{");
+        for k in keys {
+            let p = &d.partitions[&k];
+            s.push_str(&format!(
+                "{k}: ring.PartitionDesc{{Id:{}, Tokens:{}, State:{}, StateTimestamp:{}, StateChangeLocked:{}, StateChangeLockedTimestamp:{}, TokenScheme:{}}},",
+                p.id,
+                go_sharp_v_u32_slice(&p.tokens),
+                p.state,
+                p.state_timestamp,
+                p.state_change_locked,
+                p.state_change_locked_timestamp,
+                p.token_scheme,
+            ));
+        }
+        s.push_str("},\n");
+    }
+    if !d.owners.is_empty() {
+        let mut keys: Vec<&String> = d.owners.keys().collect();
+        keys.sort();
+        s.push_str("Owners: map[string]OwnerDesc{");
+        for k in keys {
+            let o = &d.owners[k];
+            s.push_str(&format!(
+                "{}: ring.OwnerDesc{{OwnedPartition:{}, State:{}, UpdatedTimestamp:{}}},",
+                go_sharp_v_str(k),
+                o.owned_partition,
+                o.state,
+                o.updated_timestamp,
+            ));
+        }
+        s.push_str("},\n");
+    }
+    s.push('}');
+    s
+}
+
 impl Mergeable for PartitionRingDesc {
     fn merge(
         &mut self,
@@ -511,6 +630,14 @@ impl Mergeable for PartitionRingDesc {
 
     fn clone_mergeable(&self) -> Box<dyn Mergeable> {
         Box::new(self.clone())
+    }
+
+    fn to_go_json(&self) -> GoJson {
+        partition_ring_desc_to_go_json(self)
+    }
+
+    fn go_string(&self) -> String {
+        partition_ring_desc_go_string(self)
     }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {

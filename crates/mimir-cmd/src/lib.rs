@@ -11,6 +11,7 @@ pub mod app;
 pub mod cli;
 pub mod grpc;
 pub mod http;
+pub mod memberlist_status;
 pub mod metrics;
 
 pub use app::{init_logging, run_mimir};

@@ -5,7 +5,9 @@
 //! - github.com/hashicorp/memberlist/*
 
 pub mod client;
+pub mod gofmt;
 pub mod gometrics;
+pub mod http_status;
 pub mod lzw;
 pub mod mergeable;
 mod metrics;
@@ -17,7 +19,7 @@ pub mod tcp_transport;
 pub mod wire;
 mod zone_aware;
 
-pub use client::{KvOptions, MemberlistKv, MemberlistKvClient, NodeState};
+pub use client::{KvOptions, MemberlistKv, MemberlistKvClient, NodeState, ValueDesc};
 pub use mergeable::Mergeable;
 pub use node_meta::{encode_node_metadata, EncodedNodeMetadata, NodeRole};
 pub use tcp_transport::TcpTransport;

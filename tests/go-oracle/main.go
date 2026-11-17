@@ -85,6 +85,10 @@ func main() {
 		out, err = cmdGoSort(input)
 	case "tsdb-open-report":
 		out, err = cmdTSDBOpenReport(input)
+	case "memberlist-status-page":
+		out, err = cmdMemberlistStatusPage(input)
+	case "memberlist-format-value":
+		out, err = cmdMemberlistFormatValue(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}

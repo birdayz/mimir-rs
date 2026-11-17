@@ -9,6 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mimir_proto::ringpb::{Desc, InstanceDesc, InstanceState};
 
+use crate::kv::memberlist::gofmt::{
+    go_sharp_v_str, go_sharp_v_u32_slice, go_sharp_v_u64_map, GoJson,
+};
 use crate::kv::memberlist::Mergeable;
 use crate::kv::{Codec, ProtoSnappyCodec};
 use crate::token_gen::token_distance;
@@ -527,6 +530,105 @@ pub(crate) fn read_only_instances_and_oldest_updated(desc: &Desc) -> (usize, i64
     (count, oldest)
 }
 
+/// Go `encoding/json` of `ring.Desc` (gogo `json:"ingesters"`; `InstanceDesc` fields `omitempty`).
+pub fn desc_to_go_json(d: &Desc) -> GoJson {
+    let ingesters = if d.ingesters.is_empty() {
+        GoJson::Null
+    } else {
+        GoJson::sorted_map(
+            d.ingesters
+                .iter()
+                .map(|(k, v)| (k.clone(), instance_desc_to_go_json(v)))
+                .collect(),
+        )
+    };
+    GoJson::Object(vec![("ingesters".into(), ingesters)])
+}
+
+fn instance_desc_to_go_json(i: &InstanceDesc) -> GoJson {
+    let mut f: Vec<(String, GoJson)> = Vec::new();
+    if !i.addr.is_empty() {
+        f.push(("addr".into(), GoJson::str(i.addr.as_str())));
+    }
+    if i.timestamp != 0 {
+        f.push(("timestamp".into(), GoJson::int(i.timestamp)));
+    }
+    if i.state != 0 {
+        f.push(("state".into(), GoJson::int(i.state)));
+    }
+    if !i.tokens.is_empty() {
+        f.push((
+            "tokens".into(),
+            GoJson::Array(i.tokens.iter().map(|t| GoJson::int(*t)).collect()),
+        ));
+    }
+    if !i.zone.is_empty() {
+        f.push(("zone".into(), GoJson::str(i.zone.as_str())));
+    }
+    if i.registered_timestamp != 0 {
+        f.push(("registered_timestamp".into(), GoJson::int(i.registered_timestamp)));
+    }
+    if !i.id.is_empty() {
+        f.push(("id".into(), GoJson::str(i.id.as_str())));
+    }
+    if i.read_only_updated_timestamp != 0 {
+        f.push((
+            "read_only_updated_timestamp".into(),
+            GoJson::int(i.read_only_updated_timestamp),
+        ));
+    }
+    if i.read_only {
+        f.push(("read_only".into(), GoJson::Bool(true)));
+    }
+    if !i.versions.is_empty() {
+        f.push((
+            "versions".into(),
+            GoJson::sorted_map(
+                i.versions
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), GoJson::int(*v)))
+                    .collect(),
+            ),
+        ));
+    }
+    GoJson::Object(f)
+}
+
+/// Go `fmt.Sprintf("%#v", *ring.Desc)` (gogo `Desc.GoString`; map values use Go's default `%#v`).
+pub fn desc_go_string(d: &Desc) -> String {
+    let mut s = String::from("&ring.Desc{");
+    if !d.ingesters.is_empty() {
+        let mut keys: Vec<&String> = d.ingesters.keys().collect();
+        keys.sort();
+        s.push_str("Ingesters: map[string]InstanceDesc{");
+        for k in keys {
+            s.push_str(&go_sharp_v_str(k));
+            s.push_str(": ");
+            s.push_str(&instance_desc_sharp_v(&d.ingesters[k]));
+            s.push(',');
+        }
+        s.push_str("},\n");
+    }
+    s.push('}');
+    s
+}
+
+fn instance_desc_sharp_v(i: &InstanceDesc) -> String {
+    format!(
+        "ring.InstanceDesc{{Addr:{}, Timestamp:{}, State:{}, Tokens:{}, Zone:{}, RegisteredTimestamp:{}, Id:{}, ReadOnlyUpdatedTimestamp:{}, ReadOnly:{}, Versions:{}}}",
+        go_sharp_v_str(&i.addr),
+        i.timestamp,
+        i.state,
+        go_sharp_v_u32_slice(&i.tokens),
+        go_sharp_v_str(&i.zone),
+        i.registered_timestamp,
+        go_sharp_v_str(&i.id),
+        i.read_only_updated_timestamp,
+        i.read_only,
+        go_sharp_v_u64_map(&i.versions),
+    )
+}
+
 impl Mergeable for Desc {
     fn merge(
         &mut self,
@@ -572,6 +674,14 @@ impl Mergeable for Desc {
 
     fn clone_mergeable(&self) -> Box<dyn Mergeable> {
         Box::new(self.clone())
+    }
+
+    fn to_go_json(&self) -> GoJson {
+        desc_to_go_json(self)
+    }
+
+    fn go_string(&self) -> String {
+        desc_go_string(self)
     }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {
