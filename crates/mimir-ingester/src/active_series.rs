@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU16, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -890,11 +890,10 @@ impl SeriesIndexReader for mimir_tsdb::head::Head {
 // ---------------------------------------------------------------------------
 
 const SLAB_PAGE_SHIFT: usize = 12;
-const SLAB_PAGE_SIZE: usize = 1 << SLAB_PAGE_SHIFT; // 4,096 slots = 36 KiB/page
+const SLAB_PAGE_SIZE: usize = 1 << SLAB_PAGE_SHIFT; // 4,096 slots = 32 KiB/page
 const SLAB_PAGE_MASK: usize = SLAB_PAGE_SIZE - 1;
 const SLAB_MAX_PAGES: usize = 8192; // 33,554,432 slots max
 const SLAB_MAX_SLOTS: u32 = (SLAB_MAX_PAGES * SLAB_PAGE_SIZE) as u32;
-const SLOT_NONE: u32 = u32::MAX;
 const SLOT_INACTIVE: i64 = i64::MIN;
 
 const CACHE_FLAG_PLAIN_FLOAT: u8 = 1 << 0;
@@ -903,7 +902,6 @@ const CACHE_FLAG_IS_OTLP: u8 = 1 << 1;
 #[inline(always)]
 const fn pack_active_cache(
     epoch: u16,
-    slot_gen: u8,
     is_plain_float: bool,
     is_otlp: bool,
     slot: u32,
@@ -914,24 +912,30 @@ const fn pack_active_cache(
         0
     }) | (if is_otlp { CACHE_FLAG_IS_OTLP } else { 0 });
     ((epoch as u64) << 48)
-        | ((slot_gen as u64) << 40)
         | ((flags as u64) << 32)
         | (slot as u64)
 }
 
 #[inline(always)]
-const fn unpack_active_cache(packed: u64) -> (u16, u8, u8, u32) {
+const fn unpack_active_cache(packed: u64) -> (u16, u8, u32) {
     let epoch = (packed >> 48) as u16;
-    let slot_gen = (packed >> 40) as u8;
     let flags = (packed >> 32) as u8;
     let slot = packed as u32;
-    (epoch, slot_gen, flags, slot)
+    (epoch, flags, slot)
+}
+
+#[inline(always)]
+const fn sanitize_nanos(now_ns: i64) -> i64 {
+    if now_ns == SLOT_INACTIVE {
+        SLOT_INACTIVE + 1
+    } else {
+        now_ns
+    }
 }
 
 #[repr(C, align(64))]
 struct SlabPage {
     slots: [AtomicI64; SLAB_PAGE_SIZE],
-    gens: [AtomicU8; SLAB_PAGE_SIZE],
 }
 
 impl SlabPage {
@@ -945,10 +949,8 @@ impl SlabPage {
         // SAFETY: `ptr` is valid for writes of `SlabPage`; every field is initialized before `Box::from_raw`.
         unsafe {
             let slots_ptr = std::ptr::addr_of_mut!((*ptr).slots) as *mut AtomicI64;
-            let gens_ptr = std::ptr::addr_of_mut!((*ptr).gens) as *mut AtomicU8;
             for i in 0..SLAB_PAGE_SIZE {
                 slots_ptr.add(i).write(AtomicI64::new(SLOT_INACTIVE));
-                gens_ptr.add(i).write(AtomicU8::new(0));
             }
             Box::from_raw(ptr)
         }
@@ -957,9 +959,7 @@ impl SlabPage {
 
 struct NanosSlab {
     pages: Box<[AtomicPtr<SlabPage>; SLAB_MAX_PAGES]>,
-    next_slot: AtomicU32,
     alloc_mtx: Mutex<()>,
-    free_slots: Mutex<Vec<(u32, u8)>>,
 }
 
 impl NanosSlab {
@@ -972,49 +972,30 @@ impl NanosSlab {
         Self {
             // SAFETY: `[AtomicPtr<SlabPage>; SLAB_MAX_PAGES]` has exact length `SLAB_MAX_PAGES`.
             pages: unsafe { Box::from_raw(raw) },
-            next_slot: AtomicU32::new(0),
             alloc_mtx: Mutex::new(()),
-            free_slots: Mutex::new(Vec::new()),
         }
     }
 
     #[inline(always)]
-    fn slot_ref(&self, slot: u32) -> Option<&AtomicI64> {
-        self.slot_and_gen_ref(slot).map(|(s, _)| s)
-    }
-
-    #[inline(always)]
-    fn slot_and_gen_ref(&self, slot: u32) -> Option<(&AtomicI64, &AtomicU8)> {
-        if slot >= SLAB_MAX_SLOTS {
+    fn slot_ref(&self, ref_id: u32) -> Option<&AtomicI64> {
+        if ref_id >= SLAB_MAX_SLOTS {
             return None;
         }
-        let page_idx = (slot as usize) >> SLAB_PAGE_SHIFT;
-        let offset = (slot as usize) & SLAB_PAGE_MASK;
+        let page_idx = (ref_id as usize) >> SLAB_PAGE_SHIFT;
+        let offset = (ref_id as usize) & SLAB_PAGE_MASK;
         let ptr = self.pages[page_idx].load(Ordering::Acquire);
         if ptr.is_null() {
             return None;
         }
         // SAFETY: `ptr` points to a heap-allocated `SlabPage` freed only in `NanosSlab::drop`,
         // and `offset < SLAB_PAGE_SIZE`.
-        unsafe { Some((&(*ptr).slots[offset], &(*ptr).gens[offset])) }
+        unsafe { Some(&(*ptr).slots[offset]) }
     }
 
-    fn alloc_slot(&self, initial_nanos: i64) -> (u32, u8) {
-        if let Some((slot, slot_gen)) = self.free_slots.lock().pop() {
-            if let Some(a) = self.slot_ref(slot) {
-                a.store(initial_nanos, Ordering::Release);
-                return (slot, slot_gen);
-            }
-        }
-        if self.next_slot.load(Ordering::Relaxed) >= SLAB_MAX_SLOTS {
-            return (SLOT_NONE, 0);
-        }
-        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
-        if slot >= SLAB_MAX_SLOTS {
-            return (SLOT_NONE, 0);
-        }
-        let page_idx = (slot as usize) >> SLAB_PAGE_SHIFT;
-        let offset = (slot as usize) & SLAB_PAGE_MASK;
+    fn ensure_and_store(&self, ref_id: u32, initial_nanos: i64) {
+        debug_assert!(ref_id < SLAB_MAX_SLOTS);
+        let page_idx = (ref_id as usize) >> SLAB_PAGE_SHIFT;
+        let offset = (ref_id as usize) & SLAB_PAGE_MASK;
         let mut page_ptr = self.pages[page_idx].load(Ordering::Acquire);
         if page_ptr.is_null() {
             let _g = self.alloc_mtx.lock();
@@ -1025,28 +1006,42 @@ impl NanosSlab {
             }
         }
         // SAFETY: `page_ptr` was just initialized/loaded and `offset < SLAB_PAGE_SIZE`.
-        unsafe { &(*page_ptr).slots[offset] }.store(initial_nanos, Ordering::Release);
-        (slot, 0)
+        unsafe { &(*page_ptr).slots[offset] }.store(sanitize_nanos(initial_nanos), Ordering::Release);
     }
 
     #[inline(always)]
-    fn load(&self, slot: u32) -> i64 {
-        self.slot_ref(slot)
-            .map_or(SLOT_INACTIVE, |a| a.load(Ordering::Relaxed))
-    }
-
-    fn free_slot(&self, slot: u32) {
-        if let Some((slot_atomic, gen_atomic)) = self.slot_and_gen_ref(slot) {
-            slot_atomic.store(SLOT_INACTIVE, Ordering::Release);
-            let new_gen = gen_atomic.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-            self.free_slots.lock().push((slot, new_gen));
+    fn write_nanos_if_active(&self, ref_id: u32, now_ns: i64) -> Option<bool> {
+        let now_ns = sanitize_nanos(now_ns);
+        let slot_atomic = self.slot_ref(ref_id)?;
+        let mut cur = slot_atomic.load(Ordering::Relaxed);
+        while cur != SLOT_INACTIVE && now_ns > cur {
+            match slot_atomic.compare_exchange_weak(
+                cur,
+                now_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(true),
+                Err(actual) => cur = actual,
+            }
+        }
+        if cur == SLOT_INACTIVE {
+            None
+        } else {
+            Some(false)
         }
     }
 
-    fn recycle_inactive_slot(&self, slot: u32) {
-        if let Some((_, gen_atomic)) = self.slot_and_gen_ref(slot) {
-            let new_gen = gen_atomic.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-            self.free_slots.lock().push((slot, new_gen));
+    #[inline(always)]
+    fn load(&self, ref_id: u32) -> i64 {
+        self.slot_ref(ref_id)
+            .map_or(SLOT_INACTIVE, |a| a.load(Ordering::Acquire))
+    }
+
+    #[inline(always)]
+    fn mark_inactive(&self, ref_id: u32) {
+        if let Some(slot_atomic) = self.slot_ref(ref_id) {
+            slot_atomic.store(SLOT_INACTIVE, Ordering::Release);
         }
     }
 }
@@ -1068,54 +1063,12 @@ impl Drop for NanosSlab {
 // ---------------------------------------------------------------------------
 
 struct SeriesEntry {
-    nanos: AtomicI64,
-    slot: u32,
     num_native_histogram_buckets: i32, // -1 if not a native histogram
+    matches_handle: u32,               // 0 = no custom tracker matches; >0 = 1-based slot
     flags: u8,
-    slot_gen: u8,
-    matches: PreAllocDynamicSlice,
 }
 
 impl SeriesEntry {
-    fn read_nanos(&self, slab: &NanosSlab) -> i64 {
-        if self.slot != SLOT_NONE {
-            let v = slab.load(self.slot);
-            if v != SLOT_INACTIVE {
-                return v;
-            }
-        }
-        self.nanos.load(Ordering::Relaxed)
-    }
-
-    fn write_nanos(&self, slab: &NanosSlab, now_ns: i64) -> bool {
-        if self.slot != SLOT_NONE && now_ns != SLOT_INACTIVE {
-            if let Some(slot_atomic) = slab.slot_ref(self.slot) {
-                let mut cur = slot_atomic.load(Ordering::Relaxed);
-                while cur != SLOT_INACTIVE && now_ns > cur {
-                    match slot_atomic.compare_exchange_weak(
-                        cur,
-                        now_ns,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return true,
-                        Err(actual) => cur = actual,
-                    }
-                }
-                if cur != SLOT_INACTIVE {
-                    return false;
-                }
-            }
-        }
-        let prev = self.nanos.load(Ordering::Relaxed);
-        if now_ns > prev {
-            self.nanos.store(now_ns, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    }
-
     fn is_deleted(&self) -> bool {
         (self.flags & FLAG_IS_DELETED) != 0
     }
@@ -1209,9 +1162,9 @@ impl DeletedSeries {
 }
 
 #[derive(Clone, Copy, Default)]
-struct FastU64Hasher(u64);
+struct FastIntHasher(u64);
 
-impl std::hash::Hasher for FastU64Hasher {
+impl std::hash::Hasher for FastIntHasher {
     #[inline]
     fn finish(&self) -> u64 {
         self.0
@@ -1228,27 +1181,93 @@ impl std::hash::Hasher for FastU64Hasher {
     }
 
     #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+
+    #[inline]
     fn write_u64(&mut self, i: u64) {
         let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        x ^= x >> 32;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
         self.0 = x;
     }
 }
 
 #[derive(Clone, Copy, Default)]
-struct FastU64BuildHasher;
+struct FastIntBuildHasher;
 
-impl std::hash::BuildHasher for FastU64BuildHasher {
-    type Hasher = FastU64Hasher;
+impl std::hash::BuildHasher for FastIntBuildHasher {
+    type Hasher = FastIntHasher;
 
     #[inline]
     fn build_hasher(&self) -> Self::Hasher {
-        FastU64Hasher(0)
+        FastIntHasher(0)
+    }
+}
+
+#[derive(Default)]
+struct CustomMatchesTable {
+    slots: Vec<Option<PreAllocDynamicSlice>>,
+    free: Vec<u32>,
+}
+
+impl CustomMatchesTable {
+    fn insert(&mut self, matches: PreAllocDynamicSlice) -> u32 {
+        if let Some(idx) = self.free.pop() {
+            self.slots[idx as usize] = Some(matches);
+            return idx + 1;
+        }
+        let idx = self.slots.len() as u32;
+        self.slots.push(Some(matches));
+        idx + 1
+    }
+
+    #[inline]
+    fn get(&self, handle: u32) -> Option<&PreAllocDynamicSlice> {
+        if handle == 0 {
+            return None;
+        }
+        self.slots
+            .get((handle - 1) as usize)
+            .and_then(|o| o.as_ref())
+    }
+
+    fn remove(&mut self, handle: u32) -> bool {
+        if handle == 0 {
+            return false;
+        }
+        let idx = (handle - 1) as usize;
+        if idx < self.slots.len() && self.slots[idx].take().is_some() {
+            self.free.push(handle - 1);
+            if self.free.len() == self.slots.len() {
+                self.slots.clear();
+                self.slots.shrink_to_fit();
+                self.free.clear();
+                self.free.shrink_to_fit();
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Default)]
+struct OverflowStripeData {
+    nanos: hashbrown::HashMap<u64, Box<AtomicI64>, FastIntBuildHasher>,
+    refs: hashbrown::HashMap<u64, SeriesEntry, FastIntBuildHasher>,
+}
+
+impl OverflowStripeData {
+    fn is_empty(&self) -> bool {
+        self.nanos.is_empty() && self.refs.is_empty()
     }
 }
 
 struct SeriesStripeInner {
-    refs: hashbrown::HashMap<u64, SeriesEntry, FastU64BuildHasher>,
+    refs: hashbrown::HashMap<u32, SeriesEntry, FastIntBuildHasher>,
+    overflow: Option<Box<OverflowStripeData>>,
+    custom_matches: Option<Box<CustomMatchesTable>>,
     active: u32,
     active_otlp: u32,
     active_matching: Vec<u32>,
@@ -1259,6 +1278,164 @@ struct SeriesStripeInner {
     matchers: Arc<Matchers>,
     cat: Option<Arc<CostAttributionTracker>>,
     attribution_failures: f64,
+}
+
+impl SeriesStripeInner {
+    #[inline]
+    fn get_entry(&self, ref_id: u64) -> Option<&SeriesEntry> {
+        if let Ok(r32) = u32::try_from(ref_id) {
+            self.refs.get(&r32)
+        } else {
+            self.overflow.as_ref().and_then(|o| o.refs.get(&ref_id))
+        }
+    }
+
+    #[inline]
+    fn get_entry_mut(&mut self, ref_id: u64) -> Option<&mut SeriesEntry> {
+        if let Ok(r32) = u32::try_from(ref_id) {
+            self.refs.get_mut(&r32)
+        } else {
+            self.overflow
+                .as_mut()
+                .and_then(|o| o.refs.get_mut(&ref_id))
+        }
+    }
+
+    fn insert_entry(&mut self, ref_id: u64, entry: SeriesEntry) {
+        if let Ok(r32) = u32::try_from(ref_id) {
+            self.refs.insert(r32, entry);
+        } else {
+            self.overflow
+                .get_or_insert_with(Default::default)
+                .refs
+                .insert(ref_id, entry);
+        }
+    }
+
+    fn remove_entry(&mut self, ref_id: u64) -> Option<SeriesEntry> {
+        if let Ok(r32) = u32::try_from(ref_id) {
+            self.refs.remove(&r32)
+        } else {
+            self.overflow
+                .as_mut()
+                .and_then(|o| o.refs.remove(&ref_id))
+        }
+    }
+
+    #[inline]
+    fn read_nanos(&self, ref_id: u64, slab: &NanosSlab) -> i64 {
+        if ref_id < SLAB_MAX_SLOTS as u64 {
+            slab.load(ref_id as u32)
+        } else {
+            self.overflow
+                .as_ref()
+                .and_then(|o| o.nanos.get(&ref_id))
+                .map_or(SLOT_INACTIVE, |a| a.load(Ordering::Acquire))
+        }
+    }
+
+    #[inline]
+    fn write_nanos_existing(&self, ref_id: u64, slab: &NanosSlab, now_ns: i64) -> Option<bool> {
+        let now_ns = sanitize_nanos(now_ns);
+        if ref_id < SLAB_MAX_SLOTS as u64 {
+            slab.write_nanos_if_active(ref_id as u32, now_ns)
+        } else if let Some(slot_atomic) = self.overflow.as_ref().and_then(|o| o.nanos.get(&ref_id))
+        {
+            let mut cur = slot_atomic.load(Ordering::Relaxed);
+            while cur != SLOT_INACTIVE && now_ns > cur {
+                match slot_atomic.compare_exchange_weak(
+                    cur,
+                    now_ns,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Some(true),
+                    Err(actual) => cur = actual,
+                }
+            }
+            if cur == SLOT_INACTIVE {
+                None
+            } else {
+                Some(false)
+            }
+        } else {
+            None
+        }
+    }
+
+    fn store_nanos_new_or_update(&mut self, ref_id: u64, slab: &NanosSlab, now_ns: i64) -> bool {
+        let now_ns = sanitize_nanos(now_ns);
+        if ref_id < SLAB_MAX_SLOTS as u64 {
+            match slab.write_nanos_if_active(ref_id as u32, now_ns) {
+                Some(updated) => updated,
+                None => {
+                    slab.ensure_and_store(ref_id as u32, now_ns);
+                    true
+                }
+            }
+        } else {
+            let ov = self.overflow.get_or_insert_with(Default::default);
+            if let Some(a) = ov.nanos.get(&ref_id) {
+                let mut cur = a.load(Ordering::Relaxed);
+                while now_ns > cur {
+                    match a.compare_exchange_weak(cur, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+                    {
+                        Ok(_) => return true,
+                        Err(actual) => cur = actual,
+                    }
+                }
+                false
+            } else {
+                ov.nanos.insert(ref_id, Box::new(AtomicI64::new(now_ns)));
+                true
+            }
+        }
+    }
+
+    fn alloc_matches_handle(&mut self, matches: PreAllocDynamicSlice) -> u32 {
+        if matches.is_empty() {
+            return 0;
+        }
+        self.custom_matches
+            .get_or_insert_with(Default::default)
+            .insert(matches)
+    }
+
+    fn replace_matches_handle(&mut self, old_handle: u32, new_matches: PreAllocDynamicSlice) -> u32 {
+        if new_matches.is_empty() {
+            self.free_matches_handle(old_handle);
+            return 0;
+        }
+        if old_handle != 0 {
+            if let Some(ref mut cm) = self.custom_matches {
+                let idx = (old_handle - 1) as usize;
+                if idx < cm.slots.len() && cm.slots[idx].is_some() {
+                    cm.slots[idx] = Some(new_matches);
+                    return old_handle;
+                }
+            }
+        }
+        self.alloc_matches_handle(new_matches)
+    }
+
+    fn free_matches_handle(&mut self, handle: u32) {
+        if handle == 0 {
+            return;
+        }
+        let all_empty = self
+            .custom_matches
+            .as_mut()
+            .is_some_and(|cm| cm.remove(handle));
+        if all_empty {
+            self.custom_matches = None;
+        }
+    }
+
+    fn cleanup_overflow_if_empty(&mut self) {
+        if self.overflow.as_ref().is_some_and(|o| o.is_empty()) {
+            self.overflow = None;
+        }
+    }
 }
 
 struct SeriesStripe {
@@ -1272,7 +1449,9 @@ impl SeriesStripe {
         Self {
             oldest_entry_ns: AtomicI64::new(0),
             inner: RwLock::new(SeriesStripeInner {
-                refs: hashbrown::HashMap::with_hasher(FastU64BuildHasher),
+                refs: hashbrown::HashMap::with_hasher(FastIntBuildHasher),
+                overflow: None,
+                custom_matches: None,
                 active: 0,
                 active_otlp: 0,
                 active_matching: vec![0; num_matchers],
@@ -1300,6 +1479,7 @@ impl SeriesStripe {
         epoch: u16,
         head_entry: Option<&mimir_tsdb::head::SeriesEntry>,
     ) -> bool {
+        let now_ns = sanitize_nanos(now_ns);
         let buckets_i32 = num_native_histogram_buckets.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let mut need_write = false;
         let mut created = false;
@@ -1307,20 +1487,21 @@ impl SeriesStripe {
 
         {
             let guard = self.inner.read();
-            if let Some(entry) = guard.refs.get(&ref_id) {
-                if entry.write_nanos(slab, now_ns) {
-                    entry_time_set = true;
+            if let Some(entry) = guard.get_entry(ref_id) {
+                match guard.write_nanos_existing(ref_id, slab, now_ns) {
+                    Some(true) => entry_time_set = true,
+                    Some(false) => {}
+                    None => need_write = true,
                 }
                 if entry.num_native_histogram_buckets != buckets_i32 {
                     need_write = true;
                 } else if let Some(he) = head_entry {
-                    if buckets_i32 < 0 && entry.slot != SLOT_NONE {
+                    if buckets_i32 < 0 && ref_id < SLAB_MAX_SLOTS as u64 {
                         he.set_active_cache(pack_active_cache(
                             epoch,
-                            entry.slot_gen,
                             true,
                             entry.is_otlp(),
-                            entry.slot,
+                            ref_id as u32,
                         ));
                     } else if buckets_i32 >= 0 {
                         he.set_active_cache(0);
@@ -1333,93 +1514,111 @@ impl SeriesStripe {
 
         if need_write {
             let mut guard = self.inner.write();
-            if guard.refs.contains_key(&ref_id) {
-                let (old_buckets, matches, entry_slot, entry_slot_gen, now_is_otlp) = {
-                    let entry = guard.refs.get_mut(&ref_id).expect("checked contains_key");
-                    if entry.write_nanos(slab, now_ns) {
-                        entry_time_set = true;
-                    }
+            if guard.get_entry(ref_id).is_some() {
+                if guard.store_nanos_new_or_update(ref_id, slab, now_ns) {
+                    entry_time_set = true;
+                }
+                let (old_buckets, matches_handle, now_is_otlp) = {
+                    let entry = guard.get_entry_mut(ref_id).expect("checked is_some");
                     let old_b = entry.num_native_histogram_buckets;
                     if old_b != buckets_i32 {
                         entry.num_native_histogram_buckets = buckets_i32;
                     }
-                    (
-                        old_b,
-                        entry.matches.clone(),
-                        entry.slot,
-                        entry.slot_gen,
-                        entry.is_otlp(),
-                    )
+                    (old_b, entry.matches_handle, entry.is_otlp())
                 };
                 if let Some(he) = head_entry {
-                    if buckets_i32 < 0 && entry_slot != SLOT_NONE {
+                    if buckets_i32 < 0 && ref_id < SLAB_MAX_SLOTS as u64 {
                         he.set_active_cache(pack_active_cache(
                             epoch,
-                            entry_slot_gen,
                             true,
                             now_is_otlp,
-                            entry_slot,
+                            ref_id as u32,
                         ));
                     } else if buckets_i32 >= 0 {
                         he.set_active_cache(0);
                     }
                 }
                 if old_buckets != buckets_i32 {
+                    let guard_ref = &mut *guard;
                     if old_buckets >= 0 && buckets_i32 < 0 {
-                        guard.active_native_histograms =
-                            guard.active_native_histograms.saturating_sub(1);
-                        guard.active_native_histogram_buckets = guard
+                        guard_ref.active_native_histograms =
+                            guard_ref.active_native_histograms.saturating_sub(1);
+                        guard_ref.active_native_histogram_buckets = guard_ref
                             .active_native_histogram_buckets
                             .saturating_sub(old_buckets as u32);
-                        for idx in matches.iter() {
-                            if let Some(v) = guard.active_matching_native_histograms.get_mut(idx) {
-                                *v = v.saturating_sub(1);
-                            }
-                            if let Some(v) =
-                                guard.active_matching_native_histogram_buckets.get_mut(idx)
-                            {
-                                *v = v.saturating_sub(old_buckets as u32);
+                        if let Some(cm) = guard_ref.custom_matches.as_ref() {
+                            if let Some(matches) = cm.get(matches_handle) {
+                                for idx in matches.iter() {
+                                    if let Some(v) =
+                                        guard_ref.active_matching_native_histograms.get_mut(idx)
+                                    {
+                                        *v = v.saturating_sub(1);
+                                    }
+                                    if let Some(v) = guard_ref
+                                        .active_matching_native_histogram_buckets
+                                        .get_mut(idx)
+                                    {
+                                        *v = v.saturating_sub(old_buckets as u32);
+                                    }
+                                }
                             }
                         }
                     } else if old_buckets < 0 && buckets_i32 >= 0 {
-                        guard.active_native_histograms += 1;
-                        guard.active_native_histogram_buckets += buckets_i32 as u32;
-                        for idx in matches.iter() {
-                            if let Some(v) = guard.active_matching_native_histograms.get_mut(idx) {
-                                *v += 1;
-                            }
-                            if let Some(v) =
-                                guard.active_matching_native_histogram_buckets.get_mut(idx)
-                            {
-                                *v += buckets_i32 as u32;
+                        guard_ref.active_native_histograms += 1;
+                        guard_ref.active_native_histogram_buckets += buckets_i32 as u32;
+                        if let Some(cm) = guard_ref.custom_matches.as_ref() {
+                            if let Some(matches) = cm.get(matches_handle) {
+                                for idx in matches.iter() {
+                                    if let Some(v) =
+                                        guard_ref.active_matching_native_histograms.get_mut(idx)
+                                    {
+                                        *v += 1;
+                                    }
+                                    if let Some(v) = guard_ref
+                                        .active_matching_native_histogram_buckets
+                                        .get_mut(idx)
+                                    {
+                                        *v += buckets_i32 as u32;
+                                    }
+                                }
                             }
                         }
                     } else if old_buckets >= 0 && buckets_i32 >= 0 {
                         let delta = buckets_i32 - old_buckets;
                         if delta >= 0 {
-                            guard.active_native_histogram_buckets += delta as u32;
-                            for idx in matches.iter() {
-                                if let Some(v) =
-                                    guard.active_matching_native_histogram_buckets.get_mut(idx)
-                                {
-                                    *v += delta as u32;
+                            guard_ref.active_native_histogram_buckets += delta as u32;
+                            if let Some(cm) = guard_ref.custom_matches.as_ref() {
+                                if let Some(matches) = cm.get(matches_handle) {
+                                    for idx in matches.iter() {
+                                        if let Some(v) = guard_ref
+                                            .active_matching_native_histogram_buckets
+                                            .get_mut(idx)
+                                        {
+                                            *v += delta as u32;
+                                        }
+                                    }
                                 }
                             }
                         } else {
                             let sub = (-delta) as u32;
-                            guard.active_native_histogram_buckets =
-                                guard.active_native_histogram_buckets.saturating_sub(sub);
-                            for idx in matches.iter() {
-                                if let Some(v) =
-                                    guard.active_matching_native_histogram_buckets.get_mut(idx)
-                                {
-                                    *v = v.saturating_sub(sub);
+                            guard_ref.active_native_histogram_buckets =
+                                guard_ref.active_native_histogram_buckets.saturating_sub(sub);
+                            if let Some(cm) = guard_ref.custom_matches.as_ref() {
+                                if let Some(matches) = cm.get(matches_handle) {
+                                    for idx in matches.iter() {
+                                        if let Some(v) = guard_ref
+                                            .active_matching_native_histogram_buckets
+                                            .get_mut(idx)
+                                        {
+                                            *v = v.saturating_sub(sub);
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
 
-                    if let Some(ref cat) = guard.cat {
+                    if let Some(ref cat) = guard_ref.cat {
                         let lbls_owned;
                         let lbls = match series_labels {
                             Some(l) => l,
@@ -1484,31 +1683,28 @@ impl SeriesStripe {
                     );
                 }
 
-                let (slot, slot_gen) = if now_ns != SLOT_INACTIVE {
-                    slab.alloc_slot(now_ns)
-                } else {
-                    (SLOT_NONE, 0)
-                };
+                let matches_handle = guard.alloc_matches_handle(matches);
+                guard.insert_entry(
+                    ref_id,
+                    SeriesEntry {
+                        num_native_histogram_buckets: buckets_i32,
+                        matches_handle,
+                        flags,
+                    },
+                );
+                guard.store_nanos_new_or_update(ref_id, slab, now_ns);
                 if let Some(he) = head_entry {
-                    if buckets_i32 < 0 && slot != SLOT_NONE {
+                    if buckets_i32 < 0 && ref_id < SLAB_MAX_SLOTS as u64 {
                         he.set_active_cache(pack_active_cache(
-                            epoch, slot_gen, true, is_otlp, slot,
+                            epoch,
+                            true,
+                            is_otlp,
+                            ref_id as u32,
                         ));
                     } else {
                         he.set_active_cache(0);
                     }
                 }
-                guard.refs.insert(
-                    ref_id,
-                    SeriesEntry {
-                        nanos: AtomicI64::new(now_ns),
-                        slot,
-                        matches,
-                        num_native_histogram_buckets: buckets_i32,
-                        flags,
-                        slot_gen,
-                    },
-                );
                 created = true;
                 entry_time_set = true;
             }
@@ -1532,13 +1728,18 @@ impl SeriesStripe {
         created
     }
 
-    fn contains_ref(&self, ref_id: u64) -> bool {
-        self.inner.read().refs.contains_key(&ref_id)
+    fn contains_ref_at(&self, ref_id: u64, cutoff_ns: i64, slab: &NanosSlab) -> bool {
+        let guard = self.inner.read();
+        if guard.get_entry(ref_id).is_none() {
+            return false;
+        }
+        let ts = guard.read_nanos(ref_id, slab);
+        ts != SLOT_INACTIVE && ts >= cutoff_ns
     }
 
     fn native_histogram_buckets(&self, ref_id: u64) -> Option<u64> {
         let guard = self.inner.read();
-        let e = guard.refs.get(&ref_id)?;
+        let e = guard.get_entry(ref_id)?;
         if e.num_native_histogram_buckets >= 0 {
             Some(e.num_native_histogram_buckets as u64)
         } else {
@@ -1548,7 +1749,7 @@ impl SeriesStripe {
 
     fn mark_deleted(&self, ref_id: u64, labels: &Labels, deleted: &DeletedSeries) {
         let mut guard = self.inner.write();
-        if let Some(entry) = guard.refs.get_mut(&ref_id) {
+        if let Some(entry) = guard.get_entry_mut(ref_id) {
             entry.mark_deleted();
             deleted.add(ref_id, labels);
         }
@@ -1562,41 +1763,60 @@ impl SeriesStripe {
         slab: &NanosSlab,
     ) {
         let mut guard = self.inner.write();
-        let Some(entry) = guard.refs.remove(&ref_id) else {
+        let Some(entry) = guard.remove_entry(ref_id) else {
             return;
         };
-        if entry.slot != SLOT_NONE {
-            slab.free_slot(entry.slot);
+        if ref_id < SLAB_MAX_SLOTS as u64 {
+            slab.mark_inactive(ref_id as u32);
+        } else if let Some(ref mut ov) = guard.overflow {
+            ov.nanos.remove(&ref_id);
         }
         guard.active = guard.active.saturating_sub(1);
+        if entry.is_otlp() {
+            guard.active_otlp = guard.active_otlp.saturating_sub(1);
+        }
         if let Some(ref cat) = guard.cat {
             match idx.and_then(|r| r.series_labels(ref_id)) {
                 Some(lbls) => cat.decrement(&lbls, entry.num_native_histogram_buckets as i64),
                 None => guard.attribution_failures += 1.0,
             }
         }
-        for match_idx in entry.matches.iter() {
-            if let Some(v) = guard.active_matching.get_mut(match_idx) {
-                *v = v.saturating_sub(1);
+        let guard_ref = &mut *guard;
+        if let Some(cm) = guard_ref.custom_matches.as_ref() {
+            if let Some(matches) = cm.get(entry.matches_handle) {
+                for match_idx in matches.iter() {
+                    if let Some(v) = guard_ref.active_matching.get_mut(match_idx) {
+                        *v = v.saturating_sub(1);
+                    }
+                }
             }
         }
         if entry.num_native_histogram_buckets >= 0 {
             let b = entry.num_native_histogram_buckets as u32;
-            guard.active_native_histograms = guard.active_native_histograms.saturating_sub(1);
-            guard.active_native_histogram_buckets =
-                guard.active_native_histogram_buckets.saturating_sub(b);
-            for match_idx in entry.matches.iter() {
-                if let Some(v) = guard.active_matching_native_histograms.get_mut(match_idx) {
-                    *v = v.saturating_sub(1);
-                }
-                if let Some(v) = guard
-                    .active_matching_native_histogram_buckets
-                    .get_mut(match_idx)
-                {
-                    *v = v.saturating_sub(b);
+            guard_ref.active_native_histograms =
+                guard_ref.active_native_histograms.saturating_sub(1);
+            guard_ref.active_native_histogram_buckets =
+                guard_ref.active_native_histogram_buckets.saturating_sub(b);
+            if let Some(cm) = guard_ref.custom_matches.as_ref() {
+                if let Some(matches) = cm.get(entry.matches_handle) {
+                    for match_idx in matches.iter() {
+                        if let Some(v) =
+                            guard_ref.active_matching_native_histograms.get_mut(match_idx)
+                        {
+                            *v = v.saturating_sub(1);
+                        }
+                        if let Some(v) = guard_ref
+                            .active_matching_native_histogram_buckets
+                            .get_mut(match_idx)
+                        {
+                            *v = v.saturating_sub(b);
+                        }
+                    }
                 }
             }
         }
+        guard_ref.free_matches_handle(entry.matches_handle);
+        guard_ref.cleanup_overflow_if_empty();
         deleted.purge(ref_id);
     }
 
@@ -1612,7 +1832,13 @@ impl SeriesStripe {
         // Phase 1: pre-fetch refs under lock.
         let refs: Vec<u64> = {
             let g = self.inner.read();
-            g.refs.keys().copied().collect()
+            let ov_len = g.overflow.as_ref().map_or(0, |o| o.refs.len());
+            let mut out = Vec::with_capacity(g.refs.len() + ov_len);
+            out.extend(g.refs.keys().map(|&r| r as u64));
+            if let Some(ref ov) = g.overflow {
+                out.extend(ov.refs.keys().copied());
+            }
+            out
         };
 
         // Phase 2: lookup labels and evaluate matchers outside lock.
@@ -1642,35 +1868,37 @@ impl SeriesStripe {
         }
 
         if matchers_changed || cat_changed {
+            let ov_len = guard.overflow.as_ref().map_or(0, |o| o.refs.len());
             let mut updates: Vec<(u64, PreAllocDynamicSlice)> =
-                Vec::with_capacity(guard.refs.len());
+                Vec::with_capacity(guard.refs.len() + ov_len);
             let mut failures = 0.0;
-            for (&ref_id, entry) in &guard.refs {
+
+            let mut process_entry = |ref_id: u64, buckets: i32| {
                 if let Some((lbls, matches)) = resolved.get(&ref_id) {
                     if cat_changed {
                         if let Some(ref cat) = new_cat {
-                            let ts = entry.read_nanos(slab);
+                            let ts = guard.read_nanos(ref_id, slab);
                             cat.increment(
                                 lbls,
                                 UNIX_EPOCH + Duration::from_nanos(ts.max(0) as u64),
-                                entry.num_native_histogram_buckets as i64,
+                                buckets as i64,
                             );
                         }
                     }
                     if matchers_changed {
                         updates.push((ref_id, matches.clone()));
                     }
-                    continue;
+                    return;
                 }
 
                 if let Some(lbls) = idx.and_then(|r| r.series_labels(ref_id)) {
                     if cat_changed {
                         if let Some(ref cat) = new_cat {
-                            let ts = entry.read_nanos(slab);
+                            let ts = guard.read_nanos(ref_id, slab);
                             cat.increment(
                                 &lbls,
                                 UNIX_EPOCH + Duration::from_nanos(ts.max(0) as u64),
-                                entry.num_native_histogram_buckets as i64,
+                                buckets as i64,
                             );
                         }
                     }
@@ -1685,15 +1913,34 @@ impl SeriesStripe {
                         updates.push((ref_id, new_matchers.matches(&Labels::empty())));
                     }
                 }
+            };
+
+            let small_items: Vec<(u64, i32)> = guard
+                .refs
+                .iter()
+                .map(|(&r, e)| (r as u64, e.num_native_histogram_buckets))
+                .collect();
+            for (ref_id, buckets) in small_items {
+                process_entry(ref_id, buckets);
+            }
+            if let Some(ref ov) = guard.overflow {
+                let large_items: Vec<(u64, i32)> = ov
+                    .refs
+                    .iter()
+                    .map(|(&r, e)| (r, e.num_native_histogram_buckets))
+                    .collect();
+                for (ref_id, buckets) in large_items {
+                    process_entry(ref_id, buckets);
+                }
             }
             guard.attribution_failures += failures;
 
             if matchers_changed {
                 for (ref_id, matches) in updates {
-                    let buckets = if let Some(e) = guard.refs.get_mut(&ref_id) {
-                        e.matches = matches.clone();
-                        e.num_native_histogram_buckets
-                    } else {
+                    let Some((old_handle, buckets)) = guard
+                        .get_entry(ref_id)
+                        .map(|e| (e.matches_handle, e.num_native_histogram_buckets))
+                    else {
                         continue;
                     };
                     for m_idx in matches.iter() {
@@ -1710,6 +1957,10 @@ impl SeriesStripe {
                                 *v += buckets as u32;
                             }
                         }
+                    }
+                    let new_handle = guard.replace_matches_handle(old_handle, matches);
+                    if let Some(e) = guard.get_entry_mut(ref_id) {
+                        e.matches_handle = new_handle;
                     }
                 }
             }
@@ -1742,9 +1993,13 @@ impl SeriesStripe {
 
         let mut new_oldest = i64::MAX;
         let mut to_remove = Vec::new();
-        for (&ref_id, entry) in &guard.refs {
-            if entry.slot != SLOT_NONE {
-                if let Some(slot_atomic) = slab.slot_ref(entry.slot) {
+
+        let check_ref = |ref_id: u64,
+                         ov: Option<&OverflowStripeData>,
+                         to_remove: &mut Vec<u64>,
+                         new_oldest: &mut i64| {
+            if ref_id < SLAB_MAX_SLOTS as u64 {
+                if let Some(slot_atomic) = slab.slot_ref(ref_id as u32) {
                     loop {
                         let ts = slot_atomic.load(Ordering::Acquire);
                         if ts == SLOT_INACTIVE {
@@ -1752,8 +2007,8 @@ impl SeriesStripe {
                             break;
                         }
                         if ts >= keep_until_ns {
-                            if ts < new_oldest {
-                                new_oldest = ts;
+                            if ts < *new_oldest {
+                                *new_oldest = ts;
                             }
                             break;
                         }
@@ -1770,22 +2025,39 @@ impl SeriesStripe {
                             break;
                         }
                     }
-                    continue;
+                    return;
                 }
+                to_remove.push(ref_id);
+                return;
             }
-            let ts = entry.nanos.load(Ordering::Relaxed);
+            let ts = ov
+                .and_then(|o| o.nanos.get(&ref_id))
+                .map_or(SLOT_INACTIVE, |a| a.load(Ordering::Acquire));
             if ts < keep_until_ns {
                 to_remove.push(ref_id);
-            } else if ts < new_oldest {
-                new_oldest = ts;
+            } else if ts < *new_oldest {
+                *new_oldest = ts;
+            }
+        };
+
+        let ov_ref = guard.overflow.as_deref();
+        for &r32 in guard.refs.keys() {
+            check_ref(r32 as u64, ov_ref, &mut to_remove, &mut new_oldest);
+        }
+        if let Some(ov) = ov_ref {
+            for &r64 in ov.refs.keys() {
+                check_ref(r64, Some(ov), &mut to_remove, &mut new_oldest);
             }
         }
 
         for ref_id in to_remove {
-            if let Some(entry) = guard.refs.remove(&ref_id) {
-                if entry.slot != SLOT_NONE {
-                    slab.recycle_inactive_slot(entry.slot);
+            if let Some(entry) = guard.remove_entry(ref_id) {
+                if ref_id >= SLAB_MAX_SLOTS as u64 {
+                    if let Some(ref mut ov) = guard.overflow {
+                        ov.nanos.remove(&ref_id);
+                    }
                 }
+                guard.free_matches_handle(entry.matches_handle);
                 if let Some(ref cat) = guard.cat {
                     match idx.and_then(|r| r.series_labels(ref_id)) {
                         Some(lbls) => cat.decrement(&lbls, entry.num_native_histogram_buckets as i64),
@@ -1798,35 +2070,82 @@ impl SeriesStripe {
             }
         }
 
-        let entries: Vec<(PreAllocDynamicSlice, i32, bool)> = guard
-            .refs
-            .values()
-            .map(|e| (e.matches.clone(), e.num_native_histogram_buckets, e.is_otlp()))
-            .collect();
-        for (matches, buckets, is_otlp) in entries {
-            guard.active += 1;
-            if is_otlp {
-                guard.active_otlp += 1;
+        let SeriesStripeInner {
+            refs,
+            overflow,
+            custom_matches,
+            active,
+            active_otlp,
+            active_matching,
+            active_native_histograms,
+            active_matching_native_histograms,
+            active_native_histogram_buckets,
+            active_matching_native_histogram_buckets,
+            ..
+        } = &mut *guard;
+
+        let tally_entry = |entry: &SeriesEntry,
+                           active: &mut u32,
+                           active_otlp: &mut u32,
+                           active_matching: &mut Vec<u32>,
+                           active_native_histograms: &mut u32,
+                           active_matching_native_histograms: &mut Vec<u32>,
+                           active_native_histogram_buckets: &mut u32,
+                           active_matching_native_histogram_buckets: &mut Vec<u32>| {
+            *active += 1;
+            if entry.is_otlp() {
+                *active_otlp += 1;
             }
+            let buckets = entry.num_native_histogram_buckets;
             if buckets >= 0 {
-                guard.active_native_histograms += 1;
-                guard.active_native_histogram_buckets += buckets as u32;
+                *active_native_histograms += 1;
+                *active_native_histogram_buckets += buckets as u32;
             }
-            for match_idx in matches.iter() {
-                if let Some(v) = guard.active_matching.get_mut(match_idx) {
-                    *v += 1;
-                }
-                if buckets >= 0 {
-                    if let Some(v) = guard.active_matching_native_histograms.get_mut(match_idx) {
-                        *v += 1;
+            if let Some(cm) = custom_matches.as_deref() {
+                if let Some(matches) = cm.get(entry.matches_handle) {
+                    for match_idx in matches.iter() {
+                        if let Some(v) = active_matching.get_mut(match_idx) {
+                            *v += 1;
+                        }
+                        if buckets >= 0 {
+                            if let Some(v) = active_matching_native_histograms.get_mut(match_idx) {
+                                *v += 1;
+                            }
+                            if let Some(v) =
+                                active_matching_native_histogram_buckets.get_mut(match_idx)
+                            {
+                                *v += buckets as u32;
+                            }
+                        }
                     }
-                    if let Some(v) = guard
-                        .active_matching_native_histogram_buckets
-                        .get_mut(match_idx)
-                    {
-                        *v += buckets as u32;
-                    }
                 }
+            }
+        };
+
+        for entry in refs.values() {
+            tally_entry(
+                entry,
+                active,
+                active_otlp,
+                active_matching,
+                active_native_histograms,
+                active_matching_native_histograms,
+                active_native_histogram_buckets,
+                active_matching_native_histogram_buckets,
+            );
+        }
+        if let Some(ov) = overflow.as_deref() {
+            for entry in ov.refs.values() {
+                tally_entry(
+                    entry,
+                    active,
+                    active_otlp,
+                    active_matching,
+                    active_native_histograms,
+                    active_matching_native_histograms,
+                    active_native_histogram_buckets,
+                    active_matching_native_histogram_buckets,
+                );
             }
         }
 
@@ -1838,6 +2157,7 @@ impl SeriesStripe {
         } else if guard.refs.capacity() > (refs_len * 4).max(64) {
             guard.refs.shrink_to(refs_len * 2);
         }
+        guard.cleanup_overflow_if_empty();
 
         if new_oldest == i64::MAX {
             self.oldest_entry_ns.store(0, Ordering::Relaxed);
@@ -1848,12 +2168,14 @@ impl SeriesStripe {
 
     fn clear(&self, slab: &NanosSlab) {
         let mut guard = self.inner.write();
-        for entry in guard.refs.values() {
-            if entry.slot != SLOT_NONE {
-                slab.free_slot(entry.slot);
+        for &r32 in guard.refs.keys() {
+            if (r32 as u64) < SLAB_MAX_SLOTS as u64 {
+                slab.mark_inactive(r32);
             }
         }
         guard.refs.clear();
+        guard.overflow = None;
+        guard.custom_matches = None;
         guard.active = 0;
         guard.active_otlp = 0;
         guard.active_matching.fill(0);
@@ -1974,22 +2296,17 @@ impl ActiveSeries {
         now_ns: i64,
         _is_otlp: bool,
     ) -> bool {
+        let now_ns = sanitize_nanos(now_ns);
         let packed = head_entry.active_cache();
         if packed != 0 {
-            let (c_epoch, c_gen, c_flags, slot) = unpack_active_cache(packed);
+            let (c_epoch, c_flags, slot) = unpack_active_cache(packed);
             let cur_epoch = self.epoch.load(Ordering::Acquire);
             if c_epoch == cur_epoch && (c_flags & CACHE_FLAG_PLAIN_FLOAT) != 0 {
-                if let Some((slot_atomic, gen_atomic)) = self.slab.slot_and_gen_ref(slot) {
-                    if gen_atomic.load(Ordering::Acquire) != c_gen {
-                        return false;
-                    }
+                if let Some(slot_atomic) = self.slab.slot_ref(slot) {
                     let mut cur = slot_atomic.load(Ordering::Relaxed);
                     loop {
                         if cur == SLOT_INACTIVE {
                             break;
-                        }
-                        if gen_atomic.load(Ordering::Acquire) != c_gen {
-                            return false;
                         }
                         if now_ns <= cur {
                             return true;
@@ -2173,8 +2490,8 @@ impl ActiveSeries {
 
     pub fn post_deletion(&self, deleted: &[(u64, Labels)]) {
         for (ref_id, lbls) in deleted {
-            let stripe_id = (*ref_id as usize) & STRIPE_MASK;
-            if self.stripes[stripe_id].contains_ref(*ref_id) {
+            if self.contains_ref(*ref_id) {
+                let stripe_id = (*ref_id as usize) & STRIPE_MASK;
                 self.stripes[stripe_id].mark_deleted(*ref_id, lbls, &self.deleted);
             }
         }
@@ -2197,8 +2514,30 @@ impl ActiveSeries {
         }
     }
 
+    /// Lock-free check against `NanosSlab` whether `ref_id` is active at `cutoff_ns`
+    /// (`ts != SLOT_INACTIVE && ts >= cutoff_ns`, including `cutoff_ns == i64::MIN`).
+    /// Falls back to the stripe read lock only when `ref_id >= SLAB_MAX_SLOTS`.
+    #[inline]
+    pub fn is_ref_active_fast(&self, ref_id: u64, cutoff_ns: i64) -> bool {
+        if ref_id < SLAB_MAX_SLOTS as u64 {
+            let ts = self.slab.load(ref_id as u32);
+            return ts != SLOT_INACTIVE && ts >= cutoff_ns;
+        }
+        self.stripes[(ref_id as usize) & STRIPE_MASK].contains_ref_at(
+            ref_id,
+            cutoff_ns,
+            &self.slab,
+        )
+    }
+
+    #[inline]
+    pub fn contains_ref_at(&self, ref_id: u64, cutoff_ns: i64) -> bool {
+        self.is_ref_active_fast(ref_id, cutoff_ns)
+    }
+
+    #[inline]
     pub fn contains_ref(&self, ref_id: u64) -> bool {
-        self.stripes[(ref_id as usize) & STRIPE_MASK].contains_ref(ref_id)
+        self.is_ref_active_fast(ref_id, i64::MIN)
     }
 
     /// Buckets `(small, large)` series refs by `ref_id & STRIPE_MASK` for fast lock-free-of-postings counting.
@@ -2226,8 +2565,8 @@ impl ActiveSeries {
                 continue;
             }
             let guard = self.stripes[s_idx].inner.read();
-            for r in refs {
-                if guard.refs.contains_key(r) {
+            for &r in refs {
+                if guard.get_entry(r).is_some() {
                     count += 1;
                 }
             }
@@ -2235,29 +2574,21 @@ impl ActiveSeries {
         count
     }
 
-    /// Counts how many series refs in `(small, large)` exist in `ActiveSeries`,
-    /// acquiring each of the 128 stripe read locks at most once.
+    /// Counts how many series refs in `(small, large)` exist in `ActiveSeries`
+    /// using the lock-free `NanosSlab` fast path for `ref_id < SLAB_MAX_SLOTS`.
     pub fn count_active_in_slices(&self, small: &[u32], large: &[u64]) -> u64 {
-        let total_len = small.len() + large.len();
-        if total_len == 0 {
-            return 0;
-        }
-        if total_len <= 16 {
-            let mut count = 0u64;
-            for &r in small {
-                if self.contains_ref(r as u64) {
-                    count += 1;
-                }
+        let mut count = 0u64;
+        for &r in small {
+            if self.is_ref_active_fast(r as u64, i64::MIN) {
+                count += 1;
             }
-            for &r in large {
-                if self.contains_ref(r) {
-                    count += 1;
-                }
-            }
-            return count;
         }
-        let buckets = Self::bucket_refs_by_stripe(small, large);
-        self.count_active_in_buckets(&buckets)
+        for &r in large {
+            if self.is_ref_active_fast(r, i64::MIN) {
+                count += 1;
+            }
+        }
+        count
     }
 
     pub fn native_histogram_buckets(&self, ref_id: u64) -> Option<u64> {
@@ -2686,7 +3017,7 @@ mod tests {
     #[test]
     fn series_entry_layout_is_compact_and_deleted_shares_bytes() {
         assert!(
-            std::mem::size_of::<SeriesEntry>() <= 56,
+            std::mem::size_of::<SeriesEntry>() <= 16,
             "SeriesEntry grew unexpectedly: {}",
             std::mem::size_of::<SeriesEntry>()
         );
@@ -2800,7 +3131,7 @@ mod tests {
     }
 
     #[test]
-    fn nanos_slab_recycles_slots_with_generation_tag() {
+    fn nanos_slab_ref_id_slots_and_is_ref_active_fast_parity() {
         let dir = tempfile::tempdir().unwrap();
         let head = mimir_tsdb::head::Head::open(
             dir.path(),
@@ -2821,25 +3152,33 @@ mod tests {
 
         let tracker = ActiveSeries::new(Vec::new(), Duration::from_secs(60));
         let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        let t0_ns = system_time_to_unix_nanos(t0);
+        assert!(!tracker.is_ref_active_fast(e1.ref_id, i64::MIN));
+        assert!(!tracker.is_ref_active_fast(e1.ref_id, t0_ns));
+
         tracker.update_series_with_entry(Some(&e1), &p1, e1.hash, e1.ref_id, t0, -1, false);
         let packed1 = e1.active_cache();
-        let (_, gen1, _, slot1) = unpack_active_cache(packed1);
-        assert_eq!(slot1, 0);
-        assert_eq!(gen1, 0);
+        let (_, _, slot1) = unpack_active_cache(packed1);
+        assert_eq!(slot1, e1.ref_id as u32);
+        assert!(tracker.is_ref_active_fast(e1.ref_id, i64::MIN));
+        assert!(tracker.is_ref_active_fast(e1.ref_id, t0_ns));
+        assert!(!tracker.is_ref_active_fast(e1.ref_id, t0_ns + 1));
 
-        // Purge e1 -> slot 0 recycled with gen = 1
+        // Purge e1 -> slot marked inactive, is_ref_active_fast returns false for both i64::MIN and cutoff
         tracker.purge(t0 + Duration::from_secs(61));
-        assert_eq!(tracker.active(), (1 - 1, 0, 0, 0));
+        assert_eq!(tracker.active(), (0, 0, 0, 0));
+        assert!(!tracker.is_ref_active_fast(e1.ref_id, i64::MIN));
+        assert!(!tracker.is_ref_active_fast(e1.ref_id, t0_ns));
 
-        // Insert e2 -> reuses slot 0 with gen = 1
+        // Insert e2 -> gets its own ref_id slot
         let t1 = t0 + Duration::from_secs(70);
         tracker.update_series_with_entry(Some(&e2), &p2, e2.hash, e2.ref_id, t1, -1, false);
         let packed2 = e2.active_cache();
-        let (_, gen2, _, slot2) = unpack_active_cache(packed2);
-        assert_eq!(slot2, 0);
-        assert_eq!(gen2, 1);
+        let (_, _, slot2) = unpack_active_cache(packed2);
+        assert_eq!(slot2, e2.ref_id as u32);
+        assert!(tracker.is_ref_active_fast(e2.ref_id, i64::MIN));
 
-        // Stale active_cache on e1 (slot=0, gen=0) must NOT update e2, and must re-insert e1!
+        // Stale active_cache on e1 must NOT update e2, and must re-insert e1!
         tracker.update_series_with_entry(
             Some(&e1),
             &p1,
@@ -2850,9 +3189,25 @@ mod tests {
             false,
         );
         assert_eq!(tracker.active(), (2, 0, 0, 0));
-        let (_, gen1_new, _, slot1_new) = unpack_active_cache(e1.active_cache());
-        assert_eq!(slot1_new, 1);
-        assert_eq!(gen1_new, 0);
+        assert!(tracker.is_ref_active_fast(e1.ref_id, i64::MIN));
+        assert!(tracker.is_ref_active_fast(e2.ref_id, i64::MIN));
+
+        // Overflow refs (>= SLAB_MAX_SLOTS and > u32::MAX) also preserve full semantics
+        let high_slab_ref = (SLAB_MAX_SLOTS as u64) + 7;
+        let high_u64_ref = (u32::MAX as u64) + 99;
+        tracker.update_series(&p1, 1, high_slab_ref, t1, -1, false);
+        tracker.update_series(&p2, 2, high_u64_ref, t1, 5, true);
+        assert!(tracker.is_ref_active_fast(high_slab_ref, i64::MIN));
+        assert!(tracker.is_ref_active_fast(high_u64_ref, i64::MIN));
+        assert!(!tracker.is_ref_active_fast(high_u64_ref, system_time_to_unix_nanos(t1) + 1));
+        assert_eq!(tracker.native_histogram_buckets(high_u64_ref), Some(5));
+        assert_eq!(tracker.active(), (4, 1, 1, 5));
+
+        tracker.delete(high_slab_ref);
+        assert!(!tracker.is_ref_active_fast(high_slab_ref, i64::MIN));
+        tracker.purge(t1 + Duration::from_secs(62));
+        assert!(!tracker.is_ref_active_fast(high_u64_ref, i64::MIN));
+        assert_eq!(tracker.active(), (0, 0, 0, 0));
 
         head.close().unwrap();
     }

@@ -5,11 +5,12 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use mimir_common::limiter::{InflightPermit, ReactivePermit};
+use mimir_common::thread_pool::ScopedWorkerPool;
 use mimir_config::LimitsConfig;
 use mimir_proto::cortexpb;
 use mimir_proto::prost::Message;
@@ -21,11 +22,22 @@ use mimir_proto::zerocopy::{
 use mimir_ring::ring::replication_strategy::WRITE_NO_EXTEND;
 use mimir_tsdb::chunkenc::{CounterResetHint, FloatHistogram, Histogram, HistogramSpan};
 use mimir_tsdb::exemplar::{Exemplar, ExemplarError};
-use mimir_tsdb::head::{prefetch_read_data, HeadError, SeriesEntry};
+use mimir_tsdb::head::{prefetch_read_data, HeadAppender, HeadError, SeriesEntry};
 use mimir_tsdb::labels::{append_stringlabel_pair, iter_stringlabels, Labels};
+use parking_lot::Mutex;
 use smallvec::SmallVec;
 use tracing::warn;
 use xxhash_rust::xxh64::xxh64;
+
+const CLASSIC_PUSH_SHARD_THRESHOLD: usize = 256;
+
+fn classic_push_pool() -> &'static ScopedWorkerPool {
+    static POOL: OnceLock<ScopedWorkerPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let hw = std::thread::available_parallelism().map_or(4, |n| n.get());
+        ScopedWorkerPool::new("classic-push", hw.clamp(2, 8).saturating_sub(1))
+    })
+}
 
 use crate::active_groups::group_label;
 use crate::costattribution::SampleTracker;
@@ -904,12 +916,14 @@ impl Ingester {
             let source = cortexpb::write_request::SourceEnum::try_from(borrowed.source)
                 .unwrap_or(cortexpb::write_request::SourceEnum::Api);
             let mut min_ts = i64::MAX;
+            let mut all_sorted_have_metric_name = true;
 
             s.series_metas.reserve(ts_len);
             for ts in borrowed.timeseries() {
                 let label_start = s.label_bytes_arena.len();
                 let mut labels_sorted_unique = true;
                 let mut dropped_empty = false;
+                let mut has_metric_name = false;
                 let mut prev_name: Option<&str> = None;
 
                 if let Some(ts_labels_str) = ts.labels_str() {
@@ -922,6 +936,9 @@ impl Ingester {
                         }
                         prev_name = Some(k);
                         if !v.is_empty() {
+                            if k == "__name__" {
+                                has_metric_name = true;
+                            }
                             append_stringlabel_pair(
                                 &mut s.label_bytes_arena,
                                 k.as_bytes(),
@@ -968,6 +985,9 @@ impl Ingester {
                         }
                         prev_name = Some(k);
                         if !lp.value.is_empty() {
+                            if k == "__name__" {
+                                has_metric_name = true;
+                            }
                             append_stringlabel_pair(&mut s.label_bytes_arena, lp.name, lp.value);
                         } else {
                             dropped_empty = true;
@@ -980,6 +1000,10 @@ impl Ingester {
                             append_stringlabel_pair(&mut s.label_bytes_arena, lp.name, lp.value);
                         }
                     }
+                }
+
+                if labels_sorted_unique && !has_metric_name {
+                    all_sorted_have_metric_name = false;
                 }
 
                 let label_end = s.label_bytes_arena.len();
@@ -1054,7 +1078,21 @@ impl Ingester {
                 });
             }
 
-            self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, &items)
+            if ts_len >= CLASSIC_PUSH_SHARD_THRESHOLD
+                && all_sorted_have_metric_name
+                && !self.verify_ring_ownership.load(Ordering::Relaxed)
+                && self
+                    .cost_attribution_manager()
+                    .and_then(|m| m.sample_tracker(user_id))
+                    .is_none()
+                && !self
+                    .get_instance_limits()
+                    .is_some_and(|il| il.max_series > 0)
+            {
+                self.ingest_prehashed_classic_sharded(user_id, source, min_ts, &items)
+            } else {
+                self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, &items)
+            }
         })
     }
 
@@ -1411,6 +1449,748 @@ impl Ingester {
         };
         permit.finish(res.as_ref().err());
         res
+    }
+
+    fn ingest_prehashed_classic_sharded(
+        &self,
+        user_id: &str,
+        source: cortexpb::write_request::SourceEnum,
+        min_ts: i64,
+        items: &[PrehashedSeriesItem<'_>],
+    ) -> Result<(), IngesterError> {
+        let hw_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let max_shards = hw_threads.clamp(2, 8);
+        let desired = (items.len() / 128).clamp(2, max_shards);
+        let num_shards = 1usize << (usize::BITS - 1 - desired.leading_zeros());
+        if num_shards <= 1 {
+            return self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, items);
+        }
+        let shard_mask = num_shards - 1;
+
+        struct ShardItemRef<'a, 'b> {
+            orig_idx: usize,
+            item: &'b PrehashedSeriesItem<'a>,
+        }
+
+        let mut buckets: SmallVec<[Vec<ShardItemRef<'_, '_>>; 8]> = (0..num_shards)
+            .map(|_| Vec::with_capacity((items.len() / num_shards) + 8))
+            .collect();
+        for (idx, item) in items.iter().enumerate() {
+            let shard = (item.prom_hash as usize) & shard_mask;
+            buckets[shard].push(ShardItemRef {
+                orig_idx: idx,
+                item,
+            });
+        }
+        let active_shards: SmallVec<[Vec<ShardItemRef<'_, '_>>; 8]> =
+            buckets.into_iter().filter(|b| !b.is_empty()).collect();
+        if active_shards.len() <= 1 {
+            return self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, items);
+        }
+
+        let db = self.get_or_create_tsdb(user_id).map_err(|e| {
+            let wrapped = e.with_user(user_id, 0);
+            if wrapped.error_cause() == cortexpb::ErrorCause::InstanceLimit {
+                wrapped.with_do_not_log()
+            } else {
+                wrapped
+            }
+        })?;
+        let lock_guard = db
+            .acquire_append_lock(min_ts)
+            .map_err(|e| e.with_user(user_id, 0))?;
+
+        let start_append = SystemTime::now();
+        let start_append_ms = start_append
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let add_timer = Instant::now();
+
+        let limits = self.overrides.for_tenant(user_id);
+        let native_histograms_enabled = limits.native_histograms_ingestion_enabled;
+        let creation_grace_ms = (limits.creation_grace_period.0 / 1_000_000).max(0);
+        let past_grace_ms = (limits.past_grace_period.0 / 1_000_000).max(0);
+        let ooo_window_ms = (limits.out_of_order_time_window.0 / 1_000_000).max(0);
+        let ooo_window_dur = Duration::from_millis(ooo_window_ms as u64);
+
+        let max_timestamp_ms = start_append_ms.saturating_add(creation_grace_ms);
+        let min_timestamp_ms = if past_grace_ms > 0 {
+            start_append_ms
+                .saturating_sub(past_grace_ms)
+                .saturating_sub(ooo_window_ms)
+        } else {
+            i64::MIN
+        };
+
+        let head = db.db.head();
+        let min_append_time_available = head.initialized();
+        let min_append_time = head.appendable_min_valid_time();
+        let max_exemplars = self.limiter.max_exemplars_per_user(user_id);
+        let ignore_ooo_exemplars = limits.ignore_ooo_exemplars;
+        let is_otlp = source == cortexpb::write_request::SourceEnum::Otlp;
+        let active_series_enabled = self.cfg.active_series.active_series_metrics_enabled;
+
+        struct PreparedShard<'a> {
+            app: HeadAppender<'a>,
+            stats: PushStats,
+            first_partial: Option<(usize, IngesterError, Option<SampleKind>)>,
+        }
+        type PreparedShardSlot<'a> = Mutex<Option<Result<PreparedShard<'a>, IngesterError>>>;
+
+        let shard_slots: SmallVec<[PreparedShardSlot<'_>; 8]> =
+            (0..active_shards.len()).map(|_| Mutex::new(None)).collect();
+
+        let pool = classic_push_pool();
+        pool.scoped_execute(active_shards.len(), |s_idx| {
+            let shard_items = &active_shards[s_idx];
+            let mut app = db.db.appender_with_capacity(shard_items.len());
+            let mut stats = PushStats::default();
+            let mut first_partial: Option<(usize, IngesterError, Option<SampleKind>)> = None;
+
+            let use_batch_resolve = shard_items.len() > 2;
+            let mut resolved_guard = if use_batch_resolve {
+                let mut g = ResolvedEntriesGuard::take(shard_items.len());
+                head.resolve_prehashed_encoded_batch(
+                    shard_items,
+                    |si| {
+                        let item = si.item;
+                        if item.bad_utf8
+                            || !item.labels_sorted_unique
+                            || item.encoded_labels.is_empty()
+                        {
+                            return None;
+                        }
+                        if ooo_window_ms <= 0
+                            && min_append_time_available
+                            && item.exemplars.is_empty()
+                        {
+                            let all_samples_oob =
+                                item.samples.iter().all(|s| s.timestamp_ms < min_append_time);
+                            if all_samples_oob
+                                && (!native_histograms_enabled
+                                    || item.histograms.iter().all(|h| h.0 < min_append_time))
+                                && (!item.samples.is_empty()
+                                    || (native_histograms_enabled && !item.histograms.is_empty()))
+                            {
+                                return None;
+                            }
+                        }
+                        Some((item.prom_hash, item.encoded_labels))
+                    },
+                    &mut g.vec,
+                );
+                Some(g)
+            } else {
+                None
+            };
+
+            let mut hard_err: Option<IngesterError> = None;
+            for (local_idx, si) in shard_items.iter().enumerate() {
+                let orig_idx = si.orig_idx;
+                let item = si.item;
+                if let Some(ref g) = resolved_guard {
+                    if let Some(Some(ref next_entry)) = g.vec.get(local_idx + 4) {
+                        let next_ptr = Arc::as_ptr(next_entry);
+                        prefetch_read_data(next_ptr);
+                        prefetch_read_data((next_ptr as *const u8).wrapping_add(64));
+                    }
+                }
+                if item.bad_utf8 {
+                    hard_err = Some(
+                        IngesterError::BadRequest {
+                            message: "invalid UTF-8 in label".to_string(),
+                        }
+                        .with_user(user_id, 0),
+                    );
+                    break;
+                }
+
+                let encoded_labels = item.encoded_labels;
+                let samples = item.samples;
+                let hist_count = item.histograms.len();
+                if !samples.is_empty() && hist_count > 0 {
+                    stats.series_with_floats_and_histograms += 1;
+                }
+
+                let mut series_str_cache: Option<String> = None;
+                let mut make_series_str = |enc: &[u8]| -> String {
+                    if let Some(ref s) = series_str_cache {
+                        return s.clone();
+                    }
+                    let s = format_labels_string(iter_stringlabels(enc));
+                    series_str_cache = Some(s.clone());
+                    s
+                };
+                let mut record_partial = |err: IngesterError, kind: Option<SampleKind>| {
+                    if first_partial.is_none() {
+                        first_partial = Some((orig_idx, err, kind));
+                    }
+                };
+
+                if ooo_window_ms <= 0 && min_append_time_available && item.exemplars.is_empty() {
+                    let all_samples_oob = samples.iter().all(|s| s.timestamp_ms < min_append_time);
+                    if native_histograms_enabled {
+                        if (!samples.is_empty() || hist_count > 0)
+                            && all_samples_oob
+                            && item.histograms.iter().all(|h| h.0 < min_append_time)
+                        {
+                            let total_oob = samples.len() + hist_count;
+                            stats.failed_samples += total_oob;
+                            stats.sample_timestamp_too_old += total_oob;
+                            let mut first_ts = samples.first().map_or(0, |s| s.timestamp_ms);
+                            if hist_count > 0 {
+                                let h0_ts = item.histograms[0].0;
+                                if first_ts == 0 || h0_ts < first_ts {
+                                    first_ts = h0_ts;
+                                }
+                            }
+                            let s_str = make_series_str(encoded_labels);
+                            record_partial(
+                                IngesterError::sample_timestamp_too_old(first_ts, s_str),
+                                Some(SampleKind::SampleTimestampTooOld),
+                            );
+                            continue;
+                        }
+                    } else if !samples.is_empty() && all_samples_oob {
+                        stats.failed_samples += samples.len();
+                        stats.sample_timestamp_too_old += samples.len();
+                        let first_ts = samples[0].timestamp_ms;
+                        let s_str = make_series_str(encoded_labels);
+                        record_partial(
+                            IngesterError::sample_timestamp_too_old(first_ts, s_str),
+                            Some(SampleKind::SampleTimestampTooOld),
+                        );
+                        continue;
+                    }
+                }
+
+                if !item.labels_sorted_unique {
+                    let total_bad = samples.len() + hist_count;
+                    stats.failed_samples += total_bad;
+                    stats.labels_not_sorted += total_bad;
+                    stats.failed_exemplars += item.exemplars.len();
+                    if total_bad > 0 {
+                        let s_str = make_series_str(encoded_labels);
+                        record_partial(
+                            IngesterError::labels_not_sorted(s_str),
+                            Some(SampleKind::LabelsNotSorted),
+                        );
+                    }
+                    continue;
+                }
+
+                let mut series_entry: Option<Arc<SeriesEntry>> =
+                    if let Some(ref mut g) = resolved_guard {
+                        g.vec[local_idx].take()
+                    } else if !encoded_labels.is_empty() {
+                        head.get_entry_by_prehashed_encoded_labels(item.prom_hash, encoded_labels)
+                    } else {
+                        None
+                    };
+                let mut series_ref = series_entry.as_ref().map(|e| e.ref_id);
+
+                let prev_succeeded = stats.succeeded_samples;
+                let mut created_ts = item.created_timestamp;
+                let mut ingest_created_ts = created_ts > 0;
+                let first_hist_ts = item.histograms.first().map(|h| h.0);
+
+                for (s_idx, s) in samples.iter().enumerate() {
+                    if s.timestamp_ms > max_timestamp_ms {
+                        stats.failed_samples += 1;
+                        stats.sample_too_far_in_future += 1;
+                        let s_str = make_series_str(encoded_labels);
+                        record_partial(
+                            IngesterError::sample_too_far_in_future(s.timestamp_ms, s_str),
+                            Some(SampleKind::SampleTimestampTooFarInFuture),
+                        );
+                        continue;
+                    }
+                    if s.timestamp_ms < min_timestamp_ms {
+                        stats.failed_samples += 1;
+                        continue;
+                    }
+
+                    if ingest_created_ts
+                        && created_ts < s.timestamp_ms
+                        && (!native_histograms_enabled
+                            || hist_count == 0
+                            || first_hist_ts.is_none_or(|ht| ht >= s.timestamp_ms))
+                    {
+                        match app.append_float_with_entry_prehashed_encoded(
+                            &mut series_entry,
+                            item.prom_hash,
+                            encoded_labels,
+                            0,
+                            created_ts,
+                            0.0,
+                            true,
+                        ) {
+                            Ok(r) => {
+                                series_ref = Some(r);
+                                stats.succeeded_samples += 1;
+                            }
+                            Err(
+                                HeadError::DuplicateSampleForTimestamp
+                                | HeadError::DuplicateSampleWithDetails(_)
+                                | HeadError::OutOfOrderSample,
+                            ) => {}
+                            Err(err) => {
+                                if let Err(e) = handle_head_append_error(
+                                    err,
+                                    created_ts,
+                                    encoded_labels,
+                                    ooo_window_ms,
+                                    ooo_window_dur,
+                                    &limits,
+                                    &mut stats,
+                                    &mut make_series_str,
+                                    &mut record_partial,
+                                ) {
+                                    hard_err = Some(e.with_user(user_id, 0));
+                                    break;
+                                }
+                            }
+                        }
+                        ingest_created_ts = false;
+                        created_ts = 0;
+                    }
+
+                    let is_last_sample = s_idx + 1 == samples.len() && hist_count == 0;
+                    let append_res = if is_last_sample {
+                        app.append_float_with_entry_prehashed_encoded_take(
+                            &mut series_entry,
+                            item.prom_hash,
+                            encoded_labels,
+                            0,
+                            s.timestamp_ms,
+                            s.value,
+                            false,
+                        )
+                    } else {
+                        app.append_float_with_entry_prehashed_encoded(
+                            &mut series_entry,
+                            item.prom_hash,
+                            encoded_labels,
+                            0,
+                            s.timestamp_ms,
+                            s.value,
+                            false,
+                        )
+                    };
+                    match append_res {
+                        Ok(r) => {
+                            series_ref = Some(r);
+                            stats.succeeded_samples += 1;
+                        }
+                        Err(err) => {
+                            if let Err(e) = handle_head_append_error(
+                                err,
+                                s.timestamp_ms,
+                                encoded_labels,
+                                ooo_window_ms,
+                                ooo_window_dur,
+                                &limits,
+                                &mut stats,
+                                &mut make_series_str,
+                                &mut record_partial,
+                            ) {
+                                hard_err = Some(e.with_user(user_id, 0));
+                                break;
+                            }
+                        }
+                    }
+                }
+                if hard_err.is_some() {
+                    break;
+                }
+
+                let mut num_native_hist_buckets: i64 = -1;
+                let ex_count = item.exemplars.len();
+                let lazy_pairs: SmallVec<[(&str, &str); 24]> = if (native_histograms_enabled
+                    && hist_count > 0)
+                    || (ex_count > 0 && max_exemplars > 0)
+                {
+                    iter_stringlabels(encoded_labels).collect()
+                } else {
+                    SmallVec::new()
+                };
+
+                if native_histograms_enabled && hist_count > 0 {
+                    let pairs = lazy_pairs.as_slice();
+                    for (h_ts, is_float, ih_opt, fh_opt, bucket_count) in item.histograms.iter() {
+                        let h_ts = *h_ts;
+                        let is_float = *is_float;
+                        let bucket_count = *bucket_count;
+
+                        if h_ts > max_timestamp_ms {
+                            stats.failed_samples += 1;
+                            stats.sample_too_far_in_future += 1;
+                            let s_str = make_series_str(encoded_labels);
+                            record_partial(
+                                IngesterError::sample_too_far_in_future(h_ts, s_str),
+                                Some(SampleKind::SampleTimestampTooFarInFuture),
+                            );
+                            continue;
+                        }
+                        if h_ts < min_timestamp_ms {
+                            stats.failed_samples += 1;
+                            continue;
+                        }
+
+                        if ingest_created_ts && created_ts < h_ts {
+                            let ct_res = if is_float {
+                                let fh_ref = fh_opt.as_ref().expect("float histogram");
+                                let zero_fh = FloatHistogram {
+                                    counter_reset_hint: CounterResetHint::CounterReset,
+                                    schema: fh_ref.schema,
+                                    zero_threshold: fh_ref.zero_threshold,
+                                    custom_values: fh_ref.custom_values.clone(),
+                                    ..FloatHistogram::default()
+                                };
+                                app.append_float_histogram_reject_ooo(
+                                    series_ref, pairs, created_ts, zero_fh,
+                                )
+                            } else {
+                                let ih_ref = ih_opt.as_ref().expect("int histogram");
+                                let zero_ih = Histogram {
+                                    counter_reset_hint: CounterResetHint::CounterReset,
+                                    schema: ih_ref.schema,
+                                    zero_threshold: ih_ref.zero_threshold,
+                                    custom_values: ih_ref.custom_values.clone(),
+                                    ..Histogram::default()
+                                };
+                                app.append_histogram_reject_ooo(
+                                    series_ref, pairs, created_ts, zero_ih,
+                                )
+                            };
+                            match ct_res {
+                                Ok(r) => {
+                                    series_ref = Some(r);
+                                    stats.succeeded_samples += 1;
+                                }
+                                Err(
+                                    HeadError::DuplicateSampleForTimestamp
+                                    | HeadError::DuplicateSampleWithDetails(_)
+                                    | HeadError::OutOfOrderSample,
+                                ) => {}
+                                Err(err) => {
+                                    if let Err(e) = handle_head_append_error(
+                                        err,
+                                        created_ts,
+                                        encoded_labels,
+                                        ooo_window_ms,
+                                        ooo_window_dur,
+                                        &limits,
+                                        &mut stats,
+                                        &mut make_series_str,
+                                        &mut record_partial,
+                                    ) {
+                                        hard_err = Some(e.with_user(user_id, 0));
+                                        break;
+                                    }
+                                }
+                            }
+                            ingest_created_ts = false;
+                            created_ts = 0;
+                        }
+
+                        let res = if is_float {
+                            app.append_float_histogram(
+                                series_ref,
+                                pairs,
+                                0,
+                                h_ts,
+                                fh_opt.as_ref().expect("float histogram").clone(),
+                            )
+                        } else {
+                            app.append_histogram(
+                                series_ref,
+                                pairs,
+                                0,
+                                h_ts,
+                                ih_opt.as_ref().expect("int histogram").clone(),
+                            )
+                        };
+
+                        match res {
+                            Ok(r) => {
+                                series_ref = Some(r);
+                                stats.succeeded_samples += 1;
+                                if samples.last().is_none_or(|ls| ls.timestamp_ms < h_ts) {
+                                    num_native_hist_buckets = bucket_count as i64;
+                                }
+                            }
+                            Err(err) => {
+                                if let Err(e) = handle_head_append_error(
+                                    err,
+                                    h_ts,
+                                    encoded_labels,
+                                    ooo_window_ms,
+                                    ooo_window_dur,
+                                    &limits,
+                                    &mut stats,
+                                    &mut make_series_str,
+                                    &mut record_partial,
+                                ) {
+                                    hard_err = Some(e.with_user(user_id, 0));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if hard_err.is_some() {
+                        break;
+                    }
+                }
+
+                if active_series_enabled && stats.succeeded_samples > prev_succeeded {
+                    if let Some(ref_id) = series_ref {
+                        let entry_ref = series_entry
+                            .as_deref()
+                            .or_else(|| app.last_float_entry().filter(|e| e.ref_id == ref_id));
+                        db.active_series.update_series_with_entry_encoded(
+                            entry_ref,
+                            encoded_labels,
+                            item.prom_hash,
+                            ref_id,
+                            start_append,
+                            num_native_hist_buckets,
+                            is_otlp,
+                        );
+                    }
+                }
+
+                if ex_count > 0 && max_exemplars > 0 {
+                    if series_ref.is_none() {
+                        let (ex_ts, _, _, ex_str) = &item.exemplars[0];
+                        let s_str = make_series_str(encoded_labels);
+                        record_partial(
+                            IngesterError::exemplar_missing_series(*ex_ts, s_str, ex_str.clone()),
+                            None,
+                        );
+                        stats.failed_exemplars += ex_count;
+                    } else {
+                        let pairs = lazy_pairs.as_slice();
+                        let mut out_of_order_exemplars = 0usize;
+                        for (ex_ts, ex_val, ex_labels, ex_str) in item.exemplars {
+                            let ex_ts = *ex_ts;
+                            if ex_ts > max_timestamp_ms {
+                                stats.failed_exemplars += 1;
+                                let s_str = make_series_str(encoded_labels);
+                                record_partial(
+                                    IngesterError::exemplar_too_far_in_future(
+                                        ex_ts,
+                                        s_str,
+                                        ex_str.clone(),
+                                    ),
+                                    None,
+                                );
+                                continue;
+                            }
+                            if ex_ts < min_timestamp_ms {
+                                stats.failed_exemplars += 1;
+                                let s_str = make_series_str(encoded_labels);
+                                record_partial(
+                                    IngesterError::exemplar_too_far_in_past(
+                                        ex_ts,
+                                        s_str,
+                                        ex_str.clone(),
+                                    ),
+                                    None,
+                                );
+                                continue;
+                            }
+                            let exemplar = Exemplar::new(ex_labels.clone(), *ex_val, ex_ts);
+                            match app.append_exemplar(series_ref, pairs, exemplar) {
+                                Ok(_) => stats.succeeded_exemplars += 1,
+                                Err(HeadError::Exemplar(ExemplarError::OutOfOrderExemplar)) => {
+                                    stats.failed_exemplars += 1;
+                                    out_of_order_exemplars += 1;
+                                    if out_of_order_exemplars == ex_count && !ignore_ooo_exemplars {
+                                        let s_str = make_series_str(encoded_labels);
+                                        record_partial(
+                                            IngesterError::TsdbIngestExemplar {
+                                                original_err: "out of order exemplar".to_string(),
+                                                timestamp_ms: ex_ts,
+                                                series_labels: s_str,
+                                                exemplar_labels: ex_str.clone(),
+                                            },
+                                            None,
+                                        );
+                                    }
+                                }
+                                Err(HeadError::Exemplar(ex_err)) => {
+                                    stats.failed_exemplars += 1;
+                                    let s_str = make_series_str(encoded_labels);
+                                    record_partial(
+                                        IngesterError::TsdbIngestExemplar {
+                                            original_err: ex_err.to_string(),
+                                            timestamp_ms: ex_ts,
+                                            series_labels: s_str,
+                                            exemplar_labels: ex_str.clone(),
+                                        },
+                                        None,
+                                    );
+                                }
+                                Err(e) => {
+                                    stats.failed_exemplars += 1;
+                                    let s_str = make_series_str(encoded_labels);
+                                    record_partial(
+                                        IngesterError::TsdbIngestExemplar {
+                                            original_err: e.to_string(),
+                                            timestamp_ms: ex_ts,
+                                            series_labels: s_str,
+                                            exemplar_labels: ex_str.clone(),
+                                        },
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(err) = hard_err {
+                drop(app);
+                *shard_slots[s_idx].lock() = Some(Err(err));
+            } else {
+                *shard_slots[s_idx].lock() = Some(Ok(PreparedShard {
+                    app,
+                    stats,
+                    first_partial,
+                }));
+            }
+        });
+
+        self.metrics
+            .appender_add_duration
+            .observe(add_timer.elapsed().as_secs_f64());
+
+        let mut prepared: SmallVec<[Mutex<Option<PreparedShard<'_>>>; 8]> =
+            SmallVec::with_capacity(active_shards.len());
+        let mut first_hard_err: Option<IngesterError> = None;
+        for slot in shard_slots {
+            match slot.into_inner() {
+                Some(Ok(ps)) => prepared.push(Mutex::new(Some(ps))),
+                Some(Err(e)) => {
+                    if first_hard_err.is_none() {
+                        first_hard_err = Some(e);
+                    }
+                }
+                None => {
+                    if first_hard_err.is_none() {
+                        first_hard_err = Some(
+                            IngesterError::Internal {
+                                message: "classic push shard did not complete".to_string(),
+                            }
+                            .with_user(user_id, 0),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_hard_err {
+            drop(prepared);
+            drop(lock_guard);
+            return Err(err);
+        }
+
+        let mut stats = PushStats::default();
+        let mut best_partial: Option<(usize, IngesterError, Option<SampleKind>)> = None;
+        for slot in &prepared {
+            let mut g = slot.lock();
+            if let Some(ps) = g.as_mut() {
+                stats.succeeded_samples += ps.stats.succeeded_samples;
+                stats.failed_samples += ps.stats.failed_samples;
+                stats.succeeded_exemplars += ps.stats.succeeded_exemplars;
+                stats.failed_exemplars += ps.stats.failed_exemplars;
+                stats.sample_timestamp_too_old += ps.stats.sample_timestamp_too_old;
+                stats.sample_out_of_order += ps.stats.sample_out_of_order;
+                stats.sample_too_old += ps.stats.sample_too_old;
+                stats.sample_too_far_in_future += ps.stats.sample_too_far_in_future;
+                stats.new_value_for_timestamp += ps.stats.new_value_for_timestamp;
+                stats.per_user_series_limit += ps.stats.per_user_series_limit;
+                stats.per_metric_series_limit += ps.stats.per_metric_series_limit;
+                stats.invalid_native_histogram += ps.stats.invalid_native_histogram;
+                stats.labels_not_sorted += ps.stats.labels_not_sorted;
+                stats.series_with_floats_and_histograms +=
+                    ps.stats.series_with_floats_and_histograms;
+                if let Some((orig_idx, err, kind)) = ps.first_partial.take() {
+                    if best_partial
+                        .as_ref()
+                        .is_none_or(|(best_idx, _, _)| orig_idx < *best_idx)
+                    {
+                        best_partial = Some((orig_idx, err, kind));
+                    }
+                }
+            }
+        }
+
+        let commit_timer = Instant::now();
+        let commit_errs: SmallVec<[Mutex<Option<String>>; 8]> =
+            (0..prepared.len()).map(|_| Mutex::new(None)).collect();
+        pool.scoped_execute(prepared.len(), |s_idx| {
+            if let Some(ps) = prepared[s_idx].lock().take() {
+                if let Err(e) = ps.app.commit() {
+                    *commit_errs[s_idx].lock() = Some(e.to_string());
+                }
+            }
+        });
+        drop(lock_guard);
+        self.metrics
+            .appender_commit_duration
+            .observe(commit_timer.elapsed().as_secs_f64());
+
+        for err_slot in commit_errs {
+            if let Some(e) = err_slot.into_inner() {
+                return Err(IngesterError::Internal {
+                    message: format!("failed to commit TSDB appender: {e}"),
+                }
+                .with_user(user_id, stats.failed_samples as i64));
+            }
+        }
+
+        if stats.succeeded_samples > 0 {
+            db.set_last_update(SystemTime::now());
+        }
+
+        db.ingested_samples_counter(&self.metrics.ingested_samples)
+            .inc_by(stats.succeeded_samples as f64);
+        db.ingested_samples_fail_counter(&self.metrics.ingested_samples_fail)
+            .inc_by(stats.failed_samples as f64);
+        self.metrics
+            .ingested_exemplars
+            .inc_by(stats.succeeded_exemplars as f64);
+        self.metrics
+            .ingested_exemplars_fail
+            .inc_by(stats.failed_exemplars as f64);
+        self.appended_samples
+            .fetch_add(stats.succeeded_samples as i64, Ordering::Relaxed);
+        self.appended_exemplars
+            .fetch_add(stats.succeeded_exemplars as i64, Ordering::Relaxed);
+        self.usage_appended_samples.inc(stats.succeeded_samples as i64);
+        self.usage_appended_exemplars.inc(stats.succeeded_exemplars as i64);
+
+        let request_group = group_label(
+            &limits.separate_metrics_group_label,
+            items.first().map(|it| iter_stringlabels(it.encoded_labels)),
+        );
+        let group = self.update_active_group(user_id, request_group, start_append);
+        self.record_discarded_metrics(user_id, &group, &stats, source, &db);
+
+        if let Some((_, partial, sampler_kind)) = best_partial {
+            let err = if let Some(kind) = sampler_kind {
+                let sampler = kind.sampler(&self.error_samplers);
+                partial.with_sampling_rate(sampler.should_log(), sampler.rate())
+            } else {
+                partial
+            };
+            return Err(err.with_user(user_id, stats.failed_samples as i64));
+        }
+
+        Ok(())
     }
 
     fn ingest_prehashed_shard_batch_inner(
@@ -2015,13 +2795,9 @@ impl Ingester {
             db.set_last_update(SystemTime::now());
         }
 
-        self.metrics
-            .ingested_samples
-            .with_label_values(&[user_id])
+        db.ingested_samples_counter(&self.metrics.ingested_samples)
             .inc_by(stats.succeeded_samples as f64);
-        self.metrics
-            .ingested_samples_fail
-            .with_label_values(&[user_id])
+        db.ingested_samples_fail_counter(&self.metrics.ingested_samples_fail)
             .inc_by(stats.failed_samples as f64);
         self.metrics
             .ingested_exemplars
@@ -2591,13 +3367,9 @@ impl Ingester {
             db.set_last_update(SystemTime::now());
         }
 
-        self.metrics
-            .ingested_samples
-            .with_label_values(&[user_id])
+        db.ingested_samples_counter(&self.metrics.ingested_samples)
             .inc_by(stats.succeeded_samples as f64);
-        self.metrics
-            .ingested_samples_fail
-            .with_label_values(&[user_id])
+        db.ingested_samples_fail_counter(&self.metrics.ingested_samples_fail)
             .inc_by(stats.failed_samples as f64);
         self.metrics
             .ingested_exemplars
@@ -3019,5 +3791,173 @@ mod wave3_tests {
             )
             .unwrap_err();
         assert_eq!(err2.rejected_samples(), 2);
+    }
+
+    #[test]
+    fn classic_push_sharded_preserves_atomic_rollback_and_partial_error_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-0".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // 1. Hard error (`MissingMetricName`) at index 400 rolls back ALL 600 series.
+        let mut rollback_ts = Vec::with_capacity(600);
+        for i in 0..600 {
+            let labels = if i == 400 {
+                vec![lp("job", "missing_name")]
+            } else {
+                vec![
+                    lp("__name__", "sharded_metric"),
+                    lp("id", &format!("{i:04}")),
+                ]
+            };
+            rollback_ts.push(cortexpb::TimeSeries {
+                labels,
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: now,
+                    value: i as f64,
+                }],
+                ..Default::default()
+            });
+        }
+        let rollback_req = cortexpb::WriteRequest {
+            timeseries: rollback_ts,
+            ..Default::default()
+        };
+        let err = ing
+            .push_grpc_raw_sync(
+                "t-shard-rb",
+                &mimir_proto::prost::Message::encode_to_vec(&rollback_req),
+            )
+            .unwrap_err();
+        assert_eq!(err.error_cause(), cortexpb::ErrorCause::Unknown);
+        let m = mimir_tsdb::matcher::LabelMatcher::new(
+            mimir_tsdb::matcher::MatchType::Equal,
+            "__name__",
+            "sharded_metric",
+        )
+        .unwrap();
+        let committed = ing
+            .get_tsdb("t-shard-rb")
+            .unwrap()
+            .db
+            .chunk_querier(0, i64::MAX)
+            .select(false, &[m])
+            .unwrap();
+        assert!(committed.is_empty(), "all samples must be rolled back");
+
+        // 2. Large valid batch (600 series) succeeds & updates cached ingested_samples counter.
+        let mut ok_ts = Vec::with_capacity(600);
+        for i in 0..600 {
+            ok_ts.push(cortexpb::TimeSeries {
+                labels: vec![
+                    lp("__name__", "sharded_metric"),
+                    lp("id", &format!("{i:04}")),
+                ],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: now,
+                    value: i as f64,
+                }],
+                ..Default::default()
+            });
+        }
+        let ok_req = cortexpb::WriteRequest {
+            timeseries: ok_ts,
+            ..Default::default()
+        };
+        ing.push_grpc_raw_sync(
+            "t-shard-ok",
+            &mimir_proto::prost::Message::encode_to_vec(&ok_req),
+        )
+        .unwrap();
+        let db = ing.get_tsdb("t-shard-ok").unwrap();
+        assert_eq!(db.db.head().num_series(), 600);
+        assert_eq!(
+            db.ingested_samples_counter(&ing.metrics.ingested_samples)
+                .get(),
+            600.0
+        );
+
+        // 3. Soft errors across multiple series pick the earliest series' error & sum rejected_samples.
+        let mut soft_ts = Vec::with_capacity(400);
+        for i in 0..400 {
+            let (ts_labels, ts_ms) = if i == 12 {
+                // First soft error: unsorted labels
+                (
+                    vec![lp("z", "1"), lp("__name__", "sharded_metric")],
+                    now + 1000,
+                )
+            } else if i == 300 {
+                // Later soft error: sample too far in future
+                (
+                    vec![
+                        lp("__name__", "sharded_metric"),
+                        lp("id", &format!("{i:04}")),
+                    ],
+                    now + 10_000_000,
+                )
+            } else {
+                (
+                    vec![
+                        lp("__name__", "sharded_metric"),
+                        lp("id", &format!("{i:04}")),
+                    ],
+                    now + 1000,
+                )
+            };
+            soft_ts.push(cortexpb::TimeSeries {
+                labels: ts_labels,
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: ts_ms,
+                    value: i as f64,
+                }],
+                ..Default::default()
+            });
+        }
+        let soft_req = cortexpb::WriteRequest {
+            timeseries: soft_ts,
+            ..Default::default()
+        };
+        let soft_err = ing
+            .push_grpc_raw_sync(
+                "t-shard-ok",
+                &mimir_proto::prost::Message::encode_to_vec(&soft_req),
+            )
+            .unwrap_err();
+        assert_eq!(soft_err.rejected_samples(), 2);
+        assert!(
+            format!("{soft_err:?}").contains("LabelsNotSorted"),
+            "expected earliest soft error LabelsNotSorted, got: {soft_err:?}"
+        );
+        assert_eq!(
+            db.ingested_samples_counter(&ing.metrics.ingested_samples)
+                .get(),
+            998.0
+        );
+        assert_eq!(
+            db.ingested_samples_fail_counter(&ing.metrics.ingested_samples_fail)
+                .get(),
+            2.0
+        );
     }
 }

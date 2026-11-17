@@ -332,9 +332,22 @@ pub struct UserTsdb {
 
     /// `userTSDB.plannerProvider`: set when index lookup planning is enabled.
     planner_provider: std::sync::OnceLock<Arc<PlannerProvider>>,
+    ingested_samples_counter: std::sync::OnceLock<prometheus::Counter>,
+    ingested_samples_fail_counter: std::sync::OnceLock<prometheus::Counter>,
 }
 
 impl UserTsdb {
+    #[inline]
+    pub fn ingested_samples_counter(&self, vec: &CounterVec) -> &prometheus::Counter {
+        self.ingested_samples_counter
+            .get_or_init(|| vec.with_label_values(&[&self.user_id]))
+    }
+
+    #[inline]
+    pub fn ingested_samples_fail_counter(&self, vec: &CounterVec) -> &prometheus::Counter {
+        self.ingested_samples_fail_counter
+            .get_or_init(|| vec.with_label_values(&[&self.user_id]))
+    }
     /// Enables index lookup planning for this tenant (`newPlannerProvider(plannerFactory)`).
     pub fn set_planner_provider(&self, provider: Arc<PlannerProvider>) {
         let _ = self.planner_provider.set(provider);
@@ -662,6 +675,8 @@ impl UserTsdb {
             ),
             lifecycle_adapter,
             planner_provider: std::sync::OnceLock::new(),
+            ingested_samples_counter: std::sync::OnceLock::new(),
+            ingested_samples_fail_counter: std::sync::OnceLock::new(),
         });
         user_db_ready.store(true, Ordering::Release);
 

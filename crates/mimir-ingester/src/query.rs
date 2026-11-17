@@ -8,7 +8,7 @@
 //! - github.com/grafana/mimir/pkg/ingester/stats.go
 //! - github.com/grafana/mimir/pkg/querier/api/consistency.go
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1752,32 +1752,59 @@ impl Ingester {
         for lm_set in &req.matchers_set {
             matchers_set.push(from_proto_matchers(&lm_set.matchers)?);
         }
-
-        let cq = db
-            .db
-            .chunk_querier(req.start_timestamp_ms, req.end_timestamp_ms);
-        let mut merged_labels: BTreeSet<Labels> = BTreeSet::new();
-        for matchers in &matchers_set {
-            let series = cq
-                .select_raw_labels(true, matchers)
-                .map_err(|e| IngesterError::Internal {
-                    message: e.to_string(),
-                })?;
-            merged_labels.extend(series);
-        }
+        let start_ts = req.start_timestamp_ms;
+        let end_ts = req.end_timestamp_ms;
         let limit = if req.limit > 0 {
             req.limit as usize
         } else {
             usize::MAX
         };
-        let metric: Vec<cortexpb::Metric> = merged_labels
-            .into_iter()
-            .take(limit)
-            .map(|lbls| cortexpb::Metric {
-                labels: labels_to_proto_pairs(&lbls),
-            })
-            .collect();
-        Ok(ingesterpb::MetricsForLabelMatchersResponse { metric })
+
+        tokio::task::spawn_blocking(move || {
+            let cq = db.db.chunk_querier(start_ts, end_ts);
+            let sorted_labels: Vec<Labels> = if matchers_set.is_empty() {
+                Vec::new()
+            } else if matchers_set.len() == 1 {
+                let mut series =
+                    cq.select_raw_labels(true, &matchers_set[0])
+                        .map_err(|e| IngesterError::Internal {
+                            message: e.to_string(),
+                        })?;
+                if series.len() > limit {
+                    series.truncate(limit);
+                }
+                series
+            } else {
+                let mut dedup = hashbrown::HashSet::<Labels>::new();
+                for matchers in &matchers_set {
+                    let series = cq
+                        .select_raw_labels(false, matchers)
+                        .map_err(|e| IngesterError::Internal {
+                            message: e.to_string(),
+                        })?;
+                    dedup.extend(series);
+                }
+                let mut merged: Vec<Labels> = dedup.into_iter().collect();
+                if limit < merged.len() {
+                    merged.select_nth_unstable(limit);
+                    merged.truncate(limit);
+                }
+                merged.sort_unstable();
+                merged
+            };
+
+            let metric: Vec<cortexpb::Metric> = sorted_labels
+                .into_iter()
+                .map(|lbls| cortexpb::Metric {
+                    labels: labels_to_proto_pairs(&lbls),
+                })
+                .collect();
+            Ok(ingesterpb::MetricsForLabelMatchersResponse { metric })
+        })
+        .await
+        .map_err(|e| IngesterError::Internal {
+            message: format!("metrics_for_label_matchers task join error: {e}"),
+        })?
     }
 
     pub async fn handle_metrics_metadata(
@@ -1996,16 +2023,13 @@ impl Ingester {
                         let head = db.db.head();
                         if matchers.is_empty() {
                             if active_only {
-                                let buckets = head.visit_postings_for_label_value(
+                                Ok(head.visit_postings_for_label_value(
                                     &lbl_name,
                                     val,
-                                    crate::active_series::ActiveSeries::bucket_refs_by_stripe,
-                                );
-                                Ok(if buckets.is_empty() {
-                                    0
-                                } else {
-                                    db.active_series.count_active_in_buckets(&buckets)
-                                })
+                                    |small, large| {
+                                        db.active_series.count_active_in_slices(small, large)
+                                    },
+                                ))
                             } else {
                                 Ok(head.postings_length(&lbl_name, val) as u64)
                             }
@@ -2118,7 +2142,7 @@ impl Ingester {
         let is_native_histogram = req.r#type
             == ingesterpb::active_series_request::RequestType::NativeHistogramSeries as i32;
 
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             let head = db.db.head();
             let refs = if matchers.is_empty() {
                 Ok(Vec::new())
@@ -2131,7 +2155,7 @@ impl Ingester {
             let refs = match refs {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(e.map_read_error_to_status())).await;
+                    let _ = tx.blocking_send(Err(e.map_read_error_to_status()));
                     permit.finish(false);
                     return;
                 }
@@ -2168,7 +2192,7 @@ impl Ingester {
                 let m_size = m.encoded_len() + if is_native_histogram { 8 } else { 0 };
                 if current_size + m_size > ACTIVE_SERIES_MAX_SIZE_BYTES && !resp.metric.is_empty()
                 {
-                    if tx.send(Ok(std::mem::take(&mut resp))).await.is_err() {
+                    if tx.blocking_send(Ok(std::mem::take(&mut resp))).is_err() {
                         permit.finish(false);
                         return;
                     }
@@ -2181,7 +2205,7 @@ impl Ingester {
                 current_size += m_size;
             }
             if !resp.metric.is_empty() {
-                let _ = tx.send(Ok(resp)).await;
+                let _ = tx.blocking_send(Ok(resp));
             }
             permit.finish(false);
         });
@@ -2219,60 +2243,67 @@ impl Ingester {
             })?;
         let is_native_histogram = req.r#type
             == ingesterpb::active_series_request::RequestType::NativeHistogramSeries as i32;
-        let head = db.db.head();
-        let refs = if matchers.is_empty() {
-            Vec::new()
-        } else {
-            head.postings_for_matchers(&matchers)
-                .map_err(|e| IngesterError::Internal {
-                    message: e.to_string(),
-                })?
-        };
+        tokio::task::spawn_blocking(move || {
+            let head = db.db.head();
+            let refs = if matchers.is_empty() {
+                Vec::new()
+            } else {
+                head.postings_for_matchers(&matchers)
+                    .map_err(|e| IngesterError::Internal {
+                        message: e.to_string(),
+                    })?
+            };
 
-        let mut batches = Vec::new();
-        let mut resp = ingesterpb::ActiveSeriesResponse::default();
-        let mut current_size = 0usize;
+            let mut batches = Vec::new();
+            let mut resp = ingesterpb::ActiveSeriesResponse::default();
+            let mut current_size = 0usize;
 
-        for ref_id in refs {
-            let bucket_count = if is_native_histogram {
-                let Some(bc) = db.active_series.native_histogram_buckets(ref_id) else {
+            for ref_id in refs {
+                let bucket_count = if is_native_histogram {
+                    let Some(bc) = db.active_series.native_histogram_buckets(ref_id) else {
+                        continue;
+                    };
+                    Some(bc)
+                } else {
+                    if !db.active_series.contains_ref(ref_id) {
+                        continue;
+                    }
+                    None
+                };
+
+                let Some(lbls) = head.series_labels(ref_id) else {
                     continue;
                 };
-                Some(bc)
-            } else {
-                if !db.active_series.contains_ref(ref_id) {
-                    continue;
+                if let Some((shard_idx, shard_count)) = shard {
+                    if labels_stable_hash(&lbls) % shard_count != shard_idx {
+                        continue;
+                    }
                 }
-                None
-            };
 
-            let Some(lbls) = head.series_labels(ref_id) else {
-                continue;
-            };
-            if let Some((shard_idx, shard_count)) = shard {
-                if labels_stable_hash(&lbls) % shard_count != shard_idx {
-                    continue;
+                let m = cortexpb::Metric {
+                    labels: labels_to_proto_pairs(&lbls),
+                };
+                let m_size = m.encoded_len() + if is_native_histogram { 8 } else { 0 };
+                if current_size + m_size > ACTIVE_SERIES_MAX_SIZE_BYTES && !resp.metric.is_empty()
+                {
+                    batches.push(std::mem::take(&mut resp));
+                    current_size = 0;
                 }
+                resp.metric.push(m);
+                if let Some(bc) = bucket_count {
+                    resp.bucket_count.push(bc);
+                }
+                current_size += m_size;
             }
-
-            let m = cortexpb::Metric {
-                labels: labels_to_proto_pairs(&lbls),
-            };
-            let m_size = m.encoded_len() + if is_native_histogram { 8 } else { 0 };
-            if current_size + m_size > ACTIVE_SERIES_MAX_SIZE_BYTES && !resp.metric.is_empty() {
-                batches.push(std::mem::take(&mut resp));
-                current_size = 0;
+            if !resp.metric.is_empty() {
+                batches.push(resp);
             }
-            resp.metric.push(m);
-            if let Some(bc) = bucket_count {
-                resp.bucket_count.push(bc);
-            }
-            current_size += m_size;
-        }
-        if !resp.metric.is_empty() {
-            batches.push(resp);
-        }
-        Ok(batches)
+            Ok(batches)
+        })
+        .await
+        .map_err(|e| IngesterError::Internal {
+            message: format!("active_series task join error: {e}"),
+        })?
     }
 
     /// `org_id` is the request's org ID; as in Go the search request is validated before the
@@ -3452,5 +3483,133 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(lvc_err.to_string(), "unknown count method \"99\"");
+    }
+
+    #[tokio::test]
+    async fn metrics_for_label_matchers_dedups_sorts_and_respects_limit() {
+        use tokio_stream::StreamExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-0".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let req = cortexpb::WriteRequest {
+            timeseries: vec![
+                cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_strs("__name__", "m_b"),
+                        cortexpb::LabelPair::from_strs("env", "prod"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: 1_000,
+                        value: 1.0,
+                    }],
+                    ..Default::default()
+                },
+                cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_strs("__name__", "m_a"),
+                        cortexpb::LabelPair::from_strs("env", "prod"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: 1_000,
+                        value: 2.0,
+                    }],
+                    ..Default::default()
+                },
+                cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_strs("__name__", "m_c"),
+                        cortexpb::LabelPair::from_strs("env", "dev"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: 1_000,
+                        value: 3.0,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        ing.push_to_storage("u-mflm", &req).unwrap();
+
+        let md = MetadataMap::new();
+        let mflm = ing
+            .handle_metrics_for_label_matchers(
+                &md,
+                "u-mflm",
+                ingesterpb::MetricsForLabelMatchersRequest {
+                    start_timestamp_ms: 0,
+                    end_timestamp_ms: 2_000,
+                    matchers_set: vec![
+                        ingesterpb::LabelMatchers {
+                            matchers: vec![ingesterpb::LabelMatcher {
+                                r#type: ingesterpb::MatchType::Equal as i32,
+                                name: "env".into(),
+                                value: "prod".into(),
+                            }],
+                        },
+                        ingesterpb::LabelMatchers {
+                            matchers: vec![ingesterpb::LabelMatcher {
+                                r#type: ingesterpb::MatchType::RegexMatch as i32,
+                                name: "__name__".into(),
+                                value: "m_[ab]".into(),
+                            }],
+                        },
+                    ],
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        let names: Vec<String> = mflm
+            .metric
+            .iter()
+            .map(|m| {
+                m.labels
+                    .iter()
+                    .find(|l| l.name.as_ref() == b"__name__")
+                    .map(|l| String::from_utf8_lossy(&l.value).into_owned())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(names, vec!["m_a", "m_b"]);
+
+        let mut rx = ing
+            .handle_active_series_rx(
+                &md,
+                "u-mflm",
+                ingesterpb::ActiveSeriesRequest {
+                    matchers: vec![ingesterpb::LabelMatcher {
+                        r#type: ingesterpb::MatchType::Equal as i32,
+                        name: "env".into(),
+                        value: "prod".into(),
+                    }],
+                    r#type: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let mut active_count = 0usize;
+        while let Some(resp) = rx.next().await {
+            active_count += resp.unwrap().metric.len();
+        }
+        assert_eq!(active_count, 2);
     }
 }
