@@ -1707,6 +1707,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "ulid",
+ "uuid",
  "zstd",
 ]
 
