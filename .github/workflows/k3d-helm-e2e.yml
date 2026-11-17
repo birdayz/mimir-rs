@@ -56,7 +56,7 @@ jobs:
           compression-level: 0
 
   e2e:
-    name: k3d e2e (MODE=${{ matrix.mode }})
+    name: k3d e2e (MODE=${{ matrix.mode }}, KV=${{ matrix.kv_mode }})
     needs: image
     runs-on: ubuntu-24.04
     # Cluster bring-up ~5-10 min, checks + rolling restart ~15-20 min on a 4-vCPU runner.
@@ -64,10 +64,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [mixed, rust]
+        include:
+          - mode: mixed
+            kv_mode: memberlist
+          - mode: rust
+            kv_mode: memberlist
+          - mode: rust
+            kv_mode: etcd
     env:
       MODE: ${{ matrix.mode }}
-      CLUSTER: mimir-e2e-${{ matrix.mode }}
+      KV_MODE: ${{ matrix.kv_mode }}
+      CLUSTER: mimir-e2e-${{ matrix.mode }}-${{ matrix.kv_mode }}
       # Slower 4-vCPU runners: allow more time for all pods to become Ready.
       READY_TIMEOUT: "1200"
     steps:
@@ -108,7 +115,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: k3d-e2e-${{ matrix.mode }}-runs
+          name: k3d-e2e-${{ matrix.mode }}-${{ matrix.kv_mode }}-runs
           path: target/k3d-e2e/runs/**
           retention-days: 14
           if-no-files-found: ignore

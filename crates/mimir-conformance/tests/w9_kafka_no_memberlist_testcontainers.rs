@@ -208,6 +208,14 @@ impl Etcd {
             .and_then(|kv| kv["value"].as_str())
             .map(str::to_string))
     }
+
+    async fn pause(&self) -> Result<()> {
+        self._container.pause().await.context("pause etcd")
+    }
+
+    async fn unpause(&self) -> Result<()> {
+        self._container.unpause().await.context("unpause etcd")
+    }
 }
 
 struct Consul {
@@ -249,6 +257,13 @@ impl Consul {
             return Ok(Vec::new());
         }
         Ok(resp.json().await?)
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self._container
+            .stop_with_timeout(Some(2))
+            .await
+            .context("stop consul")
     }
 }
 
@@ -1819,3 +1834,654 @@ activity_tracker:
         assert!(!fams.iter().any(|f| f.starts_with("memberlist")));
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Test 4: Hardcore Chaos (Helm Flag Landmines + Live multi KV Migration + SIGKILL + etcd Outage)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn w9_04_hardcore_chaos_sigkill_etcd_outage_live_kv_migration_and_helm_flags() {
+    if skip_docker("w9_04_hardcore_chaos_sigkill_etcd_outage_live_kv_migration_and_helm_flags") {
+        return;
+    }
+
+    block_on_for_tests(async {
+        let (rp, consul, etcd) =
+            tokio::try_join!(Redpanda::start(), Consul::start(), Etcd::start())
+                .expect("start Redpanda + Consul + etcd");
+        let tmp = tempfile::tempdir().unwrap();
+        let client = http_client();
+
+        // -------------------------------------------------------------------------------------
+        // Subcase A: Helm flag landmine check
+        //   Pass `-memberlist.abort-if-fast-join-fails=true` + `-memberlist.abort-if-join-fails=true`
+        //   AND `memberlist.join_members: ["dns+unresolvable-gossip-ring.invalid:7946"]`
+        //   while `kvstore.store: etcd` (Go & Rust) and `kvstore.store: multi` (Rust).
+        // -------------------------------------------------------------------------------------
+        let helm_cli = vec![
+            "-memberlist.abort-if-fast-join-fails=true".to_string(),
+            "-memberlist.abort-if-join-fails=true".to_string(),
+        ];
+        for which in [Impl::Go, Impl::Rust] {
+            let dir = tmp.path().join(format!("helm-landmine-{}", which.name()));
+            fs::create_dir_all(dir.join("tsdb")).unwrap();
+            fs::create_dir_all(dir.join("bucket")).unwrap();
+            let http = free_test_port();
+            let grpc = free_test_port();
+            let mut yaml = ingester_etcd_yaml(
+                &dir,
+                http,
+                grpc,
+                &rp.address(),
+                &format!("w9-t4-helm-{}", which.name()),
+                &etcd.endpoint(),
+                "ingester-zone-a-0",
+                "zone-a",
+                &format!("helm-{}-ring/", which.name()),
+                &format!("helm-{}-part/", which.name()),
+                None,
+            );
+            yaml.push_str(
+                "memberlist:\n  join_members:\n    - dns+unresolvable-gossip-ring.invalid:7946\n",
+            );
+            let mut proc = start_mimir(which, "helm-landmine", &dir, &yaml, &helm_cli);
+            wait_ready(&client, &mut proc, http, Duration::from_secs(45)).await;
+            assert_no_memberlist_port_bound(&proc, &[http, grpc]);
+            let (code, _, body) = http_get(&client, http, "/memberlist", false).await.unwrap();
+            assert_eq!(code, 200);
+            assert_eq!(body, "This instance doesn't use memberlist.");
+            proc.sigterm();
+            let _ = proc.wait_exit(Duration::from_secs(10));
+        }
+
+        // -------------------------------------------------------------------------------------
+        // Subcase B: Live Zero-Downtime `multi` KV Migration (consul -> etcd) under Kafka Load
+        // -------------------------------------------------------------------------------------
+        let mig_dir = tmp.path().join("mig");
+        fs::create_dir_all(&mig_dir).unwrap();
+        let runtime_path = mig_dir.join("runtime.yaml");
+        fs::write(
+            &runtime_path,
+            "multi_kv_config:\n  primary: consul\n  mirror_enabled: true\n",
+        )
+        .unwrap();
+
+        let mig_topic = "w9-t4-mig";
+        let mig_ring_prefix = "mig-ring/";
+        let mig_part_prefix = "mig-part/";
+        let mig_dist_prefix = "mig-dist/";
+        let multi_kv_snippet = format!(
+            "      store: multi\n      consul:\n        host: {chost}\n      etcd:\n        endpoints: [{ehost}]\n      multi:\n        primary: consul\n        secondary: etcd\n        mirror_enabled: true",
+            chost = consul.host(),
+            ehost = etcd.endpoint(),
+        );
+
+        let (m_ing_http, m_ing_grpc) = (free_test_port(), free_test_port());
+        let m_ing_dir = mig_dir.join("rust-ing");
+        fs::create_dir_all(m_ing_dir.join("tsdb")).unwrap();
+        fs::create_dir_all(m_ing_dir.join("bucket")).unwrap();
+        let m_ing_yaml = format!(
+            r#"target: ingester
+multitenancy_enabled: true
+server:
+  http_listen_address: 127.0.0.1
+  http_listen_port: {m_ing_http}
+  grpc_listen_address: 127.0.0.1
+  grpc_listen_port: {m_ing_grpc}
+  log_level: warn
+usage_stats:
+  enabled: false
+runtime_config:
+  file: {rt}
+  period: 200ms
+memberlist:
+  join_members:
+    - dns+unresolvable-gossip-ring.invalid:7946
+ingest_storage:
+  enabled: true
+  kafka:
+    address: {kafka}
+    topic: {mig_topic}
+    auto_create_topic_enabled: true
+    auto_create_topic_default_partitions: 1
+    last_produced_offset_poll_interval: 100ms
+    consumer_group_offset_commit_interval: 500ms
+ingester:
+  push_grpc_method_enabled: false
+  ring:
+    kvstore:
+      prefix: {mig_ring_prefix}
+{multi_kv_snippet}
+    num_tokens: 0
+    instance_id: ingester-zone-b-0
+    instance_addr: 127.0.0.1
+    instance_availability_zone: zone-b
+    replication_factor: 1
+    min_ready_duration: 0s
+    final_sleep: 0s
+    heartbeat_period: 1s
+    heartbeat_timeout: 30s
+  partition_ring:
+    kvstore:
+      prefix: {mig_part_prefix}
+{multi_kv_snippet}
+    min_partition_owners_count: 1
+    min_partition_owners_duration: 0s
+blocks_storage:
+  backend: filesystem
+  filesystem:
+    dir: {bucket}
+  tsdb:
+    dir: {tsdb}
+activity_tracker:
+  filepath: ""
+"#,
+            rt = runtime_path.display(),
+            kafka = rp.address(),
+            bucket = m_ing_dir.join("bucket").display(),
+            tsdb = m_ing_dir.join("tsdb").display(),
+        );
+        let mut m_ing = start_mimir(Impl::Rust, "mig-ing", &m_ing_dir, &m_ing_yaml, &helm_cli);
+
+        let (m_dist_http, m_dist_grpc) = (free_test_port(), free_test_port());
+        let mut m_dist_yaml = distributor_yaml(
+            m_dist_http,
+            m_dist_grpc,
+            &rp.address(),
+            mig_topic,
+            &multi_kv_snippet,
+            mig_ring_prefix,
+            mig_part_prefix,
+        );
+        // Point distributor's own ring at mig-dist/ and attach runtime_config.
+        m_dist_yaml = m_dist_yaml.replacen(
+            &format!("distributor:\n  ring:\n    kvstore:\n      prefix: {mig_ring_prefix}"),
+            &format!("distributor:\n  ring:\n    kvstore:\n      prefix: {mig_dist_prefix}"),
+            1,
+        );
+        m_dist_yaml.push_str(&format!(
+            "runtime_config:\n  file: {}\n  period: 200ms\n",
+            runtime_path.display()
+        ));
+        let mut m_dist =
+            start_mimir(Impl::Go, "mig-dist", &mig_dir.join("dist"), &m_dist_yaml, &[]);
+
+        let (m_q_http, m_q_grpc) = (free_test_port(), free_test_port());
+        let m_q_dir = mig_dir.join("querier");
+        fs::create_dir_all(m_q_dir.join("bucket")).unwrap();
+        fs::create_dir_all(m_q_dir.join("sync")).unwrap();
+        let mut m_q_yaml = querier_yaml(
+            &m_q_dir,
+            m_q_http,
+            m_q_grpc,
+            &rp.address(),
+            mig_topic,
+            &multi_kv_snippet,
+            mig_ring_prefix,
+            mig_part_prefix,
+            None,
+        );
+        m_q_yaml.push_str(&format!(
+            "runtime_config:\n  file: {}\n  period: 200ms\n",
+            runtime_path.display()
+        ));
+        let mut m_querier = start_mimir(Impl::Go, "mig-q", &m_q_dir, &m_q_yaml, &[]);
+
+        wait_ready(&client, &mut m_ing, m_ing_http, Duration::from_secs(45)).await;
+        wait_ready(&client, &mut m_dist, m_dist_http, Duration::from_secs(45)).await;
+        wait_ready(&client, &mut m_querier, m_q_http, Duration::from_secs(45)).await;
+        assert_no_memberlist_port_bound(&m_ing, &[m_ing_http, m_ing_grpc]);
+
+        // Wait for PartitionActive (2) on partition 0.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let pr = partition_ring_json(&client, m_q_http).await.unwrap();
+            if pr["partitions"][0]["state"] == 2
+                && pr["partitions"][0]["owner_ids"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x == "ingester-zone-b-0"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "mig partition 0 not active: {pr}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Push batch #1 while primary=consul, mirror_enabled=true.
+        let ts1 = now_ms() - 5_000;
+        push_via_distributor(
+            &client,
+            m_dist_http,
+            "tenant-mig",
+            cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_static("__name__", "w9_mig_before"),
+                        cortexpb::LabelPair::from_static("phase", "consul"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        value: 11.0,
+                        timestamp_ms: ts1,
+                    }],
+                    ..Default::default()
+                }],
+                source: cortexpb::write_request::SourceEnum::Api as i32,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let q1 = querier_get_json(
+            &client,
+            m_q_http,
+            "tenant-mig",
+            &format!("query?query=w9_mig_before&time={}", ts1 / 1000 + 2),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(q1["data"]["result"][0]["value"][1], "11");
+
+        // Ensure mirrored keys exist in etcd before switching off Consul.
+        assert!(
+            etcd.get_raw(&client, "mig-ring/ring").await.unwrap().is_some(),
+            "etcd missing mirrored mig-ring/ring before switchover"
+        );
+        assert!(
+            etcd.get_raw(&client, "mig-part/ingester-partitions")
+                .await
+                .unwrap()
+                .is_some(),
+            "etcd missing mirrored mig-part/ingester-partitions before switchover"
+        );
+
+        // Flip runtime_config atomically on disk: primary: etcd, mirror_enabled: false.
+        let runtime_tmp = mig_dir.join("runtime.yaml.tmp");
+        fs::write(
+            &runtime_tmp,
+            "multi_kv_config:\n  primary: etcd\n  mirror_enabled: false\n",
+        )
+        .unwrap();
+        fs::rename(&runtime_tmp, &runtime_path).unwrap();
+
+        // Wait for Rust Ingester metrics to confirm primary=etcd and mirror_enabled=0 on BOTH rings.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, _, metrics) = http_get(&client, m_ing_http, "/metrics", false).await.unwrap();
+            let has_etcd_ring = metrics.lines().any(|l| {
+                l.starts_with("cortex_multikv_primary_store{")
+                    && l.contains("kv_name=\"ingester-ring\"")
+                    && l.contains("store=\"etcd\"")
+                    && l.ends_with(" 1")
+            });
+            let has_etcd_part = metrics.lines().any(|l| {
+                l.starts_with("multikv_primary_store{")
+                    && l.contains("kv_name=\"ingester-partitions-watcher\"")
+                    && l.contains("store=\"etcd\"")
+                    && l.ends_with(" 1")
+            });
+            let mirror_off_ring = metrics.lines().any(|l| {
+                l.starts_with("cortex_multikv_mirror_enabled{")
+                    && l.contains("kv_name=\"ingester-ring\"")
+                    && l.ends_with(" 0")
+            });
+            if has_etcd_ring && has_etcd_part && mirror_off_ring {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "multi KV did not switch to primary=etcd, mirror=false via runtime_config"
+            );
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        // Let Go Distributor & Go Querier also finish their 200ms runtime_config reload + watch swap.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        // Kill Consul completely!
+        consul.stop().await.unwrap();
+
+        // Push batch #2 & query with Consul completely dead -> zero errors!
+        let ts2 = now_ms() - 1_000;
+        push_via_distributor(
+            &client,
+            m_dist_http,
+            "tenant-mig",
+            cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_static("__name__", "w9_mig_after_consul_down"),
+                        cortexpb::LabelPair::from_static("phase", "etcd"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        value: 22.0,
+                        timestamp_ms: ts2,
+                    }],
+                    ..Default::default()
+                }],
+                source: cortexpb::write_request::SourceEnum::Api as i32,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let q2 = querier_get_json(
+            &client,
+            m_q_http,
+            "tenant-mig",
+            &format!(
+                "query?query=w9_mig_after_consul_down&time={}",
+                ts2 / 1000 + 2
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(q2["data"]["result"][0]["value"][1], "22");
+
+        let ring_after_kill = ingester_ring(&client, m_ing_http).await.unwrap();
+        assert_eq!(
+            ring_after_kill.get("ingester-zone-b-0"),
+            Some(&("ACTIVE".to_string(), 0))
+        );
+        let pr_after_kill = partition_ring_json(&client, m_q_http).await.unwrap();
+        assert_eq!(pr_after_kill["partitions"][0]["state"], 2);
+
+        m_ing.sigterm();
+        m_dist.sigterm();
+        m_querier.sigterm();
+        let _ = m_ing.wait_exit(Duration::from_secs(10));
+        let _ = m_dist.wait_exit(Duration::from_secs(10));
+        let _ = m_querier.wait_exit(Duration::from_secs(10));
+
+        // -------------------------------------------------------------------------------------
+        // Subcase C: Hard SIGKILL + etcd Transient Outage Recovery
+        // -------------------------------------------------------------------------------------
+        let chaos_dir = tmp.path().join("chaos");
+        let chaos_ing_dir = chaos_dir.join("rust-ing");
+        fs::create_dir_all(chaos_ing_dir.join("tsdb")).unwrap();
+        fs::create_dir_all(chaos_ing_dir.join("bucket")).unwrap();
+        let chaos_topic = "w9-t4-chaos";
+        let chaos_ring_prefix = "chaos-ring/";
+        let chaos_part_prefix = "chaos-part/";
+        let etcd_kv_yaml = format!(
+            "      store: etcd\n      etcd:\n        endpoints: [{}]",
+            etcd.endpoint()
+        );
+
+        let (c_ing_http1, c_ing_grpc1) = (free_test_port(), free_test_port());
+        let chaos_ing_yaml1 = ingester_etcd_yaml(
+            &chaos_ing_dir,
+            c_ing_http1,
+            c_ing_grpc1,
+            &rp.address(),
+            chaos_topic,
+            &etcd.endpoint(),
+            "ingester-zone-b-0",
+            "zone-b",
+            chaos_ring_prefix,
+            chaos_part_prefix,
+            None,
+        );
+        let mut c_ing1 = start_mimir(
+            Impl::Rust,
+            "chaos-ing1",
+            &chaos_ing_dir,
+            &chaos_ing_yaml1,
+            &helm_cli,
+        );
+
+        let (c_dist_http, c_dist_grpc) = (free_test_port(), free_test_port());
+        let mut c_dist = start_mimir(
+            Impl::Go,
+            "chaos-dist",
+            &chaos_dir.join("dist"),
+            &distributor_yaml(
+                c_dist_http,
+                c_dist_grpc,
+                &rp.address(),
+                chaos_topic,
+                &etcd_kv_yaml,
+                chaos_ring_prefix,
+                chaos_part_prefix,
+            ),
+            &[],
+        );
+
+        let (c_q_http, c_q_grpc) = (free_test_port(), free_test_port());
+        let c_q_dir = chaos_dir.join("querier");
+        fs::create_dir_all(c_q_dir.join("bucket")).unwrap();
+        fs::create_dir_all(c_q_dir.join("sync")).unwrap();
+        let mut c_querier = start_mimir(
+            Impl::Go,
+            "chaos-q",
+            &c_q_dir,
+            &querier_yaml(
+                &c_q_dir,
+                c_q_http,
+                c_q_grpc,
+                &rp.address(),
+                chaos_topic,
+                &etcd_kv_yaml,
+                chaos_ring_prefix,
+                chaos_part_prefix,
+                None,
+            ),
+            &[],
+        );
+
+        wait_ready(&client, &mut c_ing1, c_ing_http1, Duration::from_secs(45)).await;
+        wait_ready(&client, &mut c_dist, c_dist_http, Duration::from_secs(45)).await;
+        wait_ready(&client, &mut c_querier, c_q_http, Duration::from_secs(45)).await;
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let pr = partition_ring_json(&client, c_q_http).await.unwrap();
+            if pr["partitions"][0]["state"] == 2
+                && pr["partitions"][0]["owner_ids"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x == "ingester-zone-b-0"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "chaos partition 0 not active: {pr}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Push series before SIGKILL.
+        let ts_pre = now_ms() - 4_000;
+        push_via_distributor(
+            &client,
+            c_dist_http,
+            "tenant-chaos",
+            cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_static("__name__", "w9_sigkill_before"),
+                        cortexpb::LabelPair::from_static("job", "chaos"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        value: 77.0,
+                        timestamp_ms: ts_pre,
+                    }],
+                    ..Default::default()
+                }],
+                source: cortexpb::write_request::SourceEnum::Api as i32,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let pre_q = querier_get_json(
+            &client,
+            c_q_http,
+            "tenant-chaos",
+            &format!("query?query=w9_sigkill_before&time={}", ts_pre / 1000 + 2),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pre_q["data"]["result"][0]["value"][1], "77");
+
+        // Allow local Kafka offset file + WAL segment write, then hard SIGKILL!
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        c_ing1.signal("KILL");
+        let kill_status = c_ing1
+            .wait_exit(Duration::from_secs(10))
+            .expect("ingester exits on SIGKILL");
+        assert!(!kill_status.success(), "expected non-zero SIGKILL exit");
+
+        // Verify WAL exists and no blocks were shipped in filesystem bucket.
+        assert!(
+            chaos_ing_dir.join("tsdb/tenant-chaos/wal").exists(),
+            "expected WAL dir after SIGKILL"
+        );
+
+        // Restart Rust ingester with the SAME tsdb.dir and config.
+        let (c_ing_http2, c_ing_grpc2) = (free_test_port(), free_test_port());
+        let chaos_ing_yaml2 = ingester_etcd_yaml(
+            &chaos_ing_dir,
+            c_ing_http2,
+            c_ing_grpc2,
+            &rp.address(),
+            chaos_topic,
+            &etcd.endpoint(),
+            "ingester-zone-b-0",
+            "zone-b",
+            chaos_ring_prefix,
+            chaos_part_prefix,
+            None,
+        );
+        let mut c_ing2 = start_mimir(
+            Impl::Rust,
+            "chaos-ing2",
+            &chaos_ing_dir,
+            &chaos_ing_yaml2,
+            &helm_cli,
+        );
+        wait_ready(&client, &mut c_ing2, c_ing_http2, Duration::from_secs(45)).await;
+        assert_no_memberlist_port_bound(&c_ing2, &[c_ing_http2, c_ing_grpc2]);
+
+        // Push post-SIGKILL series and verify BOTH pre and post data via Go Querier (strong read consistency).
+        let ts_post = now_ms() - 1_000;
+        push_via_distributor(
+            &client,
+            c_dist_http,
+            "tenant-chaos",
+            cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_static("__name__", "w9_sigkill_after"),
+                        cortexpb::LabelPair::from_static("job", "chaos"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        value: 88.0,
+                        timestamp_ms: ts_post,
+                    }],
+                    ..Default::default()
+                }],
+                source: cortexpb::write_request::SourceEnum::Api as i32,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let q_pre_after_restart = querier_get_json(
+            &client,
+            c_q_http,
+            "tenant-chaos",
+            &format!(
+                "query?query=w9_sigkill_before&time={}",
+                ts_post / 1000 + 2
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(q_pre_after_restart["data"]["result"][0]["value"][1], "77");
+
+        let q_post_after_restart = querier_get_json(
+            &client,
+            c_q_http,
+            "tenant-chaos",
+            &format!(
+                "query?query=w9_sigkill_after&time={}",
+                ts_post / 1000 + 2
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(q_post_after_restart["data"]["result"][0]["value"][1], "88");
+
+        // Transient etcd outage: pause etcd for 3s, unpause, verify lifecycler recovery + ACTIVE partition.
+        etcd.pause().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        etcd.unpause().await.unwrap();
+
+        // Wait for heartbeat/reconciliation recovery and confirm ACTIVE state in both rings.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let qr = ingester_ring(&client, c_q_http).await.unwrap_or_default();
+            let pr = partition_ring_json(&client, c_q_http).await;
+            if let Ok(pr) = pr {
+                if qr.get("ingester-zone-b-0") == Some(&("ACTIVE".to_string(), 0))
+                    && pr["partitions"][0]["state"] == 2
+                    && pr["partitions"][0]["owner_ids"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|x| x == "ingester-zone-b-0"))
+                {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ingester did not recover ACTIVE ring/partition state after etcd outage"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // Push & query one more metric after etcd outage recovery.
+        let ts_blip = now_ms();
+        push_via_distributor(
+            &client,
+            c_dist_http,
+            "tenant-chaos",
+            cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_static("__name__", "w9_after_etcd_blip"),
+                        cortexpb::LabelPair::from_static("job", "chaos"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        value: 99.0,
+                        timestamp_ms: ts_blip,
+                    }],
+                    ..Default::default()
+                }],
+                source: cortexpb::write_request::SourceEnum::Api as i32,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let q_blip = querier_get_json(
+            &client,
+            c_q_http,
+            "tenant-chaos",
+            &format!(
+                "query?query=w9_after_etcd_blip&time={}",
+                ts_blip / 1000 + 2
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(q_blip["data"]["result"][0]["value"][1], "99");
+    });
+}
+

@@ -215,8 +215,6 @@ if [[ $KV_MODE == etcd ]]; then
   cat >"$WORK/values-etcd.yaml" <<EOF
 mimir:
   structuredConfig:
-    memberlist:
-      join_members: []
     ingester:
       push_grpc_method_enabled: false
       ring:
@@ -233,6 +231,11 @@ mimir:
             endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
     distributor:
       ring:
+        kvstore:
+          store: etcd
+          etcd:
+            endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
+      ha_tracker:
         kvstore:
           store: etcd
           etcd:
@@ -256,12 +259,11 @@ mimir:
           etcd:
             endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
     query_scheduler:
-      service_discovery:
-        scheduler_ring:
-          kvstore:
-            store: etcd
-            etcd:
-              endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
+      ring:
+        kvstore:
+          store: etcd
+          etcd:
+            endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
 EOF
   HELM_ARGS+=(-f "$WORK/values-etcd.yaml")
 fi
@@ -535,20 +537,34 @@ check_memberlist() {
 }
 if [[ $KV_MODE == etcd ]]; then
   check_no_memberlist() {
-    local label=$1 pods p ip ml bad=0
+    local label=$1 pods p ip ml tb_pod rc m bad=0
     pods=$(kc get pods -l app.kubernetes.io/name=mimir --field-selector=status.phase=Running -o json | jq -r '.items[]
       | select([.spec.containers[] | select(.image | test("mimir")) | .ports[]? | select(.name == "http-metrics")] | length > 0)
       | [.metadata.name, .status.podIP] | @tsv' | sort)
+    tb_pod=$(kc get pods -l app=e2e-toolbox --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
     while IFS=$'\t' read -r p ip; do
       [[ -z $p ]] && continue
       ml=$(incurl "http://$ip:8080/memberlist" 2>&1) || true
       echo "$ml" >"$OUT_DIR/memberlist-$label-$p.txt"
-      if [[ $ml == "This instance doesn't use memberlist." ]]; then
-        echo "OK $p /memberlist disabled"
-      else
+      if [[ $ml != "This instance doesn't use memberlist." ]]; then
         echo "BAD $p /memberlist returned: $(head -c 200 <<<"$ml")"
         bad=1
+        continue
       fi
+      rc=0
+      kc exec "$tb_pod" -c curl -- curl -sS --connect-timeout 2 "http://$ip:7946/" >/dev/null 2>&1 || rc=$?
+      if ((rc != 7)); then
+        echo "BAD $p port 7946 probe returned curl exit=$rc (want 7 connection refused)"
+        bad=1
+        continue
+      fi
+      m=$(incurl "http://$ip:8080/metrics" 2>/dev/null | grep -E '^(cortex_)?memberlist_' || true)
+      if [[ -n $m ]]; then
+        echo "BAD $p exposes memberlist metrics: $(head -n 3 <<<"$m")"
+        bad=1
+        continue
+      fi
+      echo "OK $p /memberlist disabled, port 7946 closed, zero memberlist metrics"
     done <<<"$pods"
     return $bad
   }
