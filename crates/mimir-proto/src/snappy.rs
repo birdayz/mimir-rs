@@ -308,7 +308,8 @@ mod tests {
     #[test]
     fn test_snappy_framed_large_multi_chunk() {
         // Larger than 64 KiB max block size to force multiple framing chunks
-        let input: Vec<u8> = (0..150_000).map(|i| (i % 251) as u8).collect();
+        let len = if cfg!(miri) { 70_000 } else { 150_000 };
+        let input: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         let compressed = compress_framed(&input).expect("compress large");
         let decompressed = decompress_framed(&compressed).expect("decompress large");
         assert_eq!(decompressed, input);
@@ -328,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_snappy_framed_bounded_zip_bomb_rejected() {
-        let big = vec![b'z'; 256 * 1024];
+        let big = vec![b'z'; if cfg!(miri) { 68 * 1024 } else { 256 * 1024 }];
         let compressed = compress_framed(&big).expect("compress");
         // Snappy framed compresses 256 KiB of identical bytes down to a tiny payload.
         assert!(compressed.len() < 16 * 1024);
@@ -355,7 +356,7 @@ mod tests {
     fn test_snappy_framed_incompressible_padding_skippable_and_errors() {
         // High-entropy > 150 KiB payload forces FrameEncoder to emit uncompressed (0x01) + multiple chunks.
         let mut state: u64 = 0x1234_5678_9abc_def0;
-        let mut input = vec![0u8; 160_000];
+        let mut input = vec![0u8; if cfg!(miri) { 68_000 } else { 160_000 }];
         for b in &mut input {
             state ^= state << 13;
             state ^= state >> 7;

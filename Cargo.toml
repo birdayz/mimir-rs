@@ -64,7 +64,6 @@ object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
 tikv-jemallocator = "0.6"
 criterion = "0.5"
 tempfile = "3"
-proptest = "1"
 base64 = "0.22"
 hex = "0.4"
 md-5 = "0.10"
@@ -72,7 +71,6 @@ async-trait = "0.1"
 quick-xml = "0.37"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rmp = "0.8"
-rmp-serde = "1"
 hickory-resolver = { version = "0.25", default-features = false, features = ["system-config", "tokio"] }
 kafka-protocol = "0.14"
 testcontainers = { version = "0.28", default-features = false }

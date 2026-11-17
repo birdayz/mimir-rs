@@ -2825,7 +2825,8 @@ mod tests {
         let mut syms = SymbolTable::new();
         let p = MemPostings::new_unordered();
         let big = (u32::MAX as u64) + 77;
-        for i in 1..=200u64 {
+        let n = if cfg!(miri) { 40u64 } else { 200u64 };
+        for i in 1..=n {
             let lbls = SymbolLabels::from_pairs(
                 &mut syms,
                 [
@@ -2849,8 +2850,8 @@ mod tests {
             visited.insert(val.to_string(), (small.to_vec(), large.to_vec()));
         });
         assert_eq!(visited.len(), 3);
-        assert_eq!(visited["prod"].0.len(), 50);
-        assert_eq!(visited["dev"].0.len(), 150);
+        assert_eq!(visited["prod"].0.len(), (n / 4) as usize);
+        assert_eq!(visited["dev"].0.len(), (n - n / 4) as usize);
         assert!(visited["staging"].0.is_empty());
         assert_eq!(visited["staging"].1, vec![big]);
 
@@ -2873,14 +2874,18 @@ mod tests {
         assert_eq!(intersect_sorted_u32_u64_count(&[1, 5, 9], &[2, 5, 9, 10]), 2);
 
         // Large eligible vs tiny small (exercises small*16 < eligible branch)
-        let huge_elig: Vec<u64> = (1..=5000).collect();
-        assert_eq!(intersect_sorted_u32_u64_count(&[10, 500, 4999, 6000], &huge_elig), 3);
-        assert!(intersect_sorted_u32_u64_any(&[4999], &huge_elig));
+        let huge_len = if cfg!(miri) { 400u64 } else { 5000u64 };
+        let huge_elig: Vec<u64> = (1..=huge_len).collect();
+        assert_eq!(
+            intersect_sorted_u32_u64_count(&[10, 100, (huge_len - 1) as u32, (huge_len + 1000) as u32], &huge_elig),
+            3
+        );
+        assert!(intersect_sorted_u32_u64_any(&[(huge_len - 1) as u32], &huge_elig));
         // Tiny eligible vs large small (exercises eligible*16 < small branch)
-        let huge_small: Vec<u32> = (1..=5000).collect();
-        assert_eq!(intersect_sorted_u32_u64_count(&huge_small, &[42, 4999, 9999]), 2);
-        assert!(intersect_sorted_u32_u64_any(&huge_small, &[4999, 9999]));
-        assert!(!intersect_sorted_u32_u64_any(&huge_small, &[6000, 7000]));
+        let huge_small: Vec<u32> = (1..=huge_len as u32).collect();
+        assert_eq!(intersect_sorted_u32_u64_count(&huge_small, &[42, huge_len - 1, huge_len + 4999]), 2);
+        assert!(intersect_sorted_u32_u64_any(&huge_small, &[huge_len - 1, huge_len + 4999]));
+        assert!(!intersect_sorted_u32_u64_any(&huge_small, &[huge_len + 1000, huge_len + 2000]));
     }
 
     #[test]
@@ -2890,7 +2895,8 @@ mod tests {
         let big1 = (u32::MAX as u64) + 10;
         let big2 = (u32::MAX as u64) + 20;
 
-        for i in 1..=600u64 {
+        let n = if cfg!(miri) { 60u64 } else { 600u64 };
+        for i in 1..=n {
             let mut pairs = vec![
                 ("__name__", if i % 5 == 0 { "err_total" } else { "req_total" }),
                 ("job", if i % 3 == 0 { "db" } else if i % 3 == 1 { "api" } else { "web" }),
@@ -2977,12 +2983,14 @@ mod tests {
         let p = MemPostings::new_unordered();
         let pool = mimir_common::thread_pool::ScopedWorkerPool::new("miri-postings", 2);
 
-        // 4 batches * 80 series = 320 >= 256 to exercise the parallel MutScratchPtr path.
+        // 4 batches * 80 series = 320 (or 4 * 64 = 256 under Miri) >= 256 to exercise the parallel MutScratchPtr path.
+        let per_batch = if cfg!(miri) { 64usize } else { 80usize };
+        let total = 4 * per_batch;
         let mut batches: Vec<Vec<(u64, SymbolLabels)>> = Vec::with_capacity(4);
         for b in 0..4usize {
-            let mut batch = Vec::with_capacity(80);
-            for i in 0..80usize {
-                let ref_id = (b * 80 + i + 1) as u64;
+            let mut batch = Vec::with_capacity(per_batch);
+            for i in 0..per_batch {
+                let ref_id = (b * per_batch + i + 1) as u64;
                 let shard = format!("s-{}", i % 16);
                 let lbls = SymbolLabels::from_pairs(
                     &mut syms,
@@ -3000,9 +3008,9 @@ mod tests {
         p.add_batches_unordered_parallel(&batches, &pool);
         p.ensure_order();
 
-        assert_eq!(p.all_postings().len(), 320);
+        assert_eq!(p.all_postings().len(), total);
         let nid = syms.get("__name__").unwrap();
         let vid = syms.get("parallel_req_total").unwrap();
-        assert_eq!(p.postings_len(nid, vid), 320);
+        assert_eq!(p.postings_len(nid, vid), total);
     }
 }

@@ -4106,7 +4106,8 @@ mod tests {
             (state & 0xff) as u8
         };
 
-        for iter in 0..1000usize {
+        let iters = if cfg!(miri) { 16 } else { 1000 };
+        for iter in 0..iters {
             let len = (iter % 97) + 1;
             let mut buf = Vec::with_capacity(len);
             for _ in 0..len {
@@ -4551,7 +4552,8 @@ mod tests {
             (state & 0xff) as u8
         };
         let mut ref_scratch = WriteRequestScratch::new();
-        for iter in 0..1000usize {
+        let iters = if cfg!(miri) { 16 } else { 1000 };
+        for iter in 0..iters {
             let len = (iter % 97) + 1;
             let mut buf = Vec::with_capacity(len);
             for _ in 0..len {

@@ -13,7 +13,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(miri)
+))]
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -26,7 +32,7 @@ use parking_lot::{Mutex, RwLock};
 pub use crate::costattribution::ActiveSeriesTracker as CostAttributionTracker;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-const NUM_STRIPES: usize = 4096;
+const NUM_STRIPES: usize = if cfg!(miri) { 16 } else { 4096 };
 const STRIPE_MASK: usize = NUM_STRIPES - 1;
 
 pub const ENABLED_FLAG: &str = "ingester.active-series-metrics-enabled";
@@ -3255,12 +3261,15 @@ mod tests {
     #[test]
     fn nanos_slab_fast_path_purge_clear_and_flip_parity() {
         let dir = tempfile::tempdir().unwrap();
-        let head = mimir_tsdb::head::Head::open(
-            dir.path(),
-            mimir_tsdb::head::HeadOptions::default(),
-            i64::MIN,
-        )
-        .unwrap();
+        let mut opts = mimir_tsdb::head::HeadOptions::default();
+        if cfg!(miri) {
+            opts.stripe_size = 16;
+            opts.enable_exemplar_storage = false;
+            opts.wal_replay_concurrency = 1;
+            opts.wal_segment_size = 64 * 1024;
+            opts.head_chunks_write_buffer_size = 4096;
+        }
+        let head = mimir_tsdb::head::Head::open(dir.path(), opts, i64::MIN).unwrap();
         let pairs = [("__name__", "up"), ("job", "api")];
         {
             let mut app = head.appender();
@@ -3355,12 +3364,15 @@ mod tests {
     #[test]
     fn nanos_slab_ref_id_slots_and_is_ref_active_fast_parity() {
         let dir = tempfile::tempdir().unwrap();
-        let head = mimir_tsdb::head::Head::open(
-            dir.path(),
-            mimir_tsdb::head::HeadOptions::default(),
-            i64::MIN,
-        )
-        .unwrap();
+        let mut opts = mimir_tsdb::head::HeadOptions::default();
+        if cfg!(miri) {
+            opts.stripe_size = 16;
+            opts.enable_exemplar_storage = false;
+            opts.wal_replay_concurrency = 1;
+            opts.wal_segment_size = 64 * 1024;
+            opts.head_chunks_write_buffer_size = 4096;
+        }
+        let head = mimir_tsdb::head::Head::open(dir.path(), opts, i64::MIN).unwrap();
         let p1 = [("__name__", "m1"), ("job", "api")];
         let p2 = [("__name__", "m2"), ("job", "api")];
         {

@@ -514,11 +514,12 @@ impl Shipper {
     /// Performs a single synchronization, uploading all unshipped level-1 non-empty local blocks
     /// to object storage (chunks/* + index first, meta.json LAST), and persisting `mimir.shipper.json`.
     pub async fn sync(&self) -> Result<usize, ShipperError> {
-        let shipped_blocks = match read_shipped_blocks(&self.dir) {
-            Ok(m) => m,
+        let meta_exists = self.dir.join(SHIPPER_META_FILENAME).exists();
+        let (shipped_blocks, meta_read_ok) = match read_shipped_blocks(&self.dir) {
+            Ok(m) => (m, true),
             Err(err) => {
                 warn!(err = %err, dir = %self.dir.display(), "reading shipper meta file failed, will override it");
-                HashMap::new()
+                (HashMap::new(), false)
             }
         };
 
@@ -570,8 +571,18 @@ impl Shipper {
             self.metrics.last_successful_upload_time.set(now_secs);
         }
 
-        if let Err(err) = write_shipper_meta_file(&self.dir, &meta) {
-            warn!(err = %err, dir = %self.dir.display(), "updating shipper meta file failed");
+        let meta_unchanged = meta_exists
+            && meta_read_ok
+            && shipped == 0
+            && meta.shipped.len() == shipped_blocks.len()
+            && meta
+                .shipped
+                .iter()
+                .all(|(k, v)| shipped_blocks.get(k) == Some(v));
+        if !meta_unchanged {
+            if let Err(err) = write_shipper_meta_file(&self.dir, &meta) {
+                warn!(err = %err, dir = %self.dir.display(), "updating shipper meta file failed");
+            }
         }
 
         if upload_errs > 0 {
