@@ -19,17 +19,18 @@ use mimir_common::logging::{
     format_rfc3339_nano_utc, LogFormat, LogLevel, Logger, StructuredLogger,
     TokenBucketRateLimitedLogger,
 };
-use mimir_common::services::{Service, ServiceContext};
+use mimir_common::services::{FnListener, ManagedBasicService, Service, ServiceContext, State};
+use mimir_common::wrapped_registry::wrap_registry_with_prefix;
 use mimir_config::ingester::KVStoreConfig;
 use mimir_config::{MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::ingest_storage::{
     ingester_partition_id_from_instance_id, IngesterPartitionRingDelegate,
 };
-use mimir_ingester::{Ingester, IngesterService};
+use mimir_ingester::{Ingester, IngesterLifecycler, IngesterService, TokenlessLifecycler};
 use mimir_proto::httpgrpcpb::http_server::HttpServer;
 use mimir_ring::kv::memberlist::MemberlistKv;
-use mimir_ring::kv::{build_kv_client, Codec};
-use mimir_ring::lifecycler::Lifecycler;
+use mimir_ring::kv::{build_kv_client_with_kv_name, Codec};
+use mimir_ring::lifecycler::{BasicLifecyclerConfig, Lifecycler};
 use mimir_ring::partition_ring::{
     partition_ring_desc_codec, PartitionInstanceLifecycler, PartitionInstanceLifecyclerConfig,
     PartitionRingOptions, PartitionRingWatcher,
@@ -48,6 +49,8 @@ use crate::cli::CliOutcome;
 use crate::grpc::{HealthService, HttpGrpcBridge, HttpGrpcStatusFixService};
 use crate::http::{build_http_router, AppHttpState};
 use crate::metrics::{register_global_metrics, revision_str, version_str};
+use crate::modules::{ModuleStates, StateCell, StateFn};
+use crate::sanity_check;
 
 const INGEST_RING_NAME: &str = "ingester";
 const INGEST_RING_KEY: &str = "ring";
@@ -247,6 +250,54 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let ingester_enabled = cfg.is_ingester_enabled();
     let service_ctx = ServiceContext::background();
 
+    // Module services of the configured targets (Go `Mimir.ServiceMap`), used by /ready,
+    // /services, the gRPC health check and failure propagation.
+    let modules = ModuleStates::new();
+    let server_state = StateCell::new(State::New);
+    modules.add("server", server_state.state_fn());
+
+    // Install SIGTERM/SIGINT listeners before any module starts: Go's signal handler runs for
+    // the whole lifetime of the service manager, including module startup.
+    let mut shutdown_sig = install_shutdown_signal();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_delay = Duration::from_nanos(cfg.shutdown_delay.0.max(0) as u64);
+
+    // `Server` depends on `SanityCheck`: nothing is served and no other module starts until
+    // the directories and object storage checks pass.
+    let sanity_state = StateCell::new(State::Starting);
+    modules.add("sanity-check", sanity_state.state_fn());
+    if ingester_enabled {
+        tokio::select! {
+            res = sanity_check::run_sanity_check(&cfg, logger.as_ref()) => {
+                if let Err(err) = res {
+                    sanity_state.set(State::Failed);
+                    let err_s = format!("starting module sanity-check: {err}");
+                    logger.log(
+                        LogLevel::Error,
+                        &[("msg", "module failed"), ("module", "sanity-check"), ("err", &err_s)],
+                    );
+                    logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
+                    bail!("failed services");
+                }
+            }
+            _ = &mut shutdown_sig => {
+                request_shutdown(&shutdown_requested, shutdown_delay).await;
+                sanity_state.set(State::Failed);
+                logger.log(
+                    LogLevel::Info,
+                    &[
+                        ("msg", "module startup aborted by shutdown signal"),
+                        ("module", "sanity-check"),
+                        ("err", "starting module sanity-check: context canceled"),
+                    ],
+                );
+                logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
+                return Ok(());
+            }
+        }
+    }
+    sanity_state.set(State::Running);
+
     // 4. Memberlist KV (if required by ring/partition_ring or explicitly targeted).
     let needs_memberlist = cfg.is_module_explicitly_targeted("memberlist-kv")
         || (ingester_enabled
@@ -269,6 +320,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     } else {
         None
     };
+    // Go always runs the `memberlist-kv` module (a lazy KV init service) for the ingester.
+    let memberlist_state = StateCell::new(State::Running);
+    modules.add("memberlist-kv", memberlist_state.state_fn());
 
     // 5. BucketClient validation (Ingester also creates its own client when shipping).
     if ingester_enabled && cfg.blocks_storage.tsdb.ship_interval.0 > 0 {
@@ -277,14 +331,12 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     }
 
     // 6. Ring, PartitionRingWatcher, Lifecycler, PartitionInstanceLifecycler, and Ingester.
-    // 6. Install SIGTERM/SIGINT listeners BEFORE startup so signals during WAL replay / catch-up
-    // cancel cleanly, and construct services before starting HTTP/gRPC servers.
-    let mut shutdown_sig = install_shutdown_signal();
-
     let mut ring_svc = None;
     let mut watcher_svc = None;
-    let mut plc_svc = None;
-    let mut active_service_names = Vec::new();
+
+    // Mimir registers dskit ring, lifecycler and partition ring metrics through
+    // `prometheus.WrapRegistererWithPrefix("cortex_", t.Registerer)`.
+    let cortex_registry = wrap_registry_with_prefix(&registry, "cortex_");
 
     let ingester_opt: Option<Arc<Ingester>> = if ingester_enabled {
         let instance_ring = Ring::new(
@@ -292,38 +344,71 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             INGEST_RING_NAME,
             INGEST_RING_KEY,
             memberlist_kv.clone(),
-            Some(&registry),
+            Some(&cortex_registry),
         )
         .context("creating ingester ring")?;
 
         let rsvc = Arc::clone(&instance_ring).into_service();
+        modules.add("ingester-ring", service_state_fn(&rsvc));
         ring_svc = Some(rsvc);
-        active_service_names.push("ingester-ring".to_string());
 
-        let lifecycler = Lifecycler::new(
-            &cfg.ingester.ring,
-            bound_grpc_addr.port(),
-            None,
-            INGEST_RING_NAME,
-            INGEST_RING_KEY,
-            cfg.blocks_storage.tsdb.flush_blocks_on_shutdown,
-            memberlist_kv.clone(),
-            Some(&registry),
-        )
-        .context("creating ingester lifecycler")?;
+        // In tokenless mode (num_tokens = 0) the ingester registers through a BasicLifecycler
+        // without tokens, otherwise through the classic Lifecycler (`ingester.New`).
+        let lifecycler: Arc<dyn IngesterLifecycler> = if cfg.ingester.ring.num_tokens == 0 {
+            if !cfg.ingest_storage.enabled {
+                bail!("ring tokens can only be disabled when ingest storage is enabled");
+            }
+            let ring_kv = build_kv_client_with_kv_name(
+                &cfg.ingester.ring.kvstore,
+                ring_desc_codec(),
+                memberlist_kv.clone(),
+                Some(&cortex_registry),
+                &format!("{INGEST_RING_NAME}-lifecycler"),
+            )
+            .context("creating KV store for ingester ring in tokenless mode")?;
+            let lifecycler_cfg = BasicLifecyclerConfig::from_ring_config_tokenless(
+                &cfg.ingester.ring,
+                bound_grpc_addr.port(),
+            )
+            .context("creating basic lifecycler config for ingester ring in tokenless mode")?;
+            TokenlessLifecycler::new(
+                lifecycler_cfg,
+                INGEST_RING_NAME,
+                INGEST_RING_KEY,
+                ring_kv,
+                cfg.ingester.ring.min_ready_duration.as_std().unwrap_or(Duration::ZERO),
+                cfg.ingester.ring.final_sleep.as_std().unwrap_or(Duration::ZERO),
+                cfg.blocks_storage.tsdb.flush_blocks_on_shutdown,
+                None,
+                Some(&cortex_registry),
+            )
+        } else {
+            Lifecycler::new(
+                &cfg.ingester.ring,
+                bound_grpc_addr.port(),
+                None,
+                INGEST_RING_NAME,
+                INGEST_RING_KEY,
+                cfg.blocks_storage.tsdb.flush_blocks_on_shutdown,
+                memberlist_kv.clone(),
+                Some(&cortex_registry),
+            )
+            .context("creating ingester lifecycler")?
+        };
 
         let (partition_ring_watcher, partition_lifecycler) = if cfg.ingest_storage.enabled {
-            let watcher_kv = build_kv_client(
+            let watcher_kv = build_kv_client_with_kv_name(
                 &cfg.ingester.partition_ring.kvstore,
                 partition_ring_desc_codec(),
                 memberlist_kv.clone(),
                 Some(&registry),
+                &format!("{PARTITION_RING_NAME}-watcher"),
             )
-            .context("creating KV store for ingester partition ring watcher")?;
+            .context("creating KV store for ingester partitions ring watcher")?;
 
             let token_table = PartitionTokenTable::new(
                 cfg.ingester.partition_ring.max_derived_token_partitions as i32,
-                Some(&registry),
+                Some(&cortex_registry),
             )
             .context("creating ingester partition token table")?;
 
@@ -335,23 +420,24 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                     token_generator: Some(Arc::new(token_table) as Arc<dyn PartitionTokenGenerator>),
                     shuffle_shard_cache_size: 0,
                 },
-                Some(&registry),
+                Some(&cortex_registry),
             );
             let wsvc = Arc::clone(&watcher).into_service();
+            modules.add("ingester-partitions-ring", service_state_fn(&wsvc));
             watcher_svc = Some(wsvc);
-            active_service_names.push("ingester-partitions-ring".to_string());
 
             let partition_id =
                 ingester_partition_id_from_instance_id(&cfg.ingester.ring.instance_id)
                     .map_err(|e| anyhow::anyhow!("calculating ingester partition ID: {e}"))?;
 
-            let plc_kv = build_kv_client(
+            let plc_kv = build_kv_client_with_kv_name(
                 &cfg.ingester.partition_ring.kvstore,
                 partition_ring_desc_codec(),
                 memberlist_kv.clone(),
                 Some(&registry),
+                &format!("{PARTITION_RING_NAME}-lifecycler"),
             )
-            .context("creating KV store for partition instance lifecycler")?;
+            .context("creating KV store for ingester partition ring")?;
 
             let plc_cfg = PartitionInstanceLifecyclerConfig {
                 partition_id,
@@ -390,19 +476,19 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                 PARTITION_RING_NAME,
                 PARTITION_RING_KEY,
                 plc_kv,
-                Some(&registry),
+                Some(&cortex_registry),
             )
-            .context("creating partition instance lifecycler")?;
+            .context("creating ingester partition lifecycler")?;
 
-            let psvc = Arc::clone(&plc).into_service();
-            plc_svc = Some(psvc);
-
+            // The partition instance lifecycler is a subservice of the ingester: it is started
+            // only once the ingester is ACTIVE in the ring (after WAL replay, partition catch-up
+            // and the shutdown marker check), and stopped before the ring lifecycler.
             (Some(watcher), Some(plc))
         } else {
             (None, None)
         };
 
-        let ingester = Ingester::new(
+        let ingester = Ingester::new_with_ingester_lifecycler(
             cfg.ingester.clone(),
             cfg.blocks_storage.clone(),
             cfg.ingest_storage.clone(),
@@ -421,25 +507,23 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             watcher.with_delegate(IngesterPartitionRingDelegate::new(Arc::clone(&ingester)));
         }
 
-        active_service_names.push("ingester".to_string());
-        active_service_names.push("ingester-service".to_string());
+        {
+            let ing = Arc::clone(&ingester);
+            modules.add("ingester-service", Arc::new(move || ing.state()));
+        }
 
         Some(ingester)
     } else {
         None
     };
 
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let runtime_config_state = StateCell::new(State::Running);
+    if runtime_config_mgr.is_some() {
+        modules.add("runtime-config", runtime_config_state.state_fn());
+    }
+
     let config_arc = Arc::new(cfg.clone());
     let default_config_arc = Arc::new(MimirConfig::default());
-
-    let mut module_services: Vec<(String, Arc<dyn mimir_common::services::Service>)> = Vec::new();
-    if let Some(ref rsvc) = ring_svc {
-        module_services.push(("ingester-ring".to_string(), Arc::clone(rsvc) as _));
-    }
-    if let Some(ref wsvc) = watcher_svc {
-        module_services.push(("ingester-partitions-ring".to_string(), Arc::clone(wsvc) as _));
-    }
 
     let http_router = build_http_router(AppHttpState {
         config: Arc::clone(&config_arc),
@@ -450,8 +534,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         runtime_config: runtime_config_mgr.clone(),
         overrides,
         memberlist_kv: memberlist_kv.clone(),
-        active_service_names,
-        module_services,
+        modules: Arc::clone(&modules),
     });
 
     // 7. Start HTTP & gRPC servers BEFORE awaiting ingester.start() so /metrics and /ready (503 -> 200)
@@ -467,7 +550,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             .accept_compressed(CompressionEncoding::Zstd),
     );
 
-    let health_svc = HealthService::new(Arc::clone(&shutdown_requested), ingester_opt.clone());
+    let health_svc = HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules));
 
     let mut grpc_builder = tonic::transport::Server::builder()
         .tcp_nodelay(true)
@@ -537,40 +620,65 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             let _ = server_done_tx.send(());
         })
         .context("spawning mimir-rpc runtime thread")?;
+    server_state.set(State::Running);
 
     // 8. Start ring, partition ring, and ingester services while honoring SIGTERM/SIGINT cancellation.
-    let mut startup_err: Option<anyhow::Error> = None;
-    let mut signaled_during_startup = false;
+    // Failures of module services (after they started) are reported here, like the service
+    // manager's `serviceFailed` listener in Go, which stops the whole application.
+    let (module_failed_tx, mut module_failed_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+    let mut listener_handles = Vec::new();
+    for (name, svc) in [("ingester-ring", &ring_svc), ("ingester-partitions-ring", &watcher_svc)] {
+        if let Some(svc) = svc {
+            let tx = module_failed_tx.clone();
+            let name = name.to_string();
+            listener_handles.push(svc.add_listener(FnListener::new(
+                None,
+                None,
+                None,
+                None,
+                Some(Box::new(move |_, err| {
+                    let _ = tx.send((name.clone(), err.to_string()));
+                })),
+            )));
+        }
+    }
+
+    let mut startup_err: Option<(String, anyhow::Error)> = None;
+    let mut signaled = false;
     {
         let startup_fut = async {
             if let Some(ref rsvc) = ring_svc {
                 rsvc.start_async(service_ctx.child())
                     .await
-                    .context("starting ingester ring service")?;
-                rsvc.await_running()
-                    .await
-                    .context("waiting for ingester ring service")?;
+                    .map_err(|e| ("ingester-ring".to_string(), anyhow::anyhow!(e)))?;
+                rsvc.await_running().await.map_err(|e| {
+                    (
+                        "ingester-ring".to_string(),
+                        anyhow::anyhow!("starting module ingester-ring: {e}"),
+                    )
+                })?;
             }
             if let Some(ref wsvc) = watcher_svc {
                 wsvc.start_async(service_ctx.child())
                     .await
-                    .context("starting partition ring watcher service")?;
-                wsvc.await_running()
-                    .await
-                    .context("waiting for partition ring watcher service")?;
-            }
-            if let Some(ref psvc) = plc_svc {
-                psvc.start_async(service_ctx.child())
-                    .await
-                    .context("starting partition instance lifecycler")?;
-                psvc.await_running()
-                    .await
-                    .context("waiting for partition instance lifecycler")?;
+                    .map_err(|e| ("ingester-partitions-ring".to_string(), anyhow::anyhow!(e)))?;
+                wsvc.await_running().await.map_err(|e| {
+                    (
+                        "ingester-partitions-ring".to_string(),
+                        anyhow::anyhow!("starting module ingester-partitions-ring: {e}"),
+                    )
+                })?;
             }
             if let Some(ref ing) = ingester_opt {
-                ing.start().await.context("starting ingester")?;
+                ing.start().await.map_err(|e| {
+                    (
+                        "ingester-service".to_string(),
+                        anyhow::anyhow!("starting module ingester-service: {e}"),
+                    )
+                })?;
             }
-            Ok::<(), anyhow::Error>(())
+            Ok::<(), (String, anyhow::Error)>(())
         };
         tokio::pin!(startup_fut);
 
@@ -581,42 +689,95 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                 }
             }
             _ = &mut shutdown_sig => {
-                signaled_during_startup = true;
+                signaled = true;
+                // Go keeps starting modules during -shutdown-delay, then stops the manager.
+                shutdown_requested.store(true, Ordering::Release);
+                tokio::select! {
+                    _ = tokio::time::sleep(shutdown_delay) => {}
+                    res = &mut startup_fut => {
+                        if res.is_ok() {
+                            tokio::time::sleep(shutdown_delay).await;
+                        }
+                    }
+                }
             }
         }
     }
 
-    if !signaled_during_startup && startup_err.is_none() {
+    let mut runtime_failure: Option<(String, String)> = None;
+    if !signaled && startup_err.is_none() {
         logger.log(LogLevel::Info, &[("msg", "Application started")]);
-        // 9. Wait for SIGTERM / SIGINT (POST /ingester/shutdown stops only the Ingester service,
-        // keeping HTTP/gRPC alive until SIGTERM, matching Go Mimir).
-        (&mut shutdown_sig).await;
+        // 9. Wait for SIGTERM / SIGINT, or for any module to fail (POST /ingester/shutdown stops
+        // only the Ingester service, keeping HTTP/gRPC alive until SIGTERM, matching Go Mimir).
+        let ingester_failure = async {
+            match ingester_opt {
+                Some(ref ing) => ing.wait_subservice_failure().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = &mut shutdown_sig => {
+                request_shutdown(&shutdown_requested, shutdown_delay).await;
+            }
+            err = ingester_failure => {
+                runtime_failure = Some(("ingester-service".to_string(), err));
+            }
+            Some(failure) = module_failed_rx.recv() => {
+                runtime_failure = Some(failure);
+            }
+        }
+    }
+    for h in listener_handles {
+        h.stop();
     }
 
+    if let Some((ref module, ref err)) = startup_err {
+        let err_s = format!("{err:#}");
+        if signaled {
+            logger.log(
+                LogLevel::Info,
+                &[
+                    ("msg", "module startup aborted by shutdown signal"),
+                    ("module", module),
+                    ("err", &err_s),
+                ],
+            );
+        } else {
+            logger.log(
+                LogLevel::Error,
+                &[("msg", "module failed"), ("module", module), ("err", &err_s)],
+            );
+        }
+    }
+    if let Some((ref module, ref err)) = runtime_failure {
+        logger.log(
+            LogLevel::Error,
+            &[("msg", "module failed"), ("module", module), ("err", err)],
+        );
+    }
     shutdown_requested.store(true, Ordering::Release);
-    if !signaled_during_startup && startup_err.is_none() && cfg.shutdown_delay.0 > 0 {
-        tokio::time::sleep(Duration::from_nanos(cfg.shutdown_delay.0 as u64)).await;
-    }
 
-    // 10. Shutdown order: stop Ingester FIRST (so lifecycler transitions to LEAVING, flushes blocks,
-    // and unregisters while HTTP/gRPC and MemberlistKv are still running), THEN stop ring services,
-    // HTTP/gRPC servers, and MemberlistKv.
+    // 10. Shutdown order (reverse module dependencies): stop the Ingester FIRST (so the lifecycler
+    // transitions to LEAVING, flushes blocks and unregisters while HTTP/gRPC and memberlist are
+    // still running), THEN the ring services, HTTP/gRPC servers, and memberlist.
+    let mut ingester_failed = false;
     if let Some(ref ing) = ingester_opt {
         if let Err(err) = ing.stop().await {
-            if !signaled_during_startup {
+            ingester_failed = true;
+            if !signaled && startup_err.is_none() && runtime_failure.is_none() {
                 let err_s = err.to_string();
                 logger.log(
-                    LogLevel::Error,
-                    &[("msg", "error stopping ingester"), ("err", &err_s)],
+                    LogLevel::Warn,
+                    &[
+                        ("msg", "module failed with error"),
+                        ("module", "ingester-service"),
+                        ("err", &err_s),
+                    ],
                 );
             }
         }
     }
 
-    if let Some(psvc) = plc_svc {
-        psvc.stop_async();
-        let _ = psvc.await_terminated().await;
-    }
     if let Some(wsvc) = watcher_svc {
         wsvc.stop_async();
         let _ = wsvc.await_terminated().await;
@@ -626,6 +787,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         let _ = rsvc.await_terminated().await;
     }
     service_ctx.cancel();
+    runtime_config_state.set(State::Stopping);
+    memberlist_state.set(State::Stopping);
+    server_state.set(State::Stopping);
 
     let _ = http_shutdown_tx.send(());
     let _ = grpc_shutdown_tx.send(());
@@ -637,13 +801,16 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             .max(100_000_000) as u64,
     );
     let _ = tokio::time::timeout(graceful_timeout, server_done_rx).await;
+    server_state.set(State::Terminated);
 
     if let Some(ml) = memberlist_kv {
         ml.shutdown().await;
     }
+    memberlist_state.set(State::Terminated);
     if let Some(rt) = runtime_config_mgr {
         rt.stop();
     }
+    runtime_config_state.set(State::Terminated);
     if let Some(at) = activity_tracker {
         if !cfg.activity_tracker.filepath.is_empty() {
             if let Ok(entries) = load_unfinished_entries(&cfg.activity_tracker.filepath) {
@@ -675,10 +842,30 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     }
 
     logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
-    if let Some(err) = startup_err {
-        return Err(err);
+    // A shutdown signal received while services are still starting is a requested shutdown,
+    // not a failure (exit 0); any other module failure makes the process exit non-zero.
+    if signaled {
+        return Ok(());
+    }
+    if startup_err.is_some() || runtime_failure.is_some() || ingester_failed {
+        bail!("failed services");
     }
     Ok(())
+}
+
+/// Go's signal handler: report "not ready" (and disable keep-alives) right away, then wait
+/// `-shutdown-delay` before stopping the modules.
+async fn request_shutdown(shutdown_requested: &AtomicBool, shutdown_delay: Duration) {
+    shutdown_requested.store(true, Ordering::Release);
+    if !shutdown_delay.is_zero() {
+        tokio::time::sleep(shutdown_delay).await;
+    }
+}
+
+/// State of a dskit-style module service.
+fn service_state_fn(svc: &Arc<ManagedBasicService>) -> StateFn {
+    let svc = Arc::clone(svc);
+    Arc::new(move || svc.state())
 }
 
 fn install_shutdown_signal() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {

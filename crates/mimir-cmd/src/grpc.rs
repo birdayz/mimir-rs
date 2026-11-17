@@ -15,8 +15,7 @@ use axum::Router;
 use bytes::Bytes;
 use futures::Future;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request as HttpRequestMsg, Uri};
-use mimir_common::services::State;
-use mimir_ingester::Ingester;
+use crate::modules::ModuleStates;
 use mimir_proto::grpcutilpb::{extract_http_response, status_with_http_response};
 use mimir_proto::httpgrpcpb;
 use mimir_proto::httpgrpcpb::http_server::Http;
@@ -55,26 +54,23 @@ const NOT_SERVING_STATUS: i32 = 2;
 #[derive(Clone)]
 pub struct HealthService {
     shutdown_requested: Arc<AtomicBool>,
-    ingester: Option<Arc<Ingester>>,
+    modules: Arc<ModuleStates>,
 }
 
 impl HealthService {
-    pub fn new(shutdown_requested: Arc<AtomicBool>, ingester: Option<Arc<Ingester>>) -> Self {
+    pub fn new(shutdown_requested: Arc<AtomicBool>, modules: Arc<ModuleStates>) -> Self {
         Self {
             shutdown_requested,
-            ingester,
+            modules,
         }
     }
 
+    /// `grpcutil.NewHealthCheckFrom(WithShutdownRequested(..), WithManager(sm))`.
     pub fn is_serving(&self) -> bool {
         if self.shutdown_requested.load(Ordering::Acquire) {
             return false;
         }
-        if let Some(ref ing) = self.ingester {
-            let st = ing.state();
-            return matches!(st, State::Running | State::Stopping);
-        }
-        true
+        self.modules.is_serving()
     }
 
     fn check_response(&self) -> HealthCheckResponse {
