@@ -22,7 +22,7 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::kv::memberlist::MemberlistKv;
-use crate::kv::{build_kv_client, KvClient, KvError};
+use crate::kv::{build_kv_client_with_kv_name, KvClient, KvError};
 use crate::prng::{shuffle_shard_expected_instances_per_zone, shuffle_shard_seed, GoRand};
 use crate::token_gen::search_token;
 
@@ -223,7 +223,13 @@ impl Ring {
         memberlist_kv: Option<Arc<MemberlistKv>>,
         reg: Option<&Registry>,
     ) -> Result<Arc<Self>, RingError> {
-        let store = build_kv_client(&cfg.kvstore, ring_desc_codec(), memberlist_kv, reg)?;
+        let store = build_kv_client_with_kv_name(
+            &cfg.kvstore,
+            ring_desc_codec(),
+            memberlist_kv,
+            reg,
+            &format!("{name}-ring"),
+        )?;
         Self::with_store_and_strategy(
             RingSettings::from(cfg),
             name,

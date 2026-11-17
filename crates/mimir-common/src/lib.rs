@@ -26,6 +26,7 @@ pub mod shutdownmarker;
 pub mod tenant;
 pub mod thread_pool;
 pub mod tls;
+pub mod wrapped_registry;
 
 #[doc(hidden)]
 pub fn block_on_for_tests<F: std::future::Future>(future: F) -> F::Output {

@@ -110,6 +110,17 @@ impl PartitionRingWatcher {
         *self.delegate.lock() = Some(delegate);
     }
 
+    /// The partition ring KV client this watcher reads from (Mimir also hands it to the
+    /// `/ingester/partition-ring` page to edit partition states).
+    pub fn kv_client(&self) -> &Arc<dyn KvClient> {
+        &self.kv
+    }
+
+    /// The KV key of the partition ring.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     pub fn partition_ring(&self) -> Arc<PartitionRing> {
         self.ring.lock().clone()
     }

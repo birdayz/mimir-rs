@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use crate::kv::memberlist::MemberlistKv;
-use crate::kv::{build_kv_client, BoxFuture, CasCallbackError, CasOutcome, KvClient, KvError};
+use crate::kv::{build_kv_client_with_kv_name, BoxFuture, CasCallbackError, CasOutcome, KvClient, KvError};
 use crate::ring::model::{ring_desc_codec, system_time_to_unix_secs, DescExt, InstanceDescExt};
 use crate::ring::replication_strategy::WRITE;
 use crate::token_gen::{
@@ -54,7 +54,9 @@ pub enum LifecyclerError {
 }
 
 pub trait FlushTransferer: Send + Sync {
-    fn flush(&self);
+    /// Flushes all in-memory data (`FlushTransferer.Flush()`); awaited by the lifecycler while
+    /// it keeps heartbeating in LEAVING state.
+    fn flush(&self) -> BoxFuture<'_, ()>;
     fn transfer_out(&self) -> BoxFuture<'_, Result<(), LifecyclerError>>;
 }
 
@@ -62,7 +64,9 @@ pub trait FlushTransferer: Send + Sync {
 pub struct NoopFlushTransferer;
 
 impl FlushTransferer for NoopFlushTransferer {
-    fn flush(&self) {}
+    fn flush(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
 
     fn transfer_out(&self) -> BoxFuture<'_, Result<(), LifecyclerError>> {
         Box::pin(async { Ok(()) })
@@ -1026,7 +1030,7 @@ struct ReadyState {
 
 pub struct Lifecycler {
     cfg: LifecyclerConfig,
-    flush_transferer: Arc<dyn FlushTransferer>,
+    flush_transferer: RwLock<Arc<dyn FlushTransferer>>,
     kv_store: Arc<dyn KvClient>,
     pub id: String,
     pub addr: String,
@@ -1058,7 +1062,14 @@ impl Lifecycler {
         memberlist_kv: Option<Arc<MemberlistKv>>,
         reg: Option<&Registry>,
     ) -> Result<Arc<Self>, LifecyclerError> {
-        let store = build_kv_client(&ring_cfg.kvstore, ring_desc_codec(), memberlist_kv, reg)?;
+        // Suffix all client names with "-lifecycler" to denote this kv client is used by the lifecycler.
+        let store = build_kv_client_with_kv_name(
+            &ring_cfg.kvstore,
+            ring_desc_codec(),
+            memberlist_kv,
+            reg,
+            &format!("{ring_name}-lifecycler"),
+        )?;
         let cfg = LifecyclerConfig::from_ring_config(ring_cfg, listen_port)?;
         Ok(Self::with_store(
             cfg,
@@ -1123,7 +1134,9 @@ impl Lifecycler {
             can_join_timeout: Duration::from_secs(5 * 60),
             metrics: LifecyclerMetrics::new(ring_name, reg),
             cfg,
-            flush_transferer: flush_transferer.unwrap_or_else(|| Arc::new(NoopFlushTransferer)),
+            flush_transferer: RwLock::new(
+                flush_transferer.unwrap_or_else(|| Arc::new(NoopFlushTransferer)),
+            ),
             kv_store,
         })
     }
@@ -1167,6 +1180,13 @@ impl Lifecycler {
 
     pub fn zones(&self) -> Vec<String> {
         self.counters.read().zones.clone()
+    }
+
+    /// Replaces the [`FlushTransferer`] used on shutdown. Mimir passes the Ingester itself to
+    /// `ring.NewLifecycler`; in Rust the Ingester is constructed after its lifecycler, so it
+    /// registers itself here before the lifecycler is started.
+    pub fn set_flush_transferer(&self, flush_transferer: Arc<dyn FlushTransferer>) {
+        *self.flush_transferer.write() = flush_transferer;
     }
 
     pub fn set_flush_on_shutdown(&self, enabled: bool) {
@@ -1733,7 +1753,8 @@ impl Lifecycler {
     async fn process_shutdown(&self) {
         let mut flush_required = self.flush_on_shutdown();
         let t_start = Instant::now();
-        match self.flush_transferer.transfer_out().await {
+        let flush_transferer = self.flush_transferer.read().clone();
+        match flush_transferer.transfer_out().await {
             Ok(()) => {
                 flush_required = false;
                 self.metrics
@@ -1755,13 +1776,15 @@ impl Lifecycler {
 
         if flush_required {
             let f_start = Instant::now();
-            self.flush_transferer.flush();
+            flush_transferer.flush().await;
             self.metrics
                 .shutdown_duration
                 .with_label_values(&["flush", "success"])
                 .observe(f_start.elapsed().as_secs_f64());
         }
 
+        // Sleep so the shutdownDuration metric can be collected.
+        info!(final_sleep = ?self.cfg.final_sleep, "lifecycler entering final sleep before shutdown");
         if !self.cfg.final_sleep.is_zero() {
             tokio::time::sleep(self.cfg.final_sleep).await;
         }

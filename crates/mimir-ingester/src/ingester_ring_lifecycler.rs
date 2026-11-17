@@ -11,14 +11,38 @@ use mimir_common::services::ManagedBasicService;
 use mimir_proto::ringpb::{Desc, InstanceDesc, InstanceState};
 use mimir_ring::kv::{BoxFuture, KvClient};
 use mimir_ring::lifecycler::{
-    BasicLifecycler, BasicLifecyclerConfig, BasicLifecyclerDelegate, LeaveOnStoppingDelegate,
-    Lifecycler, LifecyclerError,
+    BasicLifecycler, BasicLifecyclerConfig, BasicLifecyclerDelegate, FlushTransferer,
+    LeaveOnStoppingDelegate, Lifecycler, LifecyclerError,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use prometheus::Registry;
 use tracing::info;
 
-pub type FlushFn = Arc<dyn Fn() + Send + Sync>;
+/// Callback to `Ingester.Flush()` (compact + offset catalogue sync + ship), awaited on shutdown.
+pub type FlushFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// `FlushTransferer` used by the classic lifecycler for the Ingester
+/// (`pkg/ingester/ingester_http.go`: `TransferOut` returns `ring.ErrTransferDisabled`,
+/// `Flush` flushes and ships all TSDB blocks).
+pub struct IngesterFlushTransferer {
+    flush: FlushFn,
+}
+
+impl IngesterFlushTransferer {
+    pub fn new(flush: FlushFn) -> Self {
+        Self { flush }
+    }
+}
+
+impl FlushTransferer for IngesterFlushTransferer {
+    fn flush(&self) -> BoxFuture<'_, ()> {
+        (self.flush)()
+    }
+
+    fn transfer_out(&self) -> BoxFuture<'_, Result<(), LifecyclerError>> {
+        Box::pin(async { Err(LifecyclerError::TransferDisabled) })
+    }
+}
 
 /// Interface satisfied by both [`Lifecycler`] and [`TokenlessLifecycler`]
 /// (`pkg/ingester/ingester_ring_lifecycler.go:ingesterLifecycler`).
@@ -32,6 +56,9 @@ pub trait IngesterLifecycler: Send + Sync {
     fn set_flush_on_shutdown(&self, enabled: bool);
     fn flush_on_shutdown(&self) -> bool;
     fn into_managed_service(self: Arc<Self>) -> Arc<ManagedBasicService>;
+    /// Wires the Ingester's `Flush()` into the shutdown path of this lifecycler (Go passes the
+    /// Ingester as `FlushTransferer` / `flush` callback at construction time).
+    fn set_ingester_flush(&self, flush: FlushFn);
 }
 
 impl IngesterLifecycler for Lifecycler {
@@ -70,6 +97,10 @@ impl IngesterLifecycler for Lifecycler {
     fn into_managed_service(self: Arc<Self>) -> Arc<ManagedBasicService> {
         Lifecycler::into_service(self)
     }
+
+    fn set_ingester_flush(&self, flush: FlushFn) {
+        self.set_flush_transferer(Arc::new(IngesterFlushTransferer::new(flush)));
+    }
 }
 
 struct TokenlessReadyState {
@@ -79,7 +110,7 @@ struct TokenlessReadyState {
 
 struct TokenlessDelegateInner {
     final_sleep: Duration,
-    flush: Option<FlushFn>,
+    flush: Arc<RwLock<Option<FlushFn>>>,
     flush_on_shutdown: Arc<AtomicBool>,
 }
 
@@ -108,9 +139,10 @@ impl BasicLifecyclerDelegate for TokenlessDelegateInner {
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             if self.flush_on_shutdown.load(Ordering::Acquire) {
-                if let Some(ref flush) = self.flush {
+                let flush = self.flush.read().clone();
+                if let Some(flush) = flush {
                     info!("flushing blocks before shutdown");
-                    flush();
+                    flush().await;
                 }
             }
             if !self.final_sleep.is_zero() {
@@ -135,6 +167,7 @@ pub struct TokenlessLifecycler {
     basic: Arc<BasicLifecycler>,
     min_ready_duration: Duration,
     flush_on_shutdown: Arc<AtomicBool>,
+    flush: Arc<RwLock<Option<FlushFn>>>,
     ready_mu: Mutex<TokenlessReadyState>,
 }
 
@@ -152,9 +185,10 @@ impl TokenlessLifecycler {
         reg: Option<&Registry>,
     ) -> Arc<Self> {
         let flush_flag = Arc::new(AtomicBool::new(flush_on_shutdown));
+        let flush = Arc::new(RwLock::new(flush));
         let inner = Arc::new(TokenlessDelegateInner {
             final_sleep,
-            flush,
+            flush: Arc::clone(&flush),
             flush_on_shutdown: Arc::clone(&flush_flag),
         });
         let delegate: Arc<dyn BasicLifecyclerDelegate> =
@@ -165,6 +199,7 @@ impl TokenlessLifecycler {
             basic,
             min_ready_duration,
             flush_on_shutdown: flush_flag,
+            flush,
             ready_mu: Mutex::new(TokenlessReadyState {
                 ready: false,
                 ready_since: None,
@@ -248,5 +283,9 @@ impl IngesterLifecycler for TokenlessLifecycler {
 
     fn into_managed_service(self: Arc<Self>) -> Arc<ManagedBasicService> {
         Arc::clone(&self.basic).into_service()
+    }
+
+    fn set_ingester_flush(&self, flush: FlushFn) {
+        *self.flush.write() = Some(flush);
     }
 }

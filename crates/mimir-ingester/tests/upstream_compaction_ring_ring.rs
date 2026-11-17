@@ -525,12 +525,19 @@ impl TestFlushTransferer {
     }
 }
 
-impl FlushTransferer for TestFlushTransferer {
-    fn flush(&self) {
+impl TestFlushTransferer {
+    fn record_flush(&self) {
         self.flush_called.store(true, Ordering::Release);
         if let Some(ref lc) = *self.lifecycler.lock() {
             *self.state_on_flush.lock() = Some(lc.get_state());
         }
+    }
+}
+
+impl FlushTransferer for TestFlushTransferer {
+    fn flush(&self) -> BoxFuture<'_, ()> {
+        self.record_flush();
+        Box::pin(async {})
     }
 
     fn transfer_out(&self) -> BoxFuture<'_, Result<(), LifecyclerError>> {
@@ -584,7 +591,10 @@ async fn test_lifecycler_flush_on_shutdown() {
                 let basic_cfg = BasicLifecyclerConfig::from_ring_config_tokenless(&ring_cfg, 9095)
                     .unwrap();
                 let f = Arc::clone(&flusher);
-                let flush_cb: FlushFn = Arc::new(move || f.flush());
+                let flush_cb: FlushFn = Arc::new(move || {
+                    f.record_flush();
+                    Box::pin(async {})
+                });
                 TokenlessLifecycler::new(
                     basic_cfg,
                     INGEST_RING_NAME,

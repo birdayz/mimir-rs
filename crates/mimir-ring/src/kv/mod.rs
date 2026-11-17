@@ -8,6 +8,7 @@ pub mod consul;
 pub mod etcd;
 pub mod inmemory;
 pub mod memberlist;
+pub mod metrics;
 pub mod multi;
 pub mod prefix;
 
@@ -322,8 +323,22 @@ pub fn build_kv_client(
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
     reg: Option<&prometheus::Registry>,
 ) -> Result<Arc<dyn KvClient>, KvError> {
-    let client = create_client(&cfg.store, &cfg.prefix, cfg, codec, memberlist_kv, reg)?;
+    let client = create_client(&cfg.store, &cfg.prefix, cfg, codec, memberlist_kv, reg, "primary")?;
     Ok(client)
+}
+
+/// `kv.NewClient(cfg, codec, kv.RegistererWithKVName(reg, kv_name), logger)`: like
+/// [`build_kv_client`], with `kv_request_duration_seconds{kv_name=...}` and the backends'
+/// own metrics registered through `reg` (which carries any name prefix, e.g. `cortex_`).
+pub fn build_kv_client_with_kv_name(
+    cfg: &KVStoreConfig,
+    codec: Arc<dyn Codec>,
+    memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
+    reg: Option<&prometheus::Registry>,
+    kv_name: &str,
+) -> Result<Arc<dyn KvClient>, KvError> {
+    let named = reg.map(|r| mimir_common::wrapped_registry::registry_with_kv_name(r, kv_name));
+    build_kv_client(cfg, codec, memberlist_kv, named.as_ref())
 }
 
 fn create_client(
@@ -333,6 +348,7 @@ fn create_client(
     codec: Arc<dyn Codec>,
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
     reg: Option<&prometheus::Registry>,
+    role: &str,
 ) -> Result<Arc<dyn KvClient>, KvError> {
     let base: Arc<dyn KvClient> = match backend {
         "inmemory" => Arc::new(inmemory::InMemoryKv::shared_with_codec(codec)),
@@ -367,6 +383,7 @@ fn create_client(
                 codec.clone(),
                 memberlist_kv.clone(),
                 reg,
+                "primary",
             )?;
             let secondary = create_client(
                 &cfg.multi.secondary,
@@ -375,6 +392,7 @@ fn create_client(
                 codec,
                 memberlist_kv,
                 reg,
+                "secondary",
             )?;
             multi::MultiKv::new(
                 cfg.multi.clone(),
@@ -398,12 +416,18 @@ fn create_client(
         }
     };
 
-    if prefix.is_empty() {
-        Ok(base)
+    let client: Arc<dyn KvClient> = if prefix.is_empty() {
+        base
     } else {
-        Ok(Arc::new(prefix::PrefixedKvClient::new(
-            base,
-            prefix.to_string(),
-        )))
-    }
+        Arc::new(prefix::PrefixedKvClient::new(base, prefix.to_string()))
+    };
+
+    // If no Registerer is provided return the raw client.
+    let Some(reg) = reg else {
+        return Ok(client);
+    };
+    let role_reg = mimir_common::wrapped_registry::wrap_registry(reg, "", &[("role", role)]);
+    Ok(Arc::new(metrics::MetricsKvClient::new(
+        backend, client, &role_reg,
+    )))
 }
