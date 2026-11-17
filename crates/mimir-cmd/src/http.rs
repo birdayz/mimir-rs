@@ -37,6 +37,9 @@ pub struct AppHttpState {
     /// Module services other than `ingester-service` whose state `/ready` reports (Go
     /// `Mimir.ServiceMap` entries backed by a Rust service), keyed by upstream module name.
     pub module_services: Vec<(String, Arc<dyn Service>)>,
+    /// `(cost_attribution_registry_path, registry)` when cost attribution is enabled
+    /// (Go: `API.RegisterCostAttribution`).
+    pub cost_attribution_registry: Option<(String, Registry)>,
 }
 
 /// Builds the full Axum HTTP router (with `server.http_path_prefix` honored).
@@ -67,6 +70,16 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     }
     if has_memberlist {
         router = router.route("/memberlist", get(memberlist_handler));
+    }
+    if let Some((path, reg)) = state.cost_attribution_registry.clone() {
+        let path = if path.starts_with('/') { path } else { format!("/{path}") };
+        router = router.route(
+            &path,
+            get(move || {
+                let reg = reg.clone();
+                async move { encode_registry(&reg) }
+            }),
+        );
     }
 
     let state_for_root = state.clone();
@@ -144,7 +157,11 @@ async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
 }
 
 async fn metrics_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
-    let metric_families = st.registry.gather();
+    encode_registry(&st.registry)
+}
+
+fn encode_registry(registry: &Registry) -> Response {
+    let metric_families = registry.gather();
     let encoder = TextEncoder::new();
     let mut buf = Vec::with_capacity(4096);
     if let Err(err) = encoder.encode(&metric_families, &mut buf) {
