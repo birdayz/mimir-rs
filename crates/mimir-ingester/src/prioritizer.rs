@@ -102,8 +102,8 @@ impl LevelTracker {
         if current_size > 0 {
             let target = ((current_size as f64 * quantile).ceil() as usize).max(1);
             let mut counted = 0;
-            for level in 0..TOTAL_LEVELS {
-                counted += st.level_counts[level];
+            for (level, &count) in st.level_counts.iter().enumerate() {
+                counted += count;
                 if counted >= target {
                     return level;
                 }
