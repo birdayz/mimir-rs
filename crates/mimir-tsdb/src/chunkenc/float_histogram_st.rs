@@ -180,6 +180,19 @@ impl FloatHistogramStChunk {
         t: i64,
         fh: &FloatHistogram,
     ) -> Result<AppendFloatHistogramStOutcome, ChunkError> {
+        self.append_with_state_prev(cached, None, st, t, fh)
+    }
+
+    /// Appends `(st, t, fh)` in O(1) using cached `(FloatHistogramAppenderState, StEncoder)` and
+    /// optional previous-chunk state for computing `CounterResetHeader` on chunk rollover.
+    pub fn append_with_state_prev(
+        &mut self,
+        cached: &mut Option<(FloatHistogramAppenderState, StEncoder)>,
+        prev: Option<&FloatHistogramAppenderState>,
+        st: i64,
+        t: i64,
+        fh: &FloatHistogram,
+    ) -> Result<AppendFloatHistogramStOutcome, ChunkError> {
         let mut app = match cached.take() {
             Some((state, st_enc)) => FloatHistogramStAppender {
                 chunk: self,
@@ -188,7 +201,7 @@ impl FloatHistogramStChunk {
             },
             None => self.appender()?,
         };
-        let out = app.append_float_histogram(None, st, t, fh, false)?;
+        let out = app.append_float_histogram(prev, st, t, fh, false)?;
         if matches!(out, AppendFloatHistogramStOutcome::Appended { .. }) {
             *cached = Some((app.state, app.st_enc));
         }
@@ -207,6 +220,11 @@ impl<'a> FloatHistogramStAppender<'a> {
     #[inline]
     pub fn state(&self) -> &FloatHistogramAppenderState {
         &self.state
+    }
+
+    #[inline]
+    pub fn into_state(self) -> FloatHistogramAppenderState {
+        self.state
     }
 
     #[inline]

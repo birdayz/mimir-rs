@@ -190,11 +190,24 @@ impl FloatHistogramChunk {
         t: i64,
         fh: &FloatHistogram,
     ) -> Result<AppendFloatHistogramOutcome, ChunkError> {
+        self.append_with_state_prev(state, None, st, t, fh)
+    }
+
+    /// Appends `(st, t, fh)` in O(1) using a cached [`FloatHistogramAppenderState`] and
+    /// optional previous-chunk state for computing `CounterResetHeader` on chunk rollover.
+    pub fn append_with_state_prev(
+        &mut self,
+        state: &mut Option<FloatHistogramAppenderState>,
+        prev: Option<&FloatHistogramAppenderState>,
+        st: i64,
+        t: i64,
+        fh: &FloatHistogram,
+    ) -> Result<AppendFloatHistogramOutcome, ChunkError> {
         let mut app = match state.take() {
             Some(s) => FloatHistogramAppender { chunk: self, state: s },
             None => self.appender()?,
         };
-        let out = app.append_float_histogram(None, st, t, fh, false)?;
+        let out = app.append_float_histogram(prev, st, t, fh, false)?;
         if matches!(out, AppendFloatHistogramOutcome::Appended { .. }) {
             *state = Some(app.state);
         }
@@ -350,6 +363,11 @@ impl<'a> FloatHistogramAppender<'a> {
     #[inline]
     pub fn state(&self) -> &FloatHistogramAppenderState {
         &self.state
+    }
+
+    #[inline]
+    pub fn into_state(self) -> FloatHistogramAppenderState {
+        self.state
     }
 
     #[inline]
