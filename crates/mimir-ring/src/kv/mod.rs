@@ -322,7 +322,27 @@ pub fn build_kv_client(
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
     reg: Option<&prometheus::Registry>,
 ) -> Result<Arc<dyn KvClient>, KvError> {
-    let client = create_client(&cfg.store, &cfg.prefix, cfg, codec, memberlist_kv, reg)?;
+    build_kv_client_with_multi_config_provider(cfg, codec, memberlist_kv, reg, None)
+}
+
+/// Like [`build_kv_client`], with `MultiConfig.ConfigProvider` set: a `multi` store watches
+/// the provider for runtime `multi_kv_config` changes (primary switch, mirroring toggle).
+pub fn build_kv_client_with_multi_config_provider(
+    cfg: &KVStoreConfig,
+    codec: Arc<dyn Codec>,
+    memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
+    reg: Option<&prometheus::Registry>,
+    multi_config_provider: Option<multi::MultiConfigProvider>,
+) -> Result<Arc<dyn KvClient>, KvError> {
+    let client = create_client(
+        &cfg.store,
+        &cfg.prefix,
+        cfg,
+        codec,
+        memberlist_kv,
+        reg,
+        multi_config_provider,
+    )?;
     Ok(client)
 }
 
@@ -333,6 +353,7 @@ fn create_client(
     codec: Arc<dyn Codec>,
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
     reg: Option<&prometheus::Registry>,
+    multi_config_provider: Option<multi::MultiConfigProvider>,
 ) -> Result<Arc<dyn KvClient>, KvError> {
     let base: Arc<dyn KvClient> = match backend {
         "inmemory" => Arc::new(inmemory::InMemoryKv::shared_with_codec(codec)),
@@ -367,16 +388,18 @@ fn create_client(
                 codec.clone(),
                 memberlist_kv.clone(),
                 reg,
+                None,
             )?;
             let secondary = create_client(
                 &cfg.multi.secondary,
                 "",
                 cfg,
-                codec,
+                codec.clone(),
                 memberlist_kv,
                 reg,
+                None,
             )?;
-            multi::MultiKv::new(
+            multi::MultiKv::new_with_options(
                 cfg.multi.clone(),
                 vec![
                     multi::NamedKvClient {
@@ -389,6 +412,8 @@ fn create_client(
                     },
                 ],
                 reg,
+                Some(codec),
+                multi_config_provider,
             )
         }
         other => {
