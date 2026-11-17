@@ -739,7 +739,16 @@ impl PartitionCommitter {
         self.commit_requests_total.inc();
 
         if let Err(e) = self.notifier.notify_pre_commit().await {
-            warn!(partition = self.partition_id, offset, err = %e, "pre-commit notification failed, continuing with commit");
+            self.commit_requests_latency
+                .observe(start.elapsed().as_secs_f64());
+            error!(
+                partition = self.partition_id,
+                offset,
+                err = %e,
+                "pre-commit notification failed; aborting offset commit"
+            );
+            self.commit_failures_total.inc();
+            return Err(format!("pre-commit notification failed: {e}"));
         }
 
         let kafka_res = if self.consumer_group.is_empty() {
@@ -2483,5 +2492,100 @@ mod tests {
         .unwrap();
         assert_eq!(multi.readers[0].consumer_group(), "ingester-3-wc-0");
         assert_eq!(multi.readers[1].consumer_group(), "ingester-3-wc-1");
+    }
+
+    #[tokio::test]
+    async fn partition_committer_gates_commit_on_pre_commit_success_and_retries() {
+        struct ToggleNotifier {
+            fail: std::sync::atomic::AtomicBool,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl PreCommitNotifier for ToggleNotifier {
+            fn notify_pre_commit(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    if self.fail.load(Ordering::SeqCst) {
+                        Err("ENOSPC: No space left on device".to_string())
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        }
+
+        struct RecordingAdm {
+            committed: SyncMutex<Vec<i64>>,
+        }
+        impl AdmClient for RecordingAdm {
+            fn commit_offsets(
+                &self,
+                _group: &str,
+                _topic: &str,
+                _partition_id: i32,
+                offset: i64,
+            ) -> Pin<Box<dyn Future<Output = Result<i64, String>> + Send + '_>> {
+                Box::pin(async move {
+                    self.committed.lock().push(offset);
+                    Ok(offset)
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let off_path = dir.path().join("kafka-offset.json");
+        let off_file = Arc::new(OffsetFile::new(off_path.clone(), 0));
+        let notifier = Arc::new(ToggleNotifier {
+            fail: std::sync::atomic::AtomicBool::new(true),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let adm = Arc::new(RecordingAdm {
+            committed: SyncMutex::new(Vec::new()),
+        });
+
+        let mut cfg = KafkaConfig {
+            address: StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "ingest".to_string(),
+            ..Default::default()
+        };
+        cfg.consumer_group_offset_commit_interval = mimir_config::GoDuration::from_millis(20);
+
+        let reg = Registry::new();
+        let committer = Arc::new(PartitionCommitter::new(
+            cfg,
+            Arc::clone(&adm) as Arc<dyn AdmClient>,
+            0,
+            "test-group",
+            Arc::clone(&notifier) as Arc<dyn PreCommitNotifier>,
+            Some(Arc::clone(&off_file)),
+            Some(&reg),
+        ));
+
+        // Direct commit must abort before Kafka commit or kafka-offset.json write.
+        let err = committer.commit(42).await.unwrap_err();
+        assert!(err.contains("ENOSPC"), "unexpected err: {err}");
+        assert_eq!(committer.last_committed_offset(), -1);
+        assert!(adm.committed.lock().is_empty());
+        assert!(!off_path.exists());
+        assert_eq!(committer.commit_failures_count(), 1.0);
+
+        // Periodic committer loop retries without panicking and commits once notify_pre_commit recovers.
+        committer.start().await;
+        committer.enqueue_offset(42);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(committer.last_committed_offset(), -1);
+        assert!(adm.committed.lock().is_empty());
+        assert!(!off_path.exists());
+
+        notifier.fail.store(false, Ordering::SeqCst);
+        let dl = Instant::now() + Duration::from_secs(3);
+        while committer.last_committed_offset() != 42 {
+            assert!(Instant::now() < dl, "timed out waiting for retry commit");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*adm.committed.lock(), vec![42]);
+        assert_eq!(off_file.read().unwrap(), 42);
+        committer.stop().await;
     }
 }

@@ -4,7 +4,19 @@
 //! and github.com/prometheus/prometheus/tsdb/addsymbol.go.
 
 use hashbrown::HashTable;
+use thiserror::Error;
 use xxhash_rust::xxh3::xxh3_64;
+
+/// Errors returned by [`SymbolTable::try_intern`] when capacity limits are exceeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum SymbolTableError {
+    #[error("symbol table byte arena exceeded 4 GiB")]
+    ArenaFull,
+    #[error("single symbol exceeded 4 GiB")]
+    SymbolTooLarge,
+    #[error("symbol table exceeded u32::MAX entries")]
+    TooManySymbols,
+}
 
 /// Compact 32-bit identifier for an interned string in a [`SymbolTable`].
 ///
@@ -77,10 +89,11 @@ impl SymbolTable {
 
     /// Interns `s`, returning its existing [`SymbolId`] or inserting it into the arena.
     ///
-    /// Returns [`SymbolId::EMPTY`] when `s.is_empty()`.
-    pub fn intern(&mut self, s: &str) -> SymbolId {
+    /// Returns [`SymbolId::EMPTY`] when `s.is_empty()`. Returns an error if the
+    /// 4 GiB arena or `u32::MAX` symbol limit would be exceeded.
+    pub fn try_intern(&mut self, s: &str) -> Result<SymbolId, SymbolTableError> {
         if s.is_empty() {
-            return SymbolId::EMPTY;
+            return Ok(SymbolId::EMPTY);
         }
         let bytes = s.as_bytes();
         let hash = xxh3_64(bytes);
@@ -92,21 +105,26 @@ impl SymbolTable {
             |&id| Self::slice_bytes(data, entries, id) == bytes,
             |&id| xxh3_64(Self::slice_bytes(data, entries, id)),
         ) {
-            hashbrown::hash_table::Entry::Occupied(entry) => SymbolId(*entry.get()),
+            hashbrown::hash_table::Entry::Occupied(entry) => Ok(SymbolId(*entry.get())),
             hashbrown::hash_table::Entry::Vacant(entry) => {
                 let offset = u32::try_from(self.data.len())
-                    .expect("symbol table byte arena exceeded 4 GiB");
+                    .map_err(|_| SymbolTableError::ArenaFull)?;
                 let len = u32::try_from(bytes.len())
-                    .expect("single symbol exceeded 4 GiB");
+                    .map_err(|_| SymbolTableError::SymbolTooLarge)?;
                 let id = u32::try_from(self.entries.len())
-                    .expect("symbol table exceeded u32::MAX entries");
+                    .map_err(|_| SymbolTableError::TooManySymbols)?;
 
                 self.data.extend_from_slice(bytes);
                 self.entries.push(SymbolEntry { offset, len });
                 entry.insert(id);
-                SymbolId(id)
+                Ok(SymbolId(id))
             }
         }
+    }
+
+    /// Interns `s`, panicking if the 4 GiB arena or `u32::MAX` entry limit is exceeded.
+    pub fn intern(&mut self, s: &str) -> SymbolId {
+        self.try_intern(s).expect("symbol table limit exceeded")
     }
 
     /// Looks up `s` without inserting it.
@@ -190,5 +208,6 @@ mod tests {
         assert_eq!(st.resolve(c), "job");
         assert_eq!(st.len(), 4);
         assert!(!st.is_empty());
+        assert_eq!(st.try_intern("job"), Ok(c));
     }
 }

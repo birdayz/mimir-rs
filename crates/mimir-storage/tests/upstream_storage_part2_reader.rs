@@ -2859,7 +2859,7 @@ async fn test_partition_committer_commit() {
         assert!(committed.load(Ordering::SeqCst));
     }
 
-    // 5. "should proceed with commit even if notifier fails"
+    // 5. RISK-4A durability: abort commit (do not advance Kafka or offset-file offset) if pre-commit Head::sync() fails
     {
         let cfg = create_test_kafka_config("127.0.0.1:9092", TOPIC);
         let committed = Arc::new(AtomicBool::new(false));
@@ -2878,7 +2878,8 @@ async fn test_partition_committer_commit() {
             })),
         });
         let dir = tempfile::tempdir().unwrap();
-        let off_file = Arc::new(OffsetFile::new(dir.path().join("offset.json"), PARTITION_ID));
+        let off_path = dir.path().join("offset.json");
+        let off_file = Arc::new(OffsetFile::new(off_path.clone(), PARTITION_ID));
         let committer = PartitionCommitter::new(
             cfg,
             adm,
@@ -2888,8 +2889,11 @@ async fn test_partition_committer_commit() {
             Some(off_file),
             None,
         );
-        committer.commit(123).await.unwrap();
-        assert!(committed.load(Ordering::SeqCst));
+        let err = committer.commit(123).await.unwrap_err();
+        assert!(err.contains("notification failed"), "{err}");
+        assert!(!committed.load(Ordering::SeqCst));
+        assert_eq!(committer.last_committed_offset(), -1);
+        assert!(!off_path.exists());
     }
 }
 

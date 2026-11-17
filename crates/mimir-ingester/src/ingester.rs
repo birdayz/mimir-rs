@@ -159,7 +159,7 @@ pub struct Ingester {
 
     pub tsdbs: DashMap<String, Arc<UserTsdb>>,
     pub users_metadata: DashMap<String, Arc<TenantMetadataStore>>,
-    tsdb_create_mtx: Mutex<()>,
+    pub(crate) tsdb_create_mtx: Mutex<()>,
 
     pub series_count: Arc<AtomicI64>,
     pub inflight_push_requests: Arc<AtomicI64>,
@@ -1148,12 +1148,16 @@ impl Ingester {
             }
         }
         for k in keys {
-            if let Some((_, db)) = self.tsdbs.remove(&k) {
+            let removed = {
+                let _g = self.tsdb_create_mtx.lock();
+                self.tsdbs
+                    .remove_if(&k, |_, v| v.state() != crate::user_tsdb::TsdbState::Closed)
+            };
+            if let Some((_, db)) = removed {
                 let tracker_names = db.active_series.current_matcher_names();
                 if let Err(e) = db.close() {
                     warn!(user = %k, error = %e, "unable to close TSDB");
                 }
-                self.tsdb_metrics.remove_registry_for_tenant(&k);
                 self.metrics.mem_users.dec();
                 self.tsdb_metrics.remove_registry_for_tenant(&k);
                 self.metrics

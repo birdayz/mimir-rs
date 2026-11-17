@@ -196,9 +196,9 @@ pub(crate) struct BucketIterator<'a> {
 
 impl<'a> BucketIterator<'a> {
     pub fn new(spans: &'a [HistogramSpan]) -> Self {
-        let mut idx = -1;
+        let mut idx = -1i32;
         if let Some(first) = spans.first() {
-            idx += first.offset;
+            idx = idx.wrapping_add(first.offset);
         }
         Self {
             spans,
@@ -214,15 +214,18 @@ impl<'a> BucketIterator<'a> {
         }
         if self.bucket < (self.spans[self.span].length as isize) - 1 {
             self.bucket += 1;
-            self.idx += 1;
+            self.idx = self.idx.wrapping_add(1);
             return Some(self.idx);
         }
         while self.span + 1 < self.spans.len() {
             self.span += 1;
-            self.idx += self.spans[self.span].offset + 1;
+            self.idx = self
+                .idx
+                .wrapping_add(self.spans[self.span].offset)
+                .wrapping_add(1);
             self.bucket = 0;
             if self.spans[self.span].length == 0 {
-                self.idx -= 1;
+                self.idx = self.idx.wrapping_sub(1);
                 continue;
             }
             return Some(self.idx);

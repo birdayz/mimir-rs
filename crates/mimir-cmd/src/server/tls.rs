@@ -16,17 +16,16 @@
 //! restricts TLS 1.2 suites (TLS 1.3 suites are always enabled), and the minimum version
 //! defaults to TLS 1.2 (Go's server default).
 
-use std::fmt;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+use mimir_common::tls::{go_read_err, CachedReloadingCert, CertLoadError, PemSource};
 use mimir_config::server::TLSConfig;
-use rustls::crypto::{CryptoProvider, SupportedKxGroup, WebPkiSupportedAlgorithms};
+use rustls::crypto::{SupportedKxGroup, WebPkiSupportedAlgorithms};
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
-use rustls::sign::CertifiedKey;
+use rustls::server::{ResolvesServerCert, WebPkiClientVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme, SupportedCipherSuite};
 
 /// Server-wide TLS options (`-server.tls-cipher-suites`, `-server.tls-min-version`,
@@ -152,66 +151,7 @@ fn kx_groups(s: &str) -> Result<Option<Vec<&'static dyn SupportedKxGroup>>> {
     Ok(Some(out))
 }
 
-fn go_read_err(path: &str, err: &std::io::Error) -> String {
-    match err.kind() {
-        std::io::ErrorKind::NotFound => format!("open {path}: no such file or directory"),
-        std::io::ErrorKind::PermissionDenied => format!("open {path}: permission denied"),
-        _ => format!("open {path}: {err}"),
-    }
-}
 
-/// Loads the key pair like exporter-toolkit's `loadCert` (file paths win over inline values).
-fn load_cert(cfg: &TLSConfig, provider: &CryptoProvider) -> Result<Arc<CertifiedKey>> {
-    let cert_data = if !cfg.cert_file.is_empty() {
-        std::fs::read(&cfg.cert_file).map_err(|e| {
-            anyhow!("failed to read cert_file ({}): {}", cfg.cert_file, go_read_err(&cfg.cert_file, &e))
-        })?
-    } else {
-        cfg.cert.as_bytes().to_vec()
-    };
-    let key_data = if !cfg.key_file.is_empty() {
-        std::fs::read(&cfg.key_file).map_err(|e| {
-            anyhow!("failed to read key_file ({}): {}", cfg.key_file, go_read_err(&cfg.key_file, &e))
-        })?
-    } else {
-        cfg.key.as_bytes().to_vec()
-    };
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_data)
-        .filter_map(|c| c.ok())
-        .collect();
-    if certs.is_empty() {
-        bail!("failed to load X509KeyPair: tls: failed to find any PEM data in certificate input");
-    }
-    let key = PrivateKeyDer::from_pem_slice(&key_data).map_err(|_| {
-        anyhow!("failed to load X509KeyPair: tls: failed to find any PEM data in key input")
-    })?;
-    let signing_key = provider
-        .key_provider
-        .load_private_key(key)
-        .map_err(|e| anyhow!("failed to load X509KeyPair: {e}"))?;
-    let ck = CertifiedKey::new(certs, signing_key);
-    ck.keys_match()
-        .map_err(|_| anyhow!("failed to load X509KeyPair: tls: private key does not match public key"))?;
-    Ok(Arc::new(ck))
-}
-
-/// exporter-toolkit `GetCertificate`: re-reads the key pair on every handshake.
-struct ReloadingCertResolver {
-    cfg: TLSConfig,
-    provider: Arc<CryptoProvider>,
-}
-
-impl fmt::Debug for ReloadingCertResolver {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReloadingCertResolver").finish_non_exhaustive()
-    }
-}
-
-impl ResolvesServerCert for ReloadingCertResolver {
-    fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        load_cert(&self.cfg, &self.provider).ok()
-    }
-}
 
 /// Go `tls.RequestClientCert` / `tls.RequireAnyClientCert`: a client certificate is requested
 /// (optionally required) but never verified against a CA.
@@ -310,8 +250,27 @@ pub fn server_config(cfg: &TLSConfig, opts: &TlsOptions, alpn: &[&[u8]]) -> Resu
     if cfg.key_file.is_empty() && cfg.key.is_empty() {
         bail!("missing one of key or key_file");
     }
-    // Confirm that certificate and key paths are valid.
-    load_cert(cfg, &provider)?;
+    // Confirm that certificate and key paths are valid and build the cached live reloader.
+    let cert_source = if !cfg.cert_file.is_empty() {
+        PemSource::File(cfg.cert_file.clone())
+    } else {
+        PemSource::Inline(cfg.cert.as_bytes().to_vec())
+    };
+    let key_source = if !cfg.key_file.is_empty() {
+        PemSource::File(cfg.key_file.clone())
+    } else {
+        PemSource::Inline(cfg.key.as_bytes().to_vec())
+    };
+    let cert_resolver = CachedReloadingCert::new(cert_source, key_source, Arc::clone(&provider))
+        .map_err(|e| match e {
+            CertLoadError::ReadCert { path, reason } => {
+                anyhow!("failed to read cert_file ({path}): {reason}")
+            }
+            CertLoadError::ReadKey { path, reason } => {
+                anyhow!("failed to read key_file ({path}): {reason}")
+            }
+            CertLoadError::KeyPair(reason) => anyhow!("failed to load X509KeyPair: {reason}"),
+        })?;
 
     let ca = client_ca_pool(cfg)?;
     let algs = provider.signature_verification_algorithms;
@@ -340,10 +299,7 @@ pub fn server_config(cfg: &TLSConfig, opts: &TlsOptions, alpn: &[&[u8]]) -> Resu
         .with_protocol_versions(versions)
         .map_err(|e| anyhow!("{e}"))?
         .with_client_cert_verifier(verifier)
-        .with_cert_resolver(Arc::new(ReloadingCertResolver {
-            cfg: cfg.clone(),
-            provider,
-        }));
+        .with_cert_resolver(Arc::new(cert_resolver) as Arc<dyn ResolvesServerCert>);
     sc.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(Arc::new(sc))
 }

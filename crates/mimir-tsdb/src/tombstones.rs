@@ -231,11 +231,18 @@ pub fn write_tombstones_file(dir: &Path, tr: &MemTombstones) -> Result<usize, To
     out.extend_from_slice(&payload);
     out.extend_from_slice(&crc.to_be_bytes());
 
-    let mut f = File::create(&tmp)?;
-    f.write_all(&out)?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, &path)?;
+    let write_res = (|| -> io::Result<()> {
+        let mut f = File::create(&tmp)?;
+        f.write_all(&out)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(TombstoneError::Io(e));
+    }
     crate::block::sync_dir(dir)?;
     Ok(out.len())
 }

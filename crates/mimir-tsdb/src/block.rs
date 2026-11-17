@@ -272,11 +272,18 @@ pub fn write_meta_file(dir: &Path, meta: &mut BlockMeta) -> Result<usize, BlockE
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
     meta.serialize(&mut ser)?;
     buf.push(b'\n');
-    let mut f = File::create(&tmp)?;
-    f.write_all(&buf)?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, &path)?;
+    let write_res = (|| -> io::Result<()> {
+        let mut f = File::create(&tmp)?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(BlockError::Io(e));
+    }
     sync_dir(dir)?;
     Ok(buf.len())
 }

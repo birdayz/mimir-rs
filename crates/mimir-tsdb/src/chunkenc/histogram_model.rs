@@ -317,13 +317,13 @@ impl Histogram {
         let mut p_buckets = Vec::with_capacity(self.positive_buckets.len());
         let mut cur = 0i64;
         for &d in &self.positive_buckets {
-            cur += d;
+            cur = cur.wrapping_add(d);
             p_buckets.push(cur as f64);
         }
         let mut n_buckets = Vec::with_capacity(self.negative_buckets.len());
         cur = 0;
         for &d in &self.negative_buckets {
-            cur += d;
+            cur = cur.wrapping_add(d);
             n_buckets.push(cur as f64);
         }
         FloatHistogram {

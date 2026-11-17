@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -238,6 +239,7 @@ struct TsdbInner {
     opts: TsdbOptions,
     head: Head,
     blocks: RwLock<Vec<Arc<Block>>>,
+    closed: AtomicBool,
     compact_mtx: Mutex<()>,
     metrics: DbMetrics,
 }
@@ -314,6 +316,7 @@ impl Tsdb {
             opts,
             head,
             blocks: RwLock::new(blocks),
+            closed: AtomicBool::new(false),
             compact_mtx: Mutex::new(()),
             metrics,
         });
@@ -436,22 +439,40 @@ impl Tsdb {
         self.inner.truncate(mint)
     }
 
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
     /// Returns a [`TsdbQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
     pub fn querier(&self, mint: i64, maxt: i64) -> TsdbQuerier<'_> {
-        TsdbQuerier::with_blocks_lock(Some(&self.inner.head), &self.inner.blocks, mint, maxt)
+        TsdbQuerier::with_blocks_lock_and_closed(
+            Some(&self.inner.head),
+            &self.inner.blocks,
+            &self.inner.closed,
+            mint,
+            maxt,
+        )
     }
 
     /// Returns a [`TsdbChunkQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
     pub fn chunk_querier(&self, mint: i64, maxt: i64) -> TsdbChunkQuerier<'_> {
-        TsdbChunkQuerier::with_blocks_lock(Some(&self.inner.head), &self.inner.blocks, mint, maxt)
+        TsdbChunkQuerier::with_blocks_lock_and_closed(
+            Some(&self.inner.head),
+            &self.inner.blocks,
+            &self.inner.closed,
+            mint,
+            maxt,
+        )
     }
 
     /// Returns an unordered [`TsdbChunkQuerier`] (concatenating chunks across Head and Blocks
     /// without cross-block compaction, matching Prometheus `UnorderedChunkQuerier`).
     pub fn unordered_chunk_querier(&self, mint: i64, maxt: i64) -> TsdbChunkQuerier<'_> {
-        TsdbChunkQuerier::with_blocks_lock_unordered(
+        TsdbChunkQuerier::with_blocks_lock_unordered_and_closed(
             Some(&self.inner.head),
             &self.inner.blocks,
+            &self.inner.closed,
             mint,
             maxt,
         )
@@ -472,10 +493,12 @@ impl Tsdb {
         self.inner.head.exemplars().select(start, end, matcher_sets)
     }
 
-    /// Stops the background reload/mmap loop and flushes & closes Head.
+    /// Stops the background reload/mmap loop, flushes & closes Head, and drops all block mmaps.
     pub fn close(&self) -> Result<(), TsdbError> {
+        self.inner.closed.store(true, Ordering::Release);
         self.stop_background_loop();
         self.inner.head.close()?;
+        self.inner.blocks.write().clear();
         Ok(())
     }
 }
@@ -1381,5 +1404,28 @@ mod tests {
             "dropping Tsdb instances with 60s background reload loop stalled: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn closed_tsdb_rejects_queries_with_closed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Tsdb::open_with_reload_interval(dir.path(), TsdbOptions::default(), Duration::ZERO).unwrap();
+        let pairs = [("__name__", "closed_tsdb_metric"), ("job", "test")];
+        {
+            let mut app = db.appender();
+            app.append_float(None, &pairs, 1_000, 1.0).unwrap();
+            app.commit().unwrap();
+        }
+        db.compact_head_range(1_000, 2_000).unwrap().unwrap();
+        assert_eq!(db.block_ulids().len(), 1);
+
+        db.close().unwrap();
+        assert!(db.is_closed());
+
+        let matchers = [LabelMatcher::new(crate::matcher::MatchType::Equal, "__name__", "closed_tsdb_metric").unwrap()];
+        let q = db.querier(i64::MIN, i64::MAX);
+        assert!(matches!(q.select(false, &matchers), Err(crate::querier::QuerierError::Closed)));
+        assert!(matches!(q.label_names(&[]), Err(crate::querier::QuerierError::Closed)));
+        assert!(matches!(q.label_values("__name__", None, &[]), Err(crate::querier::QuerierError::Closed)));
     }
 }

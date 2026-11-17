@@ -12,8 +12,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(miri)
+))]
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -26,7 +32,7 @@ use parking_lot::{Mutex, RwLock};
 pub use crate::costattribution::ActiveSeriesTracker as CostAttributionTracker;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-const NUM_STRIPES: usize = 4096;
+const NUM_STRIPES: usize = if cfg!(miri) { 16 } else { 4096 };
 const STRIPE_MASK: usize = NUM_STRIPES - 1;
 
 pub const ENABLED_FLAG: &str = "ingester.active-series-metrics-enabled";
@@ -886,15 +892,23 @@ impl SeriesIndexReader for mimir_tsdb::head::Head {
 }
 
 // ---------------------------------------------------------------------------
-// Lock-free NanosSlab for zero-lock ActiveSeries timestamp updates
+// Lock-free 2-level paged NanosSlab for zero-lock ActiveSeries timestamp updates
 // ---------------------------------------------------------------------------
 
 const SLAB_PAGE_SHIFT: usize = 12;
 const SLAB_PAGE_SIZE: usize = 1 << SLAB_PAGE_SHIFT; // 4,096 slots = 32 KiB/page
 const SLAB_PAGE_MASK: usize = SLAB_PAGE_SIZE - 1;
-const SLAB_MAX_PAGES: usize = 8192; // 33,554,432 slots max
-const SLAB_MAX_SLOTS: u32 = (SLAB_MAX_PAGES * SLAB_PAGE_SIZE) as u32;
+const SLAB_DIR_SHIFT: usize = 8;
+const SLAB_DIR_SIZE: usize = 1 << SLAB_DIR_SHIFT; // 256 pages/dir
+const SLAB_DIR_MASK: usize = SLAB_DIR_SIZE - 1;
+const SLAB_TOP_SIZE: usize = 256; // 256 * 256 * 4096 = 268,435,456 slots (matches Head::PagedById)
+const SLAB_MAX_SLOTS: u32 = (SLAB_TOP_SIZE * SLAB_DIR_SIZE * SLAB_PAGE_SIZE) as u32;
 const SLOT_INACTIVE: i64 = i64::MIN;
+const SLOT_INACTIVE_RAW: u64 = 0;
+const NANOS_SIGN_BIT: u64 = i64::MIN as u64;
+
+const PAGE_STATE_RECLAIMED: u32 = 1 << 30;
+const PAGE_STATE_RECLAIMING: u32 = 1 << 31;
 
 const CACHE_FLAG_PLAIN_FLOAT: u8 = 1 << 0;
 const CACHE_FLAG_IS_OTLP: u8 = 1 << 1;
@@ -933,91 +947,222 @@ const fn sanitize_nanos(now_ns: i64) -> i64 {
     }
 }
 
-#[repr(C, align(64))]
+/// Order-preserving bijection `i64 -> u64` where `SLOT_INACTIVE` (`i64::MIN`) maps to `0`.
+/// Because `0` represents `SLOT_INACTIVE`, `alloc_zeroed` and Linux `madvise(MADV_DONTNEED)`
+/// zero-fill pages directly to `SLOT_INACTIVE` while preserving all negative & positive timestamps.
+#[inline(always)]
+const fn encode_nanos(ts: i64) -> u64 {
+    (ts as u64) ^ NANOS_SIGN_BIT
+}
+
+#[inline(always)]
+const fn decode_nanos(raw: u64) -> i64 {
+    (raw ^ NANOS_SIGN_BIT) as i64
+}
+
+#[repr(C, align(4096))]
 struct SlabPage {
-    slots: [AtomicI64; SLAB_PAGE_SIZE],
+    slots: [AtomicU64; SLAB_PAGE_SIZE],
 }
 
 impl SlabPage {
     fn new_boxed() -> Box<Self> {
         let layout = std::alloc::Layout::new::<Self>();
-        // SAFETY: `Self` has non-zero size and alignment 64.
-        let ptr = unsafe { std::alloc::alloc(layout) as *mut Self };
+        // SAFETY: `Self` has non-zero size (32 KiB) and 4 KiB alignment; all-zero bytes
+        // initialize every `AtomicU64` to `SLOT_INACTIVE_RAW` (`0`), decoding to `SLOT_INACTIVE`.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut Self };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
-        // SAFETY: `ptr` is valid for writes of `SlabPage`; every field is initialized before `Box::from_raw`.
-        unsafe {
-            let slots_ptr = std::ptr::addr_of_mut!((*ptr).slots) as *mut AtomicI64;
-            for i in 0..SLAB_PAGE_SIZE {
-                slots_ptr.add(i).write(AtomicI64::new(SLOT_INACTIVE));
-            }
-            Box::from_raw(ptr)
-        }
+        // SAFETY: `ptr` was allocated with `layout` and zero-initialized.
+        unsafe { Box::from_raw(ptr) }
     }
 }
 
+struct SlabPageDir {
+    pages: [AtomicPtr<SlabPage>; SLAB_DIR_SIZE],
+    states: [AtomicU32; SLAB_DIR_SIZE],
+}
+
+impl SlabPageDir {
+    fn new_boxed() -> Box<Self> {
+        Box::new(Self {
+            pages: [const { AtomicPtr::new(std::ptr::null_mut()) }; SLAB_DIR_SIZE],
+            states: [const { AtomicU32::new(0) }; SLAB_DIR_SIZE],
+        })
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(miri)
+))]
+fn madvise_dontneed_page(page_ptr: *mut SlabPage) -> bool {
+    const SC_PAGESIZE: std::ffi::c_int = 30;
+    const MADV_DONTNEED: std::ffi::c_int = 4;
+    extern "C" {
+        fn sysconf(name: std::ffi::c_int) -> std::ffi::c_long;
+        fn madvise(
+            addr: *mut std::ffi::c_void,
+            len: usize,
+            advice: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+    static OS_PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+    let os_page_size = *OS_PAGE_SIZE.get_or_init(|| {
+        // SAFETY: standard POSIX `sysconf(_SC_PAGESIZE)` query.
+        let ps = unsafe { sysconf(SC_PAGESIZE) };
+        if ps > 0 { ps as usize } else { 0 }
+    });
+    let size = std::mem::size_of::<SlabPage>();
+    if os_page_size > 0
+        && (page_ptr as usize).is_multiple_of(os_page_size)
+        && size.is_multiple_of(os_page_size)
+    {
+        // SAFETY: `page_ptr` points to a `size`-byte OS-page-aligned allocation whose slots
+        // are all `SLOT_INACTIVE_RAW` (`0`), and `PAGE_STATE_RECLAIMING` blocks concurrent stores.
+        unsafe { madvise(page_ptr.cast::<std::ffi::c_void>(), size, MADV_DONTNEED) == 0 }
+    } else {
+        false
+    }
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(miri)
+)))]
+fn madvise_dontneed_page(_page_ptr: *mut SlabPage) -> bool {
+    false
+}
+
+enum PurgeSlotOutcome {
+    Inactive,
+    Purged,
+    Kept(i64),
+}
+
 struct NanosSlab {
-    pages: Box<[AtomicPtr<SlabPage>; SLAB_MAX_PAGES]>,
+    dirs: Box<[AtomicPtr<SlabPageDir>; SLAB_TOP_SIZE]>,
     alloc_mtx: Mutex<()>,
 }
 
+// SAFETY: Directory and page pointers are published with `Release`/`Acquire` and virtual
+// memory is only freed in `NanosSlab::drop` (with `&mut self`), so lock-free readers never UAF.
+unsafe impl Send for NanosSlab {}
+unsafe impl Sync for NanosSlab {}
+
 impl NanosSlab {
     fn new() -> Self {
-        let mut v: Vec<AtomicPtr<SlabPage>> = Vec::with_capacity(SLAB_MAX_PAGES);
-        for _ in 0..SLAB_MAX_PAGES {
-            v.push(AtomicPtr::new(std::ptr::null_mut()));
-        }
-        let raw = Box::into_raw(v.into_boxed_slice()) as *mut [AtomicPtr<SlabPage>; SLAB_MAX_PAGES];
+        let dirs: Box<[AtomicPtr<SlabPageDir>]> = (0..SLAB_TOP_SIZE)
+            .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+            .collect();
+        let raw = Box::into_raw(dirs) as *mut [AtomicPtr<SlabPageDir>; SLAB_TOP_SIZE];
         Self {
-            // SAFETY: `[AtomicPtr<SlabPage>; SLAB_MAX_PAGES]` has exact length `SLAB_MAX_PAGES`.
-            pages: unsafe { Box::from_raw(raw) },
+            // SAFETY: `dirs` has exact length `SLAB_TOP_SIZE`.
+            dirs: unsafe { Box::from_raw(raw) },
             alloc_mtx: Mutex::new(()),
         }
     }
 
     #[inline(always)]
-    fn slot_ref(&self, ref_id: u32) -> Option<&AtomicI64> {
+    const fn split_id(ref_id: u32) -> (usize, usize, usize) {
+        let id = ref_id as usize;
+        let top = id >> (SLAB_PAGE_SHIFT + SLAB_DIR_SHIFT);
+        let dir = (id >> SLAB_PAGE_SHIFT) & SLAB_DIR_MASK;
+        let offset = id & SLAB_PAGE_MASK;
+        (top, dir, offset)
+    }
+
+    #[inline(always)]
+    fn slot_ref(&self, ref_id: u32) -> Option<&AtomicU64> {
+        self.slot_and_state(ref_id).map(|(slot, _)| slot)
+    }
+
+    #[inline(always)]
+    fn slot_and_state(&self, ref_id: u32) -> Option<(&AtomicU64, &AtomicU32)> {
         if ref_id >= SLAB_MAX_SLOTS {
             return None;
         }
-        let page_idx = (ref_id as usize) >> SLAB_PAGE_SHIFT;
-        let offset = (ref_id as usize) & SLAB_PAGE_MASK;
-        let ptr = self.pages[page_idx].load(Ordering::Acquire);
-        if ptr.is_null() {
+        let (top, dir, offset) = Self::split_id(ref_id);
+        let dir_ptr = self.dirs[top].load(Ordering::Acquire);
+        if dir_ptr.is_null() {
             return None;
         }
-        // SAFETY: `ptr` points to a heap-allocated `SlabPage` freed only in `NanosSlab::drop`,
+        // SAFETY: `dir_ptr` points to a `SlabPageDir` freed only in `NanosSlab::drop`.
+        let dir_ref = unsafe { &*dir_ptr };
+        let page_ptr = dir_ref.pages[dir].load(Ordering::Acquire);
+        if page_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `page_ptr` points to a `SlabPage` freed only in `NanosSlab::drop`,
         // and `offset < SLAB_PAGE_SIZE`.
-        unsafe { Some(&(*ptr).slots[offset]) }
+        unsafe { Some((&(*page_ptr).slots[offset], &dir_ref.states[dir])) }
     }
 
     fn ensure_and_store(&self, ref_id: u32, initial_nanos: i64) {
-        debug_assert!(ref_id < SLAB_MAX_SLOTS);
-        let page_idx = (ref_id as usize) >> SLAB_PAGE_SHIFT;
-        let offset = (ref_id as usize) & SLAB_PAGE_MASK;
-        let mut page_ptr = self.pages[page_idx].load(Ordering::Acquire);
-        if page_ptr.is_null() {
+        if ref_id >= SLAB_MAX_SLOTS {
+            return;
+        }
+        let (top, dir, offset) = Self::split_id(ref_id);
+        let mut dir_ptr = self.dirs[top].load(Ordering::Acquire);
+        if dir_ptr.is_null() {
             let _g = self.alloc_mtx.lock();
-            page_ptr = self.pages[page_idx].load(Ordering::Acquire);
-            if page_ptr.is_null() {
-                page_ptr = Box::into_raw(SlabPage::new_boxed());
-                self.pages[page_idx].store(page_ptr, Ordering::Release);
+            dir_ptr = self.dirs[top].load(Ordering::Acquire);
+            if dir_ptr.is_null() {
+                dir_ptr = Box::into_raw(SlabPageDir::new_boxed());
+                self.dirs[top].store(dir_ptr, Ordering::Release);
             }
         }
+        // SAFETY: `dir_ptr` was just initialized/loaded and is valid until `NanosSlab::drop`.
+        let dir_ref = unsafe { &*dir_ptr };
+        let mut page_ptr = dir_ref.pages[dir].load(Ordering::Acquire);
+        if page_ptr.is_null() {
+            let _g = self.alloc_mtx.lock();
+            page_ptr = dir_ref.pages[dir].load(Ordering::Acquire);
+            if page_ptr.is_null() {
+                page_ptr = Box::into_raw(SlabPage::new_boxed());
+                dir_ref.pages[dir].store(page_ptr, Ordering::Release);
+            }
+        }
+
+        let state_atomic = &dir_ref.states[dir];
+        loop {
+            let cur = state_atomic.load(Ordering::Acquire);
+            if (cur & PAGE_STATE_RECLAIMING) != 0 {
+                // Wait for concurrent reclaim_empty_pages() holding alloc_mtx to finish madvise.
+                let _g = self.alloc_mtx.lock();
+                std::hint::spin_loop();
+                continue;
+            }
+            let next = (cur & !PAGE_STATE_RECLAIMED) + 1;
+            if state_atomic
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let encoded = encode_nanos(sanitize_nanos(initial_nanos));
         // SAFETY: `page_ptr` was just initialized/loaded and `offset < SLAB_PAGE_SIZE`.
-        unsafe { &(*page_ptr).slots[offset] }.store(sanitize_nanos(initial_nanos), Ordering::Release);
+        let slot_atomic = unsafe { &(*page_ptr).slots[offset] };
+        let prev = slot_atomic.swap(encoded, Ordering::AcqRel);
+        if prev != SLOT_INACTIVE_RAW {
+            state_atomic.fetch_sub(1, Ordering::Release);
+        }
     }
 
     #[inline(always)]
     fn write_nanos_if_active(&self, ref_id: u32, now_ns: i64) -> Option<bool> {
-        let now_ns = sanitize_nanos(now_ns);
+        let encoded_now = encode_nanos(sanitize_nanos(now_ns));
         let slot_atomic = self.slot_ref(ref_id)?;
         let mut cur = slot_atomic.load(Ordering::Relaxed);
-        while cur != SLOT_INACTIVE && now_ns > cur {
+        while cur != SLOT_INACTIVE_RAW && encoded_now > cur {
             match slot_atomic.compare_exchange_weak(
                 cur,
-                now_ns,
+                encoded_now,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -1025,7 +1170,7 @@ impl NanosSlab {
                 Err(actual) => cur = actual,
             }
         }
-        if cur == SLOT_INACTIVE {
+        if cur == SLOT_INACTIVE_RAW {
             None
         } else {
             Some(false)
@@ -1034,25 +1179,134 @@ impl NanosSlab {
 
     #[inline(always)]
     fn load(&self, ref_id: u32) -> i64 {
-        self.slot_ref(ref_id)
-            .map_or(SLOT_INACTIVE, |a| a.load(Ordering::Acquire))
+        self.slot_ref(ref_id).map_or(SLOT_INACTIVE, |a| {
+            decode_nanos(a.load(Ordering::Acquire))
+        })
     }
 
     #[inline(always)]
     fn mark_inactive(&self, ref_id: u32) {
-        if let Some(slot_atomic) = self.slot_ref(ref_id) {
-            slot_atomic.store(SLOT_INACTIVE, Ordering::Release);
+        if let Some((slot_atomic, state_atomic)) = self.slot_and_state(ref_id) {
+            let prev = slot_atomic.swap(SLOT_INACTIVE_RAW, Ordering::AcqRel);
+            if prev != SLOT_INACTIVE_RAW {
+                state_atomic.fetch_sub(1, Ordering::Release);
+            }
         }
+    }
+
+    #[inline(always)]
+    fn try_purge_slot(&self, ref_id: u32, keep_until_ns: i64) -> PurgeSlotOutcome {
+        let Some((slot_atomic, state_atomic)) = self.slot_and_state(ref_id) else {
+            return PurgeSlotOutcome::Inactive;
+        };
+        let mut cur = slot_atomic.load(Ordering::Acquire);
+        loop {
+            if cur == SLOT_INACTIVE_RAW {
+                return PurgeSlotOutcome::Inactive;
+            }
+            let ts = decode_nanos(cur);
+            if ts >= keep_until_ns {
+                return PurgeSlotOutcome::Kept(ts);
+            }
+            match slot_atomic.compare_exchange_weak(
+                cur,
+                SLOT_INACTIVE_RAW,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    state_atomic.fetch_sub(1, Ordering::Release);
+                    return PurgeSlotOutcome::Purged;
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn reclaim_empty_pages(&self) -> usize {
+        let mut reclaimed = 0usize;
+        for dir_atomic in self.dirs.iter() {
+            let dir_ptr = dir_atomic.load(Ordering::Acquire);
+            if dir_ptr.is_null() {
+                continue;
+            }
+            // SAFETY: `dir_ptr` is valid until `NanosSlab::drop`.
+            let dir_ref = unsafe { &*dir_ptr };
+            for i in 0..SLAB_DIR_SIZE {
+                let page_ptr = dir_ref.pages[i].load(Ordering::Acquire);
+                if page_ptr.is_null() {
+                    continue;
+                }
+                let state_atomic = &dir_ref.states[i];
+                if state_atomic.load(Ordering::Relaxed) != 0 {
+                    continue;
+                }
+                let _g = self.alloc_mtx.lock();
+                if state_atomic
+                    .compare_exchange(
+                        0,
+                        PAGE_STATE_RECLAIMING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    let next_state = if madvise_dontneed_page(page_ptr) {
+                        reclaimed += 1;
+                        PAGE_STATE_RECLAIMED
+                    } else {
+                        0
+                    };
+                    state_atomic.store(next_state, Ordering::Release);
+                }
+            }
+        }
+        reclaimed
+    }
+
+    fn stats(&self) -> (usize, usize, usize) {
+        let mut allocated = 0usize;
+        let mut resident = 0usize;
+        let mut reclaimed = 0usize;
+        for dir_atomic in self.dirs.iter() {
+            let dir_ptr = dir_atomic.load(Ordering::Acquire);
+            if dir_ptr.is_null() {
+                continue;
+            }
+            // SAFETY: `dir_ptr` is valid until `NanosSlab::drop`.
+            let dir_ref = unsafe { &*dir_ptr };
+            for i in 0..SLAB_DIR_SIZE {
+                let page_ptr = dir_ref.pages[i].load(Ordering::Acquire);
+                if page_ptr.is_null() {
+                    continue;
+                }
+                allocated += 1;
+                let st = dir_ref.states[i].load(Ordering::Acquire);
+                if (st & PAGE_STATE_RECLAIMED) != 0 {
+                    reclaimed += 1;
+                } else {
+                    resident += 1;
+                }
+            }
+        }
+        (allocated, resident, reclaimed)
     }
 }
 
 impl Drop for NanosSlab {
     fn drop(&mut self) {
-        for ptr in self.pages.iter() {
-            let p = ptr.load(Ordering::Acquire);
-            if !p.is_null() {
-                // SAFETY: every non-null entry came from `Box::into_raw(SlabPage::new_boxed())`.
-                unsafe { drop(Box::from_raw(p)) };
+        for dir_atomic in self.dirs.iter_mut() {
+            let dir_ptr = *dir_atomic.get_mut();
+            if !dir_ptr.is_null() {
+                // SAFETY: `&mut self` grants exclusive ownership during drop.
+                let mut dir = unsafe { Box::from_raw(dir_ptr) };
+                for page_atomic in dir.pages.iter_mut() {
+                    let page_ptr = *page_atomic.get_mut();
+                    if !page_ptr.is_null() {
+                        // SAFETY: every non-null entry came from `Box::into_raw(SlabPage::new_boxed())`.
+                        unsafe { drop(Box::from_raw(page_ptr)) };
+                    }
+                }
             }
         }
     }
@@ -1999,35 +2253,16 @@ impl SeriesStripe {
                          to_remove: &mut Vec<u64>,
                          new_oldest: &mut i64| {
             if ref_id < SLAB_MAX_SLOTS as u64 {
-                if let Some(slot_atomic) = slab.slot_ref(ref_id as u32) {
-                    loop {
-                        let ts = slot_atomic.load(Ordering::Acquire);
-                        if ts == SLOT_INACTIVE {
-                            to_remove.push(ref_id);
-                            break;
-                        }
-                        if ts >= keep_until_ns {
-                            if ts < *new_oldest {
-                                *new_oldest = ts;
-                            }
-                            break;
-                        }
-                        if slot_atomic
-                            .compare_exchange_weak(
-                                ts,
-                                SLOT_INACTIVE,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            to_remove.push(ref_id);
-                            break;
+                match slab.try_purge_slot(ref_id as u32, keep_until_ns) {
+                    PurgeSlotOutcome::Inactive | PurgeSlotOutcome::Purged => {
+                        to_remove.push(ref_id);
+                    }
+                    PurgeSlotOutcome::Kept(ts) => {
+                        if ts < *new_oldest {
+                            *new_oldest = ts;
                         }
                     }
-                    return;
                 }
-                to_remove.push(ref_id);
                 return;
             }
             let ts = ov
@@ -2302,41 +2537,25 @@ impl ActiveSeries {
             let (c_epoch, c_flags, slot) = unpack_active_cache(packed);
             let cur_epoch = self.epoch.load(Ordering::Acquire);
             if c_epoch == cur_epoch && (c_flags & CACHE_FLAG_PLAIN_FLOAT) != 0 {
-                if let Some(slot_atomic) = self.slab.slot_ref(slot) {
-                    let mut cur = slot_atomic.load(Ordering::Relaxed);
-                    loop {
-                        if cur == SLOT_INACTIVE {
-                            break;
-                        }
-                        if now_ns <= cur {
-                            return true;
-                        }
-                        match slot_atomic.compare_exchange_weak(
-                            cur,
-                            now_ns,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        ) {
-                            Ok(_) => {
-                                let stripe = &self.stripes[(ref_id as usize) & STRIPE_MASK];
-                                let mut prev_oldest =
-                                    stripe.oldest_entry_ns.load(Ordering::Relaxed);
-                                while prev_oldest > 0 && now_ns < prev_oldest {
-                                    match stripe.oldest_entry_ns.compare_exchange_weak(
-                                        prev_oldest,
-                                        0,
-                                        Ordering::Relaxed,
-                                        Ordering::Relaxed,
-                                    ) {
-                                        Ok(_) => break,
-                                        Err(actual) => prev_oldest = actual,
-                                    }
-                                }
-                                return true;
+                match self.slab.write_nanos_if_active(slot, now_ns) {
+                    Some(true) => {
+                        let stripe = &self.stripes[(ref_id as usize) & STRIPE_MASK];
+                        let mut prev_oldest = stripe.oldest_entry_ns.load(Ordering::Relaxed);
+                        while prev_oldest > 0 && now_ns < prev_oldest {
+                            match stripe.oldest_entry_ns.compare_exchange_weak(
+                                prev_oldest,
+                                0,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(actual) => prev_oldest = actual,
                             }
-                            Err(actual) => cur = actual,
                         }
+                        return true;
                     }
+                    Some(false) => return true,
+                    None => {}
                 }
             }
         }
@@ -2512,6 +2731,7 @@ impl ActiveSeries {
         for stripe in &self.stripes {
             stripe.purge(keep_until_ns, idx, &self.deleted, &self.slab);
         }
+        self.slab.reclaim_empty_pages();
     }
 
     /// Lock-free check against `NanosSlab` whether `ref_id` is active at `cutoff_ns`
@@ -2702,6 +2922,13 @@ impl ActiveSeries {
             stripe.clear(&self.slab);
         }
         self.deleted.clear();
+        self.slab.reclaim_empty_pages();
+    }
+
+    /// Returns `(allocated_pages, resident_pages, reclaimed_pages)` in `NanosSlab` for diagnostics/tests.
+    #[doc(hidden)]
+    pub fn debug_slab_stats(&self) -> (usize, usize, usize) {
+        self.slab.stats()
     }
 
     pub fn deleted_counts(&self) -> (usize, usize) {
@@ -3034,12 +3261,15 @@ mod tests {
     #[test]
     fn nanos_slab_fast_path_purge_clear_and_flip_parity() {
         let dir = tempfile::tempdir().unwrap();
-        let head = mimir_tsdb::head::Head::open(
-            dir.path(),
-            mimir_tsdb::head::HeadOptions::default(),
-            i64::MIN,
-        )
-        .unwrap();
+        let mut opts = mimir_tsdb::head::HeadOptions::default();
+        if cfg!(miri) {
+            opts.stripe_size = 16;
+            opts.enable_exemplar_storage = false;
+            opts.wal_replay_concurrency = 1;
+            opts.wal_segment_size = 64 * 1024;
+            opts.head_chunks_write_buffer_size = 4096;
+        }
+        let head = mimir_tsdb::head::Head::open(dir.path(), opts, i64::MIN).unwrap();
         let pairs = [("__name__", "up"), ("job", "api")];
         {
             let mut app = head.appender();
@@ -3134,12 +3364,15 @@ mod tests {
     #[test]
     fn nanos_slab_ref_id_slots_and_is_ref_active_fast_parity() {
         let dir = tempfile::tempdir().unwrap();
-        let head = mimir_tsdb::head::Head::open(
-            dir.path(),
-            mimir_tsdb::head::HeadOptions::default(),
-            i64::MIN,
-        )
-        .unwrap();
+        let mut opts = mimir_tsdb::head::HeadOptions::default();
+        if cfg!(miri) {
+            opts.stripe_size = 16;
+            opts.enable_exemplar_storage = false;
+            opts.wal_replay_concurrency = 1;
+            opts.wal_segment_size = 64 * 1024;
+            opts.head_chunks_write_buffer_size = 4096;
+        }
+        let head = mimir_tsdb::head::Head::open(dir.path(), opts, i64::MIN).unwrap();
         let p1 = [("__name__", "m1"), ("job", "api")];
         let p2 = [("__name__", "m2"), ("job", "api")];
         {
@@ -3211,5 +3444,51 @@ mod tests {
         assert_eq!(tracker.active(), (0, 0, 0, 0));
 
         head.close().unwrap();
+    }
+
+    #[test]
+    fn nanos_slab_preserves_negative_and_epoch_timestamps_and_reclaims_pages() {
+        let tracker = ActiveSeries::new(Vec::new(), Duration::from_secs(60));
+        let p = [("__name__", "neg_ts")];
+
+        // Negative timestamp (before UNIX_EPOCH) & exact UNIX_EPOCH (0 ns)
+        let neg_t = UNIX_EPOCH - Duration::from_secs(100);
+        let zero_t = UNIX_EPOCH;
+        let ref_neg = 50_000_001u64;
+        let ref_zero = 268_435_455u64; // last paged slot before overflow
+        let ref_ov = 268_435_456u64;   // first overflow slot
+
+        tracker.update_series(&p, 1, ref_neg, neg_t, -1, false);
+        tracker.update_series(&p, 2, ref_zero, zero_t, -1, false);
+        tracker.update_series(&p, 3, ref_ov, zero_t, -1, false);
+
+        assert!(tracker.is_ref_active_fast(ref_neg, system_time_to_unix_nanos(neg_t)));
+        assert!(!tracker.is_ref_active_fast(ref_neg, system_time_to_unix_nanos(neg_t) + 1));
+        assert!(tracker.is_ref_active_fast(ref_zero, 0));
+        assert!(!tracker.is_ref_active_fast(ref_zero, 1));
+        assert!(tracker.is_ref_active_fast(ref_ov, 0));
+        assert!(!tracker.is_ref_active_fast(ref_ov, 1));
+        assert_eq!(tracker.debug_slab_stats(), (2, 2, 0));
+
+        // Purge all -> both slab pages become empty and are reclaimed (when madvise applies).
+        tracker.purge(UNIX_EPOCH + Duration::from_secs(120));
+        assert_eq!(tracker.active(), (0, 0, 0, 0));
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(miri)
+        ))]
+        {
+            let stats = tracker.debug_slab_stats();
+            assert!(stats == (2, 0, 2) || stats == (2, 2, 0), "unexpected slab stats: {stats:?}");
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(miri)
+        )))]
+        assert_eq!(tracker.debug_slab_stats(), (2, 2, 0));
+        assert!(!tracker.is_ref_active_fast(ref_neg, i64::MIN));
+        assert!(!tracker.is_ref_active_fast(ref_zero, i64::MIN));
     }
 }

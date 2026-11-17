@@ -239,11 +239,32 @@ impl FetchWaiter for BackoffWaiter {
 /// Ported from `handleKafkaFetchErr` in `pkg/storage/ingest/fetcher.go`.
 pub async fn handle_kafka_fetch_err(
     err: Option<&KafkaFetchError>,
+    fw: FetchWant,
+    long_backoff: &dyn FetchWaiter,
+    range_error_policy: RangeErrorPolicy,
+    partition_start_offset: &GenericOffsetReader<i64>,
+    refresher: &dyn MetadataRefresher,
+) -> Result<FetchWant, KafkaFetchError> {
+    handle_kafka_fetch_err_with_log_start(
+        err,
+        fw,
+        long_backoff,
+        range_error_policy,
+        partition_start_offset,
+        refresher,
+        None,
+    )
+    .await
+}
+
+async fn handle_kafka_fetch_err_with_log_start(
+    err: Option<&KafkaFetchError>,
     mut fw: FetchWant,
     long_backoff: &dyn FetchWaiter,
     range_error_policy: RangeErrorPolicy,
     partition_start_offset: &GenericOffsetReader<i64>,
     refresher: &dyn MetadataRefresher,
+    response_log_start_offset: Option<i64>,
 ) -> Result<FetchWant, KafkaFetchError> {
     let Some(err) = err else {
         return Ok(fw);
@@ -254,8 +275,16 @@ pub async fn handle_kafka_fetch_err(
             match range_error_policy {
                 RangeErrorPolicy::Abort => return Err(err.clone()),
                 RangeErrorPolicy::ResumeFromStart => {
-                    match partition_start_offset.cached_offset() {
-                        Some(Ok(partition_start)) => {
+                    let cached = partition_start_offset.cached_offset();
+                    let resolved_start = match (response_log_start_offset.filter(|&o| o >= 0), cached) {
+                        (Some(resp_lso), Some(Ok(cached_lso))) => Ok(Some(resp_lso.max(cached_lso))),
+                        (Some(resp_lso), _) => Ok(Some(resp_lso)),
+                        (None, Some(Ok(cached_lso))) => Ok(Some(cached_lso)),
+                        (None, Some(Err(e))) => Err(Some(e)),
+                        (None, None) => Err(None),
+                    };
+                    match resolved_start {
+                        Ok(Some(partition_start)) => {
                             if fw.start_offset < partition_start {
                                 if partition_start >= fw.end_offset {
                                     fw.start_offset = fw.end_offset;
@@ -280,13 +309,16 @@ pub async fn handle_kafka_fetch_err(
                                     start_offset = fw.start_offset,
                                     "offset out of range; waiting for new records to be produced"
                                 );
+                                long_backoff.wait().await;
                             }
                         }
-                        Some(Err(e)) => {
+                        Err(Some(e)) => {
                             error!(err = %e, "failed to find start offset to readjust on OffsetOutOfRange; retrying same records range");
+                            long_backoff.wait().await;
                         }
-                        None => {
+                        Err(None) | Ok(None) => {
                             error!("start offset not yet cached on OffsetOutOfRange; retrying same records range");
+                            long_backoff.wait().await;
                         }
                     }
                 }
@@ -663,6 +695,7 @@ impl ConcurrentFetchers {
         // produced records; it doesn't prevent progress because there is always at least one
         // inflight fetchWant.
         let high_watermark = Arc::new(AtomicI64::new(0));
+        let known_log_start = Arc::new(AtomicI64::new(-1));
         let (wants_tx, wants_rx) = mpsc::channel::<(FetchWant, mpsc::Sender<FetchResult>)>(1);
         let wants_rx = Arc::new(Mutex::new(wants_rx));
 
@@ -676,6 +709,7 @@ impl ConcurrentFetchers {
             let backoff_cfg = self.fetch_backoff_config;
             let buffered_recs = Arc::clone(&self.buffered_fetched_records);
             let hwm = Arc::clone(&high_watermark);
+            let lso = Arc::clone(&known_log_start);
             let stop_rx = self.stop_tx.subscribe();
             worker_handles.push(tokio::spawn(run_worker(
                 ctx,
@@ -685,12 +719,14 @@ impl ConcurrentFetchers {
                 backoff_cfg,
                 buffered_recs,
                 hwm,
+                lso,
                 stop_rx,
             )));
         }
 
         let start_offset = self.start_offset;
         let max_buffered_bytes_limit = self.max_buffered_bytes_limit;
+        let range_policy = self.range_error_policy;
         let inflight_bytes = Arc::clone(&self.buffered_fetched_bytes);
         let est_bpr = Arc::clone(&self.estimated_bytes_per_record);
         let ordered_tx = self.ordered_tx.clone();
@@ -710,6 +746,16 @@ impl ConcurrentFetchers {
             loop {
                 if *stop_rx.borrow() {
                     break;
+                }
+                if range_policy == RangeErrorPolicy::ResumeFromStart {
+                    let lso = known_log_start.load(Ordering::SeqCst);
+                    if lso > next_fetch.start_offset {
+                        next_fetch = FetchWant::from_offset(
+                            lso,
+                            next_fetch.max_bytes_limit,
+                            next_fetch.estimated_bytes_per_record,
+                        );
+                    }
                 }
                 let refill = ready.is_none() && !inflight.is_empty();
                 let would_exceed = inflight_bytes.load(Ordering::SeqCst)
@@ -989,7 +1035,10 @@ impl WorkerCtx {
             ));
         }
         if let Some(e) = part_resp.error_code.err() {
-            return FetchResult::error(pid, Some(KafkaFetchError::Broker(e)));
+            let mut fr = FetchResult::error(pid, Some(KafkaFetchError::Broker(e)));
+            fr.log_start_offset = part_resp.log_start_offset;
+            fr.high_watermark = part_resp.high_watermark;
+            return fr;
         }
 
         let raw = part_resp.records.clone().unwrap_or_default();
@@ -1077,6 +1126,7 @@ async fn run_worker(
     backoff_cfg: BackoffConfig,
     buffered_recs: Arc<AtomicI64>,
     hwm: Arc<AtomicI64>,
+    known_lso: Arc<AtomicI64>,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     // One backoff per worker, shared by all its fetchWants (reset on any received record).
@@ -1108,18 +1158,27 @@ async fn run_worker(
                 res = ctx.fetch_single(&w) => res,
             };
 
+            if res.log_start_offset >= 0 {
+                cas_hwm(&known_lso, res.log_start_offset);
+            }
+
             if let Some(ref err) = res.err {
+                let response_lso = Some(res.log_start_offset).filter(|&o| o >= 0);
                 // We got an error: handle it and discard this fetch result content.
-                match handle_kafka_fetch_err(
-                    Some(err),
-                    w.clone(),
-                    &err_backoff,
-                    range_policy,
-                    &start_offsets_reader,
-                    ctx.refresher.as_ref(),
-                )
-                .await
-                {
+                let handled = tokio::select! {
+                    biased;
+                    _ = stop_rx.changed() => return,
+                    r = handle_kafka_fetch_err_with_log_start(
+                        Some(err),
+                        w.clone(),
+                        &err_backoff,
+                        range_policy,
+                        &start_offsets_reader,
+                        ctx.refresher.as_ref(),
+                        response_lso,
+                    ) => r,
+                };
+                match handled {
                     Ok(adjusted) => w = adjusted,
                     Err(fatal) => {
                         tracing::warn!(partition = partition_id, error = %fatal, "failed to handle Kafka fetch error");
@@ -1185,6 +1244,422 @@ pub(crate) fn cas_hwm(hwm: &AtomicI64, new_hwm: i64) {
         match hwm.compare_exchange_weak(cur, new_hwm, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => break,
             Err(actual) => cur = actual,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{BufMut, Bytes, BytesMut};
+    use kafka_protocol::indexmap::IndexMap;
+    use kafka_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+    use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
+    use kafka_protocol::messages::list_offsets_response::{
+        ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
+    };
+    use kafka_protocol::messages::metadata_response::{
+        MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+    };
+    use kafka_protocol::messages::{
+        ApiKey, ApiVersionsRequest, BrokerId, FetchRequest, FetchResponse, ListOffsetsRequest,
+        ListOffsetsResponse, MetadataRequest, MetadataResponse, RequestHeader, ResponseHeader,
+        TopicName,
+    };
+    use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+    use kafka_protocol::records::{
+        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+        NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+    };
+    use mimir_config::types::StringSliceCSV;
+    use mimir_config::{GoDuration, KafkaConfig};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    struct CountingWaiter(AtomicUsize);
+    impl FetchWaiter for CountingWaiter {
+        fn wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    struct NoopRefresher;
+    impl MetadataRefresher for NoopRefresher {
+        fn force_metadata_refresh(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_kafka_fetch_err_backs_off_when_ahead_and_uses_response_lso() {
+        let offset_reader = GenericOffsetReader::new(
+            Arc::new(|| Box::pin(async { Ok(0) })),
+            Duration::from_secs(60),
+        );
+        offset_reader.start().await;
+        for _ in 0..20 {
+            if offset_reader.cached_offset().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // 1. fw.start_offset >= partition_start on OffsetOutOfRange MUST invoke long_backoff.
+        let waiter = CountingWaiter(AtomicUsize::new(0));
+        let fw = FetchWant {
+            start_offset: 50,
+            end_offset: 100,
+            estimated_bytes_per_record: 100,
+            max_bytes_limit: 1_000_000,
+        };
+        let adjusted = handle_kafka_fetch_err_with_log_start(
+            Some(&KafkaFetchError::Broker(ResponseError::OffsetOutOfRange)),
+            fw.clone(),
+            &waiter,
+            RangeErrorPolicy::ResumeFromStart,
+            &offset_reader,
+            &NoopRefresher,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(adjusted, fw);
+        assert_eq!(
+            waiter.0.load(Ordering::SeqCst),
+            1,
+            "OffsetOutOfRange with start_offset >= partition_start must back off"
+        );
+
+        // 2. response_log_start_offset fast-forwards even when cached_offset is stale (0).
+        let waiter2 = CountingWaiter(AtomicUsize::new(0));
+        let adjusted2 = handle_kafka_fetch_err_with_log_start(
+            Some(&KafkaFetchError::Broker(ResponseError::OffsetOutOfRange)),
+            FetchWant {
+                start_offset: 50,
+                end_offset: 100,
+                estimated_bytes_per_record: 100,
+                max_bytes_limit: 1_000_000,
+            },
+            &waiter2,
+            RangeErrorPolicy::ResumeFromStart,
+            &offset_reader,
+            &NoopRefresher,
+            Some(75),
+        )
+        .await
+        .unwrap();
+        assert_eq!(adjusted2.start_offset, 75);
+        assert_eq!(waiter2.0.load(Ordering::SeqCst), 0);
+
+        offset_reader.stop().await;
+    }
+
+    fn encode_single_record_batch(offset: i64, val: &[u8]) -> Bytes {
+        let rec = Record {
+            transactional: false,
+            control: false,
+            partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+            producer_id: NO_PRODUCER_ID,
+            producer_epoch: NO_PRODUCER_EPOCH,
+            timestamp_type: TimestampType::Creation,
+            offset,
+            sequence: 0,
+            timestamp: 1_700_000_000_000,
+            key: Some(Bytes::from_static(b"k")),
+            value: Some(Bytes::copy_from_slice(val)),
+            headers: IndexMap::new(),
+        };
+        let mut buf = BytesMut::new();
+        RecordBatchEncoder::encode_with_custom_compression(
+            &mut buf,
+            [rec].iter(),
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+            Some(crate::ingest::compression::compress_record_batch),
+        )
+        .unwrap();
+        buf.freeze()
+    }
+
+    async fn spawn_out_of_range_mock_broker(
+        log_start_offset: Arc<AtomicI64>,
+        high_watermark: Arc<AtomicI64>,
+        deliver_at_offset: Arc<AtomicI64>,
+        fetch_count: Arc<AtomicUsize>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let topic_uuid = uuid::Uuid::from_bytes([7u8; 16]);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let lso = Arc::clone(&log_start_offset);
+                let hwm = Arc::clone(&high_watermark);
+                let deliver = Arc::clone(&deliver_at_offset);
+                let fc = Arc::clone(&fetch_count);
+                let port = addr.port() as i32;
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = stream.into_split();
+                    let mut len_buf = [0u8; 4];
+                    while rd.read_exact(&mut len_buf).await.is_ok() {
+                        let sz = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; sz];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = Bytes::from(payload);
+                        let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let Ok(api_key) = ApiKey::try_from(key_i16) else {
+                            break;
+                        };
+                        let hdr_ver = match api_key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                            ApiKey::Metadata => MetadataRequest::header_version(ver),
+                            ApiKey::ListOffsets => ListOffsetsRequest::header_version(ver),
+                            ApiKey::Fetch => FetchRequest::header_version(ver),
+                            _ => break,
+                        };
+                        let Ok(req_hdr) = RequestHeader::decode(&mut buf, hdr_ver) else {
+                            break;
+                        };
+                        let mut out = BytesMut::new();
+                        out.put_u32(0);
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr
+                            .encode(&mut out, api_key.response_header_version(ver))
+                            .unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut resp = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 1, 12),
+                                    (ApiKey::ListOffsets as i16, 0, 7),
+                                    (ApiKey::Fetch as i16, 4, 13),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    resp.api_keys.push(av);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                let mut resp = MetadataResponse::default();
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = port;
+                                resp.brokers.push(b);
+                                resp.controller_id = BrokerId(0);
+                                let mut mt = MetadataResponseTopic::default();
+                                mt.name = Some(TopicName(StrBytes::from_static_str("ingest")));
+                                mt.topic_id = topic_uuid;
+                                let mut mp = MetadataResponsePartition::default();
+                                mp.partition_index = 0;
+                                mp.leader_id = BrokerId(0);
+                                mt.partitions.push(mp);
+                                resp.topics.push(mt);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::ListOffsets => {
+                                let _ = ListOffsetsRequest::decode(&mut buf, ver);
+                                let mut resp = ListOffsetsResponse::default();
+                                let mut lt = ListOffsetsTopicResponse::default();
+                                lt.name = TopicName(StrBytes::from_static_str("ingest"));
+                                let mut lp = ListOffsetsPartitionResponse::default();
+                                lp.partition_index = 0;
+                                lp.offset = 0;
+                                lp.timestamp = -1;
+                                lt.partitions.push(lp);
+                                resp.topics.push(lt);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Fetch => {
+                                let req = FetchRequest::decode(&mut buf, ver).unwrap();
+                                fc.fetch_add(1, Ordering::SeqCst);
+                                let fetch_off = req.topics[0].partitions[0].fetch_offset;
+                                let cur_lso = lso.load(Ordering::SeqCst);
+                                let cur_hwm = hwm.load(Ordering::SeqCst);
+                                let target_off = deliver.load(Ordering::SeqCst);
+
+                                let mut pd = PartitionData::default();
+                                pd.partition_index = 0;
+                                pd.log_start_offset = cur_lso;
+                                pd.high_watermark = cur_hwm;
+                                if fetch_off < cur_lso || fetch_off > cur_hwm {
+                                    pd.error_code = ResponseError::OffsetOutOfRange.code();
+                                } else if target_off >= 0 && fetch_off == target_off {
+                                    pd.records = Some(encode_single_record_batch(
+                                        target_off,
+                                        b"fast-forwarded",
+                                    ));
+                                }
+
+                                let mut ft = FetchableTopicResponse::default();
+                                ft.topic_id = topic_uuid;
+                                ft.topic = TopicName(StrBytes::from_static_str("ingest"));
+                                ft.partitions.push(pd);
+                                let mut resp = FetchResponse::default();
+                                resp.responses.push(ft);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn concurrent_fetchers_offset_out_of_range_bounds_requests_and_fast_forwards() {
+        // 1. HWM regression (start_offset >= lso) must back off instead of 0ms spin storm.
+        {
+            let lso = Arc::new(AtomicI64::new(0));
+            let hwm = Arc::new(AtomicI64::new(10));
+            let deliver = Arc::new(AtomicI64::new(-1));
+            let fetch_count = Arc::new(AtomicUsize::new(0));
+            let (addr, srv) =
+                spawn_out_of_range_mock_broker(lso, hwm, deliver, Arc::clone(&fetch_count)).await;
+
+            let cfg = KafkaConfig {
+                address: StringSliceCSV(vec![addr.to_string()]),
+                topic: "ingest".to_string(),
+                dial_timeout: GoDuration::from_secs(2),
+                ..Default::default()
+            };
+            let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+            let oc = PartitionOffsetClient::with_config(Arc::clone(&client), &cfg, None);
+            let start_reader = Arc::new(GenericOffsetReader::new(
+                Arc::new(|| Box::pin(async { Ok(0) })),
+                Duration::from_secs(60),
+            ));
+            start_reader.start().await;
+
+            let f = ConcurrentFetchers::new(
+                client,
+                "ingest",
+                0,
+                50,
+                4,
+                1024 * 1024,
+                false,
+                Duration::from_millis(50),
+                &oc,
+                RangeErrorPolicy::ResumeFromStart,
+                Arc::clone(&start_reader),
+                BackoffConfig {
+                    min_backoff: Duration::from_millis(50),
+                    max_backoff: Duration::from_millis(100),
+                    max_retries: 0,
+                },
+                FetcherMetrics::new(None),
+            )
+            .await
+            .unwrap();
+
+            f.start().await;
+            tokio::time::sleep(Duration::from_millis(260)).await;
+            let count = fetch_count.load(Ordering::SeqCst);
+            f.stop().await;
+            start_reader.stop().await;
+            srv.abort();
+
+            assert!(
+                count <= 20,
+                "expected bounded fetch count with backoff, got {count} (spin storm!)"
+            );
+        }
+
+        // 2. Retention jump (log_start_offset = 10_000 while start_offsets_reader caches 0)
+        // must fast-forward immediately from FetchResponse.log_start_offset!
+        {
+            let lso = Arc::new(AtomicI64::new(10_000));
+            let hwm = Arc::new(AtomicI64::new(10_001));
+            let deliver = Arc::new(AtomicI64::new(10_000));
+            let fetch_count = Arc::new(AtomicUsize::new(0));
+            let (addr, srv) =
+                spawn_out_of_range_mock_broker(lso, hwm, deliver, Arc::clone(&fetch_count)).await;
+
+            let cfg = KafkaConfig {
+                address: StringSliceCSV(vec![addr.to_string()]),
+                topic: "ingest".to_string(),
+                dial_timeout: GoDuration::from_secs(2),
+                ..Default::default()
+            };
+            let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+            let oc = PartitionOffsetClient::with_config(Arc::clone(&client), &cfg, None);
+            let start_reader = Arc::new(GenericOffsetReader::new(
+                Arc::new(|| Box::pin(async { Ok(0) })),
+                Duration::from_secs(60),
+            ));
+            start_reader.start().await;
+
+            let f = ConcurrentFetchers::new(
+                client,
+                "ingest",
+                0,
+                0,
+                4,
+                1024 * 1024,
+                false,
+                Duration::from_millis(50),
+                &oc,
+                RangeErrorPolicy::ResumeFromStart,
+                Arc::clone(&start_reader),
+                BackoffConfig {
+                    min_backoff: Duration::from_millis(50),
+                    max_backoff: Duration::from_millis(100),
+                    max_retries: 0,
+                },
+                FetcherMetrics::new(None),
+            )
+            .await
+            .unwrap();
+
+            f.start().await;
+            let res = tokio::time::timeout(
+                Duration::from_secs(2),
+                f.poll_fetches(Duration::from_secs(2)),
+            )
+            .await
+            .expect("timed out waiting for fast-forwarded record")
+            .expect("poll_fetches returned None");
+
+            assert!(res.err.is_none());
+            assert_eq!(res.records.len(), 1);
+            assert_eq!(res.records[0].offset, 10_000);
+            assert_eq!(res.records[0].value, Bytes::from_static(b"fast-forwarded"));
+            assert!(
+                fetch_count.load(Ordering::SeqCst) < 20,
+                "expected O(1) fast-forward, got {} fetches",
+                fetch_count.load(Ordering::SeqCst)
+            );
+
+            f.stop().await;
+            start_reader.stop().await;
+            srv.abort();
         }
     }
 }

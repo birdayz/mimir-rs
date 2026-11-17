@@ -5,6 +5,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
 use mimir_common::thread_pool::ScopedWorkerPool;
@@ -43,6 +44,8 @@ pub enum QuerierError {
     Postings(#[from] PostingsError),
     #[error("search error: {0}")]
     Search(#[from] SearchError),
+    #[error("TSDB is closed")]
+    Closed,
 }
 
 /// A queried series yielding decoded samples in `[mint, maxt]`.
@@ -146,6 +149,7 @@ pub struct TsdbQuerier<'a> {
     head: Option<&'a Head>,
     blocks: Vec<Arc<Block>>,
     blocks_lock: Option<&'a RwLock<Vec<Arc<Block>>>>,
+    closed: Option<&'a AtomicBool>,
     mint: i64,
     maxt: i64,
     select_stats: Option<BlockSelectStatsSink>,
@@ -169,6 +173,7 @@ impl<'a> TsdbQuerier<'a> {
             head,
             blocks,
             blocks_lock: None,
+            closed: None,
             mint,
             maxt,
             select_stats: None,
@@ -186,11 +191,41 @@ impl<'a> TsdbQuerier<'a> {
             head,
             blocks: Vec::new(),
             blocks_lock: Some(blocks_lock),
+            closed: None,
             mint,
             maxt,
             select_stats: None,
             select_stats_filter: None,
         }
+    }
+
+    pub fn with_blocks_lock_and_closed(
+        head: Option<&'a Head>,
+        blocks_lock: &'a RwLock<Vec<Arc<Block>>>,
+        closed: &'a AtomicBool,
+        mint: i64,
+        maxt: i64,
+    ) -> Self {
+        Self {
+            head,
+            blocks: Vec::new(),
+            blocks_lock: Some(blocks_lock),
+            closed: Some(closed),
+            mint,
+            maxt,
+            select_stats: None,
+            select_stats_filter: None,
+        }
+    }
+
+    #[inline]
+    fn check_open(&self) -> Result<(), QuerierError> {
+        if self.closed.is_some_and(|c| c.load(AtomicOrdering::Acquire))
+            || self.head.is_some_and(Head::is_closed)
+        {
+            return Err(QuerierError::Closed);
+        }
+        Ok(())
     }
 
     /// Records per block querier [`BlockSelectStats`] of chunk selects into `sink`.
@@ -343,6 +378,7 @@ impl<'a> TsdbQuerier<'a> {
         unordered: bool,
     ) -> Result<PreparedChunkSelect, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
         let blocks = self.effective_blocks(&lock_guard);
         drop(lock_guard);
         self.prepare_select_locked(blocks, matchers, unordered)
@@ -361,6 +397,7 @@ impl<'a> TsdbQuerier<'a> {
         max_total_refs: usize,
     ) -> Result<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
         let blocks = self.effective_blocks(&lock_guard);
         let prepared = self.prepare_select_locked(blocks, matchers, unordered)?;
         if prepared.is_empty() {
@@ -409,6 +446,7 @@ impl<'a> TsdbQuerier<'a> {
             },
             None => None,
         };
+        self.check_open()?;
         let blocks = self.effective_blocks(&lock_guard);
         let prepared = self.prepare_select_locked(blocks, matchers, unordered)?;
         if prepared.is_empty() {
@@ -448,6 +486,7 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
         if self.blocks_lock.is_some() {
             let current_blocks = self.effective_blocks(&lock_guard);
             let same = current_blocks.len() == prepared.overlapping_blocks.len()
@@ -470,6 +509,7 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
         let _lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
         self.execute_prepared_select_locked(prepared, sort_series)
     }
 
@@ -478,6 +518,7 @@ impl<'a> TsdbQuerier<'a> {
         prepared: PreparedChunkSelect,
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        self.check_open()?;
         let head = self.effective_head();
         let mint = prepared.mint;
         let maxt = prepared.maxt;
@@ -663,6 +704,7 @@ impl<'a> TsdbQuerier<'a> {
         F: FnMut(LazyStreamEvent) -> Result<bool, QuerierError>,
     {
         let lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
         if self.blocks_lock.is_some() {
             let current_blocks = self.effective_blocks(&lock_guard);
             let same = current_blocks.len() == prepared.overlapping_blocks.len()
@@ -1008,6 +1050,7 @@ impl<'a> TsdbQuerier<'a> {
         unordered: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
         let _lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
         let blocks = self.effective_blocks(&_lock_guard);
         let prepared = self.prepare_select_locked(blocks, matchers, unordered)?;
         self.execute_prepared_select_locked(prepared, sort_series)
@@ -1020,6 +1063,7 @@ impl<'a> TsdbQuerier<'a> {
         matchers: &[LabelMatcher],
     ) -> Result<Vec<Labels>, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
         let blocks = self.effective_blocks(&lock_guard);
         let head = self.effective_head();
 
@@ -1071,6 +1115,7 @@ impl<'a> TsdbQuerier<'a> {
     /// Returns sorted unique label names across in-order Head and overlapping Blocks matching `matchers`.
     pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
         let blocks = self.effective_blocks(&lock_guard);
         let head = self.effective_in_order_head();
         let mut set: BTreeSet<String> = BTreeSet::new();
@@ -1105,6 +1150,7 @@ impl<'a> TsdbQuerier<'a> {
         matchers: &[LabelMatcher],
     ) -> Result<Vec<String>, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
         let blocks = self.effective_blocks(&lock_guard);
         let head = self.effective_in_order_head();
 
@@ -1175,6 +1221,7 @@ impl<'a> TsdbQuerier<'a> {
     /// Returns the number of active series in Head (plus series in overlapping blocks if queried).
     pub fn series_count(&self) -> Result<usize, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
         let blocks = self.effective_blocks(&lock_guard);
         let mut set: BTreeSet<Labels> = BTreeSet::new();
         if let Some(head) = self.head {
@@ -1263,6 +1310,32 @@ impl<'a> TsdbChunkQuerier<'a> {
     ) -> Self {
         Self {
             inner: TsdbQuerier::with_blocks_lock(head, blocks_lock, mint, maxt),
+            unordered: true,
+        }
+    }
+
+    pub fn with_blocks_lock_and_closed(
+        head: Option<&'a Head>,
+        blocks_lock: &'a RwLock<Vec<Arc<Block>>>,
+        closed: &'a AtomicBool,
+        mint: i64,
+        maxt: i64,
+    ) -> Self {
+        Self {
+            inner: TsdbQuerier::with_blocks_lock_and_closed(head, blocks_lock, closed, mint, maxt),
+            unordered: false,
+        }
+    }
+
+    pub fn with_blocks_lock_unordered_and_closed(
+        head: Option<&'a Head>,
+        blocks_lock: &'a RwLock<Vec<Arc<Block>>>,
+        closed: &'a AtomicBool,
+        mint: i64,
+        maxt: i64,
+    ) -> Self {
+        Self {
+            inner: TsdbQuerier::with_blocks_lock_and_closed(head, blocks_lock, closed, mint, maxt),
             unordered: true,
         }
     }

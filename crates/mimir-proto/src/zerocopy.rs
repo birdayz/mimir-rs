@@ -4106,7 +4106,8 @@ mod tests {
             (state & 0xff) as u8
         };
 
-        for iter in 0..1000usize {
+        let iters = if cfg!(miri) { 16 } else { 1000 };
+        for iter in 0..iters {
             let len = (iter % 97) + 1;
             let mut buf = Vec::with_capacity(len);
             for _ in 0..len {
@@ -4213,6 +4214,44 @@ mod tests {
         assert_eq!(meta.len(), 1);
         assert_eq!(meta[0].metric_family_name, "last_name");
         assert_eq!(meta[0].help, "help\u{FFFD}");
+
+        // Multiple invalid-UTF8 symbols force lossy_strings Vec<Box<str>> to reallocate
+        // while &*ptr references remain held in resolved.
+        let mut multi_lossy_wire = Vec::new();
+        for sym in [b"".as_slice(), b"__name__".as_slice()] {
+            multi_lossy_wire.push(0x22);
+            multi_lossy_wire.push(sym.len() as u8);
+            multi_lossy_wire.extend_from_slice(sym);
+        }
+        for i in 0..10u8 {
+            let s = [b'h', b'0' + i, 0xff, 0xfe];
+            multi_lossy_wire.push(0x22);
+            multi_lossy_wire.push(s.len() as u8);
+            multi_lossy_wire.extend_from_slice(&s);
+        }
+        let mut ts_multi = Vec::new();
+        // labels_refs: [1 ("__name__"), 2 ("h0\xff\xfe")], metadata: help_ref=11 ("h9\xff\xfe")
+        ts_multi.extend_from_slice(&[0x0a, 0x02, 1, 2]);
+        ts_multi.extend_from_slice(&[0x2a, 0x04, 0x08, 0x01, 0x18, 11]);
+        multi_lossy_wire.push(0x2a);
+        multi_lossy_wire.push(ts_multi.len() as u8);
+        multi_lossy_wire.extend_from_slice(&ts_multi);
+        let mut meta2 = Vec::new();
+        let mut seen_labels = 0usize;
+        decode_rw2_stream(
+            &multi_lossy_wire,
+            DecodeOptions::rw2(),
+            &mut scratch,
+            &mut resolved,
+            &mut label_bytes,
+            &mut samples,
+            &mut meta2,
+            |_| seen_labels += 1,
+        )
+        .expect("multi lossy rw2 decode should succeed");
+        assert_eq!(seen_labels, 1);
+        assert_eq!(meta2.len(), 1);
+        assert_eq!(meta2[0].help, "h9\u{FFFD}\u{FFFD}");
     }
 
     fn decode_stringlabels_pairs(mut data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -4513,7 +4552,8 @@ mod tests {
             (state & 0xff) as u8
         };
         let mut ref_scratch = WriteRequestScratch::new();
-        for iter in 0..1000usize {
+        let iters = if cfg!(miri) { 16 } else { 1000 };
+        for iter in 0..iters {
             let len = (iter % 97) + 1;
             let mut buf = Vec::with_capacity(len);
             for _ in 0..len {

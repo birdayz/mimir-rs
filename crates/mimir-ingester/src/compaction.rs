@@ -644,15 +644,43 @@ impl Ingester {
             return TsdbCloseCheckResult::CloseFailed;
         }
 
+        struct RemoveTsdbGuard<'a> {
+            ingester: &'a Ingester,
+            user_id: &'a str,
+            user_db: &'a Arc<crate::user_tsdb::UserTsdb>,
+        }
+        impl Drop for RemoveTsdbGuard<'_> {
+            fn drop(&mut self) {
+                let _g = self.ingester.tsdb_create_mtx.lock();
+                if self
+                    .ingester
+                    .tsdbs
+                    .remove_if(self.user_id, |_, v| Arc::ptr_eq(v, self.user_db))
+                    .is_some()
+                {
+                    self.ingester.metrics.mem_users.dec();
+                }
+            }
+        }
+
         let _ = user_db.change_state(TsdbState::Closing, TsdbState::Closed);
-        self.tsdbs.remove(user_id);
-        self.metrics.mem_users.dec();
+        // Keep user_id (in Closed state) in self.tsdbs until metric cleanup and
+        // remove_dir_all finish so concurrent Push/get_or_create_tsdb cannot reopen
+        // a fresh TSDB in the directory while it is being deleted (Go defer parity).
+        let _remove_guard = RemoveTsdbGuard {
+            ingester: self,
+            user_id,
+            user_db: &user_db,
+        };
         self.tsdb_metrics.remove_registry_for_tenant(user_id);
         self.delete_user_metadata(user_id);
         self.metrics.delete_per_user_metrics(user_id, &tracker_names);
         self.compute_worker_pool.remove_tenant(user_id);
         self.metrics
             .delete_user_label_value_bytes_metrics(user_id, &label_value_bytes_names);
+        if let Some(mgr) = self.cost_attribution_manager() {
+            mgr.remove_tenant(user_id);
+        }
 
         if let Err(e) = std::fs::remove_dir_all(&dir) {
             warn!(user = %user_id, dir = %dir.display(), err = %e, "failed to remove closed idle TSDB directory");

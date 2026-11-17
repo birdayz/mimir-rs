@@ -581,9 +581,11 @@ mod tests {
 
     #[test]
     fn test_multi_mb_batch_parity() {
-        let mut sl_items = Vec::with_capacity(2000);
-        let mut prost_series = Vec::with_capacity(2000);
-        for i in 0..2000usize {
+        let num_series = if cfg!(miri) { 24usize } else { 2000usize };
+        let num_chunks = if cfg!(miri) { 8u64 } else { 1000u64 };
+        let mut sl_items = Vec::with_capacity(num_series);
+        let mut prost_series = Vec::with_capacity(num_series);
+        for i in 0..num_series {
             let metric = format!("metric_{i}");
             let pod = format!("pod-{:05}", i);
             let pairs: Vec<(&[u8], &[u8])> = vec![
@@ -597,14 +599,14 @@ mod tests {
         }
 
         let big_chunk = vec![0x5a; 4096];
-        let mut builder = QueryStreamBatchBuilder::with_capacity(64 * 1024);
+        let mut builder = QueryStreamBatchBuilder::with_capacity(if cfg!(miri) { 4096 } else { 64 * 1024 });
         for (sl, cc) in &sl_items {
             builder.push_series_stringlabels(sl, *cc).unwrap();
         }
         builder.set_end_of_series_stream();
 
-        let mut prost_sc = Vec::with_capacity(1000);
-        for i in 0..1000u64 {
+        let mut prost_sc = Vec::with_capacity(num_chunks as usize);
+        for i in 0..num_chunks {
             let rc = [RawChunk {
                 encoding: 4,
                 min_timestamp_ms: 1_700_000_000_000 + i as i64 * 1000,
@@ -624,7 +626,8 @@ mod tests {
         }
 
         let wire = builder.finish();
-        assert!(wire.len() > 4 * 1024 * 1024);
+        let min_wire_len = if cfg!(miri) { 32 * 1024 } else { 4 * 1024 * 1024 };
+        assert!(wire.len() > min_wire_len);
 
         let prost_msg = ingesterpb::QueryStreamResponse {
             streaming_series: prost_series,

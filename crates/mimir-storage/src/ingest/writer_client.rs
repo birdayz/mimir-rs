@@ -487,6 +487,7 @@ impl KafkaWriterClient {
         }
 
         let mut last_err;
+        let mut retry_backoff = Duration::from_millis(25);
         loop {
             let elapsed = earliest_enqueue.elapsed();
             if elapsed >= self.write_timeout {
@@ -532,14 +533,22 @@ impl KafkaWriterClient {
                     break;
                 }
                 Ok(Err(KafkaClientError::Broker(ResponseError::UnknownTopicOrPartition))) => {
-                    // Non-retriable unknown partition if already refreshed once
+                    // During live Kafka partition expansion, broker metadata propagation can take
+                    // longer than 200ms; refresh metadata and retry up to min(write_timeout, 2s).
                     last_err = Some(ProducerError::Other("unknown topic or partition".to_string()));
-                    if earliest_enqueue.elapsed() >= Duration::from_millis(200) {
+                    let unknown_limit = self.write_timeout.min(Duration::from_secs(2));
+                    if earliest_enqueue.elapsed() >= unknown_limit {
                         break;
                     }
+                    let _ = self.inner.refresh_metadata(&[topic.as_str()]).await;
+                    if earliest_enqueue.elapsed() >= unknown_limit {
+                        break;
+                    }
+                    retry_backoff = (retry_backoff * 2).min(Duration::from_millis(250));
                 }
                 Ok(Err(e)) => {
                     last_err = Some(ProducerError::Other(e.to_string()));
+                    retry_backoff = Duration::from_millis(25);
                 }
                 Err(_) => {
                     last_err = Some(ProducerError::RecordTimeout);
@@ -559,12 +568,21 @@ impl KafkaWriterClient {
             if self.closed.load(Ordering::SeqCst)
                 || earliest_enqueue.elapsed() >= self.write_timeout
             {
-                if earliest_enqueue.elapsed() >= self.write_timeout {
+                if earliest_enqueue.elapsed() >= self.write_timeout
+                    && !matches!(last_err, Some(ProducerError::Other(ref m)) if m == "unknown topic or partition")
+                {
                     last_err = Some(ProducerError::RecordTimeout);
                 }
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            let remaining = self.write_timeout.saturating_sub(earliest_enqueue.elapsed());
+            if remaining.is_zero() {
+                if !matches!(last_err, Some(ProducerError::Other(ref m)) if m == "unknown topic or partition") {
+                    last_err = Some(ProducerError::RecordTimeout);
+                }
+                break;
+            }
+            tokio::time::sleep(retry_backoff.min(remaining)).await;
         }
 
         let err = last_err.unwrap_or(ProducerError::RecordTimeout);
@@ -1041,6 +1059,197 @@ impl KafkaProducer {
                     .collect()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{BufMut, BytesMut};
+    use kafka_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+    use kafka_protocol::messages::metadata_response::{
+        MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+    };
+    use kafka_protocol::messages::produce_response::{
+        PartitionProduceResponse, TopicProduceResponse,
+    };
+    use kafka_protocol::messages::{
+        ApiKey, ApiVersionsRequest, BrokerId, MetadataRequest, MetadataResponse, ProduceRequest,
+        ProduceResponse, RequestHeader, ResponseHeader, TopicName,
+    };
+    use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+    use mimir_config::types::StringSliceCSV;
+    use mimir_config::GoDuration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn writer_client_retries_unknown_topic_or_partition_past_200ms_during_expansion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expanded = Arc::new(AtomicBool::new(false));
+        let exp_c = Arc::clone(&expanded);
+        let produce_attempts = Arc::new(AtomicUsize::new(0));
+        let pa_c = Arc::clone(&produce_attempts);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let exp = Arc::clone(&exp_c);
+                let pa = Arc::clone(&pa_c);
+                let port = addr.port() as i32;
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = stream.into_split();
+                    let mut len_buf = [0u8; 4];
+                    while rd.read_exact(&mut len_buf).await.is_ok() {
+                        let sz = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; sz];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = Bytes::from(payload);
+                        let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let Ok(api_key) = ApiKey::try_from(key_i16) else {
+                            break;
+                        };
+                        let hdr_ver = match api_key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                            ApiKey::Metadata => MetadataRequest::header_version(ver),
+                            ApiKey::Produce => ProduceRequest::header_version(ver),
+                            _ => break,
+                        };
+                        let Ok(req_hdr) = RequestHeader::decode(&mut buf, hdr_ver) else {
+                            break;
+                        };
+                        let mut out = BytesMut::new();
+                        out.put_u32(0);
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr
+                            .encode(&mut out, api_key.response_header_version(ver))
+                            .unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut resp = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 1, 12),
+                                    (ApiKey::Produce as i16, 3, 9),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    resp.api_keys.push(av);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                let mut resp = MetadataResponse::default();
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = port;
+                                resp.brokers.push(b);
+                                resp.controller_id = BrokerId(0);
+
+                                let mut mt = MetadataResponseTopic::default();
+                                mt.name = Some(TopicName(StrBytes::from_static_str("ingest")));
+                                let count = if exp.load(Ordering::SeqCst) { 2 } else { 1 };
+                                for pid in 0..count {
+                                    let mut mp = MetadataResponsePartition::default();
+                                    mp.partition_index = pid;
+                                    mp.leader_id = BrokerId(0);
+                                    mt.partitions.push(mp);
+                                }
+                                resp.topics.push(mt);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Produce => {
+                                let req = ProduceRequest::decode(&mut buf, ver).unwrap();
+                                let mut resp = ProduceResponse::default();
+                                for rt in &req.topic_data {
+                                    let mut tr = TopicProduceResponse::default();
+                                    tr.name = rt.name.clone();
+                                    for rp in &rt.partition_data {
+                                        let mut pr = PartitionProduceResponse::default();
+                                        pr.index = rp.index;
+                                        if rp.index == 1 {
+                                            pa.fetch_add(1, Ordering::SeqCst);
+                                            if exp.load(Ordering::SeqCst) {
+                                                pr.error_code = 0;
+                                                pr.base_offset = 77;
+                                            } else {
+                                                pr.error_code =
+                                                    ResponseError::UnknownTopicOrPartition.code();
+                                            }
+                                        }
+                                        tr.partition_responses.push(pr);
+                                    }
+                                    resp.responses.push(tr);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "ingest".to_string(),
+            write_timeout: GoDuration::from_secs(3),
+            ..Default::default()
+        };
+        cfg.dial_timeout = GoDuration::from_secs(2);
+
+        let client = KafkaWriterClient::new(
+            &cfg,
+            1,
+            None,
+            KafkaWriterClientOptions {
+                disable_default_topic: false,
+                disable_linger: true,
+            },
+        )
+        .unwrap();
+
+        // Simulate partition 1 propagating after 350ms (past the old 200ms cutoff).
+        let exp_flip = Arc::clone(&expanded);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            exp_flip.store(true, Ordering::SeqCst);
+        });
+
+        let res = client
+            .produce_sync(WriterRecord {
+                topic: "ingest".to_string(),
+                partition: 1,
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+                ..Default::default()
+            })
+            .await
+            .expect("produce to newly expanded partition must succeed past 200ms");
+
+        assert_eq!(res, 77);
+        assert!(produce_attempts.load(Ordering::SeqCst) >= 2);
+
+        client.close();
+        srv.abort();
     }
 }
 
