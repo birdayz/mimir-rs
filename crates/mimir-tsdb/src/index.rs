@@ -793,7 +793,7 @@ impl IndexReader {
         let slice = checked_decbuf_at(&self.mmap, self.toc.symbols as usize)?;
         let mut dec = Decbuf::new(slice);
         let cnt = dec.be32()? as usize;
-        let mut out = Vec::with_capacity(cnt);
+        let mut out = Vec::with_capacity(cnt.min(dec.len()));
         for _ in 0..cnt {
             out.push(dec.uvarint_str()?.to_string());
         }
@@ -879,16 +879,23 @@ impl IndexReader {
 
     /// Decodes the series entry at `ref_id` (`series_id = file_offset / 16`).
     pub fn series(&self, ref_id: u64) -> Result<(Labels, Vec<ChunkMeta>), IndexError> {
-        let offset = (ref_id as usize) * SERIES_BYTE_ALIGN;
+        let offset = usize::try_from(ref_id)
+            .ok()
+            .and_then(|r| r.checked_mul(SERIES_BYTE_ALIGN))
+            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
         let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
         let mut dec = Decbuf::new(payload);
         let labels = self.decode_series_labels(&mut dec)?;
 
         let num_chunks = dec.uvarint()?;
-        let mut chks = Vec::with_capacity(num_chunks);
+        let mut chks = Vec::with_capacity(num_chunks.min(dec.len()));
         if num_chunks > 0 {
             let t0 = dec.varint64()?;
-            let maxt0 = t0 + dec.uvarint64()? as i64;
+            let dt0 = i64::try_from(dec.uvarint64()?)
+                .map_err(|_| IndexError::Corrupt("chunk time delta overflow".to_string()))?;
+            let maxt0 = t0
+                .checked_add(dt0)
+                .ok_or_else(|| IndexError::Corrupt("chunk maxt overflow".to_string()))?;
             let mut ref0 = dec.uvarint64()? as i64;
             chks.push(ChunkMeta {
                 ref_id: ref0 as u64,
@@ -898,9 +905,17 @@ impl IndexReader {
             });
             let mut prev_maxt = maxt0;
             for _ in 1..num_chunks {
-                let mint = prev_maxt + dec.uvarint64()? as i64;
-                let maxt = mint + dec.uvarint64()? as i64;
-                ref0 += dec.varint64()?;
+                let d_mint = i64::try_from(dec.uvarint64()?)
+                    .map_err(|_| IndexError::Corrupt("chunk mint delta overflow".to_string()))?;
+                let mint = prev_maxt
+                    .checked_add(d_mint)
+                    .ok_or_else(|| IndexError::Corrupt("chunk mint overflow".to_string()))?;
+                let d_maxt = i64::try_from(dec.uvarint64()?)
+                    .map_err(|_| IndexError::Corrupt("chunk maxt delta overflow".to_string()))?;
+                let maxt = mint
+                    .checked_add(d_maxt)
+                    .ok_or_else(|| IndexError::Corrupt("chunk maxt overflow".to_string()))?;
+                ref0 = ref0.wrapping_add(dec.varint64()?);
                 prev_maxt = maxt;
                 chks.push(ChunkMeta {
                     ref_id: ref0 as u64,
@@ -915,7 +930,10 @@ impl IndexReader {
 
     /// Decodes only the labels for `ref_id`.
     pub fn series_labels(&self, ref_id: u64) -> Result<Labels, IndexError> {
-        let offset = (ref_id as usize) * SERIES_BYTE_ALIGN;
+        let offset = usize::try_from(ref_id)
+            .ok()
+            .and_then(|r| r.checked_mul(SERIES_BYTE_ALIGN))
+            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
         let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
         let mut dec = Decbuf::new(payload);
         self.decode_series_labels(&mut dec)
@@ -923,17 +941,22 @@ impl IndexReader {
 
     /// Decodes a raw postings list at `postings_off`.
     fn decode_postings_at(&self, postings_off: u64) -> Result<Vec<u64>, IndexError> {
-        let payload = checked_decbuf_at(&self.mmap, postings_off as usize)?;
+        let off = usize::try_from(postings_off)
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+        let payload = checked_decbuf_at(&self.mmap, off)?;
         let mut dec = Decbuf::new(payload);
         let n = dec.be32()? as usize;
-        if dec.len() != 4 * n {
+        let expected_len = 4usize
+            .checked_mul(n)
+            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+        if dec.len() != expected_len {
             return Err(IndexError::Corrupt(format!(
                 "unexpected postings length: expected {}, got {}",
-                4 * n,
+                expected_len,
                 dec.len()
             )));
         }
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n.min(dec.len() / 4));
         for _ in 0..n {
             out.push(dec.be32()? as u64);
         }
@@ -944,15 +967,20 @@ impl IndexReader {
     where
         F: FnMut(&str, u64) -> Result<bool, IndexError>,
     {
-        let table_start = self.toc.postings_table as usize;
-        if table_start + 4 > self.mmap.len() {
+        let table_start = usize::try_from(self.toc.postings_table)
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+        let payload_start = table_start
+            .checked_add(4)
+            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+        if payload_start > self.mmap.len() {
             return Err(IndexError::Encoding(EncodingError::InvalidSize));
         }
         let payload_len =
-            u32::from_be_bytes(self.mmap[table_start..table_start + 4].try_into().unwrap())
+            u32::from_be_bytes(self.mmap[table_start..payload_start].try_into().unwrap())
                 as usize;
-        let payload_start = table_start + 4;
-        let payload_end = payload_start.saturating_add(payload_len);
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
         if payload_end > self.mmap.len() {
             return Err(IndexError::Encoding(EncodingError::InvalidSize));
         }
@@ -1127,17 +1155,24 @@ impl PostingsSource for IndexReader {
 }
 
 fn checked_decbuf_at(buf: &[u8], off: usize) -> Result<&[u8], IndexError> {
-    if off + 4 > buf.len() {
+    let payload_start = off
+        .checked_add(4)
+        .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+    if payload_start > buf.len() {
         return Err(IndexError::Encoding(EncodingError::InvalidSize));
     }
-    let len = u32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-    let payload_start = off + 4;
-    let payload_end = payload_start + len;
-    if payload_end + 4 > buf.len() {
+    let len = u32::from_be_bytes(buf[off..payload_start].try_into().unwrap()) as usize;
+    let payload_end = payload_start
+        .checked_add(len)
+        .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+    let crc_end = payload_end
+        .checked_add(4)
+        .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+    if crc_end > buf.len() {
         return Err(IndexError::Encoding(EncodingError::InvalidSize));
     }
     let payload = &buf[payload_start..payload_end];
-    let exp_crc = u32::from_be_bytes(buf[payload_end..payload_end + 4].try_into().unwrap());
+    let exp_crc = u32::from_be_bytes(buf[payload_end..crc_end].try_into().unwrap());
     let actual_crc = crc32c::crc32c(payload);
     if actual_crc != exp_crc {
         return Err(IndexError::ChecksumMismatch {
@@ -1155,13 +1190,20 @@ fn checked_uvarint_decbuf_at(buf: &[u8], off: usize) -> Result<&[u8], IndexError
     let mut dec = Decbuf::new(&buf[off..]);
     let len = dec.uvarint()?;
     let header_len = (buf.len() - off) - dec.len();
-    let payload_start = off + header_len;
-    let payload_end = payload_start + len;
-    if payload_end + 4 > buf.len() {
+    let payload_start = off
+        .checked_add(header_len)
+        .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+    let payload_end = payload_start
+        .checked_add(len)
+        .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+    let crc_end = payload_end
+        .checked_add(4)
+        .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+    if crc_end > buf.len() {
         return Err(IndexError::Encoding(EncodingError::InvalidSize));
     }
     let payload = &buf[payload_start..payload_end];
-    let exp_crc = u32::from_be_bytes(buf[payload_end..payload_end + 4].try_into().unwrap());
+    let exp_crc = u32::from_be_bytes(buf[payload_end..crc_end].try_into().unwrap());
     let actual_crc = crc32c::crc32c(payload);
     if actual_crc != exp_crc {
         return Err(IndexError::ChecksumMismatch {
@@ -1196,7 +1238,8 @@ fn parse_symbols_index(buf: &[u8], off: usize) -> Result<(Vec<usize>, usize), In
     let base_pos = off + 4;
     let orig_len = payload.len();
 
-    let mut offsets = Vec::with_capacity(1 + cnt / SYMBOL_FACTOR);
+    let cap = (1 + cnt / SYMBOL_FACTOR).min(1 + dec.len() / SYMBOL_FACTOR);
+    let mut offsets = Vec::with_capacity(cap);
     for seen in 0..cnt {
         if seen % SYMBOL_FACTOR == 0 {
             offsets.push(base_pos + orig_len - dec.len());
@@ -1469,5 +1512,90 @@ mod tests {
         assert_eq!(p.len(), 1);
         let (decoded, _) = r.series(p[0]).unwrap();
         assert_eq!(decoded, l1);
+    }
+
+    #[test]
+    fn corrupt_index_headers_do_not_oom_or_panic() {
+        // 1) checked_decbuf_at and checked_uvarint_decbuf_at overflow lengths must return Err, not panic.
+        let mut huge_len = vec![0u8; 16];
+        huge_len[0..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(checked_decbuf_at(&huge_len, 0).is_err());
+        assert!(checked_decbuf_at(&huge_len, usize::MAX - 2).is_err());
+
+        let mut huge_uvarint = vec![0xffu8; 12];
+        huge_uvarint[9] = 0x01; // uvarint > usize::MAX - 20 or near u64::MAX
+        assert!(checked_uvarint_decbuf_at(&huge_uvarint, 0).is_err());
+
+        // 2) parse_symbols_index with 12-byte corrupt section (cnt = u32::MAX, valid CRC32C) must not OOM.
+        let payload = u32::MAX.to_be_bytes();
+        let crc = crc32c::crc32c(&payload);
+        let mut sym_buf = Vec::new();
+        sym_buf.extend_from_slice(&4u32.to_be_bytes());
+        sym_buf.extend_from_slice(&payload);
+        sym_buf.extend_from_slice(&crc.to_be_bytes());
+        assert!(parse_symbols_index(&sym_buf, 0).is_err());
+
+        // 3) Corrupt IndexReader file on disk with invalid TOC / huge symbol count fails cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let idx_path = dir.path().join(INDEX_FILENAME);
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&MAGIC_INDEX.to_be_bytes());
+        file_bytes.push(INDEX_FORMAT_V2);
+        let sym_off = file_bytes.len() as u64;
+        file_bytes.extend_from_slice(&sym_buf);
+        let mut toc = Vec::new();
+        toc.extend_from_slice(&sym_off.to_be_bytes());
+        for _ in 0..5 {
+            toc.extend_from_slice(&0u64.to_be_bytes());
+        }
+        let toc_crc = crc32c::crc32c(&toc);
+        file_bytes.extend_from_slice(&toc);
+        file_bytes.extend_from_slice(&toc_crc.to_be_bytes());
+        fs::write(&idx_path, &file_bytes).unwrap();
+        assert!(IndexReader::open(&idx_path).is_err());
+
+        // 4) Valid IndexReader::series on a corrupt series record with huge num_chunks does not OOM.
+        let idx_path2 = dir.path().join("index_corrupt_series");
+        let l = Labels::from_pairs([("__name__", "m")]);
+        {
+            let mut w = IndexWriter::new(&idx_path2).unwrap();
+            for s in ["", "__name__", "m"] {
+                w.add_symbol(s).unwrap();
+            }
+            w.add_series(
+                0,
+                &l,
+                &[ChunkMeta {
+                    ref_id: 1,
+                    min_time: 100,
+                    max_time: 200,
+                    chunk: None,
+                }],
+            )
+            .unwrap();
+            w.close().unwrap();
+        }
+        let reader = IndexReader::open(&idx_path2).unwrap();
+        let p = reader.postings("__name__", &["m"]).unwrap();
+        assert_eq!(p.len(), 1);
+        // Corrupt the series record's num_chunks field and recompute its CRC in a fresh file.
+        let mut raw = fs::read(&idx_path2).unwrap();
+        let off = (p[0] as usize) * SERIES_BYTE_ALIGN;
+        let len_uvarint_len = 1; // small series payload
+        let payload_len = raw[off] as usize;
+        let pstart = off + len_uvarint_len;
+        let pend = pstart + payload_len;
+        // Overwrite tail bytes inside payload with 0xff.. to make num_chunks huge (or invalid) and fix CRC.
+        if pend - pstart >= 5 {
+            for b in &mut raw[pend - 4..pend] {
+                *b = 0xff;
+            }
+            let new_crc = crc32c::crc32c(&raw[pstart..pend]);
+            raw[pend..pend + 4].copy_from_slice(&new_crc.to_be_bytes());
+            let idx_path3 = dir.path().join("index_corrupt_series2");
+            fs::write(&idx_path3, &raw).unwrap();
+            let r3 = IndexReader::open(&idx_path3).unwrap();
+            assert!(r3.series(p[0]).is_err());
+        }
     }
 }

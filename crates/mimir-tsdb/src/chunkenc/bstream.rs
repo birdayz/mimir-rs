@@ -178,6 +178,15 @@ impl<'a> BitReader<'a> {
     }
 
     #[inline]
+    pub fn remaining_bits(&self) -> usize {
+        self.stream
+            .len()
+            .saturating_sub(self.stream_offset)
+            .saturating_mul(8)
+            .saturating_add(self.valid as usize)
+    }
+
+    #[inline]
     pub fn read_bit(&mut self) -> Result<bool, ChunkError> {
         if self.valid == 0 && !self.load_next_buffer(1) {
             return Err(ChunkError::UnexpectedEof);

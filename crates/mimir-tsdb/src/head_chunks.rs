@@ -462,6 +462,11 @@ impl HeadChunksReader {
         self.files.len()
     }
 
+    #[inline]
+    pub fn has_file(&self, seq: usize) -> bool {
+        self.files.contains_key(&seq)
+    }
+
     /// Reads and CRC-validates the chunk referenced by `chunk_ref`.
     pub fn chunk(&self, chunk_ref: ChunkDiskMapperRef) -> Result<EncodedChunk, HeadChunksError> {
         let (seq_u32, offset_u32) = chunk_ref.unpack();
@@ -474,8 +479,17 @@ impl HeadChunksReader {
             message: format!("head chunk file index {seq} does not exist"),
         })?;
 
-        let chk_start = start_of_entry + SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE;
-        if chk_start + MAX_CHUNK_LENGTH_FIELD_SIZE > mmap.len() {
+        let chk_start = start_of_entry
+            .checked_add(SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE)
+            .ok_or_else(|| HeadChunksError::Corruption {
+                dir: self.dir.clone(),
+                file_index: seq as i64,
+                message: "chunk offset overflow".to_string(),
+            })?;
+        if chk_start
+            .checked_add(MAX_CHUNK_LENGTH_FIELD_SIZE)
+            .is_none_or(|end| end > mmap.len())
+        {
             return Err(HeadChunksError::Corruption {
                 dir: self.dir.clone(),
                 file_index: seq as i64,
@@ -494,7 +508,11 @@ impl HeadChunksReader {
                 file_index: seq as i64,
                 message: "invalid chunk data length uvarint".to_string(),
             })?;
-        let data_len = data_len as usize;
+        let data_len = usize::try_from(data_len).map_err(|_| HeadChunksError::Corruption {
+            dir: self.dir.clone(),
+            file_index: seq as i64,
+            message: "chunk data length overflow".to_string(),
+        })?;
 
         let data_start = len_start + ulen;
         let data_end = data_start.checked_add(data_len).ok_or_else(|| HeadChunksError::Corruption {
@@ -502,7 +520,12 @@ impl HeadChunksReader {
             file_index: seq as i64,
             message: "chunk data length overflow".to_string(),
         })?;
-        if data_end + CRC_SIZE > mmap.len() {
+        let chk_end = data_end.checked_add(CRC_SIZE).ok_or_else(|| HeadChunksError::Corruption {
+            dir: self.dir.clone(),
+            file_index: seq as i64,
+            message: "chunk data length overflow".to_string(),
+        })?;
+        if chk_end > mmap.len() {
             return Err(HeadChunksError::Corruption {
                 dir: self.dir.clone(),
                 file_index: seq as i64,
@@ -586,8 +609,20 @@ impl HeadChunksReader {
                 })?;
                 idx += ulen;
 
-                let data_len = data_len as usize;
-                if data_len < 2 || idx + data_len + CRC_SIZE > file_end {
+                let data_len = usize::try_from(data_len).map_err(|_| HeadChunksError::Corruption {
+                    dir: self.dir.clone(),
+                    file_index: seq as i64,
+                    message: "chunk data length overflow".to_string(),
+                })?;
+                let entry_end = idx
+                    .checked_add(data_len)
+                    .and_then(|end| end.checked_add(CRC_SIZE))
+                    .ok_or_else(|| HeadChunksError::Corruption {
+                        dir: self.dir.clone(),
+                        file_index: seq as i64,
+                        message: "chunk data length overflow".to_string(),
+                    })?;
+                if data_len < 2 || entry_end > file_end {
                     return Err(HeadChunksError::Corruption {
                         dir: self.dir.clone(),
                         file_index: seq as i64,
@@ -687,8 +722,7 @@ impl HeadChunksReader {
             .files
             .keys()
             .copied()
-            .take_while(|&seq| seq < before_seq)
-            .filter(|&seq| Some(seq) != active_seq)
+            .filter(|&seq| seq < before_seq && active_seq.is_none_or(|a| seq < a))
             .collect();
         for seq in to_remove {
             // Drop Mmap before unlinking so /proc/self/maps never retains `(deleted)` mappings.
@@ -746,5 +780,56 @@ mod tests {
 
         assert_eq!(reader.chunk(r1).unwrap(), encoded);
         assert_eq!(reader.chunk(r2).unwrap(), encoded);
+    }
+
+    #[test]
+    fn truncate_in_place_except_keeps_active_and_newer_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut xc = XorChunk::new();
+        xc.appender().unwrap().append(0, 1000, 1.0).unwrap();
+        let encoded = EncodedChunk::Xor(xc);
+
+        {
+            let mut w = HeadChunksWriter::with_max_file_size(dir.path(), 70).unwrap();
+            for i in 0..4 {
+                w.write_chunk(10, 1000 + i * 100, 1000 + i * 100, &encoded, false)
+                    .unwrap();
+            }
+            w.close().unwrap();
+        }
+        let mut reader = HeadChunksReader::open(dir.path()).unwrap();
+        assert_eq!(reader.file_count(), 4);
+
+        reader.truncate_in_place_except(usize::MAX, Some(3)).unwrap();
+        assert!(!reader.has_file(1));
+        assert!(!reader.has_file(2));
+        assert!(reader.has_file(3));
+        assert!(reader.has_file(4));
+        assert!(head_chunk_file_path(dir.path(), 3).exists());
+        assert!(head_chunk_file_path(dir.path(), 4).exists());
+    }
+
+    #[test]
+    fn iterate_all_chunks_corrupt_huge_uvarint_length_returns_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = head_chunk_file_path(dir.path(), 1);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC_HEAD_CHUNKS.to_be_bytes());
+        bytes.push(HEAD_CHUNKS_FORMAT_V1);
+        bytes.extend_from_slice(&[0u8; SEGMENT_HEADER_PADDING_SIZE]);
+        // series_ref = 1, mint = 100, maxt = 200, encoding = Xor(1)
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        bytes.extend_from_slice(&100i64.to_be_bytes());
+        bytes.extend_from_slice(&200i64.to_be_bytes());
+        bytes.push(1);
+        // 10-byte uvarint = u64::MAX
+        bytes.extend_from_slice(&[0xffu8; 9]);
+        bytes.push(0x01);
+        bytes.extend_from_slice(&[0u8; 32]);
+        fs::write(&path, &bytes).unwrap();
+
+        let reader = HeadChunksReader::open_no_repair(dir.path()).unwrap();
+        let err = reader.collect_all_chunks().unwrap_err();
+        assert!(matches!(err, HeadChunksError::Corruption { .. }), "got {err:?}");
     }
 }

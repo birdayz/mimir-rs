@@ -78,6 +78,8 @@ pub enum ChunkError {
     InvalidEncoding(u8),
     #[error("invalid chunk header (len={len}, expected at least {min})")]
     InvalidHeader { len: usize, min: usize },
+    #[error("invalid chunk data")]
+    InvalidChunk,
     #[error("unknown histogram schema: {0}")]
     UnknownSchema(i32),
     #[error("histogram counter reset")]

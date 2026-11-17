@@ -1835,4 +1835,173 @@ mod tests {
             Encoding::FloatHistogramSt
         );
     }
+
+    #[test]
+    fn reencode_chunk_without_tombstones_matches_go_counter_reset_header_and_stale_safety() {
+        use crate::chunkenc::{stale_nan, CounterResetHeader, CounterResetHint, HistogramSpan};
+        use crate::tombstones::Interval;
+
+        let make_hist = |sum: f64, cnt: u64, hint: CounterResetHint| Histogram {
+            counter_reset_hint: hint,
+            schema: 0,
+            zero_threshold: 0.001,
+            zero_count: 1,
+            count: cnt,
+            sum,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![1],
+            ..Histogram::default()
+        };
+        let make_fhist = |sum: f64, cnt: f64, hint: CounterResetHint| FloatHistogram {
+            counter_reset_hint: hint,
+            schema: 0,
+            zero_threshold: 0.001,
+            zero_count: 1.0,
+            count: cnt,
+            sum,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![1.0],
+            ..FloatHistogram::default()
+        };
+
+        // Matches Go Prometheus `populateCurrForSingleChunk`: GaugeType preserves GaugeType,
+        // while counter histograms emit UnknownCounterReset when re-encoded via DelIter.
+        for orig_crh in [
+            CounterResetHeader::NotCounterReset,
+            CounterResetHeader::CounterReset,
+            CounterResetHeader::UnknownCounterReset,
+            CounterResetHeader::GaugeType,
+        ] {
+            let hint = if orig_crh == CounterResetHeader::GaugeType {
+                CounterResetHint::GaugeType
+            } else {
+                CounterResetHint::NotCounterReset
+            };
+            let h1 = make_hist(10.0, 2, hint);
+            let h2 = make_hist(20.0, 4, hint);
+            let fh1 = make_fhist(10.0, 2.0, hint);
+            let fh2 = make_fhist(20.0, 4.0, hint);
+
+            let mut hc = HistogramChunk::new();
+            {
+                let mut a = hc.appender().unwrap();
+                a.append_histogram(None, 0, 100, &h1, false).unwrap();
+                a.append_histogram(None, 0, 200, &h2, false).unwrap();
+                a.set_counter_reset_header(orig_crh);
+            }
+            let mut hsc = HistogramStChunk::new();
+            {
+                let mut a = hsc.appender().unwrap();
+                a.append_histogram(None, 50, 100, &h1, false).unwrap();
+                a.append_histogram(None, 50, 200, &h2, false).unwrap();
+                a.set_counter_reset_header(orig_crh);
+            }
+            let mut fhc = FloatHistogramChunk::new();
+            {
+                let mut a = fhc.appender().unwrap();
+                a.append_float_histogram(None, 0, 100, &fh1, false).unwrap();
+                a.append_float_histogram(None, 0, 200, &fh2, false).unwrap();
+                a.set_counter_reset_header(orig_crh);
+            }
+            let mut fhsc = FloatHistogramStChunk::new();
+            {
+                let mut a = fhsc.appender().unwrap();
+                a.append_float_histogram(None, 50, 100, &fh1, false).unwrap();
+                a.append_float_histogram(None, 50, 200, &fh2, false).unwrap();
+                a.set_counter_reset_header(orig_crh);
+            }
+
+            let expected = if orig_crh == CounterResetHeader::GaugeType {
+                CounterResetHeader::GaugeType
+            } else {
+                CounterResetHeader::UnknownCounterReset
+            };
+
+            for (enc, label) in [
+                (EncodedChunk::Histogram(hc), "Histogram"),
+                (EncodedChunk::HistogramSt(hsc), "HistogramSt"),
+                (EncodedChunk::FloatHistogram(fhc), "FloatHistogram"),
+                (EncodedChunk::FloatHistogramSt(fhsc), "FloatHistogramSt"),
+            ] {
+                for del_t in [100i64, 200i64] {
+                    let out = reencode_chunk_without_tombstones(
+                        ChunkMeta {
+                            ref_id: 1,
+                            min_time: 100,
+                            max_time: 200,
+                            chunk: Some(enc.clone()),
+                        },
+                        &[Interval { mint: del_t, maxt: del_t }],
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let got = match out.chunk.unwrap() {
+                        EncodedChunk::Histogram(c) => c.counter_reset_header(),
+                        EncodedChunk::HistogramSt(c) => c.counter_reset_header(),
+                        EncodedChunk::FloatHistogram(c) => c.counter_reset_header(),
+                        EncodedChunk::FloatHistogramSt(c) => c.counter_reset_header(),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(got, expected, "{label} {orig_crh:?} del_t={del_t}");
+                }
+            }
+        }
+
+        // 2) Corrupt chunk with StaleNaN followed by a non-stale sample must return Err, not panic.
+        let mut corrupt_hc = HistogramChunk::new();
+        {
+            let mut a = corrupt_hc.appender().unwrap();
+            let stale_h = Histogram {
+                sum: stale_nan(),
+                ..Histogram::default()
+            };
+            a.append_histogram(None, 0, 100, &stale_h, false).unwrap();
+            a.append_histogram(None, 0, 200, &stale_h, false).unwrap();
+        }
+        // Build a 3-sample chunk with a StaleNaN at t=200 after a normal sample at t=100,
+        // and also test a corrupt BitStream chunk with StaleNaN at sample 0 + normal sample at sample 1.
+        let mut bs = crate::chunkenc::bstream::BitStream::new();
+        bs.write_byte(0);
+        bs.write_byte(2); // num_samples = 2
+        bs.write_byte(0); // flags = UnknownCounterReset
+        bs.write_byte(0); // zero_threshold = 0
+        crate::chunkenc::varbit::put_varbit_int(&mut bs, 0); // schema = 0
+        crate::chunkenc::varbit::put_varbit_uint(&mut bs, 0); // 0 pos spans
+        crate::chunkenc::varbit::put_varbit_uint(&mut bs, 0); // 0 neg spans
+        crate::chunkenc::varbit::put_varbit_int(&mut bs, 100); // t0 = 100
+        crate::chunkenc::varbit::put_varbit_uint(&mut bs, 0); // cnt = 0
+        crate::chunkenc::varbit::put_varbit_uint(&mut bs, 0); // z_cnt = 0
+        bs.write_bits(stale_nan().to_bits(), 64); // sample 0 sum = StaleNaN
+        // sample 1: t_dod=100, cnt_dod=1, z_cnt_dod=0, xor sum -> 5.0
+        crate::chunkenc::varbit::put_varbit_int(&mut bs, 100);
+        crate::chunkenc::varbit::put_varbit_int(&mut bs, 1);
+        crate::chunkenc::varbit::put_varbit_int(&mut bs, 0);
+        bs.write_bit(true);
+        bs.write_bit(true);
+        bs.write_bits(0, 5);
+        bs.write_bits(0, 6); // 64 bits
+        bs.write_bits(stale_nan().to_bits() ^ 5.0f64.to_bits(), 64);
+        let corrupt_stale_then_normal = HistogramChunk::from_bytes(bs.into_bytes());
+        let res_err = reencode_chunk_without_tombstones(
+            ChunkMeta {
+                ref_id: 1,
+                min_time: 100,
+                max_time: 200,
+                chunk: Some(EncodedChunk::Histogram(corrupt_stale_then_normal)),
+            },
+            &[Interval { mint: 150, maxt: 160 }],
+        );
+        assert!(matches!(res_err, Err(ChunkError::HistogramSchemaChange)), "got {res_err:?}");
+
+        let res = reencode_chunk_without_tombstones(
+            ChunkMeta {
+                ref_id: 1,
+                min_time: 100,
+                max_time: 200,
+                chunk: Some(EncodedChunk::Histogram(corrupt_hc)),
+            },
+            &[Interval { mint: 200, maxt: 200 }],
+        );
+        assert!(res.is_ok());
+    }
 }

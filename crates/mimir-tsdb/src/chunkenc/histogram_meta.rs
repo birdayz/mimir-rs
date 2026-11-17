@@ -21,6 +21,13 @@ pub(crate) fn count_spans(spans: &[HistogramSpan]) -> usize {
     spans.iter().map(|s| s.length as usize).sum()
 }
 
+#[inline]
+pub(crate) fn checked_count_spans(spans: &[HistogramSpan]) -> Option<usize> {
+    spans
+        .iter()
+        .try_fold(0usize, |acc, s| acc.checked_add(s.length as usize))
+}
+
 pub(crate) fn write_histogram_chunk_layout(
     b: &mut BitStream,
     schema: i32,
@@ -79,7 +86,11 @@ fn put_histogram_chunk_layout_spans(b: &mut BitStream, spans: &[HistogramSpan]) 
 fn read_histogram_chunk_layout_spans(
     b: &mut BitReader<'_>,
 ) -> Result<Vec<HistogramSpan>, ChunkError> {
-    let num = read_varbit_uint(b)? as usize;
+    let num_u64 = read_varbit_uint(b)?;
+    if num_u64 > (b.remaining_bits() / 4) as u64 {
+        return Err(ChunkError::UnexpectedEof);
+    }
+    let num = usize::try_from(num_u64).map_err(|_| ChunkError::InvalidChunk)?;
     let mut spans = Vec::with_capacity(num.min(4096));
     for _ in 0..num {
         let length = read_varbit_uint(b)? as u32;
@@ -99,7 +110,11 @@ fn put_histogram_chunk_layout_custom_bounds(b: &mut BitStream, custom_values: &[
 fn read_histogram_chunk_layout_custom_bounds(
     b: &mut BitReader<'_>,
 ) -> Result<Vec<f64>, ChunkError> {
-    let num = read_varbit_uint(b)? as usize;
+    let num_u64 = read_varbit_uint(b)?;
+    if num_u64 > (b.remaining_bits() / 2) as u64 {
+        return Err(ChunkError::UnexpectedEof);
+    }
+    let num = usize::try_from(num_u64).map_err(|_| ChunkError::InvalidChunk)?;
     let mut custom_values = Vec::with_capacity(num.min(4096));
     for _ in 0..num {
         custom_values.push(read_custom_bound(b)?);

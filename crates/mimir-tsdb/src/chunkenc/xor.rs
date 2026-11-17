@@ -362,7 +362,7 @@ impl<'a> XorIterator<'a> {
             return Ok(Some((self.t, self.val)));
         }
 
-        if self.leading != 0xff {
+        if self.leading != 0xff && self.leading.saturating_add(self.trailing) < 64 {
             let mbits = 64 - self.leading - self.trailing;
             if let Some(ctrl) = self.br.peek_bits_fast(2) {
                 if (ctrl & 1) == 0 {
@@ -449,14 +449,25 @@ pub(crate) fn xor_read(
     }
 
     let (_new_leading, new_trailing, mbits) = if !br.read_bit()? {
-        (*leading, *trailing, 64 - *leading - *trailing)
+        let Some(mb) = 64u8
+            .checked_sub(*leading)
+            .and_then(|r| r.checked_sub(*trailing))
+        else {
+            return Err(ChunkError::InvalidChunk);
+        };
+        if mb == 0 {
+            return Err(ChunkError::InvalidChunk);
+        }
+        (*leading, *trailing, mb)
     } else {
         let nl = br.read_bits(5)? as u8;
         let mut mb = br.read_bits(6)? as u8;
         if mb == 0 {
             mb = 64;
         }
-        let nt = 64 - nl - mb;
+        let Some(nt) = 64u8.checked_sub(nl).and_then(|r| r.checked_sub(mb)) else {
+            return Err(ChunkError::InvalidChunk);
+        };
         *leading = nl;
         *trailing = nt;
         (nl, nt, mb)
@@ -532,5 +543,41 @@ mod tests {
             pv = val;
         }
         assert_eq!(c_cold2.as_bytes(), c_ref.as_bytes());
+    }
+
+    #[test]
+    fn corrupt_xor_nl_plus_mb_gt_64_returns_error_not_panic() {
+        // 2 samples: sample 0 = (t=100, v=1.0), sample 1 = dod=0 ('0'), value ctrl='11',
+        // nl=31 (0b11111), mb=63 (0b111111) => nl + mb = 94 > 64.
+        let mut bs = BitStream::new();
+        bs.write_byte(0);
+        bs.write_byte(2); // num_samples = 2
+        bs.write_varint(100); // t0
+        bs.write_bits(1.0f64.to_bits(), 64); // v0
+        bs.write_uvarint(10); // t_delta
+        bs.write_bit(true);
+        bs.write_bit(true); // ctrl '11'
+        bs.write_bits(31, 5); // nl = 31
+        bs.write_bits(63, 6); // mb = 63 => 31 + 63 > 64
+        bs.write_bits(0, 64);
+
+        let chunk = XorChunk::from_bytes(bs.into_bytes());
+        let mut it = chunk.iter();
+        assert!(it.next_sample().is_ok()); // sample 0
+        assert!(matches!(it.next_sample(), Err(ChunkError::InvalidChunk)));
+
+        // Also test ctrl '10' before leading/trailing is initialized (leading == 0xff).
+        let mut bs2 = BitStream::new();
+        bs2.write_byte(0);
+        bs2.write_byte(2);
+        bs2.write_varint(100);
+        bs2.write_bits(1.0f64.to_bits(), 64);
+        bs2.write_uvarint(10);
+        bs2.write_bit(true);
+        bs2.write_bit(false); // ctrl '10' with leading == 0xff
+        let chunk2 = XorChunk::from_bytes(bs2.into_bytes());
+        let mut it2 = chunk2.iter();
+        assert!(it2.next_sample().is_ok());
+        assert!(matches!(it2.next_sample(), Err(ChunkError::InvalidChunk)));
     }
 }

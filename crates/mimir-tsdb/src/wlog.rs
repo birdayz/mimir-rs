@@ -916,6 +916,9 @@ impl<R: Read + SegmentTracker> WlogReader<R> {
     }
 }
 
+/// Maximum allowed decompressed size of a single WAL/WBL record (128 MiB).
+pub const MAX_WAL_RECORD_DECOMPRESSED_BYTES: usize = 128 * 1024 * 1024;
+
 /// Decompresses a raw WAL record payload produced by [`WlogReader::next_raw_record`] into `dst`.
 pub fn decompress_record_into(
     compr: CompressionType,
@@ -935,6 +938,11 @@ pub fn decompress_record_into(
             }
             let dec_len = snap::raw::decompress_len(src)
                 .map_err(|e| format!("snappy decompress_len: {e}"))?;
+            if dec_len > MAX_WAL_RECORD_DECOMPRESSED_BYTES {
+                return Err(format!(
+                    "snappy decompressed record length {dec_len} exceeds max {MAX_WAL_RECORD_DECOMPRESSED_BYTES}"
+                ));
+            }
             dst.resize(dec_len, 0);
             let n = snap::raw::Decoder::new()
                 .decompress(src, dst)
@@ -948,10 +956,17 @@ pub fn decompress_record_into(
                 return Ok(());
             }
             dst.clear();
-            let mut dec = zstd::stream::Decoder::new(src)
+            let dec = zstd::stream::Decoder::new(src)
                 .map_err(|e| format!("zstd decoder: {e}"))?;
-            io::Read::read_to_end(&mut dec, dst)
+            let mut limited = io::Read::take(dec, (MAX_WAL_RECORD_DECOMPRESSED_BYTES + 1) as u64);
+            io::Read::read_to_end(&mut limited, dst)
                 .map_err(|e| format!("zstd decompress: {e}"))?;
+            if dst.len() > MAX_WAL_RECORD_DECOMPRESSED_BYTES {
+                dst.clear();
+                return Err(format!(
+                    "zstd decompressed record exceeds max {MAX_WAL_RECORD_DECOMPRESSED_BYTES}"
+                ));
+            }
             Ok(())
         }
     }
@@ -1553,5 +1568,35 @@ mod tests {
         let recovered = r2.next_record().unwrap().unwrap();
         assert_eq!(dec.samples(recovered).unwrap()[0].t, 100);
         assert!(r2.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn wal_snappy_bomb_returns_corruption_not_oom() {
+        let dir = tempfile::tempdir().unwrap();
+        // 5-byte Snappy payload claiming u32::MAX (4 GiB) uncompressed length.
+        let bomb = [0xffu8, 0xff, 0xff, 0xff, 0x0f];
+        let mut buf = Vec::new();
+        decompress_record_into(CompressionType::Snappy, &bomb, &mut buf).unwrap_err();
+
+        // Write a full WAL record with valid CRC32C over the 5-byte Snappy bomb.
+        let crc = crc32c::crc32c(&bomb);
+        let mut frame = Vec::new();
+        frame.push(REC_FULL | SNAPPY_MASK);
+        frame.extend_from_slice(&(bomb.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&crc.to_be_bytes());
+        frame.extend_from_slice(&bomb);
+        fs::write(segment_name(dir.path(), 0), &frame).unwrap();
+
+        let mut r = WlogReader::open_dir(dir.path()).unwrap();
+        let err = r.next_record().unwrap_err();
+        assert!(matches!(err, WlogError::Corruption { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn wal_zstd_oversized_record_returns_corruption() {
+        let mut dst = Vec::new();
+        // Corrupt/truncated zstd stream or invalid header returns Err, not panic.
+        let err = decompress_record_into(CompressionType::Zstd, &[0x28, 0xb5, 0x2f, 0xfd, 0x00], &mut dst);
+        assert!(err.is_err());
     }
 }
