@@ -12,7 +12,7 @@ use serde_yaml::{Mapping, Value};
 
 use crate::duration::GoDuration;
 use crate::env::expand_environment_variables;
-use crate::error::{CliAction, ConfigError};
+use crate::error::{go_path_error, CliAction, ConfigError};
 use crate::flags::{is_targetable_module, parse_config_file_parameter, FlagSet, MainFlags};
 use crate::ingester::{ClusterValidationConfig, IngesterClientConfig, IngesterConfig};
 use crate::limits::LimitsConfig;
@@ -431,7 +431,13 @@ impl MimirConfig {
         path: &Path,
         expand_env: bool,
     ) -> Result<String, ConfigError> {
-        let raw = std::fs::read(path)?;
+        use std::io::Read as _;
+        let shown = path.display().to_string();
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| ConfigError::ReadConfigFile(go_path_error("open", &shown, &e)))?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|e| ConfigError::ReadConfigFile(go_path_error("read", &shown, &e)))?;
         self.load_config_from_bytes(&raw, expand_env)
     }
 
@@ -695,8 +701,12 @@ impl MimirConfig {
 
         self.server.validate()?;
         self.validate_filesystem_paths()?;
-        self.ingest_storage.validate()?;
-        self.compartments.validate()?;
+        self.ingest_storage
+            .validate()
+            .map_err(wrap_validation("invalid ingest storage config"))?;
+        self.compartments
+            .validate()
+            .map_err(wrap_validation("invalid compartments config"))?;
 
         if self.compartments.enabled {
             if !self.ingest_storage.enabled {
@@ -757,10 +767,15 @@ impl MimirConfig {
             ));
         }
 
-        self.memberlist.validate()?;
+        self.memberlist
+            .validate()
+            .map_err(wrap_validation("invalid memberlist config"))?;
         self.blocks_storage
-            .validate(self.ingester.active_series.active_series_metrics_enabled)?;
-        self.ingester_client.validate()?;
+            .validate(self.ingester.active_series.active_series_metrics_enabled)
+            .map_err(wrap_validation("invalid TSDB config"))?;
+        self.ingester_client
+            .validate()
+            .map_err(wrap_validation("invalid ingester_client config"))?;
 
         if let Err(err) = self.ingester.validate(
             self.compartments.enabled,
@@ -769,11 +784,13 @@ impl MimirConfig {
             // Only fail on spread-minimizing error if ingester is targeted.
             let is_spread_min = err.to_string().contains("spread-minimizing");
             if self.is_ingester_enabled() || !is_spread_min {
-                return Err(err);
+                return Err(wrap_validation("invalid ingester config")(err));
             }
         }
 
-        self.usage_stats.validate()?;
+        self.usage_stats
+            .validate()
+            .map_err(wrap_validation("invalid usage stats config"))?;
         self.limits.validate()?;
 
         Ok(())
@@ -858,6 +875,14 @@ impl MimirConfig {
         }
 
         Ok(())
+    }
+}
+
+/// `errors.Wrap(err, prefix)` as used by `pkg/mimir/mimir.go:Config.Validate`.
+fn wrap_validation(prefix: &'static str) -> impl FnOnce(ConfigError) -> ConfigError {
+    move |err| match err {
+        ConfigError::Validation(msg) => ConfigError::Validation(format!("{prefix}: {msg}")),
+        other => ConfigError::Validation(format!("{prefix}: {other}")),
     }
 }
 
@@ -1187,7 +1212,11 @@ pub fn parse_cli_and_load_config(
         Some(
             state
                 .cfg
-                .load_config_from_file(Path::new(&config_file), expand_env)?,
+                .load_config_from_file(Path::new(&config_file), expand_env)
+                .map_err(|e| ConfigError::LoadConfig {
+                    path: config_file.clone(),
+                    source: Box::new(e),
+                })?,
         )
     } else {
         None

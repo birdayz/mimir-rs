@@ -2477,15 +2477,15 @@ pub fn register_extra_flags<T: 'static>(
                             parse_go_bool(s)?;
                         }
                         FieldKind::Int => {
-                            s.parse::<i64>()
-                                .map_err(|_| ConfigError::Flag("parse error".to_string()))?;
+                            crate::flags::go_parse_int(s)?;
                         }
                         FieldKind::Float => {
-                            s.parse::<f64>()
-                                .map_err(|_| ConfigError::Flag("parse error".to_string()))?;
+                            crate::flags::go_parse_float(s)?;
                         }
                         FieldKind::Duration => {
-                            s.parse::<GoDuration>()?;
+                            // flag.durationValue.Set maps every parse error to errParse.
+                            s.parse::<GoDuration>()
+                                .map_err(|_| ConfigError::Flag("parse error".to_string()))?;
                         }
                         FieldKind::String
                         | FieldKind::StringList

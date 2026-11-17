@@ -32,7 +32,7 @@ pub use duration::{
 pub use env::{expand_environment_variables, expand_environment_variables_with};
 pub use error::{CliAction, ConfigError};
 pub use flags::{
-    format_modules, format_version, is_targetable_module, parse_config_file_parameter, FlagSet,
+    format_modules, format_version, go_version_str, is_targetable_module, parse_config_file_parameter, FlagSet,
     MainFlags, USER_VISIBLE_MODULES,
 };
 pub use ingester::{
