@@ -957,21 +957,19 @@ async fn label_churn_handler(
     Query(q): Query<LabelChurnQuery>,
 ) -> Response {
     if !st.ingester.cfg.label_churn_enabled {
-        return (
+        return go_http_error(
             StatusCode::NOT_FOUND,
             "label churn detection is disabled, enable it with -ingester.label-churn-enabled",
-        )
-            .into_response();
+        );
     }
     let lookback = if let Some(ref lb) = q.lookback {
         match parse_go_duration(lb) {
             Ok(d_ns) if d_ns > 0 => Duration::from_nanos(d_ns as u64),
             _ => {
-                return (
+                return go_http_error(
                     StatusCode::BAD_REQUEST,
                     "the lookback parameter must be a positive duration",
-                )
-                    .into_response();
+                );
             }
         }
     } else {
@@ -980,11 +978,10 @@ async fn label_churn_handler(
 
     let limit = if let Some(l) = q.limit {
         if l < 0 {
-            return (
+            return go_http_error(
                 StatusCode::BAD_REQUEST,
                 "the limit parameter must be a non-negative integer",
-            )
-                .into_response();
+            );
         }
         l as usize
     } else {
@@ -992,11 +989,10 @@ async fn label_churn_handler(
     };
 
     let Some(db) = st.ingester.get_tsdb(&tenant) else {
-        return (
+        return go_http_error(
             StatusCode::NOT_FOUND,
-            format!("the ingester has no TSDB for tenant {tenant}"),
-        )
-            .into_response();
+            &format!("the ingester has no TSDB for tenant {tenant}"),
+        );
     };
 
     let since_ms = SystemTime::now()
@@ -1023,10 +1019,10 @@ async fn label_churn_handler(
         },
     ) {
         Ok(resp) => Json(resp).into_response(),
-        Err(LabelChurnError::CompactedTooRecently | LabelChurnError::NoRecord) => {
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        Err(e @ (LabelChurnError::CompactedTooRecently | LabelChurnError::NoRecord)) => {
+            go_http_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string())
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
@@ -1214,5 +1210,50 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("prometheus_tsdb_head_series"));
+    }
+
+    #[tokio::test]
+    async fn wave3_label_churn_503_bodies_match_go_http_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-0".to_string();
+        cfg.label_churn_enabled = true;
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let db = ing.get_or_create_tsdb("t1").unwrap();
+        let app = ingester_router(Arc::clone(&ing));
+
+        // NoRecord -> 503 with Go's exact explanation + trailing newline.
+        let (code, h, body) = get(&app, "/ingester/label_churn/t1?lookback=1ms", &[]).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(h.get("content-type").unwrap(), "text/plain; charset=utf-8");
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(
+            body,
+            "the ingester has no record in the lookback window, the ingester records once per minute after it starts\n"
+        );
+
+        // CompactedTooRecently -> 503 with Go's exact explanation + trailing newline.
+        db.pending_series_removals.store(1, Ordering::Release);
+        let (code, _, body) = get(&app, "/ingester/label_churn/t1?lookback=30m", &[]).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            "a compaction removed series after the start of the lookback window, retry later or use a shorter lookback\n"
+        );
     }
 }

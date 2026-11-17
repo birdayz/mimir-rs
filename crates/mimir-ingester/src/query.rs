@@ -1802,7 +1802,7 @@ impl Ingester {
             Ok(ingesterpb::CountMethod::Active) => true,
             Err(_) => {
                 return Err(IngesterError::Internal {
-                    message: format!("unknown count method {}", req.count_method),
+                    message: format!("unknown count method \"{}\"", req.count_method),
                 });
             }
         };
@@ -1814,24 +1814,6 @@ impl Ingester {
                 .map_err(|e| IngesterError::Internal {
                     message: e.to_string(),
                 })?;
-
-            let base_matching_active: Option<hashbrown::HashSet<u64>> =
-                if active_only && !matchers.is_empty() {
-                    let base_refs =
-                        head.postings_for_matchers_arc(&matchers)
-                            .map_err(|e| IngesterError::Internal {
-                                message: e.to_string(),
-                            })?;
-                    let mut set = hashbrown::HashSet::with_capacity(base_refs.len());
-                    for &r in base_refs.iter() {
-                        if db.active_series.contains_ref(r) {
-                            set.insert(r);
-                        }
-                    }
-                    Some(set)
-                } else {
-                    None
-                };
 
             let mut batches = Vec::new();
             let mut resp = ingesterpb::LabelNamesAndValuesResponse::default();
@@ -1852,20 +1834,16 @@ impl Ingester {
 
                 let mut filtered = Vec::with_capacity(values.len());
                 if active_only {
+                    // Go `activeseries.IsLabelValueActive` (`ingester_query.go:434-437`):
+                    // keeps `(label_name, val)` if ANY active series in Head has `label_name=val`.
                     for val in values {
-                        let is_active = if let Some(ref base_set) = base_matching_active {
-                            head.visit_postings_for_label_value(&label_name, &val, |small, large| {
-                                small.iter().any(|&r| base_set.contains(&(r as u64)))
-                                    || large.iter().any(|&r| base_set.contains(&r))
-                            })
-                        } else {
+                        let is_active =
                             head.visit_postings_for_label_value(&label_name, &val, |small, large| {
                                 small
                                     .iter()
                                     .any(|&r| db.active_series.contains_ref(r as u64))
                                     || large.iter().any(|&r| db.active_series.contains_ref(r))
-                            })
-                        };
+                            });
                         if is_active {
                             filtered.push(val);
                         }
@@ -1940,7 +1918,7 @@ impl Ingester {
             Ok(ingesterpb::CountMethod::Active) => true,
             Err(_) => {
                 return Err(IngesterError::Internal {
-                    message: format!("unknown count method {}", req.count_method),
+                    message: format!("unknown count method \"{}\"", req.count_method),
                 });
             }
         };
@@ -2075,8 +2053,13 @@ impl Ingester {
     ) -> Result<ReceiverStream<Result<ingesterpb::ActiveSeriesResponse, Status>>, IngesterError>
     {
         let permit = self.start_read_request(md).await?;
-        let matchers = active_series_matchers(&req.matchers)?;
-        let (shard, matchers) = remove_shard_from_matchers(matchers)?;
+        let matchers = match active_series_matchers(&req.matchers) {
+            Ok(m) => m,
+            Err(e) => {
+                permit.finish(false);
+                return Err(e);
+            }
+        };
         if let Err(e) = self.enforce_read_consistency(md, user_id).await {
             permit.finish(e.is_deadline_exceeded());
             return Err(e);
@@ -2086,6 +2069,18 @@ impl Ingester {
             permit.finish(false);
             let (_tx, rx) = mpsc::channel(1);
             return Ok(ReceiverStream::new(rx));
+        };
+
+        let (shard, matchers) = match remove_shard_from_matchers(matchers) {
+            Ok(v) => v,
+            Err(e) => {
+                permit.finish(false);
+                return Err(IngesterError::Internal {
+                    message: format!(
+                        "error listing active series: error removing shard matcher: {e}"
+                    ),
+                });
+            }
         };
 
         let (tx, rx) = mpsc::channel(8);
@@ -2182,12 +2177,15 @@ impl Ingester {
         req: ingesterpb::ActiveSeriesRequest,
     ) -> Result<Vec<ingesterpb::ActiveSeriesResponse>, IngesterError> {
         let matchers = active_series_matchers(&req.matchers)?;
-        let (shard, matchers) = remove_shard_from_matchers(matchers)?;
         self.enforce_read_consistency(md, user_id).await?;
 
         let Some(db) = self.get_tsdb(user_id) else {
             return Ok(Vec::new());
         };
+        let (shard, matchers) =
+            remove_shard_from_matchers(matchers).map_err(|e| IngesterError::Internal {
+                message: format!("error listing active series: error removing shard matcher: {e}"),
+            })?;
         let is_native_histogram = req.r#type
             == ingesterpb::active_series_request::RequestType::NativeHistogramSeries as i32;
         let head = db.db.head();
@@ -2398,7 +2396,7 @@ fn create_user_stats(
         Ok(ingesterpb::CountMethod::Active) => db.active_series.active().0 as u64,
         Err(_) => {
             return Err(IngesterError::Internal {
-                message: format!("unknown count method {count_method}"),
+                message: format!("unknown count method \"{count_method}\""),
             });
         }
     };
@@ -3262,5 +3260,166 @@ mod tests {
             got_shard.push(item.unwrap());
         }
         assert_eq!(got_shard, expected_shard);
+    }
+
+    #[tokio::test]
+    async fn wave3_active_lnv_shard_error_and_quoted_unknown_count_method() {
+        use bytes::Bytes;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-0".to_string();
+        cfg.active_series.active_series_metrics_enabled = true;
+        cfg.active_series.active_series_metrics_idle_timeout =
+            mimir_config::GoDuration(50_000_000); // 50ms
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let lp = |n: &str, v: &str| cortexpb::LabelPair {
+            name: Bytes::copy_from_slice(n.as_bytes()),
+            value: Bytes::copy_from_slice(v.as_bytes()),
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Push `m_inactive{env="prod", only_inact="x"}` then expire it via purge(now + 1s).
+        ing.push_to_storage(
+            "u1",
+            &cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![
+                        lp("__name__", "m_inactive"),
+                        lp("env", "prod"),
+                        lp("only_inact", "x"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        value: 1.0,
+                        timestamp_ms: now,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        ing.get_tsdb("u1")
+            .unwrap()
+            .active_series
+            .purge(SystemTime::now() + Duration::from_secs(1));
+
+        // Push `m_active{env="prod"}` so `env="prod"` is active on `m_active`.
+        ing.push_to_storage(
+            "u1",
+            &cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![lp("__name__", "m_active"), lp("env", "prod")],
+                    samples: vec![cortexpb::Sample {
+                        value: 2.0,
+                        timestamp_ms: now + 1_000,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // W3-09: LabelNamesAndValues(ACTIVE, matchers=[__name__="m_inactive"]) must return {"env": ["prod"]}.
+        let md = MetadataMap::new();
+        let lnv = ing
+            .handle_label_names_and_values(
+                &md,
+                "u1",
+                ingesterpb::LabelNamesAndValuesRequest {
+                    matchers: vec![ingesterpb::LabelMatcher {
+                        r#type: ingesterpb::MatchType::Equal as i32,
+                        name: "__name__".into(),
+                        value: "m_inactive".into(),
+                    }],
+                    count_method: ingesterpb::CountMethod::Active as i32,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(lnv.len(), 1);
+        assert_eq!(lnv[0].items.len(), 1);
+        assert_eq!(lnv[0].items[0].label_name, "env");
+        assert_eq!(lnv[0].items[0].values, vec!["prod"]);
+
+        // W3-13: ActiveSeries invalid `__query_shard__` carries Go's outer prefix.
+        let bad_shard_req = ingesterpb::ActiveSeriesRequest {
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__query_shard__".into(),
+                value: "bad".into(),
+            }],
+            r#type: 0,
+        };
+        let as_err = ing
+            .handle_active_series(&md, "u1", bad_shard_req.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            as_err.to_string(),
+            "error listing active series: error removing shard matcher: invalid shard ID: \"bad\""
+        );
+        let Err(rx_err) = ing.handle_active_series_rx(&md, "u1", bad_shard_req).await else {
+            panic!("expected rx bad shard error");
+        };
+        assert_eq!(
+            rx_err.to_string(),
+            "error listing active series: error removing shard matcher: invalid shard ID: \"bad\""
+        );
+
+        // W3-14: Unknown CountMethod quotes the numeric value (`"99"`).
+        let us_err = ing
+            .handle_user_stats(&md, "u1", ingesterpb::UserStatsRequest { count_method: 99 })
+            .await
+            .unwrap_err();
+        assert_eq!(us_err.to_string(), "unknown count method \"99\"");
+
+        let lnv_err = ing
+            .handle_label_names_and_values(
+                &md,
+                "u1",
+                ingesterpb::LabelNamesAndValuesRequest {
+                    matchers: vec![],
+                    count_method: 99,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(lnv_err.to_string(), "unknown count method \"99\"");
+
+        let lvc_err = ing
+            .handle_label_values_cardinality(
+                &md,
+                "u1",
+                ingesterpb::LabelValuesCardinalityRequest {
+                    label_names: vec!["env".into()],
+                    matchers: vec![],
+                    count_method: 99,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(lvc_err.to_string(), "unknown count method \"99\"");
     }
 }

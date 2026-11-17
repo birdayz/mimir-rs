@@ -1587,16 +1587,17 @@ impl Ingester {
             }
 
             if !item.labels_sorted_unique {
-                let s_str = make_series_str(encoded_labels);
-                let total_bad =
-                    samples.len() + if native_histograms_enabled { hist_count } else { 0 };
+                let total_bad = samples.len() + hist_count;
                 stats.failed_samples += total_bad;
                 stats.labels_not_sorted += total_bad;
                 stats.failed_exemplars += item.exemplars.len();
-                record_partial(
-                    IngesterError::labels_not_sorted(s_str),
-                    Some(SampleKind::LabelsNotSorted),
-                );
+                if total_bad > 0 {
+                    let s_str = make_series_str(encoded_labels);
+                    record_partial(
+                        IngesterError::labels_not_sorted(s_str),
+                        Some(SampleKind::LabelsNotSorted),
+                    );
+                }
                 continue;
             }
 
@@ -2226,14 +2227,16 @@ impl Ingester {
             let mut series_ref = series_entry.as_ref().map(|e| e.ref_id);
 
             if let (None, Some(s_str)) = (series_ref, unsorted_series_str) {
-                let total_bad = samples.len() + if native_histograms_enabled { hist_count } else { 0 };
+                let total_bad = samples.len() + hist_count;
                 stats.failed_samples += total_bad;
                 stats.labels_not_sorted += total_bad;
                 stats.failed_exemplars += ts.exemplar_count();
-                record_partial(
-                    IngesterError::labels_not_sorted(s_str),
-                    Some(SampleKind::LabelsNotSorted),
-                );
+                if total_bad > 0 {
+                    record_partial(
+                        IngesterError::labels_not_sorted(s_str),
+                        Some(SampleKind::LabelsNotSorted),
+                    );
+                }
                 continue;
             }
 
@@ -2916,4 +2919,105 @@ fn min_timestamp_owned(ts_list: &[cortexpb::TimeSeries]) -> i64 {
 
 pub fn empty_hashset() -> HashSet<String> {
     HashSet::new()
+}
+
+#[cfg(test)]
+mod wave3_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn lp(name: &str, value: &str) -> cortexpb::LabelPair {
+        cortexpb::LabelPair {
+            name: Bytes::copy_from_slice(name.as_bytes()),
+            value: Bytes::copy_from_slice(value.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn wave3_unsorted_labels_exemplar_only_ok_and_disabled_histograms_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-0".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let limits = mimir_config::LimitsConfig {
+            native_histograms_ingestion_enabled: false,
+            ..Default::default()
+        };
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(limits),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // 1. Exemplar-only TimeSeries with unsorted labels must return Ok(()) on both push paths.
+        let ex_only_req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("z", "1"), lp("__name__", "unsort_ex_only")],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![lp("t", "1")],
+                    value: 1.0,
+                    timestamp_ms: now,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(ing.push_to_storage("t-no-nh", &ex_only_req).is_ok());
+        assert!(ing
+            .push_grpc_raw_sync(
+                "t-no-nh",
+                &mimir_proto::prost::Message::encode_to_vec(&ex_only_req)
+            )
+            .is_ok());
+
+        // 2. Unsorted labels with 2 histograms when native_histograms_ingestion_enabled=false
+        // must report rejected_samples == 2 in ErrorDetails on both push paths.
+        let mk_hist = |ts: i64, d: i64| cortexpb::Histogram {
+            count: Some(cortexpb::histogram::Count::CountInt(d as u64)),
+            zero_count: Some(cortexpb::histogram::ZeroCount::ZeroCountInt(0)),
+            sum: d as f64 * 1.5,
+            schema: 0,
+            positive_spans: vec![cortexpb::BucketSpan {
+                offset: 0,
+                length: 1,
+            }],
+            positive_deltas: vec![d],
+            timestamp: ts,
+            ..Default::default()
+        };
+        let hist_req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("z", "1"), lp("__name__", "unsort_hist_disabled")],
+                histograms: vec![mk_hist(now, 2), mk_hist(now + 1000, 3)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let err1 = ing.push_to_storage("t-no-nh", &hist_req).unwrap_err();
+        assert_eq!(err1.rejected_samples(), 2);
+
+        let err2 = ing
+            .push_grpc_raw_sync(
+                "t-no-nh",
+                &mimir_proto::prost::Message::encode_to_vec(&hist_req),
+            )
+            .unwrap_err();
+        assert_eq!(err2.rejected_samples(), 2);
+    }
 }
