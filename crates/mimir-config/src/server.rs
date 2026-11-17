@@ -201,6 +201,11 @@ pub struct ServerConfig {
     pub cluster_validation: ServerClusterValidationConfig,
     pub create_new_traces: bool,
     pub enable_open_metrics_text_created_samples: bool,
+    /// `server.Config.Throughput` (`yaml:"-"`, flags only).
+    #[serde(skip)]
+    pub throughput_latency_cutoff: GoDuration,
+    #[serde(skip)]
+    pub throughput_unit: String,
 }
 
 impl Default for ServerConfig {
@@ -266,6 +271,8 @@ impl Default for ServerConfig {
             cluster_validation: ServerClusterValidationConfig::default(),
             create_new_traces: false,
             enable_open_metrics_text_created_samples: false,
+            throughput_latency_cutoff: GoDuration::ZERO,
+            throughput_unit: "samples_processed".to_string(),
         }
     }
 }
@@ -334,9 +341,18 @@ impl ServerConfig {
             .register_flags_into("server.cluster-validation.", f, move |t| &get(t).cluster_validation, move |t| &mut get_mut(t).cluster_validation);
         f.bool_var("server.create-new-traces", self.create_new_traces, "Create new traces instead of continuing existing ones.", move |t| &get(t).create_new_traces, move |t| &mut get_mut(t).create_new_traces);
         f.bool_var("server.enable-open-metrics-text-created-samples", self.enable_open_metrics_text_created_samples, "Enable OpenMetrics text created samples.", move |t| &get(t).enable_open_metrics_text_created_samples, move |t| &mut get_mut(t).enable_open_metrics_text_created_samples);
+        f.go_duration_var("server.throughput.latency-cutoff", self.throughput_latency_cutoff, "Requests taking over the cutoff are be observed to measure throughput. Server-Timing header is used with specified unit as the indicator, for example 'Server-Timing: unit;val=8.2'. If set to 0, the throughput is not calculated.", move |t| &get(t).throughput_latency_cutoff, move |t| &mut get_mut(t).throughput_latency_cutoff);
+        f.string_var("server.throughput.unit", &self.throughput_unit, "Unit of the server throughput metric, for example 'processed_bytes' or 'samples_processed'. Observed values are gathered from the 'Server-Timing' header with the 'val' key. If set, it is appended to the request_server_throughput metric name.", move |t| &get(t).throughput_unit, move |t| &mut get_mut(t).throughput_unit);
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.throughput_latency_cutoff.0 > 0 {
+            // dskit middleware.Instrument throughput observation (request_throughput_<unit>)
+            // is not ported yet; fail explicitly instead of silently ignoring the flag.
+            return Err(ConfigError::Validation(
+                "-server.throughput.latency-cutoff > 0 (request throughput metric) is not supported by mimir-rs yet".to_string(),
+            ));
+        }
         if self.enable_open_metrics_text_created_samples && !self.register_instrumentation {
             return Err(ConfigError::Validation(
                 "server.enable-open-metrics-text-created-samples can only be used if server.register-instrumentation is set to true".to_string(),

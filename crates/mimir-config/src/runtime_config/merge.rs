@@ -146,6 +146,17 @@ fn unmarshal_json_or_yaml(data: &[u8]) -> Result<Mapping, String> {
     unmarshal_yaml_map(data)
 }
 
+/// Whether `unmarshal_maybe_gzipped` decodes this source with encoding/json (every number a
+/// float64 in Go).
+pub(crate) fn decoded_as_json(name: &str, data: &[u8]) -> bool {
+    !name.ends_with(".gz")
+        && looks_like_json_object(data)
+        && matches!(
+            serde_json::from_slice::<serde_json::Value>(data),
+            Ok(serde_json::Value::Object(_))
+        )
+}
+
 /// `unmarshalMaybeGzipped`.
 pub(crate) fn unmarshal_maybe_gzipped(name: &str, data: &[u8]) -> Result<Mapping, String> {
     if name.ends_with(".gz") {

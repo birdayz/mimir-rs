@@ -364,6 +364,79 @@ fn parse_runtime_config_value(
     Ok(out)
 }
 
+/// dskit `sourceID`s of the configured runtime config sources, in order (for creating the
+/// per-source metric series before the first load, like dskit `New`).
+pub fn runtime_config_source_ids(cfg: &RuntimeConfigConfig) -> Result<Vec<String>, ConfigError> {
+    let mut sources = Vec::with_capacity(cfg.file.0.len());
+    for entry in &cfg.file.0 {
+        if !entry.is_empty() {
+            sources.push(parse_config_source(entry)?);
+        }
+    }
+    assign_source_ids(&mut sources)?;
+    Ok(sources.into_iter().map(|s| s.source_id).collect())
+}
+
+/// Read outcome of one runtime config source during a load attempt (dskit
+/// `runtime_config_source_last_reload_successful` and the tolerated-failure warning).
+#[derive(Clone, Debug)]
+pub struct RuntimeConfigSourceStatus {
+    /// dskit `sourceID`.
+    pub source: String,
+    /// `provider.Name()` (the configured path or URL), logged as `source`.
+    pub name: String,
+    /// `sourceParameters.String()`, e.g. `optional-on-startup`.
+    pub parameters: &'static str,
+    /// Read or unmarshal error, if any.
+    pub error: Option<String>,
+    /// Whether a read error was tolerated by the source's failure policy.
+    pub tolerated: bool,
+}
+
+/// Outcome of one load attempt (dskit `Manager.loadConfig`).
+#[derive(Debug)]
+pub struct RuntimeConfigLoadEvent<'a> {
+    /// The load performed while the manager starts.
+    pub initial: bool,
+    /// Per-source status, in `runtime_config.file` order. Sources not reached because an
+    /// earlier source failed are omitted.
+    pub sources: &'a [RuntimeConfigSourceStatus],
+    /// `Err` when the attempt failed (the previous configuration stays active).
+    pub result: &'a Result<(), ConfigError>,
+    /// `runtime_config_hash` of the configuration applied by this attempt; `None` when nothing
+    /// was applied (failure, or unchanged sources).
+    pub applied_hash: Option<&'a str>,
+}
+
+/// Receives every load attempt (metrics and logging live with the caller).
+pub trait RuntimeConfigObserver: Send + Sync {
+    fn on_load(&self, event: &RuntimeConfigLoadEvent<'_>);
+}
+
+fn policy_parameters(p: &FailurePolicy) -> &'static str {
+    match p {
+        FailurePolicy::Strict => "",
+        FailurePolicy::OptionalOnStartup => "optional-on-startup",
+        FailurePolicy::OptionalKeepLastValueOnFailure => "optional-keep-last-value-on-failure",
+    }
+}
+
+/// encoding/json decodes every JSON number into a float64 (dskit hashes the merged map in that
+/// form, while values are decoded from integers where they are integral).
+fn numbers_to_f64(v: &mut Value) {
+    match v {
+        Value::Number(n) => {
+            if let Some(f) = n.as_f64() {
+                *v = Value::Number(serde_yaml::Number::from(f));
+            }
+        }
+        Value::Sequence(seq) => seq.iter_mut().for_each(numbers_to_f64),
+        Value::Mapping(m) => m.iter_mut().for_each(|(_, v)| numbers_to_f64(v)),
+        Value::Tagged(t) => numbers_to_f64(&mut t.value),
+        _ => {}
+    }
+}
+
 /// Manages loading and periodic hot-reloading of `runtime_config.file` sources (local files and
 /// HTTP/HTTPS URLs), like `dskit/runtimeconfig.Manager`.
 pub struct RuntimeConfigManager {
@@ -378,6 +451,7 @@ pub struct RuntimeConfigManager {
     http_observer: Arc<RwLock<Option<Arc<dyn RuntimeConfigHttpObserver>>>>,
     stop_flag: Arc<AtomicBool>,
     reloader: Option<JoinHandle<()>>,
+    observer: Option<Arc<dyn RuntimeConfigObserver>>,
 }
 
 impl RuntimeConfigManager {
@@ -386,6 +460,17 @@ impl RuntimeConfigManager {
         cfg: RuntimeConfigConfig,
         default_limits: LimitsConfig,
         default_ingester_limits: InstanceLimits,
+    ) -> Result<Arc<Self>, ConfigError> {
+        Self::new_with_observer(cfg, default_limits, default_ingester_limits, None)
+    }
+
+    /// Like [`Self::new`], reporting every load attempt (including the initial one) to
+    /// `observer`.
+    pub fn new_with_observer(
+        cfg: RuntimeConfigConfig,
+        default_limits: LimitsConfig,
+        default_ingester_limits: InstanceLimits,
+        observer: Option<Arc<dyn RuntimeConfigObserver>>,
     ) -> Result<Arc<Self>, ConfigError> {
         // pkg/mimir/runtime_config.go:NewRuntimeManager.
         let loader = match cfg.loader.as_str() {
@@ -431,6 +516,7 @@ impl RuntimeConfigManager {
             http_observer,
             stop_flag: Arc::new(AtomicBool::new(false)),
             reloader: None,
+            observer,
         });
 
         mgr.load_internal(true).map_err(|e| match e {
@@ -539,8 +625,28 @@ impl RuntimeConfigManager {
         });
     }
 
-    /// `Manager.loadConfig`.
+    /// `Manager.loadConfig`, reported to the observer.
     fn load_internal(&self, initial: bool) -> Result<(), ConfigError> {
+        let mut statuses = Vec::new();
+        let mut applied_hash = None;
+        let result = self.load_sources(initial, &mut statuses, &mut applied_hash);
+        if let Some(observer) = &self.observer {
+            observer.on_load(&RuntimeConfigLoadEvent {
+                initial,
+                sources: &statuses,
+                result: &result,
+                applied_hash: applied_hash.as_deref(),
+            });
+        }
+        result
+    }
+
+    fn load_sources(
+        &self,
+        initial: bool,
+        statuses: &mut Vec<RuntimeConfigSourceStatus>,
+        applied_hash: &mut Option<String>,
+    ) -> Result<(), ConfigError> {
         let mut sources = self.sources.write();
         if sources.is_empty() {
             return Ok(());
@@ -554,8 +660,16 @@ impl RuntimeConfigManager {
         let mut loaded = Vec::with_capacity(sources.len());
 
         for src in sources.iter() {
+            let mut status = RuntimeConfigSourceStatus {
+                source: src.source_id.clone(),
+                name: src.path.clone(),
+                parameters: policy_parameters(&src.policy),
+                error: None,
+                tolerated: false,
+            };
             match src.provider.read(&src.path, &src.source_id) {
                 Ok(buf) => {
+                    statuses.push(status);
                     let digest = sha256(&buf);
                     loaded.push(Loaded {
                         raw: Some(buf),
@@ -570,6 +684,9 @@ impl RuntimeConfigManager {
                         FailurePolicy::OptionalOnStartup => initial,
                         FailurePolicy::OptionalKeepLastValueOnFailure => true,
                     };
+                    status.error = Some(err.clone());
+                    status.tolerated = tolerate;
+                    statuses.push(status);
                     if !tolerate {
                         return Err(ConfigError::RuntimeConfig(err));
                     }
@@ -602,17 +719,40 @@ impl RuntimeConfigManager {
         }
 
         let mut merged = Mapping::new();
-        for (src, l) in sources.iter().zip(&loaded) {
+        // The merge as dskit hashes it (JSON sources keep encoding/json float64 numbers).
+        let mut hash_merged = Mapping::new();
+        for (i, (src, l)) in sources.iter().zip(&loaded).enumerate() {
             let Some(raw) = &l.raw else { continue };
-            let file = merge::unmarshal_maybe_gzipped(&src.path, raw).map_err(|e| {
-                ConfigError::RuntimeConfig(format!("unmarshal {:?}: {e}", src.path))
-            })?;
-            merged = merge::merge_config_maps(&merged, &file, "").map_err(|e| {
-                ConfigError::RuntimeConfig(format!(
-                    "can't merge {:?} on top of the previous providers: {e}",
-                    src.path
-                ))
-            })?;
+            let fail = |statuses: &mut Vec<RuntimeConfigSourceStatus>, msg: String| {
+                // dskit: unmarshal/merge failures also mark the source as failed.
+                if let Some(st) = statuses.get_mut(i) {
+                    st.error = Some(msg.clone());
+                    st.tolerated = false;
+                }
+                ConfigError::RuntimeConfig(msg)
+            };
+            let file = match merge::unmarshal_maybe_gzipped(&src.path, raw) {
+                Ok(f) => f,
+                Err(e) => return Err(fail(statuses, format!("unmarshal {:?}: {e}", src.path))),
+            };
+            let mut hash_file = file.clone();
+            if merge::decoded_as_json(&src.path, raw) {
+                for (_, v) in hash_file.iter_mut() {
+                    numbers_to_f64(v);
+                }
+            }
+            merged = match merge::merge_config_maps(&merged, &file, "") {
+                Ok(m) => m,
+                Err(e) => {
+                    return Err(fail(
+                        statuses,
+                        format!("can't merge {:?} on top of the previous providers: {e}", src.path),
+                    ))
+                }
+            };
+            if let Ok(m) = merge::merge_config_maps(&hash_merged, &hash_file, "") {
+                hash_merged = m;
+            }
         }
 
         let (values, hash) = match self.loader {
@@ -634,7 +774,8 @@ impl RuntimeConfigManager {
             }
             LoaderKind::Yaml => {
                 let root = Value::Mapping(merged);
-                let marshalled = serde_yaml::to_string(&root)
+                // sha256 of yaml.v3 `yaml.Marshal(mergedConfig)`.
+                let marshalled = crate::yaml_v3_emit::marshal_generic(&Value::Mapping(hash_merged))
                     .map_err(|e| ConfigError::RuntimeConfig(format!("marshal file: {e}")))?;
                 let hash = sha256_hex(marshalled.as_bytes());
                 let values = parse_runtime_config_value(
@@ -650,7 +791,8 @@ impl RuntimeConfigManager {
         let values = Arc::new(values);
         *self.current.write() = Arc::clone(&values);
         self.call_listeners(&values);
-        *self.last_hash.write() = Some(hash);
+        *self.last_hash.write() = Some(hash.clone());
+        *applied_hash = Some(hash);
 
         // Preserve per-source merge state for the next load.
         for (src, l) in sources.iter_mut().zip(loaded) {

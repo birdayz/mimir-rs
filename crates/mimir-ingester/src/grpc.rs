@@ -9,6 +9,7 @@ use std::task::{Context, Poll};
 use axum::http;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{Future, Stream};
+use mimir_common::grpc_log::{GrpcErrorLog, GrpcErrorLogEntry};
 use mimir_common::tenant::extract_tenant_id_from_grpc_metadata;
 use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb;
@@ -355,8 +356,21 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<cortexpb::WriteResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         if let Err(e) = self.ingester.push_grpc(&user_id, request.get_ref()).await {
-            if e.should_log_error() {
-                tracing::warn!(method = "/cortex.Ingester/Push", err = %e, "gRPC call failed");
+            // dskit GRPCServerLog: ErrorWithStatus logs its message; sampled errors are logged
+            // once per -ingester.error-sample-rate occurrences, instance-limit errors never.
+            let rate = self.ingester.cfg.error_sample_rate;
+            let entry = GrpcErrorLogEntry {
+                err: e.to_string(),
+                keep: e.should_log_error(),
+                reason: (e.is_sampled() && rate != 0).then(|| format!("sampled 1/{rate}")),
+            };
+            match request.extensions().get::<GrpcErrorLog>() {
+                Some(log) => log.set(entry),
+                // Served without the dskit server's log interceptor (embedded/tests): log here.
+                None if entry.keep => {
+                    tracing::warn!(method = "/cortex.Ingester/Push", err = %e, "gRPC call failed");
+                }
+                None => {}
             }
             return Err(e.map_push_error_to_grpc_server_status());
         }
