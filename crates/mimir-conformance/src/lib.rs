@@ -4,6 +4,7 @@
 //! (mixed Go+Rust cluster & Kafka ingest) verification helpers.
 
 pub mod oracle;
+pub mod twin;
 
 /// Allocates a free TCP listener port from `15000..32000` — strictly below Linux's default
 /// ephemeral range (`32768..60999`) so outgoing client connections spawned by child Go/Rust

@@ -1989,6 +1989,8 @@ impl Ingester {
             .fetch_add(stats.succeeded_samples as i64, Ordering::Relaxed);
         self.appended_exemplars
             .fetch_add(stats.succeeded_exemplars as i64, Ordering::Relaxed);
+        self.usage_appended_samples.inc(stats.succeeded_samples as i64);
+        self.usage_appended_exemplars.inc(stats.succeeded_exemplars as i64);
 
         let request_group = group_label(
             &limits.separate_metrics_group_label,
@@ -2573,6 +2575,8 @@ impl Ingester {
             .fetch_add(stats.succeeded_samples as i64, Ordering::Relaxed);
         self.appended_exemplars
             .fetch_add(stats.succeeded_exemplars as i64, Ordering::Relaxed);
+        self.usage_appended_samples.inc(stats.succeeded_samples as i64);
+        self.usage_appended_exemplars.inc(stats.succeeded_exemplars as i64);
 
         let group = self.update_active_group(user_id, request_group, start_append);
         self.record_discarded_metrics(user_id, &group, &stats, source, db);

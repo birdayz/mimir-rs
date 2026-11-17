@@ -212,6 +212,10 @@ fn test_binary_logs_tracing_events_in_go_logfmt_through_sigterm() {
         &[
             "level=info msg=\"Starting application\" version=\"(version=",
             "level=info msg=\"server listening on addresses\"",
+            "level=info msg=starting module=usage-stats",
+            "level=info msg=starting module=sanity-check",
+            "level=info msg=\"Checking directories read/write access\"",
+            "level=info msg=\"Object storage config successfully checked\"",
             "level=info msg=starting module=server",
             "level=info msg=starting module=memberlist-kv",
             "level=info component=memberlist msg=\"Using memberlist cluster label and node name\" cluster_label= node=logtest",
@@ -226,16 +230,19 @@ fn test_binary_logs_tracing_events_in_go_logfmt_through_sigterm() {
             "level=info msg=\"instance not found in ring, adding with no tokens\" ring=ingester",
             "level=info msg=\"Application started\"",
             "level=info msg=\"=== received SIGINT/SIGTERM ===\\n*** exiting\"",
+            "level=info msg=\"module stopped\" module=active-groups-cleanup-service",
             "level=info msg=\"lifecycler loop() exited gracefully\" ring=ingester",
             "level=info msg=\"changing instance state from\" old_state=ACTIVE new_state=LEAVING ring=ingester",
             "level=info msg=\"lifecycler entering final sleep before shutdown\" final_sleep=0s",
             "level=info msg=\"instance removed from the KV store\" ring=ingester",
             "level=info msg=\"module stopped\" module=ingester-service",
             "level=info msg=\"module stopped\" module=ingester-ring",
-            "level=info msg=\"server stopped\"",
-            "level=info msg=\"module stopped\" module=server",
             "level=info component=memberlist msg=\"leaving memberlist cluster\"",
             "level=info msg=\"module stopped\" module=memberlist-kv",
+            "level=info msg=\"server stopped\"",
+            "level=info msg=\"module stopped\" module=server",
+            "level=info msg=\"module stopped\" module=sanity-check",
+            "level=info msg=\"module stopped\" module=usage-stats",
             "level=info msg=\"Application stopped\"",
         ],
     );
@@ -335,10 +342,29 @@ activity_tracker:
     for l in &lines {
         assert_go_logfmt_prefix(l);
     }
+    // Go: the service manager logs every failed module (the ring, then the ingester waiting
+    // for it), stops the running ones, and `Run` returns "failed services".
+    assert_in_order(
+        &lines,
+        &[
+            "level=error msg=\"module failed\" module=ingester-ring err=\"starting module ingester-ring: invalid service state: Failed, expected: Running, failure: unable to initialise ring state: ",
+            "level=error msg=\"module failed\" module=ingester-service err=\"failed to start ingester-service, because it depends on module ingester-ring, which has failed: invalid service state: Failed, expected: Running, failure: starting module ingester-ring: ",
+            "level=info msg=\"module stopped\" module=memberlist-kv",
+            "level=info msg=\"module stopped\" module=server",
+            "level=info msg=\"Application stopped\"",
+        ],
+    );
+    for never_running in ["ingester-ring", "ingester-service"] {
+        let stopped = format!("msg=\"module stopped\" module={never_running}");
+        assert!(
+            !lines.iter().any(|l| l.contains(&stopped)),
+            "{never_running} never reached Running: no stop() in dskit\nstderr:\n{}",
+            lines.join("\n")
+        );
+    }
     let last = lines.last().expect("some output");
     assert!(
-        last.contains(" level=error msg=\"error running application\" err=\"")
-            && last.contains("unable to initialise ring state"),
+        last.contains(" level=error msg=\"error running application\" err=\"failed services"),
         "last line: {last:?}\nstderr:\n{}",
         lines.join("\n")
     );

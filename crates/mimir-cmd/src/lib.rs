@@ -14,10 +14,13 @@ pub mod grpc;
 pub mod http;
 pub mod memberlist_status;
 pub mod metrics;
+pub mod modules;
 pub mod pprof;
 pub mod process_collector;
 pub mod runtime_config_metrics;
+pub mod sanity_check;
 pub mod server;
+pub mod usagestats;
 
 pub use app::{init_logging, run_mimir};
 pub use cli::{
