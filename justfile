@@ -64,6 +64,9 @@ prod-bench *args:
     just go-oracle
     cargo run --release -p mimir-conformance --example prod_bench -- {{args}}
 
+soak *args:
+    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-6} ./scripts/run-soak-24h.sh {{args}}
+
 docker-build tag="mimir-rs:local":
     docker buildx build \
         --provenance=false \
