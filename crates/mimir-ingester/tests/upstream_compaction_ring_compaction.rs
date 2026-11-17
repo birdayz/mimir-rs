@@ -651,6 +651,7 @@ async fn test_compact_blocks_to_reduce_in_memory_series_concurrency() {
             .early_head_compaction_min_estimated_series_reduction_percentage = 0;
 
         let (ing, ring, ring_svc) = prepare_ingester_with_blocks_storage(cfg, None, None).await;
+        ing.set_head_compaction_interval_jitter_enabled(false);
         start_and_wait_healthy(&ing, &ring).await;
 
         let start_ms = unix_ms(SystemTime::now());

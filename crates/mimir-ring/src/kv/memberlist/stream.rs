@@ -3,11 +3,14 @@
 //! Ported from github.com/hashicorp/memberlist/net.go (`readStream`, `readRemoteState`, `readUserMsg`).
 
 use std::io;
+use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tracing::warn;
 
 use crate::kv::BoxFuture;
 
+use super::gometrics::GoMetrics;
 use super::wire::{
     decompress_buffer, MessageType, NodeStateType, PushNodeState, PushPullHeader, MAX_MP_DEPTH,
     MAX_PUSH_PULL_NODES, MAX_PUSH_STATE_BYTES,
@@ -26,8 +29,58 @@ pub(super) fn default_hostname() -> String {
 
 // --- Streaming MessagePack readers (never block waiting for EOF) ---
 
-pub(super) async fn read_stream_header<R: AsyncRead + Unpin + Send>(
+/// Callback decrypting memberlist's `encryptMsg` stream payload given `(ciphertext, aad)`.
+pub(crate) type StreamDecryptFn =
+    Arc<dyn Fn(&[u8], &[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
+
+/// memberlist `decryptRemoteState` (`hashicorp/memberlist/net.go:1150`): reads the 4-byte
+/// encrypted payload length, emits `sample_memberlist_size_remote`, reads the ciphertext, and
+/// invokes `decrypt` with authenticated data `[encryptMsg, len_be[0..4], stream_label...]`.
+async fn decrypt_remote_state<R: AsyncRead + Unpin + Send>(
     reader: &mut R,
+    stream_label: &str,
+    go_metrics: Option<&GoMetrics>,
+    decrypt: &StreamDecryptFn,
+) -> Result<Vec<u8>, String> {
+    let mut len_buf = [0u8; 4];
+    reader
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| format!("read encrypted state length: {e}"))?;
+    let more_bytes = u32::from_be_bytes(len_buf);
+    if let Some(gm) = go_metrics {
+        gm.add_sample(&["memberlist", "size", "remote"], more_bytes as f64, &[]);
+    }
+    if more_bytes as usize > MAX_PUSH_STATE_BYTES {
+        return Err(format!(
+            "remote node state is larger than limit ({more_bytes})"
+        ));
+    }
+    if (more_bytes as f64) > (0.6 * MAX_PUSH_STATE_BYTES as f64).floor() {
+        warn!(
+            size = more_bytes,
+            limit = MAX_PUSH_STATE_BYTES,
+            "memberlist: Remote node state size approaches limit"
+        );
+    }
+    let mut cipher_bytes = vec![0u8; more_bytes as usize];
+    if !cipher_bytes.is_empty() {
+        reader
+            .read_exact(&mut cipher_bytes)
+            .await
+            .map_err(|e| format!("read encrypted state payload: {e}"))?;
+    }
+    let mut aad = Vec::with_capacity(5 + stream_label.len());
+    aad.push(MessageType::Encrypt as u8);
+    aad.extend_from_slice(&len_buf);
+    aad.extend_from_slice(stream_label.as_bytes());
+    decrypt(&cipher_bytes, &aad)
+}
+
+pub(super) async fn read_stream_header_with_metrics<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+    go_metrics: Option<&GoMetrics>,
+    decrypt: Option<&StreamDecryptFn>,
 ) -> Result<(MessageType, String, Option<Vec<u8>>), String> {
     let mut b = [0u8; 1];
     reader
@@ -57,11 +110,31 @@ pub(super) async fn read_stream_header<R: AsyncRead + Unpin + Send>(
             .map_err(|e| format!("read msg type after label: {e}"))?;
     }
 
-    let msg_type = MessageType::try_from(b[0])
+    let mut msg_type = MessageType::try_from(b[0])
         .map_err(|v| format!("unsupported stream msgType {v}"))?;
 
+    let mut plain_body: Option<Vec<u8>> = None;
+    if msg_type == MessageType::Encrypt {
+        let Some(decrypt_fn) = decrypt else {
+            return Err("remote state is encrypted and encryption is not configured".to_string());
+        };
+        let plain = decrypt_remote_state(reader, &label, go_metrics, decrypt_fn).await?;
+        if plain.is_empty() {
+            return Err("empty decrypted stream payload".to_string());
+        }
+        msg_type = MessageType::try_from(plain[0])
+            .map_err(|v| format!("unsupported inner stream msgType {v}"))?;
+        plain_body = Some(plain[1..].to_vec());
+    }
+
     if msg_type == MessageType::Compress {
-        let raw_cp = read_msgpack_map_bytes(reader).await?;
+        let raw_cp = match plain_body {
+            Some(buf) => {
+                let mut cur = io::Cursor::new(buf);
+                read_msgpack_map_bytes(&mut cur).await?
+            }
+            None => read_msgpack_map_bytes(reader).await?,
+        };
         let cp = super::wire::decode_compressed_payload(&raw_cp)?;
         let decomp = decompress_buffer(cp.algo, &cp.buf)?;
         if decomp.is_empty() {
@@ -72,8 +145,10 @@ pub(super) async fn read_stream_header<R: AsyncRead + Unpin + Send>(
         return Ok((inner_type, label, Some(decomp[1..].to_vec())));
     }
 
-    Ok((msg_type, label, None))
+    Ok((msg_type, label, plain_body))
 }
+
+
 
 pub(super) async fn read_push_pull_from_stream<R: AsyncRead + Unpin + Send>(
     reader: &mut R,
@@ -655,6 +730,57 @@ mod tests {
         let mut cur = io::Cursor::new(buf);
         let err = read_push_pull_from_stream(&mut cur).await.unwrap_err();
         assert!(err.contains("exceeds max"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn encrypted_stream_emits_sample_memberlist_size_remote() {
+        use prometheus::Registry;
+
+        let inner = vec![MessageType::User as u8, 1, 2, 3, 4];
+        let mut frame = vec![MessageType::Encrypt as u8];
+        frame.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&inner);
+
+        // Unconfigured encryption rejects with Go's exact error message.
+        let mut cur_unconf = io::Cursor::new(frame.clone());
+        let err = read_stream_header_with_metrics(&mut cur_unconf, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "remote state is encrypted and encryption is not configured"
+        );
+
+        // Configured encryption records sample_memberlist_size_remote on GoMetrics.
+        let gm = Arc::new(GoMetrics::new());
+        let reg = Registry::new();
+        gm.register(&reg);
+        let decrypt: StreamDecryptFn = Arc::new(|cipher, aad| {
+            assert_eq!(aad[0], MessageType::Encrypt as u8);
+            Ok(cipher.to_vec())
+        });
+        let mut cur = io::Cursor::new(frame);
+        let (msg_type, label, body) =
+            read_stream_header_with_metrics(&mut cur, Some(&gm), Some(&decrypt))
+                .await
+                .unwrap();
+        assert_eq!(msg_type, MessageType::User);
+        assert!(label.is_empty());
+        assert_eq!(body.unwrap(), vec![1, 2, 3, 4]);
+
+        let text = prometheus::TextEncoder::new()
+            .encode_to_string(&reg.gather())
+            .unwrap();
+        assert!(
+            text.contains("# TYPE sample_memberlist_size_remote summary"),
+            "missing sample_memberlist_size_remote in:
+{text}"
+        );
+        assert!(
+            text.contains("sample_memberlist_size_remote_sum 5"),
+            "unexpected sample_memberlist_size_remote sum in:
+{text}"
+        );
     }
 }
 

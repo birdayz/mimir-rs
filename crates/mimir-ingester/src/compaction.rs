@@ -350,6 +350,26 @@ impl Ingester {
         (zone_aware + jitter, interval)
     }
 
+    /// Returns the active zone-staggering key `(zone_count, zone_index)` once running with
+    /// zone awareness enabled and >1 zones, or `None` when staggering is inactive.
+    /// Used by `spawn_compaction_loop` to re-align the compaction ticker whenever the
+    /// ring's zone topology changes (e.g. peer zones joining `1 -> 3` after startup).
+    pub(crate) fn compaction_zone_stagger_key(&self, zones: &[String]) -> Option<(usize, usize)> {
+        if self.state() == State::Starting
+            || !self.cfg.ring.zone_awareness_enabled
+            || self.cfg.ring.instance_availability_zone.is_empty()
+            || zones.len() <= 1
+        {
+            return None;
+        }
+        let mut sorted = zones.to_vec();
+        sorted.sort();
+        let idx = sorted
+            .iter()
+            .position(|z| z == &self.cfg.ring.instance_availability_zone)?;
+        Some((sorted.len(), idx))
+    }
+
     pub async fn compact_blocks_to_reduce_in_memory_series(&self, now: SystemTime) {
         let mut min_series = self.blocks_cfg.tsdb.early_head_compaction_min_in_memory_series;
         if let Some(il) = self.get_instance_limits() {
@@ -873,6 +893,7 @@ pub fn spawn_compaction_loop(
         .unwrap_or_default();
     let (first_interval, mut standard_interval) =
         ingester.compaction_service_interval(SystemTime::now(), &zones);
+    let mut zone_stagger_key = ingester.compaction_zone_stagger_key(&zones);
     let min_delay = ingester.min_compaction_loop_delay();
 
     let non_owned_jitter = {
@@ -899,22 +920,6 @@ pub fn spawn_compaction_loop(
             tokio::select! {
                 _ = ctx.canceled() => break,
                 _ = ticker.tick() => {
-                    let zones = ingester
-                        .instance_ring
-                        .as_ref()
-                        .map(|r| r.zones())
-                        .unwrap_or_default();
-                    let (new_first, new_std) =
-                        ingester.compaction_service_interval(SystemTime::now(), &zones);
-                    if new_std != standard_interval && ingester.state() != State::Starting {
-                        standard_interval = new_std;
-                        let nf = new_first.max(Duration::from_millis(10));
-                        let ns = new_std.max(Duration::from_millis(10));
-                        ticker = tokio::time::interval_at(tokio::time::Instant::now() + nf, ns);
-                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        continue;
-                    }
-
                     let iter_start = Instant::now();
                     ingester.num_compactions_in_progress.fetch_add(1, Ordering::AcqRel);
                     ingester.compact_blocks(false, 0, None).await;
@@ -922,7 +927,6 @@ pub fn spawn_compaction_loop(
                     ingester.compact_blocks_to_reduce_per_tenant_owned_series(SystemTime::now()).await;
                     ingester.compact_blocks_due_to_non_owned_series(non_owned_jitter).await;
                     ingester.num_compactions_in_progress.fetch_sub(1, Ordering::AcqRel);
-                    ingester.sync_offset_catalogues().await;
 
                     let extra = compaction_loop_extra_delay(iter_start.elapsed(), standard_interval, min_delay);
                     if !extra.is_zero() {
@@ -948,6 +952,9 @@ pub fn spawn_compaction_loop(
                         }
                     }
 
+                    // Re-check standard interval and zone topology after each iteration
+                    // (matching Go `ingester_compaction.go:187-194` plus zone re-alignment
+                    // when peer zones join the ring after startup).
                     let zones = ingester
                         .instance_ring
                         .as_ref()
@@ -955,13 +962,17 @@ pub fn spawn_compaction_loop(
                         .unwrap_or_default();
                     let (new_first, new_std) =
                         ingester.compaction_service_interval(SystemTime::now(), &zones);
-                    if new_std != standard_interval {
+                    let new_zone_stagger_key = ingester.compaction_zone_stagger_key(&zones);
+                    if new_std != standard_interval || new_zone_stagger_key != zone_stagger_key {
                         standard_interval = new_std;
+                        zone_stagger_key = new_zone_stagger_key;
                         let nf = new_first.max(Duration::from_millis(10));
                         let ns = new_std.max(Duration::from_millis(10));
                         ticker = tokio::time::interval_at(tokio::time::Instant::now() + nf, ns);
                         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     }
+
+                    ingester.sync_offset_catalogues().await;
                 }
                 req_opt = force_rx.recv() => {
                     let Some(req) = req_opt else { break; };
@@ -1243,5 +1254,293 @@ mod tests {
             }
         }
         assert!(saw_non_equal, "expected at least one jittered sample != input");
+    }
+
+    #[tokio::test]
+    async fn compaction_zone_stagger_key_tracks_count_index_and_state() {
+        use mimir_common::services::State;
+        use mimir_config::limits::LimitsConfig;
+        use mimir_config::{BlocksStorageConfig, IngestStorageConfig, IngesterConfig, Overrides};
+        use crate::ingester::Ingester;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = IngesterConfig::default();
+        cfg.ring.zone_awareness_enabled = true;
+        cfg.ring.instance_availability_zone = "zone-b".to_string();
+
+        let mut blocks_cfg = BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().join("tsdb").to_string_lossy().to_string();
+        blocks_cfg.bucket.backend_cfg.backend = "filesystem".to_string();
+        blocks_cfg.bucket.backend_cfg.filesystem.dir =
+            tmp.path().join("bucket").to_string_lossy().to_string();
+
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            IngestStorageConfig::default(),
+            Overrides::new(LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // While Starting, zone staggering is inactive regardless of zones.
+        ing.set_state_for_test(State::Starting);
+        assert_eq!(
+            ing.compaction_zone_stagger_key(&[
+                "zone-a".to_string(),
+                "zone-b".to_string(),
+                "zone-c".to_string(),
+            ]),
+            None
+        );
+
+        ing.set_state_for_test(State::Running);
+        assert_eq!(ing.compaction_zone_stagger_key(&[]), None);
+        assert_eq!(ing.compaction_zone_stagger_key(&["zone-b".to_string()]), None);
+        assert_eq!(
+            ing.compaction_zone_stagger_key(&["zone-b".to_string(), "zone-c".to_string()]),
+            Some((2, 0))
+        );
+        // Same zone count, shifted index -> distinct key.
+        assert_eq!(
+            ing.compaction_zone_stagger_key(&["zone-a".to_string(), "zone-b".to_string()]),
+            Some((2, 1))
+        );
+        // Zone count growth 2 -> 3 -> distinct key.
+        assert_eq!(
+            ing.compaction_zone_stagger_key(&[
+                "zone-c".to_string(),
+                "zone-a".to_string(),
+                "zone-b".to_string(),
+            ]),
+            Some((3, 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_compaction_loop_executes_transition_tick_and_realigns_zones_1_to_3() {
+        use super::spawn_compaction_loop;
+        use crate::ingester::Ingester;
+        use mimir_common::services::{Service, ServiceContext, State};
+        use mimir_config::limits::LimitsConfig;
+        use mimir_config::{
+            BlocksStorageConfig, GoDuration, IngestStorageConfig, IngesterConfig, Overrides,
+        };
+        use mimir_proto::ringpb::{Desc, InstanceState};
+        use mimir_ring::kv::inmemory::InMemoryKv;
+        use mimir_ring::kv::{CasOutcome, KvClient};
+        use mimir_ring::ring::model::{ring_desc_codec, DescExt};
+        use mimir_ring::ring::replication_strategy::DefaultReplicationStrategy;
+        use mimir_ring::ring::{Ring, RingSettings};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        use tokio::sync::mpsc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(ring_desc_codec()));
+
+        // Seed 1 zone ("zone-b") initially in the ring.
+        kv.cas(
+            "ring",
+            Box::new(|cur| {
+                let mut desc = cur
+                    .and_then(|b| b.downcast_ref::<Desc>().cloned())
+                    .unwrap_or_default();
+                desc.add_ingester(
+                    "ing-b",
+                    "127.0.0.1:9095",
+                    "zone-b",
+                    vec![100],
+                    InstanceState::Active,
+                    None,
+                    false,
+                    None,
+                    HashMap::new(),
+                );
+                Ok(CasOutcome::Update(Box::new(desc)))
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut cfg = IngesterConfig::default();
+        cfg.ring.kvstore.store = "inmemory".to_string();
+        cfg.ring.zone_awareness_enabled = true;
+        cfg.ring.replication_factor = 1;
+        cfg.ring.instance_id = "ing-b".to_string();
+        cfg.ring.instance_availability_zone = "zone-b".to_string();
+
+        let ring = Ring::with_store_and_strategy(
+            RingSettings::from(&cfg.ring),
+            "ingester",
+            "ring",
+            Arc::clone(&kv),
+            Arc::new(DefaultReplicationStrategy),
+            None,
+        )
+        .unwrap();
+        let ring_svc = Arc::clone(&ring).into_service();
+        ring_svc
+            .start_async(ServiceContext::background())
+            .await
+            .unwrap();
+        ring_svc.await_running().await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ring.zones().len() != 1 {
+            assert!(Instant::now() < deadline, "timed out waiting for initial zone");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 1000ms divides 3600s cleanly; with 3 zones ["zone-a", "zone-b", "zone-c"],
+        // zone-b (idx 1) aligns to offset 333ms within each 1000ms window.
+        let mut blocks_cfg = BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().join("tsdb").to_string_lossy().to_string();
+        blocks_cfg.tsdb.head_compaction_interval = GoDuration::from_millis(1000);
+        blocks_cfg.bucket.backend_cfg.backend = "filesystem".to_string();
+        blocks_cfg.bucket.backend_cfg.filesystem.dir =
+            tmp.path().join("bucket").to_string_lossy().to_string();
+
+        let ingester = Ingester::new(
+            cfg,
+            blocks_cfg,
+            IngestStorageConfig::default(),
+            Overrides::new(LimitsConfig::default()),
+            Some(Arc::clone(&ring)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ingester.set_head_compaction_interval_while_starting(Duration::from_millis(40));
+        ingester.set_head_compaction_interval_jitter_enabled(false);
+        ingester.set_min_compaction_loop_delay(Duration::ZERO);
+        ingester.set_state_for_test(State::Starting);
+
+        // Ensure user TSDB has 1 series so every regular compaction tick increments compactions_triggered.
+        let udb = ingester.get_or_create_tsdb("user-1").unwrap();
+        {
+            let mut app = udb.db.appender();
+            app.append_float(None, &[("__name__", "up")], 1_000, 1.0)
+                .unwrap();
+            app.commit().unwrap();
+        }
+
+        // Align loop start just after a 1000ms boundary (phase in [0, 80ms)) so Tick 1 fires at
+        // ~40-120ms and Tick 2 fires ~1000ms later at ~40-120ms (far from zone-b's 333ms slot).
+        loop {
+            let phase_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                % 1000;
+            if phase_ms < 80 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let ctx = ServiceContext::background();
+        let (_force_tx, force_rx) = mpsc::channel(1);
+        let loop_handle = spawn_compaction_loop(Arc::clone(&ingester), force_rx, ctx.child());
+
+        // Transition Starting -> Running before Tick 1 fires. Tick 1 MUST still execute!
+        ingester.set_state_for_test(State::Running);
+
+        let d1 = Instant::now() + Duration::from_millis(400);
+        while (ingester.metrics.compactions_triggered.get() as u64) < 1 {
+            assert!(
+                Instant::now() < d1,
+                "transition tick after leaving State::Starting was skipped"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Wait briefly so Tick 1 finishes resetting the ticker to the unstaggered 1000ms
+        // standard interval while zones.len() == 1.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // Now grow ring zones 1 -> 3 while already Running on the 1000ms standard interval.
+        kv.cas(
+            "ring",
+            Box::new(|cur| {
+                let mut desc = cur
+                    .and_then(|b| b.downcast_ref::<Desc>().cloned())
+                    .unwrap_or_default();
+                desc.add_ingester(
+                    "ing-a",
+                    "127.0.0.1:9096",
+                    "zone-a",
+                    vec![200],
+                    InstanceState::Active,
+                    None,
+                    false,
+                    None,
+                    HashMap::new(),
+                );
+                desc.add_ingester(
+                    "ing-c",
+                    "127.0.0.1:9097",
+                    "zone-c",
+                    vec![300],
+                    InstanceState::Active,
+                    None,
+                    false,
+                    None,
+                    HashMap::new(),
+                );
+                Ok(CasOutcome::Update(Box::new(desc)))
+            }),
+        )
+        .await
+        .unwrap();
+
+        let d_zones = Instant::now() + Duration::from_secs(2);
+        while ring.zones().len() != 3 {
+            assert!(Instant::now() < d_zones, "timed out waiting for 3 zones");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Wait for Tick 2 (the first tick after zones.len() == 3), which sees the zone
+        // topology change despite standard_interval remaining 1000ms and re-aligns the ticker
+        // to zone-b's 333ms slot.
+        let before_realign_tick = ingester.metrics.compactions_triggered.get() as u64;
+        let d2 = Instant::now() + Duration::from_secs(2);
+        while (ingester.metrics.compactions_triggered.get() as u64) <= before_realign_tick {
+            assert!(Instant::now() < d2, "timed out waiting for realign tick");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let t_realign = Instant::now();
+        let target_after_realign = ingester.metrics.compactions_triggered.get() as u64 + 1;
+
+        // Tick 3 MUST fire at the re-aligned 333ms slot (~250ms after Tick 2, well under
+        // 650ms), rather than remaining drifted at the unaligned 1000ms cadence.
+        let d3 = Instant::now() + Duration::from_millis(650);
+        while (ingester.metrics.compactions_triggered.get() as u64) < target_after_realign {
+            assert!(
+                Instant::now() < d3,
+                "tick did not re-align to zone-staggered schedule (elapsed={:?})",
+                t_realign.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let dt = t_realign.elapsed();
+        assert!(
+            dt < Duration::from_millis(650),
+            "expected re-aligned tick delta < 650ms, got {dt:?}"
+        );
+
+        ctx.cancel();
+        let _ = loop_handle.await;
+        ring_svc.stop_async();
+        let _ = ring_svc.await_terminated().await;
     }
 }

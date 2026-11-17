@@ -8,9 +8,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use prometheus::{Histogram, HistogramOpts, Registry};
 use thiserror::Error;
 use ulid::Ulid;
@@ -32,6 +32,8 @@ pub const TMP_FOR_CREATION_BLOCK_DIR_SUFFIX: &str = ".tmp-for-creation";
 pub const TMP_LEGACY_SUFFIX: &str = ".tmp";
 /// Go `chunkSnapshotPrefix`.
 pub const CHUNK_SNAPSHOT_PREFIX: &str = "chunk_snapshot.";
+/// Go `defaultBlockReloadInterval` (`1m`).
+pub const DEFAULT_BLOCK_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -231,8 +233,7 @@ fn remove_tmp_dirs(dir: &Path) -> Result<(), TsdbError> {
     Ok(())
 }
 
-/// Unified TSDB instance managing an active [`Head`] and immutable on-disk ULID [`Block`]s.
-pub struct Tsdb {
+struct TsdbInner {
     dir: PathBuf,
     opts: TsdbOptions,
     head: Head,
@@ -241,9 +242,27 @@ pub struct Tsdb {
     metrics: DbMetrics,
 }
 
+/// Unified TSDB instance managing an active [`Head`] and immutable on-disk ULID [`Block`]s.
+pub struct Tsdb {
+    inner: Arc<TsdbInner>,
+    bg_stop: Arc<(Mutex<bool>, Condvar)>,
+    bg_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
 impl Tsdb {
     /// Opens (or creates) a TSDB in `dir`, loading all on-disk ULID blocks and replaying WAL/WBL/chunks_head.
+    /// Runs the Go `DB.run()` 1-minute maintenance loop (`reload_blocks` + `mmap_head_chunks`).
     pub fn open(dir: impl AsRef<Path>, opts: TsdbOptions) -> Result<Self, TsdbError> {
+        Self::open_with_reload_interval(dir, opts, DEFAULT_BLOCK_RELOAD_INTERVAL)
+    }
+
+    /// Opens (or creates) a TSDB with a custom background `block_reload_interval`
+    /// (passing `Duration::ZERO` disables the background loop).
+    pub fn open_with_reload_interval(
+        dir: impl AsRef<Path>,
+        opts: TsdbOptions,
+        block_reload_interval: Duration,
+    ) -> Result<Self, TsdbError> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
@@ -262,8 +281,8 @@ impl Tsdb {
         let blocks = {
             let res = (|| -> Result<Vec<Arc<Block>>, TsdbError> {
                 let (to_load, deletable) =
-                    Self::prepare_reload_blocks(&dir, &opts, &metrics, &[])?;
-                Self::delete_blocks(&dir, &deletable)?;
+                    TsdbInner::prepare_reload_blocks(&dir, &opts, &metrics, &[])?;
+                TsdbInner::delete_blocks(&dir, &deletable)?;
                 Ok(to_load)
             })();
             if res.is_err() {
@@ -290,15 +309,184 @@ impl Tsdb {
 
         let head = Head::open(&dir, opts.head.clone(), min_valid_time)?;
 
-        Ok(Self {
+        let inner = Arc::new(TsdbInner {
             dir,
             opts,
             head,
             blocks: RwLock::new(blocks),
             compact_mtx: Mutex::new(()),
             metrics,
+        });
+        let bg_stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let bg_handle = if !block_reload_interval.is_zero() {
+            let inner_bg = Arc::clone(&inner);
+            let stop_bg = Arc::clone(&bg_stop);
+            let handle = std::thread::Builder::new()
+                .name("tsdb-reload".to_string())
+                .spawn(move || {
+                    let mut next_tick = Instant::now() + block_reload_interval;
+                    let mut stopped = stop_bg.0.lock();
+                    while !*stopped {
+                        let wait_res = stop_bg.1.wait_until(&mut stopped, next_tick);
+                        if *stopped {
+                            break;
+                        }
+                        if wait_res.timed_out() {
+                            drop(stopped);
+                            if let Err(e) = inner_bg.reload_blocks() {
+                                tracing::error!(err = %e, "reloadBlocks");
+                            }
+                            if let Err(e) = inner_bg.head.mmap_head_chunks() {
+                                tracing::error!(err = %e, "mmapHeadChunks");
+                            }
+                            next_tick = Instant::now() + block_reload_interval;
+                            stopped = stop_bg.0.lock();
+                        }
+                    }
+                })?;
+            Some(handle)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            inner,
+            bg_stop,
+            bg_thread: Mutex::new(bg_handle),
         })
     }
+
+    fn stop_background_loop(&self) {
+        let mut handle_guard = self.bg_thread.lock();
+        if let Some(handle) = handle_guard.take() {
+            {
+                let mut stopped = self.bg_stop.0.lock();
+                *stopped = true;
+                self.bg_stop.1.notify_all();
+            }
+            let _ = handle.join();
+        }
+    }
+
+    /// Reloads on-disk blocks, applying the block deletion filter (Go `DB.reloadBlocks`).
+    pub fn reload_blocks(&self) -> Result<(), TsdbError> {
+        self.inner.reload_blocks()
+    }
+
+    #[inline]
+    pub fn dir(&self) -> &Path {
+        &self.inner.dir
+    }
+
+    #[inline]
+    pub fn head(&self) -> &Head {
+        &self.inner.head
+    }
+
+    pub fn blocks(&self) -> Vec<Arc<Block>> {
+        self.inner.blocks()
+    }
+
+    pub fn block_ulids(&self) -> Vec<Ulid> {
+        self.inner.block_ulids()
+    }
+
+    /// Returns a new [`HeadAppender`] for writing samples, histograms, exemplars, and metadata.
+    pub fn appender(&self) -> HeadAppender<'_> {
+        self.inner.head.appender()
+    }
+
+    pub fn appender_with_capacity(&self, series_hint: usize) -> HeadAppender<'_> {
+        self.inner.head.appender_with_capacity(series_hint)
+    }
+
+    /// Go `DB.Compact`: compacts every ready `chunk_range` window of the Head into blocks,
+    /// truncates the WAL (also when a later step fails, via the deferred truncation), then
+    /// compacts the OOO head. Errors count `prometheus_tsdb_compactions_failed_total`.
+    pub fn compact(&self) -> Result<Vec<Ulid>, TsdbError> {
+        self.inner.compact()
+    }
+
+    /// Compacts the half-open time range `[mint, maxt)` of Head into a ULID block on disk,
+    /// reloading blocks and truncating Head memory & WAL up to `maxt`.
+    pub fn compact_head_range(&self, mint: i64, maxt: i64) -> Result<Option<Ulid>, TsdbError> {
+        self.inner.compact_head_range(mint, maxt)
+    }
+
+    /// Compacts the entire active Head `[head.min_time(), head.max_time() + 1)` into a ULID block.
+    pub fn compact_head_all(&self) -> Result<Option<Ulid>, TsdbError> {
+        self.inner.compact_head_all()
+    }
+
+    /// Compacts all out-of-order samples in Head into OOO ULID blocks (one per block range)
+    /// and clears the compacted OOO state.
+    pub fn compact_ooo_head(&self) -> Result<Vec<Ulid>, TsdbError> {
+        self.inner.compact_ooo_head()
+    }
+
+    /// Go `DB.CompactSelectedSeries` -> `compactHeadViewLocked`: writes the selected series
+    /// into one block per `chunk_range` window between the head's aligned min time and
+    /// its max time, then evicts them from Head.
+    pub fn compact_selected_series(&self, refs: &[u64]) -> Result<Vec<Ulid>, TsdbError> {
+        self.inner.compact_selected_series(refs)
+    }
+
+    /// Truncates Head memory and WAL older than `mint`.
+    pub fn truncate(&self, mint: i64) -> Result<(), TsdbError> {
+        self.inner.truncate(mint)
+    }
+
+    /// Returns a [`TsdbQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
+    pub fn querier(&self, mint: i64, maxt: i64) -> TsdbQuerier<'_> {
+        TsdbQuerier::with_blocks_lock(Some(&self.inner.head), &self.inner.blocks, mint, maxt)
+    }
+
+    /// Returns a [`TsdbChunkQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
+    pub fn chunk_querier(&self, mint: i64, maxt: i64) -> TsdbChunkQuerier<'_> {
+        TsdbChunkQuerier::with_blocks_lock(Some(&self.inner.head), &self.inner.blocks, mint, maxt)
+    }
+
+    /// Returns an unordered [`TsdbChunkQuerier`] (concatenating chunks across Head and Blocks
+    /// without cross-block compaction, matching Prometheus `UnorderedChunkQuerier`).
+    pub fn unordered_chunk_querier(&self, mint: i64, maxt: i64) -> TsdbChunkQuerier<'_> {
+        TsdbChunkQuerier::with_blocks_lock_unordered(
+            Some(&self.inner.head),
+            &self.inner.blocks,
+            mint,
+            maxt,
+        )
+    }
+
+    /// Returns the Head's [`CircularExemplarStorage`].
+    pub fn exemplar_querier(&self) -> &CircularExemplarStorage {
+        self.inner.head.exemplars()
+    }
+
+    /// Convenience method querying exemplars in `[start, end]`.
+    pub fn select_exemplars(
+        &self,
+        start: i64,
+        end: i64,
+        matcher_sets: &[&[LabelMatcher]],
+    ) -> Vec<ExemplarQueryResult> {
+        self.inner.head.exemplars().select(start, end, matcher_sets)
+    }
+
+    /// Stops the background reload/mmap loop and flushes & closes Head.
+    pub fn close(&self) -> Result<(), TsdbError> {
+        self.stop_background_loop();
+        self.inner.head.close()?;
+        Ok(())
+    }
+}
+
+impl Drop for Tsdb {
+    fn drop(&mut self) {
+        self.stop_background_loop();
+    }
+}
+
+impl TsdbInner {
 
     /// Go `DefaultBlocksToDelete(db)` / `deletableBlocks`: blocks marked deletable by
     /// compaction plus those beyond the time retention (`BeyondTimeRetention`).
@@ -542,7 +730,7 @@ impl Tsdb {
     }
 
     /// Reloads on-disk blocks, applying the block deletion filter (Go `DB.reloadBlocks`).
-    pub fn reload_blocks(&self) -> Result<(), TsdbError> {
+    fn reload_blocks(&self) -> Result<(), TsdbError> {
         let _guard = self.compact_mtx.lock();
         self.reload_blocks_locked()
     }
@@ -575,39 +763,20 @@ impl Tsdb {
         Ok(())
     }
 
-    #[inline]
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    #[inline]
-    pub fn head(&self) -> &Head {
-        &self.head
-    }
-
-    pub fn blocks(&self) -> Vec<Arc<Block>> {
+    fn blocks(&self) -> Vec<Arc<Block>> {
         self.blocks.read().clone()
     }
 
-    pub fn block_ulids(&self) -> Vec<Ulid> {
+    fn block_ulids(&self) -> Vec<Ulid> {
         let mut ids: Vec<Ulid> = self.blocks.read().iter().map(|b| b.ulid()).collect();
         ids.sort();
         ids
     }
 
-    /// Returns a new [`HeadAppender`] for writing samples, histograms, exemplars, and metadata.
-    pub fn appender(&self) -> HeadAppender<'_> {
-        self.head.appender()
-    }
-
-    pub fn appender_with_capacity(&self, series_hint: usize) -> HeadAppender<'_> {
-        self.head.appender_with_capacity(series_hint)
-    }
-
     /// Go `DB.Compact`: compacts every ready `chunk_range` window of the Head into blocks,
     /// truncates the WAL (also when a later step fails, via the deferred truncation), then
     /// compacts the OOO head. Errors count `prometheus_tsdb_compactions_failed_total`.
-    pub fn compact(&self) -> Result<Vec<Ulid>, TsdbError> {
+    fn compact(&self) -> Result<Vec<Ulid>, TsdbError> {
         let _guard = self.compact_mtx.lock();
         let mut created = Vec::new();
         let mut last_block_maxt = i64::MIN;
@@ -652,7 +821,7 @@ impl Tsdb {
 
     /// Compacts the half-open time range `[mint, maxt)` of Head into a ULID block on disk,
     /// reloading blocks and truncating Head memory & WAL up to `maxt`.
-    pub fn compact_head_range(&self, mint: i64, maxt: i64) -> Result<Option<Ulid>, TsdbError> {
+    fn compact_head_range(&self, mint: i64, maxt: i64) -> Result<Option<Ulid>, TsdbError> {
         let _guard = self.compact_mtx.lock();
         let uid = self.compact_head_range_locked(mint, maxt, true)?;
         if maxt > mint {
@@ -662,7 +831,7 @@ impl Tsdb {
     }
 
     /// Compacts the entire active Head `[head.min_time(), head.max_time() + 1)` into a ULID block.
-    pub fn compact_head_all(&self) -> Result<Option<Ulid>, TsdbError> {
+    fn compact_head_all(&self) -> Result<Option<Ulid>, TsdbError> {
         if !self.head.initialized() || self.head.num_series() == 0 {
             return Ok(None);
         }
@@ -710,7 +879,7 @@ impl Tsdb {
 
     /// Compacts all out-of-order samples in Head into OOO ULID blocks (one per block range)
     /// and clears the compacted OOO state.
-    pub fn compact_ooo_head(&self) -> Result<Vec<Ulid>, TsdbError> {
+    fn compact_ooo_head(&self) -> Result<Vec<Ulid>, TsdbError> {
         let _guard = self.compact_mtx.lock();
         self.compact_ooo_head_locked()
     }
@@ -808,7 +977,7 @@ impl Tsdb {
     /// Go `DB.CompactSelectedSeries` -> `compactHeadViewLocked`: writes the selected series
     /// into one block per `chunk_range` window between the head's aligned min time and
     /// its max time, then evicts them from Head.
-    pub fn compact_selected_series(&self, refs: &[u64]) -> Result<Vec<Ulid>, TsdbError> {
+    fn compact_selected_series(&self, refs: &[u64]) -> Result<Vec<Ulid>, TsdbError> {
         if refs.is_empty() {
             return Ok(Vec::new());
         }
@@ -863,46 +1032,9 @@ impl Tsdb {
     }
 
     /// Truncates Head memory and WAL older than `mint`.
-    pub fn truncate(&self, mint: i64) -> Result<(), TsdbError> {
+    fn truncate(&self, mint: i64) -> Result<(), TsdbError> {
         let _guard = self.compact_mtx.lock();
         self.head.truncate(mint)?;
-        Ok(())
-    }
-
-    /// Returns a [`TsdbQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
-    pub fn querier(&self, mint: i64, maxt: i64) -> TsdbQuerier<'_> {
-        TsdbQuerier::with_blocks_lock(Some(&self.head), &self.blocks, mint, maxt)
-    }
-
-    /// Returns a [`TsdbChunkQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
-    pub fn chunk_querier(&self, mint: i64, maxt: i64) -> TsdbChunkQuerier<'_> {
-        TsdbChunkQuerier::with_blocks_lock(Some(&self.head), &self.blocks, mint, maxt)
-    }
-
-    /// Returns an unordered [`TsdbChunkQuerier`] (concatenating chunks across Head and Blocks
-    /// without cross-block compaction, matching Prometheus `UnorderedChunkQuerier`).
-    pub fn unordered_chunk_querier(&self, mint: i64, maxt: i64) -> TsdbChunkQuerier<'_> {
-        TsdbChunkQuerier::with_blocks_lock_unordered(Some(&self.head), &self.blocks, mint, maxt)
-    }
-
-    /// Returns the Head's [`CircularExemplarStorage`].
-    pub fn exemplar_querier(&self) -> &CircularExemplarStorage {
-        self.head.exemplars()
-    }
-
-    /// Convenience method querying exemplars in `[start, end]`.
-    pub fn select_exemplars(
-        &self,
-        start: i64,
-        end: i64,
-        matcher_sets: &[&[LabelMatcher]],
-    ) -> Vec<ExemplarQueryResult> {
-        self.head.exemplars().select(start, end, matcher_sets)
-    }
-
-    /// Flushes sealed chunks to `chunks_head` and closes WAL, WBL, and `HeadChunksWriter`.
-    pub fn close(&self) -> Result<(), TsdbError> {
-        self.head.close()?;
         Ok(())
     }
 }
@@ -1138,5 +1270,116 @@ mod tests {
         .unwrap();
         app.commit().unwrap();
         db.close().unwrap();
+    }
+
+    #[test]
+    fn background_reload_loop_deletes_expired_blocks_without_new_writes_and_mmaps_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = TsdbOptions {
+            retention_duration_ms: 1000,
+            ..TsdbOptions::default()
+        };
+        opts.head.samples_per_chunk = 5;
+
+        // Seed two persisted blocks: [0, 1000) and [2000, 3000) while retention is disabled,
+        // so both remain on disk initially.
+        {
+            let mut seed_opts = opts.clone();
+            seed_opts.retention_duration_ms = 0;
+            let db = Tsdb::open_with_reload_interval(dir.path(), seed_opts, Duration::ZERO).unwrap();
+            let pairs = [("__name__", "retention_bg_metric"), ("job", "test")];
+            {
+                let mut app = db.appender();
+                app.append_float(None, &pairs, 100, 1.0).unwrap();
+                app.commit().unwrap();
+            }
+            let b1 = db.compact_head_range(0, 1000).unwrap().unwrap();
+            {
+                let mut app = db.appender();
+                app.append_float(None, &pairs, 2_000, 2.0).unwrap();
+                app.commit().unwrap();
+            }
+            let b2 = db.compact_head_range(2_000, 3_000).unwrap().unwrap();
+            assert_eq!(db.block_ulids().len(), 2);
+            assert!(dir.path().join(b1.to_string()).exists());
+            assert!(dir.path().join(b2.to_string()).exists());
+            db.close().unwrap();
+        }
+
+        // Simulate Mimir's BlocksToDelete filter: allow deleting any block returned by default
+        // retention (newest - b.max_time() >= 1000 -> b1 is expired since 3000 - 1000 >= 1000).
+        // Start with a 20ms background reload interval and do NOT perform any writes or compactions.
+        let mut ret_opts = opts.clone();
+        ret_opts.blocks_to_delete = Some(Arc::new(|blocks, default_fn| default_fn(blocks)));
+        // Initially keep retention disabled? No, enable retention immediately on open, or better:
+        // verify dynamic expiry via a custom BlocksToDelete gate that flips after open so the
+        // deletion MUST happen on a background tick (not during Tsdb::open)!
+        let allow_delete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let allow_delete_cb = Arc::clone(&allow_delete);
+        ret_opts.blocks_to_delete = Some(Arc::new(move |blocks, default_fn| {
+            if !allow_delete_cb.load(std::sync::atomic::Ordering::Acquire) {
+                return HashSet::new();
+            }
+            default_fn(blocks)
+        }));
+
+        let db = Tsdb::open_with_reload_interval(
+            dir.path(),
+            ret_opts,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(db.block_ulids().len(), 2, "both blocks kept initially");
+
+        // Append sealed chunks to Head (> samples_per_chunk=5) without calling compact().
+        {
+            let pairs = [("__name__", "retention_bg_head"), ("job", "test")];
+            let mut app = db.appender();
+            let mut r = None;
+            for i in 0..12i64 {
+                let id = app.append_float(r, &pairs, 4_000 + i * 10, i as f64).unwrap();
+                r = Some(id);
+            }
+            app.commit().unwrap();
+        }
+
+        // Flip retention expiry gate without calling compact() or reload_blocks() manually.
+        allow_delete.store(true, std::sync::atomic::Ordering::Release);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if db.block_ulids().len() == 1
+                && db.head().dir().join("chunks_head/000001").exists()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let remaining = db.block_ulids();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "expired ULID block should be deleted by background reload loop without compactions"
+        );
+        assert!(
+            db.head().dir().join("chunks_head/000001").exists(),
+            "sealed head chunks should be mmapped by background loop"
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn open_and_drop_many_tsdbs_has_zero_shutdown_latency() {
+        let start = Instant::now();
+        for _ in 0..50 {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Tsdb::open(dir.path(), TsdbOptions::default()).unwrap();
+            drop(db);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "dropping Tsdb instances with 60s background reload loop stalled: {:?}",
+            start.elapsed()
+        );
     }
 }

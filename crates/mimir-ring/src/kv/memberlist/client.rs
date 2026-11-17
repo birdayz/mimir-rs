@@ -41,8 +41,8 @@ use super::metrics::KvMetrics;
 use super::node_meta::{encode_node_metadata, NodeRole};
 use super::queue::{Broadcast, TransmitLimitedQueue};
 use super::stream::{
-    default_hostname, read_msgpack_map_bytes, read_push_pull_from_stream, read_stream_header,
-    read_user_msg_from_stream,
+    default_hostname, read_msgpack_map_bytes, read_push_pull_from_stream,
+    read_stream_header_with_metrics, read_user_msg_from_stream, StreamDecryptFn,
 };
 use super::suspicion::Awareness;
 use super::tcp_transport::{MemberlistConn, ReceivedPacket, TcpTransport};
@@ -297,6 +297,8 @@ pub struct KvOptions {
     pub probe_interval: Option<Duration>,
     /// dskit `cfg.discoverMembersBackoff`.
     pub discover_members_backoff: BackoffConfig,
+    /// Optional memberlist symmetric stream decryptor (when `MessageType::Encrypt` is used).
+    pub stream_decryptor: Option<StreamDecryptFn>,
 }
 
 impl Default for KvOptions {
@@ -309,6 +311,7 @@ impl Default for KvOptions {
                 max_backoff: Duration::from_secs(5),
                 max_retries: 10,
             },
+            stream_decryptor: None,
         }
     }
 }
@@ -364,6 +367,7 @@ pub struct MemberlistKv {
     service: OnceLock<Arc<ManagedBasicService>>,
     metrics: KvMetrics,
     go_metrics: Arc<GoMetrics>,
+    stream_decryptor: Option<StreamDecryptFn>,
 }
 
 /// Process-wide go-metrics sink (Go `metrics.NewGlobal` replaces the global sink).
@@ -448,6 +452,7 @@ impl MemberlistKv {
         };
 
         let go_metrics = global_go_metrics();
+        let stream_decryptor = opts.stream_decryptor;
         let (leave_tx, leave_rx) = mpsc::channel(1);
         let retransmit_mult = timing.retransmit_mult;
         let awareness_max = timing.awareness_max_multiplier;
@@ -509,6 +514,7 @@ impl MemberlistKv {
                 service: OnceLock::new(),
                 metrics: KvMetrics::new(metrics_namespace),
                 go_metrics: Arc::clone(&go_metrics),
+                stream_decryptor,
                 cfg,
             }
         });
@@ -1124,7 +1130,13 @@ impl MemberlistKv {
         let (read_half, mut write_half) = conn.split();
         let mut reader = BufReader::new(read_half);
 
-        let (msg_type, stream_label, body_opt) = match read_stream_header(&mut reader).await {
+        let (msg_type, stream_label, body_opt) = match read_stream_header_with_metrics(
+            &mut reader,
+            Some(&self.go_metrics),
+            self.stream_decryptor.as_ref(),
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 error!(%err, "memberlist: failed to receive");
@@ -1272,8 +1284,13 @@ impl MemberlistKv {
 
         let mut reader = BufReader::new(read_half);
         let read_fut = async {
-            let (msg_type, _label, body_opt) =
-                read_stream_header(&mut reader).await.map_err(KvError::Other)?;
+            let (msg_type, _label, body_opt) = read_stream_header_with_metrics(
+                &mut reader,
+                Some(&self.go_metrics),
+                self.stream_decryptor.as_ref(),
+            )
+            .await
+            .map_err(KvError::Other)?;
             match msg_type {
                 MessageType::Err => {
                     let e = match body_opt {

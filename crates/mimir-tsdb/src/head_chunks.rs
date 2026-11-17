@@ -206,7 +206,10 @@ impl HeadChunksWriter {
         SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE + CHUNK_ENCODING_SIZE + ulen + data_len + CRC_SIZE
     }
 
-    fn cut_new_file(&mut self) -> Result<(), HeadChunksError> {
+    pub fn cut_new_file(&mut self) -> Result<(), HeadChunksError> {
+        if self.closed {
+            return Err(HeadChunksError::Closed);
+        }
         self.finalize_current()?;
         self.seq += 1;
         let path = head_chunk_file_path(&self.dir, self.seq);
@@ -224,6 +227,7 @@ impl HeadChunksWriter {
 
         self.cur_writer = Some(BufWriter::with_capacity(self.write_buffer_size, f));
         self.offset = HEAD_CHUNK_FILE_HEADER_SIZE;
+        self.cut_on_next_chunk = false;
         Ok(())
     }
 
@@ -831,5 +835,49 @@ mod tests {
         let reader = HeadChunksReader::open_no_repair(dir.path()).unwrap();
         let err = reader.collect_all_chunks().unwrap_err();
         assert!(matches!(err, HeadChunksError::Corruption { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn synchronous_cut_new_file_refresh_and_truncate_without_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut xc = XorChunk::new();
+        xc.appender().unwrap().append(0, 1000, 1.0).unwrap();
+        let encoded = EncodedChunk::Xor(xc);
+
+        let mut w = HeadChunksWriter::open(dir.path()).unwrap();
+        let r1 = w.write_chunk(10, 1000, 1000, &encoded, false).unwrap();
+        assert_eq!(r1.unpack().0, 1);
+        assert!(w.cur_file_has_chunks());
+
+        let mut reader = HeadChunksReader::open_no_repair(dir.path()).unwrap();
+        reader.refresh_in_place().unwrap();
+        assert!(reader.has_file(1));
+
+        // Synchronously cut a new header-only file (seq 2), refresh reader, and truncate seq 1.
+        w.cut_new_file().unwrap();
+        assert_eq!(w.current_seq(), 2);
+        assert!(!w.cur_file_has_chunks());
+        reader.refresh_in_place().unwrap();
+        reader
+            .truncate_in_place_except(usize::MAX, Some(w.current_seq()))
+            .unwrap();
+
+        assert!(!reader.has_file(1));
+        assert!(!head_chunk_file_path(dir.path(), 1).exists());
+        assert!(reader.has_file(2));
+        assert_eq!(
+            fs::metadata(head_chunk_file_path(dir.path(), 2)).unwrap().len(),
+            HEAD_CHUNK_FILE_HEADER_SIZE as u64
+        );
+        assert!(reader.collect_all_chunks().unwrap().is_empty());
+
+        // Subsequent write lands in seq 2 (no extra file cut) and is readable after reopen.
+        let r2 = w.write_chunk(10, 2000, 2000, &encoded, false).unwrap();
+        assert_eq!(r2.unpack().0, 2);
+        w.close().unwrap();
+
+        let reopened = HeadChunksReader::open(dir.path()).unwrap();
+        assert_eq!(reopened.collect_all_chunks().unwrap().len(), 1);
+        assert_eq!(reopened.chunk(r2).unwrap(), encoded);
     }
 }

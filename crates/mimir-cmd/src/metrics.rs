@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use prometheus::{Gauge, GaugeVec, Opts, Registry};
+use prometheus::{Counter, Gauge, GaugeVec, Opts, Registry};
 
 pub fn version_str() -> &'static str {
     option_env!("MIMIR_VERSION").unwrap_or("unknown")
@@ -90,5 +90,143 @@ pub fn register_global_metrics(
     }
     registry.register(Box::new(config_hash))?;
 
+    register_go_package_init_metrics(registry)?;
+
     Ok(())
+}
+
+/// Registers Go Mimir package-init global metrics that Go's `promauto` / `prometheus.MustRegister`
+/// populate on `prometheus.DefaultRegisterer` regardless of which `-target` is active.
+fn register_go_package_init_metrics(registry: &Registry) -> Result<(), prometheus::Error> {
+    // .ref/mimir/pkg/distributor/ingester_client_pool.go:21
+    let ingester_clients = Gauge::new(
+        "cortex_distributor_ingester_clients",
+        "The current number of ingester clients.",
+    )?;
+    registry.register(Box::new(ingester_clients))?;
+
+    // .ref/mimir/vendor/github.com/grafana/dskit/flagext/deprecated.go:15
+    let deprecated_flags = Counter::new(
+        "deprecated_flags_inuse_total",
+        "The number of deprecated flags currently set.",
+    )?;
+    registry.register(Box::new(deprecated_flags))?;
+
+    // .ref/mimir/vendor/github.com/prometheus/prometheus/storage/remote/write.go:43,49,55
+    let remote_samples_in = Counter::new(
+        "prometheus_remote_storage_samples_in_total",
+        "Samples in to remote storage, compare to samples out for queue managers. Deprecated, check prometheus_wal_watcher_records_read_total and prometheus_remote_storage_samples_dropped_total",
+    )?;
+    registry.register(Box::new(remote_samples_in))?;
+
+    let remote_exemplars_in = Counter::new(
+        "prometheus_remote_storage_exemplars_in_total",
+        "Exemplars in to remote storage, compare to exemplars out for queue managers. Deprecated, check prometheus_wal_watcher_records_read_total and prometheus_remote_storage_exemplars_dropped_total",
+    )?;
+    registry.register(Box::new(remote_exemplars_in))?;
+
+    let remote_histograms_in = Counter::new(
+        "prometheus_remote_storage_histograms_in_total",
+        "HistogramSamples in to remote storage, compare to histograms out for queue managers. Deprecated, check prometheus_wal_watcher_records_read_total and prometheus_remote_storage_histograms_dropped_total",
+    )?;
+    registry.register(Box::new(remote_histograms_in))?;
+
+    // .ref/mimir/vendor/github.com/prometheus/prometheus/storage/remote/intern.go:32
+    let string_interner_zero_releases = Counter::new(
+        "prometheus_remote_storage_string_interner_zero_reference_releases_total",
+        "The number of times release has been called for strings that are not interned.",
+    )?;
+    registry.register(Box::new(string_interner_zero_releases))?;
+
+    // .ref/mimir/vendor/github.com/prometheus/prometheus/template/template.go:46,50
+    let template_expansion_failures = Counter::new(
+        "prometheus_template_text_expansion_failures_total",
+        "The total number of template text expansion failures.",
+    )?;
+    registry.register(Box::new(template_expansion_failures))?;
+
+    let template_expansions = Counter::new(
+        "prometheus_template_text_expansions_total",
+        "The total number of template text expansions.",
+    )?;
+    registry.register(Box::new(template_expansions))?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus::proto::MetricType;
+
+    #[test]
+    fn test_register_global_metrics_includes_go_package_inits() {
+        let reg = Registry::new();
+        register_global_metrics(&reg, Some("abc123")).unwrap();
+
+        let families = reg.gather();
+        let find = |name: &str| {
+            families
+                .iter()
+                .find(|f| f.get_name() == name)
+                .unwrap_or_else(|| panic!("missing metric family {name}"))
+        };
+
+        let expected: &[(&str, MetricType, &str)] = &[
+            (
+                "cortex_distributor_ingester_clients",
+                MetricType::GAUGE,
+                "The current number of ingester clients.",
+            ),
+            (
+                "deprecated_flags_inuse_total",
+                MetricType::COUNTER,
+                "The number of deprecated flags currently set.",
+            ),
+            (
+                "prometheus_remote_storage_samples_in_total",
+                MetricType::COUNTER,
+                "Samples in to remote storage, compare to samples out for queue managers. Deprecated, check prometheus_wal_watcher_records_read_total and prometheus_remote_storage_samples_dropped_total",
+            ),
+            (
+                "prometheus_remote_storage_exemplars_in_total",
+                MetricType::COUNTER,
+                "Exemplars in to remote storage, compare to exemplars out for queue managers. Deprecated, check prometheus_wal_watcher_records_read_total and prometheus_remote_storage_exemplars_dropped_total",
+            ),
+            (
+                "prometheus_remote_storage_histograms_in_total",
+                MetricType::COUNTER,
+                "HistogramSamples in to remote storage, compare to histograms out for queue managers. Deprecated, check prometheus_wal_watcher_records_read_total and prometheus_remote_storage_histograms_dropped_total",
+            ),
+            (
+                "prometheus_remote_storage_string_interner_zero_reference_releases_total",
+                MetricType::COUNTER,
+                "The number of times release has been called for strings that are not interned.",
+            ),
+            (
+                "prometheus_template_text_expansion_failures_total",
+                MetricType::COUNTER,
+                "The total number of template text expansion failures.",
+            ),
+            (
+                "prometheus_template_text_expansions_total",
+                MetricType::COUNTER,
+                "The total number of template text expansions.",
+            ),
+        ];
+
+        for (name, ty, help) in expected {
+            let mf = find(name);
+            assert_eq!(mf.get_field_type(), *ty, "type mismatch for {name}");
+            assert_eq!(mf.get_help(), *help, "help mismatch for {name}");
+            let m = &mf.get_metric()[0];
+            assert!(m.get_label().is_empty(), "unexpected labels on {name}");
+            let val = match ty {
+                MetricType::GAUGE => m.get_gauge().get_value(),
+                MetricType::COUNTER => m.get_counter().get_value(),
+                _ => unreachable!(),
+            };
+            assert_eq!(val, 0.0, "expected initial value 0 for {name}");
+        }
+    }
 }
