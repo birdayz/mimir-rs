@@ -744,6 +744,12 @@ impl IndexReader {
     }
 
     #[inline]
+    /// Go `index.Reader.SymbolTableSize`: `len(symbols.offsets) * 8` (one offset kept per
+    /// 32 symbols).
+    pub fn symbol_table_size(&self) -> u64 {
+        (self.symbol_offsets.len() * 8) as u64
+    }
+
     pub fn size(&self) -> usize {
         self.mmap.len()
     }

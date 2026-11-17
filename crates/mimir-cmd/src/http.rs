@@ -206,14 +206,11 @@ async fn services_handler(AxumState(st): AxumState<AppHttpState>, headers: Heade
             });
         }
     }
-    if st.memberlist_kv.is_some() {
+    if let Some(ref ml) = st.memberlist_kv {
+        let s = ml.state();
         svcs.push(RenderService {
             name: "memberlist-kv".to_string(),
-            status: if st.shutdown_requested.load(Ordering::Acquire) {
-                "Stopping".to_string()
-            } else {
-                "Running".to_string()
-            },
+            status: if s == State::New { State::Starting } else { s }.to_string(),
         });
     }
     if st.runtime_config.is_some() {

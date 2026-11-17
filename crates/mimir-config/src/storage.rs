@@ -1426,7 +1426,7 @@ impl TSDBConfig {
         f.i64_var("blocks-storage.tsdb.early-head-compaction-min-in-memory-series", self.early_head_compaction_min_in_memory_series, "Minimum in-memory series to trigger early head compaction.", move |t| &get(t).early_head_compaction_min_in_memory_series, move |t| &mut get_mut(t).early_head_compaction_min_in_memory_series);
         f.i64_var("blocks-storage.tsdb.early-head-compaction-min-estimated-series-reduction-percentage", self.early_head_compaction_min_estimated_series_reduction_percentage, "Minimum estimated series reduction percentage (0-100).", move |t| &get(t).early_head_compaction_min_estimated_series_reduction_percentage, move |t| &mut get_mut(t).early_head_compaction_min_estimated_series_reduction_percentage);
         f.bool_var("blocks-storage.tsdb.timely-head-compaction-enabled", self.timely_head_compaction_enabled, "Allows head compaction to happen when the min block range can no longer be appended.", move |t| &get(t).timely_head_compaction_enabled, move |t| &mut get_mut(t).timely_head_compaction_enabled);
-        f.bool_var("blocks-storage.tsdb.bigger-out-of-order-blocks-for-old-samples", self.bigger_out_of_order_blocks_for_old_samples, "When enabled, ingester produces 24h blocks for out-of-order data.", move |t| &get(t).bigger_out_of_order_blocks_for_old_samples, move |t| &mut get_mut(t).bigger_out_of_order_blocks_for_old_samples);
+        f.bool_var("blocks-storage.tsdb.bigger-out-of-order-blocks-for-old-samples", self.bigger_out_of_order_blocks_for_old_samples, "When enabled, ingester produces 24h blocks for out-of-order data that is before the current day, instead of the usual 2h blocks.", move |t| &get(t).bigger_out_of_order_blocks_for_old_samples, move |t| &mut get_mut(t).bigger_out_of_order_blocks_for_old_samples);
         self.index_lookup_planning
             .register_flags_into("blocks-storage.tsdb.index-lookup-planning.", f, move |t| &get(t).index_lookup_planning, move |t| &mut get_mut(t).index_lookup_planning);
         f.bool_var("blocks-storage.tsdb.offset-catalogue.enabled", self.offset_catalogue.enabled, "Controls the maintaining of kafka offset catalogue per block.", move |t| &get(t).offset_catalogue.enabled, move |t| &mut get_mut(t).offset_catalogue.enabled);
@@ -1493,7 +1493,29 @@ impl TSDBConfig {
                 "early compaction minimum series reduction percentage must be a value between 0 and 100 (included)".to_string(),
             ));
         }
-        self.index_lookup_planning.validate()
+        self.index_lookup_planning.validate()?;
+        self.validate_mimir_rs_support()
+    }
+
+    /// Settings Go accepts that mimir-rs does not implement yet: rejected explicitly instead
+    /// of being silently ignored (tracked in PORT_STATUS.md).
+    fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        if self.block_ranges_period.len() > 1 {
+            return Err(ConfigError::Validation(
+                "mimir-rs: -blocks-storage.tsdb.block-ranges-period with more than one range (local leveled compaction of TSDB blocks) is not supported yet".to_string(),
+            ));
+        }
+        if self.head_chunks_end_time_variance != 0.0 {
+            return Err(ConfigError::Validation(
+                "mimir-rs: -blocks-storage.tsdb.head-chunks-end-time-variance other than 0 is not supported yet".to_string(),
+            ));
+        }
+        if self.memory_snapshot_on_shutdown {
+            return Err(ConfigError::Validation(
+                "mimir-rs: -blocks-storage.tsdb.memory-snapshot-on-shutdown=true (TSDB chunk snapshots) is not supported yet".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

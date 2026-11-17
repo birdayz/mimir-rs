@@ -23,7 +23,7 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::kv::memberlist::MemberlistKv;
-use crate::kv::{build_kv_client, KvClient, KvError};
+use crate::kv::{build_kv_client, registerer_with_kv_name, AsRegisterer, KvClient, KvError};
 use crate::prng::{shuffle_shard_expected_instances_per_zone, shuffle_shard_seed, GoRand};
 use crate::token_gen::search_token;
 
@@ -216,15 +216,26 @@ pub struct Ring {
 }
 
 impl Ring {
-    /// Creates a new [`Ring`] backed by KV store from `RingConfig`.
-    pub fn new(
+    /// Creates a new [`Ring`] backed by KV store from `RingConfig` (Go `ring.New`).
+    /// The KV client registers its metrics through `reg` with
+    /// `kv_name="<name>-ring"` like dskit; the ring's own metrics are
+    /// registered into the underlying registry.
+    pub fn new<R: AsRegisterer + ?Sized>(
         cfg: &RingConfig,
         name: &str,
         key: &str,
         memberlist_kv: Option<Arc<MemberlistKv>>,
-        reg: Option<&Registry>,
+        reg: Option<&R>,
     ) -> Result<Arc<Self>, RingError> {
-        let store = build_kv_client(&cfg.kvstore, ring_desc_codec(), memberlist_kv, reg)?;
+        let registerer = reg.map(|r| r.as_registerer());
+        let kv_reg = registerer_with_kv_name(registerer.as_ref(), &format!("{name}-ring"));
+        let store = build_kv_client(
+            &cfg.kvstore,
+            ring_desc_codec(),
+            memberlist_kv,
+            kv_reg.as_ref(),
+        )?;
+        let reg: Option<&Registry> = registerer.as_ref().map(|r| r.registry());
         Self::with_store_and_strategy(
             RingSettings::from(cfg),
             name,

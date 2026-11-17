@@ -1000,52 +1000,48 @@ impl Ingester {
         snap
     }
 
-    /// Flushes WAL & WBL segments for all open tenant TSDBs (`NotifyPreCommit`), fsyncing up to
-    /// `-ingest-storage.write-logs-fsync-before-kafka-commit-concurrency` tenants at a time
-    /// (dskit `concurrency.ForEachUser`: every tenant is attempted, all errors are returned).
-    /// Blocking: call it from a blocking thread.
+    /// Fsyncs WAL & WBL segments for all open tenant TSDBs (Go `NotifyPreCommit`):
+    /// `concurrency.ForEachUser` with `write_logs_fsync_before_kafka_commit_concurrency`
+    /// workers; every tenant is fsynced and all errors are returned (dskit multierror).
+    /// Blocking: call from a blocking thread.
     pub fn notify_pre_commit(&self) -> Result<(), IngesterError> {
         let users = self.get_tsdb_users();
         if users.is_empty() {
             return Ok(());
         }
-        let concurrency = (self
-            .ingest_cfg
-            .write_logs_fsync_before_kafka_commit_concurrency
-            .max(1) as usize)
+        let concurrency = (self.ingest_cfg.write_logs_fsync_before_kafka_commit_concurrency.max(1)
+            as usize)
             .min(users.len());
         tracing::debug!(concurrency, "fsyncing TSDBs");
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let errs = parking_lot::Mutex::new(Vec::<String>::new());
-        let worker = || loop {
-            let idx = next.fetch_add(1, Ordering::Relaxed);
-            let Some(user_id) = users.get(idx) else {
-                return;
-            };
-            if let Some(db) = self.get_tsdb(user_id) {
-                if let Err(e) = db.db.head().sync() {
-                    errs.lock()
-                        .push(format!("failed to sync TSDB WAL for user {user_id}: {e}"));
-                }
+        let errs: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..concurrency {
+                scope.spawn(|| loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(user_id) = users.get(idx) else {
+                        break;
+                    };
+                    let Some(db) = self.get_tsdb(user_id) else {
+                        continue;
+                    };
+                    if let Err(e) = db.db.head().sync() {
+                        errs.lock()
+                            .push(format!("failed to sync TSDB WAL for user {user_id}: {e}"));
+                    }
+                });
             }
-        };
-        if concurrency == 1 {
-            worker();
-        } else {
-            std::thread::scope(|s| {
-                for _ in 0..concurrency {
-                    s.spawn(worker);
-                }
-            });
-        }
+        });
         let errs = errs.into_inner();
         if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(IngesterError::Internal {
-                message: errs.join("; "),
-            })
+            return Ok(());
         }
+        let message = if errs.len() > 1 {
+            format!("{} errors: {}", errs.len(), errs.join("; "))
+        } else {
+            errs.into_iter().next().unwrap_or_default()
+        };
+        Err(IngesterError::Internal { message })
     }
 
     /// Starts the Ingester service asynchronously, returning immediately while startup progresses.

@@ -83,6 +83,8 @@ func main() {
 		out, err = cmdNetAddrDetect(input)
 	case "go-sort":
 		out, err = cmdGoSort(input)
+	case "tsdb-open-report":
+		out, err = cmdTSDBOpenReport(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}

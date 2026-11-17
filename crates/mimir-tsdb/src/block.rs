@@ -327,6 +327,15 @@ pub struct Block {
 impl Block {
     /// Opens an on-disk ULID block directory, validating `meta.json`, `index`, `chunks/`, and `tombstones`.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, BlockError> {
+        Self::open_with_postings_cache(dir, PostingsForMatchersCacheConfig::default())
+    }
+
+    /// Opens a block with the given per-block `PostingsForMatchersCache` configuration
+    /// (Mimir `block_postings_for_matchers_cache_*`).
+    pub fn open_with_postings_cache(
+        dir: impl AsRef<Path>,
+        postings_cache: PostingsForMatchersCacheConfig,
+    ) -> Result<Self, BlockError> {
         let dir = dir.as_ref().to_path_buf();
         let meta = read_meta_file(&dir)?;
         let index = IndexReader::open(dir.join(INDEX_FILENAME))?;
@@ -349,10 +358,7 @@ impl Block {
             chunks,
             tombstones,
             total_size,
-            postings_cache: PostingsForMatchersCache::new(
-                PostingsForMatchersCacheConfig::default(),
-                None,
-            ),
+            postings_cache: PostingsForMatchersCache::new(postings_cache, None),
         })
     }
 
@@ -408,6 +414,12 @@ impl Block {
     #[inline]
     pub fn size(&self) -> u64 {
         self.total_size
+    }
+
+    /// Go `Block.GetSymbolTableSize` (`index.Reader.SymbolTableSize`).
+    #[inline]
+    pub fn symbol_table_size(&self) -> u64 {
+        self.index.symbol_table_size()
     }
 
     #[inline]
