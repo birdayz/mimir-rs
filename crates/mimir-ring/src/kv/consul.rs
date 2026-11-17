@@ -17,7 +17,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{debug, error};
 
-use super::{BoxFuture, CasFn, CasOutcome, Codec, KvClient, KvError};
+use super::{BoxFuture, CasFn, CasOutcome, Codec, KvClient, KvError, Registerer};
 
 const LONG_POLL_DURATION_SECS: u64 = 10;
 
@@ -98,6 +98,16 @@ impl ConsulKv {
         cfg: ConsulConfig,
         codec: Arc<dyn Codec>,
         reg: Option<&Registry>,
+    ) -> Result<Self, KvError> {
+        Self::with_registerer(cfg, codec, reg.map(Registerer::new).as_ref())
+    }
+
+    /// Go `consul.NewClient(cfg, codec, logger, registerer)` with a (possibly
+    /// wrapped) Go-style registerer.
+    pub fn with_registerer(
+        cfg: ConsulConfig,
+        codec: Arc<dyn Codec>,
+        reg: Option<&Registerer>,
     ) -> Result<Self, KvError> {
         let mut headers = HeaderMap::new();
         if !cfg.acl_token.is_empty() {

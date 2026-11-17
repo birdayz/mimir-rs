@@ -26,8 +26,9 @@ use mimir_ingester::ingest_storage::{
 };
 use mimir_ingester::{Ingester, IngesterService};
 use mimir_proto::httpgrpcpb::http_server::HttpServer;
-use mimir_ring::kv::memberlist::MemberlistKv;
-use mimir_ring::kv::{build_kv_client, Codec};
+use mimir_ring::kv::ha_replica::replica_desc_codec;
+use mimir_ring::kv::memberlist::{KvOptions, MemberlistKv};
+use mimir_ring::kv::{build_kv_client, registerer_with_kv_name, Codec, Registerer};
 use mimir_ring::lifecycler::Lifecycler;
 use mimir_ring::partition_ring::{
     partition_ring_desc_codec, PartitionInstanceLifecycler, PartitionInstanceLifecyclerConfig,
@@ -238,22 +239,31 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                 || (cfg.ingest_storage.enabled
                     && kv_uses_memberlist(&cfg.ingester.partition_ring.kvstore))));
 
+    // Created here, started (dskit `starting`: transport + fast-join) only after the HTTP/gRPC
+    // servers are serving, like the Go module graph where memberlist-kv starts alongside server.
+    // Mimir: MetricsNamespace "" and codecs ring, partition ring, HA tracker replica desc.
     let memberlist_kv = if needs_memberlist {
-        log_module_starting(&*logger, "memberlist-kv");
-        let codecs: Vec<Arc<dyn Codec>> =
-            vec![ring_desc_codec(), partition_ring_desc_codec()];
-        let ml = MemberlistKv::start(
+        let codecs: Vec<Arc<dyn Codec>> = vec![
+            ring_desc_codec(),
+            partition_ring_desc_codec(),
+            replica_desc_codec(),
+        ];
+        let ml = MemberlistKv::new(
             cfg.memberlist.clone(),
             codecs,
-            "cortex",
+            "",
             Some(&registry),
+            KvOptions::default(),
         )
-        .await
-        .context("starting memberlist KV")?;
+        .context("creating memberlist KV")?;
         Some(ml)
     } else {
         None
     };
+    // Go: ingester ring/lifecycler KV clients use the cortex_-prefixed registerer, the partition
+    // ring watcher/lifecycler KV clients the unprefixed one (kv_request_duration_seconds).
+    let base_registerer = Registerer::new(&registry);
+    let cortex_registerer = base_registerer.wrap_with_prefix("cortex_");
 
     // 5. BucketClient validation (Ingester also creates its own client when shipping).
     if ingester_enabled && cfg.blocks_storage.tsdb.ship_interval.0 > 0 {
@@ -277,7 +287,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             INGEST_RING_NAME,
             INGEST_RING_KEY,
             memberlist_kv.clone(),
-            Some(&registry),
+            Some(&cortex_registerer),
         )
         .context("creating ingester ring")?;
 
@@ -293,7 +303,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             INGEST_RING_KEY,
             cfg.blocks_storage.tsdb.flush_blocks_on_shutdown,
             memberlist_kv.clone(),
-            Some(&registry),
+            Some(&cortex_registerer),
         )
         .context("creating ingester lifecycler")?;
 
@@ -302,7 +312,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                 &cfg.ingester.partition_ring.kvstore,
                 partition_ring_desc_codec(),
                 memberlist_kv.clone(),
-                Some(&registry),
+                registerer_with_kv_name(Some(&base_registerer), "ingester-partitions-watcher").as_ref(),
             )
             .context("creating KV store for ingester partition ring watcher")?;
 
@@ -334,7 +344,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                 &cfg.ingester.partition_ring.kvstore,
                 partition_ring_desc_codec(),
                 memberlist_kv.clone(),
-                Some(&registry),
+                registerer_with_kv_name(Some(&base_registerer), "ingester-partitions-lifecycler").as_ref(),
             )
             .context("creating KV store for partition instance lifecycler")?;
 
@@ -419,6 +429,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let default_config_arc = Arc::new(MimirConfig::default());
 
     let mut module_services: Vec<(String, Arc<dyn mimir_common::services::Service>)> = Vec::new();
+    if let Some(ref ml) = memberlist_kv {
+        module_services.push(("memberlist-kv".to_string(), ml.service() as _));
+    }
     if let Some(ref rsvc) = ring_svc {
         module_services.push(("ingester-ring".to_string(), Arc::clone(rsvc) as _));
     }
@@ -474,6 +487,19 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let mut signaled_during_startup = false;
     {
         let startup_fut = async {
+            // memberlist-kv: starting (transport + fast-join) runs while HTTP/gRPC already serve;
+            // /ready reports "memberlist-kv: Starting" meanwhile. Rings depend on it.
+            if let Some(ref ml) = memberlist_kv {
+                log_module_starting(&*logger, "memberlist-kv");
+                let svc = ml.service();
+                svc.start_async(service_ctx.child())
+                    .await
+                    .context("starting module memberlist-kv")?;
+                if let Err(err) = svc.await_running().await {
+                    let cause = svc.failure_case().map(|f| f.to_string()).unwrap_or_else(|| err.to_string());
+                    return Err(anyhow::anyhow!("starting module memberlist-kv: {cause}"));
+                }
+            }
             if let Some(ref rsvc) = ring_svc {
                 log_module_starting(&*logger, "ingester-ring");
                 rsvc.start_async(service_ctx.child())
@@ -523,8 +549,31 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     if !signaled_during_startup && startup_err.is_none() {
         logger.log(LogLevel::Info, &[("msg", "Application started")]);
         // 9. Wait for SIGTERM / SIGINT (POST /ingester/shutdown stops only the Ingester service,
-        // keeping HTTP/gRPC alive until SIGTERM, matching Go Mimir).
-        (&mut shutdown_sig).await;
+        // keeping HTTP/gRPC alive until SIGTERM, matching Go Mimir). A failing memberlist-kv module
+        // (e.g. -memberlist.abort-if-join-fails) stops the process like the Go service manager.
+        let ml_failed = async {
+            match memberlist_kv.as_ref() {
+                Some(ml) => {
+                    let svc = ml.service();
+                    let _ = svc.await_terminated().await;
+                    match svc.failure_case() {
+                        Some(f) => f.to_string(),
+                        None => std::future::pending::<String>().await,
+                    }
+                }
+                None => std::future::pending::<String>().await,
+            }
+        };
+        tokio::select! {
+            _ = &mut shutdown_sig => {}
+            cause = ml_failed => {
+                logger.log(
+                    LogLevel::Error,
+                    &[("msg", "module failed"), ("module", "memberlist-kv"), ("err", &cause)],
+                );
+                startup_err = Some(anyhow::anyhow!("module memberlist-kv failed: {cause}"));
+            }
+        }
     }
 
     shutdown_requested.store(true, Ordering::Release);

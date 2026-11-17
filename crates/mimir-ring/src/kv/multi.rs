@@ -18,7 +18,10 @@ use prometheus::{Counter, Gauge, GaugeVec, Opts, Registry};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use super::{BoxFuture, CasCallbackError, CasFn, CasOutcome, Codec, KvClient, KvError};
+use super::{
+    AsRegisterer, BoxFuture, CasCallbackError, CasFn, CasOutcome, Codec, KvClient, KvError,
+    Registerer,
+};
 
 #[derive(Clone)]
 pub struct NamedKvClient {
@@ -110,7 +113,7 @@ struct MultiMetrics {
 }
 
 impl MultiMetrics {
-    fn new(reg: Option<&Registry>) -> Self {
+    fn new(reg: Option<&Registerer>) -> Self {
         let primary_store = GaugeVec::new(
             Opts::new("multikv_primary_store", "Selected primary KV store"),
             &["store"],
@@ -167,17 +170,45 @@ impl MultiKv {
         clients: Vec<NamedKvClient>,
         reg: Option<&Registry>,
     ) -> Arc<Self> {
-        Self::new_with_options(cfg, clients, reg, None, None)
+        Self::with_registerer_and_options(
+            cfg,
+            clients,
+            None,
+            reg.map(Registerer::new).as_ref(),
+            None,
+        )
+    }
+
+    /// Go `NewMultiClient(cfg, clients, logger, reg)` with a (possibly
+    /// wrapped) Go-style registerer.
+    pub fn with_registerer(
+        cfg: MultiKVConfig,
+        clients: Vec<NamedKvClient>,
+        codec: Option<Arc<dyn Codec>>,
+        reg: Option<&Registerer>,
+    ) -> Arc<Self> {
+        Self::with_registerer_and_options(cfg, clients, codec, reg, None)
     }
 
     /// `NewMultiClient`: `codec` enables mirroring of generic [`KvClient::cas`] writes, and
     /// `config_provider` (`MultiConfig.ConfigProvider`) is watched for runtime primary switches
     /// and mirroring toggles.
-    pub fn new_with_options(
+    pub fn new_with_options<R: AsRegisterer + ?Sized>(
         cfg: MultiKVConfig,
         clients: Vec<NamedKvClient>,
-        reg: Option<&Registry>,
+        reg: Option<&R>,
         codec: Option<Arc<dyn Codec>>,
+        config_provider: Option<MultiConfigProvider>,
+    ) -> Arc<Self> {
+        let reg = reg.map(|r| r.as_registerer());
+        Self::with_registerer_and_options(cfg, clients, codec, reg.as_ref(), config_provider)
+    }
+
+    pub fn with_registerer_and_options(
+        cfg: MultiKVConfig,
+        clients: Vec<NamedKvClient>,
+        codec: Option<Arc<dyn Codec>>,
+        reg: Option<&Registerer>,
         config_provider: Option<MultiConfigProvider>,
     ) -> Arc<Self> {
         let m = Arc::new(Self {
