@@ -3734,3 +3734,54 @@ async fn test_ingester_no_flush_with_in_flight_request() {
 
     ing.stop().await.unwrap();
 }
+
+// Go `FlushHandler` uses `r.ParseForm()`: POST form bodies, strict URL decoding (400 on a bad
+// escape) and an empty `tenant=` that allows only the empty tenant (W2-05).
+#[tokio::test]
+async fn test_flush_handler_parse_form_semantics() {
+    async fn call(ing: &Arc<Ingester>, method: Method, uri: &str, form_body: Option<&str>) -> StatusCode {
+        let mut b = HttpRequest::builder().method(method).uri(uri);
+        if form_body.is_some() {
+            b = b.header("Content-Type", "application/x-www-form-urlencoded");
+        }
+        let req = b
+            .body(Body::from(form_body.unwrap_or_default().to_string()))
+            .unwrap();
+        ingester_router(Arc::clone(ing)).oneshot(req).await.unwrap().status()
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, mut blocks_cfg) = default_ingester_test_config(tmp.path());
+    blocks_cfg.tsdb.ship_concurrency = 1;
+    blocks_cfg.tsdb.ship_interval = GoDuration::from_mins(1);
+    blocks_cfg.tsdb.flush_blocks_on_shutdown = false;
+    let reg = Registry::new();
+    let ing =
+        prepare_ingester_with_blocks_storage(tmp.path(), cfg, blocks_cfg, None, Some(&reg)).await;
+    push_single_sample_with_metadata(&ing).await;
+
+    // Invalid escape: ParseForm error -> 400, nothing flushed.
+    assert_eq!(call(&ing, Method::GET, "/ingester/flush?tenant=%ZZ&wait=true", None).await, StatusCode::BAD_REQUEST);
+    let bad_body = Some("tenant=%G1&wait=true");
+    assert_eq!(call(&ing, Method::POST, "/ingester/flush", bad_body).await, StatusCode::BAD_REQUEST);
+    verify_compacted_head(&ing, false);
+
+    // Empty tenant= allows only "" (flushes no real tenant).
+    assert_eq!(call(&ing, Method::GET, "/ingester/flush?tenant=&wait=true", None).await, StatusCode::NO_CONTENT);
+    verify_compacted_head(&ing, false);
+
+    // Form body naming another tenant: synchronous, our tenant untouched.
+    let other = Some("tenant=other&wait=true");
+    assert_eq!(call(&ing, Method::POST, "/ingester/flush", other).await, StatusCode::NO_CONTENT);
+    verify_compacted_head(&ing, false);
+
+    // Form body naming our tenant (percent-encoded) with wait=true: flushed before returning.
+    let ours = Some("tenant=%31&wait=true");
+    assert_eq!(call(&ing, Method::POST, "/ingester/flush?wait=false", ours).await, StatusCode::NO_CONTENT);
+    verify_compacted_head(&ing, true);
+    assert_eq!(
+        gather_metric_value(&reg, "cortex_ingester_shipper_uploads_total", &[]).unwrap(),
+        1.0
+    );
+    ing.stop().await.unwrap();
+}
