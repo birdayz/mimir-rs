@@ -15,6 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use super::memberlist::gofmt::{go_sharp_v_str, GoJson};
 use super::memberlist::Mergeable;
 use super::{Codec, ProtoSnappyCodec};
 
@@ -128,6 +129,37 @@ impl Mergeable for ReplicaDesc {
 
     fn clone_mergeable(&self) -> Box<dyn Mergeable> {
         Box::new(self.clone())
+    }
+
+    /// Go `encoding/json` of `distributor.ReplicaDesc` (all fields `omitempty`).
+    fn to_go_json(&self) -> GoJson {
+        let mut f: Vec<(String, GoJson)> = Vec::new();
+        if !self.replica.is_empty() {
+            f.push(("replica".into(), GoJson::str(self.replica.as_str())));
+        }
+        for (name, v) in [
+            ("received_at", self.received_at),
+            ("deleted_at", self.deleted_at),
+            ("elected_at", self.elected_at),
+            ("elected_changes", self.elected_changes),
+        ] {
+            if v != 0 {
+                f.push((name.into(), GoJson::int(v)));
+            }
+        }
+        GoJson::Object(f)
+    }
+
+    /// Go `(*ReplicaDesc).GoString` (ha_tracker.pb.go).
+    fn go_string(&self) -> String {
+        format!(
+            "&distributor.ReplicaDesc{{Replica: {},\nReceivedAt: {},\nDeletedAt: {},\nElectedAt: {},\nElectedChanges: {},\n}}",
+            go_sharp_v_str(&self.replica),
+            self.received_at,
+            self.deleted_at,
+            self.elected_at,
+            self.elected_changes
+        )
     }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {

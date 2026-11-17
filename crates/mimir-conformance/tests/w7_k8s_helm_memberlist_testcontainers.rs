@@ -2055,18 +2055,7 @@ struct Report {
 /// `MIMIR_W7_STRICT=1`. Every other difference fails. Harness errors (`harness:`) never match.
 /// Remove an entry as soon as the divergence is fixed.
 const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
-    // K8S-2: ring / partition-ring / lifecycler metrics registered without the `cortex_` prefix
-    // (`ring_members`, `partition_ring_partitions`, `lifecycler_read_only`, ...).
-    ("K8S-2", "mixin-referenced series missing"),
-    ("K8S-2", "missing labels"),
-    // K8S-4: no `sanity-check` module (Rust becomes ready with object storage unreachable).
-    ("K8S-4", "outcome ready, Go pod exited(1)"),
-    // K8S-6: /memberlist JSON is not dskit's StatusPageData.
-    (
-        "K8S-6",
-        "/memberlist JSON (Accept: application/json) top-level keys differ",
-    ),
-    // K8S-7: Go runtime profiles (/debug/pprof/heap, goroutine) not served.
+    // K8S-7: Go runtime-specific profiles (/debug/pprof/heap, goroutine) have no Rust runtime equivalent.
     ("K8S-7", "GET /debug/pprof/"),
 ];
 

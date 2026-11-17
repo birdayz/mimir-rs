@@ -19,7 +19,7 @@ use mimir_common::services::{basic_service, ManagedBasicService, ServiceContext,
 use mimir_config::ingester::RingConfig;
 use mimir_proto::ringpb::{Desc, InstanceDesc, InstanceState};
 use parking_lot::{Mutex, RwLock};
-use prometheus::{Counter, Gauge, HistogramOpts, HistogramVec, Opts, Registry};
+use prometheus::{Counter, Gauge, HistogramOpts, HistogramVec, Opts};
 use rand::seq::SliceRandom;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 use crate::kv::memberlist::MemberlistKv;
 use crate::kv::{
     build_kv_client, registerer_with_kv_name, AsRegisterer, BoxFuture, CasCallbackError,
-    CasOutcome, KvClient, KvError,
+    CasOutcome, KvClient, KvError, Registerer,
 };
 use crate::ring::model::{ring_desc_codec, system_time_to_unix_secs, DescExt, InstanceDescExt};
 use crate::ring::replication_strategy::WRITE;
@@ -58,7 +58,9 @@ pub enum LifecyclerError {
 }
 
 pub trait FlushTransferer: Send + Sync {
-    fn flush(&self);
+    /// Flushes all in-memory data (`FlushTransferer.Flush()`); awaited by the lifecycler while
+    /// it keeps heartbeating in LEAVING state.
+    fn flush(&self) -> BoxFuture<'_, ()>;
     fn transfer_out(&self) -> BoxFuture<'_, Result<(), LifecyclerError>>;
 }
 
@@ -66,7 +68,9 @@ pub trait FlushTransferer: Send + Sync {
 pub struct NoopFlushTransferer;
 
 impl FlushTransferer for NoopFlushTransferer {
-    fn flush(&self) {}
+    fn flush(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
 
     fn transfer_out(&self) -> BoxFuture<'_, Result<(), LifecyclerError>> {
         Box::pin(async { Ok(()) })
@@ -154,7 +158,7 @@ struct BasicLifecyclerMetrics {
 }
 
 impl BasicLifecyclerMetrics {
-    fn new(ring_name: &str, reg: Option<&Registry>) -> Self {
+    fn new(ring_name: &str, reg: Option<&Registerer>) -> Self {
         let mut labels = HashMap::new();
         labels.insert("name".to_string(), ring_name.to_string());
 
@@ -220,13 +224,14 @@ impl BasicLifecycler {
         ring_key: &str,
         store: Arc<dyn KvClient>,
         delegate: Arc<dyn BasicLifecyclerDelegate>,
-        reg: Option<&Registry>,
+        reg: Option<&dyn AsRegisterer>,
     ) -> Arc<Self> {
+        let reg = reg.map(|r| r.as_registerer());
         let token_generator = cfg
             .token_generator
             .clone()
             .unwrap_or_else(|| Arc::new(RandomTokenGenerator::new()));
-        let metrics = BasicLifecyclerMetrics::new(ring_name, reg);
+        let metrics = BasicLifecyclerMetrics::new(ring_name, reg.as_ref());
         metrics.tokens_to_own.set(cfg.num_tokens as f64);
 
         Arc::new(Self {
@@ -953,7 +958,7 @@ struct LifecyclerMetrics {
 }
 
 impl LifecyclerMetrics {
-    fn new(ring_name: &str, reg: Option<&Registry>) -> Self {
+    fn new(ring_name: &str, reg: Option<&Registerer>) -> Self {
         let mut labels = HashMap::new();
         labels.insert("name".to_string(), ring_name.to_string());
 
@@ -1023,7 +1028,7 @@ struct ReadyState {
 
 pub struct Lifecycler {
     cfg: LifecyclerConfig,
-    flush_transferer: Arc<dyn FlushTransferer>,
+    flush_transferer: RwLock<Arc<dyn FlushTransferer>>,
     kv_store: Arc<dyn KvClient>,
     pub id: String,
     pub addr: String,
@@ -1047,7 +1052,7 @@ impl Lifecycler {
     /// Go `ring.NewLifecycler`. `reg` is the Go registerer (Mimir's ingester
     /// passes `cortex_`-prefixed); the KV client registers its metrics with
     /// `kv_name="<ring_name>-lifecycler"` like dskit. The lifecycler's own
-    /// metrics are registered into the underlying registry.
+    /// metrics are registered through `reg` too (and thus carry its prefix).
     #[allow(clippy::too_many_arguments)]
     pub fn new<R: AsRegisterer + ?Sized>(
         ring_cfg: &RingConfig,
@@ -1068,7 +1073,6 @@ impl Lifecycler {
             memberlist_kv,
             kv_reg.as_ref(),
         )?;
-        let reg: Option<&Registry> = registerer.as_ref().map(|r| r.registry());
         let cfg = LifecyclerConfig::from_ring_config(ring_cfg, listen_port)?;
         Ok(Self::with_store(
             cfg,
@@ -1077,7 +1081,7 @@ impl Lifecycler {
             ring_name,
             ring_key,
             flush_on_shutdown,
-            reg,
+            registerer.as_ref().map(|r| r as &dyn AsRegisterer),
         ))
     }
 
@@ -1088,8 +1092,9 @@ impl Lifecycler {
         ring_name: &str,
         ring_key: &str,
         flush_on_shutdown: bool,
-        reg: Option<&Registry>,
+        reg: Option<&dyn AsRegisterer>,
     ) -> Arc<Self> {
+        let reg = reg.map(|r| r.as_registerer());
         // net.JoinHostPort(addr, strconv.Itoa(port)).
         let full_addr = join_host_port(&cfg.addr, &cfg.port.to_string());
         let token_generator = cfg
@@ -1128,9 +1133,11 @@ impl Lifecycler {
             }),
             token_generator,
             can_join_timeout: Duration::from_secs(5 * 60),
-            metrics: LifecyclerMetrics::new(ring_name, reg),
+            metrics: LifecyclerMetrics::new(ring_name, reg.as_ref()),
             cfg,
-            flush_transferer: flush_transferer.unwrap_or_else(|| Arc::new(NoopFlushTransferer)),
+            flush_transferer: RwLock::new(
+                flush_transferer.unwrap_or_else(|| Arc::new(NoopFlushTransferer)),
+            ),
             kv_store,
         })
     }
@@ -1174,6 +1181,13 @@ impl Lifecycler {
 
     pub fn zones(&self) -> Vec<String> {
         self.counters.read().zones.clone()
+    }
+
+    /// Replaces the [`FlushTransferer`] used on shutdown. Mimir passes the Ingester itself to
+    /// `ring.NewLifecycler`; in Rust the Ingester is constructed after its lifecycler, so it
+    /// registers itself here before the lifecycler is started.
+    pub fn set_flush_transferer(&self, flush_transferer: Arc<dyn FlushTransferer>) {
+        *self.flush_transferer.write() = flush_transferer;
     }
 
     pub fn set_flush_on_shutdown(&self, enabled: bool) {
@@ -1771,7 +1785,8 @@ impl Lifecycler {
     async fn process_shutdown(&self) {
         let mut flush_required = self.flush_on_shutdown();
         let t_start = Instant::now();
-        match self.flush_transferer.transfer_out().await {
+        let flush_transferer = self.flush_transferer.read().clone();
+        match flush_transferer.transfer_out().await {
             Ok(()) => {
                 flush_required = false;
                 self.metrics
@@ -1793,7 +1808,7 @@ impl Lifecycler {
 
         if flush_required {
             let f_start = Instant::now();
-            self.flush_transferer.flush();
+            flush_transferer.flush().await;
             self.metrics
                 .shutdown_duration
                 .with_label_values(&["flush", "success"])

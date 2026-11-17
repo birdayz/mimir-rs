@@ -20,7 +20,7 @@ use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb;
 use mimir_proto::ringpb::{Desc, InstanceState, PartitionRingDesc};
 use mimir_ring::kv::inmemory::InMemoryKv;
-use mimir_ring::kv::KvClient;
+use mimir_ring::kv::{AsRegisterer, KvClient};
 use mimir_ring::lifecycler::{BasicLifecyclerConfig, Lifecycler, LifecyclerConfig};
 use mimir_ring::partition_ring::model::partition_ring_desc_codec;
 use mimir_ring::partition_ring::{
@@ -102,7 +102,7 @@ pub async fn create_test_ring(
         INGEST_RING_KEY,
         kv,
         Arc::new(DefaultReplicationStrategy),
-        reg,
+        reg.map(|r| r as &dyn AsRegisterer),
     )
     .expect("create test ring");
     let svc = Arc::clone(&r).into_service();
@@ -134,7 +134,7 @@ pub async fn prepare_ingester_with_blocks_storage(
         INGEST_RING_NAME,
         INGEST_RING_KEY,
         cfg.blocks.tsdb.flush_blocks_on_shutdown,
-        reg,
+        reg.map(|r| r as &dyn AsRegisterer),
     );
 
     let ing = Ingester::new(
@@ -221,7 +221,7 @@ pub async fn create_test_ingester_with_ingest_storage(
         PARTITION_RING_KEY,
         Arc::clone(&partition_kv),
         PartitionRingOptions::default(),
-        reg,
+        reg.map(|r| r as &dyn AsRegisterer),
     );
     let watcher_svc = Arc::clone(&watcher).into_service();
     watcher_svc
@@ -245,7 +245,7 @@ pub async fn create_test_ingester_with_ingest_storage(
         PARTITION_RING_NAME,
         PARTITION_RING_KEY,
         Arc::clone(&partition_kv),
-        reg,
+        reg.map(|r| r as &dyn AsRegisterer),
     )
     .expect("create plc");
 
@@ -263,7 +263,7 @@ pub async fn create_test_ingester_with_ingest_storage(
             cfg.ingester.ring.final_sleep.as_std().unwrap_or(Duration::ZERO),
             cfg.blocks.tsdb.flush_blocks_on_shutdown,
             None,
-            reg,
+            reg.map(|r| r as &dyn AsRegisterer),
         )
     } else {
         let lc_cfg = LifecyclerConfig::from_ring_config(&cfg.ingester.ring, 0).expect("lc cfg");
@@ -274,7 +274,7 @@ pub async fn create_test_ingester_with_ingest_storage(
             INGEST_RING_NAME,
             INGEST_RING_KEY,
             cfg.blocks.tsdb.flush_blocks_on_shutdown,
-            reg,
+            reg.map(|r| r as &dyn AsRegisterer),
         )
     };
 
@@ -345,7 +345,7 @@ pub async fn create_test_compartments_ingester(
         &rc_ring_key,
         Arc::clone(&partition_kv),
         PartitionRingOptions::default(),
-        reg,
+        reg.map(|r| r as &dyn AsRegisterer),
     );
     let watcher_svc = Arc::clone(&watcher).into_service();
     watcher_svc
@@ -369,7 +369,7 @@ pub async fn create_test_compartments_ingester(
         &rc_ring_name,
         &rc_ring_key,
         Arc::clone(&partition_kv),
-        reg,
+        reg.map(|r| r as &dyn AsRegisterer),
     )
     .expect("create plc");
 
@@ -382,7 +382,7 @@ pub async fn create_test_compartments_ingester(
         INGEST_RING_NAME,
         INGEST_RING_KEY,
         cfg.blocks.tsdb.flush_blocks_on_shutdown,
-        reg,
+        reg.map(|r| r as &dyn AsRegisterer),
     );
 
     let ingester = Ingester::new(

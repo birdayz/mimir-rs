@@ -91,7 +91,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [oracle, twin-process, docker]
+        shard: [oracle, twin-process, docker, docker-k8s]
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -119,6 +119,7 @@ jobs:
           for f in crates/mimir-conformance/tests/*.rs; do
             name=$(basename "$f" .rs)
             case "$name" in
+              w7_k8s_helm_*testcontainers*) shard=docker-k8s ;;
               *testcontainers*) shard=docker ;;
               w4_*|w5_*) shard=twin-process ;;
               *) shard=oracle ;;
@@ -128,15 +129,18 @@ jobs:
           echo "args=${args[*]}" >> "$GITHUB_OUTPUT"
           echo "selected: ${args[*]}"
       - name: Pull container images
-        if: matrix.shard == 'docker'
-        run: docker pull "$REDPANDA_IMAGE" && docker pull "$DISTROLESS_IMAGE" && docker pull pgsty/silo:RELEASE.2026-09-03T13-18-01Z && docker pull mcr.microsoft.com/azure-storage/azurite:latest && docker pull "$SILO_IMAGE"
+        if: startsWith(matrix.shard, 'docker')
+        run: docker pull "$REDPANDA_IMAGE" && docker pull "$DISTROLESS_IMAGE" && docker pull pgsty/silo:RELEASE.2026-09-03T13-18-01Z && docker pull mcr.microsoft.com/azure-storage/azurite:latest
       - name: Build Go mimir, Go oracle and Rust mimir
         run: |
           ./scripts/build-go-oracle.sh
           cargo build --release -p mimir-cmd
           cargo test -p mimir-conformance ${{ steps.targets.outputs.args }} --no-run
       - name: Run conformance tests
-        run: cargo test -p mimir-conformance ${{ steps.targets.outputs.args }} -- --nocapture --test-threads 3
+        run: |
+          threads=3
+          [[ "${{ matrix.shard }}" == "docker-k8s" ]] && threads=1
+          cargo test -p mimir-conformance ${{ steps.targets.outputs.args }} -- --nocapture --test-threads "$threads"
       - name: Remove leftover containers
-        if: always() && matrix.shard == 'docker'
+        if: always() && startsWith(matrix.shard, 'docker')
         run: docker ps -aq --filter label=org.mimir-rs.conformance | xargs -r docker rm -f

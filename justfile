@@ -70,9 +70,15 @@ docker-build tag="mimir-rs:local":
         --sbom=false \
         --build-arg SOURCE_DATE_EPOCH=0 \
         --build-arg revision=$(git rev-parse HEAD) \
+        --build-arg BUILD_JOBS=${CARGO_BUILD_JOBS:-} \
         --load \
         -t {{tag}} \
         .
+
+# k3d + upstream mimir-distributed Helm chart e2e (see docs/k3d-helm-e2e.md).
+# MODE=go|mixed|rust, RUST_IMAGE=..., KEEP_CLUSTER=1
+k3d-e2e mode="go":
+    MODE={{mode}} ./scripts/k3d-helm-e2e.sh
 
 docker-build-repro out="target/mimir-rs-oci.tar":
     mkdir -p "$(dirname '{{out}}')"

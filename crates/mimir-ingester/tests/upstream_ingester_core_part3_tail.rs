@@ -25,7 +25,7 @@ use mimir_proto::ringpb::{Desc as RingDesc, InstanceState};
 use mimir_proto::symbols::FastSymbolsTable;
 use mimir_proto::timeseries::PreallocWriteRequest;
 use mimir_ring::kv::inmemory::InMemoryKv;
-use mimir_ring::kv::KvClient;
+use mimir_ring::kv::{AsRegisterer, KvClient};
 use mimir_ring::lifecycler::{Lifecycler, LifecyclerConfig};
 use mimir_ring::ring::replication_strategy::DefaultReplicationStrategy;
 use mimir_ring::ring::{ring_desc_codec, Ring, RingSettings};
@@ -129,7 +129,7 @@ async fn prepare_ingester_with_ring(
         "collectors/ring",
         kv.clone(),
         Arc::new(DefaultReplicationStrategy),
-        registry,
+        registry.map(|r| r as &dyn AsRegisterer),
     )
     .expect("ring");
     let rsvc = Arc::clone(&ring).into_service();
@@ -146,7 +146,7 @@ async fn prepare_ingester_with_ring(
         "ingester",
         "collectors/ring",
         blocks.tsdb.flush_blocks_on_shutdown,
-        registry,
+        registry.map(|r| r as &dyn AsRegisterer),
     );
 
     let ing = Ingester::new(

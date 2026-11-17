@@ -525,12 +525,19 @@ impl TestFlushTransferer {
     }
 }
 
-impl FlushTransferer for TestFlushTransferer {
-    fn flush(&self) {
+impl TestFlushTransferer {
+    fn record_flush(&self) {
         self.flush_called.store(true, Ordering::Release);
         if let Some(ref lc) = *self.lifecycler.lock() {
             *self.state_on_flush.lock() = Some(lc.get_state());
         }
+    }
+}
+
+impl FlushTransferer for TestFlushTransferer {
+    fn flush(&self) -> BoxFuture<'_, ()> {
+        self.record_flush();
+        Box::pin(async {})
     }
 
     fn transfer_out(&self) -> BoxFuture<'_, Result<(), LifecyclerError>> {
@@ -584,7 +591,10 @@ async fn test_lifecycler_flush_on_shutdown() {
                 let basic_cfg = BasicLifecyclerConfig::from_ring_config_tokenless(&ring_cfg, 9095)
                     .unwrap();
                 let f = Arc::clone(&flusher);
-                let flush_cb: FlushFn = Arc::new(move || f.flush());
+                let flush_cb: FlushFn = Arc::new(move || {
+                    f.record_flush();
+                    Box::pin(async {})
+                });
                 TokenlessLifecycler::new(
                     basic_cfg,
                     INGEST_RING_NAME,
@@ -949,6 +959,106 @@ async fn test_tokenless_lifecycler_removes_pre_existing_tokens() {
 
     tokenless_svc.stop_async();
     tokenless_svc.await_terminated().await.unwrap();
+    ring_svc.stop_async();
+    let _ = ring_svc.await_terminated().await;
+}
+
+/// Returns the sample count of `shutdown_duration_seconds{op, status}`.
+fn shutdown_duration_count(reg: &Registry, op: &str, status: &str) -> u64 {
+    reg.gather()
+        .iter()
+        .filter(|mf| mf.get_name() == "shutdown_duration_seconds")
+        .flat_map(|mf| mf.get_metric().iter())
+        .filter(|m| {
+            let l = m.get_label();
+            l.iter().any(|p| p.get_name() == "op" && p.get_value() == op)
+                && l.iter().any(|p| p.get_name() == "status" && p.get_value() == status)
+        })
+        .map(|m| m.get_histogram().get_sample_count())
+        .sum()
+}
+
+// The Ingester is the lifecycler's FlushTransferer (pkg/ingester/ingester.go `ring.NewLifecycler(
+// ..., i, ...)`): on shutdown the lifecycler switches to LEAVING, then calls Ingester.Flush()
+// (TransferOut is disabled), which compacts and ships the head, then unregisters.
+#[tokio::test]
+async fn test_ingester_flushes_through_lifecycler_on_shutdown() {
+    use compaction_ring_helpers::{
+        default_ingester_test_config, prepare_ingester_with_blocks_storage,
+        push_series_to_ingester, start_and_wait_healthy,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = default_ingester_test_config(tmp.path());
+    cfg.blocks.tsdb.flush_blocks_on_shutdown = true;
+    cfg.blocks.tsdb.ship_interval = GoDuration::from_secs(3600);
+    let bucket_dir = tmp.path().join("bucket");
+    let ring_kv = Arc::clone(&cfg.ring_kv);
+    let reg = Registry::new();
+    let (ing, ring, ring_svc) = prepare_ingester_with_blocks_storage(cfg, None, Some(&reg)).await;
+    start_and_wait_healthy(&ing, &ring).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    push_series_to_ingester(&ing, "user-1", &[(&[("__name__", "test_metric")], &[(now, 1.0)])])
+        .await
+        .unwrap();
+
+    ing.stop().await.unwrap();
+
+    assert_eq!(shutdown_duration_count(&reg, "flush", "success"), 1);
+    assert_eq!(shutdown_duration_count(&reg, "transfer", "success"), 0);
+    assert_eq!(shutdown_duration_count(&reg, "transfer", "fail"), 0);
+
+    // The head was compacted and shipped to the bucket by the lifecycler-driven flush.
+    let user_bucket = bucket_dir.join("user-1");
+    let shipped: Vec<_> = std::fs::read_dir(&user_bucket)
+        .map(|rd| rd.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(!shipped.is_empty(), "no block shipped to {}", user_bucket.display());
+
+    // unregister_on_shutdown defaults to true: the instance left the ring after the flush.
+    assert!(get_instance_state_in_ring(ring_kv.as_ref(), INGEST_RING_KEY, "localhost")
+        .await
+        .is_none());
+
+    ring_svc.stop_async();
+    let _ = ring_svc.await_terminated().await;
+}
+
+// Go: `ingesterRunning` returns `ingester subservice failed: ...` when a watched subservice
+// (lifecycler, compaction, ...) fails; the ingester then stops and ends Failed, which makes the
+// module manager stop the whole process. In Rust a panicking subservice loop counts as failed.
+#[tokio::test]
+async fn test_ingester_subservice_failure_fails_the_ingester() {
+    use compaction_ring_helpers::{
+        default_ingester_test_config, prepare_ingester_with_blocks_storage, start_and_wait_healthy,
+    };
+    use mimir_common::services::State;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = default_ingester_test_config(tmp.path());
+    let (ing, ring, ring_svc) = prepare_ingester_with_blocks_storage(cfg, None, None).await;
+    start_and_wait_healthy(&ing, &ring).await;
+    assert!(ing.subservice_failure().is_none());
+
+    let h = ing.watch_subservice_task(
+        "test-subservice",
+        tokio::spawn(async { panic!("boom") }),
+    );
+    let err = tokio::time::timeout(Duration::from_secs(5), ing.wait_subservice_failure())
+        .await
+        .expect("subservice failure reported");
+    assert!(err.starts_with("ingester subservice failed: "), "{err}");
+    assert!(err.contains("test-subservice") && err.contains("boom"), "{err}");
+    let _ = h.await;
+
+    let res = ing.stop().await;
+    assert!(res.is_err(), "stop must report the failure");
+    assert_eq!(ing.state(), State::Failed);
+
     ring_svc.stop_async();
     let _ = ring_svc.await_terminated().await;
 }
