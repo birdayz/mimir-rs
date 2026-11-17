@@ -80,7 +80,7 @@ impl ActivityTracker {
         }
 
         // Load unfinished entries from any previous run before truncating.
-        let prev_entries = load_unfinished_entries(&cfg.filepath).unwrap_or_default();
+        let (prev_entries, _) = load_unfinished_entries_partial(&cfg.filepath);
 
         let filesize = cfg.max_entries * ENTRY_SIZE;
         let file = open_and_truncate(&cfg.filepath, filesize)?;
@@ -310,12 +310,16 @@ fn open_and_truncate(path: &Path, filesize: usize) -> io::Result<File> {
     Ok(file)
 }
 
-/// Loads unfinished activity entries from an existing activity tracker file.
-pub fn load_unfinished_entries(path: impl AsRef<Path>) -> io::Result<Vec<ActivityEntry>> {
+/// Loads unfinished activity entries from an existing activity tracker file, returning both
+/// any complete entries read so far and any trailing read/truncation error (matching Go
+/// `LoadUnfinishedEntries` returning `(results, err)`).
+pub fn load_unfinished_entries_partial(
+    path: impl AsRef<Path>,
+) -> (Vec<ActivityEntry>, Option<io::Error>) {
     let mut file = match File::open(path.as_ref()) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(e) => return (Vec::new(), Some(e)),
     };
 
     let mut results = Vec::new();
@@ -323,20 +327,23 @@ pub fn load_unfinished_entries(path: impl AsRef<Path>) -> io::Result<Vec<Activit
     loop {
         let mut read_total = 0;
         while read_total < ENTRY_SIZE {
-            let n = file.read(&mut buf[read_total..])?;
-            if n == 0 {
-                break;
+            match file.read(&mut buf[read_total..]) {
+                Ok(0) => break,
+                Ok(n) => read_total += n,
+                Err(e) => return (results, Some(e)),
             }
-            read_total += n;
         }
         if read_total == 0 {
             break;
         }
         if read_total < ENTRY_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated activity tracker entry",
-            ));
+            return (
+                results,
+                Some(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated activity tracker entry",
+                )),
+            );
         }
         if buf == EMPTY_ENTRY {
             continue;
@@ -357,7 +364,16 @@ pub fn load_unfinished_entries(path: impl AsRef<Path>) -> io::Result<Vec<Activit
         });
     }
 
-    Ok(results)
+    (results, None)
+}
+
+/// Loads unfinished activity entries from an existing activity tracker file.
+pub fn load_unfinished_entries(path: impl AsRef<Path>) -> io::Result<Vec<ActivityEntry>> {
+    let (entries, err) = load_unfinished_entries_partial(path);
+    match err {
+        Some(e) => Err(e),
+        None => Ok(entries),
+    }
 }
 
 #[cfg(test)]

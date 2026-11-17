@@ -12,12 +12,12 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::duration::ModelDuration;
+use crate::duration::{GoDuration, ModelDuration};
 use crate::error::ConfigError;
 use crate::flags::FlagSet;
 use crate::types::{
-    LabelValueLengthOverLimitStrategy, LimitsMap, NameValidationScheme, OTelTranslationStrategy,
-    StringSliceCSV,
+    parse_go_yaml_timestamp, CIDRSliceCSV, LabelValueLengthOverLimitStrategy, LimitsMap,
+    NameValidationScheme, OTelTranslationStrategy, StringSliceCSV,
 };
 
 pub const MIN_COMPACTOR_PARTIAL_BLOCK_DELETION_DELAY_NANOS: i64 = 4 * 3600 * 1_000_000_000;
@@ -43,12 +43,14 @@ pub struct BlockedQuery {
 #[serde(default, deny_unknown_fields)]
 pub struct LimitedQuery {
     pub query: String,
-    pub allowed_frequency: String,
+    pub allowed_frequency: GoDuration,
     pub reason: String,
     pub id: String,
     pub note: String,
     pub created_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 }
 
@@ -217,7 +219,7 @@ pub struct LimitsConfig {
     pub enforce_metadata_metric_name: bool,
     pub ingestion_tenant_shard_size: i64,
     // Go `yaml:"...,omitempty"` (also for the other `skip_serializing_if` fields below).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "deserialize_metric_relabel_configs")]
     pub metric_relabel_configs: Vec<MetricRelabelConfig>,
     pub ingestion_artificial_delay: ModelDuration,
 
@@ -345,7 +347,7 @@ pub struct LimitsConfig {
     pub s3_sse_kms_encryption_context: String,
 
     // Alertmanager.
-    pub alertmanager_receivers_firewall_block_cidr_networks: StringSliceCSV,
+    pub alertmanager_receivers_firewall_block_cidr_networks: CIDRSliceCSV,
     pub alertmanager_receivers_firewall_block_private_addresses: bool,
     pub alertmanager_notification_rate_limit: f64,
     pub alertmanager_notification_rate_limit_per_integration: LimitsMap<f64>,
@@ -526,7 +528,7 @@ impl Default for LimitsConfig {
             s3_sse_kms_key_id: String::new(),
             s3_sse_kms_encryption_context: String::new(),
 
-            alertmanager_receivers_firewall_block_cidr_networks: StringSliceCSV::default(),
+            alertmanager_receivers_firewall_block_cidr_networks: CIDRSliceCSV::default(),
             alertmanager_receivers_firewall_block_private_addresses: false,
             alertmanager_notification_rate_limit: 0.0,
             alertmanager_notification_rate_limit_per_integration: LimitsMap::new(),
@@ -813,10 +815,10 @@ impl LimitsConfig {
         f.i64_var("store-gateway.tenant-shard-size-per-zone", self.store_gateway_tenant_shard_size_per_zone, "The tenant's shard size per availability zone.", move |t| &get(t).store_gateway_tenant_shard_size_per_zone, move |t| &mut get_mut(t).store_gateway_tenant_shard_size_per_zone);
 
         // Alertmanager
-        f.string_slice_csv_var("alertmanager.receivers-firewall-block-cidr-networks", &self.alertmanager_receivers_firewall_block_cidr_networks, "Comma-separated list of network CIDRs to block in Alertmanager receiver integrations.", move |t| &get(t).alertmanager_receivers_firewall_block_cidr_networks, move |t| &mut get_mut(t).alertmanager_receivers_firewall_block_cidr_networks);
+        f.cidr_slice_csv_var("alertmanager.receivers-firewall-block-cidr-networks", &self.alertmanager_receivers_firewall_block_cidr_networks, "Comma-separated list of network CIDRs to block in Alertmanager receiver integrations.", move |t| &get(t).alertmanager_receivers_firewall_block_cidr_networks, move |t| &mut get_mut(t).alertmanager_receivers_firewall_block_cidr_networks);
         f.bool_var("alertmanager.receivers-firewall-block-private-addresses", self.alertmanager_receivers_firewall_block_private_addresses, "True to block private and local addresses in Alertmanager receiver integrations.", move |t| &get(t).alertmanager_receivers_firewall_block_private_addresses, move |t| &mut get_mut(t).alertmanager_receivers_firewall_block_private_addresses);
         f.f64_var("alertmanager.notification-rate-limit", self.alertmanager_notification_rate_limit, "Per-tenant rate limit for sending notifications from Alertmanager.", move |t| &get(t).alertmanager_notification_rate_limit, move |t| &mut get_mut(t).alertmanager_notification_rate_limit);
-        f.limits_map_var("alertmanager.notification-rate-limit-per-integration", &self.alertmanager_notification_rate_limit_per_integration, "Per-integration notification rate limits.", move |t| &get(t).alertmanager_notification_rate_limit_per_integration, move |t| &mut get_mut(t).alertmanager_notification_rate_limit_per_integration);
+        f.limits_map_var_validated("alertmanager.notification-rate-limit-per-integration", &self.alertmanager_notification_rate_limit_per_integration, "Per-integration notification rate limits.", validate_integration_limit, move |t| &get(t).alertmanager_notification_rate_limit_per_integration, move |t| &mut get_mut(t).alertmanager_notification_rate_limit_per_integration);
         f.i64_var("alertmanager.max-config-size-bytes", self.alertmanager_max_config_size_bytes, "Maximum size of the Alertmanager configuration for a tenant.", move |t| &get(t).alertmanager_max_config_size_bytes, move |t| &mut get_mut(t).alertmanager_max_config_size_bytes);
         f.i64_var("alertmanager.max-silences-count", self.alertmanager_max_silences_count, "Maximum number of silences that a tenant can have at once.", move |t| &get(t).alertmanager_max_silences_count, move |t| &mut get_mut(t).alertmanager_max_silences_count);
         f.i64_var("alertmanager.max-silence-size-bytes", self.alertmanager_max_silence_size_bytes, "Maximum silence size in bytes.", move |t| &get(t).alertmanager_max_silence_size_bytes, move |t| &mut get_mut(t).alertmanager_max_silence_size_bytes);
@@ -843,7 +845,7 @@ impl LimitsConfig {
 
         let otel_suffixes = self.otel_metric_suffixes_enabled.unwrap_or(false);
         match self.otel_translation_strategy.0.as_str() {
-            "underscore_escaping_without_suffixes" => {
+            "UnderscoreEscapingWithoutSuffixes" => {
                 if validation_scheme != NameValidationScheme::Legacy {
                     return Err(ConfigError::Validation(format!(
                         "OTLP translation strategy {} is not allowed unless validation scheme is legacy",
@@ -857,7 +859,7 @@ impl LimitsConfig {
                     )));
                 }
             }
-            "underscore_escaping_with_suffixes" => {
+            "UnderscoreEscapingWithSuffixes" => {
                 if validation_scheme != NameValidationScheme::Legacy {
                     return Err(ConfigError::Validation(format!(
                         "OTLP translation strategy {} is not allowed unless validation scheme is legacy",
@@ -871,7 +873,7 @@ impl LimitsConfig {
                     )));
                 }
             }
-            "no_utf8_escaping_with_suffixes" => {
+            "NoUTF8EscapingWithSuffixes" => {
                 if validation_scheme != NameValidationScheme::Utf8 {
                     return Err(ConfigError::Validation(format!(
                         "OTLP translation strategy {} is not allowed unless validation scheme is utf8",
@@ -885,7 +887,7 @@ impl LimitsConfig {
                     )));
                 }
             }
-            "no_translation" => {
+            "NoTranslation" => {
                 if validation_scheme != NameValidationScheme::Utf8 {
                     return Err(ConfigError::Validation(format!(
                         "OTLP translation strategy {} is not allowed unless validation scheme is utf8",
@@ -977,12 +979,22 @@ impl LimitsConfig {
             )));
         }
 
-        if !self.cost_attribution_labels_structured.is_empty()
-            && !self.cost_attribution_trackers.is_empty()
-        {
-            return Err(ConfigError::Validation(
-                "cost_attribution_labels_structured and cost_attribution_trackers are mutually exclusive; use cost_attribution_trackers only".to_string(),
-            ));
+        if !self.cost_attribution_labels_structured.is_empty() {
+            if !self.cost_attribution_trackers.is_empty() {
+                return Err(ConfigError::Validation(
+                    "cost_attribution_labels_structured and cost_attribution_trackers are mutually exclusive; use cost_attribution_trackers only".to_string(),
+                ));
+            }
+            self.cost_attribution_trackers.insert(
+                "cost-attribution".to_string(),
+                CostAttributionTrackerConfig {
+                    labels: std::mem::take(&mut self.cost_attribution_labels_structured),
+                    internal: false,
+                },
+            );
+        }
+        for (k, v) in &self.alertmanager_notification_rate_limit_per_integration {
+            validate_integration_limit(k, v)?;
         }
         if let Some(v) = CUSTOM_TRACKERS_VALIDATOR.get() {
             v(&self.active_series_custom_trackers).map_err(ConfigError::Validation)?;
@@ -990,6 +1002,12 @@ impl LimitsConfig {
         }
         validate_cost_attribution_trackers(&self.cost_attribution_trackers)?;
         validate_cost_attribution_trackers(&self.additional_cost_attribution_trackers)?;
+        for cfg in self.cost_attribution_trackers.values_mut() {
+            cfg.labels.sort_by(|a, b| a.input.cmp(&b.input));
+        }
+        for cfg in self.additional_cost_attribution_trackers.values_mut() {
+            cfg.labels.sort_by(|a, b| a.input.cmp(&b.input));
+        }
 
         if self.early_head_compaction_min_estimated_series_reduction_percentage < 0
             || self.early_head_compaction_min_estimated_series_reduction_percentage > 100
@@ -1015,6 +1033,28 @@ impl LimitsConfig {
                 return Err(ConfigError::Validation(format!(
                     "blocked_queries[{i}]: pattern is required"
                 )));
+            }
+            if q.regex {
+                if let Err(e) = regex::Regex::new(&q.pattern) {
+                    return Err(ConfigError::Validation(format!(
+                        "blocked_queries[{i}]: invalid regex pattern {:?}: {e}",
+                        q.pattern
+                    )));
+                }
+            }
+            if let Some(ts) = q.created_at.as_deref() {
+                parse_go_yaml_timestamp(ts)?;
+            }
+            if let Some(ts) = q.expires_at.as_deref() {
+                parse_go_yaml_timestamp(ts)?;
+            }
+        }
+        for q in &self.limited_queries {
+            if let Some(ts) = q.created_at.as_deref() {
+                parse_go_yaml_timestamp(ts)?;
+            }
+            if let Some(ts) = q.expires_at.as_deref() {
+                parse_go_yaml_timestamp(ts)?;
             }
         }
 
@@ -1110,6 +1150,54 @@ pub(crate) fn validate_custom_trackers_yaml(l: &LimitsConfig) -> Result<(), Conf
         v(&l.active_series_additional_custom_trackers).map_err(ConfigError::Yaml)?;
     }
     Ok(())
+}
+
+const ALLOWED_INTEGRATION_NAMES: &[&str] = &[
+    "webhook", "email", "pagerduty", "opsgenie", "wechat", "slack", "victorops",
+    "pushover", "sns", "webex", "telegram", "discord", "msteams", "msteamsv2", "jira",
+];
+
+pub(crate) fn validate_integration_limit(k: &str, _v: &f64) -> Result<(), ConfigError> {
+    if !ALLOWED_INTEGRATION_NAMES.contains(&k) {
+        return Err(ConfigError::Flag(format!("unknown integration name: {k}")));
+    }
+    Ok(())
+}
+
+fn deserialize_metric_relabel_configs<'de, D>(
+    deserializer: D,
+) -> Result<Vec<MetricRelabelConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items: Vec<Option<MetricRelabelConfig>> = serde::Deserialize::deserialize(deserializer)?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(cfg) = item else {
+            return Err(serde::de::Error::custom("invalid metric_relabel_configs"));
+        };
+        if let Some(action) = cfg.action.as_deref() {
+            let lower = action.to_ascii_lowercase();
+            if !matches!(
+                lower.as_str(),
+                "replace" | "keep" | "drop" | "hashmod" | "labelmap" | "labeldrop" | "labelkeep"
+                    | "lowercase" | "uppercase" | "keepequal" | "dropequal"
+            ) {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown relabel action {action:?}"
+                )));
+            }
+        }
+        if let Some(re) = cfg.regex.as_deref() {
+            if let Err(e) = regex::Regex::new(re) {
+                return Err(serde::de::Error::custom(format!(
+                    "invalid relabel regex {re:?}: {e}"
+                )));
+            }
+        }
+        out.push(cfg);
+    }
+    Ok(out)
 }
 
 fn next_power_of_two(n: i64) -> i64 {

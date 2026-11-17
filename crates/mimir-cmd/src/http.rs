@@ -4,19 +4,21 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use axum::extract::{Path as AxumPath, Query, RawQuery, State as AxumState};
+use axum::extract::{Path as AxumPath, RawQuery, State as AxumState};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use mimir_common::services::State;
-use mimir_common::tenant::extract_tenant_id_from_http_headers;
+use mimir_common::tenant::{
+    extract_org_id_bytes_from_http_headers, parse_single_tenant_id_bytes, parse_tenant_ids_bytes,
+};
 use mimir_config::{yaml_v3_emit, LimitsConfig, MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::{ingester_router, Ingester};
 use mimir_ring::kv::memberlist::gofmt::{format_go_time_string, format_rfc3339_nano};
 use mimir_ring::kv::memberlist::{http_status, MemberlistKv};
 use prometheus::Registry;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_yaml::{Mapping, Value};
 
 use crate::cli::{diff_yaml_values, effective_config_yaml, marshal_config_yaml};
@@ -68,13 +70,19 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         .route("/ready", any(ready_handler))
         .route("/services", get(services_handler))
         .route("/config", get(config_handler))
-        .route("/runtime_config", get(runtime_config_handler))
-        .route("/api/v1/user_limits", get(user_limits_handler))
         .route("/api/v1/status/buildinfo", get(buildinfo_handler))
         .route("/api/v1/status/config", get(status_config_handler))
         .route("/api/v1/status/flags", get(status_flags_handler))
         .route("/static/", get(static_dir_handler))
         .route("/static/*path", get(static_file_handler));
+
+    // Go `initRuntimeConfig` only registers /runtime_config and /api/v1/user_limits when
+    // -runtime-config.file is configured (`pkg/mimir/modules.go:460-475`).
+    if state.runtime_config.is_some() {
+        router = router
+            .route("/runtime_config", get(runtime_config_handler))
+            .route("/api/v1/user_limits", get(user_limits_handler));
+    }
 
     // dskit `registerInstrumentation` registers `/debug/pprof/cmdline` (NotFound) and
     // `PathPrefix("/debug/pprof").Handler(http.DefaultServeMux)`. Because `DefaultServeMux`
@@ -116,13 +124,15 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     if has_memberlist {
         router = router.route("/memberlist", get(memberlist_handler));
     }
+    let mut cost_attribution_path: Option<String> = None;
     if let Some((path, reg)) = state.cost_attribution_registry.clone() {
         let path = if path.starts_with('/') { path } else { format!("/{path}") };
+        cost_attribution_path = Some(path.clone());
         router = router.route(
             &path,
-            any(move |headers: HeaderMap| {
+            get(move |headers: HeaderMap| {
                 let reg = reg.clone();
-                async move { encode_families(&reg.gather(), &headers) }
+                async move { encode_families(&reg.gather(), &headers, false, None) }
             }),
         );
     }
@@ -137,9 +147,10 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     // pkg/api/api.go newRoute: `gziphandler.GzipHandler` on every gzip-enabled route.
     let gzip = crate::server::gzip::GzipConfig {
         level: state_for_root.config.api_response_compression_level().unwrap_or(-1),
+        cost_attribution_path,
     };
     app = app
-        .route_layer(axum::middleware::from_fn_with_state(gzip, crate::server::gzip::gzip_handler))
+        .route_layer(axum::middleware::from_fn_with_state(gzip.clone(), crate::server::gzip::gzip_handler))
         // gorilla/mux answers a known path with an unsupported method with an empty 405 and
         // reports it as an unmatched route.
         .method_not_allowed_fallback(crate::server::http_middleware::method_not_allowed)
@@ -248,16 +259,32 @@ async fn metrics_handler(
     cache: Arc<MetricsCache>,
 ) -> Response {
     let families = cache.gather(&st.registry);
-    encode_families(&families, &headers)
+    let created = st
+        .config
+        .server
+        .enable_open_metrics_text_created_samples
+        .then_some(cache.as_ref());
+    encode_families(&families, &headers, true, created)
 }
 
 fn encode_families(
     families: &[prometheus::proto::MetricFamily],
     headers: &HeaderMap,
+    enable_open_metrics: bool,
+    created_tracker: Option<&MetricsCache>,
 ) -> Response {
     let header_str = |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
-    let format = crate::expfmt::negotiate(header_str(header::ACCEPT));
-    let body = match crate::expfmt::encode(families, &format) {
+    let format = crate::expfmt::negotiate_with_options(header_str(header::ACCEPT), enable_open_metrics);
+    let encoded = if format.kind == crate::expfmt::FormatType::OpenMetrics {
+        if let Some(cache) = created_tracker {
+            Ok(encode_openmetrics_with_created(families, cache))
+        } else {
+            crate::expfmt::encode(families, &format)
+        }
+    } else {
+        crate::expfmt::encode(families, &format)
+    };
+    let body = match encoded {
         Ok(b) => b,
         Err(err) => {
             return (
@@ -301,6 +328,7 @@ pub(crate) fn gzip_bytes(data: &[u8]) -> Vec<u8> {
 pub struct MetricsCache {
     duration: std::time::Duration,
     cached: parking_lot::Mutex<Option<(std::time::Instant, Arc<Vec<prometheus::proto::MetricFamily>>)>>,
+    created_timestamps: parking_lot::Mutex<std::collections::HashMap<String, f64>>,
 }
 
 impl MetricsCache {
@@ -308,7 +336,13 @@ impl MetricsCache {
         Self {
             duration,
             cached: parking_lot::Mutex::new(None),
+            created_timestamps: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn created_ts(&self, key: &str, now_secs: f64) -> f64 {
+        let mut map = self.created_timestamps.lock();
+        *map.entry(key.to_string()).or_insert(now_secs)
     }
 
     fn gather(&self, registry: &Registry) -> Arc<Vec<prometheus::proto::MetricFamily>> {
@@ -378,18 +412,48 @@ async fn services_handler(AxumState(st): AxumState<AppHttpState>, headers: Heade
     Html(html).into_response()
 }
 
-#[derive(Deserialize)]
-struct ConfigModeQuery {
-    mode: Option<String>,
+fn decode_query_component(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// First `mode` query parameter (`r.URL.Query().Get("mode")`), tolerating duplicates.
+fn extract_mode_query(raw: Option<&str>) -> Option<String> {
+    raw?
+        .split(['&', ';'])
+        .filter(|p| !p.is_empty())
+        .filter_map(|kv| kv.split_once('=').or(Some((kv, ""))))
+        .find(|(k, _)| decode_query_component(k) == "mode")
+        .map(|(_, v)| decode_query_component(v))
 }
 
 async fn config_handler(
     AxumState(st): AxumState<AppHttpState>,
-    Query(q): Query<ConfigModeQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
+    let mode = extract_mode_query(raw_query.as_deref());
     // Go `ConfigHandler` + `util.WriteYAMLResponse` (yaml.v3 `Marshal`): the config structs keep
     // their field order, the diff is a `map[string]interface{}` and therefore sorted.
-    let yaml = match q.mode.as_deref() {
+    let yaml = match mode.as_deref() {
         Some("diff") => {
             let def = effective_config_yaml(&st.default_config);
             let act = effective_config_yaml(&st.config);
@@ -413,8 +477,9 @@ async fn config_handler(
 
 async fn runtime_config_handler(
     AxumState(st): AxumState<AppHttpState>,
-    Query(q): Query<ConfigModeQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
+    let mode = extract_mode_query(raw_query.as_deref());
     let Some(ref mgr) = st.runtime_config else {
         return (
             StatusCode::OK,
@@ -429,7 +494,7 @@ async fn runtime_config_handler(
 
     // Go `runtimeConfigHandler`: the `runtimeConfigValues` struct, or the
     // `map[string]interface{}` returned by `util.DiffConfig` (sorted) in diff mode.
-    let yaml = match q.mode.as_deref() {
+    let yaml = match mode.as_deref() {
         Some("diff") => {
             let mut default_overrides = Mapping::new();
             let default_limit_val =
@@ -562,17 +627,58 @@ impl From<&LimitsConfig> for UserLimitsResponse {
     }
 }
 
+fn go_http_error(status: StatusCode, msg: &str) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        format!("{msg}\n"),
+    )
+        .into_response()
+}
+
 async fn user_limits_handler(
     AxumState(st): AxumState<AppHttpState>,
     headers: HeaderMap,
 ) -> Response {
-    let user_id = if st.config.multitenancy_enabled {
-        match extract_tenant_id_from_http_headers(&headers) {
-            Ok(id) => id,
-            Err(err) => return (StatusCode::UNAUTHORIZED, err.to_string()).into_response(),
+    let org_bytes: &[u8] = if st.config.multitenancy_enabled {
+        match extract_org_id_bytes_from_http_headers(&headers) {
+            Ok(b) => b,
+            Err(err) => return go_http_error(StatusCode::UNAUTHORIZED, &err.to_string()),
         }
     } else {
-        st.config.no_auth_tenant.clone()
+        st.config.no_auth_tenant.as_bytes()
+    };
+
+    let ids = match parse_tenant_ids_bytes(org_bytes) {
+        Ok(ids) => ids,
+        Err(err) => return go_http_error(StatusCode::UNAUTHORIZED, &err.to_string()),
+    };
+    let (federation, max_tenants) = st.config.tenant_federation_config();
+    if !federation && ids.len() > 1 {
+        return go_http_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!(
+                "too many tenant IDs present in the request. max: 1 actual: {}",
+                ids.len()
+            ),
+        );
+    }
+    if federation && max_tenants > 0 && ids.len() > max_tenants as usize {
+        return go_http_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!(
+                "too many tenant IDs present in the request. max: {max_tenants} actual: {}",
+                ids.len()
+            ),
+        );
+    }
+
+    let user_id = match parse_single_tenant_id_bytes(org_bytes) {
+        Ok(id) => id,
+        Err(err) => return go_http_error(StatusCode::UNAUTHORIZED, &err.to_string()),
     };
 
     let limits = st.overrides.for_tenant(&user_id);
@@ -934,6 +1040,175 @@ async fn static_file_handler(AxumPath(path): AxumPath<String>) -> Response {
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(ct));
     resp
+}
+
+fn encode_openmetrics_with_created(
+    families: &[prometheus::proto::MetricFamily],
+    cache: &MetricsCache,
+) -> Vec<u8> {
+    use std::io::Write as _;
+    use prometheus::proto::MetricType;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let om_float = |f: f64| -> String {
+        if f == 1.0 {
+            "1.0".to_string()
+        } else if f == 0.0 {
+            "0.0".to_string()
+        } else if f == -1.0 {
+            "-1.0".to_string()
+        } else if f.is_nan() || f.is_infinite() {
+            crate::expfmt::format_go_float_g(f)
+        } else {
+            let mut s = crate::expfmt::format_go_float_g(f);
+            if !s.contains('e') && !s.contains('.') {
+                s.push_str(".0");
+            }
+            s
+        }
+    };
+    let escape = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '"' => out.push_str("\\\""),
+                _ => out.push(c),
+            }
+        }
+        out
+    };
+    let write_name_labels = |
+        out: &mut Vec<u8>,
+        name: &str,
+        labels: &[&prometheus::proto::LabelPair],
+        extra: Option<(&str, &str)>,
+    | {
+        out.extend_from_slice(name.as_bytes());
+        if labels.is_empty() && extra.is_none() {
+            return;
+        }
+        let mut sep = b'{';
+        for lp in labels {
+            out.push(sep);
+            out.extend_from_slice(lp.get_name().as_bytes());
+            out.extend_from_slice(b"=\"");
+            out.extend_from_slice(escape(lp.get_value()).as_bytes());
+            out.push(b'"');
+            sep = b',';
+        }
+        if let Some((k, v)) = extra {
+            out.push(sep);
+            out.extend_from_slice(k.as_bytes());
+            out.extend_from_slice(b"=\"");
+            out.extend_from_slice(v.as_bytes());
+            out.push(b'"');
+        }
+        out.push(b'}');
+    };
+
+    let mut out = Vec::with_capacity(64 * 1024);
+    for mf in families {
+        let name = mf.get_name();
+        if mf.get_metric().is_empty() {
+            continue;
+        }
+        let typ = mf.get_field_type();
+        let mut compliant = name.to_string();
+        if typ == MetricType::COUNTER && name.ends_with("_total") {
+            compliant.truncate(name.len() - 6);
+        }
+        out.extend_from_slice(b"# HELP ");
+        out.extend_from_slice(compliant.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(escape(mf.get_help()).as_bytes());
+        out.push(b'\n');
+        let t = match typ {
+            MetricType::COUNTER if name.ends_with("_total") => "counter",
+            MetricType::COUNTER | MetricType::UNTYPED => "unknown",
+            MetricType::GAUGE => "gauge",
+            MetricType::SUMMARY => "summary",
+            MetricType::HISTOGRAM => "histogram",
+        };
+        let _ = writeln!(out, "# TYPE {compliant} {t}");
+        let sample_name = if typ == MetricType::COUNTER && name.ends_with("_total") {
+            format!("{compliant}_total")
+        } else {
+            compliant.clone()
+        };
+        for m in mf.get_metric() {
+            let mut labels: Vec<&prometheus::proto::LabelPair> = m.get_label().iter().collect();
+            labels.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+            let ts = m.has_timestamp_ms().then(|| m.get_timestamp_ms());
+            let mut key_buf = Vec::new();
+            write_name_labels(&mut key_buf, &compliant, &labels, None);
+            let series_key = String::from_utf8_lossy(&key_buf).into_owned();
+            let emit_sample = |out: &mut Vec<u8>, sname: &str, extra: Option<(&str, &str)>, val: &str| {
+                write_name_labels(out, sname, &labels, extra);
+                out.push(b' ');
+                out.extend_from_slice(val.as_bytes());
+                if let Some(ts) = ts {
+                    out.push(b' ');
+                    out.extend_from_slice(om_float(ts as f64 / 1000.0).as_bytes());
+                }
+                out.push(b'\n');
+            };
+            let emit_created = |out: &mut Vec<u8>| {
+                let created = cache.created_ts(&series_key, now_secs);
+                write_name_labels(out, &format!("{compliant}_created"), &labels, None);
+                out.push(b' ');
+                out.extend_from_slice(om_float(created).as_bytes());
+                out.push(b'\n');
+            };
+            match typ {
+                MetricType::COUNTER => {
+                    emit_sample(&mut out, &sample_name, None, &om_float(m.get_counter().get_value()));
+                    emit_created(&mut out);
+                }
+                MetricType::GAUGE => {
+                    emit_sample(&mut out, &sample_name, None, &om_float(m.get_gauge().get_value()));
+                }
+                MetricType::UNTYPED => {
+                    emit_sample(&mut out, &sample_name, None, &om_float(m.get_untyped().get_value()));
+                }
+                MetricType::SUMMARY => {
+                    let s = m.get_summary();
+                    for q in s.get_quantile() {
+                        let qv = om_float(q.get_quantile());
+                        emit_sample(&mut out, &sample_name, Some(("quantile", &qv)), &om_float(q.get_value()));
+                    }
+                    emit_sample(&mut out, &format!("{sample_name}_sum"), None, &om_float(s.get_sample_sum()));
+                    emit_sample(&mut out, &format!("{sample_name}_count"), None, &s.get_sample_count().to_string());
+                    emit_created(&mut out);
+                }
+                MetricType::HISTOGRAM => {
+                    let h = m.get_histogram();
+                    let bucket_name = format!("{sample_name}_bucket");
+                    let mut inf_seen = false;
+                    for b in h.get_bucket() {
+                        let le = om_float(b.get_upper_bound());
+                        emit_sample(&mut out, &bucket_name, Some(("le", &le)), &b.get_cumulative_count().to_string());
+                        if b.get_upper_bound().is_infinite() && b.get_upper_bound() > 0.0 {
+                            inf_seen = true;
+                        }
+                    }
+                    if !inf_seen {
+                        emit_sample(&mut out, &bucket_name, Some(("le", "+Inf")), &h.get_sample_count().to_string());
+                    }
+                    emit_sample(&mut out, &format!("{sample_name}_sum"), None, &om_float(h.get_sample_sum()));
+                    emit_sample(&mut out, &format!("{sample_name}_count"), None, &h.get_sample_count().to_string());
+                    emit_created(&mut out);
+                }
+            }
+        }
+    }
+    out.extend_from_slice(b"# EOF\n");
+    out
 }
 
 fn html_escape(s: &str) -> String {
