@@ -184,14 +184,20 @@ async fn decompress_custom_grpc_request(
         if let Ok(data) = frame.into_data() {
             if raw_body.len().saturating_add(data.len()) > max_decode_len.saturating_add(5) {
                 return Err(Status::resource_exhausted(format!(
-                    "compressed gRPC message exceeds max decoding size {max_decode_len}"
+                    "grpc: received message larger than max ({} vs. {max_decode_len})",
+                    raw_body.len().saturating_add(data.len()).saturating_sub(5)
                 )));
             }
             raw_body.extend_from_slice(&data);
         }
     }
 
-    let mut out = Vec::with_capacity(raw_body.len().saturating_mul(2));
+    let mut out = Vec::with_capacity(
+        raw_body
+            .len()
+            .saturating_mul(2)
+            .min(max_decode_len.saturating_add(5)),
+    );
     let mut pos = 0usize;
     let slice = &raw_body[..];
     while pos < slice.len() {
@@ -206,16 +212,19 @@ async fn decompress_custom_grpc_request(
             slice[pos + 4],
         ]) as usize;
         pos += 5;
-        let payload = slice.get(pos..pos + len).ok_or_else(|| {
-            Status::internal("truncated gRPC compressed frame payload")
-        })?;
-        pos += len;
+        let end = pos
+            .checked_add(len)
+            .ok_or_else(|| Status::internal("gRPC compressed frame length overflow"))?;
+        let payload = slice
+            .get(pos..end)
+            .ok_or_else(|| Status::internal("truncated gRPC compressed frame payload"))?;
+        pos = end;
 
         match flag {
             0 => {
                 if len > max_decode_len {
                     return Err(Status::resource_exhausted(format!(
-                        "gRPC message size {len} exceeds max decoding size {max_decode_len}"
+                        "grpc: received message larger than max ({len} vs. {max_decode_len})"
                     )));
                 }
                 out.push(0);
@@ -225,11 +234,25 @@ async fn decompress_custom_grpc_request(
             1 => {
                 let hdr_pos = out.len();
                 out.extend_from_slice(&[0u8; 5]);
+                let map_decomp_err = |codec: &str, e: std::io::Error| -> Status {
+                    if e.get_ref()
+                        .is_some_and(|r| r.is::<mimir_proto::snappy::DecompressLimitExceeded>())
+                    {
+                        Status::resource_exhausted(format!(
+                            "grpc: received message after decompression larger than max {max_decode_len}"
+                        ))
+                    } else {
+                        Status::internal(format!("{codec} decompression failed: {e}"))
+                    }
+                };
                 match encoding {
                     CustomGrpcEncoding::Snappy => {
-                        mimir_proto::snappy::decompress_framed_into(payload, &mut out).map_err(
-                            |e| Status::internal(format!("snappy decompression failed: {e}")),
-                        )?;
+                        mimir_proto::snappy::decompress_framed_bounded_into(
+                            payload,
+                            &mut out,
+                            max_decode_len,
+                        )
+                        .map_err(|e| map_decomp_err("snappy", e))?;
                     }
                     CustomGrpcEncoding::S2 => {
                         mimir_proto::s2::decompress_framed_into(
@@ -237,13 +260,13 @@ async fn decompress_custom_grpc_request(
                             &mut out,
                             max_decode_len,
                         )
-                        .map_err(|e| Status::internal(format!("s2 decompression failed: {e}")))?;
+                        .map_err(|e| map_decomp_err("s2", e))?;
                     }
                 }
                 let dec_len = out.len() - (hdr_pos + 5);
                 if dec_len > max_decode_len {
                     return Err(Status::resource_exhausted(format!(
-                        "decompressed gRPC message size {dec_len} exceeds max decoding size {max_decode_len}"
+                        "grpc: received message after decompression larger than max {max_decode_len}"
                     )));
                 }
                 out[hdr_pos + 1..hdr_pos + 5].copy_from_slice(&(dec_len as u32).to_be_bytes());
@@ -988,5 +1011,45 @@ mod tests {
         .unwrap();
         let committed = db.db.chunk_querier(0, i64::MAX).select(false, &[m]).unwrap();
         assert!(committed.is_empty(), "earlier series of the request must be rolled back");
+    }
+
+    #[tokio::test]
+    async fn snappy_and_s2_grpc_zip_bombs_fail_with_resource_exhausted() {
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = test_ingester(tmp.path(), true);
+        let max_decode_len = 4096usize;
+
+        // 256 KiB of zeros compresses into a small Snappy framed payload (< 16 KiB, and small
+        // enough to fit inside a 4 KiB-max compressed gRPC frame if we use ~64 KiB zeros -> ~3 KiB).
+        let uncompressed_bomb = vec![0u8; 64 * 1024];
+        let framed = mimir_proto::snappy::encode_grpc_frame(&uncompressed_bomb, true).unwrap();
+        assert!(framed.len() <= max_decode_len);
+
+        for enc in ["snappy", "s2"] {
+            let http_req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("/cortex.Ingester/Push")
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+                .header("grpc-encoding", enc)
+                .header("x-scope-orgid", "t1")
+                .body(tonic::body::BoxBody::new(SingleChunkBody(Some(framed.clone()))))
+                .unwrap();
+            let resp = IngesterService::new(Arc::clone(&ing))
+                .into_server()
+                .max_decoding_message_size(max_decode_len)
+                .oneshot(http_req)
+                .await
+                .unwrap();
+            let status =
+                tonic::Status::from_header_map(resp.headers()).expect("trailers-only error");
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted, "encoding={enc}");
+            assert_eq!(
+                status.message(),
+                format!("grpc: received message after decompression larger than max {max_decode_len}"),
+                "encoding={enc}"
+            );
+        }
     }
 }

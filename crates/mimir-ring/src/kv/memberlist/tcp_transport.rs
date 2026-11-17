@@ -37,6 +37,8 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, error, warn};
 
+use super::wire::MAX_PUSH_STATE_BYTES;
+
 const ZERO_ZERO_ZERO_ZERO: &str = "0.0.0.0";
 const COLON_COLON: &str = "::";
 
@@ -815,9 +817,24 @@ impl TcpTransport {
                 let from = String::from_utf8_lossy(&addr_buf).into_owned();
 
                 let mut buf = Vec::new();
-                if let Err(err) = conn.read_to_end(&mut buf).await {
+                if let Err(err) = (&mut conn)
+                    .take((MAX_PUSH_STATE_BYTES + 1) as u64)
+                    .read_to_end(&mut buf)
+                    .await
+                {
                     self.metrics.received_packets_errors.inc();
                     warn!(component = COMPONENT, err = %err, remote = ?remote, "error while reading packet data");
+                    return;
+                }
+                if buf.len() > MAX_PUSH_STATE_BYTES {
+                    self.metrics.received_packets_errors.inc();
+                    warn!(
+                        component = COMPONENT,
+                        data_length = buf.len(),
+                        max = MAX_PUSH_STATE_BYTES,
+                        remote = ?remote,
+                        "packet exceeds max size"
+                    );
                     return;
                 }
                 if buf.len() < 16 {
@@ -1144,5 +1161,34 @@ mod tests {
                 "failed to start TCP listener on \"127.0.0.1\" port {port}: listen tcp 127.0.0.1:{port}: bind: address already in use"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_packet_is_rejected_without_unbounded_read() {
+        let reg = Registry::new();
+        let cfg = MemberlistConfig {
+            bind_addr: vec!["127.0.0.1".to_string()],
+            bind_port: 0,
+            ..Default::default()
+        };
+        let (tr, mut packet_rx, _streams) = TcpTransport::new(&cfg, "test", Some(&reg)).await.unwrap();
+        let port = tr.auto_bind_port();
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&[PACKET_BYTE, 1, b'x']).await.unwrap();
+        let chunk = vec![0xAAu8; 64 * 1024];
+        let mut sent = 0usize;
+        while sent <= MAX_PUSH_STATE_BYTES + 128 * 1024 {
+            if client.write_all(&chunk).await.is_err() {
+                break;
+            }
+            sent += chunk.len();
+        }
+        drop(client);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(packet_rx.try_recv().is_err());
+        assert!(tr.metrics.received_packets_errors.get() >= 1.0);
+        tr.shutdown_and_wait().await;
     }
 }
