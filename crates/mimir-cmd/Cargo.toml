@@ -19,6 +19,7 @@ mimir-tsdb = { path = "../mimir-tsdb" }
 anyhow = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 http = "1"

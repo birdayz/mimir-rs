@@ -937,19 +937,13 @@ impl SaslBrokerConn {
         let alive_r = Arc::clone(&alive);
         let metrics_r = metrics.clone();
         tokio::spawn(async move {
-            let mut len_buf = [0u8; 4];
-            loop {
-                if reader.read_exact(&mut len_buf).await.is_err() {
-                    break;
-                }
-                let frame_len = u32::from_be_bytes(len_buf) as usize;
-                if !(4..=1_000_000_000).contains(&frame_len) {
-                    break;
-                }
-                let mut payload = vec![0u8; frame_len];
-                if reader.read_exact(&mut payload).await.is_err() {
-                    break;
-                }
+            while let Some(payload) = super::kafka_client::read_kafka_frame_bounded(
+                &mut reader,
+                super::kafka_client::MAX_KAFKA_FRAME_BYTES,
+            )
+            .await
+            {
+                let frame_len = payload.len();
                 if let Some(ref m) = metrics_r {
                     m.read_bytes_total.inc_by((frame_len + 4) as f64);
                 }
@@ -1389,7 +1383,7 @@ impl IngestKafkaClient {
                     producer_epoch: NO_PRODUCER_EPOCH,
                     timestamp_type: TimestampType::Creation,
                     offset: i as i64,
-                    sequence: NO_SEQUENCE,
+                    sequence: (i as i32).wrapping_add(NO_SEQUENCE),
                     timestamp: r.timestamp_ms.unwrap_or(now_ms),
                     key: r.key,
                     value: r.value,

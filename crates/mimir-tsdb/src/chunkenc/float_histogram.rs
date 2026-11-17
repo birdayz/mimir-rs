@@ -4,9 +4,9 @@
 
 use super::bstream::{BitReader, BitStream};
 use super::histogram_meta::{
-    adjust_for_inserts, count_spans, counter_reset_hint_from_header, expand_spans_both_ways,
-    insert_buckets, read_histogram_chunk_layout, write_histogram_chunk_layout, BucketIterator,
-    Insert,
+    adjust_for_inserts, checked_count_spans, count_spans, counter_reset_hint_from_header,
+    expand_spans_both_ways, insert_buckets, read_histogram_chunk_layout,
+    write_histogram_chunk_layout, BucketIterator, Insert,
 };
 use super::histogram_model::{
     custom_bucket_bounds_match, is_custom_buckets_schema, is_known_schema, CounterResetHeader,
@@ -190,11 +190,24 @@ impl FloatHistogramChunk {
         t: i64,
         fh: &FloatHistogram,
     ) -> Result<AppendFloatHistogramOutcome, ChunkError> {
+        self.append_with_state_prev(state, None, st, t, fh)
+    }
+
+    /// Appends `(st, t, fh)` in O(1) using a cached [`FloatHistogramAppenderState`] and
+    /// optional previous-chunk state for computing `CounterResetHeader` on chunk rollover.
+    pub fn append_with_state_prev(
+        &mut self,
+        state: &mut Option<FloatHistogramAppenderState>,
+        prev: Option<&FloatHistogramAppenderState>,
+        st: i64,
+        t: i64,
+        fh: &FloatHistogram,
+    ) -> Result<AppendFloatHistogramOutcome, ChunkError> {
         let mut app = match state.take() {
             Some(s) => FloatHistogramAppender { chunk: self, state: s },
             None => self.appender()?,
         };
-        let out = app.append_float_histogram(None, st, t, fh, false)?;
+        let out = app.append_float_histogram(prev, st, t, fh, false)?;
         if matches!(out, AppendFloatHistogramOutcome::Appended { .. }) {
             *state = Some(app.state);
         }
@@ -350,6 +363,11 @@ impl<'a> FloatHistogramAppender<'a> {
     #[inline]
     pub fn state(&self) -> &FloatHistogramAppenderState {
         &self.state
+    }
+
+    #[inline]
+    pub fn into_state(self) -> FloatHistogramAppenderState {
+        self.state
     }
 
     #[inline]
@@ -954,8 +972,18 @@ impl<'a> FloatHistogramIterator<'a> {
             self.n_spans = layout.negative_spans;
             self.custom_values = layout.custom_values;
 
-            let num_p = count_spans(&self.p_spans);
-            let num_n = count_spans(&self.n_spans);
+            let (Some(num_p), Some(num_n)) = (
+                checked_count_spans(&self.p_spans),
+                checked_count_spans(&self.n_spans),
+            ) else {
+                return Err(ChunkError::InvalidChunk);
+            };
+            let Some(total_buckets) = num_p.checked_add(num_n) else {
+                return Err(ChunkError::InvalidChunk);
+            };
+            if total_buckets > self.br.remaining_bits() / 64 || total_buckets > 1_000_000 {
+                return Err(ChunkError::InvalidChunk);
+            }
             self.p_buckets = vec![0.0; num_p];
             self.p_buckets_leading = vec![0; num_p];
             self.p_buckets_trailing = vec![0; num_p];
@@ -1127,4 +1155,36 @@ fn flush_float_bucket(
     }
     counts.push(val);
     *prev_idx = Some(idx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunkenc::varbit::{put_varbit_int, put_varbit_uint};
+
+    #[test]
+    fn corrupt_float_histogram_u32_max_span_returns_error_not_oom() {
+        let mut bs = BitStream::new();
+        bs.write_byte(0);
+        bs.write_byte(1);
+        bs.write_byte(0); // num_samples=1, flags=0
+        bs.write_byte(0); // zero_threshold = 0
+        put_varbit_int(&mut bs, 0); // schema = 0
+        put_varbit_uint(&mut bs, 1); // 1 positive span
+        put_varbit_uint(&mut bs, u64::from(u32::MAX)); // length = u32::MAX
+        put_varbit_int(&mut bs, 0); // offset = 0
+        put_varbit_uint(&mut bs, 0); // 0 negative spans
+        put_varbit_int(&mut bs, 100); // t
+        bs.write_bits(1.0f64.to_bits(), 64); // cnt
+        bs.write_bits(0.0f64.to_bits(), 64); // z_cnt
+        bs.write_bits(1.0f64.to_bits(), 64); // sum
+
+        let chunk = FloatHistogramChunk::from_bytes(bs.into_bytes());
+        let mut it = chunk.iter();
+        let err = it.next_float_histogram().unwrap_err();
+        assert!(
+            matches!(err, ChunkError::InvalidChunk | ChunkError::UnexpectedEof),
+            "unexpected error: {err:?}"
+        );
+    }
 }

@@ -4,8 +4,9 @@
 
 use super::bstream::{BitReader, BitStream};
 use super::histogram_meta::{
-    adjust_for_inserts, count_spans, counter_reset_hint_from_header, insert_buckets,
-    read_histogram_chunk_layout, write_histogram_chunk_layout, BucketIterator, Insert,
+    adjust_for_inserts, checked_count_spans, count_spans, counter_reset_hint_from_header,
+    insert_buckets, read_histogram_chunk_layout, write_histogram_chunk_layout, BucketIterator,
+    Insert,
 };
 use super::histogram_model::{
     custom_bucket_bounds_match, is_custom_buckets_schema, is_known_schema, CounterResetHeader,
@@ -159,11 +160,24 @@ impl HistogramChunk {
         t: i64,
         h: &Histogram,
     ) -> Result<AppendHistogramOutcome, ChunkError> {
+        self.append_with_state_prev(state, None, st, t, h)
+    }
+
+    /// Appends `(st, t, h)` in O(1) using a cached [`HistogramAppenderState`] and
+    /// optional previous-chunk state for computing `CounterResetHeader` on chunk rollover.
+    pub fn append_with_state_prev(
+        &mut self,
+        state: &mut Option<HistogramAppenderState>,
+        prev: Option<&HistogramAppenderState>,
+        st: i64,
+        t: i64,
+        h: &Histogram,
+    ) -> Result<AppendHistogramOutcome, ChunkError> {
         let mut app = match state.take() {
             Some(s) => HistogramAppender { chunk: self, state: s },
             None => self.appender()?,
         };
-        let out = app.append_histogram(None, st, t, h, false)?;
+        let out = app.append_histogram(prev, st, t, h, false)?;
         if matches!(out, AppendHistogramOutcome::Appended { .. }) {
             *state = Some(app.state);
         }
@@ -415,6 +429,11 @@ impl<'a> HistogramAppender<'a> {
     #[inline]
     pub fn state(&self) -> &HistogramAppenderState {
         &self.state
+    }
+
+    #[inline]
+    pub fn into_state(self) -> HistogramAppenderState {
+        self.state
     }
 
     #[inline]
@@ -1053,8 +1072,18 @@ impl<'a> HistogramIterator<'a> {
             self.n_spans = layout.negative_spans;
             self.custom_values = layout.custom_values;
 
-            let num_p = count_spans(&self.p_spans);
-            let num_n = count_spans(&self.n_spans);
+            let (Some(num_p), Some(num_n)) = (
+                checked_count_spans(&self.p_spans),
+                checked_count_spans(&self.n_spans),
+            ) else {
+                return Err(ChunkError::InvalidChunk);
+            };
+            let Some(total_buckets) = num_p.checked_add(num_n) else {
+                return Err(ChunkError::InvalidChunk);
+            };
+            if total_buckets > self.br.remaining_bits() / 2 || total_buckets > 1_000_000 {
+                return Err(ChunkError::InvalidChunk);
+            }
             self.p_buckets = vec![0; num_p];
             self.p_buckets_delta = vec![0; num_p];
             self.n_buckets = vec![0; num_n];
@@ -1235,4 +1264,37 @@ fn flush_int_bucket(
     deltas.push(abs_val - *prev_abs);
     *prev_idx = Some(idx);
     *prev_abs = abs_val;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunkenc::varbit::put_varbit_int;
+
+    #[test]
+    fn corrupt_histogram_u32_max_span_returns_error_not_oom() {
+        // Craft a ~20-byte HistogramChunk with 1 sample and a positive span of length u32::MAX.
+        let mut bs = BitStream::new();
+        bs.write_byte(0);
+        bs.write_byte(1);
+        bs.write_byte(0); // num_samples=1, flags=0
+        bs.write_byte(0); // zero_threshold = 0
+        put_varbit_int(&mut bs, 0); // schema = 0
+        put_varbit_uint(&mut bs, 1); // 1 positive span
+        put_varbit_uint(&mut bs, u64::from(u32::MAX)); // length = u32::MAX
+        put_varbit_int(&mut bs, 0); // offset = 0
+        put_varbit_uint(&mut bs, 0); // 0 negative spans
+        put_varbit_int(&mut bs, 100); // t
+        put_varbit_uint(&mut bs, 1); // cnt
+        put_varbit_uint(&mut bs, 0); // z_cnt
+        bs.write_bits(1.0f64.to_bits(), 64); // sum
+
+        let chunk = HistogramChunk::from_bytes(bs.into_bytes());
+        let mut it = chunk.iter();
+        let err = it.next_histogram().unwrap_err();
+        assert!(
+            matches!(err, ChunkError::InvalidChunk | ChunkError::UnexpectedEof),
+            "unexpected error: {err:?}"
+        );
+    }
 }

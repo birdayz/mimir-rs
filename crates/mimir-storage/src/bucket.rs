@@ -131,6 +131,7 @@ pub struct BucketClient {
     provider: String,
     metrics: Option<Arc<metrics::BucketMetrics>>,
     tenant_sse: Option<TenantSse>,
+    expected_not_found: bool,
 }
 
 impl std::fmt::Debug for BucketClient {
@@ -152,6 +153,7 @@ impl BucketClient {
             provider: provider.to_string(),
             metrics: None,
             tenant_sse: None,
+            expected_not_found: false,
         }
     }
 
@@ -244,6 +246,16 @@ impl BucketClient {
             )?));
         }
         Ok(client)
+    }
+
+    /// Returns a view of this bucket that treats `BucketError::NotFound` as an expected error
+    /// (matching Thanos `WithExpectedErrs(IsObjNotFoundErr)`), so `thanos_objstore_bucket_operation_failures_total`
+    /// is not incremented when probing for optional objects.
+    pub fn with_expected_not_found(&self) -> Self {
+        Self {
+            expected_not_found: true,
+            ..self.clone()
+        }
     }
 
     /// Returns a view of this bucket scoped under `<prefix>/` (matching `PrefixedBucketClient`).
@@ -457,7 +469,8 @@ impl BucketClient {
             .await,
         };
         if let Some(t) = timer {
-            t.finish_read(result.as_ref().map(|b| b.len() as u64).map_err(|_| ()));
+            let expected = self.expected_not_found && matches!(result, Err(BucketError::NotFound(_)));
+            t.finish_read(result.as_ref().map(|b| b.len() as u64).map_err(|_| ()), expected);
         }
         result
     }
@@ -857,5 +870,29 @@ mod tests {
             assert_eq!(got.len(), payload.len());
             assert_eq!(got.as_ref(), payload.as_slice());
         }
+    }
+
+    #[tokio::test]
+    async fn test_with_expected_not_found_does_not_increment_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = prometheus::Registry::new();
+        let mut cfg = BucketConfig::default();
+        cfg.backend_cfg.backend = "filesystem".to_string();
+        cfg.backend_cfg.filesystem.dir = dir.path().to_string_lossy().into_owned();
+        let bkt = BucketClient::new_client(&cfg, "usage-stats", Some(&reg)).unwrap();
+
+        assert!(matches!(
+            bkt.with_expected_not_found().download("missing.json").await,
+            Err(BucketError::NotFound(_))
+        ));
+
+        let mfs = reg.gather();
+        let failures: f64 = mfs
+            .iter()
+            .filter(|mf| mf.get_name() == "thanos_objstore_bucket_operation_failures_total")
+            .flat_map(|mf| mf.get_metric())
+            .map(|m| m.get_counter().get_value())
+            .sum();
+        assert_eq!(failures, 0.0);
     }
 }

@@ -1830,6 +1830,15 @@ impl SeriesStripe {
             }
         }
 
+        let refs_len = guard.refs.len();
+        if guard.refs.is_empty() {
+            if guard.refs.capacity() > 0 {
+                guard.refs.shrink_to_fit();
+            }
+        } else if guard.refs.capacity() > (refs_len * 4).max(64) {
+            guard.refs.shrink_to(refs_len * 2);
+        }
+
         if new_oldest == i64::MAX {
             self.oldest_entry_ns.store(0, Ordering::Relaxed);
         } else {

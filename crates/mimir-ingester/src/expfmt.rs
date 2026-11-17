@@ -209,10 +209,16 @@ fn escaping_for(ac: &Accept) -> &str {
     }
 }
 
-/// Go `expfmt.NegotiateAccept(h, DefaultOpenMetricsAcceptedFormats()...)`.
-pub fn negotiate(accept_header: Option<&str>) -> Format {
+/// Go `expfmt.NegotiateAccept(h, DefaultOpenMetricsAcceptedFormats()...)` (or
+/// `DefaultAcceptedFormats()` when `enable_open_metrics == false`).
+pub fn negotiate_with_options(accept_header: Option<&str>, enable_open_metrics: bool) -> Format {
+    let offered = if enable_open_metrics {
+        ACCEPTED
+    } else {
+        &ACCEPTED[2..]
+    };
     for ac in parse_accept(accept_header.unwrap_or("")) {
-        for t in ACCEPTED {
+        for t in offered {
             if match_format(&ac, t) {
                 return Format {
                     content_type: format!("{}; escaping={}", t.format, escaping_for(&ac)),
@@ -225,6 +231,11 @@ pub fn negotiate(accept_header: Option<&str>) -> Format {
         content_type: format!("{FMT_TEXT}; escaping={DEFAULT_ESCAPING}"),
         kind: FormatType::Text,
     }
+}
+
+/// Go `expfmt.NegotiateAccept(h, DefaultOpenMetricsAcceptedFormats()...)`.
+pub fn negotiate(accept_header: Option<&str>) -> Format {
+    negotiate_with_options(accept_header, true)
 }
 
 /// gddo `httputil.NegotiateContentEncoding(r, ["identity", "gzip"])` as used by promhttp.
@@ -759,6 +770,14 @@ mod tests {
         assert_eq!(n("application/openmetrics-text"), "application/openmetrics-text; version=0.0.1; charset=utf-8; escaping=underscores");
         assert_eq!(n("*/*"), "text/plain; version=0.0.4; charset=utf-8; escaping=underscores");
         assert_eq!(n("text/html"), "text/plain; version=0.0.4; charset=utf-8; escaping=underscores");
+        assert_eq!(
+            negotiate_with_options(Some("application/openmetrics-text;version=1.0.0,*/*;q=0.1"), false).content_type,
+            "text/plain; version=0.0.4; charset=utf-8; escaping=underscores"
+        );
+        assert_eq!(
+            negotiate_with_options(Some("application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited"), false).content_type,
+            "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited; escaping=underscores"
+        );
     }
 
     #[test]

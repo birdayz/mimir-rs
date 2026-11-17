@@ -177,7 +177,11 @@ impl std::fmt::Display for SeedError {
 
 /// `readSeedFile`.
 async fn read_seed_file(bucket: &BucketClient) -> Result<ClusterSeed, SeedError> {
-    let data = bucket.download(CLUSTER_SEED_FILE_NAME).await.map_err(|e| {
+    let data = bucket
+        .with_expected_not_found()
+        .download(CLUSTER_SEED_FILE_NAME)
+        .await
+        .map_err(|e| {
         if e.is_not_found() {
             SeedError::NotFound
         } else {

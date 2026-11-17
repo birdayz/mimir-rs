@@ -3,18 +3,17 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
 
-use axum::extract::{Query, RawQuery, State as AxumState};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Path as AxumPath, Query, RawQuery, State as AxumState};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
-use mimir_common::logging::format_rfc3339_nano_utc;
 use mimir_common::services::State;
 use mimir_common::tenant::extract_tenant_id_from_http_headers;
 use mimir_config::{yaml_v3_emit, LimitsConfig, MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::{ingester_router, Ingester};
+use mimir_ring::kv::memberlist::gofmt::{format_go_time_string, format_rfc3339_nano};
 use mimir_ring::kv::memberlist::{http_status, MemberlistKv};
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
@@ -49,8 +48,19 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     // the ingester ring); it answers "This instance doesn't use memberlist." without a KV.
     let has_memberlist = state.memberlist_kv.is_some() || state.ingester.is_some();
     let ingester_opt = state.ingester.clone();
-    let path_prefix = state.config.server.http_path_prefix.trim_end_matches('/').to_string();
+    let raw_prefix = state.config.server.http_path_prefix.as_str();
     let shutdown_requested = Arc::clone(&state.shutdown_requested);
+
+    // gorilla/mux `PathPrefix` errors when a non-empty prefix lacks a leading '/' ("mux: path
+    // must start with a slash"), leaving `subrouter.routeConf.regexp.path == nil`; dskit mounts
+    // `subrouter` directly as the HTTP handler, so routes end up mounted unprefixed at '/'
+    // (and `/<prefix>/ready` is 404).
+    let path_prefix = if !raw_prefix.starts_with('/') {
+        String::new()
+    } else {
+        raw_prefix.trim_end_matches('/').to_string()
+    };
+    let has_prefix = !path_prefix.is_empty();
 
     // `/ready` and `/metrics` are registered without a method restriction (Go
     // `Server.HTTP.Path("/ready")`, dskit `router.Handle("/metrics", ...)`).
@@ -63,18 +73,28 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         .route("/api/v1/status/buildinfo", get(buildinfo_handler))
         .route("/api/v1/status/config", get(status_config_handler))
         .route("/api/v1/status/flags", get(status_flags_handler))
-        // dskit registerInstrumentation: `/debug/pprof/cmdline` is NotFound, everything else under
-        // `/debug/pprof` goes to Go's net/http/pprof handlers (any method).
-        .route("/debug/pprof/cmdline", any(not_found_handler))
-        .route("/debug/pprof/profile", any(crate::pprof::profile_handler))
-        .route("/debug/pprof/symbol", any(crate::pprof::symbol_handler))
-        .route("/debug/pprof", any(crate::pprof::index_redirect_handler))
-        .route("/debug/pprof/", any(crate::pprof::index_handler))
-        .route("/debug/pprof/*name", any(crate::pprof::unknown_profile_handler));
+        .route("/static/", get(static_dir_handler))
+        .route("/static/*path", get(static_file_handler));
 
-    let has_prefix = !path_prefix.is_empty() && path_prefix != "/";
-    if !has_prefix {
-        router = router.route("/", get(index_handler));
+    // dskit `registerInstrumentation` registers `/debug/pprof/cmdline` (NotFound) and
+    // `PathPrefix("/debug/pprof").Handler(http.DefaultServeMux)`. Because `DefaultServeMux`
+    // only knows `/debug/pprof*` (without `-server.path-prefix`), under a non-empty prefix
+    // Go matches the prefixed route (`route="<prefix>_debug_pprof"`) and returns 404.
+    if has_prefix {
+        router = router
+            .route("/debug/pprof/cmdline", any(not_found_handler))
+            .route("/debug/pprof", any(not_found_handler))
+            .route("/debug/pprof/", any(not_found_handler))
+            .route("/debug/pprof/*name", any(not_found_handler));
+    } else {
+        router = router
+            .route("/", get(index_handler))
+            .route("/debug/pprof/cmdline", any(not_found_handler))
+            .route("/debug/pprof/profile", any(crate::pprof::profile_handler))
+            .route("/debug/pprof/symbol", any(crate::pprof::symbol_handler))
+            .route("/debug/pprof", any(crate::pprof::index_redirect_handler))
+            .route("/debug/pprof/", any(crate::pprof::index_handler))
+            .route("/debug/pprof/*name", any(crate::pprof::unknown_profile_handler));
     }
 
     if register_instrumentation {
@@ -122,25 +142,25 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(gzip, crate::server::gzip::gzip_handler))
         // gorilla/mux answers a known path with an unsupported method with an empty 405 and
         // reports it as an unmatched route.
-        .method_not_allowed_fallback(crate::server::http_middleware::method_not_allowed);
+        .method_not_allowed_fallback(crate::server::http_middleware::method_not_allowed)
+        .fallback(not_found_handler);
 
     let router = if has_prefix {
-        let normalized = if path_prefix.starts_with('/') {
-            path_prefix
-        } else {
-            format!("/{path_prefix}")
-        };
         Router::new()
-            .route(&normalized, get(index_handler).with_state(state_for_root.clone()))
             .route(
-                &format!("{normalized}/"),
-                get(index_handler).with_state(state_for_root),
+                &format!("{path_prefix}/"),
+                get(index_handler)
+                    .with_state(state_for_root)
+                    .route_layer(axum::middleware::from_fn_with_state(
+                        gzip,
+                        crate::server::gzip::gzip_handler,
+                    )),
             )
-            .nest(&normalized, app)
+            .nest(&path_prefix, app)
+            .method_not_allowed_fallback(prefixed_not_found_method_mismatch)
             .fallback(not_found_handler)
     } else {
-        // gorilla/mux NotFoundHandler default: http.NotFound.
-        app.fallback(not_found_handler)
+        app
     };
 
     // Go disables HTTP keep-alives as soon as a shutdown signal is received
@@ -171,6 +191,16 @@ pub async fn not_found_handler() -> Response {
         "404 page not found\n",
     )
         .into_response()
+}
+
+/// Under a prefixed gorilla/mux subrouter, a method mismatch on the subrouter's `/` route
+/// (e.g. `POST /mimir/`) gets cleared by subsequent routes' `PathPrefix` matcher and falls
+/// through to 404 (`route="other"`).
+async fn prefixed_not_found_method_mismatch() -> Response {
+    let mut resp = not_found_handler().await;
+    resp.extensions_mut()
+        .insert(crate::server::http_middleware::MethodMismatch);
+    resp
 }
 
 async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
@@ -323,28 +353,28 @@ async fn services_handler(AxumState(st): AxumState<AppHttpState>, headers: Heade
         })
         .collect();
 
-    let now = format_rfc3339_nano_utc(SystemTime::now());
+    let now_local = chrono::Local::now().fixed_offset();
     let accepts_json = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| s.contains("application/json"));
     if accepts_json {
+        let now = format_rfc3339_nano(&now_local);
         return Json(StatusPageContents { now, services: svcs }).into_response();
     }
 
+    let now_html = html_escape(&format_go_time_string(&now_local));
     let mut html = format!(
-        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Services' status</title></head>\
-         <body><h1>Services' status</h1><p>Current time: {now}</p>\
-         <table border=\"1\"><thead><tr><th>Service</th><th>Status</th></tr></thead><tbody>"
+        "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"UTF-8\">\n    <title>Services' status</title>\n</head>\n<body>\n<h1>Services' status</h1>\n<p>Current time: {now_html}</p>\n<table border=\"1\">\n    <thead>\n    <tr>\n        <th>Service</th>\n        <th>Status</th>\n    </tr>\n    </thead>\n    <tbody>\n"
     );
     for s in svcs {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td></tr>",
+            "    \n        <tr>\n            <td>{}</td>\n            <td>{}</td>\n        </tr>\n    \n",
             html_escape(&s.name),
             html_escape(&s.status)
         ));
     }
-    html.push_str("</tbody></table></body></html>");
+    html.push_str("    </tbody>\n</table>\n</body>\n</html>");
     Html(html).into_response()
 }
 
@@ -678,95 +708,232 @@ async fn memberlist_handler(
     resp
 }
 
-async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
-    let base = st.config.server.http_path_prefix.trim_end_matches('/');
-    let link = |path: &str| -> String {
-        if base.is_empty() {
-            path.to_string()
-        } else {
-            format!("{base}{path}")
-        }
-    };
+struct IndexLink {
+    desc: &'static str,
+    path: &'static str,
+    dangerous: bool,
+}
 
-    let mut html = String::from(
-        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Grafana Mimir</title></head>\
-         <body><h1>Grafana Mimir Admin</h1>\
-         <h2>Overview</h2><ul>",
-    );
-    html.push_str(&format!(
-        "<li><a href=\"{}\">Services' status</a></li>",
-        link("/services")
-    ));
-    html.push_str(&format!(
-        "<li><a href=\"{}\">Metrics</a></li>",
-        link("/metrics")
-    ));
-    html.push_str(&format!(
-        "<li><a href=\"{}\">Ready</a></li></ul>",
-        link("/ready")
-    ));
-    html.push_str("<h2>Current config</h2><ul>");
-    html.push_str(&format!(
-        "<li><a href=\"{}\">Including the default values</a></li>",
-        link("/config")
-    ));
-    html.push_str(&format!(
-        "<li><a href=\"{}\">Only values that differ from the defaults</a></li></ul>",
-        link("/config?mode=diff")
-    ));
+struct IndexGroup {
+    weight: u8,
+    desc: &'static str,
+    links: Vec<IndexLink>,
+}
+
+async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
+    // pkg/api/handlers.go & pkg/api/api.go: relative paths so `-server.path-prefix` works cleanly.
+    let mut groups: Vec<IndexGroup> = vec![
+        IndexGroup {
+            weight: 0,
+            desc: "Overview",
+            links: vec![IndexLink {
+                desc: "Services' status",
+                path: "services",
+                dangerous: false,
+            }],
+        },
+        IndexGroup {
+            weight: 1,
+            desc: "Current config",
+            links: vec![
+                IndexLink {
+                    desc: "Including the default values",
+                    path: "config",
+                    dangerous: false,
+                },
+                IndexLink {
+                    desc: "Only values that differ from the defaults",
+                    path: "config?mode=diff",
+                    dangerous: false,
+                },
+            ],
+        },
+    ];
 
     if st.runtime_config.is_some() {
-        html.push_str("<h2>Current runtime config</h2><ul>");
-        html.push_str(&format!(
-            "<li><a href=\"{}\">Entire runtime config (including overrides)</a></li>",
-            link("/runtime_config")
-        ));
-        html.push_str(&format!(
-            "<li><a href=\"{}\">Only values that differ from the defaults</a></li></ul>",
-            link("/runtime_config?mode=diff")
-        ));
+        groups.push(IndexGroup {
+            weight: 2,
+            desc: "Current runtime config",
+            links: vec![
+                IndexLink {
+                    desc: "Entire runtime config (including overrides)",
+                    path: "runtime_config",
+                    dangerous: false,
+                },
+                IndexLink {
+                    desc: "Only values that differ from the defaults",
+                    path: "runtime_config?mode=diff",
+                    dangerous: false,
+                },
+            ],
+        });
     }
 
     if let Some(ref ing) = st.ingester {
-        html.push_str("<h2>Ingester</h2><ul>");
-        html.push_str(&format!(
-            "<li><a href=\"{}\">Ring status</a></li>",
-            link("/ingester/ring")
-        ));
+        let mut links = vec![IndexLink {
+            desc: "Ingester Tenants",
+            path: "ingester/tenants",
+            dangerous: true,
+        }];
         if ing.partition_ring_watcher.is_some() {
-            html.push_str(&format!(
-                "<li><a href=\"{}\">Partition ring status</a></li>",
-                link("/ingester/partition-ring")
-            ));
+            links.push(IndexLink {
+                desc: "Partition ring status",
+                path: "ingester/partition-ring",
+                dangerous: false,
+            });
         }
-        html.push_str(&format!(
-            "<li><a href=\"{}\">Ingester Tenants</a></li></ul>",
-            link("/ingester/tenants")
-        ));
+        if ing.instance_ring.is_some() {
+            links.push(IndexLink {
+                desc: "Ring status",
+                path: "ingester/ring",
+                dangerous: false,
+            });
+        }
+        groups.push(IndexGroup {
+            weight: 3,
+            desc: "Ingester",
+            links,
+        });
     }
 
     if st.memberlist_kv.is_some() || st.ingester.is_some() {
-        html.push_str("<h2>Memberlist</h2><ul>");
-        html.push_str(&format!(
-            "<li><a href=\"{}\">Status</a></li></ul>",
-            link("/memberlist")
-        ));
+        groups.push(IndexGroup {
+            weight: 4,
+            desc: "Memberlist",
+            links: vec![IndexLink {
+                desc: "Status",
+                path: "memberlist",
+                dangerous: false,
+            }],
+        });
     }
 
     if st.ingester.is_some() {
-        html.push_str("<h2>Dangerous</h2><ul>");
-        html.push_str(&format!(
-            "<li><a href=\"{}\">Trigger a flush of data from ingester to storage</a></li>",
-            link("/ingester/flush")
-        ));
-        html.push_str(&format!(
-            "<li><a href=\"{}\">Trigger ingester shutdown</a></li></ul>",
-            link("/ingester/shutdown")
-        ));
+        groups.push(IndexGroup {
+            weight: 5,
+            desc: "Dangerous",
+            links: vec![
+                IndexLink {
+                    desc: "Trigger a flush of data from ingester to storage",
+                    path: "ingester/flush",
+                    dangerous: true,
+                },
+                IndexLink {
+                    desc: "Trigger ingester shutdown",
+                    path: "ingester/shutdown",
+                    dangerous: true,
+                },
+            ],
+        });
     }
 
-    html.push_str("</body></html>");
+    groups.sort_by(|a, b| a.weight.cmp(&b.weight).then_with(|| a.desc.cmp(b.desc)));
+
+    let mut html = String::from(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>Grafana Mimir</title>
+
+    <link rel="stylesheet" href="static/bootstrap-5.1.3.min.css">
+    <link rel="stylesheet" href="static/mimir-styles.css">
+    <script src="static/bootstrap-5.1.3.bundle.min.js"></script>
+</head>
+<body>
+<div class="d-flex flex-column container py-3">
+    <div class="header row border-bottom py-3 flex-column-reverse flex-sm-row">
+        <div class="col-12 col-sm-9 text-center text-sm-start">
+            <h1>Grafana Mimir Admin</h1>
+        </div>
+        <div class="col-12 col-sm-3 text-center text-sm-end mb-3 mb-sm-0">
+            <img alt="Mimir logo" class="mimir-brand" src="static/mimir-icon.png">
+        </div>
+    </div>
+"#,
+    );
+
+    for g in &groups {
+        html.push_str(&format!(
+            "    <div class=\"row service-row border-bottom py-3\">\n        <div class=\"col-sm-3 text-start text-sm-end\"><h2>{}</h2></div>\n        <div class=\"col-sm-9\">\n            <ul class=\"my-0 list-unstyled\">\n",
+            html_escape(g.desc)
+        ));
+        for l in &g.links {
+            html.push_str(&format!(
+                "                <li><a href=\"{}\">{}</a>",
+                html_escape(l.path),
+                html_escape(l.desc)
+            ));
+            if l.dangerous {
+                html.push_str(" <span class=\"badge bg-danger rounded-pill align-middle\">Dangerous</span>");
+            }
+            html.push_str("</li>\n");
+        }
+        html.push_str("            </ul>\n        </div>\n    </div>\n");
+    }
+
+    html.push_str("</div>\n</body>\n</html>");
     Html(html).into_response()
+}
+
+const STATIC_BOOTSTRAP_JS: &[u8] = include_bytes!("../static/bootstrap-5.1.3.bundle.min.js");
+const STATIC_BOOTSTRAP_CSS: &[u8] = include_bytes!("../static/bootstrap-5.1.3.min.css");
+const STATIC_BOOTSTRAP_ICONS_CSS: &[u8] = include_bytes!("../static/bootstrap-icons-1.8.1.css");
+const STATIC_BOOTSTRAP_ICONS_WOFF: &[u8] = include_bytes!("../static/fonts/bootstrap-icons.woff");
+const STATIC_BOOTSTRAP_ICONS_WOFF2: &[u8] = include_bytes!("../static/fonts/bootstrap-icons.woff2");
+const STATIC_MIMIR_ICON: &[u8] = include_bytes!("../static/mimir-icon.png");
+const STATIC_MIMIR_STYLES: &[u8] = include_bytes!("../static/mimir-styles.css");
+
+async fn static_dir_handler() -> Response {
+    let body = "<pre>\n\
+        <a href=\"bootstrap-5.1.3.bundle.min.js\">bootstrap-5.1.3.bundle.min.js</a>\n\
+        <a href=\"bootstrap-5.1.3.min.css\">bootstrap-5.1.3.min.css</a>\n\
+        <a href=\"bootstrap-icons-1.8.1.css\">bootstrap-icons-1.8.1.css</a>\n\
+        <a href=\"fonts/\">fonts/</a>\n\
+        <a href=\"mimir-icon.png\">mimir-icon.png</a>\n\
+        <a href=\"mimir-styles.css\">mimir-styles.css</a>\n\
+        </pre>\n";
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+async fn static_file_handler(AxumPath(path): AxumPath<String>) -> Response {
+    let rel = path.trim_start_matches('/');
+    let (bytes, ct): (&'static [u8], &'static str) = match rel {
+        "bootstrap-5.1.3.bundle.min.js" => (STATIC_BOOTSTRAP_JS, "text/javascript; charset=utf-8"),
+        "bootstrap-5.1.3.min.css" => (STATIC_BOOTSTRAP_CSS, "text/css; charset=utf-8"),
+        "bootstrap-icons-1.8.1.css" => (STATIC_BOOTSTRAP_ICONS_CSS, "text/css; charset=utf-8"),
+        "fonts/bootstrap-icons.woff" => (STATIC_BOOTSTRAP_ICONS_WOFF, "font/woff"),
+        "fonts/bootstrap-icons.woff2" => (STATIC_BOOTSTRAP_ICONS_WOFF2, "font/woff2"),
+        "mimir-icon.png" => (STATIC_MIMIR_ICON, "image/png"),
+        "mimir-styles.css" => (STATIC_MIMIR_STYLES, "text/css; charset=utf-8"),
+        "fonts/" | "fonts" => {
+            let body = "<pre>\n\
+                <a href=\"bootstrap-icons.woff\">bootstrap-icons.woff</a>\n\
+                <a href=\"bootstrap-icons.woff2\">bootstrap-icons.woff2</a>\n\
+                </pre>\n";
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                body,
+            )
+                .into_response();
+        }
+        _ => return not_found_handler().await,
+    };
+
+    let mut resp = Response::new(axum::body::Body::from(bytes));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(ct));
+    resp
 }
 
 fn html_escape(s: &str) -> String {
@@ -774,4 +941,151 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('+', "&#43;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http::{Method, Request};
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    fn test_state(http_path_prefix: &str, with_activity_tracker: bool) -> AppHttpState {
+        let mut cfg = MimirConfig::default();
+        cfg.server.http_path_prefix = http_path_prefix.to_string();
+        let modules = ModuleStates::new();
+        let server_cell = crate::modules::StateCell::new(State::Running);
+        modules.add("server", server_cell.state_fn());
+        if with_activity_tracker {
+            let at_cell = crate::modules::StateCell::new(State::Running);
+            modules.add("activity-tracker", at_cell.state_fn());
+        }
+        let limits = cfg.limits.clone();
+        AppHttpState {
+            config: Arc::new(cfg),
+            default_config: Arc::new(MimirConfig::default()),
+            registry: Registry::new(),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            ingester: None,
+            runtime_config: None,
+            overrides: Overrides::new(limits),
+            memberlist_kv: None,
+            modules,
+            cost_attribution_registry: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn prefixed_router_matches_go_static_pprof_and_root_routes() {
+        let router = build_http_router(test_state("/mimir", false));
+
+        // 1. Static assets served under prefix with gzip Vary header.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/mimir/static/mimir-styles.css")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::VARY).unwrap(), "Accept-Encoding");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), STATIC_MIMIR_STYLES);
+
+        // 2. /mimir (without trailing slash) -> 404.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/mimir")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 3. POST /mimir/ -> 404 (not 405).
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mimir/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp
+            .extensions()
+            .get::<crate::server::http_middleware::MethodMismatch>()
+            .is_some());
+
+        // 4. GET /mimir/ with gzip -> 200, gzipped, Vary: Accept-Encoding, relative hrefs.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/mimir/")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_ENCODING).unwrap(), "gzip");
+        assert_eq!(resp.headers().get(header::VARY).unwrap(), "Accept-Encoding");
+        let gz_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let mut dec = flate2::read::GzDecoder::new(&gz_bytes[..]);
+        let mut html = String::new();
+        std::io::Read::read_to_string(&mut dec, &mut html).unwrap();
+        assert!(html.contains(r#"href="services""#));
+        assert!(html.contains(r#"href="config""#));
+        assert!(!html.contains(r#"href="/mimir/"#));
+
+        // 5. /mimir/debug/pprof and /mimir/debug/pprof/ both return 404.
+        for p in ["/mimir/debug/pprof", "/mimir/debug/pprof/", "/mimir/debug/pprof/cmdline"] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(p)
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path {p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn slashless_prefix_falls_back_to_unprefixed_like_gorilla_mux() {
+        let router = build_http_router(test_state("mimir", false));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/mimir/ready")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(router.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(router.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unprefixed_static_and_services_format() {
+        let router = build_http_router(test_state("", true));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/static/mimir-styles.css")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/services")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(body.contains("<td>activity-tracker</td>"));
+        assert!(body.contains("Current time: "));
+        assert!(!body.contains("T00:") && !body.ends_with("Z</p>"));
+    }
 }

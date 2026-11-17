@@ -17,10 +17,10 @@ use kafka_protocol::messages::{
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 use mimir_config::KafkaConfig;
 use prometheus::{CounterVec, HistogramOpts, HistogramVec, Opts, Registry};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use super::kafka_client::{KafkaClient, KafkaClientError, KAFKA_OFFSET_END};
+use super::kafka_client::{read_kafka_frame_bounded, KafkaClient, KafkaClientError, KAFKA_OFFSET_END};
 use super::transport::KafkaTransport;
 
 #[derive(Clone)]
@@ -142,19 +142,7 @@ impl BatchConn {
         let pending_r = Arc::clone(&pending);
         let alive_r = Arc::clone(&alive);
         tokio::spawn(async move {
-            loop {
-                let mut len_buf = [0u8; 4];
-                if reader.read_exact(&mut len_buf).await.is_err() {
-                    break;
-                }
-                let frame_len = i32::from_be_bytes(len_buf) as usize;
-                if !(4..=128 * 1024 * 1024).contains(&frame_len) {
-                    break;
-                }
-                let mut body = vec![0u8; frame_len];
-                if reader.read_exact(&mut body).await.is_err() {
-                    break;
-                }
+            while let Some(body) = read_kafka_frame_bounded(&mut reader, 128 * 1024 * 1024).await {
                 let corr_id = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
                 let tx = pending_r.lock().remove(&corr_id);
                 if let Some(tx) = tx {

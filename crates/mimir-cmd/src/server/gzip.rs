@@ -157,8 +157,10 @@ pub async fn gzip_handler(State(cfg): State<GzipConfig>, req: Request, next: Nex
     }
     let (accepts_gzip, rejects_identity) = request_acceptance(req.headers());
     let mut resp = next.run(req).await;
-    resp.headers_mut()
-        .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    if !resp.headers().contains_key(header::VARY) {
+        resp.headers_mut()
+            .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
     if !accepts_gzip || resp.headers().contains_key(header::CONTENT_ENCODING) {
         return resp;
     }

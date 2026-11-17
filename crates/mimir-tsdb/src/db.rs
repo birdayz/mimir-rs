@@ -259,7 +259,19 @@ impl Tsdb {
         let metrics = DbMetrics::new(opts.head.registry.as_deref());
 
         // Go `DB.Open` -> `db.reload()` -> `reloadBlocks()` (before the head is replayed).
-        let blocks = Self::reload_blocks_impl(&dir, &opts, &metrics, &[])?;
+        let blocks = {
+            let res = (|| -> Result<Vec<Arc<Block>>, TsdbError> {
+                let (to_load, deletable) =
+                    Self::prepare_reload_blocks(&dir, &opts, &metrics, &[])?;
+                Self::delete_blocks(&dir, &deletable)?;
+                Ok(to_load)
+            })();
+            if res.is_err() {
+                metrics.reloads_failed.inc();
+            }
+            metrics.reloads.inc();
+            res?
+        };
         let mut min_valid_time = blocks
             .iter()
             .filter(|b| {
@@ -322,28 +334,15 @@ impl Tsdb {
     }
 
     /// Go `DB.reloadBlocks`: (re)opens the block dirs (re-using already open blocks),
-    /// deletes obsolete / retention-expired blocks atomically and returns the blocks to
-    /// serve, sorted by `min_time`. Counts `reloads_total` / `reloads_failures_total`.
-    fn reload_blocks_impl(
+    /// computes the kept blocks and the obsolete / retention-expired block ULIDs, and
+    /// drops any references to deletable blocks inside `loadable` before returning so the
+    /// caller can swap out `self.blocks` and unmap everything prior to `delete_blocks`.
+    fn prepare_reload_blocks(
         dir: &Path,
         opts: &TsdbOptions,
         metrics: &DbMetrics,
         loaded: &[Arc<Block>],
-    ) -> Result<Vec<Arc<Block>>, TsdbError> {
-        let res = Self::reload_blocks_inner(dir, opts, metrics, loaded);
-        if res.is_err() {
-            metrics.reloads_failed.inc();
-        }
-        metrics.reloads.inc();
-        res
-    }
-
-    fn reload_blocks_inner(
-        dir: &Path,
-        opts: &TsdbOptions,
-        metrics: &DbMetrics,
-        loaded: &[Arc<Block>],
-    ) -> Result<Vec<Arc<Block>>, TsdbError> {
+    ) -> Result<(Vec<Arc<Block>>, HashSet<Ulid>), TsdbError> {
         let (loadable, mut corrupted) = Self::open_blocks(dir, loaded, &opts.block_postings_cache)?;
 
         let default_fn =
@@ -395,8 +394,7 @@ impl Tsdb {
             .symbol_table_size
             .set(to_load.iter().map(|b| b.symbol_table_size()).sum::<u64>() as f64);
 
-        Self::delete_blocks(dir, &deletable)?;
-        Ok(to_load)
+        Ok((to_load, deletable))
     }
 
     /// Go `openBlocks`: blocks whose `meta.json` cannot be read are skipped; blocks that
@@ -521,12 +519,26 @@ impl Tsdb {
         Ok(())
     }
 
-    /// Go `DB.reloadBlocks` under `cmtx`: swaps in the reloaded block set.
+    /// Go `DB.reloadBlocks` under `cmtx`: swaps in the reloaded block set and drops all
+    /// obsolete `Arc<Block>` references BEFORE deleting their directories on disk so
+    /// every block index/chunk mmap is unmapped before unlink.
     fn reload_blocks_locked(&self) -> Result<(), TsdbError> {
-        let current = self.blocks.read().clone();
-        let reloaded = Self::reload_blocks_impl(&self.dir, &self.opts, &self.metrics, &current)?;
-        *self.blocks.write() = reloaded;
-        Ok(())
+        let res = (|| -> Result<(), TsdbError> {
+            let (to_load, deletable) = {
+                let current = self.blocks.read().clone();
+                Self::prepare_reload_blocks(&self.dir, &self.opts, &self.metrics, &current)?
+            };
+            {
+                let _old = std::mem::replace(&mut *self.blocks.write(), to_load);
+            }
+            Self::delete_blocks(&self.dir, &deletable)?;
+            Ok(())
+        })();
+        if res.is_err() {
+            self.metrics.reloads_failed.inc();
+        }
+        self.metrics.reloads.inc();
+        res
     }
 
     /// Reloads on-disk blocks, applying the block deletion filter (Go `DB.reloadBlocks`).
@@ -616,6 +628,7 @@ impl Tsdb {
                 // The head was compacted, so we compact OOO head as well.
                 created.extend(self.compact_ooo_head_locked()?);
             }
+            self.head.mmap_head_chunks().map_err(HeadError::from)?;
             Ok(())
         })();
 

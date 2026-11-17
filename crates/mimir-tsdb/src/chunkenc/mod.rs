@@ -78,6 +78,8 @@ pub enum ChunkError {
     InvalidEncoding(u8),
     #[error("invalid chunk header (len={len}, expected at least {min})")]
     InvalidHeader { len: usize, min: usize },
+    #[error("invalid chunk data")]
+    InvalidChunk,
     #[error("unknown histogram schema: {0}")]
     UnknownSchema(i32),
     #[error("histogram counter reset")]
@@ -135,6 +137,16 @@ impl Encoding {
                 | Self::Xor2
                 | Self::HistogramSt
                 | Self::FloatHistogramSt
+        )
+    }
+
+    /// Reports whether two encodings are mutually compatible with respect to
+    /// sample-value encoding (`Xor` and `Xor2`), matching Go `chunkenc.CompatibleValues`.
+    #[inline]
+    pub const fn compatible_values(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Xor | Self::Xor2, Self::Xor | Self::Xor2)
         )
     }
 }

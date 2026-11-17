@@ -314,7 +314,10 @@ impl BlockChunksReader {
                 message: "invalid chunk length uvarint".to_string(),
             }
         })?;
-        let data_len = data_len as usize;
+        let data_len = usize::try_from(data_len).map_err(|_| BlockChunksError::Corruption {
+            index: seg_idx,
+            message: "chunk data length overflow".to_string(),
+        })?;
 
         let enc_start = chk_start + ulen;
         let data_start = enc_start + CHUNK_ENCODING_SIZE;
@@ -324,7 +327,12 @@ impl BlockChunksReader {
                 message: "chunk data length overflow".to_string(),
             }
         })?;
-        let chk_end = data_end + CRC_SIZE;
+        let chk_end = data_end.checked_add(CRC_SIZE).ok_or_else(|| {
+            BlockChunksError::Corruption {
+                index: seg_idx,
+                message: "chunk data length overflow".to_string(),
+            }
+        })?;
         if chk_end > mmap.len() {
             return Err(BlockChunksError::Corruption {
                 index: seg_idx,

@@ -671,8 +671,11 @@ impl<'a> Xor2Iterator<'a> {
         if sigbits == 0 {
             sigbits = 64;
         }
+        let Some(nt) = 64u8.checked_sub(nl).and_then(|r| r.checked_sub(sigbits)) else {
+            return Err(ChunkError::InvalidChunk);
+        };
         self.leading = nl;
-        self.trailing = 64 - nl - sigbits;
+        self.trailing = nt;
         let value_bits = self.br.read_bits(sigbits)?;
         let vbits = self.baseline_v.to_bits() ^ (value_bits << self.trailing);
         self.val = f64::from_bits(vbits);
@@ -686,7 +689,15 @@ impl<'a> Xor2Iterator<'a> {
             return Ok(());
         }
         if !self.br.read_bit()? {
-            let sz = 64 - self.leading - self.trailing;
+            let Some(sz) = 64u8
+                .checked_sub(self.leading)
+                .and_then(|r| r.checked_sub(self.trailing))
+            else {
+                return Err(ChunkError::InvalidChunk);
+            };
+            if sz == 0 {
+                return Err(ChunkError::InvalidChunk);
+            }
             let value_bits = self.br.read_bits(sz)?;
             let vbits = self.baseline_v.to_bits() ^ (value_bits << self.trailing);
             self.val = f64::from_bits(vbits);
@@ -702,7 +713,15 @@ impl<'a> Xor2Iterator<'a> {
 
     fn decode_value_known_non_zero(&mut self) -> Result<(), ChunkError> {
         if !self.br.read_bit()? {
-            let sz = 64 - self.leading - self.trailing;
+            let Some(sz) = 64u8
+                .checked_sub(self.leading)
+                .and_then(|r| r.checked_sub(self.trailing))
+            else {
+                return Err(ChunkError::InvalidChunk);
+            };
+            if sz == 0 {
+                return Err(ChunkError::InvalidChunk);
+            }
             let value_bits = self.br.read_bits(sz)?;
             let vbits = self.baseline_v.to_bits() ^ (value_bits << self.trailing);
             self.val = f64::from_bits(vbits);
@@ -908,5 +927,29 @@ mod tests {
             assert!(cold_state.valid);
         }
         assert_eq!(c_cold.as_bytes(), c_ref.as_bytes());
+    }
+
+    #[test]
+    fn corrupt_xor2_nl_plus_mb_gt_64_returns_error_not_panic() {
+        let mut bs = BitStream::new();
+        bs.write_byte(0);
+        bs.write_byte(2); // num_samples = 2
+        bs.write_byte(0); // st_header (1 byte: first_st_known = false, first_st_change_on = 0)
+        // Sample 0
+        bs.write_varint(100);
+        bs.write_bits(1.0f64.to_bits(), 64);
+        // Sample 1: t_delta = 10, value ctrl = '110', nl = 31, sigbits = 63 (31 + 63 > 64)
+        bs.write_uvarint(10);
+        bs.write_bit(true);
+        bs.write_bit(true);
+        bs.write_bit(false);
+        bs.write_bits(31, 5);
+        bs.write_bits(63, 6);
+        bs.write_bits(0, 64);
+
+        let chunk = Xor2Chunk::from_bytes(bs.into_bytes());
+        let mut it = chunk.iter();
+        assert!(it.next_sample().is_ok());
+        assert!(matches!(it.next_sample(), Err(ChunkError::InvalidChunk)));
     }
 }

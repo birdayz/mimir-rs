@@ -23,6 +23,7 @@ pub const COMPOUND_OVERHEAD: usize = 2;
 pub const USER_MSG_OVERHEAD: usize = 1;
 pub const MAX_PUSH_STATE_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_DECOMPRESS_BYTES: usize = MAX_PUSH_STATE_BYTES + (1 << 20);
+pub(super) const MAX_MP_DEPTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -638,6 +639,13 @@ impl<'a> MpReader<'a> {
     }
 
     fn skip_value(&mut self) -> Result<(), String> {
+        self.skip_value_depth(0)
+    }
+
+    fn skip_value_depth(&mut self, depth: usize) -> Result<(), String> {
+        if depth >= MAX_MP_DEPTH {
+            return Err(format!("msgpack nesting depth exceeds max {MAX_MP_DEPTH}"));
+        }
         let bd = self.read_byte()?;
         match bd {
             0x00..=0x7f | 0xc0..=0xc3 | 0xe0..=0xff => Ok(()),
@@ -679,46 +687,64 @@ impl<'a> MpReader<'a> {
             }
             0x90..=0x9f => {
                 let n = (bd & 0x0f) as usize;
+                if n > self.buf.len() {
+                    return Err("msgpack: array truncated".to_string());
+                }
                 for _ in 0..n {
-                    self.skip_value()?;
+                    self.skip_value_depth(depth + 1)?;
                 }
                 Ok(())
             }
             0xdc => {
                 let n = self.read_u16_be()? as usize;
+                if n > self.buf.len() {
+                    return Err("msgpack: array16 truncated".to_string());
+                }
                 for _ in 0..n {
-                    self.skip_value()?;
+                    self.skip_value_depth(depth + 1)?;
                 }
                 Ok(())
             }
             0xdd => {
                 let n = self.read_u32_be()? as usize;
+                if n > self.buf.len() {
+                    return Err("msgpack: array32 truncated".to_string());
+                }
                 for _ in 0..n {
-                    self.skip_value()?;
+                    self.skip_value_depth(depth + 1)?;
                 }
                 Ok(())
             }
             0x80..=0x8f => {
                 let n = (bd & 0x0f) as usize;
+                if n.saturating_mul(2) > self.buf.len() {
+                    return Err("msgpack: map truncated".to_string());
+                }
                 for _ in 0..n {
-                    self.skip_value()?;
-                    self.skip_value()?;
+                    self.skip_value_depth(depth + 1)?;
+                    self.skip_value_depth(depth + 1)?;
                 }
                 Ok(())
             }
             0xde => {
                 let n = self.read_u16_be()? as usize;
+                if n.saturating_mul(2) > self.buf.len() {
+                    return Err("msgpack: map16 truncated".to_string());
+                }
                 for _ in 0..n {
-                    self.skip_value()?;
-                    self.skip_value()?;
+                    self.skip_value_depth(depth + 1)?;
+                    self.skip_value_depth(depth + 1)?;
                 }
                 Ok(())
             }
             0xdf => {
                 let n = self.read_u32_be()? as usize;
+                if n.saturating_mul(2) > self.buf.len() {
+                    return Err("msgpack: map32 truncated".to_string());
+                }
                 for _ in 0..n {
-                    self.skip_value()?;
-                    self.skip_value()?;
+                    self.skip_value_depth(depth + 1)?;
+                    self.skip_value_depth(depth + 1)?;
                 }
                 Ok(())
             }
@@ -744,17 +770,26 @@ impl<'a> MpReader<'a> {
             }
             0xc7 => {
                 let n = self.read_byte()? as usize;
-                self.read_exact(1 + n)?;
+                let total = 1usize
+                    .checked_add(n)
+                    .ok_or_else(|| "msgpack: ext8 length overflow".to_string())?;
+                self.read_exact(total)?;
                 Ok(())
             }
             0xc8 => {
                 let n = self.read_u16_be()? as usize;
-                self.read_exact(1 + n)?;
+                let total = 1usize
+                    .checked_add(n)
+                    .ok_or_else(|| "msgpack: ext16 length overflow".to_string())?;
+                self.read_exact(total)?;
                 Ok(())
             }
             0xc9 => {
                 let n = self.read_u32_be()? as usize;
-                self.read_exact(1 + n)?;
+                let total = 1usize
+                    .checked_add(n)
+                    .ok_or_else(|| "msgpack: ext32 length overflow".to_string())?;
+                self.read_exact(total)?;
                 Ok(())
             }
         }
@@ -1191,5 +1226,25 @@ mod tests {
         assert_eq!(crc_wrapped[0], MessageType::HasCrc as u8);
         let unwrapped = unwrap_crc32(&crc_wrapped).unwrap();
         assert_eq!(unwrapped, lzw.as_slice());
+    }
+
+    #[test]
+    fn test_skip_value_rejects_deep_nesting_and_4gib_ext32() {
+        // 64-deep nested fixarray1 (0x91) ending with 0x00.
+        let mut nested = vec![0x91u8; 64];
+        nested.push(0x00);
+        let mut r = MpReader::new(&nested);
+        let err = r.skip_value().unwrap_err();
+        assert!(err.contains("depth"), "unexpected error: {err}");
+
+        // 0xc9 ext32 claiming 4 GiB payload on a 5-byte buffer.
+        let ext32_bomb = [0xc9u8, 0xff, 0xff, 0xff, 0xff];
+        let mut r = MpReader::new(&ext32_bomb);
+        assert!(r.skip_value().is_err());
+
+        // 0xdd array32 claiming u32::MAX elements on a 5-byte buffer fails fast.
+        let arr32_bomb = [0xddu8, 0xff, 0xff, 0xff, 0xff];
+        let mut r = MpReader::new(&arr32_bomb);
+        assert!(r.skip_value().is_err());
     }
 }

@@ -81,8 +81,18 @@ impl PostingsList {
 
     fn delete(&mut self, deleted: &HashSet<u64>) {
         self.small.retain(|&id| !deleted.contains(&(id as u64)));
+        if self.small.is_empty() {
+            self.small.shrink_to_fit();
+        } else if self.small.capacity() > (self.small.len() * 4).max(1024) {
+            self.small.shrink_to(self.small.len() * 2);
+        }
         if !self.overflow.is_empty() {
             self.overflow.retain(|id| !deleted.contains(id));
+            if self.overflow.is_empty() {
+                self.overflow.shrink_to_fit();
+            } else if self.overflow.capacity() > (self.overflow.len() * 4).max(256) {
+                self.overflow.shrink_to(self.overflow.len() * 2);
+            }
         }
     }
 
@@ -432,11 +442,110 @@ impl MemPostings {
                 if empty_name {
                     stripe.m.remove(&name_id);
                     stripe.lvs.remove(&name_id);
-                } else if let Some(vm) = stripe.m.get(&name_id) {
+                } else if let Some(vm) = stripe.m.get_mut(&name_id) {
+                    let vm_len = vm.len();
+                    if vm.capacity() > (vm_len * 4).max(64) {
+                        vm.shrink_to(vm_len * 2);
+                    }
                     let lvs: Vec<SymbolId> = vm.keys().copied().collect();
                     stripe.lvs.insert(name_id, lvs);
                 }
             }
+            if stripe.m.is_empty() {
+                stripe.m.shrink_to_fit();
+                stripe.lvs.shrink_to_fit();
+                stripe.overflow.shrink_to_fit();
+            } else {
+                let m_len = stripe.m.len();
+                if stripe.m.capacity() > (m_len * 4).max(64) {
+                    stripe.m.shrink_to(m_len * 2);
+                }
+                let lvs_len = stripe.lvs.len();
+                if stripe.lvs.capacity() > (lvs_len * 4).max(64) {
+                    stripe.lvs.shrink_to(lvs_len * 2);
+                }
+            }
+        }
+    }
+
+    /// Returns `true` when `all_postings` is empty (zero indexed series).
+    pub fn is_all_empty(&self) -> bool {
+        self.all_postings.read().is_empty()
+    }
+
+    /// Clears and shrinks all stripe maps when zero series remain.
+    pub fn clear_and_shrink(&self) {
+        {
+            let mut all = self.all_postings.write();
+            all.small = Vec::new();
+            all.overflow = Vec::new();
+        }
+        for s in &self.stripes {
+            let mut st = s.write();
+            st.m = HashMap::new();
+            st.overflow = HashMap::new();
+            st.lvs = HashMap::new();
+        }
+    }
+
+    /// Marks every `SymbolId` currently referenced by live postings keys in `used`.
+    pub fn collect_live_symbols(&self, used: &mut [bool]) {
+        for s in &self.stripes {
+            let st = s.read();
+            for (&nid, vm) in &st.m {
+                if let Some(slot) = used.get_mut(nid.0 as usize) {
+                    *slot = true;
+                }
+                for &vid in vm.keys() {
+                    if let Some(slot) = used.get_mut(vid.0 as usize) {
+                        *slot = true;
+                    }
+                }
+            }
+            for &(nid, vid) in st.overflow.keys() {
+                if let Some(slot) = used.get_mut(nid.0 as usize) {
+                    *slot = true;
+                }
+                if let Some(slot) = used.get_mut(vid.0 as usize) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+
+    /// Remaps all `SymbolId` keys across all 64 stripes according to `remap`, re-bucketing
+    /// entries to their new `stripe_idx(new_name_id)` and shrinking stripe tables to fit.
+    pub fn remap_symbols(&self, remap: &[SymbolId]) {
+        let mut guards: SmallVec<[_; POSTINGS_STRIPES]> =
+            self.stripes.iter().map(|s| s.write()).collect();
+        let mut new_stripes: [PostingsStripe; POSTINGS_STRIPES] =
+            std::array::from_fn(|_| PostingsStripe::default());
+
+        for g in guards.iter_mut() {
+            for (old_nid, vm) in g.m.drain() {
+                let new_nid = remap[old_nid.0 as usize];
+                let dst = &mut new_stripes[Self::stripe_idx(new_nid)];
+                let dst_vm = dst.m.entry(new_nid).or_default();
+                let dst_lvs = dst.lvs.entry(new_nid).or_default();
+                dst_vm.reserve(vm.len());
+                dst_lvs.reserve(vm.len());
+                for (old_vid, list) in vm {
+                    let new_vid = remap[old_vid.0 as usize];
+                    dst_vm.insert(new_vid, list);
+                    dst_lvs.push(new_vid);
+                }
+            }
+            for ((old_nid, old_vid), ov) in g.overflow.drain() {
+                let new_nid = remap[old_nid.0 as usize];
+                let new_vid = remap[old_vid.0 as usize];
+                new_stripes[Self::stripe_idx(new_nid)]
+                    .overflow
+                    .insert((new_nid, new_vid), ov);
+            }
+        }
+
+        for (g, ns) in guards.iter_mut().zip(new_stripes) {
+            **g = ns;
         }
     }
 
