@@ -43,6 +43,17 @@ pub trait PostingsSource {
         name: &str,
         pred: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Vec<u64>, PostingsError>;
+
+    /// Optional fast-path evaluator for [`postings_for_matchers`] (used by [`MemPostingsView`]
+    /// to intersect/subtract `&[u32]` posting slices directly without intermediate `Vec<u64>`
+    /// allocations).
+    #[doc(hidden)]
+    fn try_eval_matchers_fast(
+        &self,
+        _matchers: &[LabelMatcher],
+    ) -> Option<Result<Vec<u64>, PostingsError>> {
+        None
+    }
 }
 
 const POSTINGS_STRIPES: usize = 64;
@@ -869,6 +880,391 @@ impl MemPostings {
         self.sorted_label_values_with_limit(name, symbols, None)
     }
 
+    /// Visits `(value_str, small_u32_slice, large_u64_slice)` for every value of `name`
+    /// under a single postings stripe read lock with zero postings cloning.
+    pub fn visit_all_values_postings_for_name(
+        &self,
+        name: &str,
+        symbols: &SymbolTable,
+        mut f: impl FnMut(&str, &[u32], &[u64]),
+    ) {
+        if !self.ordered.load(AtomicOrdering::Acquire) {
+            self.ensure_order();
+        }
+        let Some(name_id) = symbols.get(name) else {
+            return;
+        };
+        if name_id == ALL_POSTINGS_KEY.0 {
+            return;
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let Some(vm) = stripe.m.get(&name_id) else {
+            return;
+        };
+        for (&val_id, small) in vm {
+            let val_str = symbols.resolve(val_id);
+            let large = if stripe.overflow.is_empty() {
+                &[]
+            } else {
+                stripe
+                    .overflow
+                    .get(&(name_id, val_id))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            };
+            f(val_str, small.as_slice(), large);
+        }
+        if !stripe.overflow.is_empty() {
+            for (&(nid, vid), large) in &stripe.overflow {
+                if nid == name_id && !vm.contains_key(&vid) {
+                    f(symbols.resolve(vid), &[], large.as_slice());
+                }
+            }
+        }
+    }
+
+    /// Evaluates `matchers` directly on `MemPostings` `&[u32]` posting slices (widening to
+    /// `Vec<u64>` only once for the final result), avoiding intermediate `Vec<u64>` allocations.
+    pub fn postings_for_matchers(
+        &self,
+        symbols: &SymbolTable,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<u64>, PostingsError> {
+        if matchers.is_empty() {
+            return Ok(Vec::new());
+        }
+        if matchers.len() == 1 && matchers[0].name.is_empty() && matchers[0].value.is_empty() {
+            return Ok(self.all_postings());
+        }
+        if !self.ordered.load(AtomicOrdering::Acquire) {
+            self.ensure_order();
+        }
+
+        let mut label_must_be_set: HashSet<&str> = HashSet::with_capacity(matchers.len());
+        for m in matchers {
+            if !m.matches_empty() {
+                label_must_be_set.insert(m.name.as_str());
+            }
+        }
+
+        let is_subtracting_matcher = |m: &LabelMatcher| -> bool {
+            if !label_must_be_set.contains(m.name.as_str()) {
+                return true;
+            }
+            matches!(m.match_type, MatchType::NotEqual | MatchType::RegexNotMatch)
+                && m.matches_empty()
+        };
+
+        let mut has_subtracting = false;
+        let mut has_intersecting = false;
+        for m in matchers {
+            if is_subtracting_matcher(m) {
+                has_subtracting = true;
+            } else {
+                has_intersecting = true;
+            }
+        }
+
+        let mut its: SmallVec<[MemTerm; 8]> = SmallVec::new();
+        let mut not_its: SmallVec<[MemTerm; 4]> = SmallVec::new();
+
+        if has_subtracting && !has_intersecting {
+            let len = self.all_postings.read().len();
+            if len == 0 {
+                return Ok(Vec::new());
+            }
+            its.push(MemTerm::AllPostings { len_hint: len });
+        }
+
+        let mut ordered: SmallVec<[&LabelMatcher; 8]> = matchers.iter().collect();
+        ordered.sort_by_key(|m| is_subtracting_matcher(m));
+
+        for m in ordered {
+            if m.name.is_empty() && m.value.is_empty() {
+                return Err(PostingsError::UnexpectedAllPostings);
+            }
+            if m.match_type == MatchType::RegexMatch && m.value == ".*" {
+                continue;
+            }
+            if m.match_type == MatchType::RegexNotMatch && m.value == ".*" {
+                return Ok(Vec::new());
+            }
+            if m.match_type == MatchType::RegexMatch && m.value == ".+" {
+                match self.resolve_all_values_term(symbols, &m.name) {
+                    Some(t) => its.push(t),
+                    None => return Ok(Vec::new()),
+                }
+                continue;
+            }
+            if m.match_type == MatchType::RegexNotMatch && m.value == ".+" {
+                if let Some(t) = self.resolve_all_values_term(symbols, &m.name) {
+                    not_its.push(t);
+                }
+                continue;
+            }
+
+            if label_must_be_set.contains(m.name.as_str()) {
+                let matches_empty = m.matches_empty();
+                let is_not = matches!(m.match_type, MatchType::NotEqual | MatchType::RegexNotMatch);
+                if is_not && matches_empty {
+                    let inv = m.inverse()?;
+                    if let Some(t) = self.resolve_single_matcher_term(symbols, &inv) {
+                        not_its.push(t);
+                    }
+                } else if is_not && !matches_empty {
+                    let inv = m.inverse()?;
+                    match self.resolve_inverse_single_matcher_term(symbols, &inv) {
+                        Some(t) => its.push(t),
+                        None => return Ok(Vec::new()),
+                    }
+                } else {
+                    match self.resolve_single_matcher_term(symbols, m) {
+                        Some(t) => its.push(t),
+                        None => return Ok(Vec::new()),
+                    }
+                }
+            } else if let Some(t) = self.resolve_inverse_single_matcher_term(symbols, m) {
+                not_its.push(t);
+            }
+        }
+
+        if its.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Start from the smallest intersecting term so larger terms intersect in-place
+        // directly against `&[u32]` under their stripe read lock with zero intermediate allocs.
+        its.sort_unstable_by_key(MemTerm::len_hint);
+
+        let mut acc = PostingsAcc::from_term(self, &its[0]);
+        for term in &its[1..] {
+            if acc.is_empty() {
+                return Ok(Vec::new());
+            }
+            acc.intersect_term(self, term);
+        }
+        for term in &not_its {
+            if acc.is_empty() {
+                return Ok(Vec::new());
+            }
+            acc.subtract_term(self, term);
+        }
+        Ok(acc.into_u64_vec())
+    }
+
+    fn resolve_single_matcher_term(&self, symbols: &SymbolTable, m: &LabelMatcher) -> Option<MemTerm> {
+        if m.match_type == MatchType::Equal {
+            return self.resolve_single_value_term(symbols, &m.name, &m.value);
+        }
+        if m.match_type == MatchType::RegexMatch {
+            if let Some(set) = m.set_matches() {
+                return self.resolve_set_values_term(symbols, &m.name, set);
+            }
+        }
+        self.resolve_matching_term(symbols, &m.name, |v| m.matches(v))
+    }
+
+    fn resolve_inverse_single_matcher_term(
+        &self,
+        symbols: &SymbolTable,
+        m: &LabelMatcher,
+    ) -> Option<MemTerm> {
+        if m.match_type == MatchType::RegexNotMatch {
+            if let Some(set) = m.set_matches() {
+                return self.resolve_set_values_term(symbols, &m.name, set);
+            }
+        }
+        if m.match_type == MatchType::NotEqual {
+            return self.resolve_single_value_term(symbols, &m.name, &m.value);
+        }
+        if m.value.is_empty() && matches!(m.match_type, MatchType::RegexMatch | MatchType::Equal) {
+            return self.resolve_all_values_term(symbols, &m.name);
+        }
+        self.resolve_matching_term(symbols, &m.name, |v| !m.matches(v))
+    }
+
+    fn resolve_single_value_term(
+        &self,
+        symbols: &SymbolTable,
+        name: &str,
+        value: &str,
+    ) -> Option<MemTerm> {
+        let name_id = symbols.get(name)?;
+        let value_id = symbols.get(value)?;
+        if (name_id, value_id) == ALL_POSTINGS_KEY {
+            let len = self.all_postings.read().len();
+            return (len > 0).then_some(MemTerm::AllPostings { len_hint: len });
+        }
+        if name_id == ALL_POSTINGS_KEY.0 {
+            return None;
+        }
+        let len = self.postings_len(name_id, value_id);
+        if len == 0 {
+            None
+        } else {
+            Some(MemTerm::SinglePair {
+                name_id,
+                value_id,
+                len_hint: len,
+            })
+        }
+    }
+
+    fn resolve_set_values_term(
+        &self,
+        symbols: &SymbolTable,
+        name: &str,
+        values: &[String],
+    ) -> Option<MemTerm> {
+        if values.is_empty() {
+            return None;
+        }
+        if values.len() == 1 {
+            return self.resolve_single_value_term(symbols, name, &values[0]);
+        }
+        let name_id = symbols.get(name)?;
+        if name_id == ALL_POSTINGS_KEY.0 {
+            let has_empty = values
+                .iter()
+                .any(|v| symbols.get(v) == Some(ALL_POSTINGS_KEY.1));
+            if has_empty {
+                let len = self.all_postings.read().len();
+                return (len > 0).then_some(MemTerm::AllPostings { len_hint: len });
+            }
+            return None;
+        }
+        let mut value_ids: SmallVec<[SymbolId; 8]> = SmallVec::with_capacity(values.len());
+        for v in values {
+            if let Some(vid) = symbols.get(v) {
+                if !value_ids.contains(&vid) {
+                    value_ids.push(vid);
+                }
+            }
+        }
+        if value_ids.is_empty() {
+            return None;
+        }
+        if value_ids.len() == 1 {
+            let vid = value_ids[0];
+            let len = self.postings_len(name_id, vid);
+            return (len > 0).then_some(MemTerm::SinglePair {
+                name_id,
+                value_id: vid,
+                len_hint: len,
+            });
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let vm = stripe.m.get(&name_id)?;
+        let mut non_empty_ids: SmallVec<[SymbolId; 8]> = SmallVec::with_capacity(value_ids.len());
+        let mut len_hint = 0usize;
+        for vid in value_ids {
+            let s_len = vm.get(&vid).map_or(0, Vec::len);
+            let o_len = if stripe.overflow.is_empty() {
+                0
+            } else {
+                stripe.overflow.get(&(name_id, vid)).map_or(0, Vec::len)
+            };
+            let total = s_len + o_len;
+            if total > 0 {
+                len_hint += total;
+                non_empty_ids.push(vid);
+            }
+        }
+        if non_empty_ids.is_empty() {
+            None
+        } else if non_empty_ids.len() == 1 {
+            Some(MemTerm::SinglePair {
+                name_id,
+                value_id: non_empty_ids[0],
+                len_hint,
+            })
+        } else {
+            Some(MemTerm::MultiValues {
+                name_id,
+                value_ids: non_empty_ids,
+                len_hint,
+            })
+        }
+    }
+
+    fn resolve_all_values_term(&self, symbols: &SymbolTable, name: &str) -> Option<MemTerm> {
+        let name_id = symbols.get(name)?;
+        if name_id == ALL_POSTINGS_KEY.0 {
+            let len = self.all_postings.read().len();
+            return (len > 0).then_some(MemTerm::AllPostings { len_hint: len });
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let vm = stripe.m.get(&name_id)?;
+        if vm.len() == 1 && stripe.overflow.is_empty() {
+            if let Some((&vid, list)) = vm.iter().next() {
+                return (!list.is_empty()).then_some(MemTerm::SinglePair {
+                    name_id,
+                    value_id: vid,
+                    len_hint: list.len(),
+                });
+            }
+        }
+        let mut len_hint = 0usize;
+        for list in vm.values() {
+            len_hint += list.len();
+        }
+        if !stripe.overflow.is_empty() {
+            for (&(nid, _), ov) in &stripe.overflow {
+                if nid == name_id {
+                    len_hint += ov.len();
+                }
+            }
+        }
+        (len_hint > 0).then_some(MemTerm::AllValuesForName { name_id, len_hint })
+    }
+
+    fn resolve_matching_term(
+        &self,
+        symbols: &SymbolTable,
+        name: &str,
+        mut pred: impl FnMut(&str) -> bool,
+    ) -> Option<MemTerm> {
+        let name_id = symbols.get(name)?;
+        if name_id == ALL_POSTINGS_KEY.0 {
+            return None;
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let lvs = stripe.lvs.get(&name_id)?;
+        let vm = stripe.m.get(&name_id)?;
+        let mut value_ids: SmallVec<[SymbolId; 8]> = SmallVec::new();
+        let mut len_hint = 0usize;
+        for &vid in lvs {
+            if pred(symbols.resolve(vid)) {
+                let s_len = vm.get(&vid).map_or(0, Vec::len);
+                let o_len = if stripe.overflow.is_empty() {
+                    0
+                } else {
+                    stripe.overflow.get(&(name_id, vid)).map_or(0, Vec::len)
+                };
+                let total = s_len + o_len;
+                if total > 0 {
+                    len_hint += total;
+                    value_ids.push(vid);
+                }
+            }
+        }
+        if value_ids.is_empty() {
+            None
+        } else if value_ids.len() == 1 {
+            Some(MemTerm::SinglePair {
+                name_id,
+                value_id: value_ids[0],
+                len_hint,
+            })
+        } else {
+            Some(MemTerm::MultiValues {
+                name_id,
+                value_ids,
+                len_hint,
+            })
+        }
+    }
+
     /// Returns all `(name, value)` pairs present in postings sorted lexicographically.
     pub fn sorted_keys(&self, symbols: &SymbolTable) -> Vec<(String, String)> {
         let mut pairs: Vec<(SymbolId, SymbolId)> = Vec::new();
@@ -1014,12 +1410,12 @@ impl PostingsStripe {
     }
 }
 
-fn merge_postings_u32_to_u64(lists: &[&[u32]]) -> Vec<u64> {
+fn merge_postings_u32(lists: &[&[u32]]) -> Vec<u32> {
     if lists.is_empty() {
         return Vec::new();
     }
     if lists.len() == 1 {
-        return lists[0].iter().map(|&x| x as u64).collect();
+        return lists[0].to_vec();
     }
     let total: usize = lists.iter().map(|s| s.len()).sum();
     let mut merged = Vec::with_capacity(total);
@@ -1028,7 +1424,980 @@ fn merge_postings_u32_to_u64(lists: &[&[u32]]) -> Vec<u64> {
     }
     merged.sort_unstable();
     merged.dedup();
-    merged.into_iter().map(|x| x as u64).collect()
+    merged
+}
+
+fn merge_postings_u32_to_u64(lists: &[&[u32]]) -> Vec<u64> {
+    if lists.is_empty() {
+        return Vec::new();
+    }
+    if lists.len() == 1 {
+        return lists[0].iter().map(|&x| x as u64).collect();
+    }
+    merge_postings_u32(lists)
+        .into_iter()
+        .map(|x| x as u64)
+        .collect()
+}
+
+enum MemTerm {
+    AllPostings {
+        len_hint: usize,
+    },
+    SinglePair {
+        name_id: SymbolId,
+        value_id: SymbolId,
+        len_hint: usize,
+    },
+    MultiValues {
+        name_id: SymbolId,
+        value_ids: SmallVec<[SymbolId; 8]>,
+        len_hint: usize,
+    },
+    AllValuesForName {
+        name_id: SymbolId,
+        len_hint: usize,
+    },
+}
+
+impl MemTerm {
+    #[inline]
+    fn len_hint(&self) -> usize {
+        match *self {
+            Self::AllPostings { len_hint }
+            | Self::SinglePair { len_hint, .. }
+            | Self::MultiValues { len_hint, .. }
+            | Self::AllValuesForName { len_hint, .. } => len_hint,
+        }
+    }
+}
+
+struct PostingsAcc {
+    small: Vec<u32>,
+    large: Vec<u64>,
+}
+
+impl PostingsAcc {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.small.is_empty() && self.large.is_empty()
+    }
+
+    fn into_u64_vec(self) -> Vec<u64> {
+        let mut out = Vec::with_capacity(self.small.len() + self.large.len());
+        out.extend(self.small.iter().map(|&x| x as u64));
+        out.extend_from_slice(&self.large);
+        out
+    }
+
+    fn from_term(postings: &MemPostings, term: &MemTerm) -> Self {
+        match term {
+            MemTerm::AllPostings { .. } => {
+                let all = postings.all_postings.read();
+                Self {
+                    small: all.small.clone(),
+                    large: all.overflow.clone(),
+                }
+            }
+            MemTerm::SinglePair {
+                name_id, value_id, ..
+            } => {
+                let stripe = postings.stripes[MemPostings::stripe_idx(*name_id)].read();
+                let small = stripe
+                    .m
+                    .get(name_id)
+                    .and_then(|vm| vm.get(value_id))
+                    .cloned()
+                    .unwrap_or_default();
+                let large = if stripe.overflow.is_empty() {
+                    Vec::new()
+                } else {
+                    stripe
+                        .overflow
+                        .get(&(*name_id, *value_id))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                Self { small, large }
+            }
+            MemTerm::MultiValues {
+                name_id, value_ids, ..
+            } => {
+                let stripe = postings.stripes[MemPostings::stripe_idx(*name_id)].read();
+                let small = match stripe.m.get(name_id) {
+                    Some(vm) => {
+                        let lists: SmallVec<[&[u32]; 16]> = value_ids
+                            .iter()
+                            .filter_map(|vid| vm.get(vid).map(Vec::as_slice))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        merge_postings_u32(&lists)
+                    }
+                    None => Vec::new(),
+                };
+                let large = if stripe.overflow.is_empty() {
+                    Vec::new()
+                } else {
+                    let ov_lists: SmallVec<[&[u64]; 8]> = value_ids
+                        .iter()
+                        .filter_map(|vid| stripe.overflow.get(&(*name_id, *vid)).map(Vec::as_slice))
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    merge_postings(&ov_lists)
+                };
+                Self { small, large }
+            }
+            MemTerm::AllValuesForName { name_id, .. } => {
+                let stripe = postings.stripes[MemPostings::stripe_idx(*name_id)].read();
+                let small = match stripe.m.get(name_id) {
+                    Some(vm) => {
+                        let lists: Vec<&[u32]> = vm
+                            .values()
+                            .map(Vec::as_slice)
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        merge_postings_u32(&lists)
+                    }
+                    None => Vec::new(),
+                };
+                let large = if stripe.overflow.is_empty() {
+                    Vec::new()
+                } else {
+                    let ov_lists: Vec<&[u64]> = stripe
+                        .overflow
+                        .iter()
+                        .filter(|(&(nid, _), ov)| nid == *name_id && !ov.is_empty())
+                        .map(|(_, ov)| ov.as_slice())
+                        .collect();
+                    merge_postings(&ov_lists)
+                };
+                Self { small, large }
+            }
+        }
+    }
+
+    fn intersect_term(&mut self, postings: &MemPostings, term: &MemTerm) {
+        match term {
+            MemTerm::AllPostings { .. } => {
+                let all = postings.all_postings.read();
+                intersect_u32_in_place(&mut self.small, &all.small);
+                if !self.large.is_empty() {
+                    intersect_u64_in_place(&mut self.large, &all.overflow);
+                }
+            }
+            MemTerm::SinglePair {
+                name_id, value_id, ..
+            } => {
+                let stripe = postings.stripes[MemPostings::stripe_idx(*name_id)].read();
+                if !self.small.is_empty() {
+                    let other_small = stripe
+                        .m
+                        .get(name_id)
+                        .and_then(|vm| vm.get(value_id))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    intersect_u32_in_place(&mut self.small, other_small);
+                }
+                if !self.large.is_empty() {
+                    let other_large = if stripe.overflow.is_empty() {
+                        &[]
+                    } else {
+                        stripe
+                            .overflow
+                            .get(&(*name_id, *value_id))
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[])
+                    };
+                    intersect_u64_in_place(&mut self.large, other_large);
+                }
+            }
+            MemTerm::MultiValues {
+                name_id, value_ids, ..
+            } => {
+                let stripe = postings.stripes[MemPostings::stripe_idx(*name_id)].read();
+                if !self.small.is_empty() {
+                    let lists: SmallVec<[&[u32]; 16]> = stripe
+                        .m
+                        .get(name_id)
+                        .map(|vm| {
+                            value_ids
+                                .iter()
+                                .filter_map(|vid| vm.get(vid).map(Vec::as_slice))
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    intersect_u32_union_in_place(&mut self.small, &lists);
+                }
+                if !self.large.is_empty() {
+                    if stripe.overflow.is_empty() {
+                        self.large.clear();
+                    } else {
+                        let ov_lists: SmallVec<[&[u64]; 8]> = value_ids
+                            .iter()
+                            .filter_map(|vid| {
+                                stripe.overflow.get(&(*name_id, *vid)).map(Vec::as_slice)
+                            })
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        let merged = merge_postings(&ov_lists);
+                        intersect_u64_in_place(&mut self.large, &merged);
+                    }
+                }
+            }
+            MemTerm::AllValuesForName { name_id, .. } => {
+                let stripe = postings.stripes[MemPostings::stripe_idx(*name_id)].read();
+                if !self.small.is_empty() {
+                    let lists: Vec<&[u32]> = stripe
+                        .m
+                        .get(name_id)
+                        .map(|vm| {
+                            vm.values()
+                                .map(Vec::as_slice)
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    intersect_u32_union_in_place(&mut self.small, &lists);
+                }
+                if !self.large.is_empty() {
+                    if stripe.overflow.is_empty() {
+                        self.large.clear();
+                    } else {
+                        let ov_lists: Vec<&[u64]> = stripe
+                            .overflow
+                            .iter()
+                            .filter(|(&(nid, _), ov)| nid == *name_id && !ov.is_empty())
+                            .map(|(_, ov)| ov.as_slice())
+                            .collect();
+                        let merged = merge_postings(&ov_lists);
+                        intersect_u64_in_place(&mut self.large, &merged);
+                    }
+                }
+            }
+        }
+    }
+
+    fn subtract_term(&mut self, postings: &MemPostings, term: &MemTerm) {
+        match term {
+            MemTerm::AllPostings { .. } => {
+                let all = postings.all_postings.read();
+                without_u32_in_place(&mut self.small, &all.small);
+                if !self.large.is_empty() && !all.overflow.is_empty() {
+                    without_u64_in_place(&mut self.large, &all.overflow);
+                }
+            }
+            MemTerm::SinglePair {
+                name_id, value_id, ..
+            } => {
+                let stripe = postings.stripes[MemPostings::stripe_idx(*name_id)].read();
+                if !self.small.is_empty() {
+                    if let Some(other_small) =
+                        stripe.m.get(name_id).and_then(|vm| vm.get(value_id))
+                    {
+                        without_u32_in_place(&mut self.small, other_small);
+                    }
+                }
+                if !self.large.is_empty() && !stripe.overflow.is_empty() {
+                    if let Some(other_large) = stripe.overflow.get(&(*name_id, *value_id)) {
+                        without_u64_in_place(&mut self.large, other_large);
+                    }
+                }
+            }
+            MemTerm::MultiValues {
+                name_id, value_ids, ..
+            } => {
+                let stripe = postings.stripes[MemPostings::stripe_idx(*name_id)].read();
+                if !self.small.is_empty() {
+                    let lists: SmallVec<[&[u32]; 16]> = stripe
+                        .m
+                        .get(name_id)
+                        .map(|vm| {
+                            value_ids
+                                .iter()
+                                .filter_map(|vid| vm.get(vid).map(Vec::as_slice))
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    without_u32_union_in_place(&mut self.small, &lists);
+                }
+                if !self.large.is_empty() && !stripe.overflow.is_empty() {
+                    let ov_lists: SmallVec<[&[u64]; 8]> = value_ids
+                        .iter()
+                        .filter_map(|vid| stripe.overflow.get(&(*name_id, *vid)).map(Vec::as_slice))
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !ov_lists.is_empty() {
+                        let merged = merge_postings(&ov_lists);
+                        without_u64_in_place(&mut self.large, &merged);
+                    }
+                }
+            }
+            MemTerm::AllValuesForName { name_id, .. } => {
+                let stripe = postings.stripes[MemPostings::stripe_idx(*name_id)].read();
+                if !self.small.is_empty() {
+                    let lists: Vec<&[u32]> = stripe
+                        .m
+                        .get(name_id)
+                        .map(|vm| {
+                            vm.values()
+                                .map(Vec::as_slice)
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    without_u32_union_in_place(&mut self.small, &lists);
+                }
+                if !self.large.is_empty() && !stripe.overflow.is_empty() {
+                    let ov_lists: Vec<&[u64]> = stripe
+                        .overflow
+                        .iter()
+                        .filter(|(&(nid, _), ov)| nid == *name_id && !ov.is_empty())
+                        .map(|(_, ov)| ov.as_slice())
+                        .collect();
+                    if !ov_lists.is_empty() {
+                        let merged = merge_postings(&ov_lists);
+                        without_u64_in_place(&mut self.large, &merged);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn intersect_u32_union_in_place(acc: &mut Vec<u32>, lists: &[&[u32]]) {
+    if acc.is_empty() || lists.is_empty() {
+        acc.clear();
+        return;
+    }
+    if lists.len() == 1 {
+        intersect_u32_in_place(acc, lists[0]);
+        return;
+    }
+    let total_len: usize = lists.iter().map(|s| s.len()).sum();
+    if acc.len().saturating_mul(lists.len()).saturating_mul(8) < total_len {
+        acc.retain(|x| lists.iter().any(|s| s.binary_search(x).is_ok()));
+    } else {
+        let merged = merge_postings_u32(lists);
+        intersect_u32_in_place(acc, &merged);
+    }
+}
+
+#[inline]
+fn without_u32_union_in_place(acc: &mut Vec<u32>, lists: &[&[u32]]) {
+    if acc.is_empty() || lists.is_empty() {
+        return;
+    }
+    if lists.len() == 1 {
+        without_u32_in_place(acc, lists[0]);
+        return;
+    }
+    let total_len: usize = lists.iter().map(|s| s.len()).sum();
+    if acc.len().saturating_mul(lists.len()).saturating_mul(8) < total_len {
+        acc.retain(|x| !lists.iter().any(|s| s.binary_search(x).is_ok()));
+    } else {
+        let merged = merge_postings_u32(lists);
+        without_u32_in_place(acc, &merged);
+    }
+}
+
+#[inline]
+fn intersect_u32_in_place(acc: &mut Vec<u32>, other: &[u32]) {
+    if acc.is_empty() || other.is_empty() {
+        acc.clear();
+        return;
+    }
+    let min_a = acc[0];
+    let max_a = acc[acc.len() - 1];
+    let min_b = other[0];
+    let max_b = other[other.len() - 1];
+    if max_a < min_b || min_a > max_b {
+        acc.clear();
+        return;
+    }
+    if other.len() > acc.len().saturating_mul(8) {
+        let mut write = 0usize;
+        let mut lo = if min_a > min_b {
+            other.partition_point(|&x| x < min_a)
+        } else {
+            0
+        };
+        for read in 0..acc.len() {
+            let x = acc[read];
+            if x > max_b {
+                break;
+            }
+            match other[lo..].binary_search(&x) {
+                Ok(idx) => {
+                    acc[write] = x;
+                    write += 1;
+                    lo += idx + 1;
+                }
+                Err(idx) => {
+                    lo += idx;
+                }
+            }
+            if lo >= other.len() {
+                break;
+            }
+        }
+        acc.truncate(write);
+    } else if acc.len() > other.len().saturating_mul(8) {
+        let mut write = 0usize;
+        let mut lo = if min_b > min_a {
+            acc.partition_point(|&x| x < min_b)
+        } else {
+            0
+        };
+        for &y in other {
+            if y > max_a {
+                break;
+            }
+            match acc[lo..].binary_search(&y) {
+                Ok(idx) => {
+                    acc[write] = y;
+                    write += 1;
+                    lo += idx + 1;
+                }
+                Err(idx) => {
+                    lo += idx;
+                }
+            }
+            if lo >= acc.len() {
+                break;
+            }
+        }
+        acc.truncate(write);
+    } else {
+        let mut write = 0usize;
+        let mut i = if min_a < min_b {
+            acc.partition_point(|&x| x < min_b)
+        } else {
+            0
+        };
+        let mut j = if min_b < min_a {
+            other.partition_point(|&x| x < min_a)
+        } else {
+            0
+        };
+        while i < acc.len() && j < other.len() {
+            let a = acc[i];
+            let b = other[j];
+            match a.cmp(&b) {
+                Ordering::Less => i += 1,
+                Ordering::Greater => j += 1,
+                Ordering::Equal => {
+                    acc[write] = a;
+                    write += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        acc.truncate(write);
+    }
+}
+
+#[inline]
+fn intersect_u64_in_place(acc: &mut Vec<u64>, other: &[u64]) {
+    if acc.is_empty() || other.is_empty() {
+        acc.clear();
+        return;
+    }
+    let min_a = acc[0];
+    let max_a = acc[acc.len() - 1];
+    let min_b = other[0];
+    let max_b = other[other.len() - 1];
+    if max_a < min_b || min_a > max_b {
+        acc.clear();
+        return;
+    }
+    let mut write = 0usize;
+    let mut i = if min_a < min_b {
+        acc.partition_point(|&x| x < min_b)
+    } else {
+        0
+    };
+    let mut j = if min_b < min_a {
+        other.partition_point(|&x| x < min_a)
+    } else {
+        0
+    };
+    while i < acc.len() && j < other.len() {
+        match acc[i].cmp(&other[j]) {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
+                acc[write] = acc[i];
+                write += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    acc.truncate(write);
+}
+
+#[inline]
+fn without_u32_in_place(acc: &mut Vec<u32>, drop: &[u32]) {
+    if acc.is_empty() || drop.is_empty() {
+        return;
+    }
+    let min_a = acc[0];
+    let max_a = acc[acc.len() - 1];
+    let min_d = drop[0];
+    let max_d = drop[drop.len() - 1];
+    if max_a < min_d || min_a > max_d {
+        return;
+    }
+    if drop.len() > acc.len().saturating_mul(8) {
+        let mut write = 0usize;
+        let mut lo = if min_a > min_d {
+            drop.partition_point(|&x| x < min_a)
+        } else {
+            0
+        };
+        for read in 0..acc.len() {
+            let x = acc[read];
+            if x > max_d {
+                let rem = acc.len() - read;
+                acc.copy_within(read.., write);
+                write += rem;
+                break;
+            }
+            match drop[lo..].binary_search(&x) {
+                Ok(idx) => {
+                    lo += idx + 1;
+                }
+                Err(idx) => {
+                    acc[write] = x;
+                    write += 1;
+                    lo += idx;
+                }
+            }
+            if lo >= drop.len() {
+                let next_read = read + 1;
+                if next_read < acc.len() {
+                    let rem = acc.len() - next_read;
+                    acc.copy_within(next_read.., write);
+                    write += rem;
+                }
+                break;
+            }
+        }
+        acc.truncate(write);
+    } else {
+        let mut i = if min_a < min_d {
+            acc.partition_point(|&x| x < min_d)
+        } else {
+            0
+        };
+        if i >= acc.len() {
+            return;
+        }
+        let mut write = i;
+        let mut j = if min_d < acc[i] {
+            drop.partition_point(|&x| x < acc[i])
+        } else {
+            0
+        };
+        while i < acc.len() && j < drop.len() {
+            match acc[i].cmp(&drop[j]) {
+                Ordering::Less => {
+                    acc[write] = acc[i];
+                    write += 1;
+                    i += 1;
+                }
+                Ordering::Greater => j += 1,
+                Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        if i < acc.len() {
+            let rem = acc.len() - i;
+            acc.copy_within(i.., write);
+            write += rem;
+        }
+        acc.truncate(write);
+    }
+}
+
+#[inline]
+fn without_u64_in_place(acc: &mut Vec<u64>, drop: &[u64]) {
+    if acc.is_empty() || drop.is_empty() {
+        return;
+    }
+    let min_a = acc[0];
+    let max_a = acc[acc.len() - 1];
+    let min_d = drop[0];
+    let max_d = drop[drop.len() - 1];
+    if max_a < min_d || min_a > max_d {
+        return;
+    }
+    let mut i = if min_a < min_d {
+        acc.partition_point(|&x| x < min_d)
+    } else {
+        0
+    };
+    if i >= acc.len() {
+        return;
+    }
+    let mut write = i;
+    let mut j = if min_d < acc[i] {
+        drop.partition_point(|&x| x < acc[i])
+    } else {
+        0
+    };
+    while i < acc.len() && j < drop.len() {
+        match acc[i].cmp(&drop[j]) {
+            Ordering::Less => {
+                acc[write] = acc[i];
+                write += 1;
+                i += 1;
+            }
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    if i < acc.len() {
+        let rem = acc.len() - i;
+        acc.copy_within(i.., write);
+        write += rem;
+    }
+    acc.truncate(write);
+}
+
+/// Counts elements present in both sorted `small: &[u32]` and sorted `eligible: &[u64]`.
+#[inline]
+pub fn intersect_sorted_u32_u64_count(small: &[u32], eligible: &[u64]) -> u64 {
+    if small.is_empty() || eligible.is_empty() {
+        return 0;
+    }
+    let min_s = small[0] as u64;
+    let max_s = small[small.len() - 1] as u64;
+    let min_e = eligible[0];
+    let max_e = eligible[eligible.len() - 1];
+    if max_s < min_e || min_s > max_e {
+        return 0;
+    }
+    let mut count = 0u64;
+    if small.len().saturating_mul(16) < eligible.len() {
+        let mut lo = if min_s > min_e {
+            eligible.partition_point(|&x| x < min_s)
+        } else {
+            0
+        };
+        for &s in small {
+            let v = s as u64;
+            if v > max_e {
+                break;
+            }
+            match eligible[lo..].binary_search(&v) {
+                Ok(pos) => {
+                    count += 1;
+                    lo += pos + 1;
+                }
+                Err(pos) => {
+                    lo += pos;
+                }
+            }
+        }
+        return count;
+    }
+    if eligible.len().saturating_mul(16) < small.len() {
+        let mut lo = if min_e > min_s {
+            small.partition_point(|&x| (x as u64) < min_e)
+        } else {
+            0
+        };
+        for &e in eligible {
+            if e > max_s {
+                break;
+            }
+            let Ok(e32) = u32::try_from(e) else {
+                break;
+            };
+            match small[lo..].binary_search(&e32) {
+                Ok(pos) => {
+                    count += 1;
+                    lo += pos + 1;
+                }
+                Err(pos) => {
+                    lo += pos;
+                }
+            }
+        }
+        return count;
+    }
+    let mut i = if min_s < min_e {
+        small.partition_point(|&x| (x as u64) < min_e)
+    } else {
+        0
+    };
+    let mut j = if min_e < min_s {
+        eligible.partition_point(|&x| x < min_s)
+    } else {
+        0
+    };
+    while i < small.len() && j < eligible.len() {
+        let a = small[i] as u64;
+        let b = eligible[j];
+        match a.cmp(&b) {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
+                count += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Counts elements present in both sorted `large: &[u64]` and sorted `eligible: &[u64]`.
+#[inline]
+pub fn intersect_sorted_u64_count(large: &[u64], eligible: &[u64]) -> u64 {
+    if large.is_empty() || eligible.is_empty() {
+        return 0;
+    }
+    let min_l = large[0];
+    let max_l = large[large.len() - 1];
+    let min_e = eligible[0];
+    let max_e = eligible[eligible.len() - 1];
+    if max_l < min_e || min_l > max_e {
+        return 0;
+    }
+    let mut count = 0u64;
+    if large.len().saturating_mul(16) < eligible.len() {
+        let mut lo = if min_l > min_e {
+            eligible.partition_point(|&x| x < min_l)
+        } else {
+            0
+        };
+        for &v in large {
+            if v > max_e {
+                break;
+            }
+            match eligible[lo..].binary_search(&v) {
+                Ok(pos) => {
+                    count += 1;
+                    lo += pos + 1;
+                }
+                Err(pos) => {
+                    lo += pos;
+                }
+            }
+        }
+        return count;
+    }
+    if eligible.len().saturating_mul(16) < large.len() {
+        let mut lo = if min_e > min_l {
+            large.partition_point(|&x| x < min_e)
+        } else {
+            0
+        };
+        for &e in eligible {
+            if e > max_l {
+                break;
+            }
+            match large[lo..].binary_search(&e) {
+                Ok(pos) => {
+                    count += 1;
+                    lo += pos + 1;
+                }
+                Err(pos) => {
+                    lo += pos;
+                }
+            }
+        }
+        return count;
+    }
+    let mut i = if min_l < min_e {
+        large.partition_point(|&x| x < min_e)
+    } else {
+        0
+    };
+    let mut j = if min_e < min_l {
+        eligible.partition_point(|&x| x < min_l)
+    } else {
+        0
+    };
+    while i < large.len() && j < eligible.len() {
+        let a = large[i];
+        let b = eligible[j];
+        match a.cmp(&b) {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
+                count += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Counts total matching refs across disjoint `(small, large)` postings slices and `eligible`.
+#[inline]
+pub fn intersect_sorted_count(small: &[u32], large: &[u64], eligible: &[u64]) -> u64 {
+    intersect_sorted_u32_u64_count(small, eligible) + intersect_sorted_u64_count(large, eligible)
+}
+
+/// Returns `true` if sorted `small: &[u32]` and sorted `eligible: &[u64]` share at least one ref.
+#[inline]
+pub fn intersect_sorted_u32_u64_any(small: &[u32], eligible: &[u64]) -> bool {
+    if small.is_empty() || eligible.is_empty() {
+        return false;
+    }
+    let min_s = small[0] as u64;
+    let max_s = small[small.len() - 1] as u64;
+    let min_e = eligible[0];
+    let max_e = eligible[eligible.len() - 1];
+    if max_s < min_e || min_s > max_e {
+        return false;
+    }
+    if small.len().saturating_mul(16) < eligible.len() {
+        let mut lo = if min_s > min_e {
+            eligible.partition_point(|&x| x < min_s)
+        } else {
+            0
+        };
+        for &s in small {
+            let v = s as u64;
+            if v > max_e {
+                break;
+            }
+            match eligible[lo..].binary_search(&v) {
+                Ok(_) => return true,
+                Err(pos) => lo += pos,
+            }
+        }
+        return false;
+    }
+    if eligible.len().saturating_mul(16) < small.len() {
+        let mut lo = if min_e > min_s {
+            small.partition_point(|&x| (x as u64) < min_e)
+        } else {
+            0
+        };
+        for &e in eligible {
+            if e > max_s {
+                break;
+            }
+            let Ok(e32) = u32::try_from(e) else {
+                break;
+            };
+            match small[lo..].binary_search(&e32) {
+                Ok(_) => return true,
+                Err(pos) => lo += pos,
+            }
+        }
+        return false;
+    }
+    let mut i = if min_s < min_e {
+        small.partition_point(|&x| (x as u64) < min_e)
+    } else {
+        0
+    };
+    let mut j = if min_e < min_s {
+        eligible.partition_point(|&x| x < min_s)
+    } else {
+        0
+    };
+    while i < small.len() && j < eligible.len() {
+        let a = small[i] as u64;
+        let b = eligible[j];
+        match a.cmp(&b) {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+/// Returns `true` if sorted `large: &[u64]` and sorted `eligible: &[u64]` share at least one ref.
+#[inline]
+pub fn intersect_sorted_u64_any(large: &[u64], eligible: &[u64]) -> bool {
+    if large.is_empty() || eligible.is_empty() {
+        return false;
+    }
+    let min_l = large[0];
+    let max_l = large[large.len() - 1];
+    let min_e = eligible[0];
+    let max_e = eligible[eligible.len() - 1];
+    if max_l < min_e || min_l > max_e {
+        return false;
+    }
+    if large.len().saturating_mul(16) < eligible.len() {
+        let mut lo = if min_l > min_e {
+            eligible.partition_point(|&x| x < min_l)
+        } else {
+            0
+        };
+        for &v in large {
+            if v > max_e {
+                break;
+            }
+            match eligible[lo..].binary_search(&v) {
+                Ok(_) => return true,
+                Err(pos) => lo += pos,
+            }
+        }
+        return false;
+    }
+    if eligible.len().saturating_mul(16) < large.len() {
+        let mut lo = if min_e > min_l {
+            large.partition_point(|&x| x < min_e)
+        } else {
+            0
+        };
+        for &e in eligible {
+            if e > max_l {
+                break;
+            }
+            match large[lo..].binary_search(&e) {
+                Ok(_) => return true,
+                Err(pos) => lo += pos,
+            }
+        }
+        return false;
+    }
+    let mut i = if min_l < min_e {
+        large.partition_point(|&x| x < min_e)
+    } else {
+        0
+    };
+    let mut j = if min_e < min_l {
+        eligible.partition_point(|&x| x < min_l)
+    } else {
+        0
+    };
+    while i < large.len() && j < eligible.len() {
+        let a = large[i];
+        let b = eligible[j];
+        match a.cmp(&b) {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+/// Returns `true` if `(small, large)` postings slices and `eligible` share at least one ref.
+#[inline]
+pub fn intersect_sorted_any(small: &[u32], large: &[u64], eligible: &[u64]) -> bool {
+    intersect_sorted_u32_u64_any(small, eligible) || intersect_sorted_u64_any(large, eligible)
 }
 
 /// Borrowed view pairing [`MemPostings`] with a [`SymbolTable`] to implement [`PostingsSource`].
@@ -1077,6 +2446,13 @@ impl PostingsSource for MemPostingsView<'_> {
         Ok(self
             .postings
             .postings_for_label_matching_id(name_id, self.symbols, pred))
+    }
+
+    fn try_eval_matchers_fast(
+        &self,
+        matchers: &[LabelMatcher],
+    ) -> Option<Result<Vec<u64>, PostingsError>> {
+        Some(self.postings.postings_for_matchers(self.symbols, matchers))
     }
 }
 
@@ -1195,6 +2571,16 @@ pub fn without_postings(full: &[u64], drop: &[u64]) -> Vec<u64> {
 /// Evaluates `matchers` against `source`, matching Prometheus `tsdb.PostingsForMatchers` semantics
 /// including match-empty matchers (`foo=""`, `foo!="bar"`, `foo=~".*"`, `foo!~".+"`, etc.).
 pub fn postings_for_matchers<S: PostingsSource + ?Sized>(
+    source: &S,
+    matchers: &[LabelMatcher],
+) -> Result<Vec<u64>, PostingsError> {
+    if let Some(res) = source.try_eval_matchers_fast(matchers) {
+        return res;
+    }
+    postings_for_matchers_generic(source, matchers)
+}
+
+fn postings_for_matchers_generic<S: PostingsSource + ?Sized>(
     source: &S,
     matchers: &[LabelMatcher],
 ) -> Result<Vec<u64>, PostingsError> {
@@ -1432,5 +2818,156 @@ mod tests {
         del.insert(big2);
         p.delete(&del, s3.as_slice());
         assert_eq!(p.all_postings(), vec![42, big1]);
+    }
+
+    #[test]
+    fn visit_all_values_and_galloping_helpers() {
+        let mut syms = SymbolTable::new();
+        let p = MemPostings::new_unordered();
+        let big = (u32::MAX as u64) + 77;
+        for i in 1..=200u64 {
+            let lbls = SymbolLabels::from_pairs(
+                &mut syms,
+                [
+                    ("__name__", "req"),
+                    ("env", if i % 4 == 0 { "prod" } else { "dev" }),
+                    ("shard", &format!("s-{}", i % 10)),
+                ],
+            );
+            p.add(i, &lbls);
+        }
+        let lbl_big = SymbolLabels::from_pairs(
+            &mut syms,
+            [("__name__", "req"), ("env", "staging"), ("shard", "s-0")],
+        );
+        p.add(big, &lbl_big);
+        p.ensure_order();
+
+        let mut visited: std::collections::BTreeMap<String, (Vec<u32>, Vec<u64>)> =
+            std::collections::BTreeMap::new();
+        p.visit_all_values_postings_for_name("env", &syms, |val, small, large| {
+            visited.insert(val.to_string(), (small.to_vec(), large.to_vec()));
+        });
+        assert_eq!(visited.len(), 3);
+        assert_eq!(visited["prod"].0.len(), 50);
+        assert_eq!(visited["dev"].0.len(), 150);
+        assert!(visited["staging"].0.is_empty());
+        assert_eq!(visited["staging"].1, vec![big]);
+
+        // Test galloping count & any across skewed, comparable, and overflow inputs
+        let elig_small = [4u64, 8, 12, big];
+        assert_eq!(
+            intersect_sorted_count(&visited["prod"].0, &visited["prod"].1, &elig_small),
+            3
+        );
+        assert!(intersect_sorted_any(
+            &visited["prod"].0,
+            &visited["prod"].1,
+            &elig_small
+        ));
+        assert_eq!(
+            intersect_sorted_count(&visited["staging"].0, &visited["staging"].1, &elig_small),
+            1
+        );
+        assert!(!intersect_sorted_u32_u64_any(&[1, 2, 3], &[4, 5, 6]));
+        assert_eq!(intersect_sorted_u32_u64_count(&[1, 5, 9], &[2, 5, 9, 10]), 2);
+
+        // Large eligible vs tiny small (exercises small*16 < eligible branch)
+        let huge_elig: Vec<u64> = (1..=5000).collect();
+        assert_eq!(intersect_sorted_u32_u64_count(&[10, 500, 4999, 6000], &huge_elig), 3);
+        assert!(intersect_sorted_u32_u64_any(&[4999], &huge_elig));
+        // Tiny eligible vs large small (exercises eligible*16 < small branch)
+        let huge_small: Vec<u32> = (1..=5000).collect();
+        assert_eq!(intersect_sorted_u32_u64_count(&huge_small, &[42, 4999, 9999]), 2);
+        assert!(intersect_sorted_u32_u64_any(&huge_small, &[4999, 9999]));
+        assert!(!intersect_sorted_u32_u64_any(&huge_small, &[6000, 7000]));
+    }
+
+    #[test]
+    fn direct_u32_matchers_parity_with_generic_and_overflow() {
+        let mut syms = SymbolTable::new();
+        let p = MemPostings::new_unordered();
+        let big1 = (u32::MAX as u64) + 10;
+        let big2 = (u32::MAX as u64) + 20;
+
+        for i in 1..=600u64 {
+            let mut pairs = vec![
+                ("__name__", if i % 5 == 0 { "err_total" } else { "req_total" }),
+                ("job", if i % 3 == 0 { "db" } else if i % 3 == 1 { "api" } else { "web" }),
+            ];
+            let shard_val = format!("s-{}", i % 25);
+            pairs.push(("shard", &shard_val));
+            let env_val = if i % 7 == 0 { "" } else if i % 2 == 0 { "prod" } else { "dev" };
+            if !env_val.is_empty() {
+                pairs.push(("env", env_val));
+            }
+            let lbls = SymbolLabels::from_pairs(&mut syms, pairs);
+            p.add(i, &lbls);
+        }
+        // Add u64 overflow refs too
+        let lbl_ov1 = SymbolLabels::from_pairs(
+            &mut syms,
+            [("__name__", "req_total"), ("job", "api"), ("shard", "s-0"), ("env", "prod")],
+        );
+        let lbl_ov2 = SymbolLabels::from_pairs(
+            &mut syms,
+            [("__name__", "err_total"), ("job", "web"), ("shard", "s-1")],
+        );
+        p.add(big1, &lbl_ov1);
+        p.add(big2, &lbl_ov2);
+        p.ensure_order();
+
+        let src = p.as_source(&syms);
+        let m = |mt, k, v| LabelMatcher::new(mt, k, v).unwrap();
+        let suites: Vec<Vec<LabelMatcher>> = vec![
+            vec![],
+            vec![m(MatchType::Equal, "", "")],
+            vec![m(MatchType::Equal, "__name__", "req_total")],
+            vec![
+                m(MatchType::Equal, "__name__", "req_total"),
+                m(MatchType::Equal, "shard", "s-0"),
+            ],
+            vec![
+                m(MatchType::Equal, "__name__", "req_total"),
+                m(MatchType::RegexMatch, "job", "api|web"),
+                m(MatchType::NotEqual, "env", "dev"),
+            ],
+            vec![
+                m(MatchType::Equal, "env", ""),
+                m(MatchType::RegexNotMatch, "job", "db"),
+            ],
+            vec![
+                m(MatchType::NotEqual, "env", ""),
+                m(MatchType::RegexMatch, "shard", "s-1|s-2|s-3"),
+            ],
+            vec![
+                m(MatchType::RegexMatch, "__name__", ".*"),
+                m(MatchType::RegexMatch, "env", ".+"),
+                m(MatchType::RegexNotMatch, "shard", "s-0|s-1"),
+            ],
+            vec![
+                m(MatchType::RegexNotMatch, "job", ".*"),
+                m(MatchType::Equal, "__name__", "req_total"),
+            ],
+            vec![
+                m(MatchType::RegexNotMatch, "env", ".+"),
+            ],
+            vec![
+                m(MatchType::Equal, "__name__", "missing"),
+                m(MatchType::Equal, "job", "api"),
+            ],
+            vec![
+                m(MatchType::RegexMatch, "shard", "s-[12].*"),
+                m(MatchType::RegexNotMatch, "env", "^$"),
+            ],
+        ];
+
+        for ms in &suites {
+            let fast = p.postings_for_matchers(&syms, ms).unwrap();
+            let generic = postings_for_matchers_generic(&src, ms).unwrap();
+            assert_eq!(fast, generic, "parity mismatch for matchers {ms:?}");
+            let via_trait = postings_for_matchers(&src, ms).unwrap();
+            assert_eq!(via_trait, generic, "trait fast-path mismatch for {ms:?}");
+        }
     }
 }

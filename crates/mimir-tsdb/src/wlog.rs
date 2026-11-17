@@ -5,6 +5,7 @@
 //! github.com/prometheus/prometheus/tsdb/wlog/live_reader.go,
 //! and github.com/prometheus/prometheus/tsdb/wlog/checkpoint.go.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
@@ -38,6 +39,78 @@ pub enum CompressionType {
     None,
     Snappy,
     Zstd,
+}
+
+/// Alias for [`CompressionType`] used by pre-compressed WAL helpers.
+pub type WlogCompression = CompressionType;
+
+thread_local! {
+    static TLS_SNAPPY_ENCODER: RefCell<snap::raw::Encoder> =
+        RefCell::new(snap::raw::Encoder::new());
+    static TLS_ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        const { RefCell::new(None) };
+}
+
+/// Compresses a single encoded WAL record into `out` using thread-local reusable compressors.
+///
+/// Returns `Ok(true)` if `out` contains a compressed payload strictly smaller than `rec`
+/// (in which case the caller should pass `(&out, true)` to [`WlogWriter::log_precompressed`]),
+/// or `Ok(false)` if `rec` should be logged uncompressed (`(rec, false)`).
+pub fn compress_wal_record(
+    rec: &[u8],
+    compression: WlogCompression,
+    out: &mut Vec<u8>,
+) -> Result<bool, WlogError> {
+    if rec.is_empty() || compression == CompressionType::None {
+        return Ok(false);
+    }
+
+    match compression {
+        CompressionType::None => unreachable!(),
+        CompressionType::Snappy => {
+            let max_len = snap::raw::max_compress_len(rec.len());
+            if out.len() < max_len {
+                out.resize(max_len, 0);
+            }
+            let n = TLS_SNAPPY_ENCODER.with(|cell| {
+                if let Ok(mut enc) = cell.try_borrow_mut() {
+                    enc.compress(rec, &mut out[..max_len])
+                } else {
+                    snap::raw::Encoder::new().compress(rec, &mut out[..max_len])
+                }
+            })
+            .map_err(|e| WlogError::Compression(e.to_string()))?;
+            out.truncate(n);
+        }
+        CompressionType::Zstd => {
+            let bound = zstd::zstd_safe::compress_bound(rec.len());
+            out.clear();
+            out.reserve(bound);
+            TLS_ZSTD_COMPRESSOR.with(|cell| -> Result<(), WlogError> {
+                if let Ok(mut slot) = cell.try_borrow_mut() {
+                    if slot.is_none() {
+                        *slot = Some(
+                            zstd::bulk::Compressor::new(3)
+                                .map_err(|e| WlogError::Compression(e.to_string()))?,
+                        );
+                    }
+                    if let Some(comp) = slot.as_mut() {
+                        comp.compress_to_buffer(rec, out)
+                            .map_err(|e| WlogError::Compression(e.to_string()))?;
+                        return Ok(());
+                    }
+                }
+                let mut fallback = zstd::bulk::Compressor::new(3)
+                    .map_err(|e| WlogError::Compression(e.to_string()))?;
+                fallback
+                    .compress_to_buffer(rec, out)
+                    .map_err(|e| WlogError::Compression(e.to_string()))?;
+                Ok(())
+            })?;
+        }
+    }
+
+    Ok(out.len() < rec.len())
 }
 
 #[derive(Debug, Error)]
@@ -335,18 +408,61 @@ impl WlogWriter {
         Ok(())
     }
 
+    /// Logs one or more pre-compressed (or uncompressed) records prepared with [`compress_wal_record`],
+    /// avoiding compression work while holding the WAL lock.
+    ///
+    /// Each element is `(payload_bytes, is_compressed)` where `is_compressed` indicates whether
+    /// `payload_bytes` was compressed using `self.compression()`.
+    pub fn log_precompressed(&mut self, records: &[(&[u8], bool)]) -> Result<(), WlogError> {
+        if self.closed {
+            return Err(WlogError::Closed);
+        }
+        for (i, &(payload, compressed)) in records.iter().enumerate() {
+            let used_comp = if compressed {
+                self.compress
+            } else {
+                CompressionType::None
+            };
+            if let Err(e) = self.write_record_payload(payload, used_comp, i + 1 == records.len()) {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.writes_failed.inc();
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     fn log_one(&mut self, rec: &[u8], is_final: bool) -> Result<(), WlogError> {
+        let mut comp_buf = std::mem::take(&mut self.comp_buf);
+        let comp_res = compress_wal_record(rec, self.compress, &mut comp_buf);
+        let compressed = match comp_res {
+            Ok(c) => c,
+            Err(e) => {
+                self.comp_buf = comp_buf;
+                return Err(e);
+            }
+        };
+        let res = if compressed {
+            self.write_record_payload(&comp_buf, self.compress, is_final)
+        } else {
+            self.write_record_payload(rec, CompressionType::None, is_final)
+        };
+        self.comp_buf = comp_buf;
+        res
+    }
+
+    fn write_record_payload(
+        &mut self,
+        payload: &[u8],
+        used_comp: CompressionType,
+        is_final: bool,
+    ) -> Result<(), WlogError> {
         if self.page.full() {
             self.flush_page(true)?;
         }
 
-        let (used_comp, use_comp_buf) =
-            Self::encode_compressed(self.compress, rec, &mut self.comp_buf)?;
-        let payload_len = if use_comp_buf {
-            self.comp_buf.len()
-        } else {
-            rec.len()
-        };
+        let payload_len = payload.len();
 
         let left = (self.page.remaining() - RECORD_HEADER_SIZE)
             + (PAGE_SIZE - RECORD_HEADER_SIZE)
@@ -378,11 +494,7 @@ impl WlogWriter {
                 CompressionType::Zstd => typ |= ZSTD_MASK,
             }
 
-            let part = if use_comp_buf {
-                &self.comp_buf[offset..offset + part_len]
-            } else {
-                &rec[offset..offset + part_len]
-            };
+            let part = &payload[offset..offset + part_len];
             let crc = crc32c::crc32c(part);
             let hdr_pos = self.page.alloc;
             self.page.buf[hdr_pos] = typ;
@@ -406,40 +518,6 @@ impl WlogWriter {
         }
 
         Ok(())
-    }
-
-    fn encode_compressed(
-        compress: CompressionType,
-        rec: &[u8],
-        comp_buf: &mut Vec<u8>,
-    ) -> Result<(CompressionType, bool), WlogError> {
-        if rec.is_empty() || compress == CompressionType::None {
-            return Ok((CompressionType::None, false));
-        }
-
-        comp_buf.clear();
-        match compress {
-            CompressionType::None => unreachable!(),
-            CompressionType::Snappy => {
-                let max_len = snap::raw::max_compress_len(rec.len());
-                comp_buf.resize(max_len, 0);
-                let n = snap::raw::Encoder::new()
-                    .compress(rec, comp_buf)
-                    .map_err(|e| WlogError::Compression(e.to_string()))?;
-                comp_buf.truncate(n);
-            }
-            CompressionType::Zstd => {
-                let encoded = zstd::bulk::compress(rec, 3)
-                    .map_err(|e| WlogError::Compression(e.to_string()))?;
-                *comp_buf = encoded;
-            }
-        }
-
-        if comp_buf.len() >= rec.len() {
-            Ok((CompressionType::None, false))
-        } else {
-            Ok((compress, true))
-        }
     }
 
     pub fn last_segment_and_offset(&self) -> Result<(Option<usize>, usize), WlogError> {
@@ -1598,5 +1676,159 @@ mod tests {
         // Corrupt/truncated zstd stream or invalid header returns Err, not panic.
         let err = decompress_record_into(CompressionType::Zstd, &[0x28, 0xb5, 0x2f, 0xfd, 0x00], &mut dst);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn compress_wal_record_and_log_precompressed_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = RecordEncoder::new(false);
+        let dec = RecordDecoder::new();
+
+        // Build diverse records: empty, tiny incompressible, compressible multi-sample,
+        // huge multi-page (>64 KiB) series record, and pseudo-random incompressible payload.
+        let mut big_series = Vec::new();
+        for i in 0..1800u64 {
+            big_series.push(RefSeries {
+                ref_id: i + 1,
+                labels: Labels::from_pairs([
+                    ("__name__", "http_requests_total"),
+                    ("instance", "host-01.prod.internal:8080"),
+                    ("index", &format!("{i:05}")),
+                ]),
+            });
+        }
+        let rec_big = enc.series(&big_series, Vec::new());
+        let rec_empty: Vec<u8> = Vec::new();
+        let rec_tiny = enc.samples(
+            &[RefSample {
+                ref_id: 1,
+                st: 0,
+                t: 1_700_000_000_000,
+                v: 42.5,
+            }],
+            Vec::new(),
+        );
+        let mut rec_batch_samples = Vec::new();
+        for i in 0..500u64 {
+            rec_batch_samples.push(RefSample {
+                ref_id: i + 1,
+                st: 0,
+                t: 1_700_000_000_000 + (i as i64) * 1000,
+                v: (i as f64) * 1.25,
+            });
+        }
+        let rec_samples = enc.samples(&rec_batch_samples, Vec::new());
+
+        // Pseudo-random incompressible bytes (300 bytes)
+        let mut rec_incompressible = vec![0u8; 300];
+        let mut x = 0x1234_5678_9abc_def0u64;
+        for b in &mut rec_incompressible {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x >> 24) as u8;
+        }
+
+        let seg_size = PAGE_SIZE * 4; // 128 KiB segments to also exercise segment rotation
+
+        for comp in [
+            CompressionType::None,
+            CompressionType::Snappy,
+            CompressionType::Zstd,
+        ] {
+            let dir_log = dir.path().join(format!("log_{comp:?}"));
+            let dir_pre = dir.path().join(format!("pre_{comp:?}"));
+
+            // 1. Write using WlogWriter::log
+            {
+                let mut w = WlogWriter::with_segment_size(&dir_log, seg_size, comp).unwrap();
+                w.log(&[&rec_empty, &rec_tiny]).unwrap();
+                w.log(&[&rec_incompressible]).unwrap();
+                w.log(&[&rec_big, &rec_samples]).unwrap();
+                w.log(&[&rec_samples]).unwrap();
+                w.close().unwrap();
+            }
+
+            // 2. Pre-compress on background threads and write via WlogWriter::log_precompressed
+            let prep_batch = |recs: &[&[u8]]| -> Vec<(Vec<u8>, bool)> {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = recs
+                        .iter()
+                        .map(|&r| {
+                            s.spawn(move || {
+                                let mut buf = Vec::new();
+                                let compressed = compress_wal_record(r, comp, &mut buf).unwrap();
+                                if compressed {
+                                    (buf, true)
+                                } else {
+                                    (r.to_vec(), false)
+                                }
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            };
+
+            {
+                let mut w = WlogWriter::with_segment_size(&dir_pre, seg_size, comp).unwrap();
+                for batch in [
+                    vec![rec_empty.as_slice(), rec_tiny.as_slice()],
+                    vec![rec_incompressible.as_slice()],
+                    vec![rec_big.as_slice(), rec_samples.as_slice()],
+                    vec![rec_samples.as_slice()],
+                ] {
+                    let pre = prep_batch(&batch);
+                    let refs: Vec<(&[u8], bool)> =
+                        pre.iter().map(|(b, c)| (b.as_slice(), *c)).collect();
+                    w.log_precompressed(&refs).unwrap();
+                }
+                w.close().unwrap();
+            }
+
+            // 3. Assert 100% byte-identical segment files (headers, pages, CRCs, padding)
+            let range_log = segments_range(&dir_log).unwrap().unwrap();
+            let range_pre = segments_range(&dir_pre).unwrap().unwrap();
+            assert_eq!(range_log, range_pre, "segment range mismatch for {comp:?}");
+            for idx in range_log.0..=range_log.1 {
+                let bytes_log = fs::read(segment_name(&dir_log, idx)).unwrap();
+                let bytes_pre = fs::read(segment_name(&dir_pre, idx)).unwrap();
+                assert_eq!(
+                    bytes_log, bytes_pre,
+                    "segment {idx:08} not byte-identical for {comp:?}"
+                );
+            }
+
+            // 4. Verify reader decodes all records cleanly
+            let mut reader = WlogReader::open_dir(&dir_pre).unwrap();
+            assert!(reader.next_record().unwrap().unwrap().is_empty());
+            assert_eq!(
+                dec.samples(reader.next_record().unwrap().unwrap()).unwrap()[0].v,
+                42.5
+            );
+            assert_eq!(
+                reader.next_record().unwrap().unwrap(),
+                rec_incompressible.as_slice()
+            );
+            assert_eq!(
+                dec.series(reader.next_record().unwrap().unwrap())
+                    .unwrap()
+                    .len(),
+                1800
+            );
+            assert_eq!(
+                dec.samples(reader.next_record().unwrap().unwrap())
+                    .unwrap()
+                    .len(),
+                500
+            );
+            assert_eq!(
+                dec.samples(reader.next_record().unwrap().unwrap())
+                    .unwrap()
+                    .len(),
+                500
+            );
+            assert!(reader.next_record().unwrap().is_none());
+        }
     }
 }
