@@ -18,36 +18,72 @@ pub type FrameCallback = Box<dyn FnMut(&Frame<Bytes>) + Send + Sync>;
 /// failed.
 pub type DoneCallback = Box<dyn FnOnce(bool) + Send + Sync>;
 
-pub struct TrackedBody<B> {
-    inner: B,
+/// Observer notified for every frame yielded by [`TrackedBody`] and once when the body completes
+/// or is dropped/aborted.
+pub trait BodyObserver {
+    fn on_frame(&mut self, frame: &Frame<Bytes>);
+    fn on_done(&mut self, completed: bool);
+}
+
+/// Default [`BodyObserver`] backed by optional boxed callbacks.
+#[derive(Default)]
+pub struct CallbackObserver {
     on_frame: Option<FrameCallback>,
     on_done: Option<DoneCallback>,
+}
+
+impl BodyObserver for CallbackObserver {
+    #[inline]
+    fn on_frame(&mut self, frame: &Frame<Bytes>) {
+        if let Some(cb) = self.on_frame.as_mut() {
+            cb(frame);
+        }
+    }
+
+    #[inline]
+    fn on_done(&mut self, completed: bool) {
+        if let Some(cb) = self.on_done.take() {
+            cb(completed);
+        }
+    }
+}
+
+pub struct TrackedBody<B, O: BodyObserver = CallbackObserver> {
+    inner: B,
+    observer: O,
+    done: bool,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     deadline_msg: &'static str,
     /// Builds the deadline error instead of `deadline_msg` (e.g. an `h2` reset reason).
     deadline_err: Option<fn() -> BoxError>,
 }
 
-impl<B> TrackedBody<B> {
+impl<B> TrackedBody<B, CallbackObserver> {
     pub fn new(inner: B) -> Self {
-        Self {
-            inner,
-            on_frame: None,
-            on_done: None,
-            deadline: None,
-            deadline_msg: "",
-            deadline_err: None,
-        }
+        Self::with_observer(inner, CallbackObserver::default())
     }
 
     pub fn on_frame(mut self, cb: FrameCallback) -> Self {
-        self.on_frame = Some(cb);
+        self.observer.on_frame = Some(cb);
         self
     }
 
     pub fn on_done(mut self, cb: DoneCallback) -> Self {
-        self.on_done = Some(cb);
+        self.observer.on_done = Some(cb);
         self
+    }
+}
+
+impl<B, O: BodyObserver> TrackedBody<B, O> {
+    pub fn with_observer(inner: B, observer: O) -> Self {
+        Self {
+            inner,
+            observer,
+            done: false,
+            deadline: None,
+            deadline_msg: "",
+            deadline_err: None,
+        }
     }
 
     pub fn deadline(mut self, at: Option<Instant>, msg: &'static str) -> Self {
@@ -63,23 +99,26 @@ impl<B> TrackedBody<B> {
         self
     }
 
+    #[inline]
     fn finish(&mut self, completed: bool) {
-        if let Some(cb) = self.on_done.take() {
-            cb(completed);
+        if !self.done {
+            self.done = true;
+            self.observer.on_done(completed);
         }
     }
 }
 
-impl<B> Drop for TrackedBody<B> {
+impl<B, O: BodyObserver> Drop for TrackedBody<B, O> {
     fn drop(&mut self) {
         self.finish(false);
     }
 }
 
-impl<B> Body for TrackedBody<B>
+impl<B, O> Body for TrackedBody<B, O>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: Into<BoxError>,
+    O: BodyObserver + Unpin,
 {
     type Data = Bytes;
     type Error = BoxError;
@@ -91,9 +130,7 @@ where
         let this = &mut *self;
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(cb) = this.on_frame.as_mut() {
-                    cb(&frame);
-                }
+                this.observer.on_frame(&frame);
                 if this.inner.is_end_stream() {
                     this.finish(true);
                 }

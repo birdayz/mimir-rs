@@ -20,10 +20,12 @@ COPY crates ./crates
 ARG revision=unknown
 # Optional cap on cargo parallelism (e.g. --build-arg BUILD_JOBS=6); unset = cargo default.
 ARG BUILD_JOBS
+# Optional target CPU (e.g. --build-arg TARGET_CPU=x86-64-v3 or neoverse-n1); unset = generic baseline.
+ARG TARGET_CPU
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
-    MIMIR_REVISION="${revision}" cargo build --locked --release -p mimir-cmd ${BUILD_JOBS:+--jobs ${BUILD_JOBS}} \
+    RUSTFLAGS="${RUSTFLAGS}${TARGET_CPU:+ -C target-cpu=${TARGET_CPU}}" MIMIR_REVISION="${revision}" cargo build --locked --release -p mimir-cmd ${BUILD_JOBS:+--jobs ${BUILD_JOBS}} \
       --config 'profile.release.lto="fat"' \
       --config 'profile.release.codegen-units=1' \
       --config 'profile.release.debug=false' \

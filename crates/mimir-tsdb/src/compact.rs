@@ -566,11 +566,35 @@ pub fn reencode_chunk_without_tombstones(
     cm: ChunkMeta,
     tombs: &[Interval],
 ) -> Result<Option<ChunkMeta>, ChunkError> {
-    if tombs.is_empty()
-        || !tombs
+    reencode_single_chunk_filtered(cm, tombs, i64::MIN, i64::MAX)
+}
+
+fn compact_chunk_in_place(cm: &mut ChunkMeta) {
+    if let Some(chk) = cm.chunk.as_mut() {
+        match chk {
+            EncodedChunk::Xor(x) => x.compact(),
+            EncodedChunk::Xor2(x) => x.compact(),
+            EncodedChunk::Histogram(h) => h.compact(),
+            EncodedChunk::HistogramSt(h) => h.compact(),
+            EncodedChunk::FloatHistogram(fh) => fh.compact(),
+            EncodedChunk::FloatHistogramSt(fh) => fh.compact(),
+        }
+    }
+}
+
+fn reencode_single_chunk_filtered(
+    mut cm: ChunkMeta,
+    tombs: &[Interval],
+    mint: i64,
+    maxt_inclusive: i64,
+) -> Result<Option<ChunkMeta>, ChunkError> {
+    let outside_range = cm.min_time < mint || cm.max_time > maxt_inclusive;
+    let overlaps_tombs = !tombs.is_empty()
+        && tombs
             .iter()
-            .any(|iv| iv.overlaps(cm.min_time, cm.max_time))
-    {
+            .any(|iv| iv.overlaps(cm.min_time, cm.max_time));
+    if !outside_range && !overlaps_tombs {
+        compact_chunk_in_place(&mut cm);
         return Ok(Some(cm));
     }
     if tombs
@@ -585,7 +609,9 @@ pub fn reencode_chunk_without_tombstones(
     let samples = decode_chunk_samples(enc)?;
     let surviving: Vec<DecodedSample> = samples
         .into_iter()
-        .filter(|s| !tombs.iter().any(|iv| iv.in_bounds(s.t)))
+        .filter(|s| {
+            s.t >= mint && s.t <= maxt_inclusive && !tombs.iter().any(|iv| iv.in_bounds(s.t))
+        })
         .collect();
     if surviving.is_empty() {
         return Ok(None);
@@ -1046,6 +1072,115 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
     Ok(out)
 }
 
+/// Merges multiple pre-sorted sample streams using Prometheus `storage.chainSampleIterator`
+/// (`merge.go:615-675`) + Go `container/heap` min-heap tie-breaking semantics.
+fn chain_sample_merge(streams: Vec<Vec<DecodedSample>>) -> Vec<DecodedSample> {
+    let mut iters: Vec<(Vec<DecodedSample>, usize)> = streams
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| (s, 0usize))
+        .collect();
+    if iters.is_empty() {
+        return Vec::new();
+    }
+    if iters.len() == 1 {
+        let Some((mut out, _)) = iters.pop() else {
+            return Vec::new();
+        };
+        out.dedup_by_key(|s| s.t);
+        return out;
+    }
+
+    #[inline]
+    fn heap_up(h: &mut [(i64, usize)], mut j: usize) {
+        while j > 0 {
+            let i = (j - 1) / 2;
+            if h[j].0 >= h[i].0 {
+                break;
+            }
+            h.swap(i, j);
+            j = i;
+        }
+    }
+
+    #[inline]
+    fn heap_down(h: &mut [(i64, usize)], mut i: usize, n: usize) {
+        loop {
+            let j1 = 2 * i + 1;
+            if j1 >= n {
+                break;
+            }
+            let mut j = j1;
+            let j2 = j1 + 1;
+            if j2 < n && h[j2].0 < h[j1].0 {
+                j = j2;
+            }
+            if h[j].0 >= h[i].0 {
+                break;
+            }
+            h.swap(i, j);
+            i = j;
+        }
+    }
+
+    let mut h: Vec<(i64, usize)> = Vec::with_capacity(iters.len() - 1);
+    for (k, (stream, _)) in iters.iter().enumerate().skip(1) {
+        h.push((stream[0].t, k));
+        let len = h.len();
+        heap_up(&mut h, len - 1);
+    }
+
+    let total_cap: usize = iters.iter().map(|(s, _)| s.len()).sum();
+    let mut out = Vec::with_capacity(total_cap);
+    let mut curr_id = 0usize;
+    let mut last_t: Option<i64> = None;
+
+    loop {
+        if iters[curr_id].1 < iters[curr_id].0.len() {
+            let idx = iters[curr_id].1;
+            iters[curr_id].1 = idx + 1;
+            let curr_t = iters[curr_id].0[idx].t;
+            if last_t == Some(curr_t) {
+                continue;
+            }
+            if h.is_empty() {
+                last_t = Some(curr_t);
+                out.push(iters[curr_id].0[idx].clone());
+                continue;
+            }
+            let next_t = h[0].0;
+            if curr_t < next_t {
+                last_t = Some(curr_t);
+                out.push(iters[curr_id].0[idx].clone());
+                continue;
+            }
+            // Rewind cursor to `idx` (current AtT) before pushing onto heap.
+            iters[curr_id].1 = idx;
+            h.push((curr_t, curr_id));
+            let len = h.len();
+            heap_up(&mut h, len - 1);
+        } else if h.is_empty() {
+            break;
+        }
+
+        let n = h.len() - 1;
+        h.swap(0, n);
+        heap_down(&mut h, 0, n);
+        let Some((pop_t, pop_id)) = h.pop() else {
+            break;
+        };
+        curr_id = pop_id;
+        let idx = iters[curr_id].1;
+        iters[curr_id].1 = idx + 1;
+        if last_t != Some(pop_t) {
+            last_t = Some(pop_t);
+            out.push(iters[curr_id].0[idx].clone());
+        }
+    }
+
+    out
+}
+
 /// Applies per-chunk tombstones and (unless `allow_non_overlapping_raw` is set) merges only
 /// overlapping chunk clusters, without trimming surviving samples to `[mint, maxt]`
 /// (matching Prometheus `ooo_head_read.go:154-175` & `querier.go:1130-1330` under `DisableTrimming = true`).
@@ -1073,7 +1208,7 @@ pub fn merge_chunks_with_tombstones(
         return Ok(out);
     }
 
-    items.sort_by_key(|(cm, _)| (cm.min_time, cm.ref_id, cm.max_time));
+    items.sort_by_key(|(cm, _)| (cm.min_time, cm.ref_id));
 
     let mut out = Vec::with_capacity(items.len());
     let mut cluster: Vec<(ChunkMeta, Vec<Interval>)> = Vec::new();
@@ -1092,21 +1227,24 @@ pub fn merge_chunks_with_tombstones(
             }
             return Ok(());
         }
-        let mut samples = Vec::new();
+        let mut streams = Vec::with_capacity(cluster.len());
         for (cm, tombs) in cluster.drain(..) {
             let Some(ref enc) = cm.chunk else {
                 continue;
             };
+            let mut stream = Vec::new();
             for s in decode_chunk_samples(enc)? {
                 if tombs.iter().any(|iv| iv.in_bounds(s.t)) {
                     continue;
                 }
-                samples.push(s);
+                stream.push(s);
+            }
+            if !stream.is_empty() {
+                streams.push(stream);
             }
         }
+        let samples = chain_sample_merge(streams);
         if !samples.is_empty() {
-            samples.sort_by_key(|s| s.t);
-            samples.dedup_by_key(|s| s.t);
             out.extend(encode_iterable_chunks(&samples)?);
         }
         Ok(())
@@ -1150,7 +1288,7 @@ pub fn merge_head_chunks_with_tombstones(
         .windows(2)
         .all(|w| w[0].min_time <= w[1].min_time && w[0].max_time < w[1].min_time);
     if !already_sorted_disjoint {
-        chks.sort_by_key(|c| (c.min_time, c.ref_id, c.max_time));
+        chks.sort_by_key(|c| (c.min_time, c.ref_id));
     }
 
     let mut out = Vec::with_capacity(chks.len());
@@ -1169,21 +1307,24 @@ pub fn merge_head_chunks_with_tombstones(
                 }
                 return Ok(());
             }
-            let mut samples = Vec::new();
+            let mut streams = Vec::with_capacity(cluster.len());
             for cm in cluster.drain(..) {
                 let Some(ref enc) = cm.chunk else {
                     continue;
                 };
+                let mut stream = Vec::new();
                 for s in decode_chunk_samples(enc)? {
                     if !tombs.is_empty() && tombs.iter().any(|iv| iv.in_bounds(s.t)) {
                         continue;
                     }
-                    samples.push(s);
+                    stream.push(s);
+                }
+                if !stream.is_empty() {
+                    streams.push(stream);
                 }
             }
+            let samples = chain_sample_merge(streams);
             if !samples.is_empty() {
-                samples.sort_by_key(|s| s.t);
-                samples.dedup_by_key(|s| s.t);
                 out.extend(encode_iterable_chunks(&samples)?);
             }
             Ok(())
@@ -1214,13 +1355,18 @@ pub struct CompactionSeries {
     pub tombstones: Vec<Interval>,
 }
 
-/// Trims/merges `chunks` to closed `[mint, maxt_inclusive]` excluding `tombstones`.
+/// Trims/merges `chunks` to closed `[mint, maxt_inclusive]` excluding `tombstones`,
+/// matching Prometheus `populateWithDelChunkSeriesIterator`:
+/// - Non-overlapping single chunks are kept verbatim (compacted in-place) or trimmed individually
+///   with `prev_state = None` while preserving their original encoding (`populateCurrForSingleChunk`).
+/// - Only overlapping clusters are merged via `chain_sample_merge` and re-encoded via
+///   `encode_iterable_chunks` (`populateChunksFromIterable`, where `st == 0` floats use `Xor`).
 pub fn trim_and_merge_chunks(
     mut chunks: Vec<ChunkMeta>,
     tombstones: &[Interval],
     mint: i64,
     maxt_inclusive: i64,
-    samples_per_chunk: usize,
+    _samples_per_chunk: usize,
 ) -> Result<Vec<ChunkMeta>, ChunkError> {
     if chunks.is_empty() || mint > maxt_inclusive {
         return Ok(Vec::new());
@@ -1237,73 +1383,69 @@ pub fn trim_and_merge_chunks(
         return Ok(Vec::new());
     }
 
-    chunks.sort_by_key(|c| (c.min_time, c.max_time));
+    chunks.sort_by_key(|c| (c.min_time, c.ref_id));
 
-    let any_overlap = chunks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
-    let any_partial = chunks.iter().any(|c| {
-        c.min_time < mint
-            || c.max_time > maxt_inclusive
-            || tombstones.iter().any(|iv| iv.overlaps(c.min_time, c.max_time))
-    });
+    let mut out = Vec::with_capacity(chunks.len());
+    let mut cluster: Vec<ChunkMeta> = Vec::new();
+    let mut cluster_max = i64::MIN;
 
-    if !any_overlap && !any_partial {
-        for c in &mut chunks {
-            if let Some(chk) = c.chunk.as_mut() {
-                match chk {
-                    EncodedChunk::Xor(x) => x.compact(),
-                    EncodedChunk::Xor2(x) => x.compact(),
-                    EncodedChunk::Histogram(h) => h.compact(),
-                    EncodedChunk::HistogramSt(h) => h.compact(),
-                    EncodedChunk::FloatHistogram(fh) => fh.compact(),
-                    EncodedChunk::FloatHistogramSt(fh) => fh.compact(),
+    let flush_cluster =
+        |cluster: &mut Vec<ChunkMeta>, out: &mut Vec<ChunkMeta>| -> Result<(), ChunkError> {
+            if cluster.is_empty() {
+                return Ok(());
+            }
+            if cluster.len() == 1 {
+                let Some(cm) = cluster.pop() else {
+                    return Ok(());
+                };
+                if let Some(c) =
+                    reencode_single_chunk_filtered(cm, tombstones, mint, maxt_inclusive)?
+                {
+                    out.push(c);
+                }
+                return Ok(());
+            }
+            let mut streams = Vec::with_capacity(cluster.len());
+            for cm in cluster.drain(..) {
+                let Some(ref encoded) = cm.chunk else {
+                    continue;
+                };
+                let mut stream = Vec::new();
+                for s in decode_chunk_samples(encoded)? {
+                    if s.t < mint || s.t > maxt_inclusive {
+                        continue;
+                    }
+                    if !tombstones.is_empty() && tombstones.iter().any(|iv| iv.in_bounds(s.t)) {
+                        continue;
+                    }
+                    stream.push(s);
+                }
+                if !stream.is_empty() {
+                    streams.push(stream);
                 }
             }
-        }
-        return Ok(chunks);
-    }
-
-    // Slow path: decode samples, filter [mint, maxt_inclusive] & tombstones, sort & dedup by timestamp, re-encode.
-    let mut float_enc = Encoding::Xor;
-    let mut hist_enc = Encoding::Histogram;
-    let mut fhist_enc = Encoding::FloatHistogram;
-    for c in &chunks {
-        if let Some(ref enc) = c.chunk {
-            match enc.encoding() {
-                Encoding::Xor2 => float_enc = Encoding::Xor2,
-                Encoding::HistogramSt => hist_enc = Encoding::HistogramSt,
-                Encoding::FloatHistogramSt => fhist_enc = Encoding::FloatHistogramSt,
-                _ => {}
+            let merged = chain_sample_merge(streams);
+            if !merged.is_empty() {
+                out.extend(encode_iterable_chunks(&merged)?);
             }
-        }
-    }
-    let mut samples = Vec::new();
-    for c in &chunks {
-        let Some(ref encoded) = c.chunk else {
-            continue;
+            Ok(())
         };
-        for s in decode_chunk_samples(encoded)? {
-            if s.t < mint || s.t > maxt_inclusive {
-                continue;
-            }
-            if tombstones.iter().any(|iv| iv.in_bounds(s.t)) {
-                continue;
-            }
-            samples.push(s);
+
+    for cm in chunks {
+        if cluster.is_empty() {
+            cluster_max = cm.max_time;
+            cluster.push(cm);
+        } else if cm.min_time > cluster_max {
+            flush_cluster(&mut cluster, &mut out)?;
+            cluster_max = cm.max_time;
+            cluster.push(cm);
+        } else {
+            cluster_max = cluster_max.max(cm.max_time);
+            cluster.push(cm);
         }
     }
-    if samples.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    samples.sort_by_key(|s| s.t);
-    samples.dedup_by_key(|s| s.t);
-    encode_samples_into_chunks_with_encodings(
-        &samples,
-        samples_per_chunk,
-        float_enc,
-        hist_enc,
-        fhist_enc,
-    )
+    flush_cluster(&mut cluster, &mut out)?;
+    Ok(out)
 }
 
 /// Streams Head compaction without materializing all `CompactionSeries` or chunk buffers in RAM.

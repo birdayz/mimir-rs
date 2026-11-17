@@ -38,6 +38,20 @@ pub mod thread_pool;
 pub mod tls;
 pub mod usagestats;
 
+static ALLOCATOR_PURGE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Registers a process-global allocator arena purge callback (e.g. jemalloc `arena.4096.purge`).
+pub fn register_allocator_purge_hook(hook: fn()) {
+    let _ = ALLOCATOR_PURGE_HOOK.set(hook);
+}
+
+/// Returns unused dirty/muzzy pages across allocator arenas back to the OS when a hook is registered.
+pub fn purge_allocator_arenas() {
+    if let Some(hook) = ALLOCATOR_PURGE_HOOK.get() {
+        hook();
+    }
+}
+
 #[doc(hidden)]
 pub fn block_on_for_tests<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_multi_thread()

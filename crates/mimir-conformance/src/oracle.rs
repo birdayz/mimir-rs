@@ -542,3 +542,21 @@ pub struct HttpGrpcCallResponse {
     #[serde(default)]
     pub raw_grpc_error: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrpcIngesterCheckRequest {
+    pub grpc_addr: String,
+    pub tenant: String,
+    pub compression: String,
+    pub metric_name: String,
+    pub timestamp_ms: i64,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrpcIngesterCheckResponse {
+    pub series_count: usize,
+    pub chunks_count: usize,
+    pub label_values: Vec<String>,
+    pub cardinality_count: u64,
+}

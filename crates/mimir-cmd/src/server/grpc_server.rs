@@ -22,9 +22,10 @@
 //! `-server.grpc.keepalive.ping-without-stream-allowed`) is not available in the hyper/h2 stack;
 //! non-default values are rejected at startup (see `super::validate_supported`).
 
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -34,6 +35,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use mimir_common::grpc_deadline;
 use mimir_common::grpc_log::{GrpcErrorLog, GrpcErrorLogEntry};
 use mimir_common::logging::{LogLevel, Logger};
+use mimir_common::native_histogram::Histogram;
 use mimir_config::GoDuration;
 use parking_lot::Mutex;
 use rand::Rng;
@@ -41,9 +43,9 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tower::ServiceExt;
 
-use super::body::{GrpcFrameCounter, TrackedBody};
+use super::body::{BodyObserver, GrpcFrameCounter, TrackedBody};
 use super::listener::{finish_accept, Acceptor, PrefixedIo};
-use super::metrics::{grpc_status_label, ServerMetrics};
+use super::metrics::ServerMetrics;
 
 #[derive(Clone)]
 pub struct GrpcServerConfig {
@@ -103,6 +105,281 @@ pub struct GrpcContext {
     pub logger: Arc<dyn Logger>,
 }
 
+/// Known gRPC routes mapped to `&'static str` + fixed slot indices so hot RPCs avoid
+/// `String` allocation and `RwLock` + `HashMap` metric lookups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum KnownGrpcMethod {
+    IngesterPush = 0,
+    IngesterQueryStream = 1,
+    IngesterQueryExemplars = 2,
+    IngesterLabelValues = 3,
+    IngesterLabelNames = 4,
+    IngesterUserStats = 5,
+    IngesterAllUserStats = 6,
+    IngesterMetricsForLabelMatchers = 7,
+    IngesterMetricsMetadata = 8,
+    IngesterLabelNamesAndValues = 9,
+    IngesterLabelValuesCardinality = 10,
+    IngesterActiveSeries = 11,
+    IngesterSearchLabelNames = 12,
+    IngesterSearchLabelValues = 13,
+    HttpGrpcHandle = 14,
+    HealthCheck = 15,
+    HealthWatch = 16,
+    HealthList = 17,
+}
+
+const NUM_KNOWN_GRPC_METHODS: usize = 18;
+
+impl KnownGrpcMethod {
+    #[inline]
+    const fn path(self) -> &'static str {
+        match self {
+            Self::IngesterPush => "/cortex.Ingester/Push",
+            Self::IngesterQueryStream => "/cortex.Ingester/QueryStream",
+            Self::IngesterQueryExemplars => "/cortex.Ingester/QueryExemplars",
+            Self::IngesterLabelValues => "/cortex.Ingester/LabelValues",
+            Self::IngesterLabelNames => "/cortex.Ingester/LabelNames",
+            Self::IngesterUserStats => "/cortex.Ingester/UserStats",
+            Self::IngesterAllUserStats => "/cortex.Ingester/AllUserStats",
+            Self::IngesterMetricsForLabelMatchers => "/cortex.Ingester/MetricsForLabelMatchers",
+            Self::IngesterMetricsMetadata => "/cortex.Ingester/MetricsMetadata",
+            Self::IngesterLabelNamesAndValues => "/cortex.Ingester/LabelNamesAndValues",
+            Self::IngesterLabelValuesCardinality => "/cortex.Ingester/LabelValuesCardinality",
+            Self::IngesterActiveSeries => "/cortex.Ingester/ActiveSeries",
+            Self::IngesterSearchLabelNames => "/cortex.Ingester/SearchLabelNames",
+            Self::IngesterSearchLabelValues => "/cortex.Ingester/SearchLabelValues",
+            Self::HttpGrpcHandle => "/httpgrpc.HTTP/Handle",
+            Self::HealthCheck => "/grpc.health.v1.Health/Check",
+            Self::HealthWatch => "/grpc.health.v1.Health/Watch",
+            Self::HealthList => "/grpc.health.v1.Health/List",
+        }
+    }
+
+    #[inline]
+    const fn is_no_grpc_auth(self) -> bool {
+        matches!(self, Self::HealthCheck)
+    }
+
+    #[inline]
+    const fn is_streaming_or_health(self) -> bool {
+        matches!(
+            self,
+            Self::IngesterQueryStream
+                | Self::IngesterLabelNamesAndValues
+                | Self::IngesterLabelValuesCardinality
+                | Self::IngesterActiveSeries
+                | Self::IngesterSearchLabelNames
+                | Self::IngesterSearchLabelValues
+                | Self::HealthCheck
+                | Self::HealthWatch
+                | Self::HealthList
+        )
+    }
+}
+
+#[inline]
+fn classify_grpc_method(path: &str) -> (Option<KnownGrpcMethod>, Cow<'static, str>) {
+    let known = match path {
+        "/cortex.Ingester/Push" => Some(KnownGrpcMethod::IngesterPush),
+        "/cortex.Ingester/QueryStream" => Some(KnownGrpcMethod::IngesterQueryStream),
+        "/cortex.Ingester/QueryExemplars" => Some(KnownGrpcMethod::IngesterQueryExemplars),
+        "/cortex.Ingester/LabelValues" => Some(KnownGrpcMethod::IngesterLabelValues),
+        "/cortex.Ingester/LabelNames" => Some(KnownGrpcMethod::IngesterLabelNames),
+        "/cortex.Ingester/UserStats" => Some(KnownGrpcMethod::IngesterUserStats),
+        "/cortex.Ingester/AllUserStats" => Some(KnownGrpcMethod::IngesterAllUserStats),
+        "/cortex.Ingester/MetricsForLabelMatchers" => {
+            Some(KnownGrpcMethod::IngesterMetricsForLabelMatchers)
+        }
+        "/cortex.Ingester/MetricsMetadata" => Some(KnownGrpcMethod::IngesterMetricsMetadata),
+        "/cortex.Ingester/LabelNamesAndValues" => {
+            Some(KnownGrpcMethod::IngesterLabelNamesAndValues)
+        }
+        "/cortex.Ingester/LabelValuesCardinality" => {
+            Some(KnownGrpcMethod::IngesterLabelValuesCardinality)
+        }
+        "/cortex.Ingester/ActiveSeries" => Some(KnownGrpcMethod::IngesterActiveSeries),
+        "/cortex.Ingester/SearchLabelNames" => Some(KnownGrpcMethod::IngesterSearchLabelNames),
+        "/cortex.Ingester/SearchLabelValues" => Some(KnownGrpcMethod::IngesterSearchLabelValues),
+        "/httpgrpc.HTTP/Handle" => Some(KnownGrpcMethod::HttpGrpcHandle),
+        "/grpc.health.v1.Health/Check" => Some(KnownGrpcMethod::HealthCheck),
+        "/grpc.health.v1.Health/Watch" => Some(KnownGrpcMethod::HealthWatch),
+        "/grpc.health.v1.Health/List" => Some(KnownGrpcMethod::HealthList),
+        _ => None,
+    };
+    match known {
+        Some(m) => (Some(m), Cow::Borrowed(m.path())),
+        None => (None, Cow::Owned(path.to_owned())),
+    }
+}
+
+#[derive(Default)]
+struct MethodMetricsSlot {
+    recv_size: OnceLock<Arc<Histogram>>,
+    sent_size: OnceLock<Arc<Histogram>>,
+    inflight: OnceLock<prometheus::Gauge>,
+    duration_ok: OnceLock<Arc<Histogram>>,
+    duration_canceled: OnceLock<Arc<Histogram>>,
+}
+
+struct GrpcMetricsCache {
+    slots: [MethodMetricsSlot; NUM_KNOWN_GRPC_METHODS],
+    metrics: ServerMetrics,
+    logger: Arc<dyn Logger>,
+    stats_tracking: bool,
+    report_grpc_status: bool,
+}
+
+impl GrpcMetricsCache {
+    fn new(ctx: &GrpcContext, stats_tracking: bool, report_grpc_status: bool) -> Self {
+        Self {
+            slots: std::array::from_fn(|_| MethodMetricsSlot::default()),
+            metrics: ctx.metrics.clone(),
+            logger: Arc::clone(&ctx.logger),
+            stats_tracking,
+            report_grpc_status,
+        }
+    }
+
+    #[inline]
+    fn recv_size(&self, known: Option<KnownGrpcMethod>, method: &str) -> Arc<Histogram> {
+        match known {
+            Some(k) => Arc::clone(
+                self.slots[k as usize]
+                    .recv_size
+                    .get_or_init(|| self.metrics.received_message_size.with_label_values(&["gRPC", k.path()])),
+            ),
+            None => self.metrics.received_message_size.with_label_values(&["gRPC", method]),
+        }
+    }
+
+    #[inline]
+    fn sent_size(&self, known: Option<KnownGrpcMethod>, method: &str) -> Arc<Histogram> {
+        match known {
+            Some(k) => Arc::clone(
+                self.slots[k as usize]
+                    .sent_size
+                    .get_or_init(|| self.metrics.sent_message_size.with_label_values(&["gRPC", k.path()])),
+            ),
+            None => self.metrics.sent_message_size.with_label_values(&["gRPC", method]),
+        }
+    }
+
+    #[inline]
+    fn inc_inflight(&self, known: Option<KnownGrpcMethod>, method: &str) -> Option<prometheus::Gauge> {
+        match known {
+            Some(k) => {
+                self.slots[k as usize]
+                    .inflight
+                    .get_or_init(|| self.metrics.inflight_requests.with_label_values(&["gRPC", k.path()]))
+                    .inc();
+                None
+            }
+            None => {
+                let g = self.metrics.inflight_requests.with_label_values(&["gRPC", method]);
+                g.inc();
+                Some(g)
+            }
+        }
+    }
+
+    #[inline]
+    fn dec_inflight(
+        &self,
+        known: Option<KnownGrpcMethod>,
+        unknown_inflight: Option<&prometheus::Gauge>,
+    ) {
+        if let Some(k) = known {
+            if let Some(g) = self.slots[k as usize].inflight.get() {
+                g.dec();
+            }
+        } else if let Some(g) = unknown_inflight {
+            g.dec();
+        }
+    }
+
+    #[inline]
+    fn observe_duration(
+        &self,
+        known: Option<KnownGrpcMethod>,
+        method: &str,
+        label_code: i32,
+        secs: f64,
+    ) {
+        if let Some(k) = known {
+            if label_code == 0 {
+                let ok_label = if self.report_grpc_status { "OK" } else { "success" };
+                self.slots[k as usize]
+                    .duration_ok
+                    .get_or_init(|| {
+                        self.metrics
+                            .request_duration
+                            .with_label_values(&["gRPC", k.path(), ok_label, "false"])
+                    })
+                    .observe(secs);
+                return;
+            }
+            if label_code == 1 {
+                let cancel_label = if self.report_grpc_status {
+                    "Canceled"
+                } else {
+                    "cancel"
+                };
+                self.slots[k as usize]
+                    .duration_canceled
+                    .get_or_init(|| {
+                        self.metrics
+                            .request_duration
+                            .with_label_values(&["gRPC", k.path(), cancel_label, "false"])
+                    })
+                    .observe(secs);
+                return;
+            }
+        }
+        let status = grpc_status_label_cow(label_code, self.report_grpc_status);
+        self.metrics
+            .request_duration
+            .with_label_values(&["gRPC", method, status.as_ref(), "false"])
+            .observe(secs);
+    }
+}
+
+#[inline]
+fn grpc_status_label_cow(code: i32, report_grpc_status: bool) -> Cow<'static, str> {
+    if (100..600).contains(&code) {
+        return Cow::Owned(code.to_string());
+    }
+    if report_grpc_status {
+        let s = match code {
+            0 => "OK",
+            1 => "Canceled",
+            2 => "Unknown",
+            3 => "InvalidArgument",
+            4 => "DeadlineExceeded",
+            5 => "NotFound",
+            6 => "AlreadyExists",
+            7 => "PermissionDenied",
+            8 => "ResourceExhausted",
+            9 => "FailedPrecondition",
+            10 => "Aborted",
+            11 => "OutOfRange",
+            12 => "Unimplemented",
+            13 => "Internal",
+            14 => "Unavailable",
+            15 => "DataLoss",
+            16 => "Unauthenticated",
+            other => return Cow::Owned(format!("Code({other})")),
+        };
+        return Cow::Borrowed(s);
+    }
+    Cow::Borrowed(match code {
+        0 => "success",
+        1 => "cancel",
+        _ => "error",
+    })
+}
+
 /// Serves `routes` until `shutdown` flips to true, then stops gracefully: GOAWAY on every
 /// connection and wait for in-flight RPCs without a deadline (grpc-go `GracefulStop`).
 pub async fn serve(
@@ -116,6 +393,11 @@ pub async fn serve(
         .grpc_concurrent_streams_limit
         .with_label_values(&[])
         .set(f64::from(cfg.max_concurrent_streams));
+    let cache = Arc::new(GrpcMetricsCache::new(
+        &ctx,
+        cfg.stats_tracking,
+        cfg.report_grpc_status,
+    ));
     let acceptor = Arc::new(acceptor);
     let routes = routes.prepare();
     let mut conns: JoinSet<()> = JoinSet::new();
@@ -128,7 +410,7 @@ pub async fn serve(
                 let acc = Arc::clone(&acceptor);
                 let cfg = cfg.clone();
                 let routes = routes.clone();
-                let ctx = ctx.clone();
+                let cache = Arc::clone(&cache);
                 let shutdown = shutdown.clone();
                 conns.spawn(async move {
                     let Ok(accepted) = finish_accept(stream, addr, guard, acc.options()).await else { return };
@@ -139,10 +421,10 @@ pub async fn serve(
                         // grpc-go's default ConnectionTimeout for the handshake is 120s.
                         let hs = tokio_rustls::TlsAcceptor::from(tls).accept(io);
                         if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(120), hs).await {
-                            serve_conn(s, remote, cfg, routes, ctx, shutdown).await;
+                            serve_conn(s, remote, cfg, routes, cache, shutdown).await;
                         }
                     } else {
-                        serve_conn(io, remote, cfg, routes, ctx, shutdown).await;
+                        serve_conn(io, remote, cfg, routes, cache, shutdown).await;
                     }
                 });
             }
@@ -167,7 +449,7 @@ async fn serve_conn<T>(
     remote: SocketAddr,
     cfg: GrpcServerConfig,
     routes: tonic::service::Routes,
-    ctx: GrpcContext,
+    cache: Arc<GrpcMetricsCache>,
     mut shutdown: watch::Receiver<bool>,
 ) where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -181,7 +463,14 @@ async fn serve_conn<T>(
         let conn_state = Arc::clone(&conn_state);
         let cfg = cfg.clone();
         hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
-            handle(req, remote, Arc::clone(&conn_state), routes.clone(), cfg.clone(), ctx.clone())
+            handle(
+                req,
+                remote,
+                Arc::clone(&conn_state),
+                routes.clone(),
+                cfg.clone(),
+                Arc::clone(&cache),
+            )
         })
     };
 
@@ -267,27 +556,40 @@ const NO_GRPC_AUTH_ON: &[&str] = &[
 
 /// dskit `middleware.ServerUserHeaderInterceptor` / `StreamServerUserHeaderInterceptor`
 /// (`user.ExtractFromGRPCRequest`): exactly one `x-scope-orgid` metadata value.
-fn check_org_id(headers: &http::HeaderMap, method: &str) -> Option<tonic::Status> {
-    if NO_GRPC_AUTH_ON.contains(&method) || headers.get_all("x-scope-orgid").iter().count() == 1 {
+fn check_org_id_known(
+    headers: &http::HeaderMap,
+    known: Option<KnownGrpcMethod>,
+    method: &str,
+) -> Option<tonic::Status> {
+    let exempt = match known {
+        Some(k) => k.is_no_grpc_auth(),
+        None => NO_GRPC_AUTH_ON.contains(&method),
+    };
+    if exempt || headers.get_all("x-scope-orgid").iter().count() == 1 {
         return None;
     }
     Some(tonic::Status::unknown("no org id"))
+}
+
+#[cfg(test)]
+fn check_org_id(headers: &http::HeaderMap, method: &str) -> Option<tonic::Status> {
+    let (known, _) = classify_grpc_method(method);
+    check_org_id_known(headers, known, method)
 }
 
 /// Per-RPC bookkeeping started when the request arrives and finalized exactly once: when the
 /// response body completes, or on drop (handler future or response body dropped because the
 /// client reset the stream), like the `defer`s of dskit's interceptors and stats handler.
 struct RpcGuard {
-    method: String,
+    known_method: Option<KnownGrpcMethod>,
+    method: Cow<'static, str>,
     begin: Instant,
     conn: Arc<Conn>,
-    stream_tracker: Option<Arc<super::metrics::StreamTracker>>,
-    inflight: Option<prometheus::Gauge>,
-    duration_vec: mimir_common::native_histogram::HistogramVec,
-    report_grpc_status: bool,
-    logger: Arc<dyn Logger>,
+    cache: Arc<GrpcMetricsCache>,
+    unknown_inflight: Option<prometheus::Gauge>,
     error_log: GrpcErrorLog,
-    status: Arc<Mutex<(Option<i32>, Option<String>)>>,
+    status_code: Option<i32>,
+    status_message: Option<String>,
     done: bool,
 }
 
@@ -296,8 +598,7 @@ impl RpcGuard {
         if std::mem::replace(&mut self.done, true) {
             return;
         }
-        let (code, msg) = self.status.lock().clone();
-        let code = match code {
+        let code = match self.status_code {
             Some(c) => c,
             None if completed => 0,
             // A stream torn down before its status was sent (client reset, or the request
@@ -307,23 +608,23 @@ impl RpcGuard {
         let elapsed = self.begin.elapsed();
         // dskit derives the label from the handler's Go error, which may differ from the code
         // grpc-go sends (e.g. a wrapped context.DeadlineExceeded is labelled Unknown).
-        let label_code = match self.error_log.instrumentation_code() {
-            Some(c) if code != 0 => c,
-            _ => code,
+        let label_code = if code != 0 {
+            self.error_log.instrumentation_code().unwrap_or(code)
+        } else {
+            0
         };
-        self.duration_vec
-            .with_label_values(&[
-                "gRPC",
-                &self.method,
-                &grpc_status_label(label_code, self.report_grpc_status),
-                "false",
-            ])
-            .observe(elapsed.as_secs_f64());
-        if let Some(g) = &self.inflight {
-            g.dec();
-        }
-        if let Some(t) = &self.stream_tracker {
-            t.close_stream(self.conn.id);
+        self.cache.observe_duration(
+            self.known_method,
+            &self.method,
+            label_code,
+            elapsed.as_secs_f64(),
+        );
+        if self.cache.stats_tracking {
+            self.cache
+                .dec_inflight(self.known_method, self.unknown_inflight.as_ref());
+            if let Some(t) = &self.cache.metrics.stream_tracker {
+                t.close_stream(self.conn.id);
+            }
         }
         if self.conn.active.fetch_sub(1, Ordering::AcqRel) == 1 {
             *self.conn.idle_since.lock() = Instant::now();
@@ -339,8 +640,8 @@ impl RpcGuard {
                 None => (
                     format!(
                         "rpc error: code = {} desc = {}",
-                        grpc_status_label(code, true),
-                        percent_decode(msg.as_deref().unwrap_or(""))
+                        grpc_status_label_cow(code, true),
+                        percent_decode(self.status_message.as_deref().unwrap_or(""))
                     ),
                     true,
                 ),
@@ -348,9 +649,14 @@ impl RpcGuard {
             if keep {
                 let dur = GoDuration(elapsed.as_nanos() as i64).to_string();
                 let level = if code == 1 { LogLevel::Debug } else { LogLevel::Warn };
-                self.logger.log(
+                self.cache.logger.log(
                     level,
-                    &[("method", &self.method), ("duration", &dur), ("msg", "gRPC"), ("err", &err)],
+                    &[
+                        ("method", self.method.as_ref()),
+                        ("duration", &dur),
+                        ("msg", "gRPC"),
+                        ("err", &err),
+                    ],
                 );
             }
         }
@@ -360,6 +666,57 @@ impl RpcGuard {
 impl Drop for RpcGuard {
     fn drop(&mut self) {
         self.finish(false);
+    }
+}
+
+struct GrpcRecvObserver {
+    counter: GrpcFrameCounter,
+    recv: Arc<Histogram>,
+}
+
+impl BodyObserver for GrpcRecvObserver {
+    #[inline]
+    fn on_frame(&mut self, frame: &Frame<Bytes>) {
+        if let Some(d) = frame.data_ref() {
+            self.counter.feed(d, |n| self.recv.observe(n as f64));
+        }
+    }
+
+    #[inline]
+    fn on_done(&mut self, _completed: bool) {}
+}
+
+struct GrpcRespObserver {
+    guard: RpcGuard,
+    sent: Option<Arc<Histogram>>,
+    out_counter: GrpcFrameCounter,
+}
+
+impl BodyObserver for GrpcRespObserver {
+    #[inline]
+    fn on_frame(&mut self, frame: &Frame<Bytes>) {
+        if let Some(d) = frame.data_ref() {
+            if let Some(h) = &self.sent {
+                self.out_counter.feed(d, |n| h.observe(n as f64));
+            }
+        } else if let Some(t) = frame.trailers_ref() {
+            let code = t
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i32>().ok());
+            if let Some(code) = code {
+                self.guard.status_code = Some(code);
+                self.guard.status_message = t
+                    .get("grpc-message")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+            }
+        }
+    }
+
+    #[inline]
+    fn on_done(&mut self, completed: bool) {
+        self.guard.finish(completed);
     }
 }
 
@@ -376,15 +733,14 @@ async fn handle<B>(
     conn: Arc<Conn>,
     routes: tonic::service::Routes,
     cfg: GrpcServerConfig,
-    ctx: GrpcContext,
+    cache: Arc<GrpcMetricsCache>,
 ) -> Result<GrpcResponse, std::convert::Infallible>
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<super::body::BoxError>,
 {
-    let method = req.uri().path().to_string();
+    let (known_method, method) = classify_grpc_method(req.uri().path());
     let begin = Instant::now();
-    let m = &ctx.metrics;
 
     // grpc-go operateHeaders: a malformed or already expired `grpc-timeout` aborts the stream
     // before any interceptor or stats handler runs.
@@ -411,37 +767,34 @@ where
     };
 
     conn.active.fetch_add(1, Ordering::AcqRel);
-    let stream_tracker = if cfg.stats_tracking { m.stream_tracker.clone() } else { None };
-    if let Some(t) = &stream_tracker {
-        t.open_stream(conn.id);
-    }
     // Pre-resolve all labeled metric handles once per stream (`grpcStatsHandler.TagRPC` in
     // `dskit/middleware/grpc_stats.go`), so `cortex_request_message_bytes` and
     // `cortex_response_message_bytes` expose `count=0` even if the RPC is canceled before
     // receiving or sending a frame.
-    let (recv_size, sent_size, inflight) = if cfg.stats_tracking {
-        let recv = m.received_message_size.with_label_values(&["gRPC", &method]);
-        let sent = m.sent_message_size.with_label_values(&["gRPC", &method]);
-        let inflight = m.inflight_requests.with_label_values(&["gRPC", &method]);
-        inflight.inc();
-        (Some(recv), Some(sent), Some(inflight))
+    let (recv_size, sent_size, unknown_inflight) = if cache.stats_tracking {
+        if let Some(t) = &cache.metrics.stream_tracker {
+            t.open_stream(conn.id);
+        }
+        let recv = cache.recv_size(known_method, &method);
+        let sent = cache.sent_size(known_method, &method);
+        let unknown_inflight = cache.inc_inflight(known_method, &method);
+        (Some(recv), Some(sent), unknown_inflight)
     } else {
         (None, None, None)
     };
     let error_log = GrpcErrorLog::default();
     // From here on every exit path (including this future being dropped when the client
     // resets the stream) finalizes the RPC exactly once.
-    let guard = RpcGuard {
-        method: method.clone(),
+    let mut guard = RpcGuard {
+        known_method,
+        method,
         begin,
         conn,
-        stream_tracker,
-        inflight,
-        duration_vec: m.request_duration.clone(),
-        report_grpc_status: cfg.report_grpc_status,
-        logger: Arc::clone(&ctx.logger),
+        cache: Arc::clone(&cache),
+        unknown_inflight,
         error_log: error_log.clone(),
-        status: Arc::new(Mutex::new((None, None))),
+        status_code: None,
+        status_message: None,
         done: false,
     };
 
@@ -455,7 +808,7 @@ where
     // cluster validation (unary RPCs only, never health checks).
     let auth_rejection = cfg
         .multitenancy_enabled
-        .then(|| check_org_id(req.headers(), &method))
+        .then(|| check_org_id_known(req.headers(), known_method, &guard.method))
         .flatten();
     if auth_rejection.is_some() {
         // `user.ErrNoOrgID` is a plain Go error: logged as its text.
@@ -466,24 +819,30 @@ where
         });
     }
     let rejection = auth_rejection.or_else(|| {
-            cfg.cluster_validation.as_ref().and_then(|cv| {
-                if STREAMING_METHODS.contains(&method.as_str())
-                    || method.starts_with("/grpc.health.v1.Health/")
-                {
-                    return None;
+        cfg.cluster_validation.as_ref().and_then(|cv| {
+            let skip = match known_method {
+                Some(k) => k.is_streaming_or_health(),
+                None => {
+                    STREAMING_METHODS.contains(&guard.method.as_ref())
+                        || guard.method.starts_with("/grpc.health.v1.Health/")
                 }
-                check_cluster(req.headers(), &method, cv, &ctx)
-            })
-        });
+            };
+            if skip {
+                return None;
+            }
+            check_cluster(req.headers(), &guard.method, cv, &cache)
+        })
+    });
 
     let req = if let Some(recv) = recv_size {
-        let mut counter = GrpcFrameCounter::default();
         req.map(|b| {
-            tonic::body::boxed(TrackedBody::new(b).on_frame(Box::new(move |f: &Frame<Bytes>| {
-                if let Some(d) = f.data_ref() {
-                    counter.feed(d, |n| recv.observe(n as f64));
-                }
-            })))
+            tonic::body::boxed(TrackedBody::with_observer(
+                b,
+                GrpcRecvObserver {
+                    counter: GrpcFrameCounter::default(),
+                    recv,
+                },
+            ))
         })
     } else {
         req.map(tonic::body::boxed)
@@ -510,51 +869,30 @@ where
     };
 
     // Trailers-only responses carry grpc-status in the headers.
-    let header_status = resp
+    guard.status_code = resp
         .headers()
         .get("grpc-status")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<i32>().ok());
-    let header_message = resp
+    guard.status_message = resp
         .headers()
         .get("grpc-message")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    *guard.status.lock() = (header_status, header_message);
+        .map(str::to_owned);
 
-    let sent = sent_size;
-    let mut out_counter = GrpcFrameCounter::default();
-    let status_f = Arc::clone(&guard.status);
-    let on_frame = Box::new(move |f: &Frame<Bytes>| {
-        if let Some(d) = f.data_ref() {
-            if let Some(h) = &sent {
-                out_counter.feed(d, |n| h.observe(n as f64));
-            }
-        } else if let Some(t) = f.trailers_ref() {
-            let code = t
-                .get("grpc-status")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<i32>().ok());
-            let msg = t.get("grpc-message").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-            let mut s = status_f.lock();
-            if code.is_some() {
-                s.0 = code;
-                s.1 = msg;
-            }
-        }
-    });
-    let on_done = Box::new(move |completed: bool| {
-        let mut guard = guard;
-        guard.finish(completed);
-    });
     // grpc-go closes the stream (RST_STREAM CANCEL) when the deadline expires mid-response.
     let body_deadline = deadline.map(tokio::time::Instant::into_std);
     Ok(resp.map(|b| {
         tonic::body::boxed(
-            TrackedBody::new(b)
-                .on_frame(on_frame)
-                .on_done(on_done)
-                .deadline_with(body_deadline, cancel_stream_error),
+            TrackedBody::with_observer(
+                b,
+                GrpcRespObserver {
+                    guard,
+                    sent: sent_size,
+                    out_counter: GrpcFrameCounter::default(),
+                },
+            )
+            .deadline_with(body_deadline, cancel_stream_error),
         )
     }))
 }
@@ -609,7 +947,7 @@ fn check_cluster(
     headers: &http::HeaderMap,
     method: &str,
     cv: &GrpcClusterValidation,
-    ctx: &GrpcContext,
+    cache: &GrpcMetricsCache,
 ) -> Option<tonic::Status> {
     let values: Vec<&str> = headers
         .get_all("x-cluster")
@@ -635,14 +973,15 @@ fn check_cluster(
             ("soft_validation", &soft),
         ];
         kvs.extend_from_slice(extra);
-        ctx.logger.log(LogLevel::Warn, &kvs);
+        cache.logger.log(LogLevel::Warn, &kvs);
     };
     if values.len() > 1 {
         let msg = format!(
             "gRPC metadata should contain exactly 1 value for key \"x-cluster\", but it contains [{}]",
             values.join(" ")
         );
-        ctx.metrics
+        cache
+            .metrics
             .invalid_cluster_requests
             .with_label_values(&["grpc", method, first, ""])
             .inc();
@@ -652,7 +991,8 @@ fn check_cluster(
     match values.first().copied().filter(|v| !v.is_empty()) {
         Some(req_cluster) if cv.allowed.iter().any(|a| a == req_cluster) => None,
         Some(req_cluster) => {
-            ctx.metrics
+            cache
+                .metrics
                 .invalid_cluster_requests
                 .with_label_values(&["grpc", method, first, req_cluster])
                 .inc();
@@ -667,7 +1007,8 @@ fn check_cluster(
             })
         }
         None => {
-            ctx.metrics
+            cache
+                .metrics
                 .invalid_cluster_requests
                 .with_label_values(&["grpc", method, first, ""])
                 .inc();
@@ -729,7 +1070,7 @@ mod tests {
     struct Fixture {
         reg: prometheus::Registry,
         conn: Arc<Conn>,
-        ctx: GrpcContext,
+        cache: Arc<GrpcMetricsCache>,
         cfg: GrpcServerConfig,
         routes: tonic::service::Routes,
     }
@@ -737,6 +1078,28 @@ mod tests {
     fn fixture(multitenancy_enabled: bool) -> Fixture {
         let reg = prometheus::Registry::new();
         let metrics = ServerMetrics::new(&reg, true, true).unwrap();
+        let ctx = GrpcContext {
+            metrics,
+            logger: Arc::new(VecLogger::default()),
+        };
+        let cfg = GrpcServerConfig {
+            max_concurrent_streams: 0,
+            keepalive_time: None,
+            keepalive_timeout: Duration::from_secs(20),
+            max_connection_idle: None,
+            max_connection_age: None,
+            max_connection_age_grace: None,
+            tls: None,
+            stats_tracking: true,
+            report_grpc_status: true,
+            cluster_validation: None,
+            multitenancy_enabled,
+        };
+        let cache = Arc::new(GrpcMetricsCache::new(
+            &ctx,
+            cfg.stats_tracking,
+            cfg.report_grpc_status,
+        ));
         Fixture {
             reg,
             conn: Arc::new(Conn {
@@ -744,23 +1107,8 @@ mod tests {
                 active: AtomicUsize::new(0),
                 idle_since: Mutex::new(Instant::now()),
             }),
-            ctx: GrpcContext {
-                metrics,
-                logger: Arc::new(VecLogger::default()),
-            },
-            cfg: GrpcServerConfig {
-                max_concurrent_streams: 0,
-                keepalive_time: None,
-                keepalive_timeout: Duration::from_secs(20),
-                max_connection_idle: None,
-                max_connection_age: None,
-                max_connection_age_grace: None,
-                tls: None,
-                stats_tracking: true,
-                report_grpc_status: true,
-                cluster_validation: None,
-                multitenancy_enabled,
-            },
+            cache,
+            cfg,
             routes: tonic::service::Routes::new(HangingSvc).prepare(),
         }
     }
@@ -785,7 +1133,7 @@ mod tests {
                 Arc::clone(&self.conn),
                 self.routes.clone(),
                 self.cfg.clone(),
-                self.ctx.clone(),
+                Arc::clone(&self.cache),
             )
         }
 
@@ -956,5 +1304,159 @@ mod tests {
         let fx = fixture(false);
         let resp = fx.call(route, &[]).await.unwrap();
         assert_eq!(drain(resp).await.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn classify_grpc_method_avoids_alloc_for_all_known_routes() {
+        let known = [
+            "/cortex.Ingester/Push",
+            "/cortex.Ingester/QueryStream",
+            "/cortex.Ingester/QueryExemplars",
+            "/cortex.Ingester/LabelValues",
+            "/cortex.Ingester/LabelNames",
+            "/cortex.Ingester/UserStats",
+            "/cortex.Ingester/AllUserStats",
+            "/cortex.Ingester/MetricsForLabelMatchers",
+            "/cortex.Ingester/MetricsMetadata",
+            "/cortex.Ingester/LabelNamesAndValues",
+            "/cortex.Ingester/LabelValuesCardinality",
+            "/cortex.Ingester/ActiveSeries",
+            "/cortex.Ingester/SearchLabelNames",
+            "/cortex.Ingester/SearchLabelValues",
+            "/httpgrpc.HTTP/Handle",
+            "/grpc.health.v1.Health/Check",
+            "/grpc.health.v1.Health/Watch",
+            "/grpc.health.v1.Health/List",
+        ];
+        for path in known {
+            let (kind, cow) = classify_grpc_method(path);
+            assert!(kind.is_some(), "expected KnownGrpcMethod for {path}");
+            assert!(matches!(cow, Cow::Borrowed(_)), "expected Borrowed for {path}");
+            assert_eq!(cow.as_ref(), path);
+        }
+        let (kind, cow) = classify_grpc_method("/custom.Svc/Unknown");
+        assert!(kind.is_none());
+        assert!(matches!(cow, Cow::Owned(_)));
+        assert_eq!(cow.as_ref(), "/custom.Svc/Unknown");
+    }
+
+    #[tokio::test]
+    async fn cached_known_method_metrics_match_exact_labels_and_dont_pollute_uncalled() {
+        #[derive(Clone)]
+        struct EchoIngesterSvc;
+        impl tonic::server::NamedService for EchoIngesterSvc {
+            const NAME: &'static str = "cortex.Ingester";
+        }
+        impl tower::Service<http::Request<tonic::body::BoxBody>> for EchoIngesterSvc {
+            type Response = http::Response<tonic::body::BoxBody>;
+            type Error = std::convert::Infallible;
+            type Future = Pin<
+                Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>,
+            >;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+                Box::pin(async move {
+                    let _ = http_body_util::BodyExt::collect(req.into_body()).await;
+                    let frame = Bytes::from_static(&[0, 0, 0, 0, 3, b'a', b'b', b'c']);
+                    let body = http_body_util::Full::new(frame)
+                        .map_err(|e| -> tonic::Status { match e {} });
+                    let mut resp = http::Response::new(tonic::body::boxed(body));
+                    resp.headers_mut().insert(
+                        http::header::CONTENT_TYPE,
+                        http::HeaderValue::from_static("application/grpc"),
+                    );
+                    Ok(resp)
+                })
+            }
+        }
+
+        use http_body_util::BodyExt;
+        let reg = prometheus::Registry::new();
+        let metrics = ServerMetrics::new(&reg, true, true).unwrap();
+        let ctx = GrpcContext {
+            metrics,
+            logger: Arc::new(VecLogger::default()),
+        };
+        let cfg = GrpcServerConfig {
+            max_concurrent_streams: 0,
+            keepalive_time: None,
+            keepalive_timeout: Duration::from_secs(20),
+            max_connection_idle: None,
+            max_connection_age: None,
+            max_connection_age_grace: None,
+            tls: None,
+            stats_tracking: true,
+            report_grpc_status: true,
+            cluster_validation: None,
+            multitenancy_enabled: false,
+        };
+        let cache = Arc::new(GrpcMetricsCache::new(
+            &ctx,
+            cfg.stats_tracking,
+            cfg.report_grpc_status,
+        ));
+        let conn = Arc::new(Conn {
+            id: 7,
+            active: AtomicUsize::new(0),
+            idle_since: Mutex::new(Instant::now()),
+        });
+        let routes = tonic::service::Routes::new(EchoIngesterSvc).prepare();
+
+        for _ in 0..3 {
+            let req_frame = Bytes::from_static(&[0, 0, 0, 0, 2, 1, 2]);
+            let req = http::Request::builder()
+                .method("POST")
+                .uri("/cortex.Ingester/Push")
+                .header("content-type", "application/grpc")
+                .body(http_body_util::Full::new(req_frame))
+                .unwrap();
+            let resp = handle(
+                req,
+                "127.0.0.1:1".parse().unwrap(),
+                Arc::clone(&conn),
+                routes.clone(),
+                cfg.clone(),
+                Arc::clone(&cache),
+            )
+            .await
+            .unwrap();
+            let _ = resp.into_body().collect().await.unwrap();
+        }
+
+        let mfs = reg.gather();
+        let duration_mf = mfs
+            .iter()
+            .find(|mf| mf.get_name() == "cortex_request_duration_seconds")
+            .unwrap();
+        // Only /cortex.Ingester/Push with status OK should be registered; uncalled routes must not appear.
+        assert_eq!(duration_mf.get_metric().len(), 1);
+        let metric = &duration_mf.get_metric()[0];
+        assert_eq!(metric.get_histogram().get_sample_count(), 3);
+        let has_label = |k: &str, v: &str| {
+            metric
+                .get_label()
+                .iter()
+                .any(|l| l.get_name() == k && l.get_value() == v)
+        };
+        assert!(has_label("method", "gRPC"));
+        assert!(has_label("route", "/cortex.Ingester/Push"));
+        assert!(has_label("status_code", "OK"));
+        assert!(has_label("ws", "false"));
+
+        let req_bytes_mf = mfs
+            .iter()
+            .find(|mf| mf.get_name() == "cortex_request_message_bytes")
+            .unwrap();
+        assert_eq!(req_bytes_mf.get_metric()[0].get_histogram().get_sample_count(), 3);
+        assert_eq!(req_bytes_mf.get_metric()[0].get_histogram().get_sample_sum(), 21.0);
+
+        let resp_bytes_mf = mfs
+            .iter()
+            .find(|mf| mf.get_name() == "cortex_response_message_bytes")
+            .unwrap();
+        assert_eq!(resp_bytes_mf.get_metric()[0].get_histogram().get_sample_count(), 3);
+        assert_eq!(resp_bytes_mf.get_metric()[0].get_histogram().get_sample_sum(), 24.0);
     }
 }

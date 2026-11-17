@@ -1081,7 +1081,7 @@ impl<'a> HistogramIterator<'a> {
             let Some(total_buckets) = num_p.checked_add(num_n) else {
                 return Err(ChunkError::InvalidChunk);
             };
-            if total_buckets > self.br.remaining_bits() / 2 || total_buckets > 1_000_000 {
+            if total_buckets > self.br.remaining_bits() || total_buckets > 1_000_000 {
                 return Err(ChunkError::InvalidChunk);
             }
             self.p_buckets = vec![0; num_p];

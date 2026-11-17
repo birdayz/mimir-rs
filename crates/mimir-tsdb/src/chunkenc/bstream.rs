@@ -2,22 +2,128 @@
 //!
 //! Ported from github.com/prometheus/prometheus/tsdb/chunkenc/bstream.go.
 
+use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
+use std::ptr::NonNull;
+
 use super::ChunkError;
 
+#[inline]
+const fn next_bitstream_capacity(cur_cap: usize) -> usize {
+    if cur_cap < 32 {
+        32
+    } else if cur_cap < 64 {
+        64
+    } else if cur_cap < 96 {
+        96
+    } else if cur_cap < 128 {
+        128
+    } else if cur_cap < 160 {
+        160
+    } else if cur_cap < 192 {
+        192
+    } else if cur_cap < 256 {
+        256
+    } else {
+        // 1.5x growth above 256 bytes, rounded up to 32-byte alignment, capped at `u32::MAX`.
+        let next = cur_cap.saturating_add(cur_cap >> 1);
+        let aligned = next.saturating_add(31) & !31;
+        if aligned > u32::MAX as usize {
+            u32::MAX as usize
+        } else {
+            aligned
+        }
+    }
+}
+
 /// Bit-level writer matching `chunkenc.bstream` in Prometheus TSDB.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct BitStream {
-    pub(crate) stream: Vec<u8>,
+    ptr: NonNull<u8>,
+    len: u32,
+    cap: u32,
     /// Number of unused right-most bits remaining in the last byte of `stream` (`0..=8`).
     pub(crate) count: u8,
+    _marker: PhantomData<Vec<u8>>,
 }
+
+// SAFETY: `BitStream` uniquely owns its heap buffer just like `Vec<u8>`.
+unsafe impl Send for BitStream {}
+// SAFETY: `BitStream` uniquely owns its heap buffer just like `Vec<u8>`.
+unsafe impl Sync for BitStream {}
+
+struct VecGuard<'a> {
+    bs: &'a mut BitStream,
+    vec: ManuallyDrop<Vec<u8>>,
+}
+
+impl Drop for VecGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: `Vec::as_mut_ptr` is always non-null (dangling when capacity == 0).
+        self.bs.ptr = unsafe { NonNull::new_unchecked(self.vec.as_mut_ptr()) };
+        let Ok(len) = u32::try_from(self.vec.len()) else {
+            std::process::abort();
+        };
+        let Ok(cap) = u32::try_from(self.vec.capacity()) else {
+            std::process::abort();
+        };
+        self.bs.len = len;
+        self.bs.cap = cap;
+    }
+}
+
+impl Drop for BitStream {
+    #[inline]
+    fn drop(&mut self) {
+        if self.cap > 0 {
+            // SAFETY: `ptr`, `len`, `cap` were created from a `Vec<u8>` allocation.
+            unsafe {
+                drop(Vec::from_raw_parts(
+                    self.ptr.as_ptr(),
+                    self.len as usize,
+                    self.cap as usize,
+                ));
+            }
+        }
+    }
+}
+
+impl Clone for BitStream {
+    #[inline]
+    fn clone(&self) -> Self {
+        if self.len == 0 {
+            Self {
+                ptr: NonNull::dangling(),
+                len: 0,
+                cap: 0,
+                count: self.count,
+                _marker: PhantomData,
+            }
+        } else {
+            Self::from_bytes(self.bytes().to_vec(), self.count)
+        }
+    }
+}
+
+impl PartialEq for BitStream {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.count == other.count && self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for BitStream {}
 
 impl BitStream {
     #[inline]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            stream: Vec::new(),
+            ptr: NonNull::dangling(),
+            len: 0,
+            cap: 0,
             count: 0,
+            _marker: PhantomData,
         }
     }
 
@@ -25,33 +131,110 @@ impl BitStream {
     pub fn with_header(header_len: usize, capacity: usize) -> Self {
         let mut stream = Vec::with_capacity(capacity.max(header_len));
         stream.resize(header_len, 0);
-        Self { stream, count: 0 }
+        Self::from_bytes(stream, 0)
     }
 
     #[inline]
-    pub fn from_bytes(stream: Vec<u8>, count: u8) -> Self {
-        Self { stream, count }
+    pub fn from_bytes(mut stream: Vec<u8>, count: u8) -> Self {
+        if stream.capacity() > u32::MAX as usize && stream.len() <= u32::MAX as usize {
+            stream.shrink_to_fit();
+        }
+        assert!(
+            stream.len() <= u32::MAX as usize && stream.capacity() <= u32::MAX as usize,
+            "BitStream length/capacity ({}/{}) exceeds u32::MAX",
+            stream.len(),
+            stream.capacity()
+        );
+        let mut v = ManuallyDrop::new(stream);
+        let len = v.len() as u32;
+        let cap = v.capacity() as u32;
+        // SAFETY: `Vec::as_mut_ptr` is always non-null (dangling when capacity == 0).
+        let ptr = unsafe { NonNull::new_unchecked(v.as_mut_ptr()) };
+        Self {
+            ptr,
+            len,
+            cap,
+            count,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn with_vec<R>(&mut self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        let vec = if self.cap == 0 {
+            ManuallyDrop::new(Vec::new())
+        } else {
+            // SAFETY: `ptr`, `len`, `cap` belong to a valid `Vec<u8>` allocation.
+            ManuallyDrop::new(unsafe {
+                Vec::from_raw_parts(self.ptr.as_ptr(), self.len as usize, self.cap as usize)
+            })
+        };
+        let mut guard = VecGuard { bs: self, vec };
+        f(&mut guard.vec)
+    }
+
+    #[inline(always)]
+    fn push_byte(&mut self, byte: u8) {
+        if self.len < self.cap {
+            // SAFETY: `self.len < self.cap` guarantees the write is within allocated capacity.
+            unsafe {
+                *self.ptr.as_ptr().add(self.len as usize) = byte;
+            }
+            self.len += 1;
+        } else {
+            self.grow_and_push(byte);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_and_push(&mut self, byte: u8) {
+        assert!(self.len < u32::MAX, "BitStream length exceeds u32::MAX");
+        let target_cap = next_bitstream_capacity(self.cap as usize);
+        let additional = target_cap.saturating_sub(self.len as usize).max(1);
+        self.with_vec(|v| {
+            v.reserve_exact(additional);
+            assert!(
+                v.capacity() <= u32::MAX as usize,
+                "BitStream capacity {} exceeds u32::MAX",
+                v.capacity()
+            );
+            v.push(byte);
+        });
     }
 
     #[inline]
     pub fn bytes(&self) -> &[u8] {
-        &self.stream
+        // SAFETY: `ptr` is valid for `len` initialized bytes (or dangling with `len == 0`).
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
     }
 
     #[inline]
     pub fn bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.stream
+        // SAFETY: `ptr` is uniquely owned and valid for `len` initialized bytes.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len as usize) }
     }
 
     #[inline]
     pub fn into_bytes(self) -> Vec<u8> {
-        self.stream
+        let me = ManuallyDrop::new(self);
+        if me.cap == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: `ptr`, `len`, `cap` belong to a valid `Vec<u8>` allocation.
+            unsafe { Vec::from_raw_parts(me.ptr.as_ptr(), me.len as usize, me.cap as usize) }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.cap as usize
     }
 
     #[inline]
     pub fn compact(&mut self, threshold: usize) {
-        if self.stream.capacity() > self.stream.len() + threshold {
-            self.stream.shrink_to_fit();
+        if (self.cap as usize) > (self.len as usize) + threshold {
+            self.with_vec(|v| v.shrink_to_fit());
         }
     }
 
@@ -59,12 +242,14 @@ impl BitStream {
     #[inline]
     pub fn write_bit(&mut self, bit: bool) {
         if self.count == 0 {
-            self.stream.push(0);
+            self.push_byte(0);
             self.count = 8;
         }
         if bit {
-            let last = self.stream.len() - 1;
-            self.stream[last] |= 1u8 << (self.count - 1);
+            let mask = 1u8 << (self.count - 1);
+            if let Some(last) = self.bytes_mut().last_mut() {
+                *last |= mask;
+            }
         }
         self.count -= 1;
     }
@@ -73,12 +258,14 @@ impl BitStream {
     #[inline]
     pub fn write_byte(&mut self, byt: u8) {
         if self.count == 0 {
-            self.stream.push(byt);
+            self.push_byte(byt);
             return;
         }
-        let last = self.stream.len() - 1;
-        self.stream[last] |= byt >> (8 - self.count);
-        self.stream.push(byt << self.count);
+        let shift = 8 - self.count;
+        if let Some(last) = self.bytes_mut().last_mut() {
+            *last |= byt >> shift;
+        }
+        self.push_byte(byt << self.count);
     }
 
     /// Appends the `nbits` right-most bits of `u` in MSB-first order (`0 <= nbits <= 64`).
@@ -93,8 +280,10 @@ impl BitStream {
 
         if self.count > 0 {
             let free = self.count as usize;
-            let last = self.stream.len() - 1;
-            self.stream[last] |= (u >> (64 - free)) as u8;
+            let hi = (u >> (64 - free)) as u8;
+            if let Some(last) = self.bytes_mut().last_mut() {
+                *last |= hi;
+            }
             if rem < free {
                 self.count = (free - rem) as u8;
                 return;
@@ -105,13 +294,13 @@ impl BitStream {
         }
 
         while rem >= 8 {
-            self.stream.push((u >> 56) as u8);
+            self.push_byte((u >> 56) as u8);
             u <<= 8;
             rem -= 8;
         }
 
         if rem > 0 {
-            self.stream.push((u >> 56) as u8);
+            self.push_byte((u >> 56) as u8);
             self.count = (8 - rem) as u8;
         }
     }
@@ -341,5 +530,36 @@ mod tests {
         assert_eq!(br.read_bits(64).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
         assert_eq!(br.read_varint().unwrap(), -123456789);
         assert_eq!(br.read_uvarint().unwrap(), 9876543210);
+    }
+
+    #[test]
+    fn bitstream_size_and_compact_growth_steps() {
+        assert_eq!(std::mem::size_of::<BitStream>(), 24);
+        let mut bs = BitStream::with_header(2, 32);
+        let mut caps = vec![bs.capacity()];
+        for i in 0..400usize {
+            bs.write_byte((i & 0xff) as u8);
+            let c = bs.capacity();
+            if *caps.last().unwrap() != c {
+                caps.push(c);
+            }
+        }
+        // Verify compact steps avoid jumping straight from 128 -> 256 -> 512.
+        assert!(caps.contains(&32), "caps={caps:?}");
+        assert!(caps.contains(&64), "caps={caps:?}");
+        assert!(caps.contains(&96), "caps={caps:?}");
+        assert!(caps.contains(&128), "caps={caps:?}");
+        assert!(caps.contains(&160), "caps={caps:?}");
+        assert!(caps.contains(&192), "caps={caps:?}");
+        assert!(caps.contains(&256), "caps={caps:?}");
+        assert!(caps.contains(&384), "caps={caps:?}");
+        assert!(!caps.contains(&512), "caps={caps:?}");
+    }
+
+    #[test]
+    fn next_bitstream_capacity_clamps_to_u32_max() {
+        assert_eq!(next_bitstream_capacity(2_863_311_510), u32::MAX as usize);
+        assert_eq!(next_bitstream_capacity(u32::MAX as usize), u32::MAX as usize);
+        assert!(next_bitstream_capacity(2_000_000_000) <= u32::MAX as usize);
     }
 }

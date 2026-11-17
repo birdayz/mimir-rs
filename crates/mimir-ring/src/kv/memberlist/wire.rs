@@ -23,6 +23,7 @@ pub const COMPOUND_OVERHEAD: usize = 2;
 pub const USER_MSG_OVERHEAD: usize = 1;
 pub const MAX_PUSH_STATE_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_DECOMPRESS_BYTES: usize = MAX_PUSH_STATE_BYTES + (1 << 20);
+pub const MAX_PUSH_PULL_NODES: usize = 65_536;
 pub(super) const MAX_MP_DEPTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -955,8 +956,22 @@ pub fn decode_push_pull(buf: &[u8]) -> Result<(bool, Vec<PushNodeState>, &[u8]),
     for _ in 0..hlen {
         let key = r.read_string()?;
         match key.as_str() {
-            "Nodes" => hdr.nodes = r.read_u64()? as usize,
-            "UserStateLen" => hdr.user_state_len = r.read_u64()? as usize,
+            "Nodes" => {
+                let raw = r.read_u64()?;
+                if raw > MAX_PUSH_PULL_NODES as u64 {
+                    return Err(format!(
+                        "push/pull node count {raw} exceeds max {MAX_PUSH_PULL_NODES}"
+                    ));
+                }
+                hdr.nodes = raw as usize;
+            }
+            "UserStateLen" => {
+                let raw = r.read_u64()?;
+                if raw > MAX_PUSH_STATE_BYTES as u64 {
+                    return Err(format!("user state length {raw} exceeds limit"));
+                }
+                hdr.user_state_len = raw as usize;
+            }
             "Join" => hdr.join = r.read_bool()?,
             _ => r.skip_value()?,
         }

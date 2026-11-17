@@ -93,6 +93,8 @@ func main() {
 		out, err = cmdMemberlistFormatValue(input)
 	case "grpc-health-probe":
 		out, err = cmdGrpcHealthProbe(input)
+	case "grpc-ingester-check":
+		out, err = cmdGrpcIngesterCheck(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}

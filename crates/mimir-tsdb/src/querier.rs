@@ -3,10 +3,12 @@
 //! Ported from github.com/prometheus/prometheus/tsdb/querier.go
 //! and github.com/prometheus/prometheus/tsdb/db.go.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use parking_lot::RwLock;
+use mimir_common::thread_pool::ScopedWorkerPool;
+use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -19,7 +21,7 @@ use crate::compact::{
 };
 use crate::head::{Head, HeadError};
 use crate::index::IndexError;
-use crate::labels::Labels;
+use crate::labels::{decode_stringlabel_size, Labels};
 use crate::matcher::LabelMatcher;
 use crate::postings::PostingsError;
 use crate::search::{apply_search_hints, SearchError, SearchHints, SearchResult};
@@ -728,7 +730,7 @@ impl<'a> TsdbQuerier<'a> {
             );
 
             if sort_series && entries.len() > 1 {
-                entries.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+                sort_lazy_entries(&mut entries);
             }
 
             for entry in entries.iter_mut() {
@@ -747,10 +749,7 @@ impl<'a> TsdbQuerier<'a> {
                         LazyChunkSource::Head(r) => r,
                         _ => continue,
                     };
-                    let chks = match h.series_final_chunks(r, mint, maxt)? {
-                        Some((_, c)) => c,
-                        None => Vec::new(),
-                    };
+                    let chks = h.series_final_chunks_only(r, mint, maxt)?;
                     if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
                         return Ok(());
                     }
@@ -967,7 +966,7 @@ impl<'a> TsdbQuerier<'a> {
         }
 
         if sort_series && entries.len() > 1 {
-            entries.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+            sort_lazy_entries(&mut entries);
         }
 
         for entry in entries.iter_mut() {
@@ -1397,6 +1396,327 @@ impl<'a> TsdbChunkQuerier<'a> {
 /// Helper to iterate samples out of an [`EncodedChunk`] slice.
 pub fn chunk_to_samples(chunk: &EncodedChunk) -> Result<Vec<DecodedSample>, ChunkError> {
     decode_chunk_samples(chunk)
+}
+
+const PARALLEL_SORT_THRESHOLD: usize = 16_384;
+
+fn read_sort_pool() -> &'static ScopedWorkerPool {
+    static POOL: OnceLock<ScopedWorkerPool> = OnceLock::new();
+    // 3 background workers + calling thread = 4 sort threads.
+    POOL.get_or_init(|| ScopedWorkerPool::new("read-sort", 3))
+}
+
+#[inline]
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let limit = a.len().min(b.len());
+    let mut i = 0usize;
+    while i + 8 <= limit {
+        let wa = u64::from_ne_bytes([
+            a[i],
+            a[i + 1],
+            a[i + 2],
+            a[i + 3],
+            a[i + 4],
+            a[i + 5],
+            a[i + 6],
+            a[i + 7],
+        ]);
+        let wb = u64::from_ne_bytes([
+            b[i],
+            b[i + 1],
+            b[i + 2],
+            b[i + 3],
+            b[i + 4],
+            b[i + 5],
+            b[i + 6],
+            b[i + 7],
+        ]);
+        if wa != wb {
+            break;
+        }
+        i += 8;
+    }
+    while i < limit && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+#[inline]
+fn pack_u64_prefix(bytes: &[u8]) -> u64 {
+    if bytes.len() >= 8 {
+        u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    } else {
+        let mut buf = [0u8; 8];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        u64::from_be_bytes(buf)
+    }
+}
+
+#[inline]
+fn extract_lazy_sort_key(
+    labels: &Labels,
+    skip_bytes: usize,
+    value_offset: Option<usize>,
+) -> u64 {
+    let b = labels.as_bytes();
+    if let Some(vlen_pos) = value_offset {
+        let (vlen, vstart) = decode_stringlabel_size(b, vlen_pos);
+        pack_u64_prefix(&b[vstart..vstart + vlen])
+    } else if skip_bytes >= b.len() {
+        0
+    } else {
+        let (nlen, nstart) = decode_stringlabel_size(b, skip_bytes);
+        pack_u64_prefix(&b[nstart..nstart + nlen])
+    }
+}
+
+#[inline]
+fn cmp_lazy_keys(
+    entries: &[LazySeriesEntry],
+    skip_bytes: usize,
+    a: &(u64, u32),
+    b: &(u64, u32),
+) -> Ordering {
+    if a.0 != b.0 {
+        return a.0.cmp(&b.0);
+    }
+    entries[a.1 as usize]
+        .labels
+        .cmp_from_pair_offset(&entries[b.1 as usize].labels, skip_bytes)
+}
+
+fn merge_sorted_keys(
+    entries: &[LazySeriesEntry],
+    skip_bytes: usize,
+    left: &[(u64, u32)],
+    right: &[(u64, u32)],
+    out: &mut Vec<(u64, u32)>,
+) {
+    out.clear();
+    out.reserve(left.len() + right.len());
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < left.len() && j < right.len() {
+        if cmp_lazy_keys(entries, skip_bytes, &left[i], &right[j]) != Ordering::Greater {
+            out.push(left[i]);
+            i += 1;
+        } else {
+            out.push(right[j]);
+            j += 1;
+        }
+    }
+    if i < left.len() {
+        out.extend_from_slice(&left[i..]);
+    }
+    if j < right.len() {
+        out.extend_from_slice(&right[j..]);
+    }
+}
+
+/// Sorts `entries` in exact `Labels::cmp` lexicographical order, skipping the shared
+/// pair-aligned prefix across all entries, using an 8-byte big-endian `u64` prefix key
+/// for single-instruction comparisons, and sorting in parallel across 4 threads when large.
+fn sort_lazy_entries(entries: &mut [LazySeriesEntry]) {
+    let n = entries.len();
+    if n <= 1 {
+        return;
+    }
+    if u32::try_from(n).is_err() {
+        entries.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+        return;
+    }
+
+    // 1. Find longest common byte prefix across all entries in 1 linear pass.
+    let b0 = entries[0].labels.as_bytes();
+    let mut lcp = b0.len();
+    for entry in &entries[1..] {
+        lcp = common_prefix_len(&b0[..lcp], entry.labels.as_bytes());
+        if lcp == 0 {
+            break;
+        }
+    }
+
+    // 2. Snap `lcp` down to the largest pair boundary in `b0` and check if the next
+    //    label's name is also identical across all entries.
+    let mut skip_bytes = 0usize;
+    let mut pos = 0usize;
+    let mut value_offset: Option<usize> = None;
+    while pos < b0.len() {
+        let (nlen, nstart) = decode_stringlabel_size(b0, pos);
+        let name_end = nstart + nlen;
+        let (vlen, vstart) = decode_stringlabel_size(b0, name_end);
+        let next_pos = vstart + vlen;
+        if next_pos <= lcp {
+            skip_bytes = next_pos;
+            pos = next_pos;
+        } else {
+            if name_end <= lcp {
+                value_offset = Some(name_end);
+            }
+            break;
+        }
+    }
+
+    // 3. Extract 8-byte sort keys once per entry into compact 16-byte `(key, idx)` tuples.
+    let mut keys: Vec<(u64, u32)> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            (
+                extract_lazy_sort_key(&e.labels, skip_bytes, value_offset),
+                i as u32,
+            )
+        })
+        .collect();
+
+    if n < PARALLEL_SORT_THRESHOLD {
+        keys.sort_unstable_by(|a, b| cmp_lazy_keys(entries, skip_bytes, a, b));
+    } else {
+        let pool = read_sort_pool();
+        let q1_end = n / 4;
+        let q2_end = n / 2;
+        let q3_end = (3 * n) / 4;
+        let (s0, rest) = keys.split_at_mut(q1_end);
+        let (s1, rest) = rest.split_at_mut(q2_end - q1_end);
+        let (s2, s3) = rest.split_at_mut(q3_end - q2_end);
+
+        let entries_ref: &[LazySeriesEntry] = entries;
+        let slices = [
+            Mutex::new(Some(s0)),
+            Mutex::new(Some(s1)),
+            Mutex::new(Some(s2)),
+            Mutex::new(Some(s3)),
+        ];
+        pool.scoped_execute(4, |tid| {
+            if let Some(slice) = slices[tid].lock().take() {
+                slice.sort_unstable_by(|a, b| cmp_lazy_keys(entries_ref, skip_bytes, a, b));
+            }
+        });
+
+        let (left_in, right_in) = keys.split_at(q2_end);
+        let (q0, q1) = left_in.split_at(q1_end);
+        let (q2, q3) = right_in.split_at(q3_end - q2_end);
+
+        let mut left = Vec::with_capacity(q0.len() + q1.len());
+        let mut right = Vec::with_capacity(q2.len() + q3.len());
+        {
+            let pairs = [(q0, q1), (q2, q3)];
+            let outs = [Mutex::new(Some(&mut left)), Mutex::new(Some(&mut right))];
+            pool.scoped_execute(2, |tid| {
+                if let Some(out) = outs[tid].lock().take() {
+                    merge_sorted_keys(entries_ref, skip_bytes, pairs[tid].0, pairs[tid].1, out);
+                }
+            });
+        }
+        merge_sorted_keys(entries_ref, skip_bytes, &left, &right, &mut keys);
+    }
+
+    // 4. Permute `entries` in-place via cycle decomposition (0 extra allocations).
+    for i in 0..n {
+        let mut cur = i;
+        loop {
+            let next = keys[cur].1 as usize;
+            keys[cur].1 = cur as u32;
+            if next == i {
+                break;
+            }
+            entries.swap(cur, next);
+            cur = next;
+        }
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn make_entry(lbls: Labels) -> LazySeriesEntry {
+        LazySeriesEntry {
+            labels: lbls,
+            source: LazyChunkSource::Head(0),
+            chunk_count: 1,
+        }
+    }
+
+    #[test]
+    fn sort_lazy_entries_matches_labels_cmp_edge_cases_and_parallel() {
+        // 1. Shared prefix + varying label counts + >255B names/values + embedded NUL bytes
+        let long_name_a = format!("lbl_{}", "x".repeat(300));
+        let long_name_b = format!("lbl_{}", "y".repeat(300));
+        let long_a = format!("val-{}", "a".repeat(300));
+        let long_b = format!("val-{}", "b".repeat(300));
+        let mut raw_nul_1 = Vec::new();
+        crate::labels::append_stringlabel_pair(&mut raw_nul_1, b"__name__", b"m");
+        crate::labels::append_stringlabel_pair(&mut raw_nul_1, b"pod", b"a\0c");
+        let mut raw_nul_2 = Vec::new();
+        crate::labels::append_stringlabel_pair(&mut raw_nul_2, b"__name__", b"m");
+        crate::labels::append_stringlabel_pair(&mut raw_nul_2, b"pod", b"a\0");
+        let mut raw_nul_3 = Vec::new();
+        crate::labels::append_stringlabel_pair(&mut raw_nul_3, b"__name__", b"m");
+        crate::labels::append_stringlabel_pair(&mut raw_nul_3, b"pod", b"a");
+        let mut raw_nul_4 = Vec::new();
+        crate::labels::append_stringlabel_pair(&mut raw_nul_4, b"__name__", b"m");
+        crate::labels::append_stringlabel_pair(&mut raw_nul_4, b"pod", b"");
+
+        let mut samples = vec![
+            Labels::from_pairs([("__name__", "m"), ("pod", "pod-99999999")]),
+            Labels::from_pairs([("__name__", "m"), ("pod", "pod-10000000")]),
+            Labels::from_pairs([("__name__", "m"), ("pod", "pod-10000001")]),
+            Labels::from_pairs([("__name__", "m")]),
+            Labels::from_pairs([("__name__", "m"), ("extra", "1"), ("pod", "pod-0")]),
+            Labels::from_pairs([("__name__", "m"), ("pod", &long_b)]),
+            Labels::from_pairs([("__name__", "m"), ("pod", &long_a)]),
+            Labels::from_pairs([("__name__", "m"), (&long_name_b, "1")]),
+            Labels::from_pairs([("__name__", "m"), (&long_name_a, "2")]),
+            Labels::from_pairs([("__name__", "m"), (&long_name_a, "1")]),
+            Labels::from_raw_stringlabels_bytes(Bytes::from(raw_nul_1)),
+            Labels::from_raw_stringlabels_bytes(Bytes::from(raw_nul_2)),
+            Labels::from_raw_stringlabels_bytes(Bytes::from(raw_nul_3)),
+            Labels::from_raw_stringlabels_bytes(Bytes::from(raw_nul_4)),
+        ];
+        samples.reverse();
+
+        let mut expected: Vec<LazySeriesEntry> = samples.iter().cloned().map(make_entry).collect();
+        expected.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+
+        let mut actual: Vec<LazySeriesEntry> = samples.into_iter().map(make_entry).collect();
+        sort_lazy_entries(&mut actual);
+        assert_eq!(
+            actual.iter().map(|e| &e.labels).collect::<Vec<_>>(),
+            expected.iter().map(|e| &e.labels).collect::<Vec<_>>()
+        );
+
+        // 2. Parallel sort (> PARALLEL_SORT_THRESHOLD) with 10-label shared prefix + ties
+        let total = PARALLEL_SORT_THRESHOLD + 4_000;
+        let mut big_actual = Vec::with_capacity(total);
+        for i in (0..total).rev() {
+            let pod = format!("pod-{:04}-suffix-{}", (i * 7919) % 500, i);
+            let lbls = Labels::from_pairs([
+                ("__name__", "container_cpu_usage_seconds_total"),
+                ("cluster", "prod-eu"),
+                ("container", "app"),
+                ("env", "prod"),
+                ("namespace", &format!("ns-{}", i % 10)),
+                ("pod", &pod),
+                ("series", &format!("{i:06}")),
+            ]);
+            big_actual.push(make_entry(lbls));
+        }
+        let mut big_expected: Vec<LazySeriesEntry> = big_actual
+            .iter()
+            .map(|e| make_entry(e.labels.clone()))
+            .collect();
+        big_expected.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+
+        sort_lazy_entries(&mut big_actual);
+        for (idx, (a, e)) in big_actual.iter().zip(big_expected.iter()).enumerate() {
+            assert_eq!(a.labels, e.labels, "mismatch at sorted index {idx}");
+        }
+    }
 }
 
 #[cfg(test)]

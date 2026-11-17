@@ -116,7 +116,7 @@ fn try_decode_stringlabel_size(data: &[u8], pos: usize) -> Result<(usize, usize)
 }
 
 #[inline]
-fn decode_stringlabel_size(data: &[u8], pos: usize) -> (usize, usize) {
+pub fn decode_stringlabel_size(data: &[u8], pos: usize) -> (usize, usize) {
     let b = data[pos];
     if b == 255 {
         let len = (data[pos + 1] as usize)
@@ -437,6 +437,33 @@ impl Labels {
     /// Returns `true` if all `matchers` match this label set (with missing labels treated as `""`).
     pub fn matches(&self, matchers: &[LabelMatcher]) -> bool {
         matchers.iter().all(|m| m.matches(self.get(&m.name)))
+    }
+
+    /// Compares `self` and `other` assuming both share an identical pair-aligned byte prefix
+    /// `0..pair_offset` (so all label pairs before `pair_offset` are identical).
+    #[inline]
+    pub fn cmp_from_pair_offset(&self, other: &Self, pair_offset: usize) -> Ordering {
+        let mut a = LabelsIter {
+            data: &self.data,
+            pos: pair_offset,
+        };
+        let mut b = LabelsIter {
+            data: &other.data,
+            pos: pair_offset,
+        };
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return Ordering::Equal,
+                (None, Some(_)) => return Ordering::Less,
+                (Some(_), None) => return Ordering::Greater,
+                (Some((an, av)), Some((bn, bv))) => {
+                    match an.cmp(bn).then_with(|| av.cmp(bv)) {
+                        Ordering::Equal => continue,
+                        ord => return ord,
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use mimir_common::thread_pool::ScopedWorkerPool;
@@ -214,7 +214,7 @@ struct WorkerArena {
     label_bytes_arena: Vec<u8>,
     samples_arena: Vec<cortexpb::Sample>,
     histograms_arena: Vec<ConvertedHistogram>,
-    exemplars_arena: Vec<(i64, f64, Labels, String)>,
+    exemplars_arena: Vec<Result<(i64, f64, Labels, String), crate::errors::IngesterError>>,
     shard_buckets: Vec<Vec<ShardSeriesItem>>,
     metadata: MetadataStash,
     empty_tenant_errors: usize,
@@ -370,16 +370,19 @@ impl Drop for ArenaPoolGuard<'_> {
             a.wr_scratch.clear();
             for b in &mut a.shard_buckets {
                 b.clear();
+                if b.capacity() > 2048 {
+                    b.shrink_to(512);
+                }
             }
             a.metadata.clear();
-            if a.metadata.bytes.capacity() > 1024 * 1024 {
+            if a.metadata.bytes.capacity() > 256 * 1024 {
                 a.metadata.bytes = Vec::new();
             }
             // Prevent retaining outlier allocations after massive spikes.
-            if a.label_bytes_arena.capacity() > 4 * 1024 * 1024 {
+            if a.label_bytes_arena.capacity() > 512 * 1024 {
                 a.label_bytes_arena = Vec::with_capacity(65_536);
             }
-            if a.samples_arena.capacity() > 65_536 {
+            if a.samples_arena.capacity() > 16_384 {
                 a.samples_arena = Vec::with_capacity(512);
             }
         }
@@ -418,6 +421,9 @@ pub struct IngesterShardedBatchConsumer {
     ingester: Arc<Ingester>,
     kafka_cfg: KafkaConfig,
     metrics: PusherConsumerMetrics,
+    processing_time_timeseries: OnceLock<prometheus::Histogram>,
+    processing_time_metadata: OnceLock<prometheus::Histogram>,
+    processing_time_timeseries_and_metadata: OnceLock<prometheus::Histogram>,
     error_handler: Arc<PushErrorHandler>,
     arena_pool: Mutex<Vec<WorkerArena>>,
     worker_pool: ScopedWorkerPool,
@@ -454,6 +460,9 @@ impl IngesterShardedBatchConsumer {
             ingester,
             kafka_cfg,
             metrics,
+            processing_time_timeseries: OnceLock::new(),
+            processing_time_metadata: OnceLock::new(),
+            processing_time_timeseries_and_metadata: OnceLock::new(),
             error_handler,
             arena_pool: Mutex::new(Vec::new()),
             worker_pool,
@@ -639,7 +648,8 @@ impl IngesterShardedBatchConsumer {
                 invalid_tenant_indices,
                 total_series,
             } = arena;
-            let mut tmp_ex: Vec<(i64, f64, Labels, String)> = Vec::new();
+            let mut tmp_ex: Vec<Result<(i64, f64, Labels, String), crate::errors::IngesterError>> =
+                Vec::new();
             let mut bucket_bases = [0usize; 16];
             for (local_i, rec) in slice.iter().enumerate() {
                 let tenant_idx = tids[local_i];
@@ -700,22 +710,17 @@ impl IngesterShardedBatchConsumer {
 
                             let ex_start = exemplars_arena.len() as u32;
                             let mut ex_len = 0u32;
-                            let mut bad_utf8 = false;
                             if ts.exemplars_len() > 0 {
                                 tmp_ex.clear();
                                 for ex in ts.exemplars() {
-                                    if let Ok(conv) = convert_borrowed_exemplar(&ex) {
+                                    let res = convert_borrowed_exemplar(&ex);
+                                    if let Ok(ref conv) = res {
                                         min_ts = min_ts.min(conv.0);
-                                        tmp_ex.push(conv);
-                                        ex_len += 1;
-                                    } else {
-                                        bad_utf8 = true;
-                                        break;
                                     }
+                                    tmp_ex.push(res);
+                                    ex_len += 1;
                                 }
-                                if !bad_utf8 {
-                                    exemplars_arena.append(&mut tmp_ex);
-                                }
+                                exemplars_arena.append(&mut tmp_ex);
                             }
 
                             let shard = shard_for(tenant_idx, prom_hash);
@@ -727,7 +732,7 @@ impl IngesterShardedBatchConsumer {
                                 source: ts.source,
                                 skip_label_validation: ts.skip_label_validation,
                                 labels_sorted_unique: ts.labels_sorted_unique,
-                                bad_utf8,
+                                bad_utf8: false,
                                 prom_hash,
                                 label_bytes_start,
                                 label_bytes_len,
@@ -891,18 +896,14 @@ impl IngesterShardedBatchConsumer {
                     if ts.exemplars().len() > 0 {
                         tmp_ex.clear();
                         for ex in ts.exemplars() {
-                            if let Ok(conv) = convert_borrowed_exemplar(&ex) {
+                            let res = convert_borrowed_exemplar(&ex);
+                            if let Ok(ref conv) = res {
                                 min_ts = min_ts.min(conv.0);
-                                tmp_ex.push(conv);
-                                ex_len += 1;
-                            } else {
-                                bad_utf8 = true;
-                                break;
                             }
+                            tmp_ex.push(res);
+                            ex_len += 1;
                         }
-                        if !bad_utf8 {
-                            exemplars_arena.append(&mut tmp_ex);
-                        }
+                        exemplars_arena.append(&mut tmp_ex);
                     }
 
                     let shard = shard_for(tenant_idx, prom_hash);
@@ -1039,17 +1040,26 @@ impl IngesterShardedBatchConsumer {
                 let tenant_id = &tenant_ids_ref[tenant_idx as usize];
                 let norm_source = cortexpb::write_request::SourceEnum::try_from(source_raw)
                     .unwrap_or(cortexpb::write_request::SourceEnum::Api);
-                let contents = match (batch_vec.is_empty(), metas.is_empty()) {
-                    (false, false) => "timeseries_and_metadata",
-                    (false, true) => "timeseries",
-                    _ => "metadata",
+                let m = &self.metrics.storage_pusher_metrics;
+                let processing_hist = match (batch_vec.is_empty(), metas.is_empty()) {
+                    (false, false) => self
+                        .processing_time_timeseries_and_metadata
+                        .get_or_init(|| {
+                            m.processing_time
+                                .with_label_values(&["timeseries_and_metadata"])
+                        }),
+                    (false, true) => self
+                        .processing_time_timeseries
+                        .get_or_init(|| m.processing_time.with_label_values(&["timeseries"])),
+                    _ => self
+                        .processing_time_metadata
+                        .get_or_init(|| m.processing_time.with_label_values(&["metadata"])),
                 };
                 let meta_views: SmallVec<[BorrowedMetadata<'_>; 8]> = metas
                     .iter()
                     .map(|it| arenas_ref[it.worker_idx as usize].metadata.view(it))
                     .collect();
 
-                let m = &self.metrics.storage_pusher_metrics;
                 m.batch_age.observe(batch_started.elapsed().as_secs_f64());
                 m.batching_queue_metrics.flush_total.inc();
                 m.time_series_per_flush.observe(batch_vec.len() as f64);
@@ -1065,9 +1075,7 @@ impl IngesterShardedBatchConsumer {
                         &meta_views,
                     )
                     .map_err(ingester_err_to_pusher_err);
-                m.processing_time
-                    .with_label_values(&[contents])
-                    .observe(proc_t0.elapsed().as_secs_f64());
+                processing_hist.observe(proc_t0.elapsed().as_secs_f64());
                 batch_vec.clear();
 
                 match res {
