@@ -164,8 +164,24 @@ struct ClusterMetadata {
     topic_partitions: HashMap<String, Vec<i32>>,
 }
 
+/// kgo `broker.loadConnection`: requests are spread over separate connections per broker so
+/// that long-polling Fetch requests (and slow / produce requests) never delay other requests
+/// queued behind them on the same connection (brokers answer a connection's requests in order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ConnKind {
+    /// `cxnNormal`: metadata, ListOffsets, offset commit / fetch, ...
+    Normal,
+    /// `cxnProduce`.
+    Produce,
+    /// `cxnFetch`: Fetch (long poll).
+    Fetch,
+    /// `cxnSlow`: requests carrying a timeout (e.g. CreateTopics).
+    Slow,
+}
+
 struct BrokerConn {
     addr: String,
+    kind: ConnKind,
     client_id: String,
     next_corr_id: AtomicI32,
     write_tx: mpsc::Sender<Bytes>,
@@ -196,8 +212,10 @@ impl Drop for PendingGuard<'_> {
 }
 
 impl BrokerConn {
+    #[allow(clippy::too_many_arguments)]
     async fn connect(
         addr: String,
+        kind: ConnKind,
         client_id: String,
         transport: &KafkaTransport,
         request_timeout: Duration,
@@ -265,6 +283,7 @@ impl BrokerConn {
 
         Ok(Arc::new(Self {
             addr,
+            kind,
             client_id,
             next_corr_id: AtomicI32::new(established.next_correlation_id),
             write_tx,
@@ -440,7 +459,7 @@ pub struct KafkaClient {
     client_rack: String,
     request_timeout: Duration,
     transport: Arc<KafkaTransport>,
-    conns_by_addr: Mutex<HashMap<String, Arc<BrokerConn>>>,
+    conns_by_addr: Mutex<HashMap<(String, ConnKind), Arc<BrokerConn>>>,
     metadata: RwLock<ClusterMetadata>,
     decode_pool: OnceLock<ScopedWorkerPool>,
     /// `-ingest-storage.kafka.last-produced-offset-retry-timeout`: the `ListOffsets` retry timeout
@@ -554,7 +573,7 @@ impl KafkaClient {
         let Some(addr) = addr else {
             return Err(KafkaClientError::UnknownBroker);
         };
-        let conn = self.load_conn(&addr).await?;
+        let conn = self.load_conn_kind(&addr, ConnKind::Fetch).await?;
         let ver = conn.pick_version(ApiKey::Fetch, min_version, max_version);
         let res = conn.send_raw_timeout(ApiKey::Fetch, ver, req, timeout).await;
         if let Err(ref e) = res {
@@ -652,20 +671,26 @@ impl KafkaClient {
         Ok(client)
     }
 
-    async fn get_conn_for_addr(&self, addr: &str) -> Result<Arc<BrokerConn>, KafkaClientError> {
+    async fn get_conn_for_addr(
+        &self,
+        addr: &str,
+        kind: ConnKind,
+    ) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        let key = (addr.to_string(), kind);
         {
             let mut map = self.conns_by_addr.lock().await;
-            if let Some(c) = map.get(addr) {
+            if let Some(c) = map.get(&key) {
                 if c.is_usable() {
                     return Ok(Arc::clone(c));
                 }
-                map.remove(addr);
+                map.remove(&key);
             }
         }
 
         // Connect and negotiate outside conns_by_addr lock so slow/dead brokers never block others.
         let conn = BrokerConn::connect(
             addr.to_string(),
+            kind,
             self.client_id.clone(),
             &self.transport,
             self.request_timeout,
@@ -688,22 +713,23 @@ impl KafkaClient {
         })?;
 
         let mut map = self.conns_by_addr.lock().await;
-        if let Some(existing) = map.get(addr) {
+        if let Some(existing) = map.get(&key) {
             if existing.is_usable() {
                 conn.mark_dead();
                 return Ok(Arc::clone(existing));
             }
         }
-        map.insert(addr.to_string(), Arc::clone(&conn));
+        map.insert(key, Arc::clone(&conn));
         Ok(conn)
     }
 
     async fn drop_conn(&self, conn: &Arc<BrokerConn>) {
         conn.mark_dead();
         let mut map = self.conns_by_addr.lock().await;
-        if let Some(existing) = map.get(&conn.addr) {
+        let key = (conn.addr.clone(), conn.kind);
+        if let Some(existing) = map.get(&key) {
             if Arc::ptr_eq(existing, conn) {
-                map.remove(&conn.addr);
+                map.remove(&key);
             }
         }
     }
@@ -718,7 +744,15 @@ impl KafkaClient {
     /// Returns a pooled connection, dialing a new one if needed. A new connection failing with a
     /// retryable error is retried once (kgo `broker.handleReq`).
     async fn load_conn(&self, addr: &str) -> Result<Arc<BrokerConn>, KafkaClientError> {
-        load_connection_retrying_once(|| self.get_conn_for_addr(addr)).await
+        self.load_conn_kind(addr, ConnKind::Normal).await
+    }
+
+    async fn load_conn_kind(
+        &self,
+        addr: &str,
+        kind: ConnKind,
+    ) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        load_connection_retrying_once(|| self.get_conn_for_addr(addr, kind)).await
     }
 
     /// `cl.broker()`: the next "any" broker (discovered brokers, then seeds).
@@ -863,9 +897,13 @@ impl KafkaClient {
     }
 
     async fn any_conn(&self) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        self.any_conn_kind(ConnKind::Normal).await
+    }
+
+    async fn any_conn_kind(&self, kind: ConnKind) -> Result<Arc<BrokerConn>, KafkaClientError> {
         let mut last_err = None;
         for seed in &self.seed_brokers {
-            match self.load_conn(seed).await {
+            match self.load_conn_kind(seed, kind).await {
                 Ok(c) => return Ok(c),
                 Err(e) => last_err = Some(e),
             }
@@ -873,23 +911,28 @@ impl KafkaClient {
         Err(last_err.unwrap_or(KafkaClientError::NoSeedBrokers))
     }
 
-    async fn conn_for_node(&self, node_id: i32) -> Result<Arc<BrokerConn>, KafkaClientError> {
+    async fn conn_for_node(
+        &self,
+        node_id: i32,
+        kind: ConnKind,
+    ) -> Result<Arc<BrokerConn>, KafkaClientError> {
         let addr = {
             let md = self.metadata.read();
             md.brokers.get(&node_id).map(|b| b.addr.clone())
         };
         if let Some(addr) = addr {
-            if let Ok(conn) = self.load_conn(&addr).await {
+            if let Ok(conn) = self.load_conn_kind(&addr, kind).await {
                 return Ok(conn);
             }
         }
-        self.any_conn().await
+        self.any_conn_kind(kind).await
     }
 
     async fn leader_conn(
         &self,
         topic: &str,
         partition: i32,
+        kind: ConnKind,
     ) -> Result<Arc<BrokerConn>, KafkaClientError> {
         let leader = {
             let md = self.metadata.read();
@@ -897,7 +940,7 @@ impl KafkaClient {
         };
         if let Some(node_id) = leader {
             if node_id >= 0 {
-                return self.conn_for_node(node_id).await;
+                return self.conn_for_node(node_id, kind).await;
             }
         }
         self.refresh_metadata(&[topic]).await?;
@@ -907,10 +950,10 @@ impl KafkaClient {
         };
         if let Some(node_id) = leader {
             if node_id >= 0 {
-                return self.conn_for_node(node_id).await;
+                return self.conn_for_node(node_id, kind).await;
             }
         }
-        self.any_conn().await
+        self.any_conn_kind(kind).await
     }
 
     /// Refreshes cluster & topic metadata from any reachable broker.
@@ -1007,7 +1050,7 @@ impl KafkaClient {
             |b: BrokerChoice| {
                 let req = &req;
                 async move {
-                    let conn = self.load_conn(&b.addr).await?;
+                    let conn = self.load_conn_kind(&b.addr, ConnKind::Slow).await?;
                     let ver = conn.pick_version(ApiKey::CreateTopics, 0, 5);
                     self.send_on(&conn, ApiKey::CreateTopics, ver, req, read_timeout)
                         .await
@@ -1211,7 +1254,7 @@ impl KafkaClient {
     ) -> Result<FetchPartitionResult, KafkaClientError> {
         let wait_timeout = self.request_timeout.max(max_wait + Duration::from_secs(5));
         for attempt in 0..2 {
-            let conn = self.leader_conn(topic, partition).await?;
+            let conn = self.leader_conn(topic, partition, ConnKind::Fetch).await?;
             let ver = conn.pick_version(ApiKey::Fetch, 4, 12);
 
             let mut fp = FetchPartition::default();
@@ -1358,7 +1401,7 @@ impl KafkaClient {
         let payload = batch_buf.freeze();
 
         for attempt in 0..2 {
-            let conn = self.leader_conn(topic, partition).await?;
+            let conn = self.leader_conn(topic, partition, ConnKind::Produce).await?;
             let ver = conn.pick_version(ApiKey::Produce, 3, 9);
 
             let mut pp = PartitionProduceData::default();

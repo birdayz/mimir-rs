@@ -221,7 +221,7 @@ impl Cluster {
         } else if fp.fetch_offset < hwm {
             pd.records = Some(encode_records(fp.fetch_offset, hwm));
         } else {
-            tokio::time::sleep(Duration::from_millis(req.max_wait_ms.clamp(0, 200) as u64)).await;
+            tokio::time::sleep(Duration::from_millis(req.max_wait_ms.clamp(0, 2000) as u64)).await;
         }
         let mut ft = FetchableTopicResponse::default();
         ft.topic = t.topic.clone();
@@ -392,4 +392,29 @@ async fn concurrent_fetchers_ignore_rack_and_read_from_leader() {
     }
     assert_eq!(by.len(), 1, "{by:?}");
     assert!(by.contains_key(&(LEADER, 13, String::new(), LEADER_EPOCH)), "{by:?}");
+}
+
+/// kgo `broker.loadConnection`: Fetch requests use their own connection, so a long-polling
+/// Fetch (brokers answer a connection's requests in order) never delays ListOffsets / metadata.
+#[tokio::test]
+async fn long_poll_fetch_does_not_block_other_requests() {
+    let cluster = Cluster::start().await;
+    let client = Arc::new(KafkaClient::from_config(&kafka_cfg(&cluster, "")).unwrap());
+    client.refresh_metadata(&[TOPIC]).await.unwrap();
+    let c = Arc::clone(&client);
+    let fetch = tokio::spawn(async move {
+        // Beyond the HWM: the broker holds the request for max_wait.
+        c.fetch(TOPIC, 0, NUM_RECORDS, Duration::from_millis(1500), 1, 1 << 20)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let start = std::time::Instant::now();
+    let end = client.list_offset(TOPIC, 0, -1).await.unwrap();
+    assert_eq!(end, NUM_RECORDS);
+    assert!(
+        start.elapsed() < Duration::from_millis(800),
+        "ListOffsets waited {:?} behind a long-poll Fetch",
+        start.elapsed()
+    );
+    assert!(fetch.await.unwrap().unwrap().records.is_empty());
 }
