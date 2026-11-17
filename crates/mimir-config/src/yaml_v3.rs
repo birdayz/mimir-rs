@@ -195,8 +195,14 @@ impl Parser {
             return Ok(e.typ);
         }
         let mut ev = std::mem::MaybeUninit::<unsafe_sys::yaml_event_t>::uninit();
-        // SAFETY: parser is initialized; on success the event is initialized and deleted below
-        // after copying its data out.
+        struct EventGuard(*mut unsafe_sys::yaml_event_t);
+        impl Drop for EventGuard {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` was initialized by a successful `yaml_parser_parse` call.
+                unsafe { unsafe_sys::yaml_event_delete(self.0) };
+            }
+        }
+        // SAFETY: parser is initialized; on success `EventGuard` deletes the event on return/unwind.
         unsafe {
             if unsafe_sys::yaml_parser_parse(self.raw, ev.as_mut_ptr()).fail
                 || (&*self.raw).error != unsafe_sys::YAML_NO_ERROR
@@ -204,6 +210,7 @@ impl Parser {
                 return Err(self.fail());
             }
             let ev = ev.as_mut_ptr();
+            let _ev_guard = EventGuard(ev);
             let typ = (*ev).type_;
             let mut out = Event {
                 typ,
@@ -223,8 +230,12 @@ impl Parser {
                     let s = (*ev).data.scalar;
                     out.anchor = (!s.anchor.is_null()).then(|| c_str(s.anchor));
                     out.tag = c_str(s.tag);
-                    let bytes = std::slice::from_raw_parts(s.value, s.length as usize);
-                    out.value = String::from_utf8_lossy(bytes).into_owned();
+                    out.value = if s.value.is_null() || s.length == 0 {
+                        String::new()
+                    } else {
+                        let bytes = std::slice::from_raw_parts(s.value, s.length as usize);
+                        String::from_utf8_lossy(bytes).into_owned()
+                    };
                     out.scalar_style = Some(s.style);
                 }
                 unsafe_sys::YAML_SEQUENCE_START_EVENT => {
@@ -239,7 +250,6 @@ impl Parser {
                 }
                 _ => {}
             }
-            unsafe_sys::yaml_event_delete(ev);
             self.event = Some(out);
             Ok(typ)
         }
