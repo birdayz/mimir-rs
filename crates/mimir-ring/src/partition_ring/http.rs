@@ -79,6 +79,22 @@ pub fn partition_ring_router(
         .with_state(state)
 }
 
+/// Serves the partition ring status page and editor at `path` only (Mimir registers one per read
+/// compartment at `/ingester/partition-ring/compartment-<id>`, `pkg/api/api.go`).
+pub fn partition_ring_router_at(
+    path: &str,
+    reader: Arc<dyn PartitionRingReader>,
+    editor: Arc<PartitionRingEditor>,
+) -> Router {
+    let state = PartitionRingPageState { reader, editor };
+    Router::new()
+        .route(
+            path,
+            get(handle_partition_ring_get).post(handle_partition_ring_post),
+        )
+        .with_state(state)
+}
+
 pub async fn handle_partition_ring_get(
     State(state): State<PartitionRingPageState>,
     headers: HeaderMap,

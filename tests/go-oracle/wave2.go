@@ -358,6 +358,7 @@ type kfakeRecordIn struct {
 type kfakeBrokerIn struct {
 	Topic       string          `json:"topic"`
 	Partitions  int32           `json:"partitions"`
+	Port        int             `json:"port,omitempty"`
 	Compression string          `json:"compression,omitempty"`
 	Records     []kfakeRecordIn `json:"records"`
 }
@@ -444,10 +445,14 @@ func cmdKfakeBroker() error {
 		in.Partitions = 1
 	}
 
-	cluster, err := kfake.NewCluster(
+	opts := []kfake.Opt{
 		kfake.NumBrokers(1),
 		kfake.SeedTopics(in.Partitions, in.Topic),
-	)
+	}
+	if in.Port > 0 {
+		opts = append(opts, kfake.Ports(in.Port))
+	}
+	cluster, err := kfake.NewCluster(opts...)
 	if err != nil {
 		return fmt.Errorf("start kfake cluster: %w", err)
 	}

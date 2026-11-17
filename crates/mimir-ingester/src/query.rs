@@ -103,16 +103,24 @@ impl Drop for ReadPermit {
 /// `errWaitStrongReadConsistencyTimeoutExceeded` (wrapping `context.DeadlineExceeded`, so
 /// `codes.DeadlineExceeded` and a read circuit breaker timeout). The request's own deadline
 /// cancels the wait by dropping it (grpc-go resets the stream and cancels the handler context).
+/// Go checks `errors.Is(err, context.DeadlineExceeded)`, which also holds for the
+/// multi-cluster reader's `write compartment N: ...` wrapped / multierror results
+/// ([`ReaderError::is_deadline_exceeded`]).
 fn map_strong_read_consistency_wait_err(e: ReaderError) -> IngesterError {
-    match e {
-        ReaderError::WaitStrongReadConsistencyTimeoutExceeded
-        | ReaderError::Watcher(OffsetWatcherError::Timeout(_)) => IngesterError::DeadlineExceeded {
-            message: "wait for read consistency: wait strong read consistency timeout exceeded: context deadline exceeded".to_string(),
-        },
-        e => IngesterError::Internal {
+    if !e.is_deadline_exceeded() {
+        return IngesterError::Internal {
             message: format!("wait for read consistency: {e}"),
-        },
+        };
     }
+    let message = match e {
+        // The caller's deadline expired first: Go's wait returns the context cause
+        // `context.DeadlineExceeded` itself.
+        ReaderError::Watcher(OffsetWatcherError::Timeout(_)) => {
+            "wait for read consistency: context deadline exceeded".to_string()
+        }
+        e => format!("wait for read consistency: {e}"),
+    };
+    IngesterError::DeadlineExceeded { message }
 }
 
 /// Counts only the series of the requested query shard in the per-block select stats (Go

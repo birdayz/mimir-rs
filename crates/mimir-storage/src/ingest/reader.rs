@@ -32,6 +32,7 @@ use super::fetcher::{
 };
 use super::heap_merger::{HeapMerger, HeapMergerMetrics};
 use super::kprom::KpromMetrics;
+use super::labeled_registry::register_labeled_child;
 use super::kafka_client::{
     FetchedRecord, KafkaClient, KafkaClientError, KAFKA_OFFSET_END, KAFKA_OFFSET_START,
 };
@@ -70,12 +71,19 @@ pub enum ReaderError {
     MaxDelayExceeded,
     #[error("partition reader service is not running")]
     NotRunning,
-    #[error("wait strong read consistency timeout exceeded")]
+    /// `errors.Wrap(context.DeadlineExceeded, "wait strong read consistency timeout exceeded")`.
+    #[error("wait strong read consistency timeout exceeded: context deadline exceeded")]
     WaitStrongReadConsistencyTimeoutExceeded,
     #[error("invalid configuration: {0}")]
     Config(String),
-    #[error("cluster offset mismatch: expected {expected} clusters, got {got}")]
+    #[error("the multi-cluster partition reader consumes from {expected} Kafka clusters but was given read consistency offsets for {got}")]
     ClusterCountMismatch { expected: usize, got: usize },
+    /// `errors.Wrapf(err, "write compartment %d", kafkaClusterID)`.
+    #[error("write compartment {id}: {source}")]
+    WriteCompartment { id: usize, source: Box<ReaderError> },
+    /// dskit `multierror.MultiError` of per write compartment errors.
+    #[error("{}", format_multi_error(.0))]
+    Multi(Vec<ReaderError>),
     #[error("single-cluster partition reader was given read consistency offsets for {0} Kafka clusters")]
     InvalidClusterOffsetCount(usize),
     #[error("startup canceled")]
@@ -1731,7 +1739,9 @@ impl SingleClusterPartitionReader {
                 .max(0) as u64,
         );
         let (effective_timeout, is_configured) = if !configured_timeout.is_zero()
-            && (caller_timeout.is_zero() || configured_timeout < caller_timeout)
+            // Go `context.WithTimeoutCause(ctx, WaitStrongReadConsistencyTimeout, ...)`: the
+            // configured timeout's cause wins unless the caller's deadline is strictly earlier.
+            && (caller_timeout.is_zero() || configured_timeout <= caller_timeout)
         {
             (configured_timeout, true)
         } else {
@@ -2151,6 +2161,47 @@ pub fn instrument_gaps(gaps: &[OffsetRange], missed_records: &Counter) {
     }
 }
 
+impl ReaderError {
+    /// Go `errors.Is(err, context.DeadlineExceeded)` (gRPC status `DeadlineExceeded`).
+    pub fn is_deadline_exceeded(&self) -> bool {
+        match self {
+            Self::WaitStrongReadConsistencyTimeoutExceeded
+            | Self::WaitTargetLagDeadlineExceeded
+            | Self::Watcher(OffsetWatcherError::Timeout(_)) => true,
+            Self::WriteCompartment { source, .. } => source.is_deadline_exceeded(),
+            Self::Multi(errs) => errs.iter().any(Self::is_deadline_exceeded),
+            _ => false,
+        }
+    }
+}
+
+/// dskit `nonNilMultiError.Error()`.
+fn format_multi_error(errs: &[ReaderError]) -> String {
+    let mut out = String::new();
+    if errs.len() > 1 {
+        out.push_str(&format!("{} errors: ", errs.len()));
+    }
+    for (i, e) in errs.iter().enumerate() {
+        if i != 0 {
+            out.push_str("; ");
+        }
+        out.push_str(&e.to_string());
+    }
+    out
+}
+
+fn wrap_write_compartment(id: usize, res: Result<(), ReaderError>) -> Result<(), ReaderError> {
+    res.map_err(|e| ReaderError::WriteCompartment {
+        id,
+        source: Box::new(e),
+    })
+}
+
+/// Builds the downstream consumer of a partition reader, registering its metrics (Go
+/// `NewPusherConsumerMetrics(reg)`) into the given registry.
+pub type RecordBatchConsumerFactory<'a> =
+    dyn Fn(Option<&Registry>) -> Arc<dyn RecordBatchConsumer> + 'a;
+
 /// Multi-cluster partition reader consuming the same partition ID across multiple Kafka write
 /// compartments, optionally merging records in timestamp order via [`HeapMerger`].
 pub struct MultiClusterPartitionReader {
@@ -2174,13 +2225,16 @@ impl MultiClusterPartitionReader {
             partition_id,
             instance_id,
             offset_file_paths,
-            consumer,
+            &|_| Arc::clone(&consumer),
             Arc::new(NoOpPreCommitNotifier),
             Duration::ZERO,
             registry,
         )
     }
 
+    /// `consumer_factory` builds the downstream consumer: once on `registry` when records are
+    /// merged across clusters (ordered consumption), otherwise once per Kafka cluster on that
+    /// cluster's `write_compartment="<id>"`-labelled registerer, like Go.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_notifier(
         cluster_configs: &[KafkaConfig],
@@ -2188,7 +2242,7 @@ impl MultiClusterPartitionReader {
         partition_id: i32,
         instance_id: &str,
         offset_file_paths: Vec<Option<PathBuf>>,
-        consumer: Arc<dyn RecordBatchConsumer>,
+        consumer_factory: &RecordBatchConsumerFactory<'_>,
         notifier: Arc<dyn PreCommitNotifier>,
         max_replay_period: Duration,
         registry: Option<&Registry>,
@@ -2205,7 +2259,9 @@ impl MultiClusterPartitionReader {
         }
 
         let merger = if ordered_cfg.enabled && cluster_configs.len() > 1 {
-            let downstream = Arc::clone(&consumer);
+            // The downstream push path is shared across all clusters, so its consumer metrics
+            // are registered once on the base registerer rather than per cluster.
+            let downstream = consumer_factory(registry);
             let cb = Arc::new(move |recs: Vec<FetchedRecord>| {
                 let d = Arc::clone(&downstream);
                 Box::pin(async move { d.consume(recs).await })
@@ -2229,6 +2285,8 @@ impl MultiClusterPartitionReader {
             .zip(offset_file_paths)
             .enumerate()
         {
+            // Go: `prometheus.WrapRegistererWith({write_compartment: <id>}, reg)`.
+            let cluster_registry = registry.map(|_| Registry::new());
             let cluster_consumer: Arc<dyn RecordBatchConsumer> =
                 if let Some(ref m) = shared_merger {
                     struct MergerSubmitter {
@@ -2251,7 +2309,7 @@ impl MultiClusterPartitionReader {
                         cluster_id,
                     })
                 } else {
-                    Arc::clone(&consumer)
+                    consumer_factory(cluster_registry.as_ref())
                 };
 
             let cluster_instance = format!("{instance_id}-wc-{cluster_id}");
@@ -2262,10 +2320,19 @@ impl MultiClusterPartitionReader {
                 off_path,
                 cluster_consumer,
                 Arc::clone(&notifier),
-                registry,
+                cluster_registry.as_ref(),
             )?;
             if !max_replay_period.is_zero() {
                 r = r.with_max_replay_period(max_replay_period);
+            }
+            if let (Some(parent), Some(child)) = (registry, cluster_registry) {
+                let id = cluster_id.to_string();
+                register_labeled_child(parent, child, &[("write_compartment", id.as_str())])
+                    .map_err(|e| {
+                        ReaderError::Config(format!(
+                            "creating partition reader for write compartment {cluster_id}: {e}"
+                        ))
+                    })?;
             }
             readers.push(Arc::new(r));
         }
@@ -2307,9 +2374,16 @@ impl MultiClusterPartitionReader {
                 got: offsets.num_kafka_clusters(),
             });
         }
+        // Each per-cluster offset goes through that cluster's reader as-is (Running check,
+        // timeout error and strong consistency metrics); the first failure drops the others.
         let futs = self.readers.iter().enumerate().map(|(cid, r)| {
-            let target = offsets.for_kafka_cluster(cid);
-            async move { r.wait_for_offset(target, timeout).await }
+            let target = PartitionOffsets::new_single_cluster(offsets.for_kafka_cluster(cid));
+            async move {
+                wrap_write_compartment(
+                    cid,
+                    r.wait_read_consistency_until_offsets(&target, timeout).await,
+                )
+            }
         });
         try_join_all(futs).await?;
         Ok(())
@@ -2319,19 +2393,31 @@ impl MultiClusterPartitionReader {
         &self,
         timeout: Duration,
     ) -> Result<(), ReaderError> {
-        let futs = self
-            .readers
-            .iter()
-            .map(|r| r.wait_read_consistency_until_last_produced_offset(timeout));
+        let futs = self.readers.iter().enumerate().map(|(cid, r)| async move {
+            wrap_write_compartment(
+                cid,
+                r.wait_read_consistency_until_last_produced_offset(timeout).await,
+            )
+        });
         try_join_all(futs).await?;
         Ok(())
     }
 
+    /// The ingester is caught up only when all Kafka clusters are.
     pub fn enforce_read_max_delay(&self, max_delay: Duration) -> Result<(), ReaderError> {
-        for r in &self.readers {
-            r.enforce_read_max_delay(max_delay)?;
+        let errs: Vec<ReaderError> = self
+            .readers
+            .iter()
+            .enumerate()
+            .filter_map(|(cid, r)| {
+                wrap_write_compartment(cid, r.enforce_read_max_delay(max_delay)).err()
+            })
+            .collect();
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(ReaderError::Multi(errs))
         }
-        Ok(())
     }
 }
 

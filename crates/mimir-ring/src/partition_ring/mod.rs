@@ -14,6 +14,7 @@ pub mod lifecycler;
 pub mod model;
 pub mod ring;
 pub mod watcher;
+pub mod watchers;
 
 pub use instance_ring::{InstanceRingReader, PartitionInstanceRing, PartitionRingReader};
 pub use lifecycler::{
@@ -27,3 +28,4 @@ pub use model::{
 };
 pub use ring::{resolve_partition_tokens, ActivePartitionBatchRing, PartitionRing, PartitionRingOptions};
 pub use watcher::{PartitionRingWatcher, PartitionRingWatcherDelegate};
+pub use watchers::PartitionRingWatchers;

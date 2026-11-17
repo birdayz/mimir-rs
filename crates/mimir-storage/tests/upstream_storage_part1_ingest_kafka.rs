@@ -2092,7 +2092,7 @@ async fn test_multi_cluster_partition_reader_wait_read_consistency_until_offsets
         )
         .await
         .unwrap_err();
-    assert!(err1.to_string().contains("expected 2 clusters, got 1"));
+    assert!(err1.to_string().contains("consumes from 2 Kafka clusters but was given read consistency offsets for 1"));
 
     let err2 = reader
         .wait_read_consistency_until_offsets(
@@ -2101,7 +2101,7 @@ async fn test_multi_cluster_partition_reader_wait_read_consistency_until_offsets
         )
         .await
         .unwrap_err();
-    assert!(err2.to_string().contains("expected 2 clusters, got 3"));
+    assert!(err2.to_string().contains("consumes from 2 Kafka clusters but was given read consistency offsets for 3"));
 }
 
 // Upstream: pkg/storage/ingest/multi_cluster_reader_test.go::TestMultiClusterPartitionReader_WaitReadConsistencyUntilOffsets_RoutesOffsetsPerCluster

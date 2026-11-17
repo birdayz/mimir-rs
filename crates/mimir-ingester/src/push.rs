@@ -1300,6 +1300,7 @@ impl Ingester {
             .unwrap_or(0);
         let mut ingested = 0usize;
         let mut failed = 0usize;
+        let mut first_err: Option<IngesterError> = None;
         for bm in req.metadata() {
             match store.add_parts_at(
                 bm.metric_type,
@@ -1309,11 +1310,19 @@ impl Ingester {
                 now_nanos,
             ) {
                 Ok(()) => ingested += 1,
-                Err(_) => failed += 1,
+                Err(e) => {
+                    failed += 1;
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
             }
         }
         self.metrics.ingested_metadata.inc_by(ingested as f64);
         self.metrics.ingested_metadata_fail.inc_by(failed as f64);
+        if let Some(err) = first_err {
+            warn!(user = %user_id, err = %err, "failed to ingest some metadata");
+        }
         ingested
     }
 
@@ -1332,6 +1341,7 @@ impl Ingester {
             .unwrap_or(0);
         let mut ingested = 0usize;
         let mut failed = 0usize;
+        let mut first_err: Option<IngesterError> = None;
         for bm in items {
             match store.add_parts_at(
                 bm.metric_type,
@@ -1341,11 +1351,19 @@ impl Ingester {
                 now_nanos,
             ) {
                 Ok(()) => ingested += 1,
-                Err(_) => failed += 1,
+                Err(e) => {
+                    failed += 1;
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
             }
         }
         self.metrics.ingested_metadata.inc_by(ingested as f64);
         self.metrics.ingested_metadata_fail.inc_by(failed as f64);
+        if let Some(err) = first_err {
+            warn!(user = %user_id, err = %err, "failed to ingest some metadata");
+        }
         ingested
     }
 
@@ -1355,8 +1373,9 @@ impl Ingester {
         source: cortexpb::write_request::SourceEnum,
         min_ts: i64,
         items: &[PrehashedSeriesItem<'_>],
+        metadata: &[BorrowedMetadata<'_>],
     ) -> Result<(), IngesterError> {
-        if items.is_empty() {
+        if items.is_empty() && metadata.is_empty() {
             return Ok(());
         }
         let track_bytes = self
@@ -1371,12 +1390,25 @@ impl Ingester {
                         + it.histograms.len() * 64
                         + it.exemplars.len() * 48
                 })
+                .chain(metadata.iter().map(|m| {
+                    m.metric_family_name.len() + m.help.len() + m.unit.len() + 8
+                }))
                 .sum::<usize>() as i64
         } else {
             0
         };
         let permit = self.start_push_request_sync(req_size)?;
-        let res = self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, items);
+        // Go `PushWithCleanup`: metadata is best-effort and ingested before samples, under the
+        // same `startPushRequest`; metadata-only requests return before touching the TSDB.
+        let meta_count = self.push_metadata_items(user_id, metadata);
+        if meta_count > 0 {
+            self.ingestion_rate.add(meta_count as i64);
+        }
+        let res = if items.is_empty() {
+            Ok(())
+        } else {
+            self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, items)
+        };
         permit.finish(res.as_ref().err());
         res
     }
