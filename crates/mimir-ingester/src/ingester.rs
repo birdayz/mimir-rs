@@ -1124,7 +1124,11 @@ impl Ingester {
     /// Wraps a spawned subservice loop so that a panic is reported as a subservice failure
     /// (in Go a panicking goroutine crashes the whole process) instead of being swallowed by
     /// the tokio runtime.
-    fn watch_task(self: &Arc<Self>, name: &'static str, handle: JoinHandle<()>) -> JoinHandle<()> {
+    pub fn watch_subservice_task(
+        self: &Arc<Self>,
+        name: &'static str,
+        handle: JoinHandle<()>,
+    ) -> JoinHandle<()> {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             if let Err(err) = handle.await {
@@ -1258,7 +1262,7 @@ impl Ingester {
                     }
                 }
             }
-            let h = self.watch_task(
+            let h = self.watch_subservice_task(
                 "ingester-owned-series",
                 spawn_owned_series_loop(Arc::clone(self), ctx.child()),
             );
@@ -1270,15 +1274,15 @@ impl Ingester {
 
         // Start compaction, metrics updater, and metadata purger before partition replay.
         {
-            let compaction = self.watch_task(
+            let compaction = self.watch_subservice_task(
                 "ingester-compaction",
                 spawn_compaction_loop(Arc::clone(self), fc_rx, ctx.child()),
             );
-            let metrics_updater = self.watch_task(
+            let metrics_updater = self.watch_subservice_task(
                 "ingester-metrics-updater",
                 spawn_metrics_updater_loop(Arc::clone(self), ctx.child()),
             );
-            let metadata_purger = self.watch_task(
+            let metadata_purger = self.watch_subservice_task(
                 "ingester-metadata-purger",
                 spawn_metadata_purger_loop(Arc::clone(self), ctx.child()),
             );
@@ -1384,14 +1388,14 @@ impl Ingester {
             if self.blocks_cfg.tsdb.ship_interval.0 > 0 {
                 let (ship_tx, ship_rx) = mpsc::channel(16);
                 *self.ship_tx.write() = Some(ship_tx);
-                new_tasks.push(self.watch_task(
+                new_tasks.push(self.watch_subservice_task(
                     "ingester-shipping",
                     spawn_shipping_loop(Arc::clone(self), ship_rx, ctx.child()),
                 ));
             }
 
             if self.blocks_cfg.tsdb.close_idle_tsdb_timeout.0 > 0 {
-                new_tasks.push(self.watch_task(
+                new_tasks.push(self.watch_subservice_task(
                     "ingester-close-idle-tsdb",
                     spawn_idle_tsdb_loop(Arc::clone(self), ctx.child()),
                 ));

@@ -1027,3 +1027,38 @@ async fn test_ingester_flushes_through_lifecycler_on_shutdown() {
     ring_svc.stop_async();
     let _ = ring_svc.await_terminated().await;
 }
+
+// Go: `ingesterRunning` returns `ingester subservice failed: ...` when a watched subservice
+// (lifecycler, compaction, ...) fails; the ingester then stops and ends Failed, which makes the
+// module manager stop the whole process. In Rust a panicking subservice loop counts as failed.
+#[tokio::test]
+async fn test_ingester_subservice_failure_fails_the_ingester() {
+    use compaction_ring_helpers::{
+        default_ingester_test_config, prepare_ingester_with_blocks_storage, start_and_wait_healthy,
+    };
+    use mimir_common::services::State;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = default_ingester_test_config(tmp.path());
+    let (ing, ring, ring_svc) = prepare_ingester_with_blocks_storage(cfg, None, None).await;
+    start_and_wait_healthy(&ing, &ring).await;
+    assert!(ing.subservice_failure().is_none());
+
+    let h = ing.watch_subservice_task(
+        "test-subservice",
+        tokio::spawn(async { panic!("boom") }),
+    );
+    let err = tokio::time::timeout(Duration::from_secs(5), ing.wait_subservice_failure())
+        .await
+        .expect("subservice failure reported");
+    assert!(err.starts_with("ingester subservice failed: "), "{err}");
+    assert!(err.contains("test-subservice") && err.contains("boom"), "{err}");
+    let _ = h.await;
+
+    let res = ing.stop().await;
+    assert!(res.is_err(), "stop must report the failure");
+    assert_eq!(ing.state(), State::Failed);
+
+    ring_svc.stop_async();
+    let _ = ring_svc.await_terminated().await;
+}
