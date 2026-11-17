@@ -3,13 +3,19 @@
 //! Run via: `just bench-vs-go`
 
 use std::fs;
+use std::future::Future;
 use std::net::TcpListener;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::http;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use http_body_util::BodyExt;
 use mimir_common::tenant::LOWER_ORG_ID_HEADER_NAME;
 use mimir_conformance::oracle::{
     ensure_go_oracle_built, ensure_rust_mimir_release_built, go_mimir_bin,
@@ -18,9 +24,366 @@ use mimir_conformance::oracle::{
 use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb;
 use mimir_proto::ingesterpb::ingester_client::IngesterClient;
+use mimir_proto::{s2, snappy};
 use tokio_stream::StreamExt;
+use tonic::codec::CompressionEncoding;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
+use tonic::Status;
+use tower::Service;
+
+const MAX_GRPC_MSG_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GrpcCompression {
+    #[default]
+    Identity,
+    Snappy,
+    S2,
+    Gzip,
+}
+
+impl GrpcCompression {
+    fn from_str_flag(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "" | "identity" => Self::Identity,
+            "snappy" => Self::Snappy,
+            "s2" => Self::S2,
+            "gzip" => Self::Gzip,
+            other => panic!(
+                "unsupported --compression value: {other:?} (expected identity|snappy|s2|gzip)"
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Snappy => "snappy",
+            Self::S2 => "s2",
+            Self::Gzip => "gzip",
+        }
+    }
+}
+
+fn encode_s2_framed(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() / 2 + 32);
+    out.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+    let mut enc = snap::raw::Encoder::new();
+    for block in payload.chunks(65_536) {
+        let compressed = enc.compress_vec(block).expect("snappy raw compress");
+        let crc = s2::masked_crc32c(block);
+        if compressed.len() < block.len() {
+            let chunk_len = 4 + compressed.len();
+            out.push(0x00);
+            out.push((chunk_len & 0xff) as u8);
+            out.push(((chunk_len >> 8) & 0xff) as u8);
+            out.push(((chunk_len >> 16) & 0xff) as u8);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&compressed);
+        } else {
+            let chunk_len = 4 + block.len();
+            out.push(0x01);
+            out.push((chunk_len & 0xff) as u8);
+            out.push(((chunk_len >> 8) & 0xff) as u8);
+            out.push(((chunk_len >> 16) & 0xff) as u8);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(block);
+        }
+    }
+    out
+}
+
+fn compress_grpc_frames(raw_body: &[u8], mode: GrpcCompression) -> Bytes {
+    let mut out = BytesMut::with_capacity(raw_body.len() + 32);
+    let mut pos = 0usize;
+    while pos + 5 <= raw_body.len() {
+        let flag = raw_body[pos];
+        let len = u32::from_be_bytes([
+            raw_body[pos + 1],
+            raw_body[pos + 2],
+            raw_body[pos + 3],
+            raw_body[pos + 4],
+        ]) as usize;
+        pos += 5;
+        let end = pos + len;
+        if end > raw_body.len() {
+            break;
+        }
+        let payload = &raw_body[pos..end];
+        pos = end;
+        if flag == 0 {
+            let comp = match mode {
+                GrpcCompression::Snappy => snappy::compress_framed(payload).expect("snappy"),
+                GrpcCompression::S2 => encode_s2_framed(payload),
+                GrpcCompression::Identity | GrpcCompression::Gzip => payload.to_vec(),
+            };
+            out.put_u8(1);
+            out.put_u32(comp.len() as u32);
+            out.put_slice(&comp);
+        } else {
+            out.put_u8(flag);
+            out.put_u32(len as u32);
+            out.put_slice(payload);
+        }
+    }
+    out.freeze()
+}
+
+struct SingleChunkBody(Option<Bytes>);
+
+impl hyper::body::Body for SingleChunkBody {
+    type Data = Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match self.0.take() {
+            Some(b) if !b.is_empty() => Poll::Ready(Some(Ok(hyper::body::Frame::data(b)))),
+            _ => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.as_ref().is_none_or(Bytes::is_empty)
+    }
+}
+
+struct DecompressGrpcBody {
+    inner: tonic::body::BoxBody,
+    mode: GrpcCompression,
+    in_buf: BytesMut,
+    decomp_scratch: Vec<u8>,
+    pending_trailers: Option<http::HeaderMap>,
+    done: bool,
+}
+
+impl DecompressGrpcBody {
+    fn new(inner: tonic::body::BoxBody, mode: GrpcCompression) -> Self {
+        Self {
+            inner,
+            mode,
+            in_buf: BytesMut::new(),
+            decomp_scratch: Vec::new(),
+            pending_trailers: None,
+            done: false,
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn drain_complete_frames(&mut self) -> Result<Option<Bytes>, Status> {
+        let mut out = BytesMut::new();
+        while self.in_buf.len() >= 5 {
+            let flag = self.in_buf[0];
+            let len = u32::from_be_bytes([
+                self.in_buf[1],
+                self.in_buf[2],
+                self.in_buf[3],
+                self.in_buf[4],
+            ]) as usize;
+            let frame_end = 5 + len;
+            if self.in_buf.len() < frame_end {
+                break;
+            }
+            if flag == 0 {
+                out.extend_from_slice(&self.in_buf[..frame_end]);
+            } else if flag == 1 {
+                let comp = &self.in_buf[5..frame_end];
+                self.decomp_scratch.clear();
+                match self.mode {
+                    GrpcCompression::Snappy => {
+                        snappy::decompress_framed_bounded_into(
+                            comp,
+                            &mut self.decomp_scratch,
+                            MAX_GRPC_MSG_BYTES,
+                        )
+                        .map_err(|e| Status::internal(format!("snappy decompress: {e}")))?;
+                    }
+                    GrpcCompression::S2 => {
+                        s2::decompress_framed_into(
+                            comp,
+                            &mut self.decomp_scratch,
+                            MAX_GRPC_MSG_BYTES,
+                        )
+                        .map_err(|e| Status::internal(format!("s2 decompress: {e}")))?;
+                    }
+                    GrpcCompression::Identity | GrpcCompression::Gzip => {
+                        self.decomp_scratch.extend_from_slice(comp);
+                    }
+                }
+                out.reserve(5 + self.decomp_scratch.len());
+                out.put_u8(0);
+                out.put_u32(self.decomp_scratch.len() as u32);
+                out.put_slice(&self.decomp_scratch);
+            } else {
+                return Err(Status::internal(format!(
+                    "unexpected gRPC compression flag {flag}"
+                )));
+            }
+            self.in_buf.advance(frame_end);
+        }
+        if out.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(out.freeze()))
+        }
+    }
+}
+
+impl hyper::body::Body for DecompressGrpcBody {
+    type Data = Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(trailers) = self.pending_trailers.take() {
+            self.done = true;
+            return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+        }
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match self.drain_complete_frames() {
+                Ok(Some(chunk)) => return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk)))),
+                Ok(None) => {}
+                Err(e) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+            }
+            match Pin::new(&mut self.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.done = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => {
+                        if !data.is_empty() {
+                            self.in_buf.extend_from_slice(&data);
+                        }
+                    }
+                    Err(other) => {
+                        if let Ok(trailers) = other.into_trailers() {
+                            self.done = true;
+                            return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+}
+
+#[derive(Clone)]
+struct CompressedChannel {
+    inner: Channel,
+    mode: GrpcCompression,
+}
+
+impl CompressedChannel {
+    fn new(inner: Channel, mode: GrpcCompression) -> Self {
+        Self { inner, mode }
+    }
+}
+
+impl Service<http::Request<tonic::body::BoxBody>> for CompressedChannel {
+    type Response = http::Response<tonic::body::BoxBody>;
+    type Error = tonic::transport::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+        let mode = self.mode;
+        if !matches!(mode, GrpcCompression::Snappy | GrpcCompression::S2) {
+            let fut = self.inner.call(req);
+            return Box::pin(fut);
+        }
+
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move {
+            let (mut parts, body) = req.into_parts();
+            let collected = body
+                .collect()
+                .await
+                .expect("collect unary gRPC request body")
+                .to_bytes();
+            let comp_body = compress_grpc_frames(&collected, mode);
+            parts.headers.insert(
+                "grpc-encoding",
+                http::HeaderValue::from_static(mode.as_str()),
+            );
+            parts.headers.insert(
+                "grpc-accept-encoding",
+                http::HeaderValue::from_static(match mode {
+                    GrpcCompression::Snappy => "snappy,identity",
+                    GrpcCompression::S2 => "s2,identity",
+                    _ => "identity",
+                }),
+            );
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+
+            let new_req = http::Request::from_parts(
+                parts,
+                tonic::body::BoxBody::new(SingleChunkBody(Some(comp_body))),
+            );
+            let resp = inner.call(new_req).await?;
+            let resp_enc = resp
+                .headers()
+                .get("grpc-encoding")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| match s.to_ascii_lowercase().as_str() {
+                    "snappy" => Some(GrpcCompression::Snappy),
+                    "s2" => Some(GrpcCompression::S2),
+                    _ => None,
+                });
+            if let Some(enc) = resp_enc {
+                let (mut rparts, rbody) = resp.into_parts();
+                rparts.headers.remove("grpc-encoding");
+                rparts.headers.remove(http::header::CONTENT_LENGTH);
+                Ok(http::Response::from_parts(
+                    rparts,
+                    tonic::body::BoxBody::new(DecompressGrpcBody::new(rbody, enc)),
+                ))
+            } else {
+                Ok(resp)
+            }
+        })
+    }
+}
+
+fn build_ingester_client(
+    ch: Channel,
+    mode: GrpcCompression,
+) -> IngesterClient<CompressedChannel> {
+    let mut client = IngesterClient::new(CompressedChannel::new(ch, mode))
+        .max_decoding_message_size(MAX_GRPC_MSG_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MSG_BYTES);
+    if mode == GrpcCompression::Gzip {
+        client = client
+            .send_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Gzip);
+    }
+    client
+}
 
 struct ProcessGuard {
     name: String,
@@ -171,6 +534,7 @@ struct BenchConfig {
     batch_size: usize,
     concurrency: usize,
     queries: usize,
+    compression: GrpcCompression,
     run_go: bool,
     run_rust: bool,
     perf_out: Option<String>,
@@ -186,6 +550,7 @@ impl Default for BenchConfig {
             batch_size: 1_000,
             concurrency: 8,
             queries: 200,
+            compression: GrpcCompression::Identity,
             run_go: true,
             run_rust: true,
             perf_out: None,
@@ -218,6 +583,10 @@ fn parse_args() -> BenchConfig {
             "--batch-size" => cfg.batch_size = next_val(&mut i),
             "--concurrency" => cfg.concurrency = next_val(&mut i),
             "--queries" => cfg.queries = next_val(&mut i),
+            "--compression" => {
+                let mode = next_str(&mut i);
+                cfg.compression = GrpcCompression::from_str_flag(&mode);
+            }
             "--rust-only" => {
                 cfg.run_go = false;
                 cfg.run_rust = true;
@@ -244,7 +613,13 @@ fn build_batch_templates(cfg: &BenchConfig, base_ts: i64) -> Vec<(String, cortex
         "container_cpu_usage_seconds_total",
         "process_network_bytes_total",
     ];
-    let namespaces = ["prod-api", "prod-checkout", "prod-auth", "prod-billing", "prod-search"];
+    let namespaces = [
+        "prod-api",
+        "prod-checkout",
+        "prod-auth",
+        "prod-billing",
+        "prod-search",
+    ];
     let containers = ["app", "envoy", "otel-sidecar", "worker"];
     let statuses = ["200", "201", "400", "404", "500"];
 
@@ -393,6 +768,10 @@ struct BenchResult {
     query_wall_s: f64,
     query_stream_p50_ms: f64,
     query_stream_p99_ms: f64,
+    lnv_p50_ms: f64,
+    lnv_p99_ms: f64,
+    lvc_p50_ms: f64,
+    lvc_p99_ms: f64,
     after_queries: ProcStats,
 }
 
@@ -521,10 +900,9 @@ async fn run_single_engine(
             let ch = ch.clone();
             let tmpl = Arc::clone(&templates_arc);
             let idx_ctr = Arc::clone(&next_idx);
+            let compression = cfg.compression;
             handles.push(tokio::spawn(async move {
-                let mut client = IngesterClient::new(ch)
-                    .max_decoding_message_size(100 * 1024 * 1024)
-                    .max_encoding_message_size(100 * 1024 * 1024);
+                let mut client = build_ingester_client(ch, compression);
                 let mut lats = Vec::new();
                 loop {
                     let i = idx_ctr.fetch_add(1, Ordering::Relaxed);
@@ -572,7 +950,7 @@ async fn run_single_engine(
     push_latencies.sort();
     let total_samples_ingested = cfg.rounds * (cfg.total_series + cfg.hist_series);
 
-    // Phase 2: 200 concurrent QueryStream + LabelValues + ActiveSeries requests
+    // Phase 2: concurrent QueryStream + LabelValues + ActiveSeries + LabelNamesAndValues + LabelValuesCardinality
     let start_ms = base_ts - 1000;
     let end_ms = base_ts + ((cfg.rounds as i64) * 15_000) + 1000;
     let next_q = Arc::new(AtomicUsize::new(0));
@@ -584,11 +962,12 @@ async fn run_single_engine(
         let q_ctr = Arc::clone(&next_q);
         let total_q = cfg.queries;
         let tenants = cfg.tenants;
+        let compression = cfg.compression;
         q_handles.push(tokio::spawn(async move {
-            let mut client = IngesterClient::new(ch)
-                .max_decoding_message_size(100 * 1024 * 1024)
-                .max_encoding_message_size(100 * 1024 * 1024);
+            let mut client = build_ingester_client(ch, compression);
             let mut qs_lats = Vec::new();
+            let mut lnv_lats = Vec::new();
+            let mut lvc_lats = Vec::new();
             loop {
                 let qi = q_ctr.fetch_add(1, Ordering::Relaxed);
                 if qi >= total_q {
@@ -602,7 +981,7 @@ async fn run_single_engine(
                     3 => "prod-billing",
                     _ => "prod-search",
                 };
-                match qi % 3 {
+                match qi % 5 {
                     0 => {
                         let t0 = Instant::now();
                         let mut stream = client
@@ -649,7 +1028,7 @@ async fn run_single_engine(
                             .await
                             .unwrap();
                     }
-                    _ => {
+                    2 => {
                         let mut stream = client
                             .active_series(with_tenant(
                                 &tenant,
@@ -670,19 +1049,71 @@ async fn run_single_engine(
                             let _ = item.unwrap();
                         }
                     }
+                    3 => {
+                        let t0 = Instant::now();
+                        let mut stream = client
+                            .label_names_and_values(with_tenant(
+                                &tenant,
+                                ingesterpb::LabelNamesAndValuesRequest {
+                                    matchers: vec![ingesterpb::LabelMatcher {
+                                        r#type: ingesterpb::MatchType::Equal as i32,
+                                        name: "namespace".to_string(),
+                                        value: ns.to_string(),
+                                    }],
+                                    count_method: ingesterpb::CountMethod::Active as i32,
+                                },
+                            ))
+                            .await
+                            .unwrap()
+                            .into_inner();
+                        while let Some(item) = stream.next().await {
+                            let _ = item.unwrap();
+                        }
+                        lnv_lats.push(t0.elapsed());
+                    }
+                    _ => {
+                        let t0 = Instant::now();
+                        let mut stream = client
+                            .label_values_cardinality(with_tenant(
+                                &tenant,
+                                ingesterpb::LabelValuesCardinalityRequest {
+                                    label_names: vec![
+                                        "namespace".to_string(),
+                                        "cluster".to_string(),
+                                        "status_code".to_string(),
+                                    ],
+                                    matchers: Vec::new(),
+                                    count_method: ingesterpb::CountMethod::Active as i32,
+                                },
+                            ))
+                            .await
+                            .unwrap()
+                            .into_inner();
+                        while let Some(item) = stream.next().await {
+                            let _ = item.unwrap();
+                        }
+                        lvc_lats.push(t0.elapsed());
+                    }
                 }
             }
-            qs_lats
+            (qs_lats, lnv_lats, lvc_lats)
         }));
     }
 
     let mut qs_latencies = Vec::new();
+    let mut lnv_latencies = Vec::new();
+    let mut lvc_latencies = Vec::new();
     for h in q_handles {
-        qs_latencies.extend(h.await.unwrap());
+        let (qs, lnv, lvc) = h.await.unwrap();
+        qs_latencies.extend(qs);
+        lnv_latencies.extend(lnv);
+        lvc_latencies.extend(lvc);
     }
     let query_wall = query_start.elapsed();
     let after_queries = read_proc_stats(pid);
     qs_latencies.sort();
+    lnv_latencies.sort();
+    lvc_latencies.sort();
 
     BenchResult {
         name,
@@ -695,6 +1126,10 @@ async fn run_single_engine(
         query_wall_s: query_wall.as_secs_f64(),
         query_stream_p50_ms: percentile_ms(&qs_latencies, 0.50),
         query_stream_p99_ms: percentile_ms(&qs_latencies, 0.99),
+        lnv_p50_ms: percentile_ms(&lnv_latencies, 0.50),
+        lnv_p99_ms: percentile_ms(&lnv_latencies, 0.99),
+        lvc_p50_ms: percentile_ms(&lvc_latencies, 0.50),
+        lvc_p99_ms: percentile_ms(&lvc_latencies, 0.99),
         after_queries,
     }
 }
@@ -702,12 +1137,16 @@ async fn run_single_engine(
 #[tokio::main]
 async fn main() {
     let cfg = parse_args();
-    ensure_go_oracle_built().expect("go-mimir must build");
-    ensure_rust_mimir_release_built().expect("target/release/mimir must build");
+    if cfg.run_go {
+        ensure_go_oracle_built().expect("go-mimir must build");
+    }
+    if cfg.run_rust {
+        ensure_rust_mimir_release_built().expect("target/release/mimir must build");
+    }
 
     let base_ts = now_ms() - ((cfg.rounds as i64) * 20_000);
     println!(
-        "Preparing benchmark workload: {} float series + {} histogram series across {} tenants, {} rounds ({} batches/round, batch_size={}, concurrency={}), {} read RPCs...",
+        "Preparing benchmark workload: {} float series + {} histogram series across {} tenants, {} rounds ({} batches/round, batch_size={}, concurrency={}, compression={}), {} read RPCs...",
         cfg.total_series,
         cfg.hist_series,
         cfg.tenants,
@@ -715,6 +1154,7 @@ async fn main() {
         (cfg.total_series + cfg.hist_series).div_ceil(cfg.batch_size),
         cfg.batch_size,
         cfg.concurrency,
+        cfg.compression.as_str(),
         cfg.queries
     );
     let templates = build_batch_templates(&cfg, base_ts);
@@ -743,13 +1183,17 @@ async fn main() {
     let print_res = |r: &BenchResult| {
         let m_samples = r.total_samples_ingested as f64 / 1_000_000.0;
         println!(
-            "--- {} ---\n\
-             Ingest wall:      {:>8.3} s  ({:.0} samples/sec)\n\
-             Push latency:     p50={:.2} ms   p99={:.2} ms\n\
-             After ingest:     CPU={:.3} s ({:.3} CPU-s/1M)  VmRSS={:.2} MiB  VmHWM={:.2} MiB\n\
-             Query wall ({}x): {:>8.3} s  (QueryStream p50={:.2} ms  p99={:.2} ms)\n\
-             After queries:    CPU={:.3} s  VmRSS={:.2} MiB  VmHWM={:.2} MiB",
+            "--- {} ({}) ---\n\
+             Ingest wall:             {:>8.3} s  ({:.0} samples/sec)\n\
+             Push latency:            p50={:.2} ms   p99={:.2} ms\n\
+             After ingest:            CPU={:.3} s ({:.3} CPU-s/1M)  VmRSS={:.2} MiB  VmHWM={:.2} MiB\n\
+             Query wall ({}x):        {:>8.3} s\n\
+             QueryStream latency:     p50={:.2} ms   p99={:.2} ms\n\
+             LabelNamesAndValues:     p50={:.2} ms   p99={:.2} ms\n\
+             LabelValuesCardinality:  p50={:.2} ms   p99={:.2} ms\n\
+             After queries:           CPU={:.3} s  VmRSS={:.2} MiB  VmHWM={:.2} MiB",
             r.name,
+            cfg.compression.as_str(),
             r.ingest_wall_s,
             r.throughput_samples_per_s,
             r.push_p50_ms,
@@ -762,6 +1206,10 @@ async fn main() {
             r.query_wall_s,
             r.query_stream_p50_ms,
             r.query_stream_p99_ms,
+            r.lnv_p50_ms,
+            r.lnv_p99_ms,
+            r.lvc_p50_ms,
+            r.lvc_p99_ms,
             r.after_queries.cpu_secs,
             r.after_queries.vm_rss_mib,
             r.after_queries.vm_hwm_mib,
@@ -778,38 +1226,46 @@ async fn main() {
     }
     if let (Some(go_res), Some(rust_res)) = (go_res, rust_res) {
         println!();
-        println!("=== Comparison (Go / Rust) ===");
+        println!("=== Comparison (Go / Rust, compression={}) ===", cfg.compression.as_str());
         println!(
-            "Ingest throughput speedup: {:.2}x",
+            "Ingest throughput speedup:        {:.2}x",
             rust_res.throughput_samples_per_s / go_res.throughput_samples_per_s
         );
         println!(
-            "Ingest CPU reduction:      {:.2}x ({:.1}% less CPU)",
+            "Ingest CPU reduction:             {:.2}x ({:.1}% less CPU)",
             go_res.after_ingest.cpu_secs / rust_res.after_ingest.cpu_secs,
             (1.0 - rust_res.after_ingest.cpu_secs / go_res.after_ingest.cpu_secs) * 100.0
         );
         println!(
-            "Total CPU reduction:       {:.2}x ({:.1}% less CPU)",
+            "Total CPU reduction:              {:.2}x ({:.1}% less CPU)",
             go_res.after_queries.cpu_secs / rust_res.after_queries.cpu_secs,
             (1.0 - rust_res.after_queries.cpu_secs / go_res.after_queries.cpu_secs) * 100.0
         );
         println!(
-            "RSS memory reduction:      {:.2}x ({:.1}% less RSS)",
+            "RSS memory reduction:             {:.2}x ({:.1}% less RSS)",
             go_res.after_queries.vm_rss_mib / rust_res.after_queries.vm_rss_mib,
             (1.0 - rust_res.after_queries.vm_rss_mib / go_res.after_queries.vm_rss_mib) * 100.0
         );
         println!(
-            "Peak HWM reduction:        {:.2}x ({:.1}% less peak RAM)",
+            "Peak HWM reduction:               {:.2}x ({:.1}% less peak RAM)",
             go_res.after_queries.vm_hwm_mib / rust_res.after_queries.vm_hwm_mib,
             (1.0 - rust_res.after_queries.vm_hwm_mib / go_res.after_queries.vm_hwm_mib) * 100.0
         );
         println!(
-            "Push p99 improvement:      {:.2}x",
+            "Push p99 improvement:             {:.2}x",
             go_res.push_p99_ms / rust_res.push_p99_ms
         );
         println!(
-            "QueryStream p99 improv.:   {:.2}x",
+            "QueryStream p99 improvement:      {:.2}x",
             go_res.query_stream_p99_ms / rust_res.query_stream_p99_ms
+        );
+        println!(
+            "LabelNamesAndValues p99 improv.:  {:.2}x",
+            go_res.lnv_p99_ms / rust_res.lnv_p99_ms
+        );
+        println!(
+            "LabelValuesCardinality p99 imp.:  {:.2}x",
+            go_res.lvc_p99_ms / rust_res.lvc_p99_ms
         );
     }
 }
