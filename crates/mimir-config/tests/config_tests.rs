@@ -549,3 +549,46 @@ fn instance_interface_names_default_and_help() {
         );
     }
 }
+
+/// CFG-16: Go fetches secrets from Vault (`pkg/mimir/modules.go` `initVault`) when
+/// `vault.enabled` is true; mimir-rs has no Vault client and must refuse to start instead of
+/// silently using the configured on-disk paths.
+#[test]
+fn vault_enabled_is_rejected_explicitly() {
+    const MSG: &str =
+        "error validating config: vault integration (-vault.enabled) is not supported by mimir-rs";
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("mimir.yaml");
+    fs::write(
+        &file,
+        "target: ingester\nvault:\n  enabled: true\n  url: http://vault:8200\n",
+    )
+    .unwrap();
+    let cfg_arg = format!("-config.file={}", file.display());
+
+    // YAML.
+    let err = parse_cli_and_load_config("mimir", std::slice::from_ref(&cfg_arg))
+        .expect_err("vault.enabled: true must be rejected");
+    assert_eq!(err.to_string(), MSG);
+
+    // Flag overriding YAML disables it again.
+    let loaded =
+        parse_cli_and_load_config("mimir", &[cfg_arg, "-vault.enabled=false".to_string()])
+            .unwrap();
+    assert!(!loaded.config.vault_enabled().unwrap());
+
+    // Flag only (bool flag without value).
+    let err = parse_cli_and_load_config(
+        "mimir",
+        &["-target=ingester".to_string(), "-vault.enabled".to_string()],
+    )
+    .expect_err("-vault.enabled must be rejected");
+    assert_eq!(err.to_string(), MSG);
+
+    // Disabled (default) or explicitly false: accepted.
+    let mut cfg = MimirConfig::default();
+    cfg.load_config_from_bytes(b"vault:\n  enabled: false\n", false)
+        .unwrap();
+    assert!(!cfg.vault_enabled().unwrap());
+    cfg.validate().unwrap();
+}

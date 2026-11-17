@@ -249,7 +249,11 @@ fn render_ring_html(
             .and_then(|f| desc.ingesters.get(&s.id).map(|d| f(&s.id, d)))
             .filter(|l| !l.is_empty());
         match link_html {
-            Some(l) => out.push_str(&format!("<td><a href=\"{l}\">{}</a></td>", html_escape(&s.id))),
+            Some(l) => out.push_str(&format!(
+                "<td><a href=\"{}\">{}</a></td>",
+                html_url_attr_escape(&l),
+                html_escape(&s.id)
+            )),
             None => out.push_str(&format!("<td>{}</td>", html_escape(&s.id))),
         }
         out.push_str(&format!("<td>{}</td>", html_escape(&s.zone)));
@@ -299,9 +303,137 @@ fn render_ring_html(
     out
 }
 
+/// Go `html/template` `htmlEscaper` / `attrEscaper` (`htmlReplacementTable`).
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\0' => out.push('\u{FFFD}'),
+            '"' => out.push_str("&#34;"),
+            '&' => out.push_str("&amp;"),
+            '\'' => out.push_str("&#39;"),
+            '+' => out.push_str("&#43;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Go `html/template` escaping of a string in a quoted URL attribute (`href="{{ .Link }}"`):
+/// `urlFilter` (schemes other than http, https and mailto become `#ZgotmplZ`), `urlNormalizer`
+/// (`processURLOnto(s, true)`: lower-case `%xx` for bytes outside RFC 3986 unreserved/reserved
+/// characters, valid escapes kept) and `attrEscaper`.
+fn html_url_attr_escape(s: &str) -> String {
+    if let Some((protocol, _)) = s.split_once(':') {
+        if !protocol.contains('/')
+            && !protocol.eq_ignore_ascii_case("http")
+            && !protocol.eq_ignore_ascii_case("https")
+            && !protocol.eq_ignore_ascii_case("mailto")
+        {
+            return "#ZgotmplZ".to_string();
+        }
+    }
+    let b = s.as_bytes();
+    let mut normalized = String::with_capacity(s.len() + 16);
+    for (i, &c) in b.iter().enumerate() {
+        let keep = match c {
+            b'!' | b'#' | b'$' | b'&' | b'*' | b'+' | b',' | b'/' | b':' | b';' | b'=' | b'?'
+            | b'@' | b'[' | b']' | b'-' | b'.' | b'_' | b'~' => true,
+            b'%' => i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit(),
+            c => c.is_ascii_alphanumeric(),
+        };
+        if keep {
+            normalized.push(char::from(c));
+        } else {
+            normalized.push_str(&format!("%{c:02x}"));
+        }
+    }
+    html_escape(&normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Expected values produced by Go `html/template` with dskit's
+    /// `<a href="{{ .Link }}">{{ .ID }}</a>` (Go 1.27).
+    #[test]
+    fn url_attr_and_html_escaping_match_go_html_template() {
+        for (link, want) in [
+            ("http://10.0.0.1:8080/ingester/tenants", "http://10.0.0.1:8080/ingester/tenants"),
+            (
+                "http://[::1]:8080/x?a=b&c=d e+f'\"<>%41%zz%4",
+                "http://[::1]:8080/x?a=b&amp;c=d%20e&#43;f%27%22%3c%3e%41%25zz%254",
+            ),
+            ("javascript:alert(1)", "#ZgotmplZ"),
+            ("ftp://x/y", "#ZgotmplZ"),
+            ("/relative/{ingester}é", "/relative/%7bingester%7d%c3%a9"),
+            ("HTTPS://x", "HTTPS://x"),
+            ("mailto:a@b", "mailto:a@b"),
+            ("a/b:c", "a/b:c"),
+        ] {
+            assert_eq!(html_url_attr_escape(link), want, "{link:?}");
+        }
+        assert_eq!(html_escape("ing-1<&\"'+>"), "ing-1&lt;&amp;&#34;&#39;&#43;&gt;");
+    }
+
+    #[test]
+    fn ring_page_links_instances_with_the_configured_template() {
+        let mut desc = Desc::default();
+        desc.ingesters.insert(
+            "ingester-1".to_string(),
+            InstanceDesc {
+                addr: "[2001:db8::1]:9095".to_string(),
+                ..Default::default()
+            },
+        );
+        desc.ingesters.insert("ingester-2".to_string(), InstanceDesc::default());
+        let shard = |id: &str| IngesterHttpDesc {
+            id: id.to_string(),
+            state: "ACTIVE".to_string(),
+            address: String::new(),
+            timestamp: String::new(),
+            registered_timestamp: String::new(),
+            read_only: false,
+            read_only_updated_timestamp: String::new(),
+            zone: String::new(),
+            tokens: Vec::new(),
+            versions: HashMap::new(),
+        };
+        let shards = [shard("ingester-1"), shard("ingester-2")];
+        let mut cfg = mimir_config::ingester::RingConfig {
+            status_page_ingester_link_template: "http://{host}:8080/{ingester}/x?a=1&b=2".to_string(),
+            ..Default::default()
+        };
+        let page = render_ring_html(
+            &shards,
+            &HashMap::new(),
+            SystemTime::now(),
+            false,
+            &super::super::to_status_page_config(&cfg),
+            &desc,
+        );
+        assert!(
+            page.contains(
+                "<td><a href=\"http://[2001:db8::1]:8080/ingester-1/x?a=1&amp;b=2\">ingester-1</a></td>"
+            ),
+            "{page}"
+        );
+        // An address without port is used as the host as is.
+        assert!(page.contains("<a href=\"http://:8080/ingester-2/x?a=1&amp;b=2\">ingester-2</a>"), "{page}");
+
+        // Empty template: no links.
+        cfg.status_page_ingester_link_template.clear();
+        let page = render_ring_html(
+            &shards,
+            &HashMap::new(),
+            SystemTime::now(),
+            false,
+            &super::super::to_status_page_config(&cfg),
+            &desc,
+        );
+        assert!(page.contains("<td>ingester-1</td>") && !page.contains("<a href"), "{page}");
+    }
 }

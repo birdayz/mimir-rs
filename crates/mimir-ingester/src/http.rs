@@ -33,7 +33,8 @@ use mimir_config::{parse_go_duration, GoDuration};
 use mimir_proto::ringpb::PartitionState;
 use mimir_ring::partition_ring::http::partition_ring_router;
 use mimir_ring::partition_ring::{PartitionRingEditor, PartitionRingError, PartitionRingReader};
-use mimir_ring::ring::http::{ring_router, StatusPageConfig};
+use mimir_ring::ring::http::ring_router;
+use mimir_ring::ring::to_status_page_config;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -87,7 +88,9 @@ pub fn ingester_router(ingester: Arc<Ingester>) -> Router {
         .with_state(state);
 
     if let Some(ref ring) = ingester.instance_ring {
-        router = router.merge(ring_router(Arc::clone(ring), StatusPageConfig::default()));
+        // Go `RingConfig.ToRingConfig`: `StatusPageConfig = toStatusPageConfig()` (links from
+        // `-ingester.ring.status-page-ingester-link-template`).
+        router = router.merge(ring_router(Arc::clone(ring), to_status_page_config(&ingester.cfg.ring)));
     }
 
     if let Some(ref watcher) = ingester.partition_ring_watcher {

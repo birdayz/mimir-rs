@@ -24,6 +24,7 @@ pub mod db;
 mod db_upstream_tests;
 pub mod encoding;
 pub mod exemplar;
+pub mod go_regexp_syntax;
 pub mod head;
 pub mod head_chunks;
 pub mod index;

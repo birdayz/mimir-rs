@@ -1,6 +1,6 @@
 //! Etcd v3 HTTP/JSON gateway KV client.
 //!
-//! Ported from github.com/grafana/dskit/kv/etcd/etcd.go
+//! Ported from github.com/grafana/dskit/kv/etcd/etcd.go (TLS: see [`super::etcd_tls`]).
 
 use std::any::Any;
 use std::sync::Arc;
@@ -13,9 +13,21 @@ use mimir_config::ingester::EtcdConfig;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use super::{BoxFuture, CasFn, CasOutcome, Codec, KvClient, KvError};
+
+/// reqwest's error text plus its source chain (the TLS / connect cause is only in the sources).
+fn format_reqwest_error(err: &reqwest::Error) -> String {
+    let mut msg = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    msg
+}
 
 fn b64_encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -160,13 +172,19 @@ impl EtcdKv {
             ));
         }
 
+        // dskit `Config.GetTLS`: TLS settings only apply with `tls_enabled`; otherwise `https://`
+        // endpoints still get TLS with the host roots (clientv3 `CredsRequire`).
+        let tls = if cfg.tls_enabled {
+            super::etcd_tls::client_config(&cfg)
+        } else {
+            super::etcd_tls::default_client_config()
+        }
+        .map_err(|e| KvError::Other(format!("{}: {e}", super::etcd_tls::TLS_INIT_ERROR_PREFIX)))?;
+
         let timeout: Duration = cfg.dial_timeout.as_std().unwrap_or(Duration::ZERO);
-        let mut builder = reqwest::Client::builder();
+        let mut builder = reqwest::Client::builder().use_preconfigured_tls(tls);
         if !timeout.is_zero() {
             builder = builder.connect_timeout(timeout);
-        }
-        if cfg.tls_insecure_skip_verify {
-            builder = builder.danger_accept_invalid_certs(true);
         }
         let http = builder
             .build()
@@ -250,35 +268,55 @@ impl EtcdKv {
                 headers.insert("Authorization", val);
             }
         }
-        let mut last_err = None;
-        for idx in 0..self.endpoints.len() {
-            let url = format!("{}{path}", self.endpoint(idx));
-            match self
-                .http
-                .post(&url)
-                .headers(headers.clone())
-                .json(body)
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    return resp
-                        .json::<Resp>()
-                        .await
-                        .map_err(|e| KvError::Http(format!("decode etcd {path}: {e}")));
-                }
-                Ok(resp) => {
-                    last_err = Some(KvError::Http(format!(
-                        "etcd {path} returned {}",
-                        resp.status()
-                    )));
-                }
-                Err(e) => {
-                    last_err = Some(KvError::Http(e.to_string()));
+        // etcd clientv3 issues every RPC with `grpc.WaitForReady(true)`: while no endpoint can be
+        // connected to (refused, TLS handshake failure, ...) the call blocks and reconnects with
+        // gRPC's connection backoff (1s base, x1.6, max 120s) until the caller gives up (the
+        // caller's context; here: the future is dropped). HTTP-level errors fail immediately.
+        let mut reconnect = Backoff::new(BackoffConfig {
+            min_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(120),
+            max_retries: 0,
+        });
+        loop {
+            let mut last_err = None;
+            let mut responded = false;
+            for idx in 0..self.endpoints.len() {
+                let url = format!("{}{path}", self.endpoint(idx));
+                match self
+                    .http
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        return resp
+                            .json::<Resp>()
+                            .await
+                            .map_err(|e| KvError::Http(format!("decode etcd {path}: {e}")));
+                    }
+                    Ok(resp) => {
+                        responded = true;
+                        last_err = Some(KvError::Http(format!(
+                            "etcd {path} returned {}",
+                            resp.status()
+                        )));
+                    }
+                    Err(e) => {
+                        last_err = Some(KvError::Http(format_reqwest_error(&e)));
+                    }
                 }
             }
+            let Some(err) = last_err else {
+                return Err(KvError::Http("no etcd endpoints".to_string()));
+            };
+            if responded {
+                return Err(err);
+            }
+            warn!(path, err = %err, "etcd endpoints unavailable, waiting for a connection");
+            reconnect.wait().await;
         }
-        Err(last_err.unwrap_or_else(|| KvError::Http("no etcd endpoints".to_string())))
     }
 }
 

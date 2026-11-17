@@ -85,6 +85,8 @@ func main() {
 		out, err = cmdGoSort(input)
 	case "tsdb-open-report":
 		out, err = cmdTSDBOpenReport(input)
+	case "regex-matcher-errors":
+		out, err = cmdRegexMatcherErrors(input)
 	case "memberlist-status-page":
 		out, err = cmdMemberlistStatusPage(input)
 	case "memberlist-format-value":

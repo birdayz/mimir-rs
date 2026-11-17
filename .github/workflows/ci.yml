@@ -2,7 +2,7 @@ name: CI
 
 # Lint, unit/integration tests, upstream test parity, and the Go-vs-Rust conformance suites
 # (Tier-1 oracle, twin-process, and Docker/testcontainers suites incl. Kafka TLS/SASL + outage,
-# ring instance address in distroless pods). k3d + Helm e2e lives in k3d-helm-e2e.yml.
+# ring instance address in distroless pods, etcd KV over mTLS). k3d + Helm e2e lives in k3d-helm-e2e.yml.
 
 on:
   push:
@@ -22,6 +22,8 @@ env:
   MIMIR_REF: 06de3ebd2b12aa22861b96e6863b93a162c31e3c
   REDPANDA_IMAGE: redpandadata/redpanda:v26.2.7@sha256:43545ee03966431f5451e0b3c1e651b39fbe3eb383360220311021f50133b649
   DISTROLESS_IMAGE: gcr.io/distroless/cc-debian13@sha256:809d04afa1be033c441f76bb0051878c342fb76d0ea236bc6dc94b655fa0fbd6
+  # Tag must match ETCD_IMAGE / ETCD_TAG in crates/mimir-conformance/tests/w8_kv_etcd_tls_testcontainers.rs.
+  ETCD_IMAGE: quay.io/coreos/etcd:v3.5.17
   SILO_IMAGE: pgsty/silo:RELEASE.2026-09-03T13-18-01Z@sha256:b616a0cf8cb281e7e6bb3c9b1fb53875b4016a2878223925541c18f82d6c5ca3
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -130,7 +132,7 @@ jobs:
           echo "selected: ${args[*]}"
       - name: Pull container images
         if: startsWith(matrix.shard, 'docker')
-        run: docker pull "$REDPANDA_IMAGE" && docker pull "$DISTROLESS_IMAGE" && docker pull pgsty/silo:RELEASE.2026-09-03T13-18-01Z && docker pull mcr.microsoft.com/azure-storage/azurite:latest
+        run: docker pull "$REDPANDA_IMAGE" && docker pull "$DISTROLESS_IMAGE" && docker pull pgsty/silo:RELEASE.2026-09-03T13-18-01Z && docker pull mcr.microsoft.com/azure-storage/azurite:latest && docker pull "$ETCD_IMAGE"
       - name: Build Go mimir, Go oracle and Rust mimir
         run: |
           ./scripts/build-go-oracle.sh

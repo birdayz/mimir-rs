@@ -1072,6 +1072,24 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
         let mut active_tick = tokio::time::interval(active_period);
         let mut limit_tick = tokio::time::interval(limit_period);
         let mut churn_tick = tokio::time::interval(LABEL_CHURN_RECORD_INTERVAL);
+        // Go runs the 250ms inflight requests ticker in its own goroutine so that it is not
+        // delayed by the other (possibly slow) updates of this loop.
+        let inflight_ingester = Arc::clone(&ingester);
+        let inflight_ctx = ctx.clone();
+        let inflight_sampler = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(INFLIGHT_REQUESTS_SAMPLE_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = inflight_ctx.canceled() => break,
+                    _ = tick.tick() => {
+                        let inflight = inflight_ingester.inflight_push_requests.load(Ordering::Relaxed);
+                        inflight_ingester.metrics.inflight_requests_summary.observe(inflight as f64);
+                    }
+                }
+            }
+        });
 
         ingest_rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1125,9 +1143,13 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
                 }
             }
         }
+        inflight_sampler.abort();
         ingester.set_metrics_updater_service_state(State::Terminated);
     })
 }
+
+/// Go `metricsUpdaterServiceRunning` `inflightRequestsTicker`.
+const INFLIGHT_REQUESTS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 pub fn spawn_owned_series_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> JoinHandle<()> {
     let normal_interval = Duration::from_nanos(

@@ -97,21 +97,9 @@ impl From<&RingConfig> for RingSettings {
     }
 }
 
+/// `host, _, err := net.SplitHostPort(addr); if err != nil { host = addr }`.
 fn split_host_from_addr(addr: &str) -> String {
-    if let Some(rest) = addr.strip_prefix('[') {
-        if let Some((host, port)) = rest.split_once("]:") {
-            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-                return host.to_string();
-            }
-        }
-        return addr.to_string();
-    }
-    if let Some((host, port)) = addr.rsplit_once(':') {
-        if !host.contains(':') && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-            return host.to_string();
-        }
-    }
-    addr.to_string()
+    crate::dns::net::split_host_port(addr).map_or(addr, |(host, _)| host).to_string()
 }
 
 pub fn to_status_page_config(cfg: &RingConfig) -> http::StatusPageConfig {
@@ -125,11 +113,32 @@ pub fn to_status_page_config(cfg: &RingConfig) -> http::StatusPageConfig {
             if host.contains(':') {
                 host = format!("[{host}]");
             }
-            link_template
-                .replace("{host}", &host)
-                .replace("{ingester}", ingester_id)
+            replace_host_and_ingester(&link_template, &host, ingester_id)
         })),
     }
+}
+
+/// `strings.NewReplacer("{host}", host, "{ingester}", ingester).Replace(template)`: a single
+/// left-to-right pass, so substituted values are never rescanned.
+fn replace_host_and_ingester(template: &str, host: &str, ingester: &str) -> String {
+    let mut out = String::with_capacity(template.len() + host.len() + ingester.len());
+    let mut rest = template;
+    while let Some(idx) = rest.find('{') {
+        out.push_str(&rest[..idx]);
+        let tail = &rest[idx..];
+        if let Some(after) = tail.strip_prefix("{host}") {
+            out.push_str(host);
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("{ingester}") {
+            out.push_str(ingester);
+            rest = after;
+        } else {
+            out.push('{');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 struct RingInner {
@@ -338,14 +347,18 @@ impl Ring {
         let r_start = self.clone();
         let r_run = self.clone();
         basic_service(
-            Some(Box::new(move |_ctx| {
+            Some(Box::new(move |ctx| {
                 let r = r_start.clone();
                 Box::pin(async move {
                     if let Some(kv) = &r.kv_client {
-                        let val = kv
-                            .get(&r.key)
-                            .await
-                            .map_err(|e| ServiceError::failure(format!("unable to initialise ring state: {e}")))?;
+                        // Go passes the service context to `KVClient.Get`: a KV that waits for a
+                        // connection (etcd `WaitForReady`) is abandoned when the service stops.
+                        let val = tokio::select! {
+                            res = kv.get(&r.key) => res.map_err(|e| {
+                                ServiceError::failure(format!("unable to initialise ring state: {e}"))
+                            })?,
+                            _ = ctx.canceled() => return Err(ServiceError::Canceled),
+                        };
                         if let Some(any) = val {
                             if let Ok(desc) = any.downcast::<Desc>() {
                                 r.update_ring_state(*desc);

@@ -23,7 +23,7 @@ use mimir_tsdb::db::{BlocksToDeleteFn, Tsdb, TsdbError, TsdbOptions};
 use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::metadata::MetadataLimits;
-use mimir_tsdb::postings_cache::PostingsForMatchersCacheConfig;
+use mimir_tsdb::postings_cache::{PostingsForMatchersCacheConfig, PostingsForMatchersCacheMetrics};
 use mimir_tsdb::record::MetricType;
 use mimir_tsdb::wlog::CompressionType;
 use parking_lot::{Mutex, RwLock};
@@ -338,7 +338,7 @@ impl UserTsdb {
         limiter: Arc<Limiter>,
         bucket: Option<&BucketClient>,
         shipper_metrics: ShipperMetrics,
-        reg: Option<&Registry>,
+        shared_metrics: &SharedTsdbMetrics,
         tsdb_prom_reg: Option<Arc<Registry>>,
         wal_replay_concurrency: usize,
         instance_series_count: Arc<AtomicI64>,
@@ -450,6 +450,10 @@ impl UserTsdb {
                 enable_invalidation: true,
                 num_metric_versions: blocks_cfg.tsdb.head_postings_for_matchers_cache_versions.max(0)
                     as usize,
+                metrics: shared_metrics.head_postings_cache.clone(),
+                // Go tracks metric versions only for a shared cache with invalidation.
+                report_invalidations: blocks_cfg.tsdb.shared_postings_for_matchers_cache
+                    && blocks_cfg.tsdb.head_postings_for_matchers_cache_invalidation,
             },
             metadata_limits: MetadataLimits {
                 max_metrics_with_metadata_per_user: limiter.max_metadata_per_user(&user_id),
@@ -515,6 +519,8 @@ impl UserTsdb {
                     as usize,
                 enable_invalidation: false,
                 num_metric_versions: 0,
+                metrics: shared_metrics.block_postings_cache.clone(),
+                report_invalidations: false,
             },
         };
 
@@ -582,7 +588,7 @@ impl UserTsdb {
                 &udir,
                 &user_id,
                 ingest_partition_id,
-                OffsetCatalogueMetrics::new(reg),
+                shared_metrics.offset_catalogue.clone(),
             ))
         } else {
             None
@@ -1170,6 +1176,41 @@ impl UserTsdb {
     pub fn close(&self) -> Result<(), TsdbError> {
         self.lifecycle_adapter.limiter_slot.write().take();
         self.db.close()
+    }
+}
+
+/// Ingester-level metrics every tenant TSDB updates, registered once on the ingester registry
+/// like Go `newIngester`:
+/// - `headPostingsForMatchersCacheFactory` / `blockPostingsForMatchersCacheFactory` metrics
+///   (`cortex_ingester_tsdb_{head,block}_postings_for_matchers_cache_*`);
+/// - `offsetCatalogueMetrics` (`cortex_ingester_offset_catalogue_*`).
+#[derive(Clone)]
+pub struct SharedTsdbMetrics {
+    pub head_postings_cache: Option<PostingsForMatchersCacheMetrics>,
+    pub block_postings_cache: Option<PostingsForMatchersCacheMetrics>,
+    pub offset_catalogue: OffsetCatalogueMetrics,
+}
+
+impl SharedTsdbMetrics {
+    pub fn new(reg: Option<&Registry>) -> Self {
+        Self {
+            head_postings_cache: Some(PostingsForMatchersCacheMetrics::new(
+                "cortex_ingester_tsdb_head_",
+                reg,
+            )),
+            block_postings_cache: Some(PostingsForMatchersCacheMetrics::new(
+                "cortex_ingester_tsdb_block_",
+                reg,
+            )),
+            offset_catalogue: OffsetCatalogueMetrics::new(reg),
+        }
+    }
+}
+
+impl Default for SharedTsdbMetrics {
+    /// Unregistered metrics.
+    fn default() -> Self {
+        Self::new(None)
     }
 }
 

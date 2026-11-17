@@ -505,24 +505,21 @@ pub fn inject_org_id_into_http_headers(
     Ok(())
 }
 
-/// Extracts the org ID from gRPC incoming metadata (`x-scope-orgid`).
+/// Extracts the org ID from gRPC incoming metadata (`x-scope-orgid`), like dskit
+/// `user.ExtractFromGRPCRequest`: anything but exactly one metadata value (missing or repeated,
+/// even with identical values) is [`TenantError::NoOrgID`].
 ///
-/// Rejects missing metadata with [`TenantError::NoOrgID`] and multiple inconsistent
-/// metadata values with [`TenantError::TooManyOrgIDs`].
+/// Known divergence: an empty value is rejected with [`TenantError::NoOrgID`] too, whereas Go
+/// accepts the empty tenant ID (and would place its TSDB in the TSDB root directory).
 pub fn extract_org_id_from_grpc_metadata(metadata: &MetadataMap) -> Result<String, TenantError> {
-    let mut found: Option<&str> = None;
-    for value in metadata.get_all(LOWER_ORG_ID_HEADER_NAME) {
-        let val_str = value.to_str().map_err(|_| TenantError::NoOrgID)?;
-        if val_str.is_empty() {
-            return Err(TenantError::NoOrgID);
-        }
-        match found {
-            None => found = Some(val_str),
-            Some(prev) if prev == val_str => {}
-            Some(_) => return Err(TenantError::TooManyOrgIDs),
-        }
+    let mut values = metadata.get_all(LOWER_ORG_ID_HEADER_NAME).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return Err(TenantError::NoOrgID);
+    };
+    match value.to_str() {
+        Ok(s) if !s.is_empty() => Ok(s.to_string()),
+        _ => Err(TenantError::NoOrgID),
     }
-    found.map(|s| s.to_string()).ok_or(TenantError::NoOrgID)
 }
 
 /// Extracts a validated single tenant ID from gRPC incoming metadata.
@@ -702,7 +699,15 @@ mod tests {
         md.append("x-scope-orgid", "tenant-b".parse().unwrap());
         assert_eq!(
             extract_org_id_from_grpc_metadata(&md).unwrap_err(),
-            TenantError::TooManyOrgIDs
+            TenantError::NoOrgID
+        );
+        // dskit: exactly one value, even repeated identical values are "no org id".
+        let mut md = MetadataMap::new();
+        md.append("x-scope-orgid", "tenant-a".parse().unwrap());
+        md.append("x-scope-orgid", "tenant-a".parse().unwrap());
+        assert_eq!(
+            extract_org_id_from_grpc_metadata(&md).unwrap_err(),
+            TenantError::NoOrgID
         );
     }
 }

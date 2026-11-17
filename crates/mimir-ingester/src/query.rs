@@ -172,6 +172,9 @@ pub fn remove_shard_from_matchers(
     Ok((None, matchers))
 }
 
+/// Go `client.FromLabelMatchers`. Its errors are plain errors, which the read RPCs return as
+/// `codes.Internal` (`mapReadErrorToErrorWithStatus`) with the Go text: `invalid matcher type` or
+/// the Prometheus regex error (`error parsing regexp: ...`).
 pub fn from_proto_matchers(
     raw: &[ingesterpb::LabelMatcher],
 ) -> Result<Vec<LabelMatcher>, IngesterError> {
@@ -183,15 +186,13 @@ pub fn from_proto_matchers(
             Ok(ingesterpb::MatchType::RegexMatch) => MatchType::RegexMatch,
             Ok(ingesterpb::MatchType::RegexNoMatch) => MatchType::RegexNotMatch,
             Err(_) => {
-                return Err(IngesterError::BadRequest {
-                    message: format!("unknown match type {}", m.r#type),
+                return Err(IngesterError::Internal {
+                    message: "invalid matcher type".to_string(),
                 });
             }
         };
-        let lm = LabelMatcher::new(mt, &m.name, &m.value).map_err(|e| {
-            IngesterError::BadRequest {
-                message: format!("invalid matcher: {e}"),
-            }
+        let lm = LabelMatcher::new(mt, &m.name, &m.value).map_err(|e| IngesterError::Internal {
+            message: e.to_string(),
         })?;
         out.push(lm);
     }
@@ -255,7 +256,10 @@ pub fn build_search_hints(
     limit: i64,
     wire_matchers: &[ingesterpb::LabelMatcher],
 ) -> Result<(SearchHints, Vec<LabelMatcher>), IngesterError> {
-    let matchers = from_proto_matchers(wire_matchers)?;
+    // Go `SearchLabel{Names,Values}` return every buildSearchHints error as InvalidArgument.
+    let matchers = from_proto_matchers(wire_matchers).map_err(|e| IngesterError::BadRequest {
+        message: e.to_string(),
+    })?;
     let parsed_filter = proto_to_params(filter)?;
     if limit < 0 {
         return Err(IngesterError::BadRequest {
@@ -1941,7 +1945,7 @@ impl Ingester {
     ) -> Result<ReceiverStream<Result<ingesterpb::ActiveSeriesResponse, Status>>, IngesterError>
     {
         let permit = self.start_read_request(md).await?;
-        let matchers = from_proto_matchers(&req.matchers)?;
+        let matchers = active_series_matchers(&req.matchers)?;
         let (shard, matchers) = remove_shard_from_matchers(matchers)?;
         self.enforce_read_consistency(md, user_id).await?;
 
@@ -2044,7 +2048,7 @@ impl Ingester {
         user_id: &str,
         req: ingesterpb::ActiveSeriesRequest,
     ) -> Result<Vec<ingesterpb::ActiveSeriesResponse>, IngesterError> {
-        let matchers = from_proto_matchers(&req.matchers)?;
+        let matchers = active_series_matchers(&req.matchers)?;
         let (shard, matchers) = remove_shard_from_matchers(matchers)?;
         self.enforce_read_consistency(md, user_id).await?;
 
@@ -2109,14 +2113,17 @@ impl Ingester {
         Ok(batches)
     }
 
+    /// `org_id` is the request's org ID; as in Go the search request is validated before the
+    /// tenant ID (`tenant.TenantID`).
     pub async fn handle_search_label_names(
         &self,
         md: &MetadataMap,
-        user_id: &str,
+        org_id: &str,
         req: ingesterpb::SearchLabelNamesRequest,
     ) -> Result<Vec<ingesterpb::SearchResultBatch>, IngesterError> {
         let (hints, matchers) =
             build_search_hints(req.filter.as_ref(), req.ordering, req.limit, &req.matchers)?;
+        let user_id = &search_tenant_id(org_id)?;
         let permit = self.start_read_request(md).await?;
         let res = async {
             self.enforce_read_consistency(md, user_id).await?;
@@ -2154,14 +2161,16 @@ impl Ingester {
         res
     }
 
+    /// See [`Self::handle_search_label_names`] for `org_id`.
     pub async fn handle_search_label_values(
         &self,
         md: &MetadataMap,
-        user_id: &str,
+        org_id: &str,
         req: ingesterpb::SearchLabelValuesRequest,
     ) -> Result<Vec<ingesterpb::SearchResultBatch>, IngesterError> {
         let (hints, matchers) =
             build_search_hints(req.filter.as_ref(), req.ordering, req.limit, &req.matchers)?;
+        let user_id = &search_tenant_id(org_id)?;
         let permit = self.start_read_request(md).await?;
         let res = async {
             self.enforce_read_consistency(md, user_id).await?;
@@ -2199,6 +2208,22 @@ impl Ingester {
         permit.finish(false);
         res
     }
+}
+
+/// Go `ActiveSeries`: `fmt.Errorf("error parsing label matchers: %w", err)`.
+fn active_series_matchers(
+    raw: &[ingesterpb::LabelMatcher],
+) -> Result<Vec<LabelMatcher>, IngesterError> {
+    from_proto_matchers(raw).map_err(|e| IngesterError::Internal {
+        message: format!("error parsing label matchers: {e}"),
+    })
+}
+
+/// dskit `tenant.TenantID` inside the search handlers (plain error -> `codes.Internal`).
+fn search_tenant_id(org_id: &str) -> Result<String, IngesterError> {
+    mimir_common::tenant::parse_single_tenant_id(org_id).map_err(|e| IngesterError::Internal {
+        message: e.to_string(),
+    })
 }
 
 fn create_user_stats(

@@ -8,7 +8,6 @@ license.workspace = true
 mimir-common = { path = "../mimir-common" }
 mimir-config = { path = "../mimir-config" }
 mimir-proto = { path = "../mimir-proto" }
-mimir-tsdb = { path = "../mimir-tsdb" }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 crc32c = { workspace = true }

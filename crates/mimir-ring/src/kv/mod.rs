@@ -6,6 +6,7 @@
 
 pub mod consul;
 pub mod etcd;
+pub mod etcd_tls;
 pub mod ha_replica;
 pub mod inmemory;
 pub mod memberlist;

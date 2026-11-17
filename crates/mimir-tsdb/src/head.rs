@@ -2051,7 +2051,6 @@ impl Head {
                     enable_invalidation: true,
                     ..opts.postings_cache.clone()
                 },
-                opts.registry.as_deref(),
             ),
             tombstones: MemTombstones::new(),
             exemplars: CircularExemplarStorage::new_with_registry(
@@ -8711,9 +8710,17 @@ mod tests {
     fn postings_cache_push_then_query_and_per_metric_invalidation() {
         let dir = tempfile::tempdir().unwrap();
         let reg = Arc::new(Registry::new());
+        let defaults = HeadOptions::default();
         let opts = HeadOptions {
             registry: Some(Arc::clone(&reg)),
-            ..HeadOptions::default()
+            postings_cache: PostingsForMatchersCacheConfig {
+                metrics: Some(crate::postings_cache::PostingsForMatchersCacheMetrics::new(
+                    "prometheus_tsdb_",
+                    Some(&reg),
+                )),
+                ..defaults.postings_cache.clone()
+            },
+            ..defaults
         };
         let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
 

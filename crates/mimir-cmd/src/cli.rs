@@ -81,7 +81,10 @@ fn execute_cli_inner(prog_name: &str, args: &[String], test_mode: bool) -> CliOu
                     0
                 }
                 CliAction::PrintConfig => {
-                    stdout = dump_yaml(&loaded.config);
+                    // Go `mimir.New`: `yaml.NewEncoder(os.Stdout).Encode(&cfg)` (no extra newline,
+                    // unlike `DumpYaml`).
+                    stdout = marshal_config_yaml(&loaded.config)
+                        .unwrap_or_else(|e| format!("Error encoding config: {e}\n"));
                     0
                 }
                 CliAction::Run => {
@@ -136,10 +139,17 @@ pub fn effective_config_yaml(cfg: &MimirConfig) -> Value {
     val
 }
 
+/// yaml.v3 `yaml.Marshal(cfg)` of the effective configuration: Go field order, Go map key
+/// order, 4-space indentation and yaml.v3 scalar quoting.
+pub fn marshal_config_yaml(cfg: &MimirConfig) -> Result<String, String> {
+    let mut val = effective_config_yaml(cfg);
+    mimir_config::yaml_v3::order_like_go_config(&mut val)?;
+    mimir_config::yaml_v3_emit::marshal_struct(&val)
+}
+
 /// Dumps the effective configuration as YAML (matching `DumpYaml` in `cmd/mimir/main.go`).
 pub fn dump_yaml(cfg: &MimirConfig) -> String {
-    let val = effective_config_yaml(cfg);
-    match serde_yaml::to_string(&val) {
+    match marshal_config_yaml(cfg) {
         Ok(s) => format!("{s}\n"),
         Err(e) => format!("# error encoding config: {e}\n"),
     }
@@ -174,6 +184,14 @@ fn build_block_yaml(
         };
         let val = match field.kind {
             FieldKind::Secret => mask_secret_yaml_value(&val),
+            FieldKind::Bytes => match &val {
+                Value::String(s) => bytes_yaml_value(s),
+                Value::Number(n) => n
+                    .as_u64()
+                    .map(|n| Value::String(mimir_config::HumanBytes(n).to_string()))
+                    .unwrap_or(val),
+                _ => val,
+            },
             FieldKind::SecretOmitEmpty => {
                 if secret_yaml_value_is_empty(&val) {
                     continue;
@@ -226,7 +244,19 @@ fn field_default_yaml_value(field: &SchemaField) -> Value {
                 .collect(),
         );
     }
+    if field.default_str == "<hostname>" && field.kind == FieldKind::String {
+        // `os.Hostname()` at flag registration (the `<hostname>` placeholder is docs-only).
+        return Value::String(mimir_config::ingester::default_hostname());
+    }
     default_yaml_value(field.kind, field.default_str)
+}
+
+/// `flagext.Bytes.MarshalYAML`: the parsed size in `units.Base2Bytes.String()` form.
+fn bytes_yaml_value(raw: &str) -> Value {
+    match mimir_config::HumanBytes::parse(raw) {
+        Ok(n) => Value::String(mimir_config::HumanBytes(n).to_string()),
+        Err(_) => Value::String(raw.to_string()),
+    }
 }
 
 fn default_yaml_value(kind: FieldKind, default_str: &str) -> Value {
@@ -251,13 +281,18 @@ fn default_yaml_value(kind: FieldKind, default_str: &str) -> Value {
             }
         }
         FieldKind::String => Value::String(default_str.to_string()),
+        FieldKind::Bytes => bytes_yaml_value(default_str),
         FieldKind::StringList => {
             if default_str.is_empty() || default_str == "[]" {
                 Value::Sequence(Vec::new())
             } else {
-                Value::String(default_str.to_string())
+                Value::Sequence(
+                    default_str.split(',').map(|s| Value::String(s.to_string())).collect(),
+                )
             }
         }
+        // Empty Go maps (e.g. `flagext.LimitsMap`) render as `{}`.
+        FieldKind::Other if default_str == "{}" => Value::Mapping(Mapping::new()),
         FieldKind::Other | FieldKind::Secret | FieldKind::SecretOmitEmpty => {
             Value::String(default_str.to_string())
         }
@@ -284,6 +319,7 @@ fn parse_cli_value_for_yaml(kind: FieldKind, raw: &str) -> Value {
             }
         }
         FieldKind::String => Value::String(raw.to_string()),
+        FieldKind::Bytes => bytes_yaml_value(raw),
         FieldKind::StringList => {
             if raw.is_empty() {
                 Value::Sequence(Vec::new())
@@ -400,7 +436,9 @@ usage_tracker:
         assert!(out.contains("basic_auth_password: '********'"));
         assert!(out.contains("key: <secret>"));
         // Empty secrets render as "" (flagext.Secret) / null (prometheus config.Secret).
-        assert!(out.contains("sasl_msk_iam_secret_key: ''"));
+        assert!(out.contains("sasl_msk_iam_secret_key: \"\""));
+        // yaml.v3 layout: 4-space indentation.
+        assert!(out.contains("\ningest_storage:\n    enabled: false\n    kafka:\n        backend: kafka\n"), "{out}");
         assert!(out.contains("key: null"));
         // `service_account_token` is `omitempty` in Go.
         assert!(!out.contains("service_account_token:"));

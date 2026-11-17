@@ -13,6 +13,8 @@
 //!   OpenMetrics, delimited protobuf, gzip)
 //! - `-target=all` (rejected by mimir-rs with an explicit error, never served ingester-only)
 //! - `-help`, `-help-all`, `-version`
+//! - gRPC status code, message and details of tenant (`x-scope-orgid`) and label matcher errors
+//!   on all 14 `cortex.Ingester` RPCs
 //!
 //! Upstream behaviour: github.com/grafana/dskit/server/server.go, dskit/middleware/*,
 //! github.com/grafana/mimir/pkg/api/*, cmd/mimir/main.go.
@@ -756,4 +758,446 @@ fn w9_runtime_config_reload_metrics_parity() {
     let g3 = rc_metrics(procs[0].0.http_port);
     assert_ne!(g3, g);
     assert_eq!(rc_metrics(procs[1].0.http_port), g3, "after good reload");
+}
+
+// ---------------------------------------------------------------------------------------------
+// S24: gRPC status codes of tenant and matcher errors on every cortex.Ingester RPC
+// ---------------------------------------------------------------------------------------------
+
+mod s24 {
+    use mimir_proto::cortexpb;
+    use mimir_proto::ingesterpb::{self, ingester_client::IngesterClient};
+    use tokio_stream::StreamExt;
+    use tonic::metadata::MetadataValue;
+    use tonic::transport::Channel;
+    use tonic::{Code, Request, Status, Streaming};
+
+    /// Final status: code, message and the raw `grpc-status-details-bin` payload.
+    pub type Outcome = Result<(), (Code, String, Vec<u8>)>;
+
+    pub const RPCS: &[&str] = &[
+        "Push",
+        "QueryStream",
+        "QueryExemplars",
+        "LabelValues",
+        "LabelNames",
+        "UserStats",
+        "AllUserStats",
+        "MetricsForLabelMatchers",
+        "MetricsMetadata",
+        "LabelNamesAndValues",
+        "LabelValuesCardinality",
+        "ActiveSeries",
+        "SearchLabelNames",
+        "SearchLabelValues",
+    ];
+
+    fn st(s: Status) -> (Code, String, Vec<u8>) {
+        (s.code(), s.message().to_string(), s.details().to_vec())
+    }
+
+    async fn drain<T>(r: Result<tonic::Response<Streaming<T>>, Status>) -> Outcome {
+        let mut s = r.map_err(st)?.into_inner();
+        while let Some(item) = s.next().await {
+            item.map_err(st)?;
+        }
+        Ok(())
+    }
+
+    fn req<T>(msg: T, org_ids: &[&str]) -> Request<T> {
+        let mut r = Request::new(msg);
+        for id in org_ids {
+            r.metadata_mut()
+                .append("x-scope-orgid", MetadataValue::try_from(*id).unwrap());
+        }
+        r
+    }
+
+    pub fn matcher(t: ingesterpb::MatchType, name: &str, value: &str) -> ingesterpb::LabelMatcher {
+        ingesterpb::LabelMatcher {
+            r#type: t as i32,
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    pub fn sample_write_request(ts: i64) -> cortexpb::WriteRequest {
+        cortexpb::WriteRequest {
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair::from_static("__name__", "up"),
+                    cortexpb::LabelPair::from_static("job", "w9"),
+                ],
+                samples: vec![cortexpb::Sample {
+                    value: 1.0,
+                    timestamp_ms: ts,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Calls `rpc` with the given `x-scope-orgid` values and matchers, returning the final status.
+    pub async fn call(
+        c: &mut IngesterClient<Channel>,
+        rpc: &str,
+        org_ids: &[&str],
+        matchers: &[ingesterpb::LabelMatcher],
+        now_ms: i64,
+    ) -> Outcome {
+        let (start, end) = (now_ms - 3_600_000, now_ms + 3_600_000);
+        let m = matchers.to_vec();
+        let ms = ingesterpb::LabelMatchers { matchers: m.clone() };
+        match rpc {
+            "Push" => c
+                .push(req(sample_write_request(now_ms), org_ids))
+                .await
+                .map(|_| ())
+                .map_err(st),
+            "QueryStream" => drain(
+                c.query_stream(req(
+                    ingesterpb::QueryRequest {
+                        start_timestamp_ms: start,
+                        end_timestamp_ms: end,
+                        matchers: m,
+                        streaming_chunks_batch_size: 0,
+                    },
+                    org_ids,
+                ))
+                .await,
+            )
+            .await,
+            "QueryExemplars" => c
+                .query_exemplars(req(
+                    ingesterpb::ExemplarQueryRequest {
+                        start_timestamp_ms: start,
+                        end_timestamp_ms: end,
+                        matchers: vec![ms],
+                    },
+                    org_ids,
+                ))
+                .await
+                .map(|_| ())
+                .map_err(st),
+            "LabelValues" => c
+                .label_values(req(
+                    ingesterpb::LabelValuesRequest {
+                        label_name: "job".into(),
+                        start_timestamp_ms: start,
+                        end_timestamp_ms: end,
+                        matchers: Some(ms),
+                        limit: 0,
+                    },
+                    org_ids,
+                ))
+                .await
+                .map(|_| ())
+                .map_err(st),
+            "LabelNames" => c
+                .label_names(req(
+                    ingesterpb::LabelNamesRequest {
+                        start_timestamp_ms: start,
+                        end_timestamp_ms: end,
+                        matchers: Some(ms),
+                        limit: 0,
+                    },
+                    org_ids,
+                ))
+                .await
+                .map(|_| ())
+                .map_err(st),
+            "UserStats" => c
+                .user_stats(req(ingesterpb::UserStatsRequest::default(), org_ids))
+                .await
+                .map(|_| ())
+                .map_err(st),
+            "AllUserStats" => c
+                .all_user_stats(req(ingesterpb::UserStatsRequest::default(), org_ids))
+                .await
+                .map(|_| ())
+                .map_err(st),
+            "MetricsForLabelMatchers" => c
+                .metrics_for_label_matchers(req(
+                    ingesterpb::MetricsForLabelMatchersRequest {
+                        start_timestamp_ms: start,
+                        end_timestamp_ms: end,
+                        matchers_set: vec![ms],
+                        limit: 0,
+                    },
+                    org_ids,
+                ))
+                .await
+                .map(|_| ())
+                .map_err(st),
+            "MetricsMetadata" => c
+                .metrics_metadata(req(
+                    ingesterpb::MetricsMetadataRequest {
+                        limit: -1,
+                        limit_per_metric: -1,
+                        ..Default::default()
+                    },
+                    org_ids,
+                ))
+                .await
+                .map(|_| ())
+                .map_err(st),
+            "LabelNamesAndValues" => drain(
+                c.label_names_and_values(req(
+                    ingesterpb::LabelNamesAndValuesRequest {
+                        matchers: m,
+                        count_method: 0,
+                    },
+                    org_ids,
+                ))
+                .await,
+            )
+            .await,
+            "LabelValuesCardinality" => drain(
+                c.label_values_cardinality(req(
+                    ingesterpb::LabelValuesCardinalityRequest {
+                        label_names: vec!["job".into()],
+                        matchers: m,
+                        count_method: 0,
+                    },
+                    org_ids,
+                ))
+                .await,
+            )
+            .await,
+            "ActiveSeries" => drain(
+                c.active_series(req(
+                    ingesterpb::ActiveSeriesRequest {
+                        matchers: m,
+                        ..Default::default()
+                    },
+                    org_ids,
+                ))
+                .await,
+            )
+            .await,
+            "SearchLabelNames" => drain(
+                c.search_label_names(req(
+                    ingesterpb::SearchLabelNamesRequest {
+                        start_timestamp_ms: start,
+                        end_timestamp_ms: end,
+                        matchers: m,
+                        ..Default::default()
+                    },
+                    org_ids,
+                ))
+                .await,
+            )
+            .await,
+            "SearchLabelValues" => drain(
+                c.search_label_values(req(
+                    ingesterpb::SearchLabelValuesRequest {
+                        start_timestamp_ms: start,
+                        end_timestamp_ms: end,
+                        name: "job".into(),
+                        matchers: m,
+                        ..Default::default()
+                    },
+                    org_ids,
+                ))
+                .await,
+            )
+            .await,
+            other => panic!("unknown rpc {other}"),
+        }
+    }
+}
+
+/// S24: `x-scope-orgid` tenant errors (multi-tenant `a|b`, repeated header, invalid tenant ID)
+/// and invalid regex matchers produce the same gRPC status code and message on every
+/// `cortex.Ingester` RPC as Go (dskit `ServerUserHeaderInterceptor` + `tenant.TenantID`, Mimir
+/// `mapReadErrorToErrorWithStatus`).
+#[test]
+fn w9_grpc_tenant_and_matcher_error_status_parity() {
+    use mimir_proto::ingesterpb::{ingester_client::IngesterClient, MatchType};
+
+    let (_tmp, [(go, _gp), (cand, _cp)]) = start_pair("", &[], "http");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let bad_regex = [s24::matcher(MatchType::RegexMatch, "job", "(")];
+    let bad_nregex = [s24::matcher(MatchType::RegexNoMatch, "job", "a(")];
+    let good = [s24::matcher(MatchType::Equal, "job", "w9")];
+    let bad_type = [mimir_proto::ingesterpb::LabelMatcher {
+        r#type: 9,
+        name: "job".into(),
+        value: "w9".into(),
+    }];
+    // (label, org ids, matchers)
+    let cases: Vec<(&str, Vec<&str>, &[mimir_proto::ingesterpb::LabelMatcher])> = vec![
+        ("no header", vec![], &good),
+        ("multi-tenant a|b", vec!["a|b"], &good),
+        ("same tenant twice a|a", vec!["w9|w9"], &good),
+        ("repeated header", vec!["w9", "w9"], &good),
+        ("repeated header differing", vec!["a", "b"], &good),
+        ("invalid tenant char", vec!["a/b"], &good),
+        // Not compared: an empty `x-scope-orgid` value. Go accepts the empty tenant ID (reads
+        // succeed, a push would put the tenant TSDB into the TSDB root directory); mimir-rs
+        // rejects it as `no org id` (documented divergence in PORT_STATUS.md).
+        ("unsafe tenant ..", vec![".."], &good),
+        ("invalid regex, existing tenant", vec!["w9"], &bad_regex),
+        ("invalid negative regex, existing tenant", vec!["w9"], &bad_nregex),
+        ("invalid regex, unknown tenant", vec!["nobody"], &bad_regex),
+        ("unknown matcher type", vec!["w9"], &bad_type),
+    ];
+    let rt = rt();
+    let results = rt.block_on(async {
+        let mut out: Vec<[s24::Outcome; 2]> = Vec::new();
+        let mut clients = Vec::new();
+        for inst in [&go, &cand] {
+            let ch = Channel::from_shared(format!("http://127.0.0.1:{}", inst.grpc_port))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut c = IngesterClient::new(ch);
+            // Create the `w9` TSDB so matcher errors are hit with and without a tenant DB.
+            s24::call(&mut c, "Push", &["w9"], &[], now_ms).await.unwrap();
+            clients.push(c);
+        }
+        let mut labels = Vec::new();
+        for (label, ids, matchers) in &cases {
+            for rpc in s24::RPCS {
+                let g = s24::call(&mut clients[0], rpc, ids, matchers, now_ms).await;
+                let c = s24::call(&mut clients[1], rpc, ids, matchers, now_ms).await;
+                labels.push(format!("{rpc} [{label}]"));
+                out.push([g, c]);
+            }
+        }
+        (labels, out)
+    });
+    let mut mismatches = Vec::new();
+    for (label, [g, c]) in results.0.iter().zip(results.1.iter()) {
+        eprintln!("{label}: go={g:?}");
+        if g != c {
+            mismatches.push(format!("{label}:\n    go:        {g:?}\n    candidate: {c:?}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
+}
+
+/// Item 6: ingester-level metrics every tenant TSDB updates are registered once at startup like
+/// Go `newIngester` / `newIngesterMetrics`: the head / block PostingsForMatchers cache metrics
+/// (`cortex_ingester_tsdb_{head,block}_postings_for_matchers_cache_*`, every `reason`), the
+/// offset catalogue metrics and `cortex_ingester_inflight_push_requests_summary`. Compares HELP,
+/// TYPE and the series (name + labels) of each family; counters and gauges must also match
+/// (no queries are issued, so all are 0), summary quantile values are not compared.
+#[test]
+fn w9_ingester_shared_tsdb_metric_families_parity() {
+    let (_tmp, [(go, _gp), (cand, _cp)]) = start_pair("", &[], "http");
+    // Let the 250ms inflight sampler observe at least once in both processes.
+    std::thread::sleep(Duration::from_millis(600));
+    let scrape = |port: u16| {
+        let r = curl(&[&format!("http://127.0.0.1:{port}/metrics")]);
+        assert_eq!(r.status, 200);
+        String::from_utf8(r.body).unwrap()
+    };
+    let (g, c) = (scrape(go.http_port), scrape(cand.http_port));
+    let prefixes = [
+        "cortex_ingester_tsdb_head_postings_for_matchers_cache_",
+        "cortex_ingester_tsdb_block_postings_for_matchers_cache_",
+        "cortex_ingester_offset_catalogue_",
+        "cortex_ingester_inflight_push_requests_summary",
+    ];
+    for prefix in prefixes {
+        let gf = families(&g, prefix);
+        assert!(!gf.is_empty(), "go exposes no {prefix}* family");
+        assert_eq!(families(&c, prefix), gf, "{prefix}* families");
+        for fam in &gf {
+            let meta = |text: &str| -> Vec<String> {
+                text.lines()
+                    .filter(|l| {
+                        l.strip_prefix("# HELP ").or_else(|| l.strip_prefix("# TYPE "))
+                            .is_some_and(|r| r.split(' ').next() == Some(fam.as_str()))
+                    })
+                    .map(str::to_string)
+                    .collect()
+            };
+            assert_eq!(meta(&c), meta(&g), "{fam} HELP/TYPE");
+            let series = |text: &str| -> BTreeSet<String> {
+                text.lines()
+                    .filter(|l| !l.starts_with('#'))
+                    .filter_map(|l| l.rsplit_once(' ').map(|(s, _)| s.to_string()))
+                    .filter(|s| s == fam || s.starts_with(&format!("{fam}{{")) || s.starts_with(&format!("{fam}_")))
+                    .collect()
+            };
+            assert_eq!(series(&c), series(&g), "{fam} series");
+            if !fam.ends_with("_summary") {
+                let mut gs = samples(&g, fam);
+                let mut cs = samples(&c, fam);
+                gs.sort();
+                cs.sort();
+                assert_eq!(cs, gs, "{fam} values");
+            }
+        }
+    }
+}
+
+/// S26: `/config`, `/config?mode=defaults`, `/config?mode=diff` and `-print.config` are
+/// byte-identical to Go's yaml.v3 output (4-space indentation, `""`, struct field order, sorted
+/// map keys in the diff), after replacing the per-instance values (directories, ports) and
+/// dropping the hidden `block_builder`, `block_builder_scheduler` and `usage_tracker` blocks
+/// mimir-rs does not model (documented gap in PORT_STATUS.md).
+#[test]
+fn w9_config_yaml_rendering_parity() {
+    let (_tmp, [(go, _gp), (cand, _cp)]) = start_pair("", &[], "http");
+    let normalize = |inst: &Instance, text: &str| -> String {
+        let mut out = String::new();
+        let mut skipping = false;
+        for line in text.lines() {
+            let top_level = !line.starts_with(' ');
+            if top_level {
+                skipping = ["block_builder:", "block_builder_scheduler:", "usage_tracker:"]
+                    .contains(&line);
+            }
+            if skipping {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.replace(&inst.dir.display().to_string(), "<dir>")
+            .replace(&format!(": {}\n", inst.http_port), ": <http-port>\n")
+            .replace(&format!(": {}\n", inst.grpc_port), ": <grpc-port>\n")
+    };
+    let assert_same = |what: &str, g: &str, c: &str| {
+        if g != c {
+            let first = g
+                .lines()
+                .zip(c.lines())
+                .position(|(a, b)| a != b)
+                .unwrap_or(g.lines().count().min(c.lines().count()));
+            let ctx = |s: &str| s.lines().skip(first.saturating_sub(3)).take(8).collect::<Vec<_>>().join("\n");
+            panic!("{what} differs at line {}:\n--- go\n{}\n--- candidate\n{}", first + 1, ctx(g), ctx(c));
+        }
+    };
+    for q in ["", "?mode=defaults", "?mode=diff"] {
+        let get = |inst: &Instance| {
+            let r = curl(&[&format!("http://127.0.0.1:{}/config{q}", inst.http_port)]);
+            assert_eq!(r.status, 200, "/config{q}");
+            normalize(inst, &String::from_utf8(r.body).unwrap())
+        };
+        assert_same(&format!("/config{q}"), &get(&go), &get(&cand));
+    }
+
+    // `-print.config` (Go `mimir.New`: `yaml.NewEncoder(os.Stdout).Encode(&cfg)`).
+    let (go_bin, cand_bin) = ensure_binaries();
+    let print = |inst: &Instance, bin: &Path| {
+        let out = Command::new(bin)
+            .arg(format!("-config.file={}", inst.dir.join("mimir.yaml").display()))
+            .arg("-print.config")
+            .current_dir(&inst.dir)
+            .output()
+            .expect("run -print.config");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        normalize(inst, &String::from_utf8(out.stdout).unwrap())
+    };
+    assert_same("-print.config", &print(&go, &go_bin), &print(&cand, &cand_bin));
 }

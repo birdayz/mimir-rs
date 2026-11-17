@@ -814,7 +814,31 @@ impl MimirConfig {
 
         self.limits.validate()?;
 
+        // Go fetches keys and certificates from Vault in the `vault` module (initVault) of every
+        // target; mimir-rs has no Vault client, so refuse to start instead of silently using the
+        // on-disk paths.
+        if self.vault_enabled()? {
+            return Err(ConfigError::Validation(
+                "vault integration (-vault.enabled) is not supported by mimir-rs".to_string(),
+            ));
+        }
+
         Ok(())
+    }
+
+    /// `vault.enabled` / `-vault.enabled` (default false). The `vault` block is kept as an extra
+    /// section; an explicitly set flag overrides the YAML value like Go's flag parsing.
+    pub fn vault_enabled(&self) -> Result<bool, ConfigError> {
+        if let Some(v) = self.extra_cli_flag_value("vault.enabled") {
+            // Already type-checked when the flag was parsed.
+            return crate::types::parse_go_bool(v);
+        }
+        Ok(self
+            .extra_sections
+            .get("vault")
+            .and_then(|vault| vault.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
     }
 
     /// `api.response_compression_level` / `-http.response-compression-level` (default
