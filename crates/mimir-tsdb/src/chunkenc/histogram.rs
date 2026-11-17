@@ -1196,12 +1196,16 @@ fn reduce_int_side(
         let Some(orig_idx) = it.next_idx() else {
             break;
         };
-        cur_abs += d;
+        cur_abs = cur_abs.wrapping_add(d);
         // Arithmetic right shift toward -inf: floor(orig_idx / 2^shift)
-        let target_idx = orig_idx.div_euclid(1 << shift);
+        let target_idx = if shift >= 32 {
+            if orig_idx < 0 { -1 } else { 0 }
+        } else {
+            orig_idx >> shift
+        };
         match acc_idx {
             Some(idx) if idx == target_idx => {
-                acc_count += cur_abs;
+                acc_count = acc_count.wrapping_add(cur_abs);
             }
             Some(idx) => {
                 flush_int_bucket(
@@ -1250,7 +1254,7 @@ fn flush_int_bucket(
             });
         }
         Some(p) => {
-            let gap = idx - p - 1;
+            let gap = idx.wrapping_sub(p).wrapping_sub(1);
             if gap == 0 {
                 spans.last_mut().unwrap().length += 1;
             } else {
@@ -1261,7 +1265,7 @@ fn flush_int_bucket(
             }
         }
     }
-    deltas.push(abs_val - *prev_abs);
+    deltas.push(abs_val.wrapping_sub(*prev_abs));
     *prev_idx = Some(idx);
     *prev_abs = abs_val;
 }
@@ -1296,5 +1300,20 @@ mod tests {
             matches!(err, ChunkError::InvalidChunk | ChunkError::UnexpectedEof),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn corrupt_reserved_schema_and_extreme_deltas_do_not_overflow() {
+        let mut h = Histogram {
+            schema: 52,
+            positive_spans: vec![HistogramSpan {
+                offset: i32::MIN,
+                length: 2,
+            }],
+            positive_buckets: vec![i64::MAX, i64::MAX],
+            ..Default::default()
+        };
+        reduce_int_resolution(&mut h, super::super::EXPONENTIAL_SCHEMA_MAX);
+        assert_eq!(h.schema, super::super::EXPONENTIAL_SCHEMA_MAX);
     }
 }

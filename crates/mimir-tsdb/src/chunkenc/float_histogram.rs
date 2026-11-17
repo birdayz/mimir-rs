@@ -1105,7 +1105,11 @@ fn reduce_float_side(
         let Some(orig_idx) = it.next_idx() else {
             break;
         };
-        let target_idx = orig_idx.div_euclid(1 << shift);
+        let target_idx = if shift >= 32 {
+            if orig_idx < 0 { -1 } else { 0 }
+        } else {
+            orig_idx >> shift
+        };
         match acc_idx {
             Some(idx) if idx == target_idx => {
                 acc_count += val;
@@ -1142,7 +1146,7 @@ fn flush_float_bucket(
             });
         }
         Some(p) => {
-            let gap = idx - p - 1;
+            let gap = idx.wrapping_sub(p).wrapping_sub(1);
             if gap == 0 {
                 spans.last_mut().unwrap().length += 1;
             } else {

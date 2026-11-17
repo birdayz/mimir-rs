@@ -69,6 +69,29 @@ jobs:
       - name: cargo test (all crates except mimir-conformance)
         run: cargo test --workspace --exclude mimir-conformance
 
+  miri:
+    name: miri (unsafe primitives)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      MIRIFLAGS: "-Zmiri-disable-isolation"
+      PROPTEST_CASES: "8"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust nightly with Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri
+          rustup override set nightly
+          cargo +nightly miri setup
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: miri
+      - name: Run Miri on unsafe primitives
+        run: |
+          cargo +nightly miri test -p mimir-common --lib -- thread_pool labels_hash
+          cargo +nightly miri test -p mimir-proto --lib -- zerocopy snappy s2 query_stream_enc
+          cargo +nightly miri test -p mimir-tsdb --lib -- bstream paged_by_id hash_sorted_pairs labels:: symbols:: postings::
+
   parity:
     name: upstream test parity
     runs-on: ubuntu-24.04
