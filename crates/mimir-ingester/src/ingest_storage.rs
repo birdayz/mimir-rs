@@ -197,6 +197,17 @@ struct ShardSeriesItem {
     min_ts: i64,
 }
 
+/// Metric metadata entry stashed during Phase A; strings live in `MetadataStash::bytes`.
+#[derive(Clone, Copy)]
+struct ShardMetadataItem {
+    worker_idx: u16,
+    tenant_idx: u32,
+    record_offset: i64,
+    metric_type: i32,
+    /// `[name_start, help_start, unit_start, unit_end)` offsets into `MetadataStash::bytes`.
+    bounds: [u32; 4],
+}
+
 struct WorkerArena {
     wr_scratch: WriteRequestScratch,
     rw2_resolved: Rw2ResolvedScratch,
@@ -205,9 +216,96 @@ struct WorkerArena {
     histograms_arena: Vec<ConvertedHistogram>,
     exemplars_arena: Vec<(i64, f64, Labels, String)>,
     shard_buckets: Vec<Vec<ShardSeriesItem>>,
+    metadata: MetadataStash,
     empty_tenant_errors: usize,
     invalid_tenant_indices: Vec<u32>,
     total_series: usize,
+}
+
+/// Per-worker metric metadata copied out of the records during Phase A, bucketed by shard.
+struct MetadataStash {
+    bytes: Vec<u8>,
+    buckets: Vec<Vec<ShardMetadataItem>>,
+    total: usize,
+}
+
+impl MetadataStash {
+    fn new(num_shards: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            buckets: (0..num_shards).map(|_| Vec::new()).collect(),
+            total: 0,
+        }
+    }
+
+    fn reset_for(&mut self, num_shards: usize) {
+        self.clear();
+        if self.buckets.len() < num_shards {
+            self.buckets.resize_with(num_shards, Vec::new);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        for b in &mut self.buckets {
+            b.clear();
+        }
+        self.total = 0;
+    }
+
+    /// Copies the metadata of one record, distributing entries across `num_shards` shards
+    /// round-robin like Go `parallelStorageShards.PushToStorageAndReleaseRequest`.
+    fn stash<'m>(
+        &mut self,
+        num_shards: usize,
+        item: ShardMetadataItem,
+        first_series_shard: Option<usize>,
+        metadata: impl Iterator<Item = BorrowedMetadata<'m>>,
+    ) {
+        let num_shards = num_shards.clamp(1, self.buckets.len().max(1));
+        // Go starts from a random shard to avoid hotspots. Start from the shard holding the
+        // record's first series so small mixed records still flush as one request (as Go's
+        // single ideal shard does), else from the record offset as a well-distributed
+        // stand-in.
+        let mut shard = first_series_shard
+            .unwrap_or((item.record_offset as u64 % num_shards as u64) as usize)
+            % num_shards;
+        for m in metadata {
+            let name_start = self.bytes.len() as u32;
+            self.bytes.extend_from_slice(m.metric_family_name.as_bytes());
+            let help_start = self.bytes.len() as u32;
+            self.bytes.extend_from_slice(m.help.as_bytes());
+            let unit_start = self.bytes.len() as u32;
+            self.bytes.extend_from_slice(m.unit.as_bytes());
+            let unit_end = self.bytes.len() as u32;
+            if let Some(bucket) = self.buckets.get_mut(shard) {
+                bucket.push(ShardMetadataItem {
+                    metric_type: m.metric_type,
+                    bounds: [name_start, help_start, unit_start, unit_end],
+                    ..item
+                });
+                self.total += 1;
+            }
+            shard = (shard + 1) % num_shards;
+        }
+    }
+
+    #[inline]
+    fn view(&self, item: &ShardMetadataItem) -> BorrowedMetadata<'_> {
+        let [n, h, u, end] = item.bounds.map(|b| b as usize);
+        let s = |a: usize, b: usize| {
+            self.bytes
+                .get(a..b)
+                .and_then(|raw| std::str::from_utf8(raw).ok())
+                .unwrap_or_default()
+        };
+        BorrowedMetadata {
+            metric_type: item.metric_type,
+            metric_family_name: s(n, h),
+            help: s(h, u),
+            unit: s(u, end),
+        }
+    }
 }
 
 impl WorkerArena {
@@ -220,6 +318,7 @@ impl WorkerArena {
             histograms_arena: Vec::new(),
             exemplars_arena: Vec::new(),
             shard_buckets: (0..num_shards).map(|_| Vec::with_capacity(128)).collect(),
+            metadata: MetadataStash::new(num_shards),
             empty_tenant_errors: 0,
             invalid_tenant_indices: Vec::new(),
             total_series: 0,
@@ -239,6 +338,7 @@ impl WorkerArena {
         for b in &mut self.shard_buckets {
             b.clear();
         }
+        self.metadata.reset_for(num_shards);
         self.empty_tenant_errors = 0;
         self.invalid_tenant_indices.clear();
         self.total_series = 0;
@@ -268,6 +368,10 @@ impl Drop for ArenaPoolGuard<'_> {
             a.wr_scratch.clear();
             for b in &mut a.shard_buckets {
                 b.clear();
+            }
+            a.metadata.clear();
+            if a.metadata.bytes.capacity() > 1024 * 1024 {
+                a.metadata.bytes = Vec::new();
             }
             // Prevent retaining outlier allocations after massive spikes.
             if a.label_bytes_arena.capacity() > 4 * 1024 * 1024 {
@@ -423,19 +527,30 @@ impl IngesterShardedBatchConsumer {
             rec_tenant_idx.push(tid_idx);
         }
 
-        // Validate every tenant ID once against dskit's strict rules (prevents path traversal).
-        let tenant_invalid_errors: SmallVec<[Option<String>; 4]> = tenants
-            .iter()
-            .map(|tid| {
-                if tid.is_empty() {
-                    None
-                } else {
-                    mimir_common::tenant::valid_tenant_id(tid)
-                        .err()
-                        .map(|e| e.to_string())
+        // Resolve every distinct record key once to its canonical tenant ID like Go's
+        // `tenant.TenantID(ctx)` (dskit/tenant/resolver.go): strip `:key=value` metadata
+        // (`123456:product=k6` -> `123456`), accept `a|a`, and apply dskit's strict
+        // validation (prevents path traversal).
+        let mut tenant_ids: SmallVec<[String; 4]> = SmallVec::with_capacity(tenants.len());
+        let mut tenant_invalid_errors: SmallVec<[Option<String>; 4]> =
+            SmallVec::with_capacity(tenants.len());
+        for tid in &tenants {
+            if tid.is_empty() {
+                tenant_ids.push(String::new());
+                tenant_invalid_errors.push(None);
+                continue;
+            }
+            match mimir_common::tenant::parse_single_tenant_id(tid) {
+                Ok(id) => {
+                    tenant_ids.push(id);
+                    tenant_invalid_errors.push(None);
                 }
-            })
-            .collect();
+                Err(e) => {
+                    tenant_ids.push(String::new());
+                    tenant_invalid_errors.push(Some(e.to_string()));
+                }
+            }
+        }
 
         let num_shards = if self.kafka_cfg.ingestion_concurrency_max <= 0 {
             1
@@ -487,6 +602,7 @@ impl IngesterShardedBatchConsumer {
                 histograms_arena,
                 exemplars_arena,
                 shard_buckets,
+                metadata,
                 empty_tenant_errors,
                 invalid_tenant_indices,
                 total_series,
@@ -495,8 +611,7 @@ impl IngesterShardedBatchConsumer {
             let mut bucket_bases = [0usize; 16];
             for (local_i, rec) in slice.iter().enumerate() {
                 let tenant_idx = tids[local_i];
-                let tenant_id = &tenants[tenant_idx as usize];
-                if tenant_id.is_empty() {
+                if tenants[tenant_idx as usize].is_empty() {
                     *empty_tenant_errors += 1;
                     continue;
                 }
@@ -520,6 +635,7 @@ impl IngesterShardedBatchConsumer {
                     }
 
                     let mut rec_metadata: Vec<BorrowedMetadata<'_>> = Vec::new();
+                    let mut rec_first_shard: Option<usize> = None;
                     let stream_res = decode_rw2_stream(
                         &rec.value,
                         DecodeOptions::kafka_v2(),
@@ -571,6 +687,7 @@ impl IngesterShardedBatchConsumer {
                             }
 
                             let shard = (prom_hash as usize) & shard_mask;
+                            rec_first_shard.get_or_insert(shard);
                             shard_buckets[shard].push(ShardSeriesItem {
                                 worker_idx: worker_idx as u16,
                                 record_offset: rec.offset,
@@ -607,12 +724,18 @@ impl IngesterShardedBatchConsumer {
                                 }
                             }
                             if !rec_metadata.is_empty() {
-                                let meta_count = self
-                                    .ingester
-                                    .push_metadata_items(tenant_id, &rec_metadata);
-                                if meta_count > 0 {
-                                    self.ingester.ingestion_rate.add(meta_count as i64);
-                                }
+                                metadata.stash(
+                                    num_shards,
+                                    ShardMetadataItem {
+                                        worker_idx: worker_idx as u16,
+                                        tenant_idx,
+                                        record_offset: rec.offset,
+                                        metric_type: 0,
+                                        bounds: [0; 4],
+                                    },
+                                    rec_first_shard,
+                                    rec_metadata.iter().copied(),
+                                );
                             }
                         }
                         Err(e) => {
@@ -645,13 +768,7 @@ impl IngesterShardedBatchConsumer {
                         }
                     };
 
-                if borrowed.metadata_len() > 0 {
-                    let meta_count = self.ingester.push_metadata_borrowed(tenant_id, &borrowed);
-                    if meta_count > 0 {
-                        self.ingester.ingestion_rate.add(meta_count as i64);
-                    }
-                }
-
+                let mut rec_first_shard: Option<usize> = None;
                 let source = borrowed.source;
                 let skip_label_validation = borrowed.skip_label_validation;
                 let ts_count = borrowed.timeseries_len();
@@ -756,6 +873,7 @@ impl IngesterShardedBatchConsumer {
                     }
 
                     let shard = (prom_hash as usize) & shard_mask;
+                    rec_first_shard.get_or_insert(shard);
                     shard_buckets[shard].push(ShardSeriesItem {
                         worker_idx: worker_idx as u16,
                         record_offset: rec.offset,
@@ -777,6 +895,21 @@ impl IngesterShardedBatchConsumer {
                         min_ts,
                     });
                     *total_series += 1;
+                }
+
+                if borrowed.metadata_len() > 0 {
+                    metadata.stash(
+                        num_shards,
+                        ShardMetadataItem {
+                            worker_idx: worker_idx as u16,
+                            tenant_idx,
+                            record_offset: rec.offset,
+                            metric_type: 0,
+                            bounds: [0; 4],
+                        },
+                        rec_first_shard,
+                        borrowed.metadata(),
+                    );
                 }
 
                 let _ = rec_offset_start;
@@ -807,8 +940,10 @@ impl IngesterShardedBatchConsumer {
         }
 
         let mut total_series = 0usize;
+        let mut total_metadata = 0usize;
         for a in &pool_guard.arenas {
             total_series += a.total_series;
+            total_metadata += a.metadata.total;
             for _ in 0..a.empty_tenant_errors {
                 let err = PusherError::ingester(ErrorCause::BadData, "InvalidArgument", "no org id");
                 let _ = self.error_handler.is_server_error("", Some(&err));
@@ -823,50 +958,62 @@ impl IngesterShardedBatchConsumer {
             }
         }
 
-        if total_series == 0 {
+        if total_series == 0 && total_metadata == 0 {
             return Ok(());
         }
 
         // Phase B: parallel shard ingestion across `num_shards` threads.
         let arenas_ref: &[WorkerArena] = &pool_guard.arenas;
         let tenants_ref: &[String] = &tenants;
+        let tenant_ids_ref: &[String] = &tenant_ids;
 
         let run_shard = |shard_idx: usize| -> Result<(), String> {
             let mut items_for_shard: Vec<ShardSeriesItem> = Vec::new();
+            let mut metas_for_shard: Vec<ShardMetadataItem> = Vec::new();
             for arena in arenas_ref {
                 let b = &arena.shard_buckets[shard_idx];
                 if !b.is_empty() {
                     items_for_shard.extend_from_slice(b);
                 }
+                if let Some(mb) = arena.metadata.buckets.get(shard_idx) {
+                    metas_for_shard.extend_from_slice(mb);
+                }
             }
-            if items_for_shard.is_empty() {
+            if items_for_shard.is_empty() && metas_for_shard.is_empty() {
                 return Ok(());
             }
 
             if tenants_ref.len() > 1 {
                 items_for_shard.sort_by_key(|it| it.tenant_idx);
+                metas_for_shard.sort_by_key(|it| it.tenant_idx);
             }
 
-            let mut batch: Vec<PrehashedSeriesItem<'_>> =
-                Vec::with_capacity(items_for_shard.len().min(SHARD_COMMIT_MAX_SERIES));
-            let mut batch_samples = 0usize;
-            let mut batch_min_ts = i64::MAX;
-            let mut cur_tenant_idx = items_for_shard[0].tenant_idx;
-            let mut cur_source = items_for_shard[0].source;
-            let mut last_offset = items_for_shard[0].record_offset;
-
+            // One flush == one Go `Pusher.PushToStorageAndReleaseRequest` call: the series
+            // batch plus (on the tenant's first flush in this shard) its metadata, all under a
+            // single `startPushRequest` and `pushErrorHandler.IsServerError` accounting.
             let flush_batch = |tenant_idx: u32,
                                    source_raw: i32,
                                    min_ts: i64,
                                    last_off: i64,
-                                   batch_vec: &mut Vec<PrehashedSeriesItem<'_>>|
+                                   batch_vec: &mut Vec<PrehashedSeriesItem<'_>>,
+                                   metas: &[ShardMetadataItem]|
              -> Result<(), String> {
-                if batch_vec.is_empty() {
+                if batch_vec.is_empty() && metas.is_empty() {
                     return Ok(());
                 }
-                let tenant_id = &tenants_ref[tenant_idx as usize];
+                let tenant_key = &tenants_ref[tenant_idx as usize];
+                let tenant_id = &tenant_ids_ref[tenant_idx as usize];
                 let norm_source = cortexpb::write_request::SourceEnum::try_from(source_raw)
                     .unwrap_or(cortexpb::write_request::SourceEnum::Api);
+                let contents = match (batch_vec.is_empty(), metas.is_empty()) {
+                    (false, false) => "timeseries_and_metadata",
+                    (false, true) => "timeseries",
+                    _ => "metadata",
+                };
+                let meta_views: SmallVec<[BorrowedMetadata<'_>; 8]> = metas
+                    .iter()
+                    .map(|it| arenas_ref[it.worker_idx as usize].metadata.view(it))
+                    .collect();
 
                 let m = &self.metrics.storage_pusher_metrics;
                 m.batch_age.observe(batch_started.elapsed().as_secs_f64());
@@ -876,23 +1023,29 @@ impl IngesterShardedBatchConsumer {
                 let proc_t0 = Instant::now();
                 let res = self
                     .ingester
-                    .ingest_prehashed_shard_batch(tenant_id, norm_source, min_ts, batch_vec)
+                    .ingest_prehashed_shard_batch(
+                        tenant_id,
+                        norm_source,
+                        min_ts,
+                        batch_vec,
+                        &meta_views,
+                    )
                     .map_err(ingester_err_to_pusher_err);
                 m.processing_time
-                    .with_label_values(&["timeseries"])
+                    .with_label_values(&[contents])
                     .observe(proc_t0.elapsed().as_secs_f64());
                 batch_vec.clear();
 
                 match res {
                     Ok(()) => {
-                        self.error_handler.is_server_error(tenant_id, None);
+                        self.error_handler.is_server_error(tenant_key, None);
                         Ok(())
                     }
                     Err(err) => {
-                        if self.error_handler.is_server_error(tenant_id, Some(&err)) {
+                        if self.error_handler.is_server_error(tenant_key, Some(&err)) {
                             m.batching_queue_metrics.flush_errors_total.inc();
                             Err(format!(
-                                "consuming record at offset {last_off} for tenant {tenant_id}: {err}"
+                                "consuming record at offset {last_off} for tenant {tenant_key}: {err}"
                             ))
                         } else {
                             Ok(())
@@ -900,6 +1053,46 @@ impl IngesterShardedBatchConsumer {
                     }
                 }
             };
+
+            // End (exclusive) of the run of metadata items for `tenant_idx` starting at `pos`.
+            let meta_run_end = |pos: usize, tenant_idx: u32| -> usize {
+                metas_for_shard[pos..]
+                    .iter()
+                    .position(|it| it.tenant_idx != tenant_idx)
+                    .map_or(metas_for_shard.len(), |n| pos + n)
+            };
+            // Metadata-only flushes for tenants (sorted) before `upto` without series here.
+            let flush_metadata_only_before = |upto: u32, pos: &mut usize| -> Result<(), String> {
+                while let Some(first) = metas_for_shard.get(*pos) {
+                    if first.tenant_idx >= upto {
+                        break;
+                    }
+                    let end = meta_run_end(*pos, first.tenant_idx);
+                    let last_off = metas_for_shard[end - 1].record_offset;
+                    flush_batch(
+                        first.tenant_idx,
+                        cortexpb::write_request::SourceEnum::Api as i32,
+                        i64::MAX,
+                        last_off,
+                        &mut Vec::new(),
+                        &metas_for_shard[*pos..end],
+                    )?;
+                    *pos = end;
+                }
+                Ok(())
+            };
+            let mut meta_pos = 0usize;
+
+            let Some(first_item) = items_for_shard.first() else {
+                return flush_metadata_only_before(u32::MAX, &mut meta_pos);
+            };
+            let mut batch: Vec<PrehashedSeriesItem<'_>> =
+                Vec::with_capacity(items_for_shard.len().min(SHARD_COMMIT_MAX_SERIES));
+            let mut batch_samples = 0usize;
+            let mut batch_min_ts = i64::MAX;
+            let mut cur_tenant_idx = first_item.tenant_idx;
+            let mut cur_source = first_item.source;
+            let mut last_offset = first_item.record_offset;
 
             for item in &items_for_shard {
                 let norm_item_src = cortexpb::write_request::SourceEnum::try_from(item.source)
@@ -915,13 +1108,17 @@ impl IngesterShardedBatchConsumer {
                         && (batch_samples + (item.samples_len as usize) > SHARD_COMMIT_MAX_SAMPLES
                             || batch.len() >= SHARD_COMMIT_MAX_SERIES))
                 {
+                    flush_metadata_only_before(cur_tenant_idx, &mut meta_pos)?;
+                    let meta_end = meta_run_end(meta_pos, cur_tenant_idx);
                     flush_batch(
                         cur_tenant_idx,
                         norm_cur_src,
                         batch_min_ts,
                         last_offset,
                         &mut batch,
+                        &metas_for_shard[meta_pos..meta_end],
                     )?;
+                    meta_pos = meta_end;
                     batch_samples = 0;
                     batch_min_ts = i64::MAX;
                     cur_tenant_idx = item.tenant_idx;
@@ -967,15 +1164,18 @@ impl IngesterShardedBatchConsumer {
             let norm_cur_src = cortexpb::write_request::SourceEnum::try_from(cur_source)
                 .map(|s| s as i32)
                 .unwrap_or(cortexpb::write_request::SourceEnum::Api as i32);
+            flush_metadata_only_before(cur_tenant_idx, &mut meta_pos)?;
+            let meta_end = meta_run_end(meta_pos, cur_tenant_idx);
             flush_batch(
                 cur_tenant_idx,
                 norm_cur_src,
                 batch_min_ts,
                 last_offset,
                 &mut batch,
+                &metas_for_shard[meta_pos..meta_end],
             )?;
-
-            Ok(())
+            meta_pos = meta_end;
+            flush_metadata_only_before(u32::MAX, &mut meta_pos)
         };
 
         let mut first_err: Option<String> = None;
@@ -1255,5 +1455,207 @@ mod tests {
             consumer.metrics.storage_pusher_metrics.client_err_requests.get(),
             1.0
         );
+    }
+}
+
+#[cfg(test)]
+mod consumer_tests {
+    use super::*;
+    use mimir_common::services::State;
+    use mimir_storage::ingest::{RecordSerializer, RecordVersion};
+
+    fn running_ingester(dir: &std::path::Path) -> Arc<Ingester> {
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-0".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = dir.to_string_lossy().into_owned();
+        let overrides = mimir_config::Overrides::new(mimir_config::LimitsConfig::default());
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            overrides,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(State::Running);
+        ing
+    }
+
+    fn consumer(ing: &Arc<Ingester>, reg: &prometheus::Registry) -> IngesterShardedBatchConsumer {
+        IngesterShardedBatchConsumer::new(
+            Arc::clone(ing),
+            mimir_config::IngestStorageConfig::default().kafka,
+            PusherConsumerMetrics::new(Some(reg)),
+        )
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
+    fn series(name: &str) -> cortexpb::TimeSeries {
+        cortexpb::TimeSeries {
+            labels: vec![cortexpb::LabelPair {
+                name: "__name__".into(),
+                value: bytes::Bytes::copy_from_slice(name.as_bytes()),
+            }],
+            samples: vec![cortexpb::Sample {
+                timestamp_ms: now_ms(),
+                value: 1.0,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn metadata(name: &str) -> cortexpb::MetricMetadata {
+        cortexpb::MetricMetadata {
+            r#type: cortexpb::metric_metadata::MetricType::Counter as i32,
+            metric_family_name: name.into(),
+            help: "help".into(),
+            unit: String::new(),
+        }
+    }
+
+    fn records(
+        version: RecordVersion,
+        key: &str,
+        req: &cortexpb::WriteRequest,
+        first_offset: i64,
+    ) -> Vec<FetchedRecord> {
+        let (recs, _) = RecordSerializer::new(version)
+            .to_records("t", 0, key, req, 16 << 20)
+            .unwrap();
+        recs.into_iter()
+            .enumerate()
+            .map(|(i, r)| FetchedRecord {
+                key: r.key,
+                value: r.value,
+                headers: r.headers,
+                offset: first_offset + i as i64,
+                timestamp_ms: 0,
+            })
+            .collect()
+    }
+
+    fn processing_count(reg: &prometheus::Registry, contents: &str) -> u64 {
+        reg.gather()
+            .iter()
+            .find(|mf| mf.get_name() == "cortex_ingest_storage_reader_pusher_processing_time_seconds")
+            .and_then(|mf| {
+                mf.get_metric()
+                    .iter()
+                    .find(|m| m.get_label().iter().any(|l| l.get_value() == contents))
+                    .map(|m| m.get_histogram().get_sample_count())
+            })
+            .unwrap_or(0)
+    }
+
+    /// W2-02: dskit `tenant.TenantID` strips `:key=value` metadata from the Kafka record key.
+    #[test]
+    fn record_key_with_tenant_metadata_is_normalized() {
+        for version in [RecordVersion::V1, RecordVersion::V2] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ing = running_ingester(tmp.path());
+            let reg = prometheus::Registry::new();
+            let c = consumer(&ing, &reg);
+            let req = cortexpb::WriteRequest {
+                timeseries: vec![series("m1")],
+                ..Default::default()
+            };
+            let mut recs = records(version, "123456:product=k6", &req, 1);
+            recs.extend(records(version, "a|a:k=v", &req, 2));
+            recs.extend(records(version, "x|y", &req, 3));
+            c.consume_records_sync(&recs).unwrap();
+
+            assert_eq!(ing.get_tsdb("123456").unwrap().db.head().num_series(), 1);
+            assert!(ing.get_tsdb("123456:product=k6").is_none());
+            assert_eq!(ing.get_tsdb("a").unwrap().db.head().num_series(), 1);
+            assert!(ing.get_tsdb("x").is_none() && ing.get_tsdb("x|y").is_none());
+            let m = &c.metrics.storage_pusher_metrics;
+            assert_eq!(m.client_err_requests.get(), 1.0, "x|y is a too-many-org-ids error");
+            assert_eq!(m.total_requests.get(), 3.0);
+        }
+    }
+
+    /// W2-11: metadata goes through the pusher accounting like Go `requestContents`.
+    #[test]
+    fn metadata_records_are_accounted_as_pusher_requests() {
+        for version in [RecordVersion::V1, RecordVersion::V2] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ing = running_ingester(tmp.path());
+            let reg = prometheus::Registry::new();
+            let c = consumer(&ing, &reg);
+
+            let meta_only = cortexpb::WriteRequest {
+                metadata: vec![metadata("m_meta")],
+                ..Default::default()
+            };
+            c.consume_records_sync(&records(version, "tenant-a", &meta_only, 1))
+                .unwrap();
+            let m = &c.metrics.storage_pusher_metrics;
+            assert_eq!(m.total_requests.get(), 1.0);
+            // Go decodes RW2 metadata as attached to a (sample-less) series, so a v2
+            // metadata-only record still reaches the pusher as `timeseries_and_metadata`.
+            let v2 = version == RecordVersion::V2;
+            let meta_only_contents = if v2 { "timeseries_and_metadata" } else { "metadata" };
+            assert_eq!(processing_count(&reg, meta_only_contents), 1);
+            if !v2 {
+                assert!(ing.get_tsdb("tenant-a").is_none(), "metadata-only must not create a TSDB");
+            }
+            let stored = ing
+                .get_user_metadata("tenant-a")
+                .unwrap()
+                .query(&[], "", -1, -1);
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].metric_family_name, "m_meta");
+
+            let mixed = cortexpb::WriteRequest {
+                timeseries: vec![series("m1")],
+                metadata: vec![metadata("m1")],
+                ..Default::default()
+            };
+            c.consume_records_sync(&records(version, "tenant-a", &mixed, 2))
+                .unwrap();
+            assert_eq!(m.total_requests.get(), 2.0);
+            assert_eq!(processing_count(&reg, "timeseries_and_metadata"), 1 + u64::from(v2));
+            assert_eq!(processing_count(&reg, "timeseries"), 0);
+            assert_eq!(
+                ing.get_user_metadata("tenant-a")
+                    .unwrap()
+                    .query(&[], "", -1, -1)
+                    .len(),
+                2
+            );
+            assert_eq!(ing.get_tsdb("tenant-a").unwrap().db.head().num_series(), 1);
+        }
+    }
+
+    /// W2-11: metadata-only records pass through `startPushRequest` (rejected when not running).
+    #[test]
+    fn metadata_only_record_goes_through_start_push_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = running_ingester(tmp.path());
+        ing.set_state_for_test(State::Stopping);
+        let reg = prometheus::Registry::new();
+        let c = consumer(&ing, &reg);
+        let meta_only = cortexpb::WriteRequest {
+            metadata: vec![metadata("m_meta")],
+            ..Default::default()
+        };
+        let err = c
+            .consume_records_sync(&records(RecordVersion::V1, "tenant-a", &meta_only, 7))
+            .unwrap_err();
+        assert!(err.contains("consuming record at offset 7 for tenant tenant-a"), "{err}");
+        assert_eq!(c.metrics.storage_pusher_metrics.server_err_requests.get(), 1.0);
+        assert!(ing.get_user_metadata("tenant-a").is_none());
     }
 }
