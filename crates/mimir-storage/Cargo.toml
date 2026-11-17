@@ -44,5 +44,10 @@ ulid = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "kafka_v2_reader"
+harness = false

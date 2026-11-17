@@ -23,5 +23,10 @@ tower = { workspace = true }
 xxhash-rust = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
+
+[[bench]]
+name = "wire_codecs"
+harness = false
