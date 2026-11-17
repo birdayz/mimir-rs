@@ -416,7 +416,7 @@ mod tests {
     }
 
     /// Requires a working system DNS resolver: only runs when
-    /// `MIMIR_RS_NETWORK_TESTS=1` (`#[ignore]` is forbidden in this repo).
+    /// `MIMIR_RS_NETWORK_TESTS=1` (ignored tests are forbidden in this repo).
     #[tokio::test]
     async fn network_nxdomain_is_not_found_and_real_names_resolve() {
         if std::env::var("MIMIR_RS_NETWORK_TESTS").as_deref() != Ok("1") {
