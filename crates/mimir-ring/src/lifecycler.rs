@@ -26,7 +26,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use crate::kv::memberlist::MemberlistKv;
-use crate::kv::{build_kv_client, BoxFuture, CasCallbackError, CasOutcome, KvClient, KvError};
+use crate::kv::{
+    build_kv_client, registerer_with_kv_name, AsRegisterer, BoxFuture, CasCallbackError,
+    CasOutcome, KvClient, KvError,
+};
 use crate::ring::model::{ring_desc_codec, system_time_to_unix_secs, DescExt, InstanceDescExt};
 use crate::ring::replication_strategy::WRITE;
 use crate::ring::util::{get_instance_addr, get_instance_port, join_host_port};
@@ -1041,8 +1044,12 @@ pub struct Lifecycler {
 }
 
 impl Lifecycler {
+    /// Go `ring.NewLifecycler`. `reg` is the Go registerer (Mimir's ingester
+    /// passes `cortex_`-prefixed); the KV client registers its metrics with
+    /// `kv_name="<ring_name>-lifecycler"` like dskit. The lifecycler's own
+    /// metrics are registered into the underlying registry.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new<R: AsRegisterer + ?Sized>(
         ring_cfg: &RingConfig,
         listen_port: u16,
         flush_transferer: Option<Arc<dyn FlushTransferer>>,
@@ -1050,9 +1057,18 @@ impl Lifecycler {
         ring_key: &str,
         flush_on_shutdown: bool,
         memberlist_kv: Option<Arc<MemberlistKv>>,
-        reg: Option<&Registry>,
+        reg: Option<&R>,
     ) -> Result<Arc<Self>, LifecyclerError> {
-        let store = build_kv_client(&ring_cfg.kvstore, ring_desc_codec(), memberlist_kv, reg)?;
+        let registerer = reg.map(|r| r.as_registerer());
+        let kv_reg =
+            registerer_with_kv_name(registerer.as_ref(), &format!("{ring_name}-lifecycler"));
+        let store = build_kv_client(
+            &ring_cfg.kvstore,
+            ring_desc_codec(),
+            memberlist_kv,
+            kv_reg.as_ref(),
+        )?;
+        let reg: Option<&Registry> = registerer.as_ref().map(|r| r.registry());
         let cfg = LifecyclerConfig::from_ring_config(ring_cfg, listen_port)?;
         Ok(Self::with_store(
             cfg,

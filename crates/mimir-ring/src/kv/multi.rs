@@ -14,7 +14,11 @@ use parking_lot::Mutex;
 use prometheus::{Counter, Gauge, GaugeVec, Opts, Registry};
 use tracing::{info, warn};
 
-use super::{BoxFuture, CasCallbackError, CasFn, CasOutcome, KvClient, KvError};
+use super::{BoxFuture, CasCallbackError, CasFn, CasOutcome, Codec, KvClient, KvError, Registerer};
+
+/// Value written to the primary store, encoded with the mirror codec (or the
+/// encoding error).
+type EncodedMirrorValue = Result<Vec<u8>, String>;
 
 #[derive(Clone)]
 pub struct NamedKvClient {
@@ -41,7 +45,7 @@ struct MultiMetrics {
 }
 
 impl MultiMetrics {
-    fn new(reg: Option<&Registry>) -> Self {
+    fn new(reg: Option<&Registerer>) -> Self {
         let primary_store = GaugeVec::new(
             Opts::new("multikv_primary_store", "Selected primary KV store"),
             &["store"],
@@ -87,6 +91,10 @@ pub struct MultiKv {
     in_progress: Mutex<HashMap<usize, InProgressWatch>>,
     in_progress_cnt: AtomicUsize,
     metrics: MultiMetrics,
+    /// Codec used to copy the value written to the primary store into the
+    /// secondary stores when mirroring through the generic [`KvClient::cas`]
+    /// (Go hands the same `interface{}` value to every store).
+    mirror_codec: Option<Arc<dyn Codec>>,
 }
 
 impl MultiKv {
@@ -94,6 +102,19 @@ impl MultiKv {
         cfg: MultiKVConfig,
         clients: Vec<NamedKvClient>,
         reg: Option<&Registry>,
+    ) -> Arc<Self> {
+        Self::with_registerer(cfg, clients, None, reg.map(Registerer::new).as_ref())
+    }
+
+    /// Go `NewMultiClient(cfg, clients, logger, reg)` with a (possibly
+    /// wrapped) Go-style registerer. When `mirror_codec` is set, the generic
+    /// [`KvClient::cas`] mirrors the written value to the secondary stores
+    /// like Go `MultiClient.CAS`.
+    pub fn with_registerer(
+        cfg: MultiKVConfig,
+        clients: Vec<NamedKvClient>,
+        mirror_codec: Option<Arc<dyn Codec>>,
+        reg: Option<&Registerer>,
     ) -> Arc<Self> {
         let m = Arc::new(Self {
             clients,
@@ -103,6 +124,7 @@ impl MultiKv {
             in_progress: Mutex::new(HashMap::new()),
             in_progress_cnt: AtomicUsize::new(0),
             metrics: MultiMetrics::new(reg),
+            mirror_codec,
         });
         m.update_primary_store_gauge();
         m.update_mirror_enabled_gauge();
@@ -283,10 +305,84 @@ impl KvClient for MultiKv {
         })
     }
 
-    fn cas<'a>(&'a self, key: &'a str, f: CasFn) -> BoxFuture<'a, Result<(), KvError>> {
+    fn cas<'a>(&'a self, key: &'a str, mut f: CasFn) -> BoxFuture<'a, Result<(), KvError>> {
         Box::pin(async move {
             let (_, primary) = self.get_primary_client();
-            primary.client.cas(key, f).await
+            let Some(codec) = self.mirror_codec.clone() else {
+                return primary.client.cas(key, f).await;
+            };
+            if !self.mirroring_enabled.load(Ordering::Acquire) {
+                return primary.client.cas(key, f).await;
+            }
+
+            // Capture the last value handed to the primary store (encoded, so
+            // it can be re-created for each secondary store).
+            let updated: Arc<Mutex<Option<EncodedMirrorValue>>> = Arc::new(Mutex::new(None));
+            let updated_cb = updated.clone();
+            let enc_codec = codec.clone();
+            let cb: CasFn = Box::new(move |cur| {
+                let out = f(cur)?;
+                *updated_cb.lock() = match &out {
+                    CasOutcome::NoChange => None,
+                    CasOutcome::Update(v) => {
+                        Some(enc_codec.encode(v.as_ref()).map_err(|e| e.to_string()))
+                    }
+                };
+                Ok(out)
+            });
+
+            let res = primary.client.cas(key, cb).await;
+            if res.is_ok() && self.mirroring_enabled.load(Ordering::Acquire) {
+                let maybe = updated.lock().take();
+                if let Some(encoded) = maybe {
+                    for kv in &self.clients {
+                        if kv.name == primary.name {
+                            continue;
+                        }
+                        self.metrics.mirror_writes.inc();
+                        let value = match &encoded {
+                            Ok(bytes) => codec.decode(bytes),
+                            Err(e) => Err(KvError::Codec(e.clone())),
+                        };
+                        let r = match value {
+                            Err(e) => Err(e),
+                            Ok(value) => {
+                                let mut value = Some(value);
+                                // try once
+                                let sec_cb: CasFn = Box::new(move |_| {
+                                    value.take().map(CasOutcome::Update).ok_or_else(|| {
+                                        CasCallbackError::fatal(KvError::UnexpectedState(
+                                            "mirror value already consumed".to_string(),
+                                        ))
+                                    })
+                                });
+                                let fut = kv.client.cas(key, sec_cb);
+                                if !self.mirror_timeout.is_zero() {
+                                    match tokio::time::timeout(self.mirror_timeout, fut).await {
+                                        Ok(r) => r,
+                                        Err(_) => Err(KvError::Other(
+                                            "context deadline exceeded".to_string(),
+                                        )),
+                                    }
+                                } else {
+                                    fut.await
+                                }
+                            }
+                        };
+                        if let Err(err) = r {
+                            self.metrics.mirror_failures.inc();
+                            warn!(
+                                key,
+                                primary = %primary.name,
+                                secondary = %kv.name,
+                                %err,
+                                "failed to update value in secondary store"
+                            );
+                        }
+                    }
+                }
+            }
+            res
         })
     }
 

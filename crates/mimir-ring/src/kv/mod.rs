@@ -6,8 +6,11 @@
 
 pub mod consul;
 pub mod etcd;
+pub mod ha_replica;
 pub mod inmemory;
 pub mod memberlist;
+pub mod metrics;
+pub mod mock;
 pub mod multi;
 pub mod prefix;
 
@@ -21,6 +24,7 @@ use mimir_config::ingester::KVStoreConfig;
 use thiserror::Error;
 
 use self::memberlist::mergeable::Mergeable;
+pub use self::metrics::{registerer_with_kv_name, AsRegisterer, Registerer, Role};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -44,6 +48,14 @@ pub enum KvError {
     UnexpectedState(String),
     #[error("context canceled")]
     Canceled,
+    /// An `httpgrpc` error (Go `httpgrpc.Errorf`): tracked in
+    /// `kv_request_duration_seconds` CAS metrics with its HTTP code.
+    #[error("rpc error: code = Code({code}) desc = {body}")]
+    HttpGrpc { code: i32, body: String },
+    /// An error returned to abort a CAS operation (Go errors implementing
+    /// `IsOperationAborted() bool` returning true): tracked as `200`.
+    #[error("{0}")]
+    OperationAborted(String),
     #[error("{0}")]
     Other(String),
 }
@@ -315,28 +327,49 @@ where
     client.cas(key, cb).await
 }
 
-/// Builds a [`KvClient`] from [`KVStoreConfig`].
-pub fn build_kv_client(
+/// Builds a [`KvClient`] from [`KVStoreConfig`] (Go `kv.NewClient`).
+///
+/// When `reg` is set, the client is wrapped with the `kv_request_duration_seconds`
+/// metrics client (`type=<backend>`, `role="primary"`) registered through `reg`,
+/// exactly like dskit. Callers must pass the same registerer as Go, i.e.
+/// usually `registerer_with_kv_name(Some(&base), "<name>")` where `base` may be
+/// prefix-wrapped (e.g. `cortex_`). Registering twice the same series set fails
+/// (Go panics in `promauto`).
+pub fn build_kv_client<R: AsRegisterer + ?Sized>(
     cfg: &KVStoreConfig,
     codec: Arc<dyn Codec>,
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
-    reg: Option<&prometheus::Registry>,
+    reg: Option<&R>,
 ) -> Result<Arc<dyn KvClient>, KvError> {
-    let client = create_client(&cfg.store, &cfg.prefix, cfg, codec, memberlist_kv, reg)?;
-    Ok(client)
+    let reg = reg.map(|r| r.as_registerer());
+    create_client(
+        &cfg.store,
+        &cfg.prefix,
+        cfg,
+        codec,
+        memberlist_kv,
+        Role::Primary,
+        reg.as_ref(),
+    )
 }
 
-fn create_client(
+/// Go `kv.createClient`.
+pub fn create_client(
     backend: &str,
     prefix: &str,
     cfg: &KVStoreConfig,
     codec: Arc<dyn Codec>,
     memberlist_kv: Option<Arc<memberlist::MemberlistKv>>,
-    reg: Option<&prometheus::Registry>,
+    role: Role,
+    reg: Option<&Registerer>,
 ) -> Result<Arc<dyn KvClient>, KvError> {
     let base: Arc<dyn KvClient> = match backend {
         "inmemory" => Arc::new(inmemory::InMemoryKv::shared_with_codec(codec)),
-        "consul" => Arc::new(consul::ConsulKv::new(cfg.consul.clone(), codec, reg)?),
+        "consul" => Arc::new(consul::ConsulKv::with_registerer(
+            cfg.consul.clone(),
+            codec,
+            reg,
+        )?),
         "etcd" => Arc::new(etcd::EtcdKv::new(cfg.etcd.clone(), codec)?),
         "memberlist" => {
             let ml = memberlist_kv.ok_or_else(|| {
@@ -366,17 +399,19 @@ fn create_client(
                 cfg,
                 codec.clone(),
                 memberlist_kv.clone(),
+                Role::Primary,
                 reg,
             )?;
             let secondary = create_client(
                 &cfg.multi.secondary,
                 "",
                 cfg,
-                codec,
+                codec.clone(),
                 memberlist_kv,
+                Role::Secondary,
                 reg,
             )?;
-            multi::MultiKv::new(
+            multi::MultiKv::with_registerer(
                 cfg.multi.clone(),
                 vec![
                     multi::NamedKvClient {
@@ -388,9 +423,12 @@ fn create_client(
                         client: secondary,
                     },
                 ],
+                Some(codec),
                 reg,
             )
         }
+        // This case is for testing. The mock KV client does not do anything internally.
+        "mock" => Arc::new(mock::MockKv::new()),
         other => {
             return Err(KvError::InvalidConfig(format!(
                 "invalid KV store type: {other}"
@@ -398,12 +436,15 @@ fn create_client(
         }
     };
 
-    if prefix.is_empty() {
-        Ok(base)
+    let client: Arc<dyn KvClient> = if prefix.is_empty() {
+        base
     } else {
-        Ok(Arc::new(prefix::PrefixedKvClient::new(
-            base,
-            prefix.to_string(),
-        )))
+        Arc::new(prefix::PrefixedKvClient::new(base, prefix.to_string()))
+    };
+
+    // If no Registerer is provided return the raw client.
+    match reg {
+        None => Ok(client),
+        Some(reg) => metrics::new_metrics_client(backend, client, &reg.wrap_with(role.labels())),
     }
 }

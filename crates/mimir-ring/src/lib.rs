@@ -5,6 +5,7 @@
 //! - github.com/grafana/dskit/ring/*
 //! - github.com/hashicorp/memberlist/*
 
+pub mod dns;
 pub mod kv;
 pub mod lifecycler;
 pub mod partition_ring;
