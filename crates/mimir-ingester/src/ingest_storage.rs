@@ -253,24 +253,27 @@ impl MetadataStash {
         self.total = 0;
     }
 
-    /// Copies the metadata of one record, distributing entries across `num_shards` shards
-    /// round-robin like Go `parallelStorageShards.PushToStorageAndReleaseRequest`.
+    /// Copies the metadata of one record, distributing entries round-robin across `spread`
+    /// consecutive shards (the tenant's Go `idealShardsFor`) like Go
+    /// `parallelStorageShards.PushToStorageAndReleaseRequest`.
     fn stash<'m>(
         &mut self,
         num_shards: usize,
+        spread: usize,
         item: ShardMetadataItem,
         first_series_shard: Option<usize>,
         metadata: impl Iterator<Item = BorrowedMetadata<'m>>,
     ) {
         let num_shards = num_shards.clamp(1, self.buckets.len().max(1));
+        let spread = spread.clamp(1, num_shards);
         // Go starts from a random shard to avoid hotspots. Start from the shard holding the
-        // record's first series so small mixed records still flush as one request (as Go's
-        // single ideal shard does), else from the record offset as a well-distributed
+        // record's first series so metadata of small tenants (one ideal shard in Go) flushes
+        // with its series as one request, else from the record offset as a well-distributed
         // stand-in.
-        let mut shard = first_series_shard
-            .unwrap_or((item.record_offset as u64 % num_shards as u64) as usize)
-            % num_shards;
-        for m in metadata {
+        let start = first_series_shard
+            .unwrap_or((item.record_offset as u64 % num_shards as u64) as usize);
+        for (i, m) in metadata.enumerate() {
+            let shard = (start + i % spread) % num_shards;
             let name_start = self.bytes.len() as u32;
             self.bytes.extend_from_slice(m.metric_family_name.as_bytes());
             let help_start = self.bytes.len() as u32;
@@ -286,7 +289,6 @@ impl MetadataStash {
                 });
                 self.total += 1;
             }
-            shard = (shard + 1) % num_shards;
         }
     }
 
@@ -578,6 +580,36 @@ impl IngesterShardedBatchConsumer {
             }
         }
 
+        // Go `parallelStoragePusher.idealShardsFor`: each tenant's series (and metadata) are
+        // spread over at most that many shards, so a small tenant's batch is pushed as one
+        // request like Go. Distinct tenants start at distinct shards to keep Phase B parallel.
+        let tenant_shard_spread: SmallVec<[usize; 4]> = tenant_bytes
+            .iter()
+            .map(|&bytes| {
+                let k = &self.kafka_cfg;
+                if k.ingestion_concurrency_max <= 0 {
+                    return 1;
+                }
+                let expected = bytes as i64
+                    / k.ingestion_concurrency_estimated_bytes_per_sample.max(1);
+                let ideal = expected
+                    / k.ingestion_concurrency_batch_size.max(1)
+                    / k.ingestion_concurrency_target_flushes_per_shard.max(1);
+                ideal.min(k.ingestion_concurrency_max).max(1) as usize
+            })
+            .collect();
+        let shard_for = |tenant_idx: u32, prom_hash: u64| -> usize {
+            let spread = tenant_shard_spread
+                .get(tenant_idx as usize)
+                .copied()
+                .unwrap_or(1);
+            if spread >= num_shards {
+                (prom_hash as usize) & shard_mask
+            } else {
+                (tenant_idx as usize + (prom_hash % spread as u64) as usize) & shard_mask
+            }
+        };
+
         let hw_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         let num_workers = if records.len() <= 1 {
             1
@@ -686,7 +718,7 @@ impl IngesterShardedBatchConsumer {
                                 }
                             }
 
-                            let shard = (prom_hash as usize) & shard_mask;
+                            let shard = shard_for(tenant_idx, prom_hash);
                             rec_first_shard.get_or_insert(shard);
                             shard_buckets[shard].push(ShardSeriesItem {
                                 worker_idx: worker_idx as u16,
@@ -726,6 +758,7 @@ impl IngesterShardedBatchConsumer {
                             if !rec_metadata.is_empty() {
                                 metadata.stash(
                                     num_shards,
+                                    tenant_shard_spread[tenant_idx as usize],
                                     ShardMetadataItem {
                                         worker_idx: worker_idx as u16,
                                         tenant_idx,
@@ -872,7 +905,7 @@ impl IngesterShardedBatchConsumer {
                         }
                     }
 
-                    let shard = (prom_hash as usize) & shard_mask;
+                    let shard = shard_for(tenant_idx, prom_hash);
                     rec_first_shard.get_or_insert(shard);
                     shard_buckets[shard].push(ShardSeriesItem {
                         worker_idx: worker_idx as u16,
@@ -900,6 +933,7 @@ impl IngesterShardedBatchConsumer {
                 if borrowed.metadata_len() > 0 {
                     metadata.stash(
                         num_shards,
+                        tenant_shard_spread[tenant_idx as usize],
                         ShardMetadataItem {
                             worker_idx: worker_idx as u16,
                             tenant_idx,
@@ -1260,13 +1294,14 @@ pub async fn start_ingest_reader(ingester: Arc<Ingester>) -> Result<Arc<IngestRe
     let adapter = Arc::new(IngesterStorageAdapter(Arc::clone(&ingester)));
     let notifier: Arc<dyn PreCommitNotifier> = adapter;
 
-    let pusher_metrics = PusherConsumerMetrics::new(ingester.registry.as_ref());
-    let sharded_consumer = Arc::new(IngesterShardedBatchConsumer::new(
-        Arc::clone(&ingester),
-        ingester.ingest_cfg.kafka.clone(),
-        pusher_metrics,
-    ));
-    let consumer: Arc<dyn RecordBatchConsumer> = Arc::new(ShardedConsumerHandle(sharded_consumer));
+    // Go `NewPusherConsumer(pusher, kafkaCfg, NewPusherConsumerMetrics(reg), ...)`.
+    let consumer_factory = |reg: Option<&prometheus::Registry>| -> Arc<dyn RecordBatchConsumer> {
+        Arc::new(ShardedConsumerHandle(Arc::new(IngesterShardedBatchConsumer::new(
+            Arc::clone(&ingester),
+            ingester.ingest_cfg.kafka.clone(),
+            PusherConsumerMetrics::new(reg),
+        ))))
+    };
     let max_replay_period = Duration::from_nanos(
         ingester
             .blocks_cfg
@@ -1296,7 +1331,7 @@ pub async fn start_ingest_reader(ingester: Arc<Ingester>) -> Result<Arc<IngestRe
             ingester.ingest_partition_id,
             &ingester.cfg.ring.instance_id,
             offset_paths,
-            consumer,
+            &consumer_factory,
             notifier,
             max_replay_period,
             ingester.registry.as_ref(),
@@ -1309,7 +1344,7 @@ pub async fn start_ingest_reader(ingester: Arc<Ingester>) -> Result<Arc<IngestRe
             ingester.ingest_partition_id,
             &ingester.cfg.ring.instance_id,
             Some(offset_file_path),
-            consumer,
+            consumer_factory(ingester.registry.as_ref()),
             notifier,
             ingester.registry.as_ref(),
         )?;
@@ -1595,17 +1630,20 @@ mod consumer_tests {
             let reg = prometheus::Registry::new();
             let c = consumer(&ing, &reg);
 
+            // Go decodes RW2 metadata as attached to a (sample-less) series, so a v2
+            // metadata-only record still reaches the pusher as `timeseries_and_metadata`.
+            let v2 = version == RecordVersion::V2;
+            let meta_entries = vec![metadata("m_meta"), metadata("m_meta_2")];
+            let num_meta = meta_entries.len();
             let meta_only = cortexpb::WriteRequest {
-                metadata: vec![metadata("m_meta")],
+                metadata: meta_entries,
                 ..Default::default()
             };
             c.consume_records_sync(&records(version, "tenant-a", &meta_only, 1))
                 .unwrap();
             let m = &c.metrics.storage_pusher_metrics;
+            // All entries in one request (Go: a single ideal shard for a small tenant).
             assert_eq!(m.total_requests.get(), 1.0);
-            // Go decodes RW2 metadata as attached to a (sample-less) series, so a v2
-            // metadata-only record still reaches the pusher as `timeseries_and_metadata`.
-            let v2 = version == RecordVersion::V2;
             let meta_only_contents = if v2 { "timeseries_and_metadata" } else { "metadata" };
             assert_eq!(processing_count(&reg, meta_only_contents), 1);
             if !v2 {
@@ -1615,8 +1653,8 @@ mod consumer_tests {
                 .get_user_metadata("tenant-a")
                 .unwrap()
                 .query(&[], "", -1, -1);
-            assert_eq!(stored.len(), 1);
-            assert_eq!(stored[0].metric_family_name, "m_meta");
+            assert_eq!(stored.len(), num_meta);
+            assert!(stored.iter().any(|m| m.metric_family_name == "m_meta"));
 
             let mixed = cortexpb::WriteRequest {
                 timeseries: vec![series("m1")],
@@ -1633,7 +1671,7 @@ mod consumer_tests {
                     .unwrap()
                     .query(&[], "", -1, -1)
                     .len(),
-                2
+                num_meta + 1
             );
             assert_eq!(ing.get_tsdb("tenant-a").unwrap().db.head().num_series(), 1);
         }

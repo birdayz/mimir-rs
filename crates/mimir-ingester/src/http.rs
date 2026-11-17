@@ -12,7 +12,10 @@
 //! - `/ingester/tsdb/:tenant` (GET)
 //! - `/ingester/label_churn/:tenant` (GET)
 //! - `/ingester/ring` (GET, POST - when classic Ring is configured)
-//! - `/ingester/partition-ring` (GET, POST - when PartitionRingWatcher is configured)
+//! - `/ingester/partition-ring` (GET, POST - when PartitionRingWatcher is configured; with
+//!   compartments enabled a GET-only index page plus `/ingester/partition-ring/compartment-<id>`)
+//!
+//! Also ported from github.com/grafana/mimir/pkg/compartments/index_page.go (+ `.gohtml`).
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -21,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, RawQuery, State as AxumState};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -31,7 +34,7 @@ use mimir_common::shutdownmarker;
 use mimir_common::tenant::extract_tenant_id_from_http_headers;
 use mimir_config::{parse_go_duration, GoDuration};
 use mimir_proto::ringpb::PartitionState;
-use mimir_ring::partition_ring::http::partition_ring_router;
+use mimir_ring::partition_ring::http::{partition_ring_router, partition_ring_router_at};
 use mimir_ring::partition_ring::{PartitionRingEditor, PartitionRingError, PartitionRingReader};
 use mimir_ring::ring::http::{ring_router, StatusPageConfig};
 use serde::{Deserialize, Serialize};
@@ -90,7 +93,43 @@ pub fn ingester_router(ingester: Arc<Ingester>) -> Router {
         router = router.merge(ring_router(Arc::clone(ring), StatusPageConfig::default()));
     }
 
-    if let Some(ref watcher) = ingester.partition_ring_watcher {
+    let compartment_watchers = ingester
+        .partition_ring_watchers()
+        .filter(|_| ingester.compartments_config().enabled);
+    if let Some(watchers) = compartment_watchers {
+        // Go `RegisterIngesterPartitionRings` with compartments enabled: an index page linking
+        // one page per read compartment, each editing that compartment's `-rc-<id>` ring key.
+        let index = compartments_index_page_html(
+            "Partitions Ring Status",
+            "partition-ring/compartment-<read-compartment-id>",
+            watchers.count(),
+        );
+        router = router.route(
+            "/ingester/partition-ring",
+            get(move || {
+                let body = index.clone();
+                async move {
+                    (
+                        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        body,
+                    )
+                }
+            }),
+        );
+        for (compartment_id, watcher) in watchers.all().iter().enumerate() {
+            let editor = Arc::new(PartitionRingEditor::new(
+                watcher.key(),
+                Arc::clone(watcher.kv_client()),
+            ));
+            let reader: Arc<dyn PartitionRingReader> =
+                Arc::clone(watcher) as Arc<dyn PartitionRingReader>;
+            router = router.merge(partition_ring_router_at(
+                &format!("/ingester/partition-ring/compartment-{compartment_id}"),
+                reader,
+                editor,
+            ));
+        }
+    } else if let Some(ref watcher) = ingester.partition_ring_watcher {
         // Go: `RegisterIngesterPartitionRings(..., PartitionRingKey, kvClient)` with the
         // partition ring watcher's KV client (partition_ring.kvstore, partition ring codec).
         let editor = Arc::new(PartitionRingEditor::new(
@@ -102,6 +141,44 @@ pub fn ingester_router(ingester: Arc<Ingester>) -> Router {
     }
 
     router
+}
+
+/// Go `html/template` escaping of text and attribute values.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&#34;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `compartments.NewIndexPageHandler`: one link per compartment, with the read compartment ID
+/// placeholder of `link_path_format` replaced by the compartment ID (`index_page.gohtml`).
+fn compartments_index_page_html(
+    page_title: &str,
+    link_path_format: &str,
+    num_compartments: usize,
+) -> String {
+    let title = escape_html(page_title);
+    let mut out = format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"UTF-8\">\n    <title>{title}</title>\n</head>\n<body>\n    <h1>{title}</h1>\n    <ul>\n    "
+    );
+    for id in 0..num_compartments {
+        let path = link_path_format.replace("<read-compartment-id>", &id.to_string());
+        out.push_str(&format!(
+            "\n        <li><a href=\"{}\">Compartment {id}</a></li>\n    ",
+            escape_html(&path)
+        ));
+    }
+    out.push_str("\n    </ul>\n</body>\n</html>\n");
+    out
 }
 
 fn parse_query_params(raw_query: Option<&str>) -> (Option<HashSet<String>>, bool) {

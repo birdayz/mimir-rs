@@ -24,7 +24,9 @@ use mimir_config::{
 };
 use mimir_proto::ringpb::InstanceState;
 use mimir_ring::lifecycler::Lifecycler;
-use mimir_ring::partition_ring::{PartitionInstanceLifecycler, PartitionRingWatcher};
+use mimir_ring::partition_ring::{
+    PartitionInstanceLifecycler, PartitionRingWatcher, PartitionRingWatchers,
+};
 use mimir_ring::ring::Ring;
 use mimir_storage::bucket::BucketClient;
 use mimir_storage::shipper::ShipperMetrics;
@@ -136,6 +138,9 @@ pub struct Ingester {
     pub ingest_partition_id: i32,
     pub ingest_reader: RwLock<Option<Arc<IngestReaderHandle>>>,
     compartments: RwLock<CompartmentsConfig>,
+    /// Every read compartment's partition ring watcher (Go `IngesterPartitionRingWatchers`),
+    /// served by the `/ingester/partition-ring/compartment-<id>` pages.
+    partition_ring_watchers: RwLock<Option<Arc<PartitionRingWatchers>>>,
 
     pub bucket: RwLock<Option<Arc<BucketClient>>>,
     pub limiter: Arc<Limiter>,
@@ -446,6 +451,7 @@ impl Ingester {
             ingest_partition_id,
             ingest_reader: RwLock::new(None),
             compartments: RwLock::new(CompartmentsConfig::default()),
+            partition_ring_watchers: RwLock::new(None),
             bucket: RwLock::new(bucket),
             limiter,
             owned_series_strategy,
@@ -532,6 +538,15 @@ impl Ingester {
 
     pub fn compartments_config(&self) -> CompartmentsConfig {
         self.compartments.read().clone()
+    }
+
+    /// Sets the partition ring watchers of all read compartments (for the status pages).
+    pub fn set_partition_ring_watchers(&self, watchers: Option<Arc<PartitionRingWatchers>>) {
+        *self.partition_ring_watchers.write() = watchers;
+    }
+
+    pub fn partition_ring_watchers(&self) -> Option<Arc<PartitionRingWatchers>> {
+        self.partition_ring_watchers.read().clone()
     }
 
     pub fn set_head_compaction_interval_while_starting(&self, d: Duration) {
