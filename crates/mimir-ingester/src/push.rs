@@ -27,6 +27,8 @@ use smallvec::SmallVec;
 use tracing::warn;
 use xxhash_rust::xxh64::xxh64;
 
+use crate::active_groups::group_label;
+use crate::costattribution::SampleTracker;
 use crate::circuit_breaker::BreakerPermit;
 use crate::errors::{
     format_labels_string, map_native_histogram_err_id, ErrorSampler, ErrorSamplers,
@@ -116,6 +118,59 @@ struct PushStats {
     invalid_native_histogram: usize,
     labels_not_sorted: usize,
     series_with_floats_and_histograms: usize,
+}
+
+impl PushStats {
+    /// Discarded-sample counters in the order of [`DISCARD_REASONS`].
+    fn reason_counts(&self) -> [usize; 9] {
+        [
+            self.sample_timestamp_too_old,
+            self.sample_out_of_order,
+            self.sample_too_old,
+            self.sample_too_far_in_future,
+            self.new_value_for_timestamp,
+            self.per_user_series_limit,
+            self.per_metric_series_limit,
+            self.invalid_native_histogram,
+            self.labels_not_sorted,
+        ]
+    }
+}
+
+/// Discard reasons attributed by cost attribution (Go: `reason*` constants in `pkg/ingester/ingester.go`).
+const DISCARD_REASONS: [&str; 9] = [
+    "sample-timestamp-too-old",
+    "sample-out-of-order",
+    "sample-too-old",
+    "sample-too-far-in-future",
+    "new-value-for-timestamp",
+    "per_user_series_limit",
+    "per_metric_series_limit",
+    "invalid-native-histogram",
+    "labels-not-sorted",
+];
+
+/// Attributes the samples discarded since `prev` to the series whose labels are `labels`
+/// (Go: `SampleTracker.IncrementDiscardedSamples` calls in the push error processor).
+fn attribute_discarded<'l>(
+    cast: &SampleTracker,
+    prev: &mut [usize; 9],
+    stats: &PushStats,
+    labels: impl Iterator<Item = (&'l str, &'l str)> + Clone,
+    now: SystemTime,
+) {
+    let cur = stats.reason_counts();
+    if cur == *prev {
+        return;
+    }
+    let get = |n: &str| labels.clone().find(|(k, _)| *k == n).map(|(_, v)| v.to_string());
+    for (i, reason) in DISCARD_REASONS.iter().enumerate() {
+        let delta = cur[i] - prev[i];
+        if delta > 0 {
+            cast.increment_discarded_samples(&get, delta as f64, reason, now);
+        }
+    }
+    *prev = cur;
 }
 
 pub(crate) type ConvertedHistogram = (i64, bool, Option<Histogram>, Option<FloatHistogram>, usize);
@@ -1334,7 +1389,6 @@ impl Ingester {
 
         let limits = self.overrides.for_tenant(user_id);
         let native_histograms_enabled = limits.native_histograms_ingestion_enabled;
-        let max_hist_buckets = limits.max_native_histogram_buckets.max(0) as usize;
         let creation_grace_ms = (limits.creation_grace_period.0 / 1_000_000).max(0);
         let past_grace_ms = (limits.past_grace_period.0 / 1_000_000).max(0);
         let ooo_window_ms = (limits.out_of_order_time_window.0 / 1_000_000).max(0);
@@ -1361,6 +1415,11 @@ impl Ingester {
         let mut app = db.db.appender_with_capacity(items.len());
         let mut stats = PushStats::default();
         let mut first_partial: Option<(IngesterError, Option<SampleKind>)> = None;
+
+        let cast = self
+            .cost_attribution_manager()
+            .and_then(|m| m.sample_tracker(user_id));
+        let mut ca_prev = [0usize; 9];
 
         let use_batch_resolve = items.len() > 2;
         let mut resolved_guard = if use_batch_resolve {
@@ -1396,6 +1455,9 @@ impl Ingester {
         };
 
         for (idx, item) in items.iter().enumerate() {
+            if let (Some(cast), Some(prev_item)) = (cast.as_deref(), idx.checked_sub(1).map(|i| &items[i])) {
+                attribute_discarded(cast, &mut ca_prev, &stats, iter_stringlabels(prev_item.encoded_labels), start_append);
+            }
             if let Some(ref g) = resolved_guard {
                 if let Some(Some(ref next_entry)) = g.vec.get(idx + 4) {
                     let next_ptr = Arc::as_ptr(next_entry);
@@ -1668,20 +1730,6 @@ impl Ingester {
                         stats.failed_samples += 1;
                         continue;
                     }
-                    if max_hist_buckets > 0 && bucket_count > max_hist_buckets {
-                        stats.failed_samples += 1;
-                        stats.invalid_native_histogram += 1;
-                        let s_str = make_series_str(encoded_labels);
-                        record_partial(
-                            IngesterError::max_native_histogram_buckets(
-                                bucket_count,
-                                max_hist_buckets,
-                                s_str,
-                            ),
-                            Some(SampleKind::NativeHistogramValidation),
-                        );
-                        continue;
-                    }
 
                     if ingest_created_ts && created_ts < h_ts {
                         let ct_res = if is_float {
@@ -1899,6 +1947,9 @@ impl Ingester {
             }
         }
 
+        if let (Some(cast), Some(last)) = (cast.as_deref(), items.last()) {
+            attribute_discarded(cast, &mut ca_prev, &stats, iter_stringlabels(last.encoded_labels), start_append);
+        }
         self.metrics
             .appender_add_duration
             .observe(add_timer.elapsed().as_secs_f64());
@@ -1939,12 +1990,17 @@ impl Ingester {
         self.appended_exemplars
             .fetch_add(stats.succeeded_exemplars as i64, Ordering::Relaxed);
 
-        self.record_discarded_metrics(user_id, "", &stats, source, &db);
+        let request_group = group_label(
+            &limits.separate_metrics_group_label,
+            items.first().map(|it| iter_stringlabels(it.encoded_labels)),
+        );
+        let group = self.update_active_group(user_id, request_group, start_append);
+        self.record_discarded_metrics(user_id, &group, &stats, source, &db);
 
         if let Some((partial, sampler_kind)) = first_partial {
             let err = if let Some(kind) = sampler_kind {
-                let should_log = kind.sampler(&self.error_samplers).should_log();
-                partial.with_sampling(should_log)
+                let sampler = kind.sampler(&self.error_samplers);
+                partial.with_sampling_rate(sampler.should_log(), sampler.rate())
             } else {
                 partial
             };
@@ -1978,7 +2034,6 @@ impl Ingester {
 
         let limits = self.overrides.for_tenant(user_id);
         let native_histograms_enabled = limits.native_histograms_ingestion_enabled;
-        let max_hist_buckets = limits.max_native_histogram_buckets.max(0) as usize;
         let creation_grace_ms = (limits.creation_grace_period.0 / 1_000_000).max(0);
         let past_grace_ms = (limits.past_grace_period.0 / 1_000_000).max(0);
         let ooo_window_ms = (limits.out_of_order_time_window.0 / 1_000_000).max(0);
@@ -2008,6 +2063,13 @@ impl Ingester {
         let pairs = pairs_guard.as_mut_pairs();
         let mut series_str_cache: Option<String>;
 
+        let cast = self
+            .cost_attribution_manager()
+            .and_then(|m| m.sample_tracker(user_id));
+        let mut ca_prev = [0usize; 9];
+        let mut first_series = true;
+        let mut request_group = String::new();
+
         let mut record_partial = |err: IngesterError, kind: Option<SampleKind>| {
             if first_partial.is_none() {
                 first_partial = Some((err, kind));
@@ -2015,6 +2077,9 @@ impl Ingester {
         };
 
         for ts in timeseries {
+            if let Some(cast) = cast.as_deref() {
+                attribute_discarded(cast, &mut ca_prev, &stats, pairs.iter().copied(), start_append);
+            }
             series_str_cache = None;
             let samples = ts.samples();
             let hist_count = ts.histogram_count();
@@ -2024,6 +2089,13 @@ impl Ingester {
 
             if let Err(e) = ts.fill_pairs(pairs) {
                 return Err(e.with_user(user_id, 0));
+            }
+            if first_series {
+                first_series = false;
+                request_group = group_label(
+                    &limits.separate_metrics_group_label,
+                    Some(pairs.iter().copied()),
+                );
             }
 
             // Fast path when all samples (and histograms when enabled) are older than head's min_append_time and OOO is disabled.
@@ -2252,20 +2324,6 @@ impl Ingester {
                         stats.failed_samples += 1;
                         continue;
                     }
-                    if max_hist_buckets > 0 && bucket_count > max_hist_buckets {
-                        stats.failed_samples += 1;
-                        stats.invalid_native_histogram += 1;
-                        let s_str = make_series_str(pairs);
-                        record_partial(
-                            IngesterError::max_native_histogram_buckets(
-                                bucket_count,
-                                max_hist_buckets,
-                                s_str,
-                            ),
-                            Some(SampleKind::NativeHistogramValidation),
-                        );
-                        continue;
-                    }
 
                     if ingest_created_ts && created_ts < h_ts {
                         let ct_res = if is_float {
@@ -2475,6 +2533,9 @@ impl Ingester {
             }
         }
 
+        if let Some(cast) = cast.as_deref() {
+            attribute_discarded(cast, &mut ca_prev, &stats, pairs.iter().copied(), start_append);
+        }
         self.metrics
             .appender_add_duration
             .observe(add_timer.elapsed().as_secs_f64());
@@ -2513,12 +2574,13 @@ impl Ingester {
         self.appended_exemplars
             .fetch_add(stats.succeeded_exemplars as i64, Ordering::Relaxed);
 
-        self.record_discarded_metrics(user_id, "", &stats, source, db);
+        let group = self.update_active_group(user_id, request_group, start_append);
+        self.record_discarded_metrics(user_id, &group, &stats, source, db);
 
         if let Some((partial, sampler_kind)) = first_partial {
             let err = if let Some(kind) = sampler_kind {
-                let should_log = kind.sampler(&self.error_samplers).should_log();
-                partial.with_sampling(should_log)
+                let sampler = kind.sampler(&self.error_samplers);
+                partial.with_sampling_rate(sampler.should_log(), sampler.rate())
             } else {
                 partial
             };
@@ -2526,6 +2588,14 @@ impl Ingester {
         }
 
         Ok(())
+    }
+
+/// Go: `i.activeGroups.UpdateActiveGroupTimestamp(userID, validation.GroupLabel(...), startAppend)`.
+    fn update_active_group(&self, user_id: &str, group: String, now: SystemTime) -> String {
+        match self.active_groups() {
+            Some(svc) => svc.update_active_group_timestamp(user_id, group, now),
+            None => group,
+        }
     }
 
     fn record_discarded_metrics(

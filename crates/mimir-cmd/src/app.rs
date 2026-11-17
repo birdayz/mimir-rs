@@ -29,14 +29,18 @@ use mimir_ingester::{Ingester, IngesterService};
 use mimir_proto::httpgrpcpb::http_server::HttpServer;
 use mimir_ring::kv::ha_replica::replica_desc_codec;
 use mimir_ring::kv::memberlist::{KvOptions, MemberlistKv};
-use mimir_ring::kv::{build_kv_client, registerer_with_kv_name, Codec, Registerer};
-use mimir_ring::lifecycler::Lifecycler;
+use mimir_ring::kv::multi::runtime_config_provider;
+use mimir_ring::kv::{
+    build_kv_client_with_multi_config_provider, registerer_with_kv_name, Codec, Registerer,
+};
+use mimir_ring::lifecycler::{Lifecycler, LifecyclerConfig};
 use mimir_ring::partition_ring::{
     partition_ring_desc_codec, PartitionInstanceLifecycler, PartitionInstanceLifecyclerConfig,
     PartitionRingOptions, PartitionRingWatcher,
 };
 use mimir_ring::ring::model::ring_desc_codec;
-use mimir_ring::ring::Ring;
+use mimir_ring::ring::replication_strategy::DefaultReplicationStrategy;
+use mimir_ring::ring::{Ring, RingSettings};
 use mimir_ring::token_gen::{PartitionTokenGenerator, PartitionTokenTable};
 use prometheus::Registry;
 use tokio::net::TcpListener;
@@ -304,13 +308,27 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let mut plc_svc = None;
     let mut active_service_names = Vec::new();
 
+    let mut cost_attribution_registry: Option<(String, Registry)> = None;
     let ingester_opt: Option<Arc<Ingester>> = if ingester_enabled {
-        let instance_ring = Ring::new(
-            &cfg.ingester.ring,
+        // modules.go initRuntimeConfig: `multi` KV clients of the ingester ring and partition
+        // ring follow `multi_kv_config` from the runtime config (multiClientRuntimeConfigChannel).
+        // KV metrics get dskit's kv_name label and the registerer prefix of each client.
+        let multi_cfg_provider = runtime_config_mgr.as_ref().map(runtime_config_provider);
+        let instance_ring_kv = build_kv_client_with_multi_config_provider(
+            &cfg.ingester.ring.kvstore,
+            ring_desc_codec(),
+            memberlist_kv.clone(),
+            registerer_with_kv_name(Some(&cortex_registerer), "ingester-ring").as_ref(),
+            multi_cfg_provider.clone(),
+        )
+        .context("creating ingester ring")?;
+        let instance_ring = Ring::with_store_and_strategy(
+            RingSettings::from(&cfg.ingester.ring),
             INGEST_RING_NAME,
             INGEST_RING_KEY,
-            memberlist_kv.clone(),
-            Some(&cortex_registerer),
+            instance_ring_kv,
+            Arc::new(DefaultReplicationStrategy),
+            Some(&registry),
         )
         .context("creating ingester ring")?;
 
@@ -318,24 +336,33 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         ring_svc = Some(rsvc);
         active_service_names.push("ingester-ring".to_string());
 
-        let lifecycler = Lifecycler::new(
-            &cfg.ingester.ring,
-            bound_grpc_addr.port(),
+        let lifecycler_kv = build_kv_client_with_multi_config_provider(
+            &cfg.ingester.ring.kvstore,
+            ring_desc_codec(),
+            memberlist_kv.clone(),
+            registerer_with_kv_name(Some(&cortex_registerer), "ingester-lifecycler").as_ref(),
+            multi_cfg_provider.clone(),
+        )
+        .context("creating ingester lifecycler")?;
+        let lifecycler = Lifecycler::with_store(
+            LifecyclerConfig::from_ring_config(&cfg.ingester.ring, bound_grpc_addr.port())
+                .context("creating ingester lifecycler")?,
+            lifecycler_kv,
             None,
             INGEST_RING_NAME,
             INGEST_RING_KEY,
             cfg.blocks_storage.tsdb.flush_blocks_on_shutdown,
-            memberlist_kv.clone(),
-            Some(&cortex_registerer),
-        )
-        .context("creating ingester lifecycler")?;
+            Some(&registry),
+        );
 
         let (partition_ring_watcher, partition_lifecycler) = if cfg.ingest_storage.enabled {
-            let watcher_kv = build_kv_client(
+            let watcher_kv = build_kv_client_with_multi_config_provider(
                 &cfg.ingester.partition_ring.kvstore,
                 partition_ring_desc_codec(),
                 memberlist_kv.clone(),
-                registerer_with_kv_name(Some(&base_registerer), "ingester-partitions-watcher").as_ref(),
+                registerer_with_kv_name(Some(&base_registerer), "ingester-partitions-watcher")
+                    .as_ref(),
+                multi_cfg_provider.clone(),
             )
             .context("creating KV store for ingester partition ring watcher")?;
 
@@ -363,11 +390,13 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                 ingester_partition_id_from_instance_id(&cfg.ingester.ring.instance_id)
                     .map_err(|e| anyhow::anyhow!("calculating ingester partition ID: {e}"))?;
 
-            let plc_kv = build_kv_client(
+            let plc_kv = build_kv_client_with_multi_config_provider(
                 &cfg.ingester.partition_ring.kvstore,
                 partition_ring_desc_codec(),
                 memberlist_kv.clone(),
-                registerer_with_kv_name(Some(&base_registerer), "ingester-partitions-lifecycler").as_ref(),
+                registerer_with_kv_name(Some(&base_registerer), "ingester-partitions-lifecycler")
+                    .as_ref(),
+                multi_cfg_provider,
             )
             .context("creating KV store for partition instance lifecycler")?;
 
@@ -435,6 +464,36 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         .context("creating ingester")?;
         ingester.set_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
 
+        // Cost attribution service (pkg/mimir/modules.go initCostAttributionService): only enabled
+        // when -cost-attribution.registry-path is set.
+        if !cfg.cost_attribution_registry_path.is_empty() {
+            let ca_reg = Registry::new();
+            let mgr = mimir_ingester::costattribution::Manager::new(
+                go_duration_std(cfg.cost_attribution_eviction_interval),
+                overrides.clone(),
+                Some(&registry),
+                &ca_reg,
+            )
+            .map_err(|e| anyhow::anyhow!("creating cost attribution manager: {e}"))?;
+            ingester.set_cost_attribution_manager(Some(Arc::clone(&mgr)));
+            spawn_timer(go_duration_std(cfg.cost_attribution_cleanup_interval), move || {
+                mgr.purge_inactive_attributions_until(std::time::SystemTime::now());
+            });
+            cost_attribution_registry =
+                Some((cfg.cost_attribution_registry_path.clone(), ca_reg));
+        }
+
+        // Active groups cleanup service (pkg/mimir/modules.go initActiveGroupsCleanupService).
+        let active_groups = mimir_ingester::active_groups::ActiveGroupsCleanupService::new(
+            Duration::from_secs(3 * 60),
+            go_duration_std(cfg.ingester.active_series.active_series_metrics_idle_timeout),
+            cfg.max_separate_metrics_groups_per_user.max(0) as usize,
+        );
+        ingester.set_active_groups_cleanup_service(Some(Arc::clone(&active_groups)));
+        spawn_timer(active_groups.cleanup_interval(), move || {
+            active_groups.iteration(std::time::SystemTime::now());
+        });
+
         if let Some(ref watcher) = partition_ring_watcher {
             watcher.with_delegate(IngesterPartitionRingDelegate::new(Arc::clone(&ingester)));
         }
@@ -473,6 +532,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         memberlist_kv: memberlist_kv.clone(),
         active_service_names,
         module_services,
+        cost_attribution_registry,
     });
 
     // 7. Start HTTP & gRPC servers BEFORE awaiting ingester.start() so /metrics and /ready (503 -> 200)
@@ -765,6 +825,25 @@ fn log_module_starting(logger: &dyn Logger, module: &str) {
 /// dskit modules/module_service.go stop().
 fn log_module_stopped(logger: &dyn Logger, module: &str) {
     logger.log(LogLevel::Info, &[("msg", "module stopped"), ("module", module)]);
+}
+
+fn go_duration_std(d: mimir_config::GoDuration) -> Duration {
+    Duration::from_nanos(d.0.max(0) as u64)
+}
+
+/// Runs `f` every `interval` (first run after one interval), like dskit's `NewTimerService`.
+fn spawn_timer(interval: Duration, f: impl Fn() + Send + 'static) {
+    if interval.is_zero() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            f();
+        }
+    });
 }
 
 fn install_shutdown_signal(
