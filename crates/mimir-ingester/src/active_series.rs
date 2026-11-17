@@ -816,6 +816,12 @@ pub struct CustomTrackerMatcher {
     pub matchers: Vec<LabelMatcher>,
 }
 
+/// Validates a custom trackers map like Go's `NewCustomTrackersConfig` (used as the
+/// `mimir_config::limits` custom trackers validator).
+pub fn validate_custom_trackers(m: &BTreeMap<String, String>) -> Result<(), String> {
+    CustomTrackersConfig::new(m.clone()).map(|_| ())
+}
+
 /// Returns the active series custom trackers to use for a tenant: the base trackers
 /// (`active_series_custom_trackers`) merged with the additional trackers
 /// (`active_series_additional_custom_trackers`), where additional trackers win on a name clash.

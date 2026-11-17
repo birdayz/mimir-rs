@@ -8,6 +8,7 @@
 //! - github.com/grafana/mimir/pkg/costattribution/costattributionmodel/*
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -633,16 +634,41 @@ impl LimitsConfig {
             "{}",
             "Additional active series metrics, matching the provided matchers.",
             move |t, s| {
-                let map = &mut get_mut(t).active_series_custom_trackers;
-                for part in s.split(';') {
-                    let part = part.trim();
-                    if part.is_empty() {
-                        continue;
-                    }
-                    let (k, v) = part.split_once(':').ok_or_else(|| {
-                        ConfigError::Flag(format!("invalid active-series-custom-tracker {part:?}"))
+                // Go: CustomTrackersConfig.Set + customTrackerFlagValueToMap.
+                if s.trim().is_empty() {
+                    return Ok(());
+                }
+                let mut source = BTreeMap::new();
+                for (i, p) in s.split(';').enumerate() {
+                    let (name, matcher) = p.split_once(':').ok_or_else(|| {
+                        ConfigError::Flag(format!(
+                            "value should be <name>:<matcher>[;<name>:<matcher>]*, but colon was not found in the value {i}: {p:?}"
+                        ))
                     })?;
-                    map.insert(k.to_string(), v.to_string());
+                    let (name, matcher) = (name.trim(), matcher.trim());
+                    if name.is_empty() || matcher.is_empty() {
+                        return Err(ConfigError::Flag(format!(
+                            "semicolon-separated values should be <name>:<matcher>, but one of the sides was empty in the value {i}: {p:?}"
+                        )));
+                    }
+                    if source.contains_key(name) {
+                        return Err(ConfigError::Flag(format!(
+                            "matcher {name:?} for active series custom trackers is provided twice"
+                        )));
+                    }
+                    source.insert(name.to_string(), matcher.to_string());
+                }
+                if let Some(v) = CUSTOM_TRACKERS_VALIDATOR.get() {
+                    v(&source).map_err(ConfigError::Flag)?;
+                }
+                let map = &mut get_mut(t).active_series_custom_trackers;
+                for (name, matcher) in source {
+                    if map.contains_key(&name) {
+                        return Err(ConfigError::Flag(format!(
+                            "matcher {name:?} for active series custom trackers is provided more than once"
+                        )));
+                    }
+                    map.insert(name, matcher);
                 }
                 Ok(())
             },
@@ -944,6 +970,10 @@ impl LimitsConfig {
                 "cost_attribution_labels_structured and cost_attribution_trackers are mutually exclusive; use cost_attribution_trackers only".to_string(),
             ));
         }
+        if let Some(v) = CUSTOM_TRACKERS_VALIDATOR.get() {
+            v(&self.active_series_custom_trackers).map_err(ConfigError::Validation)?;
+            v(&self.active_series_additional_custom_trackers).map_err(ConfigError::Validation)?;
+        }
         validate_cost_attribution_trackers(&self.cost_attribution_trackers)?;
         validate_cost_attribution_trackers(&self.additional_cost_attribution_trackers)?;
 
@@ -1041,6 +1071,29 @@ fn validate_cost_attribution_trackers(tc: &CostAttributionTrackerConfigs) -> Res
                 "cost attribution tracker {name:?} must have at least one label"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Validates an active series custom trackers map (`name -> matchers`), returning the Go
+/// `NewCustomTrackersConfig` error on invalid matchers.
+pub type CustomTrackersValidator = fn(&BTreeMap<String, String>) -> Result<(), String>;
+
+static CUSTOM_TRACKERS_VALIDATOR: OnceLock<CustomTrackersValidator> = OnceLock::new();
+
+/// Installs the matcher validator used by [`LimitsConfig::validate`] for
+/// `active_series_custom_trackers` / `active_series_additional_custom_trackers`. The matcher
+/// parser lives in `mimir-ingester` (`activeseries/model`), so the binary wires it at startup;
+/// Go fails config (and runtime config) loading on invalid matchers in `UnmarshalYAML`.
+pub fn set_active_series_custom_trackers_validator(f: CustomTrackersValidator) {
+    let _ = CUSTOM_TRACKERS_VALIDATOR.set(f);
+}
+
+/// YAML-decode-time custom trackers validation (Go: `CustomTrackersConfig.UnmarshalYAML`).
+pub(crate) fn validate_custom_trackers_yaml(l: &LimitsConfig) -> Result<(), ConfigError> {
+    if let Some(v) = CUSTOM_TRACKERS_VALIDATOR.get() {
+        v(&l.active_series_custom_trackers).map_err(ConfigError::Yaml)?;
+        v(&l.active_series_additional_custom_trackers).map_err(ConfigError::Yaml)?;
     }
     Ok(())
 }
