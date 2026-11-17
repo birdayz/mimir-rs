@@ -18,7 +18,8 @@ unsafe impl Sync for MallocConfPtr {}
 static _rjem_malloc_conf_override: MallocConfPtr =
     MallocConfPtr(c"dirty_decay_ms:500,muzzy_decay_ms:500,narenas:8".as_ptr());
 
-use mimir_cmd::{parse_cli_for_run, run_mimir};
+use mimir_cmd::{init_logging, parse_cli_for_run, run_mimir};
+use mimir_common::logging::check_fatal;
 use mimir_config::CliAction;
 
 fn main() {
@@ -41,19 +42,21 @@ fn main() {
         return;
     }
 
+    // util_log.InitLogger: from here on every log line (including all `tracing` events) is
+    // rendered in go-kit logfmt/json on stderr, honouring -log.level, -log.format and
+    // -log.rate-limit-*.
+    init_logging(&outcome);
+
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
-        Err(err) => {
-            eprintln!("error initializing tokio runtime: {err}");
-            std::process::exit(1);
-        }
+        Err(err) => check_fatal("initializing application", &err.to_string()),
     };
 
     if let Err(err) = rt.block_on(run_mimir(outcome)) {
-        eprintln!("error running mimir: {err:#}");
-        std::process::exit(1);
+        // util_log.CheckFatal("running application", err): logs and exits 1.
+        check_fatal("running application", &format!("{err:#}"));
     }
 }

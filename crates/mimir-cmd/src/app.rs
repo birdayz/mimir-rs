@@ -16,8 +16,8 @@ use mimir_common::activitytracker::{
     load_unfinished_entries, ActivityTracker, ActivityTrackerConfig,
 };
 use mimir_common::logging::{
-    format_rfc3339_nano_utc, LogFormat, LogLevel, Logger, StructuredLogger,
-    TokenBucketRateLimitedLogger,
+    format_rfc3339_nano_utc, global_logger, init_global_logger, LogFormat, LogLevel, LogSink,
+    Logger,
 };
 use mimir_common::services::{Service, ServiceContext};
 use mimir_config::ingester::KVStoreConfig;
@@ -47,7 +47,7 @@ use tonic::codec::CompressionEncoding;
 use crate::cli::CliOutcome;
 use crate::grpc::{HealthService, HttpGrpcBridge, HttpGrpcStatusFixService};
 use crate::http::{build_http_router, AppHttpState};
-use crate::metrics::{register_global_metrics, revision_str, version_str};
+use crate::metrics::{register_global_metrics, version_info};
 
 const INGEST_RING_NAME: &str = "ingester";
 const INGEST_RING_KEY: &str = "ring";
@@ -69,24 +69,31 @@ fn convert_log_level(lvl: mimir_config::LogLevel) -> LogLevel {
     }
 }
 
-fn build_logger(cfg: &MimirConfig, outcome: &CliOutcome, registry: &Registry) -> Arc<dyn Logger> {
-    let format = LogFormat::parse(&cfg.server.log_format);
-    let level = convert_log_level(cfg.server.log_level);
-    let base: Arc<dyn Logger> = Arc::new(StructuredLogger::new(
-        format,
-        level,
-        Box::new(std::io::stderr()),
-    ));
+/// Builds the process logger like `util_log.InitLogger(cfg.Server.LogFormat, cfg.Server.LogLevel,
+/// ..., RateLimitedLoggerCfg{...})` in `cmd/mimir/main.go`.
+fn build_log_sink(outcome: &CliOutcome) -> LogSink {
+    let (format, level) = match outcome.config.as_ref() {
+        Some(cfg) => (
+            LogFormat::parse(&cfg.server.log_format),
+            convert_log_level(cfg.server.log_level),
+        ),
+        None => (LogFormat::Logfmt, LogLevel::Info),
+    };
+    let sink = LogSink::new(format, level, Box::new(std::io::stderr()));
     if outcome.rate_limited_logs_enabled {
-        Arc::new(TokenBucketRateLimitedLogger::new(
-            base,
+        sink.with_rate_limit(
             outcome.rate_limited_logs_per_second,
-            outcome.rate_limited_logs_burst_size.max(1) as usize,
-            Some(registry),
-        ))
+            outcome.rate_limited_logs_burst_size.max(0) as usize,
+        )
     } else {
-        base
+        sink
     }
+}
+
+/// Installs the process-wide logger and the `tracing` subscriber that renders every `tracing`
+/// event through it (Go `util_log.InitLogger`). Must be called once, before `run_mimir`.
+pub fn init_logging(outcome: &CliOutcome) -> Arc<LogSink> {
+    init_global_logger(build_log_sink(outcome))
 }
 
 fn validate_supported_targets(cfg: &MimirConfig) -> Result<()> {
@@ -129,18 +136,18 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     };
 
     let registry = Registry::new();
-    let logger = build_logger(&cfg, &outcome, &registry);
+    // The binary installs the global logger in main() (init_logging); in-process callers that
+    // did not install one get a private stderr logger with the same settings.
+    let logger = global_logger().unwrap_or_else(|| Arc::new(build_log_sink(&outcome)));
+    logger.register_metrics(&registry);
 
     register_global_metrics(&registry, outcome.config_hash_sha256.as_deref())
         .context("registering global Prometheus metrics")?;
 
+    let version = version_info();
     logger.log(
         LogLevel::Info,
-        &[
-            ("msg", "Starting application"),
-            ("version", version_str()),
-            ("revision", revision_str()),
-        ],
+        &[("msg", "Starting application"), ("version", &version)],
     );
 
     // 1. Activity tracker (matching initActivityTracker in pkg/mimir/modules.go).
@@ -255,6 +262,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                     && kv_uses_memberlist(&cfg.ingester.partition_ring.kvstore))));
 
     let memberlist_kv = if needs_memberlist {
+        log_module_starting(&*logger, "memberlist-kv");
         let codecs: Vec<Arc<dyn Codec>> =
             vec![ring_desc_codec(), partition_ring_desc_codec()];
         let ml = MemberlistKv::start(
@@ -279,7 +287,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     // 6. Ring, PartitionRingWatcher, Lifecycler, PartitionInstanceLifecycler, and Ingester.
     // 6. Install SIGTERM/SIGINT listeners BEFORE startup so signals during WAL replay / catch-up
     // cancel cleanly, and construct services before starting HTTP/gRPC servers.
-    let mut shutdown_sig = install_shutdown_signal();
+    let mut shutdown_sig = install_shutdown_signal(Arc::clone(&logger));
 
     let mut ring_svc = None;
     let mut watcher_svc = None;
@@ -493,6 +501,8 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     http_std.set_nonblocking(true)?;
     grpc_std.set_nonblocking(true)?;
 
+    log_module_starting(&*logger, "server");
+
     std::thread::Builder::new()
         .name("mimir-rpc-rt".to_string())
         .spawn(move || {
@@ -544,6 +554,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     {
         let startup_fut = async {
             if let Some(ref rsvc) = ring_svc {
+                log_module_starting(&*logger, "ingester-ring");
                 rsvc.start_async(service_ctx.child())
                     .await
                     .context("starting ingester ring service")?;
@@ -552,6 +563,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                     .context("waiting for ingester ring service")?;
             }
             if let Some(ref wsvc) = watcher_svc {
+                log_module_starting(&*logger, "ingester-partitions-ring");
                 wsvc.start_async(service_ctx.child())
                     .await
                     .context("starting partition ring watcher service")?;
@@ -568,6 +580,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                     .context("waiting for partition instance lifecycler")?;
             }
             if let Some(ref ing) = ingester_opt {
+                log_module_starting(&*logger, "ingester-service");
                 ing.start().await.context("starting ingester")?;
             }
             Ok::<(), anyhow::Error>(())
@@ -602,13 +615,21 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     // and unregisters while HTTP/gRPC and MemberlistKv are still running), THEN stop ring services,
     // HTTP/gRPC servers, and MemberlistKv.
     if let Some(ref ing) = ingester_opt {
-        if let Err(err) = ing.stop().await {
-            if !signaled_during_startup {
-                let err_s = err.to_string();
-                logger.log(
-                    LogLevel::Error,
-                    &[("msg", "error stopping ingester"), ("err", &err_s)],
-                );
+        match ing.stop().await {
+            Ok(()) => log_module_stopped(&*logger, "ingester-service"),
+            Err(err) => {
+                if !signaled_during_startup {
+                    // dskit modules/module_service.go stop()
+                    let err_s = err.to_string();
+                    logger.log(
+                        LogLevel::Warn,
+                        &[
+                            ("msg", "module failed with error"),
+                            ("module", "ingester-service"),
+                            ("err", &err_s),
+                        ],
+                    );
+                }
             }
         }
     }
@@ -620,10 +641,12 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     if let Some(wsvc) = watcher_svc {
         wsvc.stop_async();
         let _ = wsvc.await_terminated().await;
+        log_module_stopped(&*logger, "ingester-partitions-ring");
     }
     if let Some(rsvc) = ring_svc {
         rsvc.stop_async();
         let _ = rsvc.await_terminated().await;
+        log_module_stopped(&*logger, "ingester-ring");
     }
     service_ctx.cancel();
 
@@ -637,9 +660,13 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             .max(100_000_000) as u64,
     );
     let _ = tokio::time::timeout(graceful_timeout, server_done_rx).await;
+    // dskit server_service.go
+    logger.log(LogLevel::Info, &[("msg", "server stopped")]);
+    log_module_stopped(&*logger, "server");
 
     if let Some(ml) = memberlist_kv {
         ml.shutdown().await;
+        log_module_stopped(&*logger, "memberlist-kv");
     }
     if let Some(rt) = runtime_config_mgr {
         rt.stop();
@@ -681,7 +708,19 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     Ok(())
 }
 
-fn install_shutdown_signal() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+/// dskit modules/module_service.go start().
+fn log_module_starting(logger: &dyn Logger, module: &str) {
+    logger.log(LogLevel::Info, &[("msg", "starting"), ("module", module)]);
+}
+
+/// dskit modules/module_service.go stop().
+fn log_module_stopped(logger: &dyn Logger, module: &str) {
+    logger.log(LogLevel::Info, &[("msg", "module stopped"), ("module", module)]);
+}
+
+fn install_shutdown_signal(
+    logger: Arc<LogSink>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     #[cfg(unix)]
     {
         let mut sigterm =
@@ -694,6 +733,11 @@ fn install_shutdown_signal() -> std::pin::Pin<Box<dyn std::future::Future<Output
                 _ = sigterm.recv() => {}
                 _ = sigint.recv() => {}
             }
+            // dskit signals/signals.go Handler.Loop()
+            logger.log(
+                LogLevel::Info,
+                &[("msg", "=== received SIGINT/SIGTERM ===\n*** exiting")],
+            );
         })
     }
 
@@ -701,6 +745,10 @@ fn install_shutdown_signal() -> std::pin::Pin<Box<dyn std::future::Future<Output
     {
         Box::pin(async move {
             let _ = tokio::signal::ctrl_c().await;
+            logger.log(
+                LogLevel::Info,
+                &[("msg", "=== received SIGINT/SIGTERM ===\n*** exiting")],
+            );
         })
     }
 }
