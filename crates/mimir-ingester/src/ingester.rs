@@ -219,16 +219,17 @@ impl Ingester {
         runtime_cfg: Option<Arc<RuntimeConfigManager>>,
         registry: Option<&Registry>,
     ) -> Result<Arc<Self>, IngesterError> {
-        let bucket = match BucketClient::from_config(&blocks_cfg.bucket) {
+        // Go newIngester: the bucket client is always created (whatever ship_interval is) and
+        // a construction error fails the ingester.
+        if blocks_cfg.bucket.backend_cfg.backend == "filesystem" {
+            warn!("-blocks-storage.backend=filesystem is for development and testing only; you should switch to an external object store for production use or use a shared filesystem");
+        }
+        let bucket = match BucketClient::new_client(&blocks_cfg.bucket, "ingester", registry) {
             Ok(b) => Some(Arc::new(b)),
             Err(e) => {
-                if blocks_cfg.tsdb.ship_interval.0 > 0 {
-                    return Err(IngesterError::Internal {
-                        message: format!("failed to create bucket client: {e}"),
-                    });
-                }
-                warn!(err = %e, "bucket client unavailable (shipping disabled)");
-                None
+                return Err(IngesterError::Internal {
+                    message: format!("failed to create the bucket client: {e}"),
+                });
             }
         };
 
@@ -952,7 +953,7 @@ impl Ingester {
             if let Some((_, db)) = self.tsdbs.remove(&k) {
                 let tracker_names = db.active_series.current_matcher_names();
                 if let Err(e) = db.close() {
-                    warn!(user = %k, err = %e, "unable to close TSDB");
+                    warn!(user = %k, error = %e, "unable to close TSDB");
                 }
                 self.tsdb_metrics.remove_registry_for_tenant(&k);
                 self.metrics.mem_users.dec();
@@ -1000,48 +1001,16 @@ impl Ingester {
         snap
     }
 
-    /// Fsyncs WAL & WBL segments for all open tenant TSDBs (Go `NotifyPreCommit`):
-    /// `concurrency.ForEachUser` with `write_logs_fsync_before_kafka_commit_concurrency`
-    /// workers; every tenant is fsynced and all errors are returned (dskit multierror).
-    /// Blocking: call from a blocking thread.
+    /// Flushes WAL & WBL segments for all open tenant TSDBs (`NotifyPreCommit`).
     pub fn notify_pre_commit(&self) -> Result<(), IngesterError> {
-        let users = self.get_tsdb_users();
-        if users.is_empty() {
-            return Ok(());
-        }
-        let concurrency = (self.ingest_cfg.write_logs_fsync_before_kafka_commit_concurrency.max(1)
-            as usize)
-            .min(users.len());
-        tracing::debug!(concurrency, "fsyncing TSDBs");
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let errs: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
-        std::thread::scope(|scope| {
-            for _ in 0..concurrency {
-                scope.spawn(|| loop {
-                    let idx = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(user_id) = users.get(idx) else {
-                        break;
-                    };
-                    let Some(db) = self.get_tsdb(user_id) else {
-                        continue;
-                    };
-                    if let Err(e) = db.db.head().sync() {
-                        errs.lock()
-                            .push(format!("failed to sync TSDB WAL for user {user_id}: {e}"));
-                    }
-                });
+        for user_id in self.get_tsdb_users() {
+            if let Some(db) = self.get_tsdb(&user_id) {
+                db.db.head().sync().map_err(|e| IngesterError::Internal {
+                    message: format!("failed to sync TSDB WAL for user {user_id}: {e}"),
+                })?;
             }
-        });
-        let errs = errs.into_inner();
-        if errs.is_empty() {
-            return Ok(());
         }
-        let message = if errs.len() > 1 {
-            format!("{} errors: {}", errs.len(), errs.join("; "))
-        } else {
-            errs.into_iter().next().unwrap_or_default()
-        };
-        Err(IngesterError::Internal { message })
+        Ok(())
     }
 
     /// Starts the Ingester service asynchronously, returning immediately while startup progresses.

@@ -536,10 +536,11 @@ impl UserTsdb {
                 let ooo_overrides = overrides.clone();
                 let ooo_user = user_id.clone();
                 Arc::new(
-                    Shipper::new_for_user(
+                    Shipper::new_for_user_with_config(
                         &user_id,
                         &udir,
                         b,
+                        Arc::new(overrides.clone()),
                         SourceType::Receive,
                         ooo_ext,
                         shipper_metrics,

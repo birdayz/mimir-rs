@@ -114,17 +114,16 @@ impl S3SSEConfig {
                 "unsupported S3 SSE type".to_string(),
             ));
         }
-        if !self.kms_encryption_context.is_empty() {
-            let parsed: Result<serde_json::Value, _> =
-                serde_json::from_str(&self.kms_encryption_context);
-            match parsed {
-                Ok(serde_json::Value::Object(_)) => {}
-                _ => {
-                    return Err(ConfigError::Validation(
-                        "invalid S3 SSE encryption context".to_string(),
-                    ));
-                }
-            }
+        // parseKMSEncryptionContext: json.Unmarshal into map[string]string ("null" is valid).
+        if !self.kms_encryption_context.is_empty()
+            && serde_json::from_str::<Option<std::collections::BTreeMap<String, String>>>(
+                &self.kms_encryption_context,
+            )
+            .is_err()
+        {
+            return Err(ConfigError::Validation(
+                "invalid S3 SSE encryption context".to_string(),
+            ));
         }
         Ok(())
     }
@@ -134,6 +133,40 @@ impl S3SSEConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct S3TraceConfig {
     pub enabled: bool,
+}
+
+/// aws-sdk-go-v2 `types.StorageClass.Values()` (Mimir `supportedStorageClasses`).
+pub const S3_SUPPORTED_STORAGE_CLASSES: &[&str] = &[
+    "STANDARD",
+    "REDUCED_REDUNDANCY",
+    "STANDARD_IA",
+    "ONEZONE_IA",
+    "INTELLIGENT_TIERING",
+    "GLACIER",
+    "DEEP_ARCHIVE",
+    "OUTPOSTS",
+    "GLACIER_IR",
+    "SNOW",
+    "EXPRESS_ONEZONE",
+    "FSX_OPENZFS",
+    "FSX_ONTAP",
+];
+
+/// Mimir `util.IsValidURL`: `url.Parse` succeeds with a non-empty scheme and host.
+fn is_valid_url(endpoint: &str) -> bool {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    let scheme_ok = scheme
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    scheme_ok && !host.is_empty() && !host.contains(' ')
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,7 +264,32 @@ impl S3Config {
                 ));
             }
         }
+        if !self.sts_endpoint.is_empty() && !is_valid_url(&self.sts_endpoint) {
+            return Err(ConfigError::Validation(
+                "sts-endpoint must be a valid url".to_string(),
+            ));
+        }
+        if !self.storage_class.is_empty()
+            && !S3_SUPPORTED_STORAGE_CLASSES.contains(&self.storage_class.as_str())
+        {
+            return Err(ConfigError::Validation(format!(
+                "unsupported S3 storage class (supported values: {})",
+                S3_SUPPORTED_STORAGE_CLASSES.join(", ")
+            )));
+        }
         self.sse.validate()
+    }
+
+    /// See [`StorageBackendConfig::validate_mimir_rs_support`]. The S3 client is built without
+    /// HTTP/2 support, so `http.force_attempt_http2: true` cannot be honoured.
+    pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        if self.http.force_attempt_http2 {
+            return Err(ConfigError::Validation(
+                "http.force_attempt_http2 is not supported by mimir-rs for the s3 backend"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -556,6 +614,21 @@ impl StorageBackendConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_with_extra_backends(&[])
+    }
+
+    /// Rejects configurations of the selected backend that mimir-rs cannot honour (instead of
+    /// silently ignoring them). Called for the blocks storage bucket when the ingester is
+    /// enabled; Go has no equivalent because it supports every setting.
+    pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        match self.backend.as_str() {
+            "swift" => Err(ConfigError::Validation(
+                "the swift storage backend is not supported by mimir-rs".to_string(),
+            )),
+            "s3" => self.s3.validate_mimir_rs_support(),
+            "gcs" => self.gcs.validate_mimir_rs_support(),
+            "azure" => self.azure.validate_mimir_rs_support(),
+            _ => Ok(()),
+        }
     }
 
     /// Returns the flag suffixes relative to `<prefix>` belonging to `StorageBackendConfig`.

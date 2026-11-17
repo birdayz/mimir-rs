@@ -760,6 +760,12 @@ impl MimirConfig {
         self.memberlist.validate()?;
         self.blocks_storage
             .validate(self.ingester.active_series.active_series_metrics_enabled)?;
+        if self.is_ingester_enabled() {
+            self.blocks_storage
+                .bucket
+                .backend_cfg
+                .validate_mimir_rs_support()?;
+        }
         self.ingester_client.validate()?;
 
         if let Err(err) = self.ingester.validate(
