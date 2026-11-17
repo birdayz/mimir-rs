@@ -16,7 +16,7 @@
 //! lazily on the first `Read`), so a failing handshake is logged as `failed to read message type`.
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
