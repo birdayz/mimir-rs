@@ -411,6 +411,69 @@ impl<'v, 'a> StreamedRw2Series<'v, 'a> {
     }
 }
 
+/// Header fields decoded by [`decode_classic_stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamedClassicHeader {
+    pub source: i32,
+    pub skip_label_validation: bool,
+    pub skip_label_count_validation: bool,
+    pub header_changed_after_series: bool,
+}
+
+/// Borrowed view of a single Classic `TimeSeries` emitted by [`decode_classic_stream`].
+///
+/// Labels are encoded directly into `label_bytes_arena` in Prometheus `stringlabels` flat byte
+/// format, samples are appended directly into `samples_arena`, and `prom_hash` (`xxh64`) is
+/// precomputed when labels are valid UTF-8 and sorted/unique.
+pub struct StreamedClassicSeries<'v, 'a> {
+    pub label_bytes_range: Range<usize>,
+    pub encoded_labels: &'v [u8],
+    pub prom_hash: u64,
+    pub labels_sorted_unique: bool,
+    pub bad_utf8: bool,
+    pub samples_range: Range<usize>,
+    pub min_sample_ts: i64,
+    pub created_timestamp: i64,
+    pub histograms_range: Range<usize>,
+    pub exemplars_range: Range<usize>,
+    pub source: i32,
+    pub skip_label_validation: bool,
+    scratch: &'v WriteRequestScratch,
+    input: &'a [u8],
+}
+
+impl<'v, 'a> StreamedClassicSeries<'v, 'a> {
+    #[inline]
+    pub fn histograms_len(&self) -> usize {
+        self.histograms_range.len()
+    }
+
+    #[inline]
+    pub fn exemplars_len(&self) -> usize {
+        self.exemplars_range.len()
+    }
+
+    pub fn histograms(&self) -> impl ExactSizeIterator<Item = BorrowedHistogramView<'_>> {
+        self.scratch.histograms[self.histograms_range.clone()]
+            .iter()
+            .map(move |h| BorrowedHistogramView {
+                scratch: self.scratch,
+                meta: h,
+            })
+    }
+
+    pub fn exemplars(&self) -> impl ExactSizeIterator<Item = BorrowedExemplarView<'_, 'a>> {
+        self.scratch.exemplars[self.exemplars_range.clone()]
+            .iter()
+            .map(move |ex| BorrowedExemplarView {
+                input: self.input,
+                common_symbols: &[],
+                scratch: self.scratch,
+                meta: ex,
+            })
+    }
+}
+
 /// Reusable lifetime-free scratch space for zero-allocation `WriteRequest` decoding.
 #[derive(Debug, Default)]
 pub struct WriteRequestScratch {
@@ -465,6 +528,22 @@ impl WriteRequestScratch {
         self.rw2_label_refs.clear();
         self.dedup_hashes.clear();
         self.utf8_arena.clear();
+    }
+
+    #[inline]
+    pub fn metadata_len(&self) -> usize {
+        self.metadata.len()
+    }
+
+    pub fn metadata<'a>(&'a self, input: &'a [u8]) -> impl ExactSizeIterator<Item = BorrowedMetadata<'a>> + 'a {
+        self.metadata.iter().map(move |m| BorrowedMetadata {
+            metric_type: m.metric_type,
+            metric_family_name: m
+                .family_name
+                .resolve_str(input, &[], &self.utf8_arena),
+            help: m.help.resolve_str(input, &[], &self.utf8_arena),
+            unit: m.unit.resolve_str(input, &[], &self.utf8_arena),
+        })
     }
 }
 
@@ -990,6 +1069,338 @@ pub fn decode_write_request<'a, 's>(
         skip_label_validation,
         skip_label_count_validation,
         labels_utf8_validated: is_rw2 && all_symbols_utf8,
+    })
+}
+
+#[inline(always)]
+fn is_valid_utf8_fast(b: &[u8]) -> bool {
+    b.is_ascii() || std::str::from_utf8(b).is_ok()
+}
+
+#[inline(always)]
+fn decode_label_pair_slices<'a>(
+    input: &'a [u8],
+    range: Range<usize>,
+) -> Result<(&'a [u8], &'a [u8]), DecodeError> {
+    let mut name: &'a [u8] = &[];
+    let mut value: &'a [u8] = &[];
+    let mut pos = range.start;
+    let end = range.end;
+    while pos < end {
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
+        match field_num {
+            1 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 1,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                name = &input[sub];
+            }
+            2 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 2,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                value = &input[sub];
+            }
+            _ => {
+                skip_field_bounded(input, &mut pos, end, wire_type)?;
+            }
+        }
+    }
+    Ok((name, value))
+}
+
+#[cold]
+#[inline(never)]
+fn reemit_raw_classic_labels(
+    input: &[u8],
+    range: Range<usize>,
+    label_bytes_arena: &mut Vec<u8>,
+    label_bytes_start: usize,
+) -> Result<(), DecodeError> {
+    label_bytes_arena.truncate(label_bytes_start);
+    let mut pos = range.start;
+    let end = range.end;
+    while pos < end {
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
+        if field_num == 1 && wire_type == 2 {
+            let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+            let (name, value) = decode_label_pair_slices(input, sub)?;
+            append_stringlabel_pair_proto(label_bytes_arena, name, value)?;
+        } else {
+            skip_field_bounded(input, &mut pos, end, wire_type)?;
+        }
+    }
+    Ok(())
+}
+
+/// Streams a Classic RW1 `cortexpb.WriteRequest` directly into contiguous
+/// `stringlabels` bytes (`label_bytes_arena`), prehashed series metadata (`xxh64`), and
+/// `samples_arena`, without intermediate `Vec<LabelRefPair>` allocations per series.
+///
+/// Decoded `MetricMetadata` entries are stored in `scratch` and can be iterated afterwards via
+/// [`WriteRequestScratch::metadata`].
+pub fn decode_classic_stream<'a, F>(
+    input: &'a [u8],
+    opts: DecodeOptions<'a>,
+    scratch: &mut WriteRequestScratch,
+    label_bytes_arena: &mut Vec<u8>,
+    samples_arena: &mut Vec<cortexpb::Sample>,
+    mut on_series: F,
+) -> Result<StreamedClassicHeader, DecodeError>
+where
+    F: FnMut(StreamedClassicSeries<'_, 'a>),
+{
+    if !matches!(opts.mode, DecodeMode::Classic) {
+        return Err(DecodeError::UnexpectedRw2Timeseries);
+    }
+    if input.len() > u32::MAX as usize {
+        return Err(DecodeError::InputTooLarge);
+    }
+    scratch.clear();
+    let label_base = label_bytes_arena.len();
+    let samples_base = samples_arena.len();
+
+    let mut source: i32 = 0;
+    let mut skip_label_validation = false;
+    let mut skip_label_count_validation = false;
+    let mut emitted_any_series = false;
+    let mut header_changed_after_series = false;
+
+    let res: Result<(), DecodeError> = (|| {
+        let mut pos = 0usize;
+        let len = input.len();
+        while pos < len {
+            let (field_num, wire_type) = read_key_bounded(input, &mut pos, len)?;
+            match field_num {
+                1 => {
+                    if wire_type != 2 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 1,
+                            wire_type,
+                        });
+                    }
+                    let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
+                    let series = decode_timeseries_classic_stream(
+                        input,
+                        sub,
+                        opts.skip_unmarshaling_exemplars,
+                        scratch,
+                        label_bytes_arena,
+                        samples_arena,
+                        source,
+                        skip_label_validation,
+                    )?;
+                    emitted_any_series = true;
+                    on_series(series);
+                }
+                2 => {
+                    if wire_type != 0 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 2,
+                            wire_type,
+                        });
+                    }
+                    let new_src = read_varint(input, &mut pos)? as i32;
+                    if emitted_any_series && new_src != source {
+                        header_changed_after_series = true;
+                    }
+                    source = new_src;
+                }
+                3 => {
+                    if wire_type != 2 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 3,
+                            wire_type,
+                        });
+                    }
+                    let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
+                    let meta = decode_metadata_rw1(input, sub, scratch)?;
+                    scratch.metadata.push(meta);
+                }
+                4 => return Err(DecodeError::UnexpectedRw2Symbols),
+                5 => return Err(DecodeError::UnexpectedRw2Timeseries),
+                1000 => {
+                    if wire_type != 0 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 1000,
+                            wire_type,
+                        });
+                    }
+                    let val = read_varint(input, &mut pos)? != 0;
+                    if emitted_any_series && val != skip_label_validation {
+                        header_changed_after_series = true;
+                    }
+                    skip_label_validation = val;
+                }
+                1001 => {
+                    if wire_type != 0 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 1001,
+                            wire_type,
+                        });
+                    }
+                    skip_label_count_validation = read_varint(input, &mut pos)? != 0;
+                }
+                _ => {
+                    skip_field_bounded(input, &mut pos, len, wire_type)?;
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = res {
+        label_bytes_arena.truncate(label_base);
+        samples_arena.truncate(samples_base);
+        return Err(e);
+    }
+
+    Ok(StreamedClassicHeader {
+        source,
+        skip_label_validation,
+        skip_label_count_validation,
+        header_changed_after_series,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_timeseries_classic_stream<'v, 'a>(
+    input: &'a [u8],
+    range: Range<usize>,
+    skip_exemplars: bool,
+    scratch: &'v mut WriteRequestScratch,
+    label_bytes_arena: &'v mut Vec<u8>,
+    samples_arena: &mut Vec<cortexpb::Sample>,
+    source: i32,
+    skip_label_validation: bool,
+) -> Result<StreamedClassicSeries<'v, 'a>, DecodeError> {
+    let label_bytes_start = label_bytes_arena.len();
+    let samples_start = samples_arena.len();
+    let exemplars_start = scratch.exemplars.len();
+    let histograms_start = scratch.histograms.len();
+    let mut created_timestamp = 0i64;
+    let mut min_sample_ts = i64::MAX;
+    let mut prev_name: Option<&'a [u8]> = None;
+    let mut labels_sorted_unique = true;
+    let mut bad_utf8 = false;
+    let mut dropped_empty = false;
+
+    let mut pos = range.start;
+    let end = range.end;
+    while pos < end {
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
+        match field_num {
+            1 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 1,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                let (name, value) = decode_label_pair_slices(input, sub)?;
+                if !is_valid_utf8_fast(name) || !is_valid_utf8_fast(value) {
+                    bad_utf8 = true;
+                } else {
+                    if let Some(pn) = prev_name {
+                        if pn >= name {
+                            labels_sorted_unique = false;
+                        }
+                    }
+                    prev_name = Some(name);
+                }
+                if !value.is_empty() {
+                    append_stringlabel_pair_proto(label_bytes_arena, name, value)?;
+                } else {
+                    dropped_empty = true;
+                }
+            }
+            2 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 2,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                let sample = decode_sample(input, sub)?;
+                min_sample_ts = min_sample_ts.min(sample.timestamp_ms);
+                samples_arena.push(sample);
+            }
+            3 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 3,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                if !skip_exemplars {
+                    let ex = decode_exemplar_rw1(input, sub, scratch)?;
+                    scratch.exemplars.push(ex);
+                }
+            }
+            4 => {
+                if wire_type != 2 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 4,
+                        wire_type,
+                    });
+                }
+                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                let hist = decode_histogram(input, sub, scratch)?;
+                scratch.histograms.push(hist);
+            }
+            6 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 6,
+                        wire_type,
+                    });
+                }
+                created_timestamp = read_varint_bounded(input, &mut pos, end)? as i64;
+            }
+            _ => {
+                skip_field_bounded(input, &mut pos, end, wire_type)?;
+            }
+        }
+    }
+
+    if !bad_utf8 && !labels_sorted_unique && dropped_empty {
+        reemit_raw_classic_labels(input, range, label_bytes_arena, label_bytes_start)?;
+    }
+
+    let label_bytes_end = label_bytes_arena.len();
+    let encoded_labels = &label_bytes_arena[label_bytes_start..label_bytes_end];
+    let prom_hash = if !bad_utf8 && labels_sorted_unique && !encoded_labels.is_empty() {
+        xxhash_rust::xxh64::xxh64(encoded_labels, 0)
+    } else {
+        0
+    };
+
+    Ok(StreamedClassicSeries {
+        label_bytes_range: label_bytes_start..label_bytes_end,
+        encoded_labels,
+        prom_hash,
+        labels_sorted_unique,
+        bad_utf8,
+        samples_range: samples_start..samples_arena.len(),
+        min_sample_ts,
+        created_timestamp,
+        histograms_range: histograms_start..scratch.histograms.len(),
+        exemplars_range: exemplars_start..scratch.exemplars.len(),
+        source,
+        skip_label_validation,
+        scratch,
+        input,
     })
 }
 
@@ -3802,5 +4213,343 @@ mod tests {
         assert_eq!(meta.len(), 1);
         assert_eq!(meta[0].metric_family_name, "last_name");
         assert_eq!(meta[0].help, "help\u{FFFD}");
+    }
+
+    fn decode_stringlabels_pairs(mut data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        while !data.is_empty() {
+            let mut read_part = || {
+                let len = if data[0] < 255 {
+                    let l = data[0] as usize;
+                    data = &data[1..];
+                    l
+                } else {
+                    let l = (data[1] as usize)
+                        | ((data[2] as usize) << 8)
+                        | ((data[3] as usize) << 16);
+                    data = &data[4..];
+                    l
+                };
+                let slice = data[..len].to_vec();
+                data = &data[len..];
+                slice
+            };
+            let k = read_part();
+            let v = read_part();
+            out.push((k, v));
+        }
+        out
+    }
+
+    #[test]
+    fn test_decode_classic_stream_differential_parity() {
+        let long_val = "v".repeat(300);
+        let req = cortexpb::WriteRequest {
+            timeseries: vec![
+                // Series 0: sorted unique labels with an empty value that must be dropped,
+                // samples, exemplar, native histogram, created_timestamp.
+                cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_static("__name__", "http_requests_total"),
+                        cortexpb::LabelPair::from_static("empty", ""),
+                        cortexpb::LabelPair::from_static("job", "api"),
+                        cortexpb::LabelPair::from_strs("long", &long_val),
+                    ],
+                    samples: vec![
+                        cortexpb::Sample {
+                            value: 1.5,
+                            timestamp_ms: 1_700_000_000_000,
+                        },
+                        cortexpb::Sample {
+                            value: 2.5,
+                            timestamp_ms: 1_700_000_015_000,
+                        },
+                    ],
+                    exemplars: vec![cortexpb::Exemplar {
+                        labels: vec![cortexpb::LabelPair::from_static("trace_id", "abc")],
+                        value: 0.25,
+                        timestamp_ms: 1_700_000_015_000,
+                    }],
+                    histograms: vec![cortexpb::Histogram {
+                        count: Some(cortexpb::histogram::Count::CountInt(10)),
+                        sum: 12.5,
+                        schema: 3,
+                        zero_threshold: 0.001,
+                        zero_count: Some(cortexpb::histogram::ZeroCount::ZeroCountInt(2)),
+                        negative_spans: vec![cortexpb::BucketSpan {
+                            offset: -1,
+                            length: 2,
+                        }],
+                        negative_deltas: vec![1, 2],
+                        positive_spans: vec![cortexpb::BucketSpan {
+                            offset: 0,
+                            length: 2,
+                        }],
+                        positive_deltas: vec![3, -1],
+                        reset_hint: 1,
+                        timestamp: 1_700_000_015_000,
+                        custom_values: vec![1.0, 2.0],
+                        ..Default::default()
+                    }],
+                    created_timestamp: 1_699_999_000_000,
+                },
+                // Series 1: unsorted labels WITH an empty value — empty value must be preserved
+                // in encoded_labels for labels_not_sorted error formatting parity.
+                cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_static("z", "1"),
+                        cortexpb::LabelPair::from_static("drop_or_keep", ""),
+                        cortexpb::LabelPair::from_static("a", "2"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        value: 3.0,
+                        timestamp_ms: 1_700_000_000_500,
+                    }],
+                    ..Default::default()
+                },
+                // Series 2: duplicate label name -> labels_sorted_unique == false
+                cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_static("a", "1"),
+                        cortexpb::LabelPair::from_static("a", "2"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        value: 4.0,
+                        timestamp_ms: 1_700_000_000_600,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            source: cortexpb::write_request::SourceEnum::Rule as i32,
+            metadata: vec![cortexpb::MetricMetadata {
+                r#type: cortexpb::metric_metadata::MetricType::Counter as i32,
+                metric_family_name: "http_requests_total".to_string(),
+                help: "total requests".to_string(),
+                unit: "requests".to_string(),
+            }],
+            skip_label_validation: true,
+            skip_label_count_validation: true,
+            ..Default::default()
+        };
+
+        let wire = req.encode_to_vec();
+
+        let mut ref_scratch = WriteRequestScratch::new();
+        let ref_dec =
+            decode_write_request(&wire, DecodeOptions::classic(), &mut ref_scratch).unwrap();
+
+        let mut stream_scratch = WriteRequestScratch::new();
+        let mut label_bytes_arena = Vec::new();
+        let mut samples_arena = Vec::new();
+        struct Seen {
+            label_range: Range<usize>,
+            encoded_labels: Vec<u8>,
+            prom_hash: u64,
+            sorted_unique: bool,
+            bad_utf8: bool,
+            samples_range: Range<usize>,
+            min_ts: i64,
+            created_ts: i64,
+            histograms: Vec<cortexpb::Histogram>,
+            exemplar_count: usize,
+        }
+        let mut seen = Vec::new();
+        let hdr = decode_classic_stream(
+            &wire,
+            DecodeOptions::classic(),
+            &mut stream_scratch,
+            &mut label_bytes_arena,
+            &mut samples_arena,
+            |s| {
+                seen.push(Seen {
+                    label_range: s.label_bytes_range.clone(),
+                    encoded_labels: s.encoded_labels.to_vec(),
+                    prom_hash: s.prom_hash,
+                    sorted_unique: s.labels_sorted_unique,
+                    bad_utf8: s.bad_utf8,
+                    samples_range: s.samples_range.clone(),
+                    min_ts: s.min_sample_ts,
+                    created_ts: s.created_timestamp,
+                    histograms: s.histograms().map(|h| h.to_owned_histogram()).collect(),
+                    exemplar_count: s.exemplars_len(),
+                });
+            },
+        )
+        .unwrap();
+
+        for s in &seen {
+            assert_eq!(s.encoded_labels.as_slice(), &label_bytes_arena[s.label_range.clone()]);
+        }
+
+        assert_eq!(hdr.source, ref_dec.source);
+        assert_eq!(hdr.skip_label_validation, ref_dec.skip_label_validation);
+        assert_eq!(
+            hdr.skip_label_count_validation,
+            ref_dec.skip_label_count_validation
+        );
+        assert!(hdr.header_changed_after_series);
+        assert_eq!(seen.len(), ref_dec.timeseries_len());
+
+        // Series 0 parity
+        assert!(seen[0].sorted_unique);
+        assert!(!seen[0].bad_utf8);
+        assert_eq!(
+            seen[0].prom_hash,
+            xxhash_rust::xxh64::xxh64(&label_bytes_arena[seen[0].label_range.clone()], 0)
+        );
+        assert_ne!(seen[0].prom_hash, 0);
+        assert_eq!(
+            decode_stringlabels_pairs(&label_bytes_arena[seen[0].label_range.clone()]),
+            vec![
+                (b"__name__".to_vec(), b"http_requests_total".to_vec()),
+                (b"job".to_vec(), b"api".to_vec()),
+                (b"long".to_vec(), long_val.as_bytes().to_vec()),
+            ]
+        );
+        assert_eq!(
+            &samples_arena[seen[0].samples_range.clone()],
+            ref_dec.timeseries_at(0).samples()
+        );
+        assert_eq!(seen[0].min_ts, 1_700_000_000_000);
+        assert_eq!(seen[0].created_ts, 1_699_999_000_000);
+        assert_eq!(seen[0].exemplar_count, 1);
+        assert_eq!(
+            seen[0].histograms,
+            ref_dec
+                .timeseries_at(0)
+                .histograms()
+                .map(|h| h.to_owned_histogram())
+                .collect::<Vec<_>>()
+        );
+
+        // Series 1 parity: unsorted + empty value retained
+        assert!(!seen[1].sorted_unique);
+        assert_eq!(seen[1].prom_hash, 0);
+        assert_eq!(
+            decode_stringlabels_pairs(&label_bytes_arena[seen[1].label_range.clone()]),
+            vec![
+                (b"z".to_vec(), b"1".to_vec()),
+                (b"drop_or_keep".to_vec(), b"".to_vec()),
+                (b"a".to_vec(), b"2".to_vec()),
+            ]
+        );
+
+        // Series 2 parity: duplicate label name
+        assert!(!seen[2].sorted_unique);
+        assert_eq!(seen[2].prom_hash, 0);
+
+        // Metadata parity
+        let ref_meta: Vec<_> = ref_dec.metadata().collect();
+        let stream_meta: Vec<_> = stream_scratch.metadata(&wire).collect();
+        assert_eq!(stream_meta, ref_meta);
+    }
+
+    #[test]
+    fn test_decode_classic_stream_bad_utf8_and_error_parity_fuzz() {
+        // Invalid UTF-8 in label value sets bad_utf8=true and prom_hash=0 without erroring,
+        // matching decode_write_request succeeding.
+        let req_bad_utf8 = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![cortexpb::LabelPair {
+                    name: bytes::Bytes::from_static(b"__name__"),
+                    value: bytes::Bytes::from_static(b"bad\xffval"),
+                }],
+                samples: vec![cortexpb::Sample {
+                    value: 1.0,
+                    timestamp_ms: 100,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bad_wire = req_bad_utf8.encode_to_vec();
+        let mut scratch = WriteRequestScratch::new();
+        assert!(decode_write_request(&bad_wire, DecodeOptions::classic(), &mut scratch).is_ok());
+        let mut label_bytes = Vec::new();
+        let mut samples = Vec::new();
+        let mut bad_flags = Vec::new();
+        decode_classic_stream(
+            &bad_wire,
+            DecodeOptions::classic(),
+            &mut scratch,
+            &mut label_bytes,
+            &mut samples,
+            |s| bad_flags.push((s.bad_utf8, s.prom_hash)),
+        )
+        .unwrap();
+        assert_eq!(bad_flags, vec![(true, 0)]);
+
+        // RW2 wire bytes must produce identical error in both classic decoders.
+        let rw2 = cortexpb::WriteRequest {
+            symbols_rw2: vec!["".into(), "__name__".into(), "up".into()],
+            timeseries_rw2: vec![cortexpb::TimeSeriesRw2 {
+                labels_refs: vec![1, 2],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let e1 = decode_write_request(&rw2, DecodeOptions::classic(), &mut scratch)
+            .err()
+            .unwrap();
+        let e2 = decode_classic_stream(
+            &rw2,
+            DecodeOptions::classic(),
+            &mut scratch,
+            &mut label_bytes,
+            &mut samples,
+            |_| {},
+        )
+        .err()
+        .unwrap();
+        assert_eq!(e1, e2);
+
+        // Deterministic PRNG differential parity across 1,000 fuzzed inputs.
+        let mut state: u64 = 0x517c_c1b7_2722_0a95;
+        let mut next_u8 = || -> u8 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xff) as u8
+        };
+        let mut ref_scratch = WriteRequestScratch::new();
+        for iter in 0..1000usize {
+            let len = (iter % 97) + 1;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                buf.push(next_u8());
+            }
+            let r_ref = decode_write_request(&buf, DecodeOptions::classic(), &mut ref_scratch);
+            label_bytes.clear();
+            samples.clear();
+            let mut stream_count = 0usize;
+            let r_stream = decode_classic_stream(
+                &buf,
+                DecodeOptions::classic(),
+                &mut scratch,
+                &mut label_bytes,
+                &mut samples,
+                |_| stream_count += 1,
+            );
+            match (r_ref, r_stream) {
+                (Ok(ref_b), Ok(hdr)) => {
+                    assert_eq!(stream_count, ref_b.timeseries_len());
+                    assert_eq!(hdr.source, ref_b.source);
+                    assert_eq!(hdr.skip_label_validation, ref_b.skip_label_validation);
+                    assert_eq!(
+                        hdr.skip_label_count_validation,
+                        ref_b.skip_label_count_validation
+                    );
+                    assert_eq!(scratch.metadata(&buf).collect::<Vec<_>>(), ref_b.metadata().collect::<Vec<_>>());
+                }
+                (Err(e1), Err(e2)) => {
+                    assert_eq!(e1, e2, "error mismatch on fuzz iter {iter}");
+                    assert!(label_bytes.is_empty());
+                    assert!(samples.is_empty());
+                }
+                (Ok(_), Err(e)) => panic!("ref Ok, stream Err({e:?}) on iter {iter}"),
+                (Err(e), Ok(_)) => panic!("ref Err({e:?}), stream Ok on iter {iter}"),
+            }
+        }
     }
 }
