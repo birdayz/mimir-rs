@@ -19,6 +19,9 @@ use mimir_config::parse_go_duration;
 use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb;
 use mimir_proto::prost::Message;
+use mimir_proto::query_stream_enc::{
+    encoded_series_chunks_len, QueryStreamBatchBuilder, RawChunk,
+};
 use mimir_storage::ingest::partition_offset_watcher::OffsetWatcherError;
 use mimir_storage::ingest::reader::ReaderError;
 use mimir_storage::ingest::PartitionOffsets;
@@ -52,6 +55,8 @@ pub const QUERY_STREAM_BATCH_MESSAGE_SIZE: usize = 1024 * 1024;
 pub type QueryStreamBox = std::pin::Pin<
     Box<dyn futures::Stream<Item = Result<ingesterpb::QueryStreamResponse, Status>> + Send + 'static>,
 >;
+pub type RawQueryStreamBox =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, Status>> + Send + 'static>>;
 pub const LABEL_NAMES_AND_VALUES_TARGET_SIZE_BYTES: usize = 1024 * 1024;
 pub const LABEL_VALUES_CARDINALITY_TARGET_SIZE_BYTES: usize = 1024 * 1024;
 pub const ACTIVE_SERIES_MAX_SIZE_BYTES: usize = 1024 * 1024;
@@ -966,6 +971,440 @@ impl Ingester {
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
 
+    /// Zero-alloc wire-encoding `QueryStream` implementation returning raw serialized
+    /// `QueryStreamResponse` protobuf `Bytes` batches (served via `RawQueryStreamCodec` in `grpc.rs`).
+    ///
+    /// Eliminates per-series `Vec<cortexpb::LabelPair>`, per-label `Bytes::slice` atomic refcount
+    /// ops, per-chunk `Vec<ingesterpb::Chunk>`, and `prost` double-pass encoding.
+    pub async fn handle_query_stream_raw(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        mut req: ingesterpb::QueryRequest,
+    ) -> Result<RawQueryStreamBox, IngesterError> {
+        let permit = self.start_read_request(md).await?;
+        if req.streaming_chunks_batch_size == 0 {
+            req.streaming_chunks_batch_size = FALLBACK_CHUNK_STREAM_BATCH_SIZE;
+        }
+        let matchers = from_proto_matchers(&req.matchers)?;
+        let (shard, matchers) = remove_shard_from_matchers(matchers)?;
+
+        self.metrics.queries.inc();
+        if let Err(e) = self.enforce_read_consistency(md, user_id).await {
+            permit.finish(e.is_deadline_exceeded());
+            return Err(e);
+        }
+
+        let Some(db) = self.get_tsdb(user_id) else {
+            permit.finish(false);
+            return Ok(Box::pin(tokio_stream::empty()));
+        };
+
+        let start_ts = req.start_timestamp_ms;
+        let end_ts = req.end_timestamp_ms;
+        let batch_limit = req.streaming_chunks_batch_size as usize;
+        let chunk_series = if !self
+            .blocks_cfg
+            .tsdb
+            .index_lookup_planning
+            .index_lookup_planning_enabled
+        {
+            const INLINE_CHUNK_LOAD_SERIES_LIMIT: usize = 256;
+            const INLINE_CHUNK_LOAD_REFS_LIMIT: usize = 512;
+
+            let ooo_window = self
+                .overrides
+                .for_tenant(user_id)
+                .out_of_order_time_window
+                .0;
+            let unordered = ooo_window > 0;
+            let select_stats = BlockSelectStatsSink::default();
+            let cq = if unordered {
+                db.db.unordered_chunk_querier(start_ts, end_ts)
+            } else {
+                db.db.chunk_querier(start_ts, end_ts)
+            }
+            .with_filtered_select_stats(Arc::clone(&select_stats), shard_stats_filter(shard));
+            match cq
+                .try_select_adaptive(
+                    true,
+                    &matchers,
+                    INLINE_CHUNK_LOAD_SERIES_LIMIT,
+                    INLINE_CHUNK_LOAD_REFS_LIMIT,
+                )
+                .map_err(|e| IngesterError::Internal {
+                    message: format!("selecting series from ChunkQuerier: {e}"),
+                })? {
+                Some(Ok(mut inline_series)) => {
+                    self.observe_block_select_stats(
+                        user_id,
+                        &db,
+                        &select_stats,
+                        shard.is_some(),
+                        &matchers,
+                    );
+                    if let Some((shard_idx, shard_count)) = shard {
+                        inline_series
+                            .retain(|cs| labels_stable_hash(&cs.labels) % shard_count == shard_idx);
+                    }
+                    inline_series
+                }
+                maybe_prepared => {
+                    let prepared_opt = match maybe_prepared {
+                        Some(Err(p)) => Some(p),
+                        None => None,
+                        Some(Ok(_)) => unreachable!(),
+                    };
+                    let (tx, rx) = mpsc::channel(4);
+                    let ingester = Arc::clone(self);
+                    let db_c = Arc::clone(&db);
+                    let user_c = user_id.to_owned();
+                    tokio::task::spawn_blocking(move || {
+                        let cq_b = if unordered {
+                            db_c.db.unordered_chunk_querier(start_ts, end_ts)
+                        } else {
+                            db_c.db.chunk_querier(start_ts, end_ts)
+                        }
+                        .with_filtered_select_stats(
+                            Arc::clone(&select_stats),
+                            shard_stats_filter(shard),
+                        );
+                        let prepared = match prepared_opt {
+                            Some(p) => p,
+                            None => match cq_b.prepare_select(&matchers) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    let err = IngesterError::Internal {
+                                        message: format!("selecting series from ChunkQuerier: {e}"),
+                                    };
+                                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                                    permit.finish(false);
+                                    return;
+                                }
+                            },
+                        };
+                        let shard_pred = shard.map(|(shard_idx, shard_count)| {
+                            move |lbls: &Labels| labels_stable_hash(lbls) % shard_count == shard_idx
+                        });
+                        let filter_ref: Option<&dyn Fn(&Labels) -> bool> =
+                            shard_pred.as_ref().map(|f| f as &dyn Fn(&Labels) -> bool);
+
+                        let mut num_series = 0usize;
+                        let mut num_samples = 0usize;
+                        let mut builder = QueryStreamBatchBuilder::with_capacity(64 * 1024);
+                        let mut series_in_batch = 0usize;
+                        let mut chunks_in_batch = 0usize;
+                        let mut receiver_closed = false;
+
+                        let res = cq_b.stream_prepared_chunks_lazy(
+                            prepared,
+                            &matchers,
+                            true,
+                            filter_ref,
+                            |ev| match ev {
+                                LazyStreamEvent::Series(labels, chunk_count) => {
+                                    num_series += 1;
+                                    if builder
+                                        .push_series_stringlabels(
+                                            labels.as_bytes(),
+                                            chunk_count as i64,
+                                        )
+                                        .is_err()
+                                    {
+                                        return Err(mimir_tsdb::querier::QuerierError::Chunk(
+                                            mimir_tsdb::chunkenc::ChunkError::InvalidEncoding(0),
+                                        ));
+                                    }
+                                    drop(labels);
+                                    series_in_batch += 1;
+                                    if series_in_batch >= QUERY_STREAM_BATCH_SIZE {
+                                        let bytes = builder.finish();
+                                        series_in_batch = 0;
+                                        if tx.blocking_send(Ok(bytes)).is_err() {
+                                            receiver_closed = true;
+                                            return Ok(false);
+                                        }
+                                    }
+                                    Ok(true)
+                                }
+                                LazyStreamEvent::SeriesEnd => {
+                                    builder.set_end_of_series_stream();
+                                    let bytes = builder.finish();
+                                    series_in_batch = 0;
+                                    if tx.blocking_send(Ok(bytes)).is_err() {
+                                        receiver_closed = true;
+                                        return Ok(false);
+                                    }
+                                    Ok(true)
+                                }
+                                LazyStreamEvent::SeriesChunks(series_idx, chks) => {
+                                    let mut raw_chunks: smallvec::SmallVec<[RawChunk<'_>; 4]> =
+                                        smallvec::SmallVec::with_capacity(chks.len());
+                                    for cm in &chks {
+                                        let Some(ref enc_chunk) = cm.chunk else {
+                                            return Err(mimir_tsdb::querier::QuerierError::Chunk(
+                                                mimir_tsdb::chunkenc::ChunkError::InvalidEncoding(0),
+                                            ));
+                                        };
+                                        num_samples += enc_chunk.num_samples();
+                                        raw_chunks.push(RawChunk {
+                                            encoding: tsdb_encoding_to_wire(enc_chunk.encoding()),
+                                            min_timestamp_ms: cm.min_time,
+                                            max_timestamp_ms: cm.max_time,
+                                            data: enc_chunk.as_bytes(),
+                                        });
+                                    }
+                                    let entry_len =
+                                        encoded_series_chunks_len(series_idx as u64, &raw_chunks);
+                                    if (chunks_in_batch > 0
+                                        && builder.len() + entry_len
+                                            > QUERY_STREAM_BATCH_MESSAGE_SIZE)
+                                        || chunks_in_batch >= batch_limit
+                                    {
+                                        let bytes = builder.finish();
+                                        chunks_in_batch = 0;
+                                        if tx.blocking_send(Ok(bytes)).is_err() {
+                                            receiver_closed = true;
+                                            return Ok(false);
+                                        }
+                                    }
+                                    builder.push_series_chunks(series_idx as u64, &raw_chunks);
+                                    chunks_in_batch += 1;
+                                    Ok(true)
+                                }
+                            },
+                        );
+                        ingester.observe_block_select_stats(
+                            &user_c,
+                            &db_c,
+                            &select_stats,
+                            shard.is_some(),
+                            &matchers,
+                        );
+
+                        match res {
+                            Ok(()) => {
+                                if !receiver_closed {
+                                    if !builder.is_empty() {
+                                        let _ = tx.blocking_send(Ok(builder.finish()));
+                                    }
+                                    ingester
+                                        .metrics
+                                        .queried_series
+                                        .with_label_values(&["merged_blocks"])
+                                        .observe(num_series as f64);
+                                    ingester.metrics.queried_samples.observe(num_samples as f64);
+                                }
+                            }
+                            Err(e) => {
+                                let err = IngesterError::Internal {
+                                    message: format!("selecting series from ChunkQuerier: {e}"),
+                                };
+                                let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                            }
+                        }
+                        permit.finish(false);
+                    });
+
+                    return Ok(Box::pin(ReceiverStream::new(rx)));
+                }
+            }
+        } else {
+            let ing_c = Arc::clone(self);
+            let db_c = Arc::clone(&db);
+            let uid_c = user_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                ing_c.select_chunk_series_for_query(
+                    &db_c, &uid_c, start_ts, end_ts, shard, &matchers,
+                )
+            })
+            .await
+            .map_err(|e| IngesterError::Internal {
+                message: format!("query task join error: {e}"),
+            })??
+        };
+
+        let num_series = chunk_series.len();
+        let total_chunks: usize = chunk_series.iter().map(|cs| cs.chunks.len()).sum();
+        let est_chunk_bytes: usize = chunk_series
+            .iter()
+            .flat_map(|cs| cs.chunks.iter())
+            .map(|cm| cm.chunk.as_ref().map_or(0, |c| c.as_bytes().len() + 32))
+            .sum();
+
+        if num_series <= QUERY_STREAM_BATCH_SIZE
+            && total_chunks <= batch_limit
+            && est_chunk_bytes < QUERY_STREAM_BATCH_MESSAGE_SIZE
+        {
+            let mut builder = QueryStreamBatchBuilder::with_capacity(
+                (est_chunk_bytes + num_series * 128).max(256),
+            );
+            if num_series == 0 {
+                self.metrics
+                    .queried_series
+                    .with_label_values(&["merged_blocks"])
+                    .observe(0.0);
+                self.metrics.queried_samples.observe(0.0);
+                permit.finish(false);
+                builder.set_end_of_series_stream();
+                return Ok(Box::pin(tokio_stream::iter(std::iter::once(Ok(
+                    builder.finish(),
+                )))));
+            }
+
+            for cs in &chunk_series {
+                builder
+                    .push_series_stringlabels(cs.labels.as_bytes(), cs.chunks.len() as i64)
+                    .map_err(|e| IngesterError::Internal {
+                        message: format!("encoding QueryStreamSeries: {e}"),
+                    })?;
+            }
+            builder.set_end_of_series_stream();
+
+            let mut responses: smallvec::SmallVec<[Result<Bytes, Status>; 2]> =
+                smallvec::SmallVec::new();
+            responses.push(Ok(builder.finish()));
+
+            let mut num_samples = 0usize;
+            let mut chunks_in_batch = 0usize;
+            let mut raw_chunks: smallvec::SmallVec<[RawChunk<'_>; 4]> = smallvec::SmallVec::new();
+
+            for (series_idx, cs) in chunk_series.iter().enumerate() {
+                raw_chunks.clear();
+                for cm in &cs.chunks {
+                    let Some(ref enc_chunk) = cm.chunk else {
+                        permit.finish(false);
+                        return Err(IngesterError::Internal {
+                            message: "unfilled chunk returned from TSDB chunk querier".to_string(),
+                        });
+                    };
+                    num_samples += enc_chunk.num_samples();
+                    raw_chunks.push(RawChunk {
+                        encoding: tsdb_encoding_to_wire(enc_chunk.encoding()),
+                        min_timestamp_ms: cm.min_time,
+                        max_timestamp_ms: cm.max_time,
+                        data: enc_chunk.as_bytes(),
+                    });
+                }
+                let entry_len = encoded_series_chunks_len(series_idx as u64, &raw_chunks);
+                if (chunks_in_batch > 0
+                    && builder.len() + entry_len > QUERY_STREAM_BATCH_MESSAGE_SIZE)
+                    || chunks_in_batch >= batch_limit
+                {
+                    responses.push(Ok(builder.finish()));
+                    chunks_in_batch = 0;
+                }
+                builder.push_series_chunks(series_idx as u64, &raw_chunks);
+                chunks_in_batch += 1;
+            }
+
+            if !builder.is_empty() {
+                responses.push(Ok(builder.finish()));
+            }
+
+            self.metrics
+                .queried_series
+                .with_label_values(&["merged_blocks"])
+                .observe(num_series as f64);
+            self.metrics.queried_samples.observe(num_samples as f64);
+            permit.finish(false);
+            return Ok(Box::pin(tokio_stream::iter(responses)));
+        }
+
+        let (tx, rx) = mpsc::channel(8);
+        let ingester = Arc::clone(self);
+        tokio::spawn(async move {
+            let res = ingester
+                .stream_selected_raw_query_batches(chunk_series, batch_limit, &tx)
+                .await;
+            if let Err(e) = res {
+                let _ = tx.send(Err(e.map_read_error_to_status())).await;
+            }
+            permit.finish(false);
+        });
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    async fn stream_selected_raw_query_batches(
+        &self,
+        mut chunk_series: Vec<QueryChunkSeries>,
+        batch_limit: usize,
+        tx: &mpsc::Sender<Result<Bytes, Status>>,
+    ) -> Result<(), IngesterError> {
+        let num_series = chunk_series.len();
+        let mut builder = QueryStreamBatchBuilder::with_capacity(64 * 1024);
+        let mut series_in_batch = 0usize;
+        for cs in chunk_series.iter_mut() {
+            let labels = std::mem::take(&mut cs.labels);
+            builder
+                .push_series_stringlabels(labels.as_bytes(), cs.chunks.len() as i64)
+                .map_err(|e| IngesterError::Internal {
+                    message: format!("encoding QueryStreamSeries: {e}"),
+                })?;
+            drop(labels);
+            series_in_batch += 1;
+            if series_in_batch >= QUERY_STREAM_BATCH_SIZE {
+                let bytes = builder.finish();
+                series_in_batch = 0;
+                if tx.send(Ok(bytes)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        builder.set_end_of_series_stream();
+        if tx.send(Ok(builder.finish())).await.is_err() {
+            return Ok(());
+        }
+
+        let mut num_samples = 0usize;
+        let mut chunks_in_batch = 0usize;
+        let mut raw_chunks: smallvec::SmallVec<[RawChunk<'_>; 4]> = smallvec::SmallVec::new();
+
+        for (series_idx, cs) in chunk_series.iter().enumerate() {
+            raw_chunks.clear();
+            for cm in &cs.chunks {
+                let Some(ref enc_chunk) = cm.chunk else {
+                    return Err(IngesterError::Internal {
+                        message: "unfilled chunk returned from TSDB chunk querier".to_string(),
+                    });
+                };
+                num_samples += enc_chunk.num_samples();
+                raw_chunks.push(RawChunk {
+                    encoding: tsdb_encoding_to_wire(enc_chunk.encoding()),
+                    min_timestamp_ms: cm.min_time,
+                    max_timestamp_ms: cm.max_time,
+                    data: enc_chunk.as_bytes(),
+                });
+            }
+            let entry_len = encoded_series_chunks_len(series_idx as u64, &raw_chunks);
+            if (chunks_in_batch > 0
+                && builder.len() + entry_len > QUERY_STREAM_BATCH_MESSAGE_SIZE)
+                || chunks_in_batch >= batch_limit
+            {
+                let bytes = builder.finish();
+                chunks_in_batch = 0;
+                if tx.send(Ok(bytes)).await.is_err() {
+                    return Ok(());
+                }
+            }
+            builder.push_series_chunks(series_idx as u64, &raw_chunks);
+            chunks_in_batch += 1;
+        }
+
+        if !builder.is_empty() && tx.send(Ok(builder.finish())).await.is_err() {
+            return Ok(());
+        }
+
+        self.metrics
+            .queried_series
+            .with_label_values(&["merged_blocks"])
+            .observe(num_series as f64);
+        self.metrics.queried_samples.observe(num_samples as f64);
+
+        Ok(())
+    }
+
     /// Streaming `QueryStream` implementation backed by a bounded `mpsc::channel(8)` so
     /// 128-series label batches and chunk batches are flushed and dropped incrementally
     /// without buffering the entire query result set in memory.
@@ -1867,8 +2306,22 @@ impl Ingester {
 
         tokio::task::spawn_blocking(move || -> Result<Vec<ingesterpb::LabelNamesAndValuesResponse>, IngesterError> {
             let head = db.db.head();
+            let base_refs_arc = if !matchers.is_empty() {
+                let refs = head
+                    .postings_for_matchers_arc(&matchers)
+                    .map_err(|e| IngesterError::Internal {
+                        message: e.to_string(),
+                    })?;
+                if refs.is_empty() {
+                    return Ok(Vec::new());
+                }
+                Some(refs)
+            } else {
+                None
+            };
+
             let label_names = head
-                .label_names(&matchers)
+                .label_names(&[])
                 .map_err(|e| IngesterError::Internal {
                     message: e.to_string(),
                 })?;
@@ -1878,60 +2331,63 @@ impl Ingester {
             let mut resp_bytes = 0usize;
 
             for label_name in label_names {
+                let mut filtered = Vec::new();
+                head.visit_all_values_postings_for_name(&label_name, |val_str, small, large| {
+                    if val_str.is_empty() {
+                        return;
+                    }
+                    let matched = match base_refs_arc.as_deref() {
+                        Some(base) => {
+                            mimir_tsdb::postings::intersect_sorted_any(small, large, base)
+                        }
+                        None => !small.is_empty() || !large.is_empty(),
+                    };
+                    if !matched {
+                        return;
+                    }
+                    let is_active = !active_only
+                        || small
+                            .iter()
+                            .any(|&r| db.active_series.is_ref_active_fast(r as u64, i64::MIN))
+                        || large
+                            .iter()
+                            .any(|&r| db.active_series.is_ref_active_fast(r, i64::MIN));
+                    if is_active {
+                        filtered.push(val_str.to_owned());
+                    }
+                });
+
+                if filtered.is_empty() {
+                    continue;
+                }
+                filtered.sort_unstable();
+
                 resp_bytes += label_name.len();
                 if resp_bytes >= LABEL_NAMES_AND_VALUES_TARGET_SIZE_BYTES && !resp.items.is_empty() {
                     batches.push(std::mem::take(&mut resp));
                     resp_bytes = label_name.len();
                 }
 
-                let values = head
-                    .label_values(&label_name, &matchers)
-                    .map_err(|e| IngesterError::Internal {
-                        message: e.to_string(),
-                    })?;
-
-                let mut filtered = Vec::with_capacity(values.len());
-                if active_only {
-                    // Go `activeseries.IsLabelValueActive` (`ingester_query.go:434-437`):
-                    // keeps `(label_name, val)` if ANY active series in Head has `label_name=val`.
-                    for val in values {
-                        let is_active =
-                            head.visit_postings_for_label_value(&label_name, &val, |small, large| {
-                                small
-                                    .iter()
-                                    .any(|&r| db.active_series.contains_ref(r as u64))
-                                    || large.iter().any(|&r| db.active_series.contains_ref(r))
-                            });
-                        if is_active {
-                            filtered.push(val);
-                        }
-                    }
-                } else {
-                    filtered = values;
-                }
-
-                if filtered.is_empty() {
-                    continue;
-                }
-
                 let mut cur_vals = Vec::new();
-                for (idx, val) in filtered.iter().enumerate() {
+                for val in filtered {
                     resp_bytes += val.len();
-                    cur_vals.push(val.clone());
-                    let is_last = idx + 1 == filtered.len();
+                    cur_vals.push(val);
                     if resp_bytes >= LABEL_NAMES_AND_VALUES_TARGET_SIZE_BYTES {
                         resp.items.push(ingesterpb::LabelValues {
                             label_name: label_name.clone(),
                             values: std::mem::take(&mut cur_vals),
                         });
                         batches.push(std::mem::take(&mut resp));
-                        resp_bytes = if is_last { 0 } else { label_name.len() };
-                    } else if is_last && !cur_vals.is_empty() {
-                        resp.items.push(ingesterpb::LabelValues {
-                            label_name: label_name.clone(),
-                            values: std::mem::take(&mut cur_vals),
-                        });
+                        resp_bytes = label_name.len();
                     }
+                }
+                if !cur_vals.is_empty() {
+                    resp.items.push(ingesterpb::LabelValues {
+                        label_name: label_name.clone(),
+                        values: cur_vals,
+                    });
+                } else {
+                    resp_bytes = 0;
                 }
             }
 
@@ -2003,51 +2459,79 @@ impl Ingester {
                 message: e.to_string(),
             };
 
+            let head = db.db.head();
+            let eligible_refs: Option<Arc<[u64]>> = if !matchers.is_empty() {
+                let base_refs =
+                    head.postings_for_matchers_arc(&matchers)
+                        .map_err(|e| IngesterError::Internal {
+                            message: e.to_string(),
+                        })?;
+                if active_only {
+                    let mut filtered = Vec::with_capacity(base_refs.len());
+                    for &r in base_refs.iter() {
+                        if db.active_series.is_ref_active_fast(r, i64::MIN) {
+                            filtered.push(r);
+                        }
+                    }
+                    if filtered.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    Some(Arc::from(filtered))
+                } else {
+                    if base_refs.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    Some(base_refs)
+                }
+            } else {
+                None
+            };
+
             let mut batches = Vec::new();
             let mut resp = ingesterpb::LabelValuesCardinalityResponse::default();
             let mut resp_bytes = 0usize;
 
             for lbl_name in &label_names {
-                let lbl_values =
-                    db.db
-                        .head()
-                        .label_values(lbl_name, &matchers)
-                        .map_err(|e| IngesterError::Internal {
+                let lbl_values = if let Some(ref elig) = eligible_refs {
+                    let mut vals = Vec::new();
+                    head.visit_all_values_postings_for_name(lbl_name, |val_str, small, large| {
+                        if !val_str.is_empty()
+                            && mimir_tsdb::postings::intersect_sorted_any(small, large, elig)
+                        {
+                            vals.push(val_str.to_owned());
+                        }
+                    });
+                    vals.sort_unstable();
+                    vals
+                } else {
+                    head.label_values(lbl_name, &[]).map_err(|e| {
+                        IngesterError::Internal {
                             message: e.to_string(),
-                        })?;
+                        }
+                    })?
+                };
 
                 let count_fn: LabelValueCountFn = {
-                    let (db, matchers, lbl_name) =
-                        (Arc::clone(&db), matchers.clone(), lbl_name.clone());
+                    let (db, eligible_refs, lbl_name) =
+                        (Arc::clone(&db), eligible_refs.clone(), lbl_name.clone());
                     Arc::new(move |val: &str| -> Result<u64, LabelNamesAndValuesError> {
                         let head = db.db.head();
-                        if matchers.is_empty() {
-                            if active_only {
-                                Ok(head.visit_postings_for_label_value(
-                                    &lbl_name,
-                                    val,
-                                    |small, large| {
+                        Ok(head.visit_postings_for_label_value(
+                            &lbl_name,
+                            val,
+                            |small, large| match eligible_refs.as_deref() {
+                                Some(elig) => {
+                                    mimir_tsdb::postings::intersect_sorted_count(small, large, elig)
+                                }
+                                None => {
+                                    if active_only {
                                         db.active_series.count_active_in_slices(small, large)
-                                    },
-                                ))
-                            } else {
-                                Ok(head.postings_length(&lbl_name, val) as u64)
-                            }
-                        } else {
-                            let mut ms = matchers.clone();
-                            ms.push(
-                                LabelMatcher::new(MatchType::Equal, &lbl_name, val)
-                                    .map_err(|e| LabelNamesAndValuesError::Other(e.to_string()))?,
-                            );
-                            let refs = head
-                                .postings_for_matchers_arc(&ms)
-                                .map_err(|e| LabelNamesAndValuesError::Other(e.to_string()))?;
-                            Ok(if active_only {
-                                db.active_series.count_active_in_slices(&[], &refs)
-                            } else {
-                                refs.len() as u64
-                            })
-                        }
+                                    } else {
+                                        (small.len() + large.len()) as u64
+                                    }
+                                }
+                            },
+                        ))
                     })
                 };
 

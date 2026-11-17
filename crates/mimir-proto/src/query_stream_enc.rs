@@ -241,6 +241,22 @@ where
     }
 }
 
+/// Returns the exact protobuf wire byte length of one `QueryStreamResponse.streaming_series_chunks`
+/// entry (field 5 tag + varint length + payload).
+#[inline]
+pub fn encoded_series_chunks_len(series_index: u64, chunks: &[RawChunk<'_>]) -> usize {
+    let mut sc_payload_len = if series_index != 0 {
+        1 + varint_len(series_index)
+    } else {
+        0
+    };
+    for c in chunks {
+        let clen = raw_chunk_payload_len(c);
+        sc_payload_len += 1 + varint_len(clen as u64) + clen;
+    }
+    1 + varint_len(sc_payload_len as u64) + sc_payload_len
+}
+
 /// Appends one `QueryStreamResponse.streaming_series_chunks` entry (field 5) directly from raw
 /// chunk metadata + `&[u8]` chunk bytes into `dst`.
 pub fn encode_query_stream_series_chunks(

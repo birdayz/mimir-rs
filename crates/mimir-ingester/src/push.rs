@@ -23,11 +23,10 @@ use mimir_ring::ring::replication_strategy::WRITE_NO_EXTEND;
 use mimir_tsdb::chunkenc::{CounterResetHint, FloatHistogram, Histogram, HistogramSpan};
 use mimir_tsdb::exemplar::{Exemplar, ExemplarError};
 use mimir_tsdb::head::{prefetch_read_data, HeadAppender, HeadError, SeriesEntry};
-use mimir_tsdb::labels::{append_stringlabel_pair, iter_stringlabels, Labels};
+use mimir_tsdb::labels::{iter_stringlabels, Labels};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use tracing::warn;
-use xxhash_rust::xxh64::xxh64;
 
 const CLASSIC_PUSH_SHARD_THRESHOLD: usize = 256;
 
@@ -824,6 +823,9 @@ impl Ingester {
         struct ClassicSeriesMeta {
             label_start: u32,
             label_len: u32,
+            sample_start: u32,
+            sample_len: u32,
+            created_timestamp: i64,
             prom_hash: u64,
             labels_sorted_unique: bool,
             hist_start: u32,
@@ -835,6 +837,7 @@ impl Ingester {
         struct ClassicPushScratch {
             wr_scratch: mimir_proto::zerocopy::WriteRequestScratch,
             label_bytes_arena: Vec<u8>,
+            samples_arena: Vec<cortexpb::Sample>,
             histograms_arena: Vec<ConvertedHistogram>,
             exemplars_arena: Vec<(i64, f64, Labels, String)>,
             series_metas: Vec<ClassicSeriesMeta>,
@@ -845,6 +848,7 @@ impl Ingester {
                 Self {
                     wr_scratch: mimir_proto::zerocopy::WriteRequestScratch::new(),
                     label_bytes_arena: Vec::with_capacity(64 * 1024),
+                    samples_arena: Vec::with_capacity(2048),
                     histograms_arena: Vec::new(),
                     exemplars_arena: Vec::new(),
                     series_metas: Vec::with_capacity(2048),
@@ -854,11 +858,15 @@ impl Ingester {
             fn clear(&mut self) {
                 self.wr_scratch.clear();
                 self.label_bytes_arena.clear();
+                self.samples_arena.clear();
                 self.histograms_arena.clear();
                 self.exemplars_arena.clear();
                 self.series_metas.clear();
                 if self.label_bytes_arena.capacity() > 4 * 1024 * 1024 {
                     self.label_bytes_arena.shrink_to(256 * 1024);
+                }
+                if self.samples_arena.capacity() > 256 * 1024 {
+                    self.samples_arena.shrink_to(16 * 1024);
                 }
             }
         }
@@ -880,23 +888,97 @@ impl Ingester {
             let guard = ScratchResetGuard(&mut scratch_ref);
             let s = &mut *guard.0;
 
-            let borrowed = match mimir_proto::zerocopy::decode_write_request(
+            let mut min_ts = i64::MAX;
+            let mut all_sorted_have_metric_name = true;
+            let mut bad_utf8 = false;
+            let mut exemplar_err: Option<IngesterError> = None;
+
+            let ClassicPushScratch {
+                ref mut wr_scratch,
+                ref mut label_bytes_arena,
+                ref mut samples_arena,
+                ref mut histograms_arena,
+                ref mut exemplars_arena,
+                ref mut series_metas,
+            } = *s;
+
+            let stream_res = mimir_proto::zerocopy::decode_classic_stream(
                 raw_bytes,
                 mimir_proto::zerocopy::DecodeOptions::classic(),
-                &mut s.wr_scratch,
-            ) {
-                Ok(b) => b,
+                wr_scratch,
+                label_bytes_arena,
+                samples_arena,
+                |series| {
+                    if series.bad_utf8 {
+                        bad_utf8 = true;
+                    } else if series.labels_sorted_unique
+                        && !iter_stringlabels(series.encoded_labels).any(|(k, _)| k == "__name__")
+                    {
+                        all_sorted_have_metric_name = false;
+                    }
+                    min_ts = min_ts.min(series.min_sample_ts);
+
+                    let hist_start = histograms_arena.len() as u32;
+                    let mut hist_len = 0u32;
+                    for h in series.histograms() {
+                        let conv = convert_borrowed_histogram(&h);
+                        min_ts = min_ts.min(conv.0);
+                        histograms_arena.push(conv);
+                        hist_len += 1;
+                    }
+
+                    let ex_start = exemplars_arena.len() as u32;
+                    let mut ex_len = 0u32;
+                    for ex in series.exemplars() {
+                        match convert_borrowed_exemplar(&ex) {
+                            Ok(conv) => {
+                                min_ts = min_ts.min(conv.0);
+                                exemplars_arena.push(conv);
+                                ex_len += 1;
+                            }
+                            Err(e) => {
+                                if exemplar_err.is_none() {
+                                    exemplar_err = Some(e.with_user(user_id, 0));
+                                }
+                            }
+                        }
+                    }
+
+                    series_metas.push(ClassicSeriesMeta {
+                        label_start: series.label_bytes_range.start as u32,
+                        label_len: series.label_bytes_range.len() as u32,
+                        sample_start: series.samples_range.start as u32,
+                        sample_len: series.samples_range.len() as u32,
+                        created_timestamp: series.created_timestamp,
+                        prom_hash: series.prom_hash,
+                        labels_sorted_unique: series.labels_sorted_unique,
+                        hist_start,
+                        hist_len,
+                        ex_start,
+                        ex_len,
+                    });
+                },
+            );
+
+            let header = match stream_res {
+                Ok(h) => h,
                 Err(
                     mimir_proto::zerocopy::DecodeError::UnexpectedRw2Timeseries
                     | mimir_proto::zerocopy::DecodeError::UnexpectedRw2Symbols,
-                ) => mimir_proto::zerocopy::decode_write_request(
-                    raw_bytes,
-                    mimir_proto::zerocopy::DecodeOptions::rw2(),
-                    &mut s.wr_scratch,
-                )
-                .map_err(|e| IngesterError::BadRequest {
-                    message: e.to_string(),
-                })?,
+                ) => {
+                    histograms_arena.clear();
+                    exemplars_arena.clear();
+                    series_metas.clear();
+                    let borrowed = mimir_proto::zerocopy::decode_write_request(
+                        raw_bytes,
+                        mimir_proto::zerocopy::DecodeOptions::rw2(),
+                        wr_scratch,
+                    )
+                    .map_err(|e| IngesterError::BadRequest {
+                        message: e.to_string(),
+                    })?;
+                    return self.push_borrowed_inner(user_id, &borrowed);
+                }
                 Err(e) => {
                     return Err(IngesterError::BadRequest {
                         message: e.to_string(),
@@ -904,172 +986,51 @@ impl Ingester {
                 }
             };
 
-            let meta_count = self.push_metadata_borrowed(user_id, &borrowed);
+            let meta_count = self.push_metadata_iter(user_id, wr_scratch.metadata(raw_bytes));
             if meta_count > 0 {
                 self.ingestion_rate.add(meta_count as i64);
             }
-            let ts_len = borrowed.timeseries_len();
+            if bad_utf8 {
+                return Err(IngesterError::BadRequest {
+                    message: "invalid UTF-8 in label".to_string(),
+                }
+                .with_user(user_id, 0));
+            }
+            if let Some(err) = exemplar_err {
+                return Err(err);
+            }
+
+            let ts_len = series_metas.len();
             if ts_len == 0 {
                 return Ok(());
             }
 
-            let source = cortexpb::write_request::SourceEnum::try_from(borrowed.source)
+            let source = cortexpb::write_request::SourceEnum::try_from(header.source)
                 .unwrap_or(cortexpb::write_request::SourceEnum::Api);
-            let mut min_ts = i64::MAX;
-            let mut all_sorted_have_metric_name = true;
-
-            s.series_metas.reserve(ts_len);
-            for ts in borrowed.timeseries() {
-                let label_start = s.label_bytes_arena.len();
-                let mut labels_sorted_unique = true;
-                let mut dropped_empty = false;
-                let mut has_metric_name = false;
-                let mut prev_name: Option<&str> = None;
-
-                if let Some(ts_labels_str) = ts.labels_str() {
-                    s.label_bytes_arena.reserve(ts_labels_str.len() * 24);
-                    for (k, v) in ts_labels_str {
-                        if let Some(pn) = prev_name {
-                            if pn >= k {
-                                labels_sorted_unique = false;
-                            }
-                        }
-                        prev_name = Some(k);
-                        if !v.is_empty() {
-                            if k == "__name__" {
-                                has_metric_name = true;
-                            }
-                            append_stringlabel_pair(
-                                &mut s.label_bytes_arena,
-                                k.as_bytes(),
-                                v.as_bytes(),
-                            );
-                        } else {
-                            dropped_empty = true;
-                        }
-                    }
-                    if !labels_sorted_unique && dropped_empty {
-                        // The series is rejected as unsorted without being appended: keep the raw
-                        // wire labels (empty values included) for `newLabelsNotSortedError`.
-                        s.label_bytes_arena.truncate(label_start);
-                        if let Some(raw) = ts.labels_str() {
-                            for (k, v) in raw {
-                                append_stringlabel_pair(
-                                    &mut s.label_bytes_arena,
-                                    k.as_bytes(),
-                                    v.as_bytes(),
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    let ts_labels = ts.labels();
-                    s.label_bytes_arena.reserve(ts_labels.len() * 24);
-                    for lp in ts_labels {
-                        let k = fast_utf8_str(lp.name).map_err(|_| {
-                            IngesterError::BadRequest {
-                                message: "invalid UTF-8 in label name".to_string(),
-                            }
-                            .with_user(user_id, 0)
-                        })?;
-                        let _v = fast_utf8_str(lp.value).map_err(|_| {
-                            IngesterError::BadRequest {
-                                message: "invalid UTF-8 in label value".to_string(),
-                            }
-                            .with_user(user_id, 0)
-                        })?;
-                        if let Some(pn) = prev_name {
-                            if pn >= k {
-                                labels_sorted_unique = false;
-                            }
-                        }
-                        prev_name = Some(k);
-                        if !lp.value.is_empty() {
-                            if k == "__name__" {
-                                has_metric_name = true;
-                            }
-                            append_stringlabel_pair(&mut s.label_bytes_arena, lp.name, lp.value);
-                        } else {
-                            dropped_empty = true;
-                        }
-                    }
-                    if !labels_sorted_unique && dropped_empty {
-                        // See above: raw wire labels for the labels-not-sorted error.
-                        s.label_bytes_arena.truncate(label_start);
-                        for lp in ts.labels() {
-                            append_stringlabel_pair(&mut s.label_bytes_arena, lp.name, lp.value);
-                        }
-                    }
-                }
-
-                if labels_sorted_unique && !has_metric_name {
-                    all_sorted_have_metric_name = false;
-                }
-
-                let label_end = s.label_bytes_arena.len();
-                let label_len = (label_end - label_start) as u32;
-                let prom_hash = if labels_sorted_unique && label_len > 0 {
-                    xxh64(&s.label_bytes_arena[label_start..label_end], 0)
-                } else {
-                    0
-                };
-
-                for sample in ts.samples() {
-                    min_ts = min_ts.min(sample.timestamp_ms);
-                }
-
-                let hist_start = s.histograms_arena.len() as u32;
-                let mut hist_len = 0u32;
-                for h in ts.histograms() {
-                    let conv = convert_borrowed_histogram(&h);
-                    min_ts = min_ts.min(conv.0);
-                    s.histograms_arena.push(conv);
-                    hist_len += 1;
-                }
-
-                let ex_start = s.exemplars_arena.len() as u32;
-                let mut ex_len = 0u32;
-                for ex in ts.exemplars() {
-                    let conv = convert_borrowed_exemplar(&ex)
-                        .map_err(|e| e.with_user(user_id, 0))?;
-                    min_ts = min_ts.min(conv.0);
-                    s.exemplars_arena.push(conv);
-                    ex_len += 1;
-                }
-
-                s.series_metas.push(ClassicSeriesMeta {
-                    label_start: label_start as u32,
-                    label_len,
-                    prom_hash,
-                    labels_sorted_unique,
-                    hist_start,
-                    hist_len,
-                    ex_start,
-                    ex_len,
-                });
-            }
 
             let mut items: Vec<PrehashedSeriesItem<'_>> = Vec::with_capacity(ts_len);
-            for (ts, m) in borrowed.timeseries().zip(s.series_metas.iter()) {
+            for m in series_metas.iter() {
                 let l_start = m.label_start as usize;
                 let encoded_labels =
-                    &s.label_bytes_arena[l_start..l_start + m.label_len as usize];
+                    &label_bytes_arena[l_start..l_start + m.label_len as usize];
+                let s_start = m.sample_start as usize;
+                let samples = &samples_arena[s_start..s_start + m.sample_len as usize];
                 let histograms = if m.hist_len == 0 {
                     &[][..]
                 } else {
                     let h_start = m.hist_start as usize;
-                    &s.histograms_arena[h_start..h_start + m.hist_len as usize]
+                    &histograms_arena[h_start..h_start + m.hist_len as usize]
                 };
                 let exemplars = if m.ex_len == 0 {
                     &[][..]
                 } else {
                     let e_start = m.ex_start as usize;
-                    &s.exemplars_arena[e_start..e_start + m.ex_len as usize]
+                    &exemplars_arena[e_start..e_start + m.ex_len as usize]
                 };
                 items.push(PrehashedSeriesItem {
                     encoded_labels,
-                    samples: ts.samples(),
-                    created_timestamp: ts.created_timestamp(),
+                    samples,
+                    created_timestamp: m.created_timestamp,
                     prom_hash: m.prom_hash,
                     labels_sorted_unique: m.labels_sorted_unique,
                     bad_utf8: false,
@@ -1328,7 +1289,15 @@ impl Ingester {
         user_id: &str,
         req: &BorrowedWriteRequest<'_, '_>,
     ) -> usize {
-        if req.metadata().len() == 0 {
+        self.push_metadata_iter(user_id, req.metadata())
+    }
+
+    pub(crate) fn push_metadata_iter<'a>(
+        &self,
+        user_id: &str,
+        metadata: impl ExactSizeIterator<Item = mimir_proto::zerocopy::BorrowedMetadata<'a>>,
+    ) -> usize {
+        if metadata.len() == 0 {
             return 0;
         }
         let store = self.get_or_create_user_metadata(user_id);
@@ -1339,7 +1308,7 @@ impl Ingester {
         let mut ingested = 0usize;
         let mut failed = 0usize;
         let mut first_err: Option<IngesterError> = None;
-        for bm in req.metadata() {
+        for bm in metadata {
             match store.add_parts_at(
                 bm.metric_type,
                 bm.metric_family_name,

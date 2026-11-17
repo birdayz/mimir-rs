@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::http;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{Future, Stream};
 use mimir_common::grpc_log::{GrpcErrorLog, GrpcErrorLogEntry};
 use mimir_common::tenant::{extract_org_id_from_grpc_metadata, parse_single_tenant_id};
@@ -19,7 +19,7 @@ use tonic::{Request, Response, Status};
 
 use crate::errors::IngesterError;
 use crate::ingester::Ingester;
-use crate::query::build_search_hints;
+use crate::query::{build_search_hints, RawQueryStreamBox};
 
 pub struct IngesterService {
     ingester: Arc<Ingester>,
@@ -93,6 +93,51 @@ impl Codec for RawPushCodec {
 
     fn decoder(&mut self) -> Self::Decoder {
         RawPushDecoder
+    }
+}
+
+#[derive(Clone, Default)]
+struct QueryRequestDecoder;
+
+impl Decoder for QueryRequestDecoder {
+    type Item = ingesterpb::QueryRequest;
+    type Error = Status;
+
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+        ingesterpb::QueryRequest::decode(src)
+            .map(Some)
+            .map_err(|e| Status::internal(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default)]
+struct RawBytesEncoder;
+
+impl Encoder for RawBytesEncoder {
+    type Item = Bytes;
+    type Error = Status;
+
+    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+        dst.put_slice(&item);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct RawQueryStreamCodec;
+
+impl Codec for RawQueryStreamCodec {
+    type Encode = Bytes;
+    type Decode = ingesterpb::QueryRequest;
+    type Encoder = RawBytesEncoder;
+    type Decoder = QueryRequestDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        RawBytesEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        QueryRequestDecoder
     }
 }
 
@@ -478,7 +523,9 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
     fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
         let custom_enc = custom_grpc_encoding(req.headers());
         let max_decode_len = self.max_decoding_message_size.unwrap_or(4 * 1024 * 1024);
-        let is_push = req.uri().path() == "/cortex.Ingester/Push";
+        let path = req.uri().path();
+        let is_push = path == "/cortex.Ingester/Push";
+        let is_query_stream = path == "/cortex.Ingester/QueryStream";
 
         let ingester = Arc::clone(&self.ingester);
         let accept_compression = self.accept_compression;
@@ -553,6 +600,52 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     push_grpc = push_grpc.max_encoding_message_size(lim);
                 }
                 push_grpc.unary(RawPushSvc(ingester), req).await
+            } else if is_query_stream {
+                struct RawQueryStreamSvc(Arc<Ingester>);
+                impl tonic::server::ServerStreamingService<ingesterpb::QueryRequest> for RawQueryStreamSvc {
+                    type Response = Bytes;
+                    type ResponseStream = RawQueryStreamBox;
+                    type Future = Pin<
+                        Box<
+                            dyn Future<Output = Result<Response<Self::ResponseStream>, Status>>
+                                + Send
+                                + 'static,
+                        >,
+                    >;
+
+                    fn call(&mut self, request: Request<ingesterpb::QueryRequest>) -> Self::Future {
+                        let ingester = Arc::clone(&self.0);
+                        Box::pin(async move {
+                            let user_id = tenant_from_req(&ingester, &request)?;
+                            let (md, ext, inner) = request.into_parts();
+                            let stream = ingester
+                                .handle_query_stream_raw(&md, &user_id, inner)
+                                .await
+                                .map_err(|e| read_error_status(&ext, e))?;
+                            Ok(Response::new(stream))
+                        })
+                    }
+                }
+
+                let mut qs_grpc = tonic::server::Grpc::new(RawQueryStreamCodec);
+                for enc in accept_compression[..accept_compression_len]
+                    .iter()
+                    .flatten()
+                {
+                    qs_grpc = qs_grpc.accept_compressed(*enc);
+                }
+                if let Some(enc) = send_compression {
+                    qs_grpc = qs_grpc.send_compressed(enc);
+                }
+                if let Some(lim) = max_decoding_message_size {
+                    qs_grpc = qs_grpc.max_decoding_message_size(lim);
+                }
+                if let Some(lim) = max_encoding_message_size {
+                    qs_grpc = qs_grpc.max_encoding_message_size(lim);
+                }
+                qs_grpc
+                    .server_streaming(RawQueryStreamSvc(ingester), req)
+                    .await
             } else {
                 inner.call(req).await?
             };

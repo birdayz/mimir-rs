@@ -749,10 +749,7 @@ impl<'a> TsdbQuerier<'a> {
                         LazyChunkSource::Head(r) => r,
                         _ => continue,
                     };
-                    let chks = match h.series_final_chunks(r, mint, maxt)? {
-                        Some((_, c)) => c,
-                        None => Vec::new(),
-                    };
+                    let chks = h.series_final_chunks_only(r, mint, maxt)?;
                     if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
                         return Ok(());
                     }

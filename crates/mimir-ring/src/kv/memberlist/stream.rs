@@ -10,7 +10,7 @@ use crate::kv::BoxFuture;
 
 use super::wire::{
     decompress_buffer, MessageType, NodeStateType, PushNodeState, PushPullHeader, MAX_MP_DEPTH,
-    MAX_PUSH_STATE_BYTES,
+    MAX_PUSH_PULL_NODES, MAX_PUSH_STATE_BYTES,
 };
 
 pub(super) fn default_hostname() -> String {
@@ -79,14 +79,30 @@ pub(super) async fn read_push_pull_from_stream<R: AsyncRead + Unpin + Send>(
     reader: &mut R,
 ) -> Result<(bool, Vec<PushNodeState>, Vec<u8>), String> {
     let hdr_bytes = read_msgpack_map_bytes(reader).await?;
+    let mut cumulative_bytes = hdr_bytes.len();
     let hdr = parse_push_pull_header_only(&hdr_bytes)?;
+    if hdr.nodes > MAX_PUSH_PULL_NODES {
+        return Err(format!(
+            "push/pull node count {} exceeds max {MAX_PUSH_PULL_NODES}",
+            hdr.nodes
+        ));
+    }
     let mut nodes = Vec::with_capacity(hdr.nodes.min(4096));
     for _ in 0..hdr.nodes {
-        let node_bytes = read_msgpack_map_bytes(reader).await?;
+        let remaining = MAX_PUSH_STATE_BYTES.saturating_sub(cumulative_bytes);
+        let node_bytes = read_msgpack_map_bytes_with_limit(reader, remaining).await?;
+        cumulative_bytes = cumulative_bytes
+            .checked_add(node_bytes.len())
+            .ok_or_else(|| "push/pull byte count overflow".to_string())?;
+        if cumulative_bytes > MAX_PUSH_STATE_BYTES {
+            return Err(format!(
+                "push/pull payload size {cumulative_bytes} exceeds max {MAX_PUSH_STATE_BYTES}"
+            ));
+        }
         let ns = parse_push_node_state_only(&node_bytes)?;
         nodes.push(ns);
     }
-    if hdr.user_state_len > MAX_PUSH_STATE_BYTES {
+    if hdr.user_state_len > MAX_PUSH_STATE_BYTES.saturating_sub(cumulative_bytes) {
         return Err(format!(
             "user state length {} exceeds limit",
             hdr.user_state_len
@@ -131,8 +147,22 @@ fn parse_push_pull_header_only(bytes: &[u8]) -> Result<PushPullHeader, String> {
     for _ in 0..map_len {
         let key = read_sync_string(bytes, &mut pos)?;
         match key.as_str() {
-            "Nodes" => hdr.nodes = read_sync_u64(bytes, &mut pos)? as usize,
-            "UserStateLen" => hdr.user_state_len = read_sync_u64(bytes, &mut pos)? as usize,
+            "Nodes" => {
+                let raw = read_sync_u64(bytes, &mut pos)?;
+                if raw > MAX_PUSH_PULL_NODES as u64 {
+                    return Err(format!(
+                        "push/pull node count {raw} exceeds max {MAX_PUSH_PULL_NODES}"
+                    ));
+                }
+                hdr.nodes = raw as usize;
+            }
+            "UserStateLen" => {
+                let raw = read_sync_u64(bytes, &mut pos)?;
+                if raw > MAX_PUSH_STATE_BYTES as u64 {
+                    return Err(format!("user state length {raw} exceeds limit"));
+                }
+                hdr.user_state_len = raw as usize;
+            }
             "Join" => hdr.join = read_sync_bool(bytes, &mut pos)?,
             _ => skip_sync_val(bytes, &mut pos)?,
         }
@@ -350,8 +380,15 @@ fn skip_sync_val(b: &[u8], pos: &mut usize) -> Result<(), String> {
 
 /// Reads a single complete self-delimiting MessagePack item from an async reader into a byte buffer.
 pub(super) async fn read_msgpack_map_bytes<R: AsyncRead + Unpin + Send>(reader: &mut R) -> Result<Vec<u8>, String> {
+    read_msgpack_map_bytes_with_limit(reader, MAX_PUSH_STATE_BYTES).await
+}
+
+async fn read_msgpack_map_bytes_with_limit<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(64);
-    read_mp_item(reader, &mut out, 0)
+    read_mp_item_limited(reader, &mut out, 0, max_bytes)
         .await
         .map_err(|e| e.to_string())?;
     Ok(out)
@@ -361,23 +398,33 @@ fn mp_invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-fn ensure_capacity_within_limit(out: &[u8], extra: usize) -> io::Result<()> {
+fn ensure_capacity_within_limit(out: &[u8], extra: usize, max_bytes: usize) -> io::Result<()> {
     let new_len = out
         .len()
         .checked_add(extra)
         .ok_or_else(|| mp_invalid("msgpack item length overflow"))?;
-    if new_len > MAX_PUSH_STATE_BYTES {
+    if new_len > max_bytes {
         return Err(mp_invalid(format!(
-            "msgpack payload size {new_len} exceeds max {MAX_PUSH_STATE_BYTES}"
+            "msgpack payload size {new_len} exceeds max {max_bytes}"
         )));
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn read_mp_item<'a, R: AsyncRead + Unpin + Send>(
     reader: &'a mut R,
     out: &'a mut Vec<u8>,
     depth: usize,
+) -> BoxFuture<'a, io::Result<()>> {
+    read_mp_item_limited(reader, out, depth, MAX_PUSH_STATE_BYTES)
+}
+
+fn read_mp_item_limited<'a, R: AsyncRead + Unpin + Send>(
+    reader: &'a mut R,
+    out: &'a mut Vec<u8>,
+    depth: usize,
+    max_bytes: usize,
 ) -> BoxFuture<'a, io::Result<()>> {
     Box::pin(async move {
         if depth >= MAX_MP_DEPTH {
@@ -385,7 +432,7 @@ fn read_mp_item<'a, R: AsyncRead + Unpin + Send>(
                 "msgpack nesting depth exceeds max {MAX_MP_DEPTH}"
             )));
         }
-        ensure_capacity_within_limit(out, 1)?;
+        ensure_capacity_within_limit(out, 1, max_bytes)?;
         let mut bd_buf = [0u8; 1];
         reader.read_exact(&mut bd_buf).await?;
         let bd = bd_buf[0];
@@ -393,76 +440,76 @@ fn read_mp_item<'a, R: AsyncRead + Unpin + Send>(
 
         match bd {
             0x00..=0x7f | 0xc0..=0xc3 | 0xe0..=0xff => Ok(()),
-            0xcc | 0xd0 => read_append(reader, out, 1).await,
-            0xcd | 0xd1 => read_append(reader, out, 2).await,
-            0xce | 0xd2 | 0xca => read_append(reader, out, 4).await,
-            0xcf | 0xd3 | 0xcb => read_append(reader, out, 8).await,
-            0xa0..=0xbf => read_append(reader, out, (bd & 0x1f) as usize).await,
+            0xcc | 0xd0 => read_append(reader, out, 1, max_bytes).await,
+            0xcd | 0xd1 => read_append(reader, out, 2, max_bytes).await,
+            0xce | 0xd2 | 0xca => read_append(reader, out, 4, max_bytes).await,
+            0xcf | 0xd3 | 0xcb => read_append(reader, out, 8, max_bytes).await,
+            0xa0..=0xbf => read_append(reader, out, (bd & 0x1f) as usize, max_bytes).await,
             0xd9 | 0xc4 => {
-                ensure_capacity_within_limit(out, 1)?;
+                ensure_capacity_within_limit(out, 1, max_bytes)?;
                 let mut l = [0u8; 1];
                 reader.read_exact(&mut l).await?;
                 out.push(l[0]);
-                read_append(reader, out, l[0] as usize).await
+                read_append(reader, out, l[0] as usize, max_bytes).await
             }
             0xda | 0xc5 => {
-                ensure_capacity_within_limit(out, 2)?;
+                ensure_capacity_within_limit(out, 2, max_bytes)?;
                 let mut l = [0u8; 2];
                 reader.read_exact(&mut l).await?;
                 out.extend_from_slice(&l);
-                read_append(reader, out, u16::from_be_bytes(l) as usize).await
+                read_append(reader, out, u16::from_be_bytes(l) as usize, max_bytes).await
             }
             0xdb | 0xc6 => {
-                ensure_capacity_within_limit(out, 4)?;
+                ensure_capacity_within_limit(out, 4, max_bytes)?;
                 let mut l = [0u8; 4];
                 reader.read_exact(&mut l).await?;
                 out.extend_from_slice(&l);
                 let len = u32::from_be_bytes(l) as usize;
-                read_append(reader, out, len).await
+                read_append(reader, out, len, max_bytes).await
             }
             0x90..=0x9f => {
                 let n = (bd & 0x0f) as usize;
-                ensure_capacity_within_limit(out, n)?;
+                ensure_capacity_within_limit(out, n, max_bytes)?;
                 for _ in 0..n {
-                    read_mp_item(reader, out, depth + 1).await?;
+                    read_mp_item_limited(reader, out, depth + 1, max_bytes).await?;
                 }
                 Ok(())
             }
             0xdc => {
-                ensure_capacity_within_limit(out, 2)?;
+                ensure_capacity_within_limit(out, 2, max_bytes)?;
                 let mut l = [0u8; 2];
                 reader.read_exact(&mut l).await?;
                 out.extend_from_slice(&l);
                 let n = u16::from_be_bytes(l) as usize;
-                ensure_capacity_within_limit(out, n)?;
+                ensure_capacity_within_limit(out, n, max_bytes)?;
                 for _ in 0..n {
-                    read_mp_item(reader, out, depth + 1).await?;
+                    read_mp_item_limited(reader, out, depth + 1, max_bytes).await?;
                 }
                 Ok(())
             }
             0xdd => {
-                ensure_capacity_within_limit(out, 4)?;
+                ensure_capacity_within_limit(out, 4, max_bytes)?;
                 let mut l = [0u8; 4];
                 reader.read_exact(&mut l).await?;
                 out.extend_from_slice(&l);
                 let n = u32::from_be_bytes(l) as usize;
-                ensure_capacity_within_limit(out, n)?;
+                ensure_capacity_within_limit(out, n, max_bytes)?;
                 for _ in 0..n {
-                    read_mp_item(reader, out, depth + 1).await?;
+                    read_mp_item_limited(reader, out, depth + 1, max_bytes).await?;
                 }
                 Ok(())
             }
             0x80..=0x8f => {
                 let n = (bd & 0x0f) as usize;
-                ensure_capacity_within_limit(out, n.saturating_mul(2))?;
+                ensure_capacity_within_limit(out, n.saturating_mul(2), max_bytes)?;
                 for _ in 0..n {
-                    read_mp_item(reader, out, depth + 1).await?;
-                    read_mp_item(reader, out, depth + 1).await?;
+                    read_mp_item_limited(reader, out, depth + 1, max_bytes).await?;
+                    read_mp_item_limited(reader, out, depth + 1, max_bytes).await?;
                 }
                 Ok(())
             }
             0xde => {
-                ensure_capacity_within_limit(out, 2)?;
+                ensure_capacity_within_limit(out, 2, max_bytes)?;
                 let mut l = [0u8; 2];
                 reader.read_exact(&mut l).await?;
                 out.extend_from_slice(&l);
@@ -470,15 +517,15 @@ fn read_mp_item<'a, R: AsyncRead + Unpin + Send>(
                 let min_bytes = n
                     .checked_mul(2)
                     .ok_or_else(|| mp_invalid("msgpack map16 length overflow"))?;
-                ensure_capacity_within_limit(out, min_bytes)?;
+                ensure_capacity_within_limit(out, min_bytes, max_bytes)?;
                 for _ in 0..n {
-                    read_mp_item(reader, out, depth + 1).await?;
-                    read_mp_item(reader, out, depth + 1).await?;
+                    read_mp_item_limited(reader, out, depth + 1, max_bytes).await?;
+                    read_mp_item_limited(reader, out, depth + 1, max_bytes).await?;
                 }
                 Ok(())
             }
             0xdf => {
-                ensure_capacity_within_limit(out, 4)?;
+                ensure_capacity_within_limit(out, 4, max_bytes)?;
                 let mut l = [0u8; 4];
                 reader.read_exact(&mut l).await?;
                 out.extend_from_slice(&l);
@@ -486,41 +533,41 @@ fn read_mp_item<'a, R: AsyncRead + Unpin + Send>(
                 let min_bytes = n
                     .checked_mul(2)
                     .ok_or_else(|| mp_invalid("msgpack map32 length overflow"))?;
-                ensure_capacity_within_limit(out, min_bytes)?;
+                ensure_capacity_within_limit(out, min_bytes, max_bytes)?;
                 for _ in 0..n {
-                    read_mp_item(reader, out, depth + 1).await?;
-                    read_mp_item(reader, out, depth + 1).await?;
+                    read_mp_item_limited(reader, out, depth + 1, max_bytes).await?;
+                    read_mp_item_limited(reader, out, depth + 1, max_bytes).await?;
                 }
                 Ok(())
             }
-            0xd4 => read_append(reader, out, 2).await,
-            0xd5 => read_append(reader, out, 3).await,
-            0xd6 => read_append(reader, out, 5).await,
-            0xd7 => read_append(reader, out, 9).await,
-            0xd8 => read_append(reader, out, 17).await,
+            0xd4 => read_append(reader, out, 2, max_bytes).await,
+            0xd5 => read_append(reader, out, 3, max_bytes).await,
+            0xd6 => read_append(reader, out, 5, max_bytes).await,
+            0xd7 => read_append(reader, out, 9, max_bytes).await,
+            0xd8 => read_append(reader, out, 17, max_bytes).await,
             0xc7 => {
-                ensure_capacity_within_limit(out, 1)?;
+                ensure_capacity_within_limit(out, 1, max_bytes)?;
                 let mut l = [0u8; 1];
                 reader.read_exact(&mut l).await?;
                 out.push(l[0]);
-                read_append(reader, out, 1 + l[0] as usize).await
+                read_append(reader, out, 1 + l[0] as usize, max_bytes).await
             }
             0xc8 => {
-                ensure_capacity_within_limit(out, 2)?;
+                ensure_capacity_within_limit(out, 2, max_bytes)?;
                 let mut l = [0u8; 2];
                 reader.read_exact(&mut l).await?;
                 out.extend_from_slice(&l);
-                read_append(reader, out, 1 + u16::from_be_bytes(l) as usize).await
+                read_append(reader, out, 1 + u16::from_be_bytes(l) as usize, max_bytes).await
             }
             0xc9 => {
-                ensure_capacity_within_limit(out, 4)?;
+                ensure_capacity_within_limit(out, 4, max_bytes)?;
                 let mut l = [0u8; 4];
                 reader.read_exact(&mut l).await?;
                 out.extend_from_slice(&l);
                 let len = 1usize
                     .checked_add(u32::from_be_bytes(l) as usize)
                     .ok_or_else(|| mp_invalid("msgpack ext32 length overflow"))?;
-                read_append(reader, out, len).await
+                read_append(reader, out, len, max_bytes).await
             }
         }
     })
@@ -530,8 +577,9 @@ async fn read_append<R: AsyncRead + Unpin + Send>(
     reader: &mut R,
     out: &mut Vec<u8>,
     len: usize,
+    max_bytes: usize,
 ) -> io::Result<()> {
-    ensure_capacity_within_limit(out, len)?;
+    ensure_capacity_within_limit(out, len, max_bytes)?;
     let start = out.len();
     out.resize(start + len, 0);
     reader.read_exact(&mut out[start..]).await?;
@@ -594,6 +642,19 @@ mod tests {
         let mut out_arr = Vec::new();
         let err_arr = read_mp_item(&mut cursor_arr, &mut out_arr, 0).await.unwrap_err();
         assert_eq!(err_arr.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_push_pull_rejects_excessive_nodes_and_empty_map_flood() {
+        // Header with Nodes = 100_000 (> MAX_PUSH_PULL_NODES).
+        let mut buf = vec![0x83];
+        buf.extend_from_slice(b"\xa5Nodes");
+        buf.push(0xce);
+        buf.extend_from_slice(&100_000u32.to_be_bytes());
+        buf.extend_from_slice(b"\xacUserStateLen\x00\xa4Join\xc2");
+        let mut cur = io::Cursor::new(buf);
+        let err = read_push_pull_from_stream(&mut cur).await.unwrap_err();
+        assert!(err.contains("exceeds max"), "got: {err}");
     }
 }
 

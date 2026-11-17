@@ -2338,7 +2338,6 @@ fn stateful_tsdb_differential_proptest_multi_seed() {
 }
 
 #[test]
-#[ignore = "BUG-1 (P0 regression in 6ac12b8): HistogramIterator::next_sample remaining_bits()/2 rejects valid 250-bucket sparse NHCB integer histogram on recode"]
 fn repro_bug1_wide_sparse_nhcb_int_histogram_recode_live_differential() {
     block_on_for_tests(async {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2415,7 +2414,6 @@ fn repro_bug1_wide_sparse_nhcb_int_histogram_recode_live_differential() {
 }
 
 #[test]
-#[ignore = "BUG-2 (P1): trim_and_merge_chunks encodes overlapping OOO Xor2 chunks (st==0) as EncXOR2(7) instead of Go populateChunksFromIterable EncXOR(4)"]
 fn repro_bug2_ooo_compaction_xor2_overlap_encoding_divergence() {
     block_on_for_tests(async {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2504,7 +2502,6 @@ fn repro_bug2_ooo_compaction_xor2_overlap_encoding_divergence() {
 }
 
 #[test]
-#[ignore = "BUG-3 (P1): Head overlapping in-order + OOO chunk merge tie-breaking diverges from Go chainSampleIterator + HeadChunkRef ordering"]
 fn repro_bug3_head_in_order_ooo_duplicate_timestamp_merge_divergence() {
     block_on_for_tests(async {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2588,7 +2585,6 @@ fn repro_bug3_head_in_order_ooo_duplicate_timestamp_merge_divergence() {
 }
 
 #[test]
-#[ignore = "BUG-4 (P1): trim_and_merge_chunks coalesces disjoint histogram chunks when one boundary chunk is partially trimmed, turning UnknownCounterReset into NotCounterReset"]
 fn repro_bug4_compaction_partial_boundary_coalesces_disjoint_histogram_chunks() {
     block_on_for_tests(async {
         let tmp = tempfile::tempdir().expect("tempdir");

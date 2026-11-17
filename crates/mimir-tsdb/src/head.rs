@@ -5010,6 +5010,18 @@ impl Head {
         self.postings.visit_postings_for_id(nid, vid, f)
     }
 
+    /// Visits all `(val, small_u32_refs, large_u64_refs)` postings for `name` under a single
+    /// `symbols.read()` and single postings stripe lock.
+    pub fn visit_all_values_postings_for_name(
+        &self,
+        name: &str,
+        f: impl FnMut(&str, &[u32], &[u64]),
+    ) {
+        let syms = self.symbols.read();
+        self.postings
+            .visit_all_values_postings_for_name(name, &syms, f);
+    }
+
     /// Returns number of postings for `(name, value)`.
     pub fn postings_length(&self, name: &str, value: &str) -> usize {
         let syms = self.symbols.read();
@@ -5743,6 +5755,7 @@ impl Head {
             hists_committed: 0,
             fhists_committed: 0,
             wal_buf: scratch.wal_buf,
+            wal_comp_buf: scratch.wal_comp_buf,
             closed: false,
         }
     }
@@ -6038,32 +6051,37 @@ impl Head {
         let Some(entry) = self.series.get_by_id(ref_id) else {
             return Ok(());
         };
-        let mut mmapped_refs: SmallVec<[MmappedChunk; 8]> = SmallVec::new();
+        const OOO_HEAD_CHUNK_REF_BIT: u64 = 1u64 << 31;
+        let mut mmapped_refs: SmallVec<[(u64, MmappedChunk); 8]> = SmallVec::new();
         {
             let st = entry.inner.lock();
             let Some(ooo) = st.ooo() else {
                 return Ok(());
             };
+            let mut ooo_pos = 0u64;
             for mc in &ooo.ooo_mmapped_chunks {
-                mmapped_refs.push(*mc);
+                mmapped_refs.push((OOO_HEAD_CHUNK_REF_BIT | ooo_pos, *mc));
+                ooo_pos += 1;
             }
             for (mc, chk) in &ooo.ooo_pending_mmapped {
                 out_chunks.push(ChunkMeta {
-                    ref_id: mc.ref_id.as_u64(),
+                    ref_id: OOO_HEAD_CHUNK_REF_BIT | ooo_pos,
                     min_time: mc.min_time,
                     max_time: mc.max_time,
                     chunk: Some(chk.clone()),
                 });
+                ooo_pos += 1;
             }
             if let Some(ref ohc) = ooo.ooo_head_chunk {
                 let use_xor2 = self.float_chunk_encoding() == Encoding::Xor2;
                 let use_hist_st = self.opts.enable_histogram_st_encoding;
+                let head_ref = OOO_HEAD_CHUNK_REF_BIT | ooo_pos;
                 for cc in ohc
                     .chunk
                     .to_encoded_chunks(i64::MIN, i64::MAX, use_xor2, use_hist_st)?
                 {
                     out_chunks.push(ChunkMeta {
-                        ref_id: 0,
+                        ref_id: head_ref,
                         min_time: cc.min_time,
                         max_time: cc.max_time,
                         chunk: Some(cc.chunk),
@@ -6074,10 +6092,10 @@ impl Head {
         if !mmapped_refs.is_empty() {
             let chunk_reader_guard = self.chunk_reader.read();
             if let Some(r) = chunk_reader_guard.as_ref() {
-                for mc in mmapped_refs {
+                for (sort_ref, mc) in mmapped_refs {
                     let enc = r.chunk(mc.ref_id)?;
                     out_chunks.push(ChunkMeta {
-                        ref_id: mc.ref_id.as_u64(),
+                        ref_id: sort_ref,
                         min_time: mc.min_time,
                         max_time: mc.max_time,
                         chunk: Some(enc),
@@ -7210,12 +7228,15 @@ impl Head {
             return Ok(None);
         };
 
+        const OOO_HEAD_CHUNK_REF_BIT: u64 = 1u64 << 31;
+
         'retry: loop {
             let (mmapped_in_order, head_chks, mmapped_ooo, ooo_head_chks) = {
                 let st = entry.inner.lock();
                 if entry.is_gced() {
                     return Ok(None);
                 }
+                let mut in_order_pos = 0u64;
                 let mmapped_count = st
                     .mmapped()
                     .iter()
@@ -7225,7 +7246,8 @@ impl Head {
                 if mmapped_count > 0 {
                     for mc in st.mmapped() {
                         if mc.overlaps_closed_interval(mint, maxt) {
-                            mmapped_in_order.push(*mc);
+                            mmapped_in_order.push((in_order_pos, *mc));
+                            in_order_pos += 1;
                         }
                     }
                 }
@@ -7233,35 +7255,40 @@ impl Head {
                 st.for_each_head_chunk(|hc_chunk, hc_min, hc_max| {
                     if hc_min <= maxt && mint <= hc_max {
                         head_chks.push(ChunkMeta {
-                            ref_id: 0,
+                            ref_id: in_order_pos,
                             min_time: hc_min,
                             max_time: hc_max,
                             chunk: Some(hc_chunk.clone()),
                         });
+                        in_order_pos += 1;
                     }
                 });
                 let mut mmapped_ooo = Vec::new();
                 let mut ooo_head_chks = Vec::new();
                 if let Some(ooo) = st.ooo() {
+                    let mut ooo_pos = 0u64;
                     for mc in &ooo.ooo_mmapped_chunks {
                         if mc.overlaps_closed_interval(mint, maxt) {
-                            mmapped_ooo.push(*mc);
+                            mmapped_ooo.push((OOO_HEAD_CHUNK_REF_BIT | ooo_pos, *mc));
                         }
+                        ooo_pos += 1;
                     }
                     for (mc, chk) in &ooo.ooo_pending_mmapped {
                         if mc.overlaps_closed_interval(mint, maxt) {
                             ooo_head_chks.push(ChunkMeta {
-                                ref_id: mc.ref_id.as_u64(),
+                                ref_id: OOO_HEAD_CHUNK_REF_BIT | ooo_pos,
                                 min_time: mc.min_time,
                                 max_time: mc.max_time,
                                 chunk: Some(chk.clone()),
                             });
                         }
+                        ooo_pos += 1;
                     }
                     if let Some(ref ohc) = ooo.ooo_head_chunk {
                         if ohc.overlaps_closed_interval(mint, maxt) {
                             let use_xor2 = self.float_chunk_encoding() == Encoding::Xor2;
                             let use_hist_st = self.opts.enable_histogram_st_encoding;
+                            let head_ref = OOO_HEAD_CHUNK_REF_BIT | ooo_pos;
                             for cc in ohc.chunk.to_encoded_chunks(
                                 ohc.min_time,
                                 ohc.max_time,
@@ -7269,7 +7296,7 @@ impl Head {
                                 use_hist_st,
                             )? {
                                 ooo_head_chks.push(ChunkMeta {
-                                    ref_id: 0,
+                                    ref_id: head_ref,
                                     min_time: cc.min_time,
                                     max_time: cc.max_time,
                                     chunk: Some(cc.chunk),
@@ -7302,11 +7329,11 @@ impl Head {
             let mut chks = Vec::with_capacity(
                 mmapped_in_order.len() + head_chks.len() + mmapped_ooo.len() + ooo_head_chks.len(),
             );
-            for mc in mmapped_in_order {
+            for (sort_ref, mc) in mmapped_in_order {
                 if let Some(r) = chunk_reader {
                     match r.chunk(mc.ref_id) {
                         Ok(enc) => chks.push(ChunkMeta {
-                            ref_id: mc.ref_id.as_u64(),
+                            ref_id: sort_ref,
                             min_time: mc.min_time,
                             max_time: mc.max_time,
                             chunk: Some(enc),
@@ -7327,11 +7354,11 @@ impl Head {
                 }
             }
             chks.extend(head_chks);
-            for mc in mmapped_ooo {
+            for (sort_ref, mc) in mmapped_ooo {
                 if let Some(r) = chunk_reader {
                     match r.chunk(mc.ref_id) {
                         Ok(enc) => chks.push(ChunkMeta {
-                            ref_id: mc.ref_id.as_u64(),
+                            ref_id: sort_ref,
                             min_time: mc.min_time,
                             max_time: mc.max_time,
                             chunk: Some(enc),
@@ -7680,6 +7707,7 @@ struct AppenderScratch {
     types_in_batch: FastU64Map<BatchSampleType>,
     batch_boundaries: Vec<BatchBoundary>,
     wal_buf: Vec<u8>,
+    wal_comp_buf: Vec<u8>,
 }
 
 /// Transactional write appender for [`Head`] matching `tsdb.headAppender`.
@@ -7705,6 +7733,7 @@ pub struct HeadAppender<'a> {
     hists_committed: usize,
     fhists_committed: usize,
     wal_buf: Vec<u8>,
+    wal_comp_buf: Vec<u8>,
     closed: bool,
 }
 
@@ -7832,6 +7861,7 @@ impl<'a> HeadAppender<'a> {
         self.types_in_batch.clear();
         self.batch_boundaries.clear();
         self.wal_buf.clear();
+        self.wal_comp_buf.clear();
         self.indexed_floats_len = 0;
         self.indexed_hists_len = 0;
         self.indexed_fhists_len = 0;
@@ -7868,6 +7898,9 @@ impl<'a> HeadAppender<'a> {
         if self.wal_buf.capacity() > 512 * 1024 {
             self.wal_buf = Vec::new();
         }
+        if self.wal_comp_buf.capacity() > 512 * 1024 {
+            self.wal_comp_buf = Vec::new();
+        }
         let mut pool = self.head.appender_pool.lock();
         if pool.len() < 32 {
             pool.push(AppenderScratch {
@@ -7882,6 +7915,7 @@ impl<'a> HeadAppender<'a> {
                 types_in_batch: std::mem::take(&mut self.types_in_batch),
                 batch_boundaries: std::mem::take(&mut self.batch_boundaries),
                 wal_buf: std::mem::take(&mut self.wal_buf),
+                wal_comp_buf: std::mem::take(&mut self.wal_comp_buf),
             });
         }
     }
@@ -9975,10 +10009,7 @@ impl<'a> HeadAppender<'a> {
     }
 
     fn log_wal(&mut self) -> Result<(), HeadError> {
-        let mut wal_guard = self.head.wal.lock();
-        let Some(ref mut wal) = *wal_guard else {
-            return Ok(());
-        };
+        let wal_compression = self.head.opts.wal_compression;
         let enc = RecordEncoder::new(self.head.opts.enable_st_storage);
 
         if self.series_refs.is_empty()
@@ -9990,6 +10021,8 @@ impl<'a> HeadAppender<'a> {
             if self.floats.is_empty() {
                 return Ok(());
             }
+            // Encode and compress OUTSIDE `head.wal.lock()` so concurrent appenders parallelize
+            // varint/float serialization and Snappy/Zstd compression.
             self.wal_buf.clear();
             let need = self.floats.len() * 14 + 17;
             if self.wal_buf.capacity() < need {
@@ -10005,7 +10038,31 @@ impl<'a> HeadAppender<'a> {
                 }),
                 buf,
             );
-            let res = wal.log(&[&rec]);
+            self.wal_comp_buf.clear();
+            let is_compressed = match crate::wlog::compress_wal_record(
+                &rec,
+                wal_compression,
+                &mut self.wal_comp_buf,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.wal_buf = rec;
+                    return Err(e.into());
+                }
+            };
+            let res = {
+                let mut wal_guard = self.head.wal.lock();
+                if let Some(ref mut wal) = *wal_guard {
+                    let payload = if is_compressed {
+                        self.wal_comp_buf.as_slice()
+                    } else {
+                        rec.as_slice()
+                    };
+                    wal.log_precompressed(&[(payload, is_compressed)])
+                } else {
+                    Ok(())
+                }
+            };
             self.wal_buf = rec;
             res?;
             return Ok(());
@@ -10114,8 +10171,23 @@ impl<'a> HeadAppender<'a> {
         }
 
         if !recs.is_empty() {
-            let slices: Vec<&[u8]> = recs.iter().map(|v| v.as_slice()).collect();
-            wal.log(&slices)?;
+            let mut prepared: Vec<(Vec<u8>, bool)> = Vec::with_capacity(recs.len());
+            for r in recs {
+                let mut comp_buf = Vec::new();
+                if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
+                    prepared.push((comp_buf, true));
+                } else {
+                    prepared.push((r, false));
+                }
+            }
+            let slices: Vec<(&[u8], bool)> = prepared
+                .iter()
+                .map(|(b, c)| (b.as_slice(), *c))
+                .collect();
+            let mut wal_guard = self.head.wal.lock();
+            if let Some(ref mut wal) = *wal_guard {
+                wal.log_precompressed(&slices)?;
+            }
         }
         Ok(())
     }
