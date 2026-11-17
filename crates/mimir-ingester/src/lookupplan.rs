@@ -114,7 +114,7 @@ impl Metrics {
         let filtered_ratio = HistogramVec::new(
             HistogramOpts::new(
                 "cortex_tsdb_index_lookup_planning_filtered_ratio",
-                "Ratio of series retrieved from the index which were also matching the vector selectors from the query.",
+                "Ratio of series retrieved from the index which were also matching the vector selectors from the query. This should always be 1.0 when index_lookup_planning_enabled: true.",
             ),
             &["user"],
         )
