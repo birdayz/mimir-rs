@@ -455,9 +455,10 @@ async fn user_registry_handler(
     match encoder.encode_to_string(&families) {
         Ok(body) => (
             StatusCode::OK,
+            // promhttp's negotiated text format (`expfmt.Negotiate` with underscore escaping).
             [(
                 axum::http::header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8",
+                "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
             )],
             body,
         )
