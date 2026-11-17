@@ -158,6 +158,7 @@ pub struct HeadChunksWriter {
     seq: usize,
     offset: usize,
     cur_writer: Option<BufWriter<File>>,
+    cut_on_next_chunk: bool,
     closed: bool,
 }
 
@@ -194,6 +195,7 @@ impl HeadChunksWriter {
             seq,
             offset: 0,
             cur_writer: None,
+            cut_on_next_chunk: false,
             closed: false,
         })
     }
@@ -250,7 +252,11 @@ impl HeadChunksWriter {
         let data = chunk.as_bytes();
         let needed = Self::entry_len(data.len());
 
-        if self.cur_writer.is_none() || self.offset + needed > self.max_file_size {
+        if self.cut_on_next_chunk
+            || self.cur_writer.is_none()
+            || self.offset + needed > self.max_file_size
+        {
+            self.cut_on_next_chunk = false;
             self.cut_new_file()?;
         }
 
@@ -297,6 +303,14 @@ impl HeadChunksWriter {
 
     pub fn has_active_file(&self) -> bool {
         self.cur_writer.is_some()
+    }
+
+    pub fn cur_file_has_chunks(&self) -> bool {
+        self.cur_writer.is_some() && self.offset > HEAD_CHUNK_FILE_HEADER_SIZE
+    }
+
+    pub fn cut_file_on_next_chunk(&mut self) {
+        self.cut_on_next_chunk = true;
     }
 
     pub fn current_seq(&self) -> usize {
@@ -609,12 +623,23 @@ impl HeadChunksReader {
     }
 
     /// Deletes all head chunk files with sequence `< before_seq`.
-    pub fn truncate(mut self, before_seq: usize) -> Result<Self, HeadChunksError> {
+    pub fn truncate(self, before_seq: usize) -> Result<Self, HeadChunksError> {
+        self.truncate_except(before_seq, None)
+    }
+
+    /// Deletes all head chunk files with sequence `< before_seq` except `active_seq`
+    /// (`ChunkDiskMapper.Truncate` in Go `head_chunks.go`).
+    pub fn truncate_except(
+        mut self,
+        before_seq: usize,
+        active_seq: Option<usize>,
+    ) -> Result<Self, HeadChunksError> {
         let to_remove: Vec<usize> = self
             .files
             .keys()
             .copied()
             .take_while(|&seq| seq < before_seq)
+            .filter(|&seq| Some(seq) != active_seq)
             .collect();
         for seq in to_remove {
             self.files.remove(&seq);

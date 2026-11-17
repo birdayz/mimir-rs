@@ -4612,6 +4612,7 @@ impl Head {
         }
         let affected: Vec<(SymbolId, SymbolId)> = affected_set.into_iter().collect();
 
+        let mut chunks_removed = 0u64;
         for e in entries {
             self.series.remove(&e);
             e.gced.store(true, Ordering::Release);
@@ -4624,6 +4625,8 @@ impl Head {
             }
             {
                 let mut st = e.inner.lock();
+                chunks_removed += (st.mmapped().len() + st.head_chunks.len()) as u64;
+                st.mmapped_chunks = None;
                 st.set_gced(true);
                 if let Some(keep_until) = {
                     let mt = st.max_time();
@@ -4645,6 +4648,7 @@ impl Head {
         if let Some(ref c) = self.series_removed_total {
             c.inc_by(removed_count as f64);
         }
+        self.metrics.chunks_removed(chunks_removed);
         self.postings.delete(&deleted, &affected);
         drop(affected);
         if entries_len > 64 {
@@ -4866,7 +4870,6 @@ impl Head {
         mint: i64,
         maxt_inclusive: i64,
     ) -> Result<Vec<(u64, Labels)>, HeadError> {
-        self.mmap_head_chunks()?;
         let has_tombs = self.tombstones.has_any();
         let mut tombs_buf = Vec::new();
         let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
@@ -5176,7 +5179,6 @@ impl Head {
         &self,
         refs: &[u64],
     ) -> Result<CompactionCandidatesRange, HeadError> {
-        self.mmap_head_chunks()?;
         let mut out = Vec::with_capacity(refs.len());
         let mut mint = i64::MAX;
         let mut maxt = i64::MIN;
@@ -5217,7 +5219,6 @@ impl Head {
         mint: i64,
         maxt_inclusive: i64,
     ) -> Result<Vec<CompactionSeries>, HeadError> {
-        self.mmap_head_chunks()?;
         let entries = self.series.all_entries();
 
         struct ExtractedSeries {
@@ -5615,20 +5616,31 @@ impl Head {
             self.finish_deleted_series_cleanup(to_delete);
         }
 
-        let (has_active, active_seq) = {
-            let w = self.chunk_writer.lock();
-            w.as_ref()
-                .map_or((false, 0usize), |wr| (wr.has_active_file(), wr.current_seq()))
+        self.truncate_chunks_head(min_mmap_seq)?;
+        Ok(())
+    }
+
+    /// Go `ChunkDiskMapper.Truncate(uint32(minMmapFile))`: marks the current non-empty
+    /// `chunks_head` file to cut a new file on the next write and deletes every older file
+    /// `< min_mmap_seq` (`head_chunks.go:971-1010`).
+    fn truncate_chunks_head(&self, min_mmap_seq: usize) -> Result<(), HeadError> {
+        let active_seq = {
+            let mut w = self.chunk_writer.lock();
+            match w.as_mut() {
+                Some(wr) => {
+                    let cur = wr.has_active_file().then(|| wr.current_seq());
+                    if wr.cur_file_has_chunks() {
+                        wr.cut_file_on_next_chunk();
+                    }
+                    cur
+                }
+                None => None,
+            }
         };
-        let cut_before = if has_active {
-            min_mmap_seq.min(active_seq)
-        } else {
-            min_mmap_seq
-        };
-        if cut_before > 1 {
+        if min_mmap_seq > 1 {
             let reader_opt = self.chunk_reader.write().take();
             if let Some(reader) = reader_opt {
-                let truncated = reader.truncate(cut_before)?;
+                let truncated = reader.truncate_except(min_mmap_seq, active_seq)?;
                 *self.chunk_reader.write() = Some(truncated);
             }
         }
@@ -5640,7 +5652,6 @@ impl Head {
         &self,
         refs: &[u64],
     ) -> Result<(Vec<CompactionSeries>, i64, i64), HeadError> {
-        self.mmap_head_chunks()?;
 
         struct ExtractedSelected {
             entry: Arc<SeriesEntry>,
@@ -5865,9 +5876,9 @@ impl Head {
 
         self.tombstones.truncate_before(mint);
 
-        if actual_mint != i64::MAX && actual_mint > self.min_time() {
-            self.min_time.store(actual_mint, Ordering::Release);
+        if actual_mint > self.min_time() {
             let clamped = actual_mint.min(self.appendable_min_valid_time());
+            self.min_time.store(clamped, Ordering::Release);
             self.min_valid_time.store(clamped, Ordering::Release);
         }
         // Go `Head.truncateSeriesAndChunkDiskMapper` (`prometheus/tsdb/head.go:1994-2000`):
@@ -5879,23 +5890,7 @@ impl Head {
         }
         self.min_ooo_time.store(min_ooo_time, Ordering::Release);
 
-        let (has_active, active_seq) = {
-            let w = self.chunk_writer.lock();
-            w.as_ref()
-                .map_or((false, 0usize), |wr| (wr.has_active_file(), wr.current_seq()))
-        };
-        let cut_before = if has_active {
-            min_mmap_seq.min(active_seq)
-        } else {
-            min_mmap_seq
-        };
-        if cut_before > 1 {
-            let reader_opt = self.chunk_reader.write().take();
-            if let Some(reader) = reader_opt {
-                let truncated = reader.truncate(cut_before)?;
-                *self.chunk_reader.write() = Some(truncated);
-            }
-        }
+        self.truncate_chunks_head(min_mmap_seq)?;
         Ok(())
     }
 
@@ -5910,23 +5905,7 @@ impl Head {
         if actual_mint != i64::MAX && self.initialized() && actual_mint > self.min_time() {
             self.min_time.store(actual_mint, Ordering::Release);
         }
-        let (has_active, active_seq) = {
-            let w = self.chunk_writer.lock();
-            w.as_ref()
-                .map_or((false, 0usize), |wr| (wr.has_active_file(), wr.current_seq()))
-        };
-        let cut_before = if has_active {
-            min_mmap_seq.min(active_seq)
-        } else {
-            min_mmap_seq
-        };
-        if cut_before > 1 {
-            let reader_opt = self.chunk_reader.write().take();
-            if let Some(reader) = reader_opt {
-                let truncated = reader.truncate(cut_before)?;
-                *self.chunk_reader.write() = Some(truncated);
-            }
-        }
+        self.truncate_chunks_head(min_mmap_seq)?;
         Ok(())
     }
 

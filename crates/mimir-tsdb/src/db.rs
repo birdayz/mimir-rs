@@ -616,6 +616,7 @@ impl Tsdb {
                 // The head was compacted, so we compact OOO head as well.
                 created.extend(self.compact_ooo_head_locked()?);
             }
+            self.head.mmap_head_chunks().map_err(HeadError::from)?;
             Ok(())
         })();
 
