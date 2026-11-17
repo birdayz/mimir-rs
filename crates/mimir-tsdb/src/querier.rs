@@ -13,8 +13,11 @@ use thiserror::Error;
 use crate::block::{Block, BlockError};
 use crate::chunkenc::{ChunkError, EncodedChunk};
 use crate::chunks_block::{BlockChunksError, ChunkMeta};
-use crate::compact::{decode_chunk_samples, encode_samples_into_chunks, DecodedSample};
-use crate::head::{Head, HeadError, DEFAULT_SAMPLES_PER_CHUNK};
+use crate::compact::{
+    decode_chunk_samples, merge_chunks_with_tombstones, merge_head_chunks_with_tombstones,
+    DecodedSample,
+};
+use crate::head::{Head, HeadError};
 use crate::index::IndexError;
 use crate::labels::Labels;
 use crate::matcher::LabelMatcher;
@@ -449,59 +452,7 @@ impl<'a> TsdbQuerier<'a> {
             let mut out = Vec::with_capacity(refs.len());
             for &r in refs.iter() {
                 if let Some((labels, chks, tombs)) = head.series_chunks(r, mint, maxt)? {
-                    if chks.is_empty() {
-                        continue;
-                    }
-                    let has_tombstones = !tombs.is_empty()
-                        && chks
-                            .iter()
-                            .any(|cm| tombs.iter().any(|iv| iv.overlaps(cm.min_time, cm.max_time)));
-                    let final_chunks = if has_tombstones {
-                        let mut samples = Vec::new();
-                        for cm in &chks {
-                            if let Some(ref enc) = cm.chunk {
-                                for s in decode_chunk_samples(enc)? {
-                                    if s.t >= mint && s.t <= maxt {
-                                        samples.push(s);
-                                    }
-                                }
-                            }
-                        }
-                        samples.sort_by_key(|s| s.t);
-                        samples.dedup_by_key(|s| s.t);
-                        encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
-                    } else if chks.len() > 1 {
-                        let mut chks = chks;
-                        let already_sorted_disjoint = chks
-                            .windows(2)
-                            .all(|w| w[0].min_time <= w[1].min_time && w[0].max_time < w[1].min_time);
-                        if already_sorted_disjoint {
-                            chks
-                        } else {
-                            chks.sort_by_key(|c| (c.min_time, c.max_time));
-                            let has_overlap =
-                                chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
-                            if has_overlap {
-                                let mut samples = Vec::new();
-                                for cm in &chks {
-                                    if let Some(ref enc) = cm.chunk {
-                                        for s in decode_chunk_samples(enc)? {
-                                            if s.t >= mint && s.t <= maxt {
-                                                samples.push(s);
-                                            }
-                                        }
-                                    }
-                                }
-                                samples.sort_by_key(|s| s.t);
-                                samples.dedup_by_key(|s| s.t);
-                                encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
-                            } else {
-                                chks
-                            }
-                        }
-                    } else {
-                        chks
-                    };
+                    let final_chunks = merge_head_chunks_with_tombstones(chks, &tombs)?;
                     if !final_chunks.is_empty() {
                         out.push(QueryChunkSeries {
                             labels,
@@ -614,61 +565,10 @@ impl<'a> TsdbQuerier<'a> {
         let merge_or_collect = |items: Vec<(ChunkMeta, Vec<Interval>)>,
                                 allow_non_overlapping_raw: bool|
          -> Result<Vec<ChunkMeta>, QuerierError> {
-            if items.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut chks: Vec<ChunkMeta> = Vec::with_capacity(items.len());
-            let mut has_tombstones = false;
-            for (cm, tombs) in items {
-                if tombs
-                    .iter()
-                    .any(|iv| iv.overlaps(cm.min_time, cm.max_time))
-                {
-                    has_tombstones = true;
-                }
-                chks.push(cm);
-            }
-            if has_tombstones {
-                let mut samples = Vec::new();
-                for cm in &chks {
-                    let Some(ref enc) = cm.chunk else {
-                        continue;
-                    };
-                    for s in decode_chunk_samples(enc)? {
-                        if s.t < mint || s.t > maxt {
-                            continue;
-                        }
-                        samples.push(s);
-                    }
-                }
-                samples.sort_by_key(|s| s.t);
-                samples.dedup_by_key(|s| s.t);
-                Ok(encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?)
-            } else if allow_non_overlapping_raw {
-                Ok(chks)
-            } else {
-                chks.sort_by_key(|c| (c.min_time, c.max_time));
-                let has_overlap = chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
-                if has_overlap {
-                    let mut samples = Vec::new();
-                    for cm in &chks {
-                        let Some(ref enc) = cm.chunk else {
-                            continue;
-                        };
-                        for s in decode_chunk_samples(enc)? {
-                            if s.t < mint || s.t > maxt {
-                                continue;
-                            }
-                            samples.push(s);
-                        }
-                    }
-                    samples.sort_by_key(|s| s.t);
-                    samples.dedup_by_key(|s| s.t);
-                    Ok(encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?)
-                } else {
-                    Ok(chks)
-                }
-            }
+            Ok(merge_chunks_with_tombstones(
+                items,
+                allow_non_overlapping_raw,
+            )?)
         };
 
         let mut out = Vec::with_capacity(per_series.len());
@@ -740,61 +640,10 @@ impl<'a> TsdbQuerier<'a> {
         let merge_or_collect = |items: Vec<(ChunkMeta, Vec<Interval>)>,
                                 allow_non_overlapping_raw: bool|
          -> Result<Vec<ChunkMeta>, QuerierError> {
-            if items.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut chks: Vec<ChunkMeta> = Vec::with_capacity(items.len());
-            let mut has_tombstones = false;
-            for (cm, tombs) in items {
-                if tombs
-                    .iter()
-                    .any(|iv| iv.overlaps(cm.min_time, cm.max_time))
-                {
-                    has_tombstones = true;
-                }
-                chks.push(cm);
-            }
-            if has_tombstones {
-                let mut samples = Vec::new();
-                for cm in &chks {
-                    let Some(ref enc) = cm.chunk else {
-                        continue;
-                    };
-                    for s in decode_chunk_samples(enc)? {
-                        if s.t < mint || s.t > maxt {
-                            continue;
-                        }
-                        samples.push(s);
-                    }
-                }
-                samples.sort_by_key(|s| s.t);
-                samples.dedup_by_key(|s| s.t);
-                Ok(encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?)
-            } else if allow_non_overlapping_raw {
-                Ok(chks)
-            } else {
-                chks.sort_by_key(|c| (c.min_time, c.max_time));
-                let has_overlap = chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
-                if has_overlap {
-                    let mut samples = Vec::new();
-                    for cm in &chks {
-                        let Some(ref enc) = cm.chunk else {
-                            continue;
-                        };
-                        for s in decode_chunk_samples(enc)? {
-                            if s.t < mint || s.t > maxt {
-                                continue;
-                            }
-                            samples.push(s);
-                        }
-                    }
-                    samples.sort_by_key(|s| s.t);
-                    samples.dedup_by_key(|s| s.t);
-                    Ok(encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?)
-                } else {
-                    Ok(chks)
-                }
-            }
+            Ok(merge_chunks_with_tombstones(
+                items,
+                allow_non_overlapping_raw,
+            )?)
         };
 
         if prepared.block_refs.is_empty() {
@@ -984,9 +833,9 @@ impl<'a> TsdbQuerier<'a> {
             for &(tag, r) in srcs {
                 if tag == 0 {
                     if let Some(h) = head {
-                        if let Some((_, chks, tombs)) = h.series_chunks(r, mint, maxt)? {
+                        if let Some((_, chks)) = h.series_final_chunks(r, mint, maxt)? {
                             for c in chks {
-                                head_items.push((c, tombs.clone()));
+                                head_items.push((c, Vec::new()));
                             }
                         }
                     }
@@ -1562,6 +1411,612 @@ mod wave3_tests {
         let q_ino = TsdbQuerier::new(Some(&head), Vec::new(), 1_000_000, 1_000_000);
         assert_eq!(q_ino.label_names(&[]).unwrap(), vec!["__name__", "head_lbl"]);
         assert_eq!(q_ino.label_values("head_lbl", None, &[]).unwrap(), vec!["hv"]);
+        head.close().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod wave4_tests {
+    use super::*;
+    use crate::block::BlockMetaCompaction;
+    use crate::chunkenc::{
+        CounterResetHeader, CounterResetHint, Encoding, FloatHistogram, Histogram, HistogramSpan,
+    };
+    use crate::chunks_block::DEFAULT_CHUNK_SEGMENT_SIZE;
+    use crate::compact::{
+        encode_samples_into_chunks_with_encodings, write_block_from_series, CompactionSeries,
+        SampleValue,
+    };
+    use crate::head::HeadOptions;
+    use crate::matcher::MatchType;
+    use crate::record::{RecordEncoder, Tombstone};
+    use crate::tombstones::{write_tombstones_file, Interval, MemTombstones};
+    use crate::wlog::{CompressionType, WlogWriter};
+
+    fn make_ih(d0: i64, d1: i64, sum: f64, schema: i32, hint: CounterResetHint) -> Histogram {
+        let b0 = d0;
+        let b1 = d0 + d1;
+        let count = (1 + b0 + b1) as u64;
+        Histogram {
+            count,
+            zero_count: 1,
+            zero_threshold: 0.001,
+            sum,
+            schema,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 2,
+            }],
+            positive_buckets: vec![d0, d1],
+            negative_spans: Vec::new(),
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+            counter_reset_hint: hint,
+        }
+    }
+
+    fn make_fh(b0: f64, b1: f64, sum: f64, schema: i32, hint: CounterResetHint) -> FloatHistogram {
+        let count = 0.5 + b0 + b1;
+        FloatHistogram {
+            count,
+            zero_count: 0.5,
+            zero_threshold: 0.001,
+            sum,
+            schema,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 2,
+            }],
+            positive_buckets: vec![b0, b1],
+            negative_spans: Vec::new(),
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+            counter_reset_hint: hint,
+        }
+    }
+
+    #[test]
+    fn w4_01_partial_tombstones_block_and_head_wal_preserve_encoding_and_disable_trimming() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. ULID block with Xor2, HistogramSt, and FloatHistogramSt chunks + partial tombstones.
+        let blk_dir = dir.path().join("blocks");
+        std::fs::create_dir_all(&blk_dir).unwrap();
+        let lbl_x2 = Labels::from_pairs(vec![("__name__", "s_x2")]);
+        let lbl_hst = Labels::from_pairs(vec![("__name__", "s_hst")]);
+        let lbl_gone = Labels::from_pairs(vec![("__name__", "s_gone")]);
+
+        let chks_x2 = encode_samples_into_chunks_with_encodings(
+            &[
+                DecodedSample {
+                    st: 500,
+                    t: 1_000,
+                    value: SampleValue::Float(10.0),
+                },
+                DecodedSample {
+                    st: 500,
+                    t: 2_000,
+                    value: SampleValue::Float(20.0),
+                },
+                DecodedSample {
+                    st: 500,
+                    t: 3_000,
+                    value: SampleValue::Float(30.0),
+                },
+                DecodedSample {
+                    st: 500,
+                    t: 4_000,
+                    value: SampleValue::Float(40.0),
+                },
+            ],
+            120,
+            Encoding::Xor2,
+            Encoding::HistogramSt,
+            Encoding::FloatHistogramSt,
+        )
+        .unwrap();
+
+        let chks_hst = encode_samples_into_chunks_with_encodings(
+            &[
+                DecodedSample {
+                    st: 500,
+                    t: 1_000,
+                    value: SampleValue::Histogram(Box::new(make_ih(
+                        10,
+                        2,
+                        10.0,
+                        2,
+                        CounterResetHint::CounterReset,
+                    ))),
+                },
+                DecodedSample {
+                    st: 500,
+                    t: 2_000,
+                    value: SampleValue::Histogram(Box::new(make_ih(
+                        12,
+                        2,
+                        12.0,
+                        2,
+                        CounterResetHint::NotCounterReset,
+                    ))),
+                },
+                DecodedSample {
+                    st: 500,
+                    t: 4_000,
+                    value: SampleValue::Histogram(Box::new(make_ih(
+                        14,
+                        2,
+                        14.0,
+                        2,
+                        CounterResetHint::NotCounterReset,
+                    ))),
+                },
+            ],
+            120,
+            Encoding::Xor2,
+            Encoding::HistogramSt,
+            Encoding::FloatHistogramSt,
+        )
+        .unwrap();
+
+        let chks_gone = encode_samples_into_chunks_with_encodings(
+            &[
+                DecodedSample {
+                    st: 0,
+                    t: 1_000,
+                    value: SampleValue::Float(1.0),
+                },
+                DecodedSample {
+                    st: 0,
+                    t: 4_000,
+                    value: SampleValue::Float(4.0),
+                },
+            ],
+            120,
+            Encoding::Xor,
+            Encoding::Histogram,
+            Encoding::FloatHistogram,
+        )
+        .unwrap();
+
+        let meta = write_block_from_series(
+            &blk_dir,
+            1_000,
+            4_001,
+            vec![
+                CompactionSeries {
+                    labels: lbl_gone.clone(),
+                    chunks: chks_gone,
+                    tombstones: Vec::new(),
+                },
+                CompactionSeries {
+                    labels: lbl_hst.clone(),
+                    chunks: chks_hst,
+                    tombstones: Vec::new(),
+                },
+                CompactionSeries {
+                    labels: lbl_x2.clone(),
+                    chunks: chks_x2,
+                    tombstones: Vec::new(),
+                },
+            ],
+            BlockMetaCompaction::default(),
+            false,
+            DEFAULT_CHUNK_SEGMENT_SIZE,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Write partial tombstones directly on disk to simulate post-compaction db.Delete().
+        let block_path = blk_dir.join(meta.ulid.to_string());
+        let blk_opened = Block::open(&block_path).unwrap();
+        let ref_x2 = blk_opened
+            .postings_for_matchers(&[LabelMatcher::new(MatchType::Equal, "__name__", "s_x2").unwrap()])
+            .unwrap()[0];
+        let ref_hst = blk_opened
+            .postings_for_matchers(&[LabelMatcher::new(MatchType::Equal, "__name__", "s_hst").unwrap()])
+            .unwrap()[0];
+        let ref_gone = blk_opened
+            .postings_for_matchers(&[LabelMatcher::new(MatchType::Equal, "__name__", "s_gone").unwrap()])
+            .unwrap()[0];
+        drop(blk_opened);
+
+        let tombs_map = MemTombstones::new();
+        tombs_map.add_interval(ref_x2, Interval::new(1_500, 3_500));
+        tombs_map.add_interval(ref_hst, Interval::new(1_500, 2_500));
+        // Two disjoint intervals that together delete every sample of s_gone without being a subrange of [1000, 4000]
+        tombs_map.add_interval(ref_gone, Interval::new(900, 1_100));
+        tombs_map.add_interval(ref_gone, Interval::new(3_900, 4_100));
+        write_tombstones_file(&block_path, &tombs_map).unwrap();
+
+        let blk = Arc::new(Block::open(&block_path).unwrap());
+
+        // Query narrow window [3_800, 4_200] -> DisableTrimming must keep t=1_000 and t=4_000,
+        // omit deleted [1_500, 3_500], preserve Xor2 & HistogramSt, and omit s_gone completely.
+        let q = TsdbQuerier::new(None, vec![blk], 3_800, 4_200);
+        let all_m = [LabelMatcher::new(MatchType::RegexMatch, "__name__", ".+").unwrap()];
+        let res = q.select_chunks(true, &all_m).unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].labels.get("__name__"), "s_hst");
+        assert_eq!(res[0].chunks.len(), 1);
+        assert_eq!(
+            res[0].chunks[0].chunk.as_ref().unwrap().encoding(),
+            Encoding::HistogramSt
+        );
+        let hst_samples = chunk_to_samples(res[0].chunks[0].chunk.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            hst_samples.iter().map(|s| (s.st, s.t)).collect::<Vec<_>>(),
+            vec![(500, 1_000), (500, 4_000)]
+        );
+
+        assert_eq!(res[1].labels.get("__name__"), "s_x2");
+        assert_eq!(res[1].chunks.len(), 1);
+        assert_eq!(
+            res[1].chunks[0].chunk.as_ref().unwrap().encoding(),
+            Encoding::Xor2
+        );
+        let x2_samples = chunk_to_samples(res[1].chunks[0].chunk.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            x2_samples
+                .iter()
+                .map(|s| (s.st, s.t, s.value.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (500, 1_000, SampleValue::Float(10.0)),
+                (500, 4_000, SampleValue::Float(40.0)),
+            ]
+        );
+
+        // Verify lazy stream matches eager select_chunks!
+        let prep = q.prepare_select_chunks(&all_m, false).unwrap();
+        let mut lazy_series = Vec::new();
+        let mut lazy_chunks: Vec<Vec<ChunkMeta>> = Vec::new();
+        q.stream_prepared_chunks_lazy(prep, &all_m, true, None, |ev| {
+            match ev {
+                LazyStreamEvent::Series(l, c) => lazy_series.push((l, c)),
+                LazyStreamEvent::SeriesEnd => {}
+                LazyStreamEvent::SeriesChunks(_, chks) => lazy_chunks.push(chks),
+            }
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(lazy_series.len(), 2);
+        assert_eq!(lazy_series[0].1, 1);
+        assert_eq!(lazy_series[1].1, 1);
+        assert_eq!(lazy_chunks[0][0].min_time, 1_000);
+        assert_eq!(lazy_chunks[0][0].max_time, 4_000);
+
+        // 2. Replayed Head WAL partial tombstone.
+        let head_dir = dir.path().join("head");
+        let ref_id = {
+            let opts = HeadOptions {
+                float_chunk_encoding: Encoding::Xor2,
+                ..HeadOptions::default()
+            };
+            let head = Head::open(&head_dir, opts, i64::MIN).unwrap();
+            let r = {
+                let mut app = head.appender();
+                let mut r = None;
+                for (t, v) in [(1_000, 1.0), (2_000, 2.0), (3_000, 3.0), (4_000, 4.0)] {
+                    r = Some(
+                        app.append_float(r, &[("__name__", "hd_part")], t, v)
+                            .unwrap(),
+                    );
+                }
+                app.commit().unwrap();
+                r.unwrap()
+            };
+            head.close().unwrap();
+            r
+        };
+        {
+            let mut wal = WlogWriter::with_segment_size(
+                head_dir.join("wal"),
+                128 * 1024,
+                CompressionType::None,
+            )
+            .unwrap();
+            let rec = RecordEncoder::new(false).tombstones(
+                &[Tombstone {
+                    ref_id,
+                    mint: 1_500,
+                    maxt: 3_500,
+                }],
+                Vec::new(),
+            );
+            wal.log(&[&rec]).unwrap();
+            wal.close().unwrap();
+        }
+        let head = Head::open(
+            &head_dir,
+            HeadOptions {
+                float_chunk_encoding: Encoding::Xor2,
+                ..HeadOptions::default()
+            },
+            i64::MIN,
+        )
+        .unwrap();
+        let qh = TsdbQuerier::new(Some(&head), Vec::new(), 3_800, 4_200);
+        let m = [LabelMatcher::new(MatchType::Equal, "__name__", "hd_part").unwrap()];
+        let hres = qh.select_chunks(true, &m).unwrap();
+        assert_eq!(hres.len(), 1);
+        assert_eq!(
+            hres[0].chunks[0].chunk.as_ref().unwrap().encoding(),
+            Encoding::Xor2
+        );
+        let hsamps = chunk_to_samples(hres[0].chunks[0].chunk.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            hsamps.iter().map(|s| s.t).collect::<Vec<_>>(),
+            vec![1_000, 4_000]
+        );
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn w4_02_overlapping_ooo_and_in_order_head_no_trimming_and_gap_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            chunk_range_ms: 50_000,
+            ooo_time_window_ms: 2 * 3_600_000,
+            float_chunk_encoding: Encoding::Xor2,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+
+        // In-order chunk 1: [10_000, 30_000]; OOO chunk: [12_000, 28_000].
+        {
+            let mut app = head.appender();
+            app.append_float(None, &[("__name__", "gap_m")], 10_000, 1.0)
+                .unwrap();
+            app.append_float(None, &[("__name__", "gap_m")], 30_000, 4.0)
+                .unwrap();
+            app.commit().unwrap();
+        }
+        {
+            let mut app = head.appender();
+            app.append_float(None, &[("__name__", "gap_m")], 12_000, 2.0)
+                .unwrap();
+            app.append_float(None, &[("__name__", "gap_m")], 28_000, 3.0)
+                .unwrap();
+            app.commit().unwrap();
+        }
+
+        // Non-overlapping later in-order chunk 2: [60_000, 70_000] (past chunk_range_ms=50_000).
+        {
+            let mut app = head.appender();
+            app.append_float(None, &[("__name__", "gap_m")], 60_000, 5.0)
+                .unwrap();
+            app.append_float(None, &[("__name__", "gap_m")], 70_000, 6.0)
+                .unwrap();
+            app.commit().unwrap();
+        }
+
+        // Query a gap window [18_000, 22_000] inside the overlapping cluster [10_000..30_000]:
+        // Must return 1 series with all 4 samples [10_000, 12_000, 28_000, 30_000] (lookback preserved!).
+        let q_gap = TsdbQuerier::new(Some(&head), Vec::new(), 18_000, 22_000);
+        let m = [LabelMatcher::new(MatchType::Equal, "__name__", "gap_m").unwrap()];
+        let res_gap = q_gap.select_chunks(true, &m).unwrap();
+        assert_eq!(res_gap.len(), 1);
+        assert_eq!(res_gap[0].chunks.len(), 1);
+        let samps = chunk_to_samples(res_gap[0].chunks[0].chunk.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            samps.iter().map(|s| s.t).collect::<Vec<_>>(),
+            vec![10_000, 12_000, 28_000, 30_000]
+        );
+
+        // Verify lazy stream matches!
+        let prep = q_gap.prepare_select_chunks(&m, false).unwrap();
+        let mut lazy_cnt = 0u32;
+        let mut lazy_chks = Vec::new();
+        q_gap
+            .stream_prepared_chunks_lazy(prep, &m, true, None, |ev| {
+                match ev {
+                    LazyStreamEvent::Series(_, c) => lazy_cnt = c,
+                    LazyStreamEvent::SeriesChunks(_, cs) => lazy_chks = cs,
+                    LazyStreamEvent::SeriesEnd => {}
+                }
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(lazy_cnt, 1);
+        assert_eq!(lazy_chks.len(), 1);
+        assert_eq!(lazy_chks[0].min_time, 10_000);
+        assert_eq!(lazy_chks[0].max_time, 30_000);
+
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn w4_04_histogram_rollover_preserves_counter_reset_header_all_4_encodings() {
+        const TWO_HOURS_MS: i64 = 2 * 3_600_000;
+        let t_before = TWO_HOURS_MS - 10_000;
+        let t_after = TWO_HOURS_MS + 5_000;
+
+        for enable_hist_st in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = HeadOptions {
+                chunk_range_ms: TWO_HOURS_MS,
+                enable_histogram_st_encoding: enable_hist_st,
+                ..HeadOptions::default()
+            };
+            let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+
+            // 6 monotonic samples before 2h boundary, then 1 monotonic sample after boundary -> crh = NotCounterReset!
+            // Second series drops count after boundary -> crh = CounterReset!
+            // Third series is float histogram monotonic -> crh = NotCounterReset!
+            // Fourth series is float histogram count drop -> crh = CounterReset!
+            for k in 0..6i64 {
+                let ts = t_before + k * 1_000;
+                let mut app = head.appender();
+                app.append_histogram(
+                    None,
+                    &[("__name__", "ih_noreset")],
+                    0,
+                    ts,
+                    make_ih(5 + k, 2, (20 + k) as f64, 2, CounterResetHint::UnknownCounterReset),
+                )
+                .unwrap();
+                app.append_histogram(
+                    None,
+                    &[("__name__", "ih_reset")],
+                    0,
+                    ts,
+                    make_ih(10 + k, 2, (30 + k) as f64, 2, CounterResetHint::UnknownCounterReset),
+                )
+                .unwrap();
+                app.append_float_histogram(
+                    None,
+                    &[("__name__", "fh_noreset")],
+                    0,
+                    ts,
+                    make_fh(5.0 + k as f64, 2.0, 20.0 + k as f64, 2, CounterResetHint::UnknownCounterReset),
+                )
+                .unwrap();
+                app.append_float_histogram(
+                    None,
+                    &[("__name__", "fh_reset")],
+                    0,
+                    ts,
+                    make_fh(10.0 + k as f64, 2.0, 30.0 + k as f64, 2, CounterResetHint::UnknownCounterReset),
+                )
+                .unwrap();
+                app.commit().unwrap();
+            }
+
+            {
+                let mut app = head.appender();
+                app.append_histogram(
+                    None,
+                    &[("__name__", "ih_noreset")],
+                    0,
+                    t_after,
+                    make_ih(20, 3, 50.0, 2, CounterResetHint::UnknownCounterReset),
+                )
+                .unwrap();
+                app.append_histogram(
+                    None,
+                    &[("__name__", "ih_reset")],
+                    0,
+                    t_after,
+                    make_ih(1, 0, 2.0, 2, CounterResetHint::UnknownCounterReset),
+                )
+                .unwrap();
+                app.append_float_histogram(
+                    None,
+                    &[("__name__", "fh_noreset")],
+                    0,
+                    t_after,
+                    make_fh(20.0, 3.0, 50.0, 2, CounterResetHint::UnknownCounterReset),
+                )
+                .unwrap();
+                app.append_float_histogram(
+                    None,
+                    &[("__name__", "fh_reset")],
+                    0,
+                    t_after,
+                    make_fh(1.0, 0.0, 2.0, 2, CounterResetHint::UnknownCounterReset),
+                )
+                .unwrap();
+                app.commit().unwrap();
+            }
+
+            let crh_of = |enc: &EncodedChunk| -> CounterResetHeader {
+                match enc {
+                    EncodedChunk::Histogram(c) => c.counter_reset_header(),
+                    EncodedChunk::FloatHistogram(c) => c.counter_reset_header(),
+                    EncodedChunk::HistogramSt(c) => c.counter_reset_header(),
+                    EncodedChunk::FloatHistogramSt(c) => c.counter_reset_header(),
+                    _ => unreachable!(),
+                }
+            };
+
+            let q = TsdbQuerier::new(Some(&head), Vec::new(), 0, TWO_HOURS_MS * 2);
+            let all_m = [LabelMatcher::new(MatchType::RegexMatch, "__name__", ".+").unwrap()];
+            let res = q.select_chunks(true, &all_m).unwrap();
+            assert_eq!(res.len(), 4);
+
+            // Alphabetical: fh_noreset, fh_reset, ih_noreset, ih_reset
+            assert_eq!(res[0].chunks.len(), 2);
+            assert_eq!(
+                crh_of(res[0].chunks[1].chunk.as_ref().unwrap()),
+                CounterResetHeader::NotCounterReset
+            );
+
+            assert_eq!(res[1].chunks.len(), 2);
+            assert_eq!(
+                crh_of(res[1].chunks[1].chunk.as_ref().unwrap()),
+                CounterResetHeader::CounterReset
+            );
+
+            assert_eq!(res[2].chunks.len(), 2);
+            assert_eq!(
+                crh_of(res[2].chunks[1].chunk.as_ref().unwrap()),
+                CounterResetHeader::NotCounterReset
+            );
+
+            assert_eq!(res[3].chunks.len(), 2);
+            assert_eq!(
+                crh_of(res[3].chunks[1].chunk.as_ref().unwrap()),
+                CounterResetHeader::CounterReset
+            );
+
+            head.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn w4_07_runtime_float_chunk_encoding_compatible_values_does_not_cut_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            float_chunk_encoding: Encoding::Xor2,
+            samples_per_chunk: 120,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+
+        // Append 1 sample under xor2.
+        {
+            let mut app = head.appender();
+            app.append_float(None, &[("__name__", "rt_enc")], 1_000, 1.0)
+                .unwrap();
+            app.commit().unwrap();
+        }
+
+        // Switch runtime encoding xor2 -> xor (enable_st_storage == false).
+        // Must continue appending to active Xor2 chunk until normal rollover (2 * 120 = 240 samples).
+        head.set_float_chunk_encoding(Encoding::Xor);
+        for k in 1..=245i64 {
+            let mut app = head.appender();
+            app.append_float(None, &[("__name__", "rt_enc")], 1_000 + k * 10, k as f64)
+                .unwrap();
+            app.commit().unwrap();
+        }
+
+        let q = TsdbQuerier::new(Some(&head), Vec::new(), 0, 100_000);
+        let m = [LabelMatcher::new(MatchType::Equal, "__name__", "rt_enc").unwrap()];
+        let res = q.select_chunks(true, &m).unwrap();
+        assert_eq!(res.len(), 1);
+        let encs: Vec<Encoding> = res[0]
+            .chunks
+            .iter()
+            .map(|c| c.chunk.as_ref().unwrap().encoding())
+            .collect();
+        // First chunk finishes filling with Xor2 (~120 samples via compute_chunk_end_time),
+        // subsequent chunks use Xor. (Without CompatibleValues, chunk 0 would have only 1 sample.)
+        assert_eq!(encs, vec![Encoding::Xor2, Encoding::Xor, Encoding::Xor]);
+        assert!(
+            res[0].chunks[0].chunk.as_ref().unwrap().num_samples() > 1,
+            "xor2 chunk must continue filling until normal rollover"
+        );
+        assert_eq!(
+            res[0]
+                .chunks
+                .iter()
+                .map(|c| c.chunk.as_ref().unwrap().num_samples())
+                .sum::<usize>(),
+            246
+        );
+
         head.close().unwrap();
     }
 }

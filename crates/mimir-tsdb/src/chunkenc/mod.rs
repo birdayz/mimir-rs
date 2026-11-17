@@ -137,6 +137,16 @@ impl Encoding {
                 | Self::FloatHistogramSt
         )
     }
+
+    /// Reports whether two encodings are mutually compatible with respect to
+    /// sample-value encoding (`Xor` and `Xor2`), matching Go `chunkenc.CompatibleValues`.
+    #[inline]
+    pub const fn compatible_values(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Xor | Self::Xor2, Self::Xor | Self::Xor2)
+        )
+    }
 }
 
 /// Sample value type yielded by chunk iterators.

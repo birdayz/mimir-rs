@@ -35,7 +35,7 @@ use crate::chunkenc::{
 };
 use crate::chunks_block::ChunkMeta;
 use crate::compact::{
-    decode_chunk_samples, encode_samples_into_chunks, CompactionSeries, SampleValue,
+    decode_chunk_samples, merge_head_chunks_with_tombstones, CompactionSeries, SampleValue,
 };
 use crate::exemplar::{CircularExemplarStorage, Exemplar, ExemplarError};
 use crate::head_chunks::{
@@ -910,6 +910,7 @@ impl SeriesState {
         self.set_computed_hist_end_time(false);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_float_in_order(
         &mut self,
         st: i64,
@@ -918,6 +919,7 @@ impl SeriesState {
         chunk_range_ms: i64,
         samples_per_chunk: usize,
         float_enc: Encoding,
+        store_st: bool,
     ) -> Result<(bool, bool), ChunkError> {
         let target_enc = if float_enc == Encoding::Xor2 {
             Encoding::Xor2
@@ -941,9 +943,11 @@ impl SeriesState {
             if cur.max_time >= t {
                 return Ok((false, chunk_created));
             }
+            let cur_enc = cur.chunk.encoding();
             let num_samples = cur.chunk.num_samples();
             (!chunk_created && cur.chunk.as_bytes().len() > MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND)
-                || cur.chunk.encoding() != target_enc
+                || (cur_enc != target_enc
+                    && (!cur_enc.compatible_values(target_enc) || store_st || st != 0))
                 || (num_samples > 0 && (t >= self.next_at || num_samples >= samples_per_chunk * 2))
         };
 
@@ -989,6 +993,64 @@ impl SeriesState {
         Ok((true, chunk_created))
     }
 
+    fn prev_int_histogram_state(&mut self) -> Result<Option<HistogramAppenderState>, ChunkError> {
+        let Some(cur) = self.head_chunks.last_mut() else {
+            return Ok(None);
+        };
+        if cur.chunk.num_samples() == 0 {
+            return Ok(None);
+        }
+        match cur.chunk {
+            EncodedChunk::Histogram(ref mut hc) => {
+                if let Some(ref cache) = self.hist_state {
+                    if let HistAppendCache::Histogram(Some(ref st)) = **cache {
+                        return Ok(Some(st.clone()));
+                    }
+                }
+                Ok(Some(hc.appender()?.into_state()))
+            }
+            EncodedChunk::HistogramSt(ref mut hc) => {
+                if let Some(ref cache) = self.hist_state {
+                    if let HistAppendCache::HistogramSt(Some((ref st, _))) = **cache {
+                        return Ok(Some(st.clone()));
+                    }
+                }
+                Ok(Some(hc.appender()?.into_state()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn prev_float_histogram_state(
+        &mut self,
+    ) -> Result<Option<FloatHistogramAppenderState>, ChunkError> {
+        let Some(cur) = self.head_chunks.last_mut() else {
+            return Ok(None);
+        };
+        if cur.chunk.num_samples() == 0 {
+            return Ok(None);
+        }
+        match cur.chunk {
+            EncodedChunk::FloatHistogram(ref mut fhc) => {
+                if let Some(ref cache) = self.hist_state {
+                    if let HistAppendCache::FloatHistogram(Some(ref st)) = **cache {
+                        return Ok(Some(st.clone()));
+                    }
+                }
+                Ok(Some(fhc.appender()?.into_state()))
+            }
+            EncodedChunk::FloatHistogramSt(ref mut fhc) => {
+                if let Some(ref cache) = self.hist_state {
+                    if let HistAppendCache::FloatHistogramSt(Some((ref st, _))) = **cache {
+                        return Ok(Some(st.clone()));
+                    }
+                }
+                Ok(Some(fhc.appender()?.into_state()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn append_histogram_in_order(
         &mut self,
         st: i64,
@@ -1020,8 +1082,10 @@ impl SeriesState {
             }
         }
 
+        let mut prev_state: Option<HistogramAppenderState> = None;
         let cur_enc = self.head_chunks.last().unwrap().chunk.encoding();
         if cur_enc != target_enc {
+            prev_state = self.prev_int_histogram_state()?;
             self.cut_new_head_chunk(t, target_enc, chunk_range_ms);
             chunk_created = true;
         }
@@ -1051,10 +1115,18 @@ impl SeriesState {
         if (t >= self.next_at || num_bytes >= TARGET_BYTES_PER_HISTOGRAM_CHUNK * 2)
             && (num_samples >= MIN_SAMPLES_PER_HISTOGRAM_CHUNK || t >= next_chunk_range_start)
         {
+            if prev_state.is_none() {
+                prev_state = self.prev_int_histogram_state()?;
+            }
             self.cut_new_head_chunk(t, target_enc, chunk_range_ms);
             chunk_created = true;
         }
 
+        let prev_ref = if chunk_created {
+            prev_state.as_ref()
+        } else {
+            None
+        };
         let cur = self.head_chunks.last_mut().unwrap();
         match cur.chunk {
             EncodedChunk::Histogram(ref mut hc) => {
@@ -1067,7 +1139,7 @@ impl SeriesState {
                 let HistAppendCache::Histogram(ref mut st_opt) = **cache else {
                     unreachable!();
                 };
-                match hc.append_with_state(st_opt, st, t, h)? {
+                match hc.append_with_state_prev(st_opt, prev_ref, st, t, h)? {
                     AppendHistogramOutcome::Appended { .. } => {
                         cur.max_time = t;
                     }
@@ -1093,7 +1165,7 @@ impl SeriesState {
                 let HistAppendCache::HistogramSt(ref mut st_opt) = **cache else {
                     unreachable!();
                 };
-                match hc.append_with_state(st_opt, st, t, h)? {
+                match hc.append_with_state_prev(st_opt, prev_ref, st, t, h)? {
                     AppendHistogramStOutcome::Appended { .. } => {
                         cur.max_time = t;
                     }
@@ -1149,8 +1221,10 @@ impl SeriesState {
             }
         }
 
+        let mut prev_state: Option<FloatHistogramAppenderState> = None;
         let cur_enc = self.head_chunks.last().unwrap().chunk.encoding();
         if cur_enc != target_enc {
+            prev_state = self.prev_float_histogram_state()?;
             self.cut_new_head_chunk(t, target_enc, chunk_range_ms);
             chunk_created = true;
         }
@@ -1180,10 +1254,18 @@ impl SeriesState {
         if (t >= self.next_at || num_bytes >= TARGET_BYTES_PER_HISTOGRAM_CHUNK * 2)
             && (num_samples >= MIN_SAMPLES_PER_HISTOGRAM_CHUNK || t >= next_chunk_range_start)
         {
+            if prev_state.is_none() {
+                prev_state = self.prev_float_histogram_state()?;
+            }
             self.cut_new_head_chunk(t, target_enc, chunk_range_ms);
             chunk_created = true;
         }
 
+        let prev_ref = if chunk_created {
+            prev_state.as_ref()
+        } else {
+            None
+        };
         let cur = self.head_chunks.last_mut().unwrap();
         match cur.chunk {
             EncodedChunk::FloatHistogram(ref mut fhc) => {
@@ -1196,7 +1278,7 @@ impl SeriesState {
                 let HistAppendCache::FloatHistogram(ref mut st_opt) = **cache else {
                     unreachable!();
                 };
-                match fhc.append_with_state(st_opt, st, t, fh)? {
+                match fhc.append_with_state_prev(st_opt, prev_ref, st, t, fh)? {
                     AppendFloatHistogramOutcome::Appended { .. } => {
                         cur.max_time = t;
                     }
@@ -1222,7 +1304,7 @@ impl SeriesState {
                 let HistAppendCache::FloatHistogramSt(ref mut st_opt) = **cache else {
                     unreachable!();
                 };
-                match fhc.append_with_state(st_opt, st, t, fh)? {
+                match fhc.append_with_state_prev(st_opt, prev_ref, st, t, fh)? {
                     AppendFloatHistogramStOutcome::Appended { .. } => {
                         cur.max_time = t;
                     }
@@ -2551,6 +2633,7 @@ impl Head {
                 self.opts.chunk_range_ms,
                 self.opts.samples_per_chunk,
                 self.float_chunk_encoding(),
+                self.opts.enable_st_storage,
             )?) {
             *mint = (*mint).min(s.t);
             *maxt = (*maxt).max(s.t);
@@ -6429,55 +6512,7 @@ impl Head {
         if chks.is_empty() {
             return Ok(None);
         }
-        let has_tombstones = !tombs.is_empty()
-            && chks
-                .iter()
-                .any(|cm| tombs.iter().any(|iv| iv.overlaps(cm.min_time, cm.max_time)));
-        let final_chunks = if has_tombstones {
-            let mut samples = Vec::new();
-            for cm in &chks {
-                if let Some(ref enc) = cm.chunk {
-                    for s in decode_chunk_samples(enc)? {
-                        if s.t >= mint && s.t <= maxt {
-                            samples.push(s);
-                        }
-                    }
-                }
-            }
-            samples.sort_by_key(|s| s.t);
-            samples.dedup_by_key(|s| s.t);
-            encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
-        } else if chks.len() > 1 {
-            let mut chks = chks;
-            let already_sorted_disjoint = chks
-                .windows(2)
-                .all(|w| w[0].min_time <= w[1].min_time && w[0].max_time < w[1].min_time);
-            if already_sorted_disjoint {
-                chks
-            } else {
-                chks.sort_by_key(|c| (c.min_time, c.max_time));
-                let has_overlap = chks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
-                if has_overlap {
-                    let mut samples = Vec::new();
-                    for cm in &chks {
-                        if let Some(ref enc) = cm.chunk {
-                            for s in decode_chunk_samples(enc)? {
-                                if s.t >= mint && s.t <= maxt {
-                                    samples.push(s);
-                                }
-                            }
-                        }
-                    }
-                    samples.sort_by_key(|s| s.t);
-                    samples.dedup_by_key(|s| s.t);
-                    encode_samples_into_chunks(&samples, DEFAULT_SAMPLES_PER_CHUNK)?
-                } else {
-                    chks
-                }
-            }
-        } else {
-            chks
-        };
+        let final_chunks = merge_head_chunks_with_tombstones(chks, &tombs)?;
         if final_chunks.is_empty() {
             Ok(None)
         } else {
@@ -8388,6 +8423,7 @@ impl<'a> HeadAppender<'a> {
         };
 
         let float_enc = self.head.float_chunk_encoding();
+        let store_st = self.head.opts.enable_st_storage;
         let use_xor2 = float_enc == Encoding::Xor2;
         let use_hist_st = self.head.opts.enable_histogram_st_encoding;
         let chunk_range_ms = self.head.opts.chunk_range_ms;
@@ -8439,6 +8475,7 @@ impl<'a> HeadAppender<'a> {
                         chunk_range_ms,
                         samples_per_chunk,
                         float_enc,
+                        store_st,
                     )?) {
                         in_order_mint = in_order_mint.min(pf.t);
                         in_order_maxt = in_order_maxt.max(pf.t);
@@ -8724,6 +8761,7 @@ impl<'a> HeadAppender<'a> {
                         chunk_range_ms,
                         samples_per_chunk,
                         float_enc,
+                        store_st,
                     )?) {
                         in_order_mint = in_order_mint.min(pf.t);
                         in_order_maxt = in_order_maxt.max(pf.t);
