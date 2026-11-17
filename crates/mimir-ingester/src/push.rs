@@ -31,7 +31,7 @@ use crate::active_groups::group_label;
 use crate::costattribution::SampleTracker;
 use crate::circuit_breaker::BreakerPermit;
 use crate::errors::{
-    format_labels_string, map_native_histogram_err_id, ErrorSampler, ErrorSamplers,
+    format_labels_string, map_native_histogram_err, ErrorSampler, ErrorSamplers,
     IngesterError,
 };
 use crate::ingester::Ingester;
@@ -174,8 +174,6 @@ fn attribute_discarded<'l>(
 }
 
 pub(crate) type ConvertedHistogram = (i64, bool, Option<Histogram>, Option<FloatHistogram>, usize);
-pub(crate) type SeriesFormatter<'b, 'a> = &'b mut dyn FnMut(&[(&'a str, &'a str)]) -> String;
-type EncodedSeriesFormatter<'b> = &'b mut dyn FnMut(&[u8]) -> String;
 
 #[derive(Clone, Copy)]
 enum SampleKind {
@@ -330,7 +328,6 @@ pub(crate) struct PrehashedSeriesItem<'a> {
     pub prom_hash: u64,
     pub labels_sorted_unique: bool,
     pub bad_utf8: bool,
-    pub skip_label_validation: bool,
     pub histograms: &'a [ConvertedHistogram],
     pub exemplars: &'a [(i64, f64, Labels, String)],
 }
@@ -912,6 +909,7 @@ impl Ingester {
             for ts in borrowed.timeseries() {
                 let label_start = s.label_bytes_arena.len();
                 let mut labels_sorted_unique = true;
+                let mut dropped_empty = false;
                 let mut prev_name: Option<&str> = None;
 
                 if let Some(ts_labels_str) = ts.labels_str() {
@@ -929,6 +927,22 @@ impl Ingester {
                                 k.as_bytes(),
                                 v.as_bytes(),
                             );
+                        } else {
+                            dropped_empty = true;
+                        }
+                    }
+                    if !labels_sorted_unique && dropped_empty {
+                        // The series is rejected as unsorted without being appended: keep the raw
+                        // wire labels (empty values included) for `newLabelsNotSortedError`.
+                        s.label_bytes_arena.truncate(label_start);
+                        if let Some(raw) = ts.labels_str() {
+                            for (k, v) in raw {
+                                append_stringlabel_pair(
+                                    &mut s.label_bytes_arena,
+                                    k.as_bytes(),
+                                    v.as_bytes(),
+                                );
+                            }
                         }
                     }
                 } else {
@@ -954,6 +968,15 @@ impl Ingester {
                         }
                         prev_name = Some(k);
                         if !lp.value.is_empty() {
+                            append_stringlabel_pair(&mut s.label_bytes_arena, lp.name, lp.value);
+                        } else {
+                            dropped_empty = true;
+                        }
+                    }
+                    if !labels_sorted_unique && dropped_empty {
+                        // See above: raw wire labels for the labels-not-sorted error.
+                        s.label_bytes_arena.truncate(label_start);
+                        for lp in ts.labels() {
                             append_stringlabel_pair(&mut s.label_bytes_arena, lp.name, lp.value);
                         }
                     }
@@ -1002,7 +1025,6 @@ impl Ingester {
                 });
             }
 
-            let skip_label_validation = borrowed.skip_label_validation;
             let mut items: Vec<PrehashedSeriesItem<'_>> = Vec::with_capacity(ts_len);
             for (ts, m) in borrowed.timeseries().zip(s.series_metas.iter()) {
                 let l_start = m.label_start as usize;
@@ -1027,7 +1049,6 @@ impl Ingester {
                     prom_hash: m.prom_hash,
                     labels_sorted_unique: m.labels_sorted_unique,
                     bad_utf8: false,
-                    skip_label_validation,
                     histograms,
                     exemplars,
                 });
@@ -1557,32 +1578,22 @@ impl Ingester {
             };
             let mut series_ref = series_entry.as_ref().map(|e| e.ref_id);
 
-            if series_ref.is_none() {
-                if !item.skip_label_validation {
-                    if let Some(err) =
-                        validate_encoded_labels(encoded_labels, &limits, &mut make_series_str)
-                    {
-                        let total_bad = samples.len()
-                            + if native_histograms_enabled { hist_count } else { 0 };
-                        stats.failed_samples += total_bad;
-                        stats.failed_exemplars += item.exemplars.len();
-                        record_partial(err, None);
-                        continue;
-                    }
+            // Like Go, the ingester does not validate label names: a missing metric name or an
+            // empty label set fails inside the TSDB appender (`PreCreation` / `getOrCreate`) as a
+            // hard error that rolls back the whole request.
+            if series_ref.is_none()
+                && verify_ownership
+                && !self.check_ring_ownership_iter(user_id, iter_stringlabels(encoded_labels))
+            {
+                drop(app);
+                drop(lock_guard);
+                return Err(IngesterError::Internal {
+                    message: format!(
+                        "series {} is not owned by this ingester",
+                        make_series_str(encoded_labels)
+                    ),
                 }
-                if verify_ownership
-                    && !self.check_ring_ownership_iter(user_id, iter_stringlabels(encoded_labels))
-                {
-                    drop(app);
-                    drop(lock_guard);
-                    return Err(IngesterError::Internal {
-                        message: format!(
-                            "series {} is not owned by this ingester",
-                            make_series_str(encoded_labels)
-                        ),
-                    }
-                    .with_user(user_id, 0));
-                }
+                .with_user(user_id, 0));
             }
 
             let prev_succeeded = stats.succeeded_samples;
@@ -2018,7 +2029,7 @@ impl Ingester {
         user_id: &str,
         db: &UserTsdb,
         source: cortexpb::write_request::SourceEnum,
-        skip_label_validation: bool,
+        _skip_label_validation: bool,
         _skip_label_count_validation: bool,
         series_hint: usize,
         timeseries: I,
@@ -2158,6 +2169,9 @@ impl Ingester {
                     has_empty_val = true;
                 }
             }
+            // `newLabelsNotSortedError(ts.Labels)` formats the raw wire labels.
+            let unsorted_series_str =
+                (!labels_sorted_unique).then(|| format_labels_string(pairs.iter().copied()));
             if has_empty_val {
                 pairs.retain(|(_, v)| !v.is_empty());
             }
@@ -2179,8 +2193,7 @@ impl Ingester {
                 };
             let mut series_ref = series_entry.as_ref().map(|e| e.ref_id);
 
-            if series_ref.is_none() && !labels_sorted_unique {
-                let s_str = make_series_str(pairs);
+            if let (None, Some(s_str)) = (series_ref, unsorted_series_str) {
                 let total_bad = samples.len() + if native_histograms_enabled { hist_count } else { 0 };
                 stats.failed_samples += total_bad;
                 stats.labels_not_sorted += total_bad;
@@ -2192,28 +2205,14 @@ impl Ingester {
                 continue;
             }
 
-            // Additional validation when not skipped
-            if series_ref.is_none() {
-                if !skip_label_validation {
-                    if let Some(err) = validate_label_pairs(pairs, &limits, &mut make_series_str) {
-                        let total_bad = samples.len()
-                            + if native_histograms_enabled { hist_count } else { 0 };
-                        stats.failed_samples += total_bad;
-                        stats.failed_exemplars += ts.exemplar_count();
-                        record_partial(err, None);
-                        continue;
-                    }
+            if series_ref.is_none() && verify_ownership && !self.check_ring_ownership(user_id, pairs) {
+                return Err(IngesterError::Internal {
+                    message: format!(
+                        "series {} is not owned by this ingester",
+                        make_series_str(pairs)
+                    ),
                 }
-
-                if verify_ownership && !self.check_ring_ownership(user_id, pairs) {
-                    return Err(IngesterError::Internal {
-                        message: format!(
-                            "series {} is not owned by this ingester",
-                            make_series_str(pairs)
-                        ),
-                    }
-                    .with_user(user_id, 0));
-                }
+                .with_user(user_id, 0));
             }
 
             let prev_succeeded = stats.succeeded_samples;
@@ -2706,8 +2705,48 @@ impl Ingester {
     }
 }
 
+/// Label set arguments of [`handle_head_append_error`]: stringlabels-encoded bytes or sorted pairs.
+trait LabelPairsArg {
+    fn for_each_pair(&self, f: &mut dyn FnMut(&str, &str));
+}
+
+impl LabelPairsArg for [u8] {
+    fn for_each_pair(&self, f: &mut dyn FnMut(&str, &str)) {
+        for (k, v) in iter_stringlabels(self) {
+            f(k, v);
+        }
+    }
+}
+
+impl LabelPairsArg for [(&str, &str)] {
+    fn for_each_pair(&self, f: &mut dyn FnMut(&str, &str)) {
+        for &(k, v) in self {
+            f(k, v);
+        }
+    }
+}
+
+/// Go `fmt.Sprintf("%s", []mimirpb.LabelAdapter)`: `[{__name__ m} {job api}]`.
+fn format_label_adapters<L: ?Sized + LabelPairsArg>(labels: &L) -> String {
+    let mut out = String::from("[");
+    let mut first = true;
+    labels.for_each_pair(&mut |k, v| {
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        out.push('{');
+        out.push_str(k);
+        out.push(' ');
+        out.push_str(v);
+        out.push('}');
+    });
+    out.push(']');
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
-fn handle_head_append_error<L: ?Sized>(
+fn handle_head_append_error<L: ?Sized + LabelPairsArg>(
     err: HeadError,
     ts: i64,
     labels_arg: &L,
@@ -2772,15 +2811,21 @@ fn handle_head_append_error<L: ?Sized>(
             );
             Ok(())
         }
-        HeadError::HistogramValidation(msg) => {
+        HeadError::HistogramValidation(err) => {
+            // globalerror.MapNativeHistogramErr: only 8 sentinels are soft errors; any other
+            // validation error aborts the request with a 500.
+            let Some(err_id) = map_native_histogram_err(err.kind) else {
+                warn!(msg = "unknown histogram error", err = %err);
+                return Err(IngesterError::Internal {
+                    message: err.to_string(),
+                });
+            };
             stats.invalid_native_histogram += 1;
-            let err_id = map_native_histogram_err_id(&msg);
-            let s_str = make_series_str(labels_arg);
             record_partial(
                 IngesterError::NativeHistogramValidation {
                     err_id,
-                    original_err: msg,
-                    series: s_str,
+                    original_err: err.to_string(),
+                    series: format_label_adapters(labels_arg),
                     timestamp_ms: ts,
                 },
                 Some(SampleKind::NativeHistogramValidation),
@@ -2809,72 +2854,16 @@ fn handle_head_append_error<L: ?Sized>(
             );
             Ok(())
         }
-        HeadError::MissingMetricName => {
-            let s_str = make_series_str(labels_arg);
-            record_partial(IngesterError::invalid_label_name("__name__", s_str), None);
-            Ok(())
-        }
+        // `extract.MetricNameFromLabels` in `PreCreation` / `getOrCreate`'s empty label set check:
+        // hard errors in Go (not handled by the soft error processor).
+        e @ (HeadError::MissingMetricName | HeadError::EmptyLabelset) => Err(IngesterError::Internal {
+            message: e.to_string(),
+        }),
         HeadError::MaxInMemorySeriesReached => Err(IngesterError::max_in_memory_series_reached()),
         other => Err(IngesterError::Internal {
             message: other.to_string(),
         }),
     }
-}
-
-fn validate_encoded_labels(
-    encoded_labels: &[u8],
-    _limits: &LimitsConfig,
-    make_series_str: EncodedSeriesFormatter<'_>,
-) -> Option<IngesterError> {
-    let mut has_metric_name = false;
-
-    for (name, value) in iter_stringlabels(encoded_labels) {
-        if name == "__name__" && !value.is_empty() {
-            has_metric_name = true;
-        }
-        if name.is_empty() {
-            return Some(IngesterError::invalid_label_name(
-                name,
-                make_series_str(encoded_labels),
-            ));
-        }
-    }
-
-    if !has_metric_name {
-        return Some(IngesterError::invalid_label_name(
-            "__name__",
-            make_series_str(encoded_labels),
-        ));
-    }
-    None
-}
-
-fn validate_label_pairs<'a>(
-    pairs: &[(&'a str, &'a str)],
-    _limits: &LimitsConfig,
-    make_series_str: SeriesFormatter<'_, 'a>,
-) -> Option<IngesterError> {
-    let mut has_metric_name = false;
-
-    for &(name, value) in pairs {
-        if name == "__name__" && !value.is_empty() {
-            has_metric_name = true;
-        }
-        if name.is_empty() {
-            return Some(IngesterError::invalid_label_name(
-                name,
-                make_series_str(pairs),
-            ));
-        }
-    }
-
-    if !has_metric_name {
-        return Some(IngesterError::invalid_label_name(
-            "__name__",
-            make_series_str(pairs),
-        ));
-    }
-    None
 }
 
 fn min_timestamp_owned(ts_list: &[cortexpb::TimeSeries]) -> i64 {

@@ -765,7 +765,7 @@ fn build_push_cases(now_ms: i64) -> Vec<PushTestCase> {
                 contains: vec![
                     "21 observations found in buckets, but the Count field is 22".to_string(),
                     "timestamp=1970-01-01T00:00:00.01Z".to_string(),
-                    "series=test".to_string(),
+                    "series=[{__name__ test}]".to_string(),
                 ],
             }),
             expected_metrics: r#"
@@ -800,7 +800,7 @@ fn build_push_cases(now_ms: i64) -> Vec<PushTestCase> {
                 contains: vec![
                     "21 observations found in buckets, but the Count field is 20".to_string(),
                     "timestamp=1970-01-01T00:00:00.01Z".to_string(),
-                    "series=test".to_string(),
+                    "series=[{__name__ test}]".to_string(),
                 ],
             }),
             expected_metrics: r#"
@@ -835,7 +835,7 @@ fn build_push_cases(now_ms: i64) -> Vec<PushTestCase> {
                 contains: vec![
                     "positive side: span number 2 with offset -2: histogram has a span whose offset is negative".to_string(),
                     "timestamp=1970-01-01T00:00:00.01Z".to_string(),
-                    "series=test".to_string(),
+                    "series=[{__name__ test}]".to_string(),
                 ],
             }),
             expected_metrics: r#"
@@ -870,7 +870,7 @@ fn build_push_cases(now_ms: i64) -> Vec<PushTestCase> {
                 contains: vec![
                     "positive side: spans need 5 buckets, have 4 buckets".to_string(),
                     "timestamp=1970-01-01T00:00:00.01Z".to_string(),
-                    "series=test".to_string(),
+                    "series=[{__name__ test}]".to_string(),
                 ],
             }),
             expected_metrics: r#"
@@ -935,7 +935,7 @@ fn build_push_cases(now_ms: i64) -> Vec<PushTestCase> {
                 contains: vec![
                     "custom buckets: only 1 custom bounds defined which is insufficient to cover total span length of 5".to_string(),
                     "timestamp=1970-01-01T00:00:00.01Z".to_string(),
-                    "series=test".to_string(),
+                    "series=[{__name__ test}]".to_string(),
                 ],
             }),
             expected_metrics: r#"
@@ -970,7 +970,7 @@ fn build_push_cases(now_ms: i64) -> Vec<PushTestCase> {
                 contains: vec![
                     "custom buckets: previous bound is 100.000000 and current is 50.000000".to_string(),
                     "timestamp=1970-01-01T00:00:00.01Z".to_string(),
-                    "series=test".to_string(),
+                    "series=[{__name__ test}]".to_string(),
                 ],
             }),
             expected_metrics: r#"
@@ -1005,7 +1005,7 @@ fn build_push_cases(now_ms: i64) -> Vec<PushTestCase> {
                 contains: vec![
                     "custom buckets: last +Inf bound must not be explicitly defined".to_string(),
                     "timestamp=1970-01-01T00:00:00.01Z".to_string(),
-                    "series=test".to_string(),
+                    "series=[{__name__ test}]".to_string(),
                 ],
             }),
             expected_metrics: r#"
@@ -1131,7 +1131,7 @@ fn build_push_cases(now_ms: i64) -> Vec<PushTestCase> {
                 contains: vec![
                     "negative side: bucket number 2 has observation count of -98".to_string(),
                     "timestamp=1970-01-01T00:00:00.01Z".to_string(),
-                    "series=test".to_string(),
+                    "series=[{__name__ test}]".to_string(),
                 ],
             }),
             expected_metrics: r#"

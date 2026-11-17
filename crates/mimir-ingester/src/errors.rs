@@ -13,13 +13,13 @@ use mimir_common::errors::{
     GlobalErrorId, EXEMPLAR_SERIES_MISSING, EXEMPLAR_TOO_FAR_IN_FUTURE, EXEMPLAR_TOO_FAR_IN_PAST,
     INGESTER_MAX_INFLIGHT_PUSH_REQUESTS, INGESTER_MAX_INFLIGHT_PUSH_REQUESTS_BYTES,
     INGESTER_MAX_INGESTION_RATE, INGESTER_MAX_IN_MEMORY_SERIES, INGESTER_MAX_TENANTS,
-    INVALID_SCHEMA_NATIVE_HISTOGRAM, MAX_METADATA_PER_METRIC, MAX_METADATA_PER_USER,
+    MAX_METADATA_PER_METRIC, MAX_METADATA_PER_USER,
     MAX_NATIVE_HISTOGRAM_BUCKETS, MAX_SERIES_PER_METRIC, MAX_SERIES_PER_USER,
     NATIVE_HISTOGRAM_COUNT_MISMATCH, NATIVE_HISTOGRAM_COUNT_NOT_BIG_ENOUGH,
     NATIVE_HISTOGRAM_CUSTOM_BUCKETS_INFINITE, NATIVE_HISTOGRAM_CUSTOM_BUCKETS_INVALID,
-    NATIVE_HISTOGRAM_CUSTOM_BUCKETS_MISMATCH, NATIVE_HISTOGRAM_CUSTOM_BUCKETS_NOT_REDUCIBLE,
+    NATIVE_HISTOGRAM_CUSTOM_BUCKETS_MISMATCH,
     NATIVE_HISTOGRAM_NEGATIVE_BUCKET_COUNT, NATIVE_HISTOGRAM_SPANS_BUCKETS_MISMATCH,
-    NATIVE_HISTOGRAM_SPAN_NEGATIVE_OFFSET, NOT_REDUCIBLE_NATIVE_HISTOGRAM,
+    NATIVE_HISTOGRAM_SPAN_NEGATIVE_OFFSET,
     SAMPLE_DUPLICATE_TIMESTAMP, SAMPLE_OUT_OF_ORDER, SAMPLE_TIMESTAMP_TOO_OLD,
     SAMPLE_TOO_FAR_IN_FUTURE, SAMPLE_TOO_FAR_IN_PAST, SERIES_INVALID_LABEL,
     SERIES_INVALID_LABEL_VALUE, SERIES_LABELS_NOT_SORTED, SERIES_LABEL_NAME_TOO_LONG,
@@ -30,6 +30,7 @@ use mimir_common::services::State;
 use mimir_proto::cortexpb;
 use mimir_proto::grpcutilpb;
 use mimir_proto::httpgrpcpb;
+use mimir_tsdb::chunkenc::HistogramErrorKind;
 
 pub const INGESTER_TOO_BUSY_MSG: &str =
     "ingester is currently too busy to process queries, try again later";
@@ -189,6 +190,12 @@ pub enum IngesterError {
         message: String,
     },
     Internal {
+        message: String,
+    },
+    /// An error wrapping `context.DeadlineExceeded` (the gRPC request deadline or
+    /// `errWaitStrongReadConsistencyTimeoutExceeded`): returned as-is by
+    /// `mapReadErrorToErrorWithStatus`, so grpc-go reports `codes.DeadlineExceeded`.
+    DeadlineExceeded {
         message: String,
     },
     WrappedUser {
@@ -577,13 +584,16 @@ impl IngesterError {
             Self::CircuitBreakerOpen { .. } => cortexpb::ErrorCause::CircuitBreakerOpen,
             Self::ReactiveLimiterExceeded { .. } => cortexpb::ErrorCause::RequestRateLimited,
             Self::BadRequest { .. } => cortexpb::ErrorCause::BadData,
-            Self::Internal { .. } => cortexpb::ErrorCause::Unknown,
+            Self::Internal { .. } | Self::DeadlineExceeded { .. } => cortexpb::ErrorCause::Unknown,
             Self::WrappedUser { inner, .. } | Self::Sampled { inner, .. } | Self::DoNotLog { inner } => inner.error_cause(),
         }
     }
 
     pub fn has_ingester_error_details(&self) -> bool {
-        !matches!(self, Self::Internal { .. } | Self::BadRequest { .. })
+        !matches!(
+            self,
+            Self::Internal { .. } | Self::BadRequest { .. } | Self::DeadlineExceeded { .. }
+        )
             && match self {
                 Self::WrappedUser { inner, .. } | Self::Sampled { inner, .. } | Self::DoNotLog { inner } => {
                     inner.has_ingester_error_details()
@@ -670,9 +680,27 @@ impl IngesterError {
         }
     }
 
+    /// Whether the circuit breaker should count this error as a timeout (Go `isDeadlineExceeded`).
+    pub fn is_deadline_exceeded(&self) -> bool {
+        match self {
+            Self::DeadlineExceeded { .. } => true,
+            Self::WrappedUser { inner, .. } | Self::Sampled { inner, .. } | Self::DoNotLog { inner } => {
+                inner.is_deadline_exceeded()
+            }
+            _ => false,
+        }
+    }
+
+    /// `mapReadErrorToErrorWithStatus`: plain (non-ingester) errors such as invalid matchers or
+    /// shard IDs become `codes.Internal`; only `SearchLabelNames` / `SearchLabelValues` validate
+    /// their input as `codes.InvalidArgument`, before this mapping applies.
     pub fn map_read_error_to_status(&self) -> tonic::Status {
-        if let Self::BadRequest { message } = self {
-            return tonic::Status::invalid_argument(message.clone());
+        match self {
+            Self::BadRequest { message } => return tonic::Status::internal(message.clone()),
+            Self::DeadlineExceeded { message } => {
+                return tonic::Status::deadline_exceeded(message.clone())
+            }
+            _ => {}
         }
         let code = match self.error_cause() {
             cortexpb::ErrorCause::TooBusy => tonic::Code::ResourceExhausted,
@@ -833,7 +861,7 @@ impl fmt::Display for IngesterError {
             ),
             Self::ReactiveLimiterExceeded { message } => f.write_str(message),
             Self::BadRequest { message } => f.write_str(message),
-            Self::Internal { message } => f.write_str(message),
+            Self::Internal { message } | Self::DeadlineExceeded { message } => f.write_str(message),
             Self::WrappedUser { user_id, inner, .. } => write!(f, "user={user_id}: {inner}"),
             Self::Sampled { inner, .. } | Self::DoNotLog { inner } => write!(f, "{inner}"),
         }
@@ -842,42 +870,27 @@ impl fmt::Display for IngesterError {
 
 impl std::error::Error for IngesterError {}
 
-/// Maps native histogram validation error strings to their exact `GlobalErrorId`.
-pub fn map_native_histogram_err_id(msg: &str) -> GlobalErrorId {
-    if msg.contains("observation count should equal")
-        || msg.contains("count mismatch")
-        || msg.contains("positive/negative")
-    {
-        NATIVE_HISTOGRAM_COUNT_MISMATCH
-    } else if msg.contains("observation count should be at least") || msg.contains("not big enough")
-    {
-        NATIVE_HISTOGRAM_COUNT_NOT_BIG_ENOUGH
-    } else if msg.contains("observation count is negative")
-        || msg.contains("negative bucket count")
-    {
-        NATIVE_HISTOGRAM_NEGATIVE_BUCKET_COUNT
-    } else if msg.contains("offset is negative") || msg.contains("negative offset") {
-        NATIVE_HISTOGRAM_SPAN_NEGATIVE_OFFSET
-    } else if msg.contains("spans") && msg.contains("buckets") {
-        NATIVE_HISTOGRAM_SPANS_BUCKETS_MISMATCH
-    } else if (msg.contains("custom buckets") || msg.contains("custom bounds"))
-        && (msg.contains("must be finite") || msg.contains("infinite"))
-    {
-        NATIVE_HISTOGRAM_CUSTOM_BUCKETS_INFINITE
-    } else if (msg.contains("custom buckets") || msg.contains("custom bounds"))
-        && msg.contains("reducible")
-    {
-        NATIVE_HISTOGRAM_CUSTOM_BUCKETS_NOT_REDUCIBLE
-    } else if msg.contains("custom bounds are too few")
-        || (msg.contains("custom buckets") && msg.contains("mismatch"))
-    {
-        NATIVE_HISTOGRAM_CUSTOM_BUCKETS_MISMATCH
-    } else if msg.contains("custom buckets") || msg.contains("custom bounds") {
-        NATIVE_HISTOGRAM_CUSTOM_BUCKETS_INVALID
-    } else if msg.contains("reducible") {
-        NOT_REDUCIBLE_NATIVE_HISTOGRAM
-    } else {
-        INVALID_SCHEMA_NATIVE_HISTOGRAM
+/// `globalerror.MapNativeHistogramErr`: the soft-error ID of a native histogram validation
+/// error, or `None` for errors Go treats as hard (500) errors.
+pub fn map_native_histogram_err(kind: HistogramErrorKind) -> Option<GlobalErrorId> {
+    match kind {
+        HistogramErrorKind::CountMismatch => Some(NATIVE_HISTOGRAM_COUNT_MISMATCH),
+        HistogramErrorKind::CountNotBigEnough => Some(NATIVE_HISTOGRAM_COUNT_NOT_BIG_ENOUGH),
+        HistogramErrorKind::NegativeBucketCount => Some(NATIVE_HISTOGRAM_NEGATIVE_BUCKET_COUNT),
+        HistogramErrorKind::SpanNegativeOffset => Some(NATIVE_HISTOGRAM_SPAN_NEGATIVE_OFFSET),
+        HistogramErrorKind::SpansBucketsMismatch => Some(NATIVE_HISTOGRAM_SPANS_BUCKETS_MISMATCH),
+        HistogramErrorKind::CustomBucketsMismatch => Some(NATIVE_HISTOGRAM_CUSTOM_BUCKETS_MISMATCH),
+        HistogramErrorKind::CustomBucketsInvalid => Some(NATIVE_HISTOGRAM_CUSTOM_BUCKETS_INVALID),
+        HistogramErrorKind::CustomBucketsInfinite => Some(NATIVE_HISTOGRAM_CUSTOM_BUCKETS_INFINITE),
+        HistogramErrorKind::NegativeCount
+        | HistogramErrorKind::SpanIndexOutOfRange
+        | HistogramErrorKind::CustomBucketsNaN
+        | HistogramErrorKind::CustomBucketsZeroCount
+        | HistogramErrorKind::CustomBucketsZeroThresh
+        | HistogramErrorKind::CustomBucketsNegSpans
+        | HistogramErrorKind::CustomBucketsNegBuckets
+        | HistogramErrorKind::ExpSchemaCustomBounds
+        | HistogramErrorKind::InvalidSchema => None,
     }
 }
 
