@@ -74,3 +74,16 @@ memberlist JSON, query logs, metric dumps, and ingester logs.
 | e5 | Every Rust ingester (every ingester in MODE=go) served queries: `cortex_ingester_queries_total` increased. |
 | f1–f7 | `kubectl rollout restart` of the `ROLLOUT_ZONE` ingester StatefulSet; the rollout-operator deletes the pod. Checks that the pod comes back Ready, that queries running throughout see no errors, and that the pod keeps the same ring tokens and partition. Then re-runs the ring, partition-ring, and memberlist checks, and checks that the data is still queryable (the restarted ingester's `cortex_ingester_memory_series` must be ≥ 80% of its peers'). |
 | g  | Report only: the metric names that the mimir-mixin dashboards (`operations/mimir-mixin-compiled/dashboards`) reference, that Go ingesters expose, and that a Rust ingester does not expose. The Go reference is saved by MODE=go and MODE=mixed to `target/k3d-e2e/go-ingester-metrics.txt`. |
+
+## CI
+
+`.github/workflows/k3d-helm-e2e.yml` runs on pushes to `main`, on pull requests and on
+demand. The `image` job builds the mimir-rs image once with the repository `Dockerfile` and
+passes it to the e2e jobs as an artifact. The `e2e` job is a matrix over `MODE=mixed` and
+`MODE=rust`. Each job runs on a standard `ubuntu-24.04` runner (4 vCPU, 16 GB): it frees disk
+space, fetches `.ref/mimir` at the pinned `MIMIR_REF`, installs k3d v5.9.0 (docker, helm,
+kubectl and jq are preinstalled), raises the inotify limits, and runs the script with
+`RUST_IMAGE` set and `READY_TIMEOUT=1200`. The chart values only request a few hundred
+millicores and about 1.5 GiB in total, so the cluster fits on the runner. The job writes
+`summary.txt` to the job summary, uploads `target/k3d-e2e/runs/**` as an artifact when it
+fails, and always deletes the k3d cluster.
