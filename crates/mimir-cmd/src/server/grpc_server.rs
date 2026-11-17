@@ -415,12 +415,19 @@ where
     if let Some(t) = &stream_tracker {
         t.open_stream(conn.id);
     }
-    let inflight = cfg
-        .stats_tracking
-        .then(|| m.inflight_requests.with_label_values(&["gRPC", &method]));
-    if let Some(g) = &inflight {
-        g.inc();
-    }
+    // Pre-resolve all labeled metric handles once per stream (`grpcStatsHandler.TagRPC` in
+    // `dskit/middleware/grpc_stats.go`), so `cortex_request_message_bytes` and
+    // `cortex_response_message_bytes` expose `count=0` even if the RPC is canceled before
+    // receiving or sending a frame.
+    let (recv_size, sent_size, inflight) = if cfg.stats_tracking {
+        let recv = m.received_message_size.with_label_values(&["gRPC", &method]);
+        let sent = m.sent_message_size.with_label_values(&["gRPC", &method]);
+        let inflight = m.inflight_requests.with_label_values(&["gRPC", &method]);
+        inflight.inc();
+        (Some(recv), Some(sent), Some(inflight))
+    } else {
+        (None, None, None)
+    };
     let error_log = GrpcErrorLog::default();
     // From here on every exit path (including this future being dropped when the client
     // resets the stream) finalizes the RPC exactly once.
@@ -469,8 +476,7 @@ where
             })
         });
 
-    let req = if cfg.stats_tracking {
-        let recv = m.received_message_size.with_label_values(&["gRPC", &method]);
+    let req = if let Some(recv) = recv_size {
         let mut counter = GrpcFrameCounter::default();
         req.map(|b| {
             tonic::body::boxed(TrackedBody::new(b).on_frame(Box::new(move |f: &Frame<Bytes>| {
@@ -516,9 +522,7 @@ where
         .map(|s| s.to_string());
     *guard.status.lock() = (header_status, header_message);
 
-    let sent = cfg
-        .stats_tracking
-        .then(|| m.sent_message_size.with_label_values(&["gRPC", &method]));
+    let sent = sent_size;
     let mut out_counter = GrpcFrameCounter::default();
     let status_f = Arc::clone(&guard.status);
     let on_frame = Box::new(move |f: &Frame<Bytes>| {
@@ -795,6 +799,23 @@ mod tests {
             })
         }
 
+        fn histogram_sample_count(&self, name: &str, route: &str) -> Option<u64> {
+            for mf in self.reg.gather() {
+                if mf.get_name() != name {
+                    continue;
+                }
+                for m in mf.get_metric() {
+                    let has = |k: &str, v: &str| {
+                        m.get_label().iter().any(|l| l.get_name() == k && l.get_value() == v)
+                    };
+                    if has("method", "gRPC") && has("route", route) {
+                        return Some(m.get_histogram().get_sample_count());
+                    }
+                }
+            }
+            None
+        }
+
         fn sample(
             &self,
             name: &str,
@@ -846,6 +867,14 @@ mod tests {
         assert_eq!(fx.gauge("cortex_inflight_requests", route), 0.0);
         assert_eq!(fx.conn.active.load(Ordering::Acquire), 0);
         assert_eq!(fx.duration_count(route, "Canceled"), 1.0);
+        assert_eq!(
+            fx.histogram_sample_count("cortex_request_message_bytes", route),
+            Some(0)
+        );
+        assert_eq!(
+            fx.histogram_sample_count("cortex_response_message_bytes", route),
+            Some(0)
+        );
     }
 
     #[tokio::test]
@@ -877,6 +906,10 @@ mod tests {
         }
         assert_eq!(reason, Some(h2::Reason::CANCEL));
         assert_eq!(fx.duration_count(route, "Canceled"), 1.0);
+        assert_eq!(
+            fx.histogram_sample_count("cortex_response_message_bytes", route),
+            Some(0)
+        );
     }
 
     #[tokio::test]
@@ -914,6 +947,8 @@ mod tests {
             .unwrap();
         assert_eq!(drain(resp).await.as_deref(), Some("2"));
         let resp = fx.call(route, &[("x-scope-orgid", "a|b")]).await.unwrap();
+        assert_eq!(drain(resp).await.as_deref(), Some("0"));
+        let resp = fx.call(route, &[("x-scope-orgid", "")]).await.unwrap();
         assert_eq!(drain(resp).await.as_deref(), Some("0"));
         assert_eq!(fx.duration_count(route, "Unknown"), 2.0);
         assert!(check_org_id(&http::HeaderMap::new(), "/grpc.health.v1.Health/Check").is_none());

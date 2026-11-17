@@ -7,14 +7,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use mimir_common::logging::format_rfc3339_nano_utc;
 use mimir_proto::ringpb::{PartitionState, PartitionTokenScheme};
 use serde::{Deserialize, Serialize};
 
@@ -105,11 +104,7 @@ pub async fn handle_partition_ring_get(
         };
         let mut owners = ring.partition_owner_ids_copy(id);
         owners.sort();
-        let ts = if part.state_timestamp > 0 {
-            format_rfc3339_nano_utc(UNIX_EPOCH + Duration::from_secs(part.state_timestamp as u64))
-        } else {
-            "1970-01-01T00:00:00Z".to_string()
-        };
+        let ts = format_unix_secs_local_rfc3339(part.state_timestamp);
         by_id.insert(
             id,
             PartitionPageData {
@@ -222,6 +217,18 @@ pub async fn handle_partition_ring_post(
     }
 
     (StatusCode::FOUND, [(header::LOCATION, "#")], "").into_response()
+}
+
+/// Go `PartitionDesc.GetStateTime()` (`time.Unix(stateTimestamp, 0)` in `time.Local`) marshaled
+/// via `time.Time.MarshalJSON` (`RFC3339Nano`: local offset, or `Z` when local offset is 0).
+fn format_unix_secs_local_rfc3339(secs: i64) -> String {
+    match chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0) {
+        Some(utc) => {
+            let local = utc.with_timezone(&chrono::Local).fixed_offset();
+            crate::kv::memberlist::gofmt::format_rfc3339_nano(&local)
+        }
+        None => "1970-01-01T00:00:00Z".to_string(),
+    }
 }
 
 /// Go `strconv.Atoi` (64-bit `int`), including its error messages. The caller truncates to
@@ -501,5 +508,58 @@ mod tests {
         assert_eq!(go_parse_bool("1"), Ok(true));
         assert_eq!(go_parse_bool("False"), Ok(false));
         assert!(go_parse_bool("tRuE").is_err());
+    }
+
+    #[tokio::test]
+    async fn get_json_formats_state_timestamp_in_local_timezone() {
+        let kv = Arc::new(InMemoryKv::new(partition_ring_desc_codec()));
+        let mut desc = PartitionRingDesc::default();
+        let fixed_secs = 1_794_898_593i64;
+        desc.add_partition(
+            0,
+            PartitionState::PartitionActive,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(fixed_secs as u64),
+        );
+        // Add an owner pointing to non-existent partition 9 -> corrupted entry (`time.Time{}`).
+        desc.owners.insert(
+            "orphan-owner".to_string(),
+            mimir_proto::ringpb::OwnerDesc {
+                owned_partition: 9,
+                updated_timestamp: fixed_secs,
+                ..Default::default()
+            },
+        );
+        kv.put_any("ingester-partitions", &desc).await.unwrap();
+        let reader = Arc::new(Static(PartitionRing::new(desc).unwrap()));
+        let editor = Arc::new(PartitionRingEditor::new(
+            "ingester-partitions",
+            Arc::clone(&kv) as Arc<dyn KvClient>,
+        ));
+        let app = PartitionRingPageState { reader, editor };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "application/json".parse().unwrap());
+        let resp = handle_partition_ring_get(
+            State(app),
+            headers,
+            axum::extract::Query(PartitionRingQuery { tokens: None }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: PartitionRingHttpResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.partitions.len(), 2);
+
+        let expected_local = crate::kv::memberlist::gofmt::format_rfc3339_nano(
+            &chrono::DateTime::<chrono::Utc>::from_timestamp(fixed_secs, 0)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+                .fixed_offset(),
+        );
+        assert_eq!(parsed.partitions[0].id, 0);
+        assert_eq!(parsed.partitions[0].state_timestamp, expected_local);
+        assert_eq!(parsed.partitions[1].id, 9);
+        assert!(parsed.partitions[1].corrupted);
+        assert_eq!(parsed.partitions[1].state_timestamp, "0001-01-01T00:00:00Z");
     }
 }
