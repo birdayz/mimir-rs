@@ -1122,10 +1122,10 @@ blocks_storage:
             .unwrap();
         let mut ing = IngesterClient::new(ch);
 
-        // Request strong read consistency for unreachable offset v1=0:999999 with a 150ms client
-        // timeout, forcing the stream to cancel before sending any response frame!
+        // Request strong read consistency for unreachable offset v1=0:999999 and cancel from the
+        // client after 150ms (pure client RST_STREAM without sending a racing `grpc-timeout`
+        // header, where grpc-go races its transport stream-reset timer against context deadline).
         let mut req = tonic::Request::new(ingesterpb::LabelNamesRequest::default());
-        req.set_timeout(Duration::from_millis(150));
         req.metadata_mut()
             .insert("x-scope-orgid", MetadataValue::from_static("t-cancel"));
         req.metadata_mut()
@@ -1134,17 +1134,12 @@ blocks_storage:
             "__consistency_offsets__",
             MetadataValue::from_static("v1=0:999999"),
         );
-        let err = ing.label_names(req).await.expect_err("must time out");
-        assert!(
-            matches!(
-                err.code(),
-                tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
-            ),
-            "unexpected code: {err:?}"
-        );
+        tokio::time::timeout(Duration::from_millis(150), ing.label_names(req))
+            .await
+            .expect_err("client timeout must cancel in-flight strong-consistency LabelNames");
 
         // Give the server a brief moment to finalize the canceled stream's RpcGuard.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let (m_code, _, m_body) = http_get(&http, http_ports[idx], "/metrics", false)
             .await
