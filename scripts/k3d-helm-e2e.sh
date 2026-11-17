@@ -8,8 +8,11 @@
 # restart of an ingester zone, and metric coverage. See docs/k3d-helm-e2e.md.
 #
 # Env:
-#   MODE=go|mixed|rust   go = chart defaults (baseline), mixed = ingester zone-a+b Rust
-#                        and zone-c Go, rust = all ingester zones Rust. Default: go.
+#   MODE=go|mixed|rust         go = chart defaults (baseline), mixed = ingester zone-a+b Rust
+#                              and zone-c Go, rust = all ingester zones Rust. Default: go.
+#   KV_MODE=memberlist|etcd    memberlist = chart default gossip ring, etcd = shared etcd KV
+#                              with num_tokens=0, push_grpc_method_enabled=false, memberlist
+#                              disabled (also honored via RING_STORE=etcd). Default: memberlist.
 #   RUST_IMAGE=img:tag   Rust image to use. Default: build mimir-rs:k3d-<shortsha>
 #                        from this worktree with `just docker-build` (if missing).
 #   KEEP_CLUSTER=1       keep the k3d cluster on exit (default: delete it).
@@ -25,6 +28,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HERE=$ROOT/scripts/k3d-helm-e2e
 MODE=${MODE:-go}
+KV_MODE=${KV_MODE:-${RING_STORE:-memberlist}}
 CLUSTER=${CLUSTER:-mimir-e2e-$MODE}
 NS=mimir
 RELEASE=mimir
@@ -49,6 +53,7 @@ export KUBECONFIG=$WORK/kubeconfig-$CLUSTER
 export HELM_CONFIG_HOME=$WORK/helm/config HELM_CACHE_HOME=$WORK/helm/cache HELM_DATA_HOME=$WORK/helm/data
 
 case $MODE in go|mixed|rust) ;; *) echo "MODE must be go|mixed|rust, got '$MODE'" >&2; exit 2 ;; esac
+case $KV_MODE in memberlist|etcd) ;; *) echo "KV_MODE must be memberlist|etcd, got '$KV_MODE'" >&2; exit 2 ;; esac
 for t in "$K3D" "$HELM" "$KUBECTL" docker jq awk; do
   command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 2; }
 done
@@ -119,7 +124,7 @@ if [[ $MODE != go ]]; then
   fi
   docker image inspect "$RUST_IMAGE" >/dev/null 2>&1 || docker pull "$RUST_IMAGE"
 fi
-info "MODE=$MODE cluster=$CLUSTER go_image=$GO_IMAGE rust_image=${RUST_IMAGE:-n/a} out=$OUT_DIR"
+info "MODE=$MODE KV_MODE=$KV_MODE cluster=$CLUSTER go_image=$GO_IMAGE rust_image=${RUST_IMAGE:-n/a} out=$OUT_DIR"
 
 ###############################################################################
 # Chart (copied out of .ref so `helm dependency build` never writes into it)
@@ -169,6 +174,7 @@ IMAGES=(
   docker.io/curlimages/curl:8.15.0
 )
 if [[ $MODE != go ]]; then IMAGES+=("$RUST_IMAGE"); fi
+if [[ $KV_MODE == etcd ]]; then IMAGES+=(quay.io/coreos/etcd:v3.5.17); fi
 for img in "${IMAGES[@]}"; do
   docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null
 done
@@ -205,12 +211,110 @@ done
 ###############################################################################
 HELM_ARGS=(upgrade --install "$RELEASE" "$CHART" -n "$NS" --create-namespace
   -f "$HERE/values.yaml" --timeout 20m)
+if [[ $KV_MODE == etcd ]]; then
+  cat >"$WORK/values-etcd.yaml" <<EOF
+mimir:
+  structuredConfig:
+    ingester:
+      push_grpc_method_enabled: false
+      ring:
+        num_tokens: 0
+        tokens_file_path: ""
+        kvstore:
+          store: etcd
+          etcd:
+            endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
+      partition_ring:
+        kvstore:
+          store: etcd
+          etcd:
+            endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
+    distributor:
+      ring:
+        kvstore:
+          store: etcd
+          etcd:
+            endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
+      ha_tracker:
+        kvstore:
+          store: etcd
+          etcd:
+            endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
+    compactor:
+      sharding_ring:
+        kvstore:
+          store: etcd
+          etcd:
+            endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
+    store_gateway:
+      sharding_ring:
+        kvstore:
+          store: etcd
+          etcd:
+            endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
+    querier:
+      ring:
+        kvstore:
+          store: etcd
+          etcd:
+            endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
+    query_scheduler:
+      ring:
+        kvstore:
+          store: etcd
+          etcd:
+            endpoints: ["$RELEASE-etcd.$NS.svc.cluster.local:2379"]
+EOF
+  HELM_ARGS+=(-f "$WORK/values-etcd.yaml")
+fi
 if [[ $MODE != go ]]; then
   HELM_ARGS+=(--set "ingester.image.repository=${RUST_IMAGE%:*}" --set "ingester.image.tag=${RUST_IMAGE##*:}")
 fi
 if [[ $MODE == mixed ]]; then
   export E2E_RUST_IMAGE=$RUST_IMAGE E2E_GO_IMAGE=$GO_IMAGE E2E_GO_STATEFULSETS="$RELEASE-ingester-zone-c"
   HELM_ARGS+=(--post-renderer "$HERE/post-render-mixed.sh")
+fi
+if [[ $KV_MODE == etcd ]]; then
+  "$KUBECTL" create namespace "$NS" --dry-run=client -o yaml | "$KUBECTL" apply -f - >/dev/null
+  kc apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $RELEASE-etcd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: $RELEASE-etcd
+  template:
+    metadata:
+      labels:
+        app: $RELEASE-etcd
+    spec:
+      containers:
+      - name: etcd
+        image: quay.io/coreos/etcd:v3.5.17
+        command: ["etcd"]
+        args:
+        - "--name=etcd0"
+        - "--data-dir=/tmp/etcd"
+        - "--listen-client-urls=http://0.0.0.0:2379"
+        - "--advertise-client-urls=http://$RELEASE-etcd.$NS.svc.cluster.local:2379"
+        ports:
+        - containerPort: 2379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: $RELEASE-etcd
+spec:
+  selector:
+    app: $RELEASE-etcd
+  ports:
+  - port: 2379
+    targetPort: 2379
+EOF
+  kc rollout status "deployment/$RELEASE-etcd" --timeout=120s >/dev/null
 fi
 log "helm ${HELM_ARGS[*]}"
 "$HELM" "${HELM_ARGS[@]}" >"$OUT_DIR/helm.log" 2>&1 || { cat "$OUT_DIR/helm.log" >&2; exit 1; }
@@ -297,7 +401,7 @@ check_ring() {
       bad=1
       continue
     fi
-    out=$(jq -r --arg ing "$INGESTERS" '
+    out=$(jq -r --arg ing "$INGESTERS" --arg kv_mode "$KV_MODE" '
       ($ing | split("\n") | map(select(length > 0) | split("\t") | {name: .[0], ip: .[1], zone: .[2], impl: .[3]})) as $want
       | (.shards | map({key: .id, value: .}) | from_entries) as $have
       | ($want[] | . as $w | $have[$w.name] as $s
@@ -306,7 +410,11 @@ check_ring() {
               ( (if $s.state != "ACTIVE" then ["state=\($s.state)"] else [] end)
               + (if $s.address != "\($w.ip):9095" then ["address=\($s.address) want \($w.ip):9095"] else [] end)
               + (if $s.zone != $w.zone then ["zone=\($s.zone) want \($w.zone)"] else [] end)
-              + (if ($s.tokens | length) == 0 then ["no tokens"] else [] end)
+              + (if $kv_mode == "etcd" then
+                   (if ($s.tokens | length) != 0 then ["expected 0 tokens in tokenless mode, got \($s.tokens | length)"] else [] end)
+                 else
+                   (if ($s.tokens | length) == 0 then ["no tokens"] else [] end)
+                 end)
               ) as $errs
               | if ($errs | length) > 0 then "BAD \($w.name) (\($w.impl)): \($errs | join(", "))"
                 else "OK \($w.name) (\($w.impl)) \($s.state) \($s.address) \($s.zone) tokens=\($s.tokens | length)" end
@@ -427,34 +535,77 @@ check_memberlist() {
   if [[ -n $expected ]]; then echo "expected members: $expected"; fi
   return $bad
 }
-log "d. checking memberlist membership on every memberlist pod"
-ok=0
-for i in $(seq 1 12); do if res=$(check_memberlist initial); then ok=1; break; fi; sleep 10; done
-if ((ok)); then
-  pass "d1. memberlist: every member pod sees the same full membership at the right pod IPs"
+if [[ $KV_MODE == etcd ]]; then
+  check_no_memberlist() {
+    local label=$1 pods p ip ml tb_pod rc m bad=0
+    pods=$(kc get pods -l app.kubernetes.io/name=mimir --field-selector=status.phase=Running -o json | jq -r '.items[]
+      | select([.spec.containers[] | select(.image | test("mimir")) | .ports[]? | select(.name == "http-metrics")] | length > 0)
+      | [.metadata.name, .status.podIP] | @tsv' | sort)
+    tb_pod=$(kc get pods -l app=e2e-toolbox --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+    while IFS=$'\t' read -r p ip; do
+      [[ -z $p ]] && continue
+      ml=$(incurl "http://$ip:8080/memberlist" 2>&1) || true
+      echo "$ml" >"$OUT_DIR/memberlist-$label-$p.txt"
+      if [[ $ml != "This instance doesn't use memberlist." ]]; then
+        echo "BAD $p /memberlist returned: $(head -c 200 <<<"$ml")"
+        bad=1
+        continue
+      fi
+      rc=0
+      kc exec "$tb_pod" -c curl -- curl -sS --connect-timeout 2 "http://$ip:7946/" >/dev/null 2>&1 || rc=$?
+      if ((rc != 7)); then
+        echo "BAD $p port 7946 probe returned curl exit=$rc (want 7 connection refused)"
+        bad=1
+        continue
+      fi
+      m=$(incurl "http://$ip:8080/metrics" 2>/dev/null | grep -E '^(cortex_)?memberlist_' || true)
+      if [[ -n $m ]]; then
+        echo "BAD $p exposes memberlist metrics: $(head -n 3 <<<"$m")"
+        bad=1
+        continue
+      fi
+      echo "OK $p /memberlist disabled, port 7946 closed, zero memberlist metrics"
+    done <<<"$pods"
+    return $bad
+  }
+  log "d. checking memberlist is disabled on every mimir pod (KV_MODE=etcd)"
+  if res=$(check_no_memberlist initial); then
+    pass "d1. memberlist disabled on every mimir pod"
+    pass "d2. /memberlist disabled response verified (KV_MODE=etcd)"
+  else
+    fail "d1. some pod unexpectedly uses memberlist under KV_MODE=etcd"
+  fi
+  echo "$res" | evidence
 else
-  fail "d1. memberlist views differ / incomplete"
+  log "d. checking memberlist membership on every memberlist pod"
+  ok=0
+  for i in $(seq 1 12); do if res=$(check_memberlist initial); then ok=1; break; fi; sleep 10; done
+  if ((ok)); then
+    pass "d1. memberlist: every member pod sees the same full membership at the right pod IPs"
+  else
+    fail "d1. memberlist views differ / incomplete"
+  fi
+  echo "$res" | evidence
+  # d2: GET /memberlist with Accept: application/json must have dskit's schema
+  # (memberlist.StatusPageData: SortedMembers, Store, ...) on every pod.
+  schema_bad=""
+  for f in "$OUT_DIR"/memberlist-initial-*.json; do
+    memberlist_members <"$f" >/dev/null 2>&1 && [[ -n $(memberlist_members <"$f" 2>/dev/null) ]] || continue
+    memberlist_schema <"$f" || schema_bad+="$(basename "$f" .json | sed 's/^memberlist-initial-//') keys=$(jq -c 'keys' "$f" 2>/dev/null) "$'\n'
+  done
+  if [[ -z $schema_bad ]]; then
+    pass "d2. /memberlist JSON has dskit's StatusPageData schema on every pod"
+  else
+    fail "d2. /memberlist JSON is not dskit's StatusPageData schema (want keys SortedMembers, Store, ...) on:"
+    echo -n "$schema_bad" | evidence
+  fi
+  # d3 (report-only): incarnation numbers, where the JSON exposes them. Go nodes
+  # only bump their incarnation to refute suspicion, so it stays 1 in a healthy cluster.
+  for f in "$OUT_DIR"/memberlist-initial-*.json; do
+    inc=$({ memberlist_members <"$f" 2>/dev/null || true; } | awk -F'\t' '$3 != "-" {printf "%s=%s ", $1, $3}')
+    if [[ -n $inc ]]; then info "d3. incarnations seen by $(basename "$f" .json | sed 's/^memberlist-initial-//'): $inc"; fi
+  done
 fi
-echo "$res" | evidence
-# d2: GET /memberlist with Accept: application/json must have dskit's schema
-# (memberlist.StatusPageData: SortedMembers, Store, ...) on every pod.
-schema_bad=""
-for f in "$OUT_DIR"/memberlist-initial-*.json; do
-  memberlist_members <"$f" >/dev/null 2>&1 && [[ -n $(memberlist_members <"$f" 2>/dev/null) ]] || continue
-  memberlist_schema <"$f" || schema_bad+="$(basename "$f" .json | sed 's/^memberlist-initial-//') keys=$(jq -c 'keys' "$f" 2>/dev/null) "$'\n'
-done
-if [[ -z $schema_bad ]]; then
-  pass "d2. /memberlist JSON has dskit's StatusPageData schema on every pod"
-else
-  fail "d2. /memberlist JSON is not dskit's StatusPageData schema (want keys SortedMembers, Store, ...) on:"
-  echo -n "$schema_bad" | evidence
-fi
-# d3 (report-only): incarnation numbers, where the JSON exposes them. Go nodes
-# only bump their incarnation to refute suspicion, so it stays 1 in a healthy cluster.
-for f in "$OUT_DIR"/memberlist-initial-*.json; do
-  inc=$({ memberlist_members <"$f" 2>/dev/null || true; } | awk -F'\t' '$3 != "-" {printf "%s=%s ", $1, $3}')
-  if [[ -n $inc ]]; then info "d3. incarnations seen by $(basename "$f" .json | sed 's/^memberlist-initial-//'): $inc"; fi
-done
 
 ###############################################################################
 # e. Write + read path
@@ -640,10 +791,18 @@ echo "$ring_json" >"$OUT_DIR/ring-after-rollout.json"
 tokens_after=$(jq -c --arg id "$RPOD" '[.shards[] | select(.id == $id) | .tokens[]] | sort' <<<"$ring_json" || echo "[]")
 parts_after=$(incurl -H 'Accept: application/json' "http://$(pod_ip "$DISTRIBUTOR"):8080/ingester/partition-ring" |
   jq -c --arg id "$RPOD" '[.partitions[] | select(.owner_ids | index($id)) | .id] | sort' || echo "[]")
-if [[ $tokens_before == "$tokens_after" && $tokens_before != "[]" && $parts_before == "$parts_after" && $parts_before != "[]" ]]; then
-  pass "f3. $RPOD kept its $(jq length <<<"$tokens_before") ring tokens and partitions $parts_after"
+if [[ $KV_MODE == etcd ]]; then
+  if [[ $tokens_before == "[]" && $tokens_after == "[]" && $parts_before == "$parts_after" && $parts_before != "[]" ]]; then
+    pass "f3. $RPOD kept 0 ring tokens (tokenless) and partitions $parts_after"
+  else
+    fail "f3. $RPOD ring identity changed: tokens $(jq length <<<"$tokens_before") -> $(jq length <<<"$tokens_after"), partitions $parts_before -> $parts_after"
+  fi
 else
-  fail "f3. $RPOD ring identity changed: tokens $(jq length <<<"$tokens_before") -> $(jq length <<<"$tokens_after") equal=$([[ $tokens_before == "$tokens_after" ]] && echo yes || echo no), partitions $parts_before -> $parts_after"
+  if [[ $tokens_before == "$tokens_after" && $tokens_before != "[]" && $parts_before == "$parts_after" && $parts_before != "[]" ]]; then
+    pass "f3. $RPOD kept its $(jq length <<<"$tokens_before") ring tokens and partitions $parts_after"
+  else
+    fail "f3. $RPOD ring identity changed: tokens $(jq length <<<"$tokens_before") -> $(jq length <<<"$tokens_after") equal=$([[ $tokens_before == "$tokens_after" ]] && echo yes || echo no), partitions $parts_before -> $parts_after"
+  fi
 fi
 if res=$(ring_with_retry after-rollout); then
   pass "f4. ingester ring after rollout: all ingesters ACTIVE at their (new) podIP:9095"
@@ -669,9 +828,13 @@ fi
 echo "$mem" | evidence
 if res=$(check_partition_ring after-rollout); then pass "f6. partition ring after rollout OK"; else fail "f6. partition ring after rollout"; fi
 echo "$res" | evidence
-ok=0
-for i in $(seq 1 12); do if res=$(check_memberlist after-rollout); then ok=1; break; fi; sleep 10; done
-if ((ok)); then pass "f7. memberlist membership after rollout OK"; else fail "f7. memberlist after rollout"; fi
+if [[ $KV_MODE == etcd ]]; then
+  if res=$(check_no_memberlist after-rollout); then pass "f7. memberlist disabled after rollout OK"; else fail "f7. memberlist enabled after rollout"; fi
+else
+  ok=0
+  for i in $(seq 1 12); do if res=$(check_memberlist after-rollout); then ok=1; break; fi; sleep 10; done
+  if ((ok)); then pass "f7. memberlist membership after rollout OK"; else fail "f7. memberlist after rollout"; fi
+fi
 echo "$res" | evidence
 
 ###############################################################################
