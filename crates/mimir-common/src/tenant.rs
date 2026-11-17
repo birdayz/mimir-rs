@@ -507,18 +507,16 @@ pub fn inject_org_id_into_http_headers(
 
 /// Extracts the org ID from gRPC incoming metadata (`x-scope-orgid`), like dskit
 /// `user.ExtractFromGRPCRequest`: anything but exactly one metadata value (missing or repeated,
-/// even with identical values) is [`TenantError::NoOrgID`].
-///
-/// Known divergence: an empty value is rejected with [`TenantError::NoOrgID`] too, whereas Go
-/// accepts the empty tenant ID (and would place its TSDB in the TSDB root directory).
+/// even with identical values) is [`TenantError::NoOrgID`]. An empty metadata value (`""`) is
+/// accepted, matching Go `len(orgIDs) == 1` + `tenant.ValidTenantID("")`.
 pub fn extract_org_id_from_grpc_metadata(metadata: &MetadataMap) -> Result<String, TenantError> {
     let mut values = metadata.get_all(LOWER_ORG_ID_HEADER_NAME).iter();
     let (Some(value), None) = (values.next(), values.next()) else {
         return Err(TenantError::NoOrgID);
     };
     match value.to_str() {
-        Ok(s) if !s.is_empty() => Ok(s.to_string()),
-        _ => Err(TenantError::NoOrgID),
+        Ok(s) => Ok(s.to_string()),
+        Err(_) => Err(TenantError::NoOrgID),
     }
 }
 
@@ -707,6 +705,38 @@ mod tests {
         md.append("x-scope-orgid", "tenant-a".parse().unwrap());
         assert_eq!(
             extract_org_id_from_grpc_metadata(&md).unwrap_err(),
+            TenantError::NoOrgID
+        );
+
+        // dskit/user/grpc.go: a single empty `x-scope-orgid: ""` metadata value is accepted on
+        // gRPC (`len(orgIDs) == 1` + `tenant.ValidTenantID("")`), while repeated empty values are
+        // rejected, and HTTP `ExtractOrgIDFromHTTPRequest` still rejects empty `X-Scope-OrgID`.
+        let mut md_empty = MetadataMap::new();
+        md_empty.insert("x-scope-orgid", "".parse().unwrap());
+        assert_eq!(extract_org_id_from_grpc_metadata(&md_empty).unwrap(), "");
+        assert_eq!(extract_tenant_id_from_grpc_metadata(&md_empty).unwrap(), "");
+        assert_eq!(
+            extract_tenant_ids_from_grpc_metadata(&md_empty).unwrap(),
+            vec![""]
+        );
+        md_empty.append("x-scope-orgid", "".parse().unwrap());
+        assert_eq!(
+            extract_org_id_from_grpc_metadata(&md_empty).unwrap_err(),
+            TenantError::NoOrgID
+        );
+
+        let mut http_empty = HeaderMap::new();
+        http_empty.insert("x-scope-orgid", "".parse().unwrap());
+        assert_eq!(
+            extract_org_id_from_http_headers(&http_empty).unwrap_err(),
+            TenantError::NoOrgID
+        );
+        assert_eq!(
+            extract_tenant_id_from_http_headers(&http_empty).unwrap_err(),
+            TenantError::NoOrgID
+        );
+        assert_eq!(
+            extract_org_id_from_headers([("X-Scope-OrgID", "")]).unwrap_err(),
             TenantError::NoOrgID
         );
     }
