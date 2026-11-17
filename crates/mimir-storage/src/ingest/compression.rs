@@ -13,8 +13,19 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use kafka_protocol::records::Compression;
 use lz4_flex::frame::{BlockMode, FrameDecoder, FrameEncoder, FrameInfo};
+use thiserror::Error;
 
 const XERIAL_MAGIC: &[u8; 8] = b"\x82SNAPPY\x00";
+
+/// Maximum decompressed size permitted for a single Kafka RecordBatch (`256 MiB`),
+/// protecting against Snappy varint bombs and Gzip/LZ4/Zstd zip bombs.
+pub const MAX_DECOMPRESSED_KAFKA_BATCH_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionError {
+    #[error("decompressed Kafka batch exceeds limit of {limit} bytes")]
+    DecompressedSizeExceeded { limit: usize },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KafkaCompression {
@@ -125,28 +136,55 @@ pub fn decompress_record_batch(
     compressed: &mut Bytes,
     compression: Compression,
 ) -> Result<Bytes> {
+    decompress_record_batch_with_limit(compressed, compression, MAX_DECOMPRESSED_KAFKA_BATCH_BYTES)
+}
+
+/// Decompresses a Kafka RecordBatch payload while enforcing `max_bytes` as a hard upper bound on
+/// the decompressed output size before allocating large buffers.
+pub fn decompress_record_batch_with_limit(
+    compressed: &mut Bytes,
+    compression: Compression,
+    max_bytes: usize,
+) -> Result<Bytes> {
     let raw = compressed.copy_to_bytes(compressed.remaining());
     match compression {
-        Compression::None => Ok(raw),
+        Compression::None => {
+            if raw.len() > max_bytes {
+                return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+            }
+            Ok(raw)
+        }
         Compression::Gzip => {
-            let mut decoder = GzDecoder::new(&raw[..]);
-            let mut out = Vec::with_capacity(raw.len() * 2);
-            decoder
-                .read_to_end(&mut out)
-                .context("gzip decompress record batch")?;
+            let mut out = Vec::with_capacity(raw.len().saturating_mul(2).min(max_bytes));
+            read_bounded(GzDecoder::new(&raw[..]), max_bytes, &mut out, "gzip")?;
             Ok(Bytes::from(out))
         }
-        Compression::Snappy => decompress_snappy(&raw),
+        Compression::Snappy => decompress_snappy(&raw, max_bytes),
         Compression::Lz4 => {
-            let mut decoder = FrameDecoder::new(&raw[..]);
-            let mut out = Vec::with_capacity(raw.len() * 2);
-            decoder
-                .read_to_end(&mut out)
-                .context("lz4 decompress record batch")?;
+            let mut out = Vec::with_capacity(raw.len().saturating_mul(2).min(max_bytes));
+            read_bounded(FrameDecoder::new(&raw[..]), max_bytes, &mut out, "lz4")?;
             Ok(Bytes::from(out))
         }
-        Compression::Zstd => decompress_zstd(&raw),
+        Compression::Zstd => decompress_zstd(&raw, max_bytes),
     }
+}
+
+fn read_bounded<R: Read>(
+    reader: R,
+    max_bytes: usize,
+    out: &mut Vec<u8>,
+    codec: &str,
+) -> Result<()> {
+    let start = out.len();
+    let remaining = max_bytes.saturating_sub(start);
+    let mut limited = reader.take((remaining as u64).saturating_add(1));
+    limited
+        .read_to_end(out)
+        .with_context(|| format!("{codec} decompress record batch"))?;
+    if out.len() - start > remaining {
+        return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+    }
+    Ok(())
 }
 
 thread_local! {
@@ -154,8 +192,11 @@ thread_local! {
         RefCell::new(zstd::bulk::Decompressor::default());
 }
 
-fn decompress_zstd(raw: &[u8]) -> Result<Bytes> {
+fn decompress_zstd(raw: &[u8], max_bytes: usize) -> Result<Bytes> {
     if let Ok(Some(sz)) = zstd::zstd_safe::get_frame_content_size(raw) {
+        if sz > max_bytes as u64 {
+            return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+        }
         if sz <= 64 * 1024 * 1024 {
             let mut out = Vec::with_capacity(sz as usize);
             let bulk_res = ZSTD_DECOMPRESSOR
@@ -165,15 +206,16 @@ fn decompress_zstd(raw: &[u8]) -> Result<Bytes> {
             }
         }
     }
-    let mut out = Vec::with_capacity(raw.len().saturating_mul(3));
-    zstd::stream::copy_decode(raw, &mut out).context("zstd decompress record batch")?;
+    let decoder = zstd::stream::read::Decoder::new(raw).context("zstd decompress record batch")?;
+    let mut out = Vec::with_capacity(raw.len().saturating_mul(3).min(max_bytes));
+    read_bounded(decoder, max_bytes, &mut out, "zstd")?;
     Ok(Bytes::from(out))
 }
 
-fn decompress_snappy(src: &[u8]) -> Result<Bytes> {
+fn decompress_snappy(src: &[u8], max_bytes: usize) -> Result<Bytes> {
     if src.len() >= 16 && &src[..8] == XERIAL_MAGIC {
         let mut rem = &src[16..];
-        let mut out = Vec::with_capacity(src.len() * 2);
+        let mut out = Vec::with_capacity(src.len().saturating_mul(2).min(max_bytes));
         let mut dec = snap::raw::Decoder::new();
         while !rem.is_empty() {
             if rem.len() < 4 {
@@ -188,7 +230,13 @@ fn decompress_snappy(src: &[u8]) -> Result<Bytes> {
             rem = &rem[size..];
             let dec_len = snap::raw::decompress_len(chunk).context("snappy xerial chunk len")?;
             let start = out.len();
-            out.resize(start + dec_len, 0);
+            let new_len = start
+                .checked_add(dec_len)
+                .ok_or(CompressionError::DecompressedSizeExceeded { limit: max_bytes })?;
+            if new_len > max_bytes {
+                return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+            }
+            out.resize(new_len, 0);
             let actual = dec
                 .decompress(chunk, &mut out[start..])
                 .context("snappy xerial chunk decompress")?;
@@ -198,6 +246,9 @@ fn decompress_snappy(src: &[u8]) -> Result<Bytes> {
     }
 
     let dec_len = snap::raw::decompress_len(src).context("snappy raw decompress_len")?;
+    if dec_len > max_bytes {
+        return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+    }
     let mut out = vec![0u8; dec_len];
     let actual = snap::raw::Decoder::new()
         .decompress(src, &mut out)
@@ -246,5 +297,92 @@ mod tests {
         let mut buf = Bytes::from(xerial);
         let dec = decompress_record_batch(&mut buf, Compression::Snappy).unwrap();
         assert_eq!(dec.as_ref(), b"hello xerial");
+    }
+
+    #[test]
+    fn test_snappy_4gib_varint_bomb_rejected() {
+        // 5-byte Snappy header claiming u32::MAX (4 GiB) decompressed length.
+        let bomb = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
+        let mut buf = bomb.clone();
+        let err = decompress_record_batch(&mut buf, Compression::Snappy).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CompressionError>(),
+            Some(&CompressionError::DecompressedSizeExceeded {
+                limit: MAX_DECOMPRESSED_KAFKA_BATCH_BYTES
+            })
+        );
+
+        // Same bomb wrapped inside a Xerial Snappy chunk.
+        let mut xerial = Vec::new();
+        xerial.extend_from_slice(XERIAL_MAGIC);
+        xerial.extend_from_slice(&1u32.to_be_bytes());
+        xerial.extend_from_slice(&1u32.to_be_bytes());
+        xerial.extend_from_slice(&(bomb.len() as u32).to_be_bytes());
+        xerial.extend_from_slice(&bomb);
+        let mut xbuf = Bytes::from(xerial);
+        let err = decompress_record_batch(&mut xbuf, Compression::Snappy).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CompressionError>(),
+            Some(&CompressionError::DecompressedSizeExceeded {
+                limit: MAX_DECOMPRESSED_KAFKA_BATCH_BYTES
+            })
+        );
+    }
+
+    #[test]
+    fn test_xerial_snappy_cumulative_size_limit() {
+        let chunk1 = snap::raw::Encoder::new().compress_vec(&vec![b'a'; 600]).unwrap();
+        let chunk2 = snap::raw::Encoder::new().compress_vec(&vec![b'b'; 600]).unwrap();
+        let mut xerial = Vec::new();
+        xerial.extend_from_slice(XERIAL_MAGIC);
+        xerial.extend_from_slice(&1u32.to_be_bytes());
+        xerial.extend_from_slice(&1u32.to_be_bytes());
+        xerial.extend_from_slice(&(chunk1.len() as u32).to_be_bytes());
+        xerial.extend_from_slice(&chunk1);
+        xerial.extend_from_slice(&(chunk2.len() as u32).to_be_bytes());
+        xerial.extend_from_slice(&chunk2);
+
+        let mut buf = Bytes::from(xerial);
+        let err = decompress_record_batch_with_limit(&mut buf, Compression::Snappy, 1024)
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CompressionError>(),
+            Some(&CompressionError::DecompressedSizeExceeded { limit: 1024 })
+        );
+    }
+
+    #[test]
+    fn test_gzip_lz4_zstd_zip_bombs_rejected() {
+        let zeros = vec![0u8; 64 * 1024];
+        for codec in [Compression::Gzip, Compression::Lz4, Compression::Zstd] {
+            let mut src = BytesMut::from(&zeros[..]);
+            let mut compressed = BytesMut::new();
+            compress_record_batch(&mut src, &mut compressed, codec).unwrap();
+            let comp = compressed.freeze();
+
+            let mut buf = comp.clone();
+            let err = decompress_record_batch_with_limit(&mut buf, codec, 1024).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<CompressionError>(),
+                Some(&CompressionError::DecompressedSizeExceeded { limit: 1024 }),
+                "codec {codec:?}"
+            );
+        }
+
+        // Real Zstd frame claiming > 256 MiB content size is rejected by default limit before allocation.
+        let mut frame = Vec::new();
+        // Zstd magic (0xFD2FB528 LE), Frame_Header_Descriptor (0xE0: FCS_Flag=3 -> 8-byte FCS, single segment),
+        // Frame_Content_Size = MAX_DECOMPRESSED_KAFKA_BATCH_BYTES + 1
+        frame.extend_from_slice(&0xFD2F_B528u32.to_le_bytes());
+        frame.push(0xE0);
+        frame.extend_from_slice(&((MAX_DECOMPRESSED_KAFKA_BATCH_BYTES as u64) + 1).to_le_bytes());
+        let mut zbuf = Bytes::from(frame);
+        let err = decompress_record_batch(&mut zbuf, Compression::Zstd).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CompressionError>(),
+            Some(&CompressionError::DecompressedSizeExceeded {
+                limit: MAX_DECOMPRESSED_KAFKA_BATCH_BYTES
+            })
+        );
     }
 }

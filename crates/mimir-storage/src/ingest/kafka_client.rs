@@ -61,6 +61,44 @@ use super::transport::{KafkaTransport, SaslAuthConfig};
 pub const KAFKA_OFFSET_START: i64 = -2;
 pub const KAFKA_OFFSET_END: i64 = -1;
 
+/// Maximum Kafka TCP response frame length (`256 MiB`), preventing 1 GiB upfront allocations on
+/// corrupt or hostile 4-byte headers (upstream `franz-go` defaults `maxBrokerReadBytes` to 100 MiB).
+pub(crate) const MAX_KAFKA_FRAME_BYTES: usize = 256 * 1024 * 1024;
+const KAFKA_FRAME_INITIAL_CAP: usize = 64 * 1024;
+
+/// Reads a single 4-byte length-prefixed Kafka response frame, growing the buffer incrementally as
+/// bytes arrive so a 4-byte corrupt header followed by EOF cannot trigger a huge allocation.
+pub(crate) async fn read_kafka_frame_bounded<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    max_frame_bytes: usize,
+) -> Option<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    if reader.read_exact(&mut len_buf).await.is_err() {
+        return None;
+    }
+    let frame_len = u32::from_be_bytes(len_buf) as usize;
+    if !(4..=max_frame_bytes).contains(&frame_len) {
+        return None;
+    }
+    let mut payload = Vec::with_capacity(frame_len.min(KAFKA_FRAME_INITIAL_CAP));
+    let mut filled = 0usize;
+    while filled < frame_len {
+        if filled == payload.len() {
+            let next_len = if payload.is_empty() {
+                frame_len.min(KAFKA_FRAME_INITIAL_CAP)
+            } else {
+                payload.len().saturating_mul(2).min(frame_len)
+            };
+            payload.resize(next_len, 0);
+        }
+        match reader.read(&mut payload[filled..]).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => filled += n,
+        }
+    }
+    Some(payload)
+}
+
 #[derive(Debug, Error)]
 pub enum KafkaClientError {
     #[error("no seed brokers configured")]
@@ -255,19 +293,9 @@ impl BrokerConn {
         let alive_r = Arc::clone(&alive);
         let disconnect_hook = kprom.clone().map(|k| (k, node.clone()));
         tokio::spawn(async move {
-            let mut len_buf = [0u8; 4];
-            loop {
-                if reader.read_exact(&mut len_buf).await.is_err() {
-                    break;
-                }
-                let frame_len = u32::from_be_bytes(len_buf) as usize;
-                if !(4..=1_000_000_000).contains(&frame_len) {
-                    break;
-                }
-                let mut payload = vec![0u8; frame_len];
-                if reader.read_exact(&mut payload).await.is_err() {
-                    break;
-                }
+            while let Some(payload) =
+                read_kafka_frame_bounded(&mut reader, MAX_KAFKA_FRAME_BYTES).await
+            {
                 let corr_id = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 let tx = pending_r.lock().remove(&corr_id);
                 if let Some(tx) = tx {
@@ -2196,5 +2224,30 @@ mod tests {
         assert_eq!(12 + batch_len, raw.len());
         let last_offset_delta = i32::from_be_bytes([raw[23], raw[24], raw[25], raw[26]]);
         assert_eq!(last_offset_delta, 4);
+    }
+
+    #[tokio::test]
+    async fn kafka_frame_reader_rejects_oversized_and_truncated_large_headers() {
+        // 1 GiB frame header is rejected before reading payload.
+        let oversized = (1_000_000_000u32).to_be_bytes();
+        let mut cursor = std::io::Cursor::new(&oversized[..]);
+        assert!(read_kafka_frame_bounded(&mut cursor, MAX_KAFKA_FRAME_BYTES).await.is_none());
+
+        // 200 MiB frame header followed by 8 bytes + EOF returns None without a 200 MiB alloc.
+        let mut truncated = Vec::from((200 * 1024 * 1024u32).to_be_bytes());
+        truncated.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut cursor_trunc = std::io::Cursor::new(truncated);
+        assert!(read_kafka_frame_bounded(&mut cursor_trunc, MAX_KAFKA_FRAME_BYTES).await.is_none());
+
+        // Valid multi-chunk frame > INITIAL_CAP (150 KiB) succeeds.
+        let body: Vec<u8> = (0..150 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut wire = Vec::with_capacity(4 + body.len());
+        wire.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&body);
+        let mut cursor_ok = std::io::Cursor::new(wire);
+        let got = read_kafka_frame_bounded(&mut cursor_ok, MAX_KAFKA_FRAME_BYTES)
+            .await
+            .expect("valid large frame");
+        assert_eq!(got, body);
     }
 }

@@ -303,9 +303,10 @@ pub fn decompress_framed_into(
                 }
                 let produced = out.len() - start_len;
                 if produced.saturating_add(dec_len) > max_out_len {
+                    out.truncate(start_len);
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("s2: decompressed payload exceeds limit {max_out_len}"),
+                        crate::snappy::DecompressLimitExceeded { limit: max_out_len },
                     ));
                 }
                 let dst_start = out.len();
@@ -340,9 +341,10 @@ pub fn decompress_framed_into(
                 }
                 let produced = out.len() - start_len;
                 if produced.saturating_add(payload.len()) > max_out_len {
+                    out.truncate(start_len);
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("s2: decompressed payload exceeds limit {max_out_len}"),
+                        crate::snappy::DecompressLimitExceeded { limit: max_out_len },
                     ));
                 }
                 if masked_crc32c(payload) != checksum {
