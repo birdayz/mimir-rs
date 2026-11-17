@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mimir_config::limits::CostAttributionLabel;
 use mimir_ingester::active_series::{
-    ActiveSeries, CostAttributionActiveTracker, CostAttributionLabel, CustomTrackersConfig,
+    ActiveSeries, CostAttributionTracker, CustomTrackersConfig,
     Matchers, SeriesIndexReader,
 };
 use mimir_tsdb::labels::Labels;
@@ -342,9 +343,9 @@ fn active_series_contains_ref() {
     }
 }
 
-fn new_user5_cat_tracker(reg: &Registry) -> Arc<CostAttributionActiveTracker> {
+fn new_user5_cat_tracker(reg: &Registry) -> Arc<CostAttributionTracker> {
     // user5 attributes cost by the "a" label (MaxCostAttributionCardinality: 10).
-    CostAttributionActiveTracker::new(
+    let cat = CostAttributionTracker::new_for_tests(
         "user5",
         "cost-attribution",
         vec![CostAttributionLabel {
@@ -353,8 +354,10 @@ fn new_user5_cat_tracker(reg: &Registry) -> Arc<CostAttributionActiveTracker> {
         }],
         10,
         Duration::ZERO,
-        Some(reg.clone()),
     )
+    .unwrap();
+    cat.register_for_tests(reg);
+    cat
 }
 
 // Upstream: pkg/ingester/activeseries/active_series_test.go::TestActiveSeries_UpdateSeries_WithCostAttribution
@@ -866,8 +869,8 @@ fn cat_for_tests(
     user: &str,
     labels: &[&str],
     max_cardinality: usize,
-) -> Arc<CostAttributionActiveTracker> {
-    CostAttributionActiveTracker::new(
+) -> Arc<CostAttributionTracker> {
+    CostAttributionTracker::new_for_tests(
         user,
         "cost-attribution",
         labels
@@ -879,8 +882,8 @@ fn cat_for_tests(
             .collect(),
         max_cardinality,
         Duration::from_secs(5 * 60),
-        None,
     )
+    .unwrap()
 }
 
 // Upstream: pkg/ingester/activeseries/active_series_test.go::TestActiveSeries_ReloadCostAttributionTrackers
@@ -910,7 +913,7 @@ fn active_series_reload_cost_attribution_trackers() {
     let cat = cat_for_tests("a", &["a"], 4);
     c.reload_series_config(asm, Some(Arc::clone(&cat)), false, true, idx_opt(idx));
     purge(&c, current_time, idx);
-    assert!(cat.equals(c.cost_attribution_tracker().as_deref()));
+    assert!(cat.equals(c.cost_attribution_tracker().as_ref()));
     let (all_active, ..) = c.active_with_matchers();
     assert_eq!(2, all_active);
 }
@@ -992,7 +995,7 @@ fn active_series_reload_series_matchers_less_matchers() {
         &active_matching,
         &c.current_matcher_names(),
     );
-    assert!(cat.equals(c.cost_attribution_tracker().as_deref()));
+    assert!(cat.equals(c.cost_attribution_tracker().as_ref()));
 
     update(&c, &ls1, ref1, current_time, -1, false, None);
     purge(&c, current_time, None);
@@ -1003,7 +1006,7 @@ fn active_series_reload_series_matchers_less_matchers() {
         &active_matching,
         &c.current_matcher_names(),
     );
-    assert!(cat.equals(c.cost_attribution_tracker().as_deref()));
+    assert!(cat.equals(c.cost_attribution_tracker().as_ref()));
 
     // Reload with fewer matchers and remove cat: series preserved, matchers re-evaluated.
     let asm = new_matchers(&[("foo", "{a=~.+}")]);

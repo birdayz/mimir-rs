@@ -1123,6 +1123,26 @@ impl ReactiveLimiter {
         })
     }
 
+    /// Acquires a permit from the underlying semaphore, blocking if needed, without the
+    /// queueing rejection check (Go: `adaptiveLimiter.AcquirePermit`, used by `priorityLimiter`
+    /// after its own prioritized admission check).
+    pub async fn acquire_permit_unchecked(
+        self: &Arc<Self>,
+    ) -> Result<ReactivePermit, ReactiveLimitError> {
+        self.semaphore.acquire().await?;
+        Ok(ReactivePermit {
+            limiter: self.clone(),
+            start_time: Instant::now(),
+            current_inflight: self.semaphore.used(),
+            finished: false,
+        })
+    }
+
+    /// Whether the limiter's semaphore is full (Go: `adaptiveLimiter.semaphore.IsFull()`).
+    pub fn is_full(&self) -> bool {
+        self.semaphore.is_full()
+    }
+
     pub fn try_acquire_permit(self: &Arc<Self>) -> Option<ReactivePermit> {
         if !self.semaphore.try_acquire() {
             return None;

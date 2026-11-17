@@ -556,6 +556,8 @@ impl MimirConfig {
 
         let core: CoreMimirConfig = serde_yaml::from_value(merged_core)
             .map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        // Go fails in CustomTrackersConfig.UnmarshalYAML (i.e. while parsing the file).
+        crate::limits::validate_custom_trackers_yaml(&core.limits)?;
 
         self.apply_core(core);
         self.extra_sections = extras;
@@ -777,6 +779,12 @@ impl MimirConfig {
         self.blocks_storage
             .validate(self.ingester.active_series.active_series_metrics_enabled)
             .map_err(wrap_validation("invalid TSDB config"))?;
+        if self.is_ingester_enabled() {
+            self.blocks_storage
+                .bucket
+                .backend_cfg
+                .validate_mimir_rs_support()?;
+        }
         self.ingester_client
             .validate()
             .map_err(wrap_validation("invalid ingester_client config"))?;

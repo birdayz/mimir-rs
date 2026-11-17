@@ -5,10 +5,12 @@
 //! - github.com/grafana/mimir/pkg/ingester/activeseries/*
 //! - github.com/grafana/mimir/pkg/ingester/lookupplan/*
 
+pub mod active_groups;
 pub mod active_series;
 pub mod activity;
 pub mod circuit_breaker;
 pub mod compaction;
+pub mod costattribution;
 pub mod errors;
 pub mod grpc;
 pub mod http;
@@ -22,10 +24,13 @@ pub mod metric_counter;
 pub mod metrics;
 pub mod mirror_querier;
 pub mod owned_series;
+pub mod prioritizer;
 pub mod push;
 pub mod query;
 pub mod reactive_limiter;
 pub mod user_tsdb;
+pub mod utilization;
+pub mod workerpool;
 
 pub use errors::IngesterError;
 pub use grpc::{IngesterService, IngesterZeroCopyServer};

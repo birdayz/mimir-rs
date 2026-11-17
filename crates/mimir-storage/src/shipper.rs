@@ -487,6 +487,30 @@ impl Shipper {
         )
     }
 
+    /// Like [`Shipper::new_for_user`], with the bucket built by Mimir
+    /// `bucket.NewUserBucketClient(userID, bucket, cfgProvider)` (tenant prefix + per-tenant
+    /// S3 SSE overrides).
+    pub fn new_for_user_with_config(
+        user_id: impl Into<String>,
+        dir: impl AsRef<Path>,
+        root_bucket: &BucketClient,
+        cfg_provider: std::sync::Arc<dyn crate::bucket::TenantConfigProvider>,
+        source: SourceType,
+        out_of_order_external_label_enabled: bool,
+        metrics: ShipperMetrics,
+    ) -> Self {
+        let user_id = user_id.into();
+        let scoped = root_bucket.for_user_with_config(&user_id, cfg_provider);
+        Self::new(
+            user_id,
+            dir,
+            scoped,
+            source,
+            out_of_order_external_label_enabled,
+            metrics,
+        )
+    }
+
     /// Performs a single synchronization, uploading all unshipped level-1 non-empty local blocks
     /// to object storage (chunks/* + index first, meta.json LAST), and persisting `mimir.shipper.json`.
     pub async fn sync(&self) -> Result<usize, ShipperError> {

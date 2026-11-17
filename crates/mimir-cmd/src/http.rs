@@ -37,6 +37,9 @@ pub struct AppHttpState {
     /// Module services other than `ingester-service` whose state `/ready` reports (Go
     /// `Mimir.ServiceMap` entries backed by a Rust service), keyed by upstream module name.
     pub module_services: Vec<(String, Arc<dyn Service>)>,
+    /// `(cost_attribution_registry_path, registry)` when cost attribution is enabled
+    /// (Go: `API.RegisterCostAttribution`).
+    pub cost_attribution_registry: Option<(String, Registry)>,
 }
 
 /// Builds the full Axum HTTP router (with `server.http_path_prefix` honored).
@@ -89,6 +92,16 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     }
     if has_memberlist {
         router = router.route("/memberlist", get(memberlist_handler));
+    }
+    if let Some((path, reg)) = state.cost_attribution_registry.clone() {
+        let path = if path.starts_with('/') { path } else { format!("/{path}") };
+        router = router.route(
+            &path,
+            any(move |headers: HeaderMap| {
+                let reg = reg.clone();
+                async move { encode_families(&reg.gather(), &headers) }
+            }),
+        );
     }
 
     let state_for_root = state.clone();
@@ -199,10 +212,17 @@ async fn metrics_handler(
     headers: HeaderMap,
     cache: Arc<MetricsCache>,
 ) -> Response {
+    let families = cache.gather(&st.registry);
+    encode_families(&families, &headers)
+}
+
+fn encode_families(
+    families: &[prometheus::proto::MetricFamily],
+    headers: &HeaderMap,
+) -> Response {
     let header_str = |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
     let format = crate::expfmt::negotiate(header_str(header::ACCEPT));
-    let families = cache.gather(&st.registry);
-    let body = match crate::expfmt::encode(&families, &format) {
+    let body = match crate::expfmt::encode(families, &format) {
         Ok(b) => b,
         Err(err) => {
             return (

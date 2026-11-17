@@ -973,6 +973,7 @@ fn test_user_tsdb_update_last_series_removal() {
         Default::default(),
         0,
         0,
+        None,
     )
     .unwrap();
 

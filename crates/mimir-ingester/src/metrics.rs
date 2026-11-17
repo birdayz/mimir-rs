@@ -137,16 +137,48 @@ impl DiscardedMetrics {
         }
     }
 
+    fn all(&self) -> [&CounterVec; 9] {
+        [
+            &self.sample_timestamp_too_old,
+            &self.sample_out_of_order,
+            &self.sample_too_old,
+            &self.sample_too_far_in_future,
+            &self.new_value_for_timestamp,
+            &self.per_user_series_limit,
+            &self.per_metric_series_limit,
+            &self.invalid_native_histogram,
+            &self.labels_not_sorted,
+        ]
+    }
+
+    /// Deletes all series of `user_id`, whatever their group (Go: `DeletePartialMatch({user})`).
     pub fn delete_user(&self, user_id: &str) {
-        let _ = self.sample_timestamp_too_old.remove_label_values(&[user_id, ""]);
-        let _ = self.sample_out_of_order.remove_label_values(&[user_id, ""]);
-        let _ = self.sample_too_old.remove_label_values(&[user_id, ""]);
-        let _ = self.sample_too_far_in_future.remove_label_values(&[user_id, ""]);
-        let _ = self.new_value_for_timestamp.remove_label_values(&[user_id, ""]);
-        let _ = self.per_user_series_limit.remove_label_values(&[user_id, ""]);
-        let _ = self.per_metric_series_limit.remove_label_values(&[user_id, ""]);
-        let _ = self.invalid_native_histogram.remove_label_values(&[user_id, ""]);
-        let _ = self.labels_not_sorted.remove_label_values(&[user_id, ""]);
+        for cv in self.all() {
+            let mut groups = Vec::new();
+            for mf in cv.collect() {
+                for m in mf.get_metric() {
+                    let lp = m.get_label();
+                    let user = lp.iter().find(|l| l.get_name() == "user").map(|l| l.get_value());
+                    if user == Some(user_id) {
+                        let group = lp
+                            .iter()
+                            .find(|l| l.get_name() == "group")
+                            .map_or("", |l| l.get_value());
+                        groups.push(group.to_string());
+                    }
+                }
+            }
+            for g in groups {
+                let _ = cv.remove_label_values(&[user_id, &g]);
+            }
+        }
+    }
+
+    /// Deletes the series of `(user_id, group)` (Go: `discardedMetrics.DeleteLabelValues`).
+    pub fn delete_label_values(&self, user_id: &str, group: &str) {
+        for cv in self.all() {
+            let _ = cv.remove_label_values(&[user_id, group]);
+        }
     }
 }
 

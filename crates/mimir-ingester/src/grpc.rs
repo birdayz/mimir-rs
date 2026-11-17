@@ -281,7 +281,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                                     "gRPC call failed"
                                 );
                             }
-                            return Err(e.map_push_error_to_status());
+                            return Err(e.map_push_error_to_grpc_server_status());
                         }
                         Ok(Response::new(cortexpb::WriteResponse {}))
                     })
@@ -372,7 +372,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 }
                 None => {}
             }
-            return Err(e.map_push_error_to_status());
+            return Err(e.map_push_error_to_grpc_server_status());
         }
         Ok(Response::new(cortexpb::WriteResponse {}))
     }

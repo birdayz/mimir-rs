@@ -27,7 +27,6 @@ use mimir_tsdb::labels::Labels;
 use mimir_tsdb::matcher::{LabelMatcher, MatchType};
 use mimir_tsdb::querier::{LazyStreamEvent, QueryChunkSeries};
 use mimir_tsdb::search::{FuzzAlg, SearchHints, SearchOrdering, SearchResult};
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataMap;
@@ -1813,72 +1812,114 @@ impl Ingester {
         };
 
         let label_names = req.label_names;
+        let pool = Arc::clone(&self.compute_worker_pool);
+        let chunk_size = self.cfg.label_values_count.chunk_size.max(1) as usize;
+        let tenant_id = user_id.to_string();
         tokio::task::spawn_blocking(move || -> Result<Vec<ingesterpb::LabelValuesCardinalityResponse>, IngesterError> {
-            let head = db.db.head();
+            // Go: ctx canceled on return so in-flight chunk tasks on the shared pool bail out.
+            struct CancelOnDrop(Arc<AtomicBool>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, AtomicOrdering::Release);
+                }
+            }
+            let canceled = Arc::new(AtomicBool::new(false));
+            let _cancel_guard = CancelOnDrop(Arc::clone(&canceled));
+            let is_canceled: Arc<dyn Fn() -> bool + Send + Sync> = {
+                let c = Arc::clone(&canceled);
+                Arc::new(move || c.load(AtomicOrdering::Acquire))
+            };
+            let to_err = |e: LabelNamesAndValuesError| IngesterError::Internal {
+                message: e.to_string(),
+            };
+
             let mut batches = Vec::new();
             let mut resp = ingesterpb::LabelValuesCardinalityResponse::default();
             let mut resp_bytes = 0usize;
 
             for lbl_name in &label_names {
                 let lbl_values =
-                    head.label_values(lbl_name, &matchers)
+                    db.db
+                        .head()
+                        .label_values(lbl_name, &matchers)
                         .map_err(|e| IngesterError::Internal {
                             message: e.to_string(),
                         })?;
 
-                let mut map: HashMap<String, u64> = HashMap::new();
-                for val in lbl_values {
-                    let count = if matchers.is_empty() {
-                        if active_only {
-                            let buckets = head.visit_postings_for_label_value(
-                                lbl_name,
-                                &val,
-                                crate::active_series::ActiveSeries::bucket_refs_by_stripe,
-                            );
-                            if buckets.is_empty() {
-                                0
+                let count_fn: LabelValueCountFn = {
+                    let (db, matchers, lbl_name) =
+                        (Arc::clone(&db), matchers.clone(), lbl_name.clone());
+                    Arc::new(move |val: &str| -> Result<u64, LabelNamesAndValuesError> {
+                        let head = db.db.head();
+                        if matchers.is_empty() {
+                            if active_only {
+                                let buckets = head.visit_postings_for_label_value(
+                                    &lbl_name,
+                                    val,
+                                    crate::active_series::ActiveSeries::bucket_refs_by_stripe,
+                                );
+                                Ok(if buckets.is_empty() {
+                                    0
+                                } else {
+                                    db.active_series.count_active_in_buckets(&buckets)
+                                })
                             } else {
-                                db.active_series.count_active_in_buckets(&buckets)
+                                Ok(head.postings_length(&lbl_name, val) as u64)
                             }
                         } else {
-                            head.postings_length(lbl_name, &val) as u64
+                            let mut ms = matchers.clone();
+                            ms.push(
+                                LabelMatcher::new(MatchType::Equal, &lbl_name, val)
+                                    .map_err(|e| LabelNamesAndValuesError::Other(e.to_string()))?,
+                            );
+                            let refs = head
+                                .postings_for_matchers_arc(&ms)
+                                .map_err(|e| LabelNamesAndValuesError::Other(e.to_string()))?;
+                            Ok(if active_only {
+                                db.active_series.count_active_in_slices(&[], &refs)
+                            } else {
+                                refs.len() as u64
+                            })
                         }
-                    } else {
-                        let mut ms = matchers.clone();
-                        ms.push(
-                            LabelMatcher::new(MatchType::Equal, lbl_name, &val)
-                                .expect("valid eq matcher"),
-                        );
-                        let refs = head
-                            .postings_for_matchers_arc(&ms)
-                            .map_err(|e| IngesterError::Internal {
-                                message: e.to_string(),
-                            })?;
-                        if active_only {
-                            db.active_series.count_active_in_slices(&[], &refs)
-                        } else {
-                            refs.len() as u64
-                        }
-                    };
-                    if count == 0 {
+                    })
+                };
+
+                // Go: labelValuesCardinality consumes computeLabelValuesSeriesCount results in
+                // completion order, starting a new item after each flushed message.
+                let mut rx = compute_label_values_counts(
+                    Arc::clone(&is_canceled),
+                    &pool,
+                    &tenant_id,
+                    chunk_size,
+                    Arc::new(lbl_values),
+                    count_fn,
+                );
+                let mut item: Option<ingesterpb::LabelValueSeriesCount> = None;
+                while let Some(res) = rx.blocking_recv() {
+                    if let Some(e) = res.err {
+                        return Err(to_err(e));
+                    }
+                    if res.count == 0 {
                         continue;
                     }
-                    resp_bytes += val.len();
-                    map.insert(val, count);
-                    if resp_bytes >= LABEL_VALUES_CARDINALITY_TARGET_SIZE_BYTES {
-                        resp.items.push(ingesterpb::LabelValueSeriesCount {
-                            label_name: lbl_name.clone(),
-                            label_value_series: std::mem::take(&mut map),
-                        });
-                        batches.push(std::mem::take(&mut resp));
-                        resp_bytes = 0;
-                    }
-                }
-                if !map.is_empty() {
-                    resp.items.push(ingesterpb::LabelValueSeriesCount {
+                    resp_bytes += res.val.len();
+                    item.get_or_insert_with(|| ingesterpb::LabelValueSeriesCount {
                         label_name: lbl_name.clone(),
-                        label_value_series: map,
-                    });
+                        label_value_series: HashMap::new(),
+                    })
+                    .label_value_series
+                    .insert(res.val, res.count);
+                    if resp_bytes < LABEL_VALUES_CARDINALITY_TARGET_SIZE_BYTES {
+                        continue;
+                    }
+                    if let Some(it) = item.take() {
+                        resp.items.push(it);
+                    }
+                    batches.push(std::mem::take(&mut resp));
+                    resp_bytes = 0;
+                }
+                if let Some(it) = item.take() {
+                    resp.items.push(it);
                 }
             }
             if !resp.items.is_empty() {
@@ -2604,152 +2645,117 @@ pub fn count_label_value_series(
     Ok(count)
 }
 
-type WorkerJob = Box<dyn FnOnce() + Send>;
+/// Shared tenant-fair compute worker pool (Go: `pkg/util/workerpool.Pool`).
+pub use crate::workerpool::Pool as ComputeWorkerPool;
 
-/// Simple bounded compute worker pool matching `pkg/util/workerpool`.
-pub struct ComputeWorkerPool {
-    stopped: Arc<AtomicBool>,
-    tx: Mutex<Option<mpsc::UnboundedSender<WorkerJob>>>,
-    handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+/// Go: `dimensionLabelValuesSeriesCount`.
+pub const DIMENSION_LABEL_VALUES_SERIES_COUNT: &str = "label-values-series-count";
+
+/// Counts the series for one label value.
+pub type LabelValueCountFn =
+    Arc<dyn Fn(&str) -> Result<u64, LabelNamesAndValuesError> + Send + Sync>;
+
+/// Go: `computeLabelValuesSeriesCount`, generic over the per-value counting function.
+///
+/// Values are split into `chunk_size` chunks, each submitted to the shared pool on behalf of
+/// `tenant_id`. Results arrive in completion order; the receiver ends once every submitted chunk
+/// has finished. Submission stops at the first cancellation (`context canceled`) or pool error.
+pub fn compute_label_values_counts(
+    is_canceled: Arc<dyn Fn() -> bool + Send + Sync>,
+    pool: &ComputeWorkerPool,
+    tenant_id: &str,
+    chunk_size: usize,
+    lbl_values: Arc<Vec<String>>,
+    count_fn: LabelValueCountFn,
+) -> mpsc::Receiver<LabelValueCountResult> {
+    let (tx, rx) = mpsc::channel(lbl_values.len().max(1));
+    if lbl_values.is_empty() {
+        return rx;
+    }
+    let chunk_size = chunk_size.max(1);
+    let mut start = 0usize;
+    while start < lbl_values.len() {
+        if is_canceled() {
+            let _ = tx.try_send(LabelValueCountResult {
+                val: String::new(),
+                count: 0,
+                err: Some(LabelNamesAndValuesError::Canceled),
+            });
+            return rx;
+        }
+        let end = (start + chunk_size).min(lbl_values.len());
+        let (values, cancel, count_fn, tx_c) = (
+            Arc::clone(&lbl_values),
+            Arc::clone(&is_canceled),
+            Arc::clone(&count_fn),
+            tx.clone(),
+        );
+        let submitted = pool.submit(DIMENSION_LABEL_VALUES_SERIES_COUNT, tenant_id, move || {
+            for v in &values[start..end] {
+                let res = if cancel() {
+                    Err(LabelNamesAndValuesError::Canceled)
+                } else {
+                    count_fn(v)
+                };
+                // The channel has room for every value, so this never fails while the
+                // receiver is alive.
+                let _ = tx_c.try_send(match res {
+                    Ok(count) => LabelValueCountResult {
+                        val: v.clone(),
+                        count,
+                        err: None,
+                    },
+                    Err(err) => LabelValueCountResult {
+                        val: v.clone(),
+                        count: 0,
+                        err: Some(err),
+                    },
+                });
+            }
+        });
+        if submitted.is_err() {
+            let _ = tx.try_send(LabelValueCountResult {
+                val: String::new(),
+                count: 0,
+                err: Some(LabelNamesAndValuesError::PoolStopped),
+            });
+            return rx;
+        }
+        start = end;
+    }
+    rx
 }
 
-impl ComputeWorkerPool {
-    pub fn new(size: usize) -> Arc<Self> {
-        let (tx, rx) = mpsc::unbounded_channel::<WorkerJob>();
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
-        let mut handles = Vec::with_capacity(size.max(1));
-        for _ in 0..size.max(1) {
-            let rx_c = Arc::clone(&rx);
-            handles.push(tokio::spawn(async move {
-                loop {
-                    let job = {
-                        let mut guard = rx_c.lock().await;
-                        guard.recv().await
-                    };
-                    let Some(job) = job else {
-                        break;
-                    };
-                    let _ = tokio::task::spawn_blocking(job).await;
-                }
-            }));
-        }
-        Arc::new(Self {
-            stopped: Arc::new(AtomicBool::new(false)),
-            tx: Mutex::new(Some(tx)),
-            handles: Mutex::new(handles),
-        })
-    }
-
-    pub fn submit(
-        &self,
-        job: impl FnOnce() + Send + 'static,
-    ) -> Result<(), LabelNamesAndValuesError> {
-        if self.stopped.load(AtomicOrdering::Acquire) {
-            return Err(LabelNamesAndValuesError::PoolStopped);
-        }
-        let guard = self.tx.lock();
-        let Some(ref tx) = *guard else {
-            return Err(LabelNamesAndValuesError::PoolStopped);
-        };
-        tx.send(Box::new(job))
-            .map_err(|_| LabelNamesAndValuesError::PoolStopped)
-    }
-
-    pub async fn stop(&self) {
-        self.stopped.store(true, AtomicOrdering::Release);
-        self.tx.lock().take();
-        let handles = std::mem::take(&mut *self.handles.lock());
-        for h in handles {
-            let _ = h.await;
-        }
-    }
-}
-
+/// Go: `computeLabelValuesSeriesCount` (postings-based counting via `countLabelValueSeries`).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_label_values_series_count(
     is_canceled: Arc<dyn Fn() -> bool + Send + Sync>,
-    pool: Arc<ComputeWorkerPool>,
+    pool: &ComputeWorkerPool,
+    tenant_id: &str,
     chunk_size: usize,
     lbl_name: String,
     lbl_values: Vec<String>,
     matchers: Vec<LabelMatcher>,
     postings_for_matchers_fn: PostingsForMatchersFn,
 ) -> mpsc::Receiver<LabelValueCountResult> {
-    let cap = lbl_values.len().max(1);
-    let (tx, rx) = mpsc::channel(cap);
-    if lbl_values.is_empty() {
-        return rx;
-    }
-
-    tokio::spawn(async move {
-        let mut wg_handles = Vec::new();
-        let chunk_sz = chunk_size.max(1);
-        let mut start = 0usize;
-        while start < lbl_values.len() {
-            if is_canceled() {
-                let _ = tx
-                    .send(LabelValueCountResult {
-                        val: String::new(),
-                        count: 0,
-                        err: Some(LabelNamesAndValuesError::Canceled),
-                    })
-                    .await;
-                break;
-            }
-            let end = (start + chunk_sz).min(lbl_values.len());
-            let chunk_vals = lbl_values[start..end].to_vec();
-            let cancel_c = Arc::clone(&is_canceled);
-            let lbl_c = lbl_name.clone();
-            let matchers_c = matchers.clone();
-            let fn_c = Arc::clone(&postings_for_matchers_fn);
-            let tx_c = tx.clone();
-            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-
-            if let Err(e) = pool.submit(move || {
-                for v in chunk_vals {
-                    match count_label_value_series(
-                        cancel_c.as_ref(),
-                        &lbl_c,
-                        &v,
-                        &matchers_c,
-                        &fn_c,
-                    ) {
-                        Ok(count) => {
-                            let _ = tx_c.try_send(LabelValueCountResult {
-                                val: v,
-                                count,
-                                err: None,
-                            });
-                        }
-                        Err(err) => {
-                            let _ = tx_c.try_send(LabelValueCountResult {
-                                val: v,
-                                count: 0,
-                                err: Some(err),
-                            });
-                        }
-                    }
-                }
-                let _ = done_tx.send(());
-            }) {
-                let _ = tx
-                    .send(LabelValueCountResult {
-                        val: String::new(),
-                        count: 0,
-                        err: Some(e),
-                    })
-                    .await;
-                break;
-            }
-            wg_handles.push(done_rx);
-            start = end;
-        }
-        for h in wg_handles {
-            let _ = h.await;
-        }
+    let cancel = Arc::clone(&is_canceled);
+    let count_fn: LabelValueCountFn = Arc::new(move |v: &str| {
+        count_label_value_series(
+            cancel.as_ref(),
+            &lbl_name,
+            v,
+            &matchers,
+            &postings_for_matchers_fn,
+        )
     });
-
-    rx
+    compute_label_values_counts(
+        is_canceled,
+        pool,
+        tenant_id,
+        chunk_size,
+        Arc::new(lbl_values),
+        count_fn,
+    )
 }
 
 #[cfg(test)]

@@ -199,6 +199,8 @@ pub enum IngesterError {
     Sampled {
         inner: Box<IngesterError>,
         should_log: bool,
+        /// Sampling frequency N (`-ingester.error-sample-rate`); 0 when not sampled.
+        rate: i64,
     },
     DoNotLog {
         inner: Box<IngesterError>,
@@ -487,9 +489,39 @@ impl IngesterError {
     }
 
     pub fn with_sampling(self, should_log: bool) -> Self {
+        self.with_sampling_rate(should_log, 0)
+    }
+
+    /// Wraps a sampled soft error (Go: `util_log.Sampler.WrapError`).
+    pub fn with_sampling_rate(self, should_log: bool, rate: i64) -> Self {
         Self::Sampled {
             inner: Box::new(self),
             should_log,
+            rate,
+        }
+    }
+
+    /// Go dskit `GRPCServerLog` appends ` (sampled 1/N)` to the returned error of sampled errors.
+    fn sampling_reason(&self) -> Option<String> {
+        match self {
+            Self::Sampled { rate, inner, .. } => {
+                if *rate != 0 {
+                    Some(format!("sampled 1/{rate}"))
+                } else {
+                    inner.sampling_reason()
+                }
+            }
+            Self::WrappedUser { inner, .. } | Self::DoNotLog { inner } => inner.sampling_reason(),
+            _ => None,
+        }
+    }
+
+    /// Error message as returned by Go's gRPC server for Push, including the dskit
+    /// `GRPCServerLog` sampling suffix.
+    pub fn grpc_push_message(&self) -> String {
+        match self.sampling_reason() {
+            Some(reason) => format!("{self} ({reason})"),
+            None => self.to_string(),
         }
     }
 
@@ -607,6 +639,16 @@ impl IngesterError {
     }
 
     pub fn map_push_error_to_status(&self) -> tonic::Status {
+        self.map_push_error_to_status_with_message(self.to_string())
+    }
+
+    /// Status returned by the gRPC server for Push: like [`Self::map_push_error_to_status`] but
+    /// with the dskit `GRPCServerLog` interceptor's ` (sampled 1/N)` suffix for sampled errors.
+    pub fn map_push_error_to_grpc_server_status(&self) -> tonic::Status {
+        self.map_push_error_to_status_with_message(self.grpc_push_message())
+    }
+
+    fn map_push_error_to_status_with_message(&self, message: String) -> tonic::Status {
         if let Self::BadRequest { message } = self {
             return tonic::Status::invalid_argument(message.clone());
         }
@@ -622,9 +664,9 @@ impl IngesterError {
         };
         match self.error_details() {
             Some(details) => {
-                grpcutilpb::status_with_cortex_error_details(code, self.to_string(), &details)
+                grpcutilpb::status_with_cortex_error_details(code, message, &details)
             }
-            None => tonic::Status::new(code, self.to_string()),
+            None => tonic::Status::new(code, message),
         }
     }
 
@@ -852,6 +894,10 @@ impl ErrorSampler {
             rate,
             counter: AtomicI64::new(0),
         }
+    }
+
+    pub fn rate(&self) -> i64 {
+        self.rate
     }
 
     /// Returns `true` if this error occurrence should be logged.
