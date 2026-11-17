@@ -22,7 +22,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -152,7 +151,7 @@ impl Drop for Proc {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    mimir_conformance::free_test_port()
 }
 
 // ---------------------------------------------------------------------------------------------
