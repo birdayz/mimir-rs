@@ -5,8 +5,8 @@
 //! These tests exercise the startup/membership behaviour that the ingester relies on in
 //! Kubernetes (Helm sets `join_members: [dns+...]`, `rejoin_interval: 60s`; jsonnet sets
 //! `-memberlist.abort-if-fast-join-fails=true`, `-memberlist.rejoin-interval`).
-//! dskit injects a `DNSProvider` mock; mimir-rs has no such seam, so `dns+` cases resolve
-//! `localhost` through the system resolver instead.
+//! DNS cases use either the real resolver (`dns+localhost`) or an injected `DnsProvider` mock
+//! (`KvOptions::dns_provider`), like dskit's `DNSProvider` mocks.
 
 use super::*;
 use crate::ring::model::ring_desc_codec;
@@ -515,4 +515,343 @@ async fn test_member_list_probe_node_suspect() {
         Some(NodeStateType::Suspect),
         "a node that fails its probe must be marked suspect"
     );
+}
+
+// --- DNS provider mocks (dskit memberlist_client_test.go) ----------------------------------------
+
+type OnResolve = Box<dyn Fn(&[String]) -> (Vec<String>, Option<String>) + Send + Sync>;
+
+/// dskit `dnsProviderMock`.
+struct DnsProviderMock {
+    on_resolve: OnResolve,
+    resolved: parking_lot::Mutex<Vec<String>>,
+}
+
+impl crate::dns::DnsProvider for DnsProviderMock {
+    fn resolve<'a>(&'a self, addrs: &'a [String]) -> BoxFuture<'a, Result<(), crate::dns::DnsError>> {
+        Box::pin(async move {
+            let (resolved, err) = (self.on_resolve)(addrs);
+            *self.resolved.lock() = resolved;
+            match err {
+                Some(e) => Err(crate::dns::DnsError::Other(e)),
+                None => Ok(()),
+            }
+        })
+    }
+    fn addresses(&self) -> Vec<String> {
+        self.resolved.lock().clone()
+    }
+}
+
+/// dskit `delayedDNSProviderMock`: returns nothing (and no error) for the first `delay` calls.
+struct DelayedDnsProviderMock {
+    delay: parking_lot::Mutex<usize>,
+    resolved: parking_lot::Mutex<Vec<String>>,
+}
+
+impl crate::dns::DnsProvider for DelayedDnsProviderMock {
+    fn resolve<'a>(&'a self, addrs: &'a [String]) -> BoxFuture<'a, Result<(), crate::dns::DnsError>> {
+        Box::pin(async move {
+            let mut d = self.delay.lock();
+            if *d == 0 {
+                *self.resolved.lock() = addrs
+                    .iter()
+                    .map(|a| a[a.find('+').map(|i| i + 1).unwrap_or(0)..].to_string())
+                    .collect();
+            } else {
+                *d -= 1;
+            }
+            Ok(())
+        })
+    }
+    fn addresses(&self) -> Vec<String> {
+        self.resolved.lock().clone()
+    }
+}
+
+// Upstream: github.com/grafana/dskit/kv/memberlist/memberlist_client_test.go::TestMemberlist_discoverMembersWithRetries
+#[tokio::test]
+async fn test_memberlist_discover_members_with_retries() {
+    let addrs_mocked = vec!["1.1.1.1".to_string(), "2.2.2.2".to_string()];
+    let max_retries = KvOptions::default().discover_members_backoff.max_retries;
+    for (name, num_failures, expect_err) in [
+        ("first resolution succeed", 0usize, false),
+        ("first 3 resolutions fails", 3, false),
+        ("all resolutions fail", max_retries, true),
+    ] {
+        let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let f2 = Arc::clone(&failures);
+        let addrs = addrs_mocked.clone();
+        let mock = DnsProviderMock {
+            on_resolve: Box::new(move |_| {
+                if f2.load(Ordering::SeqCst) < num_failures {
+                    f2.fetch_add(1, Ordering::SeqCst);
+                    return (Vec::new(), Some("mocked error".to_string()));
+                }
+                (addrs.clone(), None)
+            }),
+            resolved: parking_lot::Mutex::new(Vec::new()),
+        };
+        let mut opts = KvOptions {
+            dns_provider: Some(Arc::new(mock)),
+            ..Default::default()
+        };
+        opts.discover_members_backoff.min_backoff = Duration::from_millis(1);
+        opts.discover_members_backoff.max_backoff = Duration::from_millis(1);
+        let kv = MemberlistKv::new(test_cfg("discover"), vec![ring_desc_codec()], "", None, opts).unwrap();
+        let (got, err) = kv
+            .discover_members_with_retries(&ServiceContext::background(), &["dns+memberlist.cluster".to_string()])
+            .await;
+        if expect_err {
+            assert_eq!(err.as_deref(), Some("mocked error"), "{name}");
+            assert_eq!(failures.load(Ordering::SeqCst), max_retries, "{name}");
+            assert!(got.is_empty(), "{name}");
+        } else {
+            assert!(err.is_none(), "{name}: {err:?}");
+            assert_eq!(got, addrs_mocked, "{name}");
+        }
+    }
+}
+
+// Upstream: github.com/grafana/dskit/kv/memberlist/memberlist_client_test.go::TestJoinMembersWithRetryBackoff
+// ("Test late start of DNS service": DNS lookups return nothing for the first 5 attempts).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_join_members_with_retry_backoff_late_dns() {
+    let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let mut kvs = Vec::new();
+    let mut handles = Vec::new();
+    for (i, port) in ports.iter().enumerate() {
+        let mut cfg = test_cfg(&format!("Member-{i}"));
+        cfg.bind_port = *port as i64;
+        cfg.advertise_port = *port as i64;
+        cfg.gossip_nodes = 3;
+        cfg.pull_push_interval = GoDuration::from_secs(5);
+        cfg.min_join_backoff = GoDuration::from_millis(100);
+        cfg.max_join_backoff = GoDuration::from_mins(1);
+        cfg.max_join_retries = 10;
+        cfg.abort_if_cluster_join_fails = true;
+        let mut opts = KvOptions::default();
+        if i == 0 {
+            cfg.join_members.0 = vec![format!("dns+localhost:{}", ports[1])];
+            opts.dns_provider = Some(Arc::new(DelayedDnsProviderMock {
+                delay: parking_lot::Mutex::new(5),
+                resolved: parking_lot::Mutex::new(Vec::new()),
+            }));
+        } else if i >= 2 {
+            cfg.join_members.0 = vec![format!("127.0.0.1:{}", ports[i - 1])];
+        }
+        let id = format!("Member-{i}");
+        handles.push(tokio::spawn(async move {
+            let kv = MemberlistKv::start_with_options(cfg, vec![ring_desc_codec()], "", None, opts)
+                .await
+                .expect("failed to start KV");
+            add_ring_member(&kv, &id).await;
+            kv
+        }));
+    }
+    for h in handles {
+        kvs.push(h.await.unwrap());
+    }
+    let first = Arc::clone(&kvs[0]);
+    let ok = eventually(Duration::from_secs(10), || {
+        let first = Arc::clone(&first);
+        async move { ring_members(&first) == 3 }
+    })
+    .await;
+    let seen = ring_members(&first);
+    for kv in &kvs {
+        assert!(kv.service().failure_case().is_none(), "service reported error");
+    }
+    for kv in kvs {
+        kv.shutdown().await;
+    }
+    assert!(ok, "expected to see at least 3 but saw {seen}");
+}
+
+async fn with_fixture() -> (Arc<MemberlistKv>, MemberlistKvClient) {
+    let kv = MemberlistKv::start(test_cfg("fixture"), vec![ring_desc_codec()], "", None)
+        .await
+        .unwrap();
+    let client = MemberlistKvClient::new(Arc::clone(&kv), ring_desc_codec()).unwrap();
+    (kv, client)
+}
+
+// Upstream: github.com/grafana/dskit/kv/memberlist/memberlist_client_test.go::TestCASNoOutput
+#[tokio::test]
+async fn test_cas_no_output() {
+    let (kv, client) = with_fixture().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = Arc::clone(&calls);
+    client
+        .cas(
+            "test",
+            Box::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(CasOutcome::NoChange)
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    kv.shutdown().await;
+}
+
+async fn cas_error(retry: bool) -> (String, usize) {
+    let (kv, client) = with_fixture().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = Arc::clone(&calls);
+    let err = client
+        .cas(
+            "test",
+            Box::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err(crate::kv::CasCallbackError {
+                    err: KvError::Other("don't worry, be happy".to_string()),
+                    retry,
+                })
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    kv.shutdown().await;
+    (err, calls.load(Ordering::SeqCst))
+}
+
+// Upstream: github.com/grafana/dskit/kv/memberlist/memberlist_client_test.go::TestCASErrorNoRetry
+#[tokio::test]
+async fn test_cas_error_no_retry() {
+    let (err, calls) = cas_error(false).await;
+    assert_eq!(err, "failed to CAS-update key test: fn returned error: don't worry, be happy");
+    assert_eq!(calls, 1);
+}
+
+// Upstream: github.com/grafana/dskit/kv/memberlist/memberlist_client_test.go::TestCASErrorWithRetries
+#[tokio::test]
+async fn test_cas_error_with_retries() {
+    let (err, calls) = cas_error(true).await;
+    assert_eq!(err, "failed to CAS-update key test: fn returned error: don't worry, be happy");
+    assert_eq!(calls, 10);
+}
+
+// Upstream: github.com/grafana/dskit/kv/memberlist/memberlist_client_test.go::TestCASNoChange
+#[tokio::test]
+async fn test_cas_no_change() {
+    let (kv, client) = with_fixture().await;
+    let _ = &client;
+    add_ring_member(&kv, "hello").await;
+    let start = std::time::Instant::now();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = Arc::clone(&calls);
+    let err = client
+        .cas(
+            "ring",
+            Box::new(move |cur| {
+                c.fetch_add(1, Ordering::SeqCst);
+                let d = cur.and_then(|v| v.downcast_ref::<Desc>()).cloned().unwrap_or_default();
+                Ok(CasOutcome::Update(Box::new(d)))
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(err, "failed to CAS-update key ring: no change detected");
+    assert_eq!(calls.load(Ordering::SeqCst), MAX_CAS_RETRIES);
+    assert!(start.elapsed() >= NO_CHANGE_DETECTED_RETRY_SLEEP * (MAX_CAS_RETRIES as u32 - 1));
+    kv.shutdown().await;
+}
+
+// Upstream: github.com/grafana/dskit/kv/memberlist/memberlist_client_test.go::TestDelete
+#[tokio::test]
+async fn test_delete() {
+    let reg = Registry::new();
+    let mut cfg = test_cfg("delete");
+    cfg.gossip_nodes = 1;
+    cfg.gossip_interval = GoDuration::from_millis(100);
+    cfg.obsolete_entries_timeout = GoDuration::from_millis(500);
+    cfg.cluster_label_verification_disabled = true;
+    let kv = MemberlistKv::start(cfg, vec![ring_desc_codec()], "", Some(&reg)).await.unwrap();
+    let client = MemberlistKvClient::new(Arc::clone(&kv), ring_desc_codec()).unwrap();
+    assert!(client.get(KEY).await.unwrap().is_none());
+    add_ring_member(&kv, "test").await;
+    client.delete(KEY).await.unwrap();
+    let gone = eventually(Duration::from_secs(2), || {
+        let kv = Arc::clone(&kv);
+        async move { kv.get_value(KEY).is_none() }
+    })
+    .await;
+    assert!(gone, "expected nil after delete");
+    let dropped = reg
+        .gather()
+        .into_iter()
+        .find(|mf| mf.get_name() == "memberlist_client_messages_to_broadcast_dropped_total")
+        .map(|mf| mf.get_metric()[0].get_counter().get_value());
+    assert_eq!(dropped, Some(0.0));
+    kv.shutdown().await;
+}
+
+// Upstream: github.com/grafana/dskit/kv/memberlist/memberlist_client_test.go::TestMessageBuffer
+#[test]
+fn test_message_buffer() {
+    let msg = |size: usize| HistoryMessage {
+        id: 0,
+        time: SystemTime::now(),
+        size,
+        pair: KeyValuePair::default(),
+        version: 0,
+        changes: Vec::new(),
+    };
+    let mut buf = VecDeque::new();
+    let mut size = 0;
+    add_message_to_buffer(&mut buf, &mut size, 100, msg(50));
+    assert_eq!((buf.len(), size), (1, 50));
+    add_message_to_buffer(&mut buf, &mut size, 100, msg(50));
+    assert_eq!((buf.len(), size), (2, 100));
+    add_message_to_buffer(&mut buf, &mut size, 100, msg(25));
+    assert_eq!((buf.len(), size), (2, 75));
+}
+
+// Upstream: github.com/grafana/dskit/kv/memberlist/memberlist_client_test.go::TestGenerateRandomSuffix
+#[test]
+fn test_generate_random_suffix() {
+    let (h1, h2, h3) = (generate_random_suffix(), generate_random_suffix(), generate_random_suffix());
+    assert_ne!(h1, h2);
+    assert_ne!(h2, h3);
+    assert_eq!(h1.len(), 8);
+}
+
+// Not an upstream test: a crashed peer (no Leave) must eventually be declared dead and reaped
+// (memberlist suspicion timeout + GossipToTheDeadTime), so cluster_members_count drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_crashed_member_is_marked_dead_and_reaped() {
+    let opts = || KvOptions {
+        probe_interval: Some(Duration::from_millis(200)),
+        ..Default::default()
+    };
+    let mut cfg1 = test_cfg("fd-1");
+    cfg1.gossip_to_dead_nodes_time = GoDuration::from_secs(1);
+    let m1 = MemberlistKv::start_with_options(cfg1, vec![ring_desc_codec()], "", None, opts()).await.unwrap();
+    let mut cfg2 = test_cfg("fd-2");
+    cfg2.join_members.0 = vec![format!("127.0.0.1:{}", m1.listening_port())];
+    let m2 = MemberlistKv::start_with_options(cfg2, vec![ring_desc_codec()], "", None, opts()).await.unwrap();
+    let k = Arc::clone(&m1);
+    assert!(eventually(Duration::from_secs(5), || { let n = k.num_members(); async move { n == 2 } }).await);
+    // Simulate a crash: stop transport and tasks without leaving.
+    m2.shutdown_ctx.cancel();
+    m2.transport().shutdown_and_wait().await;
+    let k = Arc::clone(&m1);
+    let dead = eventually(Duration::from_secs(10), || {
+        let n = k.num_members();
+        async move { n == 1 }
+    })
+    .await;
+    assert!(dead, "crashed member still counted: {:?}", m1.all_nodes());
+    let k = Arc::clone(&m1);
+    let reaped = eventually(Duration::from_secs(10), || {
+        let n = k.all_nodes().len();
+        async move { n == 1 }
+    })
+    .await;
+    assert!(reaped, "dead member not reaped: {:?}", m1.all_nodes());
+    m1.shutdown().await;
 }

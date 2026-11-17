@@ -380,12 +380,7 @@ impl MemberlistKv {
             cfg.node_name.clone()
         };
         if cfg.randomize_node_name {
-            // dskit generateRandomSuffix: fmt.Sprintf("%2x", 4 random bytes).
-            let suffix: [u8; 4] = rand::thread_rng().gen();
-            node_name = format!(
-                "{node_name}-{}",
-                suffix.iter().map(|b| format!("{b:02x}")).collect::<String>()
-            );
+            node_name = format!("{node_name}-{}", generate_random_suffix());
         }
 
         let compression_algo = match cfg.compression_algorithm.as_str() {
@@ -769,7 +764,7 @@ impl MemberlistKv {
         }
         self.shutdown_ctx.cancel();
         if let Some(t) = self.transport.get() {
-            t.shutdown();
+            t.shutdown_and_wait().await;
         }
         for timer in self.nodes.read().timers.values() {
             timer.stop();
@@ -2364,6 +2359,12 @@ impl MemberlistKv {
         }
         msgs
     }
+}
+
+/// dskit `generateRandomSuffix`: `fmt.Sprintf("%2x", 4 random bytes)`.
+pub(crate) fn generate_random_suffix() -> String {
+    let suffix: [u8; 4] = rand::thread_rng().gen();
+    suffix.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// memberlist `ensurePort`.
