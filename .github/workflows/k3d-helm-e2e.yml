@@ -1,0 +1,117 @@
+name: k3d Helm e2e
+
+# Deploys the upstream mimir-distributed Helm chart (.ref/mimir @ MIMIR_REF) into a k3d
+# cluster with mimir-rs ingesters and checks rings, memberlist, read/write path and a rolling
+# restart from the outside (scripts/k3d-helm-e2e.sh, docs/k3d-helm-e2e.md).
+# MODE=mixed: ingester zone-a + zone-b Rust, zone-c Go. MODE=rust: all ingester zones Rust.
+# The mimir-rs image is built once and shared with both e2e jobs as an artifact.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MIMIR_REF: 06de3ebd2b12aa22861b96e6863b93a162c31e3c
+  K3D_VERSION: v5.9.0
+  RUST_IMAGE: mimir-rs:ci-${{ github.sha }}
+
+jobs:
+  image:
+    name: build mimir-rs image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: |
+          docker buildx build \
+            --provenance=false \
+            --sbom=false \
+            --build-arg SOURCE_DATE_EPOCH=0 \
+            --build-arg revision="$GITHUB_SHA" \
+            --load \
+            -t "$RUST_IMAGE" \
+            .
+          mkdir -p target
+          docker save "$RUST_IMAGE" | gzip -1 > target/mimir-rs-image.tar.gz
+          ls -lh target/mimir-rs-image.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mimir-rs-image
+          path: target/mimir-rs-image.tar.gz
+          retention-days: 3
+          compression-level: 0
+
+  e2e:
+    name: k3d e2e (MODE=${{ matrix.mode }})
+    needs: image
+    runs-on: ubuntu-24.04
+    # Cluster bring-up ~5-10 min, checks + rolling restart ~15-20 min on a 4-vCPU runner.
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [mixed, rust]
+    env:
+      MODE: ${{ matrix.mode }}
+      CLUSTER: mimir-e2e-${{ matrix.mode }}
+      # Slower 4-vCPU runners: allow more time for all pods to become Ready.
+      READY_TIMEOUT: "1200"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Fetch upstream Go reference (.ref/mimir)
+        run: |
+          git init -q .ref/mimir
+          git -C .ref/mimir remote add origin https://github.com/grafana/mimir.git
+          git -C .ref/mimir fetch -q --depth 1 origin "$MIMIR_REF"
+          git -C .ref/mimir checkout -q FETCH_HEAD
+      - name: Install k3d
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/k3d" \
+            "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64"
+          sudo install -m 0755 "$RUNNER_TEMP/k3d" /usr/local/bin/k3d
+          k3d version
+          helm version --short
+          kubectl version --client
+      - name: Raise inotify limits (many pods on one host)
+        run: sudo sysctl -w fs.inotify.max_user_instances=1024 fs.inotify.max_user_watches=1048576
+      - uses: actions/download-artifact@v4
+        with:
+          name: mimir-rs-image
+          path: target
+      - name: Load image
+        run: gunzip -c target/mimir-rs-image.tar.gz | docker load && rm target/mimir-rs-image.tar.gz
+      - name: Run k3d Helm e2e
+        run: ./scripts/k3d-helm-e2e.sh
+      - name: Summary
+        if: always()
+        run: |
+          f=$(ls -1d target/k3d-e2e/runs/*/summary.txt 2>/dev/null | tail -1)
+          [[ -n $f ]] && { echo '```'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: k3d-e2e-${{ matrix.mode }}-runs
+          path: target/k3d-e2e/runs/**
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Delete k3d cluster
+        if: always()
+        run: k3d cluster delete "$CLUSTER" || true

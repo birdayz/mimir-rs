@@ -5,23 +5,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use axum::extract::{Query, State as AxumState};
+use axum::extract::{Query, RawQuery, State as AxumState};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use mimir_common::logging::format_rfc3339_nano_utc;
-use mimir_common::services::{Service, State};
+use mimir_common::services::State;
 use mimir_common::tenant::extract_tenant_id_from_http_headers;
 use mimir_config::{yaml_v3_emit, LimitsConfig, MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::{ingester_router, Ingester};
-use mimir_ring::kv::memberlist::MemberlistKv;
+use mimir_ring::kv::memberlist::{http_status, MemberlistKv};
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
 use crate::cli::{diff_yaml_values, effective_config_yaml, marshal_config_yaml};
+use crate::memberlist_status::render_memberlist_status_page;
 use crate::metrics::{branch_str, go_version_str, revision_str, version_str};
+use crate::modules::ModuleStates;
 
 #[derive(Clone)]
 pub struct AppHttpState {
@@ -33,10 +35,8 @@ pub struct AppHttpState {
     pub runtime_config: Option<Arc<RuntimeConfigManager>>,
     pub overrides: Overrides,
     pub memberlist_kv: Option<Arc<MemberlistKv>>,
-    pub active_service_names: Vec<String>,
-    /// Module services other than `ingester-service` whose state `/ready` reports (Go
-    /// `Mimir.ServiceMap` entries backed by a Rust service), keyed by upstream module name.
-    pub module_services: Vec<(String, Arc<dyn Service>)>,
+    /// Module services of the configured targets (Go `Mimir.ServiceMap`) and their states.
+    pub modules: Arc<ModuleStates>,
     /// `(cost_attribution_registry_path, registry)` when cost attribution is enabled
     /// (Go: `API.RegisterCostAttribution`).
     pub cost_attribution_registry: Option<(String, Registry)>,
@@ -45,9 +45,12 @@ pub struct AppHttpState {
 /// Builds the full Axum HTTP router (with `server.http_path_prefix` honored).
 pub fn build_http_router(state: AppHttpState) -> Router {
     let register_instrumentation = state.config.server.register_instrumentation;
-    let has_memberlist = state.memberlist_kv.is_some();
+    // Go registers /memberlist whenever the memberlist-kv module is initialised (a dependency of
+    // the ingester ring); it answers "This instance doesn't use memberlist." without a KV.
+    let has_memberlist = state.memberlist_kv.is_some() || state.ingester.is_some();
     let ingester_opt = state.ingester.clone();
     let path_prefix = state.config.server.http_path_prefix.trim_end_matches('/').to_string();
+    let shutdown_requested = Arc::clone(&state.shutdown_requested);
 
     // `/ready` and `/metrics` are registered without a method restriction (Go
     // `Server.HTTP.Path("/ready")`, dskit `router.Handle("/metrics", ...)`).
@@ -121,7 +124,7 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         // reports it as an unmatched route.
         .method_not_allowed_fallback(crate::server::http_middleware::method_not_allowed);
 
-    if has_prefix {
+    let router = if has_prefix {
         let normalized = if path_prefix.starts_with('/') {
             path_prefix
         } else {
@@ -138,7 +141,23 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     } else {
         // gorilla/mux NotFoundHandler default: http.NotFound.
         app.fallback(not_found_handler)
-    }
+    };
+
+    // Go disables HTTP keep-alives as soon as a shutdown signal is received
+    // (`t.Server.HTTPServer.SetKeepAlivesEnabled(false)`): responses then carry
+    // `Connection: close` and connections are closed after the response.
+    router.layer(axum::middleware::map_response(move |mut resp: Response| {
+        let shutdown_requested = Arc::clone(&shutdown_requested);
+        async move {
+            if shutdown_requested.load(Ordering::Acquire) {
+                resp.headers_mut().insert(
+                    header::CONNECTION,
+                    header::HeaderValue::from_static("close"),
+                );
+            }
+            resp
+        }
+    }))
 }
 
 /// `http.NotFoundHandler()` (`http.Error(w, "404 page not found", 404)`).
@@ -160,22 +179,8 @@ async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
     }
 
     // Go: `if !sm.IsHealthy()` lists every module service that is not Running, one
-    // "<module>: <state>" per line (pkg/mimir/mimir.go readyHandler). Every module service is
-    // started by the service manager at once, so a not yet started one is reported as Starting.
-    let module_state = |s: State| if s == State::New { State::Starting } else { s };
-    let mut not_running: Vec<String> = Vec::new();
-    for (name, svc) in &st.module_services {
-        let s = module_state(svc.state());
-        if s != State::Running {
-            not_running.push(format!("{name}: {s}"));
-        }
-    }
-    if let Some(ref ing) = st.ingester {
-        let s = module_state(ing.state());
-        if s != State::Running {
-            not_running.push(format!("ingester-service: {s}"));
-        }
-    }
+    // "<module>: <state>" per line (pkg/mimir/mimir.go readyHandler).
+    let not_running = st.modules.not_running();
     if !not_running.is_empty() {
         // http.Error appends a trailing newline.
         return (
@@ -305,59 +310,18 @@ struct StatusPageContents {
 }
 
 async fn services_handler(AxumState(st): AxumState<AppHttpState>, headers: HeaderMap) -> Response {
-    let mut svcs = Vec::new();
-    if let Some(ref ing) = st.ingester {
-        svcs.push(RenderService {
-            name: "ingester".to_string(),
-            status: ing.state().to_string(),
-        });
-        svcs.push(RenderService {
-            name: "ingester-service".to_string(),
-            status: ing.state().to_string(),
-        });
-        if ing.instance_ring.is_some() {
-            svcs.push(RenderService {
-                name: "ingester-ring".to_string(),
-                status: if ing.state() == State::Running {
-                    "Running".to_string()
-                } else {
-                    ing.state().to_string()
-                },
-            });
-        }
-        if ing.partition_ring_watcher.is_some() {
-            svcs.push(RenderService {
-                name: "ingester-partitions-ring".to_string(),
-                status: if ing.state() == State::Running {
-                    "Running".to_string()
-                } else {
-                    ing.state().to_string()
-                },
-            });
-        }
-    }
-    if let Some(ref ml) = st.memberlist_kv {
-        let s = ml.state();
-        svcs.push(RenderService {
-            name: "memberlist-kv".to_string(),
-            status: if s == State::New { State::Starting } else { s }.to_string(),
-        });
-    }
-    if st.runtime_config.is_some() {
-        svcs.push(RenderService {
-            name: "runtime-config".to_string(),
-            status: "Running".to_string(),
-        });
-    }
-    for name in &st.active_service_names {
-        if !svcs.iter().any(|s| s.name == *name) {
-            svcs.push(RenderService {
-                name: name.clone(),
-                status: "Running".to_string(),
-            });
-        }
-    }
-    svcs.sort_by(|a, b| a.name.cmp(&b.name));
+    // `servicesHandler`: every module service of `Mimir.ServiceMap` with its current state. The
+    // service manager starts every module at once (each waits for its dependencies while
+    // Starting), so a module not started yet is reported as Starting.
+    let svcs: Vec<RenderService> = st
+        .modules
+        .snapshot()
+        .into_iter()
+        .map(|(name, state)| RenderService {
+            name,
+            status: if state == State::New { State::Starting } else { state }.to_string(),
+        })
+        .collect();
 
     let now = format_rfc3339_nano_utc(SystemTime::now());
     let accepts_json = headers
@@ -675,78 +639,30 @@ async fn status_flags_handler() -> Response {
     .into_response()
 }
 
-#[derive(Serialize)]
-struct MemberlistMemberJson {
-    name: String,
-    addr: String,
-    state: String,
-    incarnation: u32,
-}
-
-#[derive(Serialize)]
-struct MemberlistStatusJson {
-    node_name: String,
-    advertise_addr: String,
-    keys_count: usize,
-    members: Vec<MemberlistMemberJson>,
-}
-
+/// Mimir `memberlistStatusHandler(kvs)` = dskit `HTTPStatusHandler` with Mimir's page template.
 async fn memberlist_handler(
     AxumState(st): AxumState<AppHttpState>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    let Some(ref ml) = st.memberlist_kv else {
-        return (StatusCode::NOT_FOUND, "memberlist KV is not enabled").into_response();
-    };
-
-    let members_raw = ml.members();
-    let keys_count = ml.list_keys("").len();
-    let mut members: Vec<MemberlistMemberJson> = members_raw
-        .into_iter()
-        .map(|m| MemberlistMemberJson {
-            name: m.name.clone(),
-            addr: m.address(),
-            state: format!("{:?}", m.state),
-            incarnation: m.incarnation,
-        })
-        .collect();
-    members.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let accepts_json = headers
+    let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.contains("application/json"));
-
-    if accepts_json {
-        return Json(MemberlistStatusJson {
-            node_name: ml.node_name().to_string(),
-            advertise_addr: ml.advertise_addr(),
-            keys_count,
-            members,
-        })
-        .into_response();
-    }
-
-    let mut html = format!(
-        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Memberlist Status</title></head>\
-         <body><h1>Memberlist Status</h1>\
-         <p>Node: {} ({})</p><p>KV keys: {}</p>\
-         <table border=\"1\"><thead><tr><th>Name</th><th>Address</th><th>State</th><th>Incarnation</th></tr></thead><tbody>",
-        html_escape(ml.node_name()),
-        html_escape(&ml.advertise_addr()),
-        keys_count
+        .unwrap_or_default();
+    let res = http_status::serve_http(
+        st.memberlist_kv.as_deref(),
+        query.as_deref(),
+        accept,
+        render_memberlist_status_page,
     );
-    for m in members {
-        html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            html_escape(&m.name),
-            html_escape(&m.addr),
-            html_escape(&m.state),
-            m.incarnation
-        ));
+    let mut resp = Response::new(axum::body::Body::from(res.body));
+    *resp.status_mut() = StatusCode::from_u16(res.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    for (name, value) in res.headers {
+        if let Ok(v) = header::HeaderValue::from_str(&value) {
+            resp.headers_mut().insert(name, v);
+        }
     }
-    html.push_str("</tbody></table></body></html>");
-    Html(html).into_response()
+    resp
 }
 
 async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
@@ -816,7 +732,7 @@ async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
         ));
     }
 
-    if st.memberlist_kv.is_some() {
+    if st.memberlist_kv.is_some() || st.ingester.is_some() {
         html.push_str("<h2>Memberlist</h2><ul>");
         html.push_str(&format!(
             "<li><a href=\"{}\">Status</a></li></ul>",

@@ -94,15 +94,14 @@ pub fn ingester_router(ingester: Arc<Ingester>) -> Router {
     }
 
     if let Some(ref watcher) = ingester.partition_ring_watcher {
-        if let Some(kv) = ingester
-            .instance_ring
-            .as_ref()
-            .and_then(|r| r.kv_client().cloned())
-        {
-            let editor = Arc::new(PartitionRingEditor::new("ingester-partitions", kv));
-            let reader: Arc<dyn PartitionRingReader> = Arc::clone(watcher) as Arc<dyn PartitionRingReader>;
-            router = router.merge(partition_ring_router(reader, editor));
-        }
+        // Go: `RegisterIngesterPartitionRings(..., PartitionRingKey, kvClient)` with the
+        // partition ring watcher's KV client (partition_ring.kvstore, partition ring codec).
+        let editor = Arc::new(PartitionRingEditor::new(
+            watcher.key(),
+            Arc::clone(watcher.kv_client()),
+        ));
+        let reader: Arc<dyn PartitionRingReader> = Arc::clone(watcher) as Arc<dyn PartitionRingReader>;
+        router = router.merge(partition_ring_router(reader, editor));
     }
 
     router
@@ -301,11 +300,8 @@ async fn prepare_partition_downscale_handler(
                 .change_partition_state(PartitionState::PartitionInactive)
                 .await
             {
-                let status = if matches!(
-                    e,
-                    PartitionRingError::PartitionStateChangeLocked
-                        | PartitionRingError::PartitionStateChangeNotAllowed
-                ) {
+                // Only `ring.ErrPartitionStateChangeLocked` maps to 409 Conflict.
+                let status = if matches!(e, PartitionRingError::PartitionStateChangeLocked) {
                     StatusCode::CONFLICT
                 } else {
                     StatusCode::INTERNAL_SERVER_ERROR
@@ -322,11 +318,8 @@ async fn prepare_partition_downscale_handler(
                     .change_partition_state(PartitionState::PartitionActive)
                     .await
                 {
-                    let status = if matches!(
-                        e,
-                        PartitionRingError::PartitionStateChangeLocked
-                            | PartitionRingError::PartitionStateChangeNotAllowed
-                    ) {
+                    // Only `ring.ErrPartitionStateChangeLocked` maps to 409 Conflict.
+                    let status = if matches!(e, PartitionRingError::PartitionStateChangeLocked) {
                         StatusCode::CONFLICT
                     } else {
                         StatusCode::INTERNAL_SERVER_ERROR

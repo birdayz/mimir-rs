@@ -141,12 +141,14 @@ impl NodeState {
 }
 
 pub(crate) fn format_ip_port(addr: &[u8], port: u16) -> String {
+    // Go `net.IP.String()` prints IPv4-mapped IPv6 addresses (what `net.ParseIP` returns for an
+    // IPv4 address, so what Go peers put on the wire) in dotted IPv4 form.
     let ip: IpAddr = if addr.len() == 4 {
         let a: [u8; 4] = addr.try_into().expect("4 bytes");
         IpAddr::from(a)
     } else if addr.len() == 16 {
         let a: [u8; 16] = addr.try_into().expect("16 bytes");
-        IpAddr::from(a)
+        IpAddr::from(a).to_canonical()
     } else {
         return format!("127.0.0.1:{port}");
     };
@@ -160,12 +162,17 @@ pub(crate) fn ip_to_bytes(ip: IpAddr) -> Vec<u8> {
     }
 }
 
-struct ValueDesc {
-    value: Box<dyn Mergeable>,
-    version: usize,
-    codec_id: String,
-    deleted: bool,
-    update_time: Option<SystemTime>,
+/// dskit `ValueDesc`: a stored value with its codec and local version.
+pub struct ValueDesc {
+    pub value: Box<dyn Mergeable>,
+    /// Local only: used to keep track of what we're gossiping about.
+    pub version: usize,
+    /// ID of codec used to write this value.
+    pub codec_id: String,
+    /// Deleted is used to mark the value as deleted.
+    pub deleted: bool,
+    /// UpdateTime keeps track of the last time the value was updated (`None` = Go zero time).
+    pub update_time: Option<SystemTime>,
 }
 
 impl Clone for ValueDesc {
@@ -1607,6 +1614,16 @@ impl MemberlistKv {
 
     pub fn node_name(&self) -> &str {
         &self.node_name
+    }
+
+    /// The dskit `KVConfig` this KV was created with.
+    pub fn config(&self) -> &MemberlistConfig {
+        &self.cfg
+    }
+
+    /// dskit `storeCopy`: deep copy of the whole store, including deleted entries.
+    pub fn store_copy(&self) -> HashMap<String, ValueDesc> {
+        self.store.lock().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
     pub fn node_meta(&self) -> Option<&[u8]> {

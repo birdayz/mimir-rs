@@ -260,9 +260,8 @@ impl Pod {
 
     /// The local memberlist node's advertised `ip:port`, from `GET /memberlist` (JSON).
     ///
-    /// Go serialises dskit's `StatusPageData` (`SortedMembers[].Addr` + `Port`); Rust's JSON
-    /// status page differs in shape (pre-existing, tracked in PORT_STATUS.md), so both shapes
-    /// are accepted here — only the advertised address is compared.
+    /// Both Go and Rust serialise dskit's `StatusPageData`; the single member of this one-node
+    /// cluster is the local node (`SortedMembers[0].Addr` + `Port`).
     async fn memberlist_advertise(&self) -> Result<String> {
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut last = String::new();
@@ -274,9 +273,6 @@ impl Pod {
                             let ip: IpAddr = ip.parse()?;
                             return Ok(std::net::SocketAddr::new(ip, port as u16).to_string());
                         }
-                    }
-                    if let Some(a) = v["advertise_addr"].as_str().filter(|a| !a.is_empty()) {
-                        return Ok(a.to_string());
                     }
                     last = v.to_string();
                 }

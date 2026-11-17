@@ -34,6 +34,10 @@ test-crate crate *args:
 conformance-kafka-tls *args:
     ./scripts/build-go-oracle.sh && cargo test -p mimir-conformance --test w6_kafka_tls_sasl_testcontainers {{args}} -- --nocapture --test-threads 3
 
+# Kubernetes/Helm-faithful Go vs Rust differential suite (docker compose; one cluster at a time).
+conformance-k8s *args:
+    ./scripts/build-go-oracle.sh && cargo test -p mimir-conformance --test w7_k8s_helm_memberlist_testcontainers {{args}} -- --nocapture --test-threads 1
+
 conformance *args:
     ./scripts/build-go-oracle.sh && cargo test -p mimir-conformance {{args}}
 
@@ -66,9 +70,15 @@ docker-build tag="mimir-rs:local":
         --sbom=false \
         --build-arg SOURCE_DATE_EPOCH=0 \
         --build-arg revision=$(git rev-parse HEAD) \
+        --build-arg BUILD_JOBS=${CARGO_BUILD_JOBS:-} \
         --load \
         -t {{tag}} \
         .
+
+# k3d + upstream mimir-distributed Helm chart e2e (see docs/k3d-helm-e2e.md).
+# MODE=go|mixed|rust, RUST_IMAGE=..., KEEP_CLUSTER=1
+k3d-e2e mode="go":
+    MODE={{mode}} ./scripts/k3d-helm-e2e.sh
 
 docker-build-repro out="target/mimir-rs-oci.tar":
     mkdir -p "$(dirname '{{out}}')"

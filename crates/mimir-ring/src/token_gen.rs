@@ -13,7 +13,7 @@ use std::time::SystemTime;
 
 use mimir_proto::ringpb::InstanceDesc;
 use parking_lot::Mutex;
-use prometheus::Registry;
+use crate::kv::{AsRegisterer, Registerer};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -609,7 +609,9 @@ pub struct PartitionTokenTable {
 }
 
 impl PartitionTokenTable {
-    pub fn new(partitions: i32, reg: Option<&Registry>) -> Result<Self, TokenGenError> {
+    pub fn new(partitions: i32, reg: Option<&dyn AsRegisterer>) -> Result<Self, TokenGenError> {
+        let reg = reg.map(|r| r.as_registerer());
+        let reg = reg.as_ref();
         if partitions < 0 {
             return Err(TokenGenError::NegativePartitionCount(partitions));
         }
@@ -653,7 +655,7 @@ impl PartitionTokenGenerator for PartitionTokenTable {
     }
 }
 
-fn register_partition_token_table_metrics(partitions: i32, reg: Option<&Registry>) {
+fn register_partition_token_table_metrics(partitions: i32, reg: Option<&Registerer>) {
     let Some(reg) = reg else {
         return;
     };

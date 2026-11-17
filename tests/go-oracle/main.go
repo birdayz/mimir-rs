@@ -87,6 +87,10 @@ func main() {
 		out, err = cmdTSDBOpenReport(input)
 	case "regex-matcher-errors":
 		out, err = cmdRegexMatcherErrors(input)
+	case "memberlist-status-page":
+		out, err = cmdMemberlistStatusPage(input)
+	case "memberlist-format-value":
+		out, err = cmdMemberlistFormatValue(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}

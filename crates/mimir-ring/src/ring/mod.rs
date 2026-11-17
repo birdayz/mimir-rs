@@ -18,12 +18,14 @@ use mimir_common::services::{basic_service, ManagedBasicService, ServiceContext,
 use mimir_config::ingester::RingConfig;
 use mimir_proto::ringpb::{Desc, InstanceDesc, InstanceState};
 use parking_lot::RwLock;
-use prometheus::{Gauge, GaugeVec, Opts, Registry};
+use prometheus::{Gauge, GaugeVec, Opts};
 use thiserror::Error;
 use tracing::info;
 
 use crate::kv::memberlist::MemberlistKv;
-use crate::kv::{build_kv_client, registerer_with_kv_name, AsRegisterer, KvClient, KvError};
+use crate::kv::{
+    build_kv_client, registerer_with_kv_name, AsRegisterer, KvClient, KvError, Registerer,
+};
 use crate::prng::{shuffle_shard_expected_instances_per_zone, shuffle_shard_seed, GoRand};
 use crate::token_gen::search_token;
 
@@ -167,7 +169,7 @@ struct RingMetrics {
 }
 
 impl RingMetrics {
-    fn new(name: &str, reg: Option<&Registry>) -> Self {
+    fn new(name: &str, reg: Option<&Registerer>) -> Self {
         let mut const_labels = HashMap::new();
         const_labels.insert("name".to_string(), name.to_string());
 
@@ -230,8 +232,9 @@ pub struct Ring {
 impl Ring {
     /// Creates a new [`Ring`] backed by KV store from `RingConfig` (Go `ring.New`).
     /// The KV client registers its metrics through `reg` with
-    /// `kv_name="<name>-ring"` like dskit; the ring's own metrics are
-    /// registered into the underlying registry.
+    /// `kv_name="<name>-ring"` like dskit; the ring's own metrics
+    /// (`ring_members`, ...) are registered through `reg` too, so they carry
+    /// its prefix (Mimir: `cortex_`).
     pub fn new<R: AsRegisterer + ?Sized>(
         cfg: &RingConfig,
         name: &str,
@@ -250,14 +253,13 @@ impl Ring {
             memberlist_kv,
             kv_reg.as_ref(),
         )?;
-        let reg: Option<&Registry> = registerer.as_ref().map(|r| r.registry());
         Self::with_store_and_strategy(
             RingSettings::from(cfg),
             name,
             key,
             store,
             Arc::new(DefaultReplicationStrategy),
-            reg,
+            registerer.as_ref().map(|r| r as &dyn AsRegisterer),
         )
     }
 
@@ -267,8 +269,9 @@ impl Ring {
         key: &str,
         store: Arc<dyn KvClient>,
         strategy: Arc<dyn ReplicationStrategy>,
-        reg: Option<&Registry>,
+        reg: Option<&dyn AsRegisterer>,
     ) -> Result<Arc<Self>, RingError> {
+        let reg = reg.map(|r| r.as_registerer());
         if settings.replication_factor == 0 {
             return Err(RingError::InvalidReplicationFactor(0));
         }
@@ -296,7 +299,7 @@ impl Ring {
                 shuffled_subring_cache: HashMap::new(),
                 shuffled_subring_with_lookback_cache: HashMap::new(),
             }),
-            metrics: Some(RingMetrics::new(name, reg)),
+            metrics: Some(RingMetrics::new(name, reg.as_ref())),
         }))
     }
 
@@ -1385,7 +1388,7 @@ mod new_ring_tests {
             let mut cfg = RingConfig::default();
             cfg.kvstore.store = "inmemory".to_string();
             cfg.replication_factor = rf;
-            let err = match Ring::new::<Registry>(&cfg, "ingester", "ring", None, None) {
+            let err = match Ring::new::<prometheus::Registry>(&cfg, "ingester", "ring", None, None) {
                 Ok(_) => panic!("expected error for replication factor {rf}"),
                 Err(e) => e,
             };
