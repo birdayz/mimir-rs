@@ -23,6 +23,7 @@ pub mod activitytracker;
 pub mod backoff;
 pub mod errors;
 pub mod gosort;
+pub mod grpc_log;
 pub mod labels_hash;
 pub mod limiter;
 pub mod netutil;

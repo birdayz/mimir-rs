@@ -31,6 +31,7 @@ use bytes::Bytes;
 use http_body::Frame;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use mimir_common::grpc_log::GrpcErrorLog;
 use mimir_common::logging::{LogLevel, Logger};
 use mimir_config::GoDuration;
 use parking_lot::Mutex;
@@ -269,6 +270,8 @@ async fn handle(
         local_addr: None,
         remote_addr: Some(remote),
     });
+    let error_log = GrpcErrorLog::default();
+    req.extensions_mut().insert(error_log.clone());
 
     // Cluster validation (unary RPCs only, never health checks).
     let rejection = cfg.cluster_validation.as_ref().and_then(|cv| {
@@ -361,17 +364,30 @@ async fn handle(
             *conn.idle_since.lock() = Instant::now();
         }
         if code != 0 {
-            let err = format!(
-                "rpc error: code = {} desc = {}",
-                grpc_status_label(code, true),
-                percent_decode(msg.as_deref().unwrap_or(""))
-            );
-            let dur = GoDuration(elapsed.as_nanos() as i64).to_string();
-            let level = if code == 1 { LogLevel::Debug } else { LogLevel::Warn };
-            logger.log(
-                level,
-                &[("method", &method), ("duration", &dur), ("msg", "gRPC"), ("err", &err)],
-            );
+            // The handler's view of its error (Go error text, OptionalLogging), or a plain
+            // `status.Error` as grpc-go would format it.
+            let (err, keep) = match error_log.take() {
+                Some(e) => match e.reason {
+                    Some(r) => (format!("{} ({r})", e.err), e.keep),
+                    None => (e.err, e.keep),
+                },
+                None => (
+                    format!(
+                        "rpc error: code = {} desc = {}",
+                        grpc_status_label(code, true),
+                        percent_decode(msg.as_deref().unwrap_or(""))
+                    ),
+                    true,
+                ),
+            };
+            if keep {
+                let dur = GoDuration(elapsed.as_nanos() as i64).to_string();
+                let level = if code == 1 { LogLevel::Debug } else { LogLevel::Warn };
+                logger.log(
+                    level,
+                    &[("method", &method), ("duration", &dur), ("msg", "gRPC"), ("err", &err)],
+                );
+            }
         }
     });
     Ok(resp.map(|b| tonic::body::boxed(TrackedBody::new(b).on_frame(on_frame).on_done(on_done))))

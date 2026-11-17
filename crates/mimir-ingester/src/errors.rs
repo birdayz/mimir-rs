@@ -508,6 +508,15 @@ impl IngesterError {
         }
     }
 
+    /// Wrapped in a log sampler (`log.SampledError`).
+    pub fn is_sampled(&self) -> bool {
+        match self {
+            Self::Sampled { .. } => true,
+            Self::WrappedUser { inner, .. } => inner.is_sampled(),
+            _ => false,
+        }
+    }
+
     pub fn is_optional_logging(&self) -> bool {
         match self {
             Self::Sampled { .. } | Self::DoNotLog { .. } => true,
