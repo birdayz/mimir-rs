@@ -4,3 +4,4 @@
 //! (mixed Go+Rust cluster & Kafka ingest) verification helpers.
 
 pub mod oracle;
+pub mod twin;
