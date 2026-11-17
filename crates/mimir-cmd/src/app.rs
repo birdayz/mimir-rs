@@ -371,11 +371,34 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     sanity_state.set(State::Running);
 
     // 4. Memberlist KV (if required by ring/partition_ring or explicitly targeted).
+    // Go always runs `initMemberlistKV` for the ingester (`memberlist.KVInitService`, which
+    // creates the memberlist client lazily on `GetMemberlistKV`, while eagerly creating its
+    // `dns.Provider` with `cortex_` prefix and `component="memberlist"`).
     let needs_memberlist = cfg.is_module_explicitly_targeted("memberlist-kv")
         || (ingester_enabled
             && (kv_uses_memberlist(&cfg.ingester.ring.kvstore)
                 || (cfg.ingest_storage.enabled
                     && kv_uses_memberlist(&cfg.ingester.partition_ring.kvstore))));
+
+    let memberlist_module = ingester_enabled || needs_memberlist;
+    let memberlist_dns_provider: Option<Arc<dyn mimir_ring::dns::DnsProvider>> =
+        if memberlist_module {
+            let labels = std::collections::HashMap::from([(
+                "component".to_string(),
+                "memberlist".to_string(),
+            )]);
+            let provider = mimir_ring::dns::Provider::new(
+                &mimir_ring::dns::GOLANG_RESOLVER_TYPE,
+                0,
+                Some(&registry),
+                "cortex_",
+                labels,
+            )
+            .context("creating memberlist DNS provider")?;
+            Some(Arc::new(provider))
+        } else {
+            None
+        };
 
     // Created here, started (dskit `starting`: transport + fast-join) only after the HTTP/gRPC
     // servers are serving, like the Go module graph where memberlist-kv starts alongside server.
@@ -391,17 +414,16 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             codecs,
             "",
             Some(&registry),
-            KvOptions::default(),
+            KvOptions {
+                dns_provider: memberlist_dns_provider.clone(),
+                ..Default::default()
+            },
         )
         .context("creating memberlist KV")?;
         Some(ml)
     } else {
         None
     };
-    // Go always runs the `memberlist-kv` module for the ingester (`memberlist.KVInitService`,
-    // which creates the memberlist client lazily): its state is the memberlist service's one when
-    // memberlist is used, otherwise it is an idle service.
-    let memberlist_module = ingester_enabled || memberlist_kv.is_some();
     let memberlist_state = StateCell::new(State::New);
     let memberlist_svc = memberlist_kv.as_ref().map(|ml| ml.service());
     if memberlist_module {

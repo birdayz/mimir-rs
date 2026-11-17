@@ -101,8 +101,11 @@ pub fn ingester_router(ingester: Arc<Ingester>) -> Router {
 
     if let Some(ref ring) = ingester.instance_ring {
         // Go `RingConfig.ToRingConfig`: `StatusPageConfig = toStatusPageConfig()` (links from
-        // `-ingester.ring.status-page-ingester-link-template`).
-        router = router.merge(ring_router(Arc::clone(ring), to_status_page_config(&ingester.cfg.ring)));
+        // `-ingester.ring.status-page-ingester-link-template`, and
+        // `HideTokensInStatusPage = cfg.IngestStorage.Enabled` in `pkg/mimir/modules.go`).
+        let mut status_cfg = to_status_page_config(&ingester.cfg.ring);
+        status_cfg.hide_tokens_ui_elements = ingester.ingest_cfg.enabled;
+        router = router.merge(ring_router(Arc::clone(ring), status_cfg));
     }
 
     let compartment_watchers = ingester
