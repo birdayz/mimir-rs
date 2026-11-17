@@ -41,7 +41,7 @@ KUBECTL=${KUBECTL:-$(command -v kubectl || echo "$HOME/google-cloud-sdk/bin/kube
 K3S_IMAGE=${K3S_IMAGE:-rancher/k3s:v1.35.5-k3s1}
 
 CHART_SRC=$ROOT/.ref/mimir/operations/helm/charts/mimir-distributed
-MIXIN_DASHBOARDS=$ROOT/.ref/mimir/operations/mimir-mixin-compiled/dashboards
+MIXIN=$ROOT/.ref/mimir/operations/mimir-mixin-compiled
 WORK=$ROOT/target/k3d-e2e
 CHART=$WORK/chart
 OUT_DIR=${OUT_DIR:-$WORK/runs/$MODE-$(date +%Y%m%d-%H%M%S)}
@@ -97,7 +97,8 @@ cleanup() {
     log "KEEP_CLUSTER=1: keeping cluster $CLUSTER (KUBECONFIG=$KUBECONFIG)"
   else
     log "deleting k3d cluster $CLUSTER"
-    "$K3D" cluster delete "$CLUSTER" >/dev/null 2>&1 || true
+    "$K3D" cluster delete "$CLUSTER" >/dev/null 2>&1 || { sleep 5; "$K3D" cluster delete "$CLUSTER" >/dev/null 2>&1; } || true
+    "$K3D" cluster get "$CLUSTER" >/dev/null 2>&1 && log "WARNING: cluster $CLUSTER still exists after delete"
     rm -f "$KUBECONFIG"
   fi
   exit "$rc"
@@ -678,7 +679,7 @@ echo "$res" | evidence
 ###############################################################################
 sample_names() { awk '!/^#/ && NF {n = $1; sub(/\{.*/, "", n); print n} /^# TYPE /{print $3}' | sort -u; }
 mixin=$OUT_DIR/mixin-metrics.txt
-grep -ohE '\b[a-z][a-z0-9_]*_[a-z0-9_]+' "$MIXIN_DASHBOARDS"/*.json | sort -u >"$mixin"
+grep -ohE '\b[a-z][a-z0-9_]*_[a-z0-9_]+' "$MIXIN"/dashboards/*.json "$MIXIN"/alerts.yaml "$MIXIN"/rules.yaml | sort -u >"$mixin"
 GO_REF=$WORK/go-ingester-metrics.txt
 while IFS=$'\t' read -r p ip zone impl img; do
   { incurl "http://$ip:8080/metrics" || true; } | sample_names >"$OUT_DIR/metrics-$p.txt"
@@ -691,8 +692,10 @@ elif [[ -f $GO_REF ]]; then
   while IFS=$'\t' read -r p ip zone impl img; do
     [[ $impl == rust ]] || continue
     comm -12 "$mixin" "$GO_REF" | comm -23 - "$OUT_DIR/metrics-$p.txt" >"$OUT_DIR/missing-mixin-metrics-$p.txt"
-    info "g. $p (rust): $(wc -l <"$OUT_DIR/missing-mixin-metrics-$p.txt") mixin-dashboard metric names exposed by Go ingesters but not by this Rust ingester (report-only):"
-    tr '\n' ' ' <"$OUT_DIR/missing-mixin-metrics-$p.txt" | fold -s -w 150 | evidence
+    info "g. $p (rust): $(wc -l <"$OUT_DIR/missing-mixin-metrics-$p.txt") mixin (dashboards+alerts+rules) metric names exposed by Go ingesters but not by this Rust ingester (report-only):"
+    { tr '\n' ' ' <"$OUT_DIR/missing-mixin-metrics-$p.txt"; echo; } | fold -s -w 150 | evidence
+    comm -23 "$GO_REF" "$OUT_DIR/metrics-$p.txt" >"$OUT_DIR/missing-all-metrics-$p.txt"
+    info "g. $p (rust): $(wc -l <"$OUT_DIR/missing-all-metrics-$p.txt") metric names in total exposed by Go but not Rust ingesters (list: $OUT_DIR/missing-all-metrics-$p.txt)"
   done <<<"$INGESTERS"
 else
   info "g. no Go ingester reference metrics ($GO_REF missing); run MODE=go or MODE=mixed first"
