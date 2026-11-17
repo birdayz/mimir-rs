@@ -12,13 +12,25 @@ pub enum ConfigError {
     #[error("error reading config file: {0}")]
     Io(#[from] std::io::Error),
 
+    /// `LoadConfig` read failure, formatted like Go's `*fs.PathError` (`open <path>: <errno text>`).
+    #[error("error reading config file: {0}")]
+    ReadConfigFile(String),
+
+    /// `cmd/mimir/main.go`: `error loading config from %s: %v` around any `LoadConfig` error.
+    #[error("error loading config from {path}: {source}")]
+    LoadConfig {
+        path: String,
+        source: Box<ConfigError>,
+    },
+
     #[error("error parsing config file: {0}")]
     Yaml(String),
 
     #[error("unknown configuration field: {0}")]
     UnknownField(String),
 
-    #[error("invalid duration {input:?}: {reason}")]
+    /// `reason` is the exact Go error text (`time.ParseDuration` / `model.ParseDuration`).
+    #[error("{reason}")]
     Duration { input: String, reason: String },
 
     #[error("invalid flag: {0}")]
@@ -43,6 +55,22 @@ impl ConfigError {
             _ => 1,
         }
     }
+}
+
+/// Formats an I/O error like Go's `*fs.PathError`: `<op> <path>: <errno text>`, where the errno
+/// text is the lower-cased C `strerror` message (Go's `syscall.Errno.Error()` table).
+pub fn go_path_error(op: &str, path: &str, err: &std::io::Error) -> String {
+    let msg = err.to_string();
+    let msg = match msg.find(" (os error ") {
+        Some(idx) if err.raw_os_error().is_some() => msg[..idx].to_string(),
+        _ => msg,
+    };
+    let mut chars = msg.chars();
+    let msg = match chars.next() {
+        Some(c) => c.to_lowercase().collect::<String>() + chars.as_str(),
+        None => msg,
+    };
+    format!("{op} {path}: {msg}")
 }
 
 /// Exit action requested by special CLI flags (`-version`, `-modules`, `-help`, `-help-all`).

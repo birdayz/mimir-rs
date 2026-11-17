@@ -4,12 +4,14 @@
 //! - github.com/grafana/mimir/pkg/storage/ingest/*
 //! - github.com/grafana/mimir/pkg/ingester/offset_catalogue.go
 
+pub mod client_consumer;
 pub mod compression;
 pub mod fetcher;
 pub mod fixture_generator;
 pub mod heap_merger;
 pub mod kafka_client;
 pub mod kgo_retry;
+pub mod kprom;
 pub mod offset_catalogue;
 pub mod offset_file;
 pub mod partition_offset_client;

@@ -25,14 +25,20 @@ use mimir_proto::zerocopy::{BorrowedWriteRequest, WriteRequestScratch};
 
 use mimir_common::backoff::{Backoff, BackoffConfig};
 
+use super::client_consumer::ClientPartitionConsumer;
+use super::fetcher::{
+    native_only_buckets, ConcurrentFetchers, FetchResult, FetcherMetrics, OffsetRange,
+    RangeErrorPolicy,
+};
 use super::heap_merger::{HeapMerger, HeapMergerMetrics};
+use super::kprom::KpromMetrics;
 use super::kafka_client::{
     FetchedRecord, KafkaClient, KafkaClientError, KAFKA_OFFSET_END, KAFKA_OFFSET_START,
 };
 use super::offset_catalogue::PartitionOffsets;
 use super::offset_file::OffsetFile;
 use super::partition_offset_client::PartitionOffsetClient;
-use super::partition_offset_reader::SingleClusterPartitionOffsetReader;
+use super::partition_offset_reader::{GenericOffsetReader, SingleClusterPartitionOffsetReader};
 use super::partition_offset_watcher::{OffsetWatcherError, PartitionOffsetWatcher};
 use super::pusher::{NoOpPreCommitNotifier, PreCommitNotifier};
 use super::util::create_topics;
@@ -74,6 +80,9 @@ pub enum ReaderError {
     InvalidClusterOffsetCount(usize),
     #[error("startup canceled")]
     Canceled,
+    /// `errWaitTargetLagDeadlineExceeded`.
+    #[error("target lag deadline exceeded")]
+    WaitTargetLagDeadlineExceeded,
     #[error("startup error: {0}")]
     Startup(String),
 }
@@ -217,21 +226,30 @@ impl StrongReadConsistencyMetrics {
     }
 }
 
+/// The fetcher currently used by a reader (`ReaderMetricsSource`), read by the pulled gauges.
+type FetcherSlot = Arc<parking_lot::RwLock<Option<Arc<ReaderFetcher>>>>;
+
+/// `prometheus.ExponentialBuckets(start, factor, count)`.
+pub(crate) fn exponential_buckets(start: f64, factor: f64, count: usize) -> Vec<f64> {
+    prometheus::exponential_buckets(start, factor, count).expect("valid buckets")
+}
+
 #[derive(Clone)]
 pub struct ReaderMetrics {
     pub fetches_total: Counter,
     pub fetches_errors: Counter,
     pub records_per_fetch: Histogram,
     pub consume_latency: Histogram,
-    pub fetch_wait_duration: Histogram,
+    /// `fetchMaxBytes`, `fetchWaitDuration` and `fetchedDiscardedRecordBytes`
+    /// (`ConcurrentFetchers` only).
+    pub fetcher: FetcherMetrics,
+    pub estimated_bytes_per_record: Histogram,
     pub last_consumed_offset: GaugeVec,
     pub missed_records: Counter,
     pub receive_delay: HistogramVec,
     pub receive_and_consume_delay: HistogramVec,
-    pub buffered_fetch_records_client: GaugeVec,
     pub strong_consistency: StrongReadConsistencyMetrics,
-    buffered_records_cb: Arc<AtomicI64>,
-    buffered_bytes_cb: Arc<AtomicI64>,
+    source: FetcherSlot,
 }
 
 impl ReaderMetrics {
@@ -239,7 +257,9 @@ impl ReaderMetrics {
         Self::new_for_topic(registry, "")
     }
 
+    /// `NewReaderMetrics` (`reader.go`).
     pub fn new_for_topic(registry: Option<&Registry>, topic: &str) -> Self {
+        let source: FetcherSlot = Arc::new(parking_lot::RwLock::new(None));
         let fetches_total = Counter::with_opts(Opts::new(
             "cortex_ingest_storage_reader_fetches_total",
             "Total number of Kafka fetches received by the consumer.",
@@ -250,25 +270,34 @@ impl ReaderMetrics {
             "The number of fetch errors encountered by the consumer.",
         ))
         .expect("valid metric");
-        let records_per_fetch = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_reader_records_per_fetch",
-            "The number of records received by the consumer in a single fetch operation.",
-        ))
+        let records_per_fetch = Histogram::with_opts(
+            HistogramOpts::new(
+                "cortex_ingest_storage_reader_records_per_fetch",
+                "The number of records received by the consumer in a single fetch operation.",
+            )
+            .buckets(exponential_buckets(1.0, 2.0, 15)),
+        )
         .expect("valid metric");
-        let consume_latency = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_reader_records_batch_process_duration_seconds",
-            "How long a consumer spent processing a batch of records from Kafka.",
-        ))
+        let consume_latency = Histogram::with_opts(
+            HistogramOpts::new(
+                "cortex_ingest_storage_reader_records_batch_process_duration_seconds",
+                "How long a consumer spent processing a batch of records from Kafka. This includes retries on server errors.",
+            )
+            .buckets(native_only_buckets()),
+        )
         .expect("valid metric");
-        let fetch_wait_duration = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_reader_records_batch_wait_duration_seconds",
-            "How long a consumer spent waiting for a batch of records from the Kafka client.",
-        ))
+        let estimated_bytes_per_record = Histogram::with_opts(
+            HistogramOpts::new(
+                "cortex_ingest_storage_reader_estimated_bytes_per_record",
+                "Observations with the current size estimation of records fetched from Kafka. Sampled at 10Hz.",
+            )
+            .buckets(native_only_buckets()),
+        )
         .expect("valid metric");
         let last_consumed_offset = GaugeVec::new(
             Opts::new(
                 "cortex_ingest_storage_reader_last_consumed_offset",
-                "The last offset successfully consumed by the partition reader. Set to -1 if no offset has been consumed yet.",
+                "The last offset successfully consumed by the partition reader. Set to -1 if not offset has been consumed yet.",
             ),
             &["partition"],
         )
@@ -278,11 +307,13 @@ impl ReaderMetrics {
             "The number of offsets that were never consumed by the reader because they weren't fetched.",
         ))
         .expect("valid metric");
+        // Buckets between 125ms and 9h (plus a native histogram upstream).
         let receive_delay = HistogramVec::new(
             HistogramOpts::new(
                 "cortex_ingest_storage_reader_receive_delay_seconds",
                 "Delay between producing a record and receiving it in the consumer.",
-            ),
+            )
+            .buckets(exponential_buckets(0.125, 2.0, 18)),
             &["phase"],
         )
         .expect("valid metric");
@@ -290,58 +321,49 @@ impl ReaderMetrics {
             HistogramOpts::new(
                 "cortex_ingest_storage_reader_receive_and_consume_delay_seconds",
                 "Delay between producing a record and consuming it in the consumer.",
-            ),
+            )
+            .buckets(exponential_buckets(0.125, 2.0, 18)),
             &["phase"],
         )
         .expect("valid metric");
-        let buffered_fetch_records_client = GaugeVec::new(
-            Opts::new(
-                "cortex_ingest_storage_reader_buffered_fetch_records_total",
-                "Total number of records buffered within the client ready to be consumed",
-            ),
-            &["component"],
-        )
-        .expect("valid metric");
-        buffered_fetch_records_client
-            .with_label_values(&["partition-reader"])
-            .set(0.0);
+        for phase in [PHASE_STARTING, PHASE_RUNNING] {
+            let _ = receive_delay.with_label_values(&[phase]);
+            let _ = receive_and_consume_delay.with_label_values(&[phase]);
+        }
 
-        let buffered_records_cb = Arc::new(AtomicI64::new(0));
-        let buffered_bytes_cb = Arc::new(AtomicI64::new(0));
-
-        let br_clone = Arc::clone(&buffered_records_cb);
+        let src = Arc::clone(&source);
         let buffered_fetched_records = PullingGauge::new(
             "cortex_ingest_storage_reader_buffered_fetched_records",
             "The number of records fetched from Kafka by both concurrent fetchers and the Kafka client but not yet processed.",
-            Box::new(move || br_clone.load(Ordering::Relaxed) as f64),
+            Box::new(move || src.read().as_ref().map_or(0, |f| f.buffered_records()) as f64),
         )
         .expect("valid metric");
 
-        let bb_clone = Arc::clone(&buffered_bytes_cb);
+        let src = Arc::clone(&source);
         let buffered_fetched_bytes = PullingGauge::new(
             "cortex_ingest_storage_reader_buffered_fetched_bytes",
-            "The number of bytes fetched or requested from Kafka by both concurrent fetchers and the Kafka client but not yet processed.",
-            Box::new(move || bb_clone.load(Ordering::Relaxed) as f64),
+            "The number of bytes fetched or requested from Kafka by both concurrent fetchers and the Kafka client but not yet processed. The value depends on -ingest-storage.kafka.use-compressed-bytes-as-fetch-max-bytes.",
+            Box::new(move || src.read().as_ref().map_or(0, |f| f.buffered_bytes()) as f64),
         )
         .expect("valid metric");
 
         let topics_arr = if topic.is_empty() { vec![] } else { vec![topic] };
         let strong_consistency =
             StrongReadConsistencyMetrics::new(registry, "partition-reader", &topics_arr);
+        let fetcher = FetcherMetrics::new(registry);
 
         if let Some(reg) = registry {
-            let _ = reg.register(Box::new(fetches_total.clone()));
-            let _ = reg.register(Box::new(fetches_errors.clone()));
-            let _ = reg.register(Box::new(records_per_fetch.clone()));
-            let _ = reg.register(Box::new(consume_latency.clone()));
-            let _ = reg.register(Box::new(fetch_wait_duration.clone()));
-            let _ = reg.register(Box::new(last_consumed_offset.clone()));
-            let _ = reg.register(Box::new(missed_records.clone()));
-            let _ = reg.register(Box::new(receive_delay.clone()));
-            let _ = reg.register(Box::new(receive_and_consume_delay.clone()));
-            let _ = reg.register(Box::new(buffered_fetch_records_client.clone()));
             let _ = reg.register(Box::new(buffered_fetched_records));
             let _ = reg.register(Box::new(buffered_fetched_bytes));
+            let _ = reg.register(Box::new(estimated_bytes_per_record.clone()));
+            let _ = reg.register(Box::new(receive_delay.clone()));
+            let _ = reg.register(Box::new(receive_and_consume_delay.clone()));
+            let _ = reg.register(Box::new(last_consumed_offset.clone()));
+            let _ = reg.register(Box::new(records_per_fetch.clone()));
+            let _ = reg.register(Box::new(fetches_errors.clone()));
+            let _ = reg.register(Box::new(fetches_total.clone()));
+            let _ = reg.register(Box::new(consume_latency.clone()));
+            let _ = reg.register(Box::new(missed_records.clone()));
         }
 
         Self {
@@ -349,15 +371,95 @@ impl ReaderMetrics {
             fetches_errors,
             records_per_fetch,
             consume_latency,
-            fetch_wait_duration,
+            fetcher,
+            estimated_bytes_per_record,
             last_consumed_offset,
             missed_records,
             receive_delay,
             receive_and_consume_delay,
-            buffered_fetch_records_client,
             strong_consistency,
-            buffered_records_cb,
-            buffered_bytes_cb,
+            source,
+        }
+    }
+
+    /// The `ingest-storage-partition-reader-metrics` timer service: samples the estimated bytes
+    /// per record every 100ms until `stop_rx` flips.
+    fn spawn_sampler(&self, mut stop_rx: watch::Receiver<bool>) -> JoinHandle<()> {
+        let hist = self.estimated_bytes_per_record.clone();
+        let source = Arc::clone(&self.source);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(100));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            return;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let v = source.read().as_ref().map_or(0, |f| f.estimated_bytes_per_record());
+                        hist.observe(v as f64);
+                    }
+                }
+            }
+        })
+    }
+}
+
+pub const PHASE_STARTING: &str = "starting";
+pub const PHASE_RUNNING: &str = "running";
+
+/// The fetcher of a partition reader: `ConcurrentFetchers` (`fetch_concurrency_max > 0`) or the
+/// Kafka client consuming the partition (`fetch_concurrency_max = 0`).
+pub enum ReaderFetcher {
+    Concurrent(ConcurrentFetchers),
+    Client(ClientPartitionConsumer),
+}
+
+impl ReaderFetcher {
+    async fn start(&self) {
+        match self {
+            Self::Concurrent(f) => f.start().await,
+            Self::Client(c) => c.start().await,
+        }
+    }
+
+    async fn stop(&self) {
+        match self {
+            Self::Concurrent(f) => f.stop().await,
+            Self::Client(c) => c.stop().await,
+        }
+    }
+
+    /// `PollFetches(ctx)`: zero fetches if `cancel` completes first.
+    async fn poll_fetches<F: Future>(&self, cancel: F) -> Vec<FetchResult> {
+        let res = match self {
+            Self::Concurrent(f) => f.poll_fetches_until(cancel).await,
+            Self::Client(c) => c.poll_fetches_until(cancel).await,
+        };
+        res.into_iter().collect()
+    }
+
+    pub fn buffered_records(&self) -> i64 {
+        match self {
+            Self::Concurrent(f) => f.buffered_records(),
+            Self::Client(c) => c.buffered_records(),
+        }
+    }
+
+    pub fn buffered_bytes(&self) -> i64 {
+        match self {
+            Self::Concurrent(f) => f.buffered_bytes(),
+            Self::Client(c) => c.buffered_bytes(),
+        }
+    }
+
+    pub fn estimated_bytes_per_record(&self) -> i64 {
+        match self {
+            Self::Concurrent(f) => f.estimated_bytes_per_record(),
+            Self::Client(_) => 0,
         }
     }
 }
@@ -698,7 +800,14 @@ pub struct SingleClusterPartitionReader {
     offset_watcher: Arc<PartitionOffsetWatcher>,
     offset_reader: Arc<SingleClusterPartitionOffsetReader>,
     committer: Arc<PartitionCommitter>,
+    /// The offsets client shared by the offset reader and the concurrent fetchers.
+    offset_client: PartitionOffsetClient,
     metrics: ReaderMetrics,
+    /// Set once started: the fetcher records are polled from.
+    fetcher: Mutex<Option<Arc<ReaderFetcher>>>,
+    /// Partition start offset reader refreshed every 10s (`startOffsetReader`).
+    start_offset_reader: Mutex<Option<Arc<GenericOffsetReader<i64>>>>,
+    sampler: Mutex<Option<JoinHandle<()>>>,
     last_seen_offset: Arc<AtomicI64>,
     highest_consumed_ts_before_end_ms: Arc<AtomicI64>,
     max_replay_period: Duration,
@@ -811,9 +920,11 @@ impl SingleClusterPartitionReader {
         let consumer_group = super::get_consumer_group(&kafka_cfg, instance_id, partition_id);
         let offset_file = offset_file_path.map(|p| Arc::new(OffsetFile::new(p, partition_id)));
         let offset_watcher = Arc::new(PartitionOffsetWatcher::new());
+        // kprom hooks of the reader client (`NewKafkaReaderClientMetrics`).
+        client.set_kprom(KpromMetrics::new(READER_METRICS_PREFIX, "partition-reader", registry));
         let offset_client = PartitionOffsetClient::new(Arc::clone(&client), registry);
         let offset_reader = Arc::new(SingleClusterPartitionOffsetReader::new(
-            offset_client,
+            offset_client.clone(),
             kafka_cfg.topic.clone(),
             partition_id,
             Duration::from_nanos(
@@ -854,7 +965,11 @@ impl SingleClusterPartitionReader {
             offset_watcher,
             offset_reader,
             committer,
+            offset_client,
             metrics,
+            fetcher: Mutex::new(None),
+            start_offset_reader: Mutex::new(None),
+            sampler: Mutex::new(None),
             last_seen_offset: Arc::new(AtomicI64::new(-1)),
             highest_consumed_ts_before_end_ms: Arc::new(AtomicI64::new(0)),
             max_replay_period: Duration::ZERO,
@@ -940,12 +1055,23 @@ impl SingleClusterPartitionReader {
         PartitionOffsets::new_single_cluster(self.last_seen_offset())
     }
 
+    /// `BufferedRecords`: records fetched but not yet consumed (0 before starting).
     pub fn buffered_records(&self) -> i64 {
-        self.metrics.buffered_records_cb.load(Ordering::Relaxed)
+        self.metrics.source.read().as_ref().map_or(0, |f| f.buffered_records())
     }
 
+    /// `BufferedBytes`: bytes fetched or requested but not yet consumed (0 before starting).
     pub fn buffered_bytes(&self) -> i64 {
-        self.metrics.buffered_bytes_cb.load(Ordering::Relaxed)
+        self.metrics.source.read().as_ref().map_or(0, |f| f.buffered_bytes())
+    }
+
+    /// `EstimatedBytesPerRecord` (0 unless concurrent fetching is used).
+    pub fn estimated_bytes_per_record(&self) -> i64 {
+        self.metrics
+            .source
+            .read()
+            .as_ref()
+            .map_or(0, |f| f.estimated_bytes_per_record())
     }
 
     pub fn highest_consumed_timestamp_before_partition_end_ms(&self) -> i64 {
@@ -1151,25 +1277,9 @@ impl SingleClusterPartitionReader {
         }
     }
 
-    async fn resolve_concrete_fetch_offset(&self, start_offset: i64) -> Result<i64, ReaderError> {
-        let topic = &self.kafka_cfg.topic;
-        if start_offset == KAFKA_OFFSET_START {
-            Ok(self
-                .client
-                .fetch_partition_start_offset(topic, self.partition_id)
-                .await?)
-        } else if start_offset == KAFKA_OFFSET_END {
-            let last = self
-                .client
-                .fetch_partition_last_produced_offset(topic, self.partition_id)
-                .await?;
-            Ok((last + 1).max(0))
-        } else {
-            Ok(start_offset.max(0))
-        }
-    }
-
-    /// Starts the partition reader background fetch/consume loop and offset poller.
+    /// Starts the partition reader (`SingleClusterPartitionReader.start`): resolves the start
+    /// offset, starts the dependencies and the fetcher, consumes until the max consumer lag at
+    /// startup is honored, then runs the fetch/consume loop in the background (`run`).
     pub async fn start(&self) -> Result<(), ReaderError> {
         let mut guard = self.task.lock().await;
         if guard.is_some() {
@@ -1178,32 +1288,47 @@ impl SingleClusterPartitionReader {
         self.state
             .store(ReaderState::Starting as u8, Ordering::SeqCst);
 
+        let fetch_loop = match self.start_inner().await {
+            Ok(l) => l,
+            Err(e) => {
+                self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+                // Stop dependencies if the start fails.
+                self.stop_dependencies().await;
+                return Err(e);
+            }
+        };
+
+        let cancel = Cancel::new(self.stop_tx.subscribe(), None);
+        let state = Arc::clone(&self.state);
+        let partition = self.partition_id;
+        *guard = Some(tokio::spawn(async move {
+            if let Err(e) = fetch_loop.run(cancel).await {
+                // Fail the whole service in case of a non-recoverable error.
+                error!(partition, err = %e, "partition reader failed");
+                state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+            }
+        }));
+        self.state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+        info!(partition = self.partition_id, "started partition reader");
+        Ok(())
+    }
+
+    async fn start_inner(&self) -> Result<Arc<FetchLoop>, ReaderError> {
         if self.kafka_cfg.auto_create_topic_enabled {
             let topic_ref = [self.kafka_cfg.topic.as_str()];
-            if let Err(e) = create_topics(&self.kafka_cfg, &topic_ref).await {
-                self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
-                return Err(ReaderError::Startup(e));
-            }
+            create_topics(&self.kafka_cfg, &topic_ref)
+                .await
+                .map_err(ReaderError::Startup)?;
         }
 
-        if self.kafka_cfg.fetch_concurrency_max > 0 && !self.kafka_cfg.client_rack.is_empty() {
-            let msg = "the configured Kafka client rack has no effect because concurrent fetching is enabled: records are always fetched from the partition leader, regardless of the configured rack";
-            warn!(
-                client_rack = %self.kafka_cfg.client_rack,
-                fetch_concurrency_max = self.kafka_cfg.fetch_concurrency_max,
-                "{msg}"
-            );
-            if let Some(ref sink) = self.log_sink {
-                sink.lock().push(msg.to_string());
-            }
-        }
-
-        let mut startup_stop_rx = self.stop_tx.subscribe();
+        let startup_stop_rx = self.stop_tx.subscribe();
         let canceled = |rx: &watch::Receiver<bool>| *rx.borrow();
 
         // getStartOffset(): resolving the start offset is retried with a dskit backoff
         // (min 100ms, max 2s, 10 retries); configuration errors are returned immediately.
         let (start_offset, last_consumed) = {
+            let mut stop_rx = startup_stop_rx.clone();
             let mut retry = Backoff::new(BackoffConfig {
                 min_backoff: Duration::from_millis(100),
                 max_backoff: Duration::from_secs(2),
@@ -1212,8 +1337,7 @@ impl SingleClusterPartitionReader {
             let mut last_err = None;
             let mut resolved = None;
             while retry.ongoing() {
-                if canceled(&startup_stop_rx) {
-                    self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+                if canceled(&stop_rx) {
                     return Err(ReaderError::Canceled);
                 }
                 match self.get_start_offset().await {
@@ -1221,591 +1345,277 @@ impl SingleClusterPartitionReader {
                         resolved = Some(v);
                         break;
                     }
-                    Err(e @ ReaderError::Config(_)) => {
-                        self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
-                        return Err(e);
-                    }
+                    Err(e @ ReaderError::Config(_)) => return Err(e),
                     Err(e) => {
                         warn!(partition = self.partition_id, err = %e, "failed to fetch offset");
                         last_err = Some(e);
                     }
                 }
                 tokio::select! {
-                    _ = startup_stop_rx.changed() => {}
+                    _ = stop_rx.changed() => {}
                     _ = retry.wait() => {}
                 }
             }
             match resolved {
                 Some(v) => v,
-                None => {
-                    self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
-                    return Err(last_err.unwrap_or(ReaderError::Canceled));
-                }
+                None => return Err(last_err.unwrap_or(ReaderError::Canceled)),
             }
         };
 
-        // Upstream hands the special -2 / -1 start offsets to the fetchers, which resolve them
-        // against Kafka retrying forever (until the reader is stopped); do the same here.
-        let concrete_start = {
-            let mut retry = Backoff::new(BackoffConfig {
-                min_backoff: Duration::from_millis(100),
-                max_backoff: Duration::from_secs(1),
-                max_retries: 0,
-            });
-            loop {
-                if canceled(&startup_stop_rx) {
-                    self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
-                    return Err(ReaderError::Canceled);
-                }
-                match self.resolve_concrete_fetch_offset(start_offset).await {
-                    Ok(v) => break v,
-                    Err(e) => {
-                        warn!(partition = self.partition_id, err = %e, start_offset, "failed to resolve start offset");
-                    }
-                }
-                tokio::select! {
-                    _ = startup_stop_rx.changed() => {}
-                    _ = retry.wait() => {}
-                }
-            }
-        };
-
+        // lastConsumedOffset could be a special negative offset (partition start / end).
         self.last_seen_offset.store(last_consumed, Ordering::SeqCst);
+        // Initialise the last consumed offset only with an actual offset from the consumer group.
         if last_consumed >= 0 {
             self.offset_watcher.notify(last_consumed);
         }
 
-        self.offset_reader.start().await;
-        self.committer.start().await;
-
-        let mut next_offset = concrete_start;
-
-        // Enforce startup consumer lag if configured and not starting from end.
-        let target_lag = Duration::from_nanos(
-            self.kafka_cfg.target_consumer_lag_at_startup.as_nanos().max(0) as u64,
-        );
-        let max_lag = Duration::from_nanos(
-            self.kafka_cfg.max_consumer_lag_at_startup.as_nanos().max(0) as u64,
-        );
-        if !target_lag.is_zero() && !max_lag.is_zero() && start_offset != KAFKA_OFFSET_END {
-            match self
-                .catchup_startup_lag(&mut next_offset, target_lag, max_lag)
-                .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
-                    self.offset_reader.stop().await;
-                    self.committer.stop().await;
-                    return Err(e);
-                }
-            }
-        }
-
-        let client = Arc::clone(&self.client);
-        let consumer = Arc::clone(&self.consumer);
-        let offset_watcher = Arc::clone(&self.offset_watcher);
-        let committer = Arc::clone(&self.committer);
-        let metrics = self.metrics.clone();
-        let last_seen_offset = Arc::clone(&self.last_seen_offset);
-        let highest_ts_ref = Arc::clone(&self.highest_consumed_ts_before_end_ms);
+        // It's ok to have the start offset slightly outdated: it is only needed if we fall
+        // behind, or start, and the log gets truncated from beneath us.
+        const START_OFFSET_READER_REFRESH_DURATION: Duration = Duration::from_secs(10);
+        let oc = self.offset_client.clone();
         let topic = self.kafka_cfg.topic.clone();
         let partition_id = self.partition_id;
-        let fetch_max_wait = Duration::from_nanos(
-            self.kafka_cfg.fetch_max_wait.as_nanos().max(0) as u64,
-        )
-        .min(Duration::from_millis(250))
-        .max(Duration::from_millis(20));
-        let max_partition_bytes = Self::partition_max_bytes(&self.kafka_cfg);
-        let mut stop_rx = self.stop_tx.subscribe();
+        let start_offset_reader = Arc::new(GenericOffsetReader::new(
+            Arc::new(move || {
+                let oc = oc.clone();
+                let topic = topic.clone();
+                Box::pin(async move {
+                    oc.fetch_partition_start_offset(&topic, partition_id)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            }),
+            START_OFFSET_READER_REFRESH_DURATION,
+        ));
+        *self.start_offset_reader.lock().await = Some(Arc::clone(&start_offset_reader));
+        // The offset readers fetch their first value synchronously while starting; don't let
+        // that delay a stop requested meanwhile.
+        {
+            let mut stop_rx = startup_stop_rx.clone();
+            tokio::select! {
+                _ = stop_rx.wait_for(|v| *v) => return Err(ReaderError::Canceled),
+                _ = async {
+                    self.committer.start().await;
+                    self.offset_reader.start().await;
+                    start_offset_reader.start().await;
+                } => {}
+            }
+        }
+        *self.sampler.lock().await = Some(self.metrics.spawn_sampler(self.stop_tx.subscribe()));
 
-        let handle = tokio::spawn(async move {
-            let (batch_tx, mut batch_rx) =
-                tokio::sync::mpsc::channel::<super::kafka_client::FetchPartitionResult>(2);
-            let mut fetch_stop_rx = stop_rx.clone();
-            let fetch_metrics = metrics.clone();
-            let fetch_topic = topic.clone();
-            let fetch_client = Arc::clone(&client);
-            let mut fetch_offset = next_offset;
-
-            let fetcher_task = tokio::spawn(async move {
-                loop {
-                    if *fetch_stop_rx.borrow() {
-                        break;
-                    }
-                    let fetch_start = Instant::now();
-                    let fetch_res = tokio::select! {
-                        _ = fetch_stop_rx.changed() => {
-                            if *fetch_stop_rx.borrow() {
-                                break;
-                            }
-                            continue;
-                        }
-                        res = fetch_client.fetch(
-                            &fetch_topic,
-                            partition_id,
-                            fetch_offset,
-                            fetch_max_wait,
-                            1,
-                            max_partition_bytes,
-                        ) => res,
-                    };
-                    fetch_metrics
-                        .fetch_wait_duration
-                        .observe(fetch_start.elapsed().as_secs_f64());
-
-                    match fetch_res {
-                        Ok(batch) => {
-                            fetch_metrics.fetches_total.inc();
-                            fetch_metrics
-                                .records_per_fetch
-                                .observe(batch.records.len() as f64);
-                            if batch.next_fetch_offset > fetch_offset {
-                                fetch_offset = batch.next_fetch_offset;
-                            } else if let Some(last) = batch.records.last() {
-                                fetch_offset = last.offset + 1;
-                            }
-                            if !batch.records.is_empty() || batch.last_batch_end_offset.is_some() {
-                                tokio::select! {
-                                    _ = fetch_stop_rx.changed() => {
-                                        if *fetch_stop_rx.borrow() {
-                                            break;
-                                        }
-                                    }
-                                    res = batch_tx.send(batch) => {
-                                        if res.is_err() {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(KafkaClientError::Broker(
-                            kafka_protocol::error::ResponseError::OffsetOutOfRange,
-                        )) => {
-                            fetch_metrics.fetches_errors.inc();
-                            warn!(
-                                partition = partition_id,
-                                fetch_offset,
-                                "kafka fetch offset out of range; resetting to partition start"
-                            );
-                            match fetch_client
-                                .fetch_partition_start_offset(&fetch_topic, partition_id)
-                                .await
-                            {
-                                Ok(start_off) => {
-                                    fetch_offset = start_off;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        partition = partition_id,
-                                        err = %e,
-                                        "failed to resolve partition start offset after OffsetOutOfRange"
-                                    );
-                                }
-                            }
-                            tokio::select! {
-                                _ = fetch_stop_rx.changed() => {
-                                    if *fetch_stop_rx.borrow() {
-                                        break;
-                                    }
-                                }
-                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                            }
-                        }
-                        Err(err) => {
-                            fetch_metrics.fetches_errors.inc();
-                            warn!(partition = partition_id, err = %err, "kafka fetch error");
-                            tokio::select! {
-                                _ = fetch_stop_rx.changed() => {
-                                    if *fetch_stop_rx.borrow() {
-                                        break;
-                                    }
-                                }
-                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                            }
-                        }
-                    }
+        let fetcher = if self.kafka_cfg.fetch_concurrency_max > 0 {
+            if !self.kafka_cfg.client_rack.is_empty() {
+                // ConcurrentFetchers builds its own Fetch requests without a rack and always
+                // reads from the partition leader.
+                let msg = "the configured Kafka client rack has no effect because concurrent fetching is enabled: records are always fetched from the partition leader, regardless of the configured rack";
+                warn!(
+                    client_rack = %self.kafka_cfg.client_rack,
+                    fetch_concurrency_max = self.kafka_cfg.fetch_concurrency_max,
+                    "{msg}"
+                );
+                if let Some(ref sink) = self.log_sink {
+                    sink.lock().push(msg.to_string());
                 }
-            });
-
-            'consume_loop: loop {
-                let batch = tokio::select! {
-                    _ = stop_rx.changed() => {
-                        if *stop_rx.borrow() {
-                            break;
-                        }
-                        continue;
-                    }
-                    maybe_batch = batch_rx.recv() => {
-                        match maybe_batch {
-                            Some(b) => b,
-                            None => break,
-                        }
-                    }
-                };
-
-                let record_last = batch.records.last().map(|r| r.offset);
-                let batch_last_offset_opt = match (record_last, batch.last_batch_end_offset) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
-                let Some(batch_last_offset) = batch_last_offset_opt else {
-                    continue;
-                };
-
-                if !batch.records.is_empty() {
-                    let first_ts = batch.records.first().unwrap().timestamp_ms;
-                    let highest_ts =
-                        batch.records.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
-                    last_seen_offset.fetch_max(batch_last_offset, Ordering::SeqCst);
-
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as i64;
-                    for r in &batch.records {
-                        let delay = ((now_ms - r.timestamp_ms).max(0) as f64) / 1000.0;
-                        metrics
-                            .receive_delay
-                            .with_label_values(&["running"])
-                            .observe(delay);
-                    }
-
-                    if highest_ts_ref.load(Ordering::SeqCst) == 0 {
-                        highest_ts_ref.store(first_ts, Ordering::SeqCst);
-                    }
-
-                    metrics
-                        .buffered_records_cb
-                        .store(batch.records.len() as i64, Ordering::Relaxed);
-                    let total_b: i64 =
-                        batch.records.iter().map(|r| r.value.len() as i64).sum();
-                    metrics
-                        .buffered_bytes_cb
-                        .store(total_b, Ordering::Relaxed);
-
-                    let consume_start = Instant::now();
-                    let mut consumed_ok = false;
-                    let mut first_try = Some(batch.records);
-                    loop {
-                        let to_consume = match first_try.take() {
-                            Some(recs) => recs,
-                            None => break,
-                        };
-                        match consumer.consume(to_consume.clone()).await {
-                            Ok(()) => {
-                                consumed_ok = true;
-                                break;
-                            }
-                            Err(err) => {
-                                error!(
-                                    partition = partition_id,
-                                    err = %err,
-                                    "error consuming Kafka batch; retrying"
-                                );
-                                if *stop_rx.borrow() {
-                                    break;
-                                }
-                                first_try = Some(to_consume);
-                                tokio::select! {
-                                    _ = stop_rx.changed() => {
-                                        if *stop_rx.borrow() {
-                                            break;
-                                        }
-                                    }
-                                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                                }
-                            }
-                        }
-                    }
-                    metrics
-                        .buffered_records_cb
-                        .store(0, Ordering::Relaxed);
-                    metrics.buffered_bytes_cb.store(0, Ordering::Relaxed);
-                    metrics
-                        .consume_latency
-                        .observe(consume_start.elapsed().as_secs_f64());
-
-                    if !consumed_ok {
-                        break 'consume_loop;
-                    }
-
-                    if batch_last_offset + 1 >= batch.high_watermark {
-                        highest_ts_ref.store(0, Ordering::SeqCst);
-                    } else {
-                        highest_ts_ref.store(highest_ts, Ordering::SeqCst);
-                    }
-                } else {
-                    // Control-only batch (e.g. transaction commit/abort marker):
-                    // advance offsets cleanly without invoking data consumer.
-                    last_seen_offset.fetch_max(batch_last_offset, Ordering::SeqCst);
-                    if batch_last_offset + 1 >= batch.high_watermark {
-                        highest_ts_ref.store(0, Ordering::SeqCst);
-                    }
-                }
-
-                committer.enqueue_offset(batch_last_offset);
-                offset_watcher.notify(batch_last_offset);
-                metrics
-                    .last_consumed_offset
-                    .with_label_values(&[&partition_id.to_string()])
-                    .set(batch_last_offset as f64);
             }
 
-            drop(batch_rx);
-            let _ = fetcher_task.await;
+            let mut stop_rx = startup_stop_rx.clone();
+            let created = tokio::select! {
+                _ = stop_rx.wait_for(|v| *v) => return Err(ReaderError::Canceled),
+                f = ConcurrentFetchers::new(
+                    Arc::clone(&self.client),
+                    self.kafka_cfg.topic.clone(),
+                    self.partition_id,
+                    start_offset,
+                    self.kafka_cfg.fetch_concurrency_max as usize,
+                    self.kafka_cfg.max_buffered_bytes.clamp(0, i32::MAX as i64) as i32,
+                    self.kafka_cfg.use_compressed_bytes_as_fetch_max_bytes,
+                    self.concurrent_fetchers_min_bytes_max_wait_time,
+                    &self.offset_client,
+                    RangeErrorPolicy::ResumeFromStart,
+                    Arc::clone(&start_offset_reader),
+                    DEFAULT_FETCH_BACKOFF_CONFIG,
+                    self.metrics.fetcher.clone(),
+                ) => f,
+            };
+            let f = created.map_err(|e| {
+                ReaderError::Startup(format!("creating concurrent fetchers during startup: {e}"))
+            })?;
+            ReaderFetcher::Concurrent(f)
+        } else {
+            // The Kafka client consumes the partition (it sends the client rack and honours
+            // the broker's preferred read replica).
+            ReaderFetcher::Client(ClientPartitionConsumer::new(
+                Arc::clone(&self.client),
+                self.kafka_cfg.topic.clone(),
+                self.partition_id,
+                start_offset,
+                go_duration(self.kafka_cfg.fetch_max_wait.as_nanos()),
+            ))
+        };
+        let fetcher = Arc::new(fetcher);
+        fetcher.start().await;
+        *self.fetcher.lock().await = Some(Arc::clone(&fetcher));
+        *self.metrics.source.write() = Some(Arc::clone(&fetcher));
+
+        let fetch_loop = Arc::new(FetchLoop {
+            partition_id: self.partition_id,
+            topic: self.kafka_cfg.topic.clone(),
+            fetcher,
+            consumer: Arc::clone(&self.consumer),
+            committer: Arc::clone(&self.committer),
+            offset_watcher: Arc::clone(&self.offset_watcher),
+            metrics: self.metrics.clone(),
+            last_seen_offset: Arc::clone(&self.last_seen_offset),
+            highest_ts: Arc::clone(&self.highest_consumed_ts_before_end_ms),
         });
 
-        *guard = Some(handle);
-        self.state
-            .store(ReaderState::Running as u8, Ordering::SeqCst);
-        info!(partition = self.partition_id, start_offset, "started partition reader");
-        Ok(())
-    }
-
-    fn partition_max_bytes(cfg: &KafkaConfig) -> i32 {
-        let mut max_b = if cfg.max_buffered_bytes > 0 {
-            cfg.max_buffered_bytes as i32
-        } else {
-            50 * 1024 * 1024
-        };
-        if cfg.fetch_concurrency_max > 1 {
-            max_b = (max_b / cfg.fetch_concurrency_max as i32).max(1024 * 1024);
+        // Enforce the max consumer lag (if enabled).
+        let target_lag = go_duration(self.kafka_cfg.target_consumer_lag_at_startup.as_nanos());
+        let max_lag = go_duration(self.kafka_cfg.max_consumer_lag_at_startup.as_nanos());
+        if !target_lag.is_zero() && !max_lag.is_zero() {
+            if start_offset != KAFKA_OFFSET_END {
+                self.process_next_fetches_until_target_or_max_lag_honored(
+                    &fetch_loop,
+                    target_lag,
+                    max_lag,
+                )
+                .await?;
+            } else {
+                info!(partition = self.partition_id, "partition reader is skipping to consume partition until max consumer lag is honored because it's going to consume the partition from the end");
+            }
         }
-        max_b
+
+        Ok(fetch_loop)
     }
 
-    async fn catchup_startup_lag(
+    /// `processNextFetchesUntilTargetOrMaxLagHonored`: consumes until at least the max lag is
+    /// honored, best-effort reaching the target lag.
+    async fn process_next_fetches_until_target_or_max_lag_honored(
         &self,
-        next_offset: &mut i64,
+        fetch_loop: &FetchLoop,
         target_lag: Duration,
         max_lag: Duration,
     ) -> Result<(), ReaderError> {
-        let mut stop_rx = self.stop_tx.subscribe();
-        let max_partition_bytes = Self::partition_max_bytes(&self.kafka_cfg);
+        info!(partition = self.partition_id, ?target_lag, ?max_lag, "partition reader is starting to consume partition until target and max consumer lag is honored");
 
-        // Attempt 1: honor max_lag; Attempt 2: best-effort target_lag within 2*max_lag; Attempt 3: ensure max_lag
-        let mut curr_lag = self
-            .process_fetches_until_lag(
-                next_offset,
-                max_lag,
-                None,
-                max_partition_bytes,
-                &mut stop_rx,
-            )
-            .await?;
-
-        if curr_lag > target_lag {
+        let stop_rx = self.stop_tx.subscribe();
+        let mut curr_lag = Duration::ZERO;
+        for attempt in 0..3 {
+            let (desired, deadline) = match attempt {
+                // First process fetches until at least the max lag is honored.
+                0 => (max_lag, None),
+                // Then try to reach the (lower) target lag within 2x max lag (best-effort).
+                1 => (target_lag, Some(tokio::time::Instant::now() + 2 * max_lag)),
+                // Then guarantee the max lag is still honored.
+                _ => (max_lag, None),
+            };
+            let mut cancel = Cancel::new(stop_rx.clone(), deadline);
             match self
-                .process_fetches_until_lag(
-                    next_offset,
-                    target_lag,
-                    Some(2 * max_lag),
-                    max_partition_bytes,
-                    &mut stop_rx,
-                )
+                .process_next_fetches_until_lag_honored(fetch_loop, desired, &mut cancel)
                 .await
             {
                 Ok(l) => curr_lag = l,
-                Err(ReaderError::WaitStrongReadConsistencyTimeoutExceeded) => {
-                    curr_lag = self
-                        .process_fetches_until_lag(
-                            next_offset,
-                            max_lag,
-                            None,
-                            max_partition_bytes,
-                            &mut stop_rx,
-                        )
-                        .await?;
-                }
+                Err(ReaderError::WaitTargetLagDeadlineExceeded) => continue,
                 Err(e) => return Err(e),
+            }
+            if curr_lag <= target_lag {
+                let msg = "partition reader consumed partition and current lag is lower than configured target consumer lag";
+                info!(
+                    partition = self.partition_id,
+                    last_consumed_offset = self.offset_watcher.last_consumed_offset(),
+                    current_lag = ?curr_lag,
+                    "{msg}"
+                );
+                if let Some(ref sink) = self.log_sink {
+                    sink.lock().push(msg.to_string());
+                }
+                return Ok(());
             }
         }
 
-        if curr_lag <= target_lag {
-            let msg = "partition reader consumed partition and current lag is lower than configured target consumer lag";
-            info!(partition = self.partition_id, "{msg}");
-            if let Some(ref sink) = self.log_sink {
-                sink.lock().push(msg.to_string());
-            }
-        } else {
-            let msg = "partition reader consumed partition and current lag is lower than configured max consumer lag but higher than target consumer lag";
-            warn!(partition = self.partition_id, "{msg}");
-            if let Some(ref sink) = self.log_sink {
-                sink.lock().push(msg.to_string());
-            }
+        let msg = "partition reader consumed partition and current lag is lower than configured max consumer lag but higher than target consumer lag";
+        warn!(
+            partition = self.partition_id,
+            last_consumed_offset = self.offset_watcher.last_consumed_offset(),
+            current_lag = ?curr_lag,
+            "{msg}"
+        );
+        if let Some(ref sink) = self.log_sink {
+            sink.lock().push(msg.to_string());
         }
         Ok(())
     }
 
-    async fn process_fetches_until_lag(
+    /// `processNextFetchesUntilLagHonored`.
+    async fn process_next_fetches_until_lag_honored(
         &self,
-        next_offset: &mut i64,
-        desired_lag: Duration,
-        deadline_dur: Option<Duration>,
-        max_partition_bytes: i32,
-        stop_rx: &mut watch::Receiver<bool>,
+        fetch_loop: &FetchLoop,
+        max_lag: Duration,
+        cancel: &mut Cancel,
     ) -> Result<Duration, ReaderError> {
-        let deadline = deadline_dur.map(|d| Instant::now() + d);
-        // Retry forever (unless stopped / the deadline expires), like upstream's dskit backoff.
+        // Retry forever (unless canceled / deadline exceeded).
         let mut boff = Backoff::new(BackoffConfig {
             min_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(1),
             max_retries: 0,
         });
+        let mut curr_lag = Duration::ZERO;
         loop {
-            if *stop_rx.borrow() {
-                return Err(ReaderError::Canceled);
+            if let Some(cause) = cancel.cause() {
+                return Err(cause);
             }
-            if let Some(dl) = deadline {
-                if Instant::now() >= dl {
-                    return Err(ReaderError::WaitStrongReadConsistencyTimeoutExceeded);
-                }
-            }
-
-            let part_start = match self.offset_reader.fetch_partition_start_offset().await {
+            // Direct request to Kafka for the partition start offset.
+            let partition_start = match self.offset_reader.fetch_partition_start_offset().await {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(partition = self.partition_id, err = %e, "partition reader failed to fetch partition start offset");
-                    boff.wait().await;
+                    cancel.sleep(boff.next_delay()).await;
                     continue;
                 }
             };
-            let req_at = Instant::now();
+            // Direct request for the last produced offset (no WaitNextFetchLastProducedOffset,
+            // to not introduce further latency).
+            let requested_at = Instant::now();
             let last_produced = match self.offset_reader.fetch_last_produced_offset().await {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(partition = self.partition_id, err = %e, "partition reader failed to fetch last produced offset");
-                    boff.wait().await;
+                    cancel.sleep(boff.next_delay()).await;
                     continue;
                 }
             };
 
-            if part_start > last_produced {
+            // Ensure there are some records to consume (e.g. all records deleted by retention).
+            if partition_start > last_produced {
+                info!(partition = self.partition_id, partition_start_offset = partition_start, last_produced_offset = last_produced, "partition reader found no records to consume because partition is empty");
                 return Ok(Duration::ZERO);
             }
 
+            info!(
+                partition = self.partition_id,
+                current_lag = ?curr_lag,
+                partition_start_offset = partition_start,
+                last_produced_offset = last_produced,
+                "partition reader is consuming records to honor target and max consumer lag"
+            );
+
+            // Continue reading until we reached the desired offset.
             while self.offset_watcher.last_consumed_offset() < last_produced {
-                if *stop_rx.borrow() {
-                    return Err(ReaderError::Canceled);
+                if let Some(cause) = cancel.cause() {
+                    return Err(cause);
                 }
-                if let Some(dl) = deadline {
-                    if Instant::now() >= dl {
-                        return Err(ReaderError::WaitStrongReadConsistencyTimeoutExceeded);
-                    }
-                }
-                let fetch_res = tokio::select! {
-                    _ = stop_rx.changed() => {
-                        if *stop_rx.borrow() {
-                            return Err(ReaderError::Canceled);
-                        }
-                        continue;
-                    }
-                    r = self.client.fetch(
-                        &self.kafka_cfg.topic,
-                        self.partition_id,
-                        *next_offset,
-                        Duration::from_millis(100),
-                        1,
-                        max_partition_bytes,
-                    ) => r,
-                };
-                match fetch_res {
-                    Ok(batch) => {
-                        self.metrics.fetches_total.inc();
-                        self.metrics
-                            .records_per_fetch
-                            .observe(batch.records.len() as f64);
-                        let record_last = batch.records.last().map(|r| r.offset);
-                        let last_off_opt = match (record_last, batch.last_batch_end_offset) {
-                            (Some(a), Some(b)) => Some(a.max(b)),
-                            (Some(a), None) => Some(a),
-                            (None, Some(b)) => Some(b),
-                            (None, None) => None,
-                        };
-                        if let Some(last_off) = last_off_opt {
-                            if !batch.records.is_empty() {
-                                let first_ts = batch.records.first().unwrap().timestamp_ms;
-                                let high_ts = batch
-                                    .records
-                                    .iter()
-                                    .map(|r| r.timestamp_ms)
-                                    .max()
-                                    .unwrap_or(0);
-                                self.last_seen_offset
-                                    .fetch_max(last_off, Ordering::SeqCst);
-                                if self.highest_consumed_ts_before_end_ms.load(Ordering::SeqCst) == 0 {
-                                    self.highest_consumed_ts_before_end_ms
-                                        .store(first_ts, Ordering::SeqCst);
-                                }
-
-                                while let Err(e) = self.consumer.consume(batch.records.clone()).await {
-                                    error!(partition = self.partition_id, err = %e, "error consuming startup batch; retrying");
-                                    if *stop_rx.borrow() {
-                                        return Err(ReaderError::Canceled);
-                                    }
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
-                                }
-
-                                if last_off + 1 >= batch.high_watermark {
-                                    self.highest_consumed_ts_before_end_ms
-                                        .store(0, Ordering::SeqCst);
-                                } else {
-                                    self.highest_consumed_ts_before_end_ms
-                                        .store(high_ts, Ordering::SeqCst);
-                                }
-                            } else {
-                                self.last_seen_offset
-                                    .fetch_max(last_off, Ordering::SeqCst);
-                                if last_off + 1 >= batch.high_watermark {
-                                    self.highest_consumed_ts_before_end_ms
-                                        .store(0, Ordering::SeqCst);
-                                }
-                            }
-
-                            self.committer.enqueue_offset(last_off);
-                            self.offset_watcher.notify(last_off);
-                            self.metrics
-                                .last_consumed_offset
-                                .with_label_values(&[&self.partition_id.to_string()])
-                                .set(last_off as f64);
-                            *next_offset = batch.next_fetch_offset.max(last_off + 1);
-                        }
-                    }
-                    Err(KafkaClientError::Broker(
-                        kafka_protocol::error::ResponseError::OffsetOutOfRange,
-                    )) => {
-                        self.metrics.fetches_errors.inc();
-                        warn!(
-                            partition = self.partition_id,
-                            next_offset = *next_offset,
-                            "kafka fetch offset out of range during startup; resetting to partition start"
-                        );
-                        if let Ok(start_off) = self.fetch_partition_start_offset().await {
-                            *next_offset = start_off;
-                            if start_off > last_produced {
-                                return Ok(req_at.elapsed());
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Err(err) => {
-                        self.metrics.fetches_errors.inc();
-                        warn!(
-                            partition = self.partition_id,
-                            err = %err,
-                            "kafka fetch error during startup lag catchup"
-                        );
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                }
+                fetch_loop
+                    .process_next_fetches(PHASE_STARTING, cancel)
+                    .await?;
+            }
+            if let Some(cause) = cancel.cause() {
+                return Err(cause);
             }
 
-            let curr_lag = req_at.elapsed();
-            if curr_lag <= desired_lag {
+            // If it took less than the max desired lag to replay the partition then we can
+            // stop here, otherwise we'll have to redo it.
+            curr_lag = requested_at.elapsed();
+            if curr_lag <= max_lag {
                 return Ok(curr_lag);
             }
         }
@@ -1830,14 +1640,30 @@ impl SingleClusterPartitionReader {
         if let Some(sh) = self.start_task.lock().await.take() {
             let _ = sh.await;
         }
-        self.offset_reader.stop().await;
         if let Some(handle) = self.task.lock().await.take() {
             let _ = handle.await;
         }
-        self.committer.stop().await;
+        self.stop_dependencies().await;
         if self.state() != ReaderState::Failed {
             self.state
                 .store(ReaderState::Terminated as u8, Ordering::SeqCst);
+        }
+    }
+
+    /// `stopDependencies`: stops the committer (final commit), the offset readers, the metrics
+    /// sampler, then the fetcher (buffered records are dropped).
+    async fn stop_dependencies(&self) {
+        let _ = self.stop_tx.send(true);
+        self.committer.stop().await;
+        self.offset_reader.stop().await;
+        if let Some(r) = self.start_offset_reader.lock().await.take() {
+            r.stop().await;
+        }
+        if let Some(h) = self.sampler.lock().await.take() {
+            let _ = h.await;
+        }
+        if let Some(f) = self.fetcher.lock().await.take() {
+            f.stop().await;
         }
     }
 
@@ -1987,6 +1813,341 @@ impl SingleClusterPartitionReader {
             return Err(ReaderError::MaxDelayExceeded);
         }
         Ok(())
+    }
+}
+
+
+/// dskit `backoff.Config` used by `ConcurrentFetchers` for Fetch errors
+/// (`defaultFetchBackoffConfig` in `config.go`: retry forever).
+pub const DEFAULT_FETCH_BACKOFF_CONFIG: BackoffConfig = BackoffConfig {
+    min_backoff: Duration::from_millis(250),
+    max_backoff: Duration::from_secs(2),
+    max_retries: 0,
+};
+
+fn go_duration(nanos: i64) -> Duration {
+    Duration::from_nanos(nanos.max(0) as u64)
+}
+
+/// The reader context: canceled when the reader stops, or past `deadline`
+/// (`context.WithTimeoutCause(ctx, 2*maxLag, errWaitTargetLagDeadlineExceeded)`).
+#[derive(Clone)]
+struct Cancel {
+    stop_rx: watch::Receiver<bool>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl Cancel {
+    fn new(stop_rx: watch::Receiver<bool>, deadline: Option<tokio::time::Instant>) -> Self {
+        Self { stop_rx, deadline }
+    }
+
+    /// `context.Cause(ctx)`, or `None` if not canceled.
+    fn cause(&self) -> Option<ReaderError> {
+        if *self.stop_rx.borrow() {
+            return Some(ReaderError::Canceled);
+        }
+        if self
+            .deadline
+            .is_some_and(|d| tokio::time::Instant::now() >= d)
+        {
+            return Some(ReaderError::WaitTargetLagDeadlineExceeded);
+        }
+        None
+    }
+
+    /// Completes once canceled.
+    async fn done(mut self) {
+        let deadline = self.deadline;
+        let stop = async move {
+            let _ = self.stop_rx.wait_for(|v| *v).await;
+        };
+        match deadline {
+            Some(d) => {
+                tokio::select! {
+                    _ = stop => {}
+                    _ = tokio::time::sleep_until(d) => {}
+                }
+            }
+            None => stop.await,
+        }
+    }
+
+    /// Sleeps for `d` unless canceled first.
+    async fn sleep(&self, d: Duration) {
+        tokio::select! {
+            _ = self.clone().done() => {}
+            _ = tokio::time::sleep(d) => {}
+        }
+    }
+}
+
+/// The fetch / consume loop shared by the startup catch-up and the running phase.
+struct FetchLoop {
+    partition_id: i32,
+    topic: String,
+    fetcher: Arc<ReaderFetcher>,
+    consumer: Arc<dyn RecordBatchConsumer>,
+    committer: Arc<PartitionCommitter>,
+    offset_watcher: Arc<PartitionOffsetWatcher>,
+    metrics: ReaderMetrics,
+    last_seen_offset: Arc<AtomicI64>,
+    highest_ts: Arc<AtomicI64>,
+}
+
+impl FetchLoop {
+    /// `SingleClusterPartitionReader.run`.
+    async fn run(&self, cancel: Cancel) -> Result<(), ReaderError> {
+        let mut cancel = cancel;
+        while cancel.cause().is_none() {
+            match self.process_next_fetches(PHASE_RUNNING, &mut cancel).await {
+                Ok(()) | Err(ReaderError::Canceled) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// `processNextFetches`.
+    async fn process_next_fetches(
+        &self,
+        phase: &str,
+        cancel: &mut Cancel,
+    ) -> Result<(), ReaderError> {
+        let fetches = self.fetcher.poll_fetches(cancel.clone().done()).await;
+        self.record_fetches_metrics(&fetches, phase);
+        self.log_fetch_errors(&fetches);
+        // filterOutErrFetches
+        let fetches: Vec<FetchResult> = fetches.into_iter().filter(|f| f.err.is_none()).collect();
+
+        // Instrument only after all the pre-processing of records. This is the only place
+        // that updates the last seen offset.
+        let last_seen = self.last_seen_offset.load(Ordering::SeqCst);
+        let all: Vec<&FetchedRecord> = fetches.iter().flat_map(|f| f.records.iter()).collect();
+        instrument_gaps(
+            &find_gaps_in_record_refs(&all, last_seen),
+            &self.metrics.missed_records,
+        );
+        // `lastOffset(fetches)` is 0 when there is no record.
+        let last_offset = all.last().map_or(0, |r| r.offset);
+        self.last_seen_offset
+            .store(last_seen.max(last_offset), Ordering::SeqCst);
+
+        self.update_highest_consumed_timestamp_before_consumption(&fetches);
+        let num_records = all.len();
+        drop(all);
+        self.consume_fetches(&fetches, cancel)
+            .await
+            .map_err(|e| match e {
+                ReaderError::Canceled | ReaderError::WaitTargetLagDeadlineExceeded => e,
+                other => ReaderError::Startup(format!("consume {num_records} records: {other}")),
+            })?;
+        self.enqueue_commit(&fetches);
+        self.notify_last_consumed_offset(&fetches);
+        self.update_highest_consumed_timestamp_after_consumption(&fetches, phase);
+        Ok(())
+    }
+
+    /// `recordFetchesMetrics`.
+    fn record_fetches_metrics(&self, fetches: &[FetchResult], phase: &str) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let observer = self.metrics.receive_delay.with_label_values(&[phase]);
+        let mut num_records = 0usize;
+        for r in fetches.iter().flat_map(|f| f.records.iter()) {
+            num_records += 1;
+            observer.observe((now_ms - r.timestamp_ms) as f64 / 1000.0);
+        }
+        self.metrics.fetches_total.inc_by(fetches.len() as f64);
+        self.metrics.records_per_fetch.observe(num_records as f64);
+    }
+
+    /// `logFetchErrors`.
+    fn log_fetch_errors(&self, fetches: &[FetchResult]) {
+        let errs: Vec<String> = fetches
+            .iter()
+            .filter_map(|f| f.err.as_ref().map(|e| (f.partition, e)))
+            .map(|(p, e)| format!("topic {:?}, partition {p}: {e}", self.topic))
+            .collect();
+        if errs.is_empty() {
+            return;
+        }
+        self.metrics.fetches_errors.inc_by(errs.len() as f64);
+        error!(partition = self.partition_id, err = %errs.join("; "), "encountered error while fetching");
+    }
+
+    /// `updateHighestConsumedTimestampBeforeConsumption`.
+    fn update_highest_consumed_timestamp_before_consumption(&self, fetches: &[FetchResult]) {
+        if self.highest_ts.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        for f in fetches {
+            if f.partition != self.partition_id {
+                continue;
+            }
+            if let Some(first) = f.records.first() {
+                self.highest_ts.store(first.timestamp_ms, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// `updateHighestConsumedTimestampAfterConsumption`.
+    fn update_highest_consumed_timestamp_after_consumption(&self, fetches: &[FetchResult], phase: &str) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let observer = self
+            .metrics
+            .receive_and_consume_delay
+            .with_label_values(&[phase]);
+        let mut highest = 0i64;
+        for f in fetches {
+            if f.partition != self.partition_id || f.records.is_empty() {
+                continue;
+            }
+            for r in &f.records {
+                observer.observe((now_ms - r.timestamp_ms) as f64 / 1000.0);
+                highest = highest.max(r.timestamp_ms);
+            }
+            let last = f.records.last().expect("non-empty");
+            if last.offset + 1 >= f.high_watermark {
+                self.highest_ts.store(0, Ordering::SeqCst);
+            } else {
+                self.highest_ts.store(highest, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// `consumeFetches`: retries forever (250ms..2s backoff) until canceled. An in-flight
+    /// consumption is never interrupted.
+    async fn consume_fetches(
+        &self,
+        fetches: &[FetchResult],
+        cancel: &Cancel,
+    ) -> Result<(), ReaderError> {
+        let num: usize = fetches.iter().map(|f| f.records.len()).sum();
+        if num == 0 {
+            return Ok(());
+        }
+        let collect = || -> Vec<FetchedRecord> {
+            fetches
+                .iter()
+                .flat_map(|f| f.records.iter().cloned())
+                .collect()
+        };
+        let mut min_offset = i64::MAX;
+        let mut max_offset = 0i64;
+        for r in fetches.iter().flat_map(|f| f.records.iter()) {
+            min_offset = min_offset.min(r.offset);
+            max_offset = max_offset.max(r.offset);
+        }
+
+        let consume_start = Instant::now();
+        let mut boff = Backoff::new(BackoffConfig {
+            min_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(2),
+            max_retries: 0,
+        });
+        let res = loop {
+            // The records are rebuilt from the fetches for every attempt (the consumer takes
+            // ownership); an in-flight attempt is never interrupted by cancellation.
+            match self.consumer.consume(collect()).await {
+                Ok(()) => break Ok(()),
+                Err(err) => {
+                    error!(
+                        partition = self.partition_id,
+                        err = %err,
+                        record_min_offset = min_offset,
+                        record_max_offset = max_offset,
+                        num_retries = boff.num_retries(),
+                        "encountered error while ingesting data from Kafka; should retry"
+                    );
+                    let delay = boff.next_delay();
+                    if let Some(cause) = cancel.cause() {
+                        break Err(cause);
+                    }
+                    cancel.sleep(delay).await;
+                    if let Some(cause) = cancel.cause() {
+                        break Err(cause);
+                    }
+                }
+            }
+        };
+        self.metrics
+            .consume_latency
+            .observe(consume_start.elapsed().as_secs_f64());
+        res
+    }
+
+    /// `enqueueCommit`.
+    fn enqueue_commit(&self, fetches: &[FetchResult]) {
+        let mut last = None;
+        for f in fetches {
+            if f.records.is_empty() {
+                continue;
+            }
+            if f.partition != self.partition_id {
+                error!(partition = f.partition, expected_partition = self.partition_id, "asked to commit wrong partition");
+                continue;
+            }
+            last = f.records.last().map(|r| r.offset);
+        }
+        if let Some(o) = last {
+            self.committer.enqueue_offset(o);
+        }
+    }
+
+    /// `notifyLastConsumedOffset`.
+    fn notify_last_consumed_offset(&self, fetches: &[FetchResult]) {
+        for f in fetches {
+            if f.partition != self.partition_id {
+                continue;
+            }
+            let Some(rec) = f.records.last() else {
+                continue;
+            };
+            self.offset_watcher.notify(rec.offset);
+            self.metrics
+                .last_consumed_offset
+                .with_label_values(&[&self.partition_id.to_string()])
+                .set(rec.offset as f64);
+        }
+    }
+}
+
+/// `findGapsInRecords` over the records of all fetches.
+fn find_gaps_in_record_refs(records: &[&FetchedRecord], mut last_seen_offset: i64) -> Vec<OffsetRange> {
+    let mut gaps = Vec::new();
+    if last_seen_offset < 0 {
+        if let Some(first) = records.first() {
+            // No offset seen yet: assume the first record is the first available offset.
+            last_seen_offset = first.offset;
+        }
+    }
+    for r in records {
+        if r.offset > last_seen_offset + 1 {
+            gaps.push(OffsetRange {
+                start: last_seen_offset + 1,
+                end: r.offset,
+            });
+        }
+        last_seen_offset = r.offset;
+    }
+    gaps
+}
+
+/// `instrumentGaps`.
+pub fn instrument_gaps(gaps: &[OffsetRange], missed_records: &Counter) {
+    for gap in gaps {
+        error!(
+            records_offset_gap_start_inclusive = gap.start,
+            records_offset_gap_end_exclusive = gap.end,
+            "there is a gap in consumed offsets; it is likely that there was data loss; see runbook for MimirIngesterMissedRecordsFromKafka"
+        );
+        missed_records.inc_by(gap.num_offsets() as f64);
     }
 }
 

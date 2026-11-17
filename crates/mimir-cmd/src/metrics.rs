@@ -38,8 +38,18 @@ pub fn version_info() -> String {
     )
 }
 
+/// `version.GoVersion` equivalent (shared with `-version`): the Rust toolchain, e.g. `rustc1.86.0`.
 pub fn go_version_str() -> String {
-    format!("rustc-{}", env!("CARGO_PKG_VERSION"))
+    mimir_config::go_version_str().to_string()
+}
+
+/// Registers the `process_*` collectors Go Mimir registers in pkg/mimir/mimir.go
+/// (`collectors.NewProcessCollector` + `process.NewProcessCollector`), when procfs is available.
+pub fn register_process_collector(registry: &Registry) -> Result<(), prometheus::Error> {
+    if let Some(c) = crate::process_collector::ProcessCollector::for_self() {
+        registry.register(Box::new(c))?;
+    }
+    Ok(())
 }
 
 /// Registers `mimir_build_info`, `cortex_build_info`, and `cortex_config_hash` on `registry`.

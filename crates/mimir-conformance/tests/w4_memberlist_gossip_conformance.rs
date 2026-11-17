@@ -12,7 +12,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -51,7 +51,7 @@ impl Drop for Proc {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    mimir_conformance::free_test_port()
 }
 
 fn http_get(port: u16, path: &str) -> Option<String> {
