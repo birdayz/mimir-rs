@@ -16,7 +16,7 @@
 
 mod error;
 pub mod godns;
-mod net;
+pub(crate) mod net;
 mod provider;
 mod resolver;
 
