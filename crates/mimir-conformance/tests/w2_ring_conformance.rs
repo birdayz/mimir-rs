@@ -10,7 +10,6 @@
 //! e) Live mixed-cluster memberlist gossip against real `target/go-mimir -target=ingester`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,8 +49,7 @@ use mimir_ring::token_gen::{PartitionTokenGenerator, PartitionTokenTable};
 use mimir_ring::{reqwest, tokio};
 
 fn free_localhost_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
+    mimir_conformance::free_test_port()
 }
 
 struct ChildGuard {

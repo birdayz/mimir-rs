@@ -17,7 +17,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -66,11 +65,7 @@ impl Drop for Proc {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    mimir_conformance::free_test_port()
 }
 
 fn write_yaml(path: &Path, http: u16, grpc: u16, tsdb_dir: &Path, bucket_dir: &Path) {

@@ -8,7 +8,6 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,11 +33,7 @@ impl Drop for Proc {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    mimir_conformance::free_test_port()
 }
 
 fn now_ms() -> i64 {
