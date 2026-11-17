@@ -17,6 +17,7 @@ use mimir_common::services::{
     describe_service, FnListener, ManagedBasicService, Service, ServiceContext, State,
 };
 use mimir_common::shutdownmarker;
+use mimir_common::usagestats;
 use mimir_config::{
     BlocksStorageConfig, CompartmentsConfig, IngestStorageConfig, IngesterConfig, InstanceLimits,
     Overrides, RuntimeConfigManager,
@@ -59,6 +60,18 @@ pub const INSTANCE_INGESTION_RATE_TICK_INTERVAL: Duration = Duration::from_secs(
 pub const COMPACTION_IDLE_TIMEOUT_JITTER: f64 = 0.25;
 pub const MAX_TSDB_OPEN_WITHOUT_CONCURRENCY: usize = 10;
 pub const DEFAULT_MAX_TSDB_OPENING_CONCURRENCY_ON_STARTUP: usize = 10;
+
+// Usage-stats names (`pkg/ingester/ingester.go`).
+pub const REPLICATION_FACTOR_STATS_NAME: &str = "ingester_replication_factor";
+pub const RING_STORE_STATS_NAME: &str = "ingester_ring_store";
+pub const MEMORY_SERIES_STATS_NAME: &str = "ingester_inmemory_series";
+pub const ACTIVE_SERIES_STATS_NAME: &str = "ingester_active_series";
+pub const MEMORY_TENANTS_STATS_NAME: &str = "ingester_inmemory_tenants";
+pub const APPENDED_SAMPLES_STATS_NAME: &str = "ingester_appended_samples";
+pub const APPENDED_EXEMPLARS_STATS_NAME: &str = "ingester_appended_exemplars";
+pub const TENANTS_WITH_OOO_ENABLED_STAT_NAME: &str = "ingester_ooo_enabled_tenants";
+pub const MIN_OOO_TIME_WINDOW_SECONDS_STAT_NAME: &str = "ingester_ooo_min_window";
+pub const MAX_OOO_TIME_WINDOW_SECONDS_STAT_NAME: &str = "ingester_ooo_max_window";
 
 pub trait UtilizationBasedLimiter: Send + Sync {
     fn limiting_reason(&self) -> Option<String>;
@@ -145,6 +158,10 @@ pub struct Ingester {
     pub flush_on_shutdown: AtomicBool,
     pub appended_samples: AtomicI64,
     pub appended_exemplars: AtomicI64,
+    /// Usage-stats counters (`ingester_appended_samples` / `ingester_appended_exemplars`),
+    /// updated on every push like Go's `appendedSamplesStats` / `appendedExemplarsStats`.
+    pub usage_appended_samples: Arc<usagestats::CounterStat>,
+    pub usage_appended_exemplars: Arc<usagestats::CounterStat>,
 
     pub error_samplers: ErrorSamplers,
     pub ignored_series_limit_metrics: HashSet<String>,
@@ -384,6 +401,8 @@ impl Ingester {
                 .max(0) as u64,
         );
         let flush_on_shutdown = AtomicBool::new(blocks_cfg.tsdb.flush_blocks_on_shutdown);
+        usagestats::get_int(REPLICATION_FACTOR_STATS_NAME).set(cfg.ring.replication_factor);
+        usagestats::get_string(RING_STORE_STATS_NAME).set(&cfg.ring.kvstore.store);
         let ingester = Arc::new(Self {
             cfg,
             blocks_cfg,
@@ -421,6 +440,8 @@ impl Ingester {
             flush_on_shutdown,
             appended_samples: AtomicI64::new(0),
             appended_exemplars: AtomicI64::new(0),
+            usage_appended_samples: usagestats::get_counter(APPENDED_SAMPLES_STATS_NAME),
+            usage_appended_exemplars: usagestats::get_counter(APPENDED_EXEMPLARS_STATS_NAME),
             error_samplers,
             ignored_series_limit_metrics,
             state: RwLock::new(State::New),
@@ -1069,6 +1090,16 @@ impl Ingester {
         snap.appended_samples = self.appended_samples.load(Ordering::Relaxed);
         snap.appended_exemplars = self.appended_exemplars.load(Ordering::Relaxed);
         *self.usage_stats.lock() = snap;
+
+        usagestats::get_int(MEMORY_SERIES_STATS_NAME).set(snap.memory_series);
+        usagestats::get_int(ACTIVE_SERIES_STATS_NAME).set(snap.active_series);
+        usagestats::get_int(MEMORY_TENANTS_STATS_NAME).set(snap.memory_users);
+        usagestats::get_int(TENANTS_WITH_OOO_ENABLED_STAT_NAME)
+            .set(snap.tenants_with_out_of_order_enabled);
+        usagestats::get_int(MIN_OOO_TIME_WINDOW_SECONDS_STAT_NAME)
+            .set(snap.min_out_of_order_time_window_seconds);
+        usagestats::get_int(MAX_OOO_TIME_WINDOW_SECONDS_STAT_NAME)
+            .set(snap.max_out_of_order_time_window_seconds);
         snap
     }
 

@@ -14,6 +14,7 @@ pub mod http;
 pub mod metrics;
 pub mod modules;
 pub mod sanity_check;
+pub mod usagestats;
 
 pub use app::run_mimir;
 pub use cli::{

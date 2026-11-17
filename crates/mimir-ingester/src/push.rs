@@ -1938,6 +1938,8 @@ impl Ingester {
             .fetch_add(stats.succeeded_samples as i64, Ordering::Relaxed);
         self.appended_exemplars
             .fetch_add(stats.succeeded_exemplars as i64, Ordering::Relaxed);
+        self.usage_appended_samples.inc(stats.succeeded_samples as i64);
+        self.usage_appended_exemplars.inc(stats.succeeded_exemplars as i64);
 
         self.record_discarded_metrics(user_id, "", &stats, source, &db);
 
@@ -2512,6 +2514,8 @@ impl Ingester {
             .fetch_add(stats.succeeded_samples as i64, Ordering::Relaxed);
         self.appended_exemplars
             .fetch_add(stats.succeeded_exemplars as i64, Ordering::Relaxed);
+        self.usage_appended_samples.inc(stats.succeeded_samples as i64);
+        self.usage_appended_exemplars.inc(stats.succeeded_exemplars as i64);
 
         self.record_discarded_metrics(user_id, "", &stats, source, db);
 

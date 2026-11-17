@@ -26,6 +26,7 @@ pub mod shutdownmarker;
 pub mod tenant;
 pub mod thread_pool;
 pub mod tls;
+pub mod usagestats;
 pub mod wrapped_registry;
 
 #[doc(hidden)]

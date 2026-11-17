@@ -243,7 +243,11 @@ fn lc13_services_ready_and_grpc_health_follow_module_states() {
         for which in BOTH {
             let p = ports();
             let dir = tmp.path().join(which.name());
-            let yaml = ingester_yaml(&p, &dir, "ingester-1", &filesystem_backend(&dir), "", "");
+            // Usage stats enabled (the default, also with Helm's installation_mode=helm): the
+            // `usage-stats` module is part of the service map. Nothing is sent within the test:
+            // the first report is due 4h after the cluster seed is created.
+            let yaml = ingester_yaml(&p, &dir, "ingester-1", &filesystem_backend(&dir), "", "")
+                .replace("usage_stats:\n  enabled: false\n", "usage_stats:\n  installation_mode: helm\n");
             let mut proc = start_mimir(which, "services", &dir, &yaml, &[]);
             wait_ready(&client, &mut proc, p.http, Duration::from_secs(60)).await;
             running.push((which, proc, p));
@@ -288,6 +292,7 @@ fn lc13_services_ready_and_grpc_health_follow_module_states() {
         let (_, go_svcs, go_ready, go_health) = &out[0];
         let (_, rs_svcs, rs_ready, rs_health) = &out[1];
         assert_eq!(go_svcs.get("ingester-service").map(String::as_str), Some("Terminated"));
+        assert_eq!(go_svcs.get("usage-stats").map(String::as_str), Some("Running"));
         assert_eq!(comparable_services(go_svcs.clone()), comparable_services(rs_svcs.clone()), "{label}: /services");
         assert_eq!(go_ready.0, 503);
         // Go lists not-Running modules in map order: compare the set of lines.

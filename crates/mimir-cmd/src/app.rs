@@ -298,6 +298,34 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     }
     sanity_state.set(State::Running);
 
+    // Anonymous usage statistics (`initUsageStats`), only for components accessing the blocks
+    // storage. `Server` depends on `UsageStats` in Go.
+    mimir_common::usagestats::set_target(&cfg.target.0.join(","));
+    if cfg.ingest_storage.enabled && ingester_enabled {
+        mimir_common::usagestats::set_mode(mimir_common::usagestats::MODE_INGEST_STORAGE);
+    }
+    let usage_stats_svc = if cfg.usage_stats.enabled && ingester_enabled {
+        let bucket = BucketClient::from_config(&cfg.blocks_storage.bucket)
+            .context("create usage-stats bucket client")?;
+        mimir_common::usagestats::get_string("blocks_storage_backend")
+            .set(&cfg.blocks_storage.bucket.backend_cfg.backend);
+        mimir_common::usagestats::get_string("installation_mode")
+            .set(&cfg.usage_stats.installation_mode);
+        let svc = crate::usagestats::Reporter::new(
+            crate::usagestats::ReporterConfig::default(),
+            &bucket,
+            Some(&registry),
+        )
+        .into_service();
+        svc.start_async(service_ctx.child())
+            .await
+            .context("starting module usage-stats")?;
+        modules.add("usage-stats", service_state_fn(&svc));
+        Some(svc)
+    } else {
+        None
+    };
+
     // 4. Memberlist KV (if required by ring/partition_ring or explicitly targeted).
     let needs_memberlist = cfg.is_module_explicitly_targeted("memberlist-kv")
         || (ingester_enabled
@@ -628,7 +656,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let (module_failed_tx, mut module_failed_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, String)>();
     let mut listener_handles = Vec::new();
-    for (name, svc) in [("ingester-ring", &ring_svc), ("ingester-partitions-ring", &watcher_svc)] {
+    for (name, svc) in [
+        ("ingester-ring", &ring_svc),
+        ("ingester-partitions-ring", &watcher_svc),
+        ("usage-stats", &usage_stats_svc),
+    ] {
         if let Some(svc) = svc {
             let tx = module_failed_tx.clone();
             let name = name.to_string();
@@ -802,6 +834,10 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     );
     let _ = tokio::time::timeout(graceful_timeout, server_done_rx).await;
     server_state.set(State::Terminated);
+    if let Some(svc) = usage_stats_svc {
+        svc.stop_async();
+        let _ = svc.await_terminated().await;
+    }
 
     if let Some(ml) = memberlist_kv {
         ml.shutdown().await;
