@@ -546,6 +546,8 @@ struct Cluster {
     kafka_ext_port: u16,
     pods: Vec<Pod>,
     compose: Option<DockerCompose>,
+    /// Containers that only hold an IP address on the network (see `start_ip_filler`).
+    fillers: Vec<String>,
 }
 
 impl Cluster {
@@ -554,6 +556,7 @@ impl Cluster {
         variant: Variant,
         helm: Arc<Helm>,
         specs: Vec<PodSpec>,
+        restart: &str,
     ) -> Result<Self> {
         let project = format!("w7-{test}-{}-{}", variant.name(), std::process::id());
         let dir = tempfile::Builder::new().prefix("w7-k8s-").tempdir()?;
@@ -609,6 +612,7 @@ impl Cluster {
                 &spec,
                 dir.path(),
                 &user,
+                restart,
             )?);
             pods.push(Pod {
                 container: format!("{project}-{}", spec.host()),
@@ -637,9 +641,36 @@ impl Cluster {
             kafka_ext_port,
             pods,
             compose: Some(compose),
+            fillers: Vec::new(),
         };
         cluster.wait_infra_healthy(Duration::from_secs(240)).await?;
         Ok(cluster)
+    }
+
+    /// Starts an idle container on the cluster network; it takes the lowest free IP (the one a
+    /// just-stopped pod released), so the recreated pod comes back with a new IP like in k8s.
+    async fn start_ip_filler(&mut self) -> Result<()> {
+        let name = format!("{}-ipfiller-{}", self.project, self.fillers.len());
+        let network = format!("{}_k8s", self.project);
+        let label = format!("{}={}", CONTAINER_LABEL.0, CONTAINER_LABEL.1);
+        docker(&[
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "--label",
+            &label,
+            "--network",
+            &network,
+            "--entrypoint",
+            "/bin/sh",
+            SILO_IMAGE,
+            "-c",
+            "sleep 3600",
+        ])
+        .await?;
+        self.fillers.push(name);
+        Ok(())
     }
 
     async fn wait_infra_healthy(&self, timeout: Duration) -> Result<()> {
@@ -775,6 +806,13 @@ impl Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
+        for f in &self.fillers {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", f])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         // Remove everything of the project (pods live in a profile `compose down` would skip).
         let _ = Command::new("docker")
             .args([
@@ -805,6 +843,7 @@ fn pod_service_yaml(
     spec: &PodSpec,
     dir: &Path,
     user: &str,
+    restart: &str,
 ) -> Result<String> {
     let sts = &helm.zones[&spec.zone];
     let host = spec.host();
@@ -826,7 +865,7 @@ fn pod_service_yaml(
         format!("{}/active-queries:/active-query-tracker", pod_dir.display()),
     ];
     Ok(format!(
-        "  {svc}:\n    image: {img}\n    profiles: [pods]\n    container_name: {project}-{host}\n    hostname: {host}\n    labels: {{{lk}: {lv}}}\n    # securityContext: runAsNonRoot (host uid instead of 10001 so the test can clean up),\n    # readOnlyRootFilesystem, allowPrivilegeEscalation: false, capabilities.drop: [ALL].\n    user: {user}\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [\"no-new-privileges:true\"]\n    entrypoint: [\"/bin/mimir\"]\n    command: [{args}]\n    environment: {{{env}}}\n    stop_grace_period: {grace}s\n    volumes: [{vols}]\n    networks:\n      k8s:\n        aliases: [{alias}]\n",
+        "  {svc}:\n    image: {img}\n    profiles: [pods]\n    container_name: {project}-{host}\n    hostname: {host}\n    labels: {{{lk}: {lv}}}\n    # securityContext: runAsNonRoot (host uid instead of 10001 so the test can clean up),\n    # readOnlyRootFilesystem, allowPrivilegeEscalation: false, capabilities.drop: [ALL].\n    user: {user}\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [\"no-new-privileges:true\"]\n    entrypoint: [\"/bin/mimir\"]\n    command: [{args}]\n    environment: {{{env}}}\n    stop_grace_period: {grace}s\n    # Pod restartPolicy: Always (crash -> kubelet restarts the container) where requested.\n    restart: {restart}\n    volumes: [{vols}]\n    networks:\n      k8s:\n        aliases: [{alias}]\n",
         svc = spec.service(),
         img = DISTROLESS_IMAGE,
         lk = CONTAINER_LABEL.0,
@@ -835,6 +874,7 @@ fn pod_service_yaml(
         args = args.join(", "),
         env = env.join(", "),
         grace = sts.termination_grace_secs,
+        restart = q(restart),
         vols = vols.iter().map(|v| q(v)).collect::<Vec<_>>().join(", "),
         alias = q(&helm.gossip_alias),
     ))
@@ -1101,6 +1141,8 @@ struct PartNorm {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct View {
     members: BTreeSet<String>,
+    /// Raw memberlist entries (a stale entry of a restarted pod shows up here, not in `members`).
+    member_entries: usize,
     ring: BTreeMap<String, RingNorm>,
     partitions: BTreeMap<i64, PartNorm>,
 }
@@ -1172,6 +1214,7 @@ async fn fetch_view(
         for m in arr {
             if let Some(n) = m.get(key).and_then(|n| n.as_str()) {
                 out.view.members.insert(member_host(n));
+                out.view.member_entries += 1;
             }
         }
     }
@@ -1223,7 +1266,10 @@ async fn fetch_view(
 /// Full membership of the running pods (what Go converges to; partition tokens excluded since
 /// they are compared differentially).
 fn expected_view(helm: &Helm, running: &[&PodSpec]) -> View {
-    let mut v = View::default();
+    let mut v = View {
+        member_entries: running.len(),
+        ..View::default()
+    };
     for p in running {
         v.members.insert(p.host());
         v.ring.insert(
@@ -1262,6 +1308,12 @@ fn describe_view_diff(actual: &View, expected: &View) -> String {
         d.push(format!(
             "members {:?} (want {:?})",
             actual.members, expected.members
+        ));
+    }
+    if actual.member_entries != expected.member_entries {
+        d.push(format!(
+            "{} memberlist entries (want {}, stale entry of a restarted/crashed pod)",
+            actual.member_entries, expected.member_entries
         ));
     }
     for (id, want) in &expected.ring {
@@ -2011,6 +2063,19 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     ),
     // K8S-7: /debug/pprof/{,heap,goroutine} not served.
     ("K8S-7", "GET /debug/pprof/"),
+    // K8S-8: Rust memberlist never suspects / declares dead an unresponsive member (probe
+    // timeout is ignored), so frozen or SIGKILLed pods stay `Alive` forever in Rust-only
+    // clusters and stale entries of crashed pods accumulate.
+    ("K8S-8", "still listed as a memberlist member"),
+    (
+        "K8S-8",
+        "SIGKILLed pod dropped from memberlist by every other pod",
+    ),
+    (
+        "K8S-8",
+        "frozen pod dropped from memberlist by every other pod",
+    ),
+    ("K8S-8", "stale entry of a restarted/crashed pod"),
 ];
 
 fn known_divergence(err: &str) -> Option<&'static str> {
@@ -2096,6 +2161,11 @@ struct Facts {
     restart: Option<RestartObs>,
     restart_outcome: Option<String>,
     restart_data_ok: BTreeMap<String, bool>,
+    /// (frozen pod dropped from memberlist by every other pod, reconvergence after the thaw).
+    freeze: Option<(bool, Option<Duration>)>,
+    crash_dropped_by_all: Option<bool>,
+    /// Container restarts by the restart policy (crash loops), per pod.
+    restarts: BTreeMap<String, u32>,
 }
 
 fn sides(cluster: &Cluster) -> BTreeMap<String, Side> {
@@ -2288,6 +2358,37 @@ fn compare_facts(go: &Facts, other: &Facts, other_sides: &BTreeMap<String, Side>
             ));
         }
     }
+    if let (Some((g_drop, g_conv)), Some((o_drop, o_conv))) = (go.freeze, other.freeze) {
+        if g_drop != o_drop {
+            errs.push(format!(
+                "frozen pod dropped from memberlist by every other pod: {o_drop}, Go {g_drop}"
+            ));
+        }
+        match (g_conv, o_conv) {
+            (Some(_), None) => errs.push("never reconverged after the pod freeze, Go did".into()),
+            (Some(g), Some(o)) if o > g + Duration::from_secs(30) => errs.push(format!(
+                "reconverged {:.1}s after the thaw, Go {:.1}s",
+                o.as_secs_f64(),
+                g.as_secs_f64()
+            )),
+            _ => {}
+        }
+    }
+    if go.crash_dropped_by_all.is_some() && go.crash_dropped_by_all != other.crash_dropped_by_all {
+        errs.push(format!(
+            "SIGKILLed pod dropped from memberlist by every other pod within 90s: {:?}, Go {:?}",
+            other.crash_dropped_by_all, go.crash_dropped_by_all
+        ));
+    }
+    let go_restarts: u32 = go.restarts.values().sum();
+    for (h, n) in &other.restarts {
+        if *n > 0 && go_restarts == 0 && other_sides.get(h) == Some(&Side::Rust) {
+            errs.push(format!(
+                "{}: container restarted {n} time(s) (crash), no Go pod restarted",
+                side(h)
+            ));
+        }
+    }
     if go.restart_outcome.is_some() && go.restart_outcome != other.restart_outcome {
         errs.push(format!(
             "restarted pod outcome {:?}, Go {:?}",
@@ -2327,13 +2428,14 @@ async fn fresh_install(helm: Arc<Helm>, variant: Variant) -> VariantRun {
         facts: Facts::default(),
         details: String::new(),
     };
-    let mut cluster = match Cluster::start("fresh", variant, helm.clone(), specs).await {
-        Ok(c) => c,
-        Err(e) => {
-            run.errors.push(format!("harness: cluster start: {e:#}"));
-            return run;
-        }
-    };
+    let mut cluster =
+        match Cluster::start("fresh", variant, helm.clone(), specs, "on-failure").await {
+            Ok(c) => c,
+            Err(e) => {
+                run.errors.push(format!("harness: cluster start: {e:#}"));
+                return run;
+            }
+        };
     run.sides = sides(&cluster);
     let all: Vec<usize> = (0..cluster.pods.len()).collect();
     let mut details = Vec::new();
@@ -2528,6 +2630,11 @@ async fn fresh_install(helm: Arc<Helm>, variant: Variant) -> VariantRun {
     // emptyDir is per pod: a recreated pod gets an empty one.
     let _ = fs::remove_dir_all(cluster.pod_dir(target_i).join("active-queries"));
     let _ = fs::create_dir_all(cluster.pod_dir(target_i).join("active-queries"));
+    // A recreated k8s pod gets a new IP: occupy the freed one so Docker hands out another.
+    let old_ip = cluster.pods[target_i].ip.clone();
+    if let Err(e) = cluster.start_ip_filler().await {
+        run.errors.push(format!("harness: ip filler: {e:#}"));
+    }
     progress(&format!("{}: recreating {target}", cluster.project));
     let lc =
         match start_and_observe(&mut cluster, &[target_i], true, Duration::from_secs(120)).await {
@@ -2538,6 +2645,10 @@ async fn fresh_install(helm: Arc<Helm>, variant: Variant) -> VariantRun {
                 Lifecycle::default()
             }
         };
+    details.push(format!(
+        "    {target} IP before/after recreate: {old_ip} -> {} (k8s: new pod IP)",
+        cluster.pods[target_i].ip
+    ));
     run.facts.restart_outcome = Some(lc.outcome().kind());
     if !matches!(lc.outcome(), Outcome::Ready(_)) {
         run.errors.push(format!(
@@ -2601,6 +2712,127 @@ async fn fresh_install(helm: Arc<Helm>, variant: Variant) -> VariantRun {
         obs.partition_ownership
     ));
     run.facts.restart = Some(obs);
+
+    // 6. Pod freeze (stalled node / VM pause): SIGSTOP zone-c-1 for 40s, then SIGCONT. Go
+    //    peers declare it dead in memberlist; after the thaw it refutes and the cluster view
+    //    must converge back to the full membership.
+    let frozen_i = cluster.idx(&format!("{RELEASE}-ingester-zone-c-1"));
+    let frozen = cluster.pods[frozen_i].spec.host();
+    let others: Vec<usize> = all.iter().copied().filter(|i| *i != frozen_i).collect();
+    progress(&format!("{}: freezing {frozen}", cluster.project));
+    if let Err(e) = docker(&["pause", &cluster.pods[frozen_i].container]).await {
+        run.errors.push(format!("harness: docker pause: {e:#}"));
+    }
+    let http = http_client();
+    let ip_to_host = cluster.ip_to_host();
+    let freeze_start = Instant::now();
+    let mut dropped_by: BTreeSet<String> = BTreeSet::new();
+    while freeze_start.elapsed() < Duration::from_secs(40) {
+        for i in &others {
+            let p = &cluster.pods[*i];
+            if let Ok(v) = fetch_view(&http, &p.ip, helm.http_port, &ip_to_host).await {
+                if !v.view.members.contains(&frozen) {
+                    dropped_by.insert(p.spec.host());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    if let Err(e) = docker(&["unpause", &cluster.pods[frozen_i].container]).await {
+        run.errors.push(format!("harness: docker unpause: {e:#}"));
+    }
+    let conv3 = converge(&cluster, &all, &all, Duration::from_secs(120)).await;
+    run.errors.extend(
+        convergence_errors(&cluster, &all, &conv3)
+            .into_iter()
+            .map(|e| format!("after 40s freeze of {frozen}: {e}")),
+    );
+    run.facts.freeze = Some((dropped_by.len() == others.len(), conv3.after));
+    details.push(format!(
+        "    freeze of {frozen} for 40s: dropped from memberlist by {dropped_by:?}; reconverged {:?} after thaw",
+        conv3.after
+    ));
+
+    // 7. Pod crash (OOMKill / node loss): SIGKILL zone-b-1, no graceful memberlist leave. Go
+    //    peers mark it failed after the suspicion timeout and drop it from the member list.
+    let crashed_i = cluster.idx(&format!("{RELEASE}-ingester-zone-b-1"));
+    let crashed = cluster.pods[crashed_i].spec.host();
+    let others: Vec<usize> = all.iter().copied().filter(|i| *i != crashed_i).collect();
+    progress(&format!("{}: SIGKILL {crashed}", cluster.project));
+    if let Err(e) = docker(&["kill", &cluster.pods[crashed_i].container]).await {
+        run.errors.push(format!("harness: docker kill: {e:#}"));
+    }
+    let crash_start = Instant::now();
+    let mut dropped_after: BTreeMap<String, Duration> = BTreeMap::new();
+    while crash_start.elapsed() < Duration::from_secs(90) && dropped_after.len() < others.len() {
+        for i in &others {
+            let p = &cluster.pods[*i];
+            if dropped_after.contains_key(&p.spec.host()) {
+                continue;
+            }
+            if let Ok(v) = fetch_view(&http, &p.ip, helm.http_port, &ip_to_host).await {
+                if !v.view.members.contains(&crashed) {
+                    dropped_after.insert(p.spec.host(), crash_start.elapsed());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    run.facts.crash_dropped_by_all = Some(dropped_after.len() == others.len());
+    if dropped_after.len() != others.len() {
+        let kept: Vec<String> = others
+            .iter()
+            .map(|i| &cluster.pods[*i].spec)
+            .filter(|s| !dropped_after.contains_key(&s.host()))
+            .map(|s| format!("{} ({:?})", s.host(), s.side))
+            .collect();
+        run.errors.push(format!(
+            "SIGKILLed {crashed} still listed as a memberlist member 90s later by {kept:?}"
+        ));
+    }
+    details.push(format!(
+        "    SIGKILL of {crashed}: dropped from memberlist after {dropped_after:?}"
+    ));
+    let lc =
+        match start_and_observe(&mut cluster, &[crashed_i], true, Duration::from_secs(120)).await {
+            Ok(l) => l.into_values().next().unwrap_or_default(),
+            Err(e) => {
+                run.errors
+                    .push(format!("harness: recreate {crashed}: {e:#}"));
+                Lifecycle::default()
+            }
+        };
+    if !matches!(lc.outcome(), Outcome::Ready(_)) {
+        run.errors.push(format!(
+            "{crashed} did not become ready after the crash: {}",
+            lc.timeline()
+        ));
+    }
+    let conv4 = converge(&cluster, &all, &all, Duration::from_secs(90)).await;
+    run.errors.extend(
+        convergence_errors(&cluster, &all, &conv4)
+            .into_iter()
+            .map(|e| format!("after SIGKILL + restart of {crashed}: {e}")),
+    );
+    for i in &all {
+        let restarts = docker(&[
+            "inspect",
+            "-f",
+            "{{.RestartCount}}",
+            &cluster.pods[*i].container,
+        ])
+        .await
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+        run.facts
+            .restarts
+            .insert(cluster.pods[*i].spec.host(), restarts);
+    }
+    details.push(format!(
+        "    container restarts (restartPolicy): {:?}",
+        run.facts.restarts
+    ));
     run.facts.cluster_seed = Some(bucket_objects(
         &cluster,
         "__mimir_cluster/mimir_cluster_seed.json",
@@ -2785,13 +3017,14 @@ async fn first_pod_alone(helm: Arc<Helm>, variant: Variant) -> VariantRun {
         facts: Facts::default(),
         details: String::new(),
     };
-    let mut cluster = match Cluster::start("alone", variant, helm.clone(), specs).await {
-        Ok(c) => c,
-        Err(e) => {
-            run.errors.push(format!("harness: cluster start: {e:#}"));
-            return run;
-        }
-    };
+    let mut cluster =
+        match Cluster::start("alone", variant, helm.clone(), specs, "on-failure").await {
+            Ok(c) => c,
+            Err(e) => {
+                run.errors.push(format!("harness: cluster start: {e:#}"));
+                return run;
+            }
+        };
     run.sides = sides(&cluster);
     let a = cluster.idx(&format!("{RELEASE}-ingester-zone-a-0"));
     let b = cluster.idx(&format!("{RELEASE}-ingester-zone-b-0"));
@@ -2911,7 +3144,7 @@ async fn object_storage_down(helm: Arc<Helm>, variant: Variant) -> VariantRun {
         facts: Facts::default(),
         details: String::new(),
     };
-    let mut cluster = match Cluster::start("s3down", variant, helm.clone(), specs).await {
+    let mut cluster = match Cluster::start("s3down", variant, helm.clone(), specs, "no").await {
         Ok(c) => c,
         Err(e) => {
             run.errors.push(format!("harness: cluster start: {e:#}"));
