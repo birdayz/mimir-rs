@@ -38,7 +38,6 @@ use mimir_ring::partition_ring::{
 use mimir_ring::ring::model::ring_desc_codec;
 use mimir_ring::ring::Ring;
 use mimir_ring::token_gen::{PartitionTokenGenerator, PartitionTokenTable};
-use mimir_storage::bucket::BucketClient;
 use prometheus::Registry;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -288,11 +287,12 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let base_registerer = Registerer::new(&registry);
     let cortex_registerer = base_registerer.wrap_with_prefix("cortex_");
 
-    // 5. BucketClient validation (Ingester also creates its own client when shipping).
-    if ingester_enabled && cfg.blocks_storage.tsdb.ship_interval.0 > 0 {
-        let _ = BucketClient::from_config(&cfg.blocks_storage.bucket)
-            .context("creating blocks storage bucket client")?;
-    }
+    // 5. The blocks storage bucket client is created by the ingester (Go `newIngester`); set the
+    // `thanos-<component>/<version> (<runtime>)` part of its S3 User-Agent.
+    mimir_storage::bucket::s3::set_app_version(
+        crate::metrics::version_str(),
+        &crate::metrics::go_version_str(),
+    );
 
     // 6. Ring, PartitionRingWatcher, Lifecycler, PartitionInstanceLifecycler, and Ingester.
     // 6. Install SIGTERM/SIGINT listeners BEFORE startup so signals during WAL replay / catch-up

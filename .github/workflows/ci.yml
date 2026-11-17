@@ -128,7 +128,7 @@ jobs:
           echo "selected: ${args[*]}"
       - name: Pull container images
         if: matrix.shard == 'docker'
-        run: docker pull "$REDPANDA_IMAGE" && docker pull "$DISTROLESS_IMAGE"
+        run: docker pull "$REDPANDA_IMAGE" && docker pull "$DISTROLESS_IMAGE" && docker pull pgsty/silo:RELEASE.2026-09-03T13-18-01Z && docker pull mcr.microsoft.com/azure-storage/azurite:latest
       - name: Build Go mimir, Go oracle and Rust mimir
         run: |
           ./scripts/build-go-oracle.sh

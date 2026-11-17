@@ -488,6 +488,7 @@ impl<'de> Deserialize<'de> for SASLMechanism {
 pub enum S3BucketLookupType {
     #[default]
     Auto,
+    #[serde(rename = "virtual-hosted")]
     VirtualHost,
     Path,
 }
@@ -496,10 +497,11 @@ impl S3BucketLookupType {
     pub fn parse(s: &str) -> Result<Self, ConfigError> {
         match s {
             "auto" => Ok(Self::Auto),
-            "virtual-host" => Ok(Self::VirtualHost),
+            "virtual-hosted" => Ok(Self::VirtualHost),
             "path" => Ok(Self::Path),
+            // thanos BucketLookupType.UnmarshalYAML / Mimir bucketLookupTypeValue.Set.
             _ => Err(ConfigError::Flag(format!(
-                "unsupported bucket lookup type {s:?}"
+                "unsupported bucket lookup type: {s}"
             ))),
         }
     }
@@ -507,7 +509,7 @@ impl S3BucketLookupType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::VirtualHost => "virtual-host",
+            Self::VirtualHost => "virtual-hosted",
             Self::Path => "path",
         }
     }
@@ -535,5 +537,30 @@ pub fn parse_go_bool(s: &str) -> Result<bool, ConfigError> {
         "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
         "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
         _ => Err(ConfigError::Flag(format!("invalid boolean value {s:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod s3_bucket_lookup_type_tests {
+    use super::*;
+
+    // thanos objstore s3 BucketLookupType: "auto", "virtual-hosted", "path".
+    #[test]
+    fn values_match_thanos() {
+        for (s, v) in [
+            ("auto", S3BucketLookupType::Auto),
+            ("virtual-hosted", S3BucketLookupType::VirtualHost),
+            ("path", S3BucketLookupType::Path),
+        ] {
+            assert_eq!(S3BucketLookupType::parse(s).unwrap(), v);
+            assert_eq!(v.as_str(), s);
+            let yaml: S3BucketLookupType = serde_yaml::from_str(s).unwrap();
+            assert_eq!(yaml, v);
+            assert_eq!(serde_yaml::to_string(&v).unwrap().trim(), s);
+        }
+        assert_eq!(
+            S3BucketLookupType::parse("virtual-host").unwrap_err().to_string(),
+            ConfigError::Flag("unsupported bucket lookup type: virtual-host".into()).to_string()
+        );
     }
 }
