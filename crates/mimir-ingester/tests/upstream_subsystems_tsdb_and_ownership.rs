@@ -1950,6 +1950,7 @@ fn open_standalone_user_tsdb(
         HashSet::new(),
         0,
         0,
+        None,
     )
     .unwrap()
 }

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -426,6 +427,9 @@ pub struct Shipper {
     pub bucket: BucketClient,
     pub source: SourceType,
     pub out_of_order_external_label_enabled: bool,
+    /// When set, consulted at upload time instead of `out_of_order_external_label_enabled` so that
+    /// runtime overrides apply (Go: `cfgProvider.OutOfOrderBlocksExternalLabelEnabled(userID)`).
+    pub out_of_order_external_label_provider: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub metrics: ShipperMetrics,
 }
 
@@ -447,8 +451,19 @@ impl Shipper {
             bucket,
             source,
             out_of_order_external_label_enabled,
+            out_of_order_external_label_provider: None,
             metrics,
         }
+    }
+
+    /// Sets a provider read at each upload for the per-tenant
+    /// `out_of_order_blocks_external_label_enabled` limit.
+    pub fn with_out_of_order_external_label_provider(
+        mut self,
+        provider: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        self.out_of_order_external_label_provider = Some(provider);
+        self
     }
 
     /// Creates a `Shipper` whose bucket client is scoped to `<user_id>/...`.
@@ -553,7 +568,11 @@ impl Shipper {
         meta.thanos.downsample.resolution = 0;
         meta.thanos.segment_files = get_segment_files(&block_dir);
 
-        if meta.compaction.from_out_of_order() && self.out_of_order_external_label_enabled {
+        let ooo_label_enabled = match self.out_of_order_external_label_provider {
+            Some(ref p) => p(),
+            None => self.out_of_order_external_label_enabled,
+        };
+        if meta.compaction.from_out_of_order() && ooo_label_enabled {
             meta.thanos.labels.insert(
                 OUT_OF_ORDER_EXTERNAL_LABEL.to_string(),
                 OUT_OF_ORDER_EXTERNAL_LABEL_VALUE.to_string(),

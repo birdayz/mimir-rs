@@ -280,7 +280,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                                     "gRPC call failed"
                                 );
                             }
-                            return Err(e.map_push_error_to_status());
+                            return Err(e.map_push_error_to_grpc_server_status());
                         }
                         Ok(Response::new(cortexpb::WriteResponse {}))
                     })
@@ -358,7 +358,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
             if e.should_log_error() {
                 tracing::warn!(method = "/cortex.Ingester/Push", err = %e, "gRPC call failed");
             }
-            return Err(e.map_push_error_to_status());
+            return Err(e.map_push_error_to_grpc_server_status());
         }
         Ok(Response::new(cortexpb::WriteResponse {}))
     }

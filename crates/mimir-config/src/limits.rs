@@ -545,6 +545,21 @@ impl Default for LimitsConfig {
 }
 
 impl LimitsConfig {
+    /// Effective partitions shard size for writes: the write shard size when set (> 0), clamped to
+    /// the read shard size; otherwise the read shard size
+    /// (Go: `Overrides.EffectiveIngestionPartitionsTenantWriteShardSize`).
+    pub fn effective_ingestion_partitions_tenant_write_shard_size(&self) -> i64 {
+        let read = self.ingestion_partitions_tenant_shard_size;
+        let write = self.ingestion_partitions_tenant_write_shard_size;
+        if write <= 0 {
+            return read;
+        }
+        if read > 0 && write > read {
+            return read;
+        }
+        write
+    }
+
     pub fn register_flags_into<T: 'static>(
         &self,
         f: &mut FlagSet<T>,
@@ -929,6 +944,8 @@ impl LimitsConfig {
                 "cost_attribution_labels_structured and cost_attribution_trackers are mutually exclusive; use cost_attribution_trackers only".to_string(),
             ));
         }
+        validate_cost_attribution_trackers(&self.cost_attribution_trackers)?;
+        validate_cost_attribution_trackers(&self.additional_cost_attribution_trackers)?;
 
         if self.early_head_compaction_min_estimated_series_reduction_percentage < 0
             || self.early_head_compaction_min_estimated_series_reduction_percentage > 100
@@ -985,6 +1002,47 @@ impl LimitsConfig {
 
         Ok(())
     }
+}
+
+/// Ported from `costattributionmodel.TrackerConfigs.Validate` / `Labels.Validate` / `Label.Validate`.
+fn validate_cost_attribution_trackers(tc: &CostAttributionTrackerConfigs) -> Result<(), ConfigError> {
+    let label_str = |l: &CostAttributionLabel| format!("{}:{}", l.input, l.output);
+    for (name, cfg) in tc {
+        if name.is_empty() {
+            return Err(ConfigError::Validation(
+                "cost attribution tracker name must not be empty".to_string(),
+            ));
+        }
+        let mut outputs = std::collections::HashSet::new();
+        for l in &cfg.labels {
+            let err = if l.input.is_empty() {
+                Some(format!(
+                    "cost attribution input label must not be empty: {:?}",
+                    label_str(l)
+                ))
+            } else if l.output.starts_with("__") {
+                Some(format!(
+                    "invalid cost attribution output label: {:?}",
+                    label_str(l)
+                ))
+            } else {
+                let out = if l.output.is_empty() { &l.input } else { &l.output };
+                (!outputs.insert(out.clone()))
+                    .then(|| format!("duplicate output label: {:?}", label_str(l)))
+            };
+            if let Some(e) = err {
+                return Err(ConfigError::Validation(format!(
+                    "cost attribution tracker {name:?}: {e}"
+                )));
+            }
+        }
+        if cfg.labels.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "cost attribution tracker {name:?} must have at least one label"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn next_power_of_two(n: i64) -> i64 {

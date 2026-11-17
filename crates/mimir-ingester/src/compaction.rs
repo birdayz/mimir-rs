@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::active_series::{parse_custom_tracker_matchers, Matchers};
+use crate::active_series::{merged_custom_trackers, parse_custom_tracker_matchers, Matchers};
 use crate::ingester::{Ingester, TriggerRequest, INSTANCE_INGESTION_RATE_TICK_INTERVAL};
 use crate::label_churn::LABEL_CHURN_RECORD_INTERVAL;
 use crate::owned_series::{
@@ -23,6 +23,7 @@ use crate::owned_series::{
     RECOMPUTE_OWNED_SERIES_REASON_EARLY_COMPACTION,
 };
 use crate::user_tsdb::{TsdbCloseCheckResult, TsdbState};
+use futures::StreamExt;
 
 impl Ingester {
     /// Flushes all head blocks to disk, syncs offset catalogues, and ships blocks to bucket storage.
@@ -42,19 +43,30 @@ impl Ingester {
         forced_compaction_max_time: i64,
         allowed: Option<&HashSet<String>>,
     ) {
-        let user_ids = self.get_tsdb_users();
-        for user_id in user_ids {
-            if let Some(allow) = allowed {
-                if !allow.contains(&user_id) {
-                    continue;
-                }
-            }
+        // Go: concurrency.ForEachUser(ctx, userIDs, HeadCompactionConcurrency, ...).
+        let concurrency = self.blocks_cfg.tsdb.head_compaction_concurrency.max(1) as usize;
+        let user_ids: Vec<String> = self
+            .get_tsdb_users()
+            .into_iter()
+            .filter(|u| allowed.is_none_or(|a| a.contains(u)))
+            .collect();
+        futures::stream::iter(user_ids)
+            .for_each_concurrent(concurrency, |user_id| async move {
+                self.compact_user_blocks(user_id, force, forced_compaction_max_time)
+                    .await;
+            })
+            .await;
+        self.metrics.reset_forced_compactions();
+    }
+
+    async fn compact_user_blocks(&self, user_id: String, force: bool, forced_compaction_max_time: i64) {
+        {
             let Some(user_db) = self.get_tsdb(&user_id) else {
-                continue;
+                return;
             };
             let head = user_db.db.head();
             if head.num_series() == 0 {
-                continue;
+                return;
             }
 
             self.metrics.compactions_triggered.inc();
@@ -82,7 +94,11 @@ impl Ingester {
                 }
             } else {
                 reason = "regular";
-                user_db.compact().map(|_| ()).map_err(|e| e.to_string())
+                let udb = Arc::clone(&user_db);
+                match tokio::task::spawn_blocking(move || udb.compact()).await {
+                    Ok(r) => r.map(|_| ()).map_err(|e| e.to_string()),
+                    Err(e) => Err(format!("compaction task failed: {e}")),
+                }
             };
 
             user_db.update_last_series_removal();
@@ -103,33 +119,41 @@ impl Ingester {
                 user_db.trigger_recompute_owned_series(r);
             }
         }
-        self.metrics.reset_forced_compactions();
     }
 
     pub async fn ship_blocks(&self, allowed: Option<&HashSet<String>>) {
-        let user_ids = self.get_tsdb_users();
-        for user_id in user_ids {
-            if let Some(allow) = allowed {
-                if !allow.contains(&user_id) {
-                    continue;
-                }
-            }
+        // Go: concurrency.ForEachUser(ctx, userIDs, ShipConcurrency, ...).
+        let concurrency = self.blocks_cfg.tsdb.ship_concurrency.max(1) as usize;
+        let user_ids: Vec<String> = self
+            .get_tsdb_users()
+            .into_iter()
+            .filter(|u| allowed.is_none_or(|a| a.contains(u)))
+            .collect();
+        futures::stream::iter(user_ids)
+            .for_each_concurrent(concurrency, |user_id| async move {
+                self.ship_user_blocks(user_id).await;
+            })
+            .await;
+    }
+
+    async fn ship_user_blocks(&self, user_id: String) {
+        {
             let Some(user_db) = self.get_tsdb(&user_id) else {
-                continue;
+                return;
             };
             let Some(shipper) = user_db.shipper.read().clone() else {
-                continue;
+                return;
             };
 
             let bucket_opt = self.bucket.read().clone();
             if user_db.check_deletion_mark(bucket_opt.as_deref()).await {
-                continue;
+                return;
             }
 
             let (ok, st) = user_db.change_state(TsdbState::Active, TsdbState::ActiveShipping);
             if !ok {
                 info!(user = %user_id, state = st.as_str(), "shipper skipped because TSDB is not active");
-                continue;
+                return;
             }
 
             let sync_res = shipper.sync().await;
@@ -594,6 +618,7 @@ impl Ingester {
         self.tsdb_metrics.remove_registry_for_tenant(user_id);
         self.delete_user_metadata(user_id);
         self.metrics.delete_per_user_metrics(user_id, &tracker_names);
+        self.compute_worker_pool.remove_tenant(user_id);
         self.metrics
             .delete_user_label_value_bytes_metrics(user_id, &label_value_bytes_names);
 
@@ -617,35 +642,35 @@ impl Ingester {
                 continue;
             };
             let limits = self.overrides.for_tenant(&user_id);
-            let new_matchers = parse_custom_tracker_matchers(&limits.active_series_custom_trackers);
+            let new_matchers = parse_custom_tracker_matchers(&merged_custom_trackers(
+                &limits.active_series_custom_trackers,
+                &limits.active_series_additional_custom_trackers,
+            ));
             let new_matcher_set = Matchers::from_custom_trackers(&new_matchers);
-            if user_db.active_series.matchers_differ(new_matcher_set.config()) {
-                let old_names = user_db.active_series.current_matcher_names();
-                for old_name in &old_names {
-                    let _ = self
-                        .metrics
-                        .active_series_custom_trackers_per_user
-                        .remove_label_values(&[&user_id, old_name]);
-                    let _ = self
-                        .metrics
-                        .active_series_custom_trackers_per_user_native_histograms
-                        .remove_label_values(&[&user_id, old_name]);
-                    let _ = self
-                        .metrics
-                        .active_native_histogram_buckets_custom_trackers_per_user
-                        .remove_label_values(&[&user_id, old_name]);
+            let new_cat = self
+                .cost_attribution_manager()
+                .and_then(|m| m.active_series_tracker(&user_id));
+            let matchers_changed = user_db.active_series.matchers_differ(new_matcher_set.config());
+            let cat_changed = user_db.active_series.cost_attribution_differs(new_cat.as_ref());
+            // Go keeps the old matcher metrics until after the reload (to avoid staleness markers
+            // if a scrape races with the reload) and then deletes those no longer present.
+            let mut old_matcher_names = Vec::new();
+            if matchers_changed || cat_changed {
+                if matchers_changed {
+                    old_matcher_names = user_db.active_series.current_matcher_names();
                 }
-                let cat = user_db.active_series.cost_attribution_tracker();
                 user_db.active_series.reload_series_config(
                     new_matcher_set,
-                    cat,
-                    true,
-                    false,
+                    new_cat,
+                    matchers_changed,
+                    cat_changed,
                     Some(user_db.db.head()),
                 );
             }
 
-            user_db.active_series.purge(now);
+            user_db
+                .active_series
+                .purge_with_index(now, Some(user_db.db.head()));
             let (
                 all_active,
                 active_matching,
@@ -701,6 +726,14 @@ impl Ingester {
                     .remove_label_values(&[&user_id]);
             }
 
+            let attribution_failures = user_db.active_series.active_series_attribution_failure_count();
+            if attribution_failures > 0.0 {
+                self.metrics
+                    .attributed_active_series_failures_per_user
+                    .with_label_values(&[&user_id])
+                    .inc_by(attribution_failures);
+            }
+
             let cur_names = user_db.active_series.current_matcher_names();
             for (idx, name) in cur_names.iter().enumerate() {
                 if active_matching.get(idx).copied().unwrap_or(0) > 0 {
@@ -735,6 +768,24 @@ impl Ingester {
                         .metrics
                         .active_native_histogram_buckets_custom_trackers_per_user
                         .remove_label_values(&[&user_id, name]);
+                }
+            }
+
+            // Remove the metrics belonging to old matchers now.
+            if matchers_changed {
+                for old_name in old_matcher_names.iter().filter(|n| !cur_names.contains(n)) {
+                    let _ = self
+                        .metrics
+                        .active_series_custom_trackers_per_user
+                        .remove_label_values(&[&user_id, old_name]);
+                    let _ = self
+                        .metrics
+                        .active_series_custom_trackers_per_user_native_histograms
+                        .remove_label_values(&[&user_id, old_name]);
+                    let _ = self
+                        .metrics
+                        .active_native_histogram_buckets_custom_trackers_per_user
+                        .remove_label_values(&[&user_id, old_name]);
                 }
             }
         }

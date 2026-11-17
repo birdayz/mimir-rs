@@ -31,7 +31,10 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
-use crate::active_series::{parse_custom_tracker_matchers, ActiveSeries};
+use crate::active_series::{
+    merged_custom_trackers, parse_custom_tracker_matchers, ActiveSeries, CostAttributionTracker,
+    Matchers,
+};
 use crate::errors::IngesterError;
 use crate::label_churn::{SeriesRefHistory, LABEL_CHURN_RECORDS};
 use crate::limiter::Limiter;
@@ -344,6 +347,7 @@ impl UserTsdb {
         ignored_metrics: HashSet<String>,
         ingest_partition_id: i32,
         owned_shard_size: usize,
+        cost_attribution_tracker: Option<Arc<CostAttributionTracker>>,
     ) -> Result<Arc<Self>, TsdbError> {
         let udir = PathBuf::from(&blocks_cfg.tsdb.dir).join(&user_id);
         let rate_period = Duration::from_nanos(
@@ -358,9 +362,16 @@ impl UserTsdb {
         );
         let tenant_limits = overrides.for_tenant(&user_id);
         let custom_matchers =
-            parse_custom_tracker_matchers(&tenant_limits.active_series_custom_trackers);
+            parse_custom_tracker_matchers(&merged_custom_trackers(
+                &tenant_limits.active_series_custom_trackers,
+                &tenant_limits.active_series_additional_custom_trackers,
+            ));
 
-        let active_series = Arc::new(ActiveSeries::new(custom_matchers, active_idle));
+        let active_series = Arc::new(ActiveSeries::with_matchers(
+            Matchers::from_custom_trackers(&custom_matchers),
+            active_idle,
+            cost_attribution_tracker,
+        ));
         let series_in_metric = Arc::new(MetricCounter::new(Arc::clone(&limiter), ignored_metrics));
         let initial_local_limit = limiter.max_series_per_user(&user_id, 0);
 
@@ -463,14 +474,23 @@ impl UserTsdb {
         let shipper: Option<Arc<dyn BlockShipper>> = if shipping_enabled {
             bucket.map(|b| {
                 let ooo_ext = tenant_limits.out_of_order_blocks_external_label_enabled;
-                Arc::new(Shipper::new_for_user(
-                    &user_id,
-                    &udir,
-                    b,
-                    SourceType::Receive,
-                    ooo_ext,
-                    shipper_metrics,
-                )) as Arc<dyn BlockShipper>
+                let provider_overrides = overrides.clone();
+                let provider_user = user_id.clone();
+                Arc::new(
+                    Shipper::new_for_user(
+                        &user_id,
+                        &udir,
+                        b,
+                        SourceType::Receive,
+                        ooo_ext,
+                        shipper_metrics,
+                    )
+                    .with_out_of_order_external_label_provider(Arc::new(move || {
+                        provider_overrides
+                            .for_tenant(&provider_user)
+                            .out_of_order_blocks_external_label_enabled
+                    })),
+                ) as Arc<dyn BlockShipper>
             })
         } else {
             None

@@ -162,12 +162,7 @@ impl LimiterRingStrategy for PartitionRingLimiterStrategy {
 
     fn get_shard_size(&self, user_id: &str) -> usize {
         let l = self.overrides.for_tenant(user_id);
-        let write_ss = l.ingestion_partitions_tenant_write_shard_size;
-        if write_ss > 0 {
-            write_ss as usize
-        } else {
-            l.ingestion_partitions_tenant_shard_size.max(0) as usize
-        }
+        l.effective_ingestion_partitions_tenant_write_shard_size().max(0) as usize
     }
 }
 

@@ -23,9 +23,7 @@ use mimir_tsdb::matcher::{LabelMatcher, MatchType};
 use mimir_tsdb::postings::MemPostings;
 use mimir_tsdb::symbols::SymbolTable;
 use parking_lot::{Mutex, RwLock};
-use prometheus::core::{Collector, Desc};
-use prometheus::proto::MetricFamily;
-use prometheus::{GaugeVec, Opts, Registry};
+pub use crate::costattribution::ActiveSeriesTracker as CostAttributionTracker;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const NUM_STRIPES: usize = 4096;
@@ -818,6 +816,26 @@ pub struct CustomTrackerMatcher {
     pub matchers: Vec<LabelMatcher>,
 }
 
+/// Returns the active series custom trackers to use for a tenant: the base trackers
+/// (`active_series_custom_trackers`) merged with the additional trackers
+/// (`active_series_additional_custom_trackers`), where additional trackers win on a name clash.
+///
+/// Ported from `pkg/util/validation/limits.go` `Overrides.ActiveSeriesCustomTrackersConfig` +
+/// `pkg/ingester/activeseries/model/custom_trackers_config.go` `MergeCustomTrackersConfig`.
+pub fn merged_custom_trackers(
+    base: &BTreeMap<String, String>,
+    additional: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if additional.is_empty() {
+        return base.clone();
+    }
+    let mut merged = base.clone();
+    for (k, v) in additional {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
+}
+
 /// Parses `LimitsConfig.active_series_custom_trackers` (`map[name]promql_matchers`) into `CustomTrackerMatcher`s.
 pub fn parse_custom_tracker_matchers(
     raw: &BTreeMap<String, String>,
@@ -845,322 +863,6 @@ pub fn parse_custom_tracker_matchers(
         }
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// Cost attribution active tracker (`pkg/costattribution/active_tracker.go`)
-// ---------------------------------------------------------------------------
-
-const TRACKED_SERIES_FACTOR: usize = 2;
-const MISSING_VALUE: &str = "";
-const KEY_SEP: char = '\x1e';
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CostAttributionLabel {
-    pub input: String,
-    pub output: String,
-}
-
-impl CostAttributionLabel {
-    pub fn output_label(&self) -> &str {
-        if self.output.is_empty() {
-            &self.input
-        } else {
-            &self.output
-        }
-    }
-}
-
-#[derive(Default)]
-struct CatCounters {
-    active_series: AtomicI64,
-    native_histograms: AtomicI64,
-    native_histogram_buckets: AtomicI64,
-}
-
-/// Ported from `pkg/costattribution.activeSeriesTracker`.
-pub struct CostAttributionActiveTracker {
-    user_id: String,
-    tracker_name: String,
-    labels: Vec<CostAttributionLabel>,
-    max_cardinality: usize,
-    _cooldown: Duration,
-    observed: RwLock<HashMap<String, Arc<CatCounters>>>,
-    overflow_since: Mutex<Option<SystemTime>>,
-    overflow_counter: CatCounters,
-    registry: Option<Registry>,
-    collector_registered: AtomicBool,
-}
-
-impl CostAttributionActiveTracker {
-    pub fn new(
-        user_id: impl Into<String>,
-        tracker_name: impl Into<String>,
-        labels: Vec<CostAttributionLabel>,
-        max_cardinality: usize,
-        cooldown: Duration,
-        registry: Option<Registry>,
-    ) -> Arc<Self> {
-        let tracker = Arc::new(Self {
-            user_id: user_id.into(),
-            tracker_name: tracker_name.into(),
-            labels,
-            max_cardinality,
-            _cooldown: cooldown,
-            observed: RwLock::new(HashMap::new()),
-            overflow_since: Mutex::new(None),
-            overflow_counter: CatCounters::default(),
-            registry: registry.clone(),
-            collector_registered: AtomicBool::new(false),
-        });
-        if let Some(reg) = registry {
-            if reg.register(Box::new(CatCollector(Arc::clone(&tracker)))).is_ok() {
-                tracker.collector_registered.store(true, Ordering::Relaxed);
-            }
-        }
-        tracker
-    }
-
-    pub fn equals(&self, other: Option<&Self>) -> bool {
-        let Some(other) = other else {
-            return false;
-        };
-        self.user_id == other.user_id
-            && self.tracker_name == other.tracker_name
-            && self.labels == other.labels
-            && self.max_cardinality == other.max_cardinality
-    }
-
-    fn key_from_labels(&self, lbls: &Labels) -> String {
-        let mut key = String::new();
-        for (idx, cal) in self.labels.iter().enumerate() {
-            if idx > 0 {
-                key.push(KEY_SEP);
-            }
-            let v = lbls.get(&cal.input);
-            if !v.is_empty() {
-                key.push_str(v);
-            } else {
-                key.push_str(MISSING_VALUE);
-            }
-        }
-        key
-    }
-
-    pub fn increment(&self, lbls: &Labels, now: SystemTime, native_histogram_bucket_num: i64) {
-        let key = self.key_from_labels(lbls);
-        {
-            let guard = self.observed.read();
-            if let Some(c) = guard.get(&key) {
-                c.active_series.fetch_add(1, Ordering::Relaxed);
-                if native_histogram_bucket_num >= 0 {
-                    c.native_histograms.fetch_add(1, Ordering::Relaxed);
-                    c.native_histogram_buckets
-                        .fetch_add(native_histogram_bucket_num, Ordering::Relaxed);
-                }
-                return;
-            }
-            if guard.len() >= TRACKED_SERIES_FACTOR * self.max_cardinality {
-                self.overflow_counter
-                    .active_series
-                    .fetch_add(1, Ordering::Relaxed);
-                if native_histogram_bucket_num >= 0 {
-                    self.overflow_counter
-                        .native_histograms
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.overflow_counter
-                        .native_histogram_buckets
-                        .fetch_add(native_histogram_bucket_num, Ordering::Relaxed);
-                }
-                return;
-            }
-        }
-
-        let mut guard = self.observed.write();
-        if let Some(c) = guard.get(&key) {
-            c.active_series.fetch_add(1, Ordering::Relaxed);
-            if native_histogram_bucket_num >= 0 {
-                c.native_histograms.fetch_add(1, Ordering::Relaxed);
-                c.native_histogram_buckets
-                    .fetch_add(native_histogram_bucket_num, Ordering::Relaxed);
-            }
-            return;
-        }
-        if guard.len() >= TRACKED_SERIES_FACTOR * self.max_cardinality {
-            self.overflow_counter
-                .active_series
-                .fetch_add(1, Ordering::Relaxed);
-            if native_histogram_bucket_num >= 0 {
-                self.overflow_counter
-                    .native_histograms
-                    .fetch_add(1, Ordering::Relaxed);
-                self.overflow_counter
-                    .native_histogram_buckets
-                    .fetch_add(native_histogram_bucket_num, Ordering::Relaxed);
-            }
-            return;
-        }
-
-        let counter = Arc::new(CatCounters::default());
-        counter.active_series.fetch_add(1, Ordering::Relaxed);
-        if native_histogram_bucket_num >= 0 {
-            counter.native_histograms.fetch_add(1, Ordering::Relaxed);
-            counter
-                .native_histogram_buckets
-                .fetch_add(native_histogram_bucket_num, Ordering::Relaxed);
-        }
-        guard.insert(key, counter);
-
-        if guard.len() > self.max_cardinality {
-            let mut ov = self.overflow_since.lock();
-            if ov.is_none() {
-                *ov = Some(now);
-            }
-        }
-    }
-
-    pub fn decrement(&self, lbls: &Labels, native_histogram_bucket_num: i64) {
-        let key = self.key_from_labels(lbls);
-        {
-            let guard = self.observed.read();
-            if let Some(c) = guard.get(&key) {
-                let nv = c.active_series.fetch_sub(1, Ordering::Relaxed) - 1;
-                if native_histogram_bucket_num >= 0 {
-                    c.native_histograms.fetch_sub(1, Ordering::Relaxed);
-                    c.native_histogram_buckets
-                        .fetch_sub(native_histogram_bucket_num, Ordering::Relaxed);
-                }
-                if nv > 0 {
-                    return;
-                }
-            } else {
-                drop(guard);
-                if self.overflow_since.lock().is_some() {
-                    self.overflow_counter
-                        .active_series
-                        .fetch_sub(1, Ordering::Relaxed);
-                    if native_histogram_bucket_num >= 0 {
-                        self.overflow_counter
-                            .native_histograms
-                            .fetch_sub(1, Ordering::Relaxed);
-                        self.overflow_counter
-                            .native_histogram_buckets
-                            .fetch_sub(native_histogram_bucket_num, Ordering::Relaxed);
-                    }
-                    return;
-                }
-                panic!("decrementing non-existent active series: {lbls}");
-            }
-        }
-
-        let mut guard = self.observed.write();
-        if let Some(c) = guard.get(&key) {
-            if c.active_series.load(Ordering::Relaxed) == 0 {
-                guard.remove(&key);
-            }
-        }
-    }
-
-    pub fn snapshot(&self) -> Vec<(Vec<String>, i64, i64, i64)> {
-        let guard = self.observed.read();
-        let mut out = Vec::new();
-        if self.overflow_since.lock().is_some() {
-            let mut a = self.overflow_counter.active_series.load(Ordering::Relaxed);
-            let mut h = self
-                .overflow_counter
-                .native_histograms
-                .load(Ordering::Relaxed);
-            let mut b = self
-                .overflow_counter
-                .native_histogram_buckets
-                .load(Ordering::Relaxed);
-            for c in guard.values() {
-                a += c.active_series.load(Ordering::Relaxed);
-                h += c.native_histograms.load(Ordering::Relaxed);
-                b += c.native_histogram_buckets.load(Ordering::Relaxed);
-            }
-            let mut lvals = vec!["overflow".to_string(); self.labels.len()];
-            lvals.push(self.user_id.clone());
-            out.push((lvals, a, h, b));
-            return out;
-        }
-
-        for (key, c) in guard.iter() {
-            let mut keys: Vec<String> = if self.labels.is_empty() {
-                Vec::new()
-            } else {
-                key.split(KEY_SEP).map(ToString::to_string).collect()
-            };
-            keys.push(self.user_id.clone());
-            out.push((
-                keys,
-                c.active_series.load(Ordering::Relaxed),
-                c.native_histograms.load(Ordering::Relaxed),
-                c.native_histogram_buckets.load(Ordering::Relaxed),
-            ));
-        }
-        out
-    }
-
-    pub fn registry(&self) -> Option<&Registry> {
-        self.registry.as_ref()
-    }
-}
-
-struct CatCollector(Arc<CostAttributionActiveTracker>);
-
-impl Collector for CatCollector {
-    fn desc(&self) -> Vec<&Desc> {
-        // Static descriptor list per tracker isn't strictly required by prometheus::Registry::gather;
-        // returning empty slice makes Registry call collect() unconditionally, or we can return one Desc.
-        Vec::new()
-    }
-
-    fn collect(&self) -> Vec<MetricFamily> {
-        let snap = self.0.snapshot();
-        if snap.is_empty() {
-            return Vec::new();
-        }
-        let mut label_names: Vec<&str> = self.0.labels.iter().map(|l| l.output_label()).collect();
-        label_names.push("tenant");
-
-        let mk_gv = |name: &str, help: &str| {
-            GaugeVec::new(
-                Opts::new(name, help).const_label("tracker", self.0.tracker_name.clone()),
-                &label_names,
-            )
-            .expect("valid cat gauge vec")
-        };
-
-        let gv_series = mk_gv(
-            "cortex_ingester_attributed_active_series",
-            "The total number of active series per user and attribution.",
-        );
-        let gv_hist = mk_gv(
-            "cortex_ingester_attributed_active_native_histogram_series",
-            "The total number of active native histogram series per user and attribution.",
-        );
-        let gv_buckets = mk_gv(
-            "cortex_ingester_attributed_active_native_histogram_buckets",
-            "The total number of active native histogram buckets per user and attribution.",
-        );
-
-        for (lvals, s, h, b) in snap {
-            let lrefs: Vec<&str> = lvals.iter().map(String::as_str).collect();
-            gv_series.with_label_values(&lrefs).set(s as f64);
-            if h > 0 {
-                gv_hist.with_label_values(&lrefs).set(h as f64);
-            }
-            if b > 0 {
-                gv_buckets.with_label_values(&lrefs).set(b as f64);
-            }
-        }
-
-        let mut fams = gv_series.collect();
-        fams.extend(gv_hist.collect());
-        fams.extend(gv_buckets.collect());
-        fams
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,7 +1251,7 @@ struct SeriesStripeInner {
     active_native_histogram_buckets: u32,
     active_matching_native_histogram_buckets: Vec<u32>,
     matchers: Arc<Matchers>,
-    cat: Option<Arc<CostAttributionActiveTracker>>,
+    cat: Option<Arc<CostAttributionTracker>>,
     attribution_failures: f64,
 }
 
@@ -1559,7 +1261,7 @@ struct SeriesStripe {
 }
 
 impl SeriesStripe {
-    fn new(matchers: Arc<Matchers>, cat: Option<Arc<CostAttributionActiveTracker>>) -> Self {
+    fn new(matchers: Arc<Matchers>, cat: Option<Arc<CostAttributionTracker>>) -> Self {
         let num_matchers = matchers.matcher_names().len();
         Self {
             oldest_entry_ns: AtomicI64::new(0),
@@ -1895,7 +1597,7 @@ impl SeriesStripe {
     fn reload_config(
         &self,
         new_matchers: &Arc<Matchers>,
-        new_cat: &Option<Arc<CostAttributionActiveTracker>>,
+        new_cat: &Option<Arc<CostAttributionTracker>>,
         matchers_changed: bool,
         cat_changed: bool,
         idx: Option<&dyn SeriesIndexReader>,
@@ -2154,7 +1856,7 @@ pub struct ActiveSeries {
     slab: NanosSlab,
     epoch: AtomicU16,
     deleted: DeletedSeries,
-    config_mtx: RwLock<(Arc<Matchers>, Option<Arc<CostAttributionActiveTracker>>)>,
+    config_mtx: RwLock<(Arc<Matchers>, Option<Arc<CostAttributionTracker>>)>,
     timeout: Duration,
 }
 
@@ -2167,7 +1869,7 @@ impl ActiveSeries {
     pub fn with_matchers(
         matchers: Matchers,
         timeout: Duration,
-        cat: Option<Arc<CostAttributionActiveTracker>>,
+        cat: Option<Arc<CostAttributionTracker>>,
     ) -> Self {
         let matchers = Arc::new(matchers);
         let mut stripes = Vec::with_capacity(NUM_STRIPES);
@@ -2196,16 +1898,18 @@ impl ActiveSeries {
         ct_cfg.as_str() != self.config_mtx.read().0.config().as_str()
     }
 
-    pub fn cost_attribution_differs(&self, cat: Option<&CostAttributionActiveTracker>) -> bool {
+    /// Returns true if `cat` is not the same tracker instance currently in use
+    /// (Go: `ActiveSeries.CostAttributionDiffers`).
+    pub fn cost_attribution_differs(&self, cat: Option<&Arc<CostAttributionTracker>>) -> bool {
         let g = self.config_mtx.read();
-        match (cat, g.1.as_deref()) {
+        match (cat, g.1.as_ref()) {
             (None, None) => false,
-            (Some(a), Some(b)) => !a.equals(Some(b)),
+            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
             _ => true,
         }
     }
 
-    pub fn cost_attribution_tracker(&self) -> Option<Arc<CostAttributionActiveTracker>> {
+    pub fn cost_attribution_tracker(&self) -> Option<Arc<CostAttributionTracker>> {
         self.config_mtx.read().1.clone()
     }
 
@@ -2222,7 +1926,7 @@ impl ActiveSeries {
     pub fn reload_series_config(
         &self,
         matchers: Matchers,
-        cat: Option<Arc<CostAttributionActiveTracker>>,
+        cat: Option<Arc<CostAttributionTracker>>,
         matchers_changed: bool,
         cat_changed: bool,
         idx: Option<&dyn SeriesIndexReader>,
