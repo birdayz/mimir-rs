@@ -1071,7 +1071,7 @@ fn real_go_ooo_wbl_and_ooo_chunk_conformance() {
     for s in ooo_samples {
         assert!(ooo.insert_float(s.st, s.t, s.v));
     }
-    let cut = ooo.to_encoded_chunks(i64::MIN, i64::MAX).unwrap();
+    let cut = ooo.to_encoded_chunks(i64::MIN, i64::MAX, false, false).unwrap();
     assert_eq!(cut.len(), 1);
     let EncodedChunk::Xor(xc) = &cut[0].chunk else {
         panic!("expected XOR chunk from OooChunk");

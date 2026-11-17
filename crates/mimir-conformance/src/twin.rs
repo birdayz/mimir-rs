@@ -81,11 +81,25 @@ pub struct Proc {
 
 impl Proc {
     pub fn spawn(name: &str, bin: &Path, args: &[String], workdir: &Path) -> Self {
-        let mut child = Command::new(bin)
-            .args(args)
+        Self::spawn_with_env(name, bin, args, workdir, &[])
+    }
+
+    pub fn spawn_with_env(
+        name: &str,
+        bin: &Path,
+        args: &[String],
+        workdir: &Path,
+        env: &[(&str, &str)],
+    ) -> Self {
+        let mut cmd = Command::new(bin);
+        cmd.args(args)
             .current_dir(workdir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {name} ({}): {e}", bin.display()));
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -181,12 +195,30 @@ impl Drop for Proc {
 
 /// Starts `bin -config.file=<dir>/mimir.yaml <extra...>` after writing `yaml` there.
 pub fn start_mimir(which: Impl, name: &str, dir: &Path, yaml: &str, extra: &[String]) -> Proc {
+    start_mimir_with_env(which, name, dir, yaml, extra, &[])
+}
+
+/// Like [`start_mimir`], with additional environment variables set on the child process.
+pub fn start_mimir_with_env(
+    which: Impl,
+    name: &str,
+    dir: &Path,
+    yaml: &str,
+    extra: &[String],
+    env: &[(&str, &str)],
+) -> Proc {
     std::fs::create_dir_all(dir).unwrap();
     let cfg = dir.join("mimir.yaml");
     std::fs::write(&cfg, yaml).unwrap();
     let mut args = vec![format!("-config.file={}", cfg.display())];
     args.extend(extra.iter().cloned());
-    Proc::spawn(&format!("{}-{name}", which.name()), &binary(which), &args, dir)
+    Proc::spawn_with_env(
+        &format!("{}-{name}", which.name()),
+        &binary(which),
+        &args,
+        dir,
+        env,
+    )
 }
 
 /// `GET http://127.0.0.1:{port}{path}` with a short timeout: `(status, headers, body)`.

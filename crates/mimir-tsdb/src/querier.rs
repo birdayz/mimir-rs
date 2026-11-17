@@ -228,6 +228,11 @@ impl<'a> TsdbQuerier<'a> {
         }
     }
 
+    fn effective_in_order_head(&self) -> Option<&'a Head> {
+        self.head
+            .filter(|h| h.initialized() && h.min_time() <= self.maxt && self.mint <= h.max_time())
+    }
+
     fn effective_head(&self) -> Option<&'a Head> {
         self.head.filter(|h| {
             let in_order =
@@ -1164,11 +1169,11 @@ impl<'a> TsdbQuerier<'a> {
         Ok(set.into_iter().collect())
     }
 
-    /// Returns sorted unique label names across Head and overlapping Blocks matching `matchers`.
+    /// Returns sorted unique label names across in-order Head and overlapping Blocks matching `matchers`.
     pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
         let blocks = self.effective_blocks(&lock_guard);
-        let head = self.effective_head();
+        let head = self.effective_in_order_head();
         let mut set: BTreeSet<String> = BTreeSet::new();
 
         if let Some(head) = head {
@@ -1193,7 +1198,7 @@ impl<'a> TsdbQuerier<'a> {
         Ok(set.into_iter().collect())
     }
 
-    /// Returns sorted unique label values for `name` across Head and overlapping Blocks matching `matchers`.
+    /// Returns sorted unique label values for `name` across in-order Head and overlapping Blocks matching `matchers`.
     pub fn label_values(
         &self,
         name: &str,
@@ -1202,7 +1207,7 @@ impl<'a> TsdbQuerier<'a> {
     ) -> Result<Vec<String>, QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
         let blocks = self.effective_blocks(&lock_guard);
-        let head = self.effective_head();
+        let head = self.effective_in_order_head();
 
         if blocks.is_empty() {
             return match head {
@@ -1492,4 +1497,71 @@ impl<'a> TsdbChunkQuerier<'a> {
 /// Helper to iterate samples out of an [`EncodedChunk`] slice.
 pub fn chunk_to_samples(chunk: &EncodedChunk) -> Result<Vec<DecodedSample>, ChunkError> {
     decode_chunk_samples(chunk)
+}
+
+#[cfg(test)]
+mod wave3_tests {
+    use super::*;
+    use crate::head::HeadOptions;
+
+    #[test]
+    fn label_discovery_uses_in_order_head_bounds_not_ooo_bounds() {
+        // W3-04: When `[mint, maxt]` overlaps `[min_ooo_time, max_ooo_time]` but does NOT overlap
+        // `[head.min_time(), head.max_time()]`, `label_names`, `label_values`, `search_label_names`,
+        // and `search_label_values` must NOT return Head labels/values (`ooo_head_read.go:648-680`),
+        // while `select` / `select_raw_labels` MUST still find the OOO series.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 3_600_000,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+
+        {
+            let mut app = head.appender();
+            app.append_float(
+                None,
+                &[("__name__", "m_head"), ("head_lbl", "hv")],
+                1_000_000,
+                1.0,
+            )
+            .unwrap();
+            app.commit().unwrap();
+        }
+        {
+            let mut app = head.appender();
+            app.append_float(
+                None,
+                &[("__name__", "m_head"), ("head_lbl", "hv")],
+                500_000,
+                2.0,
+            )
+            .unwrap();
+            app.commit().unwrap();
+        }
+        assert_eq!(head.min_time(), 1_000_000);
+        assert_eq!(head.min_ooo_time(), 500_000);
+
+        // Pre-Head.MinTime() OOO-only window [400_000, 600_000]:
+        let q_ooo = TsdbQuerier::new(Some(&head), Vec::new(), 400_000, 600_000);
+        assert!(q_ooo.label_names(&[]).unwrap().is_empty());
+        assert!(q_ooo.label_values("head_lbl", None, &[]).unwrap().is_empty());
+        assert!(q_ooo
+            .search_label_names(&SearchHints::default(), &[])
+            .unwrap()
+            .is_empty());
+        assert!(q_ooo
+            .search_label_values("head_lbl", &SearchHints::default(), &[])
+            .unwrap()
+            .is_empty());
+        let all_m = [LabelMatcher::new(crate::matcher::MatchType::RegexMatch, "__name__", ".+").unwrap()];
+        assert_eq!(q_ooo.select(true, &all_m).unwrap().len(), 1);
+        assert_eq!(q_ooo.select_raw_labels(true, &all_m).unwrap().len(), 1);
+
+        // Overlapping in-order Head [1_000_000, 1_000_000]:
+        let q_ino = TsdbQuerier::new(Some(&head), Vec::new(), 1_000_000, 1_000_000);
+        assert_eq!(q_ino.label_names(&[]).unwrap(), vec!["__name__", "head_lbl"]);
+        assert_eq!(q_ino.label_values("head_lbl", None, &[]).unwrap(), vec!["hv"]);
+        head.close().unwrap();
+    }
 }

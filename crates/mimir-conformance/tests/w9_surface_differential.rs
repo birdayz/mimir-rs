@@ -1038,9 +1038,7 @@ fn w9_grpc_tenant_and_matcher_error_status_parity() {
         ("repeated header", vec!["w9", "w9"], &good),
         ("repeated header differing", vec!["a", "b"], &good),
         ("invalid tenant char", vec!["a/b"], &good),
-        // Not compared: an empty `x-scope-orgid` value. Go accepts the empty tenant ID (reads
-        // succeed, a push would put the tenant TSDB into the TSDB root directory); mimir-rs
-        // rejects it as `no org id` (documented divergence in PORT_STATUS.md).
+        ("empty header", vec![""], &good),
         ("unsafe tenant ..", vec![".."], &good),
         ("invalid regex, existing tenant", vec!["w9"], &bad_regex),
         ("invalid negative regex, existing tenant", vec!["w9"], &bad_nregex),
@@ -1065,6 +1063,12 @@ fn w9_grpc_tenant_and_matcher_error_status_parity() {
         let mut labels = Vec::new();
         for (label, ids, matchers) in &cases {
             for rpc in s24::RPCS {
+                // Once Push("") creates an empty-tenant TSDB, Go's `pkg/queue` worker pool
+                // rejects `tenantID == ""` on `LabelValuesCardinality` with `invalid tenant id`
+                // (`mimir-ingester/src/workerpool.rs`); all other 13 RPCs accept `""`.
+                if *label == "empty header" && *rpc == "LabelValuesCardinality" {
+                    continue;
+                }
                 let g = s24::call(&mut clients[0], rpc, ids, matchers, now_ms).await;
                 let c = s24::call(&mut clients[1], rpc, ids, matchers, now_ms).await;
                 labels.push(format!("{rpc} [{label}]"));

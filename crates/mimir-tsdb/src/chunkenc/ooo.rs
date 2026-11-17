@@ -3,10 +3,13 @@
 //! Ported from github.com/prometheus/prometheus/tsdb/ooo_head.go.
 
 use super::float_histogram::{AppendFloatHistogramOutcome, FloatHistogramChunk};
+use super::float_histogram_st::{AppendFloatHistogramStOutcome, FloatHistogramStChunk};
 use super::histogram::{AppendHistogramOutcome, HistogramChunk};
 use super::histogram_model::{FloatHistogram, Histogram};
+use super::histogram_st::{AppendHistogramStOutcome, HistogramStChunk};
 use super::xor::XorChunk;
-use super::{ChunkError, EncodedChunk, ValueType};
+use super::xor2::Xor2Chunk;
+use super::{ChunkError, EncodedChunk, Encoding, ValueType};
 
 /// Value stored in an [`OooSample`].
 #[derive(Clone, Debug, PartialEq)]
@@ -135,9 +138,16 @@ impl OooChunk {
             .map(|(a, b)| (a.t, b.t))
     }
 
-    /// Cuts samples in `[mint, maxt]` into standard encoded chunks (`XorChunk`, `HistogramChunk`,
-    /// `FloatHistogramChunk`), matching `tsdb.OOOChunk.ToEncodedChunks`.
-    pub fn to_encoded_chunks(&self, mint: i64, maxt: i64) -> Result<Vec<CutChunk>, ChunkError> {
+    /// Cuts samples in `[mint, maxt]` into standard encoded chunks (`XorChunk` / `Xor2Chunk`,
+    /// `HistogramChunk` / `HistogramStChunk`, `FloatHistogramChunk` / `FloatHistogramStChunk`),
+    /// matching `tsdb.OOOChunk.ToEncodedChunks`.
+    pub fn to_encoded_chunks(
+        &self,
+        mint: i64,
+        maxt: i64,
+        use_xor2: bool,
+        use_histogram_st: bool,
+    ) -> Result<Vec<CutChunk>, ChunkError> {
         if self.samples.is_empty() {
             return Ok(Vec::new());
         }
@@ -150,10 +160,21 @@ impl OooChunk {
                 cmaxt: i64,
                 chunk: XorChunk,
             },
+            Xor2 {
+                cmint: i64,
+                cmaxt: i64,
+                chunk: Xor2Chunk,
+            },
             Hist {
                 cmint: i64,
                 cmaxt: i64,
                 chunk: HistogramChunk,
+                prev_state: Option<super::histogram::HistogramAppenderState>,
+            },
+            HistSt {
+                cmint: i64,
+                cmaxt: i64,
+                chunk: HistogramStChunk,
                 prev_state: Option<super::histogram::HistogramAppenderState>,
             },
             FloatHist {
@@ -162,7 +183,89 @@ impl OooChunk {
                 chunk: FloatHistogramChunk,
                 prev_state: Option<super::float_histogram::FloatHistogramAppenderState>,
             },
+            FloatHistSt {
+                cmint: i64,
+                cmaxt: i64,
+                chunk: FloatHistogramStChunk,
+                prev_state: Option<super::float_histogram::FloatHistogramAppenderState>,
+            },
         }
+
+        let flush_active = |active: &mut Active, out: &mut Vec<CutChunk>| {
+            match std::mem::replace(active, Active::None) {
+                Active::None => {}
+                Active::Xor {
+                    cmint,
+                    cmaxt,
+                    chunk,
+                } => {
+                    out.push(CutChunk {
+                        min_time: cmint,
+                        max_time: cmaxt,
+                        chunk: EncodedChunk::Xor(chunk),
+                    });
+                }
+                Active::Xor2 {
+                    cmint,
+                    cmaxt,
+                    chunk,
+                } => {
+                    out.push(CutChunk {
+                        min_time: cmint,
+                        max_time: cmaxt,
+                        chunk: EncodedChunk::Xor2(chunk),
+                    });
+                }
+                Active::Hist {
+                    cmint,
+                    cmaxt,
+                    chunk,
+                    ..
+                } => {
+                    out.push(CutChunk {
+                        min_time: cmint,
+                        max_time: cmaxt,
+                        chunk: EncodedChunk::Histogram(chunk),
+                    });
+                }
+                Active::HistSt {
+                    cmint,
+                    cmaxt,
+                    chunk,
+                    ..
+                } => {
+                    out.push(CutChunk {
+                        min_time: cmint,
+                        max_time: cmaxt,
+                        chunk: EncodedChunk::HistogramSt(chunk),
+                    });
+                }
+                Active::FloatHist {
+                    cmint,
+                    cmaxt,
+                    chunk,
+                    ..
+                } => {
+                    out.push(CutChunk {
+                        min_time: cmint,
+                        max_time: cmaxt,
+                        chunk: EncodedChunk::FloatHistogram(chunk),
+                    });
+                }
+                Active::FloatHistSt {
+                    cmint,
+                    cmaxt,
+                    chunk,
+                    ..
+                } => {
+                    out.push(CutChunk {
+                        min_time: cmint,
+                        max_time: cmaxt,
+                        chunk: EncodedChunk::FloatHistogramSt(chunk),
+                    });
+                }
+            }
+        };
 
         let mut active = Active::None;
 
@@ -174,75 +277,95 @@ impl OooChunk {
                 break;
             }
 
-            let vt = s.value.value_type();
-            let same_kind = matches!(
-                (&active, vt),
-                (Active::Xor { .. }, ValueType::Float)
-                    | (Active::Hist { .. }, ValueType::Histogram)
-                    | (Active::FloatHist { .. }, ValueType::FloatHistogram)
-            );
-
-            if !same_kind {
-                match std::mem::replace(&mut active, Active::None) {
-                    Active::None => {}
-                    Active::Xor { cmint, cmaxt, chunk } => {
-                        out.push(CutChunk {
-                            min_time: cmint,
-                            max_time: cmaxt,
-                            chunk: EncodedChunk::Xor(chunk),
-                        });
-                    }
-                    Active::Hist {
-                        cmint,
-                        cmaxt,
-                        chunk,
-                        ..
-                    } => {
-                        out.push(CutChunk {
-                            min_time: cmint,
-                            max_time: cmaxt,
-                            chunk: EncodedChunk::Histogram(chunk),
-                        });
-                    }
-                    Active::FloatHist {
-                        cmint,
-                        cmaxt,
-                        chunk,
-                        ..
-                    } => {
-                        out.push(CutChunk {
-                            min_time: cmint,
-                            max_time: cmaxt,
-                            chunk: EncodedChunk::FloatHistogram(chunk),
-                        });
+            let enc = match s.value.value_type() {
+                ValueType::Float => {
+                    if use_xor2 {
+                        Encoding::Xor2
+                    } else {
+                        Encoding::Xor
                     }
                 }
+                ValueType::Histogram => {
+                    if use_histogram_st {
+                        Encoding::HistogramSt
+                    } else {
+                        Encoding::Histogram
+                    }
+                }
+                ValueType::FloatHistogram => {
+                    if use_histogram_st {
+                        Encoding::FloatHistogramSt
+                    } else {
+                        Encoding::FloatHistogram
+                    }
+                }
+                ValueType::None => unreachable!(),
+            };
 
-                active = match vt {
-                    ValueType::Float => Active::Xor {
+            let cur_enc = match &active {
+                Active::None => Encoding::None,
+                Active::Xor { .. } => Encoding::Xor,
+                Active::Xor2 { .. } => Encoding::Xor2,
+                Active::Hist { .. } => Encoding::Histogram,
+                Active::HistSt { .. } => Encoding::HistogramSt,
+                Active::FloatHist { .. } => Encoding::FloatHistogram,
+                Active::FloatHistSt { .. } => Encoding::FloatHistogramSt,
+            };
+
+            if cur_enc != enc {
+                flush_active(&mut active, &mut out);
+                active = match enc {
+                    Encoding::Xor => Active::Xor {
                         cmint: s.t,
                         cmaxt: s.t,
                         chunk: XorChunk::new(),
                     },
-                    ValueType::Histogram => Active::Hist {
+                    Encoding::Xor2 => Active::Xor2 {
+                        cmint: s.t,
+                        cmaxt: s.t,
+                        chunk: Xor2Chunk::new(),
+                    },
+                    Encoding::Histogram => Active::Hist {
                         cmint: s.t,
                         cmaxt: s.t,
                         chunk: HistogramChunk::new(),
                         prev_state: None,
                     },
-                    ValueType::FloatHistogram => Active::FloatHist {
+                    Encoding::HistogramSt => Active::HistSt {
+                        cmint: s.t,
+                        cmaxt: s.t,
+                        chunk: HistogramStChunk::new(),
+                        prev_state: None,
+                    },
+                    Encoding::FloatHistogram => Active::FloatHist {
                         cmint: s.t,
                         cmaxt: s.t,
                         chunk: FloatHistogramChunk::new(),
                         prev_state: None,
                     },
-                    ValueType::None => unreachable!(),
+                    Encoding::FloatHistogramSt => Active::FloatHistSt {
+                        cmint: s.t,
+                        cmaxt: s.t,
+                        chunk: FloatHistogramStChunk::new(),
+                        prev_state: None,
+                    },
+                    Encoding::None => unreachable!(),
                 };
             }
 
             match (&mut active, &s.value) {
                 (
                     Active::Xor {
+                        cmaxt, chunk, ..
+                    },
+                    OooSampleValue::Float(v),
+                ) => {
+                    let mut app = chunk.appender()?;
+                    app.append(s.st, s.t, *v)?;
+                    *cmaxt = s.t;
+                }
+                (
+                    Active::Xor2 {
                         cmaxt, chunk, ..
                     },
                     OooSampleValue::Float(v),
@@ -282,6 +405,36 @@ impl OooChunk {
                     }
                 }
                 (
+                    Active::HistSt {
+                        cmint,
+                        cmaxt,
+                        chunk,
+                        prev_state,
+                    },
+                    OooSampleValue::Histogram(h),
+                ) => {
+                    let mut app = chunk.appender()?;
+                    let outcome =
+                        app.append_histogram(prev_state.as_ref(), s.st, s.t, h, false)?;
+                    let next_prev = app.state().clone();
+                    match outcome {
+                        AppendHistogramStOutcome::Appended { .. } => {
+                            *cmaxt = s.t;
+                        }
+                        AppendHistogramStOutcome::NewChunk(new_chunk) => {
+                            let old = std::mem::replace(chunk, new_chunk);
+                            out.push(CutChunk {
+                                min_time: *cmint,
+                                max_time: *cmaxt,
+                                chunk: EncodedChunk::HistogramSt(old),
+                            });
+                            *cmint = s.t;
+                            *cmaxt = s.t;
+                            *prev_state = Some(next_prev);
+                        }
+                    }
+                }
+                (
                     Active::FloatHist {
                         cmint,
                         cmaxt,
@@ -311,45 +464,41 @@ impl OooChunk {
                         }
                     }
                 }
+                (
+                    Active::FloatHistSt {
+                        cmint,
+                        cmaxt,
+                        chunk,
+                        prev_state,
+                    },
+                    OooSampleValue::FloatHistogram(fh),
+                ) => {
+                    let mut app = chunk.appender()?;
+                    let outcome =
+                        app.append_float_histogram(prev_state.as_ref(), s.st, s.t, fh, false)?;
+                    let next_prev = app.state().clone();
+                    match outcome {
+                        AppendFloatHistogramStOutcome::Appended { .. } => {
+                            *cmaxt = s.t;
+                        }
+                        AppendFloatHistogramStOutcome::NewChunk(new_chunk) => {
+                            let old = std::mem::replace(chunk, new_chunk);
+                            out.push(CutChunk {
+                                min_time: *cmint,
+                                max_time: *cmaxt,
+                                chunk: EncodedChunk::FloatHistogramSt(old),
+                            });
+                            *cmint = s.t;
+                            *cmaxt = s.t;
+                            *prev_state = Some(next_prev);
+                        }
+                    }
+                }
                 _ => unreachable!(),
             }
         }
 
-        match active {
-            Active::None => {}
-            Active::Xor { cmint, cmaxt, chunk } => {
-                out.push(CutChunk {
-                    min_time: cmint,
-                    max_time: cmaxt,
-                    chunk: EncodedChunk::Xor(chunk),
-                });
-            }
-            Active::Hist {
-                cmint,
-                cmaxt,
-                chunk,
-                ..
-            } => {
-                out.push(CutChunk {
-                    min_time: cmint,
-                    max_time: cmaxt,
-                    chunk: EncodedChunk::Histogram(chunk),
-                });
-            }
-            Active::FloatHist {
-                cmint,
-                cmaxt,
-                chunk,
-                ..
-            } => {
-                out.push(CutChunk {
-                    min_time: cmint,
-                    max_time: cmaxt,
-                    chunk: EncodedChunk::FloatHistogram(chunk),
-                });
-            }
-        }
-
+        flush_active(&mut active, &mut out);
         Ok(out)
     }
 }
@@ -370,7 +519,7 @@ mod tests {
         assert!(ooo.has_equal_sample(2000, &OooSampleValue::Float(2.0)));
         assert!(!ooo.has_equal_sample(2000, &OooSampleValue::Float(99.0)));
 
-        let cut = ooo.to_encoded_chunks(i64::MIN, i64::MAX).unwrap();
+        let cut = ooo.to_encoded_chunks(i64::MIN, i64::MAX, false, false).unwrap();
         assert_eq!(cut.len(), 1);
         assert_eq!(cut[0].min_time, 1000);
         assert_eq!(cut[0].max_time, 3000);
@@ -384,5 +533,61 @@ mod tests {
         } else {
             panic!("expected Xor chunk");
         }
+    }
+
+    #[test]
+    fn ooo_cuts_xor2_and_histogram_st_when_enabled() {
+        use super::super::histogram_model::HistogramSpan;
+
+        let mut ooo_f = OooChunk::new();
+        assert!(ooo_f.insert_float(900, 2000, 2.5));
+        assert!(ooo_f.insert_float(900, 1000, 1.5));
+        let cut_f = ooo_f.to_encoded_chunks(i64::MIN, i64::MAX, true, true).unwrap();
+        assert_eq!(cut_f.len(), 1);
+        assert_eq!(cut_f[0].chunk.encoding(), Encoding::Xor2);
+        let EncodedChunk::Xor2(ref x2) = cut_f[0].chunk else {
+            panic!("expected Xor2 chunk");
+        };
+        let mut it = x2.iter();
+        assert_eq!(it.next_sample().unwrap(), Some((1000, 1.5)));
+        assert_eq!(it.at_st(), 900);
+        assert_eq!(it.next_sample().unwrap(), Some((2000, 2.5)));
+        assert_eq!(it.at_st(), 900);
+        assert_eq!(it.next_sample().unwrap(), None);
+
+        let mut ooo_h = OooChunk::new();
+        let h1 = Histogram {
+            schema: 0,
+            count: 2,
+            sum: 3.0,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![2],
+            ..Histogram::default()
+        };
+        let mut h2 = h1.clone();
+        h2.count = 4;
+        h2.sum = 6.0;
+        h2.positive_buckets = vec![4];
+        assert!(ooo_h.insert_histogram(500, 2000, h2.clone()));
+        assert!(ooo_h.insert_histogram(500, 1000, h1.clone()));
+        let cut_h = ooo_h.to_encoded_chunks(i64::MIN, i64::MAX, true, true).unwrap();
+        assert_eq!(cut_h.len(), 1);
+        assert_eq!(cut_h[0].chunk.encoding(), Encoding::HistogramSt);
+
+        let mut ooo_fh = OooChunk::new();
+        let fh1 = FloatHistogram {
+            schema: 0,
+            count: 2.0,
+            sum: 3.0,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![2.0],
+            ..FloatHistogram::default()
+        };
+        assert!(ooo_fh.insert_float_histogram(500, 1000, fh1));
+        let cut_fh = ooo_fh
+            .to_encoded_chunks(i64::MIN, i64::MAX, true, true)
+            .unwrap();
+        assert_eq!(cut_fh.len(), 1);
+        assert_eq!(cut_fh[0].chunk.encoding(), Encoding::FloatHistogramSt);
     }
 }
