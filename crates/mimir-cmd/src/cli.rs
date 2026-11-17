@@ -4,7 +4,7 @@
 //! - github.com/grafana/mimir/cmd/mimir/main.go
 //! - github.com/grafana/mimir/pkg/util/yaml.go (`DiffConfig`)
 
-use mimir_config::schema::{FieldKind, SchemaBlock, EXTRA_TOP_BLOCKS};
+use mimir_config::schema::{FieldKind, SchemaBlock, SchemaField, EXTRA_TOP_BLOCKS};
 use mimir_config::{
     format_go_duration, format_modules, format_version, parse_cli_and_load_config, CliAction,
     ConfigError, GoDuration, MimirConfig,
@@ -157,17 +157,17 @@ fn build_block_yaml(
                 parse_cli_value_for_yaml(field.kind, cli_val)
             } else if let Some(explicit) = yaml_map.and_then(|m| m.get(&yaml_key)) {
                 if explicit.is_null() {
-                    default_yaml_value(field.kind, field.default_str)
+                    field_default_yaml_value(field)
                 } else {
                     explicit.clone()
                 }
             } else {
-                default_yaml_value(field.kind, field.default_str)
+                field_default_yaml_value(field)
             }
         } else if let Some(explicit) = yaml_map.and_then(|m| m.get(&yaml_key)) {
             explicit.clone()
         } else {
-            default_yaml_value(field.kind, field.default_str)
+            field_default_yaml_value(field)
         };
         let val = match field.kind {
             FieldKind::Secret => mask_secret_yaml_value(&val),
@@ -209,6 +209,21 @@ fn mask_secret_yaml_value(v: &Value) -> Value {
         mimir_config::secret::FLAGEXT_SECRET_MASK
     };
     Value::String(masked.to_string())
+}
+
+/// Default YAML value of a schema field. `instance_interface_names` defaults are computed at
+/// flag registration time in Go (`netutil.PrivateNetworkInterfacesWithFallback([eth0 en0])`,
+/// e.g. pkg/util/ring_config.go:53), so the effective config shows the detected interfaces.
+fn field_default_yaml_value(field: &SchemaField) -> Value {
+    if field.name == "instance_interface_names" && field.kind == FieldKind::StringList {
+        return Value::Sequence(
+            mimir_common::netutil::default_instance_interface_names()
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        );
+    }
+    default_yaml_value(field.kind, field.default_str)
 }
 
 fn default_yaml_value(kind: FieldKind, default_str: &str) -> Value {

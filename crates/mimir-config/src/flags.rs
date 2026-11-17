@@ -27,6 +27,9 @@ pub struct FlagEntry<T> {
     pub type_name: &'static str,
     pub default_str: String,
     pub usage: String,
+    /// Go only quotes `-help` defaults of flags whose value kind is `reflect.String`; e.g.
+    /// `*flagext.StringSlice` renders as type "string" but with an unquoted default.
+    pub usage_default_unquoted: bool,
     pub was_set: bool,
     setter: FlagSetter<T>,
     getter: FlagGetter<T>,
@@ -73,11 +76,23 @@ impl<T> FlagSet<T> {
                 type_name,
                 default_str: default_str.into(),
                 usage: usage.into(),
+                usage_default_unquoted: false,
                 was_set: false,
                 setter: Box::new(setter),
                 getter: Box::new(getter),
             },
         );
+    }
+
+    /// Overrides how an already registered flag is rendered by `-help`: the type name
+    /// (`usage.getFlagName`) and the default (`usage.getFlagDefault`, i.e. a struct field's
+    /// `doc:"default=..."` tag). The flag's real default value is unaffected.
+    pub fn set_usage_default(&mut self, name: &str, type_name: &'static str, default_str: &str) {
+        if let Some(entry) = self.flags.get_mut(name) {
+            entry.type_name = type_name;
+            entry.default_str = default_str.to_string();
+            entry.usage_default_unquoted = true;
+        }
     }
 
     pub fn bool_var(
@@ -631,7 +646,7 @@ impl<T> FlagSet<T> {
                 out.push_str("    \t");
                 out.push_str(&entry.usage.replace('\n', "\n    \t"));
                 if !is_zero_default(&entry.default_str, entry.is_bool) {
-                    if entry.type_name == "string" {
+                    if entry.type_name == "string" && !entry.usage_default_unquoted {
                         let _ = write!(out, " (default {:?})", entry.default_str);
                     } else {
                         let _ = write!(out, " (default {})", entry.default_str);
