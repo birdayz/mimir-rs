@@ -33,7 +33,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use mimir_common::tenant::LOWER_ORG_ID_HEADER_NAME;
 use mimir_config::storage::KafkaConfig;
-use mimir_config::StringSliceCSV;
+use mimir_config::{parse_go_duration, StringSliceCSV};
 use mimir_conformance::oracle::{
     ensure_go_oracle_built, ensure_rust_mimir_release_built, go_mimir_bin,
     rust_mimir_release_bin, workspace_root,
@@ -73,6 +73,12 @@ const NAMESPACE: &str = "mimir";
 
 const TENANT_PROD: &str = "soak-prod";
 const TENANT_CANARY: &str = "soak-canary";
+const TENANT_EPHEMERAL_PREFIX: &str = "soak-ephemeral-";
+const EPHEMERAL_SERIES_COUNT: usize = 500;
+const EPHEMERAL_CLOSE_IDLE_TIMEOUT_SECS: u64 = 15 * 60;
+const EPHEMERAL_CLOSE_IDLE_TIMEOUT_STR: &str = "15m";
+const EPHEMERAL_HEAD_COMPACTION_IDLE_TIMEOUT_STR: &str = "10m";
+const SAWTOOTH_LONG_RUN_SECS: u64 = 4 * 3600;
 const FLOAT_FAMILIES: usize = 160;
 const HIST_FAMILIES: usize = 20;
 const SERIES_PER_POD: usize = 5;
@@ -99,6 +105,7 @@ struct SoakConfig {
     parity_interval_secs: u64,
     retention_period: String,
     head_compaction_interval: Option<String>,
+    ephemeral_tenant_interval_secs: u64,
     out_dir: PathBuf,
     skip_build: bool,
     strict_rss_trend: bool,
@@ -119,6 +126,7 @@ impl Default for SoakConfig {
             parity_interval_secs: 60,
             retention_period: "6h".to_string(),
             head_compaction_interval: None,
+            ephemeral_tenant_interval_secs: 300,
             out_dir: workspace_root().join("target").join(format!("soak-{ts}")),
             skip_build: false,
             strict_rss_trend: false,
@@ -130,6 +138,33 @@ impl SoakConfig {
     fn effective_warmup_secs(&self) -> u64 {
         self.warmup_secs
             .unwrap_or_else(|| (self.duration_secs / 4).clamp(30, 600))
+    }
+
+    fn retention_secs(&self) -> f64 {
+        parse_go_duration(&self.retention_period)
+            .ok()
+            .filter(|&ns| ns > 0)
+            .map(|ns| ns as f64 / 1_000_000_000.0)
+            .unwrap_or(6.0 * 3600.0)
+    }
+
+    fn head_compaction_interval_secs(&self) -> u64 {
+        let s = self.head_compaction_interval.as_deref().unwrap_or("15m");
+        parse_go_duration(s)
+            .ok()
+            .filter(|&ns| ns > 0)
+            .map(|ns| (ns as u64) / 1_000_000_000)
+            .unwrap_or(15 * 60)
+    }
+
+    fn ephemeral_settle_max_secs(&self) -> u64 {
+        // close_idle_tsdb_timeout (15m) + head_compaction_interval (15m default)
+        // + ship_interval (1m) + DefaultCloseIdleTSDBInterval (5m) + jitter margin (10m)
+        EPHEMERAL_CLOSE_IDLE_TIMEOUT_SECS
+            + self.head_compaction_interval_secs().max(15 * 60)
+            + 60
+            + 5 * 60
+            + 10 * 60
     }
 }
 
@@ -148,6 +183,7 @@ fn print_help() {
            --parity-interval-secs <secs>    Go-vs-Rust response parity sweep interval (default: 60)\n\
            --retention-period <dur>         TSDB retention period, e.g. 6h or 13h (default: 6h)\n\
            --head-compaction-interval <dur> Optional override for head compaction interval (default: Helm 15m)\n\
+           --ephemeral-tenant-interval-secs <secs>  Spawn ephemeral 500-series idle-close tenant every N secs (default: 300, 0=off)\n\
            --out-dir <path>                 Output directory for telemetry.csv & latest-summary.txt\n\
            --strict-rss-trend               Flag monotonic RssAnon growth even on short (<30m) runs\n\
            --skip-build                     Reuse existing target/go-mimir and target/release/mimir\n\
@@ -205,6 +241,10 @@ fn parse_args() -> Result<Option<SoakConfig>> {
             "--head-compaction-interval" => {
                 cfg.head_compaction_interval =
                     Some(next_str(&mut i, "--head-compaction-interval")?);
+            }
+            "--ephemeral-tenant-interval-secs" => {
+                cfg.ephemeral_tenant_interval_secs =
+                    next_str(&mut i, "--ephemeral-tenant-interval-secs")?.parse::<u64>()?;
             }
             "--out-dir" => {
                 cfg.out_dir = PathBuf::from(next_str(&mut i, "--out-dir")?);
@@ -288,7 +328,7 @@ fn host_port(addr: &str) -> Result<(String, u16)> {
     Ok((h.trim_end_matches('.').to_string(), p.parse()?))
 }
 
-fn patch_soak_limits(mimir_yaml: &str) -> Result<String> {
+fn patch_soak_limits(mimir_yaml: &str, cfg: &SoakConfig) -> Result<String> {
     let mut root: Yaml = serde_yaml::from_str(mimir_yaml)?;
     let root_map = root
         .as_mapping_mut()
@@ -314,18 +354,50 @@ fn patch_soak_limits(mimir_yaml: &str) -> Result<String> {
     for (k, v) in overrides {
         limits.insert(Yaml::String(k.to_string()), v);
     }
+
+    if cfg.ephemeral_tenant_interval_secs > 0 {
+        let bs_key = Yaml::String("blocks_storage".to_string());
+        if !root_map.contains_key(&bs_key) {
+            root_map.insert(bs_key.clone(), Yaml::Mapping(Default::default()));
+        }
+        let bs = root_map
+            .get_mut(&bs_key)
+            .and_then(Yaml::as_mapping_mut)
+            .ok_or_else(|| anyhow!("blocks_storage is not a mapping"))?;
+        let tsdb_key = Yaml::String("tsdb".to_string());
+        if !bs.contains_key(&tsdb_key) {
+            bs.insert(tsdb_key.clone(), Yaml::Mapping(Default::default()));
+        }
+        let tsdb = bs
+            .get_mut(&tsdb_key)
+            .and_then(Yaml::as_mapping_mut)
+            .ok_or_else(|| anyhow!("blocks_storage.tsdb is not a mapping"))?;
+        // Note: Go tsdb.TSDBConfig.CloseIdleTSDBInterval has yaml:"-" (rejected by KnownFields(true))
+        // and defaults to DefaultCloseIdleTSDBInterval = 5m in both Go and Rust.
+        // Setting head_compaction_idle_timeout=10m + close_idle_tsdb_timeout=15m lets idle
+        // ephemeral tenants compact, ship (1m), and close+delete within ~15-25m.
+        tsdb.insert(
+            Yaml::String("close_idle_tsdb_timeout".to_string()),
+            Yaml::String(EPHEMERAL_CLOSE_IDLE_TIMEOUT_STR.to_string()),
+        );
+        tsdb.insert(
+            Yaml::String("head_compaction_idle_timeout".to_string()),
+            Yaml::String(EPHEMERAL_HEAD_COMPACTION_IDLE_TIMEOUT_STR.to_string()),
+        );
+    }
+
     Ok(serde_yaml::to_string(&root)?)
 }
 
 impl HelmConfig {
-    fn load() -> Result<Self> {
+    fn load(cfg: &SoakConfig) -> Result<Self> {
         let dir = workspace_root()
             .join(".ref/mimir/operations/helm/tests")
             .join(format!("{HELM_TEST}-generated"))
             .join("mimir-distributed/templates");
         let cfg_docs = yaml_docs(&dir.join("mimir-config.yaml"))?;
         let raw_mimir_yaml = ystr(&cfg_docs[0], &["data", "mimir.yaml"])?;
-        let mimir_yaml = patch_soak_limits(raw_mimir_yaml)?;
+        let mimir_yaml = patch_soak_limits(raw_mimir_yaml, cfg)?;
         let rt_docs = yaml_docs(&dir.join("runtime-configmap.yaml"))?;
         let runtime_yaml = ystr(&rt_docs[0], &["data", "runtime.yaml"])?.to_string();
 
@@ -1216,6 +1288,13 @@ async fn collect_engine_sample(http: &reqwest::Client, ep: &IngesterEndpoint) ->
 // Workload Counters & Series Layout (Floats + Native Histograms + Exemplars + OOO + Churn)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
+struct EphemeralTenantRecord {
+    tenant_id: String,
+    first_offset: i64,
+    last_written_at: Instant,
+}
+
 #[derive(Default)]
 struct WorkloadCounters {
     produced_records: AtomicU64,
@@ -1224,11 +1303,17 @@ struct WorkloadCounters {
     produced_exemplars: AtomicU64,
     produced_ooo: AtomicU64,
     produced_churn_series: AtomicU64,
+    ephemeral_tenants_created: AtomicU64,
+    ephemeral_open_go: AtomicU64,
+    ephemeral_open_rust: AtomicU64,
+    ephemeral_closed_go: AtomicU64,
+    ephemeral_closed_rust: AtomicU64,
     kafka_last_offset: AtomicI64,
     rpc_ok_total: AtomicU64,
     rpc_err_total: AtomicU64,
     parity_checks: AtomicU64,
     parity_failures: AtomicU64,
+    ephemeral_tenants: Mutex<Vec<EphemeralTenantRecord>>,
     last_rpc_error: Mutex<Option<String>>,
     last_parity_error: Mutex<Option<String>>,
 }
@@ -1429,6 +1514,14 @@ async fn run_producer_loop(
     );
     let churn_per_tick = (cfg.churn_rate_per_min / 60.0) * tick_dur.as_secs_f64();
 
+    let eph_enabled = cfg.ephemeral_tenant_interval_secs > 0;
+    let eph_interval = Duration::from_secs(cfg.ephemeral_tenant_interval_secs.max(1));
+    let eph_active_dur =
+        Duration::from_secs((cfg.ephemeral_tenant_interval_secs / 2).clamp(10, 60));
+    let mut next_eph_start = Instant::now();
+    let mut eph_epoch = 0u64;
+    let mut current_eph: Option<(String, Instant, Instant, bool)> = None;
+
     let mut interval = tokio::time::interval(tick_dur);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1533,6 +1626,69 @@ async fn run_producer_loop(
             batch_records.push(encode_rw2_record(TENANT_CANARY, canary_series, meta, now)?);
         }
 
+        let mut eph_wrote_tenant: Option<(String, bool)> = None;
+        if eph_enabled {
+            let now_inst = Instant::now();
+            if now_inst >= next_eph_start {
+                eph_epoch += 1;
+                let tid = format!("{TENANT_EPHEMERAL_PREFIX}{eph_epoch:06}");
+                let active_until = now_inst + eph_active_dur;
+                current_eph = Some((
+                    tid,
+                    active_until,
+                    now_inst - Duration::from_secs(10),
+                    false,
+                ));
+                while next_eph_start <= now_inst {
+                    next_eph_start += eph_interval;
+                }
+            }
+            if let Some((ref tid, active_until, ref mut last_write, recorded)) = current_eph {
+                if now_inst <= active_until
+                    && now_inst.saturating_duration_since(*last_write) >= Duration::from_secs(2)
+                {
+                    *last_write = now_inst;
+                    let mut eph_series = Vec::with_capacity(EPHEMERAL_SERIES_COUNT);
+                    for es in 0..EPHEMERAL_SERIES_COUNT {
+                        let status_code = STATUS_CODES[es % STATUS_CODES.len()];
+                        let labels = vec![
+                            cortexpb::LabelPair::from_static(
+                                "__name__",
+                                "soak_ephemeral_requests_total",
+                            ),
+                            cortexpb::LabelPair::from_static(
+                                "cluster",
+                                CLUSTERS[es % CLUSTERS.len()],
+                            ),
+                            cortexpb::LabelPair::from_static("job", "ephemeral/job"),
+                            cortexpb::LabelPair::from_static("namespace", "ephemeral"),
+                            cortexpb::LabelPair::from_strs("pod", format!("eph-pod-{es:04}")),
+                            cortexpb::LabelPair::from_static("service", "ephemeral-svc"),
+                            cortexpb::LabelPair::from_static("status_code", status_code),
+                        ];
+                        eph_series.push(cortexpb::TimeSeries {
+                            labels,
+                            samples: vec![cortexpb::Sample {
+                                value: (es as f64) + (step_seq as f64) * 0.1,
+                                timestamp_ms: now,
+                            }],
+                            ..Default::default()
+                        });
+                    }
+                    tick_samples += EPHEMERAL_SERIES_COUNT as u64;
+                    for chunk in eph_series.chunks(SAMPLES_PER_RECORD) {
+                        batch_records.push(encode_rw2_record(
+                            tid,
+                            chunk.to_vec(),
+                            Vec::new(),
+                            now,
+                        )?);
+                    }
+                    eph_wrote_tenant = Some((tid.clone(), !recorded));
+                }
+            }
+        }
+
         let n_recs = batch_records.len() as i64;
         if n_recs > 0 {
             match client
@@ -1540,6 +1696,7 @@ async fn run_producer_loop(
                 .await
             {
                 Ok(base_offset) => {
+                    let last_offset = base_offset + n_recs - 1;
                     counters
                         .produced_records
                         .fetch_add(n_recs as u64, Ordering::Relaxed);
@@ -1557,7 +1714,26 @@ async fn run_producer_loop(
                         .fetch_add(tick_ooo, Ordering::Relaxed);
                     counters
                         .kafka_last_offset
-                        .store(base_offset + n_recs - 1, Ordering::Release);
+                        .store(last_offset, Ordering::Release);
+                    if let Some((tid, is_new)) = eph_wrote_tenant {
+                        let written_now = Instant::now();
+                        let mut list = counters.ephemeral_tenants.lock();
+                        if is_new {
+                            list.push(EphemeralTenantRecord {
+                                tenant_id: tid,
+                                first_offset: last_offset,
+                                last_written_at: written_now,
+                            });
+                            counters
+                                .ephemeral_tenants_created
+                                .fetch_add(1, Ordering::Relaxed);
+                            if let Some((_, _, _, ref mut rec_flag)) = current_eph {
+                                *rec_flag = true;
+                            }
+                        } else if let Some(rec) = list.iter_mut().rfind(|r| r.tenant_id == tid) {
+                            rec.last_written_at = written_now;
+                        }
+                    }
                 }
                 Err(e) => {
                     counters.record_rpc_err(format!("kafka produce failed: {e}"));
@@ -2069,9 +2245,151 @@ async fn query_stream_decoded(
     Ok(out)
 }
 
+#[derive(Clone, Debug)]
+struct HttpTenantInfo {
+    series: u64,
+}
+
+async fn fetch_ingester_tenants(
+    http: &reqwest::Client,
+    http_port: u16,
+) -> Result<BTreeMap<String, HttpTenantInfo>> {
+    let resp = http
+        .get(format!("http://127.0.0.1:{http_port}/ingester/tenants"))
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .context("GET /ingester/tenants")?;
+    ensure!(
+        resp.status().is_success(),
+        "GET /ingester/tenants returned {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.context("decode /ingester/tenants JSON")?;
+    let mut out = BTreeMap::new();
+    if let Some(arr) = body["Tenants"].as_array() {
+        for item in arr {
+            if let Some(tid) = item["Tenant"].as_str() {
+                let series = item["Series"].as_u64().unwrap_or(0);
+                out.insert(tid.to_string(), HttpTenantInfo { series });
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EphemeralPhase {
+    MustBeOpen,
+    TransitionJitter,
+    MustBeClosed,
+}
+
+fn classify_ephemeral_phase(
+    first_offset: i64,
+    bar_offset: i64,
+    idle_elapsed_secs: u64,
+    close_idle_timeout_secs: u64,
+    settle_max_secs: u64,
+) -> EphemeralPhase {
+    if first_offset > bar_offset {
+        return EphemeralPhase::TransitionJitter;
+    }
+    if idle_elapsed_secs < close_idle_timeout_secs.saturating_sub(60) {
+        EphemeralPhase::MustBeOpen
+    } else if idle_elapsed_secs < settle_max_secs {
+        EphemeralPhase::TransitionJitter
+    } else {
+        EphemeralPhase::MustBeClosed
+    }
+}
+
+fn verify_tenants_parity(
+    side_label: &str,
+    go_set: &BTreeSet<String>,
+    rust_set: &BTreeSet<String>,
+    eph_records: &[EphemeralTenantRecord],
+    bar_offset: i64,
+    now_inst: Instant,
+    settle_max_secs: u64,
+) -> Result<(u64, u64, u64, u64)> {
+    for steady in [TENANT_PROD, TENANT_CANARY] {
+        ensure!(
+            go_set.contains(steady) && rust_set.contains(steady),
+            "{side_label}: steady tenant {steady} missing (go={}, rust={})",
+            go_set.contains(steady),
+            rust_set.contains(steady)
+        );
+    }
+
+    let mut tracked_ids = BTreeSet::new();
+    let (mut open_go, mut open_rust, mut closed_go, mut closed_rust) = (0u64, 0u64, 0u64, 0u64);
+
+    for rec in eph_records {
+        tracked_ids.insert(rec.tenant_id.as_str());
+        let in_go = go_set.contains(&rec.tenant_id);
+        let in_rust = rust_set.contains(&rec.tenant_id);
+        if in_go {
+            open_go += 1;
+        } else {
+            closed_go += 1;
+        }
+        if in_rust {
+            open_rust += 1;
+        } else {
+            closed_rust += 1;
+        }
+        let idle_secs = now_inst
+            .saturating_duration_since(rec.last_written_at)
+            .as_secs();
+        match classify_ephemeral_phase(
+            rec.first_offset,
+            bar_offset,
+            idle_secs,
+            EPHEMERAL_CLOSE_IDLE_TIMEOUT_SECS,
+            settle_max_secs,
+        ) {
+            EphemeralPhase::MustBeOpen => {
+                ensure!(
+                    in_go && in_rust,
+                    "{side_label}: active ephemeral tenant {} missing before idle-close (idle={}s, go={in_go}, rust={in_rust})",
+                    rec.tenant_id,
+                    idle_secs
+                );
+            }
+            EphemeralPhase::TransitionJitter => {}
+            EphemeralPhase::MustBeClosed => {
+                ensure!(
+                    !in_go && !in_rust,
+                    "{side_label}: expired ephemeral tenant {} failed to close after idle={}s (go={in_go}, rust={in_rust})",
+                    rec.tenant_id,
+                    idle_secs
+                );
+            }
+        }
+    }
+
+    for tid in go_set.union(rust_set) {
+        if tid != TENANT_PROD && tid != TENANT_CANARY && !tracked_ids.contains(tid.as_str()) {
+            bail!(
+                "{side_label}: unexpected tenant {tid} in ingester (go={}, rust={})",
+                go_set.contains(tid),
+                rust_set.contains(tid)
+            );
+        }
+    }
+
+    Ok((open_go, open_rust, closed_go, closed_rust))
+}
+
 async fn run_parity_sweep(
+    http: &reqwest::Client,
+    go_http_port: u16,
+    rust_http_port: u16,
     go_ch: Channel,
     rust_ch: Channel,
+    cfg: &SoakConfig,
     counters: &WorkloadCounters,
 ) -> Result<()> {
     let offset = counters.kafka_last_offset.load(Ordering::Acquire);
@@ -2165,7 +2483,7 @@ async fn run_parity_sweep(
     rust_names.sort();
     ensure!(go_names == rust_names, "LabelNames mismatch: {go_names:?} vs {rust_names:?}");
 
-    // AllUserStats tenant set
+    // AllUserStats + /ingester/tenants parity (accounting for ephemeral idle-close jitter)
     let aus_req = || {
         with_org(
             TENANT_PROD,
@@ -2174,9 +2492,11 @@ async fn run_parity_sweep(
             },
         )
     };
-    let (go_aus, rust_aus) = tokio::join!(
+    let (go_aus, rust_aus, go_http_tenants, rust_http_tenants) = tokio::join!(
         g_cli.all_user_stats(aus_req()),
-        r_cli.all_user_stats(aus_req())
+        r_cli.all_user_stats(aus_req()),
+        fetch_ingester_tenants(http, go_http_port),
+        fetch_ingester_tenants(http, rust_http_port)
     );
     let go_tenants: BTreeSet<String> = go_aus?
         .into_inner()
@@ -2190,10 +2510,52 @@ async fn run_parity_sweep(
         .into_iter()
         .map(|s| s.user_id)
         .collect();
-    ensure!(
-        go_tenants == rust_tenants,
-        "AllUserStats tenants mismatch: {go_tenants:?} vs {rust_tenants:?}"
-    );
+    let go_http_map = go_http_tenants?;
+    let rust_http_map = rust_http_tenants?;
+    let go_http_set: BTreeSet<String> = go_http_map.keys().cloned().collect();
+    let rust_http_set: BTreeSet<String> = rust_http_map.keys().cloned().collect();
+
+    let eph_snapshot = counters.ephemeral_tenants.lock().clone();
+    let now_inst = Instant::now();
+    let settle_max = cfg.ephemeral_settle_max_secs();
+
+    verify_tenants_parity(
+        "AllUserStats",
+        &go_tenants,
+        &rust_tenants,
+        &eph_snapshot,
+        offset,
+        now_inst,
+        settle_max,
+    )?;
+    let (open_go, open_rust, closed_go, closed_rust) = verify_tenants_parity(
+        "/ingester/tenants",
+        &go_http_set,
+        &rust_http_set,
+        &eph_snapshot,
+        offset,
+        now_inst,
+        settle_max,
+    )?;
+    counters.ephemeral_open_go.store(open_go, Ordering::Relaxed);
+    counters
+        .ephemeral_open_rust
+        .store(open_rust, Ordering::Relaxed);
+    counters
+        .ephemeral_closed_go
+        .store(closed_go, Ordering::Relaxed);
+    counters
+        .ephemeral_closed_rust
+        .store(closed_rust, Ordering::Relaxed);
+
+    for steady in [TENANT_PROD, TENANT_CANARY] {
+        let gs = go_http_map.get(steady).map(|t| t.series).unwrap_or(0);
+        let rs = rust_http_map.get(steady).map(|t| t.series).unwrap_or(0);
+        ensure!(
+            gs > 0 && rs > 0,
+            "/ingester/tenants: steady tenant {steady} has 0 series (go={gs}, rust={rs})"
+        );
+    }
 
     // SearchLabelNames
     let sln_req = || {
@@ -2250,6 +2612,13 @@ async fn run_parity_sweep(
 // Anomaly Detector & CSV / Summary Reporting
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug)]
+struct RssPoint {
+    elapsed_secs: f64,
+    rss_anon_mib: f64,
+    compactions_ok: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 struct RssTrend {
     samples: usize,
@@ -2258,10 +2627,27 @@ struct RssTrend {
     slope_mib_per_hr: f64,
     r2: f64,
     max_monotonic_streak: usize,
+    window_secs: f64,
+    cycle_troughs_mib: Vec<f64>,
+    trough_monotonic_run: usize,
+    trough_monotonic_gain_mib: f64,
+    sawtooth_leak_flagged: bool,
+    short_run_flagged: bool,
     flagged: bool,
 }
 
-fn analyze_rss_trend(pts: &[(f64, f64)], strict: bool) -> RssTrend {
+fn analyze_rss_trend(
+    all_pts: &[RssPoint],
+    warmup_secs: u64,
+    retention_secs: f64,
+    duration_secs: u64,
+    strict: bool,
+) -> RssTrend {
+    let pts: Vec<RssPoint> = all_pts
+        .iter()
+        .copied()
+        .filter(|p| p.elapsed_secs >= warmup_secs as f64)
+        .collect();
     let mut out = RssTrend {
         samples: pts.len(),
         ..Default::default()
@@ -2269,13 +2655,13 @@ fn analyze_rss_trend(pts: &[(f64, f64)], strict: bool) -> RssTrend {
     if pts.len() < 4 {
         return out;
     }
-    out.start_mib = pts.first().map(|p| p.1).unwrap_or(0.0);
-    out.end_mib = pts.last().map(|p| p.1).unwrap_or(0.0);
+    out.start_mib = pts.first().map(|p| p.rss_anon_mib).unwrap_or(0.0);
+    out.end_mib = pts.last().map(|p| p.rss_anon_mib).unwrap_or(0.0);
 
     let mut streak = 0usize;
     let mut max_streak = 0usize;
     for w in pts.windows(2) {
-        if w[1].1 > w[0].1 {
+        if w[1].rss_anon_mib > w[0].rss_anon_mib {
             streak += 1;
             max_streak = max_streak.max(streak);
         } else {
@@ -2285,14 +2671,14 @@ fn analyze_rss_trend(pts: &[(f64, f64)], strict: bool) -> RssTrend {
     out.max_monotonic_streak = max_streak;
 
     let n = pts.len() as f64;
-    let mean_x = pts.iter().map(|p| p.0).sum::<f64>() / n;
-    let mean_y = pts.iter().map(|p| p.1).sum::<f64>() / n;
+    let mean_x = pts.iter().map(|p| p.elapsed_secs).sum::<f64>() / n;
+    let mean_y = pts.iter().map(|p| p.rss_anon_mib).sum::<f64>() / n;
     let mut sxx = 0.0;
     let mut syy = 0.0;
     let mut sxy = 0.0;
-    for &(x, y) in pts {
-        let dx = x - mean_x;
-        let dy = y - mean_y;
+    for p in &pts {
+        let dx = p.elapsed_secs - mean_x;
+        let dy = p.rss_anon_mib - mean_y;
         sxx += dx * dx;
         syy += dy * dy;
         sxy += dx * dy;
@@ -2305,33 +2691,161 @@ fn analyze_rss_trend(pts: &[(f64, f64)], strict: bool) -> RssTrend {
         }
     }
 
-    let window_secs = pts.last().unwrap().0 - pts.first().unwrap().0;
-    let total_drift_mib = (out.slope_mib_per_hr / 3600.0) * window_secs;
-    let growth_threshold_mib = (out.start_mib * 0.15).max(32.0);
-    let strictly_monotonic =
-        max_streak + 1 == pts.len() && (out.end_mib - out.start_mib) > growth_threshold_mib;
-    let strong_linear_leak =
-        out.slope_mib_per_hr > 0.0 && out.r2 >= 0.85 && total_drift_mib > growth_threshold_mib;
+    let window_secs = pts.last().unwrap().elapsed_secs - pts.first().unwrap().elapsed_secs;
+    out.window_secs = window_secs;
 
-    // On short burn-in runs (<30m post-warmup), head chunks and exemplar ring buffers are still
-    // filling before the first 2h head compaction unless --strict-rss-trend is requested.
-    if strict || window_secs >= 1800.0 {
-        out.flagged = strictly_monotonic || strong_linear_leak;
+    // Post-retention compaction-cycle troughs (2h compaction windows after retention plateau).
+    // Grouping by 2h (7200s) windows prevents ephemeral-tenant compactions from slicing an
+    // active 2h climb of the main TSDB into fake sub-cycles.
+    let plateau_start = retention_secs.max(warmup_secs as f64);
+    #[derive(Clone, Copy)]
+    struct WinAcc {
+        min_rss: f64,
+        first_t: f64,
+        last_t: f64,
+        first_comp: u64,
+        last_comp: u64,
+        count: usize,
+    }
+    let mut windows: BTreeMap<usize, WinAcc> = BTreeMap::new();
+    for p in all_pts.iter().filter(|p| p.elapsed_secs >= plateau_start) {
+        let widx = ((p.elapsed_secs - plateau_start) / 7200.0).floor() as usize;
+        windows
+            .entry(widx)
+            .and_modify(|w| {
+                w.min_rss = w.min_rss.min(p.rss_anon_mib);
+                w.last_t = p.elapsed_secs;
+                w.last_comp = p.compactions_ok;
+                w.count += 1;
+            })
+            .or_insert(WinAcc {
+                min_rss: p.rss_anon_mib,
+                first_t: p.elapsed_secs,
+                last_t: p.elapsed_secs,
+                first_comp: p.compactions_ok,
+                last_comp: p.compactions_ok,
+                count: 1,
+            });
+    }
+    let max_widx = windows.keys().copied().max();
+    for (widx, w) in &windows {
+        let is_closed_window = max_widx.is_some_and(|m| *widx < m) && w.count >= 2;
+        let span = w.last_t - w.first_t;
+        let saw_compaction_and_span = w.last_comp > w.first_comp && span >= 3600.0;
+        if is_closed_window || span >= 5400.0 || saw_compaction_and_span {
+            out.cycle_troughs_mib.push(w.min_rss);
+        }
+    }
+
+    if !out.cycle_troughs_mib.is_empty() {
+        let mut run = 1usize;
+        let mut run_start = out.cycle_troughs_mib[0];
+        for i in 1..out.cycle_troughs_mib.len() {
+            if out.cycle_troughs_mib[i] > out.cycle_troughs_mib[i - 1] {
+                run += 1;
+            } else {
+                run = 1;
+                run_start = out.cycle_troughs_mib[i];
+            }
+        }
+        let last_trough = *out.cycle_troughs_mib.last().unwrap();
+        out.trough_monotonic_run = run;
+        out.trough_monotonic_gain_mib = if run >= 2 { last_trough - run_start } else { 0.0 };
+        let trough_thresh = (run_start * 0.05).max(16.0);
+        if run >= 3 && out.trough_monotonic_gain_mib > trough_thresh {
+            out.sawtooth_leak_flagged = true;
+        }
+    }
+
+    if duration_secs >= SAWTOOTH_LONG_RUN_SECS {
+        out.flagged = out.sawtooth_leak_flagged;
+    } else if strict {
+        let total_drift_mib = (out.slope_mib_per_hr / 3600.0) * window_secs;
+        let growth_threshold_mib = (out.start_mib * 0.15).max(32.0);
+        let strictly_monotonic =
+            max_streak + 1 == pts.len() && (out.end_mib - out.start_mib) > growth_threshold_mib;
+        let strong_linear_leak =
+            out.slope_mib_per_hr > 0.0 && out.r2 >= 0.85 && total_drift_mib > growth_threshold_mib;
+        out.short_run_flagged = strictly_monotonic || strong_linear_leak;
+        out.flagged = out.short_run_flagged;
     }
     out
 }
 
+#[derive(Clone, Debug, Default)]
+struct EngineAnomalyState {
+    baseline_open_fds: Option<u64>,
+    consecutive_deleted_mmaps: u64,
+    consecutive_fd_leak: u64,
+    latched_deleted_mmap: Option<String>,
+    latched_fd_leak: Option<String>,
+}
+
+impl EngineAnomalyState {
+    fn observe(&mut self, name: &str, elapsed_secs: u64, settle_after_secs: u64, s: &EngineSample) {
+        if s.alive && s.proc_stats.open_fds > 0 {
+            if self.baseline_open_fds.is_none() && elapsed_secs >= settle_after_secs {
+                self.baseline_open_fds = Some(s.proc_stats.open_fds);
+            }
+            if let Some(base) = self.baseline_open_fds {
+                if s.proc_stats.open_fds > base.saturating_add(64) {
+                    self.consecutive_fd_leak += 1;
+                    if self.consecutive_fd_leak >= 2 && self.latched_fd_leak.is_none() {
+                        self.latched_fd_leak = Some(format!(
+                            "{name}: FD leak (open_fds={} > baseline {} + 64 across {} consecutive ticks)",
+                            s.proc_stats.open_fds, base, self.consecutive_fd_leak
+                        ));
+                    }
+                } else {
+                    self.consecutive_fd_leak = 0;
+                }
+            }
+        }
+
+        if s.proc_stats.deleted_mmap_count > 0 {
+            self.consecutive_deleted_mmaps += 1;
+            if self.consecutive_deleted_mmaps >= 2 && self.latched_deleted_mmap.is_none() {
+                self.latched_deleted_mmap = Some(format!(
+                    "{name}: {} persistent (deleted) mmaps across {} consecutive ticks in /proc/{}/maps: {:?}",
+                    s.proc_stats.deleted_mmap_count,
+                    self.consecutive_deleted_mmaps,
+                    s.proc_stats.pid,
+                    s.proc_stats.deleted_mmap_lines
+                ));
+            }
+        } else {
+            self.consecutive_deleted_mmaps = 0;
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct AnomalyTracker {
+    go: EngineAnomalyState,
+    rust: EngineAnomalyState,
+}
+
+impl AnomalyTracker {
+    fn observe(&mut self, elapsed_secs: u64, duration_secs: u64, go: &EngineSample, rust: &EngineSample) {
+        let settle_after = 30.min(duration_secs / 3);
+        self.go.observe("Go", elapsed_secs, settle_after, go);
+        self.rust.observe("Rust", elapsed_secs, settle_after, rust);
+    }
+}
+
 fn detect_anomalies(
+    cfg: &SoakConfig,
     go: &EngineSample,
     rust: &EngineSample,
     counters: &WorkloadCounters,
     go_trend: &RssTrend,
     rust_trend: &RssTrend,
+    tracker: &AnomalyTracker,
 ) -> Vec<String> {
     let mut anomalies = Vec::new();
-    for (name, s, trend) in [
-        ("Go", go, go_trend),
-        ("Rust", rust, rust_trend),
+    for (name, s, state, trend) in [
+        ("Go", go, &tracker.go, go_trend),
+        ("Rust", rust, &tracker.rust, rust_trend),
     ] {
         if !s.alive {
             anomalies.push(format!("{name}: container not running"));
@@ -2366,18 +2880,38 @@ fn detect_anomalies(
                 s.metrics.request_duration_errors
             ));
         }
-        if s.proc_stats.deleted_mmap_count > 0 {
+        if let Some(ref msg) = state.latched_deleted_mmap {
+            anomalies.push(msg.clone());
+        }
+        if let Some(ref msg) = state.latched_fd_leak {
+            anomalies.push(msg.clone());
+        }
+        if cfg.duration_secs < SAWTOOTH_LONG_RUN_SECS && trend.short_run_flagged {
             anomalies.push(format!(
-                "{name}: {} (deleted) mmaps in /proc/{}/maps: {:?}",
-                s.proc_stats.deleted_mmap_count,
-                s.proc_stats.pid,
-                s.proc_stats.deleted_mmap_lines
+                "{name}: strict monotonic RssAnon growth post-warmup ({:.1} -> {:.1} MiB, slope={:+.2} MiB/hr, R^2={:.3})",
+                trend.start_mib, trend.end_mib, trend.slope_mib_per_hr, trend.r2
             ));
         }
-        if trend.flagged {
+    }
+
+    if cfg.duration_secs >= SAWTOOTH_LONG_RUN_SECS {
+        if rust_trend.sawtooth_leak_flagged {
             anomalies.push(format!(
-                "{name}: monotonic RssAnon growth post-warmup ({:.1} -> {:.1} MiB, slope={:+.2} MiB/hr, R^2={:.3})",
-                trend.start_mib, trend.end_mib, trend.slope_mib_per_hr, trend.r2
+                "Rust: post-retention compaction-cycle RssAnon trough grew monotonically across {} cycles (+{:.1} MiB, troughs={:?})",
+                rust_trend.trough_monotonic_run,
+                rust_trend.trough_monotonic_gain_mib,
+                rust_trend.cycle_troughs_mib,
+            ));
+        } else if rust_trend.window_secs >= SAWTOOTH_LONG_RUN_SECS as f64
+            && go_trend.window_secs >= SAWTOOTH_LONG_RUN_SECS as f64
+            && go.proc_stats.rss_anon_bytes > 0
+            && rust.proc_stats.rss_anon_bytes > go.proc_stats.rss_anon_bytes
+            && (rust_trend.slope_mib_per_hr - go_trend.slope_mib_per_hr) > 25.0
+        {
+            let ratio = rust.proc_stats.rss_anon_bytes as f64 / go.proc_stats.rss_anon_bytes as f64;
+            anomalies.push(format!(
+                "Rust: RssAnon slope {:+.2} MiB/hr exceeds Go {:+.2} MiB/hr by >25 MiB/hr over >=4h window while RUST/GO={ratio:.2}x > 1.0",
+                rust_trend.slope_mib_per_hr, go_trend.slope_mib_per_hr
             ));
         }
     }
@@ -2413,6 +2947,11 @@ fn csv_header() -> String {
         "rpc_err_total",
         "parity_checks",
         "parity_failures",
+        "ephemeral_tenants_created",
+        "ephemeral_open_go",
+        "ephemeral_open_rust",
+        "ephemeral_closed_go",
+        "ephemeral_closed_rust",
     ]
     .into_iter()
     .map(str::to_string)
@@ -2521,13 +3060,18 @@ fn write_summary_file(
     );
     let _ = writeln!(
         s,
-        "workload: records={} samples={} histograms={} exemplars={} ooo={} churn_series={} kafka_offset={} rpc_ok={} rpc_err={} parity_ok={} parity_err={}",
+        "workload: records={} samples={} histograms={} exemplars={} ooo={} churn_series={} ephemeral(created={} open={}/{} closed={}/{}) kafka_offset={} rpc_ok={} rpc_err={} parity_ok={} parity_err={}",
         counters.produced_records.load(Ordering::Relaxed),
         counters.produced_samples.load(Ordering::Relaxed),
         counters.produced_histograms.load(Ordering::Relaxed),
         counters.produced_exemplars.load(Ordering::Relaxed),
         counters.produced_ooo.load(Ordering::Relaxed),
         counters.produced_churn_series.load(Ordering::Relaxed),
+        counters.ephemeral_tenants_created.load(Ordering::Relaxed),
+        counters.ephemeral_open_go.load(Ordering::Relaxed),
+        counters.ephemeral_open_rust.load(Ordering::Relaxed),
+        counters.ephemeral_closed_go.load(Ordering::Relaxed),
+        counters.ephemeral_closed_rust.load(Ordering::Relaxed),
         counters.kafka_last_offset.load(Ordering::Relaxed),
         counters.rpc_ok_total.load(Ordering::Relaxed),
         counters.rpc_err_total.load(Ordering::Relaxed),
@@ -2687,19 +3231,23 @@ fn write_summary_file(
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "post-warmup RssAnon trend: GO(n={}, {:.1}->{:.1} MiB, slope={:+.2} MiB/hr, R2={:.3}, streak={})  RUST(n={}, {:.1}->{:.1} MiB, slope={:+.2} MiB/hr, R2={:.3}, streak={})",
+        "post-warmup RssAnon trend: GO(n={}, {:.1}->{:.1} MiB, slope={:+.2} MiB/hr, R2={:.3}, streak={}, cycles={}, trough_run={})  RUST(n={}, {:.1}->{:.1} MiB, slope={:+.2} MiB/hr, R2={:.3}, streak={}, cycles={}, trough_run={})",
         go_trend.samples,
         go_trend.start_mib,
         go_trend.end_mib,
         go_trend.slope_mib_per_hr,
         go_trend.r2,
         go_trend.max_monotonic_streak,
+        go_trend.cycle_troughs_mib.len(),
+        go_trend.trough_monotonic_run,
         rust_trend.samples,
         rust_trend.start_mib,
         rust_trend.end_mib,
         rust_trend.slope_mib_per_hr,
         rust_trend.r2,
         rust_trend.max_monotonic_streak,
+        rust_trend.cycle_troughs_mib.len(),
+        rust_trend.trough_monotonic_run,
     );
     if anomalies.is_empty() {
         let _ = writeln!(s, "ANOMALY DETECTOR: OK (0 anomalies)");
@@ -2743,7 +3291,7 @@ async fn main() -> Result<()> {
     writeln!(csv_writer, "{}", csv_header())?;
     csv_writer.flush()?;
 
-    let helm = HelmConfig::load()?;
+    let helm = HelmConfig::load(&cfg)?;
     eprintln!(
         "[soak] starting Redpanda + Silo + Go ({}) + Rust ({})...",
         Side::Go.host(),
@@ -2799,11 +3347,15 @@ async fn main() -> Result<()> {
     let mut parity_tick = tokio::time::interval(parity_dur);
     parity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut go_post_warmup_rss: Vec<(f64, f64)> = Vec::new();
-    let mut rust_post_warmup_rss: Vec<(f64, f64)> = Vec::new();
+    let retention_secs = cfg.retention_secs();
+    let mut go_rss_pts: Vec<RssPoint> = Vec::new();
+    let mut rust_rss_pts: Vec<RssPoint> = Vec::new();
+    let mut anomaly_tracker = AnomalyTracker::default();
 
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sighup =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
     loop {
         if start.elapsed() >= total_dur {
@@ -2818,8 +3370,20 @@ async fn main() -> Result<()> {
                 eprintln!("[soak] received SIGTERM, stopping cleanly...");
                 break;
             }
+            _ = sighup.recv() => {
+                eprintln!("[soak] received SIGHUP, stopping cleanly...");
+                break;
+            }
             _ = parity_tick.tick() => {
-                if let Err(e) = run_parity_sweep(go_ch.clone(), rust_ch.clone(), &counters).await {
+                if let Err(e) = run_parity_sweep(
+                    &http,
+                    cluster.go.http_port,
+                    cluster.rust.http_port,
+                    go_ch.clone(),
+                    rust_ch.clone(),
+                    &cfg,
+                    &counters,
+                ).await {
                     counters.record_parity_err(format!("{e:#}"));
                     eprintln!("[soak] PARITY FAILURE: {e:#}");
                 } else {
@@ -2832,18 +3396,45 @@ async fn main() -> Result<()> {
                     collect_engine_sample(&http, &cluster.go),
                     collect_engine_sample(&http, &cluster.rust)
                 );
-                if elapsed >= warmup_secs {
-                    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
-                    go_post_warmup_rss.push((elapsed as f64, mib(go_s.proc_stats.rss_anon_bytes)));
-                    rust_post_warmup_rss.push((elapsed as f64, mib(rust_s.proc_stats.rss_anon_bytes)));
-                }
-                let go_trend = analyze_rss_trend(&go_post_warmup_rss, cfg.strict_rss_trend);
-                let rust_trend = analyze_rss_trend(&rust_post_warmup_rss, cfg.strict_rss_trend);
-                let anomalies = detect_anomalies(&go_s, &rust_s, &counters, &go_trend, &rust_trend);
+                let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+                go_rss_pts.push(RssPoint {
+                    elapsed_secs: elapsed as f64,
+                    rss_anon_mib: mib(go_s.proc_stats.rss_anon_bytes),
+                    compactions_ok: go_s.metrics.compactions_total.max(0.0) as u64,
+                });
+                rust_rss_pts.push(RssPoint {
+                    elapsed_secs: elapsed as f64,
+                    rss_anon_mib: mib(rust_s.proc_stats.rss_anon_bytes),
+                    compactions_ok: rust_s.metrics.compactions_total.max(0.0) as u64,
+                });
+                anomaly_tracker.observe(elapsed, cfg.duration_secs, &go_s, &rust_s);
+                let go_trend = analyze_rss_trend(
+                    &go_rss_pts,
+                    warmup_secs,
+                    retention_secs,
+                    cfg.duration_secs,
+                    cfg.strict_rss_trend,
+                );
+                let rust_trend = analyze_rss_trend(
+                    &rust_rss_pts,
+                    warmup_secs,
+                    retention_secs,
+                    cfg.duration_secs,
+                    cfg.strict_rss_trend,
+                );
+                let anomalies = detect_anomalies(
+                    &cfg,
+                    &go_s,
+                    &rust_s,
+                    &counters,
+                    &go_trend,
+                    &rust_trend,
+                    &anomaly_tracker,
+                );
 
                 let now_iso = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                 let mut row = format!(
-                    "{now_iso},{elapsed},{},{},{},{},{},{},{},{},{},{},{}",
+                    "{now_iso},{elapsed},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                     counters.produced_records.load(Ordering::Relaxed),
                     counters.produced_samples.load(Ordering::Relaxed),
                     counters.produced_histograms.load(Ordering::Relaxed),
@@ -2855,6 +3446,11 @@ async fn main() -> Result<()> {
                     counters.rpc_err_total.load(Ordering::Relaxed),
                     counters.parity_checks.load(Ordering::Relaxed),
                     counters.parity_failures.load(Ordering::Relaxed),
+                    counters.ephemeral_tenants_created.load(Ordering::Relaxed),
+                    counters.ephemeral_open_go.load(Ordering::Relaxed),
+                    counters.ephemeral_open_rust.load(Ordering::Relaxed),
+                    counters.ephemeral_closed_go.load(Ordering::Relaxed),
+                    counters.ephemeral_closed_rust.load(Ordering::Relaxed),
                 );
                 append_engine_csv(&mut row, &go_s);
                 append_engine_csv(&mut row, &rust_s);
@@ -2875,7 +3471,7 @@ async fn main() -> Result<()> {
                 )?;
 
                 eprintln!(
-                    "[soak t={elapsed}s/{}s] GO(ws={:.1}MiB anon={:.1}MiB cpu={:.1}s series={:.0}) RUST(ws={:.1}MiB anon={:.1}MiB cpu={:.1}s series={:.0}) rpc_ok={} rpc_err={} parity={}/{} anomalies={}",
+                    "[soak t={elapsed}s/{}s] GO(ws={:.1}MiB anon={:.1}MiB cpu={:.1}s series={:.0}) RUST(ws={:.1}MiB anon={:.1}MiB cpu={:.1}s series={:.0}) eph={}/{}/{} rpc_ok={} rpc_err={} parity={}/{} anomalies={}",
                     cfg.duration_secs,
                     go_s.cgroup.working_set as f64 / (1024.0 * 1024.0),
                     go_s.proc_stats.rss_anon_bytes as f64 / (1024.0 * 1024.0),
@@ -2885,6 +3481,9 @@ async fn main() -> Result<()> {
                     rust_s.proc_stats.rss_anon_bytes as f64 / (1024.0 * 1024.0),
                     rust_s.proc_stats.cpu_secs,
                     rust_s.metrics.head_series,
+                    counters.ephemeral_tenants_created.load(Ordering::Relaxed),
+                    counters.ephemeral_open_go.load(Ordering::Relaxed),
+                    counters.ephemeral_open_rust.load(Ordering::Relaxed),
                     counters.rpc_ok_total.load(Ordering::Relaxed),
                     counters.rpc_err_total.load(Ordering::Relaxed),
                     counters.parity_checks.load(Ordering::Relaxed),
@@ -2905,17 +3504,44 @@ async fn main() -> Result<()> {
         collect_engine_sample(&http, &cluster.go),
         collect_engine_sample(&http, &cluster.rust)
     );
-    if elapsed >= warmup_secs {
-        let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
-        go_post_warmup_rss.push((elapsed as f64, mib(last_go.proc_stats.rss_anon_bytes)));
-        rust_post_warmup_rss.push((elapsed as f64, mib(last_rust.proc_stats.rss_anon_bytes)));
-    }
-    let go_trend = analyze_rss_trend(&go_post_warmup_rss, cfg.strict_rss_trend);
-    let rust_trend = analyze_rss_trend(&rust_post_warmup_rss, cfg.strict_rss_trend);
-    let last_anomalies = detect_anomalies(&last_go, &last_rust, &counters, &go_trend, &rust_trend);
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    go_rss_pts.push(RssPoint {
+        elapsed_secs: elapsed as f64,
+        rss_anon_mib: mib(last_go.proc_stats.rss_anon_bytes),
+        compactions_ok: last_go.metrics.compactions_total.max(0.0) as u64,
+    });
+    rust_rss_pts.push(RssPoint {
+        elapsed_secs: elapsed as f64,
+        rss_anon_mib: mib(last_rust.proc_stats.rss_anon_bytes),
+        compactions_ok: last_rust.metrics.compactions_total.max(0.0) as u64,
+    });
+    anomaly_tracker.observe(elapsed, cfg.duration_secs, &last_go, &last_rust);
+    let go_trend = analyze_rss_trend(
+        &go_rss_pts,
+        warmup_secs,
+        retention_secs,
+        cfg.duration_secs,
+        cfg.strict_rss_trend,
+    );
+    let rust_trend = analyze_rss_trend(
+        &rust_rss_pts,
+        warmup_secs,
+        retention_secs,
+        cfg.duration_secs,
+        cfg.strict_rss_trend,
+    );
+    let last_anomalies = detect_anomalies(
+        &cfg,
+        &last_go,
+        &last_rust,
+        &counters,
+        &go_trend,
+        &rust_trend,
+        &anomaly_tracker,
+    );
     let now_iso = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut final_row = format!(
-        "{now_iso},{elapsed},{},{},{},{},{},{},{},{},{},{},{}",
+        "{now_iso},{elapsed},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         counters.produced_records.load(Ordering::Relaxed),
         counters.produced_samples.load(Ordering::Relaxed),
         counters.produced_histograms.load(Ordering::Relaxed),
@@ -2927,6 +3553,11 @@ async fn main() -> Result<()> {
         counters.rpc_err_total.load(Ordering::Relaxed),
         counters.parity_checks.load(Ordering::Relaxed),
         counters.parity_failures.load(Ordering::Relaxed),
+        counters.ephemeral_tenants_created.load(Ordering::Relaxed),
+        counters.ephemeral_open_go.load(Ordering::Relaxed),
+        counters.ephemeral_open_rust.load(Ordering::Relaxed),
+        counters.ephemeral_closed_go.load(Ordering::Relaxed),
+        counters.ephemeral_closed_rust.load(Ordering::Relaxed),
     );
     append_engine_csv(&mut final_row, &last_go);
     append_engine_csv(&mut final_row, &last_rust);
@@ -2956,4 +3587,184 @@ async fn main() -> Result<()> {
         bail!("soak detected {} anomalies: {:?}", last_anomalies.len(), last_anomalies);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_sample(alive: bool, rss_mib: f64, open_fds: u64, deleted_mmaps: u64) -> EngineSample {
+        EngineSample {
+            alive,
+            proc_stats: ProcPidStats {
+                pid: 123,
+                rss_anon_bytes: (rss_mib * 1024.0 * 1024.0) as u64,
+                open_fds,
+                deleted_mmap_count: deleted_mmaps,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sawtooth_climb_before_first_compaction_does_not_flag() {
+        let mut pts = Vec::new();
+        for m in 0..=110 {
+            let t = (m * 60) as f64;
+            pts.push(RssPoint {
+                elapsed_secs: t,
+                rss_anon_mib: 400.0 + (m as f64) * 10.0,
+                compactions_ok: 0,
+            });
+        }
+        let trend = analyze_rss_trend(&pts, 3600, 6.0 * 3600.0, 24 * 3600, false);
+        assert!(!trend.flagged);
+        assert!(!trend.sawtooth_leak_flagged);
+    }
+
+    #[test]
+    fn sawtooth_stable_cycles_after_retention_do_not_flag() {
+        let mut pts = Vec::new();
+        let ret = 6.0 * 3600.0;
+        for h in 0..16 {
+            for m in (0..120).step_by(10) {
+                let t = (h * 3600 + m * 60) as f64;
+                let phase = ((t % 7200.0) / 7200.0) * 300.0;
+                pts.push(RssPoint {
+                    elapsed_secs: t,
+                    rss_anon_mib: 500.0 + phase,
+                    compactions_ok: (t / 7200.0).floor() as u64,
+                });
+            }
+        }
+        let trend = analyze_rss_trend(&pts, 600, ret, 24 * 3600, false);
+        assert!(trend.cycle_troughs_mib.len() >= 4);
+        assert!(!trend.sawtooth_leak_flagged);
+        assert!(!trend.flagged);
+    }
+
+    #[test]
+    fn sawtooth_monotonic_trough_leak_after_retention_flags() {
+        let mut pts = Vec::new();
+        let ret = 6.0 * 3600.0;
+        for cyc in 0..8 {
+            for m in (0..120).step_by(10) {
+                let t = (cyc * 7200 + m * 60) as f64;
+                let base = if t >= ret {
+                    500.0 + (cyc as f64) * 25.0
+                } else {
+                    500.0
+                };
+                let phase = (m as f64 / 120.0) * 250.0;
+                pts.push(RssPoint {
+                    elapsed_secs: t,
+                    rss_anon_mib: base + phase,
+                    compactions_ok: cyc as u64,
+                });
+            }
+        }
+        let trend = analyze_rss_trend(&pts, 600, ret, 24 * 3600, false);
+        assert!(trend.trough_monotonic_run >= 3);
+        assert!(trend.sawtooth_leak_flagged);
+        assert!(trend.flagged);
+    }
+
+    #[test]
+    fn rust_slope_faster_than_go_over_4h_with_ratio_gt_1_flags() {
+        let mut cfg = SoakConfig::default();
+        cfg.duration_secs = 24 * 3600;
+        let go_trend = RssTrend {
+            window_secs: 5.0 * 3600.0,
+            slope_mib_per_hr: 5.0,
+            ..Default::default()
+        };
+        let rust_trend = RssTrend {
+            window_secs: 5.0 * 3600.0,
+            slope_mib_per_hr: 35.0,
+            ..Default::default()
+        };
+        let go_s = mk_sample(true, 600.0, 40, 0);
+        let rust_s = mk_sample(true, 700.0, 40, 0);
+        let counters = WorkloadCounters::new();
+        let tracker = AnomalyTracker::default();
+        let anomalies = detect_anomalies(&cfg, &go_s, &rust_s, &counters, &go_trend, &rust_trend, &tracker);
+        assert!(anomalies.iter().any(|a| a.contains("exceeds Go")));
+    }
+
+    #[test]
+    fn deleted_mmaps_require_two_consecutive_ticks_and_fd_leak_flags() {
+        let mut cfg = SoakConfig::default();
+        cfg.duration_secs = 120;
+        let mut tracker = AnomalyTracker::default();
+        let counters = WorkloadCounters::new();
+        let trend = RssTrend::default();
+
+        // Baseline tick at t=30s
+        let g1 = mk_sample(true, 100.0, 40, 1); // transient deleted mmap
+        let r1 = mk_sample(true, 80.0, 40, 0);
+        tracker.observe(30, cfg.duration_secs, &g1, &r1);
+        let a1 = detect_anomalies(&cfg, &g1, &r1, &counters, &trend, &trend, &tracker);
+        assert!(a1.is_empty(), "single transient deleted_mmap must not flag: {a1:?}");
+
+        // Next tick resets go deleted mmap, rust has fd jump + deleted mmap tick 1
+        let g2 = mk_sample(true, 100.0, 40, 0);
+        let r2 = mk_sample(true, 80.0, 110, 1);
+        tracker.observe(45, cfg.duration_secs, &g2, &r2);
+        let a2 = detect_anomalies(&cfg, &g2, &r2, &counters, &trend, &trend, &tracker);
+        assert!(a2.is_empty(), "1-tick spikes must not flag yet: {a2:?}");
+
+        // Second consecutive tick with deleted_mmaps + fd > baseline + 64
+        let r3 = mk_sample(true, 80.0, 112, 1);
+        tracker.observe(60, cfg.duration_secs, &g2, &r3);
+        let a3 = detect_anomalies(&cfg, &g2, &r3, &counters, &trend, &trend, &tracker);
+        assert!(a3.iter().any(|a| a.contains("persistent (deleted) mmaps")));
+        assert!(a3.iter().any(|a| a.contains("FD leak")));
+    }
+
+    #[test]
+    fn ephemeral_tenant_parity_accounts_for_idle_closing_jitter() {
+        let now = Instant::now();
+        let recs = vec![
+            EphemeralTenantRecord {
+                tenant_id: "soak-ephemeral-000001".to_string(),
+                first_offset: 10,
+                last_written_at: now - Duration::from_secs(3000), // > 40m -> must be closed
+            },
+            EphemeralTenantRecord {
+                tenant_id: "soak-ephemeral-000002".to_string(),
+                first_offset: 20,
+                last_written_at: now - Duration::from_secs(1000), // 16m -> jitter window
+            },
+            EphemeralTenantRecord {
+                tenant_id: "soak-ephemeral-000003".to_string(),
+                first_offset: 30,
+                last_written_at: now - Duration::from_secs(120), // 2m -> must be open
+            },
+        ];
+        let go_set: BTreeSet<String> = [
+            TENANT_PROD.to_string(),
+            TENANT_CANARY.to_string(),
+            "soak-ephemeral-000002".to_string(), // still open in Go, closed in Rust
+            "soak-ephemeral-000003".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let rust_set: BTreeSet<String> = [
+            TENANT_PROD.to_string(),
+            TENANT_CANARY.to_string(),
+            "soak-ephemeral-000003".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        let res = verify_tenants_parity("test", &go_set, &rust_set, &recs, 30, now, 2760);
+        assert!(res.is_ok(), "jitter window difference must pass: {res:?}");
+
+        // Expired tenant still open on Rust must fail
+        let mut bad_rust = rust_set;
+        bad_rust.insert("soak-ephemeral-000001".to_string());
+        let err = verify_tenants_parity("test", &go_set, &bad_rust, &recs, 30, now, 2760);
+        assert!(err.is_err());
+    }
 }
