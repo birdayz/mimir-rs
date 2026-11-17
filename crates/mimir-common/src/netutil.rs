@@ -74,11 +74,22 @@ pub fn go_fmt_string_slice(names: &[String]) -> String {
 pub fn interfaces_with_addrs() -> std::io::Result<Vec<InterfaceWithAddrs>> {
     use std::ffi::CStr;
 
+    struct IfAddrsGuard(*mut libc::ifaddrs);
+    impl Drop for IfAddrsGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` came from a successful `getifaddrs` call.
+                unsafe { libc::freeifaddrs(self.0) };
+            }
+        }
+    }
+
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs initialises `ifap` on success; it is released with freeifaddrs below.
+    // SAFETY: getifaddrs initialises `ifap` on success; `IfAddrsGuard` frees it on drop.
     if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    let _guard = IfAddrsGuard(ifap);
 
     let mut out: Vec<InterfaceWithAddrs> = Vec::new();
     let mut cur = ifap;
@@ -142,8 +153,6 @@ pub fn interfaces_with_addrs() -> std::io::Result<Vec<InterfaceWithAddrs>> {
         };
         out[pos].addrs.push(InterfaceAddr { ip, prefix_len });
     }
-    // SAFETY: ifap came from a successful getifaddrs call.
-    unsafe { libc::freeifaddrs(ifap) };
     Ok(out)
 }
 
@@ -181,21 +190,23 @@ fn go_flags(raw: libc::c_uint) -> u32 {
 }
 
 /// # Safety
-/// `mask` must point to a sockaddr of the given `family`.
+/// `mask` must be a valid non-null `sockaddr` pointer from `getifaddrs`.
 #[cfg(unix)]
 unsafe fn netmask_prefix_len(mask: *const libc::sockaddr, family: i32) -> Option<u8> {
-    let bytes: Vec<u8> = match family {
+    if (*mask).sa_family as i32 != family {
+        return None;
+    }
+    match family {
         libc::AF_INET => {
             let sin = &*(mask as *const libc::sockaddr_in);
-            sin.sin_addr.s_addr.to_ne_bytes().to_vec()
+            Some(sin.sin_addr.s_addr.count_ones() as u8)
         }
         libc::AF_INET6 => {
             let sin6 = &*(mask as *const libc::sockaddr_in6);
-            sin6.sin6_addr.s6_addr.to_vec()
+            Some(u128::from_ne_bytes(sin6.sin6_addr.s6_addr).count_ones() as u8)
         }
-        _ => return None,
-    };
-    Some(bytes.iter().map(|b| b.count_ones() as u8).sum())
+        _ => None,
+    }
 }
 
 /// Go `net.Interfaces()`.
