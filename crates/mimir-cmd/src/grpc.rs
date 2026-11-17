@@ -541,4 +541,88 @@ mod tests {
             http_resp.headers
         );
     }
+
+    async fn call_bridge(
+        router: Router,
+        rpc_req: httpgrpcpb::HttpRequest,
+        snappy: bool,
+        error_log: Option<GrpcErrorLog>,
+    ) -> http::Response<tonic::body::BoxBody> {
+        use mimir_ingester::grpc::SnappyDecompressService;
+        let svc = HttpGrpcStatusFixService::new(SnappyDecompressService::new(
+            HttpServer::new(HttpGrpcBridge::new(router)),
+            4 << 20,
+        ));
+        let framed = mimir_proto::snappy::encode_grpc_frame(&rpc_req.encode_to_vec(), snappy).unwrap();
+        let mut b = http::Request::builder()
+            .method(Method::POST)
+            .uri("/httpgrpc.HTTP/Handle")
+            .header(http::header::CONTENT_TYPE, "application/grpc");
+        if snappy {
+            b = b.header("grpc-encoding", "snappy");
+        }
+        let mut req = b
+            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(framed))))
+            .unwrap();
+        if let Some(log) = error_log {
+            req.extensions_mut().insert(log);
+        }
+        svc.oneshot(req).await.unwrap()
+    }
+
+    async fn decode_http_response(resp: http::Response<tonic::body::BoxBody>) -> httpgrpcpb::HttpResponse {
+        use http_body_util::BodyExt;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.len() >= 5, "no response message");
+        httpgrpcpb::HttpResponse::decode(&body[5..]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn httpgrpc_empty_method_defaults_to_get_and_accepts_snappy() {
+        let router = Router::new().route("/ready", get(|| async { "ready" }));
+        for snappy in [false, true] {
+            let resp = call_bridge(
+                router.clone(),
+                httpgrpcpb::HttpRequest {
+                    method: String::new(),
+                    url: "/ready".to_string(),
+                    body: Bytes::new(),
+                    headers: Vec::new(),
+                },
+                snappy,
+                None,
+            )
+            .await;
+            assert!(resp.headers().get("grpc-status").is_none_or(|v| v == "0"));
+            let http_resp = decode_http_response(resp).await;
+            assert_eq!(http_resp.code, 200, "snappy={snappy}");
+            assert_eq!(&http_resp.body[..], b"ready");
+        }
+    }
+
+    #[tokio::test]
+    async fn httpgrpc_do_not_log_error_header_suppresses_server_log() {
+        let router = Router::new()
+            .route(
+                "/quiet",
+                get(|| async { (StatusCode::SERVICE_UNAVAILABLE, [("x-donotlogerror", "true")], "busy") }),
+            )
+            .route("/loud", get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "busy") }));
+        let get_req = |url: &str| httpgrpcpb::HttpRequest {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            body: Bytes::new(),
+            headers: Vec::new(),
+        };
+
+        let log = GrpcErrorLog::default();
+        let resp = call_bridge(router.clone(), get_req("/quiet"), false, Some(log.clone())).await;
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "503");
+        let entry = log.take().expect("DoNotLogError recorded");
+        assert!(!entry.keep);
+
+        let log = GrpcErrorLog::default();
+        let _ = call_bridge(router, get_req("/loud"), false, Some(log.clone())).await;
+        assert!(log.take().is_none(), "plain errors are logged by the interceptor");
+    }
 }

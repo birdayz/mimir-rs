@@ -778,4 +778,126 @@ mod tests {
         let db = ing.get_tsdb("tenant-snappy").expect("tenant tsdb created");
         assert_eq!(db.db.head().num_series(), 1);
     }
+
+    fn test_ingester(tmp: &std::path::Path, multitenancy: bool) -> Arc<Ingester> {
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-w2".to_string();
+        cfg.push_grpc_method_enabled = true;
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_multitenancy(multitenancy, "anonymous");
+        ing
+    }
+
+    fn series(labels: &[(&str, &str)], ts: i64) -> cortexpb::TimeSeries {
+        cortexpb::TimeSeries {
+            labels: labels
+                .iter()
+                .map(|(n, v)| cortexpb::LabelPair {
+                    name: Bytes::copy_from_slice(n.as_bytes()),
+                    value: Bytes::copy_from_slice(v.as_bytes()),
+                })
+                .collect(),
+            samples: vec![cortexpb::Sample {
+                value: 1.0,
+                timestamp_ms: ts,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn grpc_tenant_parse_errors_are_internal_and_no_auth_tenant_overrides_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = test_ingester(tmp.path(), true);
+        let mut req = Request::new(());
+        req.metadata_mut().insert("x-scope-orgid", "a|b".parse().unwrap());
+        let err = tenant_from_req(&ing, &req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "multiple org IDs present");
+
+        // noauth: the no-auth tenant is injected regardless of any x-scope-orgid.
+        ing.set_multitenancy(false, "anonymous");
+        assert_eq!(tenant_from_req(&ing, &req).unwrap(), "anonymous");
+        assert!(check_org_id_header(&ing, &Request::new(())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn raw_push_hands_error_log_decision_to_server() {
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = test_ingester(tmp.path(), true);
+        // Not running yet: Push fails with an (always logged) unavailable error.
+        let body = cortexpb::WriteRequest {
+            timeseries: vec![series(&[("__name__", "m")], 1_700_000_000_000)],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let framed = mimir_proto::snappy::encode_grpc_frame(&body, false).unwrap();
+        let log = GrpcErrorLog::default();
+        let mut http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/cortex.Ingester/Push")
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("x-scope-orgid", "t1")
+            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(framed))))
+            .unwrap();
+        http_req.extensions_mut().insert(log.clone());
+        let resp = IngesterService::new(Arc::clone(&ing))
+            .into_server()
+            .oneshot(http_req)
+            .await
+            .unwrap();
+        let status = tonic::Status::from_header_map(resp.headers()).expect("trailers-only error");
+        assert_ne!(status.code(), tonic::Code::Ok);
+        let entry = log.take().expect("RawPushSvc records the error log entry");
+        assert!(entry.keep);
+        assert_eq!(entry.reason, None);
+        assert!(entry.err.contains("unavailable"), "{}", entry.err);
+    }
+
+    #[tokio::test]
+    async fn hard_push_errors_roll_back_the_whole_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = test_ingester(tmp.path(), true);
+        ing.set_state_for_test(mimir_common::services::State::Running);
+        let ts = 1_700_000_000_000;
+        for (bad, msg) in [
+            (vec![("job", "only_job")], "user=t-hard: no metric name label"),
+            (vec![("a", "")], "user=t-hard: empty labelset: invalid sample"),
+        ] {
+            let req = cortexpb::WriteRequest {
+                timeseries: vec![series(&[("__name__", "valid_s")], ts), series(&bad, ts)],
+                ..Default::default()
+            };
+            let err = ing.push_grpc("t-hard", &req).await.unwrap_err();
+            let status = err.map_push_error_to_grpc_server_status();
+            assert_eq!(status.code(), tonic::Code::Internal, "{bad:?}");
+            assert_eq!(status.message(), msg);
+            assert!(mimir_proto::grpcutilpb::extract_cortex_error_details(&status).is_none());
+        }
+        let db = ing.get_tsdb("t-hard").expect("tenant tsdb");
+        let m = mimir_tsdb::matcher::LabelMatcher::new(
+            mimir_tsdb::matcher::MatchType::Equal,
+            "__name__",
+            "valid_s",
+        )
+        .unwrap();
+        let committed = db.db.chunk_querier(0, i64::MAX).select(false, &[m]).unwrap();
+        assert!(committed.is_empty(), "earlier series of the request must be rolled back");
+    }
 }

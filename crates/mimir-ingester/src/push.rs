@@ -2270,7 +2270,7 @@ impl Ingester {
                                 &mut stats,
                                 &mut make_series_str,
                                 &mut record_partial,
-                            )?;
+                            ).map_err(|e| e.with_user(user_id, 0))?;
                         }
                     }
                     ingest_created_ts = false;
@@ -2300,7 +2300,7 @@ impl Ingester {
                             &mut stats,
                             &mut make_series_str,
                             &mut record_partial,
-                        )?;
+                        ).map_err(|e| e.with_user(user_id, 0))?;
                     }
                 }
             }
@@ -2373,7 +2373,7 @@ impl Ingester {
                                     &mut stats,
                                     &mut make_series_str,
                                     &mut record_partial,
-                                )?;
+                                ).map_err(|e| e.with_user(user_id, 0))?;
                             }
                         }
                         ingest_created_ts = false;
@@ -2420,7 +2420,7 @@ impl Ingester {
                                 &mut stats,
                                 &mut make_series_str,
                                 &mut record_partial,
-                            )?;
+                            ).map_err(|e| e.with_user(user_id, 0))?;
                         }
                     }
                 }

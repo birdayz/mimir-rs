@@ -364,14 +364,18 @@ fn early_abort(status: tonic::Status, http_status: http::StatusCode) -> GrpcResp
     resp
 }
 
-async fn handle(
-    mut req: hyper::Request<Incoming>,
+async fn handle<B>(
+    mut req: hyper::Request<B>,
     remote: SocketAddr,
     conn: Arc<Conn>,
     routes: tonic::service::Routes,
     cfg: GrpcServerConfig,
     ctx: GrpcContext,
-) -> Result<GrpcResponse, std::convert::Infallible> {
+) -> Result<GrpcResponse, std::convert::Infallible>
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<super::body::BoxError>,
+{
     let method = req.uri().path().to_string();
     let begin = Instant::now();
     let m = &ctx.metrics;
@@ -631,5 +635,242 @@ fn check_cluster(
                 ))
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A gRPC service whose unary handler never completes (like a strong read consistency wait).
+    #[derive(Clone)]
+    struct HangingSvc;
+
+    impl tonic::server::NamedService for HangingSvc {
+        const NAME: &'static str = "test.Hanging";
+    }
+
+    impl tower::Service<http::Request<tonic::body::BoxBody>> for HangingSvc {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+            Box::pin(async move {
+                if req.uri().path() == "/test.Hanging/Fast" {
+                    return Ok(tonic::Status::ok("").into_http());
+                }
+                // Observe the request deadline like a context-aware Go handler would.
+                match grpc_deadline::current() {
+                    Some(d) => {
+                        tokio::time::sleep_until(d).await;
+                        Ok(tonic::Status::deadline_exceeded("handler saw deadline").into_http())
+                    }
+                    None => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct VecLogger(Mutex<Vec<String>>);
+
+    impl Logger for VecLogger {
+        fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
+            let kv: Vec<String> = kvs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            self.0.lock().push(format!("{level:?} {}", kv.join(" ")));
+        }
+    }
+
+    struct Fixture {
+        reg: prometheus::Registry,
+        conn: Arc<Conn>,
+        ctx: GrpcContext,
+        cfg: GrpcServerConfig,
+        routes: tonic::service::Routes,
+    }
+
+    fn fixture(multitenancy_enabled: bool) -> Fixture {
+        let reg = prometheus::Registry::new();
+        let metrics = ServerMetrics::new(&reg, true, true).unwrap();
+        Fixture {
+            reg,
+            conn: Arc::new(Conn {
+                id: 1,
+                active: AtomicUsize::new(0),
+                idle_since: Mutex::new(Instant::now()),
+            }),
+            ctx: GrpcContext {
+                metrics,
+                logger: Arc::new(VecLogger::default()),
+            },
+            cfg: GrpcServerConfig {
+                max_concurrent_streams: 0,
+                keepalive_time: None,
+                keepalive_timeout: Duration::from_secs(20),
+                max_connection_idle: None,
+                max_connection_age: None,
+                max_connection_age_grace: None,
+                tls: None,
+                stats_tracking: true,
+                report_grpc_status: true,
+                cluster_validation: None,
+                multitenancy_enabled,
+            },
+            routes: tonic::service::Routes::new(HangingSvc).prepare(),
+        }
+    }
+
+    impl Fixture {
+        fn call(
+            &self,
+            path: &str,
+            headers: &[(&str, &str)],
+        ) -> impl Future<Output = Result<GrpcResponse, std::convert::Infallible>> + Send + 'static {
+            let mut b = http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/grpc");
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            let req = b.body(tonic::body::empty_body()).unwrap();
+            handle(
+                req,
+                "127.0.0.1:1".parse().unwrap(),
+                Arc::clone(&self.conn),
+                self.routes.clone(),
+                self.cfg.clone(),
+                self.ctx.clone(),
+            )
+        }
+
+        fn gauge(&self, name: &str, route: &str) -> f64 {
+            self.sample(name, route, None, |m| m.get_gauge().get_value())
+        }
+
+        fn duration_count(&self, route: &str, status: &str) -> f64 {
+            self.sample("cortex_request_duration_seconds", route, Some(status), |m| {
+                m.get_histogram().get_sample_count() as f64
+            })
+        }
+
+        fn sample(
+            &self,
+            name: &str,
+            route: &str,
+            status: Option<&str>,
+            f: impl Fn(&prometheus::proto::Metric) -> f64,
+        ) -> f64 {
+            for mf in self.reg.gather() {
+                if mf.get_name() != name {
+                    continue;
+                }
+                for m in mf.get_metric() {
+                    let has = |k: &str, v: &str| {
+                        m.get_label().iter().any(|l| l.get_name() == k && l.get_value() == v)
+                    };
+                    if has("route", route) && status.is_none_or(|s| has("status_code", s)) {
+                        return f(m);
+                    }
+                }
+            }
+            0.0
+        }
+    }
+
+    async fn drain(resp: GrpcResponse) -> Option<String> {
+        use http_body_util::BodyExt;
+        let header = resp.headers().get("grpc-status").map(|v| v.to_str().unwrap().to_string());
+        let collected = resp.into_body().collect().await.ok()?;
+        header.or_else(|| {
+            collected
+                .trailers()
+                .and_then(|t| t.get("grpc-status"))
+                .map(|v| v.to_str().unwrap().to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn canceled_rpc_does_not_leak_inflight_streams_or_conn_activity() {
+        let fx = fixture(false);
+        let route = "/test.Hanging/Wait";
+        let task = tokio::spawn(fx.call(route, &[]));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fx.gauge("cortex_inflight_requests", route), 1.0);
+        assert_eq!(fx.conn.active.load(Ordering::Acquire), 1);
+
+        // Client RST_STREAM: hyper drops the handler future.
+        task.abort();
+        let _ = task.await;
+        assert_eq!(fx.gauge("cortex_inflight_requests", route), 0.0);
+        assert_eq!(fx.conn.active.load(Ordering::Acquire), 0);
+        assert_eq!(fx.duration_count(route, "Canceled"), 1.0);
+    }
+
+    #[tokio::test]
+    async fn grpc_timeout_is_enforced_and_visible_to_handlers() {
+        let fx = fixture(false);
+        let route = "/test.Hanging/Wait";
+        let started = Instant::now();
+        let resp = fx.call(route, &[("grpc-timeout", "100m")]).await.unwrap();
+        assert_eq!(drain(resp).await.as_deref(), Some("4"));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(fx.gauge("cortex_inflight_requests", route), 0.0);
+        assert_eq!(fx.duration_count(route, "DeadlineExceeded"), 1.0);
+        assert_eq!(fx.conn.active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_or_expired_grpc_timeout_aborts_early() {
+        let fx = fixture(false);
+        let route = "/test.Hanging/Fast";
+        let resp = fx.call(route, &[("grpc-timeout", "1x")]).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::BAD_REQUEST);
+        let st = tonic::Status::from_header_map(resp.headers()).unwrap();
+        assert_eq!(st.code(), tonic::Code::Internal);
+        assert_eq!(
+            st.message(),
+            "malformed grpc-timeout: transport: timeout unit is not recognized: \"1x\""
+        );
+        let resp = fx.call(route, &[("grpc-timeout", "0n")]).await.unwrap();
+        let st = tonic::Status::from_header_map(resp.headers()).unwrap();
+        assert_eq!(st.code(), tonic::Code::DeadlineExceeded);
+        // Early aborts never reach the interceptors / stats handler.
+        assert_eq!(fx.duration_count(route, "Internal"), 0.0);
+        assert_eq!(fx.conn.active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn multitenancy_requires_exactly_one_org_id_except_no_auth_methods() {
+        let fx = fixture(true);
+        let route = "/test.Hanging/Fast";
+        let resp = fx.call(route, &[]).await.unwrap();
+        let st = tonic::Status::from_header_map(resp.headers()).unwrap();
+        assert_eq!(st.code(), tonic::Code::Unknown);
+        assert_eq!(st.message(), "no org id");
+        assert_eq!(drain(resp).await.as_deref(), Some("2"));
+        let resp = fx
+            .call(route, &[("x-scope-orgid", "a"), ("x-scope-orgid", "a")])
+            .await
+            .unwrap();
+        assert_eq!(drain(resp).await.as_deref(), Some("2"));
+        let resp = fx.call(route, &[("x-scope-orgid", "a|b")]).await.unwrap();
+        assert_eq!(drain(resp).await.as_deref(), Some("0"));
+        assert_eq!(fx.duration_count(route, "Unknown"), 2.0);
+        assert!(check_org_id(&http::HeaderMap::new(), "/grpc.health.v1.Health/Check").is_none());
+
+        let fx = fixture(false);
+        let resp = fx.call(route, &[]).await.unwrap();
+        assert_eq!(drain(resp).await.as_deref(), Some("0"));
     }
 }
