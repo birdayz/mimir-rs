@@ -21,8 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mimir_common::block_on_for_tests;
 use mimir_common::tenant::LOWER_ORG_ID_HEADER_NAME;
 use mimir_conformance::twin::{
-    free_tcp_ports, grpc_health, http_get, ingester_ring, services, start_mimir, wait_ready,
-    FakeS3, Impl, Proc,
+    free_tcp_ports, grpc_health, http_get, ingester_ring, ring_metric_series, services,
+    start_mimir, wait_ready, FakeS3, Impl, Proc,
 };
 use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb::ingester_client::IngesterClient;
@@ -426,5 +426,46 @@ fn lc4_flush_on_shutdown_ships_blocks_while_leaving() {
                 proc.name
             );
         }
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// LC-8: ring / lifecycler / KV metrics names and labels
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn lc8_ring_lifecycler_and_kv_metrics_match() {
+    block_on_for_tests(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = http_client();
+        let mut series = Vec::new();
+        for which in BOTH {
+            let p = ports();
+            let dir = tmp.path().join(which.name());
+            let yaml = ingester_yaml(&p, &dir, "ingester-1", &filesystem_backend(&dir), "", "")
+                .replace("store: inmemory", "store: memberlist")
+                + &format!(
+                    "memberlist:\n  bind_addr: [127.0.0.1]\n  bind_port: {}\n  advertise_addr: 127.0.0.1\n",
+                    free_tcp_ports(1)[0]
+                );
+            let mut proc = start_mimir(which, "metrics", &dir, &yaml, &[]);
+            wait_ready(&client, &mut proc, p.http, Duration::from_secs(60)).await;
+            // Let at least one heartbeat / ring update happen.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let (code, _, body) = http_get(&client, p.http, "/metrics", false).await.unwrap();
+            assert_eq!(code, 200);
+            series.push((proc.name.clone(), ring_metric_series(&body)));
+            proc.sigterm();
+            assert_exit_ok(&mut proc, Duration::from_secs(30));
+        }
+        let (go_name, go) = &series[0];
+        let (rs_name, rs) = &series[1];
+        let only_go: Vec<_> = go.difference(rs).collect();
+        let only_rs: Vec<_> = rs.difference(go).collect();
+        assert!(
+            only_go.is_empty() && only_rs.is_empty(),
+            "ring/lifecycler/kv metric series differ\nonly in {go_name}: {only_go:#?}\nonly in {rs_name}: {only_rs:#?}"
+        );
+        assert!(go.iter().any(|s| s.starts_with("cortex_ring_members{")), "{go:#?}");
     });
 }

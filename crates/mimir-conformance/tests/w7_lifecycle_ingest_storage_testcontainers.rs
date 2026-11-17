@@ -27,7 +27,8 @@ use testcontainers::{ContainerAsync, CopyTargetOptions, GenericImage, ImageExt};
 
 use mimir_common::block_on_for_tests;
 use mimir_conformance::twin::{
-    free_tcp_ports, http_get, ingester_ring, start_mimir, wait_ready, Impl, Proc,
+    free_tcp_ports, http_get, ingester_ring, ring_metric_series, start_mimir, wait_ready, Impl,
+    Proc,
 };
 
 const REDPANDA_IMAGE: &str = "redpandadata/redpanda";
@@ -322,6 +323,27 @@ fn lc3_partition_registered_only_after_ingester_is_active() {
                 assert!(Instant::now() < deadline, "partition 0 not registered by both: {all:?}");
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
+
+            // LC-8: ring, lifecycler, partition ring and KV client metrics (names + labels).
+            let mut series = Vec::new();
+            for (_, proc, p) in &procs {
+                let (code, _, body) = http_get(&client, p.http, "/metrics", false).await.unwrap();
+                assert_eq!(code, 200);
+                series.push((proc.name.clone(), ring_metric_series(&body)));
+            }
+            let only_go: Vec<_> = series[0].1.difference(&series[1].1).collect();
+            let only_rs: Vec<_> = series[1].1.difference(&series[0].1).collect();
+            assert!(
+                only_go.is_empty() && only_rs.is_empty(),
+                "metric series differ\nonly in {}: {only_go:#?}\nonly in {}: {only_rs:#?}",
+                series[0].0,
+                series[1].0
+            );
+            assert!(
+                series[0].1.iter().any(|s| s.starts_with("cortex_partition_ring_partitions{")),
+                "{:#?}",
+                series[0].1
+            );
             stop_all(&mut procs);
         }
     });

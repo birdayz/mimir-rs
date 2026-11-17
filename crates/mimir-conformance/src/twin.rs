@@ -322,6 +322,39 @@ pub async fn grpc_health(port: u16) -> Result<i32, String> {
     Ok(resp.into_inner().status)
 }
 
+/// `(series name, labels)` of every exposed sample whose family belongs to the ring,
+/// lifecycler or KV client instrumentation (values and the `le` label of histogram buckets are
+/// not compared; `operation`/`status_code` only appear once requests happened).
+pub fn ring_metric_series(exposition: &str) -> std::collections::BTreeSet<String> {
+    let relevant = |name: &str| {
+        (name.contains("ring_") && !name.contains("string_"))
+            || name.contains("lifecycler")
+            || name.contains("member_consul_heartbeats")
+            || name.contains("kv_request_duration_seconds")
+            || name.contains("shutdown_duration_seconds")
+    };
+    exposition
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .filter_map(|l| {
+            let (series, _) = l.rsplit_once(' ')?;
+            let (name, labels) = match series.split_once('{') {
+                Some((n, rest)) => (n, rest.trim_end_matches('}')),
+                None => (series, ""),
+            };
+            if !relevant(name) || name.starts_with("memberlist") {
+                return None;
+            }
+            let mut kept: Vec<&str> = labels
+                .split(',')
+                .filter(|kv| !kv.is_empty() && !kv.starts_with("le=") && !kv.starts_with("operation=") && !kv.starts_with("status_code="))
+                .collect();
+            kept.sort_unstable();
+            Some(format!("{name}{{{}}}", kept.join(",")))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Fake S3 endpoint
 // ---------------------------------------------------------------------------------------------
