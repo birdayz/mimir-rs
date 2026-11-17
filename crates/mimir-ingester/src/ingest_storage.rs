@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use mimir_common::thread_pool::ScopedWorkerPool;
@@ -418,6 +418,9 @@ pub struct IngesterShardedBatchConsumer {
     ingester: Arc<Ingester>,
     kafka_cfg: KafkaConfig,
     metrics: PusherConsumerMetrics,
+    processing_time_timeseries: OnceLock<prometheus::Histogram>,
+    processing_time_metadata: OnceLock<prometheus::Histogram>,
+    processing_time_timeseries_and_metadata: OnceLock<prometheus::Histogram>,
     error_handler: Arc<PushErrorHandler>,
     arena_pool: Mutex<Vec<WorkerArena>>,
     worker_pool: ScopedWorkerPool,
@@ -454,6 +457,9 @@ impl IngesterShardedBatchConsumer {
             ingester,
             kafka_cfg,
             metrics,
+            processing_time_timeseries: OnceLock::new(),
+            processing_time_metadata: OnceLock::new(),
+            processing_time_timeseries_and_metadata: OnceLock::new(),
             error_handler,
             arena_pool: Mutex::new(Vec::new()),
             worker_pool,
@@ -1039,17 +1045,26 @@ impl IngesterShardedBatchConsumer {
                 let tenant_id = &tenant_ids_ref[tenant_idx as usize];
                 let norm_source = cortexpb::write_request::SourceEnum::try_from(source_raw)
                     .unwrap_or(cortexpb::write_request::SourceEnum::Api);
-                let contents = match (batch_vec.is_empty(), metas.is_empty()) {
-                    (false, false) => "timeseries_and_metadata",
-                    (false, true) => "timeseries",
-                    _ => "metadata",
+                let m = &self.metrics.storage_pusher_metrics;
+                let processing_hist = match (batch_vec.is_empty(), metas.is_empty()) {
+                    (false, false) => self
+                        .processing_time_timeseries_and_metadata
+                        .get_or_init(|| {
+                            m.processing_time
+                                .with_label_values(&["timeseries_and_metadata"])
+                        }),
+                    (false, true) => self
+                        .processing_time_timeseries
+                        .get_or_init(|| m.processing_time.with_label_values(&["timeseries"])),
+                    _ => self
+                        .processing_time_metadata
+                        .get_or_init(|| m.processing_time.with_label_values(&["metadata"])),
                 };
                 let meta_views: SmallVec<[BorrowedMetadata<'_>; 8]> = metas
                     .iter()
                     .map(|it| arenas_ref[it.worker_idx as usize].metadata.view(it))
                     .collect();
 
-                let m = &self.metrics.storage_pusher_metrics;
                 m.batch_age.observe(batch_started.elapsed().as_secs_f64());
                 m.batching_queue_metrics.flush_total.inc();
                 m.time_series_per_flush.observe(batch_vec.len() as f64);
@@ -1065,9 +1080,7 @@ impl IngesterShardedBatchConsumer {
                         &meta_views,
                     )
                     .map_err(ingester_err_to_pusher_err);
-                m.processing_time
-                    .with_label_values(&[contents])
-                    .observe(proc_t0.elapsed().as_secs_f64());
+                processing_hist.observe(proc_t0.elapsed().as_secs_f64());
                 batch_vec.clear();
 
                 match res {
