@@ -1941,7 +1941,7 @@ fn open_standalone_user_tsdb(
         limiter,
         None,
         ShipperMetrics::new(Some(&reg)),
-        Some(&reg),
+        &Default::default(),
         None,
         1,
         Arc::new(std::sync::atomic::AtomicI64::new(0)),

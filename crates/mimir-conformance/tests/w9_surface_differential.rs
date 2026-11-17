@@ -1082,3 +1082,60 @@ fn w9_grpc_tenant_and_matcher_error_status_parity() {
     }
     assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
 }
+
+/// Item 6: ingester-level metrics every tenant TSDB updates are registered once at startup like
+/// Go `newIngester` / `newIngesterMetrics`: the head / block PostingsForMatchers cache metrics
+/// (`cortex_ingester_tsdb_{head,block}_postings_for_matchers_cache_*`, every `reason`), the
+/// offset catalogue metrics and `cortex_ingester_inflight_push_requests_summary`. Compares HELP,
+/// TYPE and the series (name + labels) of each family; counters and gauges must also match
+/// (no queries are issued, so all are 0), summary quantile values are not compared.
+#[test]
+fn w9_ingester_shared_tsdb_metric_families_parity() {
+    let (_tmp, [(go, _gp), (cand, _cp)]) = start_pair("", &[], "http");
+    // Let the 250ms inflight sampler observe at least once in both processes.
+    std::thread::sleep(Duration::from_millis(600));
+    let scrape = |port: u16| {
+        let r = curl(&[&format!("http://127.0.0.1:{port}/metrics")]);
+        assert_eq!(r.status, 200);
+        String::from_utf8(r.body).unwrap()
+    };
+    let (g, c) = (scrape(go.http_port), scrape(cand.http_port));
+    let prefixes = [
+        "cortex_ingester_tsdb_head_postings_for_matchers_cache_",
+        "cortex_ingester_tsdb_block_postings_for_matchers_cache_",
+        "cortex_ingester_offset_catalogue_",
+        "cortex_ingester_inflight_push_requests_summary",
+    ];
+    for prefix in prefixes {
+        let gf = families(&g, prefix);
+        assert!(!gf.is_empty(), "go exposes no {prefix}* family");
+        assert_eq!(families(&c, prefix), gf, "{prefix}* families");
+        for fam in &gf {
+            let meta = |text: &str| -> Vec<String> {
+                text.lines()
+                    .filter(|l| {
+                        l.strip_prefix("# HELP ").or_else(|| l.strip_prefix("# TYPE "))
+                            .is_some_and(|r| r.split(' ').next() == Some(fam.as_str()))
+                    })
+                    .map(str::to_string)
+                    .collect()
+            };
+            assert_eq!(meta(&c), meta(&g), "{fam} HELP/TYPE");
+            let series = |text: &str| -> BTreeSet<String> {
+                text.lines()
+                    .filter(|l| !l.starts_with('#'))
+                    .filter_map(|l| l.rsplit_once(' ').map(|(s, _)| s.to_string()))
+                    .filter(|s| s == fam || s.starts_with(&format!("{fam}{{")) || s.starts_with(&format!("{fam}_")))
+                    .collect()
+            };
+            assert_eq!(series(&c), series(&g), "{fam} series");
+            if !fam.ends_with("_summary") {
+                let mut gs = samples(&g, fam);
+                let mut cs = samples(&c, fam);
+                gs.sort();
+                cs.sort();
+                assert_eq!(cs, gs, "{fam} values");
+            }
+        }
+    }
+}

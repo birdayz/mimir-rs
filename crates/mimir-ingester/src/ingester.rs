@@ -112,6 +112,7 @@ pub struct Ingester {
     pub metrics: Arc<IngesterMetrics>,
     pub tsdb_metrics: Arc<TSDBMetrics>,
     pub shipper_metrics: ShipperMetrics,
+    pub shared_tsdb_metrics: crate::user_tsdb::SharedTsdbMetrics,
     pub owned_series_metrics: OwnedSeriesMetrics,
 
     pub instance_ring: Option<Arc<Ring>>,
@@ -330,6 +331,7 @@ impl Ingester {
                 })?;
 
         let shipper_metrics = ShipperMetrics::new(registry);
+        let shared_tsdb_metrics = crate::user_tsdb::SharedTsdbMetrics::new(registry);
         let tsdb_metrics = TSDBMetrics::new("cortex_ingester_", registry);
         let owned_series_metrics = OwnedSeriesMetrics::new(registry);
 
@@ -414,6 +416,7 @@ impl Ingester {
             metrics,
             tsdb_metrics,
             shipper_metrics,
+            shared_tsdb_metrics,
             owned_series_metrics,
             instance_ring,
             lifecycler,
@@ -821,7 +824,7 @@ impl Ingester {
             Arc::clone(&self.limiter),
             bucket_guard.as_deref(),
             self.shipper_metrics.clone(),
-            self.registry.as_ref(),
+            &self.shared_tsdb_metrics,
             Some(Arc::clone(&tsdb_prom_reg)),
             effective_wal_concurrency,
             series_count,

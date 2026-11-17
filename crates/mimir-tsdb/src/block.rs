@@ -358,7 +358,7 @@ impl Block {
             chunks,
             tombstones,
             total_size,
-            postings_cache: PostingsForMatchersCache::new(postings_cache, None),
+            postings_cache: PostingsForMatchersCache::new(postings_cache),
         })
     }
 

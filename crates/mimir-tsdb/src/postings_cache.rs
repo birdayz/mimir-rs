@@ -28,6 +28,12 @@ pub struct PostingsForMatchersCacheConfig {
     pub max_bytes: usize,
     pub enable_invalidation: bool,
     pub num_metric_versions: usize,
+    /// Shared cache metrics (Go `PostingsForMatchersCacheConfig.Metrics`); `None` = not exported.
+    pub metrics: Option<PostingsForMatchersCacheMetrics>,
+    /// Whether `invalidate_metric` counts `invalidations_total`. Go only tracks metric versions
+    /// (and counts invalidations) for a shared cache with invalidation enabled; this cache always
+    /// invalidates internally, so the counter follows the Go configuration instead.
+    pub report_invalidations: bool,
 }
 
 impl Default for PostingsForMatchersCacheConfig {
@@ -38,84 +44,109 @@ impl Default for PostingsForMatchersCacheConfig {
             max_bytes: DEFAULT_POSTINGS_CACHE_MAX_BYTES,
             enable_invalidation: false,
             num_metric_versions: DEFAULT_METRIC_VERSIONS_SLOTS,
+            metrics: None,
+            report_invalidations: false,
         }
     }
 }
 
-struct PromMetrics {
+/// Go `PostingsForMatchersCacheMetrics`. One instance is shared by every cache built from the
+/// same Mimir cache factory (all tenants' Head caches, resp. all tenants' block caches), so the
+/// series are aggregated across tenants exactly like Go's single registration.
+#[derive(Clone)]
+pub struct PostingsForMatchersCacheMetrics {
     entries: Gauge,
     bytes: Gauge,
     requests: Counter,
     hits: Counter,
     misses: Counter,
+    skips_stale: Counter,
     invalidations: Counter,
     evictions_ttl: Counter,
     evictions_max_bytes: Counter,
     evictions_max_items: Counter,
+    evictions_unknown: Counter,
 }
 
-impl PromMetrics {
-    fn register(reg: &Registry) -> Self {
-        let entries = Gauge::new(
-            "prometheus_tsdb_postings_for_matchers_cache_entries_total",
-            "Total number of entries in the PostingsForMatchers cache.",
-        )
-        .expect("valid gauge");
-        let bytes = Gauge::new(
-            "prometheus_tsdb_postings_for_matchers_cache_bytes_total",
-            "Total number of bytes in the PostingsForMatchers cache.",
-        )
-        .expect("valid gauge");
-        let requests = Counter::new(
-            "prometheus_tsdb_postings_for_matchers_cache_requests_total",
-            "Total number of requests to the PostingsForMatchers cache.",
-        )
-        .expect("valid counter");
-        let hits = Counter::new(
-            "prometheus_tsdb_postings_for_matchers_cache_hits_total",
+impl std::fmt::Debug for PostingsForMatchersCacheMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostingsForMatchersCacheMetrics").finish_non_exhaustive()
+    }
+}
+
+impl PostingsForMatchersCacheMetrics {
+    /// Go `NewPostingsForMatchersCacheMetrics(prometheus.WrapRegistererWithPrefix(prefix, reg))`
+    /// (Mimir: `cortex_ingester_tsdb_head_` / `cortex_ingester_tsdb_block_`). Every series,
+    /// including each `reason` of `skips_total` and `evictions_total`, is exposed from the start.
+    /// `reg == None` (Go `NewPostingsForMatchersCacheMetrics(nil)`) creates unregistered metrics.
+    pub fn new(prefix: &str, reg: Option<&Registry>) -> Self {
+        const SKIPS_HELP: &str = "Total number of requests to the PostingsForMatchers cache that have been skipped the cache. The subsequent result is not cached.";
+        const EVICTIONS_HELP: &str = "Total number of evictions from the PostingsForMatchers cache.";
+        let name = |suffix: &str| format!("{prefix}postings_for_matchers_cache_{suffix}");
+        let gauge = |suffix: &str, help: &str| {
+            let g = Gauge::new(name(suffix), help).expect("valid postings cache gauge");
+            if let Some(reg) = reg {
+                let _ = reg.register(Box::new(g.clone()));
+            }
+            g
+        };
+        let counter = |suffix: &str, help: &str| {
+            let c = Counter::new(name(suffix), help).expect("valid postings cache counter");
+            if let Some(reg) = reg {
+                let _ = reg.register(Box::new(c.clone()));
+            }
+            c
+        };
+        let by_reason = |suffix: &str, help: &str, reasons: &[&str]| {
+            let v = CounterVec::new(Opts::new(name(suffix), help), &["reason"])
+                .expect("valid postings cache counter vec");
+            let out: Vec<Counter> = reasons.iter().map(|r| v.with_label_values(&[r])).collect();
+            if let Some(reg) = reg {
+                let _ = reg.register(Box::new(v));
+            }
+            out
+        };
+        let entries = gauge("entries_total", "Total number of entries in the PostingsForMatchers cache.");
+        let bytes = gauge("bytes_total", "Total number of bytes in the PostingsForMatchers cache.");
+        let requests = counter("requests_total", "Total number of requests to the PostingsForMatchers cache.");
+        let hits = counter(
+            "hits_total",
             "Total number of postings lists returned from the PostingsForMatchers cache.",
-        )
-        .expect("valid counter");
-        let misses = Counter::new(
-            "prometheus_tsdb_postings_for_matchers_cache_misses_total",
+        );
+        let misses = counter(
+            "misses_total",
             "Total number of requests to the PostingsForMatchers cache for which there is no valid cached entry. The subsequent result is cached.",
-        )
-        .expect("valid counter");
-        let invalidations = Counter::new(
-            "prometheus_tsdb_postings_for_matchers_cache_invalidations_total",
+        );
+        let skips = by_reason(
+            "skips_total",
+            SKIPS_HELP,
+            &["ineligible", "stale-cached-entry", "canceled-cached-entry"],
+        );
+        let invalidations = counter(
+            "invalidations_total",
             "Total number of cache entries that were invalidated.",
-        )
-        .expect("valid counter");
-        let evictions = CounterVec::new(
-            Opts::new(
-                "prometheus_tsdb_postings_for_matchers_cache_evictions_total",
-                "Total number of evictions from the PostingsForMatchers cache.",
-            ),
-            &["reason"],
-        )
-        .expect("valid counter vec");
-        let evictions_ttl = evictions.with_label_values(&["ttl-expired"]);
-        let evictions_max_bytes = evictions.with_label_values(&["max-bytes-reached"]);
-        let evictions_max_items = evictions.with_label_values(&["max-items-reached"]);
-
-        let _ = reg.register(Box::new(entries.clone()));
-        let _ = reg.register(Box::new(bytes.clone()));
-        let _ = reg.register(Box::new(requests.clone()));
-        let _ = reg.register(Box::new(hits.clone()));
-        let _ = reg.register(Box::new(misses.clone()));
-        let _ = reg.register(Box::new(invalidations.clone()));
-        let _ = reg.register(Box::new(evictions));
-
+        );
+        let evictions = by_reason(
+            "evictions_total",
+            EVICTIONS_HELP,
+            &["ttl-expired", "max-bytes-reached", "max-items-reached", "unknown"],
+        );
         Self {
             entries,
             bytes,
             requests,
             hits,
             misses,
+            // `ineligible` (Go: non-concurrent calls without `force`, or no shared cache key) stays
+            // 0: this cache serves every call (see PORT_STATUS.md).
+            // `canceled-cached-entry` (Go: the caller's context was canceled while waiting for an
+            // in-flight call) is exposed but never incremented: calls are not cancellable here.
+            skips_stale: skips[1].clone(),
             invalidations,
-            evictions_ttl,
-            evictions_max_bytes,
-            evictions_max_items,
+            evictions_ttl: evictions[0].clone(),
+            evictions_max_bytes: evictions[1].clone(),
+            evictions_max_items: evictions[2].clone(),
+            evictions_unknown: evictions[3].clone(),
         }
     }
 }
@@ -213,7 +244,7 @@ pub struct PostingsForMatchersCache {
     metric_versions: Option<Box<[AtomicU64]>>,
     inner: RwLock<CacheInner>,
     in_flight: Mutex<HashMap<InFlightKey, Arc<InFlightCall>>>,
-    metrics: Option<PromMetrics>,
+    metrics: Option<PostingsForMatchersCacheMetrics>,
 }
 
 impl std::fmt::Debug for PostingsForMatchersCache {
@@ -228,7 +259,7 @@ impl std::fmt::Debug for PostingsForMatchersCache {
 }
 
 impl PostingsForMatchersCache {
-    pub fn new(config: PostingsForMatchersCacheConfig, registry: Option<&Registry>) -> Self {
+    pub fn new(config: PostingsForMatchersCacheConfig) -> Self {
         let metric_versions = if config.enable_invalidation {
             let slots = config.num_metric_versions.max(64).next_power_of_two();
             let mut v = Vec::with_capacity(slots);
@@ -239,7 +270,7 @@ impl PostingsForMatchersCache {
         } else {
             None
         };
-        let metrics = registry.map(PromMetrics::register);
+        let metrics = config.metrics.clone();
         Self {
             config,
             global_epoch: AtomicU64::new(0),
@@ -272,8 +303,10 @@ impl PostingsForMatchersCache {
                 mv[idx].fetch_add(1, Ordering::Release);
             }
         }
-        if let Some(ref m) = self.metrics {
-            m.invalidations.inc();
+        if self.config.report_invalidations {
+            if let Some(ref m) = self.metrics {
+                m.invalidations.inc();
+            }
         }
     }
 
@@ -282,14 +315,14 @@ impl PostingsForMatchersCache {
         self.global_epoch.fetch_add(1, Ordering::Release);
         self.postings_generation.fetch_add(1, Ordering::Release);
         let mut inner = self.inner.write();
+        // The gauges are shared with other tenants' caches: subtract only this cache's share.
+        if let Some(ref m) = self.metrics {
+            m.entries.sub(inner.table.len() as f64);
+            m.bytes.sub(inner.total_bytes as f64);
+        }
         inner.table.clear();
         inner.fifo.clear();
         inner.total_bytes = 0;
-        if let Some(ref m) = self.metrics {
-            m.entries.set(0.0);
-            m.bytes.set(0.0);
-            m.invalidations.inc();
-        }
     }
 
     #[inline]
@@ -317,16 +350,20 @@ impl PostingsForMatchersCache {
     where
         F: FnOnce() -> Result<Vec<u64>, E>,
     {
+        if let Some(ref m) = self.metrics {
+            m.requests.inc();
+        }
+
         if matchers.is_empty()
             || self.config.ttl.is_zero()
             || self.config.max_items == 0
             || self.config.max_bytes == 0
         {
+            // Go still runs these through the cache (a miss whose result is not kept).
+            if let Some(ref m) = self.metrics {
+                m.misses.inc();
+            }
             return compute().map(Arc::from);
-        }
-
-        if let Some(ref m) = self.metrics {
-            m.requests.inc();
         }
 
         let mut key_buf = SmallVec::<[u8; 256]>::new();
@@ -411,7 +448,11 @@ impl PostingsForMatchersCache {
             }
         }
 
-        // Leader failed or invalidated concurrently: recompute directly.
+        // Leader failed or invalidated concurrently: recompute directly (Go: a stale in-flight
+        // entry is skipped and computed without the cache).
+        if let Some(ref m) = self.metrics {
+            m.skips_stale.inc();
+        }
         compute().map(Arc::from)
     }
 
@@ -444,6 +485,11 @@ impl PostingsForMatchersCache {
             if let Some(ref m) = self.metrics {
                 m.entries.dec();
                 m.bytes.sub(removed.size_bytes as f64);
+                if now.duration_since(removed.inserted_at) >= self.config.ttl {
+                    m.evictions_ttl.inc();
+                } else {
+                    m.evictions_unknown.inc();
+                }
             }
         }
 
@@ -486,7 +532,9 @@ impl PostingsForMatchersCache {
             if !expired && !over_bytes && !over_items {
                 break;
             }
-            let meta = inner.fifo.pop_front().unwrap();
+            let Some(meta) = inner.fifo.pop_front() else {
+                break;
+            };
             if let Ok(occ) = inner.table.find_entry(meta.hash, |e| e.id == meta.id) {
                 let (removed, _) = occ.remove();
                 inner.total_bytes = inner.total_bytes.saturating_sub(removed.size_bytes);
@@ -576,13 +624,11 @@ mod tests {
     #[test]
     fn postings_cache_hit_and_per_metric_invalidation() {
         let reg = Registry::new();
-        let cache = PostingsForMatchersCache::new(
-            PostingsForMatchersCacheConfig {
-                enable_invalidation: true,
-                ..Default::default()
-            },
-            Some(&reg),
-        );
+        let cache = PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            enable_invalidation: true,
+            metrics: Some(PostingsForMatchersCacheMetrics::new("test_", Some(&reg))),
+            ..Default::default()
+        });
 
         let m_a = vec![
             LabelMatcher::new(MatchType::Equal, "__name__", "metric_a").unwrap(),
@@ -668,8 +714,8 @@ mod tests {
                 max_bytes: 1024 * 1024,
                 enable_invalidation: false,
                 num_metric_versions: 64,
+                ..Default::default()
             },
-            None,
         );
 
         let m1 = [LabelMatcher::new(MatchType::Equal, "a", "1").unwrap()];
@@ -705,5 +751,95 @@ mod tests {
             })
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 5);
+    }
+
+    fn sample(reg: &Registry, name: &str, reason: Option<&str>) -> f64 {
+        for mf in reg.gather() {
+            if mf.get_name() != name {
+                continue;
+            }
+            for m in mf.get_metric() {
+                let r = m.get_label().iter().find(|l| l.get_name() == "reason").map(|l| l.get_value());
+                if r == reason {
+                    return if m.has_gauge() {
+                        m.get_gauge().get_value()
+                    } else {
+                        m.get_counter().get_value()
+                    };
+                }
+            }
+        }
+        panic!("{name} {reason:?} not exposed");
+    }
+
+    /// Go registers one `PostingsForMatchersCacheMetrics` per Mimir cache factory and every
+    /// tenant's cache updates it: the series are aggregated across caches, all `reason`s are
+    /// exposed from the start, and gauges only move by each cache's own share.
+    #[test]
+    fn shared_metrics_are_aggregated_across_caches() {
+        let reg = Registry::new();
+        let metrics = PostingsForMatchersCacheMetrics::new("cortex_ingester_tsdb_head_", Some(&reg));
+        let p = "cortex_ingester_tsdb_head_postings_for_matchers_cache_";
+        for (suffix, reason) in [
+            ("entries_total", None),
+            ("bytes_total", None),
+            ("requests_total", None),
+            ("hits_total", None),
+            ("misses_total", None),
+            ("invalidations_total", None),
+            ("skips_total", Some("ineligible")),
+            ("skips_total", Some("stale-cached-entry")),
+            ("skips_total", Some("canceled-cached-entry")),
+            ("evictions_total", Some("ttl-expired")),
+            ("evictions_total", Some("max-bytes-reached")),
+            ("evictions_total", Some("max-items-reached")),
+            ("evictions_total", Some("unknown")),
+        ] {
+            assert_eq!(sample(&reg, &format!("{p}{suffix}"), reason), 0.0, "{suffix} {reason:?}");
+        }
+
+        let cfg = PostingsForMatchersCacheConfig {
+            enable_invalidation: true,
+            max_items: 1,
+            metrics: Some(metrics.clone()),
+            ..Default::default()
+        };
+        let a = PostingsForMatchersCache::new(cfg.clone());
+        let b = PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            report_invalidations: true,
+            ..cfg
+        });
+        let m1 = [LabelMatcher::new(MatchType::Equal, "a", "1").unwrap()];
+        let m2 = [LabelMatcher::new(MatchType::Equal, "a", "2").unwrap()];
+        let ok = |v: Vec<u64>| move || Ok::<_, ()>(v);
+        a.get_or_compute(&m1, ok(vec![1])).unwrap();
+        a.get_or_compute(&m1, ok(vec![1])).unwrap();
+        b.get_or_compute(&m1, ok(vec![1])).unwrap();
+        assert_eq!(sample(&reg, &format!("{p}requests_total"), None), 3.0);
+        assert_eq!(sample(&reg, &format!("{p}hits_total"), None), 1.0);
+        assert_eq!(sample(&reg, &format!("{p}misses_total"), None), 2.0);
+        assert_eq!(sample(&reg, &format!("{p}entries_total"), None), 2.0);
+        let bytes = sample(&reg, &format!("{p}bytes_total"), None);
+        assert!(bytes > 0.0);
+
+        // max_items 1: the second entry of `a` evicts its first one.
+        a.get_or_compute(&m2, ok(vec![2])).unwrap();
+        assert_eq!(sample(&reg, &format!("{p}evictions_total"), Some("max-items-reached")), 1.0);
+        assert_eq!(sample(&reg, &format!("{p}entries_total"), None), 2.0);
+
+        // Invalidations are only counted when Go would track metric versions.
+        a.invalidate_metric("x");
+        b.invalidate_metric("x");
+        assert_eq!(sample(&reg, &format!("{p}invalidations_total"), None), 1.0);
+
+        // Dropping all of `a`'s entries leaves `b`'s share in the gauges.
+        a.invalidate_all();
+        assert_eq!(sample(&reg, &format!("{p}entries_total"), None), 1.0);
+        assert_eq!(sample(&reg, &format!("{p}bytes_total"), None), bytes / 2.0);
+
+        // Calls that bypass the cache are still requests (and misses, as in Go).
+        a.get_or_compute(&[], ok(vec![])).unwrap();
+        assert_eq!(sample(&reg, &format!("{p}requests_total"), None), 5.0);
+        assert_eq!(sample(&reg, &format!("{p}misses_total"), None), 4.0);
     }
 }

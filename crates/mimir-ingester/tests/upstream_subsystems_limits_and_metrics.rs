@@ -964,7 +964,7 @@ fn test_user_tsdb_update_last_series_removal() {
         limiter,
         None,
         mimir_storage::shipper::ShipperMetrics::new(Some(&reg)),
-        Some(&reg),
+        &Default::default(),
         None,
         1,
         Arc::new(std::sync::atomic::AtomicI64::new(0)),

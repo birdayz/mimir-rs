@@ -222,6 +222,9 @@ pub struct IngesterMetrics {
     pub compactions_triggered: Counter,
     pub compactions_failed: Counter,
     pub forced_compaction_in_progress: Gauge,
+    /// Go `inflightRequestsSummary` (sampled every 250ms by the metrics updater). Quantiles are
+    /// exact over a sliding 60s window (Go: CKMS estimates over 6 rotating age buckets).
+    pub inflight_requests_summary: mimir_storage::ingest::SlidingWindowSummary,
     pub per_tenant_early_compactions_triggered: Counter,
     pub early_compaction_non_owned_series_triggered: CounterVec,
     pub appender_add_duration: Histogram,
@@ -507,7 +510,18 @@ impl IngesterMetrics {
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
         ];
 
+        let inflight_requests_summary = mimir_storage::ingest::SlidingWindowSummary::new(
+            "cortex_ingester_inflight_push_requests_summary",
+            "Number of inflight requests sampled at a regular interval. Quantile buckets keep track of inflight requests over the last 60s.",
+            vec![0.5, 0.9, 0.95, 0.99, 1.0],
+            std::time::Duration::from_secs(60),
+        );
+        if let Some(r) = reg {
+            let _ = r.register(Box::new(inflight_requests_summary.clone()));
+        }
+
         Self {
+            inflight_requests_summary,
             ingested_samples: reg_counter_vec(
                 reg,
                 "cortex_ingester_ingested_samples_total",

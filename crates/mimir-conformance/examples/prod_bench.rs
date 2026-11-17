@@ -399,10 +399,12 @@ async fn scrape_metrics(http: &reqwest::Client, http_port: u16) -> Option<Scrape
                     *proc_buckets_pusher.entry(le).or_insert(0.0) += val;
                 }
             }
-            "prometheus_tsdb_postings_for_matchers_cache_hits_total" => {
+            "cortex_ingester_tsdb_head_postings_for_matchers_cache_hits_total"
+            | "cortex_ingester_tsdb_block_postings_for_matchers_cache_hits_total" => {
                 *out.postings_cache_hits.get_or_insert(0.0) += val;
             }
-            "prometheus_tsdb_postings_for_matchers_cache_misses_total" => {
+            "cortex_ingester_tsdb_head_postings_for_matchers_cache_misses_total"
+            | "cortex_ingester_tsdb_block_postings_for_matchers_cache_misses_total" => {
                 *out.postings_cache_misses.get_or_insert(0.0) += val;
             }
             _ => {}
