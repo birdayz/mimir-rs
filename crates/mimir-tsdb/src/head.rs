@@ -6581,8 +6581,9 @@ impl Head {
     }
 
     /// Go `ChunkDiskMapper.Truncate(uint32(minMmapFile))`: marks the current non-empty
-    /// `chunks_head` file to cut a new file on the next write and deletes every older file
-    /// `< min_mmap_seq` (`head_chunks.go:971-1010`).
+    /// `chunks_head` file to cut a new file on the next write (`CutNewFile` ->
+    /// `evtlPos.cutFileOnNextChunk`, `head_chunks.go:577-582, 971-1010`) and deletes every
+    /// older file `< min_mmap_seq` excluding the current active sequence.
     fn truncate_chunks_head(&self, min_mmap_seq: usize) -> Result<(), HeadError> {
         // Hold `chunk_writer` across `chunk_reader.write()` + `truncate_in_place_except`
         // (lock order: `chunk_writer` -> `chunk_reader`) so a concurrent chunk write cannot
@@ -6598,7 +6599,7 @@ impl Head {
             }
             None => None,
         };
-        if min_mmap_seq > 1 {
+        if min_mmap_seq > 0 {
             let mut guard = self.chunk_reader.write();
             if let Some(ref mut reader) = *guard {
                 reader.truncate_in_place_except(min_mmap_seq, active_seq)?;
@@ -11843,6 +11844,54 @@ mod tests {
         };
         assert_eq!(read_samples(e_rb.ref_id), vec![(2_000, 42.0)]);
         assert_eq!(read_samples(e_drop.ref_id), vec![(2_000, 84.0)]);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn truncate_chunks_head_matches_go_cut_and_unlink_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            chunk_range_ms: 10_000,
+            samples_per_chunk: 5,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts.clone(), i64::MIN).unwrap();
+        let pairs = [("__name__", "cut_lifecycle_metric"), ("job", "test")];
+
+        let mut r = None;
+        for i in 0..12i64 {
+            let mut app = head.appender();
+            let id = app.append_float(r, &pairs, 1_000 + i * 100, i as f64).unwrap();
+            r = Some(id);
+            app.commit().unwrap();
+        }
+        assert!(head.mmap_head_chunks().unwrap() >= 2);
+        let chunks_dir = dir.path().join("chunks_head");
+        let seg1 = crate::head_chunks::head_chunk_file_path(&chunks_dir, 1);
+        let seg2 = crate::head_chunks::head_chunk_file_path(&chunks_dir, 2);
+        assert!(seg1.exists());
+
+        // First truncation keeps active 000001 (no eager 000002 created, matching Go).
+        head.truncate_memory(10_000).unwrap();
+        assert!(seg1.exists());
+        assert!(!seg2.exists());
+
+        // Next mmap write cuts 000002; subsequent truncation unlinks 000001.
+        let mut r2 = None;
+        for i in 0..12i64 {
+            let mut app = head.appender();
+            let id = app.append_float(r2, &pairs, 20_000 + i * 100, i as f64).unwrap();
+            r2 = Some(id);
+            app.commit().unwrap();
+        }
+        assert!(head.mmap_head_chunks().unwrap() >= 2);
+        assert!(seg2.exists());
+        head.truncate_memory(30_000).unwrap();
+        assert!(!seg1.exists(), "000001 should be unlinked once 000002 is active");
+        assert!(seg2.exists());
+
+        head.close().unwrap();
+        let reopened = Head::open(dir.path(), opts, i64::MIN).unwrap();
         reopened.close().unwrap();
     }
 }
