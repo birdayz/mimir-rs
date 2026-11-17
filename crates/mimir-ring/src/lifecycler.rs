@@ -949,6 +949,21 @@ impl LifecyclerConfig {
             token_generator: Some(token_generator),
         })
     }
+
+    /// Ported from `github.com/grafana/dskit/ring/lifecycler.go` (`LifecyclerConfig.Validate`).
+    pub fn validate(&self) -> Result<(), LifecyclerError> {
+        if self.heartbeat_period.is_zero() {
+            return Err(LifecyclerError::InvalidConfig(
+                "heartbeat period must be greater than 0".to_string(),
+            ));
+        }
+        if self.heartbeat_timeout.is_zero() {
+            return Err(LifecyclerError::InvalidConfig(
+                "heartbeat timeout must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct LifecyclerMetrics {
@@ -1074,6 +1089,7 @@ impl Lifecycler {
             kv_reg.as_ref(),
         )?;
         let cfg = LifecyclerConfig::from_ring_config(ring_cfg, listen_port)?;
+        cfg.validate()?;
         Ok(Self::with_store(
             cfg,
             store,
@@ -2035,5 +2051,74 @@ mod tests {
             assert_eq!(lifecycler_addr(&cfg, 9095).unwrap(), format!("{expected}:9095"));
             assert!(!expected.starts_with("127."));
         }
+    }
+
+    #[test]
+    fn lifecycler_config_validate_rejects_zero_or_negative_heartbeats() {
+        let valid_ring = RingConfig {
+            instance_addr: "127.0.0.1".to_string(),
+            ..Default::default()
+        };
+        let valid = LifecyclerConfig::from_ring_config(&valid_ring, 9095).unwrap();
+        assert!(valid.validate().is_ok());
+
+        let zero_period = RingConfig {
+            instance_addr: "127.0.0.1".to_string(),
+            heartbeat_period: mimir_config::GoDuration::ZERO,
+            ..Default::default()
+        };
+        let err = LifecyclerConfig::from_ring_config(&zero_period, 9095)
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid configuration: heartbeat period must be greater than 0"
+        );
+
+        let neg_period = RingConfig {
+            instance_addr: "127.0.0.1".to_string(),
+            heartbeat_period: mimir_config::GoDuration(-1),
+            ..Default::default()
+        };
+        assert!(LifecyclerConfig::from_ring_config(&neg_period, 9095)
+            .unwrap()
+            .validate()
+            .is_err());
+
+        let zero_timeout = RingConfig {
+            instance_addr: "127.0.0.1".to_string(),
+            heartbeat_timeout: mimir_config::GoDuration::ZERO,
+            ..Default::default()
+        };
+        let err = LifecyclerConfig::from_ring_config(&zero_timeout, 9095)
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid configuration: heartbeat timeout must be greater than 0"
+        );
+
+        // Lifecycler::new also rejects zero heartbeat_period / heartbeat_timeout.
+        let mut zero_period_inmem = zero_period;
+        zero_period_inmem.kvstore.store = "inmemory".to_string();
+        let err = Lifecycler::new::<prometheus::Registry>(
+            &zero_period_inmem,
+            9095,
+            None,
+            "ingester",
+            "ring",
+            false,
+            None,
+            None,
+        )
+        .err()
+        .expect("Lifecycler::new must reject heartbeat_period=0");
+        assert!(
+            err.to_string()
+                .contains("heartbeat period must be greater than 0"),
+            "unexpected err: {err}"
+        );
     }
 }

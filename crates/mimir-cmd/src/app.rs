@@ -244,6 +244,12 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     // Module services of the configured targets (Go `Mimir.ServiceMap`), used by /ready,
     // /services, the gRPC health check and failure propagation.
     let modules = ModuleStates::new();
+    let activity_tracker_state = activity_tracker
+        .as_ref()
+        .map(|_| StateCell::new(State::Running));
+    if let Some(ref st) = activity_tracker_state {
+        modules.add("activity-tracker", st.state_fn());
+    }
     let server_state = StateCell::new(State::New);
     modules.add("server", server_state.state_fn());
 
@@ -488,9 +494,13 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                 Some(&cortex_registerer),
             )
         } else {
+            let lc_cfg = LifecyclerConfig::from_ring_config(&cfg.ingester.ring, bound_grpc_addr.port())
+                .context("creating ingester lifecycler")?;
+            lc_cfg
+                .validate()
+                .map_err(|e| anyhow::anyhow!("error initialising module: ingester-service: {e}"))?;
             Lifecycler::with_store(
-                LifecyclerConfig::from_ring_config(&cfg.ingester.ring, bound_grpc_addr.port())
-                    .context("creating ingester lifecycler")?,
+                lc_cfg,
                 lifecycler_kv.context("creating ingester lifecycler")?,
                 None,
                 INGEST_RING_NAME,
@@ -1086,6 +1096,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             }
         }
         let _ = at.flush();
+    }
+    if let Some(ref st) = activity_tracker_state {
+        st.set(State::Terminated);
     }
 
     logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
