@@ -197,10 +197,19 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
     // 2. RuntimeConfigManager & Overrides.
     let (runtime_config_mgr, overrides) = if !cfg.runtime_config.file.0.is_empty() {
-        let mgr = RuntimeConfigManager::new(
+        let sources = mimir_config::runtime_config_source_ids(&cfg.runtime_config)
+            .context("initializing runtime config manager")?;
+        let observer = crate::runtime_config_metrics::RuntimeConfigMetrics::new(
+            &registry,
+            Arc::clone(&logger) as Arc<dyn Logger>,
+            &sources,
+        )
+        .context("registering runtime config metrics")?;
+        let mgr = RuntimeConfigManager::new_with_observer(
             cfg.runtime_config.clone(),
             cfg.limits.clone(),
             cfg.ingester.instance_limits.clone(),
+            Some(Arc::new(observer)),
         )
         .context("initializing runtime config manager")?;
         let _reloader = mgr.start_reloader();

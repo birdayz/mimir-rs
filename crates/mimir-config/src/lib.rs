@@ -25,6 +25,7 @@ pub mod server;
 pub mod sha256;
 pub mod storage;
 pub mod types;
+pub mod yaml_v3_emit;
 pub mod yaml_v3;
 
 pub use duration::{
@@ -50,8 +51,9 @@ pub use limits::{
 };
 pub use mimir::{parse_cli_and_load_config, CommonConfig, LoadedConfig, MimirConfig};
 pub use runtime_config::{
-    parse_runtime_config_yaml, DistributorInstanceLimits, MultiRuntimeConfig, Overrides,
-    RuntimeConfigManager, RuntimeConfigValues,
+    parse_runtime_config_yaml, runtime_config_source_ids, DistributorInstanceLimits,
+    MultiRuntimeConfig, Overrides, RuntimeConfigLoadEvent, RuntimeConfigManager,
+    RuntimeConfigObserver, RuntimeConfigSourceStatus, RuntimeConfigValues,
 };
 pub use server::{
     ActivityTrackerConfig, ClusterValidationProtocolConfig, ClusterValidationProtocolConfigForHTTP,
