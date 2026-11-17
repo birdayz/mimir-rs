@@ -47,14 +47,49 @@ pub fn marshal_generic(value: &Value) -> Result<String, String> {
     let mut events = vec![Event::StreamStart, Event::DocumentStart];
     match value {
         Value::Mapping(root) => marshal_root_mapping(root, &mut events)?,
-        other => marshal(other, &mut events)?,
+        other => marshal(other, KeyOrder::Sorted, &mut events)?,
     }
+    emit(events)
+}
+
+/// `yaml.Marshal(v)` for a Go *struct* `v` serialized into `value` field by field: mappings
+/// keep their insertion order (yaml.v3 emits struct fields in declaration order), everything
+/// else (scalar typing and quoting, indentation, sequences) is identical to
+/// [`marshal_generic`]. Go maps nested in the struct are emitted sorted by yaml.v3; reorder such
+/// mappings with [`sort_mapping_like_go`] first.
+pub fn marshal_struct(value: &Value) -> Result<String, String> {
+    let mut events = vec![Event::StreamStart, Event::DocumentStart];
+    marshal(value, KeyOrder::Insertion, &mut events)?;
+    emit(events)
+}
+
+/// Reorders `mapping` by yaml.v3's map key order (sorter.go `keyList.Less`), as `yaml.Marshal`
+/// emits a Go map.
+pub fn sort_mapping_like_go(mapping: &mut serde_yaml::Mapping) -> Result<(), String> {
+    let mut entries = Vec::with_capacity(mapping.len());
+    for (k, v) in std::mem::take(mapping) {
+        entries.push((SortKey::new(&k)?, k, v));
+    }
+    for (_, k, v) in sort_by_less(entries, &|a, b| key_less(&a.0, &b.0)) {
+        mapping.insert(k, v);
+    }
+    Ok(())
+}
+
+fn emit(mut events: Vec<Event<'_>>) -> Result<String, String> {
     events.push(Event::DocumentEnd);
     events.push(Event::StreamEnd);
 
     let mut emitter = Emitter::new();
     emitter.emit_all(&events)?;
     String::from_utf8(emitter.out).map_err(|err| format!("yaml: emitted invalid UTF-8: {err}"))
+}
+
+/// Mapping key order of [`marshal`]: Go maps are sorted, Go structs keep their field order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyOrder {
+    Sorted,
+    Insertion,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -99,7 +134,7 @@ fn scalar<'a>(value: impl Into<Cow<'a, str>>, style: ScalarStyle) -> Event<'a> {
 }
 
 /// encode.go `marshal`.
-fn marshal<'a>(value: &'a Value, events: &mut Vec<Event<'a>>) -> Result<(), String> {
+fn marshal<'a>(value: &'a Value, order: KeyOrder, events: &mut Vec<Event<'a>>) -> Result<(), String> {
     match value {
         // nilv
         Value::Null => events.push(scalar("null", ScalarStyle::Plain)),
@@ -128,9 +163,18 @@ fn marshal<'a>(value: &'a Value, events: &mut Vec<Event<'a>>) -> Result<(), Stri
             // slicev
             events.push(Event::SequenceStart);
             for item in seq {
-                marshal(item, events)?;
+                marshal(item, order, events)?;
             }
             events.push(Event::SequenceEnd);
+        }
+        Value::Mapping(mapping) if order == KeyOrder::Insertion => {
+            // structv: fields in declaration order.
+            events.push(Event::MappingStart);
+            for (k, v) in mapping {
+                marshal(k, order, events)?;
+                marshal(v, order, events)?;
+            }
+            events.push(Event::MappingEnd);
         }
         Value::Mapping(mapping) => {
             // mapv: keys sorted with keyList.Less.
@@ -141,12 +185,12 @@ fn marshal<'a>(value: &'a Value, events: &mut Vec<Event<'a>>) -> Result<(), Stri
             let entries = sort_by_less(entries, &|a, b| key_less(&a.0, &b.0));
             events.push(Event::MappingStart);
             for (_, k, v) in entries {
-                marshal(k, events)?;
-                marshal(v, events)?;
+                marshal(k, order, events)?;
+                marshal(v, order, events)?;
             }
             events.push(Event::MappingEnd);
         }
-        Value::Tagged(tagged) => marshal(&tagged.value, events)?,
+        Value::Tagged(tagged) => marshal(&tagged.value, order, events)?,
     }
     Ok(())
 }
@@ -181,7 +225,7 @@ fn marshal_root_mapping<'a>(
     events.push(Event::MappingStart);
     for (_, k, v) in entries {
         events.push(stringv(k));
-        marshal(v, events)?;
+        marshal(v, KeyOrder::Sorted, events)?;
     }
     events.push(Event::MappingEnd);
     Ok(())

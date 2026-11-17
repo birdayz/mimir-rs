@@ -13,14 +13,14 @@ use axum::{Json, Router};
 use mimir_common::logging::format_rfc3339_nano_utc;
 use mimir_common::services::{Service, State};
 use mimir_common::tenant::extract_tenant_id_from_http_headers;
-use mimir_config::{LimitsConfig, MimirConfig, Overrides, RuntimeConfigManager};
+use mimir_config::{yaml_v3_emit, LimitsConfig, MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::{ingester_router, Ingester};
 use mimir_ring::kv::memberlist::MemberlistKv;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
-use crate::cli::{diff_yaml_values, effective_config_yaml};
+use crate::cli::{diff_yaml_values, effective_config_yaml, marshal_config_yaml};
 use crate::metrics::{branch_str, go_version_str, revision_str, version_str};
 
 #[derive(Clone)]
@@ -393,24 +393,27 @@ async fn config_handler(
     AxumState(st): AxumState<AppHttpState>,
     Query(q): Query<ConfigModeQuery>,
 ) -> Response {
-    let val = match q.mode.as_deref() {
+    // Go `ConfigHandler` + `util.WriteYAMLResponse` (yaml.v3 `Marshal`): the config structs keep
+    // their field order, the diff is a `map[string]interface{}` and therefore sorted.
+    let yaml = match q.mode.as_deref() {
         Some("diff") => {
             let def = effective_config_yaml(&st.default_config);
             let act = effective_config_yaml(&st.config);
-            diff_yaml_values(&def, &act).unwrap_or_else(|| Value::Mapping(Mapping::new()))
+            let diff = diff_yaml_values(&def, &act).unwrap_or_else(|| Value::Mapping(Mapping::new()));
+            yaml_v3_emit::marshal_generic(&diff)
         }
-        Some("defaults") => effective_config_yaml(&st.default_config),
-        _ => effective_config_yaml(&st.config),
+        Some("defaults") => marshal_config_yaml(&st.default_config),
+        _ => marshal_config_yaml(&st.config),
     };
 
-    match serde_yaml::to_string(&val) {
+    match yaml {
         Ok(yaml) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             yaml,
         )
             .into_response(),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }
 
@@ -430,7 +433,9 @@ async fn runtime_config_handler(
     let cfg = mgr.get_config();
     let actual_val = runtime_config_to_yaml(&cfg);
 
-    let output_val = match q.mode.as_deref() {
+    // Go `runtimeConfigHandler`: the `runtimeConfigValues` struct, or the
+    // `map[string]interface{}` returned by `util.DiffConfig` (sorted) in diff mode.
+    let yaml = match q.mode.as_deref() {
         Some("diff") => {
             let mut default_overrides = Mapping::new();
             let default_limit_val =
@@ -448,31 +453,41 @@ async fn runtime_config_handler(
                 serde_yaml::to_value(mimir_config::MultiRuntimeConfig::default())
                     .unwrap_or(Value::Mapping(Mapping::new())),
             );
-            diff_yaml_values(&Value::Mapping(default_root), &actual_val)
-                .unwrap_or_else(|| Value::Mapping(Mapping::new()))
+            // Go's default `runtimeConfigValues` has nil instance limits pointers.
+            default_root.insert(Value::String("ingester_limits".to_string()), Value::Null);
+            default_root.insert(Value::String("distributor_limits".to_string()), Value::Null);
+            let diff = diff_yaml_values(&Value::Mapping(default_root), &actual_val)
+                .unwrap_or_else(|| Value::Mapping(Mapping::new()));
+            yaml_v3_emit::marshal_generic(&diff)
         }
-        _ => actual_val,
+        _ => yaml_v3_emit::marshal_struct(&actual_val),
     };
 
-    match serde_yaml::to_string(&output_val) {
+    match yaml {
         Ok(yaml) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             yaml,
         )
             .into_response(),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }
 
+/// Go `runtimeConfigValues` as a `Value` in field order: `overrides` is a Go map (emitted sorted
+/// by yaml.v3), nil `ingester_limits` / `distributor_limits` pointers are `null`.
 fn runtime_config_to_yaml(cfg: &mimir_config::RuntimeConfigValues) -> Value {
     let mut root = Mapping::new();
     let mut overrides_map = Mapping::new();
     for (k, v) in &cfg.overrides {
-        if let Ok(val) = serde_yaml::to_value(v.as_ref()) {
+        if let Ok(mut val) = serde_yaml::to_value(v.as_ref()) {
+            // Only fails for a broken embedded type graph; the value is then kept as is.
+            let _ = mimir_config::yaml_v3::order_like_go_type("validation.Limits", &mut val);
             overrides_map.insert(Value::String(k.clone()), val);
         }
     }
+    // Sorting can only fail for sequence / mapping keys, which tenant IDs never are.
+    let _ = yaml_v3_emit::sort_mapping_like_go(&mut overrides_map);
     root.insert(
         Value::String("overrides".to_string()),
         Value::Mapping(overrides_map),
@@ -480,16 +495,18 @@ fn runtime_config_to_yaml(cfg: &mimir_config::RuntimeConfigValues) -> Value {
     if let Ok(multi_val) = serde_yaml::to_value(&cfg.multi_kv_config) {
         root.insert(Value::String("multi_kv_config".to_string()), multi_val);
     }
-    if let Some(ref ing) = cfg.ingester_limits {
-        if let Ok(v) = serde_yaml::to_value(ing) {
-            root.insert(Value::String("ingester_limits".to_string()), v);
-        }
-    }
-    if let Some(ref dist) = cfg.distributor_limits {
-        if let Ok(v) = serde_yaml::to_value(dist) {
-            root.insert(Value::String("distributor_limits".to_string()), v);
-        }
-    }
+    let ingester_limits = cfg
+        .ingester_limits
+        .as_ref()
+        .and_then(|ing| serde_yaml::to_value(ing).ok())
+        .unwrap_or(Value::Null);
+    root.insert(Value::String("ingester_limits".to_string()), ingester_limits);
+    let distributor_limits = cfg
+        .distributor_limits
+        .as_ref()
+        .and_then(|dist| serde_yaml::to_value(dist).ok())
+        .unwrap_or(Value::Null);
+    root.insert(Value::String("distributor_limits".to_string()), distributor_limits);
     Value::Mapping(root)
 }
 

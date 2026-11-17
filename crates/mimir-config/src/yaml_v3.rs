@@ -607,6 +607,9 @@ struct FieldInfo {
     key: String,
     #[serde(rename = "type")]
     ty: usize,
+    /// `yaml:",omitempty"`.
+    #[serde(default)]
+    omitempty: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -725,14 +728,14 @@ fn load_types() -> Result<Types, String> {
         let spec_cv_ptr = t.add(TypeInfo { elem: Some(spec_cv), ..plain("*mimir.specificLocationsUnmarshaler", "ptr") });
         let common = t.add(TypeInfo {
             fields: vec![
-                FieldInfo { key: "storage".into(), ty: spec_storage_ptr },
-                FieldInfo { key: "client_cluster_validation".into(), ty: spec_cv_ptr },
+                FieldInfo { key: "storage".into(), ty: spec_storage_ptr, omitempty: false },
+                FieldInfo { key: "client_cluster_validation".into(), ty: spec_cv_ptr, omitempty: false },
             ],
             ..plain("mimir.commonConfigUnmarshaler", "struct")
         });
         let common_ptr = t.add(TypeInfo { elem: Some(common), ..plain("*mimir.commonConfigUnmarshaler", "ptr") });
         t.common_pass = t.add(TypeInfo {
-            fields: vec![FieldInfo { key: "common".into(), ty: common_ptr }],
+            fields: vec![FieldInfo { key: "common".into(), ty: common_ptr, omitempty: false }],
             inline_map: Some(t.iface),
             ..plain("mimir.configWithCustomCommonUnmarshaler", "struct")
         });
@@ -1289,6 +1292,106 @@ fn is_base64(s: &str) -> bool {
 /// `KnownFields(true)` and returns the Go error text (without the `error parsing config file: `
 /// prefix) if Go would reject the document. `Ok(None)` means: stream has no document (Go
 /// `io.EOF`); `Ok(Some(doc))` means Go accepts it.
+/// Reshapes the YAML of a Go `mimir.Config` (as produced by serializing `MimirConfig`) the way
+/// yaml.v3 `Marshal` emits the Go value: struct fields in declaration order, keys the Go struct
+/// does not have dropped, zero `omitempty` fields omitted, Go maps (and structs that marshal as
+/// maps, e.g. `flagext.LimitsMap`) sorted by yaml.v3's key order. Used to render `/config`.
+pub fn order_like_go_config(value: &mut serde_yaml::Value) -> Result<(), String> {
+    let t = types()?;
+    order_value(t, t.root, value)
+}
+
+/// [`order_like_go_config`] for a value of the named Go type of the `mimir.Config` type graph
+/// (e.g. `validation.Limits` for the per-tenant overrides of `/runtime_config`).
+pub fn order_like_go_type(type_name: &str, value: &mut serde_yaml::Value) -> Result<(), String> {
+    let t = types()?;
+    order_value(t, t.find(type_name)?, value)
+}
+
+/// yaml.v3 `isZero` of the Go value rendered as `value` (type-directed: Go durations render as
+/// `0s`, structs are zero when every field is).
+fn is_zero(t: &Types, ty: usize, value: &serde_yaml::Value) -> bool {
+    use serde_yaml::Value;
+    let info = t.get(ty);
+    if info.kind == "ptr" {
+        // A non-nil pointer is never zero.
+        return value.is_null();
+    }
+    match value {
+        Value::Null => true,
+        Value::Bool(b) => !*b,
+        Value::Number(n) => n.as_f64() == Some(0.0),
+        Value::String(s) => {
+            s.is_empty() || (s == "0s" && matches!(info.name.as_str(), "time.Duration" | "model.Duration"))
+        }
+        Value::Sequence(items) => items.is_empty(),
+        Value::Mapping(m) => match info.kind.as_str() {
+            "struct" if !info.fields.is_empty() => info.fields.iter().all(|f| {
+                m.get(f.key.as_str()).is_none_or(|v| is_zero(t, f.ty, v))
+            }),
+            _ => m.is_empty(),
+        },
+        Value::Tagged(tagged) => is_zero(t, ty, &tagged.value),
+    }
+}
+
+fn order_value(t: &Types, ty: usize, value: &mut serde_yaml::Value) -> Result<(), String> {
+    use serde_yaml::Value;
+    let info = t.get(ty);
+    // Go types with a `MarshalYAML` that changes the shape of the value.
+    match (info.name.as_str(), &*value) {
+        // `strings.Join(v, ",")`.
+        ("flagext.StringSliceCSV" | "flagext.StringSliceCSVMulti" | "flagext.CIDRSliceCSV", Value::Sequence(items)) => {
+            let joined: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+            if joined.len() == items.len() {
+                *value = Value::String(joined.join(","));
+            }
+            return Ok(());
+        }
+        // `units.Base2Bytes(b).String()`.
+        ("flagext.Bytes", Value::Number(n)) => {
+            if let Some(n) = n.as_u64() {
+                *value = Value::String(crate::types::HumanBytes(n).to_string());
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    match (info.kind.as_str(), value) {
+        ("ptr", v) => match info.elem {
+            Some(elem) => order_value(t, elem, v),
+            None => Ok(()),
+        },
+        ("slice", Value::Sequence(items)) => match info.elem {
+            Some(elem) => items.iter_mut().try_for_each(|item| order_value(t, elem, item)),
+            None => Ok(()),
+        },
+        ("struct", Value::Mapping(m)) if !info.fields.is_empty() => {
+            let mut rest = std::mem::take(m);
+            for field in &info.fields {
+                if let Some(mut v) = rest.remove(field.key.as_str()) {
+                    if field.omitempty && is_zero(t, field.ty, &v) {
+                        continue;
+                    }
+                    order_value(t, field.ty, &mut v)?;
+                    m.insert(Value::String(field.key.clone()), v);
+                }
+            }
+            Ok(())
+        }
+        ("map", Value::Mapping(m)) | ("struct", Value::Mapping(m)) => {
+            crate::yaml_v3_emit::sort_mapping_like_go(m)?;
+            if let (Some(elem), "map") = (info.elem, info.kind.as_str()) {
+                for (_, v) in m.iter_mut() {
+                    order_value(t, elem, v)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn check_config_document(input: &[u8]) -> Result<Option<Document>, String> {
     let Some(doc) = parse_first_document(input)? else {
         return Err("EOF".to_string());

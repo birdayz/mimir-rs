@@ -195,9 +195,28 @@ impl HumanBytes {
     }
 }
 
+/// dskit `flagext.Bytes.String()` = `units.Base2Bytes.String()` (alecthomas/units `ToString(n,
+/// 1024, "iB", "B")`): e.g. `65535` -> `63KiB1023B`, `0` -> `0B`, `1048576` -> `1MiB`. Used for the
+/// flag default and the YAML (`MarshalYAML`) rendering.
 impl fmt::Display for HumanBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}B", self.0)
+        const SI_UNITS: [&str; 7] = ["", "K", "M", "G", "T", "P", "E"];
+        // Go converts to int64 first.
+        let mut n = self.0 as i64;
+        let mut parts: [Option<(i64, &str, &str)>; 7] = [None; 7];
+        for (i, unit) in SI_UNITS.iter().enumerate() {
+            if n % 1024 != 0 || (i == 0 && n == 0) {
+                parts[i] = Some((n % 1024, unit, if i == 0 { "B" } else { "iB" }));
+            }
+            n /= 1024;
+            if n == 0 {
+                break;
+            }
+        }
+        for (v, unit, suffix) in parts.iter().rev().flatten() {
+            write!(f, "{v}{unit}{suffix}")?;
+        }
+        Ok(())
     }
 }
 
@@ -562,5 +581,30 @@ mod s3_bucket_lookup_type_tests {
             S3BucketLookupType::parse("virtual-host").unwrap_err().to_string(),
             ConfigError::Flag("unsupported bucket lookup type: virtual-host".into()).to_string()
         );
+    }
+}
+
+#[cfg(test)]
+mod human_bytes_tests {
+    use super::*;
+
+    // alecthomas/units util_test.go / Go `units.Base2Bytes(n).String()`.
+    #[test]
+    fn display_matches_go_base2_bytes_string() {
+        for (n, want) in [
+            (0u64, "0B"),
+            (1, "1B"),
+            (1023, "1023B"),
+            (1024, "1KiB"),
+            (1025, "1KiB1B"),
+            (65535, "63KiB1023B"),
+            (1 << 20, "1MiB"),
+            (104_857_600, "100MiB"),
+            ((1 << 30) + (1 << 20) + 5, "1GiB1MiB5B"),
+            (1 << 60, "1EiB"),
+        ] {
+            assert_eq!(HumanBytes(n).to_string(), want, "{n}");
+            assert_eq!(HumanBytes::parse(want).unwrap(), n, "{want}");
+        }
     }
 }

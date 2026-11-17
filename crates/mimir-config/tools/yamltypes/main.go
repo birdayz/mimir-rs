@@ -21,8 +21,9 @@ import (
 )
 
 type field struct {
-	Key  string `json:"key"`
-	Type int    `json:"type"`
+	Key       string `json:"key"`
+	Type      int    `json:"type"`
+	OmitEmpty bool   `json:"omitempty,omitempty"`
 }
 
 type typeInfo struct {
@@ -105,11 +106,14 @@ func (g *gen) structFields(st reflect.Type, ti *typeInfo) {
 		if tag == "-" {
 			continue
 		}
-		inline := false
+		inline, omitEmpty := false, false
 		parts := strings.Split(tag, ",")
 		for _, fl := range parts[1:] {
-			if fl == "inline" {
+			switch fl {
+			case "inline":
 				inline = true
+			case "omitempty":
+				omitEmpty = true
 			}
 		}
 		tag = parts[0]
@@ -140,7 +144,7 @@ func (g *gen) structFields(st reflect.Type, ti *typeInfo) {
 		if key == "" {
 			key = strings.ToLower(f.Name)
 		}
-		ti.Fields = append(ti.Fields, field{Key: key, Type: g.id(f.Type)})
+		ti.Fields = append(ti.Fields, field{Key: key, Type: g.id(f.Type), OmitEmpty: omitEmpty})
 	}
 }
 

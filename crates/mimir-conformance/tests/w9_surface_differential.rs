@@ -1139,3 +1139,65 @@ fn w9_ingester_shared_tsdb_metric_families_parity() {
         }
     }
 }
+
+/// S26: `/config`, `/config?mode=defaults`, `/config?mode=diff` and `-print.config` are
+/// byte-identical to Go's yaml.v3 output (4-space indentation, `""`, struct field order, sorted
+/// map keys in the diff), after replacing the per-instance values (directories, ports) and
+/// dropping the hidden `block_builder`, `block_builder_scheduler` and `usage_tracker` blocks
+/// mimir-rs does not model (documented gap in PORT_STATUS.md).
+#[test]
+fn w9_config_yaml_rendering_parity() {
+    let (_tmp, [(go, _gp), (cand, _cp)]) = start_pair("", &[], "http");
+    let normalize = |inst: &Instance, text: &str| -> String {
+        let mut out = String::new();
+        let mut skipping = false;
+        for line in text.lines() {
+            let top_level = !line.starts_with(' ');
+            if top_level {
+                skipping = ["block_builder:", "block_builder_scheduler:", "usage_tracker:"]
+                    .contains(&line);
+            }
+            if skipping {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.replace(&inst.dir.display().to_string(), "<dir>")
+            .replace(&format!(": {}\n", inst.http_port), ": <http-port>\n")
+            .replace(&format!(": {}\n", inst.grpc_port), ": <grpc-port>\n")
+    };
+    let assert_same = |what: &str, g: &str, c: &str| {
+        if g != c {
+            let first = g
+                .lines()
+                .zip(c.lines())
+                .position(|(a, b)| a != b)
+                .unwrap_or(g.lines().count().min(c.lines().count()));
+            let ctx = |s: &str| s.lines().skip(first.saturating_sub(3)).take(8).collect::<Vec<_>>().join("\n");
+            panic!("{what} differs at line {}:\n--- go\n{}\n--- candidate\n{}", first + 1, ctx(g), ctx(c));
+        }
+    };
+    for q in ["", "?mode=defaults", "?mode=diff"] {
+        let get = |inst: &Instance| {
+            let r = curl(&[&format!("http://127.0.0.1:{}/config{q}", inst.http_port)]);
+            assert_eq!(r.status, 200, "/config{q}");
+            normalize(inst, &String::from_utf8(r.body).unwrap())
+        };
+        assert_same(&format!("/config{q}"), &get(&go), &get(&cand));
+    }
+
+    // `-print.config` (Go `mimir.New`: `yaml.NewEncoder(os.Stdout).Encode(&cfg)`).
+    let (go_bin, cand_bin) = ensure_binaries();
+    let print = |inst: &Instance, bin: &Path| {
+        let out = Command::new(bin)
+            .arg(format!("-config.file={}", inst.dir.join("mimir.yaml").display()))
+            .arg("-print.config")
+            .current_dir(&inst.dir)
+            .output()
+            .expect("run -print.config");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        normalize(inst, &String::from_utf8(out.stdout).unwrap())
+    };
+    assert_same("-print.config", &print(&go, &go_bin), &print(&cand, &cand_bin));
+}

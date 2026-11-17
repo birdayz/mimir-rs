@@ -83,6 +83,10 @@ pub struct CostAttributionTrackerConfig {
 
 pub type CostAttributionTrackerConfigs = BTreeMap<String, CostAttributionTrackerConfig>;
 
+fn csv_is_empty(v: &StringSliceCSV) -> bool {
+    v.0.is_empty()
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricRelabelConfig {
@@ -102,6 +106,8 @@ pub struct OAuth2ClientConfig {
     #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub client_secret: String,
     pub token_url: String,
+    // yaml:"scopes,omitempty"
+    #[serde(skip_serializing_if = "csv_is_empty")]
     pub scopes: StringSliceCSV,
     pub endpoint_params: LimitsMap<String>,
 }
@@ -210,6 +216,8 @@ pub struct LimitsConfig {
     pub enforce_out_of_order_window_on_distributor: bool,
     pub enforce_metadata_metric_name: bool,
     pub ingestion_tenant_shard_size: i64,
+    // Go `yaml:"...,omitempty"` (also for the other `skip_serializing_if` fields below).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub metric_relabel_configs: Vec<MetricRelabelConfig>,
     pub ingestion_artificial_delay: ModelDuration,
 
@@ -265,8 +273,11 @@ pub struct LimitsConfig {
     pub results_cache_ttl_for_errors: ModelDuration,
     pub cache_unaligned_requests: bool,
     pub max_query_expression_size_bytes: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blocked_queries: Vec<BlockedQuery>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub limited_queries: Vec<LimitedQuery>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blocked_requests: Vec<BlockedRequest>,
     pub align_queries_with_step: bool,
     pub enabled_promql_experimental_functions: StringSliceCSV,
@@ -284,8 +295,11 @@ pub struct LimitsConfig {
     pub active_series_results_max_size_bytes: i64,
 
     // Cost attribution.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cost_attribution_labels_structured: Vec<CostAttributionLabel>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub cost_attribution_trackers: CostAttributionTrackerConfigs,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub additional_cost_attribution_trackers: CostAttributionTrackerConfigs,
     pub cost_attribution_cooldown: ModelDuration,
     pub max_cost_attribution_cardinality: i64,

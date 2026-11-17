@@ -230,7 +230,8 @@ impl KVStoreConfig {
     }
 }
 
-fn default_hostname() -> String {
+/// Go `os.Hostname()` (the default of the `*.instance-id` ring flags).
+pub fn default_hostname() -> String {
     #[cfg(target_os = "linux")]
     if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
         let trimmed = s.trim();
