@@ -344,14 +344,18 @@ impl Ring {
         let r_start = self.clone();
         let r_run = self.clone();
         basic_service(
-            Some(Box::new(move |_ctx| {
+            Some(Box::new(move |ctx| {
                 let r = r_start.clone();
                 Box::pin(async move {
                     if let Some(kv) = &r.kv_client {
-                        let val = kv
-                            .get(&r.key)
-                            .await
-                            .map_err(|e| ServiceError::failure(format!("unable to initialise ring state: {e}")))?;
+                        // Go passes the service context to `KVClient.Get`: a KV that waits for a
+                        // connection (etcd `WaitForReady`) is abandoned when the service stops.
+                        let val = tokio::select! {
+                            res = kv.get(&r.key) => res.map_err(|e| {
+                                ServiceError::failure(format!("unable to initialise ring state: {e}"))
+                            })?,
+                            _ = ctx.canceled() => return Err(ServiceError::Canceled),
+                        };
                         if let Some(any) = val {
                             if let Ok(desc) = any.downcast::<Desc>() {
                                 r.update_ring_state(*desc);

@@ -213,7 +213,7 @@ fn cipher_suites(names: &str) -> Result<Option<Vec<SupportedCipherSuite>>, TlsCo
 }
 
 /// Formats an `os.ReadFile`-style error: `open <path>: <lowercase errno text>`.
-fn go_read_err(path: &str, err: &std::io::Error) -> String {
+pub fn go_read_err(path: &str, err: &std::io::Error) -> String {
     let mut msg = err.to_string();
     if let Some(idx) = msg.find(" (os error ") {
         msg.truncate(idx);
@@ -234,7 +234,7 @@ fn read_secret(path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Port of Go `tls.X509KeyPair` (PEM cert chain + PKCS#8 / PKCS#1 / SEC1 key, key must match).
-fn x509_key_pair(
+pub fn x509_key_pair(
     cert_pem: &[u8],
     key_pem: &[u8],
     provider: &CryptoProvider,
@@ -269,7 +269,7 @@ fn x509_key_pair(
 
 /// Process-wide cache of the host's root CA certificates (Go `x509.SystemCertPool` is also
 /// loaded once per process).
-fn system_roots() -> Arc<RootCertStore> {
+pub fn system_roots() -> Arc<RootCertStore> {
     static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
     Arc::clone(ROOTS.get_or_init(|| {
         let loaded = rustls_native_certs::load_native_certs();
