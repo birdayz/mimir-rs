@@ -1826,6 +1826,7 @@ name = "mimir-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "crc32c",
  "futures",
  "parking_lot",
  "prometheus",

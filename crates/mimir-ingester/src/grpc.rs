@@ -152,16 +152,27 @@ impl hyper::body::Body for SingleChunkBody {
     }
 }
 
-fn is_snappy_grpc_encoding(headers: &http::HeaderMap) -> bool {
-    headers
-        .get("grpc-encoding")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.eq_ignore_ascii_case(mimir_proto::snappy::SNAPPY_ENCODING_NAME))
+#[derive(Clone, Copy)]
+enum CustomGrpcEncoding {
+    Snappy,
+    S2,
+}
+
+fn custom_grpc_encoding(headers: &http::HeaderMap) -> Option<CustomGrpcEncoding> {
+    let val = headers.get("grpc-encoding")?.to_str().ok()?;
+    if val.eq_ignore_ascii_case(mimir_proto::snappy::SNAPPY_ENCODING_NAME) {
+        Some(CustomGrpcEncoding::Snappy)
+    } else if val.eq_ignore_ascii_case(mimir_proto::s2::S2_ENCODING_NAME) {
+        Some(CustomGrpcEncoding::S2)
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::result_large_err)]
-async fn decompress_snappy_grpc_request(
+async fn decompress_custom_grpc_request(
     req: http::Request<tonic::body::BoxBody>,
+    encoding: CustomGrpcEncoding,
     max_decode_len: usize,
 ) -> Result<http::Request<tonic::body::BoxBody>, Status> {
     let (mut parts, mut body) = req.into_parts();
@@ -185,7 +196,7 @@ async fn decompress_snappy_grpc_request(
     let slice = &raw_body[..];
     while pos < slice.len() {
         if slice.len() - pos < 5 {
-            return Err(Status::internal("truncated gRPC snappy frame header"));
+            return Err(Status::internal("truncated gRPC compressed frame header"));
         }
         let flag = slice[pos];
         let len = u32::from_be_bytes([
@@ -196,7 +207,7 @@ async fn decompress_snappy_grpc_request(
         ]) as usize;
         pos += 5;
         let payload = slice.get(pos..pos + len).ok_or_else(|| {
-            Status::internal("truncated gRPC snappy frame payload")
+            Status::internal("truncated gRPC compressed frame payload")
         })?;
         pos += len;
 
@@ -214,9 +225,21 @@ async fn decompress_snappy_grpc_request(
             1 => {
                 let hdr_pos = out.len();
                 out.extend_from_slice(&[0u8; 5]);
-                mimir_proto::snappy::decompress_framed_into(payload, &mut out).map_err(|e| {
-                    Status::internal(format!("snappy decompression failed: {e}"))
-                })?;
+                match encoding {
+                    CustomGrpcEncoding::Snappy => {
+                        mimir_proto::snappy::decompress_framed_into(payload, &mut out).map_err(
+                            |e| Status::internal(format!("snappy decompression failed: {e}")),
+                        )?;
+                    }
+                    CustomGrpcEncoding::S2 => {
+                        mimir_proto::s2::decompress_framed_into(
+                            payload,
+                            &mut out,
+                            max_decode_len,
+                        )
+                        .map_err(|e| Status::internal(format!("s2 decompression failed: {e}")))?;
+                    }
+                }
                 let dec_len = out.len() - (hdr_pos + 5);
                 if dec_len > max_decode_len {
                     return Err(Status::resource_exhausted(format!(
@@ -241,9 +264,10 @@ async fn decompress_snappy_grpc_request(
     ))
 }
 
-/// Accepts `grpc-encoding: snappy` requests for any wrapped gRPC service: Go registers dskit's
-/// `grpcencoding/snappy` compressor process-wide, so every gRPC service of a Mimir server (e.g.
-/// `httpgrpc.HTTP`) decodes Snappy-compressed messages, not just `cortex.Ingester`.
+/// Accepts `grpc-encoding: snappy` and `grpc-encoding: s2` requests for any wrapped gRPC service:
+/// Go registers dskit's `grpcencoding/snappy` and Mimir's `grpcencoding/s2` compressors
+/// process-wide, so every gRPC service of a Mimir server (e.g. `grpc.health.v1.Health`,
+/// `httpgrpc.HTTP`, `cortex.Ingester`) decodes Snappy- and S2-compressed messages.
 #[derive(Clone)]
 pub struct SnappyDecompressService<S> {
     inner: S,
@@ -284,15 +308,15 @@ where
     }
 
     fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
-        if !is_snappy_grpc_encoding(req.headers()) {
+        let Some(encoding) = custom_grpc_encoding(req.headers()) else {
             return Box::pin(self.inner.call(req));
-        }
+        };
         // Use the service that was polled ready; leave a fresh clone behind.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let max_decode_len = self.max_decode_len;
         Box::pin(async move {
-            match decompress_snappy_grpc_request(req, max_decode_len).await {
+            match decompress_custom_grpc_request(req, encoding, max_decode_len).await {
                 Ok(req) => inner.call(req).await,
                 Err(status) => Ok(status.into_http()),
             }
@@ -313,7 +337,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
     }
 
     fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
-        let snappy_req = is_snappy_grpc_encoding(req.headers());
+        let custom_enc = custom_grpc_encoding(req.headers());
         let max_decode_len = self.max_decoding_message_size.unwrap_or(4 * 1024 * 1024);
 
         if req.uri().path() == "/cortex.Ingester/Push" {
@@ -357,8 +381,8 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
             }
             let ingester = Arc::clone(&self.ingester);
             Box::pin(async move {
-                let req = if snappy_req {
-                    match decompress_snappy_grpc_request(req, max_decode_len).await {
+                let req = if let Some(encoding) = custom_enc {
+                    match decompress_custom_grpc_request(req, encoding, max_decode_len).await {
                         Ok(r) => r,
                         Err(status) => return Ok(status.into_http()),
                     }
@@ -367,10 +391,11 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 };
                 Ok(grpc.unary(RawPushSvc(ingester), req).await)
             })
-        } else if snappy_req {
+        } else if let Some(encoding) = custom_enc {
             let mut inner = self.inner.clone();
             Box::pin(async move {
-                let req = match decompress_snappy_grpc_request(req, max_decode_len).await {
+                let req = match decompress_custom_grpc_request(req, encoding, max_decode_len).await
+                {
                     Ok(r) => r,
                     Err(status) => return Ok(status.into_http()),
                 };

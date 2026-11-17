@@ -27,6 +27,7 @@ pub mod ingesterpb;
 pub mod memberlistpb;
 pub mod ref_leaks;
 pub mod ringpb;
+pub mod s2;
 pub mod sharding;
 pub mod snappy;
 pub mod split;
