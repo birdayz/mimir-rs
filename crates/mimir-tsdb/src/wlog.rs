@@ -599,7 +599,7 @@ impl WlogWriter {
 
 /// Multi-segment buffered reader matching Prometheus `wlog.segmentBufReader`.
 pub struct SegmentBufReader {
-    segs: Vec<(PathBuf, usize, BufReader<File>)>,
+    segs: Vec<(PathBuf, usize, Option<BufReader<File>>)>,
     cur: usize,
     off: usize,
 }
@@ -630,7 +630,11 @@ impl SegmentBufReader {
                 }
                 let path = range.dir.join(&r.name);
                 let file = File::open(&path)?;
-                segs.push((range.dir.clone(), r.index, BufReader::with_capacity(16 * PAGE_SIZE, file)));
+                segs.push((
+                    range.dir.clone(),
+                    r.index,
+                    Some(BufReader::with_capacity(16 * PAGE_SIZE, file)),
+                ));
             }
         }
         Ok(Self {
@@ -659,7 +663,10 @@ impl Read for SegmentBufReader {
             return Ok(0);
         }
 
-        let n = self.segs[self.cur].2.read(buf)?;
+        let Some(ref mut rdr) = self.segs[self.cur].2 else {
+            return Ok(0);
+        };
+        let n = rdr.read(buf)?;
         self.off += n;
         if n > 0 {
             return Ok(n);
@@ -673,6 +680,9 @@ impl Read for SegmentBufReader {
             self.off += pad;
             return Ok(pad);
         }
+
+        // Release finished segment FD & 512 KiB read buffer immediately.
+        self.segs[self.cur].2 = None;
 
         if self.cur + 1 >= self.segs.len() {
             return Ok(0);
