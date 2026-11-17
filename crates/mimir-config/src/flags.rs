@@ -635,33 +635,15 @@ impl<T> FlagSet<T> {
         Ok(&args[idx..])
     }
 
-    /// Formats usage output matching Go `flag.FlagSet.PrintDefaults()` / `usage.Usage`.
-    pub fn format_usage(&self, prog_name: &str, _all: bool) -> String {
-        let mut out = format!("Usage of {prog_name}:\n");
-        for entry in self.flags.values() {
-            if entry.usage.is_empty() && entry.name != "h" && entry.name != "help" {
-                continue;
-            }
-            let mut line = format!("  -{}", entry.name);
-            if !entry.type_name.is_empty() {
-                let _ = write!(line, " {}", entry.type_name);
-            }
-            out.push_str(&line);
-            out.push('\n');
-            if !entry.usage.is_empty() {
-                out.push_str("    \t");
-                out.push_str(&entry.usage.replace('\n', "\n    \t"));
-                if !is_zero_default(&entry.default_str, entry.is_bool) {
-                    if entry.type_name == "string" && !entry.usage_default_unquoted {
-                        let _ = write!(out, " (default {:?})", entry.default_str);
-                    } else {
-                        let _ = write!(out, " (default {})", entry.default_str);
-                    }
-                }
-                out.push('\n');
-            }
-        }
-        out
+    /// Formats `-help` / `-help-all` output matching `pkg/util/usage/usage.go:Usage`
+    /// (see [`crate::help`]), restricted to the flags registered in this set.
+    pub fn format_usage(&self, prog_name: &str, all: bool) -> String {
+        crate::help::format_usage(prog_name, all, |name| self.flags.contains_key(name))
+    }
+
+    /// Names of all registered flags.
+    pub fn flag_names(&self) -> impl Iterator<Item = &str> {
+        self.flags.keys().map(String::as_str)
     }
 }
 
@@ -780,14 +762,6 @@ pub fn go_parse_float(s: &str) -> Result<f64, ConfigError> {
         return Err(range_error());
     }
     Ok(v)
-}
-
-fn is_zero_default(s: &str, is_bool: bool) -> bool {
-    if is_bool {
-        s == "false" || s.is_empty()
-    } else {
-        matches!(s, "" | "0" | "0s" | "false" | "[]" | "{}")
-    }
 }
 
 /// Scans `args` for `-config.file` and `-config.expand-env` before full flag parsing,

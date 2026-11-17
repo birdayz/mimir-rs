@@ -2561,6 +2561,81 @@ pub fn register_extra_flags<T: 'static>(
         );
     }
 
+    // `continuoustest.Config` (`yaml:"-"`, pkg/continuoustest/{manager,client,*_test}.go): flags
+    // are registered for every target in Go and only consumed by `-target=continuous-test`
+    // (not ported), so they are accepted and validated like Go but have no effect elsewhere.
+    for (name, kind) in [
+        ("tests.basic-auth-password", "string"),
+        ("tests.basic-auth-user", "string"),
+        ("tests.bearer-token", "string"),
+        ("tests.client.cluster-validation.label", "string"),
+        ("tests.client.user-agent", "string"),
+        ("tests.ingest-storage-record.consumer-group", "string"),
+        ("tests.ingest-storage-record.enabled", "bool"),
+        ("tests.ingest-storage-record.max-jump-size", "int"),
+        ("tests.ingest-storage-record.max-records-per-run", "int"),
+        ("tests.ingest-storage-record.records-processed-percent", "int"),
+        ("tests.read-endpoint", "url"),
+        ("tests.read-timeout", "duration"),
+        ("tests.run-interval", "duration"),
+        ("tests.send-chunks-debugging-header", "bool"),
+        ("tests.smoke-test", "bool"),
+        ("tests.tenant-id", "string"),
+        ("tests.write-batch-size", "int"),
+        ("tests.write-endpoint", "url"),
+        ("tests.write-protocol", "write-protocol"),
+        ("tests.write-read-ooo-test.enabled", "bool"),
+        ("tests.write-read-ooo-test.max-ooo-lag", "duration"),
+        ("tests.write-read-ooo-test.max-query-age", "duration"),
+        ("tests.write-read-ooo-test.num-series", "int"),
+        ("tests.write-read-series-test.fan-out-query-enabled", "bool"),
+        ("tests.write-read-series-test.float-samples-enabled", "bool"),
+        ("tests.write-read-series-test.histogram-samples-enabled", "bool"),
+        ("tests.write-read-series-test.max-query-age", "duration"),
+        ("tests.write-read-series-test.num-series", "int"),
+        ("tests.write-timeout", "duration"),
+    ] {
+        let name_s = name.to_string();
+        let name_get = name_s.clone();
+        let is_bool = kind == "bool";
+        f.register_raw(
+            name_s.clone(),
+            is_bool,
+            match kind {
+                "bool" => "",
+                "int" => "int",
+                "duration" => "duration",
+                "write-protocol" => "value",
+                _ => "string",
+            },
+            if is_bool { "false" } else { "" },
+            "",
+            move |t, s| {
+                match kind {
+                    "bool" => {
+                        parse_go_bool(s)?;
+                    }
+                    "int" => {
+                        crate::flags::go_parse_int(s)?;
+                    }
+                    "duration" => {
+                        s.parse::<GoDuration>()
+                            .map_err(|_| ConfigError::Flag("parse error".to_string()))?;
+                    }
+                    "write-protocol"
+                        if !matches!(s, "prometheus" | "prometheus2" | "otlp-http") =>
+                    {
+                        return Err(ConfigError::Flag(format!("invalid write protocol {s:?}")));
+                    }
+                    _ => {}
+                }
+                get_mut(t).insert(name_s.clone(), s.to_string());
+                Ok(())
+            },
+            move |t| get(t).get(&name_get).cloned().unwrap_or_default(),
+        );
+    }
+
     for suffix in crate::storage::StorageBackendConfig::common_flag_suffixes() {
         let name_s = format!("usage-tracker.snapshots-storage.{suffix}");
         let name_get = name_s.clone();

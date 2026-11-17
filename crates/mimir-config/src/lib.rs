@@ -14,6 +14,7 @@ pub mod duration;
 pub mod env;
 pub mod error;
 pub mod flags;
+pub mod help;
 pub mod ingester;
 pub mod limits;
 pub mod mimir;

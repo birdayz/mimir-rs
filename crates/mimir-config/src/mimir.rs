@@ -1185,6 +1185,46 @@ pub struct LoadedConfig {
     pub usage_text: Option<String>,
 }
 
+/// Flag target of the `cmd/mimir/main.go` command line (`mimir.Config` + `mainFlags`).
+struct CliTarget {
+    cfg: MimirConfig,
+    main_flags: MainFlags,
+}
+
+/// Registers every command-line flag like `main()`: `cfg.RegisterFlags`, the ignored
+/// `-config.file` / `-config.expand-env`, and `mainFlags.registerFlags`.
+fn build_cli_flag_set(state: &CliTarget) -> FlagSet<CliTarget> {
+    let mut fs: FlagSet<CliTarget> = FlagSet::new();
+    state
+        .cfg
+        .register_flags_into(&mut fs, |t| &t.cfg, |t| &mut t.cfg);
+    fs.ignored_flag("config.file", false, "Configuration file to load.");
+    fs.ignored_flag(
+        "config.expand-env",
+        true,
+        "Expands ${var} or $var in config according to the values of the environment variables.",
+    );
+    MainFlags::register_flags_into(
+        &state.main_flags,
+        &mut fs,
+        |t| &t.main_flags,
+        |t| &mut t.main_flags,
+    );
+    fs
+}
+
+/// Names of all flags accepted on the `mimir` command line.
+pub fn cli_flag_names() -> Vec<String> {
+    let state = CliTarget {
+        cfg: MimirConfig::default(),
+        main_flags: MainFlags::default(),
+    };
+    build_cli_flag_set(&state)
+        .flag_names()
+        .map(str::to_string)
+        .collect()
+}
+
 /// Runs the full `cmd/mimir/main.go` startup config pipeline:
 /// 1) Struct defaults
 /// 2) Pre-scan `-config.file` & `-config.expand-env`, load YAML (computing SHA-256 pre-expansion)
@@ -1196,11 +1236,6 @@ pub fn parse_cli_and_load_config(
     prog_name: &str,
     args: &[String],
 ) -> Result<LoadedConfig, ConfigError> {
-    struct CliTarget {
-        cfg: MimirConfig,
-        main_flags: MainFlags,
-    }
-
     let mut state = CliTarget {
         cfg: MimirConfig::default(),
         main_flags: MainFlags::default(),
@@ -1222,22 +1257,7 @@ pub fn parse_cli_and_load_config(
         None
     };
 
-    let mut fs: FlagSet<CliTarget> = FlagSet::new();
-    state
-        .cfg
-        .register_flags_into(&mut fs, |t| &t.cfg, |t| &mut t.cfg);
-    fs.ignored_flag("config.file", false, "Configuration file to load.");
-    fs.ignored_flag(
-        "config.expand-env",
-        true,
-        "Expands ${var} or $var in config according to the values of the environment variables.",
-    );
-    MainFlags::register_flags_into(
-        &state.main_flags,
-        &mut fs,
-        |t| &t.main_flags,
-        |t| &mut t.main_flags,
-    );
+    let mut fs = build_cli_flag_set(&state);
 
     fs.parse(&mut state, args)?;
 
@@ -1288,6 +1308,51 @@ pub fn parse_cli_and_load_config(
 #[cfg(test)]
 mod yaml_defaults_tests {
     use super::*;
+
+    // Flags that Go registers but hides from -help-all (configdoc hidden overrides,
+    // `doc:"hidden"` structs/fields, or `deprecated` placeholder values).
+    const GO_HIDDEN_FLAGS: &[&str] = &[
+        "blocks-storage.tsdb.block-ranges-period",
+        "compactor.read-compartment-id",
+        "compartments.enabled",
+        "compartments.read.num-compartments",
+        "compartments.write.num-compartments",
+        "distributor.active-series-limit-response-code",
+        "distributor.influx-endpoint-enabled",
+        "distributor.ingestion-artificial-delay",
+        "distributor.max-active-series-per-user",
+        "distributor.max-influx-request-size",
+        "distributor.otel-start-time-quiet-zero",
+        "distributor.write-compartment-id",
+        "ingester.push-grpc-method-enabled",
+        "ingester.read-compartment-id",
+        "server.grpc.recv-buffer-pools-enabled",
+        "server.grpc.stats-tracking-enabled",
+        "store-gateway.read-compartment-id",
+    ];
+
+    // Every flag Go documents in -help-all must be accepted by Rust, and Rust must not
+    // accept flags Go doesn't register (hidden ones aside).
+    #[test]
+    fn cli_flags_match_go_help_all() {
+        let rust: std::collections::BTreeSet<String> = cli_flag_names().into_iter().collect();
+        let go: std::collections::BTreeSet<String> = crate::help::documented_flag_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let missing: Vec<_> = go.difference(&rust).collect();
+        assert!(missing.is_empty(), "Go flags not registered in Rust: {missing:?}");
+        let extra: Vec<_> = rust
+            .difference(&go)
+            .filter(|n| {
+                !GO_HIDDEN_FLAGS.contains(&n.as_str())
+                    && !n.starts_with("block-builder")
+                    && !n.starts_with("usage-tracker.")
+                    && !n.starts_with("distributor.usage-tracker-client.")
+            })
+            .collect();
+        assert!(extra.is_empty(), "Rust flags unknown to Go -help-all: {extra:?}");
+    }
 
     // The YAML document is merged onto the serialized current config, which therefore must
     // round-trip losslessly through serde (secrets revealed).
