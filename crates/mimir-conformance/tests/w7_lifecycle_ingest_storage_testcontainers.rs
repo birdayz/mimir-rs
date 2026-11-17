@@ -284,6 +284,11 @@ fn lc3_partition_registered_only_after_ingester_is_active() {
                     &rp.address(),
                     &format!("lc3-{}", which.name()),
                     "    num_tokens: 16\n",
+                )
+                // Helm's ingest-storage values use a dedicated instance ring prefix.
+                .replace(
+                    "    kvstore:\n      store: inmemory\n    instance_id",
+                    "    kvstore:\n      store: inmemory\n      prefix: partition-ingesters/\n    instance_id",
                 );
                 let proc = start_mimir(which, "partition", &dir, &yaml, &[]);
                 procs.push((which, proc, p));
@@ -323,6 +328,35 @@ fn lc3_partition_registered_only_after_ingester_is_active() {
                 assert!(Instant::now() < deadline, "partition 0 not registered by both: {all:?}");
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
+
+            // LC-11: the partition ring page edits the partition ring (its own KV client), even
+            // when the instance ring uses another prefix.
+            let no_redirect = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let mut after_edit = Vec::new();
+            for (_, proc, p) in &procs {
+                let resp = no_redirect
+                    .post(format!("http://127.0.0.1:{}/ingester/partition-ring", p.http))
+                    .form(&[
+                        ("action", "change_state"),
+                        ("partition_id", "0"),
+                        ("partition_state", "PartitionInactive"),
+                    ])
+                    .send()
+                    .await
+                    .unwrap();
+                let code = resp.status().as_u16();
+                let parts = partitions(&client, p.http).await.unwrap();
+                after_edit.push((proc.name.clone(), code, parts.first().map(|x| x.1.clone())));
+            }
+            assert_eq!(
+                (after_edit[0].1, &after_edit[0].2),
+                (after_edit[1].1, &after_edit[1].2),
+                "go vs rust partition ring page edit: {after_edit:?}"
+            );
+            assert_eq!(after_edit[0].1, 302, "{after_edit:?}");
 
             // LC-8: ring, lifecycler, partition ring and KV client metrics (names + labels).
             let mut series = Vec::new();
