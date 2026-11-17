@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use mimir_common::tls::{go_read_err, system_roots, x509_key_pair};
+use mimir_common::tls::{go_read_err, system_roots, CachedReloadingCert};
 use mimir_config::ingester::EtcdConfig;
 use tokio_rustls::rustls;
 use tokio_rustls::rustls::client::danger::{
@@ -38,7 +38,6 @@ use tokio_rustls::rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
 use tokio_rustls::rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{
     CertificateError, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
@@ -50,12 +49,7 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// etcd `tlsutil.NewCert`: read both files, then `tls.X509KeyPair`.
-fn new_cert(cert_path: &str, key_path: &str, provider: &CryptoProvider) -> Result<CertifiedKey, String> {
-    let cert = std::fs::read(cert_path).map_err(|e| go_read_err(cert_path, &e))?;
-    let key = std::fs::read(key_path).map_err(|e| go_read_err(key_path, &e))?;
-    x509_key_pair(&cert, &key, provider)
-}
+
 
 /// etcd `TLSInfo.ClientConfig` for the etcd KV `Config` (only called with `tls_enabled`).
 /// Errors are the Go texts, without the dskit wrapping.
@@ -72,12 +66,13 @@ pub fn client_config(cfg: &EtcdConfig) -> Result<rustls::ClientConfig, String> {
                 cfg.tls_key_path, cfg.tls_cert_path
             ));
         }
-        new_cert(&cfg.tls_cert_path, &cfg.tls_key_path, &provider)?;
-        Some(ReloadingClientCert {
-            cert_path: cfg.tls_cert_path.clone(),
-            key_path: cfg.tls_key_path.clone(),
-            provider: Arc::clone(&provider),
-        })
+        let resolver = CachedReloadingCert::from_files(
+            &cfg.tls_cert_path,
+            &cfg.tls_key_path,
+            Arc::clone(&provider),
+        )
+        .map_err(|e| e.into_reason())?;
+        Some(Arc::new(resolver) as Arc<dyn ResolvesClientCert>)
     };
 
     // `cafiles` + `tlsutil.NewCertPool`.
@@ -130,7 +125,7 @@ pub fn client_config(cfg: &EtcdConfig) -> Result<rustls::ClientConfig, String> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier));
     Ok(match client_cert {
-        Some(resolver) => builder.with_client_cert_resolver(Arc::new(resolver)),
+        Some(resolver) => builder.with_client_cert_resolver(resolver),
         None => builder.with_no_client_auth(),
     })
 }
@@ -148,35 +143,7 @@ pub fn default_client_config() -> Result<rustls::ClientConfig, String> {
     })
 }
 
-/// etcd `GetClientCertificate`: the key pair is re-read from disk on every handshake.
-#[derive(Debug)]
-struct ReloadingClientCert {
-    cert_path: String,
-    key_path: String,
-    provider: Arc<CryptoProvider>,
-}
 
-impl ResolvesClientCert for ReloadingClientCert {
-    fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
-        match new_cert(&self.cert_path, &self.key_path, &self.provider) {
-            Ok(ck) => Some(Arc::new(ck)),
-            Err(err) => {
-                // etcd logs "failed to create client certificate" and fails the handshake.
-                tracing::warn!(
-                    cert_file = %self.cert_path,
-                    key_file = %self.key_path,
-                    err = %err,
-                    "failed to create client certificate"
-                );
-                None
-            }
-        }
-    }
-
-    fn has_certs(&self) -> bool {
-        true
-    }
-}
 
 /// Server certificate verification with Go's `InsecureSkipVerify` and empty-pool semantics.
 #[derive(Debug)]

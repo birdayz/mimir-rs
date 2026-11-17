@@ -10,8 +10,8 @@
 //!   file; unparsable blocks are skipped like `x509.CertPool.AppendCertsFromPEM`). Empty: the
 //!   host's root CA certificates (`SSL_CERT_FILE` / `SSL_CERT_DIR` honoured, like Go on Linux).
 //! - `tls_cert_path` / `tls_key_path`: both or neither; the key pair is loaded and validated
-//!   eagerly (`tls.X509KeyPair`) and re-read from disk on every handshake that asks for a client
-//!   certificate (`GetClientCertificate`), so rotated certificates are picked up.
+//!   eagerly (`tls.X509KeyPair`) and cached via [`CachedReloadingCert`] with throttled metadata
+//!   checks and last-known-good fallback across transient symlink swaps.
 //! - `tls_server_name`: overrides the name verified on the server certificate (and sent as SNI).
 //!   IP addresses are verified against IP SANs.
 //! - `tls_insecure_skip_verify`: any server certificate and name is accepted; handshake
@@ -24,7 +24,11 @@
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Instant, SystemTime};
+
+use parking_lot::{Mutex, RwLock};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
@@ -305,6 +309,12 @@ pub fn parse_server_name(name: &str) -> Result<ServerName<'static>, TlsConfigErr
 impl ClientConfig {
     /// Port of dskit `ClientConfig.GetTLSConfig`.
     pub fn get_tls_config(&self) -> Result<ResolvedClientConfig, TlsConfigError> {
+        self.get_tls_config_with_resolver().map(|(cfg, _)| cfg)
+    }
+
+    fn get_tls_config_with_resolver(
+        &self,
+    ) -> Result<(ResolvedClientConfig, Option<Arc<CachedReloadingCert>>), TlsConfigError> {
         // Read CA certificates.
         let ca_roots = if self.ca_path.is_empty() {
             None
@@ -331,15 +341,26 @@ impl ClientConfig {
             if self.key_path.is_empty() {
                 return Err(TlsConfigError::KeyMissing);
             }
-            let resolver = ReloadingClientCert {
-                cert_path: self.cert_path.clone(),
-                key_path: self.key_path.clone(),
+            let resolver = CachedReloadingCert::from_files(
+                &self.cert_path,
+                &self.key_path,
                 // Key parsing does not depend on the configured cipher suites.
-                provider: Arc::new(rustls::crypto::ring::default_provider()),
-            };
-            // Confirm that certificate and key paths are valid.
-            resolver.load()?;
-            Some(resolver)
+                Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .map_err(|e| match e {
+                CertLoadError::ReadCert { path, reason } => {
+                    TlsConfigError::LoadClientCert { path, reason }
+                }
+                CertLoadError::ReadKey { path, reason } => {
+                    TlsConfigError::LoadClientKey { path, reason }
+                }
+                CertLoadError::KeyPair(reason) => TlsConfigError::KeyPair {
+                    cert_path: self.cert_path.clone(),
+                    key_path: self.key_path.clone(),
+                    reason,
+                },
+            })?;
+            Some(Arc::new(resolver))
         };
 
         let versions = protocol_versions(&self.min_version)?;
@@ -381,15 +402,21 @@ impl ClientConfig {
             }
         };
 
-        let config = match client_cert {
-            Some(resolver) => builder.with_client_cert_resolver(Arc::new(resolver)),
+        let config = match &client_cert {
+            Some(resolver) => {
+                let r: Arc<dyn ResolvesClientCert> = Arc::clone(resolver) as Arc<dyn ResolvesClientCert>;
+                builder.with_client_cert_resolver(r)
+            }
             None => builder.with_no_client_auth(),
         };
 
-        Ok(ResolvedClientConfig {
-            config: Arc::new(config),
-            server_name,
-        })
+        Ok((
+            ResolvedClientConfig {
+                config: Arc::new(config),
+                server_name,
+            },
+            client_cert,
+        ))
     }
 }
 
@@ -417,37 +444,29 @@ impl ClientConfig {
     /// also for server purposes (dskit `kv/memberlist` TCP transport). Errors are exactly those
     /// of [`ClientConfig::get_tls_config`].
     ///
-    /// Go semantics of the server side of such a config:
-    /// - `Certificates = []tls.Certificate{cert}`: the key pair loaded (once) at config time is
-    ///   served to every client; without `tls_cert_path`/`tls_key_path` the server has no
-    ///   certificate and every handshake fails (Go: `tls: no certificates configured`).
+    /// Server-side semantics for callers that use one config for both ends (e.g. memberlist):
+    /// - When `tls_cert_path`/`tls_key_path` are configured, the key pair is eagerly validated at
+    ///   startup and reloaded live via [`CachedReloadingCert`] so rotated leaf certificates take
+    ///   effect without restarting the node; without a key pair, every server handshake fails
+    ///   (Go: `tls: no certificates configured`).
     /// - `ClientAuth` is left at `tls.NoClientCert`: client certificates are never requested and
     ///   `tls_ca_path` / `tls_server_name` / `tls_insecure_skip_verify` only affect the client.
     /// - `tls_min_version` / `tls_cipher_suites` apply to both sides.
     pub fn get_client_and_server_tls_config(
         &self,
     ) -> Result<ResolvedClientServerConfig, TlsConfigError> {
-        let client = self.get_tls_config()?;
-
-        let cert = if self.cert_path.is_empty() && self.key_path.is_empty() {
-            None
-        } else {
-            // Both paths are set (validated by get_tls_config above).
-            let loader = ReloadingClientCert {
-                cert_path: self.cert_path.clone(),
-                key_path: self.key_path.clone(),
-                provider: Arc::new(rustls::crypto::ring::default_provider()),
-            };
-            Some(Arc::new(loader.load()?))
-        };
+        let (client, resolver) = self.get_tls_config_with_resolver()?;
 
         let versions = protocol_versions(&self.min_version)?;
         let provider = provider_for(self)?;
-        let server = rustls::ServerConfig::builder_with_provider(provider)
+        let builder = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(versions)
             .map_err(|e| TlsConfigError::Rustls(e.to_string()))?
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(StaticServerCert(cert)));
+            .with_no_client_auth();
+        let server = match resolver {
+            Some(r) => builder.with_cert_resolver(r as Arc<dyn rustls::server::ResolvesServerCert>),
+            None => builder.with_cert_resolver(Arc::new(NoServerCert)),
+        };
 
         Ok(ResolvedClientServerConfig {
             client,
@@ -456,67 +475,296 @@ impl ClientConfig {
     }
 }
 
-/// Go `tls.Config.Certificates` used by a server: one static key pair (or none, in which case
-/// every handshake is aborted like Go's `tls: no certificates configured`).
+/// Server cert resolver when no key pair is configured (every handshake is aborted like Go's
+/// `tls: no certificates configured`).
 #[derive(Debug)]
-struct StaticServerCert(Option<Arc<CertifiedKey>>);
+struct NoServerCert;
 
-impl rustls::server::ResolvesServerCert for StaticServerCert {
+impl rustls::server::ResolvesServerCert for NoServerCert {
     fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.0.clone()
+        None
     }
 }
 
-/// Go `GetClientCertificate`: the key pair is re-read from disk on every handshake that requests
-/// a client certificate.
-struct ReloadingClientCert {
-    cert_path: String,
-    key_path: String,
-    provider: Arc<CryptoProvider>,
+const DEFAULT_RELOAD_CHECK_INTERVAL_MS: u64 = 200;
+
+fn monotonic_millis() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let start = EPOCH.get_or_init(Instant::now);
+    start.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
-impl fmt::Debug for ReloadingClientCert {
+/// Source of a PEM-encoded certificate chain or private key.
+#[derive(Clone, Debug)]
+pub enum PemSource {
+    File(String),
+    Inline(Vec<u8>),
+}
+
+impl PemSource {
+    fn display_name(&self) -> &str {
+        match self {
+            Self::File(p) => p.as_str(),
+            Self::Inline(_) => "<inline>",
+        }
+    }
+
+    fn fingerprint(&self) -> Result<SourceFingerprint, (String, String)> {
+        match self {
+            Self::Inline(_) => Ok(SourceFingerprint::Inline),
+            Self::File(path) => {
+                let meta = std::fs::metadata(Path::new(path))
+                    .map_err(|e| (path.clone(), go_read_err(path, &e)))?;
+                let mtime = meta.modified().ok();
+                #[cfg(unix)]
+                let ino = {
+                    use std::os::unix::fs::MetadataExt;
+                    meta.ino()
+                };
+                #[cfg(not(unix))]
+                let ino = 0;
+                Ok(SourceFingerprint::File(FileMeta {
+                    mtime,
+                    ino,
+                    len: meta.len(),
+                }))
+            }
+        }
+    }
+
+    fn read_bytes(&self) -> Result<Vec<u8>, (String, String)> {
+        match self {
+            Self::Inline(b) => Ok(b.clone()),
+            Self::File(path) => read_secret(path).map_err(|reason| (path.clone(), reason)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileMeta {
+    mtime: Option<SystemTime>,
+    ino: u64,
+    len: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SourceFingerprint {
+    File(FileMeta),
+    Inline,
+}
+
+/// Structured error from eager or reloaded certificate/key loading.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum CertLoadError {
+    #[error("error loading cert {path}: {reason}")]
+    ReadCert { path: String, reason: String },
+    #[error("error loading key {path}: {reason}")]
+    ReadKey { path: String, reason: String },
+    #[error("{0}")]
+    KeyPair(String),
+}
+
+impl CertLoadError {
+    pub fn into_reason(self) -> String {
+        match self {
+            Self::ReadCert { reason, .. } | Self::ReadKey { reason, .. } | Self::KeyPair(reason) => {
+                reason
+            }
+        }
+    }
+}
+
+fn load_certified_key(
+    cert_source: &PemSource,
+    key_source: &PemSource,
+    provider: &CryptoProvider,
+) -> Result<CertifiedKey, CertLoadError> {
+    let cert_pem = cert_source
+        .read_bytes()
+        .map_err(|(path, reason)| CertLoadError::ReadCert { path, reason })?;
+    let key_pem = key_source
+        .read_bytes()
+        .map_err(|(path, reason)| CertLoadError::ReadKey { path, reason })?;
+    x509_key_pair(&cert_pem, &key_pem, provider).map_err(CertLoadError::KeyPair)
+}
+
+struct CachedCertState {
+    fingerprint: (SourceFingerprint, SourceFingerprint),
+    key: Arc<CertifiedKey>,
+}
+
+/// Thread-safe cached certificate+key reloader implementing both
+/// [`rustls::server::ResolvesServerCert`] and [`rustls::client::ResolvesClientCert`].
+///
+/// - Validates and loads the initial [`CertifiedKey`] eagerly at construction time.
+/// - Throttles `std::fs::metadata` checks to at most once every 200ms via monotonic millis so
+///   handshake storms perform zero file syscalls and zero PEM/key parses.
+/// - Stats `(mtime, ino, len)` and only re-reads/re-parses when metadata changes.
+/// - On transient reload failures (e.g. Kubernetes `..data` symlink-swap cert/key mismatch or
+///   `NotFound`), logs a warning without updating the cached fingerprint and returns the
+///   last-known-good [`CertifiedKey`] so live handshakes are never dropped.
+pub struct CachedReloadingCert {
+    cert_source: PemSource,
+    key_source: PemSource,
+    provider: Arc<CryptoProvider>,
+    check_interval_ms: u64,
+    last_check_ms: AtomicU64,
+    reload_lock: Mutex<()>,
+    state: RwLock<CachedCertState>,
+}
+
+impl fmt::Debug for CachedReloadingCert {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReloadingClientCert")
-            .field("cert_path", &self.cert_path)
-            .field("key_path", &self.key_path)
+        f.debug_struct("CachedReloadingCert")
+            .field("cert", &self.cert_source.display_name())
+            .field("key", &self.key_source.display_name())
             .finish_non_exhaustive()
     }
 }
 
-impl ReloadingClientCert {
-    fn load(&self) -> Result<CertifiedKey, TlsConfigError> {
-        let cert = read_secret(&self.cert_path).map_err(|reason| TlsConfigError::LoadClientCert {
-            path: self.cert_path.clone(),
-            reason,
-        })?;
-        let key = read_secret(&self.key_path).map_err(|reason| TlsConfigError::LoadClientKey {
-            path: self.key_path.clone(),
-            reason,
-        })?;
-        x509_key_pair(&cert, &key, &self.provider).map_err(|reason| TlsConfigError::KeyPair {
-            cert_path: self.cert_path.clone(),
-            key_path: self.key_path.clone(),
-            reason,
+impl CachedReloadingCert {
+    /// Builds a cached reloader from certificate and key file paths, validating eagerly.
+    pub fn from_files(
+        cert_path: impl Into<String>,
+        key_path: impl Into<String>,
+        provider: Arc<CryptoProvider>,
+    ) -> Result<Self, CertLoadError> {
+        Self::new(
+            PemSource::File(cert_path.into()),
+            PemSource::File(key_path.into()),
+            provider,
+        )
+    }
+
+    /// Builds a cached reloader from file or inline PEM sources, validating eagerly.
+    pub fn new(
+        cert_source: PemSource,
+        key_source: PemSource,
+        provider: Arc<CryptoProvider>,
+    ) -> Result<Self, CertLoadError> {
+        let cert_fp = cert_source
+            .fingerprint()
+            .map_err(|(path, reason)| CertLoadError::ReadCert { path, reason })?;
+        let key_fp = key_source
+            .fingerprint()
+            .map_err(|(path, reason)| CertLoadError::ReadKey { path, reason })?;
+        let ck = load_certified_key(&cert_source, &key_source, &provider)?;
+        Ok(Self {
+            cert_source,
+            key_source,
+            provider,
+            check_interval_ms: DEFAULT_RELOAD_CHECK_INTERVAL_MS,
+            last_check_ms: AtomicU64::new(monotonic_millis()),
+            reload_lock: Mutex::new(()),
+            state: RwLock::new(CachedCertState {
+                fingerprint: (cert_fp, key_fp),
+                key: Arc::new(ck),
+            }),
         })
+    }
+
+    /// Returns the active [`CertifiedKey`], reloading if the throttle window elapsed and file
+    /// metadata changed, or returning the last-known-good key on transient errors.
+    pub fn resolve_cert(&self) -> Arc<CertifiedKey> {
+        if matches!(
+            (&self.cert_source, &self.key_source),
+            (PemSource::Inline(_), PemSource::Inline(_))
+        ) {
+            return Arc::clone(&self.state.read().key);
+        }
+
+        let now = monotonic_millis();
+        let last = self.last_check_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < self.check_interval_ms {
+            return Arc::clone(&self.state.read().key);
+        }
+        if self
+            .last_check_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return Arc::clone(&self.state.read().key);
+        }
+
+        let Some(_reload_guard) = self.reload_lock.try_lock() else {
+            return Arc::clone(&self.state.read().key);
+        };
+
+        let cert_fp = match self.cert_source.fingerprint() {
+            Ok(fp) => fp,
+            Err((path, reason)) => {
+                tracing::warn!(
+                    cert = %path,
+                    key = %self.key_source.display_name(),
+                    err = %reason,
+                    "failed to stat TLS certificate during reload check; keeping last-known-good certificate"
+                );
+                return Arc::clone(&self.state.read().key);
+            }
+        };
+        let key_fp = match self.key_source.fingerprint() {
+            Ok(fp) => fp,
+            Err((path, reason)) => {
+                tracing::warn!(
+                    cert = %self.cert_source.display_name(),
+                    key = %path,
+                    err = %reason,
+                    "failed to stat TLS key during reload check; keeping last-known-good certificate"
+                );
+                return Arc::clone(&self.state.read().key);
+            }
+        };
+        let next_fp = (cert_fp, key_fp);
+
+        {
+            let guard = self.state.read();
+            if guard.fingerprint == next_fp {
+                return Arc::clone(&guard.key);
+            }
+        }
+
+        match load_certified_key(&self.cert_source, &self.key_source, &self.provider) {
+            Ok(ck) => {
+                let new_key = Arc::new(ck);
+                let mut guard = self.state.write();
+                guard.fingerprint = next_fp;
+                guard.key = Arc::clone(&new_key);
+                tracing::info!(
+                    cert = %self.cert_source.display_name(),
+                    key = %self.key_source.display_name(),
+                    "reloaded TLS certificate and key"
+                );
+                new_key
+            }
+            Err(err) => {
+                tracing::warn!(
+                    cert = %self.cert_source.display_name(),
+                    key = %self.key_source.display_name(),
+                    err = %err,
+                    "failed to reload TLS certificate/key (possible mid-swap); keeping last-known-good certificate"
+                );
+                Arc::clone(&self.state.read().key)
+            }
+        }
     }
 }
 
-impl ResolvesClientCert for ReloadingClientCert {
+impl rustls::server::ResolvesServerCert for CachedReloadingCert {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<CertifiedKey>> {
+        Some(self.resolve_cert())
+    }
+}
+
+impl ResolvesClientCert for CachedReloadingCert {
     fn resolve(
         &self,
         _root_hint_subjects: &[&[u8]],
         _sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
-        match self.load() {
-            Ok(ck) => Some(Arc::new(ck)),
-            Err(err) => {
-                // Go fails the handshake with this error; rustls can only send no certificate,
-                // which a server requiring client authentication rejects.
-                tracing::error!(err = %err, "failed to load TLS client certificate for handshake");
-                None
-            }
-        }
+        Some(self.resolve_cert())
     }
 
     fn has_certs(&self) -> bool {
@@ -777,5 +1025,103 @@ mod tests {
             ..Default::default()
         };
         c.get_tls_config().unwrap();
+    }
+
+    #[test]
+    fn cached_reloading_cert_throttles_and_survives_torn_swaps() {
+        use rustls::client::ResolvesClientCert;
+        use rustls::server::ResolvesServerCert;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("tls.crt");
+        let key_path = dir.path().join("tls.key");
+        std::fs::copy(fixture("server.crt"), &cert_path).unwrap();
+        std::fs::copy(fixture("server.key"), &key_path).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let reloader = CachedReloadingCert::from_files(
+            cert_path.to_string_lossy().into_owned(),
+            key_path.to_string_lossy().into_owned(),
+            provider,
+        )
+        .unwrap();
+
+        let k1 = ResolvesClientCert::resolve(&reloader, &[], &[]).unwrap();
+        let k1_bytes = k1.cert[0].as_ref().to_vec();
+
+        // Within the 200ms throttle window, even removing the files returns the cached key with
+        // zero syscalls.
+        std::fs::remove_file(&cert_path).unwrap();
+        let k_throttled = reloader.resolve_cert();
+        assert!(Arc::ptr_eq(&k1, &k_throttled));
+
+        // Wait past 200ms while cert is missing -> logs warn and falls back to last-known-good.
+        std::thread::sleep(Duration::from_millis(230));
+        let k_missing = reloader.resolve_cert();
+        assert!(Arc::ptr_eq(&k1, &k_missing));
+
+        // Restore original files (new inode, same contents or changed mtime) -> reloads cleanly,
+        // wait: write cert #2 while key #1 is still present (torn Kubernetes ..data swap!).
+        std::fs::copy(fixture("client.crt"), &cert_path).unwrap();
+        std::thread::sleep(Duration::from_millis(230));
+        let k_torn = reloader.resolve_cert();
+        assert!(
+            Arc::ptr_eq(&k1, &k_torn),
+            "torn cert/key swap must keep last-known-good keypair"
+        );
+
+        // Complete the swap with matching key #2, wait past 200ms -> fingerprint was NOT updated on
+        // the torn error so this check reloads cert #2!
+        std::fs::copy(fixture("client.key"), &key_path).unwrap();
+        std::thread::sleep(Duration::from_millis(230));
+        let k2 = ResolvesClientCert::resolve(&reloader, &[], &[]).unwrap();
+        assert!(!Arc::ptr_eq(&k1, &k2));
+        assert_ne!(k2.cert[0].as_ref(), k1_bytes.as_slice());
+
+        // Subsequent check after 200ms when metadata is unchanged keeps the same Arc without
+        // re-reading or re-parsing.
+        std::thread::sleep(Duration::from_millis(230));
+        let k2_again = reloader.resolve_cert();
+        assert!(Arc::ptr_eq(&k2, &k2_again));
+
+        // Verify ResolvesServerCert trait impl returns the same updated keypair (trait check).
+        let _: &dyn ResolvesServerCert = &reloader;
+    }
+
+    #[test]
+    fn client_and_server_tls_config_reloads_server_cert_live() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("node.crt");
+        let key_path = dir.path().join("node.key");
+        std::fs::copy(fixture("server.crt"), &cert_path).unwrap();
+        std::fs::copy(fixture("server.key"), &key_path).unwrap();
+
+        let mut c = cfg();
+        c.cert_path = cert_path.to_string_lossy().into_owned();
+        c.key_path = key_path.to_string_lossy().into_owned();
+        let resolved = c.get_client_and_server_tls_config().unwrap();
+
+        let initial_bytes = resolved
+            .client
+            .config
+            .client_auth_cert_resolver
+            .resolve(&[], &[])
+            .unwrap()
+            .cert[0]
+            .as_ref()
+            .to_vec();
+        std::fs::copy(fixture("client.crt"), &cert_path).unwrap();
+        std::fs::copy(fixture("client.key"), &key_path).unwrap();
+        std::thread::sleep(Duration::from_millis(230));
+        let rotated = resolved
+            .client
+            .config
+            .client_auth_cert_resolver
+            .resolve(&[], &[])
+            .unwrap();
+        assert_ne!(rotated.cert[0].as_ref(), initial_bytes.as_slice());
     }
 }

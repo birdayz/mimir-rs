@@ -29,13 +29,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use mimir_common::tls::CachedReloadingCert;
 use mimir_config::BucketHTTPConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::sign::CertifiedKey;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio::sync::Semaphore;
 
@@ -83,65 +83,7 @@ fn system_roots() -> RootCertStore {
     store
 }
 
-/// Go `tls.LoadX509KeyPair` (as used by exthttp `getClientCertificate`).
-fn load_key_pair(cert_path: &str, key_path: &str) -> Result<CertifiedKey, String> {
-    let cert_pem = std::fs::read(cert_path).map_err(|e| go_open_err(cert_path, &e))?;
-    let key_pem = std::fs::read(key_path).map_err(|e| go_open_err(key_path, &e))?;
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
-        .map_while(Result::ok)
-        .collect();
-    if certs.is_empty() {
-        if PrivateKeyDer::from_pem_slice(&cert_pem).is_ok() {
-            return Err("tls: failed to find certificate PEM data in certificate input, but did find a private key; PEM inputs may have been switched".to_string());
-        }
-        return Err("tls: failed to find any PEM data in certificate input".to_string());
-    }
-    let key = PrivateKeyDer::from_pem_slice(&key_pem).map_err(|_| {
-        if CertificateDer::pem_slice_iter(&key_pem).any(|c| c.is_ok()) {
-            "tls: found a certificate rather than a key in the PEM for the private key".to_string()
-        } else {
-            "tls: failed to find any PEM data in key input".to_string()
-        }
-    })?;
-    CertifiedKey::from_der(certs, key, &provider()).map_err(|e| match e {
-        rustls::Error::InconsistentKeys(_) => "tls: private key does not match public key".to_string(),
-        other => format!("tls: failed to parse private key: {other}"),
-    })
-}
 
-/// exthttp `getClientCertificate`: re-reads the key pair on every handshake.
-#[derive(Debug)]
-struct ReloadingClientCert {
-    cert_path: String,
-    key_path: String,
-}
-
-impl ReloadingClientCert {
-    fn load(&self) -> Result<CertifiedKey, String> {
-        load_key_pair(&self.cert_path, &self.key_path).map_err(|e| {
-            format!(
-                "unable to use specified client cert ({}) & key ({}): {e}",
-                self.cert_path, self.key_path
-            )
-        })
-    }
-}
-
-impl ResolvesClientCert for ReloadingClientCert {
-    fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
-        match self.load() {
-            Ok(k) => Some(Arc::new(k)),
-            Err(err) => {
-                tracing::error!(err = %err, "failed to load object storage TLS client certificate");
-                None
-            }
-        }
-    }
-
-    fn has_certs(&self) -> bool {
-        true
-    }
-}
 
 /// Server certificate verifier implementing Go's `InsecureSkipVerify` and `ServerName` override.
 #[derive(Debug)]
@@ -243,12 +185,20 @@ pub(crate) fn new_tls_config(cfg: &BucketHTTPConfig) -> Result<rustls::ClientCon
             ))
         }
         (false, false) => {
-            let r = ReloadingClientCert {
-                cert_path: cfg.tls_cert_path.clone(),
-                key_path: cfg.tls_key_path.clone(),
-            };
-            r.load()?;
-            Some(r)
+            let r = CachedReloadingCert::from_files(
+                &cfg.tls_cert_path,
+                &cfg.tls_key_path,
+                Arc::clone(&provider),
+            )
+            .map_err(|e| {
+                format!(
+                    "unable to use specified client cert ({}) & key ({}): {}",
+                    cfg.tls_cert_path,
+                    cfg.tls_key_path,
+                    e.into_reason()
+                )
+            })?;
+            Some(Arc::new(r) as Arc<dyn ResolvesClientCert>)
         }
     };
     let inner = if cfg.insecure_skip_verify {
@@ -272,7 +222,7 @@ pub(crate) fn new_tls_config(cfg: &BucketHTTPConfig) -> Result<rustls::ClientCon
         .with_custom_certificate_verifier(Arc::new(verifier));
     let config = match client_cert {
         None => builder.with_no_client_auth(),
-        Some(r) => builder.with_client_cert_resolver(Arc::new(r)),
+        Some(r) => builder.with_client_cert_resolver(r),
     };
     Ok(config)
 }
