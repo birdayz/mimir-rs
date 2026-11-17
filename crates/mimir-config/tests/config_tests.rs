@@ -395,7 +395,7 @@ overrides:
         parse_runtime_config_yaml(anchored, &default_limits, &InstanceLimits::default()).unwrap();
     assert_eq!(parsed.overrides.len(), 3);
     for tid in ["1234", "1235", "1236"] {
-        let l = &parsed.overrides[tid];
+        let l = parsed.overrides[tid].as_ref().unwrap();
         assert_eq!(l.ingestion_rate, 1500.0);
         assert_eq!(l.ingestion_burst_size, 15000);
         assert_eq!(l.max_global_series_per_user, 15000);

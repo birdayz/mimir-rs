@@ -26,16 +26,33 @@ pub struct GrpcErrorLogEntry {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct Inner {
+    entry: Option<GrpcErrorLogEntry>,
+    instrumentation_code: Option<i32>,
+}
+
 /// Request extension carrying the handler's logging decision back to the server.
 #[derive(Clone, Debug, Default)]
-pub struct GrpcErrorLog(Arc<Mutex<Option<GrpcErrorLogEntry>>>);
+pub struct GrpcErrorLog(Arc<Mutex<Inner>>);
 
 impl GrpcErrorLog {
     pub fn set(&self, entry: GrpcErrorLogEntry) {
-        *self.0.lock() = Some(entry);
+        self.0.lock().entry = Some(entry);
     }
 
     pub fn take(&self) -> Option<GrpcErrorLogEntry> {
-        self.0.lock().take()
+        self.0.lock().entry.take()
+    }
+
+    /// The gRPC code dskit's instrumentation derives from the handler's Go error when it differs
+    /// from the code on the wire: e.g. an error wrapping `context.DeadlineExceeded` is sent as
+    /// `DeadlineExceeded` by grpc-go but recorded as `Unknown` (`grpcutil.ErrorToStatusCode`).
+    pub fn set_instrumentation_code(&self, code: i32) {
+        self.0.lock().instrumentation_code = Some(code);
+    }
+
+    pub fn instrumentation_code(&self) -> Option<i32> {
+        self.0.lock().instrumentation_code
     }
 }

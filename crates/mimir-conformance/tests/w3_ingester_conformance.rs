@@ -909,8 +909,8 @@ fn test_ingester_http_flush_ships_block_verified_by_go_prometheus_tsdb() {
             .unwrap();
         assert_eq!(tenants_resp.status(), 200);
         let tenants_json: serde_json::Value = tenants_resp.json().await.unwrap();
-        assert_eq!(tenants_json[0]["tenant"], tenant);
-        assert_eq!(tenants_json[0]["series"], 1);
+        assert_eq!(tenants_json["Tenants"][0]["Tenant"], tenant);
+        assert_eq!(tenants_json["Tenants"][0]["Series"], 1);
 
         // Check /ingester/tsdb/:tenant
         let tsdb_resp = http

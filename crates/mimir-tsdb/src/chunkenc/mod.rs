@@ -29,7 +29,8 @@ pub use histogram::{
     HistogramAppender, HistogramAppenderState, HistogramChunk, HistogramIterator,
 };
 pub use histogram_model::{
-    CounterResetHeader, CounterResetHint, FloatHistogram, Histogram, HistogramSpan,
+    CounterResetHeader, CounterResetHint, FloatHistogram, Histogram, HistogramErrorKind,
+    HistogramSpan, HistogramValidationError,
     CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMA_MAX, EXPONENTIAL_SCHEMA_MAX_RESERVED,
     EXPONENTIAL_SCHEMA_MIN, EXPONENTIAL_SCHEMA_MIN_RESERVED,
 };

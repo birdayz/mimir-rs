@@ -26,6 +26,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 func ptrStr(s string) *string {
@@ -357,6 +358,7 @@ type kfakeRecordIn struct {
 type kfakeBrokerIn struct {
 	Topic       string          `json:"topic"`
 	Partitions  int32           `json:"partitions"`
+	Port        int             `json:"port,omitempty"`
 	Compression string          `json:"compression,omitempty"`
 	Records     []kfakeRecordIn `json:"records"`
 }
@@ -443,10 +445,14 @@ func cmdKfakeBroker() error {
 		in.Partitions = 1
 	}
 
-	cluster, err := kfake.NewCluster(
+	opts := []kfake.Opt{
 		kfake.NumBrokers(1),
 		kfake.SeedTopics(in.Partitions, in.Topic),
-	)
+	}
+	if in.Port > 0 {
+		opts = append(opts, kfake.Ports(in.Port))
+	}
+	cluster, err := kfake.NewCluster(opts...)
 	if err != nil {
 		return fmt.Errorf("start kfake cluster: %w", err)
 	}
@@ -571,6 +577,8 @@ type httpgrpcCallIn struct {
 	Url      string              `json:"url"`
 	Headers  map[string][]string `json:"headers,omitempty"`
 	BodyB64  string              `json:"body_b64,omitempty"`
+	// OrgID is sent as x-scope-orgid gRPC metadata (required by multitenant servers).
+	OrgID string `json:"org_id,omitempty"`
 }
 
 type httpgrpcCallOut struct {
@@ -614,6 +622,9 @@ func cmdHttpGrpcCall(input []byte) (*httpgrpcCallOut, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if in.OrgID != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "x-scope-orgid", in.OrgID)
+	}
 
 	conn, err := grpc.NewClient(in.GrpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {

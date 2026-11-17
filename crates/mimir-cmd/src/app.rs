@@ -24,6 +24,7 @@ use mimir_config::{MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::ingest_storage::{
     ingester_partition_id_from_instance_id, IngesterPartitionRingDelegate,
 };
+use mimir_ingester::grpc::SnappyDecompressService;
 use mimir_ingester::{Ingester, IngesterLifecycler, IngesterService, TokenlessLifecycler};
 use mimir_proto::httpgrpcpb::http_server::HttpServer;
 use mimir_ring::kv::ha_replica::replica_desc_codec;
@@ -35,13 +36,14 @@ use mimir_ring::kv::{
 use mimir_ring::lifecycler::{BasicLifecyclerConfig, Lifecycler, LifecyclerConfig};
 use mimir_ring::partition_ring::{
     partition_ring_desc_codec, PartitionInstanceLifecycler, PartitionInstanceLifecyclerConfig,
-    PartitionRingOptions, PartitionRingWatcher,
+    PartitionRingOptions, PartitionRingWatcher, PartitionRingWatchers,
 };
 use mimir_ring::ring::model::ring_desc_codec;
 use mimir_ring::ring::replication_strategy::DefaultReplicationStrategy;
 use mimir_ring::ring::{Ring, RingSettings};
 use mimir_ring::token_gen::{PartitionTokenGenerator, PartitionTokenTable};
 use mimir_storage::bucket::BucketClient;
+use mimir_storage::ingest::with_read_compartment_suffix;
 use prometheus::Registry;
 use tonic::codec::CompressionEncoding;
 
@@ -228,8 +230,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
     // 3. Server module (dskit server.New): binds HTTP & gRPC listeners early so port 0 resolves
     //    before ring registration, builds TLS configs and middleware.
-    let server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
+    let mut server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
         .context("error initialising module: server")?;
+    server.set_grpc_multitenancy(cfg.multitenancy_enabled);
     let bound_http_addr = server.http_addr()?;
     let bound_grpc_addr = server.grpc_addr()?;
     cfg.server.http_listen_port = i64::from(bound_http_addr.port());
@@ -497,6 +500,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             )
         };
 
+        let mut partition_ring_watchers: Option<Arc<PartitionRingWatchers>> = None;
         let (partition_ring_watcher, partition_lifecycler) = if cfg.ingest_storage.enabled {
             let watcher_kv = build_kv_client_with_multi_config_provider(
                 &cfg.ingester.partition_ring.kvstore,
@@ -517,17 +521,54 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             )
             .context("creating ingester partition token table")?;
 
-            let watcher = PartitionRingWatcher::new(
-                PARTITION_RING_NAME,
-                PARTITION_RING_KEY,
-                watcher_kv,
-                PartitionRingOptions {
-                    token_generator: Some(Arc::new(token_table) as Arc<dyn PartitionTokenGenerator>),
-                    shuffle_shard_cache_size: 0,
-                },
-                Some(&cortex_registerer),
-            );
-            let wsvc = Arc::clone(&watcher).into_service();
+            let ring_opts = PartitionRingOptions {
+                token_generator: Some(Arc::new(token_table) as Arc<dyn PartitionTokenGenerator>),
+                shuffle_shard_cache_size: 0,
+            };
+            // `ingest.NewPartitionRingWatchers`: with compartments enabled, one watcher per read
+            // compartment on its `-rc-<id>` ring; the ingester owns only its own compartment's
+            // ring, while the status pages serve all of them.
+            let (watcher, wsvc) = if cfg.compartments.enabled {
+                let watchers = (0..cfg.compartments.read.num_compartments.max(0) as usize)
+                    .map(|c| {
+                        PartitionRingWatcher::new(
+                            &with_read_compartment_suffix(PARTITION_RING_NAME, c),
+                            &with_read_compartment_suffix(PARTITION_RING_KEY, c),
+                            Arc::clone(&watcher_kv),
+                            ring_opts.clone(),
+                            Some(&cortex_registerer),
+                        )
+                    })
+                    .collect();
+                let group = PartitionRingWatchers::new(watchers).map_err(|e| {
+                    anyhow::anyhow!("creating ingester partition rings watcher: {e}")
+                })?;
+                let watcher = group
+                    .watcher(cfg.ingester.read_compartment_id.max(0) as usize)
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "ingester read compartment ID {} is out of range [0, {})",
+                            cfg.ingester.read_compartment_id,
+                            cfg.compartments.read.num_compartments
+                        )
+                    })?;
+                partition_ring_watchers = Some(Arc::clone(&group));
+                let wsvc = group.into_service().map_err(|e| {
+                    anyhow::anyhow!("creating ingester partition rings watcher: {e}")
+                })?;
+                (watcher, wsvc)
+            } else {
+                let watcher = PartitionRingWatcher::new(
+                    PARTITION_RING_NAME,
+                    PARTITION_RING_KEY,
+                    watcher_kv,
+                    ring_opts,
+                    Some(&cortex_registerer),
+                );
+                let wsvc = Arc::clone(&watcher).into_service();
+                (watcher, wsvc)
+            };
             modules.add("ingester-partitions-ring", service_state_fn(&wsvc));
             watcher_svc = Some(wsvc);
 
@@ -580,10 +621,21 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                     .unwrap_or(Duration::from_secs(13 * 3600)),
                 polling_interval: Duration::from_secs(5),
             };
+            // With compartments enabled the ingester registers its partition into the partition
+            // ring of its own read compartment (Go `ingester.New`).
+            let (plc_ring_name, plc_ring_key) = if cfg.compartments.enabled {
+                let rc = cfg.ingester.read_compartment_id.max(0) as usize;
+                (
+                    with_read_compartment_suffix(PARTITION_RING_NAME, rc),
+                    with_read_compartment_suffix(PARTITION_RING_KEY, rc),
+                )
+            } else {
+                (PARTITION_RING_NAME.to_string(), PARTITION_RING_KEY.to_string())
+            };
             let plc = PartitionInstanceLifecycler::new(
                 plc_cfg,
-                PARTITION_RING_NAME,
-                PARTITION_RING_KEY,
+                &plc_ring_name,
+                &plc_ring_key,
                 plc_kv,
                 Some(&cortex_registerer),
             )
@@ -611,6 +663,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         )
         .context("creating ingester")?;
         ingester.set_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
+        // modules.go initIngesterService: `t.Cfg.Ingester.Compartments = t.Cfg.Compartments`.
+        ingester.set_compartments(cfg.compartments.clone());
+        ingester.set_partition_ring_watchers(partition_ring_watchers.take());
 
         // Cost attribution service (pkg/mimir/modules.go initCostAttributionService): only enabled
         // when -cost-attribution.registry-path is set.
@@ -672,15 +727,19 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let max_recv = (cfg.server.grpc_server_max_recv_msg_size.max(1024)) as usize;
     let max_send = (cfg.server.grpc_server_max_send_msg_size.max(1024)) as usize;
 
-    let http_grpc_svc = HttpGrpcStatusFixService::new(
+    let http_grpc_svc = HttpGrpcStatusFixService::new(SnappyDecompressService::new(
         HttpServer::new(HttpGrpcBridge::new(http_router.clone()))
             .max_decoding_message_size(max_recv)
             .max_encoding_message_size(max_send)
             .accept_compressed(CompressionEncoding::Gzip)
             .accept_compressed(CompressionEncoding::Zstd),
-    );
+        max_recv,
+    ));
 
-    let health_svc = HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules));
+    let health_svc = SnappyDecompressService::new(
+        HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules)),
+        max_recv,
+    );
 
     let mut grpc_routes = tonic::service::Routes::new(health_svc).add_service(http_grpc_svc);
 

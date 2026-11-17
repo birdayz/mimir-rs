@@ -723,18 +723,22 @@ runtime_config:
         .unwrap();
     assert!(svcs_resp["services"].is_array());
 
-    // 6. Test /httpgrpc.HTTP/Handle bridge
+    // 6. Test /httpgrpc.HTTP/Handle bridge (multitenant gRPC auth applies to it, like in Go).
     let mut http_grpc_client = HttpClient::new(channel.clone());
+    let mut http_grpc_req = tonic::Request::new(HttpRequest {
+        method: "GET".to_string(),
+        url: "/api/v1/status/buildinfo".to_string(),
+        headers: vec![HttpGrpcHeader {
+            key: "Accept".to_string(),
+            values: vec!["application/json".to_string()],
+        }],
+        body: bytes::Bytes::new(),
+    });
+    http_grpc_req
+        .metadata_mut()
+        .insert("x-scope-orgid", MetadataValue::from_static("tenant-e2e"));
     let http_grpc_resp = http_grpc_client
-        .handle(HttpRequest {
-            method: "GET".to_string(),
-            url: "/api/v1/status/buildinfo".to_string(),
-            headers: vec![HttpGrpcHeader {
-                key: "Accept".to_string(),
-                values: vec!["application/json".to_string()],
-            }],
-            body: bytes::Bytes::new(),
-        })
+        .handle(http_grpc_req)
         .await
         .expect("httpgrpc /api/v1/status/buildinfo")
         .into_inner();

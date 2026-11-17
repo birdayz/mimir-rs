@@ -528,25 +528,8 @@ impl PartitionRingEditor {
         partition_id: i32,
         to_state: PartitionState,
     ) -> Result<(), PartitionRingError> {
-        self.kv
-            .cas(
-                &self.key,
-                Box::new(move |in_val| {
-                    let mut desc = in_val
-                        .and_then(|a| a.downcast_ref::<PartitionRingDesc>())
-                        .cloned()
-                        .unwrap_or_default();
-                    let changed = change_partition_state_in_desc(&mut desc, partition_id, to_state)
-                        .map_err(|e| CasCallbackError::fatal(KvError::Other(e.to_string())))?;
-                    if !changed {
-                        Ok(CasOutcome::NoChange)
-                    } else {
-                        Ok(CasOutcome::Update(Box::new(desc)))
-                    }
-                }),
-            )
+        self.update_ring(move |desc| change_partition_state_in_desc(desc, partition_id, to_state))
             .await
-            .map_err(|e| PartitionRingError::Other(e.to_string()))
     }
 
     pub async fn set_partition_state_change_lock(
@@ -554,7 +537,23 @@ impl PartitionRingEditor {
         partition_id: i32,
         locked: bool,
     ) -> Result<(), PartitionRingError> {
-        self.kv
+        self.update_ring(move |desc| {
+            if !desc.has_partition(partition_id) {
+                return Err(PartitionRingError::PartitionDoesNotExist);
+            }
+            Ok(desc.update_partition_state_change_lock(partition_id, locked, SystemTime::now()))
+        })
+        .await
+    }
+
+    async fn update_ring<F>(&self, update: F) -> Result<(), PartitionRingError>
+    where
+        F: Fn(&mut PartitionRingDesc) -> Result<bool, PartitionRingError> + Send + Sync + 'static,
+    {
+        let typed_err: Arc<Mutex<Option<PartitionRingError>>> = Arc::new(Mutex::new(None));
+        let typed_err_cb = Arc::clone(&typed_err);
+        let res = self
+            .kv
             .cas(
                 &self.key,
                 Box::new(move |in_val| {
@@ -562,16 +561,14 @@ impl PartitionRingEditor {
                         .and_then(|a| a.downcast_ref::<PartitionRingDesc>())
                         .cloned()
                         .unwrap_or_default();
-                    if !desc.has_partition(partition_id) {
-                        return Err(CasCallbackError::fatal(KvError::NotFound(
-                            "partition does not exist".to_string(),
-                        )));
-                    }
-                    let changed = desc.update_partition_state_change_lock(
-                        partition_id,
-                        locked,
-                        SystemTime::now(),
-                    );
+                    let changed = match update(&mut desc) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            *typed_err_cb.lock() = Some(e);
+                            return Err(CasCallbackError::fatal(KvError::Other(msg)));
+                        }
+                    };
                     if !changed {
                         Ok(CasOutcome::NoChange)
                     } else {
@@ -579,7 +576,16 @@ impl PartitionRingEditor {
                     }
                 }),
             )
-            .await
-            .map_err(|e| PartitionRingError::Other(e.to_string()))
+            .await;
+        match res {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(pe) = typed_err.lock().take() {
+                    Err(pe)
+                } else {
+                    Err(PartitionRingError::Other(e.to_string()))
+                }
+            }
+        }
     }
 }

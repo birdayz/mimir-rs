@@ -23,6 +23,7 @@ flate2 = { workspace = true }
 futures = { workspace = true }
 http = "1"
 http-body = "1"
+h2 = "0.4"
 http-body-util = "0.1"
 hyper = { workspace = true }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "service", "http1", "http2", "tokio"] }

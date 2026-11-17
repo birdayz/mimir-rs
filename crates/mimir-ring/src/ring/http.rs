@@ -3,16 +3,18 @@
 //! Ported from:
 //! - github.com/grafana/dskit/ring/ring_http.go
 //! - github.com/grafana/dskit/ring/ring_status.gohtml
+//! - Go `net/http` `Request.ParseForm` / `Request.FormValue` / `http.Error`, `net/url.ParseQuery`
+//!   and `mime.ParseMediaType` (shared by every admin handler that reads Go form values)
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use axum::{Form, Json, Router};
+use axum::{Json, Router};
 use mimir_common::logging::format_rfc3339_nano_utc;
 use mimir_proto::ringpb::{Desc, InstanceDesc};
 use serde::{Deserialize, Serialize};
@@ -57,12 +59,6 @@ pub struct IngesterHttpDesc {
 pub struct RingQuery {
     #[serde(default)]
     pub tokens: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct ForgetForm {
-    #[serde(default)]
-    pub forget: String,
 }
 
 pub trait RingAccess: Send + Sync {
@@ -162,18 +158,18 @@ pub async fn handle_ring_get(
     Html(html).into_response()
 }
 
-pub async fn handle_ring_post(
-    State(state): State<RingPageState>,
-    Form(form): Form<ForgetForm>,
-) -> Response {
+/// Go `ringPageHandler.handle` for `POST`: `req.FormValue("forget")` (URL query merged with an
+/// optional `application/x-www-form-urlencoded` body; no `Content-Type` is required).
+pub async fn handle_ring_post(State(state): State<RingPageState>, req: Request) -> Response {
+    let form = parse_go_form(req).await;
+    let forget = form.value("forget").to_string();
     let Some(kv) = state.ring.kv_client() else {
-        return (
+        return go_http_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "ring has no KV client configured",
-        )
-            .into_response();
+            &format!("error forgetting instance '{forget}': ring has no KV client configured"),
+        );
     };
-    let forget_id = form.forget.clone();
+    let forget_id = forget.clone();
     let res = kv
         .cas(
             state.ring.key(),
@@ -202,11 +198,10 @@ pub async fn handle_ring_post(
             "",
         )
             .into_response(),
-        Err(err) => (
+        Err(err) => go_http_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("error forgetting instance '{}': {err}", form.forget),
-        )
-            .into_response(),
+            &format!("error forgetting instance '{forget}': {err}"),
+        ),
     }
 }
 
@@ -353,9 +348,455 @@ fn html_url_attr_escape(s: &str) -> String {
     html_escape(&normalized)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Go `net/http` form handling.
+// ---------------------------------------------------------------------------------------------
+
+/// Go `http.Error(w, msg, code)`: `text/plain; charset=utf-8`, `X-Content-Type-Options: nosniff`
+/// and the message followed by a newline.
+pub fn go_http_error(status: StatusCode, msg: &str) -> Response {
+    let mut body = String::with_capacity(msg.len() + 1);
+    body.push_str(msg);
+    body.push('\n');
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Go's `http.Request.Form` (`url.Values`) after `Request.ParseForm`, plus the first error
+/// `ParseForm` reported. Like Go, values that parsed successfully are kept even on error.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GoForm {
+    values: HashMap<String, Vec<String>>,
+    err: Option<String>,
+}
+
+impl GoForm {
+    /// Go `r.Form[key]` (`None` when the key is absent; an empty value is `Some([""])`).
+    pub fn get(&self, key: &str) -> Option<&[String]> {
+        self.values.get(key).map(Vec::as_slice)
+    }
+
+    /// Go `r.FormValue(key)`: the first value, or `""`.
+    pub fn value(&self, key: &str) -> &str {
+        self.values
+            .get(key)
+            .and_then(|v| v.first())
+            .map_or("", String::as_str)
+    }
+
+    /// The error `r.ParseForm()` returned, if any.
+    pub fn error(&self) -> Option<&str> {
+        self.err.as_deref()
+    }
+
+    fn set_err(&mut self, err: String) {
+        if self.err.is_none() {
+            self.err = Some(err);
+        }
+    }
+}
+
+/// `parsePostForm`'s limit for bodies not already wrapped in a `MaxBytesReader` (10 MiB).
+const MAX_FORM_SIZE: usize = 10 << 20;
+
+/// Go `r.ParseForm()`: for `POST`/`PUT`/`PATCH` with `Content-Type:
+/// application/x-www-form-urlencoded` the body values come first, followed by the URL query
+/// values. Values are strictly percent/`+` decoded (`url.QueryUnescape`); invalid escapes,
+/// `;` separators and oversized bodies are reported through [`GoForm::error`].
+///
+/// `multipart/form-data` bodies are not decoded (only `Request.ParseMultipartForm` does that in
+/// Go, and none of the ingester admin handlers rely on it); such requests see the URL values.
+pub async fn parse_go_form(req: Request) -> GoForm {
+    let (parts, body) = req.into_parts();
+    let mut form = GoForm::default();
+
+    if matches!(parts.method, Method::POST | Method::PUT | Method::PATCH) {
+        let ct = parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+            .unwrap_or_default();
+        let ct = if ct.is_empty() {
+            "application/octet-stream"
+        } else {
+            ct.as_str()
+        };
+        let (media_type, ct_err) = go_parse_media_type(ct);
+        if let Some(e) = ct_err {
+            form.set_err(e.to_string());
+        }
+        if media_type == "application/x-www-form-urlencoded" {
+            match read_limited(body, MAX_FORM_SIZE + 1).await {
+                Ok(b) if b.len() > MAX_FORM_SIZE => form.set_err("http: POST too large".to_string()),
+                Ok(b) => {
+                    let mut post = HashMap::new();
+                    let err = go_parse_query(&mut post, &String::from_utf8_lossy(&b));
+                    form.values = post;
+                    if let Some(e) = err {
+                        form.set_err(e);
+                    }
+                }
+                Err(e) => form.set_err(e.to_string()),
+            }
+        }
+    }
+
+    let mut query_values = HashMap::new();
+    let err = go_parse_query(&mut query_values, parts.uri.query().unwrap_or(""));
+    if let Some(e) = err {
+        form.set_err(e);
+    }
+    if form.values.is_empty() {
+        form.values = query_values;
+    } else {
+        for (k, v) in query_values {
+            form.values.entry(k).or_default().extend(v);
+        }
+    }
+    form
+}
+
+/// `io.ReadAll(io.LimitReader(body, limit))`.
+async fn read_limited(body: axum::body::Body, limit: usize) -> Result<Vec<u8>, axum::Error> {
+    use futures::StreamExt as _;
+    let mut stream = body.into_data_stream();
+    let mut out = Vec::new();
+    while out.len() < limit {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let chunk = chunk?;
+        let take = chunk.len().min(limit - out.len());
+        out.extend_from_slice(&chunk[..take]);
+    }
+    Ok(out)
+}
+
+/// Go `url.ParseQuery` into `m` (`parseQuery`): returns the first error, keeping every value
+/// that parsed.
+pub fn go_parse_query(m: &mut HashMap<String, Vec<String>>, query: &str) -> Option<String> {
+    // `urlParamsWithinMax` (default `urlmaxqueryparams` = 10000).
+    if query.bytes().filter(|&b| b == b'&').count() + 1 > 10_000 {
+        return Some("number of URL query parameters exceeded limit".to_string());
+    }
+    let mut err: Option<String> = None;
+    for part in query.split('&') {
+        if part.contains(';') {
+            err = Some("invalid semicolon separator in query".to_string());
+            continue;
+        }
+        if part.is_empty() {
+            continue;
+        }
+        let (k, v) = part.split_once('=').unwrap_or((part, ""));
+        let key = match go_query_unescape(k) {
+            Ok(k) => k,
+            Err(e) => {
+                err.get_or_insert(e);
+                continue;
+            }
+        };
+        let value = match go_query_unescape(v) {
+            Ok(v) => v,
+            Err(e) => {
+                err.get_or_insert(e);
+                continue;
+            }
+        };
+        m.entry(key).or_default().push(value);
+    }
+    err
+}
+
+/// Go `url.QueryUnescape` (`unescape(s, encodeQueryComponent)`), including its
+/// `invalid URL escape "%ZZ"` error.
+pub fn go_query_unescape(s: &str) -> Result<String, String> {
+    let b = s.as_bytes();
+    if !b.iter().any(|&c| c == b'%' || c == b'+') {
+        return Ok(s.to_string());
+    }
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => match (b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                }
+                _ => {
+                    let end = (i + 3).min(b.len());
+                    let bad = String::from_utf8_lossy(&b[i..end]);
+                    return Err(format!(
+                        "invalid URL escape {}",
+                        crate::dns::go_quote(&bad)
+                    ));
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Go `mime.ParseMediaType`, returning only the (lower-cased) media type and the error. Like Go,
+/// an invalid parameter keeps the media type, while an invalid type or a conflicting duplicate
+/// parameter clears it.
+pub fn go_parse_media_type(v: &str) -> (String, Option<&'static str>) {
+    let base = v.split(';').next().unwrap_or("");
+    let media_type = base.to_lowercase().trim().to_string();
+    if let Err(e) = check_media_type_disposition(&media_type) {
+        return (String::new(), Some(e));
+    }
+    let mut params: HashMap<String, String> = HashMap::new();
+    let mut rest = &v[base.len()..];
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let Some((key, value, next)) = consume_media_param(rest) else {
+            if rest.trim() == ";" {
+                break;
+            }
+            return (media_type, Some("mime: invalid media parameter"));
+        };
+        if params.get(&key).is_some_and(|prev| *prev != value) {
+            return (String::new(), Some("mime: duplicate parameter name"));
+        }
+        params.insert(key, value);
+        rest = next;
+    }
+    (media_type, None)
+}
+
+fn is_tspecial(c: u8) -> bool {
+    b"()<>@,;:\\\"/[]?=".contains(&c)
+}
+
+fn is_token_char(c: u8) -> bool {
+    c > 0x20 && c < 0x7f && !is_tspecial(c)
+}
+
+fn consume_token(v: &str) -> (&str, &str) {
+    let end = v.bytes().position(|c| !is_token_char(c)).unwrap_or(v.len());
+    v.split_at(end)
+}
+
+fn check_media_type_disposition(s: &str) -> Result<(), &'static str> {
+    let (typ, rest) = consume_token(s);
+    if typ.is_empty() {
+        return Err("mime: no media type");
+    }
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let Some(rest) = rest.strip_prefix('/') else {
+        return Err("mime: expected slash after first token");
+    };
+    let (subtype, rest) = consume_token(rest);
+    if subtype.is_empty() {
+        return Err("mime: expected token after slash");
+    }
+    if !rest.is_empty() {
+        return Err("mime: unexpected content after media subtype");
+    }
+    Ok(())
+}
+
+/// Go `consumeValue`: a token or a quoted string; `None` when nothing could be consumed.
+fn consume_value(v: &str) -> Option<(String, &str)> {
+    let b = v.as_bytes();
+    if b.first() != Some(&b'"') {
+        let (tok, rest) = consume_token(v);
+        return if tok.is_empty() { None } else { Some((tok.to_string(), rest)) };
+    }
+    let mut buf = Vec::new();
+    let mut i = 1;
+    while i < b.len() {
+        let r = b[i];
+        if r == b'"' {
+            return Some((String::from_utf8_lossy(&buf).into_owned(), &v[i + 1..]));
+        }
+        if r == b'\\' && i + 1 < b.len() && is_tspecial(b[i + 1]) {
+            buf.push(b[i + 1]);
+            i += 2;
+            continue;
+        }
+        if r == b'\r' || r == b'\n' {
+            return None;
+        }
+        buf.push(r);
+        i += 1;
+    }
+    None
+}
+
+/// Go `consumeMediaParam`.
+fn consume_media_param(v: &str) -> Option<(String, String, &str)> {
+    let rest = v.trim_start().strip_prefix(';')?.trim_start();
+    let (param, rest) = consume_token(rest);
+    if param.is_empty() {
+        return None;
+    }
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    let (value, rest) = consume_value(rest)?;
+    Some((param.to_lowercase(), value, rest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+
+    fn req(method: Method, uri: &str, ct: Option<&str>, body: &str) -> Request {
+        let mut b = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(ct) = ct {
+            b = b.header(header::CONTENT_TYPE, ct);
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn parse_form_merges_post_body_before_query() {
+        let f = parse_go_form(req(
+            Method::POST,
+            "/x?tenant=q1&wait=false",
+            Some("application/x-www-form-urlencoded"),
+            "tenant=b1&wait=true",
+        ))
+        .await;
+        assert_eq!(f.error(), None);
+        assert_eq!(f.get("tenant").unwrap(), ["b1", "q1"]);
+        assert_eq!(f.value("wait"), "true");
+    }
+
+    #[tokio::test]
+    async fn parse_form_ignores_body_without_form_content_type() {
+        // No Content-Type => application/octet-stream: body ignored, query still parsed (no 415).
+        let f = parse_go_form(req(Method::POST, "/x?forget=ghost", None, "forget=other")).await;
+        assert_eq!(f.error(), None);
+        assert_eq!(f.value("forget"), "ghost");
+        // GET never reads the body.
+        let f = parse_go_form(req(
+            Method::GET,
+            "/x",
+            Some("application/x-www-form-urlencoded"),
+            "a=b",
+        ))
+        .await;
+        assert_eq!(f.get("a"), None);
+    }
+
+    #[tokio::test]
+    async fn parse_form_decodes_and_keeps_empty_values() {
+        let f = parse_go_form(req(Method::GET, "/x?tenant=&t=t%281%29+x&flag", None, "")).await;
+        assert_eq!(f.error(), None);
+        assert_eq!(f.get("tenant").unwrap(), [""]);
+        assert_eq!(f.value("t"), "t(1) x");
+        assert_eq!(f.get("flag").unwrap(), [""]);
+        assert_eq!(f.get("missing"), None);
+    }
+
+    #[tokio::test]
+    async fn parse_form_reports_errors_but_keeps_valid_values() {
+        let f = parse_go_form(req(Method::GET, "/x?tenant=%ZZ&wait=true", None, "")).await;
+        assert_eq!(f.error(), Some("invalid URL escape \"%ZZ\""));
+        assert_eq!(f.get("tenant"), None);
+        assert_eq!(f.value("wait"), "true");
+
+        let f = parse_go_form(req(Method::GET, "/x?a=1;b=2&c=3", None, "")).await;
+        assert_eq!(f.error(), Some("invalid semicolon separator in query"));
+        assert_eq!(f.value("c"), "3");
+
+        let f = parse_go_form(req(Method::GET, "/x?a=%4", None, "")).await;
+        assert_eq!(f.error(), Some("invalid URL escape \"%4\""));
+
+        let f = parse_go_form(req(
+            Method::POST,
+            "/x",
+            Some("application/x-www-form-urlencoded"),
+            "tenant=%G1",
+        ))
+        .await;
+        assert_eq!(f.error(), Some("invalid URL escape \"%G1\""));
+    }
+
+    #[tokio::test]
+    async fn parse_form_rejects_oversized_body() {
+        let body = "a".repeat(MAX_FORM_SIZE + 1);
+        let f = parse_go_form(req(
+            Method::POST,
+            "/x?q=1",
+            Some("application/x-www-form-urlencoded"),
+            &body,
+        ))
+        .await;
+        assert_eq!(f.error(), Some("http: POST too large"));
+        assert_eq!(f.value("q"), "1");
+    }
+
+    #[test]
+    fn media_type_matches_go_parse_media_type() {
+        assert_eq!(
+            go_parse_media_type("Application/X-WWW-Form-Urlencoded; charset=UTF-8"),
+            ("application/x-www-form-urlencoded".to_string(), None)
+        );
+        assert_eq!(
+            go_parse_media_type("application/x-www-form-urlencoded;"),
+            ("application/x-www-form-urlencoded".to_string(), None)
+        );
+        assert_eq!(
+            go_parse_media_type("application/x-www-form-urlencoded; charset"),
+            (
+                "application/x-www-form-urlencoded".to_string(),
+                Some("mime: invalid media parameter")
+            )
+        );
+        assert_eq!(
+            go_parse_media_type("text/plain; a=1; a=2"),
+            (String::new(), Some("mime: duplicate parameter name"))
+        );
+        assert_eq!(
+            go_parse_media_type("text/plain; a=\"x\\\"y\"; a=\"x\\\"y\""),
+            ("text/plain".to_string(), None)
+        );
+        assert_eq!(go_parse_media_type(""), (String::new(), Some("mime: no media type")));
+        assert_eq!(
+            go_parse_media_type("text/"),
+            (String::new(), Some("mime: expected token after slash"))
+        );
+        assert_eq!(
+            go_parse_media_type("text plain"),
+            (String::new(), Some("mime: expected slash after first token"))
+        );
+    }
+
+    #[test]
+    fn go_http_error_appends_newline() {
+        let resp = go_http_error(StatusCode::BAD_REQUEST, "boom");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    }
 
     /// Expected values produced by Go `html/template` with dskit's
     /// `<a href="{{ .Link }}">{{ .ID }}</a>` (Go 1.27).

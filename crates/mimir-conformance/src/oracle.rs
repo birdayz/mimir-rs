@@ -434,8 +434,18 @@ pub struct SpawnedKfakeBroker {
 
 impl SpawnedKfakeBroker {
     pub fn spawn(req: &KfakeBrokerRequest) -> Result<Self> {
+        Self::spawn_with_port(req, None)
+    }
+
+    /// Like [`Self::spawn`], with the broker listening on `127.0.0.1:<port>` when `port` is set.
+    pub fn spawn_with_port(req: &KfakeBrokerRequest, port: Option<u16>) -> Result<Self> {
         let bin = ensure_go_oracle_built()?;
-        let mut payload = serde_json::to_vec(req).context("serialize kfake-broker request")?;
+        let mut value = serde_json::to_value(req).context("serialize kfake-broker request")?;
+        if let (Some(port), Some(obj)) = (port, value.as_object_mut()) {
+            obj.insert("port".to_string(), serde_json::Value::from(port));
+        }
+        let mut payload =
+            serde_json::to_vec(&value).context("serialize kfake-broker request")?;
         payload.push(b'\n');
 
         let mut child = Command::new(&bin)
@@ -517,6 +527,9 @@ pub struct HttpGrpcCallRequest {
     pub headers: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub body_b64: String,
+    /// Sent as `x-scope-orgid` gRPC metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

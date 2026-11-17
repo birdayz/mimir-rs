@@ -24,7 +24,9 @@ use mimir_config::{
 };
 use mimir_proto::ringpb::InstanceState;
 use mimir_ring::lifecycler::Lifecycler;
-use mimir_ring::partition_ring::{PartitionInstanceLifecycler, PartitionRingWatcher};
+use mimir_ring::partition_ring::{
+    PartitionInstanceLifecycler, PartitionRingWatcher, PartitionRingWatchers,
+};
 use mimir_ring::ring::Ring;
 use mimir_storage::bucket::BucketClient;
 use mimir_storage::shipper::ShipperMetrics;
@@ -124,6 +126,8 @@ pub struct Ingester {
     pub runtime_cfg: Option<Arc<RuntimeConfigManager>>,
 
     pub registry: Option<Registry>,
+    /// `lookupplan.NewMetrics(registerer)`: `cortex_tsdb_index_lookup_planning_*`.
+    pub lookup_plan_metrics: crate::lookupplan::Metrics,
     pub metrics: Arc<IngesterMetrics>,
     pub tsdb_metrics: Arc<TSDBMetrics>,
     pub shipper_metrics: ShipperMetrics,
@@ -137,6 +141,9 @@ pub struct Ingester {
     pub ingest_partition_id: i32,
     pub ingest_reader: RwLock<Option<Arc<IngestReaderHandle>>>,
     compartments: RwLock<CompartmentsConfig>,
+    /// Every read compartment's partition ring watcher (Go `IngesterPartitionRingWatchers`),
+    /// served by the `/ingester/partition-ring/compartment-<id>` pages.
+    partition_ring_watchers: RwLock<Option<Arc<PartitionRingWatchers>>>,
 
     pub bucket: RwLock<Option<Arc<BucketClient>>>,
     pub limiter: Arc<Limiter>,
@@ -437,6 +444,7 @@ impl Ingester {
             overrides,
             runtime_cfg,
             registry: registry.cloned(),
+            lookup_plan_metrics: crate::lookupplan::Metrics::new(registry),
             metrics,
             tsdb_metrics,
             shipper_metrics,
@@ -449,6 +457,7 @@ impl Ingester {
             ingest_partition_id,
             ingest_reader: RwLock::new(None),
             compartments: RwLock::new(CompartmentsConfig::default()),
+            partition_ring_watchers: RwLock::new(None),
             bucket: RwLock::new(bucket),
             limiter,
             owned_series_strategy,
@@ -535,6 +544,15 @@ impl Ingester {
 
     pub fn compartments_config(&self) -> CompartmentsConfig {
         self.compartments.read().clone()
+    }
+
+    /// Sets the partition ring watchers of all read compartments (for the status pages).
+    pub fn set_partition_ring_watchers(&self, watchers: Option<Arc<PartitionRingWatchers>>) {
+        *self.partition_ring_watchers.write() = watchers;
+    }
+
+    pub fn partition_ring_watchers(&self) -> Option<Arc<PartitionRingWatchers>> {
+        self.partition_ring_watchers.read().clone()
     }
 
     pub fn set_head_compaction_interval_while_starting(&self, d: Duration) {
@@ -792,6 +810,14 @@ impl Ingester {
         *self.utilization_based_limiter.write() = limiter;
     }
 
+    /// `generateHeadStatisticsForAllUsers`.
+    pub fn generate_head_statistics_for_all_users(&self) {
+        let dbs: Vec<Arc<UserTsdb>> = self.tsdbs.iter().map(|e| Arc::clone(e.value())).collect();
+        for db in dbs {
+            db.generate_head_statistics();
+        }
+    }
+
     pub fn get_tsdb(&self, user_id: &str) -> Option<Arc<UserTsdb>> {
         self.tsdbs.get(user_id).map(|v| Arc::clone(v.value()))
     }
@@ -881,6 +907,18 @@ impl Ingester {
         .map_err(|e| IngesterError::Internal {
             message: format!("failed to open TSDB for user {user_id}: {e}"),
         })?;
+        let planning = &self.blocks_cfg.tsdb.index_lookup_planning;
+        if planning.index_lookup_planning_enabled {
+            db.set_planner_provider(Arc::new(crate::lookupplan::PlannerProvider::new(Arc::new(
+                crate::lookupplan::PlannerFactory::new(
+                    self.lookup_plan_metrics.for_user(user_id),
+                    crate::lookupplan::StatisticsGenerator::new(),
+                    planning.into(),
+                ),
+            ))));
+            // Initial statistics only once the TSDB has been opened and its WAL replayed.
+            db.generate_head_statistics();
+        }
         self.tsdb_metrics
             .set_registry_for_tenant(user_id, tsdb_prom_reg);
         Ok(db)
@@ -1543,6 +1581,35 @@ impl Ingester {
                         tokio::select! {
                             _ = sctx.canceled() => break,
                             _ = ticker.tick() => ing.apply_tsdb_settings(),
+                        }
+                    }
+                }));
+            }
+
+            // `statisticsService`: a timer service regenerating every tenant's head statistics.
+            let planning = &self.blocks_cfg.tsdb.index_lookup_planning;
+            if let Some(period) = planning
+                .index_lookup_planning_enabled
+                .then(|| planning.statistics_collection_frequency.as_std())
+                .flatten()
+                .filter(|p| !p.is_zero())
+            {
+                let ing = Arc::clone(self);
+                let sctx = ctx.child();
+                tasks.push(tokio::spawn(async move {
+                    let start = tokio::time::Instant::now() + period;
+                    let mut ticker = tokio::time::interval_at(start, period);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = sctx.canceled() => break,
+                            _ = ticker.tick() => {
+                                let ing = Arc::clone(&ing);
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    ing.generate_head_statistics_for_all_users();
+                                })
+                                .await;
+                            }
                         }
                     }
                 }));

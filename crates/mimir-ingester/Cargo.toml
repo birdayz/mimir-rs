@@ -13,6 +13,7 @@ mimir-storage = { path = "../mimir-storage" }
 mimir-tsdb = { path = "../mimir-tsdb" }
 axum = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 dashmap = { workspace = true }
 hashbrown = { workspace = true }
 futures = { workspace = true }

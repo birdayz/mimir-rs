@@ -12,6 +12,7 @@ pub mod heap_merger;
 pub mod kafka_client;
 pub mod kgo_retry;
 pub mod kprom;
+pub mod labeled_registry;
 pub mod offset_catalogue;
 pub mod offset_file;
 pub mod partition_offset_client;
@@ -76,7 +77,8 @@ pub use pusher::{
 pub use reader::{
     decode_fetched_record, AdmClient, DecodedKafkaRecord, KafkaAdmClient,
     MultiClusterPartitionReader, PartitionCommitter, ReaderError, ReaderMetrics, ReaderState,
-    RecordBatchConsumer, SingleClusterPartitionReader, StrongReadConsistencyMetrics,
+    RecordBatchConsumer, RecordBatchConsumerFactory, SingleClusterPartitionReader,
+    StrongReadConsistencyMetrics,
     ZeroCopyBatchConsumer, ZeroCopyRecordHandler, ERR_OFFSET_FILE_WRITE, READER_METRICS_PREFIX,
 };
 pub use reader_client::{
