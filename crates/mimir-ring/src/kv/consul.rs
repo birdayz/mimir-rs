@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use mimir_common::backoff::{Backoff, BackoffConfig};
 use mimir_common::services::ServiceContext;
-use mimir_common::tls::{go_read_err, parse_server_name, system_roots, x509_key_pair};
+use mimir_common::tls::{go_read_err, parse_server_name, system_roots, CachedReloadingCert};
 use mimir_config::ingester::ConsulConfig;
 use prometheus::{HistogramOpts, HistogramVec, Registry};
 use rand::Rng;
@@ -28,10 +28,9 @@ use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
 use tokio_rustls::rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
-use tokio_rustls::rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
+use tokio_rustls::rustls::crypto::WebPkiSupportedAlgorithms;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{
     CertificateError, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
@@ -228,36 +227,7 @@ fn load_ca_path(ca_path: &str) -> Result<RootCertStore, String> {
     Ok(store)
 }
 
-fn load_client_cert_key(
-    cert_path: &str,
-    key_path: &str,
-    provider: &CryptoProvider,
-) -> Result<CertifiedKey, String> {
-    let cert = std::fs::read(cert_path).map_err(|e| go_read_err(cert_path, &e))?;
-    let key = std::fs::read(key_path).map_err(|e| go_read_err(key_path, &e))?;
-    x509_key_pair(&cert, &key, provider)
-}
 
-#[derive(Debug)]
-struct ConsulClientCertResolver {
-    cert_path: String,
-    key_path: String,
-    provider: Arc<CryptoProvider>,
-    initial: Arc<CertifiedKey>,
-}
-
-impl ResolvesClientCert for ConsulClientCertResolver {
-    fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
-        match load_client_cert_key(&self.cert_path, &self.key_path, &self.provider) {
-            Ok(ck) => Some(Arc::new(ck)),
-            Err(_) => Some(Arc::clone(&self.initial)),
-        }
-    }
-
-    fn has_certs(&self) -> bool {
-        true
-    }
-}
 
 #[derive(Debug)]
 struct ConsulTlsVerifier {
@@ -336,14 +306,13 @@ fn build_consul_tls_config(env: &ConsulEnv) -> Result<rustls::ClientConfig, KvEr
             "both client cert and client key must be provided".to_string(),
         ));
     } else {
-        let initial = load_client_cert_key(&env.client_cert, &env.client_key, &provider)
-            .map_err(KvError::InvalidConfig)?;
-        Some(ConsulClientCertResolver {
-            cert_path: env.client_cert.clone(),
-            key_path: env.client_key.clone(),
-            provider: Arc::clone(&provider),
-            initial: Arc::new(initial),
-        })
+        let resolver = CachedReloadingCert::from_files(
+            &env.client_cert,
+            &env.client_key,
+            Arc::clone(&provider),
+        )
+        .map_err(|e| KvError::InvalidConfig(e.into_reason()))?;
+        Some(Arc::new(resolver) as Arc<dyn ResolvesClientCert>)
     };
 
     let custom_roots = if !env.ca_cert.is_empty() {
@@ -408,7 +377,7 @@ fn build_consul_tls_config(env: &ConsulEnv) -> Result<rustls::ClientConfig, KvEr
         .with_custom_certificate_verifier(Arc::new(verifier));
 
     Ok(match client_cert {
-        Some(resolver) => builder.with_client_cert_resolver(Arc::new(resolver)),
+        Some(resolver) => builder.with_client_cert_resolver(resolver),
         None => builder.with_no_client_auth(),
     })
 }
