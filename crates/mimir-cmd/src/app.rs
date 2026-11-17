@@ -24,6 +24,7 @@ use mimir_config::{MimirConfig, Overrides, RuntimeConfigManager};
 use mimir_ingester::ingest_storage::{
     ingester_partition_id_from_instance_id, IngesterPartitionRingDelegate,
 };
+use mimir_ingester::grpc::SnappyDecompressService;
 use mimir_ingester::{Ingester, IngesterLifecycler, IngesterService, TokenlessLifecycler};
 use mimir_proto::httpgrpcpb::http_server::HttpServer;
 use mimir_ring::kv::ha_replica::replica_desc_codec;
@@ -228,8 +229,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
     // 3. Server module (dskit server.New): binds HTTP & gRPC listeners early so port 0 resolves
     //    before ring registration, builds TLS configs and middleware.
-    let server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
+    let mut server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
         .context("error initialising module: server")?;
+    server.set_grpc_multitenancy(cfg.multitenancy_enabled);
     let bound_http_addr = server.http_addr()?;
     let bound_grpc_addr = server.grpc_addr()?;
     cfg.server.http_listen_port = i64::from(bound_http_addr.port());
@@ -672,13 +674,14 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let max_recv = (cfg.server.grpc_server_max_recv_msg_size.max(1024)) as usize;
     let max_send = (cfg.server.grpc_server_max_send_msg_size.max(1024)) as usize;
 
-    let http_grpc_svc = HttpGrpcStatusFixService::new(
+    let http_grpc_svc = HttpGrpcStatusFixService::new(SnappyDecompressService::new(
         HttpServer::new(HttpGrpcBridge::new(http_router.clone()))
             .max_decoding_message_size(max_recv)
             .max_encoding_message_size(max_send)
             .accept_compressed(CompressionEncoding::Gzip)
             .accept_compressed(CompressionEncoding::Zstd),
-    );
+        max_recv,
+    ));
 
     let health_svc = HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules));
 

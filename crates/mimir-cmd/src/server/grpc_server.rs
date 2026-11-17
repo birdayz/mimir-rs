@@ -31,6 +31,7 @@ use bytes::Bytes;
 use http_body::Frame;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use mimir_common::grpc_deadline;
 use mimir_common::grpc_log::GrpcErrorLog;
 use mimir_common::logging::{LogLevel, Logger};
 use mimir_config::GoDuration;
@@ -57,6 +58,9 @@ pub struct GrpcServerConfig {
     pub stats_tracking: bool,
     pub report_grpc_status: bool,
     pub cluster_validation: Option<GrpcClusterValidation>,
+    /// `-auth.multitenancy-enabled`: require `x-scope-orgid` on every RPC except Mimir's
+    /// `noGRPCAuthOn` methods.
+    pub multitenancy_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -243,6 +247,123 @@ async fn serve_conn<T>(
 
 type GrpcResponse = hyper::Response<tonic::body::BoxBody>;
 
+/// Methods exempt from the multitenant gRPC auth interceptor (Mimir's `noGRPCAuthOn` list in
+/// `pkg/mimir/mimir.go`, passed to `noauth.SetupAuthMiddleware`).
+const NO_GRPC_AUTH_ON: &[&str] = &[
+    "/grpc.health.v1.Health/Check",
+    "/frontend.Frontend/Process",
+    "/frontend.Frontend/NotifyClientShutdown",
+    "/ruler.Ruler/SyncRules",
+    "/schedulerpb.SchedulerForFrontend/FrontendLoop",
+    "/schedulerpb.SchedulerForQuerier/QuerierLoop",
+    "/schedulerpb.SchedulerForQuerier/NotifyQuerierShutdown",
+    "/schedulerpb.BlockBuilderScheduler/AssignJob",
+    "/schedulerpb.BlockBuilderScheduler/UpdateJob",
+    "/usagetrackerpb.UsageTracker/GetUsersCloseToLimit",
+    "/usagetrackerpb.UsageTracker/TrackSeriesBatch",
+];
+
+/// dskit `middleware.ServerUserHeaderInterceptor` / `StreamServerUserHeaderInterceptor`
+/// (`user.ExtractFromGRPCRequest`): exactly one `x-scope-orgid` metadata value.
+fn check_org_id(headers: &http::HeaderMap, method: &str) -> Option<tonic::Status> {
+    if NO_GRPC_AUTH_ON.contains(&method) || headers.get_all("x-scope-orgid").iter().count() == 1 {
+        return None;
+    }
+    Some(tonic::Status::unknown("no org id"))
+}
+
+/// Per-RPC bookkeeping started when the request arrives and finalized exactly once: when the
+/// response body completes, or on drop (handler future or response body dropped because the
+/// client reset the stream), like the `defer`s of dskit's interceptors and stats handler.
+struct RpcGuard {
+    method: String,
+    begin: Instant,
+    deadline: Option<tokio::time::Instant>,
+    conn: Arc<Conn>,
+    stream_tracker: Option<Arc<super::metrics::StreamTracker>>,
+    inflight: Option<prometheus::Gauge>,
+    duration_vec: mimir_common::native_histogram::HistogramVec,
+    report_grpc_status: bool,
+    logger: Arc<dyn Logger>,
+    error_log: GrpcErrorLog,
+    status: Arc<Mutex<(Option<i32>, Option<String>)>>,
+    done: bool,
+}
+
+impl RpcGuard {
+    fn finish(&mut self, completed: bool) {
+        if std::mem::replace(&mut self.done, true) {
+            return;
+        }
+        let (code, msg) = self.status.lock().clone();
+        let code = match code {
+            Some(c) => c,
+            None if completed => 0,
+            // Torn down by the expiry of the request's own deadline.
+            None if self.deadline.is_some_and(|d| tokio::time::Instant::now() >= d) => 4,
+            // A stream torn down before its status was sent was canceled by the client.
+            None => 1,
+        };
+        let elapsed = self.begin.elapsed();
+        self.duration_vec
+            .with_label_values(&[
+                "gRPC",
+                &self.method,
+                &grpc_status_label(code, self.report_grpc_status),
+                "false",
+            ])
+            .observe(elapsed.as_secs_f64());
+        if let Some(g) = &self.inflight {
+            g.dec();
+        }
+        if let Some(t) = &self.stream_tracker {
+            t.close_stream(self.conn.id);
+        }
+        if self.conn.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            *self.conn.idle_since.lock() = Instant::now();
+        }
+        if code != 0 {
+            // The handler's view of its error (Go error text, OptionalLogging), or a plain
+            // `status.Error` as grpc-go would format it.
+            let (err, keep) = match self.error_log.take() {
+                Some(e) => match e.reason {
+                    Some(r) => (format!("{} ({r})", e.err), e.keep),
+                    None => (e.err, e.keep),
+                },
+                None => (
+                    format!(
+                        "rpc error: code = {} desc = {}",
+                        grpc_status_label(code, true),
+                        percent_decode(msg.as_deref().unwrap_or(""))
+                    ),
+                    true,
+                ),
+            };
+            if keep {
+                let dur = GoDuration(elapsed.as_nanos() as i64).to_string();
+                let level = if code == 1 { LogLevel::Debug } else { LogLevel::Warn };
+                self.logger.log(
+                    level,
+                    &[("method", &self.method), ("duration", &dur), ("msg", "gRPC"), ("err", &err)],
+                );
+            }
+        }
+    }
+}
+
+impl Drop for RpcGuard {
+    fn drop(&mut self) {
+        self.finish(false);
+    }
+}
+
+/// A trailers-only gRPC error response with an explicit HTTP status (grpc-go `writeEarlyAbort`).
+fn early_abort(status: tonic::Status, http_status: http::StatusCode) -> GrpcResponse {
+    let mut resp = status.into_http();
+    *resp.status_mut() = http_status;
+    resp
+}
+
 async fn handle(
     mut req: hyper::Request<Incoming>,
     remote: SocketAddr,
@@ -255,6 +376,30 @@ async fn handle(
     let begin = Instant::now();
     let m = &ctx.metrics;
 
+    // grpc-go operateHeaders: a malformed or already expired `grpc-timeout` aborts the stream
+    // before any interceptor or stats handler runs.
+    let deadline = match req.headers().get("grpc-timeout") {
+        None => None,
+        Some(v) => {
+            match v.to_str().map_err(|e| e.to_string()).and_then(grpc_deadline::decode_timeout) {
+                Err(e) => {
+                    return Ok(early_abort(
+                        tonic::Status::internal(format!("malformed grpc-timeout: {e}")),
+                        http::StatusCode::BAD_REQUEST,
+                    ))
+                }
+                Ok(d) if d.is_zero() => {
+                    return Ok(early_abort(
+                        tonic::Status::deadline_exceeded("context deadline exceeded"),
+                        http::StatusCode::OK,
+                    ))
+                }
+                // Overflowing deadlines (e.g. 99999999H) never fire.
+                Ok(d) => tokio::time::Instant::now().checked_add(d),
+            }
+        }
+    };
+
     conn.active.fetch_add(1, Ordering::AcqRel);
     let stream_tracker = if cfg.stats_tracking { m.stream_tracker.clone() } else { None };
     if let Some(t) = &stream_tracker {
@@ -266,20 +411,46 @@ async fn handle(
     if let Some(g) = &inflight {
         g.inc();
     }
+    let error_log = GrpcErrorLog::default();
+    // From here on every exit path (including this future being dropped when the client
+    // resets the stream) finalizes the RPC exactly once.
+    let guard = RpcGuard {
+        method: method.clone(),
+        begin,
+        deadline,
+        conn,
+        stream_tracker,
+        inflight,
+        duration_vec: m.request_duration.clone(),
+        report_grpc_status: cfg.report_grpc_status,
+        logger: Arc::clone(&ctx.logger),
+        error_log: error_log.clone(),
+        status: Arc::new(Mutex::new((None, None))),
+        done: false,
+    };
+
     req.extensions_mut().insert(tonic::transport::server::TcpConnectInfo {
         local_addr: None,
         remote_addr: Some(remote),
     });
-    let error_log = GrpcErrorLog::default();
-    req.extensions_mut().insert(error_log.clone());
+    req.extensions_mut().insert(error_log);
 
-    // Cluster validation (unary RPCs only, never health checks).
-    let rejection = cfg.cluster_validation.as_ref().and_then(|cv| {
-        if STREAMING_METHODS.contains(&method.as_str()) || method.starts_with("/grpc.health.v1.Health/") {
-            return None;
-        }
-        check_cluster(req.headers(), &method, cv, &ctx)
-    });
+    // Interceptor order (dskit server.New): ..., Mimir's GRPCMiddleware (multitenant auth), then
+    // cluster validation (unary RPCs only, never health checks).
+    let rejection = cfg
+        .multitenancy_enabled
+        .then(|| check_org_id(req.headers(), &method))
+        .flatten()
+        .or_else(|| {
+            cfg.cluster_validation.as_ref().and_then(|cv| {
+                if STREAMING_METHODS.contains(&method.as_str())
+                    || method.starts_with("/grpc.health.v1.Health/")
+                {
+                    return None;
+                }
+                check_cluster(req.headers(), &method, cv, &ctx)
+            })
+        });
 
     let req = if cfg.stats_tracking {
         let recv = m.received_message_size.with_label_values(&["gRPC", &method]);
@@ -297,10 +468,23 @@ async fn handle(
 
     let resp: GrpcResponse = match rejection {
         Some(status) => status.into_http(),
-        None => match routes.oneshot(req).await {
-            Ok(r) => r,
-            Err(e) => tonic::Status::internal(e.to_string()).into_http(),
-        },
+        None => {
+            let call = routes.oneshot(req);
+            let res = match deadline {
+                // The handler sees the deadline (`grpc_deadline::current`) and fails on its own
+                // where it waits (e.g. strong read consistency); otherwise it is abandoned here.
+                Some(d) => tokio::time::timeout_at(d, grpc_deadline::scope(d, call))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Ok(tonic::Status::deadline_exceeded("context deadline exceeded").into_http())
+                    }),
+                None => call.await,
+            };
+            match res {
+                Ok(r) => r,
+                Err(e) => tonic::Status::internal(e.to_string()).into_http(),
+            }
+        }
     };
 
     // Trailers-only responses carry grpc-status in the headers.
@@ -314,13 +498,13 @@ async fn handle(
         .get("grpc-message")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    *guard.status.lock() = (header_status, header_message);
 
-    let status: Arc<Mutex<(Option<i32>, Option<String>)>> = Arc::new(Mutex::new((header_status, header_message)));
     let sent = cfg
         .stats_tracking
         .then(|| m.sent_message_size.with_label_values(&["gRPC", &method]));
     let mut out_counter = GrpcFrameCounter::default();
-    let status_f = Arc::clone(&status);
+    let status_f = Arc::clone(&guard.status);
     let on_frame = Box::new(move |f: &Frame<Bytes>| {
         if let Some(d) = f.data_ref() {
             if let Some(h) = &sent {
@@ -339,58 +523,20 @@ async fn handle(
             }
         }
     });
-    let duration_vec = m.request_duration.clone();
-    let report = cfg.report_grpc_status;
-    let logger = Arc::clone(&ctx.logger);
     let on_done = Box::new(move |completed: bool| {
-        let (code, msg) = status.lock().clone();
-        // A stream torn down before its status was sent was canceled by the client.
-        let code = match code {
-            Some(c) => c,
-            None if completed => 0,
-            None => 1,
-        };
-        let elapsed = begin.elapsed();
-        duration_vec
-            .with_label_values(&["gRPC", &method, &grpc_status_label(code, report), "false"])
-            .observe(elapsed.as_secs_f64());
-        if let Some(g) = &inflight {
-            g.dec();
-        }
-        if let Some(t) = &stream_tracker {
-            t.close_stream(conn.id);
-        }
-        if conn.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            *conn.idle_since.lock() = Instant::now();
-        }
-        if code != 0 {
-            // The handler's view of its error (Go error text, OptionalLogging), or a plain
-            // `status.Error` as grpc-go would format it.
-            let (err, keep) = match error_log.take() {
-                Some(e) => match e.reason {
-                    Some(r) => (format!("{} ({r})", e.err), e.keep),
-                    None => (e.err, e.keep),
-                },
-                None => (
-                    format!(
-                        "rpc error: code = {} desc = {}",
-                        grpc_status_label(code, true),
-                        percent_decode(msg.as_deref().unwrap_or(""))
-                    ),
-                    true,
-                ),
-            };
-            if keep {
-                let dur = GoDuration(elapsed.as_nanos() as i64).to_string();
-                let level = if code == 1 { LogLevel::Debug } else { LogLevel::Warn };
-                logger.log(
-                    level,
-                    &[("method", &method), ("duration", &dur), ("msg", "gRPC"), ("err", &err)],
-                );
-            }
-        }
+        let mut guard = guard;
+        guard.finish(completed);
     });
-    Ok(resp.map(|b| tonic::body::boxed(TrackedBody::new(b).on_frame(on_frame).on_done(on_done))))
+    // grpc-go closes the stream (RST_STREAM) when the deadline expires mid-response.
+    let body_deadline = deadline.map(tokio::time::Instant::into_std);
+    Ok(resp.map(|b| {
+        tonic::body::boxed(
+            TrackedBody::new(b)
+                .on_frame(on_frame)
+                .on_done(on_done)
+                .deadline(body_deadline, "context deadline exceeded"),
+        )
+    }))
 }
 
 fn percent_decode(s: &str) -> String {

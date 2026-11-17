@@ -10,7 +10,9 @@ use axum::http;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{Future, Stream};
 use mimir_common::grpc_log::{GrpcErrorLog, GrpcErrorLogEntry};
-use mimir_common::tenant::extract_tenant_id_from_grpc_metadata;
+use mimir_common::tenant::{
+    extract_tenant_id_from_grpc_metadata, TenantError, LOWER_ORG_ID_HEADER_NAME,
+};
 use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb;
 use mimir_proto::prost::Message;
@@ -19,6 +21,7 @@ use tonic::{Request, Response, Status};
 
 use crate::errors::IngesterError;
 use crate::ingester::Ingester;
+use crate::query::build_search_hints;
 
 pub struct IngesterService {
     ingester: Arc<Ingester>,
@@ -240,6 +243,65 @@ async fn decompress_snappy_grpc_request(
     ))
 }
 
+/// Accepts `grpc-encoding: snappy` requests for any wrapped gRPC service: Go registers dskit's
+/// `grpcencoding/snappy` compressor process-wide, so every gRPC service of a Mimir server (e.g.
+/// `httpgrpc.HTTP`) decodes Snappy-compressed messages, not just `cortex.Ingester`.
+#[derive(Clone)]
+pub struct SnappyDecompressService<S> {
+    inner: S,
+    max_decode_len: usize,
+}
+
+impl<S> SnappyDecompressService<S> {
+    pub fn new(inner: S, max_decode_len: usize) -> Self {
+        Self {
+            inner,
+            max_decode_len,
+        }
+    }
+}
+
+impl<S: tonic::server::NamedService> tonic::server::NamedService for SnappyDecompressService<S> {
+    const NAME: &'static str = S::NAME;
+}
+
+impl<S> tower::Service<http::Request<tonic::body::BoxBody>> for SnappyDecompressService<S>
+where
+    S: tower::Service<
+            http::Request<tonic::body::BoxBody>,
+            Response = http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = http::Response<tonic::body::BoxBody>;
+    type Error = std::convert::Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+        if !is_snappy_grpc_encoding(req.headers()) {
+            return Box::pin(self.inner.call(req));
+        }
+        // Use the service that was polled ready; leave a fresh clone behind.
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let max_decode_len = self.max_decode_len;
+        Box::pin(async move {
+            match decompress_snappy_grpc_request(req, max_decode_len).await {
+                Ok(req) => inner.call(req).await,
+                Err(status) => Ok(status.into_http()),
+            }
+        })
+    }
+}
+
 impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopyServer {
     type Response = http::Response<tonic::body::BoxBody>;
     type Error = std::convert::Infallible;
@@ -272,15 +334,9 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     let ingester = Arc::clone(&self.0);
                     Box::pin(async move {
                         let user_id = tenant_from_req(&ingester, &request)?;
-                        let raw = request.into_inner();
+                        let (_, extensions, raw) = request.into_parts();
                         if let Err(e) = ingester.push_grpc_raw(&user_id, raw).await {
-                            if e.should_log_error() {
-                                tracing::warn!(
-                                    method = "/cortex.Ingester/Push",
-                                    err = %e,
-                                    "gRPC call failed"
-                                );
-                            }
+                            record_push_error(&ingester, extensions.get::<GrpcErrorLog>(), &e);
                             return Err(e.map_push_error_to_grpc_server_status());
                         }
                         Ok(Response::new(cortexpb::WriteResponse {}))
@@ -328,18 +384,51 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
     }
 }
 
+/// Hands a failed Push's logging decision to the server's log interceptor (dskit
+/// `GRPCServerLog`: `ErrorWithStatus` logs its message; sampled errors are logged once per
+/// `-ingester.error-sample-rate` occurrences, `DoNotLogError` instance-limit errors never).
+fn record_push_error(ingester: &Ingester, log: Option<&GrpcErrorLog>, e: &IngesterError) {
+    let rate = ingester.cfg.error_sample_rate;
+    let entry = GrpcErrorLogEntry {
+        err: e.to_string(),
+        keep: e.should_log_error(),
+        reason: (e.is_sampled() && rate != 0).then(|| format!("sampled 1/{rate}")),
+    };
+    match log {
+        Some(log) => log.set(entry),
+        // Served without the dskit server's log interceptor (embedded/tests): log here.
+        None if entry.keep => {
+            tracing::warn!(method = "/cortex.Ingester/Push", err = %e, "gRPC call failed");
+        }
+        None => {}
+    }
+}
+
+/// dskit `middleware.ServerUserHeaderInterceptor` (multitenancy enabled): exactly one
+/// `x-scope-orgid` metadata value, else `user.ErrNoOrgID` (`codes.Unknown`).
+#[allow(clippy::result_large_err)]
+fn check_org_id_header<T>(ingester: &Ingester, req: &Request<T>) -> Result<(), Status> {
+    if ingester.is_multitenancy_enabled()
+        && req.metadata().get_all(LOWER_ORG_ID_HEADER_NAME).iter().count() != 1
+    {
+        return Err(Status::unknown(TenantError::NoOrgID.to_string()));
+    }
+    Ok(())
+}
+
+/// The request's tenant (`tenant.TenantID(ctx)`): with multitenancy disabled the `noauth`
+/// interceptor injects `-auth.no-auth-tenant` regardless of any `x-scope-orgid`. Tenant parsing
+/// errors (e.g. `a|b`) are plain errors mapped to `codes.Internal` by the ingester.
 #[allow(clippy::result_large_err)]
 fn tenant_from_req<T>(ingester: &Ingester, req: &Request<T>) -> Result<String, Status> {
-    match extract_tenant_id_from_grpc_metadata(req.metadata()) {
-        Ok(id) => Ok(id),
-        Err(mimir_common::tenant::TenantError::NoOrgID) if !ingester.is_multitenancy_enabled() => {
-            Ok(ingester.no_auth_tenant())
-        }
-        Err(mimir_common::tenant::TenantError::NoOrgID) => {
-            Err(Status::unknown(mimir_common::tenant::TenantError::NoOrgID.to_string()))
-        }
-        Err(e) => Err(Status::invalid_argument(e.to_string())),
+    if !ingester.is_multitenancy_enabled() {
+        return Ok(ingester.no_auth_tenant());
     }
+    check_org_id_header(ingester, req)?;
+    extract_tenant_id_from_grpc_metadata(req.metadata()).map_err(|e| match e {
+        TenantError::NoOrgID => Status::unknown(e.to_string()),
+        e => Status::internal(e.to_string()),
+    })
 }
 
 fn vec_to_stream<T: Send + 'static>(
@@ -356,22 +445,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<cortexpb::WriteResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         if let Err(e) = self.ingester.push_grpc(&user_id, request.get_ref()).await {
-            // dskit GRPCServerLog: ErrorWithStatus logs its message; sampled errors are logged
-            // once per -ingester.error-sample-rate occurrences, instance-limit errors never.
-            let rate = self.ingester.cfg.error_sample_rate;
-            let entry = GrpcErrorLogEntry {
-                err: e.to_string(),
-                keep: e.should_log_error(),
-                reason: (e.is_sampled() && rate != 0).then(|| format!("sampled 1/{rate}")),
-            };
-            match request.extensions().get::<GrpcErrorLog>() {
-                Some(log) => log.set(entry),
-                // Served without the dskit server's log interceptor (embedded/tests): log here.
-                None if entry.keep => {
-                    tracing::warn!(method = "/cortex.Ingester/Push", err = %e, "gRPC call failed");
-                }
-                None => {}
-            }
+            record_push_error(&self.ingester, request.extensions().get::<GrpcErrorLog>(), &e);
             return Err(e.map_push_error_to_grpc_server_status());
         }
         Ok(Response::new(cortexpb::WriteResponse {}))
@@ -454,6 +528,8 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::UserStatsRequest>,
     ) -> Result<Response<ingesterpb::UsersStatsResponse>, Status> {
+        // Not in Mimir's noGRPCAuthOn list: the org ID header is required (but not parsed).
+        check_org_id_header(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let resp = self
             .ingester
@@ -555,11 +631,16 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::SearchLabelNamesRequest>,
     ) -> Result<Response<Self::SearchLabelNamesStream>, Status> {
+        // Input is validated ahead of the tenant and the read error mapping (InvalidArgument).
+        let r = request.get_ref();
+        let (hints, matchers) =
+            build_search_hints(r.filter.as_ref(), r.ordering, r.limit, &r.matchers)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let items = self
             .ingester
-            .handle_search_label_names(&md, &user_id, inner)
+            .handle_search_label_names_with_hints(&md, &user_id, inner, hints, matchers)
             .await
             .map_err(|e: IngesterError| e.map_read_error_to_status())?;
         Ok(Response::new(vec_to_stream(items)))
@@ -572,11 +653,16 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::SearchLabelValuesRequest>,
     ) -> Result<Response<Self::SearchLabelValuesStream>, Status> {
+        // Input is validated ahead of the tenant and the read error mapping (InvalidArgument).
+        let r = request.get_ref();
+        let (hints, matchers) =
+            build_search_hints(r.filter.as_ref(), r.ordering, r.limit, &r.matchers)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, _, inner) = request.into_parts();
         let items = self
             .ingester
-            .handle_search_label_values(&md, &user_id, inner)
+            .handle_search_label_values_with_hints(&md, &user_id, inner, hints, matchers)
             .await
             .map_err(|e: IngesterError| e.map_read_error_to_status())?;
         Ok(Response::new(vec_to_stream(items)))

@@ -19,13 +19,15 @@ use mimir_config::parse_go_duration;
 use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb;
 use mimir_proto::prost::Message;
+use mimir_storage::ingest::partition_offset_watcher::OffsetWatcherError;
+use mimir_storage::ingest::reader::ReaderError;
 use mimir_storage::ingest::PartitionOffsets;
 use mimir_tsdb::chunkenc::Encoding;
 use mimir_tsdb::chunks_block::ChunkMeta;
 use mimir_tsdb::db::Tsdb;
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::matcher::{LabelMatcher, MatchType};
-use mimir_tsdb::querier::{LazyStreamEvent, QueryChunkSeries};
+use mimir_tsdb::querier::{BlockSelectStatsSink, LazyStreamEvent, QueryChunkSeries};
 use mimir_tsdb::search::{FuzzAlg, SearchHints, SearchOrdering, SearchResult};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -35,7 +37,7 @@ use tonic::Status;
 use crate::circuit_breaker::BreakerPermit;
 use crate::errors::IngesterError;
 use crate::ingester::Ingester;
-use crate::lookupplan::{self, BasicLookupPlan, LookupPlanner, NoopPlanner, SelectHints};
+use crate::lookupplan::{self, BasicLookupPlan, LookupPlanner, SelectHints};
 use crate::metrics::REASON_MAX_INFLIGHT_READ_REQUESTS;
 use crate::mirror_querier::{
     ChunkBlockMeta, ChunkQuerier, ChunkSeries, ChunkSeriesSet, MirroredChunkQuerier, QuerierError,
@@ -87,6 +89,47 @@ impl Drop for ReadPermit {
             rp.drop_permit();
         }
     }
+}
+
+/// The strong read consistency wait timeout given the configured
+/// `-ingest-storage.kafka.wait-strong-read-consistency-timeout` (0 = none) and the gRPC request
+/// deadline, plus the mapping of the reader's error to the Go error the wait would return:
+/// `context.DeadlineExceeded` for the request deadline, `errWaitStrongReadConsistencyTimeoutExceeded`
+/// (which wraps it) for the configured timeout, both reported as `codes.DeadlineExceeded`.
+#[allow(clippy::type_complexity)]
+fn strong_read_consistency_wait(
+    configured: Duration,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(Duration, Box<dyn Fn(ReaderError) -> IngesterError + Send + Sync>), IngesterError> {
+    const CTX_DEADLINE: &str = "wait for read consistency: context deadline exceeded";
+    const CONFIGURED_DEADLINE: &str = "wait for read consistency: wait strong read consistency timeout exceeded: context deadline exceeded";
+    let remaining = deadline.map(|d| d.saturating_duration_since(tokio::time::Instant::now()));
+    if remaining.is_some_and(|r| r.is_zero()) {
+        return Err(IngesterError::DeadlineExceeded {
+            message: CTX_DEADLINE.to_string(),
+        });
+    }
+    let (timeout, timeout_msg) = match remaining {
+        Some(r) if configured.is_zero() || r < configured => (r, CTX_DEADLINE),
+        _ => (configured, CONFIGURED_DEADLINE),
+    };
+    let map = move |e: ReaderError| match e {
+        ReaderError::WaitStrongReadConsistencyTimeoutExceeded => IngesterError::DeadlineExceeded {
+            message: CONFIGURED_DEADLINE.to_string(),
+        },
+        ReaderError::Watcher(OffsetWatcherError::Timeout(_)) => IngesterError::DeadlineExceeded {
+            message: timeout_msg.to_string(),
+        },
+        e => IngesterError::Internal {
+            message: format!("wait for read consistency: {e}"),
+        },
+    };
+    Ok((timeout, Box::new(map)))
+}
+
+/// Go `isDeadlineExceeded(err)` for the read circuit breaker's `finish`.
+fn deadline_exceeded<T>(res: &Result<T, IngesterError>) -> bool {
+    res.as_ref().err().is_some_and(IngesterError::is_deadline_exceeded)
 }
 
 pub fn is_only_replica_metadata(md: &MetadataMap) -> bool {
@@ -480,13 +523,19 @@ impl Ingester {
         }
 
         if level == READ_CONSISTENCY_STRONG {
-            let timeout = Duration::from_nanos(
+            let configured = Duration::from_nanos(
                 self.ingest_cfg
                     .kafka
                     .wait_strong_read_consistency_timeout
                     .as_nanos()
                     .max(0) as u64,
             );
+            // The wait is bounded by the request context (the gRPC deadline) and by
+            // -ingest-storage.kafka.wait-strong-read-consistency-timeout, whichever is first.
+            let (timeout, map_wait_err) = strong_read_consistency_wait(
+                configured,
+                mimir_common::grpc_deadline::current(),
+            )?;
             if let Some(encoded) = md
                 .get(CONSISTENCY_OFFSETS_MD_KEY)
                 .and_then(|v| v.to_str().ok())
@@ -499,9 +548,7 @@ impl Ingester {
                     reader
                         .wait_read_consistency_until_offsets(&offsets, timeout)
                         .await
-                        .map_err(|e| IngesterError::Internal {
-                            message: format!("wait for read consistency: {e}"),
-                        })?;
+                        .map_err(map_wait_err)?;
                     return Ok(());
                 }
             }
@@ -509,9 +556,7 @@ impl Ingester {
             reader
                 .wait_read_consistency_until_last_produced_offset(timeout)
                 .await
-                .map_err(|e| IngesterError::Internal {
-                    message: format!("wait for read consistency: {e}"),
-                })?;
+                .map_err(map_wait_err)?;
         }
 
         Ok(())
@@ -525,7 +570,7 @@ impl Ingester {
     ) -> Result<Vec<ingesterpb::QueryStreamResponse>, IngesterError> {
         let permit = self.start_read_request(md).await?;
         let res = self.query_stream_inner(md, user_id, &mut req).await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -547,7 +592,10 @@ impl Ingester {
         let (shard, matchers) = remove_shard_from_matchers(matchers)?;
 
         self.metrics.queries.inc();
-        self.enforce_read_consistency(md, user_id).await?;
+        if let Err(e) = self.enforce_read_consistency(md, user_id).await {
+            permit.finish(e.is_deadline_exceeded());
+            return Err(e);
+        }
 
         let Some(db) = self.get_tsdb(user_id) else {
             permit.finish(false);
@@ -572,11 +620,13 @@ impl Ingester {
                 .out_of_order_time_window
                 .0;
             let unordered = ooo_window > 0;
+            let select_stats = BlockSelectStatsSink::default();
             let cq = if unordered {
                 db.db.unordered_chunk_querier(start_ts, end_ts)
             } else {
                 db.db.chunk_querier(start_ts, end_ts)
-            };
+            }
+            .with_select_stats(Arc::clone(&select_stats));
             match cq
                 .try_select_adaptive(
                     true,
@@ -588,6 +638,7 @@ impl Ingester {
                     message: format!("selecting series from ChunkQuerier: {e}"),
                 })? {
                 Some(Ok(mut inline_series)) => {
+                    self.observe_block_select_stats(user_id, &select_stats);
                     if let Some((shard_idx, shard_count)) = shard {
                         inline_series
                             .retain(|cs| labels_stable_hash(&cs.labels) % shard_count == shard_idx);
@@ -605,12 +656,14 @@ impl Ingester {
                     let (tx, rx) = mpsc::channel(4);
                     let ingester = Arc::clone(self);
                     let db_c = Arc::clone(&db);
+                    let user_c = user_id.to_owned();
                     tokio::task::spawn_blocking(move || {
                         let cq_b = if unordered {
                             db_c.db.unordered_chunk_querier(start_ts, end_ts)
                         } else {
                             db_c.db.chunk_querier(start_ts, end_ts)
-                        };
+                        }
+                        .with_select_stats(Arc::clone(&select_stats));
                         let prepared = match prepared_opt {
                             Some(p) => p,
                             None => match cq_b.prepare_select(&matchers) {
@@ -725,6 +778,7 @@ impl Ingester {
                                 }
                             },
                         );
+                        ingester.observe_block_select_stats(&user_c, &select_stats);
 
                         match res {
                             Ok(()) => {
@@ -910,7 +964,10 @@ impl Ingester {
         let (shard, matchers) = remove_shard_from_matchers(matchers)?;
 
         self.metrics.queries.inc();
-        self.enforce_read_consistency(md, user_id).await?;
+        if let Err(e) = self.enforce_read_consistency(md, user_id).await {
+            permit.finish(e.is_deadline_exceeded());
+            return Err(e);
+        }
 
         let Some(db) = self.get_tsdb(user_id) else {
             permit.finish(false);
@@ -947,6 +1004,36 @@ impl Ingester {
         Ok(ReceiverStream::new(rx))
     }
 
+    /// `statsTrackingChunkSeriesSet.recordStatsToMetrics` for every block querier (Head and
+    /// persisted blocks) of a `QueryStream` select. Estimates are only set by a cost-based plan;
+    /// without one they are 0 like Go's unset `QueryStats`.
+    pub(crate) fn observe_block_select_stats(&self, user_id: &str, sink: &BlockSelectStatsSink) {
+        let stats = std::mem::take(&mut *sink.lock());
+        if stats.is_empty() {
+            return;
+        }
+        let index = self.metrics.queried_series.with_label_values(&["single_block_index"]);
+        let filter = self.metrics.queried_series.with_label_values(&["single_block_filter"]);
+        let lp = &self.lookup_plan_metrics;
+        for st in stats {
+            index.observe(st.selected_postings as f64);
+            filter.observe(st.series as f64);
+            if st.series > 0 {
+                lp.filtered_ratio
+                    .with_label_values(&[user_id])
+                    .observe(st.selected_postings as f64 / st.series as f64);
+                lp.final_cardinality_ratio
+                    .with_label_values(&[user_id])
+                    .observe(0.0);
+            }
+            if st.selected_postings > 0 {
+                lp.intersection_size_ratio
+                    .with_label_values(&[user_id])
+                    .observe(0.0);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn select_chunk_series_for_query(
         &self,
@@ -962,20 +1049,22 @@ impl Ingester {
             .for_tenant(user_id)
             .out_of_order_time_window
             .0;
+        let select_stats = BlockSelectStatsSink::default();
         let mut chunk_series = if self
             .blocks_cfg
             .tsdb
             .index_lookup_planning
             .index_lookup_planning_enabled
         {
-            let planner: Arc<dyn LookupPlanner> = Arc::new(NoopPlanner);
+            let planner: Arc<dyn LookupPlanner> = db.head_lookup_planner();
             let mut planned_cq = PlannedTsdbChunkQuerier::new_with_unordered(
                 Arc::clone(&db.db),
                 start_timestamp_ms,
                 end_timestamp_ms,
                 planner,
                 ooo_window > 0,
-            );
+            )
+            .with_select_stats(Arc::clone(&select_stats));
             let select_hints = shard.map(|(shard_index, shard_count)| SelectHints {
                 shard_index,
                 shard_count,
@@ -1036,12 +1125,14 @@ impl Ingester {
                     .unordered_chunk_querier(start_timestamp_ms, end_timestamp_ms)
             } else {
                 db.db.chunk_querier(start_timestamp_ms, end_timestamp_ms)
-            };
+            }
+            .with_select_stats(Arc::clone(&select_stats));
             cq.select(true, matchers)
                 .map_err(|e| IngesterError::Internal {
                     message: format!("selecting series from ChunkQuerier: {e}"),
                 })?
         };
+        self.observe_block_select_stats(user_id, &select_stats);
 
         if let Some((shard_idx, shard_count)) = shard {
             chunk_series.retain(|cs| labels_stable_hash(&cs.labels) % shard_count == shard_idx);
@@ -1360,7 +1451,7 @@ impl Ingester {
     ) -> Result<ingesterpb::ExemplarQueryResponse, IngesterError> {
         let permit = self.start_read_request(md).await?;
         let res = self.query_exemplars_inner(md, user_id, req).await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -1420,7 +1511,7 @@ impl Ingester {
     ) -> Result<ingesterpb::LabelValuesResponse, IngesterError> {
         let permit = self.start_read_request(md).await?;
         let res = self.label_values_inner(md, user_id, req).await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -1474,7 +1565,7 @@ impl Ingester {
     ) -> Result<ingesterpb::LabelNamesResponse, IngesterError> {
         let permit = self.start_read_request(md).await?;
         let res = self.label_names_inner(md, user_id, req).await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -1534,7 +1625,7 @@ impl Ingester {
             create_user_stats(&db, req.count_method)
         }
         .await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -1555,7 +1646,7 @@ impl Ingester {
             }
             Ok(ingesterpb::UsersStatsResponse { stats })
         })();
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -1569,7 +1660,7 @@ impl Ingester {
         let res = self
             .metrics_for_label_matchers_inner(md, user_id, req)
             .await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -1634,7 +1725,7 @@ impl Ingester {
             );
             Ok(ingesterpb::MetricsMetadataResponse { metadata })
         })();
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -1648,7 +1739,7 @@ impl Ingester {
         let res = self
             .label_names_and_values_inner(md, user_id, req)
             .await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -1786,7 +1877,7 @@ impl Ingester {
         let res = self
             .label_values_cardinality_inner(md, user_id, req)
             .await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -1943,7 +2034,10 @@ impl Ingester {
         let permit = self.start_read_request(md).await?;
         let matchers = from_proto_matchers(&req.matchers)?;
         let (shard, matchers) = remove_shard_from_matchers(matchers)?;
-        self.enforce_read_consistency(md, user_id).await?;
+        if let Err(e) = self.enforce_read_consistency(md, user_id).await {
+            permit.finish(e.is_deadline_exceeded());
+            return Err(e);
+        }
 
         let Some(db) = self.get_tsdb(user_id) else {
             permit.finish(false);
@@ -2034,7 +2128,7 @@ impl Ingester {
     ) -> Result<Vec<ingesterpb::ActiveSeriesResponse>, IngesterError> {
         let permit = self.start_read_request(md).await?;
         let res = self.active_series_inner(md, user_id, req).await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -2117,6 +2211,20 @@ impl Ingester {
     ) -> Result<Vec<ingesterpb::SearchResultBatch>, IngesterError> {
         let (hints, matchers) =
             build_search_hints(req.filter.as_ref(), req.ordering, req.limit, &req.matchers)?;
+        self.handle_search_label_names_with_hints(md, user_id, req, hints, matchers)
+            .await
+    }
+
+    /// `SearchLabelNames` after its input was validated by [`build_search_hints`] (Go validates
+    /// before the tenant and the deferred read error mapping).
+    pub async fn handle_search_label_names_with_hints(
+        &self,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::SearchLabelNamesRequest,
+        hints: SearchHints,
+        matchers: Vec<LabelMatcher>,
+    ) -> Result<Vec<ingesterpb::SearchResultBatch>, IngesterError> {
         let permit = self.start_read_request(md).await?;
         let res = async {
             self.enforce_read_consistency(md, user_id).await?;
@@ -2150,7 +2258,7 @@ impl Ingester {
             Ok(batches)
         }
         .await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 
@@ -2162,6 +2270,20 @@ impl Ingester {
     ) -> Result<Vec<ingesterpb::SearchResultBatch>, IngesterError> {
         let (hints, matchers) =
             build_search_hints(req.filter.as_ref(), req.ordering, req.limit, &req.matchers)?;
+        self.handle_search_label_values_with_hints(md, user_id, req, hints, matchers)
+            .await
+    }
+
+    /// `SearchLabelValues` after its input was validated by [`build_search_hints`] (Go validates
+    /// before the tenant and the deferred read error mapping).
+    pub async fn handle_search_label_values_with_hints(
+        &self,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::SearchLabelValuesRequest,
+        hints: SearchHints,
+        matchers: Vec<LabelMatcher>,
+    ) -> Result<Vec<ingesterpb::SearchResultBatch>, IngesterError> {
         let permit = self.start_read_request(md).await?;
         let res = async {
             self.enforce_read_consistency(md, user_id).await?;
@@ -2196,7 +2318,7 @@ impl Ingester {
             Ok(batches)
         }
         .await;
-        permit.finish(false);
+        permit.finish(deadline_exceeded(&res));
         res
     }
 }
@@ -2292,6 +2414,7 @@ pub struct PlannedTsdbChunkQuerier {
     maxt: i64,
     planner: Arc<dyn LookupPlanner>,
     unordered: bool,
+    select_stats: Option<BlockSelectStatsSink>,
 }
 
 impl PlannedTsdbChunkQuerier {
@@ -2312,7 +2435,14 @@ impl PlannedTsdbChunkQuerier {
             maxt,
             planner,
             unordered,
+            select_stats: None,
         }
+    }
+
+    /// Records per block querier stats of every select into `sink`.
+    pub fn with_select_stats(mut self, sink: BlockSelectStatsSink) -> Self {
+        self.select_stats = Some(sink);
+        self
     }
 }
 
@@ -2339,11 +2469,14 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
             }
         };
 
-        let cq = if self.unordered {
+        let mut cq = if self.unordered {
             self.db.unordered_chunk_querier(self.mint, self.maxt)
         } else {
             self.db.chunk_querier(self.mint, self.maxt)
         };
+        if let Some(sink) = &self.select_stats {
+            cq = cq.with_select_stats(Arc::clone(sink));
+        }
         match cq.select(sort_series, &plan.index_matchers) {
             Ok(series) => {
                 let items = series

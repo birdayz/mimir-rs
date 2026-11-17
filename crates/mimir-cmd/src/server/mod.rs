@@ -219,6 +219,7 @@ impl Server {
             stats_tracking: cfg.grpc_server_stats_tracking_enabled,
             report_grpc_status: cfg.report_grpc_codes_in_instrumentation_label_enabled,
             cluster_validation: grpc_cv,
+            multitenancy_enabled: false,
         };
 
         let header_timeout = opt_duration(cfg.http_server_read_header_timeout);
@@ -253,6 +254,12 @@ impl Server {
 
     pub fn grpc_addr(&self) -> std::io::Result<SocketAddr> {
         self.grpc_listener.local_addr()
+    }
+
+    /// Mimir's `noauth.SetupAuthMiddleware` gRPC interceptors: with multitenancy enabled every
+    /// RPC outside `noGRPCAuthOn` must carry exactly one `x-scope-orgid`.
+    pub fn set_grpc_multitenancy(&mut self, enabled: bool) {
+        self.grpc_cfg.multitenancy_enabled = enabled;
     }
 
     /// Go `Server.Run`: serves `router` (wrapped in the dskit HTTP middleware) and the gRPC

@@ -16,6 +16,7 @@ use bytes::Bytes;
 use futures::Future;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request as HttpRequestMsg, Uri};
 use crate::modules::ModuleStates;
+use mimir_common::grpc_log::{GrpcErrorLog, GrpcErrorLogEntry};
 use mimir_proto::grpcutilpb::{extract_http_response, status_with_http_response};
 use mimir_proto::httpgrpcpb;
 use mimir_proto::httpgrpcpb::http_server::Http;
@@ -219,10 +220,16 @@ impl Http for HttpGrpcBridge {
         &self,
         request: Request<httpgrpcpb::HttpRequest>,
     ) -> Result<Response<httpgrpcpb::HttpResponse>, Status> {
+        let error_log = request.extensions().get::<GrpcErrorLog>().cloned();
         let req = request.into_inner();
 
-        let method = Method::from_bytes(req.method.as_bytes())
-            .map_err(|e| Status::invalid_argument(format!("invalid HTTP method: {e}")))?;
+        // `http.NewRequest("", ...)`: an empty method (the proto3 default) means GET.
+        let method = if req.method.is_empty() {
+            Method::GET
+        } else {
+            Method::from_bytes(req.method.as_bytes())
+                .map_err(|e| Status::invalid_argument(format!("invalid HTTP method: {e}")))?
+        };
 
         let uri = if req.url.is_empty() {
             Uri::from_static("/")
@@ -257,7 +264,7 @@ impl Http for HttpGrpcBridge {
 
         let code = resp.status().as_u16() as i32;
         let mut resp_headers = resp.headers().clone();
-        resp_headers.remove("x-donotlogerror");
+        let do_not_log_error = resp_headers.remove("x-donotlogerror").is_some();
         let error_msg_override = resp_headers
             .remove("x-errormessage")
             .and_then(|v| v.to_str().ok().map(str::to_string))
@@ -279,6 +286,16 @@ impl Http for HttpGrpcBridge {
             let msg = error_msg_override.unwrap_or_else(|| {
                 String::from_utf8_lossy(&http_resp.body).into_owned()
             });
+            if do_not_log_error {
+                // `middleware.DoNotLogError{Err: err}`: the gRPC log interceptor drops it.
+                if let Some(log) = &error_log {
+                    log.set(GrpcErrorLogEntry {
+                        err: format!("rpc error: code = Code({code}) desc = {msg}"),
+                        keep: false,
+                        reason: None,
+                    });
+                }
+            }
             return Err(status_with_http_response(&http_resp, msg));
         }
 
