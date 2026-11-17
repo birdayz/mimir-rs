@@ -672,7 +672,11 @@ impl HeadChunksReader {
         }
 
         let raw_enc = mmap[chk_start] & !OUT_OF_ORDER_MASK;
-        let encoding = Encoding::from_u8(raw_enc)?;
+        let encoding = Encoding::from_u8(raw_enc).map_err(|e| HeadChunksError::Corruption {
+            dir: self.dir.clone(),
+            file_index: seq as i64,
+            message: e.to_string(),
+        })?;
 
         let len_start = chk_start + CHUNK_ENCODING_SIZE;
         let len_slice = &mmap[len_start..(len_start + MAX_CHUNK_LENGTH_FIELD_SIZE).min(mmap.len())];
@@ -722,8 +726,13 @@ impl HeadChunksReader {
             });
         }
 
-        EncodedChunk::from_bytes(encoding, mmap[data_start..data_end].to_vec())
-            .map_err(HeadChunksError::Chunk)
+        EncodedChunk::from_bytes(encoding, mmap[data_start..data_end].to_vec()).map_err(|e| {
+            HeadChunksError::Corruption {
+                dir: self.dir.clone(),
+                file_index: seq as i64,
+                message: e.to_string(),
+            }
+        })
     }
 
     /// Iterates over every chunk across all head chunk files in ascending sequence order,
@@ -804,7 +813,11 @@ impl HeadChunksReader {
                     });
                 }
 
-                let num_samples = u16::from_be_bytes([mmap[idx], mmap[idx + 1]]);
+                let raw_num_samples = u16::from_be_bytes([mmap[idx], mmap[idx + 1]]);
+                let num_samples = match encoding {
+                    Encoding::HistogramSt | Encoding::FloatHistogramSt => raw_num_samples & 0x3FFF,
+                    _ => raw_num_samples,
+                };
                 idx += data_len;
 
                 let expected_crc =

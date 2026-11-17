@@ -73,7 +73,7 @@ pub fn add_interval(ivs: &mut Intervals, itv: Interval) {
         return;
     }
     let pos = ivs.partition_point(|x| x.mint < itv.mint);
-    if pos > 0 && ivs[pos - 1].maxt >= itv.mint - 1 {
+    if pos > 0 && ivs[pos - 1].maxt >= itv.mint.saturating_sub(1) {
         if ivs[pos - 1].maxt < itv.maxt {
             ivs[pos - 1].maxt = itv.maxt;
         }
@@ -85,7 +85,7 @@ pub fn add_interval(ivs: &mut Intervals, itv: Interval) {
 }
 
 fn coalesce_from(ivs: &mut Intervals, idx: usize) {
-    while idx + 1 < ivs.len() && ivs[idx].maxt >= ivs[idx + 1].mint - 1 {
+    while idx + 1 < ivs.len() && ivs[idx].maxt >= ivs[idx + 1].mint.saturating_sub(1) {
         if ivs[idx + 1].maxt > ivs[idx].maxt {
             ivs[idx].maxt = ivs[idx + 1].maxt;
         }

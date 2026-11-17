@@ -1608,6 +1608,92 @@ where
     write_res
 }
 
+fn trim_and_merge_chunks_per_chunk(
+    mut chunks: Vec<(ChunkMeta, std::sync::Arc<[Interval]>)>,
+    mint: i64,
+    maxt_inclusive: i64,
+) -> Result<Vec<ChunkMeta>, ChunkError> {
+    if chunks.is_empty() || mint > maxt_inclusive {
+        return Ok(Vec::new());
+    }
+
+    chunks.retain(|(c, tombs)| {
+        c.overlaps_closed_interval(mint, maxt_inclusive)
+            && !tombs
+                .iter()
+                .any(|iv| iv.is_subrange(c.min_time, c.max_time))
+    });
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    chunks.sort_by_key(|(c, _)| (c.min_time, c.ref_id));
+
+    let mut out = Vec::with_capacity(chunks.len());
+    let mut cluster: Vec<(ChunkMeta, std::sync::Arc<[Interval]>)> = Vec::new();
+    let mut cluster_max = i64::MIN;
+
+    let flush_cluster =
+        |cluster: &mut Vec<(ChunkMeta, std::sync::Arc<[Interval]>)>,
+         out: &mut Vec<ChunkMeta>|
+         -> Result<(), ChunkError> {
+            if cluster.is_empty() {
+                return Ok(());
+            }
+            if cluster.len() == 1 {
+                let Some((cm, tombs)) = cluster.pop() else {
+                    return Ok(());
+                };
+                if let Some(c) =
+                    reencode_single_chunk_filtered(cm, &tombs, mint, maxt_inclusive)?
+                {
+                    out.push(c);
+                }
+                return Ok(());
+            }
+            let mut streams = Vec::with_capacity(cluster.len());
+            for (cm, tombs) in cluster.drain(..) {
+                let Some(ref encoded) = cm.chunk else {
+                    continue;
+                };
+                let mut stream = Vec::new();
+                for s in decode_chunk_samples(encoded)? {
+                    if s.t < mint || s.t > maxt_inclusive {
+                        continue;
+                    }
+                    if !tombs.is_empty() && tombs.iter().any(|iv| iv.in_bounds(s.t)) {
+                        continue;
+                    }
+                    stream.push(s);
+                }
+                if !stream.is_empty() {
+                    streams.push(stream);
+                }
+            }
+            let merged = chain_sample_merge(streams);
+            if !merged.is_empty() {
+                out.extend(encode_iterable_chunks(&merged)?);
+            }
+            Ok(())
+        };
+
+    for (cm, tombs) in chunks {
+        if cluster.is_empty() {
+            cluster_max = cm.max_time;
+            cluster.push((cm, tombs));
+        } else if cm.min_time > cluster_max {
+            flush_cluster(&mut cluster, &mut out)?;
+            cluster_max = cm.max_time;
+            cluster.push((cm, tombs));
+        } else {
+            cluster_max = cluster_max.max(cm.max_time);
+            cluster.push((cm, tombs));
+        }
+    }
+    flush_cluster(&mut cluster, &mut out)?;
+    Ok(out)
+}
+
 /// Writes a single Prometheus ULID block directory into `dest` from sorted [`CompactionSeries`]
 /// over the half-open interval `[mint, maxt)`.
 ///
@@ -1648,6 +1734,18 @@ pub fn write_block_from_series(
     }
 
     prepared.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    write_prepared_block(dest, mint, maxt, prepared, compaction, out_of_order, segment_size)
+}
+
+fn write_prepared_block(
+    dest: &Path,
+    mint: i64,
+    maxt: i64,
+    prepared: Vec<(Labels, Vec<ChunkMeta>)>,
+    compaction: BlockMetaCompaction,
+    out_of_order: bool,
+    segment_size: usize,
+) -> Result<Option<BlockMeta>, CompactError> {
 
     let uid = Ulid::new();
     let final_dir = dest.join(uid.to_string());
@@ -1786,8 +1884,15 @@ pub fn compact_blocks(dest: &Path, blocks: &[&Block]) -> Result<Option<BlockMeta
         });
     }
 
-    // Collect all series grouped by Labels across all input blocks.
-    let mut series_map: std::collections::BTreeMap<Labels, (Vec<ChunkMeta>, Vec<Interval>)> =
+    if maxt <= mint {
+        return Ok(None);
+    }
+    let maxt_inclusive = maxt - 1;
+
+    // Collect all series grouped by Labels across all input blocks, keeping each block's
+    // tombstones scoped strictly to chunks from that block (matching Go LeveledCompactor).
+    type SeriesChunkList = Vec<(ChunkMeta, std::sync::Arc<[Interval]>)>;
+    let mut series_map: std::collections::BTreeMap<Labels, SeriesChunkList> =
         std::collections::BTreeMap::new();
 
     for b in blocks {
@@ -1799,24 +1904,33 @@ pub fn compact_blocks(dest: &Path, blocks: &[&Block]) -> Result<Option<BlockMeta
             .map_err(CompactError::Index)?;
         for id in all_ids {
             let (labels, mut chks) = idx.series(id)?;
+            let tombs: std::sync::Arc<[Interval]> = tomb_r.get(id).into();
+            // Skip reading chunk bytes if the chunk is already completely covered by this block's tombstones.
+            chks.retain(|c| !tombs.iter().any(|iv| iv.is_subrange(c.min_time, c.max_time)));
+            if chks.is_empty() {
+                continue;
+            }
             for c in &mut chks {
                 c.chunk = Some(chk_r.chunk(c.ref_id)?);
             }
-            let tombs = tomb_r.get(id);
             let entry = series_map.entry(labels).or_default();
-            entry.0.extend(chks);
-            entry.1.extend(tombs);
+            for c in chks {
+                entry.push((c, std::sync::Arc::clone(&tombs)));
+            }
         }
     }
 
-    let comp_series: Vec<CompactionSeries> = series_map
-        .into_iter()
-        .map(|(labels, (chunks, tombstones))| CompactionSeries {
-            labels,
-            chunks,
-            tombstones,
-        })
-        .collect();
+    let mut prepared: Vec<(Labels, Vec<ChunkMeta>)> = Vec::with_capacity(series_map.len());
+    for (labels, chks) in series_map {
+        let trimmed = trim_and_merge_chunks_per_chunk(chks, mint, maxt_inclusive)?;
+        if !trimmed.is_empty() {
+            prepared.push((labels, trimmed));
+        }
+    }
+    if prepared.is_empty() {
+        return Ok(None);
+    }
+    // BTreeMap already yields sorted Labels.
 
     let mut comp = BlockMetaCompaction {
         level: max_level + 1,
@@ -1830,7 +1944,7 @@ pub fn compact_blocks(dest: &Path, blocks: &[&Block]) -> Result<Option<BlockMeta
         comp.set_out_of_order();
     }
 
-    write_block_from_series(dest, mint, maxt, comp_series, comp, all_ooo, 0)
+    write_prepared_block(dest, mint, maxt, prepared, comp, all_ooo, 0)
 }
 
 #[cfg(test)]

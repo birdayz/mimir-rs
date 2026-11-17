@@ -273,6 +273,10 @@ impl CircularExemplarStorage {
             inner.validate_exemplar(entry, &e)
         };
         if let Err(err) = validation {
+            if err == ExemplarError::DuplicateExemplar {
+                // Duplicate exemplar, noop (Go `AddExemplar`).
+                return Ok(());
+            }
             if err == ExemplarError::OutOfOrderExemplar {
                 inner.out_of_order_count += 1;
                 self.metrics.out_of_order_exemplars.inc();
@@ -291,8 +295,8 @@ impl CircularExemplarStorage {
                 if ooo {
                     insertion = inner.find_insertion_index(&e, entry);
                     if inner.ts_at(insertion) == e.timestamp_ms {
-                        // Assume duplicate exemplar, noop.
-                        return Err(ExemplarError::DuplicateExemplar);
+                        // Assume duplicate exemplar, noop (Go `AddExemplar`).
+                        return Ok(());
                     }
                 }
                 (ooo, insertion)
@@ -425,74 +429,111 @@ impl CircularExemplarStorage {
         ret
     }
 
-    /// Iterates over all stored exemplars in buffer order.
+    /// Iterates over all stored exemplars in global ring-buffer ingestion order (oldest to newest),
+    /// matching Go `CircularExemplarStorage.IterateExemplars`.
     pub fn iterate_exemplars<F>(&self, mut f: F)
     where
         F: FnMut(&Labels, &Exemplar),
     {
         let inner = self.inner.read();
-        for entry in inner.index.values() {
-            let mut cur = entry.oldest;
-            while cur != NO_EXEMPLAR {
-                let Some(ex) = inner.exemplars[cur].exemplar.as_ref() else {
-                    break;
-                };
-                f(&entry.series_labels, ex);
-                cur = inner.exemplars[cur].next;
+        let len = inner.exemplars.len();
+        if len == 0 {
+            return;
+        }
+        let start = if len == inner.max_exemplars {
+            inner.next_index
+        } else {
+            0
+        };
+        for offset in 0..len {
+            let idx = (start + offset) % len;
+            let slot = &inner.exemplars[idx];
+            if let (Some(ref ex), Some(ref key)) = (&slot.exemplar, &slot.series_key) {
+                if let Some(entry) = inner.index.get(key) {
+                    f(&entry.series_labels, ex);
+                }
             }
         }
     }
 
-    /// Resizes the circular buffer, preserving the newest entries up to `new_size`.
+    /// Resizes the circular buffer while holding the write lock, preserving the newest entries
+    /// and their per-series linked-list order without re-validating or touching append counters
+    /// (matching Go `CircularExemplarStorage.Resize`).
     pub fn resize(&self, new_size: usize) -> usize {
         let mut inner = self.inner.write();
-        if new_size == inner.max_exemplars {
+        let old_max = inner.max_exemplars;
+        if new_size == old_max {
             return 0;
         }
 
-        // Collect all active exemplars in ingestion order (oldest -> newest).
-        let mut ordered: Vec<(Labels, Exemplar)> = Vec::new();
-        let cur_len = inner.exemplars.len();
-        if cur_len > 0 {
-            let start = if cur_len == inner.max_exemplars {
-                inner.next_index
-            } else {
-                0
-            };
-            for offset in 0..cur_len {
-                let pos = (start + offset) % cur_len;
-                if let (Some(ex), Some(key)) = (
-                    inner.exemplars[pos].exemplar.take(),
-                    inner.exemplars[pos].series_key.take(),
-                ) {
-                    if let Some(ent) = inner.index.get(&key) {
-                        ordered.push((ent.series_labels.clone(), ex));
-                    }
-                }
-            }
-        }
-
-        inner.exemplars.clear();
-        inner.exemplars.shrink_to_fit();
-        inner.max_exemplars = new_size;
-        inner.next_index = 0;
-        inner.index.clear();
         self.metrics.max_exemplars.set(new_size as f64);
-
         if new_size == 0 {
+            inner.exemplars.clear();
+            inner.exemplars.shrink_to_fit();
+            inner.max_exemplars = 0;
+            inner.next_index = 0;
+            inner.index.clear();
             self.compute_metrics(&inner);
             return 0;
         }
 
-        let skip = ordered.len().saturating_sub(new_size);
-        let kept = ordered.into_iter().skip(skip).collect::<Vec<_>>();
-        let migrated = kept.len();
-        self.compute_metrics(&inner);
-        drop(inner);
-
-        for (sl, ex) in kept {
-            let _ = self.add_exemplar(&sl, ex);
+        let cur_len = inner.exemplars.len();
+        if cur_len == 0 {
+            inner.max_exemplars = new_size;
+            inner.next_index = 0;
+            self.compute_metrics(&inner);
+            return 0;
         }
+
+        let start = if cur_len == old_max {
+            inner.next_index
+        } else {
+            0
+        };
+        let mut active_positions = Vec::with_capacity(cur_len);
+        for offset in 0..cur_len {
+            let pos = (start + offset) % cur_len;
+            if inner.exemplars[pos].series_key.is_some() {
+                active_positions.push(pos);
+            }
+        }
+
+        let drop_count = active_positions.len().saturating_sub(new_size);
+        for &pos in &active_positions[..drop_count] {
+            inner.remove_at(pos);
+        }
+
+        let kept = &active_positions[drop_count..];
+        let migrated = kept.len();
+        let mut slot_remap = vec![NO_EXEMPLAR; cur_len];
+        for (new_idx, &old_pos) in kept.iter().enumerate() {
+            slot_remap[old_pos] = new_idx;
+        }
+
+        let mut new_exemplars = Vec::with_capacity(migrated);
+        for &old_pos in kept {
+            let mut entry = std::mem::take(&mut inner.exemplars[old_pos]);
+            if entry.prev != NO_EXEMPLAR {
+                entry.prev = slot_remap[entry.prev];
+            }
+            if entry.next != NO_EXEMPLAR {
+                entry.next = slot_remap[entry.next];
+            }
+            new_exemplars.push(entry);
+        }
+        for idx_entry in inner.index.values_mut() {
+            if idx_entry.oldest != NO_EXEMPLAR {
+                idx_entry.oldest = slot_remap[idx_entry.oldest];
+            }
+            if idx_entry.newest != NO_EXEMPLAR {
+                idx_entry.newest = slot_remap[idx_entry.newest];
+            }
+        }
+
+        inner.exemplars = new_exemplars;
+        inner.max_exemplars = new_size;
+        inner.next_index = migrated % new_size;
+        self.compute_metrics(&inner);
         migrated
     }
 }
@@ -615,10 +656,14 @@ mod tests {
         store
             .add_exemplar(&s1, Exemplar::new(ex_lbls.clone(), 1.0, 100))
             .unwrap();
-        // Exact duplicate returns DuplicateExemplar
+        // Exact duplicate is a no-op (Ok(())) matching Go AddExemplar, while validate_exemplar still reports DuplicateExemplar
+        assert_eq!(
+            store.validate_exemplar(&s1, &Exemplar::new(ex_lbls.clone(), 1.0, 100)),
+            Err(ExemplarError::DuplicateExemplar)
+        );
         assert_eq!(
             store.add_exemplar(&s1, Exemplar::new(ex_lbls.clone(), 1.0, 100)),
-            Err(ExemplarError::DuplicateExemplar)
+            Ok(())
         );
         // Out of order when ooo window is 0
         assert_eq!(
@@ -678,7 +723,7 @@ mod tests {
         // Buffer full; OOO exemplar with the same timestamp as a stored one is a no-op.
         assert_eq!(
             store.add_exemplar(&s, Exemplar::new(l("c"), 3.0, 100)),
-            Err(ExemplarError::DuplicateExemplar)
+            Ok(())
         );
         let all: &[LabelMatcher] = &[];
         let res = store.select(0, 1000, &[all]);

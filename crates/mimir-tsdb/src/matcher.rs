@@ -309,29 +309,37 @@ impl FastRegexMatcher {
             });
         }
 
-        // Go `syntax.Parse(v, syntax.Perl|syntax.DotNL)`: reject exactly what Go rejects, with
-        // Go's error text.
-        crate::go_regexp_syntax::check(pattern)?;
+        // Go `syntax.Parse(v, syntax.Perl|syntax.DotNL)`: validate with Go's exact error text
+        // and translate Go RE2 dialect constructs into equivalent Rust `regex` syntax.
+        let translated = crate::go_regexp_syntax::translate_to_rust(pattern)?;
 
-        // Parse with Perl + DotNL (matching Go `syntax.Perl | syntax.DotNL`) first so any
-        // syntax error (like unbalanced parens) is caught before wrapping in `\A(?s:...)\z`.
+        // Parse translated pattern with DotNL (matching Go `syntax.Perl | syntax.DotNL`).
         let hir = ParserBuilder::new()
             .dot_matches_new_line(true)
             .build()
-            .parse(pattern)
+            .parse(&translated.pattern)
             .map_err(|e| MatcherError::InvalidRegex {
                 pattern: pattern.to_string(),
                 reason: e.to_string(),
             })?;
 
-        let anchored = format!(r"\A(?s:{pattern})\z");
+        let anchored = format!(r"\A(?s:{})\z", translated.pattern);
         let re = Regex::new(&anchored).map_err(|e| MatcherError::InvalidRegex {
             pattern: pattern.to_string(),
             reason: e.to_string(),
         })?;
 
-        let set_matches = find_set_matches(&hir);
-        let (prefix, suffix, contains) = extract_concat_hints(&hir);
+        // Go `regexp.go:126` only populates `set_matches` when case-sensitive.
+        let set_matches = if translated.has_case_insensitive {
+            None
+        } else {
+            find_set_matches(&hir)
+        };
+        let (prefix, suffix, contains) = if translated.has_case_insensitive {
+            (String::new(), String::new(), Vec::new())
+        } else {
+            extract_concat_hints(&hir)
+        };
 
         let strategy = if let Some(ref matches) = set_matches {
             if matches.len() == 1 {
@@ -339,8 +347,8 @@ impl FastRegexMatcher {
             } else {
                 build_multi_strategy(matches.clone())
             }
-        } else if let Some(fast) = strategy_from_hir(&hir) {
-            fast
+        } else if !translated.has_case_insensitive {
+            strategy_from_hir(&hir).unwrap_or(Strategy::Regex(re.clone()))
         } else {
             Strategy::Regex(re.clone())
         };
@@ -418,18 +426,24 @@ fn optimize_alternating_literals(pattern: &str) -> Option<(Strategy, Option<Vec<
         return None;
     }
 
+    let mut seen = HashSet::new();
     let mut values = Vec::new();
     for part in pattern.split('|') {
         if !is_go_literal(part) {
             return None;
         }
-        values.push(part.to_string());
+        if seen.insert(part) {
+            values.push(part.to_string());
+        }
     }
     let set = if values.len() < MAX_SET_MATCHES {
         Some(values.clone())
     } else {
         None
     };
+    if values.len() == 1 {
+        return Some((Strategy::Equal(values[0].clone()), set));
+    }
     Some((build_multi_strategy(values), set))
 }
 
@@ -509,6 +523,9 @@ fn extract_concat_hints(hir: &Hir) -> (String, String, Vec<String>) {
 
 fn find_set_matches(hir: &Hir) -> Option<Vec<String>> {
     let hir = strip_capture(hir);
+    if matches!(hir.kind(), HirKind::Empty) {
+        return None;
+    }
     match hir.kind() {
         HirKind::Concat(subs) => {
             let subs = strip_outer_anchors(subs);

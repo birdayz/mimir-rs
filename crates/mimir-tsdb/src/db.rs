@@ -912,10 +912,15 @@ impl TsdbInner {
     /// `enable_bigger_ooo_block_for_old_samples`, aligned 24h blocks for the days before the
     /// in-order head's max time).
     fn compact_ooo_head_locked(&self) -> Result<Vec<Ulid>, TsdbError> {
-        let (candidates, ooo_mint, ooo_maxt) = self.head.collect_ooo_compaction_candidates()?;
-        if candidates.is_empty() || ooo_mint > ooo_maxt {
+        let snap = self.head.collect_ooo_compaction_candidates_with_watermark()?;
+        if snap.candidates.is_empty() || snap.min_time > snap.max_time {
+            self.head
+                .truncate_ooo(snap.last_wbl_file, snap.last_mmap_ref)?;
             return Ok(Vec::new());
         }
+        let ooo_mint = snap.min_time;
+        let ooo_maxt = snap.max_time;
+        let max_mmap_ref = snap.last_mmap_ref;
         tracing::info!("out-of-order compaction started");
         let start = Instant::now();
         let block_size = self.head.options().chunk_range_ms;
@@ -930,13 +935,18 @@ impl TsdbInner {
                         &self.dir,
                         mint,
                         maxt,
-                        candidates.clone(),
+                        snap.candidates.clone(),
                         compaction,
                         true,
                         self.opts.max_block_chunk_segment_size,
                         |ref_id, chks, tombs| {
                             self.head
-                                .load_series_ooo_chunks_into(ref_id, chks, tombs)
+                                .load_series_ooo_chunks_into_up_to(
+                                    ref_id,
+                                    max_mmap_ref,
+                                    chks,
+                                    tombs,
+                                )
                                 .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
                         },
                     )
@@ -993,7 +1003,8 @@ impl TsdbInner {
             }
             return Err(TsdbError::Other(msg));
         }
-        self.head.clear_ooo_data_before(ooo_maxt)?;
+        self.head
+            .truncate_ooo(snap.last_wbl_file, snap.last_mmap_ref)?;
         Ok(ulids)
     }
 
