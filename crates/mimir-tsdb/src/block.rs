@@ -410,6 +410,12 @@ impl Block {
         self.total_size
     }
 
+    /// Go `Block.GetSymbolTableSize` (`index.Reader.SymbolTableSize`).
+    #[inline]
+    pub fn symbol_table_size(&self) -> u64 {
+        self.index.symbol_table_size()
+    }
+
     #[inline]
     pub fn overlaps_closed_interval(&self, mint: i64, maxt: i64) -> bool {
         self.meta.overlaps_closed_interval(mint, maxt)

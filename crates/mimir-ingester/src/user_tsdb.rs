@@ -19,7 +19,7 @@ use mimir_storage::bucket::{tenant_deletion_mark_exists, BucketClient};
 use mimir_storage::ingest::{OffsetCatalogue, OffsetCatalogueMetrics};
 use mimir_storage::shipper::{read_shipped_blocks, Shipper, ShipperError, ShipperMetrics, SourceType};
 use mimir_tsdb::chunkenc::Encoding;
-use mimir_tsdb::db::{Tsdb, TsdbError, TsdbOptions};
+use mimir_tsdb::db::{BlocksToDeleteFn, Tsdb, TsdbError, TsdbOptions};
 use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::metadata::MetadataLimits;
@@ -312,9 +312,8 @@ pub struct UserTsdb {
     pub pending_series_removals: Arc<AtomicI64>,
     pub last_series_removal_ms: AtomicI64,
 
-    block_min_retention: Duration,
     block_duration_ms: i64,
-    shipped_blocks: Mutex<HashMap<Ulid, SystemTime>>,
+    shipped_blocks: Arc<Mutex<HashMap<Ulid, SystemTime>>>,
 
     owned_state: Arc<Mutex<OwnedSeriesState>>,
     owned_token_ranges: Mutex<Vec<u32>>,
@@ -419,9 +418,15 @@ impl UserTsdb {
             } else {
                 CompressionType::None
             },
-            wal_segment_size: blocks_cfg.tsdb.wal_segment_size_bytes.max(1024) as usize,
+            // Go `wlog.NewSize` rejects sizes that are not a multiple of the 32 KiB page.
+            wal_segment_size: blocks_cfg.tsdb.wal_segment_size_bytes.max(0) as usize,
             wal_replay_concurrency,
             max_head_chunk_file_size: mimir_tsdb::head_chunks::MAX_HEAD_CHUNK_FILE_SIZE,
+            head_chunks_write_queue_size: blocks_cfg.tsdb.head_chunks_write_queue_size.max(0)
+                as usize,
+            head_chunks_write_buffer_size: blocks_cfg.tsdb.head_chunks_write_buffer_size_bytes.max(0)
+                as usize,
+            timely_compaction: blocks_cfg.tsdb.timely_head_compaction_enabled,
             metadata_limits: MetadataLimits {
                 max_metrics_with_metadata_per_user: limiter.max_metadata_per_user(&user_id),
                 max_metadata_per_metric: limiter.max_metadata_per_metric(&user_id),
@@ -430,10 +435,52 @@ impl UserTsdb {
             registry: tsdb_prom_reg,
         };
 
+        // Go `blocksToDelete` closure + `userTSDB.blocksToDelete`: nothing is deleted until
+        // the TSDB is ready (after the post-replay compaction); then only blocks deletable by
+        // Prometheus' default rules (compacted / beyond `retention_period`) that were shipped
+        // (or, without shipping, created) more than `retention_period` ago.
+        let block_min_retention = Duration::from_nanos(
+            blocks_cfg.tsdb.retention_period.as_nanos().max(0) as u64,
+        );
+        let shipping_enabled = blocks_cfg.tsdb.ship_interval.0 > 0;
+        let has_shipper = shipping_enabled && bucket.is_some();
+        let shipped_blocks: Arc<Mutex<HashMap<Ulid, SystemTime>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let user_db_ready = Arc::new(AtomicBool::new(false));
+        let blocks_to_delete: BlocksToDeleteFn = {
+            let shipped_blocks = Arc::clone(&shipped_blocks);
+            let user_db_ready = Arc::clone(&user_db_ready);
+            Arc::new(move |blocks, default_blocks_to_delete| {
+                if !user_db_ready.load(Ordering::Acquire) {
+                    return HashSet::new();
+                }
+                let deletable = default_blocks_to_delete(blocks);
+                let deadline = SystemTime::now()
+                    .checked_sub(block_min_retention)
+                    .unwrap_or(UNIX_EPOCH);
+                if has_shipper {
+                    let shipped = shipped_blocks.lock();
+                    return deletable
+                        .into_iter()
+                        .filter(|id| shipped.get(id).is_some_and(|&t| t < deadline))
+                        .collect();
+                }
+                deletable
+                    .into_iter()
+                    .filter(|id| UNIX_EPOCH + Duration::from_millis(id.timestamp_ms()) < deadline)
+                    .collect()
+            })
+        };
+
         let tsdb_opts = TsdbOptions {
             head: head_opts,
             max_block_chunk_segment_size: 0,
             no_lockfile: true,
+            retention_duration_ms: block_min_retention.as_millis() as i64,
+            blocks_to_delete: Some(blocks_to_delete),
+            enable_bigger_ooo_block_for_old_samples: blocks_cfg
+                .tsdb
+                .bigger_out_of_order_blocks_for_old_samples,
         };
 
         let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
@@ -459,7 +506,6 @@ impl UserTsdb {
             }
         }
 
-        let shipping_enabled = blocks_cfg.tsdb.ship_interval.0 > 0;
         let shipper: Option<Arc<dyn BlockShipper>> = if shipping_enabled {
             bucket.map(|b| {
                 let ooo_ext = tenant_limits.out_of_order_blocks_external_label_enabled;
@@ -476,17 +522,15 @@ impl UserTsdb {
             None
         };
 
-        let shipped_blocks = if shipper.is_some() {
-            read_shipped_blocks(&udir)
+        if shipper.is_some() {
+            *shipped_blocks.lock() = read_shipped_blocks(&udir)
                 .map(|m| {
                     m.into_iter()
                         .map(|(k, mt)| (k, UNIX_EPOCH + Duration::from_millis(mt.0.max(0) as u64)))
                         .collect()
                 })
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
+                .unwrap_or_default();
+        }
 
         let offset_catalogue = if blocks_cfg.tsdb.offset_catalogue.enabled {
             Some(OffsetCatalogue::new(
@@ -498,10 +542,6 @@ impl UserTsdb {
         } else {
             None
         };
-
-        let block_min_retention = Duration::from_nanos(
-            blocks_cfg.tsdb.retention_period.as_nanos().max(0) as u64,
-        );
 
         let user_tsdb = Arc::new(Self {
             user_id,
@@ -528,9 +568,8 @@ impl UserTsdb {
             last_early_compaction_ms: AtomicI64::new(0),
             pending_series_removals,
             last_series_removal_ms: AtomicI64::new(0),
-            block_min_retention,
             block_duration_ms,
-            shipped_blocks: Mutex::new(shipped_blocks),
+            shipped_blocks,
             owned_state,
             owned_token_ranges: Mutex::new(Vec::new()),
             requires_owned_series_update: Mutex::new(Some(
@@ -542,6 +581,7 @@ impl UserTsdb {
             ),
             lifecycle_adapter,
         });
+        user_db_ready.store(true, Ordering::Release);
 
         Ok(user_tsdb)
     }
@@ -776,69 +816,11 @@ impl UserTsdb {
         }
     }
 
-    /// Compact ready blocks via normal Prometheus TSDB compaction.
+    /// Compact ready blocks via normal Prometheus TSDB compaction. Obsolete / retention-
+    /// expired blocks are deleted by the TSDB on every block reload through the
+    /// `blocks_to_delete` filter (Go `userTSDB.blocksToDelete`).
     pub fn compact(&self) -> Result<Vec<Ulid>, TsdbError> {
-        let mut created = self.db.compact()?;
-        // Also delete blocks past retention if already shipped
-        self.delete_expired_blocks();
-        let _ = &mut created;
-        Ok(created)
-    }
-
-    fn delete_expired_blocks(&self) {
-        let retention_ms = self.block_min_retention.as_millis() as i64;
-        if retention_ms <= 0 {
-            return;
-        }
-        let mut blocks = self.db.blocks();
-        if blocks.len() <= 1 {
-            return;
-        }
-        // Sort by max_time descending matching Prometheus `BeyondTimeRetention`.
-        blocks.sort_by_key(|b| std::cmp::Reverse(b.max_time()));
-        let newest_max_time = blocks[0].max_time();
-        let mut time_deletable = HashSet::new();
-        for (i, blk) in blocks.iter().enumerate() {
-            if i > 0 && newest_max_time - blk.max_time() >= retention_ms {
-                for b in &blocks[i..] {
-                    time_deletable.insert(b.ulid());
-                }
-                break;
-            }
-        }
-        if time_deletable.is_empty() {
-            return;
-        }
-
-        let cutoff = SystemTime::now()
-            .checked_sub(self.block_min_retention)
-            .unwrap_or(UNIX_EPOCH);
-        let has_shipper = self.shipper.read().is_some();
-        let shipped = self.shipped_blocks.lock().clone();
-        let mut any_deleted = false;
-
-        for blk in &blocks {
-            let uid = blk.ulid();
-            if !time_deletable.contains(&uid) {
-                continue;
-            }
-            let eligible = if has_shipper {
-                shipped.get(&uid).is_some_and(|&ts| ts < cutoff)
-            } else {
-                let created = UNIX_EPOCH + Duration::from_millis(uid.timestamp_ms());
-                created < cutoff
-            };
-            if eligible {
-                let dir = blk.dir().to_path_buf();
-                if std::fs::remove_dir_all(dir).is_ok() {
-                    any_deleted = true;
-                }
-            }
-        }
-
-        if any_deleted {
-            let _ = self.db.reload_blocks();
-        }
+        self.db.compact()
     }
 
     /// Force-compact TSDB head up to `forced_compaction_max_time` (or `i64::MAX` for full flush).

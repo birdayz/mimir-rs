@@ -174,6 +174,7 @@ pub struct WlogWriter {
     compress: CompressionType,
     closed: bool,
     comp_buf: Vec<u8>,
+    metrics: Option<crate::metrics::WlogMetrics>,
 }
 
 impl WlogWriter {
@@ -209,6 +210,7 @@ impl WlogWriter {
             compress,
             closed: false,
             comp_buf: Vec::new(),
+            metrics: None,
         })
     }
 
@@ -226,6 +228,30 @@ impl WlogWriter {
         &self.dir
     }
 
+    /// Attaches Go `wlog.wlMetrics` (registered by the caller with the WAL/WBL prefix).
+    pub fn set_metrics(&mut self, metrics: crate::metrics::WlogMetrics) {
+        if let Some(seg) = self.segment.as_ref() {
+            metrics.current_segment.set(seg.index as f64);
+        }
+        self.metrics = Some(metrics);
+    }
+
+    fn set_current_segment_metric(&self, index: usize) {
+        if let Some(m) = self.metrics.as_ref() {
+            m.current_segment.set(index as f64);
+        }
+    }
+
+    /// Go `WL.fsync`: fsyncs a segment file observing `fsync_duration_seconds`.
+    fn fsync_file(metrics: Option<&crate::metrics::WlogMetrics>, f: &File) -> io::Result<()> {
+        let start = std::time::Instant::now();
+        let res = f.sync_all();
+        if let Some(m) = metrics {
+            m.fsync_duration.observe(start.elapsed().as_secs_f64());
+        }
+        res
+    }
+
     #[inline]
     pub fn compression(&self) -> CompressionType {
         self.compress
@@ -237,6 +263,9 @@ impl WlogWriter {
     }
 
     fn flush_page(&mut self, force_clear: bool) -> Result<(), WlogError> {
+        if let Some(m) = self.metrics.as_ref() {
+            m.page_flushes.inc();
+        }
         let seg = self.segment.as_mut().ok_or(WlogError::Closed)?;
         let should_clear = force_clear || self.page.full();
         if should_clear {
@@ -263,6 +292,9 @@ impl WlogWriter {
         if should_clear {
             self.page.reset();
             self.done_pages += 1;
+            if let Some(m) = self.metrics.as_ref() {
+                m.page_completions.inc();
+            }
         }
         Ok(())
     }
@@ -277,12 +309,13 @@ impl WlogWriter {
         }
         let prev = self.segment.take().ok_or(WlogError::Closed)?;
         let next_idx = prev.index + 1;
-        prev.file.sync_all()?;
+        Self::fsync_file(self.metrics.as_ref(), &prev.file)?;
         drop(prev);
 
         let next = Self::create_segment(&self.dir, next_idx)?;
         self.done_pages = (next.file.metadata()?.len() as usize) / PAGE_SIZE;
         self.segment = Some(next);
+        self.set_current_segment_metric(next_idx);
         Ok(next_idx)
     }
 
@@ -292,7 +325,12 @@ impl WlogWriter {
             return Err(WlogError::Closed);
         }
         for (i, &rec) in recs.iter().enumerate() {
-            self.log_one(rec, i + 1 == recs.len())?;
+            if let Err(e) = self.log_one(rec, i + 1 == recs.len()) {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.writes_failed.inc();
+                }
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -410,19 +448,31 @@ impl WlogWriter {
         Ok((seg, offset))
     }
 
+    /// Go `WL.Truncate`: drops all segments before `before_segment`.
     pub fn truncate(&self, before_segment: usize) -> Result<(), WlogError> {
-        for r in list_segments(&self.dir)? {
-            if r.index >= before_segment {
-                break;
-            }
-            fs::remove_file(self.dir.join(&r.name))?;
+        if let Some(m) = self.metrics.as_ref() {
+            m.truncate_total.inc();
         }
-        Ok(())
+        let res = (|| {
+            for r in list_segments(&self.dir)? {
+                if r.index >= before_segment {
+                    break;
+                }
+                fs::remove_file(self.dir.join(&r.name))?;
+            }
+            Ok(())
+        })();
+        if res.is_err() {
+            if let Some(m) = self.metrics.as_ref() {
+                m.truncate_fail.inc();
+            }
+        }
+        res
     }
 
     pub fn sync(&mut self) -> Result<(), WlogError> {
         if let Some(seg) = self.segment.as_ref() {
-            seg.file.sync_all()?;
+            Self::fsync_file(self.metrics.as_ref(), &seg.file)?;
         }
         Ok(())
     }
@@ -445,7 +495,7 @@ impl WlogWriter {
                 self.flush_page(true)?;
             }
             if let Some(seg) = self.segment.take() {
-                seg.file.sync_all()?;
+                Self::fsync_file(self.metrics.as_ref(), &seg.file)?;
             }
         }
         self.closed = true;
@@ -541,6 +591,7 @@ impl WlogWriter {
         self.done_pages = (next.file.metadata()?.len() as usize) / PAGE_SIZE;
         self.segment = Some(next);
         self.page.reset();
+        self.set_current_segment_metric(corrupt_segment + 1);
         crate::block::sync_dir(&self.dir)?;
         Ok(())
     }
@@ -1011,14 +1062,24 @@ pub fn read_min_valid_time(dir: &Path) -> Result<Option<i64>, WlogError> {
 }
 
 /// Deletes all checkpoints in `dir` with index `< max_index`.
+/// Go `wlog.DeleteCheckpoints`: removes every checkpoint below `max_index`, attempting all
+/// of them and returning the first error (Go joins them).
 pub fn delete_checkpoints(dir: &Path, max_index: usize) -> Result<(), WlogError> {
+    let mut first_err = None;
     for cp in list_checkpoints(dir)? {
         if cp.index >= max_index {
             break;
         }
-        fs::remove_dir_all(dir.join(&cp.name))?;
+        if let Err(e) = fs::remove_dir_all(dir.join(&cp.name)) {
+            if e.kind() != io::ErrorKind::NotFound && first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(WlogError::Io(e)),
+        None => Ok(()),
+    }
 }
 
 /// Removes any leftover `checkpoint.*.tmp` directories in `dir`.

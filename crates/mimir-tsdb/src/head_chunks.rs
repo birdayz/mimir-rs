@@ -153,6 +153,8 @@ fn repair_last_chunk_file(files: &mut BTreeMap<usize, PathBuf>) -> Result<(), He
 pub struct HeadChunksWriter {
     dir: PathBuf,
     max_file_size: usize,
+    write_buffer_size: usize,
+    queue_metrics: Option<crate::metrics::ChunkWriteQueueMetrics>,
     seq: usize,
     offset: usize,
     cur_writer: Option<BufWriter<File>>,
@@ -168,6 +170,15 @@ impl HeadChunksWriter {
         dir: impl AsRef<Path>,
         max_file_size: usize,
     ) -> Result<Self, HeadChunksError> {
+        Self::with_options(dir, max_file_size, DEFAULT_WRITE_BUFFER_SIZE)
+    }
+
+    /// Opens the writer with Go `HeadChunksWriteBufferSize` (`write_buffer_size`).
+    pub fn with_options(
+        dir: impl AsRef<Path>,
+        max_file_size: usize,
+        write_buffer_size: usize,
+    ) -> Result<Self, HeadChunksError> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
@@ -178,6 +189,8 @@ impl HeadChunksWriter {
         Ok(Self {
             dir,
             max_file_size,
+            write_buffer_size: write_buffer_size.max(1),
+            queue_metrics: None,
             seq,
             offset: 0,
             cur_writer: None,
@@ -207,7 +220,7 @@ impl HeadChunksWriter {
         f.write_all(&hdr)?;
         f.flush()?;
 
-        self.cur_writer = Some(BufWriter::with_capacity(DEFAULT_WRITE_BUFFER_SIZE, f));
+        self.cur_writer = Some(BufWriter::with_capacity(self.write_buffer_size, f));
         self.offset = HEAD_CHUNK_FILE_HEADER_SIZE;
         Ok(())
     }
@@ -263,7 +276,16 @@ impl HeadChunksWriter {
         w.write_all(&crc.to_be_bytes())?;
 
         self.offset += needed;
+        if let Some(m) = self.queue_metrics.as_ref() {
+            m.adds.inc();
+            m.completed.inc();
+        }
         Ok(ChunkDiskMapperRef::new(self.seq as u32, chunk_offset as u32))
+    }
+
+    /// Attaches the Go `chunk_write_queue` operation counters.
+    pub fn set_queue_metrics(&mut self, m: crate::metrics::ChunkWriteQueueMetrics) {
+        self.queue_metrics = Some(m);
     }
 
     pub fn flush(&mut self) -> Result<(), HeadChunksError> {

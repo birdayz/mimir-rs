@@ -18,10 +18,6 @@ use std::time::Instant;
 use bytes::Bytes;
 use hashbrown::HashTable;
 use parking_lot::{Mutex, RwLock};
-use prometheus::core::{Collector, Desc};
-use prometheus::proto::{
-    Metric, MetricFamily, MetricType as PromMetricType, Quantile, Summary as ProtoSummary,
-};
 use prometheus::{CounterVec, Histogram as PromHistogram, HistogramOpts, Opts, Registry};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -60,8 +56,8 @@ use crate::record::{
 use crate::symbols::{SymbolId, SymbolTable};
 use crate::tombstones::{is_completely_deleted, Interval, MemTombstones};
 use crate::wlog::{
-    checkpoint_dir, create_checkpoint, decompress_record_into, delete_checkpoints,
-    delete_temp_checkpoints, last_checkpoint, read_min_valid_time, segments_range,
+    create_checkpoint, decompress_record_into, delete_checkpoints,
+    delete_temp_checkpoints, last_checkpoint, segments_range,
     CompressionType, SegmentRange, SegmentTracker, WlogError, WlogReader, WlogWriter,
     DEFAULT_SEGMENT_SIZE, WBL_DIR_NAME,
 };
@@ -147,6 +143,13 @@ pub struct HeadOptions {
     pub wal_segment_size: usize,
     pub wal_replay_concurrency: usize,
     pub max_head_chunk_file_size: usize,
+    /// Go `HeadChunksWriteQueueSize`: m-mapped chunks are written synchronously in Rust;
+    /// a non-zero size registers the Go `chunk_write_queue` operation counters.
+    pub head_chunks_write_queue_size: usize,
+    /// Go `HeadChunksWriteBufferSize`: `chunks_head` writer buffer size in bytes.
+    pub head_chunks_write_buffer_size: usize,
+    /// Go `Options.TimelyCompaction` (Mimir `timely_head_compaction_enabled`, default off).
+    pub timely_compaction: bool,
     pub metadata_limits: MetadataLimits,
     pub series_lifecycle_callback: Option<Arc<dyn SeriesLifecycleCallback>>,
     pub registry: Option<Arc<prometheus::Registry>>,
@@ -172,6 +175,15 @@ impl std::fmt::Debug for HeadOptions {
             .field("wal_segment_size", &self.wal_segment_size)
             .field("wal_replay_concurrency", &self.wal_replay_concurrency)
             .field("max_head_chunk_file_size", &self.max_head_chunk_file_size)
+            .field(
+                "head_chunks_write_queue_size",
+                &self.head_chunks_write_queue_size,
+            )
+            .field(
+                "head_chunks_write_buffer_size",
+                &self.head_chunks_write_buffer_size,
+            )
+            .field("timely_compaction", &self.timely_compaction)
             .field("metadata_limits", &self.metadata_limits)
             .field(
                 "series_lifecycle_callback",
@@ -199,6 +211,9 @@ impl Default for HeadOptions {
             wal_segment_size: DEFAULT_SEGMENT_SIZE,
             wal_replay_concurrency: 0,
             max_head_chunk_file_size: MAX_HEAD_CHUNK_FILE_SIZE,
+            head_chunks_write_queue_size: 0,
+            head_chunks_write_buffer_size: crate::head_chunks::DEFAULT_WRITE_BUFFER_SIZE,
+            timely_compaction: false,
             metadata_limits: MetadataLimits::default(),
             series_lifecycle_callback: None,
             registry: None,
@@ -1661,72 +1676,6 @@ pub type SeriesChunkMetasNoBytes = Option<(Labels, SmallVec<[(i64, i64); 4]>, bo
 /// Lightweight candidate list + `[min_time, max_time_inclusive]` range for streaming compaction.
 pub type CompactionCandidatesRange = (Vec<(u64, Labels)>, i64, i64);
 
-struct WalFsyncSummaryInner {
-    desc: Desc,
-    state: Mutex<(u64, f64)>,
-}
-
-#[derive(Clone)]
-struct WalFsyncSummary(Arc<WalFsyncSummaryInner>);
-
-impl WalFsyncSummary {
-    fn new(reg: Option<&Registry>) -> Self {
-        let desc = Desc::new(
-            "prometheus_tsdb_wal_fsync_duration_seconds".to_string(),
-            "Duration of write log fsync.".to_string(),
-            vec![],
-            HashMap::new(),
-        )
-        .expect("valid wal fsync summary desc");
-        let s = Self(Arc::new(WalFsyncSummaryInner {
-            desc,
-            state: Mutex::new((0, 0.0)),
-        }));
-        if let Some(r) = reg {
-            let _ = r.register(Box::new(s.clone()));
-        }
-        s
-    }
-
-    fn observe(&self, secs: f64) {
-        let mut g = self.0.state.lock();
-        g.0 += 1;
-        g.1 += secs;
-    }
-}
-
-impl Collector for WalFsyncSummary {
-    fn desc(&self) -> Vec<&Desc> {
-        vec![&self.0.desc]
-    }
-
-    fn collect(&self) -> Vec<MetricFamily> {
-        let (count, sum) = *self.0.state.lock();
-        let mut s = ProtoSummary::default();
-        s.set_sample_count(count);
-        s.set_sample_sum(sum);
-        let qs: Vec<Quantile> = [0.5, 0.9, 0.99]
-            .into_iter()
-            .map(|qv| {
-                let mut q = Quantile::default();
-                q.set_quantile(qv);
-                q.set_value(f64::NAN);
-                q
-            })
-            .collect();
-        s.set_quantile(qs.into());
-
-        let mut m = Metric::default();
-        m.set_summary(s);
-        let mut mf = MetricFamily::default();
-        mf.set_name(self.0.desc.fq_name.clone());
-        mf.set_help(self.0.desc.help.clone());
-        mf.set_field_type(PromMetricType::SUMMARY);
-        mf.set_metric(vec![m].into());
-        vec![mf]
-    }
-}
-
 /// Maps a WAL/WBL record decode error to a repairable `wlog.CorruptionErr` positioned at
 /// the reader's current segment/offset (Go `loadWAL` / `loadWBL`).
 fn record_decode_corruption<R: io::Read + SegmentTracker>(
@@ -1741,6 +1690,27 @@ fn record_decode_corruption<R: io::Read + SegmentTracker>(
     })
 }
 
+/// Go `loadWAL` / `loadWBL` unknown series reference accounting (per replay pass; Go
+/// accounts per WAL segment).
+#[derive(Default)]
+struct UnknownRefs {
+    samples: AtomicU64,
+    histograms: AtomicU64,
+    exemplars: AtomicU64,
+    metadata: AtomicU64,
+    tombstones: AtomicU64,
+    mmap_markers: AtomicU64,
+    series: Mutex<HashSet<u64>>,
+}
+
+impl UnknownRefs {
+    #[cold]
+    fn miss(&self, kind: &AtomicU64, series_ref: u64) {
+        kind.fetch_add(1, Ordering::Relaxed);
+        self.series.lock().insert(series_ref);
+    }
+}
+
 /// Result of [`Head::load_mmapped_chunks`] (Go `mmappedChunks`, `oooMmappedChunks`, `lastMmapRef`).
 #[derive(Default)]
 struct MmappedLoad {
@@ -1749,17 +1719,38 @@ struct MmappedLoad {
     last_ref: ChunkDiskMapperRef,
 }
 
+/// Go `headMetrics` (the subset Mimir aggregates in `TSDBMetrics`, plus the related
+/// counters), registered on the per-tenant registry.
 struct HeadMetrics {
     mmap_chunk_corruptions_total: prometheus::Counter,
     wal_corruptions_total: prometheus::Counter,
     ooo_samples_appended: CounterVec,
     ooo_histogram: PromHistogram,
-    wal_fsync_duration: WalFsyncSummary,
     active_appenders: prometheus::Gauge,
+    chunks: prometheus::Gauge,
+    chunks_created: prometheus::Counter,
+    chunks_removed: prometheus::Counter,
+    series_not_found: prometheus::Counter,
+    gc_duration: crate::metrics::Summary,
+    wal_truncate_duration: crate::metrics::Summary,
+    head_truncate_fail: prometheus::Counter,
+    head_truncate_total: prometheus::Counter,
+    checkpoint_delete_fail: prometheus::Counter,
+    checkpoint_delete_total: prometheus::Counter,
+    checkpoint_creation_fail: prometheus::Counter,
+    checkpoint_creation_total: prometheus::Counter,
+    mmap_chunks_total: prometheus::Counter,
+    head_chunks_max_mmapped: prometheus::Gauge,
+    wal_replay_unknown_refs: CounterVec,
+    wbl_replay_unknown_refs: CounterVec,
+    wal: crate::metrics::WlogMetrics,
+    wbl: crate::metrics::WlogMetrics,
+    chunk_write_queue: Option<crate::metrics::ChunkWriteQueueMetrics>,
 }
 
 impl HeadMetrics {
-    fn new(reg: Option<&Registry>) -> Self {
+    fn new(reg: Option<&Registry>, chunk_write_queue_size: usize) -> Self {
+        use crate::metrics::{counter, counter_vec, gauge, summary};
         let ooo_samples_appended = CounterVec::new(
             Opts::new(
                 "prometheus_tsdb_head_out_of_order_samples_appended_total",
@@ -1787,38 +1778,148 @@ impl HeadMetrics {
             ]),
         )
         .expect("valid ooo histogram");
-
-        let active_appenders = prometheus::Gauge::new(
-            "prometheus_tsdb_head_active_appenders",
-            "Number of currently active appender transactions.",
-        )
-        .expect("valid active appenders gauge");
-        let mmap_chunk_corruptions_total = prometheus::Counter::new(
-            "prometheus_tsdb_mmap_chunk_corruptions_total",
-            "Total number of memory-mapped chunk corruptions.",
-        )
-        .expect("valid mmap chunk corruptions counter");
-        let wal_corruptions_total = prometheus::Counter::new(
-            "prometheus_tsdb_wal_corruptions_total",
-            "Total number of WAL corruptions.",
-        )
-        .expect("valid wal corruptions counter");
-
         if let Some(r) = reg {
             let _ = r.register(Box::new(ooo_samples_appended.clone()));
             let _ = r.register(Box::new(ooo_histogram.clone()));
-            let _ = r.register(Box::new(active_appenders.clone()));
-            let _ = r.register(Box::new(mmap_chunk_corruptions_total.clone()));
-            let _ = r.register(Box::new(wal_corruptions_total.clone()));
         }
-        let wal_fsync_duration = WalFsyncSummary::new(reg);
+
         Self {
-            mmap_chunk_corruptions_total,
-            wal_corruptions_total,
+            active_appenders: gauge(
+                reg,
+                "prometheus_tsdb_head_active_appenders",
+                "Number of currently active appender transactions.",
+            ),
+            mmap_chunk_corruptions_total: counter(
+                reg,
+                "prometheus_tsdb_mmap_chunk_corruptions_total",
+                "Total number of memory-mapped chunk corruptions.",
+            ),
+            wal_corruptions_total: counter(
+                reg,
+                "prometheus_tsdb_wal_corruptions_total",
+                "Total number of WAL corruptions.",
+            ),
             ooo_samples_appended,
             ooo_histogram,
-            wal_fsync_duration,
-            active_appenders,
+            chunks: gauge(reg, "prometheus_tsdb_head_chunks", "Total number of chunks in the head block."),
+            chunks_created: counter(
+                reg,
+                "prometheus_tsdb_head_chunks_created_total",
+                "Total number of chunks created in the head",
+            ),
+            chunks_removed: counter(
+                reg,
+                "prometheus_tsdb_head_chunks_removed_total",
+                "Total number of chunks removed in the head",
+            ),
+            series_not_found: counter(
+                reg,
+                "prometheus_tsdb_head_series_not_found_total",
+                "Total number of requests for series that were not found.",
+            ),
+            gc_duration: summary(
+                reg,
+                "prometheus_tsdb_head_gc_duration_seconds",
+                "Runtime of garbage collection in the head block.",
+                &[],
+            ),
+            wal_truncate_duration: summary(
+                reg,
+                "prometheus_tsdb_wal_truncate_duration_seconds",
+                "Duration of WAL truncation.",
+                &[],
+            ),
+            head_truncate_fail: counter(
+                reg,
+                "prometheus_tsdb_head_truncations_failed_total",
+                "Total number of head truncations that failed.",
+            ),
+            head_truncate_total: counter(
+                reg,
+                "prometheus_tsdb_head_truncations_total",
+                "Total number of head truncations attempted.",
+            ),
+            checkpoint_delete_fail: counter(
+                reg,
+                "prometheus_tsdb_checkpoint_deletions_failed_total",
+                "Total number of checkpoint deletions that failed.",
+            ),
+            checkpoint_delete_total: counter(
+                reg,
+                "prometheus_tsdb_checkpoint_deletions_total",
+                "Total number of checkpoint deletions attempted.",
+            ),
+            checkpoint_creation_fail: counter(
+                reg,
+                "prometheus_tsdb_checkpoint_creations_failed_total",
+                "Total number of checkpoint creations that failed.",
+            ),
+            checkpoint_creation_total: counter(
+                reg,
+                "prometheus_tsdb_checkpoint_creations_total",
+                "Total number of checkpoint creations attempted.",
+            ),
+            mmap_chunks_total: counter(
+                reg,
+                "prometheus_tsdb_mmap_chunks_total",
+                "Total number of chunks that were memory-mapped.",
+            ),
+            head_chunks_max_mmapped: gauge(
+                reg,
+                "prometheus_tsdb_head_chunks_max_mmapped",
+                "Maximum number of head chunks memory-mapped for any individual series during the last memory-mapping pass.",
+            ),
+            wal_replay_unknown_refs: counter_vec(
+                reg,
+                "prometheus_tsdb_wal_replay_unknown_refs_total",
+                "Total number of unknown series references encountered during WAL replay.",
+                "type",
+            ),
+            wbl_replay_unknown_refs: counter_vec(
+                reg,
+                "prometheus_tsdb_wbl_replay_unknown_refs_total",
+                "Total number of unknown series references encountered during WBL replay.",
+                "type",
+            ),
+            wal: crate::metrics::WlogMetrics::new(reg, crate::metrics::WAL_METRICS_PREFIX),
+            wbl: crate::metrics::WlogMetrics::new(reg, crate::metrics::WBL_METRICS_PREFIX),
+            chunk_write_queue: (chunk_write_queue_size > 0)
+                .then(|| crate::metrics::ChunkWriteQueueMetrics::new(reg)),
+        }
+    }
+
+    /// Go `onChunkCreated` / `appendChunkAndMmap`: one chunk created in the head.
+    #[inline]
+    fn chunks_created(&self, n: u64) {
+        if n > 0 {
+            self.chunks.add(n as f64);
+            self.chunks_created.inc_by(n as f64);
+        }
+    }
+
+    /// Returns `appended` from an in-order `(appended, chunk_created)` append result,
+    /// counting the created chunk (Go `onChunkCreated` / `appendChunkAndMmap`).
+    #[inline]
+    fn track_append(&self, (appended, created): (bool, bool)) -> bool {
+        if created {
+            self.chunks_created(1);
+        }
+        appended
+    }
+
+    /// Go `chunksRemoved.Add(n); chunks.Sub(n)`.
+    #[inline]
+    fn chunks_removed(&self, n: u64) {
+        if n > 0 {
+            self.chunks.sub(n as f64);
+            self.chunks_removed.inc_by(n as f64);
+        }
+    }
+
+    /// Go `counterAddNonZero`.
+    fn add_unknown_refs(vec: &CounterVec, n: u64, typ: &str) {
+        if n > 0 {
+            vec.with_label_values(&[typ]).inc_by(n as f64);
         }
     }
 }
@@ -1926,7 +2027,7 @@ impl Head {
         } else {
             Encoding::Xor
         };
-        let metrics = HeadMetrics::new(opts.registry.as_deref());
+        let metrics = HeadMetrics::new(opts.registry.as_deref(), opts.head_chunks_write_queue_size);
         let head = Self {
             dir: dir.clone(),
             opts: opts.clone(),
@@ -1981,23 +2082,31 @@ impl Head {
 
         // Like Go `DB.Open`, the WAL/WBL are opened (cutting a new segment) before the
         // head is initialised, so that a repair operates on the live write log.
-        let wal_writer =
+        let mut wal_writer =
             WlogWriter::with_segment_size(&wal_dir, opts.wal_segment_size, opts.wal_compression)?;
+        wal_writer.set_metrics(head.metrics.wal.clone());
         *head.wal.lock() = Some(wal_writer);
 
         if opts.ooo_time_window_ms > 0 || wbl_dir.exists() {
-            let wbl_writer = WlogWriter::with_segment_size(
+            let mut wbl_writer = WlogWriter::with_segment_size(
                 &wbl_dir,
                 opts.wal_segment_size,
                 opts.wal_compression,
             )?;
+            wbl_writer.set_metrics(head.metrics.wbl.clone());
             *head.wbl.lock() = Some(wbl_writer);
         }
 
         head.replay_on_open(&wal_dir, &wbl_dir, &chunks_dir)?;
 
-        let chunk_writer =
-            HeadChunksWriter::with_max_file_size(&chunks_dir, opts.max_head_chunk_file_size)?;
+        let mut chunk_writer = HeadChunksWriter::with_options(
+            &chunks_dir,
+            opts.max_head_chunk_file_size,
+            opts.head_chunks_write_buffer_size,
+        )?;
+        if let Some(m) = head.metrics.chunk_write_queue.clone() {
+            chunk_writer.set_queue_metrics(m);
+        }
         *head.chunk_writer.lock() = Some(chunk_writer);
         let chunk_reader = HeadChunksReader::open_no_repair(&chunks_dir)?;
         *head.chunk_reader.write() = Some(chunk_reader);
@@ -2287,7 +2396,9 @@ impl Head {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attach_mmapped_chunks(
+        &self,
         entry: &SeriesEntry,
         mmc: Vec<MmappedChunk>,
         ooo_mmc: Vec<MmappedChunk>,
@@ -2299,6 +2410,9 @@ impl Head {
         if mmc.is_empty() && ooo_mmc.is_empty() {
             return;
         }
+        // Go `loadWAL` series record: `chunksCreated.Add(len(mmc) + len(oooMmc))`.
+        self.metrics
+            .chunks_created((mmc.len() + ooo_mmc.len()) as u64);
         let mut st = entry.inner.lock();
         if !mmc.is_empty() {
             for m in &mmc {
@@ -2347,16 +2461,13 @@ impl Head {
                         sum: s.v,
                         ..Histogram::default()
                     };
-                    if state
-                        .append_histogram_in_order(
+                    if self.metrics.track_append(state.append_histogram_in_order(
                             s.st,
                             s.t,
                             &h,
                             self.opts.chunk_range_ms,
                             self.opts.enable_histogram_st_encoding,
-                        )?
-                        .0
-                    {
+                        )?) {
                         *mint = (*mint).min(s.t);
                         *maxt = (*maxt).max(s.t);
                     }
@@ -2370,16 +2481,13 @@ impl Head {
                         sum: s.v,
                         ..FloatHistogram::default()
                     };
-                    if state
-                        .append_float_histogram_in_order(
+                    if self.metrics.track_append(state.append_float_histogram_in_order(
                             s.st,
                             s.t,
                             &fh,
                             self.opts.chunk_range_ms,
                             self.opts.enable_histogram_st_encoding,
-                        )?
-                        .0
-                    {
+                        )?) {
                         *mint = (*mint).min(s.t);
                         *maxt = (*maxt).max(s.t);
                     }
@@ -2391,17 +2499,14 @@ impl Head {
                 _ => {}
             }
         }
-        if state
-            .append_float_in_order(
+        if self.metrics.track_append(state.append_float_in_order(
                 s.st,
                 s.t,
                 s.v,
                 self.opts.chunk_range_ms,
                 self.opts.samples_per_chunk,
                 self.float_chunk_encoding(),
-            )?
-            .0
-        {
+            )?) {
             *mint = (*mint).min(s.t);
             *maxt = (*maxt).max(s.t);
         }
@@ -2422,16 +2527,13 @@ impl Head {
         if hs.t <= state.mm_max_time() {
             return Ok(());
         }
-        if state
-            .append_histogram_in_order(
+        if self.metrics.track_append(state.append_histogram_in_order(
                 hs.st,
                 hs.t,
                 &hs.h,
                 self.opts.chunk_range_ms,
                 self.opts.enable_histogram_st_encoding,
-            )?
-            .0
-        {
+            )?) {
             *mint = (*mint).min(hs.t);
             *maxt = (*maxt).max(hs.t);
         }
@@ -2452,16 +2554,13 @@ impl Head {
         if fhs.t <= state.mm_max_time() {
             return Ok(());
         }
-        if state
-            .append_float_histogram_in_order(
+        if self.metrics.track_append(state.append_float_histogram_in_order(
                 fhs.st,
                 fhs.t,
                 &fhs.fh,
                 self.opts.chunk_range_ms,
                 self.opts.enable_histogram_st_encoding,
-            )?
-            .0
-        {
+            )?) {
             *mint = (*mint).min(fhs.t);
             *maxt = (*maxt).max(fhs.t);
         }
@@ -2478,9 +2577,24 @@ impl Head {
         mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
         ooo_mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
     ) -> Result<(), HeadError> {
+        let unknown = UnknownRefs::default();
         if self.opts.wal_replay_concurrency > 1 {
-            return self.replay_wal_reader_parallel(r, multi_ref, mmapped_map, ooo_mmapped_map);
+            self.replay_wal_reader_parallel(r, multi_ref, mmapped_map, ooo_mmapped_map, &unknown)?;
+        } else {
+            self.replay_wal_reader_sequential(r, multi_ref, mmapped_map, ooo_mmapped_map, &unknown)?;
         }
+        self.report_wal_unknown_refs(&unknown, multi_ref);
+        Ok(())
+    }
+
+    fn replay_wal_reader_sequential<R: io::Read + SegmentTracker + Send>(
+        &self,
+        r: &mut WlogReader<R>,
+        multi_ref: &mut HashMap<u64, u64>,
+        mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
+        ooo_mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
+        unknown: &UnknownRefs,
+    ) -> Result<(), HeadError> {
 
         const WAL_POSTINGS_BATCH: usize = 4096;
 
@@ -2520,7 +2634,7 @@ impl Head {
                         ooo_mmapped_map,
                         &mut pending_postings,
                         |entry, mmc, ooo_mmc| {
-                            Self::attach_mmapped_chunks(
+                            self.attach_mmapped_chunks(
                                 &entry,
                                 mmc,
                                 ooo_mmc,
@@ -2548,6 +2662,7 @@ impl Head {
                             s.ref_id = mapped;
                         }
                         let Some(entry) = self.series.get_by_id(s.ref_id) else {
+                            unknown.miss(&unknown.samples, s.ref_id);
                             continue;
                         };
                         self.replay_one_sample(&entry, s, &mut mint, &mut maxt)?;
@@ -2563,6 +2678,7 @@ impl Head {
                             hs.ref_id = mapped;
                         }
                         let Some(entry) = self.series.get_by_id(hs.ref_id) else {
+                            unknown.miss(&unknown.histograms, hs.ref_id);
                             continue;
                         };
                         self.replay_one_histogram(&entry, hs, &mut mint, &mut maxt)?;
@@ -2578,6 +2694,7 @@ impl Head {
                             fhs.ref_id = mapped;
                         }
                         let Some(entry) = self.series.get_by_id(fhs.ref_id) else {
+                            unknown.miss(&unknown.histograms, fhs.ref_id);
                             continue;
                         };
                         self.replay_one_float_histogram(&entry, fhs, &mut mint, &mut maxt)?;
@@ -2613,6 +2730,8 @@ impl Head {
                         if self.series.get_by_id(stone.ref_id).is_some() {
                             self.tombstones
                                 .add_interval(stone.ref_id, Interval::new(stone.mint, stone.maxt));
+                        } else {
+                            unknown.miss(&unknown.tombstones, stone.ref_id);
                         }
                     }
                     if !to_delete.is_empty() {
@@ -2629,6 +2748,7 @@ impl Head {
                             ex.ref_id = mapped;
                         }
                         let Some(entry) = self.series.get_by_id(ex.ref_id) else {
+                            unknown.miss(&unknown.exemplars, ex.ref_id);
                             continue;
                         };
                         if self
@@ -2647,6 +2767,7 @@ impl Head {
                             m.ref_id = mapped;
                         }
                         let Some(entry) = self.series.get_by_id(m.ref_id) else {
+                            unknown.miss(&unknown.metadata, m.ref_id);
                             continue;
                         };
                         let metric_type = MetricType::from_u8(m.metric_type);
@@ -2688,6 +2809,7 @@ impl Head {
         multi_ref: &mut HashMap<u64, u64>,
         mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
         ooo_mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
+        unknown: &UnknownRefs,
     ) -> Result<(), HeadError> {
         enum WalSampleJob {
             Float(RefSample),
@@ -2870,7 +2992,7 @@ impl Head {
                                 mmc,
                                 ooo_mmc,
                             } => {
-                                Self::attach_mmapped_chunks(
+                                self.attach_mmapped_chunks(
                                     &entry,
                                     mmc,
                                     ooo_mmc,
@@ -2888,6 +3010,8 @@ impl Head {
                                                 self.replay_one_sample(
                                                     &entry, s, &mut mint, &mut maxt,
                                                 )?;
+                                            } else {
+                                                unknown.miss(&unknown.samples, s.ref_id);
                                             }
                                         }
                                         WalSampleJob::Histogram(hs) => {
@@ -2895,6 +3019,8 @@ impl Head {
                                                 self.replay_one_histogram(
                                                     &entry, hs, &mut mint, &mut maxt,
                                                 )?;
+                                            } else {
+                                                unknown.miss(&unknown.histograms, hs.ref_id);
                                             }
                                         }
                                         WalSampleJob::FloatHistogram(fhs) => {
@@ -2902,6 +3028,8 @@ impl Head {
                                                 self.replay_one_float_histogram(
                                                     &entry, fhs, &mut mint, &mut maxt,
                                                 )?;
+                                            } else {
+                                                unknown.miss(&unknown.histograms, fhs.ref_id);
                                             }
                                         }
                                     }
@@ -2910,6 +3038,8 @@ impl Head {
                             WalWorkerMsg::AddTombstone { ref_id, interval } => {
                                 if self.series.get_by_id(ref_id).is_some() {
                                     self.tombstones.add_interval(ref_id, interval);
+                                } else {
+                                    unknown.miss(&unknown.tombstones, ref_id);
                                 }
                             }
                         }
@@ -3261,6 +3391,7 @@ impl Head {
                                             }
                                             let Some(entry) = self.series.get_by_id(ex.ref_id)
                                             else {
+                                                unknown.miss(&unknown.exemplars, ex.ref_id);
                                                 continue;
                                             };
                                             if self
@@ -3283,6 +3414,7 @@ impl Head {
                                             }
                                             let Some(entry) = self.series.get_by_id(m.ref_id)
                                             else {
+                                                unknown.miss(&unknown.metadata, m.ref_id);
                                                 continue;
                                             };
                                             let metric_type = MetricType::from_u8(m.metric_type);
@@ -3372,6 +3504,36 @@ impl Head {
         let dec = RecordDecoder::new();
         let (last_seq, last_off) = last_mmap_ref.unpack();
         let mut pinned = HashSet::new();
+        let unknown = UnknownRefs::default();
+        self.replay_wbl_records(
+            r,
+            &dec,
+            multi_ref,
+            last_seq,
+            last_off,
+            &mut pinned,
+            &mut chunk_writer,
+            &unknown,
+        )?;
+        self.report_wbl_unknown_refs(&unknown);
+        if !pinned.is_empty() {
+            self.wbl_pinned_refs.lock().extend(pinned);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replay_wbl_records<R: io::Read + SegmentTracker>(
+        &self,
+        r: &mut WlogReader<R>,
+        dec: &RecordDecoder,
+        multi_ref: &HashMap<u64, u64>,
+        last_seq: u32,
+        last_off: u32,
+        pinned: &mut HashSet<u64>,
+        chunk_writer: &mut Option<&mut HeadChunksWriter>,
+        unknown: &UnknownRefs,
+    ) -> Result<(), HeadError> {
 
         while let Some(rec) = r.next_record()? {
             let decoded = match dec.decode_record(rec) {
@@ -3395,6 +3557,8 @@ impl Head {
                             if let Some(ref mut ooo) = st.ooo {
                                 ooo.ooo_head_chunk = None;
                             }
+                        } else {
+                            unknown.miss(&unknown.mmap_markers, rm.ref_id);
                         }
                     }
                 }
@@ -3409,7 +3573,7 @@ impl Head {
                         }
                         if let Some(entry) = self.series.get_by_id(s.ref_id) {
                             let mut st = entry.inner.lock();
-                            let (ok, _, _) = st.insert_ooo(
+                            let (ok, created, _) = st.insert_ooo(
                                 entry.ref_id,
                                 s.st,
                                 s.t,
@@ -3417,9 +3581,14 @@ impl Head {
                                 self.opts.ooo_cap_max,
                                 chunk_writer.as_deref_mut(),
                             )?;
+                            if created {
+                                self.metrics.chunks_created(1);
+                            }
                             if ok {
                                 self.update_min_ooo_max_ooo_time(s.t, s.t);
                             }
+                        } else {
+                            unknown.miss(&unknown.samples, s.ref_id);
                         }
                     }
                 }
@@ -3431,7 +3600,7 @@ impl Head {
                         }
                         if let Some(entry) = self.series.get_by_id(hs.ref_id) {
                             let mut st = entry.inner.lock();
-                            let (ok, _, _) = st.insert_ooo(
+                            let (ok, created, _) = st.insert_ooo(
                                 entry.ref_id,
                                 hs.st,
                                 hs.t,
@@ -3439,9 +3608,14 @@ impl Head {
                                 self.opts.ooo_cap_max,
                                 chunk_writer.as_deref_mut(),
                             )?;
+                            if created {
+                                self.metrics.chunks_created(1);
+                            }
                             if ok {
                                 self.update_min_ooo_max_ooo_time(hs.t, hs.t);
                             }
+                        } else {
+                            unknown.miss(&unknown.histograms, hs.ref_id);
                         }
                     }
                 }
@@ -3453,7 +3627,7 @@ impl Head {
                         }
                         if let Some(entry) = self.series.get_by_id(fhs.ref_id) {
                             let mut st = entry.inner.lock();
-                            let (ok, _, _) = st.insert_ooo(
+                            let (ok, created, _) = st.insert_ooo(
                                 entry.ref_id,
                                 fhs.st,
                                 fhs.t,
@@ -3461,19 +3635,84 @@ impl Head {
                                 self.opts.ooo_cap_max,
                                 chunk_writer.as_deref_mut(),
                             )?;
+                            if created {
+                                self.metrics.chunks_created(1);
+                            }
                             if ok {
                                 self.update_min_ooo_max_ooo_time(fhs.t, fhs.t);
                             }
+                        } else {
+                            unknown.miss(&unknown.histograms, fhs.ref_id);
                         }
                     }
                 }
                 _ => {}
             }
         }
-        if !pinned.is_empty() {
-            self.wbl_pinned_refs.lock().extend(pinned);
-        }
         Ok(())
+    }
+
+    /// Go `loadWBL` unknown-reference reporting.
+    fn report_wbl_unknown_refs(&self, u: &UnknownRefs) {
+        let samples = u.samples.load(Ordering::Relaxed);
+        let histograms = u.histograms.load(Ordering::Relaxed);
+        let mmap_markers = u.mmap_markers.load(Ordering::Relaxed);
+        if samples + histograms + mmap_markers == 0 {
+            return;
+        }
+        let series = u.series.lock().len() as u64;
+        tracing::warn!(
+            series = series,
+            samples = samples,
+            histograms = histograms,
+            mmap_markers = mmap_markers,
+            "Unknown series references for ooo WAL replay"
+        );
+        let v = &self.metrics.wbl_replay_unknown_refs;
+        HeadMetrics::add_unknown_refs(v, series, "series");
+        HeadMetrics::add_unknown_refs(v, samples, "samples");
+        HeadMetrics::add_unknown_refs(v, histograms, "histograms");
+        HeadMetrics::add_unknown_refs(v, mmap_markers, "mmap_markers");
+    }
+
+    /// Go `loadWAL` unknown-reference reporting (`found_series` / `truly_missing_series`
+    /// are the Mimir-specific diagnostics).
+    fn report_wal_unknown_refs(&self, u: &UnknownRefs, multi_ref: &HashMap<u64, u64>) {
+        let samples = u.samples.load(Ordering::Relaxed);
+        let exemplars = u.exemplars.load(Ordering::Relaxed);
+        let histograms = u.histograms.load(Ordering::Relaxed);
+        let metadata = u.metadata.load(Ordering::Relaxed);
+        let tombstones = u.tombstones.load(Ordering::Relaxed);
+        if samples + exemplars + histograms + metadata + tombstones == 0 {
+            return;
+        }
+        let missing = u.series.lock();
+        tracing::warn!(
+            series = missing.len(),
+            samples = samples,
+            exemplars = exemplars,
+            histograms = histograms,
+            metadata = metadata,
+            tombstones = tombstones,
+            "Unknown series references"
+        );
+        let mut found = 0u64;
+        for &wal_ref in missing.iter() {
+            let head_ref = multi_ref.get(&wal_ref).copied().unwrap_or(wal_ref);
+            if self.series.get_by_id(head_ref).is_some() {
+                found += 1;
+            }
+        }
+        let truly_missing = missing.len() as u64 - found;
+        let v = &self.metrics.wal_replay_unknown_refs;
+        HeadMetrics::add_unknown_refs(v, found, "found_series");
+        HeadMetrics::add_unknown_refs(v, truly_missing, "truly_missing_series");
+        HeadMetrics::add_unknown_refs(v, truly_missing + found, "series");
+        HeadMetrics::add_unknown_refs(v, samples, "samples");
+        HeadMetrics::add_unknown_refs(v, exemplars, "exemplars");
+        HeadMetrics::add_unknown_refs(v, histograms, "histograms");
+        HeadMetrics::add_unknown_refs(v, metadata, "metadata");
+        HeadMetrics::add_unknown_refs(v, tombstones, "tombstones");
     }
 
     #[inline]
@@ -3569,11 +3808,12 @@ impl Head {
             let mut wbl_guard = self.wbl.lock();
             if wbl_guard.is_none() {
                 let wbl_dir = self.dir.join(WBL_DIR_NAME);
-                let wbl_writer = WlogWriter::with_segment_size(
+                let mut wbl_writer = WlogWriter::with_segment_size(
                     &wbl_dir,
                     self.opts.wal_segment_size,
                     self.opts.wal_compression,
                 )?;
+                wbl_writer.set_metrics(self.metrics.wbl.clone());
                 *wbl_guard = Some(wbl_writer);
             }
         }
@@ -3607,11 +3847,7 @@ impl Head {
         {
             let mut wal_guard = self.wal.lock();
             if let Some(ref mut wal) = *wal_guard {
-                let start = Instant::now();
                 wal.sync()?;
-                self.metrics
-                    .wal_fsync_duration
-                    .observe(start.elapsed().as_secs_f64());
             }
         }
         {
@@ -3769,12 +4005,18 @@ impl Head {
         self.postings.label_values_bytes(&syms)
     }
 
+    /// Go `Head.compactable`: with `TimelyCompaction` the head is compactable once the min
+    /// block end is .5 chunk ranges in the past; otherwise once the head spans 1.5 chunk
+    /// ranges (the Prometheus / Mimir default).
     pub fn compactable(&self) -> bool {
         if !self.initialized() {
             return false;
         }
-        let min_block_end = range_for_timestamp(self.min_time(), self.opts.chunk_range_ms);
-        min_block_end < self.appendable_min_valid_time()
+        if self.opts.timely_compaction {
+            let min_block_end = range_for_timestamp(self.min_time(), self.opts.chunk_range_ms);
+            return min_block_end < self.appendable_min_valid_time();
+        }
+        self.max_time() - self.min_time() > self.opts.chunk_range_ms / 2 * 3
     }
 
     fn init_time(&self, t: i64) {
@@ -4499,6 +4741,7 @@ impl Head {
     pub fn mmap_head_chunks(&self) -> Result<usize, HeadChunksError> {
         let _mmap_guard = self.mmap_mtx.lock();
         let mut count = 0usize;
+        let mut max_mmapped_chunks = 0usize;
         let mut pending: Vec<(Arc<SeriesEntry>, Vec<MmappedChunk>)> = Vec::new();
         for stripe in &self.series.stripes {
             let entries: Vec<Arc<SeriesEntry>> = stripe.read().by_id.values().cloned().collect();
@@ -4515,6 +4758,7 @@ impl Head {
                     drop(st);
                     if !mmapped.is_empty() {
                         count += mmapped.len();
+                        max_mmapped_chunks = max_mmapped_chunks.max(mmapped.len());
                         pending.push((entry, mmapped));
                     }
                 }
@@ -4550,6 +4794,11 @@ impl Head {
                 }
             }
         }
+        // Go `mmapHeadChunks`.
+        self.metrics
+            .head_chunks_max_mmapped
+            .set(max_mmapped_chunks as f64);
+        self.metrics.mmap_chunks_total.inc_by(count as f64);
         Ok(count)
     }
 
@@ -5211,10 +5460,16 @@ impl Head {
                 }
 
                 if let Some(ref mut ooo) = st.ooo {
+                    let before = ooo.ooo_mmapped_chunks.len() + ooo.ooo_pending_mmapped.len();
                     ooo.ooo_mmapped_chunks
                         .retain(|mc| mc.max_time > maxt_inclusive);
                     ooo.ooo_pending_mmapped
                         .retain(|(mc, _)| mc.max_time > maxt_inclusive);
+                    // Go `truncateChunksBefore`: removed OOO m-mapped chunks.
+                    self.metrics.chunks_removed(
+                        (before - ooo.ooo_mmapped_chunks.len() - ooo.ooo_pending_mmapped.len())
+                            as u64,
+                    );
                     if let Some(ref mut ohc) = ooo.ooo_head_chunk {
                         if ohc.max_time <= maxt_inclusive {
                             ooo.ooo_head_chunk = None;
@@ -5413,9 +5668,11 @@ impl Head {
                         || !o.ooo_pending_mmapped.is_empty()
                 });
                 if !has_ooo {
+                    let removed = (st.mmapped().len() + st.head_chunks.len()) as u64;
                     if st.last_exemplar_ts().is_some_and(|ts| ts >= min_valid_time) {
                         // Keep the series identity while its exemplar can still be replayed,
                         // matching Prometheus `gcSeries`.
+                        self.metrics.chunks_removed(removed);
                         st.mmapped_chunks = None;
                         st.head_chunks.clear();
                         entry
@@ -5424,6 +5681,7 @@ impl Head {
                     } else {
                         let keep_until = st.max_time();
                         if self.series.remove_if_gced_under_entry_lock(&entry, &mut st) {
+                            self.metrics.chunks_removed(removed);
                             drop(st);
                             to_delete.push((entry, keep_until));
                         }
@@ -5460,7 +5718,16 @@ impl Head {
         self.truncate_wal(mint)
     }
 
+    /// Go `Head.truncateMemory` (counts `head_truncations_total` / `_failed_total`).
     pub fn truncate_memory(&self, mint: i64) -> Result<(), HeadError> {
+        let res = self.truncate_memory_inner(mint);
+        if res.is_err() {
+            self.metrics.head_truncate_fail.inc();
+        }
+        res
+    }
+
+    fn truncate_memory_inner(&self, mint: i64) -> Result<(), HeadError> {
         let initialized = self.initialized();
         if initialized && self.min_time() >= mint {
             return Ok(());
@@ -5475,6 +5742,8 @@ impl Head {
             return Ok(());
         }
 
+        self.metrics.head_truncate_total.inc();
+        let gc_start = Instant::now();
         let (to_delete, actual_mint, min_mmap_seq) = self.gc_collect_and_unlink(mint);
 
         if !to_delete.is_empty() {
@@ -5502,6 +5771,9 @@ impl Head {
             drop(rec_buf);
             self.finish_deleted_series_cleanup(to_delete);
         }
+        self.metrics
+            .gc_duration
+            .observe(gc_start.elapsed().as_secs_f64());
 
         self.tombstones.truncate_before(mint);
 
@@ -5566,6 +5838,7 @@ impl Head {
         let mut to_delete: Vec<(Arc<SeriesEntry>, i64)> = Vec::new();
         let mut actual_mint = i64::MAX;
         let mut min_mmap_seq = usize::MAX;
+        let mut chunks_removed = 0u64;
 
         let record_refs = |st: &SeriesState, actual_mint: &mut i64, min_mmap_seq: &mut usize| {
             let sm = st.min_time();
@@ -5607,6 +5880,7 @@ impl Head {
                 }
 
                 let prev_max_time = st.max_time();
+                let chunks_before = st.mmapped().len() + st.head_chunks.len();
                 if let Some(ref mut mv) = st.mmapped_chunks {
                     mv.retain(|mc| mc.max_time >= mint);
                     if mv.is_empty() {
@@ -5614,6 +5888,8 @@ impl Head {
                     }
                 }
                 st.head_chunks.retain(|hc| hc.max_time >= mint);
+                chunks_removed +=
+                    (chunks_before - st.mmapped().len() - st.head_chunks.len()) as u64;
                 entry
                     .in_order_max_time
                     .store(st.max_time(), Ordering::Release);
@@ -5648,13 +5924,18 @@ impl Head {
             }
         }
 
+        self.metrics.chunks_removed(chunks_removed);
         (to_delete, actual_mint, min_mmap_seq)
     }
 
+    /// Go `Head.truncateWAL`: checkpoints the lower two thirds of the WAL segments and
+    /// drops them. A failed segment truncation or old-checkpoint deletion is only logged
+    /// (and counted), like Go.
     pub fn truncate_wal(&self, mint: i64) -> Result<(), HeadError> {
         if mint <= self.last_wal_truncation_time.load(Ordering::Acquire) {
             return Ok(());
         }
+        let start = Instant::now();
         self.last_wal_truncation_time.store(mint, Ordering::Release);
 
         let wal_dir = self.dir.join("wal");
@@ -5666,22 +5947,27 @@ impl Head {
             let Some((first, last)) = segments_range(&wal_dir)? else {
                 return Ok(());
             };
+            // Start a new segment, so low ingestion volume TSDB don't have more WAL than
+            // needed.
             wal.next_segment()?;
             (first, last)
         };
 
+        // Never consider last segment for checkpoint.
         if last == 0 {
             return Ok(());
         }
         last = last.saturating_sub(1);
+        // The lower two thirds of segments should contain mostly obsolete samples.
         last = first + (last.saturating_sub(first)) * 2 / 3;
         if last <= first {
             return Ok(());
         }
 
+        self.metrics.checkpoint_creation_total.inc();
         let pinned = self.wbl_pinned_refs.lock().clone();
         let expiries = self.wal_expiries.lock().clone();
-        create_checkpoint(
+        if let Err(e) = create_checkpoint(
             &wal_dir,
             first,
             last,
@@ -5693,21 +5979,47 @@ impl Head {
             mint,
             self.opts.enable_st_storage,
             self.opts.wal_compression,
-        )?;
+        ) {
+            self.metrics.checkpoint_creation_fail.inc();
+            if matches!(e, WlogError::Corruption { .. }) {
+                self.metrics.wal_corruptions_total.inc();
+            }
+            return Err(e.into());
+        }
 
         if let Some(ref mut wal) = *self.wal.lock() {
-            wal.truncate(last + 1)?;
+            if let Err(e) = wal.truncate(last + 1) {
+                // If truncating fails, we'll just try again at the next checkpoint.
+                // Leftover segments will just be ignored in the future if there's a
+                // checkpoint that supersedes them.
+                tracing::error!(err = %e, "truncating segments failed");
+            }
         }
         {
+            // The checkpoint is written and data before mint is truncated, so stop
+            // tracking expired series.
             let mut exp = self.wal_expiries.lock();
             exp.retain(|_, &mut ku| ku >= mint);
             if exp.is_empty() {
                 exp.shrink_to_fit();
             }
         }
-        let _ = delete_checkpoints(&wal_dir, last);
-        let _ = checkpoint_dir(&wal_dir, last);
-        let _ = read_min_valid_time(&wal_dir);
+        self.metrics.checkpoint_delete_total.inc();
+        if let Err(e) = delete_checkpoints(&wal_dir, last) {
+            // Leftover old checkpoints do not cause problems down the line beyond
+            // occupying disk space: they are ignored since a higher checkpoint exists.
+            tracing::error!(err = %e, "delete old checkpoints");
+            self.metrics.checkpoint_delete_fail.inc();
+        }
+        self.metrics
+            .wal_truncate_duration
+            .observe(start.elapsed().as_secs_f64());
+        tracing::info!(
+            first = first,
+            last = last,
+            duration = ?start.elapsed(),
+            "WAL checkpoint complete"
+        );
         Ok(())
     }
 
@@ -5829,7 +6141,10 @@ impl Head {
     /// Returns `Some(entry.labels.clone())` (O(1) refcount bump, zero chunk clone) if `ref_id`
     /// has any non-tombstoned chunks overlapping `[mint, maxt]`.
     pub fn series_has_chunks_in_range(&self, ref_id: u64, mint: i64, maxt: i64) -> Option<Labels> {
-        let entry = self.series.get_by_id(ref_id)?;
+        let Some(entry) = self.series.get_by_id(ref_id) else {
+            self.metrics.series_not_found.inc();
+            return None;
+        };
         let tombs = self.tombstones.get(ref_id);
         let st = entry.inner.lock();
         let has_chunk = st.head_chunks.iter().any(|hc| {
@@ -5866,6 +6181,8 @@ impl Head {
         maxt: i64,
     ) -> Result<SeriesChunksResult, HeadError> {
         let Some(entry) = self.series.get_by_id(ref_id) else {
+            // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
+            self.metrics.series_not_found.inc();
             return Ok(None);
         };
 
@@ -6065,6 +6382,8 @@ impl Head {
         filter: Option<&dyn Fn(&Labels) -> bool>,
     ) -> Result<Option<(Labels, u32)>, HeadError> {
         let Some(entry) = self.series.get_by_id(ref_id) else {
+            // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
+            self.metrics.series_not_found.inc();
             return Ok(None);
         };
         if let Some(pred) = filter {
@@ -6142,6 +6461,8 @@ impl Head {
         filter: Option<&dyn Fn(&Labels) -> bool>,
     ) -> Result<SeriesChunkMetasNoBytes, HeadError> {
         let Some(entry) = self.series.get_by_id(ref_id) else {
+            // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
+            self.metrics.series_not_found.inc();
             return Ok(None);
         };
         if let Some(pred) = filter {
@@ -7730,17 +8051,14 @@ impl<'a> HeadAppender<'a> {
                 if v.to_bits() == QUIET_ZERO_NAN_BITS {
                     v = 0.0;
                 }
-                if state
-                    .append_float_in_order(
+                if self.head.metrics.track_append(state.append_float_in_order(
                         pf.st,
                         pf.t,
                         v,
                         chunk_range_ms,
                         samples_per_chunk,
                         float_enc,
-                    )?
-                    .0
-                {
+                    )?) {
                     in_order_mint = in_order_mint.min(pf.t);
                     in_order_maxt = in_order_maxt.max(pf.t);
                 }
@@ -7767,17 +8085,13 @@ impl<'a> HeadAppender<'a> {
                             cr_guard.as_ref(),
                         ) {
                             drop(cr_guard);
-                            if !is_dup && !is_ooo
-                                && state
-                                    .append_histogram_in_order(
-                                        pf.st,
-                                        pf.t,
-                                        &h,
-                                        self.head.opts.chunk_range_ms,
-                                        self.head.opts.enable_histogram_st_encoding,
-                                    )?
-                                    .0
-                            {
+                            if !is_dup && !is_ooo && self.head.metrics.track_append(state.append_histogram_in_order(
+                                    pf.st,
+                                    pf.t,
+                                    &h,
+                                    self.head.opts.chunk_range_ms,
+                                    self.head.opts.enable_histogram_st_encoding,
+                                )?) {
                                 in_order_mint = in_order_mint.min(pf.t);
                                 in_order_maxt = in_order_maxt.max(pf.t);
                             }
@@ -7802,17 +8116,13 @@ impl<'a> HeadAppender<'a> {
                             cr_guard.as_ref(),
                         ) {
                             drop(cr_guard);
-                            if !is_dup && !is_ooo
-                                && state
-                                    .append_float_histogram_in_order(
-                                        pf.st,
-                                        pf.t,
-                                        &fh,
-                                        self.head.opts.chunk_range_ms,
-                                        self.head.opts.enable_histogram_st_encoding,
-                                    )?
-                                    .0
-                            {
+                            if !is_dup && !is_ooo && self.head.metrics.track_append(state.append_float_histogram_in_order(
+                                    pf.st,
+                                    pf.t,
+                                    &fh,
+                                    self.head.opts.chunk_range_ms,
+                                    self.head.opts.enable_histogram_st_encoding,
+                                )?) {
                                 in_order_mint = in_order_mint.min(pf.t);
                                 in_order_maxt = in_order_maxt.max(pf.t);
                             }
@@ -7864,6 +8174,9 @@ impl<'a> HeadAppender<'a> {
                 )?;
                 drop(cw_guard);
                 if chunk_created {
+                    self.head.metrics.chunks_created(1);
+                }
+                if chunk_created {
                     let prev_markers = ooo_mmap_markers.get(&pf.entry.ref_id);
                     if prev_markers.is_none() || prev_markers.is_some_and(|r| !r.is_empty()) {
                         flush_ooo_records(
@@ -7901,17 +8214,14 @@ impl<'a> HeadAppender<'a> {
                 if v.to_bits() == QUIET_ZERO_NAN_BITS {
                     v = 0.0;
                 }
-                if state
-                    .append_float_in_order(
+                if self.head.metrics.track_append(state.append_float_in_order(
                         pf.st,
                         pf.t,
                         v,
                         self.head.opts.chunk_range_ms,
                         self.head.opts.samples_per_chunk,
                         self.head.float_chunk_encoding(),
-                    )?
-                    .0
-                {
+                    )?) {
                     in_order_mint = in_order_mint.min(pf.t);
                     in_order_maxt = in_order_maxt.max(pf.t);
                 }
@@ -7956,6 +8266,9 @@ impl<'a> HeadAppender<'a> {
                 )?;
                 drop(cw_guard);
                 if chunk_created {
+                    self.head.metrics.chunks_created(1);
+                }
+                if chunk_created {
                     let prev_markers = ooo_mmap_markers.get(&ph.entry.ref_id);
                     if prev_markers.is_none() || prev_markers.is_some_and(|r| !r.is_empty()) {
                         flush_ooo_records(
@@ -7989,16 +8302,13 @@ impl<'a> HeadAppender<'a> {
                     ooo_mint = ooo_mint.min(ph.t);
                     ooo_maxt = ooo_maxt.max(ph.t);
                 }
-            } else if state
-                .append_histogram_in_order(
+            } else if self.head.metrics.track_append(state.append_histogram_in_order(
                     ph.st,
                     ph.t,
                     &ph.h,
                     self.head.opts.chunk_range_ms,
                     self.head.opts.enable_histogram_st_encoding,
-                )?
-                .0
-            {
+                )?) {
                 in_order_mint = in_order_mint.min(ph.t);
                 in_order_maxt = in_order_maxt.max(ph.t);
                 ph.entry
@@ -8040,6 +8350,9 @@ impl<'a> HeadAppender<'a> {
                 )?;
                 drop(cw_guard);
                 if chunk_created {
+                    self.head.metrics.chunks_created(1);
+                }
+                if chunk_created {
                     let prev_markers = ooo_mmap_markers.get(&pfh.entry.ref_id);
                     if prev_markers.is_none() || prev_markers.is_some_and(|r| !r.is_empty()) {
                         flush_ooo_records(
@@ -8073,16 +8386,13 @@ impl<'a> HeadAppender<'a> {
                     ooo_mint = ooo_mint.min(pfh.t);
                     ooo_maxt = ooo_maxt.max(pfh.t);
                 }
-            } else if state
-                .append_float_histogram_in_order(
+            } else if self.head.metrics.track_append(state.append_float_histogram_in_order(
                     pfh.st,
                     pfh.t,
                     &pfh.fh,
                     self.head.opts.chunk_range_ms,
                     self.head.opts.enable_histogram_st_encoding,
-                )?
-                .0
-            {
+                )?) {
                 in_order_mint = in_order_mint.min(pfh.t);
                 in_order_maxt = in_order_maxt.max(pfh.t);
                 pfh.entry

@@ -561,3 +561,161 @@ fn corrupted_checkpoint() {
     });
     assert!(!go.open_error.is_empty(), "Go must fail Open on a corrupted checkpoint");
 }
+
+// ---------------------------------------------------------------------------------------
+// TSDB-2: per-tenant prometheus_tsdb_* metrics
+// ---------------------------------------------------------------------------------------
+
+/// Every metric Mimir's `TSDBMetrics` aggregates from the per-tenant registry
+/// (github.com/grafana/mimir/pkg/storage/tsdb/tsdb_metrics.go `Collect`).
+const MIMIR_AGGREGATED_TSDB_METRICS: &[&str] = &[
+    "prometheus_tsdb_compactions_total",
+    "prometheus_tsdb_compaction_duration_seconds",
+    "prometheus_tsdb_wal_fsync_duration_seconds",
+    "prometheus_tsdb_wal_page_flushes_total",
+    "prometheus_tsdb_wal_completed_pages_total",
+    "prometheus_tsdb_wal_truncations_failed_total",
+    "prometheus_tsdb_wal_truncations_total",
+    "prometheus_tsdb_wal_truncate_duration_seconds",
+    "prometheus_tsdb_wal_corruptions_total",
+    "prometheus_tsdb_wal_writes_failed_total",
+    "prometheus_tsdb_head_truncations_failed_total",
+    "prometheus_tsdb_head_truncations_total",
+    "prometheus_tsdb_head_gc_duration_seconds",
+    "prometheus_tsdb_head_active_appenders",
+    "prometheus_tsdb_head_series_not_found_total",
+    "prometheus_tsdb_head_chunks",
+    "prometheus_tsdb_head_chunks_created_total",
+    "prometheus_tsdb_head_chunks_removed_total",
+    "prometheus_tsdb_mmap_chunk_corruptions_total",
+    "prometheus_tsdb_chunk_write_queue_operations_total",
+    "prometheus_tsdb_mmap_chunks_total",
+    "prometheus_tsdb_head_chunks_max_mmapped",
+    "prometheus_tsdb_sample_ooo_delta",
+    "prometheus_tsdb_blocks_loaded",
+    "prometheus_tsdb_symbol_table_size_bytes",
+    "prometheus_tsdb_reloads_total",
+    "prometheus_tsdb_reloads_failures_total",
+    "prometheus_tsdb_time_retentions_total",
+    "prometheus_tsdb_storage_blocks_bytes",
+    "prometheus_tsdb_checkpoint_deletions_failed_total",
+    "prometheus_tsdb_checkpoint_deletions_total",
+    "prometheus_tsdb_checkpoint_creations_failed_total",
+    "prometheus_tsdb_checkpoint_creations_total",
+    "prometheus_tsdb_exemplar_exemplars_appended_total",
+    "prometheus_tsdb_exemplar_exemplars_in_storage",
+    "prometheus_tsdb_exemplar_series_with_exemplars_in_storage",
+    "prometheus_tsdb_exemplar_last_exemplars_timestamp_seconds",
+    "prometheus_tsdb_exemplar_out_of_order_exemplars_total",
+    "prometheus_tsdb_head_out_of_order_samples_appended_total",
+    "prometheus_tsdb_head_series",
+    "prometheus_tsdb_head_series_created_total",
+    "prometheus_tsdb_head_series_removed_total",
+    "prometheus_tsdb_wal_replay_unknown_refs_total",
+    "prometheus_tsdb_wbl_replay_unknown_refs_total",
+    "prometheus_tsdb_head_statistics_last_update_timestamp_seconds",
+    "prometheus_tsdb_head_statistics_time_to_update_seconds",
+];
+
+/// Values that are fully determined by the on-disk state at Open and must match exactly.
+const DETERMINISTIC_OPEN_METRICS: &[&str] = &[
+    "prometheus_tsdb_blocks_loaded",
+    "prometheus_tsdb_storage_blocks_bytes",
+    "prometheus_tsdb_symbol_table_size_bytes",
+    "prometheus_tsdb_reloads_total",
+    "prometheus_tsdb_reloads_failures_total",
+    "prometheus_tsdb_time_retentions_total",
+    "prometheus_tsdb_wal_corruptions_total",
+    "prometheus_tsdb_mmap_chunk_corruptions_total",
+    "prometheus_tsdb_head_series",
+    "prometheus_tsdb_head_series_created_total",
+    "prometheus_tsdb_checkpoint_creations_total",
+    "prometheus_tsdb_checkpoint_deletions_total",
+    "prometheus_tsdb_wal_truncations_total",
+    "prometheus_tsdb_compactions_total",
+    "prometheus_tsdb_wal_replay_unknown_refs_total",
+];
+
+/// Two on-disk blocks + a WAL-backed head (with records referencing an unknown series)
+/// written by the Rust engine; Go and Rust must register every per-tenant metric Mimir
+/// aggregates and agree on the values determined by the on-disk state.
+#[test]
+fn per_tenant_tsdb_metrics_registered_and_equal_at_open() {
+    if skip() {
+        return;
+    }
+    let build = |dir: &Path| {
+        let db = Tsdb::open(dir, TsdbOptions::default()).unwrap();
+        for i in 0..400i64 {
+            let mut app = db.appender();
+            for s in 0..5 {
+                let name = format!("metric_{s}");
+                let job = format!("job_{}", s % 2);
+                app.append_float(
+                    None,
+                    &[("__name__", name.as_str()), ("job", job.as_str())],
+                    i * 60_000,
+                    i as f64,
+                )
+                .unwrap();
+            }
+            app.commit().unwrap();
+        }
+        db.compact_head_range(0, 2 * 3_600_000).unwrap();
+        db.compact_head_range(2 * 3_600_000, 4 * 3_600_000).unwrap();
+        db.close().unwrap();
+        drop(db);
+        // Samples for a series ref that has no series record (unknown refs at replay).
+        let mut w = WlogWriter::open(dir.join("wal"), CompressionType::None).unwrap();
+        w.log(&[&samples_rec(999_999, &[5 * 3_600_000, 5 * 3_600_000 + 1])])
+            .unwrap();
+        w.close().unwrap();
+    };
+    let root = tempfile::tempdir().unwrap();
+    let (go_dir, rust_dir) = (root.path().join("go"), root.path().join("rust"));
+    fs::create_dir_all(&go_dir).unwrap();
+    fs::create_dir_all(&rust_dir).unwrap();
+    build(&go_dir);
+    // Identical bytes on disk for both engines.
+    copy_dir(&go_dir, &rust_dir);
+
+    let go = go_report(&go_dir, 0);
+    let rust = rust_report(&rust_dir, 0);
+    assert!(go.open_error.is_empty() && rust.open_error.is_empty());
+    assert_eq!(go.metrics["prometheus_tsdb_blocks_loaded"], 2.0);
+    // The fixture exercises non-trivial values (the comparisons below are not vacuous).
+    for m in [
+        "prometheus_tsdb_storage_blocks_bytes",
+        "prometheus_tsdb_symbol_table_size_bytes",
+        "prometheus_tsdb_wal_replay_unknown_refs_total",
+        "prometheus_tsdb_head_series",
+    ] {
+        assert!(go.metrics.get(m).copied().unwrap_or(0.0) > 0.0, "{m}: {:?}", go.metrics.get(m));
+    }
+
+    for m in MIMIR_AGGREGATED_TSDB_METRICS {
+        if go.metrics.contains_key(*m) {
+            assert!(
+                rust.metrics.contains_key(*m),
+                "metric {m} is registered by Go but not by Rust"
+            );
+        }
+    }
+    for m in DETERMINISTIC_OPEN_METRICS {
+        assert_eq!(go.metrics.get(*m), rust.metrics.get(*m), "metric {m} differs");
+    }
+    assert_eq!(go.series, rust.series, "queried data differs");
+}
+
+fn copy_dir(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for e in fs::read_dir(src).unwrap() {
+        let e = e.unwrap();
+        let to = dst.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &to);
+        } else {
+            fs::copy(e.path(), to).unwrap();
+        }
+    }
+}
