@@ -413,11 +413,15 @@ fn test_ingester_all_14_rpcs_and_query_stream_two_phase_protocol() {
             .into_inner();
         assert_eq!(us_act.num_series, 3);
 
-        // 7. AllUserStats
+        // 7. AllUserStats (not in Mimir's noGRPCAuthOn list: needs an org ID header, which it
+        // does not otherwise use).
         let all_stats = client
-            .all_user_stats(tonic::Request::new(ingesterpb::UserStatsRequest {
-                count_method: ingesterpb::CountMethod::InMemory as i32,
-            }))
+            .all_user_stats(with_tenant(
+                tenant,
+                ingesterpb::UserStatsRequest {
+                    count_method: ingesterpb::CountMethod::InMemory as i32,
+                },
+            ))
             .await
             .unwrap()
             .into_inner();
