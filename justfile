@@ -45,7 +45,7 @@ parity filter="":
     ./scripts/verify-test-parity.sh {{filter}}
 
 bench *args:
-    cargo bench --workspace {{args}}
+    cargo bench --workspace --no-fail-fast {{args}}
 
 qa:
     just go-oracle
