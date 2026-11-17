@@ -1280,6 +1280,214 @@ impl KafkaClient {
         self.next_any_broker()
     }
 
+    /// Sharded `ListOffsets` across all requested `(topic, partition_ids)` grouped by each
+    /// partition's leader broker, matching `franz-go` `RequestSharded`.
+    ///
+    /// Retries on `NOT_LEADER_OR_FOLLOWER` / `UNKNOWN_TOPIC_OR_PARTITION` / `LEADER_NOT_AVAILABLE`
+    /// and transient I/O errors with metadata invalidation up to `last_produced_offset_retry_timeout`.
+    pub async fn list_offsets_sharded(
+        &self,
+        partitions_by_topic: &HashMap<String, Vec<i32>>,
+        timestamp: i64,
+    ) -> Result<HashMap<String, HashMap<i32, i64>>, KafkaClientError> {
+        let mut pending: HashMap<String, Vec<i32>> = HashMap::with_capacity(partitions_by_topic.len());
+        let mut out: HashMap<String, HashMap<i32, i64>> =
+            HashMap::with_capacity(partitions_by_topic.len());
+        for (topic, pids) in partitions_by_topic {
+            if pids.is_empty() {
+                continue;
+            }
+            let mut dedup = pids.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            pending.insert(topic.clone(), dedup);
+            out.insert(topic.clone(), HashMap::with_capacity(pids.len()));
+        }
+        if pending.is_empty() {
+            return Ok(out);
+        }
+
+        let start = tokio::time::Instant::now();
+        let retry_timeout =
+            mimir_retry_timeout(ApiKey::ListOffsets, self.last_produced_offset_retry_timeout);
+        let mut tries = 0u32;
+
+        loop {
+            // Ensure metadata is populated for any partition lacking a cached leader.
+            let missing_topics: Vec<String> = {
+                let md = self.metadata.read();
+                let mut set = std::collections::HashSet::new();
+                for (topic, pids) in &pending {
+                    for &pid in pids {
+                        let has_leader = md
+                            .partition_leaders
+                            .get(&(topic.clone(), pid))
+                            .copied()
+                            .is_some_and(|node| node >= 0 && md.brokers.contains_key(&node));
+                        if !has_leader {
+                            set.insert(topic.clone());
+                        }
+                    }
+                }
+                set.into_iter().collect()
+            };
+            if !missing_topics.is_empty() {
+                let topic_refs: Vec<&str> = missing_topics.iter().map(String::as_str).collect();
+                self.refresh_metadata(&topic_refs).await?;
+            }
+
+            // Group pending partitions by leader broker address.
+            let mut shards: HashMap<String, HashMap<String, Vec<i32>>> = HashMap::new();
+            {
+                let fallback = self.next_any_broker().ok();
+                let md = self.metadata.read();
+                for (topic, pids) in &pending {
+                    for &pid in pids {
+                        let addr = md
+                            .partition_leaders
+                            .get(&(topic.clone(), pid))
+                            .copied()
+                            .filter(|&node| node >= 0)
+                            .and_then(|node| md.brokers.get(&node).map(|b| b.addr.clone()))
+                            .or_else(|| fallback.as_ref().map(|b| b.addr.clone()))
+                            .ok_or(KafkaClientError::NoSeedBrokers)?;
+                        shards
+                            .entry(addr)
+                            .or_default()
+                            .entry(topic.clone())
+                            .or_default()
+                            .push(pid);
+                    }
+                }
+            }
+
+            let shard_futs = shards.into_iter().map(|(broker_addr, shard_topics)| async move {
+                let mut req = ListOffsetsRequest::default();
+                req.replica_id = BrokerId(-1);
+                req.isolation_level = 0;
+                for (topic, pids) in &shard_topics {
+                    let mut lt = ListOffsetsTopic::default();
+                    lt.name = TopicName(StrBytes::from_string(topic.clone()));
+                    for &pid in pids {
+                        let mut lp = ListOffsetsPartition::default();
+                        lp.partition_index = pid;
+                        lp.current_leader_epoch = -1;
+                        lp.timestamp = timestamp;
+                        lp.max_num_offsets = 1;
+                        lt.partitions.push(lp);
+                    }
+                    req.topics.push(lt);
+                }
+
+                let res: Result<(i16, ListOffsetsResponse), KafkaClientError> = async {
+                    let conn = self.load_conn(&broker_addr).await?;
+                    let ver = conn.pick_version(ApiKey::ListOffsets, 2, 7);
+                    let resp: ListOffsetsResponse = self
+                        .send_on(&conn, ApiKey::ListOffsets, ver, &req, self.request_timeout)
+                        .await?;
+                    Ok((ver, resp))
+                }
+                .await;
+
+                (shard_topics, res)
+            });
+
+            let results = futures::future::join_all(shard_futs).await;
+
+            let mut retry_pending: HashMap<String, Vec<i32>> = HashMap::new();
+            let mut last_err: Option<KafkaClientError> = None;
+
+            for (shard_topics, res) in results {
+                match res {
+                    Ok((ver, resp)) => {
+                        let mut shard_ok: HashMap<(String, i32), i64> = HashMap::new();
+                        let mut shard_retry: HashMap<(String, i32), ResponseError> = HashMap::new();
+
+                        for rt in resp.topics {
+                            let topic_name = rt.name.0.as_str();
+                            if !shard_topics.contains_key(topic_name) {
+                                return Err(KafkaClientError::UnexpectedResponse(format!(
+                                    "unexpected topic in the response: {topic_name}"
+                                )));
+                            }
+                            for rp in rt.partitions {
+                                let pid = rp.partition_index;
+                                if let Some(err) = rp.error_code.err() {
+                                    let stale_leader = matches!(
+                                        err,
+                                        ResponseError::NotLeaderOrFollower
+                                            | ResponseError::UnknownTopicOrPartition
+                                            | ResponseError::LeaderNotAvailable
+                                    );
+                                    if stale_leader {
+                                        self.invalidate_partition_leader(topic_name, pid);
+                                        shard_ok.remove(&(topic_name.to_string(), pid));
+                                        shard_retry.insert((topic_name.to_string(), pid), err);
+                                        last_err = Some(KafkaClientError::Broker(err));
+                                    } else {
+                                        return Err(KafkaClientError::Broker(err));
+                                    }
+                                } else if !shard_retry.contains_key(&(topic_name.to_string(), pid))
+                                {
+                                    let offset = if ver == 0 {
+                                        rp.old_style_offsets.first().copied().unwrap_or(0)
+                                    } else {
+                                        rp.offset
+                                    };
+                                    shard_ok.insert((topic_name.to_string(), pid), offset);
+                                }
+                            }
+                        }
+
+                        for (topic, pids) in &shard_topics {
+                            for &pid in pids {
+                                let key = (topic.clone(), pid);
+                                if let Some(off) = shard_ok.get(&key) {
+                                    out.entry(topic.clone()).or_default().insert(pid, *off);
+                                } else if shard_retry.contains_key(&key) || !shard_retry.is_empty() {
+                                    retry_pending.entry(topic.clone()).or_default().push(pid);
+                                } else {
+                                    return Err(KafkaClientError::UnexpectedResponse(format!(
+                                        "the offset for topic {topic:?} partition {pid} is missing in the response"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let retryable = !matches!(err, KafkaClientError::Broker(_));
+                        for (topic, pids) in &shard_topics {
+                            for &pid in pids {
+                                self.invalidate_partition_leader(topic, pid);
+                            }
+                        }
+                        if !retryable {
+                            return Err(err);
+                        }
+                        for (topic, pids) in shard_topics {
+                            retry_pending.entry(topic).or_default().extend(pids);
+                        }
+                        last_err = Some(err);
+                    }
+                }
+            }
+
+            if retry_pending.is_empty() {
+                return Ok(out);
+            }
+
+            tries += 1;
+            let err = last_err.unwrap_or_else(|| {
+                KafkaClientError::UnexpectedResponse("list_offsets_sharded retry".to_string())
+            });
+            let Some(backoff) = sharded_retry_backoff(start, retry_timeout, tries, &err) else {
+                return Err(err);
+            };
+            tokio::time::sleep(backoff).await;
+            pending = retry_pending;
+        }
+    }
+
     pub async fn list_offset(
         &self,
         topic: &str,

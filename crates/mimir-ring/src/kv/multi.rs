@@ -281,21 +281,23 @@ impl MultiKv {
             .position(|c| c.name == store)
             .ok_or_else(|| KvError::Other("KV store not found".to_string()))?;
 
-        let prev = self.primary_id.swap(new_ix, Ordering::AcqRel);
-        if prev == new_ix {
-            return Ok(false);
-        }
-
-        self.update_primary_store_gauge();
-
+        // Hold `in_progress` across swapping `primary_id` and collecting active watches so
+        // `watch_key`/`watch_prefix` can never register against the stale primary after
+        // cancellation has already scanned `in_progress`.
         let to_cancel: Vec<ServiceContext> = {
             let guard = self.in_progress.lock();
+            let prev = self.primary_id.swap(new_ix, Ordering::AcqRel);
+            if prev == new_ix {
+                return Ok(false);
+            }
             guard
                 .values()
                 .filter(|w| w.client_idx == prev)
                 .map(|w| w.ctx.clone())
                 .collect()
         };
+
+        self.update_primary_store_gauge();
         for ctx in to_cancel {
             ctx.cancel();
         }
@@ -327,12 +329,12 @@ impl MultiKv {
         self.metrics.mirror_enabled.set(val);
     }
 
-    fn register_watch(&self, client_idx: usize, ctx: ServiceContext) -> usize {
+    fn register_watch_for_primary(&self, ctx: ServiceContext) -> (usize, &NamedKvClient) {
+        let mut guard = self.in_progress.lock();
+        let pid = self.primary_id.load(Ordering::Acquire);
         let id = self.in_progress_cnt.fetch_add(1, Ordering::Relaxed) + 1;
-        self.in_progress
-            .lock()
-            .insert(id, InProgressWatch { client_idx, ctx });
-        id
+        guard.insert(id, InProgressWatch { client_idx: pid, ctx });
+        (id, &self.clients[pid])
     }
 
     fn unregister_watch(&self, id: usize) {
@@ -524,9 +526,8 @@ impl KvClient for MultiKv {
                 if cancel.is_canceled() {
                     return;
                 }
-                let (pid, primary) = self.get_primary_client();
                 let child_ctx = cancel.child();
-                let reg_id = self.register_watch(pid, child_ctx.clone());
+                let (reg_id, primary) = self.register_watch_for_primary(child_ctx.clone());
 
                 let stopped_by_cb = Arc::new(AtomicBool::new(false));
                 let stopped_flag = stopped_by_cb.clone();
@@ -572,9 +573,8 @@ impl KvClient for MultiKv {
                 if cancel.is_canceled() {
                     return;
                 }
-                let (pid, primary) = self.get_primary_client();
                 let child_ctx = cancel.child();
-                let reg_id = self.register_watch(pid, child_ctx.clone());
+                let (reg_id, primary) = self.register_watch_for_primary(child_ctx.clone());
 
                 let stopped_by_cb = Arc::new(AtomicBool::new(false));
                 let stopped_flag = stopped_by_cb.clone();

@@ -380,6 +380,10 @@ impl Ring {
                             &r.key,
                             ctx,
                             Box::new(move |any| {
+                                if any.is::<crate::kv::KeyDeleted>() {
+                                    info!("ring doesn't exist in KV store yet");
+                                    return true;
+                                }
                                 if let Ok(desc) = any.downcast::<Desc>() {
                                     r_cb.update_ring_state(*desc);
                                 }

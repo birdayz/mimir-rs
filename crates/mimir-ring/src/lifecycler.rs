@@ -22,7 +22,7 @@ use parking_lot::{Mutex, RwLock};
 use prometheus::{Counter, Gauge, HistogramOpts, HistogramVec, Opts};
 use rand::seq::SliceRandom;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tracing::{debug, error, info, warn};
 
 use crate::kv::memberlist::MemberlistKv;
@@ -202,8 +202,6 @@ impl BasicLifecyclerMetrics {
     }
 }
 
-type ActorMsg = Box<dyn FnOnce() + Send>;
-
 pub struct BasicLifecycler {
     cfg: BasicLifecyclerConfig,
     ring_name: String,
@@ -214,7 +212,8 @@ pub struct BasicLifecycler {
     curr_instance_desc: RwLock<Option<InstanceDesc>>,
     keep_on_shutdown: AtomicBool,
     token_generator: Arc<dyn TokenGenerator>,
-    actor_tx: Mutex<Option<mpsc::Sender<ActorMsg>>>,
+    is_running: AtomicBool,
+    op_lock: AsyncMutex<()>,
 }
 
 impl BasicLifecycler {
@@ -244,7 +243,8 @@ impl BasicLifecycler {
             metrics,
             curr_instance_desc: RwLock::new(None),
             token_generator,
-            actor_tx: Mutex::new(None),
+            is_running: AtomicBool::new(false),
+            op_lock: AsyncMutex::new(()),
         })
     }
 
@@ -308,6 +308,16 @@ impl BasicLifecycler {
     }
 
     pub async fn change_state(&self, state: InstanceState) -> Result<(), LifecyclerError> {
+        if !self.is_running.load(Ordering::Acquire) {
+            return Err(LifecyclerError::NotRunning);
+        }
+        self.change_state_inner(state).await
+    }
+
+    pub(crate) async fn change_state_inner(
+        &self,
+        state: InstanceState,
+    ) -> Result<(), LifecyclerError> {
         self.update_instance(move |_ring, inst| {
             if inst.instance_state() == state {
                 return false;
@@ -319,6 +329,9 @@ impl BasicLifecycler {
     }
 
     pub async fn change_read_only_state(&self, read_only: bool) -> Result<(), LifecyclerError> {
+        if !self.is_running.load(Ordering::Acquire) {
+            return Err(LifecyclerError::NotRunning);
+        }
         self.update_instance(move |_ring, inst| {
             if inst.read_only == read_only {
                 return false;
@@ -364,31 +377,23 @@ impl BasicLifecycler {
             Some(Box::new(move |ctx: ServiceContext| {
                 let l = l_run.clone();
                 Box::pin(async move {
-                    let (tx, mut rx) = mpsc::channel::<ActorMsg>(32);
-                    *l.actor_tx.lock() = Some(tx);
+                    l.is_running.store(true, Ordering::Release);
                     let hb_period = l.cfg.heartbeat_period;
 
                     loop {
                         if hb_period.is_zero() {
-                            tokio::select! {
-                                _ = ctx.canceled() => break,
-                                msg = rx.recv() => {
-                                    if let Some(f) = msg { f(); } else { break; }
-                                }
-                            }
+                            ctx.canceled().await;
+                            break;
                         } else {
                             tokio::select! {
                                 _ = ctx.canceled() => break,
-                                msg = rx.recv() => {
-                                    if let Some(f) = msg { f(); } else { break; }
-                                }
                                 _ = tokio::time::sleep(hb_period) => {
                                     l.heartbeat().await;
                                 }
                             }
                         }
                     }
-                    *l.actor_tx.lock() = None;
+                    l.is_running.store(false, Ordering::Release);
                     Ok(())
                 })
             })),
@@ -569,6 +574,7 @@ impl BasicLifecycler {
     }
 
     async fn unregister_instance(&self) -> Result<(), LifecyclerError> {
+        let _op = self.op_lock.lock().await;
         let id = self.cfg.id.clone();
         self.store
             .cas(
@@ -601,6 +607,7 @@ impl BasicLifecycler {
     where
         F: FnMut(&mut Desc, &mut InstanceDesc) -> bool + Send + 'static,
     {
+        let _op = self.op_lock.lock().await;
         let id = self.cfg.id.clone();
         let addr = self.cfg.addr.clone();
         let zone = self.cfg.zone.clone();
@@ -735,7 +742,7 @@ impl BasicLifecyclerDelegate for LeaveOnStoppingDelegate {
         lifecycler: &'a BasicLifecycler,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if let Err(err) = lifecycler.change_state(InstanceState::Leaving).await {
+            if let Err(err) = lifecycler.change_state_inner(InstanceState::Leaving).await {
                 error!(%err, "failed to change instance state to LEAVING in the ring");
             }
             self.next.on_ring_instance_stopping(lifecycler).await;
@@ -1061,6 +1068,8 @@ pub struct Lifecycler {
     token_generator: Arc<dyn TokenGenerator>,
     can_join_timeout: Duration,
     metrics: LifecyclerMetrics,
+    is_running: AtomicBool,
+    op_lock: AsyncMutex<()>,
 }
 
 impl Lifecycler {
@@ -1150,6 +1159,8 @@ impl Lifecycler {
             token_generator,
             can_join_timeout: Duration::from_secs(5 * 60),
             metrics: LifecyclerMetrics::new(ring_name, reg.as_ref()),
+            is_running: AtomicBool::new(false),
+            op_lock: AsyncMutex::new(()),
             cfg,
             flush_transferer: RwLock::new(
                 flush_transferer.unwrap_or_else(|| Arc::new(NoopFlushTransferer)),
@@ -1308,6 +1319,14 @@ impl Lifecycler {
     }
 
     pub async fn change_state(&self, target: InstanceState) -> Result<(), LifecyclerError> {
+        if !self.is_running.load(Ordering::Acquire) {
+            return Err(LifecyclerError::NotRunning);
+        }
+        self.change_state_inner(target).await
+    }
+
+    async fn change_state_inner(&self, target: InstanceState) -> Result<(), LifecyclerError> {
+        let _op = self.op_lock.lock().await;
         let curr = self.get_state();
         let allowed = matches!(
             (curr, target),
@@ -1330,20 +1349,36 @@ impl Lifecycler {
             "changing instance state from"
         );
         self.state.write().state = target;
-        self.update_consul().await
+        if let Err(err) = self.update_consul_locked().await {
+            self.state.write().state = curr;
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub async fn change_read_only_state(&self, read_only: bool) -> Result<(), LifecyclerError> {
-        let (prev, _) = self.get_read_only_state();
+        if !self.is_running.load(Ordering::Acquire) {
+            return Err(LifecyclerError::NotRunning);
+        }
+        let _op = self.op_lock.lock().await;
+        let (prev, prev_ts) = self.get_read_only_state();
         if prev == read_only {
             return Ok(());
         }
         info!(readOnly = read_only, ring = %self.ring_name, "changing read-only state of instance in the ring");
         self.set_read_only_internal(read_only, Some(SystemTime::now()));
-        self.update_consul().await
+        if let Err(err) = self.update_consul_locked().await {
+            self.set_read_only_internal(prev, prev_ts);
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub async fn claim_tokens_for(&self, source_ingester_id: &str) -> Result<(), LifecyclerError> {
+        if !self.is_running.load(Ordering::Acquire) {
+            return Err(LifecyclerError::NotRunning);
+        }
+        let _op = self.op_lock.lock().await;
         let my_id = self.id.clone();
         let src_id = source_ingester_id.to_string();
         let claimed = Arc::new(Mutex::new(Vec::new()));
@@ -1437,7 +1472,17 @@ impl Lifecycler {
 
                         if inst.instance_state() == InstanceState::Joining {
                             warn!(ring = %ring_name, "instance found in ring as JOINING, setting to PENDING");
+                            inst.id = id.clone();
+                            inst.addr = addr.clone();
+                            inst.zone = zone.clone();
                             inst.state = InstanceState::Pending as i32;
+                            let now_s = system_time_to_unix_secs(SystemTime::now());
+                            inst.timestamp = if inst.timestamp == now_s {
+                                now_s.saturating_add(1)
+                            } else {
+                                now_s
+                            };
+                            *ps_cb.lock() = InstanceState::Pending;
                             ring_desc.ingesters.insert(id.clone(), inst);
                         } else {
                             let mut toks = inst.tokens.clone();
@@ -1584,6 +1629,7 @@ impl Lifecycler {
             }
         }
 
+        let _op = self.op_lock.lock().await;
         let id = self.id.clone();
         let addr = self.addr.clone();
         let zone = self.zone.clone();
@@ -1639,6 +1685,7 @@ impl Lifecycler {
     }
 
     async fn verify_tokens(&self) -> bool {
+        let _op = self.op_lock.lock().await;
         let id = self.id.clone();
         let addr = self.addr.clone();
         let zone = self.zone.clone();
@@ -1697,6 +1744,11 @@ impl Lifecycler {
     }
 
     async fn update_consul(&self) -> Result<(), LifecyclerError> {
+        let _op = self.op_lock.lock().await;
+        self.update_consul_locked().await
+    }
+
+    async fn update_consul_locked(&self) -> Result<(), LifecyclerError> {
         let id = self.id.clone();
         let addr = self.addr.clone();
         let zone = self.zone.clone();
@@ -1744,6 +1796,7 @@ impl Lifecycler {
     }
 
     async fn unregister(&self) -> Result<(), LifecyclerError> {
+        let _op = self.op_lock.lock().await;
         let id = self.id.clone();
         self.kv_store
             .cas(
@@ -1855,6 +1908,7 @@ impl Lifecycler {
                     l.init_ring()
                         .await
                         .map_err(|e| ServiceError::failure(format!("failed to join the ring {}: {e}", l.ring_name)))?;
+                    l.is_running.store(true, Ordering::Release);
 
                     let join_deadline = tokio::time::Instant::now() + l.cfg.join_after;
                     let mut join_fired = false;
@@ -1871,6 +1925,7 @@ impl Lifecycler {
                         tokio::select! {
                             _ = ctx.canceled() => {
                                 info!(ring = %l.ring_name, "lifecycler loop() exited gracefully");
+                                l.is_running.store(false, Ordering::Release);
                                 break;
                             }
                             _ = tokio::time::sleep_until(join_deadline), if !join_fired => {
@@ -1905,7 +1960,7 @@ impl Lifecycler {
                                 }
                                 if l.verify_tokens().await {
                                     info!(ring = %l.ring_name, "token verification successful");
-                                    if let Err(err) = l.change_state(InstanceState::Active).await {
+                                    if let Err(err) = l.change_state_inner(InstanceState::Active).await {
                                         error!(ring = %l.ring_name, %err, "failed to set state to ACTIVE");
                                     }
                                 } else {
@@ -1930,7 +1985,8 @@ impl Lifecycler {
                     if let Some(err) = running_err {
                         return Err(err);
                     }
-                    if let Err(err) = l.change_state(InstanceState::Leaving).await {
+                    l.is_running.store(false, Ordering::Release);
+                    if let Err(err) = l.change_state_inner(InstanceState::Leaving).await {
                         error!(ring = %l.ring_name, %err, "failed to set state to LEAVING");
                     }
 
@@ -1959,10 +2015,13 @@ impl Lifecycler {
                         info!(ring = %l.ring_name, "instance removed from the KV store");
                     }
 
-                    if !l.cfg.tokens_file_path.is_empty()
-                        && l.clear_tokens_on_shutdown()
-                        && std::fs::remove_file(&l.cfg.tokens_file_path).is_ok()
-                    {
+                    if !l.cfg.tokens_file_path.is_empty() && l.clear_tokens_on_shutdown() {
+                        std::fs::remove_file(&l.cfg.tokens_file_path).map_err(|e| {
+                            ServiceError::failure(format!(
+                                "failed to delete tokens file {}: {e}",
+                                l.cfg.tokens_file_path
+                            ))
+                        })?;
                         info!(path = %l.cfg.tokens_file_path, "removed tokens file from disk");
                     }
                     Ok(())
@@ -2118,6 +2177,132 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("heartbeat period must be greater than 0"),
+            "unexpected err: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lifecycler_not_running_errors_and_joining_recovery_timestamp() {
+        use crate::kv::memberlist::{MemberlistKv, MemberlistKvClient};
+        use mimir_config::{GoDuration, MemberlistConfig};
+
+        let cfg = RingConfig {
+            instance_id: "rec-1".to_string(),
+            instance_addr: "127.0.0.1".to_string(),
+            instance_port: 9095,
+            num_tokens: 2,
+            heartbeat_period: GoDuration::from_millis(50),
+            ..Default::default()
+        };
+
+        let ml_cfg = MemberlistConfig {
+            bind_addr: vec!["127.0.0.1".to_string()],
+            bind_port: 0,
+            node_name: "lc-rec-node".to_string(),
+            ..Default::default()
+        };
+        let ml = MemberlistKv::start(ml_cfg, vec![ring_desc_codec()], "test", None)
+            .await
+            .unwrap();
+        let kv: Arc<dyn KvClient> =
+            Arc::new(MemberlistKvClient::new(Arc::clone(&ml), ring_desc_codec()).unwrap());
+
+        let now_s = system_time_to_unix_secs(SystemTime::now());
+        kv.cas(
+            "ring",
+            Box::new(move |_| {
+                let mut d = Desc::default();
+                d.ingesters.insert(
+                    "rec-1".to_string(),
+                    InstanceDesc {
+                        id: "rec-1".to_string(),
+                        addr: "127.0.0.1:9095".to_string(),
+                        timestamp: now_s,
+                        state: InstanceState::Joining as i32,
+                        tokens: vec![10, 20],
+                        ..Default::default()
+                    },
+                );
+                Ok(CasOutcome::Update(Box::new(d)))
+            }),
+        )
+        .await
+        .unwrap();
+
+        let lc_cfg = LifecyclerConfig::from_ring_config(&cfg, 9095).unwrap();
+        let lc = Lifecycler::with_store(
+            lc_cfg,
+            Arc::clone(&kv),
+            Some(Arc::new(NoopFlushTransferer)),
+            "ingester",
+            "ring",
+            false,
+            None,
+        );
+
+        assert!(matches!(
+            lc.change_state(InstanceState::Active).await,
+            Err(LifecyclerError::NotRunning)
+        ));
+        assert!(matches!(
+            lc.change_read_only_state(true).await,
+            Err(LifecyclerError::NotRunning)
+        ));
+        assert!(matches!(
+            lc.claim_tokens_for("other").await,
+            Err(LifecyclerError::NotRunning)
+        ));
+
+        // JOINING -> PENDING recovery must bump timestamp so MemberlistKv CAS succeeds immediately.
+        lc.init_ring().await.unwrap();
+        let got = kv
+            .get("ring")
+            .await
+            .unwrap()
+            .unwrap()
+            .downcast::<Desc>()
+            .unwrap();
+        let inst = &got.ingesters["rec-1"];
+        assert_eq!(inst.instance_state(), InstanceState::Pending);
+        assert!(inst.timestamp > now_s || now_s != system_time_to_unix_secs(SystemTime::now()));
+
+        ml.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_tokens_on_shutdown_propagates_remove_error() {
+        use mimir_common::services::Service;
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("unremovable-dir");
+        std::fs::create_dir_all(missing.join("sub")).unwrap();
+        let ring_cfg = RingConfig {
+            instance_id: "clr-1".to_string(),
+            instance_addr: "127.0.0.1".to_string(),
+            tokens_file_path: missing.to_string_lossy().into_owned(),
+            final_sleep: mimir_config::GoDuration::ZERO,
+            heartbeat_period: mimir_config::GoDuration::from_millis(50),
+            ..Default::default()
+        };
+
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(ring_desc_codec()));
+        let lc_cfg = LifecyclerConfig::from_ring_config(&ring_cfg, 9095).unwrap();
+        let lc = Lifecycler::with_store(
+            lc_cfg,
+            kv,
+            Some(Arc::new(NoopFlushTransferer)),
+            "ingester",
+            "ring",
+            false,
+            None,
+        );
+        lc.set_clear_tokens_on_shutdown(true);
+        let svc = lc.into_service();
+        svc.start_async(ServiceContext::background()).await.unwrap();
+        svc.await_running().await.unwrap();
+        svc.stop_async();
+        let err = svc.await_terminated().await.unwrap_err();
+        assert!(
+            err.to_string().contains("failed to delete tokens file"),
             "unexpected err: {err}"
         );
     }
