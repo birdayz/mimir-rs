@@ -975,12 +975,32 @@ pub fn spawn_compaction_loop(
     })
 }
 
+/// Ported from `github.com/grafana/mimir/pkg/util/time.go` (`DurationWithJitter`).
+pub fn duration_with_jitter(input: Duration, variance_perc: f64) -> Duration {
+    if variance_perc <= 0.0 {
+        return input;
+    }
+    let variance = (input.as_nanos() as f64 * variance_perc) as i64;
+    if variance <= 0 {
+        return input;
+    }
+    let span = (variance as u64).saturating_mul(2);
+    if span == 0 {
+        return input;
+    }
+    let jitter = (rand::random::<u64>() % span) as i64 - variance;
+    let out_ns = (input.as_nanos() as i128) + (jitter as i128);
+    Duration::from_nanos(out_ns.max(0) as u64)
+}
+
 pub fn spawn_shipping_loop(
     ingester: Arc<Ingester>,
     mut ship_rx: mpsc::Receiver<TriggerRequest>,
     ctx: ServiceContext,
 ) -> JoinHandle<()> {
-    let interval = Duration::from_nanos(
+    // pkg/ingester/ingester_compaction.go:37: apply 1% jitter so shipping never phase-locks
+    // with head compaction or the idle TSDB closer (e.g. DefaultCloseIdleTSDBInterval = 5m).
+    let raw_interval = Duration::from_nanos(
         ingester
             .blocks_cfg
             .tsdb
@@ -988,6 +1008,7 @@ pub fn spawn_shipping_loop(
             .as_nanos()
             .max(10_000_000) as u64,
     );
+    let interval = duration_with_jitter(raw_interval, 0.01).max(Duration::from_millis(10));
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1195,4 +1216,32 @@ pub fn spawn_owned_series_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> 
         }
         ingester.set_owned_series_service_state(State::Terminated);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::duration_with_jitter;
+    use std::time::Duration;
+
+    #[test]
+    fn duration_with_jitter_bounds_and_zero_variance() {
+        let input = Duration::from_secs(60);
+        assert_eq!(duration_with_jitter(input, 0.0), input);
+        assert_eq!(duration_with_jitter(Duration::ZERO, 0.01), Duration::ZERO);
+
+        let min_expected = Duration::from_millis(59_400);
+        let max_expected = Duration::from_millis(60_600);
+        let mut saw_non_equal = false;
+        for _ in 0..64 {
+            let out = duration_with_jitter(input, 0.01);
+            assert!(
+                out >= min_expected && out <= max_expected,
+                "out={out:?} out of [59.4s, 60.6s]"
+            );
+            if out != input {
+                saw_non_equal = true;
+            }
+        }
+        assert!(saw_non_equal, "expected at least one jittered sample != input");
+    }
 }
