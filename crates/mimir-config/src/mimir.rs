@@ -791,9 +791,33 @@ impl MimirConfig {
         self.usage_stats
             .validate()
             .map_err(wrap_validation("invalid usage stats config"))?;
+
+        // pkg/api/api.go Config.Validate.
+        let level = self.api_response_compression_level()?;
+        if !(1..=9).contains(&level) && level != -1 {
+            return Err(wrap_validation("invalid API config")(ConfigError::Validation(format!(
+                "invalid gzip compression level: {level}, must be between 1 and 9 or -1 for default compression level"
+            ))));
+        }
+
         self.limits.validate()?;
 
         Ok(())
+    }
+
+    /// `api.response_compression_level` / `-http.response-compression-level` (default
+    /// `gzip.DefaultCompression` = -1). The `api` block is kept as an extra section.
+    pub fn api_response_compression_level(&self) -> Result<i64, ConfigError> {
+        if let Some(v) = self.extra_cli_flag_value("http.response-compression-level") {
+            // Already type-checked when the flag was parsed.
+            return crate::flags::go_parse_int(v);
+        }
+        Ok(self
+            .extra_sections
+            .get("api")
+            .and_then(|api| api.get("response_compression_level"))
+            .and_then(Value::as_i64)
+            .unwrap_or(-1))
     }
 
     fn validate_filesystem_paths(&self) -> Result<(), ConfigError> {

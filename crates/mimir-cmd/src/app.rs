@@ -5,7 +5,6 @@
 //! - github.com/grafana/mimir/pkg/mimir/modules.go
 //! - github.com/grafana/dskit/server/server.go
 
-use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,9 +38,6 @@ use mimir_ring::ring::Ring;
 use mimir_ring::token_gen::{PartitionTokenGenerator, PartitionTokenTable};
 use mimir_storage::bucket::BucketClient;
 use prometheus::Registry;
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codec::CompressionEncoding;
 
 use crate::cli::CliOutcome;
@@ -108,16 +104,6 @@ fn validate_supported_targets(cfg: &MimirConfig) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn resolve_bind_addr(addr: &str, port: i64) -> Result<SocketAddr> {
-    let host = if addr.is_empty() { "0.0.0.0" } else { addr };
-    let ip: IpAddr = host
-        .parse()
-        .with_context(|| format!("invalid listen IP address {host:?}"))?;
-    let port_u16 = u16::try_from(port)
-        .with_context(|| format!("invalid listen port {port}"))?;
-    Ok(SocketAddr::new(ip, port_u16))
 }
 
 /// Runs the configured Mimir application until SIGTERM/SIGINT or `/ingester/shutdown`.
@@ -221,37 +207,14 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         (None, Overrides::new(cfg.limits.clone()))
     };
 
-    // 3. Bind HTTP & gRPC listeners early so port 0 resolves before ring registration.
-    let http_addr = resolve_bind_addr(
-        &cfg.server.http_listen_address,
-        cfg.server.http_listen_port,
-    )?;
-    let grpc_addr = resolve_bind_addr(
-        &cfg.server.grpc_listen_address,
-        cfg.server.grpc_listen_port,
-    )?;
-    let http_listener = TcpListener::bind(http_addr)
-        .await
-        .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
-    let grpc_listener = TcpListener::bind(grpc_addr)
-        .await
-        .with_context(|| format!("binding gRPC listener on {grpc_addr}"))?;
-
-    let bound_http_addr = http_listener.local_addr()?;
-    let bound_grpc_addr = grpc_listener.local_addr()?;
-    cfg.server.http_listen_port = bound_http_addr.port() as i64;
-    cfg.server.grpc_listen_port = bound_grpc_addr.port() as i64;
-
-    let http_addr_s = bound_http_addr.to_string();
-    let grpc_addr_s = bound_grpc_addr.to_string();
-    logger.log(
-        LogLevel::Info,
-        &[
-            ("msg", "server listening on addresses"),
-            ("http", &http_addr_s),
-            ("grpc", &grpc_addr_s),
-        ],
-    );
+    // 3. Server module (dskit server.New): binds HTTP & gRPC listeners early so port 0 resolves
+    //    before ring registration, builds TLS configs and middleware.
+    let server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
+        .context("error initialising module: server")?;
+    let bound_http_addr = server.http_addr()?;
+    let bound_grpc_addr = server.grpc_addr()?;
+    cfg.server.http_listen_port = i64::from(bound_http_addr.port());
+    cfg.server.grpc_listen_port = i64::from(bound_grpc_addr.port());
 
     let ingester_enabled = cfg.is_ingester_enabled();
     let service_ctx = ServiceContext::background();
@@ -479,10 +442,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
     let health_svc = HealthService::new(Arc::clone(&shutdown_requested), ingester_opt.clone());
 
-    let mut grpc_builder = tonic::transport::Server::builder()
-        .tcp_nodelay(true)
-        .add_service(health_svc)
-        .add_service(http_grpc_svc);
+    let mut grpc_routes = tonic::service::Routes::new(health_svc).add_service(http_grpc_svc);
 
     if let Some(ref ing) = ingester_opt {
         let ing_svc = IngesterService::new(Arc::clone(ing))
@@ -491,64 +451,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             .max_encoding_message_size(max_send)
             .accept_compressed(CompressionEncoding::Gzip)
             .accept_compressed(CompressionEncoding::Zstd);
-        grpc_builder = grpc_builder.add_service(ing_svc);
+        grpc_routes = grpc_routes.add_service(ing_svc);
     }
 
-    let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel::<()>();
-    let (grpc_shutdown_tx, grpc_shutdown_rx) = oneshot::channel::<()>();
-    let (server_done_tx, server_done_rx) = oneshot::channel::<()>();
-
-    let http_std = http_listener.into_std()?;
-    let grpc_std = grpc_listener.into_std()?;
-    http_std.set_nonblocking(true)?;
-    grpc_std.set_nonblocking(true)?;
-
     log_module_starting(&*logger, "server");
-
-    std::thread::Builder::new()
-        .name("mimir-rpc-rt".to_string())
-        .spawn(move || {
-            let rpc_workers =
-                std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 16));
-            let rpc_rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(rpc_workers)
-                .thread_name("mimir-rpc")
-                .enable_all()
-                .build()
-                .expect("build mimir-rpc runtime");
-            rpc_rt.block_on(async move {
-                let http_l = TcpListener::from_std(http_std).expect("from_std http listener");
-                let grpc_l = TcpListener::from_std(grpc_std).expect("from_std grpc listener");
-
-                let http_task = tokio::spawn(async move {
-                    axum::serve(http_l, http_router)
-                        .with_graceful_shutdown(async {
-                            let _ = http_shutdown_rx.await;
-                        })
-                        .await
-                });
-
-                let incoming =
-                    tokio_stream::StreamExt::map(TcpListenerStream::new(grpc_l), |res| {
-                        if let Ok(ref stream) = res {
-                            let _ = stream.set_nodelay(true);
-                        }
-                        res
-                    });
-
-                let grpc_task = tokio::spawn(async move {
-                    grpc_builder
-                        .serve_with_incoming_shutdown(incoming, async {
-                            let _ = grpc_shutdown_rx.await;
-                        })
-                        .await
-                });
-
-                let _ = tokio::join!(http_task, grpc_task);
-            });
-            let _ = server_done_tx.send(());
-        })
-        .context("spawning mimir-rpc runtime thread")?;
+    let servers = server.start(http_router, grpc_routes)?;
 
     // 8. Start ring, partition ring, and ingester services while honoring SIGTERM/SIGINT cancellation.
     let mut startup_err: Option<anyhow::Error> = None;
@@ -652,16 +559,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     }
     service_ctx.cancel();
 
-    let _ = http_shutdown_tx.send(());
-    let _ = grpc_shutdown_tx.send(());
-
-    let graceful_timeout = Duration::from_nanos(
-        cfg.server
-            .graceful_shutdown_timeout
-            .0
-            .max(100_000_000) as u64,
-    );
-    let _ = tokio::time::timeout(graceful_timeout, server_done_rx).await;
+    servers.shutdown().await;
     // dskit server_service.go
     logger.log(LogLevel::Info, &[("msg", "server stopped")]);
     log_module_stopped(&*logger, "server");

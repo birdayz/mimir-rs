@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use axum::extract::{Query, State as AxumState};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get};
 use axum::{Json, Router};
 use mimir_common::logging::format_rfc3339_nano_utc;
 use mimir_common::services::{Service, State};
@@ -46,8 +46,10 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     let ingester_opt = state.ingester.clone();
     let path_prefix = state.config.server.http_path_prefix.trim_end_matches('/').to_string();
 
+    // `/ready` and `/metrics` are registered without a method restriction (Go
+    // `Server.HTTP.Path("/ready")`, dskit `router.Handle("/metrics", ...)`).
     let mut router = Router::new()
-        .route("/ready", get(ready_handler))
+        .route("/ready", any(ready_handler))
         .route("/services", get(services_handler))
         .route("/config", get(config_handler))
         .route("/runtime_config", get(runtime_config_handler))
@@ -55,7 +57,14 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         .route("/api/v1/status/buildinfo", get(buildinfo_handler))
         .route("/api/v1/status/config", get(status_config_handler))
         .route("/api/v1/status/flags", get(status_flags_handler))
-        .route("/debug/pprof/profile", get(pprof_profile_handler));
+        // dskit registerInstrumentation: `/debug/pprof/cmdline` is NotFound, everything else under
+        // `/debug/pprof` goes to Go's net/http/pprof handlers (any method).
+        .route("/debug/pprof/cmdline", any(not_found_handler))
+        .route("/debug/pprof/profile", any(crate::pprof::profile_handler))
+        .route("/debug/pprof/symbol", any(crate::pprof::symbol_handler))
+        .route("/debug/pprof", any(crate::pprof::index_redirect_handler))
+        .route("/debug/pprof/", any(crate::pprof::index_handler))
+        .route("/debug/pprof/*name", any(crate::pprof::unknown_profile_handler));
 
     let has_prefix = !path_prefix.is_empty() && path_prefix != "/";
     if !has_prefix {
@@ -73,7 +82,7 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         ));
         router = router.route(
             "/metrics",
-            get(move |st: AxumState<AppHttpState>, headers: HeaderMap| {
+            any(move |st: AxumState<AppHttpState>, headers: HeaderMap| {
                 metrics_handler(st, headers, Arc::clone(&cache))
             }),
         );
@@ -89,6 +98,16 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         app = app.merge(ingester_router(ing));
     }
 
+    // pkg/api/api.go newRoute: `gziphandler.GzipHandler` on every gzip-enabled route.
+    let gzip = crate::server::gzip::GzipConfig {
+        level: state_for_root.config.api_response_compression_level().unwrap_or(-1),
+    };
+    app = app
+        .route_layer(axum::middleware::from_fn_with_state(gzip, crate::server::gzip::gzip_handler))
+        // gorilla/mux answers a known path with an unsupported method with an empty 405 and
+        // reports it as an unmatched route.
+        .method_not_allowed_fallback(crate::server::http_middleware::method_not_allowed);
+
     if has_prefix {
         let normalized = if path_prefix.starts_with('/') {
             path_prefix
@@ -102,9 +121,24 @@ pub fn build_http_router(state: AppHttpState) -> Router {
                 get(index_handler).with_state(state_for_root),
             )
             .nest(&normalized, app)
+            .fallback(not_found_handler)
     } else {
-        app
+        // gorilla/mux NotFoundHandler default: http.NotFound.
+        app.fallback(not_found_handler)
     }
+}
+
+/// `http.NotFoundHandler()` (`http.Error(w, "404 page not found", 404)`).
+pub async fn not_found_handler() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        "404 page not found\n",
+    )
+        .into_response()
 }
 
 async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
@@ -521,40 +555,56 @@ struct BuildInfoData {
     features: BuildInfoFeatures,
 }
 
+/// Go `version.BuildInfoFeatures` (field order is the JSON order).
 #[derive(Serialize)]
 struct BuildInfoFeatures {
+    ruler_config_api: String,
     alertmanager_config_api: String,
     query_sharding: String,
-    ruler_config_api: String,
     federated_rules: String,
     ingest_storage: String,
 }
 
-async fn buildinfo_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
-    let extra_bool = |section: &str, key: &str| -> bool {
-        st.config
-            .extra_sections
-            .get(section)
-            .and_then(|v| v.get(key))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+/// A boolean option of a block mimir-rs keeps as an extra section: the CLI flag wins over the
+/// YAML value, which wins over the flag default (Go flag registration + YAML + flag parsing).
+fn extra_section_bool(cfg: &MimirConfig, path: &[&str], flag: &str, default: bool) -> bool {
+    if let Some(v) = cfg.extra_cli_flag_value(flag) {
+        // strconv.ParseBool (the value was validated when the flag was parsed).
+        return matches!(v, "1" | "t" | "T" | "TRUE" | "true" | "True");
+    }
+    let Some((section, rest)) = path.split_first() else {
+        return default;
     };
-    let query_sharding = st
-        .config
-        .extra_sections
-        .get("frontend")
-        .and_then(|v| v.get("query_sharding_total_shards"))
-        .and_then(Value::as_i64)
-        .is_some_and(|n| n > 0);
-    let federated_rules = st
-        .config
-        .extra_sections
-        .get("ruler")
-        .and_then(|v| v.get("tenant_federation"))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let mut v = cfg.extra_sections.get(*section);
+    for key in rest {
+        v = v.and_then(|v| v.get(*key));
+    }
+    v.and_then(Value::as_bool).unwrap_or(default)
+}
 
+/// pkg/mimir/modules.go `initAPI` (`version.BuildInfoHandler("Grafana Mimir", ...)`).
+async fn buildinfo_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
+    let cfg = &st.config;
+    let features = BuildInfoFeatures {
+        ruler_config_api: extra_section_bool(cfg, &["ruler", "enable_api"], "ruler.enable-api", true).to_string(),
+        alertmanager_config_api: extra_section_bool(cfg, &["alertmanager", "enable_api"], "alertmanager.enable-api", true)
+            .to_string(),
+        query_sharding: extra_section_bool(
+            cfg,
+            &["frontend", "parallelize_shardable_queries"],
+            "query-frontend.parallelize-shardable-queries",
+            true,
+        )
+        .to_string(),
+        federated_rules: extra_section_bool(
+            cfg,
+            &["ruler", "tenant_federation", "enabled"],
+            "ruler.tenant-federation.enabled",
+            false,
+        )
+        .to_string(),
+        ingest_storage: cfg.ingest_storage.enabled.to_string(),
+    };
     Json(BuildInfoResponse {
         status: "success",
         data: BuildInfoData {
@@ -563,13 +613,7 @@ async fn buildinfo_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
             revision: revision_str(),
             branch: branch_str(),
             go_version: go_version_str(),
-            features: BuildInfoFeatures {
-                alertmanager_config_api: extra_bool("alertmanager", "enable_api").to_string(),
-                query_sharding: query_sharding.to_string(),
-                ruler_config_api: extra_bool("ruler", "enable_api").to_string(),
-                federated_rules: federated_rules.to_string(),
-                ingest_storage: st.config.ingest_storage.enabled.to_string(),
-            },
+            features,
         },
     })
     .into_response()
@@ -767,127 +811,4 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-}
-
-#[derive(Deserialize)]
-struct PprofQuery {
-    seconds: Option<u64>,
-    frequency: Option<i32>,
-    format: Option<String>,
-}
-
-#[cfg(unix)]
-async fn pprof_profile_handler(Query(q): Query<PprofQuery>) -> Response {
-    use std::collections::{HashMap, HashSet};
-    use std::fmt::Write as _;
-    use std::time::Duration;
-
-    let _ = q.format;
-    let seconds = q.seconds.unwrap_or(30).clamp(1, 300);
-    let frequency = q.frequency.unwrap_or(999).clamp(10, 4000);
-
-    let guard = match pprof::ProfilerGuardBuilder::default()
-        .frequency(frequency)
-        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-        .build()
-    {
-        Ok(g) => g,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to start cpu profiler: {e}\n"),
-            )
-                .into_response();
-        }
-    };
-
-    tokio::time::sleep(Duration::from_secs(seconds)).await;
-
-    let report = match guard.report().build() {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to build cpu profile report: {e}\n"),
-            )
-                .into_response();
-        }
-    };
-
-    let mut total_samples: isize = 0;
-    let mut flat_counts: HashMap<String, isize> = HashMap::new();
-    let mut cum_counts: HashMap<String, isize> = HashMap::new();
-    let mut stacks: Vec<(isize, String)> = Vec::new();
-
-    for (frames, count) in &report.data {
-        let count = *count;
-        if count <= 0 {
-            continue;
-        }
-        total_samples += count;
-
-        let mut seen_in_stack = HashSet::new();
-        let mut stack_syms: Vec<String> = Vec::new();
-        for group in &frames.frames {
-            for sym in group {
-                let name = sym.name();
-                if stack_syms.is_empty() {
-                    *flat_counts.entry(name.clone()).or_insert(0) += count;
-                }
-                if seen_in_stack.insert(name.clone()) {
-                    *cum_counts.entry(name.clone()).or_insert(0) += count;
-                }
-                stack_syms.push(name);
-            }
-        }
-        if stack_syms.is_empty() {
-            *flat_counts.entry("<unknown>".to_string()).or_insert(0) += count;
-            stack_syms.push("<unknown>".to_string());
-        }
-        stacks.push((count, stack_syms.join("; ")));
-    }
-
-    let mut flat_vec: Vec<(String, isize)> = flat_counts.into_iter().collect();
-    flat_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
-    let mut cum_vec: Vec<(String, isize)> = cum_counts.into_iter().collect();
-    cum_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
-    stacks.sort_by_key(|a| std::cmp::Reverse(a.0));
-
-    let denom = (total_samples.max(1)) as f64;
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "CPU profile: duration={seconds}s frequency={frequency}Hz total_samples={total_samples}"
-    );
-    let _ = writeln!(out, "\n=== Top 30 Flat (Self) ===");
-    for (name, c) in flat_vec.iter().take(30) {
-        let pct = (*c as f64) * 100.0 / denom;
-        let _ = writeln!(out, "{c:>8} ({pct:>5.2}%)  {name}");
-    }
-    let _ = writeln!(out, "\n=== Top 30 Cumulative ===");
-    for (name, c) in cum_vec.iter().take(30) {
-        let pct = (*c as f64) * 100.0 / denom;
-        let _ = writeln!(out, "{c:>8} ({pct:>5.2}%)  {name}");
-    }
-    let _ = writeln!(out, "\n=== Top 20 Hot Stacks (leaf -> root) ===");
-    for (c, s) in stacks.iter().take(20) {
-        let pct = (*c as f64) * 100.0 / denom;
-        let _ = writeln!(out, "{c:>8} ({pct:>5.2}%)  {s}");
-    }
-
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        out,
-    )
-        .into_response()
-}
-
-#[cfg(not(unix))]
-async fn pprof_profile_handler(Query(_q): Query<PprofQuery>) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "CPU profiling is only supported on Unix targets\n",
-    )
-        .into_response()
 }

@@ -474,7 +474,26 @@ pub struct HistogramVec {
     label_names: Arc<Vec<String>>,
     shared: Arc<Shared>,
     const_pairs: Arc<Vec<proto::LabelPair>>,
-    children: Arc<RwLock<HashMap<Vec<String>, Arc<Histogram>>>>,
+    /// Children keyed by the xxhash64 of their label values; each bucket holds the (rarely more
+    /// than one) children with that hash. Lookups on the hot path do not allocate.
+    children: Arc<RwLock<ChildMap>>,
+}
+
+/// Label values → child histogram, bucketed by [`label_values_hash`].
+type ChildMap = HashMap<u64, Vec<(Vec<String>, Arc<Histogram>)>>;
+
+/// Hash of a label value tuple (values separated by 0xff, which never occurs in UTF-8).
+fn label_values_hash<S: AsRef<str>>(values: &[S]) -> u64 {
+    let mut h = xxhash_rust::xxh64::Xxh64::new(0);
+    for v in values {
+        h.update(v.as_ref().as_bytes());
+        h.update(&[0xff]);
+    }
+    h.digest()
+}
+
+fn same_values(a: &[String], b: &[&str]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y)
 }
 
 impl HistogramVec {
@@ -550,35 +569,48 @@ impl HistogramVec {
             self.label_names.len(),
             values.len()
         );
+        let hash = label_values_hash(values);
+        if let Some(h) = self
+            .children
+            .read()
+            .get(&hash)
+            .and_then(|b| b.iter().find(|(k, _)| same_values(k, values)))
         {
-            let children = self.children.read();
-            if let Some(h) = children
-                .iter()
-                .find(|(k, _)| k.iter().map(String::as_str).eq(values.iter().copied()))
-                .map(|(_, v)| v)
-            {
-                return Arc::clone(h);
-            }
+            return Arc::clone(&h.1);
+        }
+        let mut children = self.children.write();
+        let bucket = children.entry(hash).or_default();
+        if let Some((_, h)) = bucket.iter().find(|(k, _)| same_values(k, values)) {
+            return Arc::clone(h);
         }
         let key: Vec<String> = values.iter().map(|s| s.to_string()).collect();
-        let mut children = self.children.write();
-        Arc::clone(children.entry(key.clone()).or_insert_with(|| {
-            let mut pairs = (*self.const_pairs).clone();
-            for (name, value) in self.label_names.iter().zip(key.iter()) {
-                let mut lp = proto::LabelPair::default();
-                lp.set_name(name.clone());
-                lp.set_value(value.clone());
-                pairs.push(lp);
-            }
-            pairs.sort_by(|a, b| a.get_name().cmp(b.get_name()));
-            Arc::new(Histogram::new(Arc::clone(&self.shared), pairs))
-        }))
+        let mut pairs = (*self.const_pairs).clone();
+        for (name, value) in self.label_names.iter().zip(key.iter()) {
+            let mut lp = proto::LabelPair::default();
+            lp.set_name(name.clone());
+            lp.set_value(value.clone());
+            pairs.push(lp);
+        }
+        pairs.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+        let h = Arc::new(Histogram::new(Arc::clone(&self.shared), pairs));
+        bucket.push((key, Arc::clone(&h)));
+        h
     }
 
     /// Go `HistogramVec.DeleteLabelValues`.
     pub fn remove_label_values(&self, values: &[&str]) -> bool {
-        let key: Vec<String> = values.iter().map(|s| s.to_string()).collect();
-        self.children.write().remove(&key).is_some()
+        let hash = label_values_hash(values);
+        let mut children = self.children.write();
+        let Some(bucket) = children.get_mut(&hash) else {
+            return false;
+        };
+        let before = bucket.len();
+        bucket.retain(|(k, _)| !same_values(k, values));
+        let removed = bucket.len() != before;
+        if bucket.is_empty() {
+            children.remove(&hash);
+        }
+        removed
     }
 }
 
@@ -588,7 +620,12 @@ impl Collector for HistogramVec {
     }
 
     fn collect(&self) -> Vec<proto::MetricFamily> {
-        let children: Vec<Arc<Histogram>> = self.children.read().values().cloned().collect();
+        let children: Vec<Arc<Histogram>> = self
+            .children
+            .read()
+            .values()
+            .flat_map(|b| b.iter().map(|(_, h)| Arc::clone(h)))
+            .collect();
         if children.is_empty() && !self.label_names.is_empty() {
             return Vec::new();
         }
