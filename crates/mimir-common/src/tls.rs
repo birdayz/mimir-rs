@@ -393,6 +393,80 @@ impl ClientConfig {
     }
 }
 
+/// The single dskit `*tls.Config` resolved for both ends of a connection. dskit `kv/memberlist`
+/// (`NewTCPTransport`) passes the one `GetTLSConfig` result to `tls.Listen` (server side) and to
+/// `tls.DialWithDialer` (client side); rustls needs two distinct config objects for that.
+#[derive(Clone)]
+pub struct ResolvedClientServerConfig {
+    /// Client side (`tls.DialWithDialer`), identical to [`ClientConfig::get_tls_config`].
+    pub client: ResolvedClientConfig,
+    /// Server side (`tls.Listen`) of the same Go `tls.Config`.
+    pub server: Arc<rustls::ServerConfig>,
+}
+
+impl fmt::Debug for ResolvedClientServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedClientServerConfig")
+            .field("client", &self.client)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientConfig {
+    /// Port of dskit `ClientConfig.GetTLSConfig` for callers that use the returned `tls.Config`
+    /// also for server purposes (dskit `kv/memberlist` TCP transport). Errors are exactly those
+    /// of [`ClientConfig::get_tls_config`].
+    ///
+    /// Go semantics of the server side of such a config:
+    /// - `Certificates = []tls.Certificate{cert}`: the key pair loaded (once) at config time is
+    ///   served to every client; without `tls_cert_path`/`tls_key_path` the server has no
+    ///   certificate and every handshake fails (Go: `tls: no certificates configured`).
+    /// - `ClientAuth` is left at `tls.NoClientCert`: client certificates are never requested and
+    ///   `tls_ca_path` / `tls_server_name` / `tls_insecure_skip_verify` only affect the client.
+    /// - `tls_min_version` / `tls_cipher_suites` apply to both sides.
+    pub fn get_client_and_server_tls_config(
+        &self,
+    ) -> Result<ResolvedClientServerConfig, TlsConfigError> {
+        let client = self.get_tls_config()?;
+
+        let cert = if self.cert_path.is_empty() && self.key_path.is_empty() {
+            None
+        } else {
+            // Both paths are set (validated by get_tls_config above).
+            let loader = ReloadingClientCert {
+                cert_path: self.cert_path.clone(),
+                key_path: self.key_path.clone(),
+                provider: Arc::new(rustls::crypto::ring::default_provider()),
+            };
+            Some(Arc::new(loader.load()?))
+        };
+
+        let versions = protocol_versions(&self.min_version)?;
+        let provider = provider_for(self)?;
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .map_err(|e| TlsConfigError::Rustls(e.to_string()))?
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(StaticServerCert(cert)));
+
+        Ok(ResolvedClientServerConfig {
+            client,
+            server: Arc::new(server),
+        })
+    }
+}
+
+/// Go `tls.Config.Certificates` used by a server: one static key pair (or none, in which case
+/// every handshake is aborted like Go's `tls: no certificates configured`).
+#[derive(Debug)]
+struct StaticServerCert(Option<Arc<CertifiedKey>>);
+
+impl rustls::server::ResolvesServerCert for StaticServerCert {
+    fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.0.clone()
+    }
+}
+
 /// Go `GetClientCertificate`: the key pair is re-read from disk on every handshake that requests
 /// a client certificate.
 struct ReloadingClientCert {
@@ -672,6 +746,28 @@ mod tests {
             c.get_tls_config().unwrap().server_name,
             Some(ServerName::IpAddress(_))
         ));
+    }
+
+    #[test]
+    fn client_and_server_config() {
+        let mut c = cfg();
+        c.cert_path = fixture("server.crt");
+        c.key_path = fixture("server.key");
+        c.min_version = "VersionTLS13".into();
+        let r = c.get_client_and_server_tls_config().unwrap();
+        assert!(r.client.config.client_auth_cert_resolver.has_certs());
+
+        // Errors are those of get_tls_config.
+        let mut c = cfg();
+        c.cert_path = fixture("missing.crt");
+        c.key_path = fixture("server.key");
+        assert_eq!(
+            c.get_client_and_server_tls_config().unwrap_err(),
+            c.get_tls_config().unwrap_err()
+        );
+
+        // No key pair: the server side still builds (handshakes fail, like Go).
+        cfg().get_client_and_server_tls_config().unwrap();
     }
 
     #[test]
