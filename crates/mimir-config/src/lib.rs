@@ -25,6 +25,7 @@ pub mod server;
 pub mod sha256;
 pub mod storage;
 pub mod types;
+pub mod yaml_v3;
 
 pub use duration::{
     format_go_duration, format_model_duration, parse_duration, parse_go_duration,

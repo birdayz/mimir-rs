@@ -457,6 +457,10 @@ impl MimirConfig {
             raw_bytes
         };
 
+        // Go decodes with yaml.v3 `KnownFields(true)`: reject exactly what it rejects, with its
+        // error texts (all decode errors, in document order), before building values with serde.
+        crate::yaml_v3::check_config_document(bytes_to_parse).map_err(ConfigError::Yaml)?;
+
         let mut root: Value = serde_yaml::from_slice(bytes_to_parse)
             .map_err(|e| ConfigError::Yaml(e.to_string()))?;
 
