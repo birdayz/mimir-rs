@@ -95,10 +95,13 @@ pub fn init_logging(outcome: &CliOutcome) -> Arc<LogSink> {
 fn validate_supported_targets(cfg: &MimirConfig) -> Result<()> {
     for target in &cfg.target.0 {
         match target.as_str() {
-            "ingester" | "memberlist-kv" | "all" => {}
+            "ingester" | "memberlist-kv" => {}
+            // `all` (Mimir's default target) includes the distributor, querier, store-gateway,
+            // compactor, ruler, ... which mimir-rs does not implement: refuse to start rather
+            // than serving a "Ready" process that only runs the ingester.
             other => {
                 bail!(
-                    "target module {other:?} is not yet implemented in mimir-rs; supported targets: ingester, memberlist-kv, all"
+                    "target module {other:?} is not yet implemented in mimir-rs; supported targets: ingester, memberlist-kv"
                 );
             }
         }
@@ -650,5 +653,31 @@ fn install_shutdown_signal(
                 &[("msg", "=== received SIGINT/SIGTERM ===\n*** exiting")],
             );
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_targets(targets: &[&str]) -> MimirConfig {
+        let mut cfg = MimirConfig::default();
+        cfg.target.0 = targets.iter().map(|t| t.to_string()).collect();
+        cfg
+    }
+
+    #[test]
+    fn unimplemented_targets_are_rejected() {
+        assert!(validate_supported_targets(&with_targets(&["ingester"])).is_ok());
+        assert!(validate_supported_targets(&with_targets(&["ingester", "memberlist-kv"])).is_ok());
+        let err = validate_supported_targets(&with_targets(&["all"])).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "target module \"all\" is not yet implemented in mimir-rs; supported targets: ingester, memberlist-kv"
+        );
+        let err = validate_supported_targets(&with_targets(&["ingester", "distributor"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("target module \"distributor\" is not yet implemented"), "{err}");
     }
 }
