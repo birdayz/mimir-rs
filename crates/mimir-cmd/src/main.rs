@@ -15,8 +15,9 @@ unsafe impl Sync for MallocConfPtr {}
 #[cfg(target_os = "linux")]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
-static _rjem_malloc_conf_override: MallocConfPtr =
-    MallocConfPtr(c"dirty_decay_ms:500,muzzy_decay_ms:500,narenas:8".as_ptr());
+static _rjem_malloc_conf_override: MallocConfPtr = MallocConfPtr(
+    c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,percpu_arena:percpu".as_ptr(),
+);
 
 use mimir_cmd::{init_logging, parse_cli_for_run, run_mimir};
 use mimir_common::logging::check_fatal;

@@ -40,8 +40,8 @@ use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
 use kafka_protocol::records::{
-    Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
+    Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions,
+    TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
 };
 use mimir_config::KafkaConfig;
 use parking_lot::RwLock;
@@ -1780,44 +1780,104 @@ fn split_record_batch_v2_frames(raw: &Bytes) -> Result<Option<Vec<V2FrameInfo>>,
     Ok(Some(frames))
 }
 
-fn zigzag_varint_len(v: i64) -> usize {
-    let mut u = ((v << 1) ^ (v >> 63)) as u64;
-    let mut n = 1;
-    while u >= 0x80 {
-        u >>= 7;
-        n += 1;
+#[inline(always)]
+fn read_zigzag_i32(buf: &[u8], pos: &mut usize) -> Result<i32, KafkaClientError> {
+    let b0 = *buf.get(*pos).ok_or_else(|| {
+        KafkaClientError::Protocol(anyhow::anyhow!("unexpected EOF reading Kafka varint"))
+    })?;
+    if b0 < 0x80 {
+        *pos += 1;
+        let z = b0 as u32;
+        return Ok(((z >> 1) as i32) ^ (-((z & 1) as i32)));
     }
-    n
+    read_zigzag_i32_slow(buf, pos)
 }
 
-fn nullable_bytes_len(b: Option<&Bytes>) -> usize {
-    match b {
-        Some(b) => zigzag_varint_len(b.len() as i64) + b.len(),
-        None => zigzag_varint_len(-1),
+#[cold]
+fn read_zigzag_i32_slow(buf: &[u8], pos: &mut usize) -> Result<i32, KafkaClientError> {
+    let mut z = 0u32;
+    let mut shift = 0u32;
+    for i in 0..5 {
+        let b = *buf.get(*pos).ok_or_else(|| {
+            KafkaClientError::Protocol(anyhow::anyhow!("unexpected EOF reading Kafka varint"))
+        })?;
+        *pos += 1;
+        z |= ((b & 0x7F) as u32) << shift;
+        if b < 0x80 {
+            return Ok(((z >> 1) as i32) ^ (-((z & 1) as i32)));
+        }
+        if i == 4 {
+            return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                "Kafka varint exceeds 5 bytes"
+            )));
+        }
+        shift += 7;
     }
+    unreachable!()
 }
 
-/// Size of a record in the (uncompressed) records section of a RecordBatch v2.
-fn encoded_record_v2_len(rec: &Record, base_offset: i64, first_timestamp: i64) -> usize {
-    let mut body = 1 // attributes
-        + zigzag_varint_len(rec.timestamp.wrapping_sub(first_timestamp))
-        + zigzag_varint_len(rec.offset.wrapping_sub(base_offset))
-        + nullable_bytes_len(rec.key.as_ref())
-        + nullable_bytes_len(rec.value.as_ref())
-        + zigzag_varint_len(rec.headers.len() as i64);
-    for (k, v) in &rec.headers {
-        body += zigzag_varint_len(k.len() as i64) + k.len() + nullable_bytes_len(v.as_ref());
+#[inline(always)]
+fn read_zigzag_i64(buf: &[u8], pos: &mut usize) -> Result<i64, KafkaClientError> {
+    let b0 = *buf.get(*pos).ok_or_else(|| {
+        KafkaClientError::Protocol(anyhow::anyhow!("unexpected EOF reading Kafka varlong"))
+    })?;
+    if b0 < 0x80 {
+        *pos += 1;
+        let z = b0 as u64;
+        return Ok(((z >> 1) as i64) ^ (-((z & 1) as i64)));
     }
-    zigzag_varint_len(body as i64) + body
+    read_zigzag_i64_slow(buf, pos)
 }
 
-/// Decodes one RecordBatch v2 frame, returning the records at or after `fetch_offset` and the
-/// kgo `FetchBatchMetrics` of the batch.
+#[cold]
+fn read_zigzag_i64_slow(buf: &[u8], pos: &mut usize) -> Result<i64, KafkaClientError> {
+    let mut z = 0u64;
+    let mut shift = 0u32;
+    for i in 0..10 {
+        let b = *buf.get(*pos).ok_or_else(|| {
+            KafkaClientError::Protocol(anyhow::anyhow!("unexpected EOF reading Kafka varlong"))
+        })?;
+        *pos += 1;
+        z |= ((b & 0x7F) as u64) << shift;
+        if b < 0x80 {
+            return Ok(((z >> 1) as i64) ^ (-((z & 1) as i64)));
+        }
+        if i == 9 {
+            return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                "Kafka varlong exceeds 10 bytes"
+            )));
+        }
+        shift += 7;
+    }
+    unreachable!()
+}
+
+/// Decodes one RecordBatch v2 frame directly (zero `IndexMap` / `Vec<Record>` allocations),
+/// returning the records at or after `fetch_offset` and the kgo `FetchBatchMetrics` of the batch.
 fn decode_single_batch_slice(
-    mut slice: Bytes,
+    slice: Bytes,
     fetch_offset: i64,
 ) -> Result<(Vec<FetchedRecord>, FetchBatchMetrics), KafkaClientError> {
     let frame_len = slice.len();
+    if frame_len < V2_HEADER_LEN {
+        return Err(KafkaClientError::UnexpectedResponse(format!(
+            "RecordBatch v2 frame too short: {frame_len} < {V2_HEADER_LEN}"
+        )));
+    }
+    if slice[16] != 2 {
+        return Err(KafkaClientError::UnexpectedResponse(format!(
+            "unexpected RecordBatch magic {}, expected 2",
+            slice[16]
+        )));
+    }
+    let supplied_crc = u32::from_be_bytes([slice[17], slice[18], slice[19], slice[20]]);
+    let actual_crc = crc32c::crc32c(&slice[V2_ATTRIBUTES_OFFSET..]);
+    if supplied_crc != actual_crc {
+        return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+            "Cyclic redundancy check failed ({supplied_crc} != {actual_crc})"
+        )));
+    }
+
     let attributes = i16::from_be_bytes([
         slice[V2_ATTRIBUTES_OFFSET],
         slice[V2_ATTRIBUTES_OFFSET + 1],
@@ -1831,46 +1891,226 @@ fn decode_single_batch_slice(
         slice[V2_NUM_RECORDS_OFFSET + 2],
         slice[V2_NUM_RECORDS_OFFSET + 3],
     ]);
+    if num_records < 0 {
+        return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+            "Unexpected negative record count ({num_records})"
+        )));
+    }
+    let compression = match attributes & 0x07 {
+        0 => Compression::None,
+        1 => Compression::Gzip,
+        2 => Compression::Snappy,
+        3 => Compression::Lz4,
+        4 => Compression::Zstd,
+        other => {
+            return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                "Unknown compression algorithm used: {other}"
+            )));
+        }
+    };
+    let is_control = (attributes & 0x20) != 0;
     let log_append_time = attributes & V2_TIMESTAMP_TYPE_LOG_APPEND_TIME != 0;
-    let compressed = attributes & 0x07 != 0;
-    let batch =
-        RecordBatchDecoder::decode_with_custom_compression(&mut slice, Some(decompress_record_batch))?;
+
     // kgo: CompressedBytes = len(batch.Records) (the records section as sent), UncompressedBytes
     // = its decompressed length (equal when the batch is not compressed).
-    let compressed_bytes = frame_len.saturating_sub(V2_HEADER_LEN);
-    let uncompressed_bytes = if compressed {
-        batch
-            .iter()
-            .map(|r| encoded_record_v2_len(r, base_offset, first_timestamp))
-            .sum()
+    let compressed_bytes = frame_len - V2_HEADER_LEN;
+    let records_bytes = if matches!(compression, Compression::None) {
+        slice.slice(V2_HEADER_LEN..)
     } else {
-        compressed_bytes
+        let mut compressed_slice = slice.slice(V2_HEADER_LEN..);
+        decompress_record_batch(&mut compressed_slice, compression)?
     };
+    let uncompressed_bytes = records_bytes.len();
     let metrics = FetchBatchMetrics {
-        num_records: num_records.max(0) as usize,
-        uncompressed_bytes: if uncompressed_bytes == 0 { compressed_bytes } else { uncompressed_bytes },
+        num_records: num_records as usize,
+        uncompressed_bytes: if uncompressed_bytes == 0 {
+            compressed_bytes
+        } else {
+            uncompressed_bytes
+        },
         compressed_bytes,
     };
-    let mut out = Vec::with_capacity(batch.len());
-    for rec in batch {
-        if rec.control || rec.offset < fetch_offset {
-            continue;
+
+    let record_count = num_records as usize;
+    let buf = records_bytes.as_ref();
+    let mut pos = 0usize;
+    // Bound upfront Vec capacity by minimum possible v2 record size (~6B) to avoid OOM on corrupt headers.
+    let mut out = if is_control {
+        Vec::new()
+    } else {
+        Vec::with_capacity(record_count.min(buf.len() / 6))
+    };
+
+    for _ in 0..record_count {
+        let rec_size = read_zigzag_i32(buf, &mut pos)?;
+        if rec_size < 0 {
+            return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                "Unexpected negative record size: {rec_size}"
+            )));
         }
-        let headers = rec
-            .headers
-            .into_iter()
-            .map(|(k, v)| (k.as_str().to_owned(), v.unwrap_or_default()))
-            .collect();
-        out.push(FetchedRecord {
-            offset: rec.offset,
-            // franz-go source.go: `if batch.Attributes&0x0008 != 0 { r.Timestamp = MaxTimestamp }`
-            // (LogAppendTime batches carry the broker append time as the batch max timestamp).
-            timestamp_ms: if log_append_time { max_timestamp } else { rec.timestamp },
-            key: rec.key.unwrap_or_default(),
-            value: rec.value.unwrap_or_default(),
-            headers,
-        });
+        let rec_end = pos
+            .checked_add(rec_size as usize)
+            .filter(|&end| end <= buf.len())
+            .ok_or_else(|| {
+                KafkaClientError::Protocol(anyhow::anyhow!(
+                    "truncated Kafka v2 record (size {rec_size}, remaining {})",
+                    buf.len() - pos
+                ))
+            })?;
+        let rec_base = pos;
+        let rec_slice = &buf[rec_base..rec_end];
+        pos = rec_end;
+
+        let mut rp = 0usize;
+        if rp >= rec_slice.len() {
+            return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                "unexpected EOF reading record attributes"
+            )));
+        }
+        // 1-byte record attributes (unused in v2).
+        rp += 1;
+
+        let timestamp_delta = read_zigzag_i64(rec_slice, &mut rp)?;
+        let offset_delta = read_zigzag_i32(rec_slice, &mut rp)?;
+        let offset = base_offset.wrapping_add(offset_delta as i64);
+
+        let key_len = read_zigzag_i32(rec_slice, &mut rp)?;
+        if key_len < -1 {
+            return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                "Unexpected negative record key length ({key_len} bytes)"
+            )));
+        }
+        let key_range = if key_len == -1 {
+            None
+        } else {
+            let klen = key_len as usize;
+            let kend = rp
+                .checked_add(klen)
+                .filter(|&e| e <= rec_slice.len())
+                .ok_or_else(|| {
+                    KafkaClientError::Protocol(anyhow::anyhow!(
+                        "truncated Kafka record key ({klen} bytes)"
+                    ))
+                })?;
+            let range = (rec_base + rp)..(rec_base + kend);
+            rp = kend;
+            Some(range)
+        };
+
+        let val_len = read_zigzag_i32(rec_slice, &mut rp)?;
+        if val_len < -1 {
+            return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                "Unexpected negative record value length ({val_len} bytes)"
+            )));
+        }
+        let val_range = if val_len == -1 {
+            None
+        } else {
+            let vlen = val_len as usize;
+            let vend = rp
+                .checked_add(vlen)
+                .filter(|&e| e <= rec_slice.len())
+                .ok_or_else(|| {
+                    KafkaClientError::Protocol(anyhow::anyhow!(
+                        "truncated Kafka record value ({vlen} bytes)"
+                    ))
+                })?;
+            let range = (rec_base + rp)..(rec_base + vend);
+            rp = vend;
+            Some(range)
+        };
+
+        let num_headers = read_zigzag_i32(rec_slice, &mut rp)?;
+        if num_headers < 0 {
+            return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                "Unexpected negative record header count: {num_headers}"
+            )));
+        }
+        let num_headers = num_headers as usize;
+        let skip = is_control || offset < fetch_offset;
+        let mut headers = if skip || num_headers == 0 {
+            Vec::new()
+        } else {
+            Vec::with_capacity(num_headers.min(rec_slice.len().saturating_sub(rp) / 2))
+        };
+
+        for _ in 0..num_headers {
+            let hk_len = read_zigzag_i32(rec_slice, &mut rp)?;
+            if hk_len < 0 {
+                return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                    "Unexpected negative record header key length ({hk_len} bytes)"
+                )));
+            }
+            let hk_len = hk_len as usize;
+            let hk_end = rp
+                .checked_add(hk_len)
+                .filter(|&e| e <= rec_slice.len())
+                .ok_or_else(|| {
+                    KafkaClientError::Protocol(anyhow::anyhow!(
+                        "truncated Kafka header key ({hk_len} bytes)"
+                    ))
+                })?;
+            let hk_str = std::str::from_utf8(&rec_slice[rp..hk_end])
+                .map_err(|e| KafkaClientError::Protocol(e.into()))?;
+            rp = hk_end;
+
+            let hv_len = read_zigzag_i32(rec_slice, &mut rp)?;
+            if hv_len < -1 {
+                return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                    "Unexpected negative record header value length ({hv_len} bytes)"
+                )));
+            }
+            let hv = if hv_len == -1 {
+                Bytes::new()
+            } else {
+                let hlen = hv_len as usize;
+                let hv_end = rp
+                    .checked_add(hlen)
+                    .filter(|&e| e <= rec_slice.len())
+                    .ok_or_else(|| {
+                        KafkaClientError::Protocol(anyhow::anyhow!(
+                            "truncated Kafka header value ({hlen} bytes)"
+                        ))
+                    })?;
+                let bytes = if skip {
+                    Bytes::new()
+                } else {
+                    records_bytes.slice((rec_base + rp)..(rec_base + hv_end))
+                };
+                rp = hv_end;
+                bytes
+            };
+
+            if !skip {
+                headers.push((hk_str.to_owned(), hv));
+            }
+        }
+
+        if !skip {
+            let key = match key_range {
+                Some(r) => records_bytes.slice(r),
+                None => Bytes::new(),
+            };
+            let value = match val_range {
+                Some(r) => records_bytes.slice(r),
+                None => Bytes::new(),
+            };
+            out.push(FetchedRecord {
+                offset,
+                // franz-go source.go: `if batch.Attributes&0x0008 != 0 { r.Timestamp = MaxTimestamp }`
+                // (LogAppendTime batches carry the broker append time as the batch max timestamp).
+                timestamp_ms: if log_append_time {
+                    max_timestamp
+                } else {
+                    first_timestamp.wrapping_add(timestamp_delta)
+                },
+                key,
+                value,
+                headers,
+            });
+        }
     }
+
     Ok((out, metrics))
 }
 
@@ -2249,5 +2489,172 @@ mod tests {
             .await
             .expect("valid large frame");
         assert_eq!(got, body);
+    }
+
+    /// Reference decoder backed by `kafka_protocol::records::RecordBatchDecoder` for differential
+    /// parity verification against our zero-`IndexMap` v2 parser.
+    fn reference_decode_batch(
+        mut slice: Bytes,
+        fetch_offset: i64,
+    ) -> Result<Vec<FetchedRecord>, KafkaClientError> {
+        let attributes = i16::from_be_bytes([
+            slice[V2_ATTRIBUTES_OFFSET],
+            slice[V2_ATTRIBUTES_OFFSET + 1],
+        ]);
+        let max_timestamp = be_i64(&slice, V2_MAX_TIMESTAMP_OFFSET);
+        let log_append_time = attributes & V2_TIMESTAMP_TYPE_LOG_APPEND_TIME != 0;
+        let batch = RecordBatchDecoder::decode_with_custom_compression(
+            &mut slice,
+            Some(decompress_record_batch),
+        )?;
+        let mut out = Vec::new();
+        for rec in batch {
+            if rec.control || rec.offset < fetch_offset {
+                continue;
+            }
+            let headers = rec
+                .headers
+                .into_iter()
+                .map(|(k, v)| (k.as_str().to_owned(), v.unwrap_or_default()))
+                .collect();
+            out.push(FetchedRecord {
+                offset: rec.offset,
+                timestamp_ms: if log_append_time {
+                    max_timestamp
+                } else {
+                    rec.timestamp
+                },
+                key: rec.key.unwrap_or_default(),
+                value: rec.value.unwrap_or_default(),
+                headers,
+            });
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn fast_v2_decoder_matches_record_batch_decoder_differential() {
+        let codecs = [
+            Compression::None,
+            Compression::Gzip,
+            Compression::Snappy,
+            Compression::Lz4,
+            Compression::Zstd,
+        ];
+        let base_ts = 1_700_000_000_000i64;
+        let big_val = Bytes::from(vec![b'x'; 20_000]);
+
+        for compression in codecs {
+            let mut records = Vec::new();
+            // Record 0: None key, None value, no headers
+            records.push(Record {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                producer_id: NO_PRODUCER_ID,
+                producer_epoch: NO_PRODUCER_EPOCH,
+                timestamp_type: TimestampType::Creation,
+                offset: 100,
+                sequence: 0,
+                timestamp: base_ts,
+                key: None,
+                value: None,
+                headers: IndexMap::new(),
+            });
+            // Record 1: empty key, empty value, multiple headers
+            let mut h1 = IndexMap::new();
+            h1.insert(StrBytes::from_static_str("version"), Some(Bytes::from_static(b"2")));
+            h1.insert(StrBytes::from_static_str("empty"), Some(Bytes::new()));
+            records.push(Record {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                producer_id: NO_PRODUCER_ID,
+                producer_epoch: NO_PRODUCER_EPOCH,
+                timestamp_type: TimestampType::Creation,
+                offset: 101,
+                sequence: 1,
+                timestamp: base_ts + 250,
+                key: Some(Bytes::new()),
+                value: Some(Bytes::new()),
+                headers: h1,
+            });
+            // Record 2: large payload (multi-byte varint), large timestamp delta
+            let mut h2 = IndexMap::new();
+            h2.insert(StrBytes::from_static_str("v"), Some(Bytes::from_static(b"1")));
+            h2.insert(
+                StrBytes::from_static_str("trace"),
+                Some(Bytes::from_static(b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")),
+            );
+            records.push(Record {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                producer_id: NO_PRODUCER_ID,
+                producer_epoch: NO_PRODUCER_EPOCH,
+                timestamp_type: TimestampType::Creation,
+                offset: 102,
+                sequence: 2,
+                timestamp: base_ts + 500_000,
+                key: Some(Bytes::from_static(b"tenant-alpha")),
+                value: Some(big_val.clone()),
+                headers: h2,
+            });
+
+            let mut buf = BytesMut::new();
+            let opts = RecordEncodeOptions {
+                version: 2,
+                compression,
+            };
+            RecordBatchEncoder::encode_with_custom_compression(
+                &mut buf,
+                records.iter(),
+                &opts,
+                Some(compress_record_batch),
+            )
+            .unwrap();
+            let raw = buf.freeze();
+
+            for fetch_offset in [99, 100, 101, 102, 103] {
+                for batch in [raw.clone(), to_log_append_time(&raw, base_ts + 999_999)] {
+                    let expected = reference_decode_batch(batch.clone(), fetch_offset).unwrap();
+                    let (actual, _) = decode_single_batch_slice(batch, fetch_offset).unwrap();
+                    assert_eq!(actual.len(), expected.len(), "codec {compression:?}");
+                    for (a, e) in actual.iter().zip(expected.iter()) {
+                        assert_eq!(a.offset, e.offset);
+                        assert_eq!(a.timestamp_ms, e.timestamp_ms);
+                        assert_eq!(a.key, e.key);
+                        assert_eq!(a.value, e.value);
+                        assert_eq!(a.headers, e.headers);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_v2_decoder_rejects_corrupt_crc_and_headers_without_panic() {
+        let valid = encode_test_batch(&[0, 1, 2], false, Compression::None);
+
+        // Corrupt CRC byte.
+        let mut bad_crc = BytesMut::from(&valid[..]);
+        bad_crc[17] ^= 0xff;
+        assert!(decode_single_batch_slice(bad_crc.freeze(), 0).is_err());
+
+        // Corrupt num_records = i32::MAX (with recomputed CRC) must fail cleanly without OOM/panic.
+        let mut huge_count = BytesMut::from(&valid[..]);
+        huge_count[V2_NUM_RECORDS_OFFSET..V2_NUM_RECORDS_OFFSET + 4]
+            .copy_from_slice(&i32::MAX.to_be_bytes());
+        let crc = crc32c::crc32c(&huge_count[V2_ATTRIBUTES_OFFSET..]);
+        huge_count[17..21].copy_from_slice(&crc.to_be_bytes());
+        assert!(decode_single_batch_slice(huge_count.freeze(), 0).is_err());
+
+        // Corrupt negative num_records (-5) must fail cleanly.
+        let mut neg_count = BytesMut::from(&valid[..]);
+        neg_count[V2_NUM_RECORDS_OFFSET..V2_NUM_RECORDS_OFFSET + 4]
+            .copy_from_slice(&(-5i32).to_be_bytes());
+        let crc = crc32c::crc32c(&neg_count[V2_ATTRIBUTES_OFFSET..]);
+        neg_count[17..21].copy_from_slice(&crc.to_be_bytes());
+        assert!(decode_single_batch_slice(neg_count.freeze(), 0).is_err());
     }
 }
