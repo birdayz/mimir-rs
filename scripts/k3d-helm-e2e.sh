@@ -69,7 +69,13 @@ evidence() { sed 's/^/     /' | tee -a "$SUMMARY"; }
 
 kc() { "$KUBECTL" -n "$NS" "$@"; }
 # curl from inside the cluster (pod IPs are not reachable from the host).
-incurl() { kc exec deploy/e2e-toolbox -c curl -- curl -sS -m 20 "$@"; }
+# (exec into a Running toolbox pod: `exec deploy/...` may pick an evicted one).
+incurl() {
+  local p
+  p=$(kc get pods -l app=e2e-toolbox --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}') || return 1
+  [[ -n $p ]] || { echo "no Running e2e-toolbox pod" >&2; return 1; }
+  kc exec "$p" -c curl -- curl -sS -m 20 "$@"
+}
 
 collect_debug() {
   [[ -f $KUBECONFIG ]] || return 0
@@ -144,6 +150,10 @@ else
     --k3s-node-label 'topology.kubernetes.io/zone=zone-a@agent:0' \
     --k3s-node-label 'topology.kubernetes.io/zone=zone-b@agent:1' \
     --k3s-node-label 'topology.kubernetes.io/zone=zone-c@agent:2' \
+    --k3s-arg '--kubelet-arg=eviction-hard=imagefs.available<1%,nodefs.available<1%@all' \
+    --k3s-arg '--kubelet-arg=eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%@all' \
+    --k3s-arg '--kubelet-arg=image-gc-high-threshold=100@all' \
+    --k3s-arg '--kubelet-arg=image-gc-low-threshold=99@all' \
     --wait --timeout 300s >"$OUT_DIR/k3d-create.log" 2>&1
 fi
 "$K3D" kubeconfig get "$CLUSTER" >"$KUBECONFIG"
@@ -161,8 +171,33 @@ IMAGES=(
 for img in "${IMAGES[@]}"; do
   docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null
 done
+# `k3d image import <ref>` silently fails with docker's containerd image store
+# (multi-platform indexes with missing blobs), so save single-platform tarballs
+# and verify every node actually has every image afterwards.
+PLATFORM=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')
+mkdir -p "$WORK/images"
+TARS=()
+for img in "${IMAGES[@]}"; do
+  id=$(docker image inspect "$img" --format '{{.Id}}')
+  tar=$WORK/images/$(tr '/:' '__' <<<"$img")-${id#sha256:}.tar
+  tar=${tar:0:250}
+  [[ -s $tar ]] || docker save --platform "$PLATFORM" -o "$tar" "$img"
+  TARS+=("$tar")
+done
 log "importing ${#IMAGES[@]} images into $CLUSTER"
-"$K3D" image import -c "$CLUSTER" "${IMAGES[@]}" >"$OUT_DIR/k3d-import.log" 2>&1
+"$K3D" image import -c "$CLUSTER" "${TARS[@]}" >"$OUT_DIR/k3d-import.log" 2>&1
+normref() { # docker reference -> containerd name
+  local r=$1
+  [[ $r == */* ]] || r=library/$r
+  [[ ${r%%/*} == *.* ]] || r=docker.io/$r
+  echo "$r"
+}
+for node in $("$K3D" node list -o json | jq -r --arg c "$CLUSTER" '.[] | select(.runtimeLabels["k3d.cluster"] == $c and (.role == "server" or .role == "agent")) | .name'); do
+  have=$(docker exec "$node" ctr -n k8s.io images ls -q)
+  for img in "${IMAGES[@]}"; do
+    grep -qxF "$(normref "$img")" <<<"$have" || { echo "image $img missing on node $node after import" >&2; cat "$OUT_DIR/k3d-import.log" >&2; exit 1; }
+  done
+done
 
 ###############################################################################
 # Deploy
@@ -207,14 +242,27 @@ fi
 # Ingester inventory: name ip zone impl(go|rust) image
 ingesters_tsv() {
   kc get pods -l app.kubernetes.io/component=ingester -o json | jq -r --arg go "$GO_IMAGE" '.items[]
-    | select(.status.phase == "Running")
-    | [.metadata.name, .status.podIP, .metadata.labels.zone,
+    | [.metadata.name, (.status.podIP // "-"), .metadata.labels.zone,
        (if (.spec.containers[] | select(.name == "ingester") | .image) == $go then "go" else "rust" end),
        (.spec.containers[] | select(.name == "ingester") | .image)] | @tsv' | sort
 }
 INGESTERS=$(ingesters_tsv)
 echo "$INGESTERS" >"$OUT_DIR/ingesters.tsv"
-info "ingesters:"
+# Expected implementation per zone for this MODE.
+expect_impl() {
+  case $MODE in
+    go) echo go ;;
+    rust) echo rust ;;
+    mixed) [[ $1 == zone-c ]] && echo go || echo rust ;;
+  esac
+}
+want_inv=$(for z in zone-a zone-b zone-c; do echo "$RELEASE-ingester-$z-0 $z $(expect_impl $z)"; done)
+have_inv=$(awk -F'\t' '{print $1, $3, $4}' <<<"$INGESTERS")
+if [[ $want_inv == "$have_inv" ]]; then
+  pass "a. ingester inventory matches MODE=$MODE (name zone impl ip image):"
+else
+  fail "a. ingester inventory does not match MODE=$MODE; want: $(echo $want_inv)"
+fi
 echo "$INGESTERS" | evidence
 
 kc get pods -l app.kubernetes.io/component=ingester -o json | jq -r '.items[]
@@ -227,8 +275,8 @@ kc get pods -l app.kubernetes.io/component=ingester -o json | jq -r '.items[]
 info "a. time from container start to Ready per ingester (readinessProbe initialDelaySeconds=60 is a lower bound):"
 evidence <"$OUT_DIR/time-to-ready.tsv"
 
-pod_ip() { kc get pod "$1" -o jsonpath='{.status.podIP}'; }
-first_pod() { kc get pods -l "app.kubernetes.io/component=$1" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}'; }
+pod_ip() { kc get pod "$1" -o jsonpath='{.status.podIP}' 2>/dev/null || true; }
+first_pod() { kc get pods -l "app.kubernetes.io/component=$1" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' || true; }
 DISTRIBUTOR=$(first_pod distributor)
 QUERIER=$(first_pod querier)
 
@@ -324,8 +372,20 @@ echo "$res" | evidence
 ###############################################################################
 # d. Memberlist
 ###############################################################################
+# Normalised member list of one /memberlist JSON answer: "name<TAB>ip<TAB>incarnation".
+# dskit (Go) answers {"SortedMembers":[{"Name","Addr",...}]}; other shapes are
+# parsed best-effort so membership can still be compared (schema is checked by
+# memberlist_schema).
+memberlist_members() {
+  jq -r 'if .SortedMembers then .SortedMembers[] | [.Name, .Addr, "-"]
+    elif .members then .members[] | select(.state == null or .state == "Alive" or .state == "Suspect")
+      | [.name, (.addr | sub(":[0-9]+$"; "") | ltrimstr("[") | rtrimstr("]") | sub("^::ffff:"; "")), (.incarnation // "-" | tostring)]
+    else empty end | @tsv'
+}
+memberlist_schema() { jq -e '(.SortedMembers | type) == "array" and (.Store | type) == "object"' >/dev/null 2>&1; }
+
 check_memberlist() {
-  local label=$1 pods p ip ml bad=0 expected="" view users="" views=""
+  local label=$1 pods p ip ml bad=0 expected="" view users=""
   # Every Mimir process (all expose http-metrics:8080) is asked for its view;
   # processes that do not use memberlist (query-scheduler) answer in plain text.
   pods=$(kc get pods -l app.kubernetes.io/name=mimir --field-selector=status.phase=Running -o json | jq -r '.items[]
@@ -335,10 +395,10 @@ check_memberlist() {
     [[ -z $p ]] && continue
     ml=$(incurl -H 'Accept: application/json' "http://$ip:8080/memberlist" 2>&1) || true
     echo "$ml" >"$OUT_DIR/memberlist-$label-$p.json"
-    if jq -e '.SortedMembers' >/dev/null 2>&1 <<<"$ml"; then
+    if [[ -n $(memberlist_members <<<"$ml" 2>/dev/null) ]]; then
       users+="$p"$'\t'"$ip"$'\n'
     elif [[ $partof == memberlist ]]; then
-      echo "BAD $p (gossip-ring member): /memberlist did not return JSON with SortedMembers: $(head -c 200 <<<"$ml")"
+      echo "BAD $p (gossip-ring member): /memberlist returned no member list: $(head -c 200 <<<"$ml")"
       bad=1
       users+="$p"$'\t'"$ip"$'\n'
     fi
@@ -346,12 +406,12 @@ check_memberlist() {
   expected=$(echo -n "$users" | cut -f1 | sort | tr '\n' ' ')
   while IFS=$'\t' read -r p ip; do
     [[ -z $p ]] && continue
-    ml=$(cat "$OUT_DIR/memberlist-$label-$p.json")
-    jq -e '.SortedMembers' >/dev/null 2>&1 <<<"$ml" || continue
+    ml=$(memberlist_members <"$OUT_DIR/memberlist-$label-$p.json" 2>/dev/null) || true
+    [[ -n $ml ]] || continue
     # Map every member back to a pod: memberlist node names are "<hostname>-<random>".
-    view=$(jq -r --arg pods "$users" '
+    view=$(jq -Rr --arg pods "$users" '
       ($pods | split("\n") | map(select(length > 0) | split("\t") | {name: .[0], ip: .[1]})) as $want
-      | [.SortedMembers[] | . as $m
+      | [inputs, . | select(length > 0) | split("\t") | {Name: .[0], Addr: .[1]} | . as $m
           | ([$want[] | select(.name as $n | ($m.Name == $n) or ($m.Name | startswith($n + "-")))] | first) as $pod
           | if $pod == null then "UNKNOWN:\($m.Name)@\($m.Addr)"
             elif $pod.ip != $m.Addr then "BADADDR:\($pod.name)@\($m.Addr)!=\($pod.ip)"
@@ -370,11 +430,30 @@ log "d. checking memberlist membership on every memberlist pod"
 ok=0
 for i in $(seq 1 12); do if res=$(check_memberlist initial); then ok=1; break; fi; sleep 10; done
 if ((ok)); then
-  pass "d. memberlist: every member pod sees the same full membership"
+  pass "d1. memberlist: every member pod sees the same full membership at the right pod IPs"
 else
-  fail "d. memberlist views differ / incomplete"
+  fail "d1. memberlist views differ / incomplete"
 fi
 echo "$res" | evidence
+# d2: GET /memberlist with Accept: application/json must have dskit's schema
+# (memberlist.StatusPageData: SortedMembers, Store, ...) on every pod.
+schema_bad=""
+for f in "$OUT_DIR"/memberlist-initial-*.json; do
+  memberlist_members <"$f" >/dev/null 2>&1 && [[ -n $(memberlist_members <"$f" 2>/dev/null) ]] || continue
+  memberlist_schema <"$f" || schema_bad+="$(basename "$f" .json | sed 's/^memberlist-initial-//') keys=$(jq -c 'keys' "$f" 2>/dev/null) "$'\n'
+done
+if [[ -z $schema_bad ]]; then
+  pass "d2. /memberlist JSON has dskit's StatusPageData schema on every pod"
+else
+  fail "d2. /memberlist JSON is not dskit's StatusPageData schema (want keys SortedMembers, Store, ...) on:"
+  echo -n "$schema_bad" | evidence
+fi
+# d3 (report-only): incarnation numbers, where the JSON exposes them. Go nodes
+# only bump their incarnation to refute suspicion, so it stays 1 in a healthy cluster.
+for f in "$OUT_DIR"/memberlist-initial-*.json; do
+  inc=$(memberlist_members <"$f" 2>/dev/null | awk -F'\t' '$3 != "-" {printf "%s=%s ", $1, $3}')
+  [[ -n $inc ]] && info "d3. incarnations seen by $(basename "$f" .json | sed 's/^memberlist-initial-//'): $inc"
+done
 
 ###############################################################################
 # e. Write + read path
@@ -391,7 +470,7 @@ promq() {
 ingester_metric() { # <pod> <metric> -> sum of all series of that metric (0 if absent)
   local ip
   ip=$(pod_ip "$1")
-  incurl "http://$ip:8080/metrics" | awk -v m="$2" '$1 == m || index($1, m "{") == 1 {s += $NF} END {printf "%.0f\n", s + 0}'
+  { incurl "http://$ip:8080/metrics" 2>/dev/null || true; } | awk -v m="$2" '$1 == m || index($1, m "{") == 1 {s += $NF} END {printf "%.0f\n", s + 0}'
 }
 
 log "e. waiting for remote-written samples of every scrape target to become queryable"
@@ -500,11 +579,11 @@ RPOD=$RELEASE-ingester-$ROLLOUT_ZONE-0
 RSTS=$RELEASE-ingester-$ROLLOUT_ZONE
 RIMPL=$(awk -v p="$RPOD" '$1 == p {print $4}' <<<"$INGESTERS")
 log "f. rolling restart of $RSTS ($RIMPL)"
-ring_json=$(incurl -H 'Accept: application/json' "http://$(pod_ip "$DISTRIBUTOR"):8080/ingester/ring")
-tokens_before=$(jq -c --arg id "$RPOD" '[.shards[] | select(.id == $id) | .tokens[]] | sort' <<<"$ring_json")
+ring_json=$(incurl -H 'Accept: application/json' "http://$(pod_ip "$DISTRIBUTOR"):8080/ingester/ring" || true)
+tokens_before=$(jq -c --arg id "$RPOD" '[.shards[] | select(.id == $id) | .tokens[]] | sort' <<<"$ring_json" || echo "[]")
 parts_before=$(incurl -H 'Accept: application/json' "http://$(pod_ip "$DISTRIBUTOR"):8080/ingester/partition-ring" |
-  jq -c --arg id "$RPOD" '[.partitions[] | select(.owner_ids | index($id)) | .id] | sort')
-uid_before=$(kc get pod "$RPOD" -o jsonpath='{.metadata.uid}')
+  jq -c --arg id "$RPOD" '[.partitions[] | select(.owner_ids | index($id)) | .id] | sort' || echo "[]")
+uid_before=$(kc get pod "$RPOD" -o jsonpath='{.metadata.uid}' || true)
 restart_ts=$(date +%s)
 
 qlog=$OUT_DIR/rollout-queries.txt
@@ -555,11 +634,11 @@ else
 fi
 
 INGESTERS=$(ingesters_tsv)
-ring_json=$(incurl -H 'Accept: application/json' "http://$(pod_ip "$DISTRIBUTOR"):8080/ingester/ring")
+ring_json=$(incurl -H 'Accept: application/json' "http://$(pod_ip "$DISTRIBUTOR"):8080/ingester/ring" || true)
 echo "$ring_json" >"$OUT_DIR/ring-after-rollout.json"
-tokens_after=$(jq -c --arg id "$RPOD" '[.shards[] | select(.id == $id) | .tokens[]] | sort' <<<"$ring_json")
+tokens_after=$(jq -c --arg id "$RPOD" '[.shards[] | select(.id == $id) | .tokens[]] | sort' <<<"$ring_json" || echo "[]")
 parts_after=$(incurl -H 'Accept: application/json' "http://$(pod_ip "$DISTRIBUTOR"):8080/ingester/partition-ring" |
-  jq -c --arg id "$RPOD" '[.partitions[] | select(.owner_ids | index($id)) | .id] | sort')
+  jq -c --arg id "$RPOD" '[.partitions[] | select(.owner_ids | index($id)) | .id] | sort' || echo "[]")
 if [[ $tokens_before == "$tokens_after" && $tokens_before != "[]" && $parts_before == "$parts_after" && $parts_before != "[]" ]]; then
   pass "f3. $RPOD kept its $(jq length <<<"$tokens_before") ring tokens and partitions $parts_after"
 else
@@ -591,7 +670,7 @@ if res=$(check_partition_ring after-rollout); then pass "f6. partition ring afte
 echo "$res" | evidence
 ok=0
 for i in $(seq 1 12); do if res=$(check_memberlist after-rollout); then ok=1; break; fi; sleep 10; done
-if ((ok)); then pass "f7. memberlist after rollout OK"; else fail "f7. memberlist after rollout"; fi
+if ((ok)); then pass "f7. memberlist membership after rollout OK"; else fail "f7. memberlist after rollout"; fi
 echo "$res" | evidence
 
 ###############################################################################
@@ -602,7 +681,7 @@ mixin=$OUT_DIR/mixin-metrics.txt
 grep -ohE '\b[a-z][a-z0-9_]*_[a-z0-9_]+' "$MIXIN_DASHBOARDS"/*.json | sort -u >"$mixin"
 GO_REF=$WORK/go-ingester-metrics.txt
 while IFS=$'\t' read -r p ip zone impl img; do
-  incurl "http://$ip:8080/metrics" | sample_names >"$OUT_DIR/metrics-$p.txt" || true
+  { incurl "http://$ip:8080/metrics" || true; } | sample_names >"$OUT_DIR/metrics-$p.txt"
   [[ $impl == go ]] && cp "$OUT_DIR/metrics-$p.txt" "$GO_REF.tmp"
 done <<<"$INGESTERS"
 [[ -f $GO_REF.tmp ]] && mv "$GO_REF.tmp" "$GO_REF"
