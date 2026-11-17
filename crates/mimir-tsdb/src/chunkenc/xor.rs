@@ -13,7 +13,7 @@ const CHUNK_COMPACT_CAPACITY_THRESHOLD: usize = 32;
 /// Compact cached appender state for O(1) sequential appends on [`XorChunk`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XorAppendState {
-    pub t_delta: u64,
+    pub t_delta: u32,
     pub leading: u8,
     pub trailing: u8,
     pub valid: bool,
@@ -144,26 +144,34 @@ impl XorChunk {
         if !state.valid {
             let mut app = self.appender()?;
             app.append(0, t, v)?;
-            *state = XorAppendState {
-                t_delta: app.t_delta,
-                leading: app.leading,
-                trailing: app.trailing,
-                valid: true,
-            };
+            if app.t_delta <= u32::MAX as u64 {
+                *state = XorAppendState {
+                    t_delta: app.t_delta as u32,
+                    leading: app.leading,
+                    trailing: app.trailing,
+                    valid: true,
+                };
+            } else {
+                state.valid = false;
+            }
             return Ok(());
         }
         let mut app = XorAppender {
             b: &mut self.b,
             t: prev_t,
             v: prev_v,
-            t_delta: state.t_delta,
+            t_delta: u64::from(state.t_delta),
             leading: state.leading,
             trailing: state.trailing,
         };
         app.append(0, t, v)?;
-        state.t_delta = app.t_delta;
-        state.leading = app.leading;
-        state.trailing = app.trailing;
+        if app.t_delta <= u32::MAX as u64 {
+            state.t_delta = app.t_delta as u32;
+            state.leading = app.leading;
+            state.trailing = app.trailing;
+        } else {
+            state.valid = false;
+        }
         Ok(())
     }
 
@@ -543,6 +551,32 @@ mod tests {
             pv = val;
         }
         assert_eq!(c_cold2.as_bytes(), c_ref.as_bytes());
+
+        // Verify XorAppendState size (8B) and > u32::MAX t_delta fallback parity.
+        assert_eq!(std::mem::size_of::<XorAppendState>(), 8);
+        let huge_step: i64 = (u32::MAX as i64) + 123_456;
+        let large_samples = [
+            (1_000i64, 1.0f64),
+            (1_000 + huge_step, 2.0),
+            (1_000 + huge_step * 2, 3.0),
+            (1_000 + huge_step * 2 + 15_000, 4.0),
+        ];
+        let mut c_huge_ref = XorChunk::new();
+        for &(ts, val) in &large_samples {
+            c_huge_ref.appender().unwrap().append(0, ts, val).unwrap();
+        }
+        let mut c_huge_fast = XorChunk::new();
+        let mut h_state = XorAppendState::new_empty();
+        let mut pt = i64::MIN;
+        let mut pv = 0.0;
+        for &(ts, val) in &large_samples {
+            c_huge_fast
+                .append_with_state(&mut h_state, pt, pv, ts, val)
+                .unwrap();
+            pt = ts;
+            pv = val;
+        }
+        assert_eq!(c_huge_fast.as_bytes(), c_huge_ref.as_bytes());
     }
 
     #[test]
