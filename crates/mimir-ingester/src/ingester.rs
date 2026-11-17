@@ -1000,16 +1000,48 @@ impl Ingester {
         snap
     }
 
-    /// Flushes WAL & WBL segments for all open tenant TSDBs (`NotifyPreCommit`).
+    /// Fsyncs WAL & WBL segments for all open tenant TSDBs (Go `NotifyPreCommit`):
+    /// `concurrency.ForEachUser` with `write_logs_fsync_before_kafka_commit_concurrency`
+    /// workers; every tenant is fsynced and all errors are returned (dskit multierror).
+    /// Blocking: call from a blocking thread.
     pub fn notify_pre_commit(&self) -> Result<(), IngesterError> {
-        for user_id in self.get_tsdb_users() {
-            if let Some(db) = self.get_tsdb(&user_id) {
-                db.db.head().sync().map_err(|e| IngesterError::Internal {
-                    message: format!("failed to sync TSDB WAL for user {user_id}: {e}"),
-                })?;
-            }
+        let users = self.get_tsdb_users();
+        if users.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let concurrency = (self.ingest_cfg.write_logs_fsync_before_kafka_commit_concurrency.max(1)
+            as usize)
+            .min(users.len());
+        tracing::debug!(concurrency, "fsyncing TSDBs");
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let errs: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..concurrency {
+                scope.spawn(|| loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(user_id) = users.get(idx) else {
+                        break;
+                    };
+                    let Some(db) = self.get_tsdb(user_id) else {
+                        continue;
+                    };
+                    if let Err(e) = db.db.head().sync() {
+                        errs.lock()
+                            .push(format!("failed to sync TSDB WAL for user {user_id}: {e}"));
+                    }
+                });
+            }
+        });
+        let errs = errs.into_inner();
+        if errs.is_empty() {
+            return Ok(());
+        }
+        let message = if errs.len() > 1 {
+            format!("{} errors: {}", errs.len(), errs.join("; "))
+        } else {
+            errs.into_iter().next().unwrap_or_default()
+        };
+        Err(IngesterError::Internal { message })
     }
 
     /// Starts the Ingester service asynchronously, returning immediately while startup progresses.

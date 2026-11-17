@@ -212,6 +212,40 @@ fn test_config_validate() {
     }
 }
 
+/// mimir-rs: TSDB settings Go accepts but mimir-rs does not implement yet are rejected at
+/// config validation instead of being silently ignored (see PORT_STATUS.md).
+#[test]
+fn test_config_validate_rejects_unsupported_tsdb_settings() {
+    type SetupFn = fn(&mut BlocksStorageConfig);
+    let cases: [(&str, SetupFn, &str); 3] = [
+        (
+            "multiple block ranges",
+            |cfg| {
+                cfg.tsdb.block_ranges_period =
+                    vec![GoDuration::from_hours(2), GoDuration::from_hours(12)]
+            },
+            "block-ranges-period",
+        ),
+        (
+            "head chunks end time variance",
+            |cfg| cfg.tsdb.head_chunks_end_time_variance = 0.5,
+            "head-chunks-end-time-variance",
+        ),
+        (
+            "memory snapshot on shutdown",
+            |cfg| cfg.tsdb.memory_snapshot_on_shutdown = true,
+            "memory-snapshot-on-shutdown",
+        ),
+    ];
+    assert!(BlocksStorageConfig::default().validate(true).is_ok());
+    for (name, setup, want) in cases {
+        let mut cfg = BlocksStorageConfig::default();
+        setup(&mut cfg);
+        let err = cfg.validate(true).expect_err(name).to_string();
+        assert!(err.contains("mimir-rs") && err.contains(want), "{name}: {err}");
+    }
+}
+
 // Upstream: pkg/storage/tsdb/config_test.go::TestConfig_DurationList
 #[test]
 fn test_config_duration_list() {

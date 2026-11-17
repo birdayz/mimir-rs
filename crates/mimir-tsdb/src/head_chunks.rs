@@ -44,12 +44,29 @@ pub enum HeadChunksError {
         file_index: i64,
         message: String,
     },
+    /// Invalid head chunk file header (size / magic / version). Matches the plain
+    /// (non-`CorruptionErr`) errors of Go `ChunkDiskMapper.openMMapFiles`.
+    #[error("{path:?}: {message}")]
+    InvalidFile { path: PathBuf, message: String },
     #[error("unsequential head chunk files: {prev} followed by {next}")]
     NonSequentialFiles { prev: usize, next: usize },
     #[error("chunk decode error: {0}")]
     Chunk(#[from] ChunkError),
     #[error("head chunks writer closed")]
     Closed,
+    /// Go `Head.loadMmappedChunks` out-of-sequence in-order m-mapped chunk (plain error,
+    /// not a `CorruptionErr`).
+    #[error("out of sequence m-mapped chunk for series ref {series_ref}, last chunk: [{last_mint}, {last_maxt}], new: [{mint}, {maxt}]")]
+    OutOfSequenceChunk {
+        series_ref: u64,
+        last_mint: i64,
+        last_maxt: i64,
+        mint: i64,
+        maxt: i64,
+    },
+    /// Go `ChunkDiskMapper.DeleteCorrupted`: `cannot handle error: %w`.
+    #[error("cannot handle error: {0}")]
+    CannotHandle(String),
 }
 
 /// 64-bit packed reference to a head chunk on disk: `(seq << 32) | offset`.
@@ -136,6 +153,8 @@ fn repair_last_chunk_file(files: &mut BTreeMap<usize, PathBuf>) -> Result<(), He
 pub struct HeadChunksWriter {
     dir: PathBuf,
     max_file_size: usize,
+    write_buffer_size: usize,
+    queue_metrics: Option<crate::metrics::ChunkWriteQueueMetrics>,
     seq: usize,
     offset: usize,
     cur_writer: Option<BufWriter<File>>,
@@ -151,6 +170,15 @@ impl HeadChunksWriter {
         dir: impl AsRef<Path>,
         max_file_size: usize,
     ) -> Result<Self, HeadChunksError> {
+        Self::with_options(dir, max_file_size, DEFAULT_WRITE_BUFFER_SIZE)
+    }
+
+    /// Opens the writer with Go `HeadChunksWriteBufferSize` (`write_buffer_size`).
+    pub fn with_options(
+        dir: impl AsRef<Path>,
+        max_file_size: usize,
+        write_buffer_size: usize,
+    ) -> Result<Self, HeadChunksError> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
@@ -161,6 +189,8 @@ impl HeadChunksWriter {
         Ok(Self {
             dir,
             max_file_size,
+            write_buffer_size: write_buffer_size.max(1),
+            queue_metrics: None,
             seq,
             offset: 0,
             cur_writer: None,
@@ -190,7 +220,7 @@ impl HeadChunksWriter {
         f.write_all(&hdr)?;
         f.flush()?;
 
-        self.cur_writer = Some(BufWriter::with_capacity(DEFAULT_WRITE_BUFFER_SIZE, f));
+        self.cur_writer = Some(BufWriter::with_capacity(self.write_buffer_size, f));
         self.offset = HEAD_CHUNK_FILE_HEADER_SIZE;
         Ok(())
     }
@@ -246,7 +276,16 @@ impl HeadChunksWriter {
         w.write_all(&crc.to_be_bytes())?;
 
         self.offset += needed;
+        if let Some(m) = self.queue_metrics.as_ref() {
+            m.adds.inc();
+            m.completed.inc();
+        }
         Ok(ChunkDiskMapperRef::new(self.seq as u32, chunk_offset as u32))
+    }
+
+    /// Attaches the Go `chunk_write_queue` operation counters.
+    pub fn set_queue_metrics(&mut self, m: crate::metrics::ChunkWriteQueueMetrics) {
+        self.queue_metrics = Some(m);
     }
 
     pub fn flush(&mut self) -> Result<(), HeadChunksError> {
@@ -325,26 +364,26 @@ impl HeadChunksReader {
             // SAFETY: files are opened read-only for mmap inspection of persisted head chunks.
             let mmap = unsafe { MmapOptions::new().map(&file)? };
 
+            // Header validation errors are NOT `CorruptionErr` in Go
+            // (`openMMapFiles` returns plain `fmt.Errorf`), so they are fatal for
+            // `NewHead` and never trigger the m-map chunk repair path.
             if mmap.len() < HEAD_CHUNK_FILE_HEADER_SIZE {
-                return Err(HeadChunksError::Corruption {
-                    dir: dir.clone(),
-                    file_index: seq as i64,
-                    message: "invalid head chunk file header: too short".to_string(),
+                return Err(HeadChunksError::InvalidFile {
+                    path: path.clone(),
+                    message: "invalid head chunk file header: invalid size".to_string(),
                 });
             }
             let magic = u32::from_be_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]);
             if magic != MAGIC_HEAD_CHUNKS {
-                return Err(HeadChunksError::Corruption {
-                    dir: dir.clone(),
-                    file_index: seq as i64,
-                    message: format!("invalid magic number {magic:#x}"),
+                return Err(HeadChunksError::InvalidFile {
+                    path: path.clone(),
+                    message: format!("invalid magic number {magic:x}"),
                 });
             }
             let version = mmap[MAGIC_CHUNKS_SIZE];
             if version != HEAD_CHUNKS_FORMAT_V1 {
-                return Err(HeadChunksError::Corruption {
-                    dir: dir.clone(),
-                    file_index: seq as i64,
+                return Err(HeadChunksError::InvalidFile {
+                    path: path.clone(),
                     message: format!("invalid chunk format version {version}"),
                 });
             }
@@ -468,7 +507,11 @@ impl HeadChunksReader {
                 let raw_enc = mmap[idx];
                 idx += CHUNK_ENCODING_SIZE;
                 let is_ooo = (raw_enc & OUT_OF_ORDER_MASK) != 0;
-                let encoding = Encoding::from_u8(raw_enc & !OUT_OF_ORDER_MASK)?;
+                // Go `IterateAllChunks` does not validate the encoding; `loadMmappedChunks`
+                // skips chunks with an invalid encoding. Map unknown values to `None`
+                // (not a valid chunk encoding) so the caller skips them the same way.
+                let encoding =
+                    Encoding::from_u8(raw_enc & !OUT_OF_ORDER_MASK).unwrap_or(Encoding::None);
 
                 let (data_len, ulen) = decode_uvarint(
                     &mmap[idx..(idx + MAX_CHUNK_LENGTH_FIELD_SIZE).min(file_end)],
@@ -516,6 +559,41 @@ impl HeadChunksReader {
                     is_ooo,
                 })?;
             }
+        }
+        Ok(())
+    }
+
+    /// Port of Go `ChunkDiskMapper.DeleteCorrupted`: deletes the corrupt head chunk file
+    /// named by a [`HeadChunksError::Corruption`] and every file after it. Any other error
+    /// cannot be handled and is returned as [`HeadChunksError::CannotHandle`].
+    pub fn delete_corrupted(&mut self, original: &HeadChunksError) -> Result<(), HeadChunksError> {
+        let HeadChunksError::Corruption { file_index, .. } = original else {
+            return Err(HeadChunksError::CannotHandle(original.to_string()));
+        };
+        let segs: Vec<usize> = self
+            .files
+            .keys()
+            .copied()
+            .filter(|&seq| seq as i64 >= *file_index)
+            .collect();
+        self.delete_files(&segs)
+    }
+
+    /// Port of Go `ChunkDiskMapper.Truncate(math.MaxUint32)` at startup (no file is being
+    /// written yet): deletes every head chunk file.
+    pub fn delete_all(&mut self) -> Result<(), HeadChunksError> {
+        let segs: Vec<usize> = self.files.keys().copied().collect();
+        self.delete_files(&segs)
+    }
+
+    /// Port of Go `ChunkDiskMapper.deleteFiles`: unmaps and removes the given files,
+    /// stopping at the first removal error.
+    fn delete_files(&mut self, segs: &[usize]) -> Result<(), HeadChunksError> {
+        for &seq in segs {
+            self.files.remove(&seq);
+        }
+        for &seq in segs {
+            fs::remove_file(head_chunk_file_path(&self.dir, seq))?;
         }
         Ok(())
     }

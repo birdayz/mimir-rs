@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 smallvec = { workspace = true }
 snap = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 ulid = { workspace = true }
 xxhash-rust = { workspace = true }
 zstd = { workspace = true }

@@ -1730,6 +1730,7 @@ dependencies = [
  "snap",
  "tempfile",
  "thiserror 2.0.21",
+ "tracing",
  "ulid",
  "xxhash-rust",
  "zstd",
