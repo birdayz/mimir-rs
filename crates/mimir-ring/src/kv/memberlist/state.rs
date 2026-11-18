@@ -787,7 +787,10 @@ impl MemberlistKv {
 
         let state = table.map.get_mut(&a.node).expect("present");
         if !bootstrap && is_local {
-            if a.incarnation == state.incarnation && a.meta == state.meta && a.vsn == state.vsn {
+            if a.incarnation == state.incarnation
+                && a.meta.as_deref().unwrap_or_default() == state.meta.as_deref().unwrap_or_default()
+                && a.vsn == state.vsn
+            {
                 return;
             }
             self.refute(state, a.incarnation);

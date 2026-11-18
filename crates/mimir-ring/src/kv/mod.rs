@@ -63,8 +63,11 @@ pub enum KvError {
 
 /// Result of a CAS callback.
 pub enum CasOutcome {
-    /// Store the returned value.
+    /// Store the returned value, retrying on conflict / no-change-detected.
     Update(Box<dyn Any + Send + Sync>),
+    /// Store the returned value once without retrying on conflict / no-change-detected
+    /// (matching Go `retry=false`).
+    UpdateOnce(Box<dyn Any + Send + Sync>),
     /// Leave the stored value unchanged and succeed immediately.
     NoChange,
 }
@@ -332,7 +335,8 @@ where
         };
         match f(typed)? {
             None => Ok(CasOutcome::NoChange),
-            Some((val, _retry)) => Ok(CasOutcome::Update(Box::new(val))),
+            Some((val, true)) => Ok(CasOutcome::Update(Box::new(val))),
+            Some((val, false)) => Ok(CasOutcome::UpdateOnce(Box::new(val))),
         }
     });
     client.cas(key, cb).await

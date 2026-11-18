@@ -205,7 +205,7 @@ impl KvClient for InMemoryKv {
 
                 let new_val = match outcome {
                     CasOutcome::NoChange => return Ok(()),
-                    CasOutcome::Update(v) => v,
+                    CasOutcome::Update(v) | CasOutcome::UpdateOnce(v) => v,
                 };
 
                 let encoded = self.codec.encode(new_val.as_ref())?;

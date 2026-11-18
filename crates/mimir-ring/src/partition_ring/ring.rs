@@ -257,7 +257,7 @@ pub struct PartitionRing {
     ring_partition_active: Vec<bool>,
     owners_by_partition: HashMap<i32, Vec<String>>,
     shuffle_shard_cache: Arc<ShuffleShardCache>,
-    all_active: OnceLock<Result<Arc<PartitionRing>, String>>,
+    all_active: Arc<OnceLock<Result<Arc<PartitionRing>, String>>>,
     active_partitions_count: usize,
     non_pending_partitions_count: usize,
     max_partition_id: i32,
@@ -304,7 +304,7 @@ impl PartitionRing {
             ring_partition_active,
             owners_by_partition,
             shuffle_shard_cache: ShuffleShardCache::new(cache_size),
-            all_active: OnceLock::new(),
+            all_active: Arc::new(OnceLock::new()),
             active_partitions_count,
             non_pending_partitions_count,
             max_partition_id,
@@ -314,6 +314,16 @@ impl PartitionRing {
 
     pub fn desc(&self) -> &PartitionRingDesc {
         &self.desc
+    }
+
+    /// Reuses `prev`'s shuffle-shard cache and all-Active subring memo when the two rings
+    /// differ only in `PENDING` partitions and their owners (Go `PartitionRing.inheritShards`).
+    pub(crate) fn inherit_shards(&mut self, prev: &PartitionRing) {
+        if !same_except_pending(&prev.desc, &self.desc) {
+            return;
+        }
+        self.shuffle_shard_cache = Arc::clone(&prev.shuffle_shard_cache);
+        self.all_active = Arc::clone(&prev.all_active);
     }
 
     pub fn partition_tokens(&self, id: i32) -> Result<&[u32], PartitionRingError> {
@@ -555,7 +565,7 @@ impl PartitionRing {
                 ring_partition_active: self.ring_partition_active.clone(),
                 owners_by_partition,
                 shuffle_shard_cache: ShuffleShardCache::new(self.opts.shuffle_shard_cache_size),
-                all_active: OnceLock::new(),
+                all_active: Arc::new(OnceLock::new()),
                 active_partitions_count,
                 non_pending_partitions_count,
                 max_partition_id,
@@ -591,7 +601,7 @@ impl PartitionRing {
             ring_partition_active,
             owners_by_partition,
             shuffle_shard_cache: ShuffleShardCache::new(self.opts.shuffle_shard_cache_size),
-            all_active: OnceLock::new(),
+            all_active: Arc::new(OnceLock::new()),
             active_partitions_count,
             non_pending_partitions_count,
             max_partition_id,
@@ -729,6 +739,53 @@ impl PartitionRing {
 
         Ok(ranges)
     }
+}
+
+/// Reports whether `a` and `b` hold the same non-Pending partitions and the same owners of them
+/// (Go `sameExceptPending`).
+fn same_except_pending(a: &PartitionRingDesc, b: &PartitionRingDesc) -> bool {
+    let mut count = 0isize;
+    for (id, pa) in &a.partitions {
+        if pa.is_pending() {
+            continue;
+        }
+        count += 1;
+        match b.partitions.get(id) {
+            Some(pb) if pa == pb => {}
+            _ => return false,
+        }
+    }
+    for pb in b.partitions.values() {
+        if !pb.is_pending() {
+            count -= 1;
+        }
+    }
+    if count != 0 {
+        return false;
+    }
+
+    let owns_non_pending = |o: &mimir_proto::ringpb::OwnerDesc| -> bool {
+        a.partitions
+            .get(&o.owned_partition)
+            .is_some_and(|p| !p.is_pending())
+    };
+    count = 0;
+    for (id, oa) in &a.owners {
+        if !owns_non_pending(oa) {
+            continue;
+        }
+        count += 1;
+        match b.owners.get(id) {
+            Some(ob) if oa == ob => {}
+            _ => return false,
+        }
+    }
+    for ob in b.owners.values() {
+        if owns_non_pending(ob) {
+            count -= 1;
+        }
+    }
+    count == 0
 }
 
 pub struct ActivePartitionBatchRing {

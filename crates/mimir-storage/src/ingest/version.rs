@@ -324,13 +324,6 @@ fn resolved_symbol_size(r: u32, symbols: &[String], offset: u32) -> usize {
     1 + l + mimir_proto::prost::length_delimiter_len(l)
 }
 
-fn symbols_size_proto(symbols: &[String]) -> usize {
-    symbols
-        .iter()
-        .map(|s| 1 + s.len() + mimir_proto::prost::length_delimiter_len(s.len()))
-        .sum()
-}
-
 fn max_rw2_series_size_after_resymbolization(
     ts: &cortexpb::TimeSeriesRw2,
     symbols: &[String],
@@ -339,6 +332,11 @@ fn max_rw2_series_size_after_resymbolization(
     let highest_possible = symbols.len() as u64 + offset as u64;
     let sym_upper = 1 + mimir_proto::prost::length_delimiter_len(highest_possible as usize);
     let mut series_size = ts.encoded_len();
+    if ts.metadata.is_none() {
+        // Go `TimeSeriesRW2.Metadata` is non-nullable (`(gogoproto.nullable) = false`), so Go's
+        // `ts.Size()` always includes 2 bytes (`0x2a, 0x00`) for an empty `MetadataRW2`.
+        series_size += 2;
+    }
     let mut syms_size = 0usize;
 
     for &r in &ts.labels_refs {
@@ -352,14 +350,16 @@ fn max_rw2_series_size_after_resymbolization(
             syms_size += resolved_symbol_size(r, symbols, offset);
         }
     }
-    if let Some(ref md) = ts.metadata {
-        series_size += sym_upper
-            .saturating_sub(mimir_proto::prost::length_delimiter_len(md.help_ref as usize));
-        syms_size += resolved_symbol_size(md.help_ref, symbols, offset);
-        series_size += sym_upper
-            .saturating_sub(mimir_proto::prost::length_delimiter_len(md.unit_ref as usize));
-        syms_size += resolved_symbol_size(md.unit_ref, symbols, offset);
-    }
+    let (help_ref, unit_ref) = ts
+        .metadata
+        .as_ref()
+        .map_or((0, 0), |md| (md.help_ref, md.unit_ref));
+    series_size +=
+        sym_upper.saturating_sub(mimir_proto::prost::length_delimiter_len(help_ref as usize));
+    syms_size += resolved_symbol_size(help_ref, symbols, offset);
+    series_size +=
+        sym_upper.saturating_sub(mimir_proto::prost::length_delimiter_len(unit_ref as usize));
+    syms_size += resolved_symbol_size(unit_ref, symbols, offset);
     (series_size, syms_size)
 }
 
@@ -456,7 +456,7 @@ pub fn split_write_request_by_max_marshal_size_rw2(
 
         let new_ts = resymbolize_timeseries_rw2(ts, &req.symbols_rw2, &mut next_symbols, common_symbols);
         next_req_size += embedded_message_field_size(new_ts.encoded_len());
-        let new_syms_size = symbols_size_proto(&next_symbols.symbols());
+        let new_syms_size = next_symbols.symbols_size_proto();
         next_req_size += new_syms_size.saturating_sub(next_req_symbols_size);
         next_req_symbols_size = new_syms_size;
         next_req.timeseries_rw2.push(new_ts);
@@ -612,5 +612,33 @@ mod tests {
             }
             assert_eq!(total_series, 20);
         }
+    }
+
+    #[test]
+    fn test_max_rw2_series_size_accounts_for_empty_metadata_and_symbols_size_proto() {
+        let ts = cortexpb::TimeSeriesRw2 {
+            labels_refs: vec![1, 65],
+            samples: vec![cortexpb::Sample {
+                value: 1.0,
+                timestamp_ms: 1000,
+            }],
+            metadata: None,
+            ..Default::default()
+        };
+        let symbols = vec!["".to_string(), "foo".to_string()];
+        let (series_size, syms_size) =
+            max_rw2_series_size_after_resymbolization(&ts, &symbols, 64);
+        // Must include +2 for missing MetadataRW2 (0x2a 0x00) and 2*(sym_upper-1) + 4 for syms.
+        let sym_upper = 1 + mimir_proto::prost::length_delimiter_len(symbols.len() + 64);
+        assert!(series_size >= ts.encoded_len() + 2 + 2 * (sym_upper - 1));
+        // help_ref=0 (2 bytes) + unit_ref=0 (2 bytes) + "foo" (5 bytes) = 9 bytes.
+        assert_eq!(syms_size, 9);
+
+        let mut table = FastSymbolsTable::new(10);
+        table.configure_common_symbols(64, Some(v2_common_symbols()));
+        assert_eq!(table.symbols_size_proto(), 0);
+        table.symbolize("foo");
+        // Tag 4 (1) + len varint (1) + "foo" (3) = 5 bytes, excluding "".
+        assert_eq!(table.symbols_size_proto(), 5);
     }
 }
