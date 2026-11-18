@@ -853,87 +853,91 @@ async fn tenants_handler(
     headers: HeaderMap,
 ) -> Response {
     let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
-    let _act = st.ingester.insert_activity(|| {
-        crate::activity::request_activity(
-            "",
-            &trace_id,
-            "Ingester/TenantsHandler",
-            crate::activity::ActivityRequest::None,
-        )
-    });
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
-
-    let mut tss = Vec::new();
-    for t in st.ingester.get_tsdb_users() {
-        let Some(db) = st.ingester.get_tsdb(&t) else {
-            continue;
-        };
-        let lim = st.ingester.overrides.for_tenant(&t);
-        let past_grace = lim.past_grace_period.0;
-        let past_grace_period_ns = past_grace.wrapping_add(lim.out_of_order_time_window.0);
-        let future_grace_period_ns = lim.creation_grace_period.0;
-
-        let head = db.db.head();
-        let min_millis = head.min_time();
-        let max_millis = head.max_time();
-
-        // Go int64 arithmetic wraps (e.g. an empty head's math.MinInt64 max time).
-        let mut warnings: Vec<String> = Vec::new();
-        let delta = max_millis.wrapping_sub(now_ms);
-        if delta > future_grace_period_ns / 1_000_000 {
-            warnings.push(format!(
-                "TSDB Head max timestamp too far in the future: {}",
-                GoDuration(delta.wrapping_mul(1_000_000))
-            ));
-        }
-        if past_grace > 0 && now_ms.wrapping_sub(min_millis) > past_grace_period_ns / 1_000_000 {
-            warnings.push("TSDB Head min timestamp too far in the past".to_string());
-        }
-
-        tss.push(TenantStats {
-            series: head.num_series(),
-            blocks: db.db.blocks().len(),
-            min_time: format_millis_time(min_millis),
-            max_time: format_millis_time(max_millis),
-            past_grace_period_ns,
-            future_grace_period_ns,
-            warning: warnings.join(", "),
-            tenant: t,
-        });
-    }
-    tss.sort_by(|a, b| b.series.cmp(&a.series).then_with(|| a.tenant.cmp(&b.tenant)));
-
-    let now = local_now();
-    if accepts_json(&headers) {
-        let tenants = if tss.is_empty() {
-            GoJson::Null
-        } else {
-            GoJson::Array(
-                tss.iter()
-                    .map(|s| {
-                        GoJson::Object(vec![
-                            ("Tenant".into(), GoJson::str(s.tenant.as_str())),
-                            ("Series".into(), GoJson::int(s.series)),
-                            ("Blocks".into(), GoJson::int(s.blocks as u64)),
-                            ("MinTime".into(), GoJson::str(s.min_time.as_str())),
-                            ("MaxTime".into(), GoJson::str(s.max_time.as_str())),
-                            ("PastGracePeriod".into(), GoJson::int(s.past_grace_period_ns)),
-                            ("FutureGracePeriod".into(), GoJson::int(s.future_grace_period_ns)),
-                            ("Warning".into(), GoJson::str(s.warning.as_str())),
-                        ])
-                    })
-                    .collect(),
+    tokio::task::spawn_blocking(move || {
+        let _act = st.ingester.insert_activity(|| {
+            crate::activity::request_activity(
+                "",
+                &trace_id,
+                "Ingester/TenantsHandler",
+                crate::activity::ActivityRequest::None,
             )
-        };
-        return go_json_response(&GoJson::Object(vec![
-            ("Now".into(), GoJson::time(&now)),
-            ("Tenants".into(), tenants),
-        ]));
-    }
+        });
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
 
-    Html(render_tenants_page(&now, &tss)).into_response()
+        let mut tss = Vec::new();
+        for t in st.ingester.get_tsdb_users() {
+            let Some(db) = st.ingester.get_tsdb(&t) else {
+                continue;
+            };
+            let lim = st.ingester.overrides.for_tenant(&t);
+            let past_grace = lim.past_grace_period.0;
+            let past_grace_period_ns = past_grace.wrapping_add(lim.out_of_order_time_window.0);
+            let future_grace_period_ns = lim.creation_grace_period.0;
+
+            let head = db.db.head();
+            let min_millis = head.min_time();
+            let max_millis = head.max_time();
+
+            // Go int64 arithmetic wraps (e.g. an empty head's math.MinInt64 max time).
+            let mut warnings: Vec<String> = Vec::new();
+            let delta = max_millis.wrapping_sub(now_ms);
+            if delta > future_grace_period_ns / 1_000_000 {
+                warnings.push(format!(
+                    "TSDB Head max timestamp too far in the future: {}",
+                    GoDuration(delta.wrapping_mul(1_000_000))
+                ));
+            }
+            if past_grace > 0 && now_ms.wrapping_sub(min_millis) > past_grace_period_ns / 1_000_000 {
+                warnings.push("TSDB Head min timestamp too far in the past".to_string());
+            }
+
+            tss.push(TenantStats {
+                series: head.num_series(),
+                blocks: db.db.blocks().len(),
+                min_time: format_millis_time(min_millis),
+                max_time: format_millis_time(max_millis),
+                past_grace_period_ns,
+                future_grace_period_ns,
+                warning: warnings.join(", "),
+                tenant: t,
+            });
+        }
+        tss.sort_by(|a, b| b.series.cmp(&a.series).then_with(|| a.tenant.cmp(&b.tenant)));
+
+        let now = local_now();
+        if accepts_json(&headers) {
+            let tenants = if tss.is_empty() {
+                GoJson::Null
+            } else {
+                GoJson::Array(
+                    tss.iter()
+                        .map(|s| {
+                            GoJson::Object(vec![
+                                ("Tenant".into(), GoJson::str(s.tenant.as_str())),
+                                ("Series".into(), GoJson::int(s.series)),
+                                ("Blocks".into(), GoJson::int(s.blocks as u64)),
+                                ("MinTime".into(), GoJson::str(s.min_time.as_str())),
+                                ("MaxTime".into(), GoJson::str(s.max_time.as_str())),
+                                ("PastGracePeriod".into(), GoJson::int(s.past_grace_period_ns)),
+                                ("FutureGracePeriod".into(), GoJson::int(s.future_grace_period_ns)),
+                                ("Warning".into(), GoJson::str(s.warning.as_str())),
+                            ])
+                        })
+                        .collect(),
+                )
+            };
+            return go_json_response(&GoJson::Object(vec![
+                ("Now".into(), GoJson::time(&now)),
+                ("Tenants".into(), tenants),
+            ]));
+        }
+
+        Html(render_tenants_page(&now, &tss)).into_response()
+    })
+    .await
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// `tenants.gohtml`.
@@ -1049,138 +1053,142 @@ async fn tenant_tsdb_handler(
     headers: HeaderMap,
 ) -> Response {
     let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
-    let _act = st.ingester.insert_activity(|| {
-        crate::activity::request_activity(
-            "",
-            &trace_id,
-            "Ingester/TenantTSDBHandler",
-            crate::activity::ActivityRequest::None,
-        )
-    });
-    let tenant = uri
-        .path()
-        .strip_prefix("/ingester/tsdb/")
-        .unwrap_or_default()
-        .to_string();
-    if tenant.is_empty() {
-        return ([(header::CONTENT_TYPE, "text/plain")], "Tenant ID can't be empty").into_response();
-    }
-    let Some(db) = st.ingester.get_tsdb(&tenant) else {
-        // `w.WriteHeader(404)` precedes `WriteTextResponse`'s header, so net/http sniffs the type.
-        return (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            format!("TSDB not found for tenant {tenant}"),
-        )
-            .into_response();
-    };
-
-    let head = db.db.head();
-    let appendable_min_valid_time = head
-        .min_in_order_append_time()
-        .map(format_millis_time)
-        .unwrap_or_default();
-    let shipped = db.cached_shipped_blocks();
-    let blocks: Vec<TenantTsdbBlock> = db
-        .db
-        .blocks()
-        .iter()
-        .map(|b| {
-            let m = b.meta();
-            TenantTsdbBlock {
-                id: m.ulid.to_string(),
-                min_time: format_millis_time(m.min_time),
-                max_time: format_millis_time(m.max_time),
-                out_of_order: m.out_of_order,
-                compaction: m.compaction.clone(),
-                stats: m.stats.clone(),
-                uploaded_on: shipped
-                    .get(&m.ulid)
-                    .map(|t| format_time(DateTime::<Utc>::from(*t)))
-                    .unwrap_or_default(),
-            }
-        })
-        .collect();
-    let num_series = head.num_series();
-    let min_time = format_millis_time(head.min_time());
-    let max_time = format_millis_time(head.max_time());
-    let min_ooo_time = format_millis_time(head.min_ooo_time());
-    let max_ooo_time = format_millis_time(head.max_ooo_time());
-    let label_churn_enabled = st.ingester.cfg.label_churn_enabled;
-    let now = local_now();
-
-    if accepts_json(&headers) {
-        let blocks_json = if blocks.is_empty() {
-            GoJson::Null
-        } else {
-            GoJson::Array(blocks.iter().map(TenantTsdbBlock::to_go_json).collect())
+    tokio::task::spawn_blocking(move || {
+        let _act = st.ingester.insert_activity(|| {
+            crate::activity::request_activity(
+                "",
+                &trace_id,
+                "Ingester/TenantTSDBHandler",
+                crate::activity::ActivityRequest::None,
+            )
+        });
+        let tenant = uri
+            .path()
+            .strip_prefix("/ingester/tsdb/")
+            .unwrap_or_default()
+            .to_string();
+        if tenant.is_empty() {
+            return ([(header::CONTENT_TYPE, "text/plain")], "Tenant ID can't be empty").into_response();
+        }
+        let Some(db) = st.ingester.get_tsdb(&tenant) else {
+            // `w.WriteHeader(404)` precedes `WriteTextResponse`'s header, so net/http sniffs the type.
+            return (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("TSDB not found for tenant {tenant}"),
+            )
+                .into_response();
         };
-        return go_json_response(&GoJson::Object(vec![
-            ("Now".into(), GoJson::time(&now)),
-            ("Tenant".into(), GoJson::str(tenant.as_str())),
-            (
-                "Head".into(),
-                GoJson::Object(vec![
-                    ("MinTime".into(), GoJson::str(min_time.as_str())),
-                    ("MaxTime".into(), GoJson::str(max_time.as_str())),
-                    ("NumSeries".into(), GoJson::int(num_series)),
-                    (
-                        "AppendableMinValidTime".into(),
-                        GoJson::str(appendable_min_valid_time.as_str()),
-                    ),
-                    ("MinOOOTime".into(), GoJson::str(min_ooo_time.as_str())),
-                    ("MaxOOOTime".into(), GoJson::str(max_ooo_time.as_str())),
-                ]),
-            ),
-            ("Blocks".into(), blocks_json),
-            ("LabelChurnEnabled".into(), GoJson::Bool(label_churn_enabled)),
-        ]));
-    }
 
-    // tenant_tsdb.gohtml
-    let tenant_html = html_escape(&tenant);
-    let mut out = String::with_capacity(2048 + blocks.len() * 512);
-    let _ = write!(
-        out,
-        "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"UTF-8\">\n    <title>Ingester: TSDB for tenant {tenant_html}</title>\n</head>\n<body>\n<h1>Ingester: TSDB for tenant {tenant_html}</h1>\n<p>Current time: {}</p>\n\n<h2>TSDB Head</h2>\n\n<ul>\n    <li>Number of series: {num_series}</li>\n    <li>Min Time: {}</li>\n    <li>Max Time: {}</li>\n    <li>Appendable Min Valid Time: {}</li>\n    <li>Min OOO Time: {}</li>\n    <li>Max OOO Time: {}</li>\n</ul>\n",
-        html_escape(&format_go_time_string(&now)),
-        html_escape(&min_time),
-        html_escape(&max_time),
-        if appendable_min_valid_time.is_empty() {
-            "N/A".to_string()
-        } else {
-            html_escape(&appendable_min_valid_time)
-        },
-        html_escape(&min_ooo_time),
-        html_escape(&max_ooo_time),
-    );
-    if label_churn_enabled {
+        let head = db.db.head();
+        let appendable_min_valid_time = head
+            .min_in_order_append_time()
+            .map(format_millis_time)
+            .unwrap_or_default();
+        let shipped = db.cached_shipped_blocks();
+        let blocks: Vec<TenantTsdbBlock> = db
+            .db
+            .blocks()
+            .iter()
+            .map(|b| {
+                let m = b.meta();
+                TenantTsdbBlock {
+                    id: m.ulid.to_string(),
+                    min_time: format_millis_time(m.min_time),
+                    max_time: format_millis_time(m.max_time),
+                    out_of_order: m.out_of_order,
+                    compaction: m.compaction.clone(),
+                    stats: m.stats.clone(),
+                    uploaded_on: shipped
+                        .get(&m.ulid)
+                        .map(|t| format_time(DateTime::<Utc>::from(*t)))
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        let num_series = head.num_series();
+        let min_time = format_millis_time(head.min_time());
+        let max_time = format_millis_time(head.max_time());
+        let min_ooo_time = format_millis_time(head.min_ooo_time());
+        let max_ooo_time = format_millis_time(head.max_ooo_time());
+        let label_churn_enabled = st.ingester.cfg.label_churn_enabled;
+        let now = local_now();
+
+        if accepts_json(&headers) {
+            let blocks_json = if blocks.is_empty() {
+                GoJson::Null
+            } else {
+                GoJson::Array(blocks.iter().map(TenantTsdbBlock::to_go_json).collect())
+            };
+            return go_json_response(&GoJson::Object(vec![
+                ("Now".into(), GoJson::time(&now)),
+                ("Tenant".into(), GoJson::str(tenant.as_str())),
+                (
+                    "Head".into(),
+                    GoJson::Object(vec![
+                        ("MinTime".into(), GoJson::str(min_time.as_str())),
+                        ("MaxTime".into(), GoJson::str(max_time.as_str())),
+                        ("NumSeries".into(), GoJson::int(num_series)),
+                        (
+                            "AppendableMinValidTime".into(),
+                            GoJson::str(appendable_min_valid_time.as_str()),
+                        ),
+                        ("MinOOOTime".into(), GoJson::str(min_ooo_time.as_str())),
+                        ("MaxOOOTime".into(), GoJson::str(max_ooo_time.as_str())),
+                    ]),
+                ),
+                ("Blocks".into(), blocks_json),
+                ("LabelChurnEnabled".into(), GoJson::Bool(label_churn_enabled)),
+            ]));
+        }
+
+        // tenant_tsdb.gohtml
+        let tenant_html = html_escape(&tenant);
+        let mut out = String::with_capacity(2048 + blocks.len() * 512);
         let _ = write!(
             out,
-            "\n<p><a href=\"../label_churn/{}\">Label churn</a></p>\n",
-            html_url_attr(&tenant)
+            "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"UTF-8\">\n    <title>Ingester: TSDB for tenant {tenant_html}</title>\n</head>\n<body>\n<h1>Ingester: TSDB for tenant {tenant_html}</h1>\n<p>Current time: {}</p>\n\n<h2>TSDB Head</h2>\n\n<ul>\n    <li>Number of series: {num_series}</li>\n    <li>Min Time: {}</li>\n    <li>Max Time: {}</li>\n    <li>Appendable Min Valid Time: {}</li>\n    <li>Min OOO Time: {}</li>\n    <li>Max OOO Time: {}</li>\n</ul>\n",
+            html_escape(&format_go_time_string(&now)),
+            html_escape(&min_time),
+            html_escape(&max_time),
+            if appendable_min_valid_time.is_empty() {
+                "N/A".to_string()
+            } else {
+                html_escape(&appendable_min_valid_time)
+            },
+            html_escape(&min_ooo_time),
+            html_escape(&max_ooo_time),
         );
-    }
-    out.push_str(
-        "\n\n<h2>Blocks</h2>\n\n\n<table border=\"1\" cellpadding=\"5\" style=\"border-collapse: collapse\">\n    <thead>\n    <tr>\n        <th>ID</th>\n        <th>Min Time</th>\n        <th>Max Time</th>\n        <th>Number of Series</th>\n        <th>Number of Chunks</th>\n        <th>Number of Samples</th>\n        <th>Compaction Hints</th>\n        <th>Uploaded</th>\n    </tr>\n    </thead>\n    <tbody style=\"font-family: monospace;\">\n    ",
-    );
-    for b in &blocks {
-        let _ = write!(
-            out,
-            "\n        <tr>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n        </tr>\n    ",
-            html_escape(&b.id),
-            html_escape(&b.min_time),
-            html_escape(&b.max_time),
-            b.stats.num_series,
-            b.stats.num_chunks,
-            b.stats.num_samples,
-            // fmt of a []string: `[a b]`.
-            html_escape(&format!("[{}]", b.compaction.hints.join(" "))),
-            html_escape(&b.uploaded_on),
+        if label_churn_enabled {
+            let _ = write!(
+                out,
+                "\n<p><a href=\"../label_churn/{}\">Label churn</a></p>\n",
+                html_url_attr(&tenant)
+            );
+        }
+        out.push_str(
+            "\n\n<h2>Blocks</h2>\n\n\n<table border=\"1\" cellpadding=\"5\" style=\"border-collapse: collapse\">\n    <thead>\n    <tr>\n        <th>ID</th>\n        <th>Min Time</th>\n        <th>Max Time</th>\n        <th>Number of Series</th>\n        <th>Number of Chunks</th>\n        <th>Number of Samples</th>\n        <th>Compaction Hints</th>\n        <th>Uploaded</th>\n    </tr>\n    </thead>\n    <tbody style=\"font-family: monospace;\">\n    ",
         );
-    }
-    out.push_str("\n    </tbody>\n</table>\n</body>\n</html>");
-    Html(out).into_response()
+        for b in &blocks {
+            let _ = write!(
+                out,
+                "\n        <tr>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n            <td>{}</td>\n        </tr>\n    ",
+                html_escape(&b.id),
+                html_escape(&b.min_time),
+                html_escape(&b.max_time),
+                b.stats.num_series,
+                b.stats.num_chunks,
+                b.stats.num_samples,
+                // fmt of a []string: `[a b]`.
+                html_escape(&format!("[{}]", b.compaction.hints.join(" "))),
+                html_escape(&b.uploaded_on),
+            );
+        }
+        out.push_str("\n    </tbody>\n</table>\n</body>\n</html>");
+        Html(out).into_response()
+    })
+    .await
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 fn percent_decode_form(raw: &str) -> String {

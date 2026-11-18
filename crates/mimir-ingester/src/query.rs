@@ -20,7 +20,8 @@ use mimir_proto::cortexpb;
 use mimir_proto::ingesterpb;
 use mimir_proto::prost::Message;
 use mimir_proto::query_stream_enc::{
-    encoded_series_chunks_len, QueryStreamBatchBuilder, RawChunk,
+    encode_metrics_for_label_matchers_response, encoded_series_chunks_len, QueryStreamBatchBuilder,
+    RawChunk,
 };
 use mimir_storage::ingest::partition_offset_watcher::OffsetWatcherError;
 use mimir_storage::ingest::reader::ReaderError;
@@ -879,10 +880,9 @@ impl Ingester {
                                 LazyStreamEvent::Series(labels, chunk_count) => {
                                     num_series += 1;
                                     series_batch.push(ingesterpb::QueryStreamSeries {
-                                        labels: labels_to_proto_pairs(&labels),
+                                        labels: labels_to_proto_pairs(labels),
                                         chunk_count: chunk_count as i64,
                                     });
-                                    drop(labels);
                                     if series_batch.len() >= QUERY_STREAM_BATCH_SIZE {
                                         let resp = ingesterpb::QueryStreamResponse {
                                             streaming_series: std::mem::take(&mut series_batch),
@@ -1288,7 +1288,6 @@ impl Ingester {
                                             mimir_tsdb::chunkenc::ChunkError::InvalidEncoding(0),
                                         ));
                                     }
-                                    drop(labels);
                                     series_in_batch += 1;
                                     if series_in_batch >= QUERY_STREAM_BATCH_SIZE {
                                         let bytes = builder.finish();
@@ -2433,6 +2432,64 @@ impl Ingester {
         res
     }
 
+    /// Zero-alloc wire-encoding `MetricsForLabelMatchers` returning raw serialized
+    /// `MetricsForLabelMatchersResponse` protobuf `Bytes` (served via `RawMetricsForLabelMatchersSvc`).
+    pub async fn handle_metrics_for_label_matchers_raw(
+        &self,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::MetricsForLabelMatchersRequest,
+    ) -> Result<Bytes, IngesterError> {
+        let permit = self.start_read_request(md).await?;
+        let res = self
+            .metrics_for_label_matchers_raw_inner(md, user_id, req)
+            .await;
+        permit.finish(deadline_exceeded(&res));
+        res
+    }
+
+    fn select_sorted_labels_for_matchers(
+        db: &UserTsdb,
+        start_ts: i64,
+        end_ts: i64,
+        matchers_set: &[Vec<LabelMatcher>],
+        limit: usize,
+    ) -> Result<Vec<Labels>, IngesterError> {
+        let cq = db.db.chunk_querier(start_ts, end_ts);
+        if matchers_set.is_empty() {
+            return Ok(Vec::new());
+        }
+        if matchers_set.len() == 1 {
+            let mut series =
+                cq.select_raw_labels(true, &matchers_set[0])
+                    .map_err(|e| IngesterError::Internal {
+                        message: e.to_string(),
+                    })?;
+            if series.len() > limit {
+                series.truncate(limit);
+            }
+            return Ok(series);
+        }
+        let mut dedup = hashbrown::HashSet::<Labels>::new();
+        for matchers in matchers_set {
+            let series = cq
+                .select_raw_labels(false, matchers)
+                .map_err(|e| IngesterError::Internal {
+                    message: e.to_string(),
+                })?;
+            dedup.extend(series);
+        }
+        let mut merged: Vec<Labels> = dedup.into_iter().collect();
+        if limit < merged.len() {
+            merged.select_nth_unstable(limit);
+            merged.truncate(limit);
+        }
+        if merged.len() > 1 {
+            mimir_tsdb::querier::sort_labels(&mut merged);
+        }
+        Ok(merged)
+    }
+
     async fn metrics_for_label_matchers_inner(
         &self,
         md: &MetadataMap,
@@ -2456,38 +2513,8 @@ impl Ingester {
         };
 
         tokio::task::spawn_blocking(move || {
-            let cq = db.db.chunk_querier(start_ts, end_ts);
-            let sorted_labels: Vec<Labels> = if matchers_set.is_empty() {
-                Vec::new()
-            } else if matchers_set.len() == 1 {
-                let mut series =
-                    cq.select_raw_labels(true, &matchers_set[0])
-                        .map_err(|e| IngesterError::Internal {
-                            message: e.to_string(),
-                        })?;
-                if series.len() > limit {
-                    series.truncate(limit);
-                }
-                series
-            } else {
-                let mut dedup = hashbrown::HashSet::<Labels>::new();
-                for matchers in &matchers_set {
-                    let series = cq
-                        .select_raw_labels(false, matchers)
-                        .map_err(|e| IngesterError::Internal {
-                            message: e.to_string(),
-                        })?;
-                    dedup.extend(series);
-                }
-                let mut merged: Vec<Labels> = dedup.into_iter().collect();
-                if limit < merged.len() {
-                    merged.select_nth_unstable(limit);
-                    merged.truncate(limit);
-                }
-                merged.sort_unstable();
-                merged
-            };
-
+            let sorted_labels =
+                Self::select_sorted_labels_for_matchers(&db, start_ts, end_ts, &matchers_set, limit)?;
             let metric: Vec<cortexpb::Metric> = sorted_labels
                 .into_iter()
                 .map(|lbls| cortexpb::Metric {
@@ -2495,6 +2522,50 @@ impl Ingester {
                 })
                 .collect();
             Ok(ingesterpb::MetricsForLabelMatchersResponse { metric })
+        })
+        .await
+        .map_err(|e| IngesterError::Internal {
+            message: format!("metrics_for_label_matchers task join error: {e}"),
+        })?
+    }
+
+    async fn metrics_for_label_matchers_raw_inner(
+        &self,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::MetricsForLabelMatchersRequest,
+    ) -> Result<Bytes, IngesterError> {
+        self.enforce_read_consistency(md, user_id).await?;
+        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
+            return Ok(Bytes::new());
+        };
+        let mut matchers_set = Vec::with_capacity(req.matchers_set.len());
+        for lm_set in &req.matchers_set {
+            matchers_set.push(from_proto_matchers(&lm_set.matchers)?);
+        }
+        let start_ts = req.start_timestamp_ms;
+        let end_ts = req.end_timestamp_ms;
+        let limit = if req.limit > 0 {
+            req.limit as usize
+        } else {
+            usize::MAX
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let sorted_labels =
+                Self::select_sorted_labels_for_matchers(&db, start_ts, end_ts, &matchers_set, limit)?;
+            if sorted_labels.is_empty() {
+                return Ok(Bytes::new());
+            }
+            let mut out = bytes::BytesMut::with_capacity(sorted_labels.len().saturating_mul(192));
+            encode_metrics_for_label_matchers_response(
+                &mut out,
+                sorted_labels.iter().map(Labels::as_bytes),
+            )
+            .map_err(|e| IngesterError::Internal {
+                message: format!("encode metrics_for_label_matchers: {e}"),
+            })?;
+            Ok(out.freeze())
         })
         .await
         .map_err(|e| IngesterError::Internal {

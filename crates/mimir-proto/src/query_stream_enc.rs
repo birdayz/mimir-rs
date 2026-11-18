@@ -49,6 +49,19 @@ fn write_varint(dst: &mut BytesMut, mut v: u64) {
     dst.extend_from_slice(&buf[..=i]);
 }
 
+#[cold]
+#[inline(never)]
+fn decode_stringlabel_len_slow(
+    data: &[u8],
+    pos: usize,
+) -> Result<(usize, usize), QueryStreamEncodeError> {
+    let tail = data
+        .get(pos + 1..pos + 4)
+        .ok_or(QueryStreamEncodeError::TruncatedStringLabels)?;
+    let len = (tail[0] as usize) | ((tail[1] as usize) << 8) | ((tail[2] as usize) << 16);
+    Ok((len, pos + 4))
+}
+
 #[inline(always)]
 fn decode_stringlabel_len(
     data: &[u8],
@@ -60,11 +73,7 @@ fn decode_stringlabel_len(
     if b < 255 {
         Ok((b as usize, pos + 1))
     } else {
-        let tail = data
-            .get(pos + 1..pos + 4)
-            .ok_or(QueryStreamEncodeError::TruncatedStringLabels)?;
-        let len = (tail[0] as usize) | ((tail[1] as usize) << 8) | ((tail[2] as usize) << 16);
-        Ok((len, pos + 4))
+        decode_stringlabel_len_slow(data, pos)
     }
 }
 
@@ -140,44 +149,95 @@ fn write_raw_chunk(dst: &mut BytesMut, chunk: &RawChunk<'_>, payload_len: usize)
     }
 }
 
-/// Appends one `QueryStreamResponse.streaming_series` entry (field 3) encoded directly from
-/// raw `stringlabels` bytes into `dst`.
-pub fn encode_query_stream_series_stringlabels(
+#[inline(always)]
+fn encode_stringlabels_message_single_pass(
     dst: &mut BytesMut,
+    outer_tag: u8,
     stringlabels: &[u8],
-    chunk_count: i64,
+    chunk_count: Option<i64>,
 ) -> Result<(), QueryStreamEncodeError> {
-    let mut series_payload_len = 0usize;
-    let mut pos = 0usize;
-    while pos < stringlabels.len() {
-        let (klen, kstart) = decode_stringlabel_len(stringlabels, pos)?;
-        let kend = kstart
-            .checked_add(klen)
-            .filter(|&e| e <= stringlabels.len())
-            .ok_or(QueryStreamEncodeError::TruncatedStringLabels)?;
-        let (vlen, vstart) = decode_stringlabel_len(stringlabels, kend)?;
-        let vend = vstart
-            .checked_add(vlen)
-            .filter(|&e| e <= stringlabels.len())
-            .ok_or(QueryStreamEncodeError::TruncatedStringLabels)?;
-        pos = vend;
-        let pair_len = label_pair_payload_len(klen, vlen);
-        series_payload_len += 1 + varint_len(pair_len as u64) + pair_len;
-    }
-    if chunk_count != 0 {
-        series_payload_len += 1 + varint_len(chunk_count as u64);
-    }
-
-    dst.reserve(1 + varint_len(series_payload_len as u64) + series_payload_len);
-    dst.put_u8(0x1a); // field 3 (QueryStreamResponse.streaming_series), wire type 2
-    write_varint(dst, series_payload_len as u64);
+    let sl_len = stringlabels.len();
+    // Every valid stringlabels buffer of length L encodes to <= 2*L bytes of LabelPairs.
+    // Add 3 (outer tag + 2B varint placeholder) + 12 (optional chunk_count) + 16 slack.
+    let max_needed = 3 + sl_len.saturating_mul(2) + 28;
+    dst.reserve(max_needed);
+    let start_len = dst.len();
+    dst.put_u8(outer_tag);
+    dst.put_u16(0);
+    let body_start = dst.len();
 
     let mut pos = 0usize;
-    while pos < stringlabels.len() {
-        let (klen, kstart) = decode_stringlabel_len(stringlabels, pos)?;
-        let kend = kstart + klen;
-        let (vlen, vstart) = decode_stringlabel_len(stringlabels, kend)?;
-        let vend = vstart + vlen;
+    while pos < sl_len {
+        let b0 = stringlabels[pos];
+        if b0 < 128 && pos + 1 + (b0 as usize) < sl_len {
+            let klen = b0 as usize;
+            let kstart = pos + 1;
+            let kend = kstart + klen;
+            let b1 = stringlabels[kend];
+            if b1 < 128 && kend + 1 + (b1 as usize) <= sl_len {
+                let vlen = b1 as usize;
+                let vstart = kend + 1;
+                let vend = vstart + vlen;
+                pos = vend;
+                if klen > 0 && vlen > 0 {
+                    let pair_len = 4 + klen + vlen;
+                    if pair_len < 128 {
+                        let total = 6 + klen + vlen;
+                        // SAFETY: `max_needed >= 3 + 2*sl_len + 28` guarantees spare capacity >= `total`.
+                        // `BufMut::chunk_mut` returns `&mut UninitSlice` covering spare capacity
+                        // `[dst.len()..dst.capacity()]` with valid Stacked-Borrows provenance.
+                        unsafe {
+                            let spare = BufMut::chunk_mut(dst);
+                            debug_assert!(spare.len() >= total);
+                            let ptr = spare.as_mut_ptr();
+                            *ptr = 0x0a;
+                            *ptr.add(1) = pair_len as u8;
+                            *ptr.add(2) = 0x0a;
+                            *ptr.add(3) = klen as u8;
+                            std::ptr::copy_nonoverlapping(
+                                stringlabels.as_ptr().add(kstart),
+                                ptr.add(4),
+                                klen,
+                            );
+                            *ptr.add(4 + klen) = 0x12;
+                            *ptr.add(5 + klen) = vlen as u8;
+                            std::ptr::copy_nonoverlapping(
+                                stringlabels.as_ptr().add(vstart),
+                                ptr.add(6 + klen),
+                                vlen,
+                            );
+                            BufMut::advance_mut(dst, total);
+                        }
+                        continue;
+                    }
+                }
+                let pair_len = label_pair_payload_len(klen, vlen);
+                write_label_pair(dst, &stringlabels[kstart..kend], &stringlabels[vstart..vend], pair_len);
+                continue;
+            }
+        }
+        let (klen, kstart) = match decode_stringlabel_len(stringlabels, pos) {
+            Ok(v) => v,
+            Err(e) => {
+                dst.truncate(start_len);
+                return Err(e);
+            }
+        };
+        let Some(kend) = kstart.checked_add(klen).filter(|&e| e <= sl_len) else {
+            dst.truncate(start_len);
+            return Err(QueryStreamEncodeError::TruncatedStringLabels);
+        };
+        let (vlen, vstart) = match decode_stringlabel_len(stringlabels, kend) {
+            Ok(v) => v,
+            Err(e) => {
+                dst.truncate(start_len);
+                return Err(e);
+            }
+        };
+        let Some(vend) = vstart.checked_add(vlen).filter(|&e| e <= sl_len) else {
+            dst.truncate(start_len);
+            return Err(QueryStreamEncodeError::TruncatedStringLabels);
+        };
         pos = vend;
         let pair_len = label_pair_payload_len(klen, vlen);
         write_label_pair(
@@ -187,9 +247,70 @@ pub fn encode_query_stream_series_stringlabels(
             pair_len,
         );
     }
-    if chunk_count != 0 {
-        dst.put_u8(0x10); // field 2 (QueryStreamSeries.chunk_count), wire type 0
-        write_varint(dst, chunk_count as u64);
+    if let Some(cc) = chunk_count {
+        if cc != 0 {
+            dst.put_u8(0x10);
+            write_varint(dst, cc as u64);
+        }
+    }
+
+    let payload_len = dst.len() - body_start;
+    let actual_vlen = varint_len(payload_len as u64);
+    if actual_vlen == 2 {
+        let v = payload_len as u64;
+        dst[body_start - 2] = (v as u8 & 0x7f) | 0x80;
+        dst[body_start - 1] = (v >> 7) as u8;
+    } else if actual_vlen == 1 {
+        dst[body_start - 2] = payload_len as u8;
+        dst.copy_within(body_start.., body_start - 1);
+        dst.truncate(dst.len() - 1);
+    } else {
+        let extra = actual_vlen - 2;
+        let old_len = dst.len();
+        dst.resize(old_len + extra, 0);
+        dst.copy_within(body_start..old_len, body_start + extra);
+        let mut v = payload_len as u64;
+        let mut idx = body_start - 2;
+        while v >= 0x80 {
+            dst[idx] = (v as u8 & 0x7f) | 0x80;
+            v >>= 7;
+            idx += 1;
+        }
+        dst[idx] = v as u8;
+    }
+    Ok(())
+}
+
+/// Appends one `QueryStreamResponse.streaming_series` entry (field 3) encoded directly from
+/// raw `stringlabels` bytes into `dst`.
+pub fn encode_query_stream_series_stringlabels(
+    dst: &mut BytesMut,
+    stringlabels: &[u8],
+    chunk_count: i64,
+) -> Result<(), QueryStreamEncodeError> {
+    encode_stringlabels_message_single_pass(dst, 0x1a, stringlabels, Some(chunk_count))
+}
+
+/// Appends one `MetricsForLabelMatchersResponse.metric` entry (field 1, tag `0x0a`) encoded
+/// directly from raw `stringlabels` bytes into `dst` without allocating `Vec<LabelPair>`.
+pub fn encode_metric_stringlabels(
+    dst: &mut BytesMut,
+    stringlabels: &[u8],
+) -> Result<(), QueryStreamEncodeError> {
+    encode_stringlabels_message_single_pass(dst, 0x0a, stringlabels, None)
+}
+
+/// Encodes a sequence of raw `stringlabels` byte slices into a single
+/// `MetricsForLabelMatchersResponse` protobuf message in `dst`.
+pub fn encode_metrics_for_label_matchers_response<'a, I>(
+    dst: &mut BytesMut,
+    metrics: I,
+) -> Result<(), QueryStreamEncodeError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    for sl in metrics {
+        encode_metric_stringlabels(dst, sl)?;
     }
     Ok(())
 }
@@ -657,5 +778,54 @@ mod tests {
             encode_query_stream_series_stringlabels(&mut dst, &[1, b'k'], 1),
             Err(QueryStreamEncodeError::TruncatedStringLabels)
         );
+    }
+
+    #[test]
+    fn test_metrics_for_label_matchers_raw_wire_parity() {
+        let long_val = vec![b'x'; 300];
+        let series_cases: Vec<Vec<(&[u8], &[u8])>> = vec![
+            vec![],
+            vec![(b"__name__", b"up")],
+            vec![(b"__name__", b"http_requests_total"), (b"empty_val", b""), (b"job", b"api")],
+            vec![(b"__name__", b"long_metric"), (b"payload", &long_val)],
+        ];
+
+        let mut sl_bufs = Vec::new();
+        let mut prost_metrics = Vec::new();
+        for pairs in &series_cases {
+            sl_bufs.push(encode_stringlabels(pairs));
+            prost_metrics.push(cortexpb::Metric {
+                labels: pairs
+                    .iter()
+                    .map(|&(k, v)| cortexpb::LabelPair {
+                        name: Bytes::copy_from_slice(k),
+                        value: Bytes::copy_from_slice(v),
+                    })
+                    .collect(),
+            });
+        }
+
+        let mut raw_dst = BytesMut::new();
+        encode_metrics_for_label_matchers_response(
+            &mut raw_dst,
+            sl_bufs.iter().map(|v| v.as_slice()),
+        )
+        .unwrap();
+        let prost_resp = ingesterpb::MetricsForLabelMatchersResponse {
+            metric: prost_metrics,
+        };
+        let prost_wire = prost_resp.encode_to_vec();
+        assert_eq!(&raw_dst[..], &prost_wire[..]);
+
+        let decoded = ingesterpb::MetricsForLabelMatchersResponse::decode(&raw_dst[..]).unwrap();
+        assert_eq!(decoded, prost_resp);
+
+        // Empty response produces 0 bytes.
+        let mut empty_dst = BytesMut::new();
+        encode_metrics_for_label_matchers_response(&mut empty_dst, std::iter::empty()).unwrap();
+        assert!(empty_dst.is_empty());
+        assert!(ingesterpb::MetricsForLabelMatchersResponse::default()
+            .encode_to_vec()
+            .is_empty());
     }
 }

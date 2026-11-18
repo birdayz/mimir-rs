@@ -4,7 +4,6 @@
 //! matching `github.com/golang/snappy` `NewBufferedWriter` / `NewReader`.
 
 use std::cell::RefCell;
-use std::io::Write;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -21,6 +20,8 @@ const MAX_SNAPPY_BLOCK_SIZE: usize = 1 << 16;
 thread_local! {
     static SNAPPY_RAW_DECODER: RefCell<snap::raw::Decoder> =
         RefCell::new(snap::raw::Decoder::new());
+    static SNAPPY_RAW_ENCODER: RefCell<(snap::raw::Encoder, Vec<u8>)> =
+        RefCell::new((snap::raw::Encoder::new(), Vec::new()));
 }
 
 /// Error payload attached to `std::io::ErrorKind::InvalidData` when a bounded framed
@@ -45,12 +46,64 @@ pub fn compress_framed(input: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Compresses `input` using Snappy framing format directly into any `BufMut` (e.g. `BytesMut`
+/// or `Vec<u8>`) using a thread-local `snap::raw::Encoder` without allocating a 64 KiB buffer.
+pub fn compress_framed_buf<B: BufMut>(input: &[u8], out: &mut B) -> std::io::Result<()> {
+    out.put_slice(b"\xff\x06\x00\x00sNaPpY");
+    if input.is_empty() {
+        return Ok(());
+    }
+    SNAPPY_RAW_ENCODER.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            let (enc, scratch) = &mut *guard;
+            compress_chunks_with(enc, scratch, input, out)
+        } else {
+            let mut enc = snap::raw::Encoder::new();
+            let mut scratch = Vec::new();
+            compress_chunks_with(&mut enc, &mut scratch, input, out)
+        }
+    })
+}
+
+fn compress_chunks_with<B: BufMut>(
+    enc: &mut snap::raw::Encoder,
+    scratch: &mut Vec<u8>,
+    input: &[u8],
+    out: &mut B,
+) -> std::io::Result<()> {
+    for chunk in input.chunks(MAX_SNAPPY_BLOCK_SIZE) {
+        let crc = crate::s2::masked_crc32c(chunk);
+        let max_comp = snap::raw::max_compress_len(chunk.len());
+        if scratch.len() < max_comp {
+            scratch.resize(max_comp, 0);
+        }
+        let comp_len = enc
+            .compress(chunk, scratch)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        if comp_len < chunk.len() - (chunk.len() / 8) {
+            let payload_len = 4 + comp_len;
+            out.put_u8(CHUNK_TYPE_COMPRESSED);
+            out.put_u8((payload_len & 0xff) as u8);
+            out.put_u8(((payload_len >> 8) & 0xff) as u8);
+            out.put_u8(((payload_len >> 16) & 0xff) as u8);
+            out.put_slice(&crc.to_le_bytes());
+            out.put_slice(&scratch[..comp_len]);
+        } else {
+            let payload_len = 4 + chunk.len();
+            out.put_u8(CHUNK_TYPE_UNCOMPRESSED);
+            out.put_u8((payload_len & 0xff) as u8);
+            out.put_u8(((payload_len >> 8) & 0xff) as u8);
+            out.put_u8(((payload_len >> 16) & 0xff) as u8);
+            out.put_slice(&crc.to_le_bytes());
+            out.put_slice(chunk);
+        }
+    }
+    Ok(())
+}
+
 /// Compresses `input` using Snappy framing format into `out` (appending to `out`).
 pub fn compress_framed_into(input: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
-    let mut writer = snap::write::FrameEncoder::new(out);
-    writer.write_all(input)?;
-    writer.flush()?;
-    Ok(())
+    compress_framed_buf(input, out)
 }
 
 /// Decompresses Snappy framed stream bytes into a `Vec<u8>`.

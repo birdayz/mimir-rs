@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,7 +19,7 @@ use mimir_storage::bucket::{tenant_deletion_mark_exists, BucketClient};
 use mimir_storage::ingest::{OffsetCatalogue, OffsetCatalogueMetrics};
 use mimir_storage::shipper::{read_shipped_blocks, Shipper, ShipperError, ShipperMetrics, SourceType};
 use mimir_tsdb::chunkenc::Encoding;
-use mimir_tsdb::db::{BlocksToDeleteFn, Tsdb, TsdbError, TsdbOptions};
+use mimir_tsdb::db::{BlocksReloadedFn, BlocksToDeleteFn, Tsdb, TsdbError, TsdbOptions};
 use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::metadata::MetadataLimits;
@@ -276,6 +276,24 @@ impl SeriesLifecycleCallback for LifecycleCallbackAdapter {
     }
 }
 
+fn compute_oldest_unshipped_ms(
+    blocks: &[Arc<mimir_tsdb::block::Block>],
+    shipped: &HashMap<Ulid, SystemTime>,
+) -> u64 {
+    let mut oldest = 0u64;
+    for b in blocks {
+        let uid = b.ulid();
+        if shipped.contains_key(&uid) {
+            continue;
+        }
+        let ts = uid.timestamp_ms();
+        if oldest == 0 || ts < oldest {
+            oldest = ts;
+        }
+    }
+    oldest
+}
+
 /// Async block shipper interface matching Go `BlocksUploader` (`pkg/ingester/user_tsdb.go`).
 pub trait BlockShipper: Send + Sync {
     fn sync(&self) -> Pin<Box<dyn Future<Output = Result<usize, ShipperError>> + Send + '_>>;
@@ -320,6 +338,7 @@ pub struct UserTsdb {
 
     block_duration_ms: i64,
     shipped_blocks: Arc<Mutex<HashMap<Ulid, SystemTime>>>,
+    oldest_unshipped_block_ts_ms: Arc<AtomicU64>,
 
     owned_state: Arc<Mutex<OwnedSeriesState>>,
     owned_token_ranges: Mutex<Vec<u32>>,
@@ -512,7 +531,18 @@ impl UserTsdb {
         let has_shipper = shipping_enabled && bucket.is_some();
         let shipped_blocks: Arc<Mutex<HashMap<Ulid, SystemTime>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let oldest_unshipped_block_ts_ms = Arc::new(AtomicU64::new(0));
         let user_db_ready = Arc::new(AtomicBool::new(false));
+        let on_blocks_reload: BlocksReloadedFn = {
+            let shipped_blocks = Arc::clone(&shipped_blocks);
+            let oldest_ts = Arc::clone(&oldest_unshipped_block_ts_ms);
+            Arc::new(move |get_blocks| {
+                let shipped = shipped_blocks.lock();
+                let blocks = get_blocks();
+                let oldest = compute_oldest_unshipped_ms(&blocks, &shipped);
+                oldest_ts.store(oldest, Ordering::Release);
+            })
+        };
         let blocks_to_delete: BlocksToDeleteFn = {
             let shipped_blocks = Arc::clone(&shipped_blocks);
             let user_db_ready = Arc::clone(&user_db_ready);
@@ -544,6 +574,7 @@ impl UserTsdb {
             no_lockfile: true,
             retention_duration_ms: block_min_retention.as_millis() as i64,
             blocks_to_delete: Some(blocks_to_delete),
+            on_blocks_reload: Some(on_blocks_reload),
             enable_bigger_ooo_block_for_old_samples: blocks_cfg
                 .tsdb
                 .bigger_out_of_order_blocks_for_old_samples,
@@ -629,6 +660,12 @@ impl UserTsdb {
                 })
                 .unwrap_or_default();
         }
+        {
+            let blocks = db.blocks();
+            let shipped = shipped_blocks.lock();
+            let oldest = compute_oldest_unshipped_ms(&blocks, &shipped);
+            oldest_unshipped_block_ts_ms.store(oldest, Ordering::Release);
+        }
 
         let offset_catalogue = if blocks_cfg.tsdb.offset_catalogue.enabled {
             Some(OffsetCatalogue::new(
@@ -668,6 +705,7 @@ impl UserTsdb {
             last_series_removal_ms: AtomicI64::new(0),
             block_duration_ms,
             shipped_blocks,
+            oldest_unshipped_block_ts_ms,
             owned_state,
             owned_token_ranges: Mutex::new(Vec::new()),
             requires_owned_series_update: Mutex::new(Some(
@@ -840,12 +878,25 @@ impl UserTsdb {
 
     pub fn update_cached_shipped_blocks(&self) -> Result<(), String> {
         let m = read_shipped_blocks(self.db.dir()).map_err(|e| e.to_string())?;
-        let mut guard = self.shipped_blocks.lock();
-        *guard = m
+        let new_map: HashMap<Ulid, SystemTime> = m
             .into_iter()
             .map(|(k, mt)| (k, UNIX_EPOCH + Duration::from_millis(mt.0.max(0) as u64)))
             .collect();
+        let mut guard = self.shipped_blocks.lock();
+        let blocks = self.db.blocks();
+        *guard = new_map;
+        let oldest = compute_oldest_unshipped_ms(&blocks, &guard);
+        self.oldest_unshipped_block_ts_ms
+            .store(oldest, Ordering::Release);
         Ok(())
+    }
+
+    pub fn refresh_oldest_unshipped_block_time_ms(&self) {
+        let shipped = self.shipped_blocks.lock();
+        let blocks = self.db.blocks();
+        let oldest = compute_oldest_unshipped_ms(&blocks, &shipped);
+        self.oldest_unshipped_block_ts_ms
+            .store(oldest, Ordering::Release);
     }
 
     pub fn cached_shipped_blocks(&self) -> HashMap<Ulid, SystemTime> {
@@ -856,19 +907,7 @@ impl UserTsdb {
         if self.shipper.read().is_none() {
             return 0;
         }
-        let shipped = self.shipped_blocks.lock();
-        let mut oldest = 0u64;
-        for b in self.db.blocks() {
-            let uid = b.ulid();
-            if shipped.contains_key(&uid) {
-                continue;
-            }
-            let ts = uid.timestamp_ms();
-            if oldest == 0 || ts < oldest {
-                oldest = ts;
-            }
-        }
-        oldest
+        self.oldest_unshipped_block_ts_ms.load(Ordering::Acquire)
     }
 
     pub fn should_close_tsdb(&self, idle_timeout: Duration) -> TsdbCloseCheckResult {
@@ -922,7 +961,9 @@ impl UserTsdb {
     /// expired blocks are deleted by the TSDB on every block reload through the
     /// `blocks_to_delete` filter (Go `userTSDB.blocksToDelete`).
     pub fn compact(&self) -> Result<Vec<Ulid>, TsdbError> {
-        self.db.compact()
+        let res = self.db.compact();
+        self.refresh_oldest_unshipped_block_time_ms();
+        res
     }
 
     /// Force-compact TSDB head up to `forced_compaction_max_time` (or `i64::MAX` for full flush).
@@ -971,6 +1012,7 @@ impl UserTsdb {
         });
 
         let _ = self.change_state(TsdbState::ForceCompacting, TsdbState::Active);
+        self.refresh_oldest_unshipped_block_time_ms();
         res.map_err(|e| e.to_string())
     }
 
@@ -1282,6 +1324,7 @@ impl UserTsdb {
     pub fn close(&self) -> Result<(), TsdbError> {
         self.lifecycle_adapter.limiter_slot.write().take();
         let res = self.db.close();
+        self.oldest_unshipped_block_ts_ms.store(0, Ordering::Release);
         self.lifecycle_adapter.num_series_fn.write().take();
         self.db.head().clear_lifecycle_callback();
         res

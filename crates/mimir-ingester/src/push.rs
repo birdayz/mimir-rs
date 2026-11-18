@@ -28,7 +28,7 @@ use parking_lot::Mutex;
 use smallvec::SmallVec;
 use tracing::warn;
 
-const CLASSIC_PUSH_SHARD_THRESHOLD: usize = 256;
+const CLASSIC_PUSH_SHARD_THRESHOLD: usize = 4096;
 
 fn classic_push_pool() -> &'static ScopedWorkerPool {
     static POOL: OnceLock<ScopedWorkerPool> = OnceLock::new();
@@ -4260,11 +4260,12 @@ mod wave3_tests {
             .unwrap();
             ing.set_state_for_test(mimir_common::services::State::Running);
 
-            // Batch 1 (sharded >= 256 series): creates s_new (idx 0..300) and triggers hard error
-            // (MissingMetricName) at idx 300, rolling back the whole batch.
-            let mut batch1 = Vec::with_capacity(301);
-            for i in 0..301 {
-                let labels = if i == 300 {
+            // Batch 1 (sharded >= CLASSIC_PUSH_SHARD_THRESHOLD series): creates s_new (idx 0..4100)
+            // and triggers hard error (MissingMetricName) at idx 4100, rolling back the whole batch.
+            const BATCH1_ERR_IDX: usize = CLASSIC_PUSH_SHARD_THRESHOLD + 4;
+            let mut batch1 = Vec::with_capacity(BATCH1_ERR_IDX + 1);
+            for i in 0..=BATCH1_ERR_IDX {
+                let labels = if i == BATCH1_ERR_IDX {
                     vec![lp("job", "missing_metric_name")]
                 } else {
                     vec![lp("__name__", "rb_replay_metric"), lp("id", &format!("{i:04}"))]
