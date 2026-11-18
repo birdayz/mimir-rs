@@ -73,6 +73,7 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         .route("/api/v1/status/buildinfo", get(buildinfo_handler))
         .route("/api/v1/status/config", get(status_config_handler))
         .route("/api/v1/status/flags", get(status_flags_handler))
+        .route("/debug/fgprof", get(crate::pprof::fgprof_handler))
         .route("/static/", get(static_dir_handler))
         .route("/static/*path", get(static_file_handler));
 
@@ -84,28 +85,32 @@ pub fn build_http_router(state: AppHttpState) -> Router {
             .route("/api/v1/user_limits", get(user_limits_handler));
     }
 
-    // dskit `registerInstrumentation` registers `/debug/pprof/cmdline` (NotFound) and
-    // `PathPrefix("/debug/pprof").Handler(http.DefaultServeMux)`. Because `DefaultServeMux`
-    // only knows `/debug/pprof*` (without `-server.path-prefix`), under a non-empty prefix
-    // Go matches the prefixed route (`route="<prefix>_debug_pprof"`) and returns 404.
-    if has_prefix {
-        router = router
-            .route("/debug/pprof/cmdline", any(not_found_handler))
-            .route("/debug/pprof", any(not_found_handler))
-            .route("/debug/pprof/", any(not_found_handler))
-            .route("/debug/pprof/*name", any(not_found_handler));
-    } else {
-        router = router
-            .route("/", get(index_handler))
-            .route("/debug/pprof/cmdline", any(not_found_handler))
-            .route("/debug/pprof/profile", any(crate::pprof::profile_handler))
-            .route("/debug/pprof/symbol", any(crate::pprof::symbol_handler))
-            .route("/debug/pprof", any(crate::pprof::index_redirect_handler))
-            .route("/debug/pprof/", any(crate::pprof::index_handler))
-            .route("/debug/pprof/*name", any(crate::pprof::unknown_profile_handler));
+    if !has_prefix {
+        router = router.route("/", get(index_handler));
     }
 
     if register_instrumentation {
+        // dskit `registerInstrumentation` registers `/metrics`, `/debug/pprof/cmdline`
+        // (NotFound) and `PathPrefix("/debug/pprof").Handler(http.DefaultServeMux)`. Because
+        // `DefaultServeMux` only knows `/debug/pprof*` (without `-server.path-prefix`), under
+        // a non-empty prefix Go matches the prefixed route (`route="<prefix>_debug_pprof"`)
+        // and returns 404.
+        if has_prefix {
+            router = router
+                .route("/debug/pprof/cmdline", any(not_found_handler))
+                .route("/debug/pprof", any(not_found_handler))
+                .route("/debug/pprof/", any(not_found_handler))
+                .route("/debug/pprof/*name", any(not_found_handler));
+        } else {
+            router = router
+                .route("/debug/pprof/cmdline", any(not_found_handler))
+                .route("/debug/pprof/profile", any(crate::pprof::profile_handler))
+                .route("/debug/pprof/symbol", any(crate::pprof::symbol_handler))
+                .route("/debug/pprof", any(crate::pprof::index_redirect_handler))
+                .route("/debug/pprof/", any(crate::pprof::index_handler))
+                .route("/debug/pprof/*name", any(crate::pprof::unknown_profile_handler));
+        }
+
         let cache = Arc::new(MetricsCache::new(
             state
                 .config

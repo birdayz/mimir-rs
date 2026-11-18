@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimir_common::backoff::{Backoff, BackoffConfig};
-use mimir_common::logging::format_rfc3339_nano_utc;
+use mimir_ring::kv::memberlist::gofmt::format_go_time_string;
 use mimir_common::services::{basic_service, ManagedBasicService, ServiceContext, ServiceError};
 use mimir_common::usagestats;
 use mimir_storage::bucket::{BucketClient, MIMIR_INTERNALS_PREFIX};
@@ -258,7 +258,7 @@ async fn wait_seed_file_stability(
         if created_ago >= min_stability {
             return Ok(seed);
         }
-        info!(cluster_id = %seed.uid, created_at = %format_rfc3339_nano_utc(seed.created_at),
+        info!(cluster_id = %seed.uid, created_at = %format_local_go_time_string(seed.created_at),
             "found a cluster seed file created recently, waiting until stable");
         sleep_or_cancel(ctx, duration_with_positive_jitter(min_stability - created_ago, 0.2)).await?;
     }
@@ -284,7 +284,11 @@ async fn init_seed_file(
         sleep_or_cancel(ctx, duration_with_jitter(min_stability / 2, 1.0)).await?;
 
         if let Ok(seed) = read_seed_file(bucket).await {
-            debug!(cluster_id = %seed.uid, "skipping creation of cluster seed file because found one");
+            debug!(
+                cluster_id = %seed.uid,
+                created_at = %format_local_go_time_string(seed.created_at),
+                "skipping creation of cluster seed file because found one"
+            );
             tokio::select! {
                 _ = ctx.canceled() => return Err(SeedError::Canceled),
                 _ = backoff.wait() => {}
@@ -363,7 +367,16 @@ fn build_memstats() -> serde_json::Value {
 }
 
 /// `buildReport`.
+fn format_local_go_time_string(t: SystemTime) -> String {
+    let dt = chrono::DateTime::<chrono::Utc>::from(t)
+        .with_timezone(&chrono::Local)
+        .fixed_offset();
+    format_go_time_string(&dt)
+}
+
 pub fn build_report(seed: &ClusterSeed, report_at: SystemTime, interval: Duration) -> Report {
+    // Ensure cpu_usage is registered before collecting metrics (pkg/usagestats/reporter.go:169).
+    let cpu_usage = usagestats::get_float("cpu_usage");
     let mut metrics = serde_json::Map::new();
     metrics.insert("memstats".to_string(), build_memstats());
     let tasks = tokio::runtime::Handle::try_current()
@@ -374,7 +387,7 @@ pub fn build_report(seed: &ClusterSeed, report_at: SystemTime, interval: Duratio
         metrics.insert(k, v);
     }
     // `defer cpuUsage.Set(0)`.
-    usagestats::get_float("cpu_usage").set(0.0);
+    cpu_usage.set(0.0);
     Report {
         cluster_id: seed.uid.clone(),
         created_at: seed.created_at,
@@ -568,7 +581,7 @@ impl Reporter {
                     if now.duration_since(next_report_at).unwrap_or_default() >= interval {
                         next_report_at = get_next_report_at(interval, seed.created_at, now);
                         next_report = None;
-                        info!(next_report_at = %format_rfc3339_nano_utc(next_report_at),
+                        info!(next_report_at = %format_local_go_time_string(next_report_at),
                             "failed to send anonymous usage stats report for too long, skipping to next report");
                         continue;
                     }
@@ -626,7 +639,7 @@ mod tests {
         let a = parse_rfc3339("2026-11-17T00:24:13.728715478+01:00").unwrap();
         let b = parse_rfc3339("2026-11-16T23:24:13.728715478Z").unwrap();
         assert_eq!(a, b);
-        assert_eq!(format_rfc3339_nano_utc(b), "2026-11-16T23:24:13.728715478Z");
+        assert_eq!(mimir_common::logging::format_rfc3339_nano_utc(b), "2026-11-16T23:24:13.728715478Z");
     }
 
     // Upstream: pkg/usagestats/seed_test.go (seed creation, reading an existing seed).
@@ -656,7 +669,7 @@ mod tests {
             .unwrap();
         let s = read_seed_file(&go_bucket).await.unwrap();
         assert_eq!(s.uid, "3a7a4c2c-5c2b-4a6a-9d31-1d9f1b2b9f10");
-        assert_eq!(format_rfc3339_nano_utc(s.created_at), "2024-01-01T08:00:00.123456789Z");
+        assert_eq!(mimir_common::logging::format_rfc3339_nano_utc(s.created_at), "2024-01-01T08:00:00.123456789Z");
     }
 
     #[tokio::test]

@@ -17,12 +17,11 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::time::Duration;
 
-use axum::extract::{Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::extract::Request;
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use crate::http::AppHttpState;
-use crate::server::http_server::ServedOverHttp;
+use crate::server::http_server::SharedWriteDeadline;
 
 /// Go `runtime.SetCPUProfileRate` default used by `pprof.StartCPUProfile`.
 const CPU_PROFILE_HZ: i32 = 100;
@@ -49,8 +48,24 @@ fn serve_error(status: StatusCode, txt: &str) -> Response {
         .into_response()
 }
 
+/// Go 1.22+ `http.ServeMux` 405 response for `"GET /debug/pprof/..."` patterns.
+fn method_not_allowed_pprof() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [
+            (header::ALLOW, "GET, HEAD"),
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+        ],
+        "Method Not Allowed\n",
+    )
+        .into_response()
+}
+
 /// `ServeMux` redirect of the subtree root without its trailing slash.
 pub async fn index_redirect_handler(req: Request) -> Response {
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        return method_not_allowed_pprof();
+    }
     let mut location = format!("{}/", req.uri().path());
     if let Some(q) = req.uri().query() {
         location.push('?');
@@ -78,7 +93,10 @@ fn html_escape(s: &str) -> String {
 }
 
 /// net/http/pprof `Index` (template `indexTmplExecute`).
-pub async fn index_handler() -> Response {
+pub async fn index_handler(method: Method) -> Response {
+    if !matches!(method, Method::GET | Method::HEAD) {
+        return method_not_allowed_pprof();
+    }
     let mut b = String::from(
         "<html>\n<head>\n<title>/debug/pprof/</title>\n<style>\n.profile-name{\n\tdisplay:inline-block;\n\twidth:6rem;\n}\n</style>\n</head>\n<body>\n/debug/pprof/\n<br>\n<p>Set debug=1 as a query parameter to export in legacy text format</p>\n<br>\nTypes of profiles available:\n<table>\n<thead><td>Count</td><td>Profile</td></thead>\n",
     );
@@ -102,13 +120,19 @@ pub async fn index_handler() -> Response {
 }
 
 /// `Index` for `/debug/pprof/<name>`: `handler(name)` answers unknown profiles with 404.
-pub async fn unknown_profile_handler() -> Response {
+pub async fn unknown_profile_handler(method: Method) -> Response {
+    if !matches!(method, Method::GET | Method::HEAD) {
+        return method_not_allowed_pprof();
+    }
     serve_error(StatusCode::NOT_FOUND, "Unknown profile")
 }
 
-/// net/http/pprof `Symbol`: Go program counters cannot be resolved in a Rust binary, so only the
+/// net/http/pprof Symbol: Go program counters cannot be resolved in a Rust binary, so only the
 /// symbol-availability header is returned (Go prints a line per resolvable counter).
-pub async fn symbol_handler() -> Response {
+pub async fn symbol_handler(method: Method) -> Response {
+    if !matches!(method, Method::GET | Method::HEAD) {
+        return method_not_allowed_pprof();
+    }
     (
         StatusCode::OK,
         [
@@ -154,72 +178,166 @@ fn form_value(query: Option<&str>, key: &str) -> Option<String> {
         .map(|(_, v)| decode_query_component(v))
 }
 
-/// net/http/pprof `Profile`.
-pub async fn profile_handler(axum::extract::State(st): State<AppHttpState>, req: Request) -> Response {
+/// net/http/pprof Profile (Go 1.22+ GET-only + configureWriteDeadline).
+pub async fn profile_handler(req: Request) -> Response {
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        return method_not_allowed_pprof();
+    }
     let sec = form_value(req.uri().query(), "seconds")
         .and_then(|s| s.parse::<i64>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(30);
-    // durationExceedsWriteTimeout: only requests served by the HTTP server have a WriteTimeout.
-    if req.extensions().get::<ServedOverHttp>().is_some() {
-        let wt = st.config.server.http_server_write_timeout.as_std().unwrap_or_default();
-        if !wt.is_zero() && sec as f64 >= wt.as_secs_f64() {
-            return serve_error(StatusCode::BAD_REQUEST, "profile duration exceeds server's WriteTimeout");
+    let duration = Duration::from_secs(sec.unsigned_abs());
+    if let Some(wd) = req.extensions().get::<SharedWriteDeadline>() {
+        wd.extend_by(duration);
+    }
+    sample_pprof_profile(duration, CPU_PROFILE_HZ, "cpu", "cpu", true).await
+}
+
+/// github.com/felixge/fgprof.Handler() mounted at GET /debug/fgprof.
+pub async fn fgprof_handler(req: Request) -> Response {
+    let seconds = match form_value(req.uri().query(), "seconds").filter(|s| !s.is_empty()) {
+        None => 30i64,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(n) if n > 0 => n,
+            Ok(n) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("bad seconds: {n}: %!s(<nil>)\n"),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("bad seconds: 0: strconv.Atoi: parsing {raw:?}: invalid syntax\n"),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let format = form_value(req.uri().query(), "format").unwrap_or_default();
+    let duration = Duration::from_secs(seconds as u64);
+    match format.as_str() {
+        "" | "pprof" => sample_pprof_profile(duration, 99, "time", "wallclock", false).await,
+        "folded" => sample_fgprof_folded(duration).await,
+        _ => {
+            tokio::time::sleep(duration).await;
+            (StatusCode::OK, "").into_response()
         }
     }
-    cpu_profile(Duration::from_secs(sec.unsigned_abs())).await
 }
 
 #[cfg(unix)]
-async fn cpu_profile(duration: Duration) -> Response {
-    let guard = match pprof::ProfilerGuardBuilder::default()
-        .frequency(CPU_PROFILE_HZ)
+async fn sample_pprof_profile(
+    duration: Duration,
+    hz: i32,
+    sample_unit_type: &str,
+    period_type_name: &str,
+    pprof_headers: bool,
+) -> Response {
+    let guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(hz)
         .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-        .build()
-    {
-        Ok(g) => g,
-        Err(e) => {
-            return serve_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Could not enable CPU profiling: {e}"),
-            )
-        }
-    };
+        .build();
     tokio::time::sleep(duration).await;
-    let report = match guard.report().build() {
-        Ok(r) => r,
+    let profile = match guard {
+        Ok(g) => match g.report().build() {
+            Ok(report) => encode_profile(&report, sample_unit_type, period_type_name),
+            Err(e) => {
+                return serve_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Could not enable CPU profiling: {e}"),
+                )
+            }
+        },
         Err(e) => {
-            return serve_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Could not enable CPU profiling: {e}"),
-            )
+            if pprof_headers {
+                return serve_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Could not enable CPU profiling: {e}"),
+                );
+            }
+            encode_empty_profile(duration, hz, sample_unit_type, period_type_name)
         }
     };
-    drop(guard);
-    let profile = encode_profile(&report);
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let body = match gz.write_all(&profile).and_then(|()| gz.finish()) {
         Ok(b) => b,
         Err(e) => return serve_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    if pprof_headers {
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CONTENT_DISPOSITION, "attachment; filename=\"profile\""),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            body,
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            body,
+        )
+            .into_response()
+    }
+}
+
+#[cfg(unix)]
+async fn sample_fgprof_folded(duration: Duration) -> Response {
+    let guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(99)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build();
+    tokio::time::sleep(duration).await;
+    let mut lines = Vec::new();
+    if let Ok(g) = guard {
+        if let Ok(report) = g.report().build() {
+            for (frames, count) in &report.data {
+                let mut stack = Vec::new();
+                for frame in frames.frames.iter().rev() {
+                    for sym in frame.iter().rev() {
+                        stack.push(sym.name());
+                    }
+                }
+                if !stack.is_empty() {
+                    lines.push(format!("{} {count}", stack.join(";")));
+                }
+            }
+        }
+    }
+    lines.sort();
+    let mut out = lines.join("\n");
+    out.push('\n');
     (
         StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::CONTENT_DISPOSITION, "attachment; filename=\"profile\""),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-        ],
-        body,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        out,
     )
         .into_response()
 }
 
 #[cfg(not(unix))]
-async fn cpu_profile(_duration: Duration) -> Response {
+async fn sample_pprof_profile(
+    _duration: Duration,
+    _hz: i32,
+    _sample_unit_type: &str,
+    _period_type_name: &str,
+    _pprof_headers: bool,
+) -> Response {
     serve_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "Could not enable CPU profiling: not supported on this platform",
     )
+}
+
+#[cfg(not(unix))]
+async fn sample_fgprof_folded(_duration: Duration) -> Response {
+    (StatusCode::OK, "").into_response()
 }
 
 /// `perftools.profiles.Profile` (github.com/google/pprof/proto/profile.proto), the subset
@@ -319,7 +437,49 @@ impl StringTable {
 }
 
 #[cfg(unix)]
-fn encode_profile(report: &pprof::Report) -> Vec<u8> {
+fn encode_empty_profile(
+    duration: Duration,
+    hz: i32,
+    sample_unit_type: &str,
+    period_type_name: &str,
+) -> Vec<u8> {
+    use prost::Message as _;
+    let mut st = StringTable::new();
+    let samples_t = proto::ValueType {
+        r#type: st.intern("samples"),
+        unit: st.intern("count"),
+    };
+    let val_t = proto::ValueType {
+        r#type: st.intern(sample_unit_type),
+        unit: st.intern("nanoseconds"),
+    };
+    let period_t = proto::ValueType {
+        r#type: st.intern(period_type_name),
+        unit: st.intern("nanoseconds"),
+    };
+    let time_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64);
+    proto::Profile {
+        sample_type: vec![samples_t, val_t],
+        sample: Vec::new(),
+        location: Vec::new(),
+        function: Vec::new(),
+        string_table: st.strings,
+        time_nanos,
+        duration_nanos: duration.as_nanos() as i64,
+        period_type: Some(period_t),
+        period: 1_000_000_000 / i64::from(hz.max(1)),
+    }
+    .encode_to_vec()
+}
+
+#[cfg(unix)]
+fn encode_profile(
+    report: &pprof::Report,
+    sample_unit_type: &str,
+    period_type_name: &str,
+) -> Vec<u8> {
     use prost::Message as _;
 
     let mut st = StringTable::new();
@@ -328,7 +488,11 @@ fn encode_profile(report: &pprof::Report) -> Vec<u8> {
         unit: st.intern("count"),
     };
     let cpu_t = proto::ValueType {
-        r#type: st.intern("cpu"),
+        r#type: st.intern(sample_unit_type),
+        unit: st.intern("nanoseconds"),
+    };
+    let period_t = proto::ValueType {
+        r#type: st.intern(period_type_name),
         unit: st.intern("nanoseconds"),
     };
     let period = 1_000_000_000 / i64::from(report.timing.frequency.max(1));
@@ -378,14 +542,14 @@ fn encode_profile(report: &pprof::Report) -> Vec<u8> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i64);
     proto::Profile {
-        sample_type: vec![samples_t, cpu_t.clone()],
+        sample_type: vec![samples_t, cpu_t],
         sample: samples,
         location: locations,
         function: functions,
         string_table: st.strings,
         time_nanos,
         duration_nanos: report.timing.duration.as_nanos() as i64,
-        period_type: Some(cpu_t),
+        period_type: Some(period_t),
         period,
     }
     .encode_to_vec()

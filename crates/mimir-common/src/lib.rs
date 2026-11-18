@@ -36,6 +36,7 @@ pub mod sockaddr;
 pub mod tenant;
 pub mod thread_pool;
 pub mod tls;
+pub mod tracing;
 pub mod usagestats;
 
 static ALLOCATOR_PURGE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
