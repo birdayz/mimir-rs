@@ -1758,8 +1758,10 @@ mod yaml_defaults_tests {
     #[test]
     fn validate_filesystem_paths_handles_leading_slash_prefix_and_non_ingester_dirs() {
         // Leading '/' in storage_prefix must join onto dir like Go filepath.Join, not discard dir.
-        let mut cfg = MimirConfig::default();
-        cfg.target = StringSliceCSV(vec!["ingester".to_string()]);
+        let mut cfg = MimirConfig {
+            target: StringSliceCSV(vec!["ingester".to_string()]),
+            ..Default::default()
+        };
         cfg.blocks_storage.bucket.backend_cfg.backend = "filesystem".to_string();
         cfg.blocks_storage.bucket.backend_cfg.filesystem.dir = "/tmp/bucket".to_string();
         cfg.blocks_storage.bucket.storage_prefix = "/sub".to_string();

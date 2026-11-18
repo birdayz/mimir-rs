@@ -537,7 +537,7 @@ impl PushErrorHandler {
 
         if !err.is_client_error() {
             self.metrics.server_err_requests.inc();
-            error!(user = tenant_id, err = %err, "server error while ingesting write request");
+            // Upstream Go (pusher.go:557-560) only records on spanLog and leaves retry/error logging to reader.go.
             return true;
         }
 
