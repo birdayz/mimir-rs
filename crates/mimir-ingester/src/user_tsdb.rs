@@ -495,24 +495,10 @@ impl UserTsdb {
                 as usize,
             timely_compaction: blocks_cfg.tsdb.timely_head_compaction_enabled,
             // Go `headPostingsForMatchersCacheFactory` (MaxItems: math.MaxInt).
-            postings_cache: PostingsForMatchersCacheConfig {
-                ttl: Duration::from_nanos(
-                    blocks_cfg.tsdb.head_postings_for_matchers_cache_ttl.as_nanos().max(0) as u64,
-                ),
-                max_items: usize::MAX,
-                max_bytes: blocks_cfg.tsdb.head_postings_for_matchers_cache_max_bytes.max(0)
-                    as usize,
-                enable_invalidation: true,
-                num_metric_versions: blocks_cfg.tsdb.head_postings_for_matchers_cache_versions.max(0)
-                    as usize,
-                metrics: shared_metrics.head_postings_cache.clone(),
-                // Go tracks metric versions only for a shared cache with invalidation.
-                report_invalidations: blocks_cfg.tsdb.shared_postings_for_matchers_cache
-                    && blocks_cfg.tsdb.head_postings_for_matchers_cache_invalidation,
-            },
+            postings_cache: head_postings_for_matchers_cache_config(blocks_cfg, shared_metrics),
             metadata_limits: initial_metadata_limits,
             series_lifecycle_callback: Some(lifecycle_adapter.clone()),
-            registry: tsdb_prom_reg,
+            registry: tsdb_prom_reg.clone(),
         };
 
         // Go `blocksToDelete` closure + `userTSDB.blocksToDelete`: nothing is deleted until
@@ -575,6 +561,12 @@ impl UserTsdb {
                 report_invalidations: false,
             },
         };
+
+        if let Some(ref reg) = tsdb_prom_reg {
+            if let Some(collector) = HeadChunksStorageSizeCollector::new(udir.join("chunks_head")) {
+                let _ = reg.register(Box::new(collector));
+            }
+        }
 
         let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
         db.head()
@@ -1597,6 +1589,109 @@ impl TenantMetadataStore {
     }
 }
 
+/// Builds the Head `PostingsForMatchersCacheConfig` matching Go's `headPostingsForMatchersCacheFactory`.
+///
+/// Go only allocates `metricVersions` (`head_postings_for_matchers_cache_versions`, default 2M * 8B = 16 MiB)
+/// when both `shared_postings_for_matchers_cache` and `head_postings_for_matchers_cache_invalidation` are true.
+/// Passing 0 otherwise ensures `Head::open` allocates only the minimum 64-slot table (512 B per tenant).
+pub(crate) fn head_postings_for_matchers_cache_config(
+    blocks_cfg: &BlocksStorageConfig,
+    shared_metrics: &SharedTsdbMetrics,
+) -> PostingsForMatchersCacheConfig {
+    let invalidation = blocks_cfg.tsdb.head_postings_for_matchers_cache_invalidation;
+    let shared_invalidation =
+        blocks_cfg.tsdb.shared_postings_for_matchers_cache && invalidation;
+    PostingsForMatchersCacheConfig {
+        ttl: Duration::from_nanos(
+            blocks_cfg
+                .tsdb
+                .head_postings_for_matchers_cache_ttl
+                .as_nanos()
+                .max(0) as u64,
+        ),
+        max_items: usize::MAX,
+        max_bytes: blocks_cfg
+            .tsdb
+            .head_postings_for_matchers_cache_max_bytes
+            .max(0) as usize,
+        enable_invalidation: invalidation,
+        num_metric_versions: if shared_invalidation {
+            blocks_cfg
+                .tsdb
+                .head_postings_for_matchers_cache_versions
+                .max(0) as usize
+        } else {
+            0
+        },
+        metrics: shared_metrics.head_postings_cache.clone(),
+        report_invalidations: shared_invalidation,
+    }
+}
+
+/// Dynamic gauge collector for `prometheus_tsdb_head_chunks_storage_size_bytes`
+/// (Go `prometheus/tsdb/head.go:850` -> `h.chunkDiskMapper.Size()`).
+struct HeadChunksStorageSizeCollector {
+    desc: prometheus::core::Desc,
+    chunks_head_dir: PathBuf,
+}
+
+impl HeadChunksStorageSizeCollector {
+    fn new(chunks_head_dir: PathBuf) -> Option<Self> {
+        let desc = prometheus::core::Desc::new(
+            "prometheus_tsdb_head_chunks_storage_size_bytes".to_string(),
+            "Size of the chunks_head directory.".to_string(),
+            Vec::new(),
+            HashMap::new(),
+        )
+        .ok()?;
+        Some(Self {
+            desc,
+            chunks_head_dir,
+        })
+    }
+}
+
+fn dir_size_bytes(root: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+impl prometheus::core::Collector for HeadChunksStorageSizeCollector {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        vec![&self.desc]
+    }
+
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        let size = dir_size_bytes(&self.chunks_head_dir);
+        let mut g = prometheus::proto::Gauge::default();
+        g.set_value(size as f64);
+        let mut m = prometheus::proto::Metric::default();
+        m.set_gauge(g);
+        let mut mf = prometheus::proto::MetricFamily::default();
+        mf.set_name(self.desc.fq_name.clone());
+        mf.set_help(self.desc.help.clone());
+        mf.set_field_type(prometheus::proto::MetricType::GAUGE);
+        mf.set_metric(vec![m].into());
+        vec![mf]
+    }
+}
+
 pub fn debug_log_push_head_error(user_id: &str, err: &HeadError) {
     debug!(user = %user_id, err = %err, "head append error");
 }
@@ -1724,5 +1819,90 @@ mod tests {
         };
         assert_eq!(db.current_metadata_limits(), expected);
         assert_eq!(db.db.head().metadata_limits(), expected);
+    }
+
+    #[test]
+    fn head_postings_cache_config_respects_invalidation_and_shared_flags() {
+        let shared = SharedTsdbMetrics::default();
+        let default_cfg = mimir_config::BlocksStorageConfig::default();
+        let pc_default = head_postings_for_matchers_cache_config(&default_cfg, &shared);
+        assert!(!pc_default.enable_invalidation);
+        assert_eq!(pc_default.num_metric_versions, 0);
+        assert!(!pc_default.report_invalidations);
+
+        let mut inv_only_cfg = mimir_config::BlocksStorageConfig::default();
+        inv_only_cfg.tsdb.head_postings_for_matchers_cache_invalidation = true;
+        let pc_inv = head_postings_for_matchers_cache_config(&inv_only_cfg, &shared);
+        assert!(pc_inv.enable_invalidation);
+        assert_eq!(pc_inv.num_metric_versions, 0);
+        assert!(!pc_inv.report_invalidations);
+
+        let mut shared_inv_cfg = mimir_config::BlocksStorageConfig::default();
+        shared_inv_cfg.tsdb.shared_postings_for_matchers_cache = true;
+        shared_inv_cfg.tsdb.head_postings_for_matchers_cache_invalidation = true;
+        shared_inv_cfg.tsdb.head_postings_for_matchers_cache_versions = 4096;
+        let pc_shared = head_postings_for_matchers_cache_config(&shared_inv_cfg, &shared);
+        assert!(pc_shared.enable_invalidation);
+        assert_eq!(pc_shared.num_metric_versions, 4096);
+        assert!(pc_shared.report_invalidations);
+    }
+
+    #[test]
+    fn tenant_tsdb_registry_exposes_head_chunks_storage_size_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = dir.path().to_string_lossy().into_owned();
+        blocks_cfg.tsdb.ship_interval = mimir_config::GoDuration::ZERO;
+
+        let main_reg = Registry::new();
+        let tenant_reg = Arc::new(Registry::new());
+        let shared = SharedTsdbMetrics::new(Some(&main_reg));
+        let shipper_metrics = ShipperMetrics::new(Some(&main_reg));
+        let overrides = Overrides::new(mimir_config::LimitsConfig::default());
+        let limiter = Arc::new(Limiter::new(
+            overrides.clone(),
+            Arc::new(OneInstanceStrategy),
+        ));
+        let rejected = CounterVec::new(prometheus::Opts::new("t_rej2", "h"), &["reason"]).unwrap();
+
+        let _db = UserTsdb::open(
+            "t-chunks-size".to_string(),
+            &mimir_config::IngesterConfig::default(),
+            &blocks_cfg,
+            overrides,
+            limiter,
+            None,
+            shipper_metrics,
+            &shared,
+            Some(Arc::clone(&tenant_reg)),
+            1,
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(|| 0),
+            rejected,
+            HashSet::new(),
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+
+        let chunks_head = dir.path().join("t-chunks-size").join("chunks_head");
+        std::fs::create_dir_all(&chunks_head).unwrap();
+        std::fs::write(chunks_head.join("000001"), vec![0u8; 4096]).unwrap();
+
+        let fam = tenant_reg
+            .gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "prometheus_tsdb_head_chunks_storage_size_bytes")
+            .expect("prometheus_tsdb_head_chunks_storage_size_bytes must be in tenant registry");
+        assert!(fam.get_metric()[0].get_gauge().get_value() >= 4096.0);
+
+        assert!(
+            main_reg
+                .gather()
+                .into_iter()
+                .all(|mf| mf.get_name() != "prometheus_tsdb_head_chunks_storage_size_bytes"),
+            "prometheus_tsdb_head_chunks_storage_size_bytes must not be registered on main /metrics"
+        );
     }
 }

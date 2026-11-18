@@ -251,9 +251,10 @@ pub struct Pool {
     handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// Go: `runtime.GOMAXPROCS(0)` default (cgroup-aware CPU count).
+/// Go: `runtime.GOMAXPROCS(0)` default (cgroup-aware CPU count), clamped to `[1, 8]`
+/// so unconstrained 24+ core hosts do not spawn excessive idle worker threads.
 fn default_workers() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get())
+    std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 8))
 }
 
 impl Pool {
@@ -746,5 +747,11 @@ mod tests {
         let (mut l0, mut l1) = (None, None);
         assert_eq!(st.dequeue(0, &mut l0).unwrap().dimension, "d1");
         assert_eq!(st.dequeue(1, &mut l1).unwrap().dimension, "d2");
+    }
+
+    #[test]
+    fn default_workers_is_bounded() {
+        let w = default_workers();
+        assert!((1..=8).contains(&w), "default_workers={w} out of [1, 8]");
     }
 }
