@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimir_config::{BlocksStorageConfig, IngesterConfig, Overrides};
 use mimir_proto::cortexpb;
@@ -24,7 +24,6 @@ use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::metadata::MetadataLimits;
 use mimir_tsdb::postings_cache::{PostingsForMatchersCacheConfig, PostingsForMatchersCacheMetrics};
-use mimir_tsdb::record::MetricType;
 use mimir_tsdb::wlog::CompressionType;
 use parking_lot::{Mutex, RwLock};
 use prometheus::{CounterVec, Registry};
@@ -329,6 +328,7 @@ pub struct UserTsdb {
     early_compaction_non_owned_enabled: AtomicBool,
 
     lifecycle_adapter: Arc<LifecycleCallbackAdapter>,
+    current_metadata_limits: Arc<Mutex<MetadataLimits>>,
 
     /// `userTSDB.plannerProvider`: set when index lookup planning is enabled.
     planner_provider: std::sync::OnceLock<Arc<PlannerProvider>>,
@@ -465,6 +465,10 @@ impl UserTsdb {
         let enable_histogram_st_encoding =
             tenant_limits.histogram_chunk_encoding == "histogram_st";
 
+        let initial_metadata_limits = MetadataLimits {
+            max_metrics_with_metadata_per_user: limiter.max_metadata_per_user(&user_id),
+            max_metadata_per_metric: limiter.max_metadata_per_metric(&user_id),
+        };
         let head_opts = HeadOptions {
             chunk_range_ms: block_duration_ms,
             samples_per_chunk: mimir_tsdb::head::DEFAULT_SAMPLES_PER_CHUNK,
@@ -506,10 +510,7 @@ impl UserTsdb {
                 report_invalidations: blocks_cfg.tsdb.shared_postings_for_matchers_cache
                     && blocks_cfg.tsdb.head_postings_for_matchers_cache_invalidation,
             },
-            metadata_limits: MetadataLimits {
-                max_metrics_with_metadata_per_user: limiter.max_metadata_per_user(&user_id),
-                max_metadata_per_metric: limiter.max_metadata_per_metric(&user_id),
-            },
+            metadata_limits: initial_metadata_limits,
             series_lifecycle_callback: Some(lifecycle_adapter.clone()),
             registry: tsdb_prom_reg,
         };
@@ -683,6 +684,7 @@ impl UserTsdb {
                 ingester_cfg.early_compaction_non_owned_series_enabled,
             ),
             lifecycle_adapter,
+            current_metadata_limits: Arc::new(Mutex::new(initial_metadata_limits)),
             planner_provider: std::sync::OnceLock::new(),
             ingested_samples_counter: std::sync::OnceLock::new(),
             ingested_samples_fail_counter: std::sync::OnceLock::new(),
@@ -978,6 +980,10 @@ impl UserTsdb {
         res.map_err(|e| e.to_string())
     }
 
+    pub fn current_metadata_limits(&self) -> MetadataLimits {
+        *self.current_metadata_limits.lock()
+    }
+
     pub fn apply_tsdb_settings(&self) {
         let limits = self.overrides.for_tenant(&self.user_id);
         let ooo_ms = (limits.out_of_order_time_window.0 / 1_000_000).max(0);
@@ -992,6 +998,10 @@ impl UserTsdb {
             Encoding::Xor
         };
         self.db.head().set_float_chunk_encoding(float_enc);
+        *self.current_metadata_limits.lock() = MetadataLimits {
+            max_metrics_with_metadata_per_user: self.limiter.max_metadata_per_user(&self.user_id),
+            max_metadata_per_metric: self.limiter.max_metadata_per_metric(&self.user_id),
+        };
     }
 
     pub fn owned_series_state(&self) -> OwnedSeriesState {
@@ -1149,29 +1159,73 @@ impl UserTsdb {
     pub fn recompute_owned_series_with_compute_fn(
         &self,
         shard_size: usize,
-        _reason: &str,
+        reason: &str,
         mut compute_fn: impl FnMut() -> usize,
     ) -> (bool, usize) {
         pub const MAX_ATTEMPTS: usize = 3;
         pub const MAX_DIFF: isize = 1000;
 
+        let start = Instant::now();
         let mut attempts = 0usize;
-        for _ in 0..MAX_ATTEMPTS {
+        let mut success = false;
+        let mut owned_before = 0usize;
+        let mut shard_before = 0usize;
+        let mut local_limit_before = 0usize;
+        let mut owned_new = 0usize;
+        let mut local_limit_new = 0usize;
+
+        while !success && attempts < MAX_ATTEMPTS {
             attempts += 1;
-            let owned_before = self.owned_series_state().owned_series_count as isize;
-            let local_limit_new = self.limiter.max_series_per_user(&self.user_id, 0);
-            let owned_new = compute_fn();
+            let prev = self.owned_series_state();
+            owned_before = prev.owned_series_count;
+            shard_before = prev.shard_size;
+            local_limit_before = prev.local_series_limit;
+
+            local_limit_new = self.limiter.max_series_per_user(&self.user_id, 0);
+            owned_new = compute_fn();
 
             let mut os = self.owned_state.lock();
-            let diff = (os.owned_series_count as isize) - owned_before;
+            let diff = (os.owned_series_count as isize) - (owned_before as isize);
             os.owned_series_count = owned_new;
             os.shard_size = shard_size;
             os.local_series_limit = local_limit_new;
             if (0..=MAX_DIFF).contains(&diff) {
-                return (true, attempts);
+                success = true;
             }
         }
-        (false, attempts)
+        let duration_ms = start.elapsed().as_millis() as u64;
+        if success {
+            info!(
+                user = %self.user_id,
+                reason = %reason,
+                owned_series_before = owned_before,
+                owned_series_new = owned_new,
+                shard_size_before = shard_before,
+                shard_size_new = shard_size,
+                local_limit_before = local_limit_before,
+                local_limit_new = local_limit_new,
+                duration_ms,
+                attempts,
+                success,
+                "owned series: recomputed owned series for user"
+            );
+        } else {
+            warn!(
+                user = %self.user_id,
+                reason = %reason,
+                owned_series_before = owned_before,
+                owned_series_new = owned_new,
+                shard_size_before = shard_before,
+                shard_size_new = shard_size,
+                local_limit_before = local_limit_before,
+                local_limit_new = local_limit_new,
+                duration_ms,
+                attempts,
+                success,
+                "owned series: recomputed owned series for user"
+            );
+        }
+        (success, attempts)
     }
 
     pub fn update_owned_series_if_needed(
@@ -1296,10 +1350,15 @@ pub fn next_forced_head_compaction_range(
     if max_time < min_time {
         return None;
     }
-    let min_bucket = min_time.div_euclid(block_duration);
-    let max_bucket = max_time.div_euclid(block_duration);
-    if min_bucket != max_bucket {
-        let split_max = (min_bucket + 1) * block_duration - 1;
+    if block_duration <= 0 {
+        return Some((min_time, max_time, true));
+    }
+    let min_bucket = min_time / block_duration;
+    let max_bucket = max_time / block_duration;
+    if min_bucket.saturating_mul(block_duration) != max_bucket.saturating_mul(block_duration) {
+        let split_max = (min_bucket + 1)
+            .saturating_mul(block_duration)
+            .saturating_sub(1);
         Some((min_time, split_max, false))
     } else {
         Some((min_time, max_time, true))
@@ -1307,7 +1366,7 @@ pub fn next_forced_head_compaction_range(
 }
 
 struct MetadataEntry {
-    metric_type: MetricType,
+    raw_type: i32,
     help: String,
     unit: String,
     last_seen_nanos: AtomicI64,
@@ -1325,33 +1384,7 @@ fn system_time_to_nanos(t: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
-#[inline]
-fn proto_metric_type_to_tsdb(t: i32) -> MetricType {
-    match cortexpb::metric_metadata::MetricType::try_from(t) {
-        Ok(cortexpb::metric_metadata::MetricType::Counter) => MetricType::Counter,
-        Ok(cortexpb::metric_metadata::MetricType::Gauge) => MetricType::Gauge,
-        Ok(cortexpb::metric_metadata::MetricType::Histogram) => MetricType::HistogramSample,
-        Ok(cortexpb::metric_metadata::MetricType::Gaugehistogram) => MetricType::GaugeHistogram,
-        Ok(cortexpb::metric_metadata::MetricType::Summary) => MetricType::Summary,
-        Ok(cortexpb::metric_metadata::MetricType::Info) => MetricType::Info,
-        Ok(cortexpb::metric_metadata::MetricType::Stateset) => MetricType::Stateset,
-        _ => MetricType::Unknown,
-    }
-}
 
-#[inline]
-fn tsdb_metric_type_to_proto(t: MetricType) -> i32 {
-    match t {
-        MetricType::Counter => cortexpb::metric_metadata::MetricType::Counter as i32,
-        MetricType::Gauge => cortexpb::metric_metadata::MetricType::Gauge as i32,
-        MetricType::HistogramSample => cortexpb::metric_metadata::MetricType::Histogram as i32,
-        MetricType::GaugeHistogram => cortexpb::metric_metadata::MetricType::Gaugehistogram as i32,
-        MetricType::Summary => cortexpb::metric_metadata::MetricType::Summary as i32,
-        MetricType::Info => cortexpb::metric_metadata::MetricType::Info as i32,
-        MetricType::Stateset => cortexpb::metric_metadata::MetricType::Stateset as i32,
-        MetricType::Unknown => cortexpb::metric_metadata::MetricType::Unknown as i32,
-    }
-}
 
 /// Per-tenant metric metadata wrapper tracking metrics & limits (`user_metrics_metadata.go`).
 pub struct TenantMetadataStore {
@@ -1406,7 +1439,6 @@ impl TenantMetadataStore {
         unit: &str,
         now_nanos: i64,
     ) -> Result<(), IngesterError> {
-        let metric_type = proto_metric_type_to_tsdb(raw_type);
 
         let max_per_user = self.limiter.max_metadata_per_user(&self.user_id);
         let max_per_metric = self.limiter.max_metadata_per_metric(&self.user_id);
@@ -1417,7 +1449,7 @@ impl TenantMetadataStore {
             if let Some(entries) = guard.metrics.get(metric_family_name) {
                 if max_per_metric == 0 || entries.len() < max_per_metric {
                     for e in entries {
-                        if e.metric_type == metric_type && e.help == help && e.unit == unit {
+                        if e.raw_type == raw_type && e.help == help && e.unit == unit {
                             e.last_seen_nanos.store(now_nanos, Ordering::Relaxed);
                             return Ok(());
                         }
@@ -1442,7 +1474,7 @@ impl TenantMetadataStore {
                 ));
             }
             for e in entries {
-                if e.metric_type == metric_type && e.help == help && e.unit == unit {
+                if e.raw_type == raw_type && e.help == help && e.unit == unit {
                     e.last_seen_nanos.store(now_nanos, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -1459,7 +1491,7 @@ impl TenantMetadataStore {
         }
 
         let entry = MetadataEntry {
-            metric_type,
+            raw_type,
             help: help.to_owned(),
             unit: unit.to_owned(),
             last_seen_nanos: AtomicI64::new(now_nanos),
@@ -1522,7 +1554,7 @@ impl TenantMetadataStore {
                         break;
                     }
                     out.push(cortexpb::MetricMetadata {
-                        r#type: tsdb_metric_type_to_proto(e.metric_type),
+                        r#type: e.raw_type,
                         metric_family_name: name.to_owned(),
                         help: e.help.clone(),
                         unit: e.unit.clone(),

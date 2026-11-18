@@ -2168,9 +2168,7 @@ impl SeriesStripe {
                         updates.push((ref_id, new_matchers.matches(&lbls)));
                     }
                 } else {
-                    if cat_changed && new_cat.is_some() {
-                        failures += 1.0;
-                    }
+                    failures += 1.0;
                     if matchers_changed {
                         updates.push((ref_id, new_matchers.matches(&Labels::empty())));
                     }

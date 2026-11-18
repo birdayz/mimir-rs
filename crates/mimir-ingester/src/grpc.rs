@@ -875,19 +875,38 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         let ingester = Arc::clone(&self.ingester);
                         let outcome = Arc::clone(&self.outcome);
                         Box::pin(async move {
-                            let user_id = tenant_from_req(&ingester, &request)?;
+                            let tenant_res = tenant_from_req(&ingester, &request);
                             let (_, extensions, raw) = request.into_parts();
-                            if let Err(e) = ingester.push_grpc_raw_admitted(&user_id, raw).await {
-                                record_push_error(
-                                    &ingester,
-                                    extensions.get::<GrpcErrorLog>(),
-                                    &e,
-                                );
-                                let status = e.map_push_error_to_grpc_server_status();
-                                *outcome.lock() = Some(e);
-                                return Err(status);
+                            match tenant_res {
+                                Ok(user_id) => {
+                                    if let Err(e) =
+                                        ingester.push_grpc_raw_admitted(&user_id, raw).await
+                                    {
+                                        record_push_error(
+                                            &ingester,
+                                            extensions.get::<GrpcErrorLog>(),
+                                            &e,
+                                        );
+                                        let status = e.map_push_error_to_grpc_server_status();
+                                        *outcome.lock() = Some(e);
+                                        return Err(status);
+                                    }
+                                    Ok(Response::new(cortexpb::WriteResponse {}))
+                                }
+                                Err(tenant_status) => {
+                                    if let Err(e) = ingester.validate_grpc_push_wire(&raw) {
+                                        record_push_error(
+                                            &ingester,
+                                            extensions.get::<GrpcErrorLog>(),
+                                            &e,
+                                        );
+                                        let status = e.map_push_error_to_grpc_server_status();
+                                        *outcome.lock() = Some(e);
+                                        return Err(status);
+                                    }
+                                    Err(tenant_status)
+                                }
                             }
-                            Ok(Response::new(cortexpb::WriteResponse {}))
                         })
                     }
                 }
@@ -1155,11 +1174,7 @@ fn tenant_from_req<T>(ingester: &Ingester, req: &Request<T>) -> Result<String, S
     tenant_from_org_id(&org_id, req.extensions())
 }
 
-fn vec_to_stream<T: Send + 'static>(
-    items: Vec<T>,
-) -> Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>> {
-    Box::pin(tokio_stream::iter(items.into_iter().map(Ok)))
-}
+
 
 #[tonic::async_trait]
 impl ingesterpb::ingester_server::Ingester for IngesterService {
@@ -1380,13 +1395,13 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 ActivityRequest::None,
             )
         });
-        let items = self
+        let stream = self
             .ingester
-            .handle_label_names_and_values(&md, &user_id, inner)
+            .handle_label_names_and_values_rx(&md, &user_id, inner)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(ActivityStream {
-            inner: vec_to_stream(items),
+            inner: stream,
             _guard: act,
         })))
     }
@@ -1414,13 +1429,13 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 ActivityRequest::LabelValuesCardinality(&inner),
             )
         });
-        let items = self
+        let stream = self
             .ingester
-            .handle_label_values_cardinality(&md, &user_id, inner)
+            .handle_label_values_cardinality_rx(&md, &user_id, inner)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(ActivityStream {
-            inner: vec_to_stream(items),
+            inner: stream,
             _guard: act,
         })))
     }
@@ -1479,13 +1494,13 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 ActivityRequest::None,
             )
         });
-        let items = self
+        let stream = self
             .ingester
-            .handle_search_label_names_with_hints(&md, &user_id, inner, hints, matchers)
+            .handle_search_label_names_with_hints_rx(&md, &user_id, inner, hints, matchers)
             .await
             .map_err(|e: IngesterError| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(ActivityStream {
-            inner: vec_to_stream(items),
+            inner: stream,
             _guard: act,
         })))
     }
@@ -1515,13 +1530,13 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 ActivityRequest::None,
             )
         });
-        let items = self
+        let stream = self
             .ingester
-            .handle_search_label_values_with_hints(&md, &user_id, inner, hints, matchers)
+            .handle_search_label_values_with_hints_rx(&md, &user_id, inner, hints, matchers)
             .await
             .map_err(|e: IngesterError| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(ActivityStream {
-            inner: vec_to_stream(items),
+            inner: stream,
             _guard: act,
         })))
     }

@@ -1372,7 +1372,7 @@ fn build_span_exporter() -> Option<SpanExporterFn> {
     if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
         return None;
     }
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExportedSpan>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ExportedSpan>(4096);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -1384,7 +1384,7 @@ fn build_span_exporter() -> Option<SpanExporterFn> {
         }
     });
     Some(Arc::new(move |span: ExportedSpan| {
-        let _ = tx.send(span);
+        let _ = tx.try_send(span);
     }))
 }
 

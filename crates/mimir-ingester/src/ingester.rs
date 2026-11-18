@@ -161,6 +161,7 @@ pub struct Ingester {
     pub tsdbs: DashMap<String, Arc<UserTsdb>>,
     pub users_metadata: DashMap<String, Arc<TenantMetadataStore>>,
     pub(crate) tsdb_create_mtx: Mutex<()>,
+    closing_tsdbs: AtomicBool,
 
     pub series_count: Arc<AtomicI64>,
     pub inflight_push_requests: Arc<AtomicI64>,
@@ -181,7 +182,10 @@ pub struct Ingester {
 
     state: RwLock<State>,
     service_ctx: RwLock<Option<ServiceContext>>,
-    startup_handle: tokio::sync::Mutex<Option<JoinHandle<Result<(), IngesterError>>>>,
+    startup_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    startup_done_tx: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+    stop_done_tx: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+    pub(crate) shutdown_mtx: tokio::sync::Mutex<()>,
     lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
     partition_lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -495,6 +499,7 @@ impl Ingester {
             tsdbs: DashMap::new(),
             users_metadata: DashMap::new(),
             tsdb_create_mtx: Mutex::new(()),
+            closing_tsdbs: AtomicBool::new(false),
             series_count,
             inflight_push_requests,
             inflight_push_requests_bytes,
@@ -511,6 +516,9 @@ impl Ingester {
             state: RwLock::new(State::New),
             service_ctx: RwLock::new(None),
             startup_handle: tokio::sync::Mutex::new(None),
+            startup_done_tx: tokio::sync::watch::channel(None).0,
+            stop_done_tx: tokio::sync::watch::channel(None).0,
+            shutdown_mtx: tokio::sync::Mutex::new(()),
             lifecycler_svc: Mutex::new(None),
             partition_lifecycler_svc: Mutex::new(None),
             background_tasks: Mutex::new(Vec::new()),
@@ -876,6 +884,11 @@ impl Ingester {
         }
 
         let _guard = self.tsdb_create_mtx.lock();
+        if self.closing_tsdbs.load(Ordering::Acquire) {
+            return Err(IngesterError::Unavailable {
+                state: self.state(),
+            });
+        }
         if let Some(db) = self.get_tsdb(user_id) {
             return Ok(db);
         }
@@ -1105,6 +1118,13 @@ impl Ingester {
     /// blocking I/O + CPU work, so the workers run on the blocking thread pool instead of
     /// stalling async runtime workers.
     pub async fn open_existing_tsdbs(self: &Arc<Self>) -> Result<(), IngesterError> {
+        self.open_existing_tsdbs_with_context(None).await
+    }
+
+    pub async fn open_existing_tsdbs_with_context(
+        self: &Arc<Self>,
+        ctx: Option<&ServiceContext>,
+    ) -> Result<(), IngesterError> {
         info!("opening existing TSDBs");
         let start = Instant::now();
         let user_ids = self.find_user_ids_with_tsdb_on_filesystem().map_err(|e| {
@@ -1126,18 +1146,40 @@ impl Ingester {
             let ing = Arc::clone(self);
             let queue = Arc::clone(&queue);
             let aborted = Arc::clone(&aborted);
+            let worker_ctx = ctx.cloned();
             workers.push(tokio::task::spawn_blocking(move || -> Result<(), IngesterError> {
                 loop {
-                    if aborted.load(Ordering::Acquire) {
-                        return Ok(());
+                    if aborted.load(Ordering::Acquire)
+                        || worker_ctx.as_ref().is_some_and(ServiceContext::is_canceled)
+                        || ing.closing_tsdbs.load(Ordering::Acquire)
+                    {
+                        return Err(IngesterError::Internal {
+                            message: "opening existing TSDBs canceled".to_string(),
+                        });
                     }
                     let Some(user_id) = queue.lock().next() else {
                         return Ok(());
                     };
                     match ing.create_tsdb(&user_id, wal_replay_concurrency) {
                         Ok(db) => {
-                            ing.tsdbs.insert(user_id, db);
-                            ing.metrics.mem_users.inc();
+                            let inserted = {
+                                let _g = ing.tsdb_create_mtx.lock();
+                                if ing.closing_tsdbs.load(Ordering::Acquire)
+                                    || worker_ctx.as_ref().is_some_and(ServiceContext::is_canceled)
+                                {
+                                    false
+                                } else {
+                                    ing.tsdbs.insert(user_id.clone(), db.clone());
+                                    ing.metrics.mem_users.inc();
+                                    true
+                                }
+                            };
+                            if !inserted {
+                                let _ = db.close();
+                                return Err(IngesterError::Internal {
+                                    message: "opening existing TSDBs canceled".to_string(),
+                                });
+                            }
                         }
                         Err(e) => {
                             aborted.store(true, Ordering::Release);
@@ -1181,18 +1223,20 @@ impl Ingester {
     }
 
     pub async fn close_all_tsdbs(&self) {
-        let keys = self.get_tsdb_users();
-        for k in &keys {
-            if let Some(db) = self.get_tsdb(k) {
-                db.set_closing_state();
+        let snapshot: Vec<(String, Arc<UserTsdb>)> = {
+            let _g = self.tsdb_create_mtx.lock();
+            self.closing_tsdbs.store(true, Ordering::Release);
+            let mut items = Vec::with_capacity(self.tsdbs.len());
+            for entry in &self.tsdbs {
+                entry.value().set_closing_state();
+                items.push((entry.key().clone(), Arc::clone(entry.value())));
             }
+            items
+        };
+        for (_, db) in &snapshot {
+            db.wait_in_flight_appends().await;
         }
-        for k in &keys {
-            if let Some(db) = self.get_tsdb(k) {
-                db.wait_in_flight_appends().await;
-            }
-        }
-        for k in keys {
+        for (k, _) in snapshot {
             let removed = {
                 let _g = self.tsdb_create_mtx.lock();
                 self.tsdbs
@@ -1397,10 +1441,34 @@ impl Ingester {
             *st = State::Starting;
         }
 
+        let _ = self.startup_done_tx.send(None);
         *self.service_ctx.write() = Some(ctx.clone());
 
         let ing = Arc::clone(self);
-        let handle = tokio::spawn(async move { ing.run_starting(ctx).await });
+        let handle = tokio::spawn(async move {
+            struct StartupDoneGuard {
+                tx: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+                sent: bool,
+            }
+            impl Drop for StartupDoneGuard {
+                fn drop(&mut self) {
+                    if !self.sent {
+                        let _ = self.tx.send(Some(Err(
+                            "ingester startup task panicked".to_string(),
+                        )));
+                    }
+                }
+            }
+            let mut guard = StartupDoneGuard {
+                tx: ing.startup_done_tx.clone(),
+                sent: false,
+            };
+            let res = ing.run_starting(ctx).await;
+            guard.sent = true;
+            let _ = ing.startup_done_tx.send(Some(
+                res.as_ref().map(|&()| ()).map_err(ToString::to_string),
+            ));
+        });
         *self.startup_handle.lock().await = Some(handle);
         Ok(())
     }
@@ -1416,16 +1484,17 @@ impl Ingester {
 
     /// Waits for `start_async` to finish transitioning the Ingester into `State::Running`.
     pub async fn await_running(&self) -> Result<(), IngesterError> {
-        let handle_opt = self.startup_handle.lock().await.take();
-        if let Some(handle) = handle_opt {
-            match handle.await {
-                Ok(res) => res,
-                Err(e) => Err(IngesterError::Internal {
-                    message: format!("ingester startup task panicked: {e}"),
-                }),
+        if *self.state.read() == State::New {
+            return Ok(());
+        }
+        let mut rx = self.startup_done_tx.subscribe();
+        loop {
+            if let Some(res) = rx.borrow_and_update().clone() {
+                return res.map_err(|message| IngesterError::Internal { message });
             }
-        } else {
-            Ok(())
+            if rx.changed().await.is_err() {
+                return Ok(());
+            }
         }
     }
 
@@ -1454,7 +1523,10 @@ impl Ingester {
                 let _ = t.await;
             }
             self.close_all_tsdbs().await;
-            *self.state.write() = State::Failed;
+            let mut st = self.state.write();
+            if *st == State::Starting {
+                *st = State::Failed;
+            }
         }
         res
     }
@@ -1484,7 +1556,7 @@ impl Ingester {
             }
         }
 
-        self.open_existing_tsdbs().await?;
+        self.open_existing_tsdbs_with_context(Some(ctx)).await?;
 
         // Start owned series loop before partition replay and lifecycler.
         if self.owned_series_strategy.is_some() {
@@ -1777,16 +1849,68 @@ impl Ingester {
 
     /// Gracefully stops the Ingester service, flushing if configured and closing all TSDBs.
     pub async fn stop(self: &Arc<Self>) -> Result<(), IngesterError> {
-        {
+        let mut rx = self.stop_done_tx.subscribe();
+        let should_run_stop = {
             let mut st = self.state.write();
-            if *st == State::Terminated || *st == State::Stopping {
-                return Ok(());
+            match *st {
+                State::Terminated => return Ok(()),
+                State::Stopping => false,
+                State::Failed => {
+                    if let Some(res) = rx.borrow().clone() {
+                        return res.map_err(|message| IngesterError::Internal { message });
+                    }
+                    *st = State::Stopping;
+                    true
+                }
+                State::New | State::Starting | State::Running => {
+                    *st = State::Stopping;
+                    true
+                }
             }
-            *st = State::Stopping;
+        };
+
+        if !should_run_stop {
+            loop {
+                if let Some(res) = rx.borrow_and_update().clone() {
+                    return res.map_err(|message| IngesterError::Internal { message });
+                }
+                if rx.changed().await.is_err() {
+                    return Ok(());
+                }
+            }
         }
 
-        // 1. Stop Kafka reader first so any blocked catchup exits.
-        let reader_opt = self.ingest_reader.write().take();
+        struct StopDoneGuard {
+            tx: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+            sent: bool,
+        }
+        impl Drop for StopDoneGuard {
+            fn drop(&mut self) {
+                if !self.sent {
+                    let _ = self.tx.send(Some(Err(
+                        "ingester stop aborted before completion".to_string(),
+                    )));
+                }
+            }
+        }
+        let mut stop_guard = StopDoneGuard {
+            tx: self.stop_done_tx.clone(),
+            sent: false,
+        };
+
+        let res = self.stop_inner().await;
+        stop_guard.sent = true;
+        let _ = self.stop_done_tx.send(Some(
+            res.as_ref().map(|&()| ()).map_err(ToString::to_string),
+        ));
+        res
+    }
+
+    async fn stop_inner(self: &Arc<Self>) -> Result<(), IngesterError> {
+        // 1. Stop Kafka reader first so any blocked catchup exits, while keeping `self.ingest_reader`
+        // populated so Step 5's lifecycler `flush()` -> `sync_offset_catalogues()` can still read
+        // `last_seen_offsets()` and persist `offset-catalogue.json` before shipping blocks.
+        let reader_opt = self.ingest_reader.read().clone();
         if let Some(reader) = reader_opt {
             reader.stop().await;
         }
@@ -1801,13 +1925,19 @@ impl Ingester {
             let handle_opt = self.startup_handle.lock().await.take();
             if let Some(handle) = handle_opt {
                 match handle.await {
-                    Ok(r) => r,
+                    Ok(()) => match self.startup_done_tx.borrow().clone() {
+                        Some(Ok(())) | None => Ok(()),
+                        Some(Err(message)) => Err(IngesterError::Internal { message }),
+                    },
                     Err(e) => Err(IngesterError::Internal {
                         message: format!("ingester startup task panicked: {e}"),
                     }),
                 }
             } else {
-                Ok(())
+                match self.startup_done_tx.borrow().clone() {
+                    Some(Ok(())) | None => Ok(()),
+                    Some(Err(message)) => Err(IngesterError::Internal { message }),
+                }
             }
         };
 
@@ -1844,9 +1974,14 @@ impl Ingester {
             let _ = svc.await_terminated().await;
         }
 
-        // 6. Remove shutdown marker.
-        let marker_path = shutdownmarker::get_path(&self.blocks_cfg.tsdb.dir);
-        let _ = shutdownmarker::remove(&marker_path);
+        let _ = self.ingest_reader.write().take();
+
+        // 6. Remove shutdown marker only if startup succeeded (so a canceled/failed startup that
+        // never flushed preserves the marker for the next restart).
+        if startup_res.is_ok() {
+            let marker_path = shutdownmarker::get_path(&self.blocks_cfg.tsdb.dir);
+            let _ = shutdownmarker::remove(&marker_path);
+        }
 
         // 7. Close all TSDBs unless KeepUserTSDBOpenOnShutdown.
         if !self.blocks_cfg.tsdb.keep_user_tsdb_open_on_shutdown {
@@ -1899,7 +2034,7 @@ pub fn block_generation_calculator(
     if head_min_time == i64::MAX {
         return "unknown".to_string();
     }
-    let gen = 1i64.max((head_min_time - block_min_time) / block_range_ms);
+    let gen = 1i64.max(head_min_time.saturating_sub(block_min_time) / block_range_ms.max(1));
     if gen > 100 {
         "100+".to_string()
     } else {
