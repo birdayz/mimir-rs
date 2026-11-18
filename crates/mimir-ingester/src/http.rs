@@ -184,31 +184,45 @@ fn compartments_index_page_html(
 /// `application/x-www-form-urlencoded` body; `400` on a parse error), the tenant allow-list is
 /// `r.Form["tenant"]` (an empty `tenant=` allows only the empty tenant, an absent one allows all)
 /// and the flush is synchronous only when the first `wait` value is `"true"`.
+struct CompactionInProgressGuard<'a>(&'a Ingester);
+impl Drop for CompactionInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .num_compactions_in_progress
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Response {
+    let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
     let _act = st.ingester.insert_activity(|| {
         crate::activity::request_activity(
             "",
-            "",
+            &trace_id,
             "Ingester/FlushHandler",
             crate::activity::ActivityRequest::None,
         )
     });
     let ing_state = st.ingester.state();
     if ing_state != State::Running && ing_state != State::Starting {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("ingester is unavailable (current state: {ing_state})"),
-        )
-            .into_response();
+        let err_msg = format!("ingester is unavailable (current state: {ing_state})");
+        tracing::warn!(err = %err_msg, "flushing TSDB blocks is not allowed");
+        return (StatusCode::SERVICE_UNAVAILABLE, err_msg).into_response();
     }
 
     if st.ingester.compaction_service_state() != State::Running {
+        tracing::warn!(
+            "flushing TSDB blocks is not allowed because compaction service is not running yet"
+        );
         return go_http_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "compaction service is not running",
         );
     }
     let Some(fc_tx) = st.ingester.force_compact_tx.read().clone() else {
+        tracing::warn!(
+            "flushing TSDB blocks is not allowed because compaction service is not running yet"
+        );
         return go_http_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "compaction service is not running",
@@ -229,8 +243,17 @@ async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Res
     let ing = Arc::clone(&st.ingester);
 
     let run = async move {
+        let cur_state = ing.state();
+        if cur_state != State::Running && cur_state != State::Starting {
+            tracing::info!("flushing TSDB blocks: ingester not running, ignoring flush request");
+            return;
+        }
+
         ing.num_compactions_in_progress
             .fetch_add(1, Ordering::AcqRel);
+        let _guard = CompactionInProgressGuard(&ing);
+
+        tracing::info!("flushing TSDB blocks: triggering compaction");
         let (cb_tx, cb_rx) = oneshot::channel();
         if fc_tx
             .send(TriggerRequest {
@@ -238,11 +261,19 @@ async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Res
                 callback: cb_tx,
             })
             .await
-            .is_ok()
+            .is_err()
         {
-            let _ = cb_rx.await;
+            tracing::warn!("failed to compact TSDB blocks, ingester not running anymore");
+            return;
         }
+        if cb_rx.await.is_err() {
+            tracing::warn!("failed to compact TSDB blocks, ingester not running anymore");
+            return;
+        }
+        tracing::info!("finished compacting TSDB blocks");
+
         if let Some(ship_tx) = ship_tx_opt {
+            tracing::info!("flushing TSDB blocks: triggering shipping");
             let (scb_tx, scb_rx) = oneshot::channel();
             if ship_tx
                 .send(TriggerRequest {
@@ -250,13 +281,18 @@ async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Res
                     callback: scb_tx,
                 })
                 .await
-                .is_ok()
+                .is_err()
             {
-                let _ = scb_rx.await;
+                tracing::warn!("failed to ship TSDB blocks, ingester not running anymore");
+                return;
             }
+            if scb_rx.await.is_err() {
+                tracing::warn!("failed to ship TSDB blocks, ingester not running anymore");
+                return;
+            }
+            tracing::info!("shipping of TSDB blocks finished");
         }
-        ing.num_compactions_in_progress
-            .fetch_sub(1, Ordering::AcqRel);
+        tracing::info!("flushing TSDB blocks: finished");
     };
 
     if wait {
@@ -272,10 +308,11 @@ async fn prepare_shutdown_handler(
     AxumState(st): AxumState<HttpState>,
     method: Method,
 ) -> Response {
+    let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
     let _act = st.ingester.insert_activity(|| {
         crate::activity::request_activity(
             "",
-            "",
+            &trace_id,
             "Ingester/PrepareShutdownHandler",
             crate::activity::ActivityRequest::None,
         )
@@ -288,23 +325,51 @@ async fn prepare_shutdown_handler(
         Method::GET => match shutdownmarker::exists(&marker_path) {
             Ok(true) => (StatusCode::OK, "set\n").into_response(),
             Ok(false) => (StatusCode::OK, "unset\n").into_response(),
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(err) => {
+                tracing::error!(
+                    path = %marker_path.display(),
+                    err = %err,
+                    "unable to check for prepare-shutdown marker file"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
         },
         Method::POST => {
-            if shutdownmarker::create(&marker_path).is_err() {
+            if let Err(err) = shutdownmarker::create(&marker_path) {
+                tracing::error!(
+                    path = %marker_path.display(),
+                    err = %err,
+                    "unable to create prepare-shutdown marker file"
+                );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
             st.ingester.set_prepare_shutdown();
+            tracing::info!(
+                path = %marker_path.display(),
+                "created prepare-shutdown marker file"
+            );
             StatusCode::NO_CONTENT.into_response()
         }
         Method::DELETE => {
             if st.ingester.ingest_cfg.enabled {
+                tracing::error!(
+                    "the ingest storage doesn't support reverting the prepared shutdown"
+                );
                 return StatusCode::METHOD_NOT_ALLOWED.into_response();
             }
-            if shutdownmarker::remove(&marker_path).is_err() {
+            if let Err(err) = shutdownmarker::remove(&marker_path) {
+                tracing::error!(
+                    path = %marker_path.display(),
+                    err = %err,
+                    "unable to remove prepare-shutdown marker file"
+                );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
             st.ingester.unset_prepare_shutdown();
+            tracing::info!(
+                path = %marker_path.display(),
+                "removed prepare-shutdown marker file"
+            );
             StatusCode::NO_CONTENT.into_response()
         }
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
@@ -316,15 +381,31 @@ struct PrepareUnregisterBody {
     unregister: Option<bool>,
 }
 
+/// Decodes the first JSON value from `body` matching `unregister` case-insensitively
+/// like Go's `json.NewDecoder(r.Body).Decode(&input)`.
+fn decode_prepare_unregister_body(body: &[u8]) -> Option<bool> {
+    let mut de = serde_json::Deserializer::from_slice(body).into_iter::<serde_json::Value>();
+    let first = de.next()?.ok()?;
+    let obj = first.as_object()?;
+    if let Some(exact) = obj.get("unregister") {
+        return exact.as_bool();
+    }
+    let (_, val) = obj
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("unregister"))?;
+    val.as_bool()
+}
+
 async fn prepare_unregister_handler(
     AxumState(st): AxumState<HttpState>,
     method: Method,
     body: Bytes,
 ) -> Response {
+    let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
     let _act = st.ingester.insert_activity(|| {
         crate::activity::request_activity(
             "",
-            "",
+            &trace_id,
             "Ingester/PrepareUnregisterHandler",
             crate::activity::ActivityRequest::None,
         )
@@ -340,10 +421,7 @@ async fn prepare_unregister_handler(
     };
     match method {
         Method::PUT => {
-            let Ok(input) = serde_json::from_slice::<PrepareUnregisterBody>(&body) else {
-                return StatusCode::BAD_REQUEST.into_response();
-            };
-            let Some(val) = input.unregister else {
+            let Some(val) = decode_prepare_unregister_body(&body) else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
             lc.set_unregister_on_shutdown(val);
@@ -368,10 +446,11 @@ async fn prepare_partition_downscale_handler(
     AxumState(st): AxumState<HttpState>,
     method: Method,
 ) -> Response {
+    let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
     let _act = st.ingester.insert_activity(|| {
         crate::activity::request_activity(
             "",
-            "",
+            &trace_id,
             "Ingester/PreparePartitionDownscaleHandler",
             crate::activity::ActivityRequest::None,
         )
@@ -385,19 +464,37 @@ async fn prepare_partition_downscale_handler(
     let Some(ref plc) = st.ingester.partition_lifecycler else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    let partition_id = plc.partition_id();
 
     match method {
         Method::POST => {
-            let Ok((state, _)) = plc.get_partition_state().await else {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            let state = match plc.get_partition_state().await {
+                Ok((s, _)) => s,
+                Err(e) => {
+                    tracing::error!(
+                        partition = partition_id,
+                        err = %e,
+                        "failed to check partition state in the ring"
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
             };
             if state == PartitionState::PartitionPending {
+                tracing::warn!(
+                    partition = partition_id,
+                    "received a request to prepare partition for shutdown, but the request can't be satisfied because the partition is in PENDING state"
+                );
                 return StatusCode::CONFLICT.into_response();
             }
             if let Err(e) = plc
                 .change_partition_state(PartitionState::PartitionInactive)
                 .await
             {
+                tracing::error!(
+                    partition = partition_id,
+                    err = %e,
+                    "failed to change partition state to inactive"
+                );
                 // Only `ring.ErrPartitionStateChangeLocked` maps to 409 Conflict.
                 let status = if matches!(e, PartitionRingError::PartitionStateChangeLocked) {
                     StatusCode::CONFLICT
@@ -408,14 +505,27 @@ async fn prepare_partition_downscale_handler(
             }
         }
         Method::DELETE => {
-            let Ok((state, _)) = plc.get_partition_state().await else {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            let state = match plc.get_partition_state().await {
+                Ok((s, _)) => s,
+                Err(e) => {
+                    tracing::error!(
+                        partition = partition_id,
+                        err = %e,
+                        "failed to check partition state in the ring"
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
             };
             if state == PartitionState::PartitionInactive {
                 if let Err(e) = plc
                     .change_partition_state(PartitionState::PartitionActive)
                     .await
                 {
+                    tracing::error!(
+                        partition = partition_id,
+                        err = %e,
+                        "failed to change partition state to active"
+                    );
                     // Only `ring.ErrPartitionStateChangeLocked` maps to 409 Conflict.
                     let status = if matches!(e, PartitionRingError::PartitionStateChangeLocked) {
                         StatusCode::CONFLICT
@@ -438,7 +548,14 @@ async fn prepare_partition_downscale_handler(
             Json(TimestampBody { timestamp: unix }).into_response()
         }
         Ok(_) => Json(TimestampBody { timestamp: 0 }).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(
+                partition = partition_id,
+                err = %e,
+                "failed to check partition state in the ring"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -446,10 +563,11 @@ async fn prepare_instance_ring_downscale_handler(
     AxumState(st): AxumState<HttpState>,
     method: Method,
 ) -> Response {
+    let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
     let _act = st.ingester.insert_activity(|| {
         crate::activity::request_activity(
             "",
-            "",
+            &trace_id,
             "Ingester/PrepareInstanceRingDownscaleHandler",
             crate::activity::ActivityRequest::None,
         )
@@ -467,6 +585,10 @@ async fn prepare_instance_ring_downscale_handler(
     match method {
         Method::POST => {
             if let Err(e) = lc.change_read_only_state(true).await {
+                tracing::error!(
+                    err = %e,
+                    "failed to set ingester to read-only mode in the ring"
+                );
                 return go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
             }
             if let Some(ref pcb) = st.ingester.circuit_breaker.push {
@@ -482,12 +604,12 @@ async fn prepare_instance_ring_downscale_handler(
                     .load(Ordering::Acquire)
                     != 0
             {
-                return go_http_error(
-                    StatusCode::CONFLICT,
-                    "cannot clear read-only mode while compaction is pending or in progress",
-                );
+                let msg = "cannot clear read-only mode while compaction is pending or in progress";
+                tracing::warn!("{msg}");
+                return go_http_error(StatusCode::CONFLICT, msg);
             }
             if let Err(e) = lc.change_read_only_state(false).await {
+                tracing::error!(err = %e, "failed to clear ingester's read-only mode");
                 return go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
             }
             if let Some(ref pcb) = st.ingester.circuit_breaker.push {
@@ -509,10 +631,11 @@ async fn prepare_instance_ring_downscale_handler(
 }
 
 async fn shutdown_handler(AxumState(st): AxumState<HttpState>) -> Response {
+    let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
     let _act = st.ingester.insert_activity(|| {
         crate::activity::request_activity(
             "",
-            "",
+            &trace_id,
             "Ingester/ShutdownHandler",
             crate::activity::ActivityRequest::None,
         )
@@ -577,10 +700,11 @@ async fn user_registry_handler(
         Ok(id) => id,
         Err((status, msg)) => return go_http_error(status, &msg),
     };
+    let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
     let _act = st.ingester.insert_activity(|| {
         crate::activity::request_activity(
             &user_id,
-            "",
+            &trace_id,
             "Ingester/UserRegistryHandler",
             crate::activity::ActivityRequest::None,
         )
@@ -707,10 +831,11 @@ async fn tenants_handler(
     AxumState(st): AxumState<HttpState>,
     headers: HeaderMap,
 ) -> Response {
+    let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
     let _act = st.ingester.insert_activity(|| {
         crate::activity::request_activity(
             "",
-            "",
+            &trace_id,
             "Ingester/TenantsHandler",
             crate::activity::ActivityRequest::None,
         )
@@ -902,10 +1027,11 @@ async fn tenant_tsdb_handler(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
+    let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
     let _act = st.ingester.insert_activity(|| {
         crate::activity::request_activity(
             "",
-            "",
+            &trace_id,
             "Ingester/TenantTSDBHandler",
             crate::activity::ActivityRequest::None,
         )
@@ -1090,10 +1216,11 @@ async fn label_churn_handler(
     AxumState(st): AxumState<HttpState>,
     uri: Uri,
 ) -> Response {
+    let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
     let _act = st.ingester.insert_activity(|| {
         crate::activity::request_activity(
             "",
-            "",
+            &trace_id,
             "Ingester/LabelChurnHandler",
             crate::activity::ActivityRequest::None,
         )
@@ -1403,5 +1530,14 @@ mod tests {
             body,
             "a compaction removed series after the start of the lookback window, retry later or use a shorter lookback\n"
         );
+    }
+
+    #[test]
+    fn decode_prepare_unregister_body_is_case_insensitive() {
+        assert_eq!(decode_prepare_unregister_body(br#"{"unregister":true}"#), Some(true));
+        assert_eq!(decode_prepare_unregister_body(br#"{"Unregister":true}"#), Some(true));
+        assert_eq!(decode_prepare_unregister_body(br#"{"UNREGISTER":false}"#), Some(false));
+        assert_eq!(decode_prepare_unregister_body(br#"{"unregister":null}"#), None);
+        assert_eq!(decode_prepare_unregister_body(br#"{}"#), None);
     }
 }

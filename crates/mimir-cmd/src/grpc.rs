@@ -267,6 +267,11 @@ impl Http for HttpGrpcBridge {
         request: Request<httpgrpcpb::HttpRequest>,
     ) -> Result<Response<httpgrpcpb::HttpResponse>, Status> {
         let error_log = request.extensions().get::<GrpcErrorLog>().cloned();
+        let outer_trace = request
+            .extensions()
+            .get::<mimir_common::tracing::TraceContext>()
+            .cloned()
+            .or_else(mimir_common::tracing::current_trace_context);
         let req = request.into_inner();
 
         // `http.NewRequest("", ...)`: an empty method (the proto3 default) means GET.
@@ -321,21 +326,52 @@ impl Http for HttpGrpcBridge {
             }
         }
 
+        let effective_trace = match outer_trace {
+            Some(ref t) if t.is_valid() => {
+                let (child, _) = mimir_common::tracing::start_server_span_context(t, false);
+                child
+            }
+            _ => {
+                let from_inner = mimir_common::tracing::extract_from_http_headers(&req_headers);
+                let (ctx, _) = mimir_common::tracing::start_server_span_context(&from_inner, false);
+                ctx
+            }
+        };
         let mut http_req = HttpRequestMsg::builder()
-            .method(method)
+            .method(method.clone())
             .uri(uri)
             .body(Body::from(req.body))
             .map_err(|e| Status::internal(format!("failed to construct HTTP request: {e}")))?;
         *http_req.headers_mut() = req_headers;
+        if effective_trace.is_valid() {
+            http_req.extensions_mut().insert(effective_trace.clone());
+        }
 
-
-
-        let resp = self
-            .router
-            .clone()
-            .oneshot(http_req)
-            .await
-            .map_err(|e| Status::internal(format!("router error: {e}")))?;
+        let span_start = mimir_common::tracing::now_unix_nanos();
+        let resp = mimir_common::tracing::with_trace_context(
+            effective_trace.clone(),
+            self.router.clone().oneshot(http_req),
+        )
+        .await
+        .map_err(|e| Status::internal(format!("router error: {e}")))?;
+        if effective_trace.is_sampled() {
+            if let Some(rt) = mimir_common::tracing::global_tracing() {
+                if rt.exporter.is_some() {
+                    mimir_common::tracing::export_span(mimir_common::tracing::ExportedSpan {
+                        service_name: rt.service_name.clone(),
+                        trace_id: effective_trace.trace_id,
+                        span_id: effective_trace.span_id,
+                        parent_span_id: outer_trace.as_ref().map(|t| t.span_id),
+                        name: format!("HTTP {method}"),
+                        kind: 2,
+                        start_time_unix_nano: span_start,
+                        end_time_unix_nano: mimir_common::tracing::now_unix_nanos(),
+                        attributes: Vec::new(),
+                        status_error: resp.status().as_u16() >= 500,
+                    });
+                }
+            }
+        }
 
         let code = resp.status().as_u16() as i32;
         let mut resp_headers = resp.headers().clone();

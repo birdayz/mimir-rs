@@ -553,12 +553,39 @@ fn needs_sanitization(s: &str) -> bool {
     false
 }
 
+impl LogValue<'_> {
+    /// Renders this value as its go-logfmt / `fmt.Sprint` string representation.
+    pub fn to_logfmt_string(&self) -> String {
+        match self {
+            LogValue::Str(s) => s.to_string(),
+            LogValue::I64(n) => n.to_string(),
+            LogValue::U64(n) => n.to_string(),
+            LogValue::I128(n) => n.to_string(),
+            LogValue::U128(n) => n.to_string(),
+            LogValue::F64(f) => go_format_float_v(*f),
+            LogValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        }
+    }
+}
+
 /// Logger trait for structured key-value logging.
 pub trait Logger: Send + Sync {
     /// `#[track_caller]` so implementations that render go-kit's `caller` key (e.g. [`LogSink`])
     /// report the call site, like dskit's `spanlogger.Caller(n)`.
     #[track_caller]
     fn log(&self, level: LogLevel, kvs: &[(&str, &str)]);
+
+    /// Logs typed key-value pairs (preserving native JSON booleans & numbers in JSON mode).
+    #[track_caller]
+    fn log_values(&self, level: LogLevel, kvs: &[(&str, LogValue<'_>)]) {
+        let rendered: Vec<String> = kvs.iter().map(|(_, v)| v.to_logfmt_string()).collect();
+        let pairs: Vec<(&str, &str)> = kvs
+            .iter()
+            .zip(rendered.iter())
+            .map(|((k, _), s)| (*k, s.as_str()))
+            .collect();
+        self.log(level, &pairs);
+    }
 }
 
 /// Structured logger writing `logfmt` or `json` lines filtered by [`LogLevel`].
@@ -624,24 +651,34 @@ impl StructuredLogger {
 
 impl Logger for StructuredLogger {
     fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
+        let pairs: Vec<(&str, LogValue<'_>)> = kvs.iter().map(|&(k, v)| (k, v.into())).collect();
+        self.log_values(level, &pairs);
+    }
+
+    fn log_values(&self, level: LogLevel, kvs: &[(&str, LogValue<'_>)]) {
         if level < self.min_level {
             return;
         }
-        let ts = format_rfc3339_nano_utc((self.clock)());
-        let mut all: Vec<(&str, &str)> = Vec::with_capacity(2 + self.default_kvs.len() + kvs.len());
-        all.push(("ts", &ts));
-        all.push(("level", level.as_str()));
+        let ts = LogValue::Str(Cow::Owned(format_rfc3339_nano_utc((self.clock)())));
+        let level_v = LogValue::Str(Cow::Borrowed(level.as_str()));
+        let mut all: Vec<(&str, LogValue<'_>)> =
+            Vec::with_capacity(2 + self.default_kvs.len() + kvs.len());
+        all.push(("ts", ts));
+        all.push(("level", level_v));
         for (k, v) in &self.default_kvs {
-            all.push((k.as_str(), v.as_str()));
+            all.push((k.as_str(), LogValue::Str(Cow::Borrowed(v.as_str()))));
         }
-        all.extend_from_slice(kvs);
+        all.extend(kvs.iter().map(|(k, v)| (*k, v.clone())));
 
-        let line = match self.format {
-            LogFormat::Logfmt => format_logfmt_line(&all),
-            LogFormat::Json => format_json_line(&all),
+        let mut line = String::with_capacity(128 + kvs.len() * 24);
+        let ok = match self.format {
+            LogFormat::Logfmt => encode_logfmt_record(&mut line, &all),
+            LogFormat::Json => encode_json_record(&mut line, &all),
         };
-        let mut w = self.writer.lock();
-        let _ = w.write_all(line.as_bytes());
+        if ok {
+            let mut w = self.writer.lock();
+            let _ = w.write_all(line.as_bytes());
+        }
     }
 }
 
@@ -793,6 +830,7 @@ impl LogSink {
 }
 
 impl Logger for LogSink {
+    #[track_caller]
     fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
         if !self.enabled(level) {
             return;
@@ -800,6 +838,15 @@ impl Logger for LogSink {
         let loc = std::panic::Location::caller();
         let pairs: Vec<(&str, LogValue<'_>)> = kvs.iter().map(|&(k, v)| (k, v.into())).collect();
         self.log_record(level, Some((loc.file(), loc.line())), &pairs);
+    }
+
+    #[track_caller]
+    fn log_values(&self, level: LogLevel, kvs: &[(&str, LogValue<'_>)]) {
+        if !self.enabled(level) {
+            return;
+        }
+        let loc = std::panic::Location::caller();
+        self.log_record(level, Some((loc.file(), loc.line())), kvs);
     }
 }
 
@@ -1528,5 +1575,36 @@ mod tests {
             assert!(l.starts_with("ts=1970-01-01T00:00:00Z caller=logging.rs:"), "{l}");
             assert!(l.ends_with(&"x".repeat(4096)), "interleaved line");
         }
+    }
+
+    #[test]
+    fn log_values_preserves_native_json_types() {
+        use std::sync::Arc;
+        #[derive(Clone, Default)]
+        struct BufWriter(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = BufWriter::default();
+        let sink = LogSink::new(LogFormat::Json, LogLevel::Info, Box::new(buf.clone()));
+        sink.log_values(
+            LogLevel::Warn,
+            &[
+                ("soft_validation", LogValue::Bool(true)),
+                ("count", LogValue::U64(3)),
+                ("msg", LogValue::from("hello")),
+            ],
+        );
+        let out = String::from_utf8(buf.0.lock().clone()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["soft_validation"], serde_json::json!(true));
+        assert_eq!(v["count"], serde_json::json!(3));
+        assert_eq!(v["msg"], serde_json::json!("hello"));
     }
 }

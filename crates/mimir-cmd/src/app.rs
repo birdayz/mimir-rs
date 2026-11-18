@@ -16,7 +16,11 @@ use mimir_common::activitytracker::{
 };
 use mimir_common::logging::{
     format_rfc3339_nano_utc, global_logger, init_global_logger, LogFormat, LogLevel, LogSink,
-    Logger,
+    LogValue, Logger,
+};
+use mimir_common::tracing::{
+    detected_exporter_kind, init_otel_or_jaeger_from_env, otlp_traces_endpoint_from_env,
+    resolve_service_name, ExportedSpan, SpanAttrValue, SpanExporterFn,
 };
 use mimir_common::services::{FnListener, ManagedBasicService, Service, ServiceContext, State};
 use mimir_config::ingester::KVStoreConfig;
@@ -149,6 +153,15 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     crate::metrics::register_process_collector(&registry)
         .context("registering process collector")?;
 
+    let tracing_service = resolve_service_name(&cfg.target.0);
+    let span_exporter = build_span_exporter();
+    if let Err(err) = init_otel_or_jaeger_from_env(&tracing_service, logger.as_ref(), span_exporter) {
+        logger.log(
+            LogLevel::Error,
+            &[("msg", "Failed to setup tracing"), ("err", &err)],
+        );
+    }
+
     let version = version_info();
     logger.log(
         LogLevel::Info,
@@ -171,13 +184,15 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             );
         }
         if !entries.is_empty() {
-            let count_str = entries.len().to_string();
-            logger.log(
+            logger.log_values(
                 LogLevel::Warn,
                 &[
-                    ("component", "activity-tracker"),
-                    ("msg", "found unfinished activities from previous run"),
-                    ("count", &count_str),
+                    ("component", LogValue::from("activity-tracker")),
+                    (
+                        "msg",
+                        LogValue::from("found unfinished activities from previous run"),
+                    ),
+                    ("count", LogValue::U64(entries.len() as u64)),
                 ],
             );
             for e in &entries {
@@ -245,7 +260,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     //    before ring registration, builds TLS configs and middleware.
     let mut server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
         .context("error initialising module: server")?;
-    server.set_grpc_multitenancy(cfg.multitenancy_enabled);
+    server.set_grpc_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
     let bound_http_addr = server.http_addr()?;
     let bound_grpc_addr = server.grpc_addr()?;
     cfg.server.http_listen_port = i64::from(bound_http_addr.port());
@@ -333,53 +348,51 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let sanity_state = StateCell::new(State::Starting);
     modules.add("sanity-check", sanity_state.state_fn());
     log_module_starting(&*logger, "sanity-check");
-    if ingester_enabled {
-        let sanity_err = tokio::select! {
-            res = sanity_check::run_sanity_check(&cfg, logger.as_ref()) => {
-                res.err().map(|err| (false, format!("starting module sanity-check: {err}")))
-            }
-            _ = &mut shutdown_sig => {
-                request_shutdown(&shutdown_requested, shutdown_delay).await;
-                Some((true, "starting module sanity-check: context canceled".to_string()))
-            }
-        };
-        if let Some((signaled, err_s)) = sanity_err {
-            sanity_state.set(State::Failed);
-            if signaled {
-                logger.log(
-                    LogLevel::Info,
-                    &[
-                        ("msg", "module startup aborted by shutdown signal"),
-                        ("module", "sanity-check"),
-                        ("err", &err_s),
-                    ],
-                );
-            } else {
-                logger.log(
-                    LogLevel::Error,
-                    &[("msg", "module failed"), ("module", "sanity-check"), ("err", &err_s)],
-                );
-            }
-            // The service manager stops every other (already started) module.
-            if let Some(timer) = active_groups_timer {
-                stop_timer_module(
-                    &*logger,
-                    "active-groups-cleanup-service",
-                    &active_groups_state,
-                    timer,
-                );
-            }
-            if let Some(svc) = usage_stats_svc {
-                svc.stop_async();
-                let _ = svc.await_terminated().await;
-                log_module_stopped(&*logger, "usage-stats");
-            }
-            logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
-            if signaled {
-                return Ok(());
-            }
-            bail!("failed services");
+    let sanity_err = tokio::select! {
+        res = sanity_check::run_sanity_check(&cfg, logger.as_ref()) => {
+            res.err().map(|err| (false, format!("starting module sanity-check: {err}")))
         }
+        _ = &mut shutdown_sig => {
+            request_shutdown(&shutdown_requested, shutdown_delay).await;
+            Some((true, "starting module sanity-check: context canceled".to_string()))
+        }
+    };
+    if let Some((signaled, err_s)) = sanity_err {
+        sanity_state.set(State::Failed);
+        if signaled {
+            logger.log(
+                LogLevel::Info,
+                &[
+                    ("msg", "module startup aborted by shutdown signal"),
+                    ("module", "sanity-check"),
+                    ("err", &err_s),
+                ],
+            );
+        } else {
+            logger.log(
+                LogLevel::Error,
+                &[("msg", "module failed"), ("module", "sanity-check"), ("err", &err_s)],
+            );
+        }
+        // The service manager stops every other (already started) module.
+        if let Some(timer) = active_groups_timer {
+            stop_timer_module(
+                &*logger,
+                "active-groups-cleanup-service",
+                &active_groups_state,
+                timer,
+            );
+        }
+        if let Some(svc) = usage_stats_svc {
+            svc.stop_async();
+            let _ = svc.await_terminated().await;
+            log_module_stopped(&*logger, "usage-stats");
+        }
+        logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
+        if signaled {
+            return Ok(());
+        }
+        bail!("failed services");
     }
     sanity_state.set(State::Running);
 
@@ -1283,6 +1296,96 @@ fn install_shutdown_signal(
             );
         })
     }
+}
+
+
+fn span_to_otlp_json(span: &ExportedSpan) -> serde_json::Value {
+    let hex_bytes = |b: &[u8]| -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(b.len() * 2);
+        for &x in b {
+            s.push(HEX[(x >> 4) as usize] as char);
+            s.push(HEX[(x & 0x0f) as usize] as char);
+        }
+        s
+    };
+    let attrs: Vec<serde_json::Value> = span
+        .attributes
+        .iter()
+        .map(|a| {
+            let v = match &a.value {
+                SpanAttrValue::String(s) => serde_json::json!({ "stringValue": s }),
+                SpanAttrValue::Bool(b) => serde_json::json!({ "boolValue": b }),
+                SpanAttrValue::Int(i) => serde_json::json!({ "intValue": i.to_string() }),
+                SpanAttrValue::StringArray(arr) => serde_json::json!({
+                    "arrayValue": {
+                        "values": arr.iter().map(|s| serde_json::json!({ "stringValue": s })).collect::<Vec<_>>()
+                    }
+                }),
+            };
+            serde_json::json!({ "key": a.key, "value": v })
+        })
+        .collect();
+    let mut span_obj = serde_json::json!({
+        "traceId": hex_bytes(&span.trace_id),
+        "spanId": hex_bytes(&span.span_id),
+        "name": span.name,
+        "kind": span.kind,
+        "startTimeUnixNano": span.start_time_unix_nano.to_string(),
+        "endTimeUnixNano": span.end_time_unix_nano.to_string(),
+        "attributes": attrs,
+        "status": { "code": if span.status_error { 2 } else { 0 } },
+    });
+    if let Some(pid) = span.parent_span_id {
+        if let Some(obj) = span_obj.as_object_mut() {
+            obj.insert("parentSpanId".to_string(), serde_json::json!(hex_bytes(&pid)));
+        }
+    }
+    serde_json::json!({
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [{
+                    "key": "service.name",
+                    "value": { "stringValue": span.service_name }
+                }]
+            },
+            "scopeSpans": [{
+                "scope": { "name": "mimir-rs" },
+                "spans": [span_obj]
+            }]
+        }]
+    })
+}
+
+fn build_span_exporter() -> Option<SpanExporterFn> {
+    let kind = detected_exporter_kind()?;
+    if kind.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    if kind.eq_ignore_ascii_case("console") {
+        return Some(Arc::new(|span: ExportedSpan| {
+            let payload = span_to_otlp_json(&span);
+            println!("{payload}");
+        }));
+    }
+    let endpoint = otlp_traces_endpoint_from_env()?;
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        return None;
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExportedSpan>();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    tokio::spawn(async move {
+        while let Some(span) = rx.recv().await {
+            let body = span_to_otlp_json(&span);
+            let _ = client.post(&endpoint).json(&body).send().await;
+        }
+    });
+    Some(Arc::new(move |span: ExportedSpan| {
+        let _ = tx.send(span);
+    }))
 }
 
 #[cfg(test)]

@@ -186,13 +186,22 @@ impl Server {
             logger: Arc::clone(&logger),
             log_request_headers: cfg.log_request_headers,
             log_request_at_info_level: cfg.log_request_at_info_level_enabled,
-            log_source_ips: cfg.log_source_ips_enabled.then_some(source_ips),
+            log_source_ips: cfg.log_source_ips_enabled.then_some(source_ips.clone()),
+            trace_source_ips: Some(source_ips),
             exclude_headers: cfg
                 .log_request_exclude_headers_list
                 .split(',')
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
+            trace_request_headers: cfg.trace_request_headers,
+            trace_exclude_headers: cfg
+                .trace_request_exclude_headers_list
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            create_new_traces: cfg.create_new_traces,
             cluster_validation: http_cv,
         });
 
@@ -220,6 +229,7 @@ impl Server {
             report_grpc_status: cfg.report_grpc_codes_in_instrumentation_label_enabled,
             cluster_validation: grpc_cv,
             multitenancy_enabled: false,
+            no_auth_tenant: "anonymous".to_string(),
         };
 
         let header_timeout = opt_duration(cfg.http_server_read_header_timeout);
@@ -258,8 +268,9 @@ impl Server {
 
     /// Mimir's `noauth.SetupAuthMiddleware` gRPC interceptors: with multitenancy enabled every
     /// RPC outside `noGRPCAuthOn` must carry exactly one `x-scope-orgid`.
-    pub fn set_grpc_multitenancy(&mut self, enabled: bool) {
+    pub fn set_grpc_multitenancy(&mut self, enabled: bool, no_auth_tenant: impl Into<String>) {
         self.grpc_cfg.multitenancy_enabled = enabled;
+        self.grpc_cfg.no_auth_tenant = no_auth_tenant.into();
     }
 
     /// Go `Server.Run`: serves `router` (wrapped in the dskit HTTP middleware) and the gRPC

@@ -202,6 +202,10 @@ impl PartitionInstanceLifecycler {
         }))
     }
 
+    pub fn partition_id(&self) -> i32 {
+        self.cfg.partition_id
+    }
+
     pub fn is_started(&self) -> bool {
         self.started.load(Ordering::Acquire)
     }

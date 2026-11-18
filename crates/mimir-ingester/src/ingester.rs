@@ -450,6 +450,14 @@ impl Ingester {
         let flush_on_shutdown = AtomicBool::new(blocks_cfg.tsdb.flush_blocks_on_shutdown);
         usagestats::get_int(REPLICATION_FACTOR_STATS_NAME).set(cfg.ring.replication_factor);
         usagestats::get_string(RING_STORE_STATS_NAME).set(&cfg.ring.kvstore.store);
+        // Register and zero all periodic TSDB/OOO gauges and counters at startup
+        // (pkg/ingester/ingester.go:128-141) so early usage reports include them as 0.
+        usagestats::get_and_reset_int(MEMORY_SERIES_STATS_NAME);
+        usagestats::get_and_reset_int(MEMORY_TENANTS_STATS_NAME);
+        usagestats::get_and_reset_int(ACTIVE_SERIES_STATS_NAME);
+        usagestats::get_and_reset_int(TENANTS_WITH_OOO_ENABLED_STAT_NAME);
+        usagestats::get_and_reset_int(MIN_OOO_TIME_WINDOW_SECONDS_STAT_NAME);
+        usagestats::get_and_reset_int(MAX_OOO_TIME_WINDOW_SECONDS_STAT_NAME);
         let ingester = Arc::new(Self {
             cfg,
             blocks_cfg,
@@ -496,8 +504,8 @@ impl Ingester {
             flush_on_shutdown,
             appended_samples: AtomicI64::new(0),
             appended_exemplars: AtomicI64::new(0),
-            usage_appended_samples: usagestats::get_counter(APPENDED_SAMPLES_STATS_NAME),
-            usage_appended_exemplars: usagestats::get_counter(APPENDED_EXEMPLARS_STATS_NAME),
+            usage_appended_samples: usagestats::get_and_reset_counter(APPENDED_SAMPLES_STATS_NAME),
+            usage_appended_exemplars: usagestats::get_and_reset_counter(APPENDED_EXEMPLARS_STATS_NAME),
             error_samplers,
             ignored_series_limit_metrics,
             state: RwLock::new(State::New),

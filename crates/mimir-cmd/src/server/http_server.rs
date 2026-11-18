@@ -44,6 +44,26 @@ pub struct ServedOverHttp {
     pub remote_addr: SocketAddr,
 }
 
+/// Shared per-request write deadline handle mirroring Go's `http.ResponseController.SetWriteDeadline`.
+#[derive(Clone)]
+pub struct SharedWriteDeadline {
+    deadline: Arc<Mutex<Option<Instant>>>,
+    base_write_timeout: Duration,
+}
+
+impl SharedWriteDeadline {
+    pub fn extend_by(&self, extra: Duration) {
+        if !self.base_write_timeout.is_zero() {
+            let mut g = self.deadline.lock();
+            *g = Some(Instant::now() + self.base_write_timeout + extra);
+        }
+    }
+
+    fn current(&self) -> Option<Instant> {
+        *self.deadline.lock()
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpServerConfig {
     pub read_timeout: Duration,
@@ -381,6 +401,33 @@ pub async fn serve(acceptor: Acceptor, cfg: HttpServerConfig, router: Router, mu
     }
 }
 
+async fn run_with_dynamic_deadline<F: std::future::Future>(
+    fut: F,
+    deadline: &SharedWriteDeadline,
+) -> Result<F::Output, ()> {
+    tokio::pin!(fut);
+    loop {
+        let Some(cur) = deadline.current() else {
+            return Ok(fut.await);
+        };
+        tokio::select! {
+            biased;
+            res = &mut fut => return Ok(res),
+            _ = tokio::time::sleep_until(cur.into()) => {
+                // Re-check in case a handler (e.g. /debug/pprof/profile) extended the deadline.
+                if let Some(latest) = deadline.current() {
+                    if latest > cur {
+                        continue;
+                    }
+                } else {
+                    return Ok(fut.await);
+                }
+                return Err(());
+            }
+        }
+    }
+}
+
 fn handshake_timeout(cfg: &HttpServerConfig) -> Duration {
     // Go applies the read deadline (header timeout) to the TLS handshake as well.
     let t = cfg.header_timeout();
@@ -427,36 +474,39 @@ async fn serve_conn<T>(
         async move {
             let header_start = state.request_started();
             let read_deadline = (!read_timeout.is_zero()).then(|| header_start + read_timeout);
-            let write_deadline = (!write_timeout.is_zero()).then(|| Instant::now() + write_timeout);
+            let initial_write_deadline = (!write_timeout.is_zero()).then(|| Instant::now() + write_timeout);
+            let shared_write_deadline = SharedWriteDeadline {
+                deadline: Arc::new(Mutex::new(initial_write_deadline)),
+                base_write_timeout: write_timeout,
+            };
             req.extensions_mut().insert(ServedOverHttp { remote_addr: remote });
+            req.extensions_mut().insert(shared_write_deadline.clone());
             req.extensions_mut()
                 .insert(axum::extract::ConnectInfo(remote));
             let req = req.map(|b| {
                 axum::body::Body::new(TrackedBody::new(b).deadline(read_deadline, "http: request body read timeout"))
             });
             let fut = router.oneshot(req);
-            let resp = match write_deadline {
-                Some(d) => match tokio::time::timeout_at(d.into(), fut).await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        state.request_finished();
-                        return Err::<hyper::Response<axum::body::Body>, std::io::Error>(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "http: write timeout",
-                        ));
-                    }
-                },
-                None => fut.await,
+            let resp = match run_with_dynamic_deadline(fut, &shared_write_deadline).await {
+                Ok(r) => r,
+                Err(_) => {
+                    state.request_finished();
+                    return Err::<hyper::Response<axum::body::Body>, std::io::Error>(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "http: write timeout",
+                    ));
+                }
             };
             let resp: hyper::Response<axum::body::Body> = match resp {
                 Ok(r) => r,
                 Err(e) => match e {},
             };
+            let final_write_deadline = shared_write_deadline.current();
             let st = Arc::clone(&state);
             Ok(resp.map(|b| {
                 axum::body::Body::new(
                     TrackedBody::new(b)
-                        .deadline(write_deadline, "http: write timeout")
+                        .deadline(final_write_deadline, "http: write timeout")
                         .on_done(Box::new(move |_| st.request_finished())),
                 )
             }))
