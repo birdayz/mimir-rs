@@ -207,10 +207,8 @@ impl FloatHistogramChunk {
             Some(s) => FloatHistogramAppender { chunk: self, state: s },
             None => self.appender()?,
         };
-        let out = app.append_float_histogram(prev, st, t, fh, false)?;
-        if matches!(out, AppendFloatHistogramOutcome::Appended { .. }) {
-            *state = Some(app.state);
-        }
+        let (out, next_state) = app.append_float_histogram_with_state(prev, st, t, fh, false)?;
+        *state = Some(next_state);
         Ok(out)
     }
 }
@@ -536,11 +534,40 @@ impl<'a> FloatHistogramAppender<'a> {
     pub fn append_float_histogram(
         &mut self,
         prev: Option<&FloatHistogramAppenderState>,
-        _st: i64,
+        st: i64,
         t: i64,
         h: &FloatHistogram,
         append_only: bool,
     ) -> Result<AppendFloatHistogramOutcome, ChunkError> {
+        let (out, _) = self.append_float_histogram_inner(prev, st, t, h, append_only, false)?;
+        Ok(out)
+    }
+
+    fn append_float_histogram_with_state(
+        &mut self,
+        prev: Option<&FloatHistogramAppenderState>,
+        st: i64,
+        t: i64,
+        h: &FloatHistogram,
+        append_only: bool,
+    ) -> Result<(AppendFloatHistogramOutcome, FloatHistogramAppenderState), ChunkError> {
+        let (out, next_state) = self.append_float_histogram_inner(prev, st, t, h, append_only, true)?;
+        let st_out = match next_state {
+            Some(s) => s,
+            None => self.state.clone(),
+        };
+        Ok((out, st_out))
+    }
+
+    fn append_float_histogram_inner(
+        &mut self,
+        prev: Option<&FloatHistogramAppenderState>,
+        _st: i64,
+        t: i64,
+        h: &FloatHistogram,
+        append_only: bool,
+        return_new_state: bool,
+    ) -> Result<(AppendFloatHistogramOutcome, Option<FloatHistogramAppenderState>), ChunkError> {
         let num_samples = self.chunk.num_samples();
         if num_samples == u16::MAX as usize {
             return Err(ChunkError::CapacityExceeded);
@@ -551,7 +578,7 @@ impl<'a> FloatHistogramAppender<'a> {
             self.set_num_samples(n);
             if h.counter_reset_hint == CounterResetHint::GaugeType {
                 self.set_counter_reset_header(CounterResetHeader::GaugeType);
-                return Ok(AppendFloatHistogramOutcome::Appended { recoded: false });
+                return Ok((AppendFloatHistogramOutcome::Appended { recoded: false }, None));
             }
             if h.counter_reset_hint == CounterResetHint::CounterReset {
                 self.set_counter_reset_header(CounterResetHeader::CounterReset);
@@ -563,7 +590,7 @@ impl<'a> FloatHistogramAppender<'a> {
                     self.set_counter_reset_header(CounterResetHeader::NotCounterReset);
                 }
             }
-            return Ok(AppendFloatHistogramOutcome::Appended { recoded: false });
+            return Ok((AppendFloatHistogramOutcome::Appended { recoded: false }, None));
         }
 
         let mut h_owned;
@@ -581,15 +608,16 @@ impl<'a> FloatHistogramAppender<'a> {
                     };
                 }
                 let mut new_chunk = FloatHistogramChunk::new();
-                {
+                let new_state = {
                     let mut app = new_chunk.appender()?;
                     if counter_reset {
                         app.set_counter_reset_header(CounterResetHeader::CounterReset);
                     }
                     let n = app.append_raw(0, t, h);
                     app.set_num_samples(n);
-                }
-                return Ok(AppendFloatHistogramOutcome::NewChunk(new_chunk));
+                    return_new_state.then_some(app.state)
+                };
+                return Ok((AppendFloatHistogramOutcome::NewChunk(new_chunk), new_state));
             }
 
             if !p_bwd.is_empty() || !n_bwd.is_empty() {
@@ -614,12 +642,12 @@ impl<'a> FloatHistogramAppender<'a> {
                 self.recode_in_place(&p_fwd, &n_fwd, &h_ref.positive_spans, &h_ref.negative_spans)?;
                 let n = self.append_raw(self.chunk.num_samples(), t, h_ref);
                 self.set_num_samples(n);
-                return Ok(AppendFloatHistogramOutcome::Appended { recoded: true });
+                return Ok((AppendFloatHistogramOutcome::Appended { recoded: true }, None));
             }
 
             let n = self.append_raw(num_samples, t, h_ref);
             self.set_num_samples(n);
-            return Ok(AppendFloatHistogramOutcome::Appended { recoded: false });
+            return Ok((AppendFloatHistogramOutcome::Appended { recoded: false }, None));
         }
 
         // Gauge float histogram
@@ -637,13 +665,14 @@ impl<'a> FloatHistogramAppender<'a> {
                 return Err(ChunkError::HistogramSchemaChange);
             }
             let mut new_chunk = FloatHistogramChunk::new();
-            {
+            let new_state = {
                 let mut app = new_chunk.appender()?;
                 app.set_counter_reset_header(CounterResetHeader::GaugeType);
                 let n = app.append_raw(0, t, h);
                 app.set_num_samples(n);
-            }
-            return Ok(AppendFloatHistogramOutcome::NewChunk(new_chunk));
+                return_new_state.then_some(app.state)
+            };
+            return Ok((AppendFloatHistogramOutcome::NewChunk(new_chunk), new_state));
         }
 
         if !p_bwd.is_empty() || !n_bwd.is_empty() {
@@ -666,12 +695,12 @@ impl<'a> FloatHistogramAppender<'a> {
             self.recode_in_place(&p_fwd, &n_fwd, &h_ref.positive_spans, &h_ref.negative_spans)?;
             let n = self.append_raw(self.chunk.num_samples(), t, h_ref);
             self.set_num_samples(n);
-            return Ok(AppendFloatHistogramOutcome::Appended { recoded: true });
+            return Ok((AppendFloatHistogramOutcome::Appended { recoded: true }, None));
         }
 
         let n = self.append_raw(num_samples, t, h_ref);
         self.set_num_samples(n);
-        Ok(AppendFloatHistogramOutcome::Appended { recoded: false })
+        Ok((AppendFloatHistogramOutcome::Appended { recoded: false }, None))
     }
 }
 
@@ -951,7 +980,7 @@ impl<'a> FloatHistogramIterator<'a> {
             custom_values: self.custom_values.clone(),
         };
         if fh.schema > EXPONENTIAL_SCHEMA_MAX && fh.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED {
-            reduce_float_resolution(&mut fh, EXPONENTIAL_SCHEMA_MAX);
+            let _ = reduce_float_resolution(&mut fh, EXPONENTIAL_SCHEMA_MAX);
         }
         (self.t, fh)
     }
@@ -1001,6 +1030,12 @@ impl<'a> FloatHistogramIterator<'a> {
             }
             for i in 0..num_n {
                 self.n_buckets[i] = f64::from_bits(self.br.read_bits(64)?);
+            }
+            if self.schema > EXPONENTIAL_SCHEMA_MAX
+                && self.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED
+            {
+                super::histogram::validate_spans_for_reduce(&self.p_spans, self.p_buckets.len())?;
+                super::histogram::validate_spans_for_reduce(&self.n_spans, self.n_buckets.len())?;
             }
 
             self.num_read += 1;
@@ -1073,25 +1108,30 @@ impl<'a> FloatHistogramIterator<'a> {
     }
 }
 
-pub(crate) fn reduce_float_resolution(fh: &mut FloatHistogram, target_schema: i32) {
+pub(crate) fn reduce_float_resolution(
+    fh: &mut FloatHistogram,
+    target_schema: i32,
+) -> Result<(), ChunkError> {
     if fh.schema <= target_schema || fh.schema == super::CUSTOM_BUCKETS_SCHEMA {
-        return;
+        return Ok(());
     }
     let shift = (fh.schema - target_schema) as u32;
     (fh.positive_spans, fh.positive_buckets) =
-        reduce_float_side(&fh.positive_spans, &fh.positive_buckets, shift);
+        reduce_float_side(&fh.positive_spans, &fh.positive_buckets, shift)?;
     (fh.negative_spans, fh.negative_buckets) =
-        reduce_float_side(&fh.negative_spans, &fh.negative_buckets, shift);
+        reduce_float_side(&fh.negative_spans, &fh.negative_buckets, shift)?;
     fh.schema = target_schema;
+    Ok(())
 }
 
 fn reduce_float_side(
     spans: &[HistogramSpan],
     buckets: &[f64],
     shift: u32,
-) -> (Vec<HistogramSpan>, Vec<f64>) {
+) -> Result<(Vec<HistogramSpan>, Vec<f64>), ChunkError> {
+    super::histogram::validate_spans_for_reduce(spans, buckets.len())?;
     if spans.is_empty() {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let mut it = BucketIterator::new(spans);
     let mut new_spans: Vec<HistogramSpan> = Vec::new();
@@ -1103,13 +1143,14 @@ fn reduce_float_side(
 
     for &val in buckets {
         let Some(orig_idx) = it.next_idx() else {
-            break;
+            return Err(ChunkError::InvalidChunk);
         };
-        let target_idx = if shift >= 32 {
-            if orig_idx < 0 { -1 } else { 0 }
+        let shifted = if shift >= 64 {
+            if orig_idx <= 0 { -1 } else { 0 }
         } else {
-            orig_idx >> shift
+            (i64::from(orig_idx) - 1) >> shift
         };
+        let target_idx = (shifted + 1) as i32;
         match acc_idx {
             Some(idx) if idx == target_idx => {
                 acc_count += val;
@@ -1128,7 +1169,7 @@ fn reduce_float_side(
     if let Some(idx) = acc_idx {
         flush_float_bucket(idx, acc_count, &mut prev_new_idx, &mut new_spans, &mut new_counts);
     }
-    (new_spans, new_counts)
+    Ok((new_spans, new_counts))
 }
 
 fn flush_float_bucket(

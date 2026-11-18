@@ -250,7 +250,16 @@ impl BlockChunksReader {
         let mut segments = Vec::with_capacity(files.len());
         let mut total_size = 0usize;
 
-        for (i, (_, path)) in files.into_iter().enumerate() {
+        for (i, (seq, path)) in files.into_iter().enumerate() {
+            if seq != i + 1 {
+                return Err(BlockChunksError::Corruption {
+                    index: i,
+                    message: format!(
+                        "non-contiguous chunk segment sequence {seq} (expected {})",
+                        i + 1
+                    ),
+                });
+            }
             let f = File::open(&path)?;
             // SAFETY: persisted block chunk segments are immutable once written.
             let mmap = unsafe { MmapOptions::new().map(&f)? };

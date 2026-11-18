@@ -201,10 +201,8 @@ impl FloatHistogramStChunk {
             },
             None => self.appender()?,
         };
-        let out = app.append_float_histogram(prev, st, t, fh, false)?;
-        if matches!(out, AppendFloatHistogramStOutcome::Appended { .. }) {
-            *cached = Some((app.state, app.st_enc));
-        }
+        let (out, next_cached) = app.append_float_histogram_with_state(prev, st, t, fh, false)?;
+        *cached = Some(next_cached);
         Ok(out)
     }
 }
@@ -317,6 +315,43 @@ impl<'a> FloatHistogramStAppender<'a> {
         h: &FloatHistogram,
         append_only: bool,
     ) -> Result<AppendFloatHistogramStOutcome, ChunkError> {
+        let (out, _) = self.append_float_histogram_inner(prev, st, t, h, append_only, false)?;
+        Ok(out)
+    }
+
+    fn append_float_histogram_with_state(
+        &mut self,
+        prev: Option<&FloatHistogramAppenderState>,
+        st: i64,
+        t: i64,
+        h: &FloatHistogram,
+        append_only: bool,
+    ) -> Result<
+        (AppendFloatHistogramStOutcome, (FloatHistogramAppenderState, StEncoder)),
+        ChunkError,
+    > {
+        let (out, next_cached) =
+            self.append_float_histogram_inner(prev, st, t, h, append_only, true)?;
+        let cached = match next_cached {
+            Some(c) => c,
+            None => (self.state.clone(), self.st_enc.clone()),
+        };
+        Ok((out, cached))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn append_float_histogram_inner(
+        &mut self,
+        prev: Option<&FloatHistogramAppenderState>,
+        st: i64,
+        t: i64,
+        h: &FloatHistogram,
+        append_only: bool,
+        return_new_state: bool,
+    ) -> Result<
+        (AppendFloatHistogramStOutcome, Option<(FloatHistogramAppenderState, StEncoder)>),
+        ChunkError,
+    > {
         let num_samples = self.chunk.num_samples();
         if num_samples == HISTOGRAM_ST_SAMPLE_COUNT_MASK as usize {
             return Err(ChunkError::CapacityExceeded);
@@ -327,7 +362,7 @@ impl<'a> FloatHistogramStAppender<'a> {
             self.set_num_samples(n);
             if h.counter_reset_hint == CounterResetHint::GaugeType {
                 self.set_counter_reset_header(CounterResetHeader::GaugeType);
-                return Ok(AppendFloatHistogramStOutcome::Appended { recoded: false });
+                return Ok((AppendFloatHistogramStOutcome::Appended { recoded: false }, None));
             }
             if h.counter_reset_hint == CounterResetHint::CounterReset {
                 self.set_counter_reset_header(CounterResetHeader::CounterReset);
@@ -339,7 +374,7 @@ impl<'a> FloatHistogramStAppender<'a> {
                     self.set_counter_reset_header(CounterResetHeader::NotCounterReset);
                 }
             }
-            return Ok(AppendFloatHistogramStOutcome::Appended { recoded: false });
+            return Ok((AppendFloatHistogramStOutcome::Appended { recoded: false }, None));
         }
 
         let mut h_owned;
@@ -357,15 +392,16 @@ impl<'a> FloatHistogramStAppender<'a> {
                     };
                 }
                 let mut new_chunk = FloatHistogramStChunk::new();
-                {
+                let new_cached = {
                     let mut app = new_chunk.appender()?;
                     if counter_reset {
                         app.set_counter_reset_header(CounterResetHeader::CounterReset);
                     }
                     let n = app.append_float_histogram_st(0, st, t, h);
                     app.set_num_samples(n);
-                }
-                return Ok(AppendFloatHistogramStOutcome::NewChunk(new_chunk));
+                    return_new_state.then_some((app.state, app.st_enc))
+                };
+                return Ok((AppendFloatHistogramStOutcome::NewChunk(new_chunk), new_cached));
             }
 
             if !p_bwd.is_empty() || !n_bwd.is_empty() {
@@ -390,12 +426,12 @@ impl<'a> FloatHistogramStAppender<'a> {
                 self.recode_in_place(&p_fwd, &n_fwd, &h_ref.positive_spans, &h_ref.negative_spans)?;
                 let n = self.append_float_histogram_st(self.chunk.num_samples(), st, t, h_ref);
                 self.set_num_samples(n);
-                return Ok(AppendFloatHistogramStOutcome::Appended { recoded: true });
+                return Ok((AppendFloatHistogramStOutcome::Appended { recoded: true }, None));
             }
 
             let n = self.append_float_histogram_st(num_samples, st, t, h_ref);
             self.set_num_samples(n);
-            return Ok(AppendFloatHistogramStOutcome::Appended { recoded: false });
+            return Ok((AppendFloatHistogramStOutcome::Appended { recoded: false }, None));
         }
 
         // Gauge float histogram
@@ -413,13 +449,14 @@ impl<'a> FloatHistogramStAppender<'a> {
                 return Err(ChunkError::HistogramSchemaChange);
             }
             let mut new_chunk = FloatHistogramStChunk::new();
-            {
+            let new_cached = {
                 let mut app = new_chunk.appender()?;
                 app.set_counter_reset_header(CounterResetHeader::GaugeType);
                 let n = app.append_float_histogram_st(0, st, t, h);
                 app.set_num_samples(n);
-            }
-            return Ok(AppendFloatHistogramStOutcome::NewChunk(new_chunk));
+                return_new_state.then_some((app.state, app.st_enc))
+            };
+            return Ok((AppendFloatHistogramStOutcome::NewChunk(new_chunk), new_cached));
         }
 
         if !p_bwd.is_empty() || !n_bwd.is_empty() {
@@ -442,12 +479,12 @@ impl<'a> FloatHistogramStAppender<'a> {
             self.recode_in_place(&p_fwd, &n_fwd, &h_ref.positive_spans, &h_ref.negative_spans)?;
             let n = self.append_float_histogram_st(self.chunk.num_samples(), st, t, h_ref);
             self.set_num_samples(n);
-            return Ok(AppendFloatHistogramStOutcome::Appended { recoded: true });
+            return Ok((AppendFloatHistogramStOutcome::Appended { recoded: true }, None));
         }
 
         let n = self.append_float_histogram_st(num_samples, st, t, h_ref);
         self.set_num_samples(n);
-        Ok(AppendFloatHistogramStOutcome::Appended { recoded: false })
+        Ok((AppendFloatHistogramStOutcome::Appended { recoded: false }, None))
     }
 }
 

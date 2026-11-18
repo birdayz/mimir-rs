@@ -2,13 +2,16 @@
 //!
 //! Ported from github.com/prometheus/prometheus/tsdb/ooo_head.go.
 
-use super::float_histogram::{AppendFloatHistogramOutcome, FloatHistogramChunk};
+use super::float_histogram::{
+    AppendFloatHistogramOutcome, FloatHistogramAppenderState, FloatHistogramChunk,
+};
 use super::float_histogram_st::{AppendFloatHistogramStOutcome, FloatHistogramStChunk};
-use super::histogram::{AppendHistogramOutcome, HistogramChunk};
+use super::histogram::{AppendHistogramOutcome, HistogramAppenderState, HistogramChunk};
 use super::histogram_model::{FloatHistogram, Histogram};
 use super::histogram_st::{AppendHistogramStOutcome, HistogramStChunk};
-use super::xor::XorChunk;
-use super::xor2::Xor2Chunk;
+use super::st::StEncoder;
+use super::xor::{XorAppendState, XorChunk};
+use super::xor2::{Xor2AppendState, Xor2Chunk};
 use super::{ChunkError, EncodedChunk, Encoding, ValueType};
 
 /// Value stored in an [`OooSample`].
@@ -159,35 +162,43 @@ impl OooChunk {
                 cmint: i64,
                 cmaxt: i64,
                 chunk: XorChunk,
+                state: XorAppendState,
+                prev_t: i64,
+                prev_v: f64,
             },
             Xor2 {
                 cmint: i64,
                 cmaxt: i64,
                 chunk: Xor2Chunk,
+                state: Xor2AppendState,
             },
             Hist {
                 cmint: i64,
                 cmaxt: i64,
                 chunk: HistogramChunk,
-                prev_state: Option<super::histogram::HistogramAppenderState>,
+                state: Option<HistogramAppenderState>,
+                prev_state: Option<HistogramAppenderState>,
             },
             HistSt {
                 cmint: i64,
                 cmaxt: i64,
                 chunk: HistogramStChunk,
-                prev_state: Option<super::histogram::HistogramAppenderState>,
+                state: Option<(HistogramAppenderState, StEncoder)>,
+                prev_state: Option<HistogramAppenderState>,
             },
             FloatHist {
                 cmint: i64,
                 cmaxt: i64,
                 chunk: FloatHistogramChunk,
-                prev_state: Option<super::float_histogram::FloatHistogramAppenderState>,
+                state: Option<FloatHistogramAppenderState>,
+                prev_state: Option<FloatHistogramAppenderState>,
             },
             FloatHistSt {
                 cmint: i64,
                 cmaxt: i64,
                 chunk: FloatHistogramStChunk,
-                prev_state: Option<super::float_histogram::FloatHistogramAppenderState>,
+                state: Option<(FloatHistogramAppenderState, StEncoder)>,
+                prev_state: Option<FloatHistogramAppenderState>,
             },
         }
 
@@ -198,6 +209,7 @@ impl OooChunk {
                     cmint,
                     cmaxt,
                     chunk,
+                    ..
                 } => {
                     out.push(CutChunk {
                         min_time: cmint,
@@ -209,6 +221,7 @@ impl OooChunk {
                     cmint,
                     cmaxt,
                     chunk,
+                    ..
                 } => {
                     out.push(CutChunk {
                         min_time: cmint,
@@ -319,34 +332,42 @@ impl OooChunk {
                         cmint: s.t,
                         cmaxt: s.t,
                         chunk: XorChunk::new(),
+                        state: XorAppendState::new_empty(),
+                        prev_t: i64::MIN,
+                        prev_v: 0.0,
                     },
                     Encoding::Xor2 => Active::Xor2 {
                         cmint: s.t,
                         cmaxt: s.t,
                         chunk: Xor2Chunk::new(),
+                        state: Xor2AppendState::new_empty(),
                     },
                     Encoding::Histogram => Active::Hist {
                         cmint: s.t,
                         cmaxt: s.t,
                         chunk: HistogramChunk::new(),
+                        state: None,
                         prev_state: None,
                     },
                     Encoding::HistogramSt => Active::HistSt {
                         cmint: s.t,
                         cmaxt: s.t,
                         chunk: HistogramStChunk::new(),
+                        state: None,
                         prev_state: None,
                     },
                     Encoding::FloatHistogram => Active::FloatHist {
                         cmint: s.t,
                         cmaxt: s.t,
                         chunk: FloatHistogramChunk::new(),
+                        state: None,
                         prev_state: None,
                     },
                     Encoding::FloatHistogramSt => Active::FloatHistSt {
                         cmint: s.t,
                         cmaxt: s.t,
                         chunk: FloatHistogramStChunk::new(),
+                        state: None,
                         prev_state: None,
                     },
                     Encoding::None => unreachable!(),
@@ -356,22 +377,27 @@ impl OooChunk {
             match (&mut active, &s.value) {
                 (
                     Active::Xor {
-                        cmaxt, chunk, ..
+                        cmaxt,
+                        chunk,
+                        state,
+                        prev_t,
+                        prev_v,
+                        ..
                     },
                     OooSampleValue::Float(v),
                 ) => {
-                    let mut app = chunk.appender()?;
-                    app.append(s.st, s.t, *v)?;
+                    chunk.append_with_state(state, *prev_t, *prev_v, s.t, *v)?;
+                    *prev_t = s.t;
+                    *prev_v = *v;
                     *cmaxt = s.t;
                 }
                 (
                     Active::Xor2 {
-                        cmaxt, chunk, ..
+                        cmaxt, chunk, state, ..
                     },
                     OooSampleValue::Float(v),
                 ) => {
-                    let mut app = chunk.appender()?;
-                    app.append(s.st, s.t, *v)?;
+                    chunk.append_with_state(state, s.st, s.t, *v)?;
                     *cmaxt = s.t;
                 }
                 (
@@ -379,14 +405,13 @@ impl OooChunk {
                         cmint,
                         cmaxt,
                         chunk,
+                        state,
                         prev_state,
                     },
                     OooSampleValue::Histogram(h),
                 ) => {
-                    let mut app = chunk.appender()?;
                     let outcome =
-                        app.append_histogram(prev_state.as_ref(), s.st, s.t, h, false)?;
-                    let next_prev = app.state().clone();
+                        chunk.append_with_state_prev(state, prev_state.as_ref(), s.st, s.t, h)?;
                     match outcome {
                         AppendHistogramOutcome::Appended { .. } => {
                             *cmaxt = s.t;
@@ -400,7 +425,7 @@ impl OooChunk {
                             });
                             *cmint = s.t;
                             *cmaxt = s.t;
-                            *prev_state = Some(next_prev);
+                            *prev_state = None;
                         }
                     }
                 }
@@ -409,14 +434,13 @@ impl OooChunk {
                         cmint,
                         cmaxt,
                         chunk,
+                        state,
                         prev_state,
                     },
                     OooSampleValue::Histogram(h),
                 ) => {
-                    let mut app = chunk.appender()?;
                     let outcome =
-                        app.append_histogram(prev_state.as_ref(), s.st, s.t, h, false)?;
-                    let next_prev = app.state().clone();
+                        chunk.append_with_state_prev(state, prev_state.as_ref(), s.st, s.t, h)?;
                     match outcome {
                         AppendHistogramStOutcome::Appended { .. } => {
                             *cmaxt = s.t;
@@ -430,7 +454,7 @@ impl OooChunk {
                             });
                             *cmint = s.t;
                             *cmaxt = s.t;
-                            *prev_state = Some(next_prev);
+                            *prev_state = None;
                         }
                     }
                 }
@@ -439,14 +463,13 @@ impl OooChunk {
                         cmint,
                         cmaxt,
                         chunk,
+                        state,
                         prev_state,
                     },
                     OooSampleValue::FloatHistogram(fh),
                 ) => {
-                    let mut app = chunk.appender()?;
-                    let outcome =
-                        app.append_float_histogram(prev_state.as_ref(), s.st, s.t, fh, false)?;
-                    let next_prev = app.state().clone();
+                    let outcome = chunk
+                        .append_with_state_prev(state, prev_state.as_ref(), s.st, s.t, fh)?;
                     match outcome {
                         AppendFloatHistogramOutcome::Appended { .. } => {
                             *cmaxt = s.t;
@@ -460,7 +483,7 @@ impl OooChunk {
                             });
                             *cmint = s.t;
                             *cmaxt = s.t;
-                            *prev_state = Some(next_prev);
+                            *prev_state = None;
                         }
                     }
                 }
@@ -469,14 +492,13 @@ impl OooChunk {
                         cmint,
                         cmaxt,
                         chunk,
+                        state,
                         prev_state,
                     },
                     OooSampleValue::FloatHistogram(fh),
                 ) => {
-                    let mut app = chunk.appender()?;
-                    let outcome =
-                        app.append_float_histogram(prev_state.as_ref(), s.st, s.t, fh, false)?;
-                    let next_prev = app.state().clone();
+                    let outcome = chunk
+                        .append_with_state_prev(state, prev_state.as_ref(), s.st, s.t, fh)?;
                     match outcome {
                         AppendFloatHistogramStOutcome::Appended { .. } => {
                             *cmaxt = s.t;
@@ -490,7 +512,7 @@ impl OooChunk {
                             });
                             *cmint = s.t;
                             *cmaxt = s.t;
-                            *prev_state = Some(next_prev);
+                            *prev_state = None;
                         }
                     }
                 }
