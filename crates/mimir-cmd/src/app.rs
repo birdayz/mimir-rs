@@ -711,6 +711,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         // modules.go initIngesterService: `t.Cfg.Ingester.Compartments = t.Cfg.Compartments`.
         ingester.set_compartments(cfg.compartments.clone());
         ingester.set_partition_ring_watchers(partition_ring_watchers.take());
+        ingester.set_activity_tracker(activity_tracker.clone());
 
         // Cost attribution service (pkg/mimir/modules.go initCostAttributionService): only enabled
         // when -cost-attribution.registry-path is set.

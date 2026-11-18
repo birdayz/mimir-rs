@@ -1000,12 +1000,17 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     qs_resp
                 };
                 if let Some(tap) = read_tap.take() {
-                    qs_resp.map(|body| {
-                        tonic::body::BoxBody::new(ReadTapDropBody {
-                            inner: body,
-                            permit: Some(tap),
+                    if qs_resp.headers().contains_key("grpc-status") {
+                        tap.finish(false);
+                        qs_resp
+                    } else {
+                        qs_resp.map(|body| {
+                            tonic::body::BoxBody::new(ReadTapDropBody {
+                                inner: body,
+                                permit: Some(tap),
+                            })
                         })
-                    })
+                    }
                 } else {
                     qs_resp
                 }
@@ -1014,12 +1019,17 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     .scope(true, async { inner.call(req).await })
                     .await?;
                 if let Some(tap) = read_tap.take() {
-                    resp.map(|body| {
-                        tonic::body::BoxBody::new(ReadTapDropBody {
-                            inner: body,
-                            permit: Some(tap),
+                    if resp.headers().contains_key("grpc-status") {
+                        tap.finish(false);
+                        resp
+                    } else {
+                        resp.map(|body| {
+                            tonic::body::BoxBody::new(ReadTapDropBody {
+                                inner: body,
+                                permit: Some(tap),
+                            })
                         })
-                    })
+                    }
                 } else {
                     resp
                 }

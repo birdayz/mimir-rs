@@ -1136,4 +1136,156 @@ mod tests {
         let check = HealthCheckResponse::decode(&body[5..]).unwrap();
         assert_eq!(check.status, NOT_SERVING_STATUS);
     }
+
+    #[tokio::test]
+    async fn query_stream_compression_echo_never_double_compresses() {
+        use flate2::read::GzDecoder;
+        use http_body_util::BodyExt;
+        use mimir_proto::{cortexpb, ingesterpb};
+        use std::io::Read as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-compress".to_string();
+        cfg.push_grpc_method_enabled = true;
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Arc::new(
+            mimir_ingester::Ingester::new(
+                cfg,
+                blocks_cfg,
+                mimir_config::IngestStorageConfig::default(),
+                mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now_ms = 1_700_000_000_000i64;
+        let wr = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![cortexpb::LabelPair {
+                    name: Bytes::from_static(b"__name__"),
+                    value: Bytes::from_static(b"echo_compress_metric"),
+                }],
+                samples: vec![cortexpb::Sample {
+                    value: 42.0,
+                    timestamp_ms: now_ms,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ing.push_grpc("tenant-comp", &wr).await.unwrap();
+
+        let svc = GrpcCompressionEchoService::new(
+            mimir_ingester::IngesterService::new(Arc::clone(&ing))
+                .into_server()
+                .max_decoding_message_size(4 << 20)
+                .max_encoding_message_size(4 << 20)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd),
+        );
+
+        let q_req = ingesterpb::QueryRequest {
+            start_timestamp_ms: now_ms - 10_000,
+            end_timestamp_ms: now_ms + 10_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__name__".into(),
+                value: "echo_compress_metric".into(),
+            }],
+            streaming_chunks_batch_size: 16,
+        };
+        let raw_req = q_req.encode_to_vec();
+
+        for enc in ["snappy", "s2", "gzip", "zstd"] {
+            for accept_hdr in [Some(enc), Some("identity,gzip,zstd,snappy,s2"), None] {
+                let comp = compress_grpc_payload(enc, &raw_req).unwrap();
+                let mut framed = Vec::with_capacity(5 + comp.len());
+                framed.push(1);
+                framed.extend_from_slice(&(comp.len() as u32).to_be_bytes());
+                framed.extend_from_slice(&comp);
+
+                let mut builder = http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/cortex.Ingester/QueryStream")
+                    .header(http::header::CONTENT_TYPE, "application/grpc")
+                    .header("grpc-encoding", enc)
+                    .header("x-scope-orgid", "tenant-comp");
+                if let Some(acc) = accept_hdr {
+                    builder = builder.header("grpc-accept-encoding", acc);
+                }
+                let http_req = builder
+                    .body(tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(
+                        framed,
+                    )))))
+                    .unwrap();
+
+                let resp = svc.clone().oneshot(http_req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "enc={enc} accept={accept_hdr:?}");
+                let resp_enc = resp
+                    .headers()
+                    .get("grpc-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .expect("grpc-encoding response header")
+                    .to_string();
+                if accept_hdr.is_none() || accept_hdr == Some(enc) {
+                    assert_eq!(resp_enc, enc, "enc={enc} accept={accept_hdr:?}");
+                }
+
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                assert!(bytes.len() >= 5, "enc={enc} accept={accept_hdr:?}: empty body");
+                let mut pos = 0usize;
+                let mut total_series = 0usize;
+                while pos < bytes.len() {
+                    assert_eq!(
+                        bytes[pos], 1,
+                        "enc={enc} accept={accept_hdr:?}: expected compressed frame at {pos}"
+                    );
+                    let frame_len = u32::from_be_bytes([
+                        bytes[pos + 1],
+                        bytes[pos + 2],
+                        bytes[pos + 3],
+                        bytes[pos + 4],
+                    ]) as usize;
+                    let compressed_payload = &bytes[pos + 5..pos + 5 + frame_len];
+                    pos += 5 + frame_len;
+                    let decompressed = match resp_enc.as_str() {
+                        "snappy" => {
+                            mimir_proto::snappy::decompress_framed(compressed_payload).unwrap()
+                        }
+                        "s2" => {
+                            let mut out = Vec::new();
+                            mimir_proto::s2::decompress_framed_into(
+                                compressed_payload,
+                                &mut out,
+                                4 << 20,
+                            )
+                            .unwrap();
+                            out
+                        }
+                        "gzip" => {
+                            let mut dec = GzDecoder::new(compressed_payload);
+                            let mut out = Vec::new();
+                            dec.read_to_end(&mut out).unwrap();
+                            out
+                        }
+                        "zstd" => zstd::stream::decode_all(compressed_payload).unwrap(),
+                        other => panic!("unexpected resp_enc {other}"),
+                    };
+                    let qs = ingesterpb::QueryStreamResponse::decode(decompressed.as_slice())
+                        .expect("single decompression must yield valid QueryStreamResponse");
+                    total_series += qs.streaming_series.len();
+                }
+                assert_eq!(total_series, 1, "enc={enc} accept={accept_hdr:?}");
+            }
+        }
+    }
 }
