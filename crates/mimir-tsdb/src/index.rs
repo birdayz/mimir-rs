@@ -754,7 +754,12 @@ impl IndexReader {
 
         let toc = IndexToc::parse(&mmap)?;
         let (symbol_offsets, num_symbols) = parse_symbols_index(&mmap, toc.symbols as usize)?;
-        let postings_index = parse_postings_offset_table(&mmap, toc.postings_table as usize)?;
+        let postings_table_off = usize::try_from(toc.postings_table)
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+        let postings_payload_start = postings_table_off
+            .checked_add(4)
+            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+        let postings_index = parse_postings_offset_table(&mmap, postings_table_off)?;
 
         let mut name_cache = HashMap::with_capacity(postings_index.len());
         for entries in &postings_index {
@@ -764,8 +769,8 @@ impl IndexReader {
             if first.name_len == 0 {
                 continue;
             }
-            let start = first.name_off as usize;
-            let end = start + (first.name_len as usize);
+            let (start, end) =
+                resolve_posting_str_range(postings_payload_start, first.name_off, first.name_len);
             // SAFETY: `parse_postings_offset_table` validated UTF-8 and slice bounds on `mmap`.
             let name = unsafe { std::str::from_utf8_unchecked(&mmap[start..end]) };
             let sid = reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name)?;
@@ -785,8 +790,8 @@ impl IndexReader {
 
     #[inline]
     fn mmap_str(&self, off: u32, len: u32) -> &str {
-        let start = off as usize;
-        let end = start + (len as usize);
+        let payload_start = (self.toc.postings_table as usize) + 4;
+        let (start, end) = resolve_posting_str_range(payload_start, off, len);
         // SAFETY: offsets/lengths are derived from validated UTF-8 subslices of `self.mmap` at open.
         unsafe { std::str::from_utf8_unchecked(&self.mmap[start..end]) }
     }
@@ -1349,14 +1354,24 @@ fn reverse_lookup_symbol(
     Err(IndexError::UnknownSymbol(sym.to_string()))
 }
 
+#[inline]
+fn resolve_posting_str_range(payload_start: usize, off: u32, len: u32) -> (usize, usize) {
+    let start = payload_start + (off as usize);
+    let end = start + (len as usize);
+    (start, end)
+}
+
 fn parse_postings_offset_table(
     buf: &[u8],
     table_off: usize,
 ) -> Result<Vec<Box<[PostingOffsetEntry]>>, IndexError> {
     let payload = checked_decbuf_at(buf, table_off)?;
-    let payload_start = table_off
-        .checked_add(4)
-        .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+    parse_postings_offset_table_payload(payload)
+}
+
+fn parse_postings_offset_table_payload(
+    payload: &[u8],
+) -> Result<Vec<Box<[PostingOffsetEntry]>>, IndexError> {
     let mut dec = Decbuf::new(payload);
     let orig_len = dec.len();
     let cnt = dec.be32()? as usize;
@@ -1375,14 +1390,14 @@ fn parse_postings_offset_table(
             )));
         }
         let name = dec.uvarint_str()?;
-        let name_end = payload_start + (orig_len - dec.len());
+        let name_end = orig_len - dec.len();
         let name_off = u32::try_from(name_end - name.len())
             .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
         let name_len =
             u32::try_from(name.len()).map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
 
         let value = dec.uvarint_str()?;
-        let val_end = payload_start + (orig_len - dec.len());
+        let val_end = orig_len - dec.len();
         let val_off = u32::try_from(val_end - value.len())
             .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
         let val_len = u32::try_from(value.len())
@@ -1733,5 +1748,58 @@ mod tests {
         assert_eq!(got_chunks[0].max_time, 1_700_000_000_000);
         assert_eq!(got_chunks[1].min_time, i64::MAX - 100);
         assert_eq!(got_chunks[1].max_time, i64::MAX);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn postings_offset_table_relative_offsets_above_4gib() {
+        let mut payload = Encbuf::new();
+        let records = [
+            ("__name__", "http_requests_total", 100u64),
+            ("job", "api", 200u64),
+            ("job", "db", 300u64),
+        ];
+        payload.put_be32(records.len() as u32);
+        for &(name, val, off) in &records {
+            payload.put_uvarint(2);
+            payload.put_uvarint_str(name);
+            payload.put_uvarint_str(val);
+            payload.put_uvarint64(off);
+        }
+        let payload_bytes = payload.as_slice();
+
+        let entries = parse_postings_offset_table_payload(payload_bytes).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Simulate a >= 4 GiB ULID index file where toc.postings_table + 4 > u32::MAX.
+        let sim_payload_start = (u32::MAX as usize) + 64;
+
+        let e_name = entries[0][0];
+        let (ns, ne) = resolve_posting_str_range(sim_payload_start, e_name.name_off, e_name.name_len);
+        let (vs, ve) = resolve_posting_str_range(sim_payload_start, e_name.val_off, e_name.val_len);
+        assert!(ns > u32::MAX as usize);
+        assert!(vs > u32::MAX as usize);
+        assert_eq!(
+            std::str::from_utf8(&payload_bytes[ns - sim_payload_start..ne - sim_payload_start]).unwrap(),
+            "__name__"
+        );
+        assert_eq!(
+            std::str::from_utf8(&payload_bytes[vs - sim_payload_start..ve - sim_payload_start]).unwrap(),
+            "http_requests_total"
+        );
+
+        let e_job = entries[1][0];
+        let (ns2, ne2) = resolve_posting_str_range(sim_payload_start, e_job.name_off, e_job.name_len);
+        let (vs2, ve2) = resolve_posting_str_range(sim_payload_start, e_job.val_off, e_job.val_len);
+        assert!(ns2 > u32::MAX as usize);
+        assert!(vs2 > u32::MAX as usize);
+        assert_eq!(
+            std::str::from_utf8(&payload_bytes[ns2 - sim_payload_start..ne2 - sim_payload_start]).unwrap(),
+            "job"
+        );
+        assert_eq!(
+            std::str::from_utf8(&payload_bytes[vs2 - sim_payload_start..ve2 - sim_payload_start]).unwrap(),
+            "api"
+        );
     }
 }

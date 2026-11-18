@@ -829,16 +829,22 @@ impl SeriesState {
 
     #[inline]
     fn active_chunk_num_samples(&self) -> usize {
-        let min_hdr = match self.active_encoding() {
+        let enc = self.active_encoding();
+        let min_hdr = match enc {
             Encoding::None => return 0,
-            Encoding::Xor | Encoding::Xor2 => 2,
+            Encoding::Xor => 2,
             _ => 3,
         };
         let bytes = self.active_bstream.bytes();
         if bytes.len() < min_hdr {
-            0
-        } else {
-            u16::from_be_bytes([bytes[0], bytes[1]]) as usize
+            return 0;
+        }
+        let raw = u16::from_be_bytes([bytes[0], bytes[1]]);
+        match enc {
+            Encoding::HistogramSt | Encoding::FloatHistogramSt => {
+                (raw & crate::chunkenc::st::HISTOGRAM_ST_SAMPLE_COUNT_MASK) as usize
+            }
+            _ => raw as usize,
         }
     }
 
@@ -13546,6 +13552,93 @@ mod tests {
             std::mem::size_of::<SeriesColdState>(),
             std::mem::size_of::<MmappedChunk>(),
         );
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn active_chunk_num_samples_masks_histogram_st_and_checks_xor2_min_hdr() {
+        use crate::chunkenc::{CounterResetHint, HistogramSpan};
+
+        // Verify direct SeriesState header masking on HistogramSt / FloatHistogramSt
+        // where top 2 bits store CounterResetHeader (0x40=NotCounterReset, 0x80=CounterReset, 0xC0=GaugeType).
+        let mut st = SeriesState::new();
+        for (enc, hdr0) in [
+            (Encoding::HistogramSt, 0x40u8),
+            (Encoding::HistogramSt, 0x80u8),
+            (Encoding::HistogramSt, 0xC0u8),
+            (Encoding::FloatHistogramSt, 0x40u8),
+            (Encoding::FloatHistogramSt, 0x80u8),
+            (Encoding::FloatHistogramSt, 0xC0u8),
+        ] {
+            // Raw u16 would be 16_385 / 32_769 / 49_153 without HISTOGRAM_ST_SAMPLE_COUNT_MASK.
+            st.set_active_chunk(EncodedChunk::from_bstream(
+                enc,
+                BitStream::from_bytes(vec![hdr0, 0x01, 0x00], 0),
+            ));
+            assert_eq!(
+                st.active_chunk_num_samples(),
+                1,
+                "failed for {enc:?} with header byte {hdr0:#x}"
+            );
+        }
+
+        // Verify min_hdr = 3 is enforced for Xor2 (2-byte truncated header -> 0, 3-byte -> count).
+        st.set_active_chunk(EncodedChunk::from_bstream(
+            Encoding::Xor2,
+            BitStream::from_bytes(vec![0x00, 0x01], 0),
+        ));
+        assert_eq!(st.active_chunk_num_samples(), 0);
+        st.set_active_chunk(EncodedChunk::from_bstream(
+            Encoding::Xor2,
+            BitStream::from_bytes(vec![0x00, 0x01, 0x00], 0),
+        ));
+        assert_eq!(st.active_chunk_num_samples(), 1);
+
+        // End-to-end Head test with enable_histogram_st_encoding = true.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            enable_histogram_st_encoding: true,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let hp = [("__name__", "hist_st_active_samples")];
+        let fhp = [("__name__", "fhist_st_active_samples")];
+
+        let int_h = Histogram {
+            count: 5,
+            sum: 7.5,
+            schema: 1,
+            counter_reset_hint: CounterResetHint::NotCounterReset,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![5],
+            ..Histogram::default()
+        };
+
+        let float_h = FloatHistogram {
+            count: 5.0,
+            sum: 7.5,
+            schema: 1,
+            counter_reset_hint: CounterResetHint::CounterReset,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![5.0],
+            ..FloatHistogram::default()
+        };
+
+        {
+            let mut app = head.appender();
+            app.append_histogram(None, &hp, 0, 10_000, int_h).unwrap();
+            app.append_float_histogram(None, &fhp, 0, 10_000, float_h)
+                .unwrap();
+            app.commit().unwrap();
+        }
+
+        let he = head.get_entry_by_sorted_pairs(&hp).unwrap();
+        assert_eq!(he.inner.lock().active_chunk_num_samples(), 1);
+
+        let fhe = head.get_entry_by_sorted_pairs(&fhp).unwrap();
+        assert_eq!(fhe.inner.lock().active_chunk_num_samples(), 1);
+        assert_eq!(head.head_stats().2, 2);
+
         head.close().unwrap();
     }
 }
