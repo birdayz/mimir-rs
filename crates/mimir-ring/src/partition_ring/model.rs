@@ -36,6 +36,8 @@ pub enum PartitionRingError {
     InconsistentTokensInfo,
     #[error("too many unhealthy instances in the ring")]
     TooManyUnhealthyInstances,
+    #[error("partition {0}: too many unhealthy instances in the ring")]
+    PartitionTooManyUnhealthyInstances(i32),
     #[error("empty ring")]
     EmptyRing,
     #[error("{0}")]

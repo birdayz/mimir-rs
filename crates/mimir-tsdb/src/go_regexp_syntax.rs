@@ -117,6 +117,14 @@ fn err(code: &'static str, expr: &str) -> GoSyntaxError {
     }
 }
 
+/// Result of translating a Go `regexp/syntax` (`Perl|DotNL`) pattern into an equivalent
+/// Rust `regex` pattern.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslatedRegex {
+    pub pattern: String,
+    pub has_case_insensitive: bool,
+}
+
 /// One open group (or the whole expression) of the Go parse stack.
 #[derive(Default)]
 struct Frame {
@@ -125,6 +133,8 @@ struct Frame {
     last: Option<u64>,
     /// Maximum threshold of every other item and alternative of the group.
     rest: u64,
+    /// Whether `(?i)` (FoldCase) is currently active in this group frame.
+    fold_case: bool,
 }
 
 impl Frame {
@@ -147,9 +157,18 @@ impl Frame {
 /// groups and `*`/`+`/`?`, and `max(m, m * T(sub))` for `x{min,max}` with `m = max` (or `min`
 /// when unbounded; 0 for `max == 0`, which Go accepts without looking at the sub-expression).
 pub fn check(s: &str) -> Result<(), GoSyntaxError> {
+    translate_to_rust(s).map(|_| ())
+}
+
+/// Validates `s` like Go `syntax.Parse(s, syntax.Perl|syntax.DotNL)` and translates Go-specific
+/// RE2 syntax (`\<`, `\>`, flat `[...]` classes without set ops, `\Q...\E`, octal escapes,
+/// ASCII `\d`/`\s`/`\w`, non-repeat `{`, etc.) into an equivalent Rust `regex` pattern.
+pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
     let b = s.as_bytes();
     let len = b.len();
     let mut frames: Vec<Frame> = vec![Frame::default()];
+    let mut out = String::with_capacity(s.len());
+    let mut has_case_insensitive = false;
     // Start offset of the previous repetition operator (Go `lastRepeat`).
     let mut last_repeat: Option<usize> = None;
     let mut pos = 0;
@@ -158,9 +177,18 @@ pub fn check(s: &str) -> Result<(), GoSyntaxError> {
         match b[pos] {
             b'(' => {
                 if len - pos >= 2 && b[pos + 1] == b'?' {
-                    pos = parse_perl_flags(s, pos, &mut frames)?;
+                    let next = parse_perl_flags(s, pos, &mut frames, &mut out)?;
+                    if top(&mut frames).fold_case {
+                        has_case_insensitive = true;
+                    }
+                    pos = next;
                 } else {
-                    frames.push(Frame::default());
+                    let parent_fold = top(&mut frames).fold_case;
+                    frames.push(Frame {
+                        fold_case: parent_fold,
+                        ..Frame::default()
+                    });
+                    out.push('(');
                     pos += 1;
                 }
             }
@@ -168,6 +196,7 @@ pub fn check(s: &str) -> Result<(), GoSyntaxError> {
                 let cur = top(&mut frames);
                 cur.rest = cur.close();
                 cur.last = None;
+                out.push('|');
                 pos += 1;
             }
             b')' => {
@@ -176,27 +205,35 @@ pub fn check(s: &str) -> Result<(), GoSyntaxError> {
                 }
                 let threshold = frames.pop().map_or(0, |f| f.close());
                 top(&mut frames).push(threshold);
+                out.push(')');
                 pos += 1;
             }
             b'^' | b'$' | b'.' => {
                 top(&mut frames).push(0);
+                out.push(b[pos] as char);
                 pos += 1;
             }
             b'[' => {
-                pos = parse_class(s, pos)?;
+                let fold_case = top(&mut frames).fold_case;
+                if fold_case {
+                    has_case_insensitive = true;
+                }
+                pos = parse_class_into(s, pos, fold_case, &mut out)?;
                 top(&mut frames).push(0);
             }
             b'*' | b'+' | b'?' => {
                 let before = pos;
                 pos = apply_repeat(s, &mut frames, None, before, pos + 1, last_repeat)?;
+                out.push_str(&s[before..pos]);
                 repeat = Some(before);
             }
             b'{' => {
                 let before = pos;
                 match parse_repeat(b, pos) {
                     None => {
-                        // Not a repetition: `{` is a literal.
+                        // Not a repetition: `{` is a literal in Go (e.g. `a{01}`, `a{,2}`, `x{1001`).
                         top(&mut frames).push(0);
+                        out.push_str(r"\{");
                         pos += 1;
                     }
                     Some((min, max, after)) => {
@@ -204,15 +241,27 @@ pub fn check(s: &str) -> Result<(), GoSyntaxError> {
                             return Err(err(ERR_INVALID_REPEAT_SIZE, &s[before..after]));
                         }
                         pos = apply_repeat(s, &mut frames, Some((min, max)), before, after, last_repeat)?;
+                        out.push_str(&s[before..pos]);
                         repeat = Some(before);
                     }
                 }
             }
             b'\\' => {
-                pos = parse_top_level_escape(s, pos, &mut frames)?;
+                let fold = top(&mut frames).fold_case;
+                let (next, used_lit) = parse_top_level_escape_into(s, pos, &mut frames, &mut out)?;
+                if fold && used_lit {
+                    has_case_insensitive = true;
+                }
+                pos = next;
             }
             _ => {
-                pos += next_char_len(s, pos);
+                let clen = next_char_len(s, pos);
+                let ch_str = &s[pos..pos + clen];
+                if top(&mut frames).fold_case && ch_str.chars().any(char::is_alphabetic) {
+                    has_case_insensitive = true;
+                }
+                out.push_str(ch_str);
+                pos += clen;
                 top(&mut frames).push(0);
             }
         }
@@ -221,7 +270,10 @@ pub fn check(s: &str) -> Result<(), GoSyntaxError> {
     if frames.len() != 1 {
         return Err(err(ERR_MISSING_PAREN, s));
     }
-    Ok(())
+    Ok(TranslatedRegex {
+        pattern: out,
+        has_case_insensitive,
+    })
 }
 
 fn top(frames: &mut [Frame]) -> &mut Frame {
@@ -342,7 +394,12 @@ fn parse_repeat(b: &[u8], pos: usize) -> Option<(i64, i64, usize)> {
 }
 
 /// Go `parser.parsePerlFlags`; `pos` is at `(?`.
-fn parse_perl_flags(s: &str, pos: usize, frames: &mut Vec<Frame>) -> Result<usize, GoSyntaxError> {
+fn parse_perl_flags(
+    s: &str,
+    pos: usize,
+    frames: &mut Vec<Frame>,
+    out: &mut String,
+) -> Result<usize, GoSyntaxError> {
     let t = &s[pos..];
     let tb = t.as_bytes();
     let starts_with_p = tb.len() > 4 && tb[2] == b'P' && tb[3] == b'<';
@@ -357,17 +414,46 @@ fn parse_perl_flags(s: &str, pos: usize, frames: &mut Vec<Frame>) -> Result<usiz
         if name.is_empty() || !name.chars().all(|c| c == '_' || is_alnum(c)) {
             return Err(err(ERR_INVALID_NAMED_CAPTURE, capture));
         }
-        frames.push(Frame::default());
+        let parent_fold = top(frames).fold_case;
+        frames.push(Frame {
+            fold_case: parent_fold,
+            ..Frame::default()
+        });
+        // FastRegexMatcher never inspects capture names or numbers; emit a non-capturing
+        // group so Go-valid digit-leading or duplicate capture names compile in Rust `regex`.
+        out.push_str("(?:");
         return Ok(pos + end + 1);
     }
 
     let mut i = pos + 2;
     let mut negated = false;
     let mut saw_flag = false;
+    let mut pos_mask: u8 = 0;
+    let mut neg_mask: u8 = 0;
+    let mut next_fold = top(frames).fold_case;
     while let Some(c) = s[i..].chars().next() {
         i += c.len_utf8();
         match c {
-            'i' | 'm' | 's' | 'U' => saw_flag = true,
+            'i' | 'm' | 's' | 'U' => {
+                saw_flag = true;
+                let bit = match c {
+                    'i' => 1,
+                    'm' => 2,
+                    's' => 4,
+                    'U' => 8,
+                    _ => unreachable!(),
+                };
+                if negated {
+                    neg_mask |= bit;
+                    pos_mask &= !bit;
+                } else {
+                    pos_mask |= bit;
+                    neg_mask &= !bit;
+                }
+                if c == 'i' {
+                    next_fold = !negated;
+                }
+            }
             '-' => {
                 if negated {
                     break;
@@ -380,8 +466,31 @@ fn parse_perl_flags(s: &str, pos: usize, frames: &mut Vec<Frame>) -> Result<usiz
                     break;
                 }
                 if c == ':' {
-                    // Non-capturing group.
-                    frames.push(Frame::default());
+                    frames.push(Frame {
+                        fold_case: next_fold,
+                        ..Frame::default()
+                    });
+                } else {
+                    top(frames).fold_case = next_fold;
+                }
+                // Normalize duplicate/toggled flags (e.g. `(?ii)`, `(?i-i)`, `(?)`) so Rust
+                // `regex` accepts every flag group Go `regexp/syntax` accepts.
+                if pos_mask != 0 || neg_mask != 0 || c == ':' {
+                    out.push_str("(?");
+                    for (bit, ch) in [(1, 'i'), (2, 'm'), (4, 's'), (8, 'U')] {
+                        if (pos_mask & bit) != 0 {
+                            out.push(ch);
+                        }
+                    }
+                    if neg_mask != 0 {
+                        out.push('-');
+                        for (bit, ch) in [(1, 'i'), (2, 'm'), (4, 's'), (8, 'U')] {
+                            if (neg_mask & bit) != 0 {
+                                out.push(ch);
+                            }
+                        }
+                    }
+                    out.push(c);
                 }
                 return Ok(i);
             }
@@ -391,19 +500,119 @@ fn parse_perl_flags(s: &str, pos: usize, frames: &mut Vec<Frame>) -> Result<usiz
     Err(err(ERR_INVALID_PERL_OP, &s[pos..i]))
 }
 
-/// The `\` case of Go `parse`; `pos` is at the backslash.
-fn parse_top_level_escape(s: &str, pos: usize, frames: &mut [Frame]) -> Result<usize, GoSyntaxError> {
+#[inline]
+fn is_regex_meta(c: char) -> bool {
+    matches!(
+        c,
+        '\\' | '+' | '.' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+    )
+}
+
+fn push_outside_char(out: &mut String, c: char) {
+    if is_regex_meta(c) {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+fn push_outside_rune(out: &mut String, r: i64) {
+    if (0xD800..=0xDFFF).contains(&r) {
+        // Surrogates cannot appear in valid UTF-8 strings.
+        out.push_str(r"[^\x{0}-\x{10FFFF}]");
+        return;
+    }
+    if let Some(c) = u32::try_from(r).ok().and_then(char::from_u32) {
+        if (0x20..=0x7E).contains(&r) {
+            push_outside_char(out, c);
+            return;
+        }
+    }
+    use std::fmt::Write;
+    let _ = write!(out, "\\x{{{r:X}}}");
+}
+
+fn push_class_range_no_surrogates(out: &mut String, lo: i64, hi: i64) -> bool {
+    if lo >= 0xD800 && hi <= 0xDFFF {
+        return false;
+    }
+    if lo == hi {
+        push_class_rune(out, lo);
+        return true;
+    }
+    let mut emitted = false;
+    if lo < 0xD800 {
+        let r_hi = hi.min(0xD7FF);
+        if lo == r_hi {
+            push_class_rune(out, lo);
+        } else {
+            push_class_rune(out, lo);
+            out.push('-');
+            push_class_rune(out, r_hi);
+        }
+        emitted = true;
+    }
+    if hi > 0xDFFF {
+        let r_lo = lo.max(0xE000);
+        if r_lo == hi {
+            push_class_rune(out, hi);
+        } else {
+            push_class_rune(out, r_lo);
+            out.push('-');
+            push_class_rune(out, hi);
+        }
+        emitted = true;
+    }
+    emitted
+}
+
+fn push_class_rune(out: &mut String, r: i64) {
+    if let Some(c) = u32::try_from(r).ok().and_then(char::from_u32) {
+        if matches!(c, '\\' | '-' | '[' | ']' | '^' | '&' | '~') {
+            out.push('\\');
+            out.push(c);
+            return;
+        }
+        if (0x20..=0x7E).contains(&r) {
+            out.push(c);
+            return;
+        }
+    }
+    use std::fmt::Write;
+    let _ = write!(out, "\\x{{{r:X}}}");
+}
+
+/// The `\` case of Go `parse`; `pos` is at the backslash. Returns `(next_pos, emitted_literal_or_class)`.
+fn parse_top_level_escape_into(
+    s: &str,
+    pos: usize,
+    frames: &mut [Frame],
+    out: &mut String,
+) -> Result<(usize, bool), GoSyntaxError> {
     let b = s.as_bytes();
     if b.len() - pos >= 2 {
         match b[pos + 1] {
-            b'A' | b'b' | b'B' | b'z' => {
+            b'A' | b'z' => {
                 top(frames).push(0);
-                return Ok(pos + 2);
+                out.push('\\');
+                out.push(b[pos + 1] as char);
+                return Ok((pos + 2, false));
+            }
+            b'b' => {
+                top(frames).push(0);
+                // Go prog.go:IsWordChar is strictly ASCII [0-9A-Za-z_].
+                out.push_str(r"(?-u:\b)");
+                return Ok((pos + 2, false));
+            }
+            b'B' => {
+                top(frames).push(0);
+                out.push_str(r"(?-u:\B)");
+                return Ok((pos + 2, false));
             }
             // Any byte: not supported.
             b'C' => return Err(err(ERR_INVALID_ESCAPE, &s[pos..pos + 2])),
             b'Q' => {
                 // `\Q ... \E`: the text is literal (up to the end without `\E`).
+                // Empty `\Q\E` pushes nothing onto the parse stack in Go parse.go.
                 let rest = &s[pos + 2..];
                 let (lit, end) = match rest.find(r"\E") {
                     Some(i) => (&rest[..i], pos + 2 + i + 2),
@@ -411,23 +620,40 @@ fn parse_top_level_escape(s: &str, pos: usize, frames: &mut [Frame]) -> Result<u
                 };
                 if !lit.is_empty() {
                     top(frames).push(0);
+                    for c in lit.chars() {
+                        push_outside_char(out, c);
+                    }
+                    return Ok((end, true));
                 }
-                return Ok(end);
+                return Ok((end, false));
             }
             _ => {}
         }
     }
-    if let Some(end) = parse_unicode_class(s, pos)? {
+    if let Some((end, negated, name)) = parse_unicode_class(s, pos)? {
         top(frames).push(0);
-        return Ok(end);
+        push_unicode_class_outside(out, &s[pos..end], negated, name);
+        return Ok((end, true));
     }
     if let Some(end) = parse_perl_class_escape(s, pos) {
         top(frames).push(0);
-        return Ok(end);
+        // Go `Perl` mode `\d`, `\s`, `\w` are strictly ASCII, whereas Rust `regex`
+        // defaults to Unicode mode for `\d`/`\s`/`\w`.
+        match &s[pos..end] {
+            r"\d" => out.push_str("[0-9]"),
+            r"\D" => out.push_str("[^0-9]"),
+            r"\s" => out.push_str(r"[\t\n\f\r ]"),
+            r"\S" => out.push_str(r"[^\t\n\f\r ]"),
+            r"\w" => out.push_str("[0-9A-Z_a-z]"),
+            r"\W" => out.push_str("[^0-9A-Z_a-z]"),
+            other => out.push_str(other),
+        }
+        return Ok((end, true));
     }
-    let (_, end) = parse_escape(s, pos)?;
+    let (r, end) = parse_escape(s, pos)?;
     top(frames).push(0);
-    Ok(end)
+    push_outside_rune(out, r);
+    Ok((end, true))
 }
 
 /// Go `parser.parsePerlClassEscape` (`\d`, `\s`, `\w` and negations).
@@ -524,13 +750,13 @@ fn parse_escape(s: &str, pos: usize) -> Result<(i64, usize), GoSyntaxError> {
 
 /// Go `parser.parseUnicodeClass` (`\pN`, `\p{Name}`, `\PN`, `\p{^Name}`); `pos` is at the
 /// backslash. `Ok(None)` when `s[pos..]` is not a Unicode class.
-fn parse_unicode_class(s: &str, pos: usize) -> Result<Option<usize>, GoSyntaxError> {
+fn parse_unicode_class(s: &str, pos: usize) -> Result<Option<(usize, bool, &str)>, GoSyntaxError> {
     let b = s.as_bytes();
     if b.len() - pos < 2 || b[pos] != b'\\' || (b[pos + 1] != b'p' && b[pos + 1] != b'P') {
         return Ok(None);
     }
     let mut t = pos + 2;
-    let (seq, name) = match s[t..].chars().next() {
+    let (seq, raw_name) = match s[t..].chars().next() {
         Some('{') => {
             let Some(end) = s[pos..].find('}') else {
                 return Err(err(ERR_INVALID_CHAR_RANGE, &s[pos..]));
@@ -545,11 +771,69 @@ fn parse_unicode_class(s: &str, pos: usize) -> Result<Option<usize>, GoSyntaxErr
         // Go `nextRune("")` consumes nothing: the name is empty.
         None => (&s[pos..t], ""),
     };
-    let name = name.strip_prefix('^').unwrap_or(name);
+    let (has_caret, name) = match raw_name.strip_prefix('^') {
+        Some(rest) => (true, rest),
+        None => (false, raw_name),
+    };
     if UNICODE_TABLE_NAMES.binary_search(&name).is_err() {
         return Err(err(ERR_INVALID_CHAR_RANGE, seq));
     }
-    Ok(Some(t))
+    let negated = (b[pos + 1] == b'P') ^ has_caret;
+    Ok(Some((t, negated, name)))
+}
+
+fn unicode_17_script_ranges(name: &str) -> Option<&'static str> {
+    match name {
+        "Beria_Erfe" => Some(r"\x{16EA0}-\x{16EB8}\x{16EBB}-\x{16ED3}"),
+        "Sidetic" => Some(r"\x{10940}-\x{10959}"),
+        "Tai_Yo" => Some(r"\x{1E6C0}-\x{1E6DE}\x{1E6E0}-\x{1E6F5}\x{1E6FE}-\x{1E6FF}"),
+        "Tolong_Siki" => Some(r"\x{11DB0}-\x{11DDB}\x{11DE0}-\x{11DE9}"),
+        _ => None,
+    }
+}
+
+fn push_unicode_class_outside(out: &mut String, orig: &str, negated: bool, name: &str) {
+    if name == "Cs" {
+        if negated {
+            out.push_str(r"[\x{0}-\x{10FFFF}]");
+        } else {
+            out.push_str(r"[^\x{0}-\x{10FFFF}]");
+        }
+        return;
+    }
+    if let Some(ranges) = unicode_17_script_ranges(name) {
+        out.push('[');
+        if negated {
+            out.push('^');
+        }
+        out.push_str(ranges);
+        out.push(']');
+        return;
+    }
+    out.push_str(orig);
+}
+
+fn push_unicode_class_in_class(out: &mut String, orig: &str, negated: bool, name: &str) -> bool {
+    if name == "Cs" {
+        if negated {
+            out.push_str(r"\x{0}-\x{10FFFF}");
+            return true;
+        }
+        return false;
+    }
+    if let Some(ranges) = unicode_17_script_ranges(name) {
+        if negated {
+            out.push('[');
+            out.push('^');
+            out.push_str(ranges);
+            out.push(']');
+        } else {
+            out.push_str(ranges);
+        }
+        return true;
+    }
+    out.push_str(orig);
+    true
 }
 
 /// Go `parser.parseNamedClass` (`[:alnum:]` ...); `pos` is at `[`.
@@ -578,28 +862,80 @@ fn parse_class_char(s: &str, pos: usize, class_start: usize) -> Result<(i64, usi
     }
 }
 
-/// Go `parser.parseClass`; `pos` is at `[`. Returns the offset after the closing `]`.
-fn parse_class(s: &str, pos: usize) -> Result<usize, GoSyntaxError> {
+/// Go `parser.parseClass`; `pos` is at `[`. Returns the offset after the closing `]`
+/// while writing an equivalent flat Rust `regex` character class to `out`.
+fn parse_class_into(
+    s: &str,
+    pos: usize,
+    fold_case: bool,
+    out: &mut String,
+) -> Result<usize, GoSyntaxError> {
     let b = s.as_bytes();
     let mut t = pos + 1;
+    let class_start = out.len();
+    out.push('[');
+    let mut negated = false;
     if t < b.len() && b[t] == b'^' {
+        negated = true;
+        out.push('^');
         t += 1;
     }
+    let mut any_item = false;
     // `]` and `-` are okay as first char in class (Perl mode: `-` anywhere).
     let mut first = true;
     while t >= b.len() || b[t] != b']' || first {
         first = false;
         if b.len() - t > 2 && b[t] == b'[' && b[t + 1] == b':' {
             if let Some(nt) = parse_named_class(s, t)? {
+                let name = &s[t..nt];
+                if fold_case {
+                    // Under (?i), Go folds POSIX groups before negating (so U+017F 'ſ' and U+212A 'K'
+                    // are excluded from negated classes that exclude 's'/'k'), whereas Rust regex folds
+                    // positive ranges before matching/negating. Exclude 0x017F & 0x212A here.
+                    match name {
+                        "[:^alnum:]" => out.push_str(r"\x{0}-\x{2F}\x{3A}-\x{40}\x{5B}-\x{60}\x{7B}-\x{17E}\x{180}-\x{2129}\x{212B}-\x{10FFFF}"),
+                        "[:^alpha:]" => out.push_str(r"\x{0}-\x{40}\x{5B}-\x{60}\x{7B}-\x{17E}\x{180}-\x{2129}\x{212B}-\x{10FFFF}"),
+                        "[:^ascii:]" => out.push_str(r"\x{80}-\x{17E}\x{180}-\x{2129}\x{212B}-\x{10FFFF}"),
+                        "[:^graph:]" => out.push_str(r"\x{0}-\x{20}\x{7F}-\x{17E}\x{180}-\x{2129}\x{212B}-\x{10FFFF}"),
+                        "[:^lower:]" | "[:^upper:]" => out.push_str(r"\x{0}-\x{40}\x{5B}-\x{60}\x{7B}-\x{17E}\x{180}-\x{2129}\x{212B}-\x{10FFFF}"),
+                        "[:^print:]" => out.push_str(r"\x{0}-\x{1F}\x{7F}-\x{17E}\x{180}-\x{2129}\x{212B}-\x{10FFFF}"),
+                        "[:^word:]" => out.push_str(r"\x{0}-\x{2F}\x{3A}-\x{40}\x{5B}-\x{5E}\x{60}\x{7B}-\x{17E}\x{180}-\x{2129}\x{212B}-\x{10FFFF}"),
+                        _ => out.push_str(name),
+                    }
+                } else {
+                    out.push_str(name);
+                }
+                any_item = true;
                 t = nt;
                 continue;
             }
         }
-        if let Some(nt) = parse_unicode_class(s, t)? {
+        if let Some((nt, u_neg, u_name)) = parse_unicode_class(s, t)? {
+            if push_unicode_class_in_class(out, &s[t..nt], u_neg, u_name) {
+                any_item = true;
+            }
             t = nt;
             continue;
         }
         if let Some(nt) = parse_perl_class_escape(s, t) {
+            match &s[t..nt] {
+                r"\d" => out.push_str("0-9"),
+                r"\D" => out.push_str(r"\x{0}-\x{2F}\x{3A}-\x{10FFFF}"),
+                r"\s" => out.push_str(r"\t\n\f\r "),
+                r"\S" => out.push_str(r"\x{0}-\x{08}\x{0E}-\x{1F}\x{21}-\x{10FFFF}"),
+                r"\w" => out.push_str("0-9A-Z_a-z"),
+                r"\W" => {
+                    if fold_case {
+                        // Exclude U+017F (ſ) and U+212A (K) so (?i)[\W] / (?i)[^\W] never
+                        // fold them onto ASCII s/S/k/K (matching Go appendGroup).
+                        out.push_str(r"\x{0}-\x{2F}\x{3A}-\x{40}\x{5B}-\x{5E}\x{60}\x{7B}-\x{17E}\x{180}-\x{2129}\x{212B}-\x{10FFFF}");
+                    } else {
+                        out.push_str(r"\x{0}-\x{2F}\x{3A}-\x{40}\x{5B}-\x{5E}\x{60}\x{7B}-\x{10FFFF}");
+                    }
+                }
+                other => out.push_str(other),
+            }
+            any_item = true;
             t = nt;
             continue;
         }
@@ -613,7 +949,22 @@ fn parse_class(s: &str, pos: usize) -> Result<usize, GoSyntaxError> {
             if hi < lo {
                 return Err(err(ERR_INVALID_CHAR_RANGE, &s[rng..t]));
             }
+            if push_class_range_no_surrogates(out, lo, hi) {
+                any_item = true;
+            }
+        } else if push_class_range_no_surrogates(out, lo, lo) {
+            any_item = true;
         }
+    }
+    if !any_item {
+        out.truncate(class_start);
+        if negated {
+            out.push_str(r"[\x{0}-\x{10FFFF}]");
+        } else {
+            out.push_str(r"[^\x{0}-\x{10FFFF}]");
+        }
+    } else {
+        out.push(']');
     }
     Ok(t + 1)
 }
@@ -715,6 +1066,25 @@ mod tests {
         ];
         for (re, want) in cases {
             assert_eq!(msg(re), want, "{re:?}");
+        }
+    }
+
+    #[test]
+    fn all_unicode_table_names_compile_in_rust_regex() {
+        for name in UNICODE_TABLE_NAMES {
+            for pat in [
+                format!(r"\p{{{name}}}"),
+                format!(r"\P{{{name}}}"),
+                format!(r"[\p{{{name}}}]"),
+                format!(r"[\P{{{name}}}]"),
+            ] {
+                let tr = translate_to_rust(&pat).unwrap_or_else(|e| panic!("{pat}: {e}"));
+                let anchored = format!(r"\A(?s:{})\z", tr.pattern);
+                assert!(
+                    regex::Regex::new(&anchored).is_ok(),
+                    "pattern {pat:?} translated to {anchored:?} failed regex::Regex::new"
+                );
+            }
         }
     }
 }

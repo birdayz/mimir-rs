@@ -383,6 +383,26 @@ impl CompiledTermFilter {
     }
 }
 
+/// Rune-wise lowercase matching Go `strings.ToLower` (`unicode.ToLower(r)`).
+/// Differs from Rust `str::to_lowercase()` on `U+0130` (`'İ'` -> `'i'` vs `"i\u{0307}"`)
+/// and contextual final sigma `'Σ'` (`'σ'` vs `'ς'`).
+fn go_to_lower(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\u{0130}' {
+            out.push('i');
+        } else {
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    }
+    out
+}
+
 struct CompiledFilter {
     case_sensitive: bool,
     terms: Vec<CompiledTermFilter>,
@@ -400,7 +420,7 @@ impl CompiledFilter {
             let term = if hints.case_sensitive {
                 raw_term.clone()
             } else {
-                raw_term.to_lowercase()
+                go_to_lower(raw_term)
             };
             let leaf = match hints.fuzz_alg {
                 FuzzAlg::Subsequence => CompiledTermFilter::Subsequence { term, threshold },
@@ -425,7 +445,7 @@ impl CompiledFilter {
         let candidate = if self.case_sensitive {
             val
         } else {
-            folded = val.to_lowercase();
+            folded = go_to_lower(val);
             folded.as_str()
         };
 

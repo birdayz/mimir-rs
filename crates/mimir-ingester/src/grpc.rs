@@ -3,6 +3,7 @@
 //! Ported from `pkg/ingester/ingester_push.go`, `ingester_query.go`, `ingester_search.go`.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -17,9 +18,10 @@ use mimir_proto::prost::Message;
 use tonic::codec::{Codec, CompressionEncoding, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::{Request, Response, Status};
 
+use crate::activity::{request_activity, ActivityRequest};
 use crate::errors::IngesterError;
-use crate::ingester::Ingester;
-use crate::query::{build_search_hints, RawQueryStreamBox};
+use crate::ingester::{ActivityGuard, Ingester};
+use crate::query::{build_search_hints, RawQueryStreamBox, ReadTapPermit, READ_TAP_ADMITTED};
 
 pub struct IngesterService {
     ingester: Arc<Ingester>,
@@ -186,6 +188,106 @@ impl IngesterZeroCopyServer {
 
 impl tonic::server::NamedService for IngesterZeroCopyServer {
     const NAME: &'static str = "cortex.Ingester";
+}
+
+#[derive(Clone)]
+struct TapDeadlineFlag(Arc<AtomicBool>);
+
+struct ReadTapDropBody {
+    inner: tonic::body::BoxBody,
+    permit: Option<ReadTapPermit>,
+}
+
+impl hyper::body::Body for ReadTapDropBody {
+    type Data = Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let poll = Pin::new(&mut self.inner).poll_frame(cx);
+        let (done, deadline_exceeded) = match &poll {
+            Poll::Ready(None) => (true, false),
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(trailers) = frame.trailers_ref() {
+                    let is_deadline = trailers
+                        .get("grpc-status")
+                        .and_then(|v| v.to_str().ok())
+                        == Some("4");
+                    (true, is_deadline)
+                } else {
+                    (self.inner.is_end_stream(), false)
+                }
+            }
+            Poll::Ready(Some(Err(status))) => {
+                (true, status.code() == tonic::Code::DeadlineExceeded)
+            }
+            Poll::Pending => (false, false),
+        };
+        if done {
+            if let Some(permit) = self.permit.take() {
+                if deadline_exceeded {
+                    permit.deadline_exceeded_flag().store(true, Ordering::Release);
+                }
+                permit.finish(false);
+            }
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for ReadTapDropBody {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            permit.finish(true);
+        }
+    }
+}
+
+struct ActivityStream<S> {
+    inner: S,
+    _guard: Option<ActivityGuard>,
+}
+
+impl<S: Stream + Unpin> Stream for ActivityStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+fn parse_message_size_header(headers: &http::HeaderMap) -> i64 {
+    let mut iter = headers.get_all("message-size").iter();
+    let Some(first) = iter.next() else {
+        return 0;
+    };
+    if iter.next().is_some() {
+        return 0;
+    }
+    first
+        .to_str()
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn unavailable_tap_response(e: IngesterError) -> http::Response<tonic::body::BoxBody> {
+    let mut resp = Status::unavailable(e.to_string()).into_http();
+    resp.headers_mut().insert(
+        "grpc-accept-encoding",
+        http::HeaderValue::from_static(GRPC_ACCEPT_ENCODING_VALUE),
+    );
+    resp
 }
 
 struct SingleChunkBody(Option<Bytes>);
@@ -654,6 +756,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
         let path = req.uri().path();
         let is_push = path == "/cortex.Ingester/Push";
         let is_query_stream = path == "/cortex.Ingester/QueryStream";
+        let is_ingester_rpc = path.starts_with("/cortex.Ingester/");
         let qs_echo_encoding = if is_query_stream && self.send_compression.is_none() {
             let req_enc = req
                 .headers()
@@ -700,7 +803,26 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
-            let req = if let Some(encoding) = custom_enc {
+            // Pre-decompression gRPC TapHandle (`dskit/server/limits.go` + `pkg/mimir/grpc_call_check.go`).
+            let mut push_tap = if is_push {
+                let req_size = parse_message_size_header(req.headers());
+                match ingester.try_start_push_tap(req_size) {
+                    Ok(p) => Some(p),
+                    Err(e) => return Ok(unavailable_tap_response(e)),
+                }
+            } else {
+                None
+            };
+            let mut read_tap = if !is_push && is_ingester_rpc {
+                match ingester.try_start_read_tap(req.headers()) {
+                    Ok(p) => Some(p),
+                    Err(e) => return Ok(unavailable_tap_response(e)),
+                }
+            } else {
+                None
+            };
+
+            let mut req = if let Some(encoding) = custom_enc {
                 match decompress_custom_grpc_request(req, encoding, max_decode_len).await {
                     Ok(r) => r,
                     Err(status) => {
@@ -716,8 +838,29 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 req
             };
 
+            // RPCCallProcessing: reactive limiter blocking permit acquisition.
+            if let Some(ref mut tap) = push_tap {
+                match ingester.prepare_push_reactive().await {
+                    Ok(Some(rp)) => tap.set_reactive_permit(rp),
+                    Ok(None) => {}
+                    Err(e) => return Ok(unavailable_tap_response(e)),
+                }
+            }
+            if let Some(ref mut tap) = read_tap {
+                match ingester.prepare_read_reactive(req.headers()).await {
+                    Ok(Some(rp)) => tap.set_reactive_permit(rp),
+                    Ok(None) => {}
+                    Err(e) => return Ok(unavailable_tap_response(e)),
+                }
+                req.extensions_mut()
+                    .insert(TapDeadlineFlag(tap.deadline_exceeded_flag()));
+            }
+
             let mut resp = if is_push {
-                struct RawPushSvc(Arc<Ingester>);
+                struct RawPushSvc {
+                    ingester: Arc<Ingester>,
+                    outcome: Arc<parking_lot::Mutex<Option<IngesterError>>>,
+                }
                 impl tonic::server::UnaryService<Bytes> for RawPushSvc {
                     type Response = cortexpb::WriteResponse;
                     type Future = Pin<
@@ -729,17 +872,20 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     >;
 
                     fn call(&mut self, request: Request<Bytes>) -> Self::Future {
-                        let ingester = Arc::clone(&self.0);
+                        let ingester = Arc::clone(&self.ingester);
+                        let outcome = Arc::clone(&self.outcome);
                         Box::pin(async move {
                             let user_id = tenant_from_req(&ingester, &request)?;
                             let (_, extensions, raw) = request.into_parts();
-                            if let Err(e) = ingester.push_grpc_raw(&user_id, raw).await {
+                            if let Err(e) = ingester.push_grpc_raw_admitted(&user_id, raw).await {
                                 record_push_error(
                                     &ingester,
                                     extensions.get::<GrpcErrorLog>(),
                                     &e,
                                 );
-                                return Err(e.map_push_error_to_grpc_server_status());
+                                let status = e.map_push_error_to_grpc_server_status();
+                                *outcome.lock() = Some(e);
+                                return Err(status);
                             }
                             Ok(Response::new(cortexpb::WriteResponse {}))
                         })
@@ -762,7 +908,21 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 if let Some(lim) = max_encoding_message_size {
                     push_grpc = push_grpc.max_encoding_message_size(lim);
                 }
-                push_grpc.unary(RawPushSvc(ingester), req).await
+                let outcome = Arc::new(parking_lot::Mutex::new(None));
+                let resp = push_grpc
+                    .unary(
+                        RawPushSvc {
+                            ingester: Arc::clone(&ingester),
+                            outcome: Arc::clone(&outcome),
+                        },
+                        req,
+                    )
+                    .await;
+                if let Some(tap) = push_tap.take() {
+                    let err_guard = outcome.lock();
+                    tap.finish(err_guard.as_ref());
+                }
+                resp
             } else if is_query_stream {
                 struct RawQueryStreamSvc(Arc<Ingester>);
                 impl tonic::server::ServerStreamingService<ingesterpb::QueryRequest> for RawQueryStreamSvc {
@@ -781,11 +941,23 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         Box::pin(async move {
                             let user_id = tenant_from_req(&ingester, &request)?;
                             let (md, ext, inner) = request.into_parts();
+                            let act = ingester.insert_activity(|| {
+                                request_activity(
+                                    &user_id,
+                                    "",
+                                    "Ingester/QueryStream",
+                                    ActivityRequest::Query(&inner),
+                                )
+                            });
                             let stream = ingester
                                 .handle_query_stream_raw(&md, &user_id, inner)
                                 .await
                                 .map_err(|e| read_error_status(&ext, e))?;
-                            Ok(Response::new(stream))
+                            let wrapped: RawQueryStreamBox = Box::pin(ActivityStream {
+                                inner: stream,
+                                _guard: act,
+                            });
+                            Ok(Response::new(wrapped))
                         })
                     }
                 }
@@ -825,10 +997,10 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 if let Some(lim) = max_encoding_message_size {
                     qs_grpc = qs_grpc.max_encoding_message_size(lim);
                 }
-                let qs_resp = qs_grpc
-                    .server_streaming(RawQueryStreamSvc(ingester), req)
+                let qs_resp = READ_TAP_ADMITTED
+                    .scope(true, qs_grpc.server_streaming(RawQueryStreamSvc(ingester), req))
                     .await;
-                if let Some(custom_resp_enc @ ("snappy" | "s2")) = qs_echo_encoding {
+                let qs_resp = if let Some(custom_resp_enc @ ("snappy" | "s2")) = qs_echo_encoding {
                     if qs_resp.status() == http::StatusCode::OK
                         && !qs_resp.headers().contains_key("grpc-status")
                         && qs_resp.headers().get("grpc-encoding").is_none()
@@ -847,6 +1019,40 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     }
                 } else {
                     qs_resp
+                };
+                if let Some(tap) = read_tap.take() {
+                    if qs_resp.headers().contains_key("grpc-status") {
+                        tap.finish(false);
+                        qs_resp
+                    } else {
+                        qs_resp.map(|body| {
+                            tonic::body::BoxBody::new(ReadTapDropBody {
+                                inner: body,
+                                permit: Some(tap),
+                            })
+                        })
+                    }
+                } else {
+                    qs_resp
+                }
+            } else if is_ingester_rpc {
+                let resp = READ_TAP_ADMITTED
+                    .scope(true, async { inner.call(req).await })
+                    .await?;
+                if let Some(tap) = read_tap.take() {
+                    if resp.headers().contains_key("grpc-status") {
+                        tap.finish(false);
+                        resp
+                    } else {
+                        resp.map(|body| {
+                            tonic::body::BoxBody::new(ReadTapDropBody {
+                                inner: body,
+                                permit: Some(tap),
+                            })
+                        })
+                    }
+                } else {
+                    resp
                 }
             } else {
                 inner.call(req).await?
@@ -893,6 +1099,11 @@ fn read_error_status(ext: &http::Extensions, e: IngesterError) -> Status {
         });
         if e.is_deadline_exceeded() {
             log.set_instrumentation_code(tonic::Code::Unknown as i32);
+        }
+    }
+    if e.is_deadline_exceeded() {
+        if let Some(flag) = ext.get::<TapDeadlineFlag>() {
+            flag.0.store(true, Ordering::Relaxed);
         }
     }
     e.map_read_error_to_status()
@@ -972,12 +1183,23 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<Self::QueryStreamStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/QueryStream",
+                ActivityRequest::Query(&inner),
+            )
+        });
         let stream = self
             .ingester
             .handle_query_stream_bimodal(&md, &user_id, inner)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
-        Ok(Response::new(stream))
+        Ok(Response::new(Box::pin(ActivityStream {
+            inner: stream,
+            _guard: act,
+        })))
     }
 
     async fn query_exemplars(
@@ -986,6 +1208,14 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::ExemplarQueryResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let _act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/QueryExemplars",
+                ActivityRequest::None,
+            )
+        });
         let resp = self
             .ingester
             .handle_query_exemplars(&md, &user_id, inner)
@@ -1000,6 +1230,14 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::LabelValuesResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let _act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/LabelValues",
+                ActivityRequest::None,
+            )
+        });
         let resp = self
             .ingester
             .handle_label_values(&md, &user_id, inner)
@@ -1014,6 +1252,14 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::LabelNamesResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let _act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/LabelNames",
+                ActivityRequest::None,
+            )
+        });
         let resp = self
             .ingester
             .handle_label_names(&md, &user_id, inner)
@@ -1028,6 +1274,14 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::UserStatsResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let _act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/UserStats",
+                ActivityRequest::None,
+            )
+        });
         let resp = self
             .ingester
             .handle_user_stats(&md, &user_id, inner)
@@ -1043,6 +1297,9 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         // Not per-tenant, but still behind the gRPC auth middleware.
         org_id_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let _act = self.ingester.insert_activity(|| {
+            request_activity("", "", "Ingester/AllUserStats", ActivityRequest::None)
+        });
         let resp = self
             .ingester
             .handle_all_user_stats(&md, inner)
@@ -1057,6 +1314,14 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::MetricsForLabelMatchersResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let _act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/MetricsForLabelMatchers",
+                ActivityRequest::None,
+            )
+        });
         let resp = self
             .ingester
             .handle_metrics_for_label_matchers(&md, &user_id, inner)
@@ -1071,6 +1336,14 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::MetricsMetadataResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let _act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/MetricsMetadata",
+                ActivityRequest::MetricsMetadata(&inner),
+            )
+        });
         let resp = self
             .ingester
             .handle_metrics_metadata(&md, &user_id, inner)
@@ -1089,12 +1362,23 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<Self::LabelNamesAndValuesStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/LabelNamesAndValues",
+                ActivityRequest::None,
+            )
+        });
         let items = self
             .ingester
             .handle_label_names_and_values(&md, &user_id, inner)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
-        Ok(Response::new(vec_to_stream(items)))
+        Ok(Response::new(Box::pin(ActivityStream {
+            inner: vec_to_stream(items),
+            _guard: act,
+        })))
     }
 
     type LabelValuesCardinalityStream = Pin<
@@ -1111,12 +1395,23 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<Self::LabelValuesCardinalityStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/LabelValuesCardinality",
+                ActivityRequest::LabelValuesCardinality(&inner),
+            )
+        });
         let items = self
             .ingester
             .handle_label_values_cardinality(&md, &user_id, inner)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
-        Ok(Response::new(vec_to_stream(items)))
+        Ok(Response::new(Box::pin(ActivityStream {
+            inner: vec_to_stream(items),
+            _guard: act,
+        })))
     }
 
     type ActiveSeriesStream =
@@ -1128,12 +1423,23 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<Self::ActiveSeriesStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/ActiveSeries",
+                ActivityRequest::None,
+            )
+        });
         let stream = self
             .ingester
             .handle_active_series_rx(&md, &user_id, inner)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(Box::pin(ActivityStream {
+            inner: stream,
+            _guard: act,
+        })))
     }
 
     type SearchLabelNamesStream =
@@ -1152,12 +1458,23 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
+        let act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/SearchLabelNames",
+                ActivityRequest::None,
+            )
+        });
         let items = self
             .ingester
             .handle_search_label_names_with_hints(&md, &user_id, inner, hints, matchers)
             .await
             .map_err(|e: IngesterError| read_error_status(&ext, e))?;
-        Ok(Response::new(vec_to_stream(items)))
+        Ok(Response::new(Box::pin(ActivityStream {
+            inner: vec_to_stream(items),
+            _guard: act,
+        })))
     }
 
     type SearchLabelValuesStream =
@@ -1176,12 +1493,23 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
+        let act = self.ingester.insert_activity(|| {
+            request_activity(
+                &user_id,
+                "",
+                "Ingester/SearchLabelValues",
+                ActivityRequest::None,
+            )
+        });
         let items = self
             .ingester
             .handle_search_label_values_with_hints(&md, &user_id, inner, hints, matchers)
             .await
             .map_err(|e: IngesterError| read_error_status(&ext, e))?;
-        Ok(Response::new(vec_to_stream(items)))
+        Ok(Response::new(Box::pin(ActivityStream {
+            inner: vec_to_stream(items),
+            _guard: act,
+        })))
     }
 }
 
@@ -1480,14 +1808,33 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let ing = test_ingester(tmp.path(), true);
-        // Not running yet: Push fails with an (always logged) unavailable error.
+        // Before Running, TapHandle rejects pre-decompression with Unavailable without reaching RawPushSvc.
         let body = cortexpb::WriteRequest {
-            timeseries: vec![series(&[("__name__", "m")], 1_700_000_000_000)],
+            timeseries: vec![series(&[("job", "only_job")], 1_700_000_000_000)],
             ..Default::default()
         }
         .encode_to_vec();
         let framed = mimir_proto::snappy::encode_grpc_frame(&body, false).unwrap();
         let log = GrpcErrorLog::default();
+        let mut tap_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/cortex.Ingester/Push")
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("x-scope-orgid", "t1")
+            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(framed.clone()))))
+            .unwrap();
+        tap_req.extensions_mut().insert(log.clone());
+        let tap_resp = IngesterService::new(Arc::clone(&ing))
+            .into_server()
+            .oneshot(tap_req)
+            .await
+            .unwrap();
+        let tap_status = tonic::Status::from_header_map(tap_resp.headers()).expect("trailers-only error");
+        assert_eq!(tap_status.code(), tonic::Code::Unavailable);
+        assert!(log.take().is_none(), "TapHandle rejects before middleware/RawPushSvc");
+
+        // Once Running, RawPushSvc executes and hands the error log decision to the server.
+        ing.set_state_for_test(mimir_common::services::State::Running);
         let mut http_req = http::Request::builder()
             .method(http::Method::POST)
             .uri("/cortex.Ingester/Push")
@@ -1502,11 +1849,11 @@ mod tests {
             .await
             .unwrap();
         let status = tonic::Status::from_header_map(resp.headers()).expect("trailers-only error");
-        assert_ne!(status.code(), tonic::Code::Ok);
+        assert_eq!(status.code(), tonic::Code::Internal);
         let entry = log.take().expect("RawPushSvc records the error log entry");
         assert!(entry.keep);
         assert_eq!(entry.reason, None);
-        assert!(entry.err.contains("unavailable"), "{}", entry.err);
+        assert!(entry.err.contains("no metric name label"), "{}", entry.err);
     }
 
     #[tokio::test]
@@ -1546,6 +1893,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let ing = test_ingester(tmp.path(), true);
+        ing.set_state_for_test(mimir_common::services::State::Running);
         let max_decode_len = 4096usize;
 
         // 256 KiB of zeros compresses into a small Snappy framed payload (< 16 KiB, and small
@@ -1584,5 +1932,103 @@ mod tests {
                 Some("snappy,s2,gzip,identity")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_tap_drop_body_records_normal_completion_on_trailers_and_cancels_on_early_drop() {
+        use hyper::body::{Body as _, Frame};
+        use mimir_common::limiter::{ReactiveLimiter, ReactiveLimiterConfig};
+        use std::collections::VecDeque;
+        use std::task::{Context, Poll};
+
+        struct VecFramesBody(VecDeque<Result<Frame<Bytes>, Status>>);
+
+        impl hyper::body::Body for VecFramesBody {
+            type Data = Bytes;
+            type Error = Status;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(self.0.pop_front())
+            }
+
+            fn is_end_stream(&self) -> bool {
+                self.0.is_empty()
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = test_ingester(tmp.path(), true);
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let rl = ReactiveLimiter::new(ReactiveLimiterConfig {
+            min_limit: 1,
+            initial_limit: 2,
+            max_limit: 10,
+            max_limit_factor: 1.0,
+            min_limit_factor: 1.0,
+            recent_window_min_duration: std::time::Duration::from_millis(1),
+            recent_window_max_duration: std::time::Duration::from_millis(1),
+            recent_window_min_samples: 1,
+            initial_rejection_factor: 1.0,
+            max_rejection_factor: 1.0,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // 1) Early drop before trailers must cancel (permit.finish(true) -> drop_permit),
+        // leaving reactive limiter max_inflight() at 0.
+        let rp_early = rl.acquire_permit().await.unwrap();
+        let mut tap_early = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+        tap_early.set_reactive_permit(rp_early);
+        let inner_early = tonic::body::BoxBody::new(VecFramesBody(VecDeque::from([
+            Ok(Frame::data(Bytes::from_static(b"partial"))),
+            Ok(Frame::data(Bytes::from_static(b"more"))),
+        ])));
+        let mut body_early = ReadTapDropBody {
+            inner: inner_early,
+            permit: Some(tap_early),
+        };
+        let _ = std::future::poll_fn(|cx| Pin::new(&mut body_early).poll_frame(cx)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(body_early.permit.is_some());
+        drop(body_early);
+        assert_eq!(rl.inflight(), 0);
+        assert_eq!(
+            rl.max_inflight(),
+            0,
+            "early drop must call drop_permit() and NOT record RTT sample"
+        );
+
+        // 2) Normal gRPC read completion: hyper stops polling after Frame::trailers and drops body.
+        let rp_ok = rl.acquire_permit().await.unwrap();
+        let mut tap_ok = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+        tap_ok.set_reactive_permit(rp_ok);
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let inner_ok = tonic::body::BoxBody::new(VecFramesBody(VecDeque::from([
+            Ok(Frame::data(Bytes::from_static(b"payload"))),
+            Ok(Frame::trailers(trailers)),
+        ])));
+        let mut body_ok = ReadTapDropBody {
+            inner: inner_ok,
+            permit: Some(tap_ok),
+        };
+        let f1 = std::future::poll_fn(|cx| Pin::new(&mut body_ok).poll_frame(cx)).await;
+        assert!(f1.unwrap().unwrap().is_data());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let f2 = std::future::poll_fn(|cx| Pin::new(&mut body_ok).poll_frame(cx)).await;
+        assert!(f2.unwrap().unwrap().is_trailers());
+        // Drop immediately without polling for Poll::Ready(None), mirroring hyper HTTP/2.
+        assert!(body_ok.permit.is_none(), "permit must finish on Frame::trailers");
+        drop(body_ok);
+        assert_eq!(rl.inflight(), 0);
+        assert_eq!(
+            rl.max_inflight(),
+            1,
+            "normal completion on Frame::trailers must call rp.record()"
+        );
     }
 }

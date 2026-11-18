@@ -1858,6 +1858,7 @@ dependencies = [
  "tonic 0.12.3",
  "tower 0.5.3",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -1891,10 +1892,12 @@ dependencies = [
 name = "mimir-config"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "flate2",
  "mimir-common",
  "mimir-proto",
  "parking_lot",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

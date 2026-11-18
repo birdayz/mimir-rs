@@ -794,6 +794,13 @@ impl MemPostings {
         symbols: &SymbolTable,
         pred: &mut dyn FnMut(&str) -> bool,
     ) -> Vec<u64> {
+        if name_id == ALL_POSTINGS_KEY.0 {
+            return if pred("") {
+                self.all_postings()
+            } else {
+                Vec::new()
+            };
+        }
         let value_ids: Vec<SymbolId> = {
             let stripe = self.stripes[Self::stripe_idx(name_id)].read();
             match stripe.lvs.get(&name_id) {
@@ -1226,7 +1233,11 @@ impl MemPostings {
     ) -> Option<MemTerm> {
         let name_id = symbols.get(name)?;
         if name_id == ALL_POSTINGS_KEY.0 {
-            return None;
+            if !pred("") {
+                return None;
+            }
+            let len = self.all_postings.read().len();
+            return (len > 0).then_some(MemTerm::AllPostings { len_hint: len });
         }
         let stripe = self.stripes[Self::stripe_idx(name_id)].read();
         let lvs = stripe.lvs.get(&name_id)?;

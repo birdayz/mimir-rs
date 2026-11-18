@@ -347,6 +347,11 @@ impl HeapMerger {
         }
     }
 
+    /// Signals shutdown without awaiting completion (safe to call from sync cleanup paths).
+    pub fn stop_async(&self) {
+        let _ = self.stop_tx.send(true);
+    }
+
     /// Immediately stops the merger and drains any pending records in the heap with an error
     /// without forwarding them downstream (matching `HeapMerger.drain` in Go).
     pub async fn shutdown_and_drain(&self) {

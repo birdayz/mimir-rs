@@ -274,32 +274,61 @@ impl Http for HttpGrpcBridge {
             Method::GET
         } else {
             Method::from_bytes(req.method.as_bytes())
-                .map_err(|e| Status::invalid_argument(format!("invalid HTTP method: {e}")))?
+                .map_err(|e| Status::unknown(format!("net/http: invalid method: {e}")))?
         };
 
-        let uri = if req.url.is_empty() {
-            Uri::from_static("/")
-        } else {
-            req.url
-                .parse::<Uri>()
-                .map_err(|e| Status::invalid_argument(format!("invalid URL: {e}")))?
-        };
+        validate_go_url(&req.url)
+            .map_err(|e| Status::unknown(format!("parse {:?}: {e}", req.url)))?;
 
-        let mut builder = HttpRequestMsg::builder().method(method).uri(uri);
+        // `gorilla/mux` `ServeHTTP` (`cleanPath`): a non-empty relative URL without a leading `/`
+        // (e.g. `"ready"`, `"ingester/ring"`, or `"ready?x=1"`) redirects 301 to `/<path>[?<query>]`
+        // before `http::Uri` parsing (which rejects `/` or `?` without a leading slash).
+        let without_frag = req.url.split('#').next().unwrap_or(&req.url);
+        let (raw_path, raw_query) = match without_frag.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (without_frag, None),
+        };
+        if !raw_path.is_empty() && !raw_path.contains("://") && !raw_path.starts_with('/') {
+            let location = match raw_query {
+                Some(q) => format!("/{raw_path}?{q}"),
+                None => format!("/{raw_path}"),
+            };
+            return Ok(Response::new(httpgrpcpb::HttpResponse {
+                code: 301,
+                headers: vec![httpgrpcpb::Header {
+                    key: "Location".to_string(),
+                    values: vec![location],
+                }],
+                body: Bytes::new(),
+            }));
+        }
+
+        let uri = parse_go_url_to_http_uri(&req.url)
+            .map_err(|e| Status::unknown(format!("parse {:?}: {e}", req.url)))?;
+
+        let mut req_headers = HeaderMap::new();
         for h in req.headers {
             let Ok(name) = HeaderName::from_bytes(h.key.as_bytes()) else {
                 continue;
             };
+            // Go `httpgrpc.ToHeader`: `header[http.CanonicalHeaderKey(h.Key)] = h.Values` overwrites
+            // any prior entry for the same canonical header name.
+            req_headers.remove(&name);
             for v in h.values {
                 if let Ok(val) = HeaderValue::from_str(&v) {
-                    builder = builder.header(name.clone(), val);
+                    req_headers.append(name.clone(), val);
                 }
             }
         }
 
-        let http_req = builder
+        let mut http_req = HttpRequestMsg::builder()
+            .method(method)
+            .uri(uri)
             .body(Body::from(req.body))
             .map_err(|e| Status::internal(format!("failed to construct HTTP request: {e}")))?;
+        *http_req.headers_mut() = req_headers;
+
+
 
         let resp = self
             .router
@@ -346,6 +375,361 @@ impl Http for HttpGrpcBridge {
         }
 
         Ok(Response::new(http_resp))
+    }
+}
+
+/// Parses `req.url` with Go `net/url.Parse` tolerance (accepting relative paths without leading
+/// `/` and unescaped `{}`/`[]`/`"`/`|`/`^`/spaces in query strings) and encodes disallowed
+/// RFC 3986 characters so `http::Uri` can pass it into Axum's `Router`.
+fn validate_go_url(raw: &str) -> Result<(), String> {
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let bytes = raw.as_bytes();
+    for &b in bytes {
+        if b < 0x20 || b == 0x7f {
+            return Err("net/url: invalid control character in URL".to_string());
+        }
+    }
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            if idx + 2 >= bytes.len()
+                || !bytes[idx + 1].is_ascii_hexdigit()
+                || !bytes[idx + 2].is_ascii_hexdigit()
+            {
+                return Err("invalid URL escape".to_string());
+            }
+            idx += 3;
+        } else {
+            idx += 1;
+        }
+    }
+    let without_frag = raw.split('#').next().unwrap_or(raw);
+    let before_pq = without_frag.split(['/', '?']).next().unwrap_or("");
+    if let Some((scheme, _)) = before_pq.split_once(':') {
+        if scheme.is_empty() {
+            return Err("missing protocol scheme".to_string());
+        }
+        let sb = scheme.as_bytes();
+        if !sb[0].is_ascii_alphabetic()
+            || !sb
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        {
+            return Err("first path segment in URL cannot contain colon".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn parse_go_url_to_http_uri(raw: &str) -> Result<Uri, String> {
+    if raw.is_empty() {
+        return Ok(Uri::from_static("/"));
+    }
+    validate_go_url(raw)?;
+    let without_frag = raw.split('#').next().unwrap_or(raw);
+    let (path_part, query_part) = match without_frag.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (without_frag, None),
+    };
+
+    let encode_ascii_unsafe = |s: &str, out: &mut String| {
+        for &b in s.as_bytes() {
+            let ok = b.is_ascii_graphic()
+                && !matches!(b, b'{' | b'}' | b'[' | b']' | b'"' | b'|' | b'^' | b'`' | b'<' | b'>' | b'\\');
+            if ok {
+                out.push(b as char);
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    };
+
+    let mut encoded = String::with_capacity(without_frag.len());
+    if let Some((scheme, rest)) = path_part.split_once("://") {
+        encoded.push_str(scheme);
+        encoded.push_str("://");
+        if let Some((authority, path)) = rest.split_once('/') {
+            encoded.push_str(authority);
+            encoded.push('/');
+            encode_ascii_unsafe(path, &mut encoded);
+        } else {
+            encoded.push_str(rest);
+        }
+    } else {
+        encode_ascii_unsafe(path_part, &mut encoded);
+    }
+    if let Some(q) = query_part {
+        encoded.push('?');
+        encode_ascii_unsafe(q, &mut encoded);
+    }
+    if encoded.is_empty() {
+        encoded.push('/');
+    }
+    encoded.parse::<Uri>().map_err(|e| e.to_string())
+}
+
+const GRPC_ACCEPT_ENCODING_ALL: &str = "identity,gzip,zstd,snappy,s2";
+
+fn client_accepts_grpc_encoding(headers: &HeaderMap, enc: &str) -> bool {
+    let Some(val) = headers.get("grpc-accept-encoding").and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    val.split(',').any(|s| s.trim().eq_ignore_ascii_case(enc))
+}
+
+fn s2_compress_framed(input: &[u8]) -> Vec<u8> {
+    const MAX_BLOCK: usize = 4 << 20;
+    let mut out = Vec::with_capacity(10 + 8 + input.len());
+    out.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+    if input.is_empty() {
+        let chunk_len = 4usize;
+        out.push(0x01);
+        out.push((chunk_len & 0xff) as u8);
+        out.push(((chunk_len >> 8) & 0xff) as u8);
+        out.push(((chunk_len >> 16) & 0xff) as u8);
+        out.extend_from_slice(&mimir_proto::s2::masked_crc32c(&[]).to_le_bytes());
+        return out;
+    }
+    for chunk in input.chunks(MAX_BLOCK) {
+        let chunk_len = 4 + chunk.len();
+        out.push(0x01);
+        out.push((chunk_len & 0xff) as u8);
+        out.push(((chunk_len >> 8) & 0xff) as u8);
+        out.push(((chunk_len >> 16) & 0xff) as u8);
+        out.extend_from_slice(&mimir_proto::s2::masked_crc32c(chunk).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out
+}
+
+fn compress_grpc_payload(enc: &str, payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Write as _;
+    match enc {
+        "gzip" => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(payload)?;
+            encoder.finish()
+        }
+        "zstd" => zstd::stream::encode_all(payload, 0),
+        "snappy" => mimir_proto::snappy::compress_framed(payload),
+        "s2" => Ok(s2_compress_framed(payload)),
+        _ => Ok(payload.to_vec()),
+    }
+}
+
+struct CompressGrpcBody {
+    inner: tonic::body::BoxBody,
+    encoding: &'static str,
+    buf: Vec<u8>,
+    out_queue: std::collections::VecDeque<Bytes>,
+    pending_trailers: Option<http::HeaderMap>,
+    done: bool,
+}
+
+impl CompressGrpcBody {
+    fn new(inner: tonic::body::BoxBody, encoding: &'static str) -> Self {
+        Self {
+            inner,
+            encoding,
+            buf: Vec::new(),
+            out_queue: std::collections::VecDeque::new(),
+            pending_trailers: None,
+            done: false,
+        }
+    }
+
+    fn drain_frames(&mut self) -> Result<(), Box<Status>> {
+        while self.buf.len() >= 5 {
+            let flag = self.buf[0];
+            let msg_len =
+                u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
+            if self.buf.len() < 5 + msg_len {
+                break;
+            }
+            let frame: Vec<u8> = self.buf.drain(..5 + msg_len).collect();
+            let payload = &frame[5..];
+            if flag == 0 {
+                let compressed = compress_grpc_payload(self.encoding, payload)
+                    .map_err(|e| Box::new(Status::internal(format!("compress gRPC response: {e}"))))?;
+                let mut out = Vec::with_capacity(5 + compressed.len());
+                out.push(1);
+                out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+                out.extend_from_slice(&compressed);
+                self.out_queue.push_back(Bytes::from(out));
+            } else {
+                self.out_queue.push_back(Bytes::from(frame));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl hyper::body::Body for CompressGrpcBody {
+    type Data = Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(chunk) = self.out_queue.pop_front() {
+            return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
+        }
+        if let Some(trailers) = self.pending_trailers.take() {
+            self.done = true;
+            return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+        }
+        if self.done {
+            return Poll::Ready(None);
+        }
+        loop {
+            match Pin::new(&mut self.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if frame.is_data() {
+                        if let Ok(data) = frame.into_data() {
+                            self.buf.extend_from_slice(&data);
+                            self.drain_frames().map_err(|e| *e)?;
+                            if let Some(chunk) = self.out_queue.pop_front() {
+                                return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
+                            }
+                        }
+                    } else {
+                        match frame.into_trailers() {
+                            Ok(trailers) => {
+                                if !self.buf.is_empty() {
+                                    self.pending_trailers = Some(trailers);
+                                    let rem = std::mem::take(&mut self.buf);
+                                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                                        Bytes::from(rem),
+                                    ))));
+                                }
+                                self.done = true;
+                                return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(
+                                    trailers,
+                                ))));
+                            }
+                            Err(other_frame) => {
+                                if !self.buf.is_empty() {
+                                    let rem = std::mem::take(&mut self.buf);
+                                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                                        Bytes::from(rem),
+                                    ))));
+                                }
+                                return Poll::Ready(Some(Ok(other_frame)));
+                            }
+                        }
+                    }
+                }
+                Poll::Ready(None) => {
+                    self.done = true;
+                    if !self.buf.is_empty() {
+                        let rem = std::mem::take(&mut self.buf);
+                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(rem)))));
+                    }
+                    return Poll::Ready(None);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+            || (self.out_queue.is_empty()
+                && self.buf.is_empty()
+                && self.pending_trailers.is_none()
+                && self.inner.is_end_stream())
+    }
+}
+
+/// Echoes the client's negotiated `grpc-encoding` (`gzip`, `zstd`, `snappy`, `s2`) on gRPC
+/// responses like Go `grpc.NewServer`, and advertises `snappy,s2` in `grpc-accept-encoding` on
+/// unsupported-compressor errors.
+#[derive(Clone)]
+pub struct GrpcCompressionEchoService<S> {
+    inner: S,
+}
+
+impl<S> GrpcCompressionEchoService<S> {
+    pub fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S: tonic::server::NamedService> tonic::server::NamedService for GrpcCompressionEchoService<S> {
+    const NAME: &'static str = S::NAME;
+}
+
+impl<S> tower::Service<http::Request<tonic::body::BoxBody>> for GrpcCompressionEchoService<S>
+where
+    S: tower::Service<
+            http::Request<tonic::body::BoxBody>,
+            Response = http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = http::Response<tonic::body::BoxBody>;
+    type Error = std::convert::Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+        let req_enc = req
+            .headers()
+            .get("grpc-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase);
+        if let Some(ref enc) = req_enc {
+            if !matches!(enc.as_str(), "identity" | "gzip" | "zstd" | "snappy" | "s2") {
+                let mut resp = Status::unimplemented(format!(
+                    "grpc: Decompressor is not installed for grpc-encoding {enc:?}"
+                ))
+                .into_http();
+                resp.headers_mut().insert(
+                    "grpc-accept-encoding",
+                    HeaderValue::from_static(GRPC_ACCEPT_ENCODING_ALL),
+                );
+                return Box::pin(async move { Ok(resp) });
+            }
+        }
+        let echo_enc: Option<&'static str> = req_enc.as_deref().and_then(|enc| {
+            let canon = match enc {
+                "gzip" => "gzip",
+                "zstd" => "zstd",
+                "snappy" => "snappy",
+                "s2" => "s2",
+                _ => return None,
+            };
+            client_accepts_grpc_encoding(req.headers(), canon).then_some(canon)
+        });
+        let fut = self.inner.call(req);
+        Box::pin(async move {
+            let mut resp = fut.await?;
+            if let Some(enc) = echo_enc {
+                if !resp.headers().contains_key("grpc-encoding")
+                    && !resp.headers().contains_key("grpc-status")
+                {
+                    resp.headers_mut()
+                        .insert("grpc-encoding", HeaderValue::from_static(enc));
+                    resp = resp.map(|body| {
+                        tonic::body::BoxBody::new(CompressGrpcBody::new(body, enc))
+                    });
+                }
+            }
+            Ok(resp)
+        })
     }
 }
 
@@ -801,5 +1185,157 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let check = HealthCheckResponse::decode(&body[5..]).unwrap();
         assert_eq!(check.status, NOT_SERVING_STATUS);
+    }
+
+    #[tokio::test]
+    async fn query_stream_compression_echo_never_double_compresses() {
+        use flate2::read::GzDecoder;
+        use http_body_util::BodyExt;
+        use mimir_proto::{cortexpb, ingesterpb};
+        use std::io::Read as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-compress".to_string();
+        cfg.push_grpc_method_enabled = true;
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Arc::new(
+            mimir_ingester::Ingester::new(
+                cfg,
+                blocks_cfg,
+                mimir_config::IngestStorageConfig::default(),
+                mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now_ms = 1_700_000_000_000i64;
+        let wr = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![cortexpb::LabelPair {
+                    name: Bytes::from_static(b"__name__"),
+                    value: Bytes::from_static(b"echo_compress_metric"),
+                }],
+                samples: vec![cortexpb::Sample {
+                    value: 42.0,
+                    timestamp_ms: now_ms,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ing.push_grpc("tenant-comp", &wr).await.unwrap();
+
+        let svc = GrpcCompressionEchoService::new(
+            mimir_ingester::IngesterService::new(Arc::clone(&ing))
+                .into_server()
+                .max_decoding_message_size(4 << 20)
+                .max_encoding_message_size(4 << 20)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd),
+        );
+
+        let q_req = ingesterpb::QueryRequest {
+            start_timestamp_ms: now_ms - 10_000,
+            end_timestamp_ms: now_ms + 10_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__name__".into(),
+                value: "echo_compress_metric".into(),
+            }],
+            streaming_chunks_batch_size: 16,
+        };
+        let raw_req = q_req.encode_to_vec();
+
+        for enc in ["snappy", "s2", "gzip", "zstd"] {
+            for accept_hdr in [Some(enc), Some("identity,gzip,zstd,snappy,s2"), None] {
+                let comp = compress_grpc_payload(enc, &raw_req).unwrap();
+                let mut framed = Vec::with_capacity(5 + comp.len());
+                framed.push(1);
+                framed.extend_from_slice(&(comp.len() as u32).to_be_bytes());
+                framed.extend_from_slice(&comp);
+
+                let mut builder = http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/cortex.Ingester/QueryStream")
+                    .header(http::header::CONTENT_TYPE, "application/grpc")
+                    .header("grpc-encoding", enc)
+                    .header("x-scope-orgid", "tenant-comp");
+                if let Some(acc) = accept_hdr {
+                    builder = builder.header("grpc-accept-encoding", acc);
+                }
+                let http_req = builder
+                    .body(tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(
+                        framed,
+                    )))))
+                    .unwrap();
+
+                let resp = svc.clone().oneshot(http_req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "enc={enc} accept={accept_hdr:?}");
+                let resp_enc = resp
+                    .headers()
+                    .get("grpc-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .expect("grpc-encoding response header")
+                    .to_string();
+                if accept_hdr.is_none() || accept_hdr == Some(enc) {
+                    assert_eq!(resp_enc, enc, "enc={enc} accept={accept_hdr:?}");
+                }
+
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                assert!(bytes.len() >= 5, "enc={enc} accept={accept_hdr:?}: empty body");
+                let mut pos = 0usize;
+                let mut total_series = 0usize;
+                while pos < bytes.len() {
+                    assert_eq!(
+                        bytes[pos], 1,
+                        "enc={enc} accept={accept_hdr:?}: expected compressed frame at {pos}"
+                    );
+                    let frame_len = u32::from_be_bytes([
+                        bytes[pos + 1],
+                        bytes[pos + 2],
+                        bytes[pos + 3],
+                        bytes[pos + 4],
+                    ]) as usize;
+                    let compressed_payload = &bytes[pos + 5..pos + 5 + frame_len];
+                    pos += 5 + frame_len;
+                    let decompressed = match resp_enc.as_str() {
+                        "snappy" => {
+                            mimir_proto::snappy::decompress_framed(compressed_payload).unwrap()
+                        }
+                        "s2" => {
+                            let mut out = Vec::new();
+                            mimir_proto::s2::decompress_framed_into(
+                                compressed_payload,
+                                &mut out,
+                                4 << 20,
+                            )
+                            .unwrap();
+                            out
+                        }
+                        "gzip" => {
+                            let mut dec = GzDecoder::new(compressed_payload);
+                            let mut out = Vec::new();
+                            dec.read_to_end(&mut out).unwrap();
+                            out
+                        }
+                        "zstd" => zstd::stream::decode_all(compressed_payload).unwrap(),
+                        other => panic!("unexpected resp_enc {other}"),
+                    };
+                    let qs = ingesterpb::QueryStreamResponse::decode(decompressed.as_slice())
+                        .expect("single decompression must yield valid QueryStreamResponse");
+                    total_series += qs.streaming_series.len();
+                }
+                assert_eq!(total_series, 1, "enc={enc} accept={accept_hdr:?}");
+            }
+        }
     }
 }

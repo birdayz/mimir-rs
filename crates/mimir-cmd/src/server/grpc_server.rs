@@ -830,7 +830,7 @@ where
             if skip {
                 return None;
             }
-            check_cluster(req.headers(), &guard.method, cv, &cache)
+            check_cluster(req.headers(), &guard.method, remote, cv, &cache)
         })
     });
 
@@ -946,6 +946,7 @@ fn percent_decode(s: &str) -> String {
 fn check_cluster(
     headers: &http::HeaderMap,
     method: &str,
+    remote: SocketAddr,
     cv: &GrpcClusterValidation,
     cache: &GrpcMetricsCache,
 ) -> Option<tonic::Status> {
@@ -965,13 +966,25 @@ fn check_cluster(
             },
         )
     };
+    let client_addr = remote.to_string();
+    let tenant_id = {
+        let mut orgs = headers.get_all(mimir_common::tenant::LOWER_ORG_ID_HEADER_NAME).iter();
+        match (orgs.next(), orgs.next()) {
+            (Some(v), None) => v.to_str().ok().map(str::to_owned),
+            _ => None,
+        }
+    };
     let log = |extra: &[(&str, &str)]| {
         let soft = cv.soft.to_string();
         let mut kvs: Vec<(&str, &str)> = vec![
             ("method", method),
             ("cluster_validation_labels", &expected),
             ("soft_validation", &soft),
+            ("client_address", &client_addr),
         ];
+        if let Some(ref tid) = tenant_id {
+            kvs.push(("tenant", tid.as_str()));
+        }
         kvs.extend_from_slice(extra);
         cache.logger.log(LogLevel::Warn, &kvs);
     };

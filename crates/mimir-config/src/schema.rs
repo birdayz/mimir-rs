@@ -266,8 +266,10 @@ static USAGE_TRACKER_GRPC_BACKOFF_FIELDS: &[SchemaField] = &[
     SchemaField { name: "max_period", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
     SchemaField { name: "max_retries", flag: "", kind: FieldKind::Int, default_str: "10", usage: "" },
 ];
+pub use crate::schema_hidden::HIDDEN_TOP_BLOCKS;
+
 static USAGE_TRACKER_GRPC_CCV_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "label", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "label", flag: "distributor.usage-tracker-client.grpc-client-config.cluster-validation.label", kind: FieldKind::String, default_str: "", usage: "" },
 ];
 static USAGE_TRACKER_GRPC_BLOCKS: &[SchemaBlock] = &[
     SchemaBlock { name: "backoff_config", fields: USAGE_TRACKER_GRPC_BACKOFF_FIELDS, blocks: &[] },
@@ -2549,7 +2551,6 @@ pub fn register_extra_flags<T: 'static>(
         ("block-builder-scheduler.job-failures-allowed", false, "int"),
         ("usage-tracker.enabled", true, ""),
         ("usage-tracker.partitions", false, "int"),
-        ("distributor.usage-tracker-client.grpc-client-config.cluster-validation.label", false, "string"),
     ] {
         let name_s = name.to_string();
         let name_get = name_s.clone();
@@ -2560,6 +2561,14 @@ pub fn register_extra_flags<T: 'static>(
             if is_bool { "false" } else { "" },
             "",
             move |t, s| {
+                if is_bool {
+                    parse_go_bool(s)?;
+                } else if type_name == "int" {
+                    crate::flags::go_parse_int(s)?;
+                } else if type_name == "duration" {
+                    s.parse::<GoDuration>()
+                        .map_err(|_| ConfigError::Flag("parse error".to_string()))?;
+                }
                 get_mut(t).insert(name_s.clone(), s.to_string());
                 Ok(())
             },
@@ -2668,6 +2677,9 @@ pub fn register_extra_flags<T: 'static>(
             if is_bool { "false" } else { "" },
             "",
             move |t, s| {
+                if is_bool {
+                    parse_go_bool(s)?;
+                }
                 get_mut(t).insert(name_s.clone(), s.to_string());
                 Ok(())
             },

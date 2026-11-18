@@ -52,6 +52,66 @@ use crate::metrics::{
 };
 use crate::user_tsdb::UserTsdb;
 
+pub const ADAPTIVE_LIMITER_EXCEEDED_MSG: &str = "limit exceeded";
+
+pub struct PushTapPermit {
+    pub started_at: Instant,
+    pub breaker_permit: Option<BreakerPermit>,
+    pub reactive_permit: Option<ReactivePermit>,
+    pub ingester: Arc<Ingester>,
+    pub req_size: i64,
+    pub finished: bool,
+}
+
+impl PushTapPermit {
+    pub fn set_reactive_permit(&mut self, rp: ReactivePermit) {
+        self.reactive_permit = Some(rp);
+    }
+
+    pub fn finish(mut self, err: Option<&IngesterError>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let dur = self.started_at.elapsed();
+        self.ingester
+            .inflight_push_requests
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        if self.req_size > 0 {
+            self.ingester
+                .inflight_push_requests_bytes
+                .fetch_sub(self.req_size, std::sync::atomic::Ordering::AcqRel);
+        }
+        if let Some(bp) = self.breaker_permit.take() {
+            let be = err.map(|e| crate::circuit_breaker::BreakerError::Ingester(e.clone()));
+            bp.finish_with_err(dur, be.as_ref());
+        }
+        if let Some(rp) = self.reactive_permit.take() {
+            rp.record();
+        }
+    }
+}
+
+impl Drop for PushTapPermit {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.ingester
+                .inflight_push_requests
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            if self.req_size > 0 {
+                self.ingester
+                    .inflight_push_requests_bytes
+                    .fetch_sub(self.req_size, std::sync::atomic::Ordering::AcqRel);
+            }
+            drop(self.breaker_permit.take());
+            if let Some(rp) = self.reactive_permit.take() {
+                rp.drop_permit();
+            }
+        }
+    }
+}
+
 pub struct PushPermit<'a> {
     pub started_at: Instant,
     pub breaker_permit: Option<BreakerPermit>,
@@ -670,7 +730,7 @@ impl Ingester {
                     .with_label_values(&[REASON_MAX_INFLIGHT_PUSH_REQUESTS])
                     .inc();
                 return Err(IngesterError::ReactiveLimiterExceeded {
-                    message: "reactive limiter exceeded".to_string(),
+                    message: ADAPTIVE_LIMITER_EXCEEDED_MSG.to_string(),
                 });
             }
         }
@@ -721,17 +781,95 @@ impl Ingester {
         };
 
         if let Err(err) = self.check_instance_limits(inflight, inflight_bytes, reject_equal) {
-            drop(permit);
+            permit.finish(Some(&err));
             return Err(err);
         }
 
         Ok(permit)
     }
 
+    /// Non-blocking gRPC `TapHandle` admission (`Ingester.StartPushRequest` + `grpc_call_check.go`).
+    pub fn try_start_push_tap(self: &Arc<Self>, req_size: i64) -> Result<PushTapPermit, IngesterError> {
+        self.check_available_for_push()?;
+        let started_at = Instant::now();
+        let breaker_permit = self.circuit_breaker.try_acquire_push_permit()?;
+        if let Some(ref rl) = self.reactive_limiter.push {
+            if !rl.can_acquire_permit() {
+                self.metrics
+                    .rejected
+                    .with_label_values(&[REASON_MAX_INFLIGHT_PUSH_REQUESTS])
+                    .inc();
+                return Err(IngesterError::ReactiveLimiterExceeded {
+                    message: ADAPTIVE_LIMITER_EXCEEDED_MSG.to_string(),
+                });
+            }
+        }
+        let inflight = self
+            .inflight_push_requests
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let (inflight_bytes, reject_equal) = if req_size > 0 {
+            let b = self
+                .inflight_push_requests_bytes
+                .fetch_add(req_size, std::sync::atomic::Ordering::AcqRel)
+                + req_size;
+            (b, false)
+        } else {
+            (
+                self.inflight_push_requests_bytes
+                    .load(std::sync::atomic::Ordering::Acquire),
+                true,
+            )
+        };
+        let permit = PushTapPermit {
+            started_at,
+            breaker_permit,
+            reactive_permit: None,
+            ingester: Arc::clone(self),
+            req_size,
+            finished: false,
+        };
+        if let Err(err) = self.check_instance_limits(inflight, inflight_bytes, reject_equal) {
+            permit.finish(Some(&err));
+            return Err(err);
+        }
+        Ok(permit)
+    }
+
+    /// Blocking reactive limiter permit acquisition (`Ingester.PreparePushRequest`).
+    pub async fn prepare_push_reactive(&self) -> Result<Option<ReactivePermit>, IngesterError> {
+        let Some(ref rl) = self.reactive_limiter.push else {
+            return Ok(None);
+        };
+        match rl.acquire_permit().await {
+            Ok(p) => Ok(Some(p)),
+            Err(e) => {
+                self.metrics
+                    .rejected
+                    .with_label_values(&[REASON_MAX_INFLIGHT_PUSH_REQUESTS])
+                    .inc();
+                Err(IngesterError::ReactiveLimiterExceeded {
+                    message: e.to_string(),
+                })
+            }
+        }
+    }
+
     fn start_push_request_sync(&self, req_size: i64) -> Result<PushPermit<'_>, IngesterError> {
         self.check_available_for_push()?;
         let started_at = Instant::now();
         let breaker_permit = self.circuit_breaker.try_acquire_push_permit()?;
+        if let Some(ref rl) = self.reactive_limiter.push {
+            if !rl.can_acquire_permit() {
+                self.metrics
+                    .rejected
+                    .with_label_values(&[REASON_MAX_INFLIGHT_PUSH_REQUESTS])
+                    .inc();
+                return Err(IngesterError::ReactiveLimiterExceeded {
+                    message: ADAPTIVE_LIMITER_EXCEEDED_MSG.to_string(),
+                });
+            }
+        }
         let inflight = self
             .inflight_push_requests
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
@@ -816,7 +954,30 @@ impl Ingester {
         }
         let req_size = raw_bytes.len() as i64;
         let permit = self.start_push_request(req_size).await?;
-        let res = if raw_bytes.len() >= 2048 {
+        let res = self.push_grpc_raw_inner(user_id, raw_bytes).await;
+        permit.finish(res.as_ref().err());
+        res
+    }
+
+    /// Zero-copy raw protobuf gRPC `Push` entrypoint when admission was already performed by
+    /// the pre-decompression gRPC tap (`IngesterZeroCopyServer`).
+    pub async fn push_grpc_raw_admitted(
+        self: &Arc<Self>,
+        user_id: &str,
+        raw_bytes: Bytes,
+    ) -> Result<(), IngesterError> {
+        if !self.cfg.push_grpc_method_enabled {
+            return Err(IngesterError::PushGrpcDisabled);
+        }
+        self.push_grpc_raw_inner(user_id, raw_bytes).await
+    }
+
+    async fn push_grpc_raw_inner(
+        self: &Arc<Self>,
+        user_id: &str,
+        raw_bytes: Bytes,
+    ) -> Result<(), IngesterError> {
+        if raw_bytes.len() >= 2048 {
             let ing = Arc::clone(self);
             let uid = user_id.to_owned();
             tokio::task::spawn_blocking(move || ing.push_grpc_raw_sync(&uid, &raw_bytes))
@@ -826,9 +987,7 @@ impl Ingester {
                 })?
         } else {
             self.push_grpc_raw_sync(user_id, &raw_bytes)
-        };
-        permit.finish(res.as_ref().err());
-        res
+        }
     }
 
     fn push_grpc_raw_sync(&self, user_id: &str, raw_bytes: &[u8]) -> Result<(), IngesterError> {
@@ -1807,10 +1966,9 @@ impl Ingester {
 
                 if native_histograms_enabled && hist_count > 0 {
                     let pairs = lazy_pairs.as_slice();
-                    for (h_ts, is_float, ih_opt, fh_opt, bucket_count) in item.histograms.iter() {
+                    for (h_ts, is_float, ih_opt, fh_opt, _bucket_count) in item.histograms.iter() {
                         let h_ts = *h_ts;
                         let is_float = *is_float;
-                        let bucket_count = *bucket_count;
 
                         if h_ts > max_timestamp_ms {
                             stats.failed_samples += 1;
@@ -1906,9 +2064,6 @@ impl Ingester {
                             Ok(r) => {
                                 series_ref = Some(r);
                                 stats.succeeded_samples += 1;
-                                if samples.last().is_none_or(|ls| ls.timestamp_ms < h_ts) {
-                                    num_native_hist_buckets = bucket_count as i64;
-                                }
                             }
                             Err(err) => {
                                 if let Err(e) = handle_head_append_error(
@@ -1930,6 +2085,11 @@ impl Ingester {
                     }
                     if hard_err.is_some() {
                         break;
+                    }
+                    if let Some(last_h) = item.histograms.last() {
+                        if samples.last().is_none_or(|ls| ls.timestamp_ms < last_h.0) {
+                            num_native_hist_buckets = last_h.4 as i64;
+                        }
                     }
                 }
 
@@ -2550,10 +2710,9 @@ impl Ingester {
 
             if native_histograms_enabled && hist_count > 0 {
                 let pairs = lazy_pairs.as_slice();
-                for (h_ts, is_float, ih_opt, fh_opt, bucket_count) in item.histograms.iter() {
+                for (h_ts, is_float, ih_opt, fh_opt, _bucket_count) in item.histograms.iter() {
                     let h_ts = *h_ts;
                     let is_float = *is_float;
-                    let bucket_count = *bucket_count;
 
                     if h_ts > max_timestamp_ms {
                         stats.failed_samples += 1;
@@ -2650,12 +2809,6 @@ impl Ingester {
                         Ok(r) => {
                             series_ref = Some(r);
                             stats.succeeded_samples += 1;
-                            if samples
-                                .last()
-                                .is_none_or(|ls| ls.timestamp_ms < h_ts)
-                            {
-                                num_native_hist_buckets = bucket_count as i64;
-                            }
                         }
                         Err(err) => {
                             if let Err(e) = handle_head_append_error(
@@ -2674,6 +2827,11 @@ impl Ingester {
                                 return Err(e.with_user(user_id, 0));
                             }
                         }
+                    }
+                }
+                if let Some(last_h) = item.histograms.last() {
+                    if samples.last().is_none_or(|ls| ls.timestamp_ms < last_h.0) {
+                        num_native_hist_buckets = last_h.4 as i64;
                     }
                 }
             }
@@ -3161,7 +3319,7 @@ impl Ingester {
             let mut num_native_hist_buckets: i64 = -1;
             if native_histograms_enabled && hist_count > 0 {
                 for h_idx in 0..hist_count {
-                    let (h_ts, is_float, ih_opt, fh_opt, bucket_count) =
+                    let (h_ts, is_float, ih_opt, fh_opt, _bucket_count) =
                         ts.convert_histogram(h_idx);
 
                     if h_ts > max_timestamp_ms {
@@ -3261,12 +3419,6 @@ impl Ingester {
                         Ok(r) => {
                             series_ref = Some(r);
                             stats.succeeded_samples += 1;
-                            if samples
-                                .last()
-                                .is_none_or(|ls| ls.timestamp_ms < h_ts)
-                            {
-                                num_native_hist_buckets = bucket_count as i64;
-                            }
                         }
                         Err(err) => {
                             match handle_head_append_error(
@@ -3288,6 +3440,11 @@ impl Ingester {
                             }
                         }
                     }
+                }
+                let last_h_ts = ts.histogram_timestamp(hist_count - 1);
+                if samples.last().is_none_or(|ls| ls.timestamp_ms < last_h_ts) {
+                    let (_, _, _, _, last_buckets) = ts.convert_histogram(hist_count - 1);
+                    num_native_hist_buckets = last_buckets as i64;
                 }
             }
 

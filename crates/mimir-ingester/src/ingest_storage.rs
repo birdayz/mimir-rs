@@ -135,7 +135,8 @@ fn ingester_err_to_pusher_err(err: IngesterError) -> PusherError {
         ErrorCause::TenantLimit => "FailedPrecondition",
         ErrorCause::ServiceUnavailable
         | ErrorCause::InstanceLimit
-        | ErrorCause::CircuitBreakerOpen => "Unavailable",
+        | ErrorCause::CircuitBreakerOpen
+        | ErrorCause::RequestRateLimited => "Unavailable",
         ErrorCause::MethodNotAllowed => "Unimplemented",
         _ => "Internal",
     };

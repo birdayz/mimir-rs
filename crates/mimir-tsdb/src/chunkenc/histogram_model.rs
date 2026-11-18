@@ -383,7 +383,7 @@ impl FloatHistogram {
         {
             return false;
         }
-        if self.zero_threshold.to_bits() != other.zero_threshold.to_bits()
+        if self.zero_threshold != other.zero_threshold
             || self.zero_count.to_bits() != other.zero_count.to_bits()
         {
             return false;

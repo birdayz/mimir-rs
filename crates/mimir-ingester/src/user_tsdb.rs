@@ -372,6 +372,14 @@ impl UserTsdb {
             None => Arc::new(NoopPlanner),
         }
     }
+
+    /// `getIndexLookupPlannerFunc` for a persisted ULID block.
+    pub fn block_lookup_planner(&self, block: &mimir_tsdb::block::Block) -> Arc<dyn LookupPlanner> {
+        match self.planner_provider.get() {
+            Some(provider) => provider.get_planner(&block.meta().into(), block.index()),
+            None => Arc::new(NoopPlanner),
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         user_id: String,
@@ -1117,7 +1125,8 @@ impl UserTsdb {
             if token_ranges_include_key(&ranges, sh) {
                 count += 1;
             } else {
-                self.active_series.delete(ref_id);
+                self.active_series
+                    .delete_with_index(ref_id, Some(self.db.head()));
                 if track_non_owned {
                     non_owned_refs.insert(ref_id);
                 }
@@ -1423,8 +1432,12 @@ impl TenantMetadataStore {
                 self.discarded_per_metric
                     .with_label_values(&[&self.user_id])
                     .inc();
+                let global_limit = self
+                    .limiter
+                    .max_global_metadata_per_metric(&self.user_id)
+                    .max(0) as usize;
                 return Err(IngesterError::per_metric_metadata_limit_reached(
-                    max_per_metric,
+                    global_limit,
                     metric_family_name.to_string(),
                 ));
             }
@@ -1438,7 +1451,11 @@ impl TenantMetadataStore {
             self.discarded_per_user
                 .with_label_values(&[&self.user_id])
                 .inc();
-            return Err(IngesterError::per_user_metadata_limit_reached(max_per_user));
+            let global_limit = self
+                .limiter
+                .max_global_metrics_with_metadata_per_user(&self.user_id)
+                .max(0) as usize;
+            return Err(IngesterError::per_user_metadata_limit_reached(global_limit));
         }
 
         let entry = MetadataEntry {
@@ -1478,10 +1495,10 @@ impl TenantMetadataStore {
 
         if deleted > 0 {
             self.mem_metadata.sub(deleted as f64);
-            self.mem_removed
-                .with_label_values(&[&self.user_id])
-                .inc_by(deleted as f64);
         }
+        self.mem_removed
+            .with_label_values(&[&self.user_id])
+            .inc_by(deleted as f64);
         deleted
     }
 

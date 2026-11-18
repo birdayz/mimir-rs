@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mimir_proto::ringpb::{
     InstanceDesc, InstanceState, PartitionDesc, PartitionRingDesc, PartitionTokenScheme,
 };
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 
 use super::model::{PartitionDescExt, PartitionRingDescExt, PartitionRingError};
 use crate::prng::{shuffle_shard_seed, GoRand};
@@ -39,16 +39,167 @@ struct CachedLookback {
     valid_before: i64,
 }
 
+struct LruNode<V> {
+    key: CacheKey,
+    val: V,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+struct BoundedLru<V> {
+    cap: usize,
+    index: HashMap<CacheKey, usize>,
+    nodes: Vec<Option<LruNode<V>>>,
+    free: Vec<usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+}
+
+impl<V: Clone> BoundedLru<V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            index: HashMap::with_capacity(cap),
+            nodes: Vec::with_capacity(cap),
+            free: Vec::new(),
+            head: None,
+            tail: None,
+        }
+    }
+
+    fn detach(&mut self, idx: usize) {
+        let Some((prev, next)) = self.nodes.get(idx).and_then(|o| o.as_ref()).map(|n| (n.prev, n.next)) else {
+            return;
+        };
+        if let Some(p) = prev {
+            if let Some(pn) = self.nodes[p].as_mut() {
+                pn.next = next;
+            }
+        } else {
+            self.head = next;
+        }
+        if let Some(nx) = next {
+            if let Some(nn) = self.nodes[nx].as_mut() {
+                nn.prev = prev;
+            }
+        } else {
+            self.tail = prev;
+        }
+        if let Some(n) = self.nodes[idx].as_mut() {
+            n.prev = None;
+            n.next = None;
+        }
+    }
+
+    fn push_front(&mut self, idx: usize) {
+        let old_head = self.head;
+        if let Some(n) = self.nodes[idx].as_mut() {
+            n.prev = None;
+            n.next = old_head;
+        }
+        if let Some(h) = old_head {
+            if let Some(hn) = self.nodes[h].as_mut() {
+                hn.prev = Some(idx);
+            }
+        } else {
+            self.tail = Some(idx);
+        }
+        self.head = Some(idx);
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<V> {
+        let idx = *self.index.get(key)?;
+        if self.head != Some(idx) {
+            self.detach(idx);
+            self.push_front(idx);
+        }
+        self.nodes[idx].as_ref().map(|n| n.val.clone())
+    }
+
+    fn insert(&mut self, key: CacheKey, val: V) {
+        if let Some(&idx) = self.index.get(&key) {
+            if let Some(n) = self.nodes[idx].as_mut() {
+                n.val = val;
+            }
+            if self.head != Some(idx) {
+                self.detach(idx);
+                self.push_front(idx);
+            }
+            return;
+        }
+        if self.index.len() >= self.cap {
+            if let Some(lru_idx) = self.tail {
+                self.detach(lru_idx);
+                if let Some(old) = self.nodes[lru_idx].take() {
+                    self.index.remove(&old.key);
+                }
+                self.free.push(lru_idx);
+            }
+        }
+        let idx = if let Some(slot) = self.free.pop() {
+            self.nodes[slot] = Some(LruNode {
+                key: key.clone(),
+                val,
+                prev: None,
+                next: None,
+            });
+            slot
+        } else {
+            let slot = self.nodes.len();
+            self.nodes.push(Some(LruNode {
+                key: key.clone(),
+                val,
+                prev: None,
+                next: None,
+            }));
+            slot
+        };
+        self.index.insert(key, idx);
+        self.push_front(idx);
+    }
+}
+
+enum CacheStorage<V> {
+    Unbounded(HashMap<CacheKey, V>),
+    Lru(BoundedLru<V>),
+}
+
+impl<V: Clone> CacheStorage<V> {
+    fn new(size: usize) -> Self {
+        if size > 0 {
+            Self::Lru(BoundedLru::new(size))
+        } else {
+            Self::Unbounded(HashMap::new())
+        }
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<V> {
+        match self {
+            Self::Unbounded(m) => m.get(key).cloned(),
+            Self::Lru(lru) => lru.get(key),
+        }
+    }
+
+    fn insert(&mut self, key: CacheKey, val: V) {
+        match self {
+            Self::Unbounded(m) => {
+                m.insert(key, val);
+            }
+            Self::Lru(lru) => lru.insert(key, val),
+        }
+    }
+}
+
 struct ShuffleShardCache {
-    without_lookback: RwLock<HashMap<CacheKey, Arc<PartitionRing>>>,
-    with_lookback: RwLock<HashMap<CacheKey, CachedLookback>>,
+    without_lookback: Mutex<CacheStorage<Arc<PartitionRing>>>,
+    with_lookback: Mutex<CacheStorage<CachedLookback>>,
 }
 
 impl ShuffleShardCache {
-    fn new() -> Arc<Self> {
+    fn new(size: usize) -> Arc<Self> {
         Arc::new(Self {
-            without_lookback: RwLock::new(HashMap::new()),
-            with_lookback: RwLock::new(HashMap::new()),
+            without_lookback: Mutex::new(CacheStorage::new(size)),
+            with_lookback: Mutex::new(CacheStorage::new(size)),
         })
     }
 }
@@ -144,6 +295,7 @@ impl PartitionRing {
         let non_pending_partitions_count = desc.non_pending_partitions_count();
         let max_partition_id = desc.max_partition_id();
 
+        let cache_size = opts.shuffle_shard_cache_size;
         Ok(Arc::new(Self {
             desc,
             ring_tokens,
@@ -151,7 +303,7 @@ impl PartitionRing {
             ring_partition_ids,
             ring_partition_active,
             owners_by_partition,
-            shuffle_shard_cache: ShuffleShardCache::new(),
+            shuffle_shard_cache: ShuffleShardCache::new(cache_size),
             all_active: OnceLock::new(),
             active_partitions_count,
             non_pending_partitions_count,
@@ -229,13 +381,13 @@ impl PartitionRing {
             shard_size: size,
             lookback_period: Duration::ZERO,
         };
-        if let Some(cached) = self.shuffle_shard_cache.without_lookback.read().get(&key) {
-            return Ok(cached.clone());
+        if let Some(cached) = self.shuffle_shard_cache.without_lookback.lock().get(&key) {
+            return Ok(cached);
         }
         let sub = self.compute_shuffle_shard(identifier, size, Duration::ZERO, UNIX_EPOCH)?;
         self.shuffle_shard_cache
             .without_lookback
-            .write()
+            .lock()
             .insert(key, sub.clone());
         Ok(sub)
     }
@@ -255,9 +407,9 @@ impl PartitionRing {
         };
         let lookback_start =
             system_time_to_unix_secs(now.checked_sub(lookback_period).unwrap_or(UNIX_EPOCH));
-        if let Some(cached) = self.shuffle_shard_cache.with_lookback.read().get(&key) {
+        if let Some(cached) = self.shuffle_shard_cache.with_lookback.lock().get(&key) {
             if lookback_start >= cached.valid_after && lookback_start <= cached.valid_before {
-                return Ok(cached.subring.clone());
+                return Ok(cached.subring);
             }
         }
 
@@ -269,7 +421,7 @@ impl PartitionRing {
                 valid_before = part.state_timestamp;
             }
         }
-        let mut wl = self.shuffle_shard_cache.with_lookback.write();
+        let mut wl = self.shuffle_shard_cache.with_lookback.lock();
         let replace = wl
             .get(&key)
             .map(|e| e.valid_after < lookback_start)
@@ -402,7 +554,7 @@ impl PartitionRing {
                 ring_partition_ids: self.ring_partition_ids.clone(),
                 ring_partition_active: self.ring_partition_active.clone(),
                 owners_by_partition,
-                shuffle_shard_cache: ShuffleShardCache::new(),
+                shuffle_shard_cache: ShuffleShardCache::new(self.opts.shuffle_shard_cache_size),
                 all_active: OnceLock::new(),
                 active_partitions_count,
                 non_pending_partitions_count,
@@ -438,7 +590,7 @@ impl PartitionRing {
             ring_partition_ids,
             ring_partition_active,
             owners_by_partition,
-            shuffle_shard_cache: ShuffleShardCache::new(),
+            shuffle_shard_cache: ShuffleShardCache::new(self.opts.shuffle_shard_cache_size),
             all_active: OnceLock::new(),
             active_partitions_count,
             non_pending_partitions_count,
@@ -612,5 +764,53 @@ impl ActivePartitionBatchRing {
             zone_awareness_enabled: false,
             partition_id: pid,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mimir_proto::ringpb::{PartitionDesc, PartitionState};
+
+    #[test]
+    fn test_shuffle_shard_cache_size_evicts_lru() {
+        let mut desc = PartitionRingDesc::default();
+        for pid in 0..4 {
+            desc.partitions.insert(
+                pid,
+                PartitionDesc {
+                    state: PartitionState::PartitionActive as i32,
+                    tokens: vec![(pid as u32 + 1) * 1000],
+                    ..Default::default()
+                },
+            );
+        }
+        let ring = PartitionRing::with_options(
+            desc,
+            PartitionRingOptions {
+                token_generator: None,
+                shuffle_shard_cache_size: 2,
+            },
+        )
+        .unwrap();
+
+        let _ = ring.shuffle_shard("t1", 1).unwrap();
+        let _ = ring.shuffle_shard("t2", 1).unwrap();
+        // Touch t1 so t2 becomes LRU.
+        let _ = ring.shuffle_shard("t1", 1).unwrap();
+        // Insert t3 -> must evict t2, keeping capacity at 2.
+        let _ = ring.shuffle_shard("t3", 1).unwrap();
+
+        let guard = ring.shuffle_shard_cache.without_lookback.lock();
+        match &*guard {
+            CacheStorage::Lru(lru) => {
+                assert_eq!(lru.index.len(), 2);
+                let keys: Vec<&str> = lru.index.keys().map(|k| k.identifier.as_str()).collect();
+                assert!(keys.contains(&"t1"));
+                assert!(keys.contains(&"t3"));
+                assert!(!keys.contains(&"t2"));
+            }
+            CacheStorage::Unbounded(_) => panic!("expected bounded LRU"),
+        }
     }
 }

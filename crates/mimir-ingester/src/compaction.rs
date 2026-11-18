@@ -193,16 +193,47 @@ impl Ingester {
         let Some(reader) = self.ingest_reader.read().clone() else {
             return;
         };
-        let hw = reader.last_seen_offsets();
-        for user_id in self.get_tsdb_users() {
-            if let Some(db) = self.get_tsdb(&user_id) {
-                if let Some(ref cat) = db.offset_catalogue {
-                    if let Err(e) = cat.sync(&hw) {
-                        warn!(user = %user_id, err = %e, "offset catalogue sync failed");
+        let hw = Arc::new(reader.last_seen_offsets());
+        let concurrency = self
+            .blocks_cfg
+            .tsdb
+            .offset_catalogue
+            .sync_concurrency
+            .max(1) as usize;
+        let tasks: Vec<_> = self
+            .get_tsdb_users()
+            .into_iter()
+            .filter_map(|user_id| {
+                let db = self.get_tsdb(&user_id)?;
+                db.offset_catalogue.as_ref()?;
+                Some((user_id, db))
+            })
+            .collect();
+        futures::stream::iter(tasks)
+            .for_each_concurrent(concurrency, |(user_id, db)| {
+                let hw = Arc::clone(&hw);
+                async move {
+                    let uid = user_id.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        if let Some(ref cat) = db.offset_catalogue {
+                            cat.sync(&hw)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(user = %uid, err = %e, "offset catalogue sync failed");
+                        }
+                        Err(e) => {
+                            warn!(user = %uid, err = %e, "offset catalogue sync join error");
+                        }
                     }
                 }
-            }
-        }
+            })
+            .await;
     }
 }
 
@@ -394,7 +425,7 @@ impl Ingester {
             if user_series == 0 {
                 continue;
             }
-            db.active_series.purge(now);
+            db.active_series.purge_with_index(now, Some(db.db.head()));
             let active = db.active_series.active().0;
             let reduction = (user_series as i64 - active as i64).max(0);
             let pct = ((reduction as u64 * 100) / user_series) as i64;
@@ -492,7 +523,7 @@ impl Ingester {
             if user_series == 0 {
                 continue;
             }
-            db.active_series.purge(now);
+            db.active_series.purge_with_index(now, Some(db.db.head()));
             let active = db.active_series.active().0;
             let est_reduction = (user_series as i64 - active as i64).max(0);
             let est_pct = ((est_reduction as u64 * 100) / user_series) as i64;
@@ -554,13 +585,25 @@ impl Ingester {
             }
 
             let series_before = db.db.head().num_series();
-            let _ = db.db.compact_ooo_head();
-            if let Err(e) = db.db.compact_selected_series(&refs) {
-                db.update_last_series_removal();
-                warn!(user = %user_id, err = %e, "selected series compaction failed");
-                continue;
+            let db_c = Arc::clone(&db);
+            let compact_res = tokio::task::spawn_blocking(move || {
+                let _ = db_c.db.compact_ooo_head();
+                let res = db_c.db.compact_selected_series(&refs);
+                db_c.update_last_series_removal();
+                res
+            })
+            .await;
+            match compact_res {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(user = %user_id, err = %e, "selected series compaction failed");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(user = %user_id, err = %e, "selected series compaction join error");
+                    continue;
+                }
             }
-            db.update_last_series_removal();
             if db.db.head().num_series() < series_before {
                 db.trigger_recompute_owned_series(RECOMPUTE_OWNED_SERIES_REASON_EARLY_COMPACTION);
                 self.metrics
@@ -875,6 +918,9 @@ impl Ingester {
                 .with_label_values(&[&user_id])
                 .set(local_limit as f64);
 
+            self.metrics
+                .delete_user_label_value_bytes_metrics(&user_id, &[]);
+
             if self
                 .overrides
                 .for_tenant(&user_id)
@@ -1130,6 +1176,7 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
         let mut ingest_rate_tick = tokio::time::interval(INSTANCE_INGESTION_RATE_TICK_INTERVAL);
         let mut rate_tick = tokio::time::interval(rate_period);
         let mut active_tick = tokio::time::interval(active_period);
+        let mut usage_stats_tick = tokio::time::interval(USAGE_STATS_UPDATE_INTERVAL);
         let mut limit_tick = tokio::time::interval(limit_period);
         let mut churn_tick = tokio::time::interval(LABEL_CHURN_RECORD_INTERVAL);
         // Go runs the 250ms inflight requests ticker in its own goroutine so that it is not
@@ -1154,6 +1201,7 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
         ingest_rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         active_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        usage_stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         limit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         churn_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1161,6 +1209,7 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
         ingest_rate_tick.tick().await;
         rate_tick.tick().await;
         active_tick.tick().await;
+        usage_stats_tick.tick().await;
         limit_tick.tick().await;
         churn_tick.tick().await;
 
@@ -1189,6 +1238,13 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
                         .await;
                     }
                 }
+                _ = usage_stats_tick.tick() => {
+                    let ing_c = Arc::clone(&ingester);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        ing_c.update_usage_stats();
+                    })
+                    .await;
+                }
                 _ = limit_tick.tick() => {
                     let ing_c = Arc::clone(&ingester);
                     let _ = tokio::task::spawn_blocking(move || {
@@ -1210,6 +1266,8 @@ pub fn spawn_metrics_updater_loop(ingester: Arc<Ingester>, ctx: ServiceContext) 
 
 /// Go `metricsUpdaterServiceRunning` `inflightRequestsTicker`.
 const INFLIGHT_REQUESTS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+/// Go `usageStatsUpdateInterval` (`usagestats.DefaultReportSendInterval / 10` = 4h / 10 = 24m).
+const USAGE_STATS_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60);
 
 pub fn spawn_owned_series_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> JoinHandle<()> {
     let normal_interval = Duration::from_nanos(
@@ -1224,7 +1282,11 @@ pub fn spawn_owned_series_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> 
             return;
         };
         ingester.set_owned_series_service_state(State::Running);
-        let mut cur_interval = DEFAULT_OWNED_SERIES_INITIAL_RETRY_INTERVAL;
+        let mut cur_interval = if ingester.owned_series_initial_ring_check_succeeded() {
+            normal_interval
+        } else {
+            DEFAULT_OWNED_SERIES_INITIAL_RETRY_INTERVAL
+        };
         loop {
             tokio::select! {
                 _ = ctx.canceled() => break,

@@ -11,11 +11,12 @@ use mimir_common::backoff::{Backoff, BackoffConfig};
 use mimir_common::services::ServiceContext;
 use mimir_config::ingester::EtcdConfig;
 use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 
-use super::{BoxFuture, CasFn, CasOutcome, Codec, KvClient, KvError};
+use super::{BoxFuture, CasFn, CasOutcome, Codec, KeyDeleted, KvClient, KvError};
 
 /// reqwest's error text plus its source chain (the TLS / connect cause is only in the sources).
 fn format_reqwest_error(err: &reqwest::Error) -> String {
@@ -51,6 +52,24 @@ fn get_prefix_range_end(prefix: &str) -> Vec<u8> {
     vec![0]
 }
 
+/// Returns `(key, range_end)` matching `clientv3.WithPrefix()` (`op.go:424-433`):
+/// when `prefix` is empty, both `key` and `range_end` are `[0]` (`"\0"`).
+fn prefix_range(prefix: &str) -> (Vec<u8>, Vec<u8>) {
+    if prefix.is_empty() {
+        (vec![0], vec![0])
+    } else {
+        (prefix.as_bytes().to_vec(), get_prefix_range_end(prefix))
+    }
+}
+
+fn parse_i64_opt(v: &Option<serde_json::Value>) -> i64 {
+    match v {
+        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+        Some(serde_json::Value::String(s)) => s.parse::<i64>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 #[derive(Serialize)]
 struct RangeRequest {
     key: String,
@@ -61,26 +80,42 @@ struct RangeRequest {
 }
 
 #[derive(Deserialize)]
+struct EtcdResponseHeader {
+    #[serde(default)]
+    revision: Option<serde_json::Value>,
+}
+
+impl EtcdResponseHeader {
+    fn revision_i64(&self) -> i64 {
+        parse_i64_opt(&self.revision)
+    }
+}
+
+#[derive(Deserialize)]
 struct EtcdKeyValue {
     key: String,
     #[serde(default)]
     value: Option<String>,
     #[serde(default)]
     version: Option<serde_json::Value>,
+    #[serde(default)]
+    mod_revision: Option<serde_json::Value>,
 }
 
 impl EtcdKeyValue {
     fn version_i64(&self) -> i64 {
-        match &self.version {
-            Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
-            Some(serde_json::Value::String(s)) => s.parse::<i64>().unwrap_or(0),
-            _ => 0,
-        }
+        parse_i64_opt(&self.version)
+    }
+
+    fn mod_revision_i64(&self) -> i64 {
+        parse_i64_opt(&self.mod_revision)
     }
 }
 
 #[derive(Deserialize)]
 struct RangeResponse {
+    #[serde(default)]
+    header: Option<EtcdResponseHeader>,
     #[serde(default)]
     kvs: Vec<EtcdKeyValue>,
 }
@@ -127,6 +162,8 @@ struct WatchCreateRequest {
     key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     range_end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_revision: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -146,14 +183,42 @@ struct WatchEvent {
 struct WatchResultWrapper {
     #[serde(default)]
     result: Option<WatchResponse>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct WatchResponse {
     #[serde(default)]
+    header: Option<EtcdResponseHeader>,
+    #[serde(default)]
     events: Vec<WatchEvent>,
     #[serde(default)]
     canceled: bool,
+    #[serde(default)]
+    compact_revision: Option<serde_json::Value>,
+    #[serde(default)]
+    cancel_reason: Option<String>,
+}
+
+impl WatchResponse {
+    fn header_revision(&self) -> i64 {
+        self.header
+            .as_ref()
+            .map(EtcdResponseHeader::revision_i64)
+            .unwrap_or(0)
+    }
+
+    fn compact_revision_i64(&self) -> i64 {
+        parse_i64_opt(&self.compact_revision)
+    }
+}
+
+enum LineAction {
+    Continue,
+    BreakStream,
+    Compacted(i64),
+    StopWatching,
 }
 
 pub struct EtcdKv {
@@ -218,6 +283,10 @@ impl EtcdKv {
         &self.endpoints[idx % self.endpoints.len()]
     }
 
+    async fn invalidate_auth(&self) {
+        *self.auth_token.write().await = None;
+    }
+
     async fn ensure_auth(&self) -> Result<Option<String>, KvError> {
         if self.cfg.username.is_empty() {
             return Ok(None);
@@ -235,26 +304,46 @@ impl EtcdKv {
             token: String,
         }
 
-        let url = format!("{}/v3/auth/authenticate", self.endpoint(0));
-        let resp = self
-            .http
-            .post(&url)
-            .json(&AuthReq {
-                name: &self.cfg.username,
-                password: &self.cfg.password,
-            })
-            .send()
-            .await
-            .map_err(|e| KvError::Http(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(KvError::Http(format!("etcd auth failed: {}", resp.status())));
+        let mut last_err = None;
+        for idx in 0..self.endpoints.len() {
+            let url = format!("{}/v3/auth/authenticate", self.endpoint(idx));
+            match self
+                .http
+                .post(&url)
+                .json(&AuthReq {
+                    name: &self.cfg.username,
+                    password: &self.cfg.password,
+                })
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let parsed: AuthResp = resp
+                        .json()
+                        .await
+                        .map_err(|e| KvError::Http(format!("decode etcd auth: {e}")))?;
+                    *self.auth_token.write().await = Some(parsed.token.clone());
+                    return Ok(Some(parsed.token));
+                }
+                Ok(resp) => {
+                    last_err = Some(KvError::Http(format!("etcd auth failed: {}", resp.status())));
+                }
+                Err(e) => {
+                    last_err = Some(KvError::Http(format_reqwest_error(&e)));
+                }
+            }
         }
-        let parsed: AuthResp = resp
-            .json()
-            .await
-            .map_err(|e| KvError::Http(format!("decode etcd auth: {e}")))?;
-        *self.auth_token.write().await = Some(parsed.token.clone());
-        Ok(Some(parsed.token))
+        Err(last_err.unwrap_or_else(|| KvError::Http("no etcd endpoints".to_string())))
+    }
+
+    async fn auth_headers(&self) -> Result<HeaderMap, KvError> {
+        let mut headers = HeaderMap::new();
+        if let Some(tok) = self.ensure_auth().await? {
+            if let Ok(val) = HeaderValue::from_str(&tok) {
+                headers.insert("Authorization", val);
+            }
+        }
+        Ok(headers)
     }
 
     async fn post_json<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
@@ -262,24 +351,29 @@ impl EtcdKv {
         path: &str,
         body: &Req,
     ) -> Result<Resp, KvError> {
-        let mut headers = HeaderMap::new();
-        if let Some(tok) = self.ensure_auth().await? {
-            if let Ok(val) = HeaderValue::from_str(&tok) {
-                headers.insert("Authorization", val);
-            }
-        }
         // etcd clientv3 issues every RPC with `grpc.WaitForReady(true)`: while no endpoint can be
         // connected to (refused, TLS handshake failure, ...) the call blocks and reconnects with
         // gRPC's connection backoff (1s base, x1.6, max 120s) until the caller gives up (the
-        // caller's context; here: the future is dropped). HTTP-level errors fail immediately.
+        // caller's context; here: the future is dropped). HTTP-level errors fail immediately
+        // (except 401 when auth is enabled, which refreshes the cached token once).
         let mut reconnect = Backoff::new(BackoffConfig {
             min_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(120),
             max_retries: 0,
         });
+        let mut refreshed_auth = false;
         loop {
+            let headers = match self.auth_headers().await {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(path, err = %e, "etcd auth failed while connecting, retrying");
+                    reconnect.wait().await;
+                    continue;
+                }
+            };
             let mut last_err = None;
             let mut responded = false;
+            let mut need_auth_retry = false;
             for idx in 0..self.endpoints.len() {
                 let url = format!("{}{path}", self.endpoint(idx));
                 match self
@@ -296,6 +390,16 @@ impl EtcdKv {
                             .await
                             .map_err(|e| KvError::Http(format!("decode etcd {path}: {e}")));
                     }
+                    Ok(resp)
+                        if resp.status() == StatusCode::UNAUTHORIZED
+                            && !self.cfg.username.is_empty()
+                            && !refreshed_auth =>
+                    {
+                        refreshed_auth = true;
+                        need_auth_retry = true;
+                        self.invalidate_auth().await;
+                        break;
+                    }
                     Ok(resp) => {
                         responded = true;
                         last_err = Some(KvError::Http(format!(
@@ -307,6 +411,9 @@ impl EtcdKv {
                         last_err = Some(KvError::Http(format_reqwest_error(&e)));
                     }
                 }
+            }
+            if need_auth_retry {
+                continue;
             }
             let Some(err) = last_err else {
                 return Err(KvError::Http("no etcd endpoints".to_string()));
@@ -323,9 +430,10 @@ impl EtcdKv {
 impl KvClient for EtcdKv {
     fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>, KvError>> {
         Box::pin(async move {
+            let (key, range_end) = prefix_range(prefix);
             let req = RangeRequest {
-                key: b64_encode(prefix.as_bytes()),
-                range_end: Some(b64_encode(&get_prefix_range_end(prefix))),
+                key: b64_encode(&key),
+                range_end: Some(b64_encode(&range_end)),
                 keys_only: true,
             };
             let resp: RangeResponse = self.post_json("/v3/kv/range", &req).await?;
@@ -493,7 +601,9 @@ impl KvClient for EtcdKv {
         Box::pin(async move {
             self.watch_impl(
                 key,
+                key.as_bytes(),
                 None,
+                true,
                 cancel,
                 move |_, val| f(val),
             )
@@ -508,10 +618,12 @@ impl KvClient for EtcdKv {
         mut f: Box<dyn FnMut(&str, Box<dyn Any + Send + Sync>) -> bool + Send>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let range_end = get_prefix_range_end(prefix);
+            let (req_key, range_end) = prefix_range(prefix);
             self.watch_impl(
                 prefix,
+                &req_key,
                 Some(range_end),
+                false,
                 cancel,
                 move |k, val| f(k, val),
             )
@@ -521,10 +633,113 @@ impl KvClient for EtcdKv {
 }
 
 impl EtcdKv {
+    fn process_watch_line<F>(
+        &self,
+        key_label: &str,
+        trimmed: &[u8],
+        notify_on_delete: bool,
+        start_revision: &mut i64,
+        backoff: &mut Backoff,
+        on_event: &mut F,
+    ) -> LineAction
+    where
+        F: FnMut(&str, Box<dyn Any + Send + Sync>) -> bool + Send,
+    {
+        let wrapper = match serde_json::from_slice::<WatchResultWrapper>(trimmed) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(key = key_label, err = %e, "failed to parse etcd watch response line");
+                return LineAction::Continue;
+            }
+        };
+
+        if let Some(err_val) = wrapper.error {
+            error!(key = key_label, err = %err_val, "etcd watch stream returned error");
+            return LineAction::BreakStream;
+        }
+
+        let Some(wr) = wrapper.result else {
+            return LineAction::Continue;
+        };
+
+        if wr.canceled {
+            let compact_rev = wr.compact_revision_i64();
+            if compact_rev > 0 {
+                warn!(
+                    key = key_label,
+                    compact_revision = compact_rev,
+                    reason = wr.cancel_reason.as_deref().unwrap_or(""),
+                    "etcd watch canceled due to compaction; recovering via range GET"
+                );
+                return LineAction::Compacted(compact_rev);
+            }
+            warn!(
+                key = key_label,
+                reason = wr.cancel_reason.as_deref().unwrap_or(""),
+                "etcd watch canceled"
+            );
+            return LineAction::BreakStream;
+        }
+
+        backoff.reset();
+        let hdr_rev = wr.header_revision();
+        if hdr_rev > 0 {
+            *start_revision = (*start_revision).max(hdr_rev + 1);
+        }
+
+        for ev in wr.events {
+            let is_delete = ev.event_type.as_deref() == Some("DELETE")
+                || ev
+                    .kv
+                    .as_ref()
+                    .is_some_and(|kv| kv.version_i64() == 0 && kv.value.is_none());
+            let Some(kv) = ev.kv else { continue };
+            let mod_rev = kv.mod_revision_i64();
+            if mod_rev > 0 {
+                *start_revision = (*start_revision).max(mod_rev + 1);
+            }
+            let Ok(raw_key) = b64_decode(&kv.key) else {
+                continue;
+            };
+            let Ok(key_str) = String::from_utf8(raw_key) else {
+                continue;
+            };
+
+            if is_delete {
+                if notify_on_delete && !on_event(&key_str, Box::new(KeyDeleted)) {
+                    return LineAction::StopWatching;
+                }
+                continue;
+            }
+
+            let val_bytes = match kv.value.as_deref() {
+                Some(s) if !s.is_empty() => match b64_decode(s) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                },
+                _ => Vec::new(),
+            };
+            match self.codec.decode(&val_bytes) {
+                Ok(decoded) => {
+                    if !on_event(&key_str, decoded) {
+                        return LineAction::StopWatching;
+                    }
+                }
+                Err(e) => {
+                    error!(key = %key_str, err = %e, "error decoding etcd watch event");
+                }
+            }
+        }
+
+        LineAction::Continue
+    }
+
     async fn watch_impl<F>(
         &self,
-        key: &str,
+        key_label: &str,
+        req_key: &[u8],
         range_end: Option<Vec<u8>>,
+        notify_on_delete: bool,
         cancel: ServiceContext,
         mut on_event: F,
     ) where
@@ -536,43 +751,85 @@ impl EtcdKv {
             max_retries: 0,
         });
 
-        let req_body = WatchRequest {
-            create_request: WatchCreateRequest {
-                key: b64_encode(key.as_bytes()),
-                range_end: range_end.as_deref().map(b64_encode),
-            },
-        };
+        let mut start_revision: i64 = 0;
+        let mut ep_idx: usize = 0;
+        let mut refreshed_auth = false;
 
         while backoff.ongoing() && !cancel.is_canceled() {
-            let url = format!("{}/v3/watch", self.endpoint(0));
-            let resp_res = tokio::select! {
+            let headers = match tokio::select! {
                 _ = cancel.canceled() => return,
-                r = self.http.post(&url).json(&req_body).send() => r,
+                r = self.auth_headers() => r,
+            } {
+                Ok(h) => h,
+                Err(e) => {
+                    error!(key = key_label, err = %e, "etcd watch auth error");
+                    tokio::select! {
+                        _ = cancel.canceled() => return,
+                        _ = backoff.wait() => continue,
+                    }
+                }
             };
 
-            let mut resp = match resp_res {
-                Ok(r) if r.status().is_success() => {
-                    backoff.reset();
-                    r
-                }
-                Ok(r) => {
-                    error!(key, status = %r.status(), "etcd watch HTTP error");
-                    tokio::select! {
-                        _ = cancel.canceled() => return,
-                        _ = backoff.wait() => continue,
+            let req_body = WatchRequest {
+                create_request: WatchCreateRequest {
+                    key: b64_encode(req_key),
+                    range_end: range_end.as_deref().map(b64_encode),
+                    start_revision: (start_revision > 0).then_some(start_revision),
+                },
+            };
+
+            let mut connected_resp = None;
+            let mut unauthorized = false;
+            for attempt in 0..self.endpoints.len() {
+                let idx = (ep_idx + attempt) % self.endpoints.len();
+                let url = format!("{}/v3/watch", self.endpoint(idx));
+                let resp_res = tokio::select! {
+                    _ = cancel.canceled() => return,
+                    r = self.http.post(&url).headers(headers.clone()).json(&req_body).send() => r,
+                };
+                match resp_res {
+                    Ok(r) if r.status().is_success() => {
+                        refreshed_auth = false;
+                        ep_idx = (idx + 1) % self.endpoints.len();
+                        connected_resp = Some(r);
+                        break;
+                    }
+                    Ok(r)
+                        if r.status() == StatusCode::UNAUTHORIZED
+                            && !self.cfg.username.is_empty()
+                            && !refreshed_auth =>
+                    {
+                        warn!(key = key_label, endpoint = %self.endpoint(idx), "etcd watch unauthorized, refreshing auth token");
+                        refreshed_auth = true;
+                        self.invalidate_auth().await;
+                        unauthorized = true;
+                        break;
+                    }
+                    Ok(r) => {
+                        error!(key = key_label, endpoint = %self.endpoint(idx), status = %r.status(), "etcd watch HTTP error");
+                    }
+                    Err(e) => {
+                        error!(key = key_label, endpoint = %self.endpoint(idx), err = %e, "etcd watch error");
                     }
                 }
-                Err(e) => {
-                    error!(key, err = %e, "etcd watch error");
-                    tokio::select! {
-                        _ = cancel.canceled() => return,
-                        _ = backoff.wait() => continue,
-                    }
+            }
+
+            if unauthorized {
+                continue;
+            }
+
+            let Some(mut resp) = connected_resp else {
+                ep_idx = (ep_idx + 1) % self.endpoints.len();
+                refreshed_auth = false;
+                tokio::select! {
+                    _ = cancel.canceled() => return,
+                    _ = backoff.wait() => continue,
                 }
             };
 
             let mut buf = Vec::new();
-            loop {
+            let mut compacted_rev: Option<i64> = None;
+            'stream: loop {
                 let chunk_res = tokio::select! {
                     _ = cancel.canceled() => return,
                     c = resp.chunk() => c,
@@ -586,55 +843,127 @@ impl EtcdKv {
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            if let Ok(wrapper) = serde_json::from_slice::<WatchResultWrapper>(trimmed) {
-                                if let Some(wr) = wrapper.result {
-                                    if wr.canceled {
-                                        break;
-                                    }
-                                    for ev in wr.events {
-                                        if ev.event_type.as_deref() == Some("DELETE") {
-                                            continue;
-                                        }
-                                        let Some(kv) = ev.kv else { continue };
-                                        if kv.version_i64() == 0 && kv.value.is_none() {
-                                            continue;
-                                        }
-                                        let Ok(raw_key) = b64_decode(&kv.key) else { continue };
-                                        let Ok(key_str) = String::from_utf8(raw_key) else { continue };
-                                        let val_bytes = match kv.value.as_deref() {
-                                            Some(s) if !s.is_empty() => match b64_decode(s) {
-                                                Ok(b) => b,
-                                                Err(_) => continue,
-                                            },
-                                            _ => Vec::new(),
-                                        };
-                                        match self.codec.decode(&val_bytes) {
-                                            Ok(decoded) => {
-                                                if !on_event(&key_str, decoded) {
-                                                    return;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!(key = %key_str, err = %e, "error decoding etcd watch event");
-                                            }
-                                        }
-                                    }
+                            match self.process_watch_line(
+                                key_label,
+                                trimmed,
+                                notify_on_delete,
+                                &mut start_revision,
+                                &mut backoff,
+                                &mut on_event,
+                            ) {
+                                LineAction::Continue => {}
+                                LineAction::BreakStream => break 'stream,
+                                LineAction::Compacted(rev) => {
+                                    compacted_rev = Some(rev);
+                                    break 'stream;
                                 }
+                                LineAction::StopWatching => return,
                             }
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        let trimmed = buf.trim_ascii();
+                        if !trimmed.is_empty() {
+                            match self.process_watch_line(
+                                key_label,
+                                trimmed,
+                                notify_on_delete,
+                                &mut start_revision,
+                                &mut backoff,
+                                &mut on_event,
+                            ) {
+                                LineAction::Continue | LineAction::BreakStream => {}
+                                LineAction::Compacted(rev) => compacted_rev = Some(rev),
+                                LineAction::StopWatching => return,
+                            }
+                        }
+                        break;
+                    }
                     Err(e) => {
-                        error!(key, err = %e, "etcd watch stream error");
+                        error!(key = key_label, err = %e, "etcd watch stream error");
                         break;
                     }
                 }
             }
 
+            if let Some(c_rev) = compacted_rev {
+                let range_req = RangeRequest {
+                    key: b64_encode(req_key),
+                    range_end: range_end.as_deref().map(b64_encode),
+                    keys_only: false,
+                };
+                let range_res = tokio::select! {
+                    _ = cancel.canceled() => return,
+                    r = self.post_json::<_, RangeResponse>("/v3/kv/range", &range_req) => r,
+                };
+                match range_res {
+                    Ok(range_resp) => {
+                        if notify_on_delete
+                            && range_resp.kvs.is_empty()
+                            && !on_event(key_label, Box::new(KeyDeleted))
+                        {
+                            return;
+                        }
+                        for kv in range_resp.kvs {
+                            let Ok(raw_key) = b64_decode(&kv.key) else {
+                                continue;
+                            };
+                            let Ok(key_str) = String::from_utf8(raw_key) else {
+                                continue;
+                            };
+                            let val_bytes = match kv.value.as_deref() {
+                                Some(s) if !s.is_empty() => match b64_decode(s) {
+                                    Ok(b) => b,
+                                    Err(_) => continue,
+                                },
+                                _ => Vec::new(),
+                            };
+                            match self.codec.decode(&val_bytes) {
+                                Ok(decoded) => {
+                                    if !on_event(&key_str, decoded) {
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(key = %key_str, err = %e, "error decoding etcd compaction recovery value");
+                                }
+                            }
+                        }
+                        let hdr_rev = range_resp
+                            .header
+                            .as_ref()
+                            .map(EtcdResponseHeader::revision_i64)
+                            .unwrap_or(0);
+                        if hdr_rev > 0 {
+                            start_revision = hdr_rev + 1;
+                            backoff.reset();
+                            continue;
+                        }
+                        start_revision = c_rev;
+                    }
+                    Err(e) => {
+                        error!(key = key_label, err = %e, "etcd compaction recovery GET failed");
+                        start_revision = c_rev;
+                    }
+                }
+            }
+
+            refreshed_auth = false;
             tokio::select! {
                 _ = cancel.canceled() => return,
                 _ = backoff.wait() => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_range_empty_matches_clientv3() {
+        assert_eq!(prefix_range(""), (vec![0], vec![0]));
+        assert_eq!(prefix_range("abc"), (b"abc".to_vec(), b"abd".to_vec()));
     }
 }

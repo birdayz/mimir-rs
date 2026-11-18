@@ -51,11 +51,11 @@ impl PartitionInstanceLifecyclerConfig {
             wait_owners_duration_on_pending: cfg
                 .min_partition_owners_duration
                 .as_std()
-                .unwrap_or(Duration::from_secs(10)),
+                .unwrap_or(Duration::ZERO),
             delete_inactive_partition_after: cfg
                 .delete_inactive_partition_after
                 .as_std()
-                .unwrap_or(Duration::from_secs(13 * 3600)),
+                .unwrap_or(Duration::ZERO),
             polling_interval,
         }
     }
@@ -156,6 +156,8 @@ pub struct PartitionInstanceLifecycler {
     create_partition_on_startup: AtomicBool,
     remove_owner_on_shutdown: AtomicBool,
     started: AtomicBool,
+    running: AtomicBool,
+    op_lock: tokio::sync::Mutex<()>,
     metrics: LifecyclerMetrics,
 }
 
@@ -194,6 +196,8 @@ impl PartitionInstanceLifecycler {
             create_partition_on_startup: AtomicBool::new(true),
             remove_owner_on_shutdown: AtomicBool::new(false),
             started: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            op_lock: tokio::sync::Mutex::new(()),
             metrics: LifecyclerMetrics::new(ring_name, reg.as_ref()),
         }))
     }
@@ -243,9 +247,18 @@ impl PartitionInstanceLifecycler {
         &self,
         to_state: PartitionState,
     ) -> Result<(), PartitionRingError> {
+        if !self.running.load(Ordering::Acquire) {
+            return Err(PartitionRingError::Other("lifecycler not running".to_string()));
+        }
+        let op = self.op_lock.lock().await;
+        if !self.running.load(Ordering::Acquire) {
+            return Err(PartitionRingError::Other("lifecycler not running".to_string()));
+        }
         let pid = self.cfg.partition_id;
-        self.update_ring(move |ring| change_partition_state_in_desc(ring, pid, to_state))
-            .await
+        self.update_ring_locked(&op, move |ring| {
+            change_partition_state_in_desc(ring, pid, to_state)
+        })
+        .await
     }
 
     async fn get_ring(&self) -> Result<PartitionRingDesc, PartitionRingError> {
@@ -261,6 +274,18 @@ impl PartitionInstanceLifecycler {
     }
 
     async fn update_ring<F>(&self, update: F) -> Result<(), PartitionRingError>
+    where
+        F: Fn(&mut PartitionRingDesc) -> Result<bool, PartitionRingError> + Send + Sync + 'static,
+    {
+        let op = self.op_lock.lock().await;
+        self.update_ring_locked(&op, update).await
+    }
+
+    async fn update_ring_locked<F>(
+        &self,
+        _op: &tokio::sync::MutexGuard<'_, ()>,
+        update: F,
+    ) -> Result<(), PartitionRingError>
     where
         F: Fn(&mut PartitionRingDesc) -> Result<bool, PartitionRingError> + Send + Sync + 'static,
     {
@@ -456,13 +481,19 @@ impl PartitionInstanceLifecycler {
                 let l = l_start.clone();
                 Box::pin(async move {
                     if l.create_partition_on_startup() {
-                        l.create_partition_and_register_owner()
-                            .await
-                            .map_err(|e| ServiceError::failure(e.to_string()))?;
+                        tokio::select! {
+                            res = l.create_partition_and_register_owner() => {
+                                res.map_err(|e| ServiceError::failure(e.to_string()))?;
+                            }
+                            _ = ctx.canceled() => return Err(ServiceError::Canceled),
+                        }
                     } else {
-                        l.wait_partition_and_register_owner(&ctx)
-                            .await
-                            .map_err(|e| ServiceError::failure(e.to_string()))?;
+                        tokio::select! {
+                            res = l.wait_partition_and_register_owner(&ctx) => {
+                                res.map_err(|e| ServiceError::failure(e.to_string()))?;
+                            }
+                            _ = ctx.canceled() => return Err(ServiceError::Canceled),
+                        }
                     }
                     Ok(())
                 })
@@ -470,6 +501,7 @@ impl PartitionInstanceLifecycler {
             Some(Box::new(move |ctx: ServiceContext| {
                 let l = l_run.clone();
                 Box::pin(async move {
+                    l.running.store(true, Ordering::Release);
                     l.reconcile_owned_partition(SystemTime::now()).await;
                     l.reconcile_other_partitions(SystemTime::now()).await;
 
@@ -485,12 +517,14 @@ impl PartitionInstanceLifecycler {
                             }
                         }
                     }
+                    l.running.store(false, Ordering::Release);
                     Ok(())
                 })
             })),
             Some(Box::new(move |_| {
                 let l = l_stop.clone();
                 Box::pin(async move {
+                    l.running.store(false, Ordering::Release);
                     info!(ring = %l.ring_name, "partition ring lifecycler shutting down");
                     if l.remove_owner_on_shutdown() {
                         let owner_id = l.partition_owner_id();
@@ -587,5 +621,51 @@ impl PartitionRingEditor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv::inmemory::InMemoryKv;
+    use crate::partition_ring::model::partition_ring_desc_codec;
+
+    #[test]
+    fn negative_durations_default_to_zero() {
+        let cfg = PartitionRingConfig {
+            min_partition_owners_duration: mimir_config::GoDuration(-1),
+            delete_inactive_partition_after: mimir_config::GoDuration(-1),
+            ..Default::default()
+        };
+        let plc_cfg = PartitionInstanceLifecyclerConfig::from_partition_ring_config(
+            &cfg,
+            0,
+            "ing-0",
+            Duration::from_secs(5),
+        );
+        assert_eq!(plc_cfg.wait_owners_duration_on_pending, Duration::ZERO);
+        assert_eq!(plc_cfg.delete_inactive_partition_after, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn change_partition_state_requires_running_service() {
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(partition_ring_desc_codec()));
+        let plc = PartitionInstanceLifecycler::new(
+            PartitionInstanceLifecyclerConfig {
+                partition_id: 0,
+                instance_id: "ing-0".to_string(),
+                ..Default::default()
+            },
+            "ingester-partitions",
+            "ingester-partitions",
+            kv,
+            None,
+        )
+        .unwrap();
+        let err = plc
+            .change_partition_state(PartitionState::PartitionActive)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lifecycler not running"));
     }
 }

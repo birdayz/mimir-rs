@@ -3135,3 +3135,114 @@ async fn test_generic_partition_reader_caching() {
         r.stop().await;
     }
 }
+
+#[tokio::test]
+async fn test_get_start_offset_tolerates_unknown_topic_or_partition_with_offset_file() {
+    use mimir_storage::ingest::kafka_client::KAFKA_OFFSET_START;
+    use mimir_storage::ingest::{OffsetFile, SingleClusterPartitionReader};
+
+    let cluster = MockKafkaCluster::start(1, "existing-topic").await;
+    // Return UnknownTopicOrPartition on ListOffsets (simulating recreated cluster / missing topic).
+    cluster.set_list_offsets_hook(Some(Arc::new(|_| {
+        Box::pin(async {
+            let mut resp = ListOffsetsResponse::default();
+            let mut t1 = ListOffsetsTopicResponse::default();
+            t1.name = TopicName(StrBytes::from_static_str("missing-topic"));
+            let mut p0 = ListOffsetsPartitionResponse::default();
+            p0.partition_index = 0;
+            p0.error_code = ResponseError::UnknownTopicOrPartition.code();
+            t1.partitions = vec![p0];
+            resp.topics = vec![t1];
+            Some(resp)
+        })
+    })));
+
+    let dir = tempfile::tempdir().unwrap();
+    let off_path = dir.path().join("kafka-offset.json");
+    OffsetFile::new(off_path.clone(), 0).write(123).unwrap();
+
+    let mut cfg = make_test_kafka_cfg(&cluster.addr, "missing-topic");
+    cfg.consumer_group_offset_commit_file_enforced = true;
+    cfg.consume_from_position_at_startup = "last-offset".to_string();
+    cfg.last_produced_offset_retry_timeout = GoDuration::from_millis(200);
+
+    let reader = SingleClusterPartitionReader::new(
+        cfg,
+        0,
+        "ingester-0",
+        Some(off_path),
+        Arc::new(NoopConsumer),
+        None,
+    )
+    .unwrap()
+    .with_max_replay_period(Duration::from_secs(60));
+
+    let (start_off, last_consumed) = reader.get_start_offset().await.unwrap();
+    assert_eq!(start_off, KAFKA_OFFSET_START);
+    assert_eq!(last_consumed, -1);
+}
+
+#[tokio::test]
+async fn test_multi_cluster_partition_reader_stops_started_readers_on_partial_failure_and_propagates_runtime_error() {
+    use mimir_storage::ingest::ReaderState;
+
+    // 1. Partial startup failure cleans up without requiring manual reader.stop().
+    {
+        let healthy = MockKafkaCluster::start(1, "ingest-p1-2").await;
+        let healthy_cfg = make_test_kafka_cfg(&healthy.addr, "ingest-p1-2");
+        let mut broken_cfg = make_test_kafka_cfg(&healthy.addr, "ingest-p1-2");
+        broken_cfg.consumer_group_offset_commit_file_enforced = true;
+        broken_cfg.consume_from_position_at_startup = "last-offset".to_string();
+
+        let dir = tempfile::tempdir().unwrap();
+        let multi = MultiClusterPartitionReader::new(
+            &[healthy_cfg, broken_cfg],
+            &OrderedConsumptionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            0,
+            "ingester-0",
+            vec![
+                Some(dir.path().join("wc-0.offset")),
+                Some(dir.path().join("wc-1.offset")),
+            ],
+            Arc::new(NoopConsumer),
+            None,
+        )
+        .unwrap();
+
+        assert!(multi.start().await.is_err());
+        assert_eq!(multi.state(), ReaderState::Failed);
+    }
+
+    // 2. Partial startup failure also stops the shared HeapMerger when ordered consumption is enabled.
+    {
+        let healthy = MockKafkaCluster::start(1, "ingest-p1-2b").await;
+        let healthy_cfg = make_test_kafka_cfg(&healthy.addr, "ingest-p1-2b");
+        let mut broken_cfg = make_test_kafka_cfg(&healthy.addr, "ingest-p1-2b");
+        broken_cfg.consumer_group_offset_commit_file_enforced = true;
+        broken_cfg.consume_from_position_at_startup = "last-offset".to_string();
+
+        let dir = tempfile::tempdir().unwrap();
+        let multi = MultiClusterPartitionReader::new(
+            &[healthy_cfg, broken_cfg],
+            &OrderedConsumptionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            0,
+            "ingester-0",
+            vec![
+                Some(dir.path().join("wc-0.offset")),
+                Some(dir.path().join("wc-1.offset")),
+            ],
+            Arc::new(NoopConsumer),
+            None,
+        )
+        .unwrap();
+
+        assert!(multi.start().await.is_err());
+        assert_eq!(multi.state(), ReaderState::Failed);
+    }
+}

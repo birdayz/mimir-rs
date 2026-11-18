@@ -649,6 +649,7 @@ struct Types {
     common_pass: usize,
     storage_backend: usize,
     cluster_validation: usize,
+    runtime_config_values: usize,
 }
 
 impl Types {
@@ -704,6 +705,7 @@ fn load_types() -> Result<Types, String> {
             common_pass: 0,
             storage_backend: 0,
             cluster_validation: 0,
+            runtime_config_values: 0,
         };
         t.string = t.add(plain("string", "string"));
         t.string_slice = t.add(TypeInfo { elem: Some(t.string), ..plain("[]string", "slice") });
@@ -739,6 +741,37 @@ fn load_types() -> Result<Types, String> {
             inline_map: Some(t.iface),
             ..plain("mimir.configWithCustomCommonUnmarshaler", "struct")
         });
+
+        // pkg/mimir/runtime_config.go: runtimeConfigValues
+        let bool_ty = t.find("bool")?;
+        let bool_ptr = t.add(TypeInfo { elem: Some(bool_ty), ..plain("*bool", "ptr") });
+        let multi_rt = t.add(TypeInfo {
+            fields: vec![
+                FieldInfo { key: "primary".into(), ty: t.string, omitempty: false },
+                FieldInfo { key: "mirror_enabled".into(), ty: bool_ptr, omitempty: false },
+            ],
+            ..plain("kv.MultiRuntimeConfig", "struct")
+        });
+        let limits_ty = t.find("validation.Limits")?;
+        let limits_ptr = t.add(TypeInfo { elem: Some(limits_ty), ..plain("*validation.Limits", "ptr") });
+        let overrides_map = t.add(TypeInfo {
+            key: Some(t.string),
+            elem: Some(limits_ptr),
+            ..plain("map[string]*validation.Limits", "map")
+        });
+        let ing_limits = t.find("ingester.InstanceLimits")?;
+        let ing_limits_ptr = t.add(TypeInfo { elem: Some(ing_limits), ..plain("*ingester.InstanceLimits", "ptr") });
+        let dist_limits = t.find("distributor.InstanceLimits")?;
+        let dist_limits_ptr = t.add(TypeInfo { elem: Some(dist_limits), ..plain("*distributor.InstanceLimits", "ptr") });
+        t.runtime_config_values = t.add(TypeInfo {
+            fields: vec![
+                FieldInfo { key: "overrides".into(), ty: overrides_map, omitempty: false },
+                FieldInfo { key: "multi_kv_config".into(), ty: multi_rt, omitempty: false },
+                FieldInfo { key: "ingester_limits".into(), ty: ing_limits_ptr, omitempty: false },
+                FieldInfo { key: "distributor_limits".into(), ty: dist_limits_ptr, omitempty: false },
+            ],
+            ..plain("mimir.runtimeConfigValues", "struct")
+        });
         Ok(t)
     }
 }
@@ -757,6 +790,7 @@ struct Decoder<'a> {
     terrors: Vec<String>,
     known_fields: bool,
     aliases: HashSet<usize>,
+    merge_visited: HashSet<usize>,
     merged_fields: Option<HashSet<String>>,
 }
 
@@ -773,6 +807,7 @@ impl<'a> Decoder<'a> {
             terrors: Vec::new(),
             known_fields,
             aliases: HashSet::new(),
+            merge_visited: HashSet::new(),
             merged_fields: None,
         }
     }
@@ -943,7 +978,10 @@ impl<'a> Decoder<'a> {
     }
 
     fn deref_alias(&self, mut n: usize) -> usize {
-        while let Some(a) = self.doc.node(n).alias {
+        for _ in 0..self.doc.nodes.len() {
+            let Some(a) = self.doc.node(n).alias else {
+                break;
+            };
             n = a;
         }
         n
@@ -1022,7 +1060,11 @@ impl<'a> Decoder<'a> {
                     Resolved::Int(v) => (!is_duration && fits(*v as i128)) || (is_duration && *v == 0),
                     Resolved::Uint(v) => !is_duration && *v <= i64::MAX as u64 && fits(*v as i128),
                     Resolved::Float(f) => {
-                        !is_duration && *f <= i64::MAX as f64 && fits((*f as i64) as i128)
+                        !is_duration
+                            && !f.is_nan()
+                            && *f >= i64::MIN as f64
+                            && *f <= i64::MAX as f64
+                            && fits((*f as i64) as i128)
                     }
                     Resolved::Str(s) => is_duration && crate::duration::parse_go_duration(s).is_ok(),
                     _ => false,
@@ -1033,7 +1075,9 @@ impl<'a> Decoder<'a> {
                 match &resolved {
                     Resolved::Int(v) => *v >= 0 && (*v as u128) <= max,
                     Resolved::Uint(v) => (*v as u128) <= max,
-                    Resolved::Float(f) => *f <= u64::MAX as f64 && ((*f as u64) as u128) <= max,
+                    Resolved::Float(f) => {
+                        !f.is_nan() && *f >= 0.0 && *f <= u64::MAX as f64 && ((*f as u64) as u128) <= max
+                    }
                     _ => false,
                 }
             }
@@ -1259,20 +1303,61 @@ impl<'a> Decoder<'a> {
             }
             _ => return Err(want_map()),
         }
+        let inserted_parent = self.merge_visited.insert(parent);
         for tgt in targets {
+            let is_alias = self.doc.node(tgt).kind == Kind::Alias;
+            if is_alias && !self.aliases.insert(tgt) {
+                if inserted_parent {
+                    self.merge_visited.remove(&parent);
+                }
+                self.merged_fields = saved;
+                return Err(Fail(format!(
+                    "yaml: anchor '{}' value contains itself",
+                    self.doc.node(tgt).value
+                )));
+            }
             let tn = self.deref_alias(tgt);
-            match &strukt {
+            if self.merge_visited.contains(&tn) {
+                if is_alias {
+                    self.aliases.remove(&tgt);
+                }
+                if inserted_parent {
+                    self.merge_visited.remove(&parent);
+                }
+                self.merged_fields = saved;
+                let msg = if is_alias {
+                    format!(
+                        "yaml: anchor '{}' value contains itself",
+                        self.doc.node(tgt).value
+                    )
+                } else {
+                    "yaml: cyclic merge".to_string()
+                };
+                return Err(Fail(msg));
+            }
+            let res = match &strukt {
                 Some((ty, name)) => {
                     if self.check_unique_keys(tn) {
-                        self.mapping_struct(tn, *ty, name)?;
+                        self.mapping_struct(tn, *ty, name)
+                    } else {
+                        Ok(true)
                     }
                 }
                 None => {
                     if self.check_unique_keys(tn) {
-                        self.mapping_entries(tn, key, elem)?;
+                        self.mapping_entries(tn, key, elem)
+                    } else {
+                        Ok(true)
                     }
                 }
+            };
+            if is_alias {
+                self.aliases.remove(&tgt);
             }
+            res?;
+        }
+        if inserted_parent {
+            self.merge_visited.remove(&parent);
         }
         self.merged_fields = saved;
         Ok(())
@@ -1392,6 +1477,420 @@ fn order_value(t: &Types, ty: usize, value: &mut serde_yaml::Value) -> Result<()
     }
 }
 
+fn is_yaml11_true(s: &str) -> bool {
+    matches!(s, "y" | "Y" | "yes" | "Yes" | "YES" | "on" | "On" | "ON")
+}
+
+fn is_yaml11_bool(s: &str) -> bool {
+    matches!(
+        s,
+        "y" | "Y" | "yes" | "Yes" | "YES" | "on" | "On" | "ON" | "n" | "N" | "no" | "No" | "NO"
+            | "off" | "Off" | "OFF"
+    )
+}
+
+fn is_string_unmarshaler_type(name: &str) -> bool {
+    matches!(
+        name,
+        "flagext.StringSliceCSV"
+            | "flagext.Secret"
+            | "config.Secret"
+            | "log.Level"
+            | "flagext.Bytes"
+            | "flagext.CIDRSliceCSV"
+            | "flagext.URLValue"
+            | "model.ValidationScheme"
+            | "s3.BucketLookupType"
+            | "model.LabelName"
+            | "relabel.Action"
+            | "relabel.Regexp"
+            | "model.Duration"
+            | "validation.LabelValueLengthOverLimitStrategy"
+            | "validation.OTelTranslationStrategyValue"
+    )
+}
+
+fn deref_ptr(t: &Types, mut ty: usize) -> usize {
+    while t.get(ty).kind == "ptr" {
+        match t.get(ty).elem {
+            Some(e) => ty = e,
+            None => break,
+        }
+    }
+    ty
+}
+
+fn limits_map_elem_ty(t: &Types, name: &str) -> Option<usize> {
+    let elem = name.strip_prefix("flagext.LimitsMap[")?.strip_suffix(']')?;
+    t.find(elem).ok()
+}
+
+fn doc_deref(doc: &Document, mut n: usize) -> usize {
+    for _ in 0..doc.nodes.len() {
+        let Some(a) = doc.node(n).alias else {
+            break;
+        };
+        n = a;
+    }
+    n
+}
+
+fn doc_is_merge(doc: &Document, k: usize) -> bool {
+    let n = doc.node(doc_deref(doc, k));
+    n.kind == Kind::Scalar
+        && n.value == "<<"
+        && (n.tag.is_empty() || n.tag == "!" || short_tag(&n.tag) == MERGE_TAG)
+}
+
+fn doc_scalar_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<serde_yaml::Value, String> {
+    use serde_yaml::Value;
+    let n = doc_deref(doc, n);
+    let node = doc.node(n);
+    let ty = deref_ptr(t, ty);
+    let info = t.get(ty);
+    let indicated = doc.indicated_string(n);
+    let (_tag, resolved) = if indicated {
+        (STR_TAG.to_string(), Resolved::Str(node.value.clone()))
+    } else {
+        resolve(&node.tag, &node.value)?
+    };
+    if resolved == Resolved::Null {
+        return Ok(Value::Null);
+    }
+    if info.unmarshaler.as_deref() == Some("text") || is_string_unmarshaler_type(&info.name) {
+        return Ok(Value::String(node.value.clone()));
+    }
+    if info.name == "flagext.StringSliceCSVMulti" {
+        return Ok(Value::String(node.value.clone()));
+    }
+    if info.name == "time.Duration" {
+        return match resolved {
+            Resolved::Int(0) => Ok(Value::String("0s".to_string())),
+            Resolved::Str(s) => Ok(Value::String(s)),
+            _ => Ok(Value::String(node.value.clone())),
+        };
+    }
+    if info.name == "time.Time" {
+        return Ok(Value::String(node.value.clone()));
+    }
+    match info.kind.as_str() {
+        "string" => Ok(Value::String(node.value.clone())),
+        "bool" => match resolved {
+            Resolved::Bool(b) => Ok(Value::Bool(b)),
+            Resolved::Str(ref s) if is_yaml11_bool(s) => Ok(Value::Bool(is_yaml11_true(s))),
+            _ => Ok(Value::String(node.value.clone())),
+        },
+        "int" | "int8" | "int16" | "int32" | "int64" => match resolved {
+            Resolved::Int(v) => Ok(Value::Number(v.into())),
+            Resolved::Uint(v) => Ok(Value::Number(v.into())),
+            Resolved::Float(f) if !f.is_nan() && f >= i64::MIN as f64 && f <= i64::MAX as f64 => {
+                Ok(Value::Number((f as i64).into()))
+            }
+            _ => Ok(Value::String(node.value.clone())),
+        },
+        "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr" => match resolved {
+            Resolved::Int(v) if v >= 0 => Ok(Value::Number((v as u64).into())),
+            Resolved::Uint(v) => Ok(Value::Number(v.into())),
+            Resolved::Float(f) if !f.is_nan() && f >= 0.0 && f <= u64::MAX as f64 => {
+                Ok(Value::Number((f as u64).into()))
+            }
+            _ => Ok(Value::String(node.value.clone())),
+        },
+        "float32" | "float64" => match resolved {
+            Resolved::Int(v) => Ok(Value::Number(v.into())),
+            Resolved::Uint(v) => Ok(Value::Number(v.into())),
+            Resolved::Float(f) => Ok(Value::Number(serde_yaml::Number::from(f))),
+            _ => Ok(Value::String(node.value.clone())),
+        },
+        "interface" => match resolved {
+            Resolved::Null => Ok(Value::Null),
+            Resolved::Bool(b) => Ok(Value::Bool(b)),
+            Resolved::Int(v) => Ok(Value::Number(v.into())),
+            Resolved::Uint(v) => Ok(Value::Number(v.into())),
+            Resolved::Float(f) => Ok(Value::Number(serde_yaml::Number::from(f))),
+            Resolved::Str(_) | Resolved::Timestamp | Resolved::Merge => {
+                Ok(Value::String(node.value.clone()))
+            }
+        },
+        _ => Ok(Value::String(node.value.clone())),
+    }
+}
+
+fn collect_merged_pairs(
+    doc: &Document,
+    n: usize,
+    visited: &mut HashSet<usize>,
+) -> Result<Vec<(usize, usize)>, String> {
+    let n = doc_deref(doc, n);
+    if !visited.insert(n) {
+        return Err("yaml: anchor value contains itself".to_string());
+    }
+    let content = &doc.node(n).content;
+    let mut explicit_keys = Vec::new();
+    let mut explicit_set = HashSet::new();
+    let mut merge_val = None;
+    for pair in content.chunks(2) {
+        let (k, v) = (pair[0], pair[1]);
+        if doc_is_merge(doc, k) {
+            merge_val = Some(v);
+        } else {
+            let kn = doc.node(doc_deref(doc, k));
+            if kn.kind == Kind::Scalar {
+                explicit_set.insert(kn.value.clone());
+            }
+            explicit_keys.push((k, v));
+        }
+    }
+    if let Some(mv) = merge_val {
+        let mv = doc_deref(doc, mv);
+        let mnode = doc.node(mv);
+        let mut targets = Vec::new();
+        match mnode.kind {
+            Kind::Mapping => targets.push(mv),
+            Kind::Sequence => {
+                for &c in &mnode.content {
+                    let cn = doc_deref(doc, c);
+                    if doc.node(cn).kind == Kind::Mapping {
+                        targets.push(cn);
+                    }
+                }
+            }
+            _ => {}
+        }
+        for tgt in targets {
+            let merged = match collect_merged_pairs(doc, tgt, visited) {
+                Ok(m) => m,
+                Err(e) => {
+                    visited.remove(&n);
+                    return Err(e);
+                }
+            };
+            for (mk, mv) in merged {
+                let mkn = doc.node(doc_deref(doc, mk));
+                if mkn.kind == Kind::Scalar && !explicit_set.insert(mkn.value.clone()) {
+                    continue;
+                }
+                explicit_keys.push((mk, mv));
+            }
+        }
+    }
+    visited.remove(&n);
+    Ok(explicit_keys)
+}
+
+fn doc_node_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<serde_yaml::Value, String> {
+    use serde_yaml::{Mapping, Value};
+    let n = doc_deref(doc, n);
+    let node = doc.node(n);
+    if node.kind == Kind::Document {
+        return match node.content.first() {
+            Some(&c) => doc_node_to_yaml(doc, t, c, ty),
+            None => Ok(Value::Null),
+        };
+    }
+    if doc.short_tag_of(n) == NULL_TAG {
+        return Ok(Value::Null);
+    }
+    let ty = deref_ptr(t, ty);
+    let info = t.get(ty);
+    match node.kind {
+        Kind::Scalar => doc_scalar_to_yaml(doc, t, n, ty),
+        Kind::Sequence => {
+            let elem_ty = match info.kind.as_str() {
+                "slice" | "array" => info.elem.unwrap_or(t.iface),
+                _ => t.iface,
+            };
+            let mut seq = Vec::with_capacity(node.content.len());
+            for &c in &node.content {
+                seq.push(doc_node_to_yaml(doc, t, c, elem_ty)?);
+            }
+            Ok(Value::Sequence(seq))
+        }
+        Kind::Mapping => {
+            let mut merge_visited = HashSet::new();
+            let pairs = collect_merged_pairs(doc, n, &mut merge_visited)?;
+            let mut out = Mapping::with_capacity(pairs.len());
+            if info.name == "activeseriesmodel.CustomTrackersConfig" {
+                for (k, v) in pairs {
+                    let kv = doc_node_to_yaml(doc, t, k, t.string)?;
+                    let vv = doc_node_to_yaml(doc, t, v, t.string)?;
+                    out.insert(kv, vv);
+                }
+            } else if let Some(elem_ty) = limits_map_elem_ty(t, &info.name) {
+                for (k, v) in pairs {
+                    let kv = doc_node_to_yaml(doc, t, k, t.string)?;
+                    let vv = doc_node_to_yaml(doc, t, v, elem_ty)?;
+                    out.insert(kv, vv);
+                }
+            } else if info.kind == "struct" {
+                for (k, v) in pairs {
+                    let kv = doc_node_to_yaml(doc, t, k, t.string)?;
+                    let field_ty = kv
+                        .as_str()
+                        .and_then(|key| info.fields.iter().find(|f| f.key == key).map(|f| f.ty))
+                        .or(info.inline_map)
+                        .unwrap_or(t.iface);
+                    let vv = doc_node_to_yaml(doc, t, v, field_ty)?;
+                    out.insert(kv, vv);
+                }
+            } else if info.kind == "map" {
+                let key_ty = info.key.unwrap_or(t.string);
+                let elem_ty = info.elem.unwrap_or(t.iface);
+                for (k, v) in pairs {
+                    let kv = doc_node_to_yaml(doc, t, k, key_ty)?;
+                    let vv = doc_node_to_yaml(doc, t, v, elem_ty)?;
+                    out.insert(kv, vv);
+                }
+            } else {
+                for (k, v) in pairs {
+                    let kv = doc_node_to_yaml(doc, t, k, t.iface)?;
+                    let vv = doc_node_to_yaml(doc, t, v, t.iface)?;
+                    out.insert(kv, vv);
+                }
+            }
+            Ok(Value::Mapping(out))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+/// Converts a validated `mimir.Config` YAML [`Document`] into a [`serde_yaml::Value`] with Go
+/// `yaml.v3` scalar coercions applied according to the Go type graph.
+pub fn doc_to_serde_value(doc: &Document) -> Result<serde_yaml::Value, String> {
+    let t = types()?;
+    doc_node_to_yaml(doc, t, doc.root, t.root)
+}
+
+fn normalize_serde_scalar(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
+    use serde_yaml::Value;
+    let ty = deref_ptr(t, ty);
+    let info = t.get(ty);
+    if val.is_null() {
+        return;
+    }
+    let want_string = info.unmarshaler.as_deref() == Some("text")
+        || is_string_unmarshaler_type(&info.name)
+        || info.name == "flagext.StringSliceCSVMulti"
+        || info.name == "time.Time"
+        || (info.kind == "string");
+    if want_string {
+        match val {
+            Value::Number(n) => *val = Value::String(n.to_string()),
+            Value::Bool(b) => *val = Value::String(b.to_string()),
+            _ => {}
+        }
+        return;
+    }
+    if info.name == "time.Duration" {
+        if let Value::Number(n) = val {
+            if n.as_i64() == Some(0) || n.as_u64() == Some(0) {
+                *val = Value::String("0s".to_string());
+            }
+        }
+        return;
+    }
+    match info.kind.as_str() {
+        "bool" => {
+            if let Value::String(s) = val {
+                if is_yaml11_bool(s) {
+                    *val = Value::Bool(is_yaml11_true(s));
+                }
+            }
+        }
+        "int" | "int8" | "int16" | "int32" | "int64" => {
+            if let Value::Number(n) = val {
+                if !n.is_i64() && !n.is_u64() {
+                    if let Some(f) = n.as_f64() {
+                        if !f.is_nan() && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                            *val = Value::Number((f as i64).into());
+                        }
+                    }
+                }
+            }
+        }
+        "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr" => {
+            if let Value::Number(n) = val {
+                if !n.is_u64() {
+                    if let Some(f) = n.as_f64() {
+                        if !f.is_nan() && f >= 0.0 && f <= u64::MAX as f64 {
+                            *val = Value::Number((f as u64).into());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_serde_value(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
+    use serde_yaml::Value;
+    let ty = deref_ptr(t, ty);
+    let info = t.get(ty);
+    match val {
+        Value::Null => {}
+        Value::Sequence(items) => {
+            let elem_ty = match info.kind.as_str() {
+                "slice" | "array" => info.elem.unwrap_or(t.iface),
+                _ => t.iface,
+            };
+            for item in items {
+                normalize_serde_value(t, item, elem_ty);
+            }
+        }
+        Value::Mapping(m) => {
+            let taken = std::mem::take(m);
+            if info.name == "activeseriesmodel.CustomTrackersConfig" {
+                for (mut k, mut v) in taken {
+                    normalize_serde_scalar(t, &mut k, t.string);
+                    normalize_serde_value(t, &mut v, t.string);
+                    m.insert(k, v);
+                }
+            } else if let Some(elem_ty) = limits_map_elem_ty(t, &info.name) {
+                for (mut k, mut v) in taken {
+                    normalize_serde_scalar(t, &mut k, t.string);
+                    normalize_serde_value(t, &mut v, elem_ty);
+                    m.insert(k, v);
+                }
+            } else if info.kind == "struct" {
+                for (mut k, mut v) in taken {
+                    normalize_serde_scalar(t, &mut k, t.string);
+                    let field_ty = k
+                        .as_str()
+                        .and_then(|key| info.fields.iter().find(|f| f.key == key).map(|f| f.ty))
+                        .or(info.inline_map)
+                        .unwrap_or(t.iface);
+                    normalize_serde_value(t, &mut v, field_ty);
+                    m.insert(k, v);
+                }
+            } else if info.kind == "map" {
+                let key_ty = info.key.unwrap_or(t.string);
+                let elem_ty = info.elem.unwrap_or(t.iface);
+                for (mut k, mut v) in taken {
+                    normalize_serde_scalar(t, &mut k, key_ty);
+                    normalize_serde_value(t, &mut v, elem_ty);
+                    m.insert(k, v);
+                }
+            } else {
+                for (k, v) in taken {
+                    m.insert(k, v);
+                }
+            }
+        }
+        _ => normalize_serde_scalar(t, val, ty),
+    }
+}
+
+/// Normalizes an already-parsed [`serde_yaml::Value`] (e.g. merged `runtime_config` maps)
+/// according to Go `yaml.v3` scalar coercions for the named Go type (such as
+/// `"mimir.runtimeConfigValues"` or `"mimir.Config"`).
+pub fn normalize_value_for_type(type_name: &str, val: &mut serde_yaml::Value) -> Result<(), String> {
+    let t = types()?;
+    let ty = t.find(type_name)?;
+    normalize_serde_value(t, val, ty);
+    Ok(())
+}
+
 pub fn check_config_document(input: &[u8]) -> Result<Option<Document>, String> {
     let Some(doc) = parse_first_document(input)? else {
         return Err("EOF".to_string());
@@ -1505,5 +2004,33 @@ mod tests {
         assert_eq!(resolve("", "2001-12-14").unwrap().1, Resolved::Timestamp);
         assert_eq!(resolve("", "18446744073709551615").unwrap().1, Resolved::Uint(u64::MAX));
         assert!(resolve("!!int", "abc").is_err());
+    }
+
+    #[test]
+    fn cyclic_yaml_merge_aliases_return_error_without_stack_overflow() {
+        for yaml in [
+            "blocks_storage: &a { <<: *a }\n",
+            "blocks_storage: &a\n  <<: *a\n",
+            "blocks_storage: &a\n  <<: [*a]\n",
+            "blocks_storage: &a { <<: { <<: *a } }\n",
+            "common:\n  storage: &a\n    <<: *a\n",
+        ] {
+            let err = check(yaml).unwrap_err();
+            assert!(
+                err.contains("contains itself") || err.contains("cyclic merge"),
+                "unexpected error for {yaml:?}: {err}"
+            );
+            let doc = parse_first_document(yaml.as_bytes()).unwrap().unwrap();
+            assert!(
+                doc_to_serde_value(&doc).is_err(),
+                "expected doc_to_serde_value error for {yaml:?}"
+            );
+        }
+
+        // Diamond / non-cyclic merge must continue to succeed.
+        let ok_yaml = "common:\n  storage: &s\n    backend: s3\nblocks_storage:\n  <<: *s\n";
+        assert_eq!(check(ok_yaml), Ok(()));
+        let doc = parse_first_document(ok_yaml.as_bytes()).unwrap().unwrap();
+        assert!(doc_to_serde_value(&doc).is_ok());
     }
 }

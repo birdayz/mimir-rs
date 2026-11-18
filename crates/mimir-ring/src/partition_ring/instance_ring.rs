@@ -112,7 +112,9 @@ impl PartitionInstanceRing {
             }
 
             if instances.is_empty() {
-                return Err(PartitionRingError::TooManyUnhealthyInstances);
+                return Err(PartitionRingError::PartitionTooManyUnhealthyInstances(
+                    partition_id,
+                ));
             }
 
             zones_buf.clear();
@@ -163,5 +165,56 @@ impl PartitionInstanceRing {
             self.instances_ring.clone(),
             self.heartbeat_timeout,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::partition_ring::ring::PartitionRingOptions;
+    use mimir_proto::ringpb::{OwnerDesc, OwnerState, PartitionDesc, PartitionRingDesc, PartitionState};
+
+    #[test]
+    fn unhealthy_error_includes_partition_id() {
+        struct EmptyInstRing;
+        impl InstanceRingReader for EmptyInstRing {
+            fn get_instance(&self, _id: &str) -> Result<InstanceDesc, RingError> {
+                Err(RingError::InstanceNotFound)
+            }
+            fn instances_count(&self) -> usize {
+                0
+            }
+        }
+
+        let mut desc = PartitionRingDesc::default();
+        desc.partitions.insert(
+            42,
+            PartitionDesc {
+                state: PartitionState::PartitionActive as i32,
+                tokens: vec![100],
+                ..Default::default()
+            },
+        );
+        desc.owners.insert(
+            "owner-42".to_string(),
+            OwnerDesc {
+                state: OwnerState::OwnerActive as i32,
+                owned_partition: 42,
+                ..Default::default()
+            },
+        );
+        let ring = PartitionRing::with_options(desc, PartitionRingOptions::default()).unwrap();
+        let pir = PartitionInstanceRing::new(
+            Arc::new(StaticPartitionRingReader { ring }),
+            Arc::new(EmptyInstRing),
+            Duration::from_secs(60),
+        );
+        let err = pir
+            .get_replication_sets_for_operation(crate::ring::replication_strategy::WRITE)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "partition 42: too many unhealthy instances in the ring"
+        );
     }
 }
