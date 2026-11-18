@@ -634,7 +634,29 @@ fn is_any_char_with_nl(hir: &Hir) -> Option<bool> {
     None
 }
 
+fn strip_outer_anchors_directional(mut subs: &[Hir], at_start: bool, at_end: bool) -> &[Hir] {
+    if at_start {
+        if let Some(first) = subs.first() {
+            if matches!(strip_capture(first).kind(), HirKind::Look(Look::Start)) {
+                subs = &subs[1..];
+            }
+        }
+    }
+    if at_end {
+        if let Some(last) = subs.last() {
+            if matches!(strip_capture(last).kind(), HirKind::Look(Look::End)) {
+                subs = &subs[..subs.len() - 1];
+            }
+        }
+    }
+    subs
+}
+
 fn strategy_from_hir(hir: &Hir) -> Option<Strategy> {
+    strategy_from_hir_inner(hir, true, true)
+}
+
+fn strategy_from_hir_inner(hir: &Hir, at_start: bool, at_end: bool) -> Option<Strategy> {
     let hir = strip_capture(hir);
     match hir.kind() {
         HirKind::Empty => Some(Strategy::EmptyString),
@@ -659,16 +681,16 @@ fn strategy_from_hir(hir: &Hir) -> Option<Strategy> {
             }
         }
         HirKind::Concat(subs) => {
-            let subs = strip_outer_anchors(subs);
+            let subs = strip_outer_anchors_directional(subs, at_start, at_end);
             if subs.is_empty() {
                 return Some(Strategy::EmptyString);
             }
             if subs.len() == 1 {
-                return strategy_from_hir(&subs[0]);
+                return strategy_from_hir_inner(&subs[0], at_start, at_end);
             }
             if subs.len() == 2 {
                 if let Some(prefix) = hir_literal_str(&subs[0]) {
-                    if let Some(rest) = strategy_from_hir(&subs[1]) {
+                    if let Some(rest) = strategy_from_hir_inner(&subs[1], false, at_end) {
                         return Some(Strategy::PrefixExact {
                             prefix,
                             rest: Box::new(rest),
@@ -676,7 +698,7 @@ fn strategy_from_hir(hir: &Hir) -> Option<Strategy> {
                     }
                 }
                 if let Some(suffix) = hir_literal_str(&subs[1]) {
-                    if let Some(rest) = strategy_from_hir(&subs[0]) {
+                    if let Some(rest) = strategy_from_hir_inner(&subs[0], at_start, false) {
                         return Some(Strategy::SuffixExact {
                             rest: Box::new(rest),
                             suffix,
@@ -685,8 +707,8 @@ fn strategy_from_hir(hir: &Hir) -> Option<Strategy> {
                 }
             }
             if subs.len() == 3
-                && matches!(strategy_from_hir(&subs[0]), Some(Strategy::True))
-                && matches!(strategy_from_hir(&subs[2]), Some(Strategy::True))
+                && matches!(strategy_from_hir_inner(&subs[0], at_start, false), Some(Strategy::True))
+                && matches!(strategy_from_hir_inner(&subs[2], false, at_end), Some(Strategy::True))
             {
                 if let Some(mid) = hir_literal_str(&subs[1]) {
                     return Some(Strategy::Contains { substrs: vec![mid] });
@@ -773,5 +795,83 @@ mod tests {
 
         // Invalid syntax must fail even with wrapper
         assert!(LabelMatcher::new(MatchType::RegexMatch, "x", "foo)(bar").is_err());
+    }
+
+    #[test]
+    fn go_re2_parity_word_boundary_fold_anchors_empty_qe_and_unicode() {
+        // F-05: ASCII word boundaries (?-u:\b) and (?-u:\B)
+        let wb = FastRegexMatcher::new(r"caf\bé").unwrap();
+        assert!(wb.is_match("café"));
+        let wb_non_ascii = FastRegexMatcher::new(r".+\b").unwrap();
+        assert!(!wb_non_ascii.is_match("é"));
+        let nwb = FastRegexMatcher::new(r"caf\B.").unwrap();
+        assert!(!nwb.is_match("café"));
+        assert!(nwb.is_match("cafe"));
+
+        // F-06: (?i)[\W] and (?i)[^\W] must not match/reject ASCII s/S/k/K via ſ/K folding
+        let ci_nw = FastRegexMatcher::new(r"(?i)[\W]").unwrap();
+        for w in ["s", "S", "k", "K", "\u{017F}", "\u{212A}"] {
+            assert!(!ci_nw.is_match(w), "(?i)[\\W] must not match {w:?}");
+        }
+        assert!(ci_nw.is_match("-"));
+        let ci_neg_nw = FastRegexMatcher::new(r"(?i)[^\W]").unwrap();
+        for w in ["s", "S", "k", "K", "\u{017F}", "\u{212A}"] {
+            assert!(ci_neg_nw.is_match(w), "(?i)[^\\W] must match {w:?}");
+        }
+        assert!(!ci_neg_nw.is_match("-"));
+        let cs_nw = FastRegexMatcher::new(r"[\W]").unwrap();
+        assert!(cs_nw.is_match("\u{017F}"));
+        assert!(cs_nw.is_match("\u{212A}"));
+
+        // F-07: inner anchors must never be stripped by strip_outer_anchors
+        let inner_start = FastRegexMatcher::new("foo(^bar)").unwrap();
+        assert!(!inner_start.is_match("foobar"));
+        let inner_end = FastRegexMatcher::new("(foo$)bar").unwrap();
+        assert!(!inner_end.is_match("foobar"));
+        let outer_grouped = FastRegexMatcher::new("^(foo)$").unwrap();
+        assert!(outer_grouped.is_match("foo"));
+        assert!(!outer_grouped.is_match("foobar"));
+
+        // F-12: empty \Q\E quantifier target, empty/dup flags, digit/dup capture names, Unicode 17 & surrogates
+        let qe_plus = FastRegexMatcher::new(r"(ab)\Q\E+").unwrap();
+        assert!(qe_plus.is_match("abab"));
+        assert!(qe_plus.is_match("ab"));
+        assert!(!qe_plus.is_match(""));
+        let qe_zero = FastRegexMatcher::new(r"a\Q\E{0}").unwrap();
+        assert!(qe_zero.is_match(""));
+        assert!(!qe_zero.is_match("a"));
+
+        for pat in [
+            "(?)a",
+            "(?ii)a",
+            "(?i-i)a",
+            "(?ss:a)",
+            "(?P<0>a)",
+            "(?<1a>a)",
+            "(?P<x>a)|(?P<x>b)",
+        ] {
+            let m = FastRegexMatcher::new(pat).unwrap();
+            assert!(m.is_match("a"), "{pat:?} should match 'a'");
+        }
+        assert!(!FastRegexMatcher::new("(?i-i)a").unwrap().is_match("A"));
+
+        for pat in [
+            r"\p{Beria_Erfe}",
+            r"\p{Sidetic}",
+            r"\p{Tai_Yo}",
+            r"\p{Tolong_Siki}",
+            r"\p{Cs}",
+            r"\P{Cs}",
+            r"[\p{Cs}]",
+            r"[^\p{Cs}]",
+            r"\x{D800}",
+            r"[\x{D800}]",
+            r"[\x{D7FF}-\x{E000}]",
+        ] {
+            assert!(FastRegexMatcher::new(pat).is_ok(), "pattern {pat:?} must compile");
+        }
+        assert!(!FastRegexMatcher::new(r"\p{Cs}").unwrap().is_match("a"));
+        assert!(FastRegexMatcher::new(r"\P{Cs}").unwrap().is_match("a"));
+        assert!(!FastRegexMatcher::new(r"\x{D800}").unwrap().is_match("a"));
     }
 }

@@ -225,7 +225,8 @@ ingester:
     kvstore:
       store: inmemory
     replication_factor: 1
-    min_ready_duration: 1s
+    observe_period: 3s
+    min_ready_duration: 0s
     final_sleep: 0s
   instance_limits:
     max_inflight_push_requests_bytes: 100
@@ -255,10 +256,10 @@ activity_tracker:
             );
             let mut proc = start_mimir(which, "w11-core", &dir, &yaml, &[]);
 
-            // Wait for gRPC listener while ingester is still Starting (/ready == 503).
+            // Wait for gRPC listener while ingester is deterministically Starting (observe_period: 3s).
             let ch = wait_grpc_listening(gp, &mut proc, Duration::from_secs(15)).await;
-            let ready_code = http_req(&http, reqwest::Method::GET, hp, "/ready").await.0;
-            let starting_checks = if ready_code != 200 {
+            let (ready_code, _, ready_body) = http_req(&http, reqwest::Method::GET, hp, "/ready").await;
+            let starting_checks = if ready_code != 200 && ready_body.contains("ingester-service: Starting") {
                 let mut c = IngesterClient::new(ch.clone());
                 let push_starting = c
                     .push(with_org(
@@ -477,13 +478,13 @@ activity_tracker:
         let g = &results[0];
         let r = &results[1];
 
-        if let (Some(gs), Some(rs)) = (&g.1, &r.1) {
-            assert_eq!(rs.0, gs.0, "ING-02 starting Push mismatch");
-            assert!(rs.0.starts_with("Unavailable|"), "{}", rs.0);
-            assert_eq!(rs.1, gs.1, "ING-02 starting SearchLabelNames bad regex mismatch");
-            assert!(rs.1.starts_with("Unavailable|"), "{}", rs.1);
-            assert_eq!(rs.2 .0, gs.2 .0, "ING-14 flush starting status");
-        }
+        let gs = g.1.as_ref().expect("Go ingester did not observe Starting window");
+        let rs = r.1.as_ref().expect("Rust ingester did not observe Starting window");
+        assert_eq!(rs.0, gs.0, "ING-02 starting Push mismatch");
+        assert!(rs.0.starts_with("Unavailable|"), "{}", rs.0);
+        assert_eq!(rs.1, gs.1, "ING-02 starting SearchLabelNames bad regex mismatch");
+        assert!(rs.1.starts_with("Unavailable|"), "{}", rs.1);
+        assert_eq!(rs.2 .0, gs.2 .0, "ING-14 flush starting status");
         assert_eq!(r.2, g.2, "ING-02 oversize message-size tap mismatch");
         assert_eq!(r.2 .0, Code::Unavailable);
         assert_eq!(r.3, g.3, "ING-07 cb success after instance limit mismatch");

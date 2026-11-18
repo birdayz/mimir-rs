@@ -250,9 +250,15 @@ impl PartitionInstanceLifecycler {
         if !self.running.load(Ordering::Acquire) {
             return Err(PartitionRingError::Other("lifecycler not running".to_string()));
         }
+        let op = self.op_lock.lock().await;
+        if !self.running.load(Ordering::Acquire) {
+            return Err(PartitionRingError::Other("lifecycler not running".to_string()));
+        }
         let pid = self.cfg.partition_id;
-        self.update_ring(move |ring| change_partition_state_in_desc(ring, pid, to_state))
-            .await
+        self.update_ring_locked(&op, move |ring| {
+            change_partition_state_in_desc(ring, pid, to_state)
+        })
+        .await
     }
 
     async fn get_ring(&self) -> Result<PartitionRingDesc, PartitionRingError> {
@@ -271,7 +277,18 @@ impl PartitionInstanceLifecycler {
     where
         F: Fn(&mut PartitionRingDesc) -> Result<bool, PartitionRingError> + Send + Sync + 'static,
     {
-        let _op = self.op_lock.lock().await;
+        let op = self.op_lock.lock().await;
+        self.update_ring_locked(&op, update).await
+    }
+
+    async fn update_ring_locked<F>(
+        &self,
+        _op: &tokio::sync::MutexGuard<'_, ()>,
+        update: F,
+    ) -> Result<(), PartitionRingError>
+    where
+        F: Fn(&mut PartitionRingDesc) -> Result<bool, PartitionRingError> + Send + Sync + 'static,
+    {
         let typed_err: Arc<Mutex<Option<PartitionRingError>>> = Arc::new(Mutex::new(None));
         let typed_err_cb = Arc::clone(&typed_err);
         let res = self

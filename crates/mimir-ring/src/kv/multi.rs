@@ -450,6 +450,17 @@ impl MultiKv {
     }
 }
 
+struct WatchRegGuard<'a> {
+    multi: &'a MultiKv,
+    reg_id: usize,
+}
+
+impl Drop for WatchRegGuard<'_> {
+    fn drop(&mut self) {
+        self.multi.unregister_watch(self.reg_id);
+    }
+}
+
 impl KvClient for MultiKv {
     fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>, KvError>> {
         Box::pin(async move {
@@ -528,6 +539,10 @@ impl KvClient for MultiKv {
                 }
                 let child_ctx = cancel.child();
                 let (reg_id, primary) = self.register_watch_for_primary(child_ctx.clone());
+                let _reg_guard = WatchRegGuard {
+                    multi: self,
+                    reg_id,
+                };
 
                 let stopped_by_cb = Arc::new(AtomicBool::new(false));
                 let stopped_flag = stopped_by_cb.clone();
@@ -546,7 +561,7 @@ impl KvClient for MultiKv {
                         }),
                     )
                     .await;
-                self.unregister_watch(reg_id);
+                drop(_reg_guard);
 
                 if stopped_by_cb.load(Ordering::Acquire) || cancel.is_canceled() {
                     return;
@@ -575,6 +590,10 @@ impl KvClient for MultiKv {
                 }
                 let child_ctx = cancel.child();
                 let (reg_id, primary) = self.register_watch_for_primary(child_ctx.clone());
+                let _reg_guard = WatchRegGuard {
+                    multi: self,
+                    reg_id,
+                };
 
                 let stopped_by_cb = Arc::new(AtomicBool::new(false));
                 let stopped_flag = stopped_by_cb.clone();
@@ -593,7 +612,7 @@ impl KvClient for MultiKv {
                         }),
                     )
                     .await;
-                self.unregister_watch(reg_id);
+                drop(_reg_guard);
 
                 if stopped_by_cb.load(Ordering::Acquire) || cancel.is_canceled() {
                     return;

@@ -1225,6 +1225,10 @@ impl KafkaClient {
             match res {
                 Ok(v) => return Ok(v),
                 Err(err) => {
+                    let err = handle_dial_err(&err, || {
+                        self.invalidate_partition_leader(topic, partition);
+                    })
+                    .unwrap_or(err);
                     let stale_leader = matches!(
                         err,
                         KafkaClientError::Broker(
@@ -1455,6 +1459,14 @@ impl KafkaClient {
                         }
                     }
                     Err(err) => {
+                        let err = handle_dial_err(&err, || {
+                            for (topic, pids) in &shard_topics {
+                                for &pid in pids {
+                                    self.invalidate_partition_leader(topic, pid);
+                                }
+                            }
+                        })
+                        .unwrap_or(err);
                         let retryable = !matches!(err, KafkaClientError::Broker(_));
                         for (topic, pids) in &shard_topics {
                             for &pid in pids {

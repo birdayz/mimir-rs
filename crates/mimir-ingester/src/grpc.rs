@@ -207,8 +207,29 @@ impl hyper::body::Body for ReadTapDropBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         let poll = Pin::new(&mut self.inner).poll_frame(cx);
-        if let Poll::Ready(None) = &poll {
+        let (done, deadline_exceeded) = match &poll {
+            Poll::Ready(None) => (true, false),
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(trailers) = frame.trailers_ref() {
+                    let is_deadline = trailers
+                        .get("grpc-status")
+                        .and_then(|v| v.to_str().ok())
+                        == Some("4");
+                    (true, is_deadline)
+                } else {
+                    (self.inner.is_end_stream(), false)
+                }
+            }
+            Poll::Ready(Some(Err(status))) => {
+                (true, status.code() == tonic::Code::DeadlineExceeded)
+            }
+            Poll::Pending => (false, false),
+        };
+        if done {
             if let Some(permit) = self.permit.take() {
+                if deadline_exceeded {
+                    permit.deadline_exceeded_flag().store(true, Ordering::Release);
+                }
                 permit.finish(false);
             }
         }
@@ -1911,5 +1932,103 @@ mod tests {
                 Some("snappy,s2,gzip,identity")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_tap_drop_body_records_normal_completion_on_trailers_and_cancels_on_early_drop() {
+        use hyper::body::{Body as _, Frame};
+        use mimir_common::limiter::{ReactiveLimiter, ReactiveLimiterConfig};
+        use std::collections::VecDeque;
+        use std::task::{Context, Poll};
+
+        struct VecFramesBody(VecDeque<Result<Frame<Bytes>, Status>>);
+
+        impl hyper::body::Body for VecFramesBody {
+            type Data = Bytes;
+            type Error = Status;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(self.0.pop_front())
+            }
+
+            fn is_end_stream(&self) -> bool {
+                self.0.is_empty()
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = test_ingester(tmp.path(), true);
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let rl = ReactiveLimiter::new(ReactiveLimiterConfig {
+            min_limit: 1,
+            initial_limit: 2,
+            max_limit: 10,
+            max_limit_factor: 1.0,
+            min_limit_factor: 1.0,
+            recent_window_min_duration: std::time::Duration::from_millis(1),
+            recent_window_max_duration: std::time::Duration::from_millis(1),
+            recent_window_min_samples: 1,
+            initial_rejection_factor: 1.0,
+            max_rejection_factor: 1.0,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // 1) Early drop before trailers must cancel (permit.finish(true) -> drop_permit),
+        // leaving reactive limiter max_inflight() at 0.
+        let rp_early = rl.acquire_permit().await.unwrap();
+        let mut tap_early = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+        tap_early.set_reactive_permit(rp_early);
+        let inner_early = tonic::body::BoxBody::new(VecFramesBody(VecDeque::from([
+            Ok(Frame::data(Bytes::from_static(b"partial"))),
+            Ok(Frame::data(Bytes::from_static(b"more"))),
+        ])));
+        let mut body_early = ReadTapDropBody {
+            inner: inner_early,
+            permit: Some(tap_early),
+        };
+        let _ = std::future::poll_fn(|cx| Pin::new(&mut body_early).poll_frame(cx)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(body_early.permit.is_some());
+        drop(body_early);
+        assert_eq!(rl.inflight(), 0);
+        assert_eq!(
+            rl.max_inflight(),
+            0,
+            "early drop must call drop_permit() and NOT record RTT sample"
+        );
+
+        // 2) Normal gRPC read completion: hyper stops polling after Frame::trailers and drops body.
+        let rp_ok = rl.acquire_permit().await.unwrap();
+        let mut tap_ok = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+        tap_ok.set_reactive_permit(rp_ok);
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let inner_ok = tonic::body::BoxBody::new(VecFramesBody(VecDeque::from([
+            Ok(Frame::data(Bytes::from_static(b"payload"))),
+            Ok(Frame::trailers(trailers)),
+        ])));
+        let mut body_ok = ReadTapDropBody {
+            inner: inner_ok,
+            permit: Some(tap_ok),
+        };
+        let f1 = std::future::poll_fn(|cx| Pin::new(&mut body_ok).poll_frame(cx)).await;
+        assert!(f1.unwrap().unwrap().is_data());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let f2 = std::future::poll_fn(|cx| Pin::new(&mut body_ok).poll_frame(cx)).await;
+        assert!(f2.unwrap().unwrap().is_trailers());
+        // Drop immediately without polling for Poll::Ready(None), mirroring hyper HTTP/2.
+        assert!(body_ok.permit.is_none(), "permit must finish on Frame::trailers");
+        drop(body_ok);
+        assert_eq!(rl.inflight(), 0);
+        assert_eq!(
+            rl.max_inflight(),
+            1,
+            "normal completion on Frame::trailers must call rp.record()"
+        );
     }
 }

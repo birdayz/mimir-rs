@@ -277,12 +277,12 @@ impl Http for HttpGrpcBridge {
                 .map_err(|e| Status::unknown(format!("net/http: invalid method: {e}")))?
         };
 
-        let uri = parse_go_url_to_http_uri(&req.url)
+        validate_go_url(&req.url)
             .map_err(|e| Status::unknown(format!("parse {:?}: {e}", req.url)))?;
 
         // `gorilla/mux` `ServeHTTP` (`cleanPath`): a non-empty relative URL without a leading `/`
-        // (e.g. `"ready"` or `"ready?x=1"`, which `http::Uri` parses as authority) redirects 301
-        // to `/<path>[?<query>]`.
+        // (e.g. `"ready"`, `"ingester/ring"`, or `"ready?x=1"`) redirects 301 to `/<path>[?<query>]`
+        // before `http::Uri` parsing (which rejects `/` or `?` without a leading slash).
         let without_frag = req.url.split('#').next().unwrap_or(&req.url);
         let (raw_path, raw_query) = match without_frag.split_once('?') {
             Some((p, q)) => (p, Some(q)),
@@ -302,6 +302,9 @@ impl Http for HttpGrpcBridge {
                 body: Bytes::new(),
             }));
         }
+
+        let uri = parse_go_url_to_http_uri(&req.url)
+            .map_err(|e| Status::unknown(format!("parse {:?}: {e}", req.url)))?;
 
         let mut req_headers = HeaderMap::new();
         for h in req.headers {
@@ -378,9 +381,9 @@ impl Http for HttpGrpcBridge {
 /// Parses `req.url` with Go `net/url.Parse` tolerance (accepting relative paths without leading
 /// `/` and unescaped `{}`/`[]`/`"`/`|`/`^`/spaces in query strings) and encodes disallowed
 /// RFC 3986 characters so `http::Uri` can pass it into Axum's `Router`.
-fn parse_go_url_to_http_uri(raw: &str) -> Result<Uri, String> {
+fn validate_go_url(raw: &str) -> Result<(), String> {
     if raw.is_empty() {
-        return Ok(Uri::from_static("/"));
+        return Ok(());
     }
     let bytes = raw.as_bytes();
     for &b in bytes {
@@ -388,7 +391,6 @@ fn parse_go_url_to_http_uri(raw: &str) -> Result<Uri, String> {
             return Err("net/url: invalid control character in URL".to_string());
         }
     }
-    // Validate percent-escapes like Go `url.parse`.
     let mut idx = 0;
     while idx < bytes.len() {
         if bytes[idx] == b'%' {
@@ -403,10 +405,7 @@ fn parse_go_url_to_http_uri(raw: &str) -> Result<Uri, String> {
             idx += 1;
         }
     }
-
-    // Strip #fragment (Go `http.NewRequest` parses it into URL.Fragment, not Path/RawQuery).
     let without_frag = raw.split('#').next().unwrap_or(raw);
-    // Check scheme validity if `:` precedes `/` / `?`.
     let before_pq = without_frag.split(['/', '?']).next().unwrap_or("");
     if let Some((scheme, _)) = before_pq.split_once(':') {
         if scheme.is_empty() {
@@ -421,7 +420,15 @@ fn parse_go_url_to_http_uri(raw: &str) -> Result<Uri, String> {
             return Err("first path segment in URL cannot contain colon".to_string());
         }
     }
+    Ok(())
+}
 
+fn parse_go_url_to_http_uri(raw: &str) -> Result<Uri, String> {
+    if raw.is_empty() {
+        return Ok(Uri::from_static("/"));
+    }
+    validate_go_url(raw)?;
+    let without_frag = raw.split('#').next().unwrap_or(raw);
     let (path_part, query_part) = match without_frag.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (without_frag, None),
@@ -441,8 +448,16 @@ fn parse_go_url_to_http_uri(raw: &str) -> Result<Uri, String> {
     };
 
     let mut encoded = String::with_capacity(without_frag.len());
-    if path_part.contains("://") {
-        encoded.push_str(path_part);
+    if let Some((scheme, rest)) = path_part.split_once("://") {
+        encoded.push_str(scheme);
+        encoded.push_str("://");
+        if let Some((authority, path)) = rest.split_once('/') {
+            encoded.push_str(authority);
+            encoded.push('/');
+            encode_ascii_unsafe(path, &mut encoded);
+        } else {
+            encoded.push_str(rest);
+        }
     } else {
         encode_ascii_unsafe(path_part, &mut encoded);
     }
@@ -511,6 +526,8 @@ struct CompressGrpcBody {
     encoding: &'static str,
     buf: Vec<u8>,
     out_queue: std::collections::VecDeque<Bytes>,
+    pending_trailers: Option<http::HeaderMap>,
+    done: bool,
 }
 
 impl CompressGrpcBody {
@@ -520,6 +537,8 @@ impl CompressGrpcBody {
             encoding,
             buf: Vec::new(),
             out_queue: std::collections::VecDeque::new(),
+            pending_trailers: None,
+            done: false,
         }
     }
 
@@ -560,6 +579,13 @@ impl hyper::body::Body for CompressGrpcBody {
         if let Some(chunk) = self.out_queue.pop_front() {
             return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
         }
+        if let Some(trailers) = self.pending_trailers.take() {
+            self.done = true;
+            return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+        }
+        if self.done {
+            return Poll::Ready(None);
+        }
         loop {
             match Pin::new(&mut self.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
@@ -572,14 +598,34 @@ impl hyper::body::Body for CompressGrpcBody {
                             }
                         }
                     } else {
-                        if !self.buf.is_empty() {
-                            let rem = std::mem::take(&mut self.buf);
-                            return Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(rem)))));
+                        match frame.into_trailers() {
+                            Ok(trailers) => {
+                                if !self.buf.is_empty() {
+                                    self.pending_trailers = Some(trailers);
+                                    let rem = std::mem::take(&mut self.buf);
+                                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                                        Bytes::from(rem),
+                                    ))));
+                                }
+                                self.done = true;
+                                return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(
+                                    trailers,
+                                ))));
+                            }
+                            Err(other_frame) => {
+                                if !self.buf.is_empty() {
+                                    let rem = std::mem::take(&mut self.buf);
+                                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                                        Bytes::from(rem),
+                                    ))));
+                                }
+                                return Poll::Ready(Some(Ok(other_frame)));
+                            }
                         }
-                        return Poll::Ready(Some(Ok(frame)));
                     }
                 }
                 Poll::Ready(None) => {
+                    self.done = true;
                     if !self.buf.is_empty() {
                         let rem = std::mem::take(&mut self.buf);
                         return Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(rem)))));
@@ -592,7 +638,11 @@ impl hyper::body::Body for CompressGrpcBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.out_queue.is_empty() && self.buf.is_empty() && self.inner.is_end_stream()
+        self.done
+            || (self.out_queue.is_empty()
+                && self.buf.is_empty()
+                && self.pending_trailers.is_none()
+                && self.inner.is_end_stream())
     }
 }
 

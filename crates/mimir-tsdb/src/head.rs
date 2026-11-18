@@ -414,6 +414,21 @@ struct SeriesOooState {
     ooo_mmapped_chunks: Vec<MmappedChunk>,
 }
 
+impl SeriesOooState {
+    fn promote_pending_up_to(&mut self, flushed_ref: ChunkDiskMapperRef) {
+        if self.ooo_pending_mmapped.is_empty() {
+            return;
+        }
+        for (mc, chk) in std::mem::take(&mut self.ooo_pending_mmapped) {
+            if mc.ref_id <= flushed_ref {
+                self.ooo_mmapped_chunks.push(mc);
+            } else {
+                self.ooo_pending_mmapped.push((mc, chk));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum LastSample {
     None,
@@ -3026,6 +3041,7 @@ pub struct Head {
     chunk_writer: Mutex<Option<HeadChunksWriter>>,
     chunk_reader: RwLock<Option<HeadChunksReader>>,
     mmap_mtx: Mutex<()>,
+    ooo_wbl_gate: RwLock<()>,
     ooo_compact_wbl_cut_seg: Mutex<Option<usize>>,
 
     min_time: AtomicI64,
@@ -3148,6 +3164,7 @@ impl Head {
             chunk_writer: Mutex::new(None),
             chunk_reader: RwLock::new(None),
             mmap_mtx: Mutex::new(()),
+            ooo_wbl_gate: RwLock::new(()),
             ooo_compact_wbl_cut_seg: Mutex::new(None),
             min_time: AtomicI64::new(i64::MAX),
             max_time: AtomicI64::new(i64::MIN),
@@ -6427,15 +6444,6 @@ impl Head {
     ) -> Result<OooCompactionSnapshot, HeadError> {
         let ooo_active = self.ooo_time_window_ms.load(Ordering::Acquire) > 0
             || self.min_ooo_time.load(Ordering::Acquire) != i64::MAX;
-        let last_wbl_file = if ooo_active {
-            let mut wbl_guard = self.wbl.lock();
-            match *wbl_guard {
-                Some(ref mut wbl) => Some(wbl.next_segment()?),
-                None => None,
-            }
-        } else {
-            None
-        };
 
         let mut mmapped_any = false;
         let mut any_pending = false;
@@ -6446,103 +6454,129 @@ impl Head {
         let mut pending_entries: Vec<Arc<SeriesEntry>> = Vec::new();
         let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
 
-        for stripe in &self.series.stripes {
-            stripe_buf.clear();
-            StripeSeries::collect_stripe_into(stripe, &mut stripe_buf);
-            for entry in stripe_buf.drain(..) {
-                // Lock order: entry.inner -> chunk_writer (matching commit()).
-                let mut st = entry.inner.lock();
-                if let Some(ref mut ooo) = st.ooo_mut() {
-                    if let Some(ref ohc) = ooo.ooo_head_chunk {
-                        let cut_chunks = ohc.chunk.to_encoded_chunks(
-                            i64::MIN,
-                            i64::MAX,
-                            use_xor2,
-                            use_hist_st,
-                        )?;
-                        if !cut_chunks.is_empty() {
-                            let mut writer_guard = self.chunk_writer.lock();
-                            if let Some(ref mut writer) = *writer_guard {
-                                let snap = writer.take_snapshot();
-                                let mut staged_pending: SmallVec<[(MmappedChunk, EncodedChunk); 4]> =
-                                    SmallVec::new();
-                                let mut staged_markers: SmallVec<[RefMmapMarker; 4]> =
-                                    SmallVec::new();
-                                for cc in cut_chunks {
-                                    let r = match writer.write_chunk(
-                                        entry.ref_id,
-                                        cc.min_time,
-                                        cc.max_time,
-                                        &cc.chunk,
-                                        true,
-                                    ) {
-                                        Ok(r) => r,
-                                        Err(e) => {
-                                            writer.rollback_snapshot(snap);
-                                            return Err(e.into());
-                                        }
-                                    };
-                                    let mc = MmappedChunk {
-                                        ref_id: r,
-                                        min_time: cc.min_time,
-                                        max_time: cc.max_time,
-                                        num_samples: cc.chunk.num_samples() as u16,
-                                        encoding: cc.chunk.encoding(),
-                                    };
-                                    staged_pending.push((mc, cc.chunk));
-                                    staged_markers.push(RefMmapMarker {
-                                        ref_id: entry.ref_id,
-                                        mmap_ref: r.as_u64(),
-                                    });
+        // Hold ooo_wbl_gate exclusively across snapshotting ooo_head_chunks, logging their
+        // MmapMarkers, and cutting the WBL segment so an in-flight HeadAppender::commit cannot
+        // log Samples for an already-mmapped chunk into the new WBL segment.
+        let (last_wbl_file, flushed_ref) = {
+            let _wbl_gate = self.ooo_wbl_gate.write();
+
+            for stripe in &self.series.stripes {
+                stripe_buf.clear();
+                StripeSeries::collect_stripe_into(stripe, &mut stripe_buf);
+                for entry in stripe_buf.drain(..) {
+                    // Lock order: entry.inner -> chunk_writer (matching commit()).
+                    let mut st = entry.inner.lock();
+                    if let Some(ref mut ooo) = st.ooo_mut() {
+                        if let Some(ref ohc) = ooo.ooo_head_chunk {
+                            let cut_chunks = ohc.chunk.to_encoded_chunks(
+                                i64::MIN,
+                                i64::MAX,
+                                use_xor2,
+                                use_hist_st,
+                            )?;
+                            if !cut_chunks.is_empty() {
+                                let mut writer_guard = self.chunk_writer.lock();
+                                if let Some(ref mut writer) = *writer_guard {
+                                    let snap = writer.take_snapshot();
+                                    let mut staged_pending: SmallVec<
+                                        [(MmappedChunk, EncodedChunk); 4],
+                                    > = SmallVec::new();
+                                    let mut staged_markers: SmallVec<[RefMmapMarker; 4]> =
+                                        SmallVec::new();
+                                    for cc in cut_chunks {
+                                        let r = match writer.write_chunk(
+                                            entry.ref_id,
+                                            cc.min_time,
+                                            cc.max_time,
+                                            &cc.chunk,
+                                            true,
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                writer.rollback_snapshot(snap);
+                                                return Err(e.into());
+                                            }
+                                        };
+                                        let mc = MmappedChunk {
+                                            ref_id: r,
+                                            min_time: cc.min_time,
+                                            max_time: cc.max_time,
+                                            num_samples: cc.chunk.num_samples() as u16,
+                                            encoding: cc.chunk.encoding(),
+                                        };
+                                        staged_pending.push((mc, cc.chunk));
+                                        staged_markers.push(RefMmapMarker {
+                                            ref_id: entry.ref_id,
+                                            mmap_ref: r.as_u64(),
+                                        });
+                                    }
+                                    ooo.ooo_head_chunk = None;
+                                    ooo.ooo_pending_mmapped.extend(staged_pending);
+                                    ooo_markers.extend(staged_markers);
+                                    mmapped_any = true;
+                                    pending_entries.push(Arc::clone(&entry));
                                 }
+                            } else {
                                 ooo.ooo_head_chunk = None;
-                                ooo.ooo_pending_mmapped.extend(staged_pending);
-                                ooo_markers.extend(staged_markers);
-                                mmapped_any = true;
-                                pending_entries.push(Arc::clone(&entry));
                             }
-                        } else {
-                            ooo.ooo_head_chunk = None;
                         }
-                    }
-                    for mc in &ooo.ooo_mmapped_chunks {
-                        if mc.ref_id > last_mmap_ref {
-                            last_mmap_ref = mc.ref_id;
+                        for mc in &ooo.ooo_mmapped_chunks {
+                            if mc.ref_id > last_mmap_ref {
+                                last_mmap_ref = mc.ref_id;
+                            }
                         }
-                    }
-                    for (mc, _) in &ooo.ooo_pending_mmapped {
-                        any_pending = true;
-                        if mc.ref_id > last_mmap_ref {
-                            last_mmap_ref = mc.ref_id;
+                        for (mc, _) in &ooo.ooo_pending_mmapped {
+                            any_pending = true;
+                            if mc.ref_id > last_mmap_ref {
+                                last_mmap_ref = mc.ref_id;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if mmapped_any || any_pending {
-            let mut writer_guard = self.chunk_writer.lock();
-            if let Some(ref mut writer) = *writer_guard {
-                writer.flush()?;
-            }
-        }
+            let flushed_ref = if mmapped_any || any_pending {
+                let mut writer_guard = self.chunk_writer.lock();
+                if let Some(ref mut writer) = *writer_guard {
+                    writer.flush()?;
+                    Some(writer.last_flushed_ref())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-        if !ooo_markers.is_empty() {
-            let mut wbl_guard = self.wbl.lock();
-            if let Some(ref mut wbl) = *wbl_guard {
-                let enc = RecordEncoder::new(self.opts.enable_st_storage);
-                let rec = enc.mmap_markers(&ooo_markers, Vec::new());
-                wbl.log(&[&rec])?;
-            }
-        }
+            let last_wbl_file = if !ooo_markers.is_empty() || ooo_active {
+                let mut wbl_guard = self.wbl.lock();
+                if let Some(ref mut wbl) = *wbl_guard {
+                    if !ooo_markers.is_empty() {
+                        let enc = RecordEncoder::new(self.opts.enable_st_storage);
+                        let rec = enc.mmap_markers(&ooo_markers, Vec::new());
+                        wbl.log(&[&rec])?;
+                    }
+                    if ooo_active {
+                        Some(wbl.next_segment()?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            (last_wbl_file, flushed_ref)
+        };
 
         if mmapped_any {
-            self.refresh_chunk_reader()?;
-            for entry in pending_entries {
-                let mut st = entry.inner.lock();
-                if let Some(ref mut ooo) = st.ooo_mut() {
-                    for (mc, _) in ooo.ooo_pending_mmapped.drain(..) {
-                        ooo.ooo_mmapped_chunks.push(mc);
+            if let Some(flushed_ref) = flushed_ref {
+                self.refresh_chunk_reader()?;
+                for entry in pending_entries {
+                    let mut st = entry.inner.lock();
+                    if let Some(ref mut ooo) = st.ooo_mut() {
+                        ooo.promote_pending_up_to(flushed_ref);
                     }
                 }
             }
@@ -6827,91 +6861,104 @@ impl Head {
         let mut pending_entries: Vec<Arc<SeriesEntry>> = Vec::new();
         let entries = self.series.all_entries();
 
-        for entry in &entries {
-            // Lock order: entry.inner -> chunk_writer (matching commit()).
-            let mut st = entry.inner.lock();
-            if let Some(ref mut ooo) = st.ooo_mut() {
-                if let Some(ref ohc) = ooo.ooo_head_chunk {
-                    let cut_chunks = ohc.chunk.to_encoded_chunks(
-                        i64::MIN,
-                        i64::MAX,
-                        use_xor2,
-                        use_hist_st,
-                    )?;
-                    if !cut_chunks.is_empty() {
-                        let mut writer_guard = self.chunk_writer.lock();
-                        if let Some(ref mut writer) = *writer_guard {
-                            let snap = writer.take_snapshot();
-                            let mut staged_pending: SmallVec<[(MmappedChunk, EncodedChunk); 4]> =
-                                SmallVec::new();
-                            let mut staged_markers: SmallVec<[RefMmapMarker; 4]> = SmallVec::new();
-                            for cc in cut_chunks {
-                                let r = match writer.write_chunk(
-                                    entry.ref_id,
-                                    cc.min_time,
-                                    cc.max_time,
-                                    &cc.chunk,
-                                    true,
-                                ) {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        writer.rollback_snapshot(snap);
-                                        return Err(e.into());
-                                    }
-                                };
-                                let mc = MmappedChunk {
-                                    ref_id: r,
-                                    min_time: cc.min_time,
-                                    max_time: cc.max_time,
-                                    num_samples: cc.chunk.num_samples() as u16,
-                                    encoding: cc.chunk.encoding(),
-                                };
-                                staged_pending.push((mc, cc.chunk));
-                                staged_markers.push(RefMmapMarker {
-                                    ref_id: entry.ref_id,
-                                    mmap_ref: r.as_u64(),
-                                });
+        let flushed_ref = {
+            let _wbl_gate = self.ooo_wbl_gate.write();
+
+            for entry in &entries {
+                // Lock order: entry.inner -> chunk_writer (matching commit()).
+                let mut st = entry.inner.lock();
+                if let Some(ref mut ooo) = st.ooo_mut() {
+                    if let Some(ref ohc) = ooo.ooo_head_chunk {
+                        let cut_chunks = ohc.chunk.to_encoded_chunks(
+                            i64::MIN,
+                            i64::MAX,
+                            use_xor2,
+                            use_hist_st,
+                        )?;
+                        if !cut_chunks.is_empty() {
+                            let mut writer_guard = self.chunk_writer.lock();
+                            if let Some(ref mut writer) = *writer_guard {
+                                let snap = writer.take_snapshot();
+                                let mut staged_pending: SmallVec<
+                                    [(MmappedChunk, EncodedChunk); 4],
+                                > = SmallVec::new();
+                                let mut staged_markers: SmallVec<[RefMmapMarker; 4]> =
+                                    SmallVec::new();
+                                for cc in cut_chunks {
+                                    let r = match writer.write_chunk(
+                                        entry.ref_id,
+                                        cc.min_time,
+                                        cc.max_time,
+                                        &cc.chunk,
+                                        true,
+                                    ) {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            writer.rollback_snapshot(snap);
+                                            return Err(e.into());
+                                        }
+                                    };
+                                    let mc = MmappedChunk {
+                                        ref_id: r,
+                                        min_time: cc.min_time,
+                                        max_time: cc.max_time,
+                                        num_samples: cc.chunk.num_samples() as u16,
+                                        encoding: cc.chunk.encoding(),
+                                    };
+                                    staged_pending.push((mc, cc.chunk));
+                                    staged_markers.push(RefMmapMarker {
+                                        ref_id: entry.ref_id,
+                                        mmap_ref: r.as_u64(),
+                                    });
+                                }
+                                ooo.ooo_head_chunk = None;
+                                ooo.ooo_pending_mmapped.extend(staged_pending);
+                                ooo_markers.extend(staged_markers);
+                                mmapped_any = true;
+                                pending_entries.push(Arc::clone(entry));
                             }
+                        } else {
                             ooo.ooo_head_chunk = None;
-                            ooo.ooo_pending_mmapped.extend(staged_pending);
-                            ooo_markers.extend(staged_markers);
-                            mmapped_any = true;
-                            pending_entries.push(Arc::clone(entry));
                         }
-                    } else {
-                        ooo.ooo_head_chunk = None;
                     }
                 }
             }
-        }
 
-        if mmapped_any {
-            let mut writer_guard = self.chunk_writer.lock();
-            if let Some(ref mut writer) = *writer_guard {
-                writer.flush()?;
-            }
-        }
-
-        {
-            let mut wbl_guard = self.wbl.lock();
-            if let Some(ref mut wbl) = *wbl_guard {
-                if !ooo_markers.is_empty() {
-                    let enc = RecordEncoder::new(self.opts.enable_st_storage);
-                    let rec = enc.mmap_markers(&ooo_markers, Vec::new());
-                    wbl.log(&[&rec])?;
+            let flushed_ref = if mmapped_any {
+                let mut writer_guard = self.chunk_writer.lock();
+                if let Some(ref mut writer) = *writer_guard {
+                    writer.flush()?;
+                    Some(writer.last_flushed_ref())
+                } else {
+                    None
                 }
-                let next_seg = wbl.next_segment()?;
-                *self.ooo_compact_wbl_cut_seg.lock() = Some(next_seg);
+            } else {
+                None
+            };
+
+            {
+                let mut wbl_guard = self.wbl.lock();
+                if let Some(ref mut wbl) = *wbl_guard {
+                    if !ooo_markers.is_empty() {
+                        let enc = RecordEncoder::new(self.opts.enable_st_storage);
+                        let rec = enc.mmap_markers(&ooo_markers, Vec::new());
+                        wbl.log(&[&rec])?;
+                    }
+                    let next_seg = wbl.next_segment()?;
+                    *self.ooo_compact_wbl_cut_seg.lock() = Some(next_seg);
+                }
             }
-        }
+
+            flushed_ref
+        };
 
         if mmapped_any {
-            self.refresh_chunk_reader()?;
-            for entry in pending_entries {
-                let mut st = entry.inner.lock();
-                if let Some(ref mut ooo) = st.ooo_mut() {
-                    for (mc, _) in ooo.ooo_pending_mmapped.drain(..) {
-                        ooo.ooo_mmapped_chunks.push(mc);
+            if let Some(flushed_ref) = flushed_ref {
+                self.refresh_chunk_reader()?;
+                for entry in pending_entries {
+                    let mut st = entry.inner.lock();
+                    if let Some(ref mut ooo) = st.ooo_mut() {
+                        ooo.promote_pending_up_to(flushed_ref);
                     }
                 }
             }
@@ -7036,6 +7083,7 @@ impl Head {
             return Ok(());
         }
         if min_ooo_mmap_ref.as_u64() > 0 {
+            let _mmap_guard = self.mmap_mtx.lock();
             let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
             let head_maxt = self.max_time();
             let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
@@ -7164,6 +7212,7 @@ impl Head {
     /// samples `> maxt_inclusive` that arrived during compaction), truncates WBL segments, and
     /// cleans up empty series and unused `chunks_head` files.
     pub fn clear_ooo_data_before(&self, maxt_inclusive: i64) -> Result<(), HeadError> {
+        let _mmap_guard = self.mmap_mtx.lock();
         let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
         let head_maxt = self.max_time();
         let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
@@ -7539,6 +7588,7 @@ impl Head {
         self.metrics.head_truncate_total.inc();
         let gc_start = Instant::now();
         let head_maxt = self.max_time();
+        let _mmap_guard = self.mmap_mtx.lock();
         let (to_delete, actual_mint, mut min_ooo_time, min_mmap_seq) =
             self.gc_collect_and_unlink(mint);
 
@@ -7569,6 +7619,7 @@ impl Head {
         self.min_ooo_time.store(min_ooo_time, Ordering::Release);
 
         self.truncate_chunks_head(min_mmap_seq)?;
+        drop(_mmap_guard);
         self.series.shrink_oversized_stripes();
         self.maybe_gc_symbols();
         Ok(())
@@ -7576,6 +7627,7 @@ impl Head {
 
     /// Garbage-collects chunks `< mint` and empty series (used on startup after WAL/WBL replay).
     pub fn gc(&self, mint: i64) -> Result<(), HeadError> {
+        let _mmap_guard = self.mmap_mtx.lock();
         let (to_delete, actual_mint, _min_ooo_time, min_mmap_seq) =
             self.gc_collect_and_unlink(mint);
         if !to_delete.is_empty() {
@@ -10201,6 +10253,7 @@ impl<'a> HeadAppender<'a> {
         let samples_per_chunk = self.head.opts.samples_per_chunk;
         let ooo_cap_max = self.head.opts.ooo_cap_max;
 
+        let ooo_wbl_guard = Some(self.head.ooo_wbl_gate.read());
         let total_batches = self.batch_boundaries.len() + 1;
         let mut f_start = 0usize;
         let mut h_start = 0usize;
@@ -10755,6 +10808,7 @@ impl<'a> HeadAppender<'a> {
         }
 
         // Flush chunk_writer and log WBL BEFORE exposing any OOO MmappedChunk or OOO bounds.
+        let mut flushed_ref = None;
         if !pending_ooo_promote.is_empty() {
             if let Some(ref mut cw) = *self.head.chunk_writer.lock() {
                 if cw_start_epoch.is_some_and(|e| cw.discard_epoch() != e) {
@@ -10764,6 +10818,7 @@ impl<'a> HeadAppender<'a> {
                     .into());
                 }
                 cw.flush()?;
+                flushed_ref = Some(cw.last_flushed_ref());
             }
         }
 
@@ -10783,14 +10838,15 @@ impl<'a> HeadAppender<'a> {
                 }
             }
         }
+        drop(ooo_wbl_guard);
 
         if !pending_ooo_promote.is_empty() {
-            self.head.refresh_chunk_reader()?;
-            for entry in pending_ooo_promote {
-                let mut st = entry.inner.lock();
-                if let Some(ref mut ooo) = st.ooo_mut() {
-                    for (mc, _) in ooo.ooo_pending_mmapped.drain(..) {
-                        ooo.ooo_mmapped_chunks.push(mc);
+            if let Some(flushed_ref) = flushed_ref {
+                self.head.refresh_chunk_reader()?;
+                for entry in pending_ooo_promote {
+                    let mut st = entry.inner.lock();
+                    if let Some(ref mut ooo) = st.ooo_mut() {
+                        ooo.promote_pending_up_to(flushed_ref);
                     }
                 }
             }

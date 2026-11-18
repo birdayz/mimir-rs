@@ -180,6 +180,8 @@ pub struct HeadChunksWriter {
     record_buf: Vec<u8>,
     cut_on_next_chunk: bool,
     discard_epoch: u64,
+    last_written_ref: ChunkDiskMapperRef,
+    last_flushed_ref: ChunkDiskMapperRef,
     closed: bool,
     fault_hook: Option<WriteFaultHook>,
 }
@@ -191,6 +193,7 @@ pub(crate) struct HeadChunksSnapshot {
     file_offset: usize,
     write_buf_len: usize,
     cut_on_next_chunk: bool,
+    last_written_ref: ChunkDiskMapperRef,
 }
 
 impl HeadChunksWriter {
@@ -231,6 +234,8 @@ impl HeadChunksWriter {
             record_buf: Vec::new(),
             cut_on_next_chunk: false,
             discard_epoch: 0,
+            last_written_ref: ChunkDiskMapperRef(0),
+            last_flushed_ref: ChunkDiskMapperRef(0),
             closed: false,
             fault_hook: None,
         })
@@ -241,6 +246,11 @@ impl HeadChunksWriter {
         self.discard_epoch
     }
 
+    #[inline]
+    pub(crate) fn last_flushed_ref(&self) -> ChunkDiskMapperRef {
+        self.last_flushed_ref
+    }
+
     pub(crate) fn take_snapshot(&self) -> HeadChunksSnapshot {
         HeadChunksSnapshot {
             seq: self.seq,
@@ -248,6 +258,7 @@ impl HeadChunksWriter {
             file_offset: self.file_offset,
             write_buf_len: self.write_buf.len(),
             cut_on_next_chunk: self.cut_on_next_chunk,
+            last_written_ref: self.last_written_ref,
         }
     }
 
@@ -277,6 +288,7 @@ impl HeadChunksWriter {
             self.offset = self.file_offset;
         }
         self.cut_on_next_chunk = snap.cut_on_next_chunk;
+        self.last_written_ref = snap.last_written_ref;
     }
 
     /// Installs or clears a write fault-injection hook (used by durability tests).
@@ -345,6 +357,7 @@ impl HeadChunksWriter {
         }
         self.file_offset += self.write_buf.len();
         self.write_buf.clear();
+        self.last_flushed_ref = self.last_written_ref;
         Ok(())
     }
 
@@ -436,6 +449,8 @@ impl HeadChunksWriter {
         }
 
         let chunk_offset = self.offset;
+        let ref_id = ChunkDiskMapperRef::new(self.seq as u32, chunk_offset as u32);
+        let mut flushed_now = false;
         if self.write_buf.len() + needed > self.write_buffer_size {
             self.flush_write_buf()?;
             if needed >= self.write_buffer_size {
@@ -450,6 +465,7 @@ impl HeadChunksWriter {
                 }
                 self.file_offset += needed;
                 self.offset += needed;
+                flushed_now = true;
             } else {
                 self.write_buf.extend_from_slice(&self.record_buf);
                 self.offset += needed;
@@ -459,11 +475,15 @@ impl HeadChunksWriter {
             self.offset += needed;
         }
 
+        self.last_written_ref = ref_id;
+        if flushed_now {
+            self.last_flushed_ref = ref_id;
+        }
         if let Some(m) = self.queue_metrics.as_ref() {
             m.adds.inc();
             m.completed.inc();
         }
-        Ok(ChunkDiskMapperRef::new(self.seq as u32, chunk_offset as u32))
+        Ok(ref_id)
     }
 
     /// Attaches the Go `chunk_write_queue` operation counters.

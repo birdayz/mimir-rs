@@ -790,6 +790,7 @@ struct Decoder<'a> {
     terrors: Vec<String>,
     known_fields: bool,
     aliases: HashSet<usize>,
+    merge_visited: HashSet<usize>,
     merged_fields: Option<HashSet<String>>,
 }
 
@@ -806,6 +807,7 @@ impl<'a> Decoder<'a> {
             terrors: Vec::new(),
             known_fields,
             aliases: HashSet::new(),
+            merge_visited: HashSet::new(),
             merged_fields: None,
         }
     }
@@ -976,7 +978,10 @@ impl<'a> Decoder<'a> {
     }
 
     fn deref_alias(&self, mut n: usize) -> usize {
-        while let Some(a) = self.doc.node(n).alias {
+        for _ in 0..self.doc.nodes.len() {
+            let Some(a) = self.doc.node(n).alias else {
+                break;
+            };
             n = a;
         }
         n
@@ -1298,20 +1303,61 @@ impl<'a> Decoder<'a> {
             }
             _ => return Err(want_map()),
         }
+        let inserted_parent = self.merge_visited.insert(parent);
         for tgt in targets {
+            let is_alias = self.doc.node(tgt).kind == Kind::Alias;
+            if is_alias && !self.aliases.insert(tgt) {
+                if inserted_parent {
+                    self.merge_visited.remove(&parent);
+                }
+                self.merged_fields = saved;
+                return Err(Fail(format!(
+                    "yaml: anchor '{}' value contains itself",
+                    self.doc.node(tgt).value
+                )));
+            }
             let tn = self.deref_alias(tgt);
-            match &strukt {
+            if self.merge_visited.contains(&tn) {
+                if is_alias {
+                    self.aliases.remove(&tgt);
+                }
+                if inserted_parent {
+                    self.merge_visited.remove(&parent);
+                }
+                self.merged_fields = saved;
+                let msg = if is_alias {
+                    format!(
+                        "yaml: anchor '{}' value contains itself",
+                        self.doc.node(tgt).value
+                    )
+                } else {
+                    "yaml: cyclic merge".to_string()
+                };
+                return Err(Fail(msg));
+            }
+            let res = match &strukt {
                 Some((ty, name)) => {
                     if self.check_unique_keys(tn) {
-                        self.mapping_struct(tn, *ty, name)?;
+                        self.mapping_struct(tn, *ty, name)
+                    } else {
+                        Ok(true)
                     }
                 }
                 None => {
                     if self.check_unique_keys(tn) {
-                        self.mapping_entries(tn, key, elem)?;
+                        self.mapping_entries(tn, key, elem)
+                    } else {
+                        Ok(true)
                     }
                 }
+            };
+            if is_alias {
+                self.aliases.remove(&tgt);
             }
+            res?;
+        }
+        if inserted_parent {
+            self.merge_visited.remove(&parent);
         }
         self.merged_fields = saved;
         Ok(())
@@ -1480,7 +1526,10 @@ fn limits_map_elem_ty(t: &Types, name: &str) -> Option<usize> {
 }
 
 fn doc_deref(doc: &Document, mut n: usize) -> usize {
-    while let Some(a) = doc.node(n).alias {
+    for _ in 0..doc.nodes.len() {
+        let Some(a) = doc.node(n).alias else {
+            break;
+        };
         n = a;
     }
     n
@@ -1567,8 +1616,15 @@ fn doc_scalar_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<
     }
 }
 
-fn collect_merged_pairs(doc: &Document, n: usize) -> Vec<(usize, usize)> {
+fn collect_merged_pairs(
+    doc: &Document,
+    n: usize,
+    visited: &mut HashSet<usize>,
+) -> Result<Vec<(usize, usize)>, String> {
     let n = doc_deref(doc, n);
+    if !visited.insert(n) {
+        return Err("yaml: anchor value contains itself".to_string());
+    }
     let content = &doc.node(n).content;
     let mut explicit_keys = Vec::new();
     let mut explicit_set = HashSet::new();
@@ -1602,7 +1658,14 @@ fn collect_merged_pairs(doc: &Document, n: usize) -> Vec<(usize, usize)> {
             _ => {}
         }
         for tgt in targets {
-            for (mk, mv) in collect_merged_pairs(doc, tgt) {
+            let merged = match collect_merged_pairs(doc, tgt, visited) {
+                Ok(m) => m,
+                Err(e) => {
+                    visited.remove(&n);
+                    return Err(e);
+                }
+            };
+            for (mk, mv) in merged {
                 let mkn = doc.node(doc_deref(doc, mk));
                 if mkn.kind == Kind::Scalar && !explicit_set.insert(mkn.value.clone()) {
                     continue;
@@ -1611,7 +1674,8 @@ fn collect_merged_pairs(doc: &Document, n: usize) -> Vec<(usize, usize)> {
             }
         }
     }
-    explicit_keys
+    visited.remove(&n);
+    Ok(explicit_keys)
 }
 
 fn doc_node_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<serde_yaml::Value, String> {
@@ -1643,7 +1707,8 @@ fn doc_node_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<se
             Ok(Value::Sequence(seq))
         }
         Kind::Mapping => {
-            let pairs = collect_merged_pairs(doc, n);
+            let mut merge_visited = HashSet::new();
+            let pairs = collect_merged_pairs(doc, n, &mut merge_visited)?;
             let mut out = Mapping::with_capacity(pairs.len());
             if info.name == "activeseriesmodel.CustomTrackersConfig" {
                 for (k, v) in pairs {
@@ -1939,5 +2004,33 @@ mod tests {
         assert_eq!(resolve("", "2001-12-14").unwrap().1, Resolved::Timestamp);
         assert_eq!(resolve("", "18446744073709551615").unwrap().1, Resolved::Uint(u64::MAX));
         assert!(resolve("!!int", "abc").is_err());
+    }
+
+    #[test]
+    fn cyclic_yaml_merge_aliases_return_error_without_stack_overflow() {
+        for yaml in [
+            "blocks_storage: &a { <<: *a }\n",
+            "blocks_storage: &a\n  <<: *a\n",
+            "blocks_storage: &a\n  <<: [*a]\n",
+            "blocks_storage: &a { <<: { <<: *a } }\n",
+            "common:\n  storage: &a\n    <<: *a\n",
+        ] {
+            let err = check(yaml).unwrap_err();
+            assert!(
+                err.contains("contains itself") || err.contains("cyclic merge"),
+                "unexpected error for {yaml:?}: {err}"
+            );
+            let doc = parse_first_document(yaml.as_bytes()).unwrap().unwrap();
+            assert!(
+                doc_to_serde_value(&doc).is_err(),
+                "expected doc_to_serde_value error for {yaml:?}"
+            );
+        }
+
+        // Diamond / non-cyclic merge must continue to succeed.
+        let ok_yaml = "common:\n  storage: &s\n    backend: s3\nblocks_storage:\n  <<: *s\n";
+        assert_eq!(check(ok_yaml), Ok(()));
+        let doc = parse_first_document(ok_yaml.as_bytes()).unwrap().unwrap();
+        assert!(doc_to_serde_value(&doc).is_ok());
     }
 }

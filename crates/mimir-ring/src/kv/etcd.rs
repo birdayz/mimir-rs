@@ -753,6 +753,7 @@ impl EtcdKv {
 
         let mut start_revision: i64 = 0;
         let mut ep_idx: usize = 0;
+        let mut refreshed_auth = false;
 
         while backoff.ongoing() && !cancel.is_canceled() {
             let headers = match tokio::select! {
@@ -788,15 +789,18 @@ impl EtcdKv {
                 };
                 match resp_res {
                     Ok(r) if r.status().is_success() => {
+                        refreshed_auth = false;
                         ep_idx = (idx + 1) % self.endpoints.len();
                         connected_resp = Some(r);
                         break;
                     }
                     Ok(r)
                         if r.status() == StatusCode::UNAUTHORIZED
-                            && !self.cfg.username.is_empty() =>
+                            && !self.cfg.username.is_empty()
+                            && !refreshed_auth =>
                     {
                         warn!(key = key_label, endpoint = %self.endpoint(idx), "etcd watch unauthorized, refreshing auth token");
+                        refreshed_auth = true;
                         self.invalidate_auth().await;
                         unauthorized = true;
                         break;
@@ -816,6 +820,7 @@ impl EtcdKv {
 
             let Some(mut resp) = connected_resp else {
                 ep_idx = (ep_idx + 1) % self.endpoints.len();
+                refreshed_auth = false;
                 tokio::select! {
                     _ = cancel.canceled() => return,
                     _ = backoff.wait() => continue,
@@ -893,6 +898,12 @@ impl EtcdKv {
                 };
                 match range_res {
                     Ok(range_resp) => {
+                        if notify_on_delete
+                            && range_resp.kvs.is_empty()
+                            && !on_event(key_label, Box::new(KeyDeleted))
+                        {
+                            return;
+                        }
                         for kv in range_resp.kvs {
                             let Ok(raw_key) = b64_decode(&kv.key) else {
                                 continue;
@@ -923,9 +934,12 @@ impl EtcdKv {
                             .as_ref()
                             .map(EtcdResponseHeader::revision_i64)
                             .unwrap_or(0);
-                        start_revision = if hdr_rev > 0 { hdr_rev + 1 } else { c_rev };
-                        backoff.reset();
-                        continue;
+                        if hdr_rev > 0 {
+                            start_revision = hdr_rev + 1;
+                            backoff.reset();
+                            continue;
+                        }
+                        start_revision = c_rev;
                     }
                     Err(e) => {
                         error!(key = key_label, err = %e, "etcd compaction recovery GET failed");
@@ -934,6 +948,7 @@ impl EtcdKv {
                 }
             }
 
+            refreshed_auth = false;
             tokio::select! {
                 _ = cancel.canceled() => return,
                 _ = backoff.wait() => {}
