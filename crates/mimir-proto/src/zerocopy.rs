@@ -4913,7 +4913,7 @@ mod tests {
 
         // 4) Tag 1001 after series sets header_changed_after_series in both stream decoders
         let mut classic_tag1001 = rw1.encode_to_vec();
-        prost::encoding::encode_varint((1001u64 << 3) | 0, &mut classic_tag1001);
+        prost::encoding::encode_varint(1001u64 << 3, &mut classic_tag1001);
         classic_tag1001.push(1);
         let hdr_c = decode_classic_stream(
             &classic_tag1001,
@@ -4928,7 +4928,7 @@ mod tests {
         assert!(hdr_c.header_changed_after_series);
 
         let mut rw2_tag1001 = rw2_bytes;
-        prost::encoding::encode_varint((1001u64 << 3) | 0, &mut rw2_tag1001);
+        prost::encoding::encode_varint(1001u64 << 3, &mut rw2_tag1001);
         rw2_tag1001.push(1);
         let mut resolved = Rw2ResolvedScratch::new();
         let mut meta_out = Vec::new();

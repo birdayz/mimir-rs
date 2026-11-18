@@ -658,11 +658,12 @@ mod tests {
         let secondary: Arc<dyn KvClient> =
             Arc::new(MemberlistKvClient::new(Arc::clone(&ml), Arc::clone(&codec)).unwrap());
 
-        let mut multi_cfg = MultiKVConfig::default();
-        multi_cfg.primary = "inmemory".to_string();
-        multi_cfg.secondary = "memberlist".to_string();
-        multi_cfg.mirror_enabled = true;
-        multi_cfg.mirror_timeout = GoDuration::from_secs(5);
+        let multi_cfg = MultiKVConfig {
+            primary: "inmemory".to_string(),
+            secondary: "memberlist".to_string(),
+            mirror_enabled: true,
+            mirror_timeout: GoDuration::from_secs(5),
+        };
 
         let multi = MultiKv::with_registerer_and_options(
             multi_cfg,

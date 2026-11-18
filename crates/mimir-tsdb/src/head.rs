@@ -13,7 +13,8 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering,
+    AtomicBool, AtomicI64, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
+    Ordering,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -3167,6 +3168,8 @@ pub struct Head {
     max_ooo_time: AtomicI64,
     ooo_time_window_ms: AtomicI64,
     chunk_end_time_variance_bits: AtomicU64,
+    metadata_limits_max_metrics: AtomicUsize,
+    metadata_limits_max_per_metric: AtomicUsize,
     float_chunk_encoding: AtomicU8,
     last_series_id: AtomicU64,
     num_series: AtomicU64,
@@ -3308,6 +3311,12 @@ impl Head {
             max_ooo_time: AtomicI64::new(i64::MIN),
             ooo_time_window_ms: AtomicI64::new(opts.ooo_time_window_ms),
             chunk_end_time_variance_bits: AtomicU64::new(chunk_end_time_variance.to_bits()),
+            metadata_limits_max_metrics: AtomicUsize::new(
+                opts.metadata_limits.max_metrics_with_metadata_per_user,
+            ),
+            metadata_limits_max_per_metric: AtomicUsize::new(
+                opts.metadata_limits.max_metadata_per_metric,
+            ),
             float_chunk_encoding: AtomicU8::new(float_enc.as_u8()),
             last_series_id: AtomicU64::new(0),
             num_series: AtomicU64::new(0),
@@ -5376,6 +5385,26 @@ impl Head {
     pub fn set_chunk_end_time_variance(&self, variance: f64) {
         self.chunk_end_time_variance_bits
             .store(variance.to_bits(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn metadata_limits(&self) -> MetadataLimits {
+        MetadataLimits {
+            max_metrics_with_metadata_per_user: self
+                .metadata_limits_max_metrics
+                .load(Ordering::Relaxed),
+            max_metadata_per_metric: self
+                .metadata_limits_max_per_metric
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    #[inline]
+    pub fn set_metadata_limits(&self, limits: MetadataLimits) {
+        self.metadata_limits_max_metrics
+            .store(limits.max_metrics_with_metadata_per_user, Ordering::Relaxed);
+        self.metadata_limits_max_per_metric
+            .store(limits.max_metadata_per_metric, Ordering::Relaxed);
     }
 
     #[inline]
@@ -10307,7 +10336,7 @@ impl<'a> HeadAppender<'a> {
                 metric_type,
                 help,
                 unit,
-                self.head.opts.metadata_limits,
+                self.head.metadata_limits(),
             )?;
         }
 

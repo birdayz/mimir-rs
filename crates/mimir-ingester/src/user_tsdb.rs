@@ -577,6 +577,8 @@ impl UserTsdb {
         };
 
         let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
+        db.head()
+            .set_chunk_end_time_variance(blocks_cfg.tsdb.head_chunks_end_time_variance);
         let weak_db = Arc::downgrade(&db);
         *lifecycle_adapter.num_series_fn.write() = Some(Arc::new(move || {
             weak_db.upgrade().map_or(0, |d| d.head().num_series())
@@ -998,10 +1000,12 @@ impl UserTsdb {
             Encoding::Xor
         };
         self.db.head().set_float_chunk_encoding(float_enc);
-        *self.current_metadata_limits.lock() = MetadataLimits {
+        let metadata_limits = MetadataLimits {
             max_metrics_with_metadata_per_user: self.limiter.max_metadata_per_user(&self.user_id),
             max_metadata_per_metric: self.limiter.max_metadata_per_metric(&self.user_id),
         };
+        self.db.head().set_metadata_limits(metadata_limits);
+        *self.current_metadata_limits.lock() = metadata_limits;
     }
 
     pub fn owned_series_state(&self) -> OwnedSeriesState {
@@ -1652,5 +1656,73 @@ mod tests {
 
         let err = store.add_parts_at(1, "up", "h1", "", 200).unwrap_err();
         assert!(matches!(err, IngesterError::PerMetricMetadataLimitReached { .. }));
+    }
+
+    #[test]
+    fn user_tsdb_wires_chunk_end_time_variance_and_dynamic_metadata_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = dir.path().to_string_lossy().into_owned();
+        blocks_cfg.tsdb.ship_interval = mimir_config::GoDuration::ZERO;
+        blocks_cfg.tsdb.head_chunks_end_time_variance = 0.25;
+
+        let limits = mimir_config::LimitsConfig {
+            max_global_metadata_per_user: 10,
+            max_global_metadata_per_metric: 3,
+            ..Default::default()
+        };
+        let overrides = Overrides::new(limits);
+        let limiter = Arc::new(Limiter::new(
+            overrides.clone(),
+            Arc::new(OneInstanceStrategy),
+        ));
+        let reg = Registry::new();
+        let shared = SharedTsdbMetrics::new(Some(&reg));
+        let shipper_metrics = ShipperMetrics::new(Some(&reg));
+        let rejected = CounterVec::new(prometheus::Opts::new("t_rej", "h"), &["reason"]).unwrap();
+        let ingester_cfg = mimir_config::IngesterConfig::default();
+        let db = UserTsdb::open(
+            "u-w13".to_string(),
+            &ingester_cfg,
+            &blocks_cfg,
+            overrides.clone(),
+            limiter,
+            None,
+            shipper_metrics,
+            &shared,
+            None,
+            1,
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(|| 0),
+            rejected,
+            HashSet::new(),
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(db.db.head().chunk_end_time_variance(), 0.25);
+        assert_eq!(
+            db.db.head().metadata_limits(),
+            MetadataLimits {
+                max_metrics_with_metadata_per_user: 10,
+                max_metadata_per_metric: 3,
+            }
+        );
+
+        overrides.set_defaults(mimir_config::LimitsConfig {
+            max_global_metadata_per_user: 42,
+            max_global_metadata_per_metric: 7,
+            ..Default::default()
+        });
+        db.apply_tsdb_settings();
+
+        let expected = MetadataLimits {
+            max_metrics_with_metadata_per_user: 42,
+            max_metadata_per_metric: 7,
+        };
+        assert_eq!(db.current_metadata_limits(), expected);
+        assert_eq!(db.db.head().metadata_limits(), expected);
     }
 }

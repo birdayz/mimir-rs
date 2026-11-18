@@ -184,7 +184,9 @@ pub struct Ingester {
     service_ctx: RwLock<Option<ServiceContext>>,
     startup_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     startup_done_tx: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+    _startup_done_rx: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
     stop_done_tx: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+    _stop_done_rx: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
     pub(crate) shutdown_mtx: tokio::sync::Mutex<()>,
     lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
     partition_lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
@@ -462,6 +464,8 @@ impl Ingester {
         usagestats::get_and_reset_int(TENANTS_WITH_OOO_ENABLED_STAT_NAME);
         usagestats::get_and_reset_int(MIN_OOO_TIME_WINDOW_SECONDS_STAT_NAME);
         usagestats::get_and_reset_int(MAX_OOO_TIME_WINDOW_SECONDS_STAT_NAME);
+        let (startup_done_tx, _startup_done_rx) = tokio::sync::watch::channel(None);
+        let (stop_done_tx, _stop_done_rx) = tokio::sync::watch::channel(None);
         let ingester = Arc::new(Self {
             cfg,
             blocks_cfg,
@@ -516,8 +520,10 @@ impl Ingester {
             state: RwLock::new(State::New),
             service_ctx: RwLock::new(None),
             startup_handle: tokio::sync::Mutex::new(None),
-            startup_done_tx: tokio::sync::watch::channel(None).0,
-            stop_done_tx: tokio::sync::watch::channel(None).0,
+            startup_done_tx,
+            _startup_done_rx,
+            stop_done_tx,
+            _stop_done_rx,
             shutdown_mtx: tokio::sync::Mutex::new(()),
             lifecycler_svc: Mutex::new(None),
             partition_lifecycler_svc: Mutex::new(None),
@@ -1253,6 +1259,12 @@ impl Ingester {
                     .delete_per_user_custom_tracker_metrics(&k, &tracker_names);
             }
         }
+        if matches!(self.state(), State::New | State::Running) {
+            let _g = self.tsdb_create_mtx.lock();
+            if matches!(self.state(), State::New | State::Running) {
+                self.closing_tsdbs.store(false, Ordering::Release);
+            }
+        }
     }
 
     /// Computes anonymous usage statistics across all open tenant TSDBs (`updateUsageStats`).
@@ -1441,7 +1453,7 @@ impl Ingester {
             *st = State::Starting;
         }
 
-        let _ = self.startup_done_tx.send(None);
+        self.startup_done_tx.send_replace(None);
         *self.service_ctx.write() = Some(ctx.clone());
 
         let ing = Arc::clone(self);
@@ -1453,7 +1465,7 @@ impl Ingester {
             impl Drop for StartupDoneGuard {
                 fn drop(&mut self) {
                     if !self.sent {
-                        let _ = self.tx.send(Some(Err(
+                        self.tx.send_replace(Some(Err(
                             "ingester startup task panicked".to_string(),
                         )));
                     }
@@ -1465,7 +1477,7 @@ impl Ingester {
             };
             let res = ing.run_starting(ctx).await;
             guard.sent = true;
-            let _ = ing.startup_done_tx.send(Some(
+            ing.startup_done_tx.send_replace(Some(
                 res.as_ref().map(|&()| ()).map_err(ToString::to_string),
             ));
         });
@@ -1887,7 +1899,7 @@ impl Ingester {
         impl Drop for StopDoneGuard {
             fn drop(&mut self) {
                 if !self.sent {
-                    let _ = self.tx.send(Some(Err(
+                    self.tx.send_replace(Some(Err(
                         "ingester stop aborted before completion".to_string(),
                     )));
                 }
@@ -1900,7 +1912,7 @@ impl Ingester {
 
         let res = self.stop_inner().await;
         stop_guard.sent = true;
-        let _ = self.stop_done_tx.send(Some(
+        self.stop_done_tx.send_replace(Some(
             res.as_ref().map(|&()| ()).map_err(ToString::to_string),
         ));
         res
