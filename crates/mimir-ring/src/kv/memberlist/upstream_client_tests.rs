@@ -857,3 +857,167 @@ async fn test_crashed_member_is_marked_dead_and_reaped() {
     assert!(reaped, "dead member not reaped: {:?}", m1.all_nodes());
     m1.shutdown().await;
 }
+
+// Not an upstream test: probing a frozen/blackholed peer (TCP connections accepted into kernel
+// backlog or blackholed without reply, and no UDP/packet response) must mark the peer Suspect
+// right at ProbeInterval without stalling subsequent probes for tcp_timeout (10s), and a 6-node
+// cluster must reach Dead across all 5 healthy peers via indirect ping + nack + suspicion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_frozen_blackholed_peer_suspect_within_probe_interval_without_stalling() {
+    use tokio::net::TcpListener;
+
+    let probe_iv = Duration::from_millis(500);
+    let opts = || KvOptions {
+        probe_interval: Some(probe_iv),
+        ..Default::default()
+    };
+
+    // Use a long stream_timeout (10s) to prove probe_node does not block synchronously on TCP fallback.
+    let mut cfg1 = test_cfg("frozen-probe-1");
+    cfg1.stream_timeout = GoDuration::from_secs(10);
+    let m1 = MemberlistKv::start_with_options(cfg1, vec![ring_desc_codec()], "", None, opts())
+        .await
+        .unwrap();
+
+    let mut cfg2 = test_cfg("frozen-probe-2");
+    cfg2.stream_timeout = GoDuration::from_secs(10);
+    cfg2.join_members.0 = vec![format!("127.0.0.1:{}", m1.listening_port())];
+    let m2 = MemberlistKv::start_with_options(cfg2, vec![ring_desc_codec()], "", None, opts())
+        .await
+        .unwrap();
+
+    // A frozen peer: TcpListener stays open (accepting SYN into kernel backlog like SIGSTOP /
+    // docker pause) and never reads or replies.
+    let frozen_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let frozen_port = frozen_listener.local_addr().unwrap().port();
+    m1.alive_node(
+        &Alive {
+            incarnation: 1,
+            node: "frozen-peer".to_string(),
+            addr: vec![127, 0, 0, 1],
+            port: frozen_port,
+            meta: None,
+            vsn: vec![
+                PROTOCOL_VERSION_MIN,
+                PROTOCOL_VERSION_MAX,
+                PROTOCOL_VERSION_2_COMPATIBLE,
+                0,
+                0,
+                0,
+            ],
+        },
+        None,
+        false,
+    );
+
+    let frozen_node = m1.nodes.read().map.get("frozen-peer").cloned().unwrap();
+    let t0 = std::time::Instant::now();
+    m1.probe_node(&frozen_node).await;
+    let probe_elapsed = t0.elapsed();
+    assert!(
+        probe_elapsed < Duration::from_secs(2),
+        "probe_node on frozen peer stalled for {probe_elapsed:?} (must finish around ProbeInterval {probe_iv:?}, not tcp_timeout 10s)"
+    );
+    assert_eq!(
+        m1.nodes.read().map.get("frozen-peer").map(|n| n.state),
+        Some(NodeStateType::Suspect),
+        "frozen peer must enter Suspect right after failed probe"
+    );
+
+    // Subsequent probe against healthy peer m2 must complete promptly without stalling.
+    let ok = eventually(Duration::from_secs(2), || {
+        let m1 = Arc::clone(&m1);
+        let name = m2.node_name().to_string();
+        async move {
+            let Some(healthy) = m1.nodes.read().map.get(&name).cloned() else {
+                return false;
+            };
+            let t1 = std::time::Instant::now();
+            m1.probe_node(&healthy).await;
+            t1.elapsed() < Duration::from_millis(200)
+                && m1.nodes.read().map.get(&name).map(|n| n.state) == Some(NodeStateType::Alive)
+        }
+    })
+    .await;
+    assert!(ok, "subsequent probe to healthy peer stalled or failed");
+
+    // Verify indirect ping NackResp is reliably delivered after probe_timeout (not canceled when
+    // set_ack_handler reaps the expired local_seq entry at probe_timeout).
+    let (nack_ack_tx, _nack_ack_rx) = tokio::sync::mpsc::channel(4);
+    let (nack_tx, mut nack_rx) = tokio::sync::mpsc::channel(4);
+    m1.set_probe_channels(7777, nack_ack_tx, Some(nack_tx), Duration::from_secs(2));
+    let (m1_ip, m1_port) = m1.advertise();
+    let ind = super::super::wire::IndirectPingReq {
+        seq_no: 7777,
+        target: ip_to_bytes(m1_ip),
+        port: frozen_port,
+        node: "frozen-peer".to_string(),
+        nack: true,
+        source_addr: ip_to_bytes(m1_ip),
+        source_port: m1_port,
+        source_node: m1.node_name().to_string(),
+    };
+    m1.send_msg(
+        &format!("127.0.0.1:{}", m2.listening_port()),
+        super::super::wire::encode_indirect_ping(&ind),
+    )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), nack_rx.recv())
+        .await
+        .expect("timed out waiting for NackResp from indirect peer")
+        .expect("nack channel closed");
+
+    drop(frozen_listener);
+    m2.shutdown().await;
+    m1.shutdown().await;
+
+    // 6-node cluster: freeze node 5 (keep listener open, cancel its tasks so it never answers)
+    // and verify all 5 healthy peers mark it Dead via indirect ping + nack + suspicion.
+    let mut nodes: Vec<Arc<MemberlistKv>> = Vec::new();
+    for i in 0..6 {
+        let mut cfg = test_cfg(&format!("freeze6-{i}"));
+        cfg.stream_timeout = GoDuration::from_secs(10);
+        if i > 0 {
+            cfg.join_members.0 = vec![format!("127.0.0.1:{}", nodes[0].listening_port())];
+        }
+        let kv = MemberlistKv::start_with_options(cfg, vec![ring_desc_codec()], "", None, opts())
+            .await
+            .unwrap();
+        nodes.push(kv);
+    }
+    let converged = eventually(Duration::from_secs(10), || {
+        let ns = nodes.clone();
+        async move { ns.iter().all(|n| n.num_members() == 6) }
+    })
+    .await;
+    assert!(converged, "6-node cluster did not converge");
+
+    // Freeze node 5: cancel its tasks without shutting down its TCP listener (simulating SIGSTOP).
+    let frozen_name = nodes[5].node_name().to_string();
+    let t_freeze = std::time::Instant::now();
+    nodes[5].shutdown_ctx.cancel();
+    let dropped_all = eventually(Duration::from_secs(10), || {
+        let ns = nodes[..5].to_vec();
+        let frozen_name = frozen_name.clone();
+        async move {
+            ns.iter().all(|n| {
+                n.nodes
+                    .read()
+                    .map
+                    .get(&frozen_name)
+                    .is_some_and(|st| st.state == NodeStateType::Dead)
+            })
+        }
+    })
+    .await;
+    assert!(
+        dropped_all,
+        "not all 5 peers marked frozen peer Dead within 10s (elapsed {:?})",
+        t_freeze.elapsed()
+    );
+
+    for kv in nodes.into_iter().take(5) {
+        kv.shutdown().await;
+    }
+}

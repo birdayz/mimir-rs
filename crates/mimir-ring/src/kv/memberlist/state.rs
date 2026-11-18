@@ -12,13 +12,13 @@
 //! It lives in a child module of `client` so it can use `MemberlistKv`'s private state.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use rand::seq::SliceRandom;
 use rand::Rng;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, error, info, warn};
 
 use super::super::queue::Broadcast;
@@ -212,6 +212,9 @@ impl MemberlistKv {
             }
         }
         let n = nodes.len();
+        if n == 0 {
+            return k_nodes;
+        }
         let mut rng = rand::thread_rng();
         let mut i = 0;
         while i < 3 * n && k_nodes.len() < k {
@@ -344,7 +347,7 @@ impl MemberlistKv {
     }
 
     /// Go `setProbeChannels`.
-    fn set_probe_channels(
+    pub(crate) fn set_probe_channels(
         &self,
         seq_no: u32,
         ack_tx: mpsc::Sender<AckMessage>,
@@ -651,15 +654,19 @@ impl MemberlistKv {
         } else {
             from.to_string()
         };
-        let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
+        // Only an actual Ack response cancels the Nack timer (Go closes cancelCh inside
+        // respHandler; expiring the ackHandler on timeout must NOT cancel sending NackResp).
+        let acked = Arc::new((AtomicBool::new(false), Notify::new()));
         {
             let me = self.me.clone();
             let ind_addr = ind_addr.clone();
             let seq = ind.seq_no;
+            let acked_cb = Arc::clone(&acked);
             self.set_ack_handler(
                 local_seq,
                 Box::new(move || {
-                    let _ = cancel_tx.try_send(());
+                    acked_cb.0.store(true, Ordering::Release);
+                    acked_cb.1.notify_waiters();
                     if let Some(kv) = me.upgrade() {
                         tokio::spawn(async move {
                             let ack = AckResp { seq_no: seq, payload: None };
@@ -681,9 +688,17 @@ impl MemberlistKv {
             let timeout = self.timing.probe_timeout;
             let seq = ind.seq_no;
             tokio::spawn(async move {
+                let notified = acked.1.notified();
+                tokio::pin!(notified);
+                if acked.0.load(Ordering::Acquire) {
+                    return;
+                }
                 tokio::select! {
-                    _ = cancel_rx.recv() => {}
+                    _ = &mut notified => {}
                     _ = tokio::time::sleep(timeout) => {
+                        if acked.0.load(Ordering::Acquire) {
+                            return;
+                        }
                         if let Some(kv) = me.upgrade() {
                             let nack = NackResp { seq_no: seq };
                             if let Err(err) = kv.send_msg(&ind_addr, encode_nack_resp(&nack)).await {
@@ -783,7 +798,9 @@ impl MemberlistKv {
         if a.incarnation < state_inc && is_local {
             return;
         }
-        table.timers.remove(&a.node);
+        if let Some(t) = table.timers.remove(&a.node) {
+            t.stop();
+        }
 
         let state = table.map.get_mut(&a.node).expect("present");
         if !bootstrap && is_local {
@@ -898,7 +915,9 @@ impl MemberlistKv {
         if d.incarnation < state.incarnation {
             return;
         }
-        table.timers.remove(&d.node);
+        if let Some(t) = table.timers.remove(&d.node) {
+            t.stop();
+        }
         let state = table.map.get_mut(&d.node).expect("present");
         if state.dead_or_left() {
             return;

@@ -450,7 +450,7 @@ compactor:
   data_dir: {}
   compaction_interval: 2s
   cleanup_interval: 2s
-  deletion_delay: 0s
+  deletion_delay: 1h
   first_level_compaction_wait_period: 0s
   first_level_compaction_ooo_wait_period: 0s
   first_level_compaction_skip_future_max_time: false
