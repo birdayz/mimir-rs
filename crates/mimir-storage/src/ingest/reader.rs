@@ -832,6 +832,8 @@ pub struct SingleClusterPartitionReader {
     state: Arc<AtomicU8>,
     log_sink: Option<Arc<SyncMutex<Vec<String>>>>,
     stop_tx: watch::Sender<bool>,
+    failure_tx: watch::Sender<Option<String>>,
+    _failure_rx: watch::Receiver<Option<String>>,
     task: Mutex<Option<JoinHandle<()>>>,
     start_task: Mutex<Option<JoinHandle<Result<(), ReaderError>>>>,
 }
@@ -970,6 +972,7 @@ impl SingleClusterPartitionReader {
             Duration::from_nanos(kafka_cfg.fetch_max_wait.as_nanos().max(0) as u64);
 
         let (stop_tx, _) = watch::channel(false);
+        let (failure_tx, failure_rx) = watch::channel(None);
 
         Ok(Self {
             kafka_cfg,
@@ -994,6 +997,8 @@ impl SingleClusterPartitionReader {
             state: Arc::new(AtomicU8::new(ReaderState::New as u8)),
             log_sink: None,
             stop_tx,
+            failure_tx,
+            _failure_rx: failure_rx,
             task: Mutex::new(None),
             start_task: Mutex::new(None),
         })
@@ -1253,18 +1258,32 @@ impl SingleClusterPartitionReader {
                     }
                     if let Some(ref f) = self.offset_file {
                         if let Some(file_offset) = f.read() {
-                            let part_start = self
+                            match self
                                 .client
                                 .fetch_partition_start_offset(topic, self.partition_id)
-                                .await?;
-                            if file_offset >= part_start {
-                                return Ok((file_offset + 1, file_offset));
+                                .await
+                            {
+                                Ok(part_start) => {
+                                    if file_offset >= part_start {
+                                        return Ok((file_offset + 1, file_offset));
+                                    }
+                                    warn!(
+                                        file_offset,
+                                        part_start,
+                                        "file-stored offset no longer exists for partition, resolving from max replay period or partition start"
+                                    );
+                                }
+                                Err(KafkaClientError::Broker(
+                                    kafka_protocol::error::ResponseError::UnknownTopicOrPartition,
+                                )) => {
+                                    warn!(
+                                        file_offset,
+                                        part_start = 0,
+                                        "file-stored offset no longer exists for partition, resolving from max replay period or partition start"
+                                    );
+                                }
+                                Err(e) => return Err(e.into()),
                             }
-                            warn!(
-                                file_offset,
-                                part_start,
-                                "file-stored offset no longer exists for partition, resolving from max replay period or partition start"
-                            );
                         }
                     }
 
@@ -1315,18 +1334,29 @@ impl SingleClusterPartitionReader {
             }
         };
 
+        self.state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
         let cancel = Cancel::new(self.stop_tx.subscribe(), None);
         let state = Arc::clone(&self.state);
+        let offset_watcher = Arc::clone(&self.offset_watcher);
+        let committer = Arc::clone(&self.committer);
+        let offset_reader = Arc::clone(&self.offset_reader);
+        let stop_tx = self.stop_tx.clone();
+        let failure_tx = self.failure_tx.clone();
         let partition = self.partition_id;
         *guard = Some(tokio::spawn(async move {
             if let Err(e) = fetch_loop.run(cancel).await {
                 // Fail the whole service in case of a non-recoverable error.
                 error!(partition, err = %e, "partition reader failed");
+                let err_msg = e.to_string();
                 state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+                offset_watcher.stop();
+                let _ = stop_tx.send(true);
+                committer.stop().await;
+                offset_reader.stop().await;
+                let _ = failure_tx.send(Some(err_msg));
             }
         }));
-        self.state
-            .store(ReaderState::Running as u8, Ordering::SeqCst);
         info!(partition = self.partition_id, "started partition reader");
         Ok(())
     }
@@ -1649,9 +1679,20 @@ impl SingleClusterPartitionReader {
         *guard = Some(tokio::spawn(async move { this.start().await }));
     }
 
+    pub fn failure_error(&self) -> Option<String> {
+        self.failure_tx.borrow().clone()
+    }
+
+    pub fn subscribe_failure(&self) -> watch::Receiver<Option<String>> {
+        self.failure_tx.subscribe()
+    }
+
     pub async fn stop(&self) {
-        self.state
-            .store(ReaderState::Stopping as u8, Ordering::SeqCst);
+        let was_failed = self.state() == ReaderState::Failed;
+        if !was_failed {
+            self.state
+                .store(ReaderState::Stopping as u8, Ordering::SeqCst);
+        }
         let _ = self.stop_tx.send(true);
         self.offset_watcher.stop();
         if let Some(sh) = self.start_task.lock().await.take() {
@@ -1661,7 +1702,7 @@ impl SingleClusterPartitionReader {
             let _ = handle.await;
         }
         self.stop_dependencies().await;
-        if self.state() != ReaderState::Failed {
+        if !was_failed && self.state() != ReaderState::Failed {
             self.state
                 .store(ReaderState::Terminated as u8, Ordering::SeqCst);
         }
@@ -1734,12 +1775,44 @@ impl SingleClusterPartitionReader {
         Fut: Future<Output = Result<i64, ReaderError>>,
     {
         let topic = self.kafka_cfg.topic.as_str();
+        struct StrongConsistencyGuard<'a> {
+            metrics: &'a ReaderMetrics,
+            topic: &'a str,
+            start: Instant,
+            finished: bool,
+            failed: bool,
+        }
+
+        impl Drop for StrongConsistencyGuard<'_> {
+            fn drop(&mut self) {
+                self.metrics
+                    .strong_consistency
+                    .latency
+                    .with_label_values(&[self.topic])
+                    .observe(self.start.elapsed().as_secs_f64());
+                if !self.finished || self.failed {
+                    self.metrics
+                        .strong_consistency
+                        .failures
+                        .with_label_values(&[self.topic])
+                        .inc();
+                }
+            }
+        }
+
         self.metrics
             .strong_consistency
             .requests
             .with_label_values(&[if with_offset { "true" } else { "false" }, topic])
             .inc();
         let start = Instant::now();
+        let mut guard = StrongConsistencyGuard {
+            metrics: &self.metrics,
+            topic,
+            start,
+            finished: false,
+            failed: false,
+        };
 
         let configured_timeout = Duration::from_nanos(
             self.kafka_cfg
@@ -1800,19 +1873,9 @@ impl SingleClusterPartitionReader {
         }
         .await;
 
-        self.metrics
-            .strong_consistency
-            .latency
-            .with_label_values(&[topic])
-            .observe(start.elapsed().as_secs_f64());
-
-        if res.is_err() {
-            self.metrics
-                .strong_consistency
-                .failures
-                .with_label_values(&[topic])
-                .inc();
-        }
+        guard.failed = res.is_err();
+        guard.finished = true;
+        drop(guard);
         res
     }
 
@@ -2216,6 +2279,10 @@ pub type RecordBatchConsumerFactory<'a> =
 pub struct MultiClusterPartitionReader {
     readers: Vec<Arc<SingleClusterPartitionReader>>,
     merger: Option<Arc<HeapMerger>>,
+    state: Arc<AtomicU8>,
+    failure_error: Arc<SyncMutex<Option<String>>>,
+    stop_tx: watch::Sender<bool>,
+    watcher_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl MultiClusterPartitionReader {
@@ -2289,80 +2356,181 @@ impl MultiClusterPartitionReader {
         let mut merger_opt = merger;
         let shared_merger = merger_opt.take().map(Arc::new);
 
-        for (cluster_id, (cfg, off_path)) in cluster_configs
-            .iter()
-            .zip(offset_file_paths)
-            .enumerate()
-        {
-            // Go: `prometheus.WrapRegistererWith({write_compartment: <id>}, reg)`.
-            let cluster_registry = registry.map(|_| Registry::new());
-            let cluster_consumer: Arc<dyn RecordBatchConsumer> =
-                if let Some(ref m) = shared_merger {
-                    struct MergerSubmitter {
-                        merger: Arc<HeapMerger>,
-                        cluster_id: usize,
-                    }
-                    impl RecordBatchConsumer for MergerSubmitter {
-                        fn consume(
-                            &self,
-                            records: Vec<FetchedRecord>,
-                        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>
-                        {
-                            Box::pin(async move {
-                                self.merger.submit_and_wait(self.cluster_id, records).await
-                            })
+        let build_res: Result<(), ReaderError> = (|| {
+            for (cluster_id, (cfg, off_path)) in cluster_configs
+                .iter()
+                .zip(offset_file_paths)
+                .enumerate()
+            {
+                // Go: `prometheus.WrapRegistererWith({write_compartment: <id>}, reg)`.
+                let cluster_registry = registry.map(|_| Registry::new());
+                let cluster_consumer: Arc<dyn RecordBatchConsumer> =
+                    if let Some(ref m) = shared_merger {
+                        struct MergerSubmitter {
+                            merger: Arc<HeapMerger>,
+                            cluster_id: usize,
                         }
-                    }
-                    Arc::new(MergerSubmitter {
-                        merger: Arc::clone(m),
-                        cluster_id,
-                    })
-                } else {
-                    consumer_factory(cluster_registry.as_ref())
-                };
+                        impl RecordBatchConsumer for MergerSubmitter {
+                            fn consume(
+                                &self,
+                                records: Vec<FetchedRecord>,
+                            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>
+                            {
+                                Box::pin(async move {
+                                    self.merger.submit_and_wait(self.cluster_id, records).await
+                                })
+                            }
+                        }
+                        Arc::new(MergerSubmitter {
+                            merger: Arc::clone(m),
+                            cluster_id,
+                        })
+                    } else {
+                        consumer_factory(cluster_registry.as_ref())
+                    };
 
-            let cluster_instance = format!("{instance_id}-wc-{cluster_id}");
-            let mut r = SingleClusterPartitionReader::new_with_notifier(
-                cfg.clone(),
-                partition_id,
-                &cluster_instance,
-                off_path,
-                cluster_consumer,
-                Arc::clone(&notifier),
-                cluster_registry.as_ref(),
-            )?;
-            if !max_replay_period.is_zero() {
-                r = r.with_max_replay_period(max_replay_period);
+                let cluster_instance = format!("{instance_id}-wc-{cluster_id}");
+                let mut r = SingleClusterPartitionReader::new_with_notifier(
+                    cfg.clone(),
+                    partition_id,
+                    &cluster_instance,
+                    off_path,
+                    cluster_consumer,
+                    Arc::clone(&notifier),
+                    cluster_registry.as_ref(),
+                )?;
+                if !max_replay_period.is_zero() {
+                    r = r.with_max_replay_period(max_replay_period);
+                }
+                if let (Some(parent), Some(child)) = (registry, cluster_registry) {
+                    let id = cluster_id.to_string();
+                    register_labeled_child(parent, child, &[("write_compartment", id.as_str())])
+                        .map_err(|e| {
+                            ReaderError::Config(format!(
+                                "creating partition reader for write compartment {cluster_id}: {e}"
+                            ))
+                        })?;
+                }
+                readers.push(Arc::new(r));
             }
-            if let (Some(parent), Some(child)) = (registry, cluster_registry) {
-                let id = cluster_id.to_string();
-                register_labeled_child(parent, child, &[("write_compartment", id.as_str())])
-                    .map_err(|e| {
-                        ReaderError::Config(format!(
-                            "creating partition reader for write compartment {cluster_id}: {e}"
-                        ))
-                    })?;
+            Ok(())
+        })();
+
+        if let Err(e) = build_res {
+            if let Some(ref m) = shared_merger {
+                m.stop_async();
             }
-            readers.push(Arc::new(r));
+            return Err(e);
         }
 
+        let (stop_tx, _) = watch::channel(false);
         Ok(Self {
             readers,
             merger: shared_merger,
+            state: Arc::new(AtomicU8::new(ReaderState::New as u8)),
+            failure_error: Arc::new(SyncMutex::new(None)),
+            stop_tx,
+            watcher_task: Mutex::new(None),
         })
     }
 
+    pub fn state(&self) -> ReaderState {
+        match self.state.load(Ordering::SeqCst) {
+            0 => ReaderState::New,
+            1 => ReaderState::Starting,
+            2 => ReaderState::Running,
+            3 => ReaderState::Stopping,
+            4 => ReaderState::Terminated,
+            _ => ReaderState::Failed,
+        }
+    }
+
+    pub fn failure_error(&self) -> Option<String> {
+        self.failure_error.lock().clone()
+    }
+
     pub async fn start(&self) -> Result<(), ReaderError> {
+        self.state
+            .store(ReaderState::Starting as u8, Ordering::SeqCst);
+        let mut rxs: Vec<(usize, watch::Receiver<Option<String>>)> = self
+            .readers
+            .iter()
+            .enumerate()
+            .map(|(cid, r)| (cid, r.subscribe_failure()))
+            .collect();
         let futs = self.readers.iter().map(|r| r.start());
-        try_join_all(futs).await?;
+        if let Err(e) = try_join_all(futs).await {
+            self.state
+                .store(ReaderState::Failed as u8, Ordering::SeqCst);
+            *self.failure_error.lock() = Some(e.to_string());
+            self.stop().await;
+            return Err(e);
+        }
+
+        self.state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+
+        let readers = self.readers.clone();
+        let merger = self.merger.clone();
+        let state = Arc::clone(&self.state);
+        let failure_error = Arc::clone(&self.failure_error);
+        let mut stop_rx = self.stop_tx.subscribe();
+        let handle = tokio::spawn(async move {
+
+            loop {
+                if *stop_rx.borrow() {
+                    return;
+                }
+                for (cid, rx) in &rxs {
+                    let err_opt = rx.borrow().clone();
+                    if let Some(err) = err_opt {
+                        let msg = format!(
+                            "a multi-cluster partition reader subservice failed (write compartment {cid}): {err}"
+                        );
+                        error!(write_compartment = cid, err = %err, "multi-cluster partition reader subservice failed");
+                        *failure_error.lock() = Some(msg);
+                        state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+                        join_all(readers.iter().map(|r| r.stop())).await;
+                        if let Some(ref m) = merger {
+                            m.shutdown_and_drain().await;
+                        }
+                        return;
+                    }
+                }
+
+                let wait_futs = rxs.iter_mut().map(|(_, rx)| Box::pin(rx.changed()));
+                tokio::select! {
+                    _ = stop_rx.changed() => {
+                        if *stop_rx.borrow() {
+                            return;
+                        }
+                    }
+                    _ = futures::future::select_all(wait_futs) => {}
+                }
+            }
+        });
+        *self.watcher_task.lock().await = Some(handle);
         Ok(())
     }
 
     pub async fn stop(&self) {
+        let was_failed = self.state() == ReaderState::Failed;
+        if !was_failed {
+            self.state
+                .store(ReaderState::Stopping as u8, Ordering::SeqCst);
+        }
+        let _ = self.stop_tx.send(true);
+        if let Some(h) = self.watcher_task.lock().await.take() {
+            let _ = h.await;
+        }
         let stop_futs = self.readers.iter().map(|r| r.stop());
         join_all(stop_futs).await;
         if let Some(ref m) = self.merger {
             m.shutdown_and_drain().await;
+        }
+        if !was_failed && self.state() != ReaderState::Failed {
+            self.state
+                .store(ReaderState::Terminated as u8, Ordering::SeqCst);
         }
     }
 
@@ -2587,5 +2755,179 @@ mod tests {
         assert_eq!(*adm.committed.lock(), vec![42]);
         assert_eq!(off_file.read().unwrap(), 42);
         committer.stop().await;
+    }
+
+    #[tokio::test]
+    async fn wait_read_consistency_drop_guard_records_failure_and_latency() {
+        struct NoOpConsumer;
+        impl RecordBatchConsumer for NoOpConsumer {
+            fn consume(
+                &self,
+                _records: Vec<FetchedRecord>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let reg = Registry::new();
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "ingest-sc".to_string(),
+            ..Default::default()
+        };
+        let reader = SingleClusterPartitionReader::new(
+            cfg,
+            0,
+            "ing-0",
+            None,
+            Arc::new(NoOpConsumer),
+            Some(&reg),
+        )
+        .unwrap();
+        // Force Running state so wait_read_consistency reaches offset_watcher.wait_for_offset().
+        reader
+            .state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+
+        let offs = PartitionOffsets::new_single_cluster(10);
+        // Simulate gRPC deadline cancellation dropping the future mid-await.
+        let timed = tokio::time::timeout(
+            Duration::from_millis(20),
+            reader.wait_read_consistency_until_offsets(&offs, Duration::from_secs(30)),
+        )
+        .await;
+        assert!(timed.is_err());
+
+        let mfs = reg.gather();
+        let reqs: f64 = mfs
+            .iter()
+            .find(|m| m.get_name() == "cortex_ingest_storage_strong_consistency_requests_total")
+            .unwrap()
+            .get_metric()
+            .iter()
+            .map(|m| m.get_counter().get_value())
+            .sum();
+        let fails = mfs
+            .iter()
+            .find(|m| m.get_name() == "cortex_ingest_storage_strong_consistency_failures_total")
+            .unwrap()
+            .get_metric()[0]
+            .get_counter()
+            .get_value();
+        let lat_count = mfs
+            .iter()
+            .find(|m| m.get_name() == "cortex_ingest_storage_strong_consistency_wait_duration_seconds")
+            .unwrap()
+            .get_metric()[0]
+            .get_histogram()
+            .get_sample_count();
+        assert_eq!(reqs, 1.0);
+        assert_eq!(fails, 1.0);
+        assert_eq!(lat_count, 1);
+    }
+
+    #[tokio::test]
+    async fn multi_cluster_reader_propagates_runtime_subservice_failure() {
+        struct NoOpConsumer;
+        impl RecordBatchConsumer for NoOpConsumer {
+            fn consume(
+                &self,
+                _records: Vec<FetchedRecord>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "ingest-rt".to_string(),
+            auto_create_topic_enabled: false,
+            consume_from_position_at_startup: "start".to_string(),
+            ..Default::default()
+        };
+        let multi = MultiClusterPartitionReader::new(
+            &[cfg.clone(), cfg],
+            &OrderedConsumptionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            0,
+            "ing-0",
+            vec![None, None],
+            Arc::new(NoOpConsumer),
+            None,
+        )
+        .unwrap();
+
+        // Simulate running state + watcher monitoring both readers.
+        multi.readers[0]
+            .state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+        multi.readers[1]
+            .state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+        multi
+            .state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+
+        let readers = multi.readers.clone();
+        let merger = multi.merger.clone();
+        let state = Arc::clone(&multi.state);
+        let failure_error = Arc::clone(&multi.failure_error);
+        let mut stop_rx = multi.stop_tx.subscribe();
+        let handle = tokio::spawn(async move {
+            let mut rxs: Vec<(usize, watch::Receiver<Option<String>>)> = readers
+                .iter()
+                .enumerate()
+                .map(|(cid, r)| (cid, r.subscribe_failure()))
+                .collect();
+            loop {
+                if *stop_rx.borrow() {
+                    return;
+                }
+                for (cid, rx) in &rxs {
+                    let err_opt = rx.borrow().clone();
+                    if let Some(err) = err_opt {
+                        *failure_error.lock() = Some(format!(
+                            "a multi-cluster partition reader subservice failed (write compartment {cid}): {err}"
+                        ));
+                        state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+                        join_all(readers.iter().map(|r| r.stop())).await;
+                        if let Some(ref m) = merger {
+                            m.shutdown_and_drain().await;
+                        }
+                        return;
+                    }
+                }
+                let wait_futs = rxs.iter_mut().map(|(_, rx)| Box::pin(rx.changed()));
+                tokio::select! {
+                    _ = stop_rx.changed() => { if *stop_rx.borrow() { return; } }
+                    _ = futures::future::select_all(wait_futs) => {}
+                }
+            }
+        });
+        *multi.watcher_task.lock().await = Some(handle);
+
+        // Simulate runtime failure in compartment 1.
+        multi.readers[1]
+            .state
+            .store(ReaderState::Failed as u8, Ordering::SeqCst);
+        let _ = multi.readers[1]
+            .failure_tx
+            .send(Some("simulated fatal fetch error".to_string()));
+
+        let dl = Instant::now() + Duration::from_secs(3);
+        while multi.state() != ReaderState::Failed {
+            assert!(Instant::now() < dl, "timed out waiting for Failed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(multi
+            .failure_error()
+            .unwrap()
+            .contains("write compartment 1"));
+        assert_eq!(multi.readers[0].state(), ReaderState::Terminated);
+        assert_eq!(multi.readers[1].state(), ReaderState::Failed);
+        multi.stop().await;
+        assert_eq!(multi.state(), ReaderState::Failed);
     }
 }

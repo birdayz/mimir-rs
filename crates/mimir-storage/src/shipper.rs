@@ -183,6 +183,14 @@ mod ulid_serde {
     }
 }
 
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 mod ulid_vec_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use ulid::Ulid;
@@ -193,7 +201,7 @@ mod ulid_vec_serde {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Ulid>, D::Error> {
-        let strs = Vec::<String>::deserialize(d)?;
+        let strs = Option::<Vec<String>>::deserialize(d)?.unwrap_or_default();
         strs.into_iter()
             .map(|x| Ulid::from_string(&x).map_err(serde::de::Error::custom))
             .collect()
@@ -218,7 +226,7 @@ mod ulid_map_serde {
     pub fn deserialize<'de, D: Deserializer<'de>>(
         d: D,
     ) -> Result<BTreeMap<Ulid, ModelTime>, D::Error> {
-        let str_map = BTreeMap::<String, ModelTime>::deserialize(d)?;
+        let str_map = Option::<BTreeMap<String, ModelTime>>::deserialize(d)?.unwrap_or_default();
         str_map
             .into_iter()
             .map(|(k, v)| {
@@ -242,16 +250,17 @@ pub struct BlockDesc {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BlockMetaCompaction {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub level: i32,
     #[serde(default, skip_serializing_if = "Vec::is_empty", with = "ulid_vec_serde")]
     pub sources: Vec<Ulid>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_false")]
     pub deletable: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<BlockDesc>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_false")]
     pub failed: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "Vec::is_empty")]
     pub hints: Vec<String>,
 }
 
@@ -282,17 +291,17 @@ pub struct BlockFile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ThanosMeta {
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_zero_i32")]
     pub version: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub labels: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub downsample: ThanosDownsample,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub source: SourceType,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "Vec::is_empty")]
     pub segment_files: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<BlockFile>,
 }
 
@@ -305,13 +314,14 @@ pub struct BlockMeta {
     pub min_time: i64,
     #[serde(rename = "maxTime")]
     pub max_time: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub stats: BlockStats,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub compaction: BlockMetaCompaction,
     pub version: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub out_of_order: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub thanos: ThanosMeta,
 }
 
@@ -376,7 +386,7 @@ impl BlockMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShipperMeta {
     pub version: i32,
-    #[serde(with = "ulid_map_serde")]
+    #[serde(default, with = "ulid_map_serde")]
     pub shipped: BTreeMap<Ulid, ModelTime>,
 }
 
@@ -660,11 +670,7 @@ pub async fn upload_block_to_bucket(
         for (fname, path) in chunk_entries {
             let obj_key = format!("{id}/{CHUNKS_DIRNAME}/{fname}");
             if let Err(e) = bucket.upload_file(&obj_key, &path).await {
-                let _ = bucket.delete_prefix(&id.to_string()).await;
-                return Err(ShipperError::Upload {
-                    file_type: "chunks",
-                    message: e.to_string(),
-                });
+                return Err(cleanup_failed_upload(bucket, id, "chunks", e).await);
             }
         }
     }
@@ -674,11 +680,7 @@ pub async fn upload_block_to_bucket(
         let index_path = block_dir.join(INDEX_FILENAME);
         let obj_key = format!("{id}/{INDEX_FILENAME}");
         if let Err(e) = bucket.upload_file(&obj_key, &index_path).await {
-            let _ = bucket.delete_prefix(&id.to_string()).await;
-            return Err(ShipperError::Upload {
-                file_type: "index",
-                message: e.to_string(),
-            });
+            return Err(cleanup_failed_upload(bucket, id, "index", e).await);
         }
     }
 
@@ -692,11 +694,7 @@ pub async fn upload_block_to_bucket(
         let sparse_path = block_dir.join(SPARSE_INDEX_HEADER_FILENAME);
         let obj_key = format!("{id}/{SPARSE_INDEX_HEADER_FILENAME}");
         if let Err(e) = bucket.upload_file(&obj_key, &sparse_path).await {
-            let _ = bucket.delete_prefix(&id.to_string()).await;
-            return Err(ShipperError::Upload {
-                file_type: "sparse_index_header",
-                message: e.to_string(),
-            });
+            return Err(cleanup_failed_upload(bucket, id, "sparse_index_header", e).await);
         }
     }
 
@@ -865,6 +863,26 @@ pub fn is_block_dir(path: &str) -> (Ulid, bool) {
     match Ulid::from_string(base) {
         Ok(id) => (id, true),
         Err(_) => (Ulid::nil(), false),
+    }
+}
+
+async fn cleanup_failed_upload(
+    bucket: &BucketClient,
+    id: Ulid,
+    file_type: &'static str,
+    orig_err: impl std::fmt::Display,
+) -> ShipperError {
+    match delete_block(bucket, id).await {
+        Ok(()) => ShipperError::Upload {
+            file_type,
+            message: orig_err.to_string(),
+        },
+        Err(clean_err) => ShipperError::Upload {
+            file_type,
+            message: format!(
+                "failed to clean block after upload issue. Partial block in system. Err: {clean_err}: {orig_err}"
+            ),
+        },
     }
 }
 
@@ -1386,6 +1404,177 @@ mod tests {
         assert!(
             !dir.path().join("kafka-offset.json.tmp").exists(),
             "orphan .tmp file must be removed on error"
+        );
+    }
+
+    #[test]
+    fn block_and_shipper_meta_accept_go_null_maps_and_slices() {
+        let id = Ulid::from_parts(1000, 1);
+        let block_json = format!(
+            r#"{{
+                "ulid": "{id}",
+                "minTime": 1000,
+                "maxTime": 2000,
+                "stats": null,
+                "compaction": {{
+                    "level": 1,
+                    "sources": null,
+                    "parents": null,
+                    "hints": null
+                }},
+                "version": 1,
+                "thanos": {{
+                    "version": 1,
+                    "labels": null,
+                    "source": "receive",
+                    "segment_files": null,
+                    "files": null
+                }}
+            }}"#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let bdir = dir.path().join(id.to_string());
+        fs::create_dir_all(&bdir).unwrap();
+        fs::write(bdir.join(META_FILENAME), block_json).unwrap();
+        let meta = BlockMeta::read_from_dir(&bdir).unwrap();
+        assert!(meta.thanos.labels.is_empty());
+        assert!(meta.thanos.segment_files.is_empty());
+        assert!(meta.thanos.files.is_empty());
+        assert!(meta.compaction.sources.is_empty());
+        assert!(meta.compaction.parents.is_empty());
+        assert!(meta.compaction.hints.is_empty());
+
+        let shipper_json = r#"{"version": 1, "shipped": null}"#;
+        let sm: ShipperMeta = serde_json::from_str(shipper_json).unwrap();
+        assert!(sm.shipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_failure_cleanup_deletes_meta_json_first() {
+        use futures::stream::BoxStream;
+        use object_store::path::Path as ObjPath;
+        use object_store::{
+            GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+            PutMultipartOpts, PutOptions, PutPayload, PutResult,
+        };
+        use parking_lot::Mutex;
+
+        #[derive(Debug)]
+        struct DeleteOrderStore {
+            inner: object_store::memory::InMemory,
+            delete_order: Mutex<Vec<String>>,
+        }
+        impl std::fmt::Display for DeleteOrderStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "DeleteOrderStore")
+            }
+        }
+        impl ObjectStore for DeleteOrderStore {
+            fn put_opts<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                location: &'life1 ObjPath,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = object_store::Result<PutResult>> + Send + 'async_trait>>
+            where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait {
+                let loc = location.to_string();
+                let location = location.clone();
+                Box::pin(async move {
+                    if loc.ends_with("/index") {
+                        return Err(object_store::Error::Generic {
+                            store: "DeleteOrderStore",
+                            source: "simulated index upload failure".into(),
+                        });
+                    }
+                    self.inner.put_opts(&location, payload, opts).await
+                })
+            }
+            fn put_multipart_opts<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                location: &'life1 ObjPath,
+                opts: PutMultipartOpts,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = object_store::Result<Box<dyn MultipartUpload>>> + Send + 'async_trait>>
+            where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait {
+                let location = location.clone();
+                Box::pin(async move { self.inner.put_multipart_opts(&location, opts).await })
+            }
+            fn get_opts<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                location: &'life1 ObjPath,
+                options: GetOptions,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = object_store::Result<GetResult>> + Send + 'async_trait>>
+            where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait {
+                let location = location.clone();
+                Box::pin(async move { self.inner.get_opts(&location, options).await })
+            }
+            fn delete<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                location: &'life1 ObjPath,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = object_store::Result<()>> + Send + 'async_trait>>
+            where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait {
+                let loc = location.to_string();
+                let location = location.clone();
+                Box::pin(async move {
+                    self.delete_order.lock().push(loc);
+                    self.inner.delete(&location).await
+                })
+            }
+            fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+            fn list_with_delimiter<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                prefix: Option<&'life1 ObjPath>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = object_store::Result<ListResult>> + Send + 'async_trait>>
+            where 'life0: 'async_trait, 'life1: 'async_trait, Self: 'async_trait {
+                let prefix = prefix.cloned();
+                Box::pin(async move { self.inner.list_with_delimiter(prefix.as_ref()).await })
+            }
+            fn copy<'life0, 'life1, 'life2, 'async_trait>(
+                &'life0 self,
+                from: &'life1 ObjPath,
+                to: &'life2 ObjPath,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = object_store::Result<()>> + Send + 'async_trait>>
+            where 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait {
+                let from = from.clone();
+                let to = to.clone();
+                Box::pin(async move { self.inner.copy(&from, &to).await })
+            }
+            fn copy_if_not_exists<'life0, 'life1, 'life2, 'async_trait>(
+                &'life0 self,
+                from: &'life1 ObjPath,
+                to: &'life2 ObjPath,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = object_store::Result<()>> + Send + 'async_trait>>
+            where 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait {
+                let from = from.clone();
+                let to = to.clone();
+                Box::pin(async move { self.inner.copy_if_not_exists(&from, &to).await })
+            }
+        }
+
+        let store = Arc::new(DeleteOrderStore {
+            inner: object_store::memory::InMemory::new(),
+            delete_order: Mutex::new(Vec::new()),
+        });
+        let bkt = BucketClient::from_object_store(store.clone(), "del", "DEL");
+        let id = Ulid::from_parts(7000, 7);
+        // Pre-seed an old meta.json to verify cleanup deletes meta.json FIRST (before chunks).
+        bkt.upload(&format!("{id}/{META_FILENAME}"), Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+
+        let blocks_dir = tempfile::tempdir().unwrap();
+        let mut meta = make_meta(id, 7000, 8000, 10);
+        create_test_block(blocks_dir.path(), id, &meta);
+        let err = upload_block_to_bucket(&bkt, &blocks_dir.path().join(id.to_string()), &mut meta)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ShipperError::Upload { file_type: "index", .. }));
+        let dels = store.delete_order.lock().clone();
+        assert!(!dels.is_empty());
+        assert!(
+            dels[0].ends_with(&format!("{id}/{META_FILENAME}")),
+            "meta.json must be deleted first, got {dels:?}"
         );
     }
 }

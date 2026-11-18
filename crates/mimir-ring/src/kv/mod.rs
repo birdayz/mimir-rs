@@ -256,6 +256,16 @@ impl Codec for StringCodec {
     }
 }
 
+/// Sentinel value passed to [`KvClient::watch_key`] callbacks when a watched key is deleted
+/// (matching Go `dskit/kv` passing `nil` to `WatchKey` callbacks).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyDeleted;
+
+/// Returns `true` if a [`KvClient::watch_key`] payload represents a deleted key.
+pub fn is_key_deleted(any: &(dyn Any + Send + Sync)) -> bool {
+    any.is::<KeyDeleted>()
+}
+
 pub type WatchKeyFn = Box<dyn FnMut(Box<dyn Any + Send + Sync>) -> bool + Send>;
 pub type WatchPrefixFn = Box<dyn FnMut(&str, Box<dyn Any + Send + Sync>) -> bool + Send>;
 

@@ -184,12 +184,15 @@ impl PartitionRingWatcher {
         let w_run = self.clone();
 
         basic_service(
-            Some(Box::new(move |_ctx| {
+            Some(Box::new(move |ctx| {
                 let w = w_start.clone();
                 Box::pin(async move {
-                    let val = w.kv.get(&w.key).await.map_err(|e| {
-                        ServiceError::failure(format!("unable to initialise ring state: {e}"))
-                    })?;
+                    let val = tokio::select! {
+                        res = w.kv.get(&w.key) => res.map_err(|e| {
+                            ServiceError::failure(format!("unable to initialise ring state: {e}"))
+                        })?,
+                        _ = ctx.canceled() => return Err(ServiceError::Canceled),
+                    };
                     let desc = match val {
                         Some(any) => any
                             .downcast::<PartitionRingDesc>()
@@ -216,6 +219,10 @@ impl PartitionRingWatcher {
                             &w.key,
                             ctx,
                             Box::new(move |any| {
+                                if any.is::<crate::kv::KeyDeleted>() {
+                                    info!("partition ring doesn't exist in KV store yet");
+                                    return true;
+                                }
                                 if let Ok(desc) = any.downcast::<PartitionRingDesc>() {
                                     if let Err(e) = w_cb.update_partition_ring(*desc) {
                                         *err_cb.lock() = Some(e.to_string());

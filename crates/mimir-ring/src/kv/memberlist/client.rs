@@ -46,6 +46,7 @@ use super::stream::{
 };
 use super::suspicion::Awareness;
 use super::tcp_transport::{MemberlistConn, ReceivedPacket, TcpTransport};
+use crate::kv::KeyDeleted;
 use super::wire::{
     add_label_header, compress_payload, decode_ack_resp, decode_alive, decode_compound_message,
     decode_dead, decode_indirect_ping, decode_nack_resp, decode_ping, decode_push_pull,
@@ -1893,27 +1894,41 @@ impl MemberlistKv {
             });
         }
 
-        let (mut result, mut change, curr_version, curr_deleted, curr_update) = match curr {
-            Some(curr) => {
-                let mut v = curr.value.clone_mergeable();
-                let ch = v.merge(incoming, cas_version > 0).map_err(KvError::Other)?;
-                (v, ch, curr.version, curr.deleted, curr.update_time)
-            }
-            None => {
-                let v = incoming.clone_mergeable();
-                let ch = Some(v.clone_mergeable());
-                (v, ch, 0, false, None)
-            }
+        let had_curr = curr.is_some();
+        let (curr_version, curr_deleted, curr_update) = match curr {
+            Some(c) => (c.version, c.deleted, c.update_time),
+            None => (0, false, None),
         };
 
         let mut new_updated = curr_update;
         let mut new_deleted = curr_deleted;
         if let Some(ut) = update_time {
-            if new_updated.is_none_or(|prev| ut > prev) && deleted {
+            if new_updated.is_none_or(|prev| ut > prev) && (deleted || curr_deleted) {
                 new_updated = Some(ut);
                 new_deleted = deleted;
             }
         }
+
+        let (mut result, mut change) = match curr {
+            Some(curr) => {
+                if curr.deleted && !new_deleted {
+                    // Re-creating a previously deleted key starts from the incoming value rather
+                    // than merging stale pre-deletion state back in.
+                    let v = incoming.clone_mergeable();
+                    let ch = Some(v.clone_mergeable());
+                    (v, ch)
+                } else {
+                    let mut v = curr.value.clone_mergeable();
+                    let ch = v.merge(incoming, cas_version > 0).map_err(KvError::Other)?;
+                    (v, ch)
+                }
+            }
+            None => {
+                let v = incoming.clone_mergeable();
+                let ch = Some(v.clone_mergeable());
+                (v, ch)
+            }
+        };
 
         let change_empty = change.as_ref().is_none_or(|c| c.merge_content().is_empty());
         if change_empty && curr_deleted == new_deleted {
@@ -1934,13 +1949,33 @@ impl MemberlistKv {
             }
             if let Some(ref mut ch) = change {
                 ch.remove_tombstones(limit);
-                if ch.merge_content().is_empty() {
-                    return Ok((None, 0, curr_deleted, curr_update));
+                if ch.merge_content().is_empty() && curr_deleted == new_deleted {
+                    if !had_curr {
+                        return Ok((None, 0, curr_deleted, curr_update));
+                    }
+                    // Store the merged & tombstone-stripped result even when nothing remains to
+                    // gossip, matching Go's in-place mutation of curr.value so LEFT /
+                    // PartitionDeleted / OwnerDeleted transitions are never dropped and local
+                    // watchers are notified.
+                    let new_version = curr_version + 1;
+                    store.insert(
+                        key.to_string(),
+                        ValueDesc {
+                            value: result,
+                            version: new_version,
+                            codec_id: codec_id.to_string(),
+                            deleted: new_deleted,
+                            update_time: new_updated,
+                        },
+                    );
+                    return Ok((None, new_version, new_deleted, new_updated));
                 }
             }
         }
 
-        if change.is_none() && curr_deleted != new_deleted {
+        if (change.is_none() || change.as_ref().is_some_and(|c| c.merge_content().is_empty()))
+            && curr_deleted != new_deleted
+        {
             change = Some(result.clone_mergeable());
         }
 
@@ -2540,10 +2575,13 @@ impl KvClient for MemberlistKvClient {
                     _ = cancel.canceled() => break,
                     _ = self.kv.shutdown_ctx.canceled() => break,
                     _ = notify.notified() => {
-                        if let Some((val, _)) = self.kv.get_value(key) {
-                            if !f(val) {
-                                break;
-                            }
+                        let val = self
+                            .kv
+                            .get_value(key)
+                            .map(|(v, _)| v)
+                            .unwrap_or_else(|| Box::new(KeyDeleted));
+                        if !f(val) {
+                            break;
                         }
                     }
                 }
