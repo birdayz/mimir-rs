@@ -173,6 +173,255 @@ pub fn reqwest_client(
         .map_err(|e| BucketError::Config(format!("building HTTP client: {e}")))
 }
 
+/// Bounded HTTP client for credential/metadata/OAuth endpoints (connect 5s, total 15s).
+pub(crate) fn bounded_auth_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Parses `x-ms-retry-after-ms` or `Retry-After` (seconds or HTTP-date).
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if let Some(ms) = headers
+        .get("x-ms-retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return Some(Duration::from_millis(ms));
+    }
+    let val = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(secs) = val.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(val) {
+        let delta = dt.with_timezone(&chrono::Utc) - chrono::Utc::now();
+        return Some(delta.to_std().unwrap_or(Duration::ZERO));
+    }
+    None
+}
+
+/// Parses `Content-Range: bytes <start>-<end>/<total>`.
+pub(crate) fn parse_content_range(s: &str) -> Option<(std::ops::Range<usize>, usize)> {
+    let rem = s.trim().strip_prefix("bytes ")?;
+    let (range, size) = rem.split_once('/')?;
+    let size: usize = size.parse().ok()?;
+    let (start_s, end_s) = range.split_once('-')?;
+    let start: usize = start_s.parse().ok()?;
+    let end: usize = end_s.parse().ok()?;
+    Some((start..end + 1, size))
+}
+
+pub(crate) fn map_http_error(
+    store: &'static str,
+    path: &str,
+    status: reqwest::StatusCode,
+    body: String,
+) -> object_store::Error {
+    let source: Box<dyn std::error::Error + Send + Sync> = if body.is_empty() {
+        format!("Client/Server error with status {status}").into()
+    } else {
+        format!("HTTP error with status {status}: {body}").into()
+    };
+    match status {
+        reqwest::StatusCode::NOT_FOUND => object_store::Error::NotFound {
+            path: path.to_string(),
+            source,
+        },
+        reqwest::StatusCode::NOT_MODIFIED => object_store::Error::NotModified {
+            path: path.to_string(),
+            source,
+        },
+        reqwest::StatusCode::PRECONDITION_FAILED => object_store::Error::Precondition {
+            path: path.to_string(),
+            source,
+        },
+        reqwest::StatusCode::CONFLICT => object_store::Error::AlreadyExists {
+            path: path.to_string(),
+            source,
+        },
+        reqwest::StatusCode::FORBIDDEN => object_store::Error::PermissionDenied {
+            path: path.to_string(),
+            source,
+        },
+        reqwest::StatusCode::UNAUTHORIZED => object_store::Error::Unauthenticated {
+            path: path.to_string(),
+            source,
+        },
+        _ => object_store::Error::Generic { store, source },
+    }
+}
+
+/// Percent-encodes every non-ASCII-alphanumeric byte as `%XX` (matching `object_store` GCS).
+pub(crate) fn percent_encode_non_alnum(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+pub(crate) fn extract_object_meta(
+    store: &'static str,
+    location: &object_store::path::Path,
+    headers: &reqwest::header::HeaderMap,
+    version_header: Option<&str>,
+) -> object_store::Result<object_store::ObjectMeta> {
+    use chrono::{DateTime, TimeZone, Utc};
+    use reqwest::header::{CONTENT_LENGTH, ETAG, LAST_MODIFIED};
+    let err = |msg: String| object_store::Error::Generic {
+        store,
+        source: msg.into(),
+    };
+    let last_modified = match headers.get(LAST_MODIFIED) {
+        Some(lm) => {
+            let s = lm.to_str().map_err(|e| err(e.to_string()))?;
+            DateTime::parse_from_rfc2822(s)
+                .map_err(|e| err(format!("Invalid last modified '{s}': {e}")))?
+                .with_timezone(&Utc)
+        }
+        None => Utc.timestamp_nanos(0),
+    };
+    let e_tag = match headers.get(ETAG) {
+        Some(et) => Some(et.to_str().map_err(|e| err(e.to_string()))?.to_string()),
+        None => None,
+    };
+    let size = match headers.get(CONTENT_LENGTH) {
+        Some(cl) => {
+            let s = cl.to_str().map_err(|e| err(e.to_string()))?;
+            s.parse::<usize>()
+                .map_err(|e| err(format!("Invalid content length '{s}': {e}")))?
+        }
+        None => 0,
+    };
+    let version = match version_header.and_then(|h| headers.get(h)) {
+        Some(v) => Some(v.to_str().map_err(|e| err(e.to_string()))?.to_string()),
+        None => None,
+    };
+    Ok(object_store::ObjectMeta {
+        location: location.clone(),
+        last_modified,
+        version,
+        size,
+        e_tag,
+    })
+}
+
+pub(crate) fn extract_attributes(
+    headers: &reqwest::header::HeaderMap,
+    meta_prefix: Option<&str>,
+) -> object_store::Attributes {
+    use object_store::{Attribute, Attributes};
+    use reqwest::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE};
+    let mut attrs = Attributes::new();
+    for (hdr, attr) in [
+        (CACHE_CONTROL, Attribute::CacheControl),
+        (CONTENT_DISPOSITION, Attribute::ContentDisposition),
+        (CONTENT_ENCODING, Attribute::ContentEncoding),
+        (CONTENT_LANGUAGE, Attribute::ContentLanguage),
+        (CONTENT_TYPE, Attribute::ContentType),
+    ] {
+        if let Some(Ok(s)) = headers.get(hdr).map(|v| v.to_str()) {
+            attrs.insert(attr, s.to_string().into());
+        }
+    }
+    if let Some(prefix) = meta_prefix {
+        for (k, v) in headers {
+            if let Some(suffix) = k.as_str().strip_prefix(prefix) {
+                if let Ok(s) = v.to_str() {
+                    attrs.insert(
+                        Attribute::Metadata(suffix.to_string().into()),
+                        s.to_string().into(),
+                    );
+                }
+            }
+        }
+    }
+    attrs
+}
+
+pub(crate) fn payload_to_body(payload: &object_store::PutPayload) -> reqwest::Body {
+    let chunks: Vec<bytes::Bytes> = payload.as_ref().to_vec();
+    reqwest::Body::wrap_stream(futures::stream::iter(
+        chunks.into_iter().map(Ok::<_, std::io::Error>),
+    ))
+}
+
+pub(crate) fn validate_get_range(
+    store: &'static str,
+    range: &object_store::GetRange,
+) -> object_store::Result<()> {
+    if let object_store::GetRange::Bounded(r) = range {
+        if r.start >= r.end {
+            return Err(object_store::Error::Generic {
+                store,
+                source: format!("Wanted range starting at {} and ending at {}, but end must be greater than start", r.start, r.end).into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_get_range(
+    store: &'static str,
+    range: &object_store::GetRange,
+    len: usize,
+) -> object_store::Result<std::ops::Range<usize>> {
+    use object_store::GetRange;
+    match range {
+        GetRange::Bounded(r) => {
+            if r.start >= len {
+                return Err(object_store::Error::Generic {
+                    store,
+                    source: format!("Wanted range starting at {}, but object was only {} bytes long", r.start, len).into(),
+                });
+            }
+            Ok(r.start..r.end.min(len))
+        }
+        GetRange::Offset(start) => {
+            if *start >= len {
+                return Err(object_store::Error::Generic {
+                    store,
+                    source: format!("Wanted range starting at {}, but object was only {} bytes long", start, len).into(),
+                });
+            }
+            Ok(*start..len)
+        }
+        GetRange::Suffix(n) => Ok(len.saturating_sub(*n)..len),
+    }
+}
+
+pub(crate) fn apply_get_options(
+    mut rb: reqwest::RequestBuilder,
+    options: &object_store::GetOptions,
+) -> reqwest::RequestBuilder {
+    use reqwest::header::*;
+    const DATE_FORMAT: &str = "%a, %d %b %Y %H:%M:%S GMT";
+    if let Some(ref range) = options.range {
+        rb = rb.header(RANGE, range.to_string());
+    }
+    if let Some(ref tag) = options.if_match {
+        rb = rb.header(IF_MATCH, tag);
+    }
+    if let Some(ref tag) = options.if_none_match {
+        rb = rb.header(IF_NONE_MATCH, tag);
+    }
+    if let Some(date) = options.if_unmodified_since {
+        rb = rb.header(IF_UNMODIFIED_SINCE, date.format(DATE_FORMAT).to_string());
+    }
+    if let Some(date) = options.if_modified_since {
+        rb = rb.header(IF_MODIFIED_SINCE, date.format(DATE_FORMAT).to_string());
+    }
+    rb
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -713,7 +713,7 @@ fn msk_iam_challenge(auth: &KafkaMskIamAuth, addr: &str, now: SystemTime) -> Res
 enum SaslSession {
     Plain,
     Scram(Box<ScramSession>),
-    Oauthbearer,
+    Oauthbearer { error_challenge: Option<String> },
     MskIam,
 }
 
@@ -744,7 +744,10 @@ impl SaslSession {
             }
             SaslAuthConfig::Oauthbearer(m) => {
                 let auth = resolve_credentials(m).await?;
-                Ok((Self::Oauthbearer, oauthbearer_initial(&auth)?))
+                Ok((
+                    Self::Oauthbearer { error_challenge: None },
+                    oauthbearer_initial(&auth)?,
+                ))
             }
             SaslAuthConfig::MskIam(m) => {
                 let auth = resolve_credentials(m).await?;
@@ -758,9 +761,14 @@ impl SaslSession {
         match self {
             Self::Plain => Ok((true, Vec::new())),
             Self::Scram(s) => s.challenge(resp),
-            Self::Oauthbearer => {
+            Self::Oauthbearer { error_challenge } => {
                 if !resp.is_empty() {
-                    return Err("unexpected data in oauth response".to_string());
+                    let msg = String::from_utf8_lossy(resp).trim().to_string();
+                    if msg.starts_with('{') {
+                        *error_challenge = Some(msg);
+                        return Ok((true, vec![0x01]));
+                    }
+                    return Err(format!("unexpected data in oauth response: {msg}"));
                 }
                 Ok((true, Vec::new()))
             }
@@ -990,10 +998,20 @@ impl KafkaTransport {
                 let resp: SaslAuthenticateResponse =
                     io.roundtrip(ApiKey::SaslAuthenticate, auth_ver, &req).await?;
                 if let Some(err) = resp.error_code.err() {
-                    return Err(sasl_err(match resp.error_message {
+                    let detail = match resp.error_message {
                         Some(m) => format!("{err}: {}", m.as_str()),
                         None => err.to_string(),
-                    }));
+                    };
+                    let oauth_ctx = match &session {
+                        SaslSession::Oauthbearer { error_challenge: Some(c) } => format!(" (oauthbearer challenge: {c})"),
+                        _ => String::new(),
+                    };
+                    let tag = if err == ResponseError::SaslAuthenticationFailed {
+                        "SASL_AUTHENTICATION_FAILED: "
+                    } else {
+                        ""
+                    };
+                    return Err(sasl_err(format!("{tag}{detail}{oauth_ctx}")));
                 }
                 lifetime_ms = resp.session_lifetime_ms;
                 resp.auth_bytes
@@ -1006,6 +1024,9 @@ impl KafkaTransport {
             }
         }
 
+        if let SaslSession::Oauthbearer { error_challenge: Some(c) } = session {
+            return Err(sasl_err(format!("server sent OAUTHBEARER error challenge: {c}")));
+        }
         if lifetime_ms <= 0 {
             return Ok(None);
         }
@@ -1294,6 +1315,15 @@ mod tests {
             oauthbearer_initial(&auth).unwrap_err(),
             "OAUTHBEARER token must be non-empty"
         );
+        // RFC 7628 §3.2.2 error challenge yields 0x01 and captures JSON.
+        let mut s = SaslSession::Oauthbearer { error_challenge: None };
+        let (done, reply) = s.challenge(br#"{"status":"invalid_token","scope":"kafka"}"#).unwrap();
+        assert!(done);
+        assert_eq!(reply, vec![0x01]);
+        assert!(matches!(
+            s,
+            SaslSession::Oauthbearer { error_challenge: Some(ref m) } if m.contains("invalid_token")
+        ));
     }
 
     #[test]

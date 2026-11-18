@@ -278,14 +278,15 @@ impl HttpTransport {
         })
     }
 
-    /// Go `http.DefaultTransport` (used by thanos for the IAM credential provider).
+    /// Go `http.DefaultTransport`.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn go_default() -> Self {
         let cfg = BucketHTTPConfig {
             response_header_timeout: Default::default(),
             max_idle_connections_per_host: 0,
             ..Default::default()
         };
-        // http.DefaultTransport has no custom TLS config; it trusts the system roots.
         Self::new(&cfg).expect("default transport")
     }
 }

@@ -18,8 +18,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
-use super::transport::HttpTransport;
-
 /// minio-go `SignatureType` (only the variants reachable from thanos).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum SignerType {
@@ -52,6 +50,7 @@ impl Value {
 pub(crate) trait Provider: Send + Sync {
     async fn retrieve(&mut self) -> Result<Value, String>;
     fn is_expired(&self) -> bool;
+    fn expire(&mut self) {}
 }
 
 /// minio-go `credentials.Expiry` (`DefaultExpiryWindow` = -1: refresh after 80% of the
@@ -136,6 +135,9 @@ impl Provider for EnvAws {
     fn is_expired(&self) -> bool {
         !self.retrieved
     }
+    fn expire(&mut self) {
+        self.retrieved = false;
+    }
 }
 
 /// A parsed INI file (gopkg.in/ini.v1 semantics for the subset used by AWS files).
@@ -209,11 +211,15 @@ async fn run_credential_process(command: &str) -> Result<Value, String> {
     if args.len() <= 1 {
         return Err("invalid credential process args".to_string());
     }
-    let out = tokio::process::Command::new(args[0])
-        .args(&args[1..])
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(args[0])
+            .args(&args[1..])
+            .output(),
+    )
+    .await
+    .map_err(|_| "credential_process timed out".to_string())?
+    .map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!("exit status {}", out.status.code().unwrap_or(-1)));
     }
@@ -288,6 +294,10 @@ impl Provider for FileAwsCredentials {
         }
         self.expiry.expiration.is_some() && self.expiry.is_expired()
     }
+    fn expire(&mut self) {
+        self.retrieved = false;
+        self.expiry.expiration = None;
+    }
 }
 
 /// minio-go `ec2RoleCredRespBody`.
@@ -323,22 +333,71 @@ fn status_text(status: reqwest::StatusCode) -> String {
     )
 }
 
-/// `getEcsTaskCredentials`.
+const CREDENTIAL_HTTP_RETRIES: usize = 3;
+
+fn iam_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn is_cred_http_status_retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn cred_retry_delay(attempt: usize, headers: Option<&reqwest::header::HeaderMap>) -> Duration {
+    if let Some(h) = headers {
+        if let Some(v) = h.get("retry-after").and_then(|v| v.to_str().ok()) {
+            if let Ok(secs) = v.trim().parse::<u64>() {
+                return Duration::from_secs(secs.min(5));
+            }
+        }
+    }
+    Duration::from_millis((100u64 << attempt.min(5)).min(2_000))
+}
+
+/// `getEcsTaskCredentials` (with retries on transient transport/408/429/5xx errors).
 async fn get_ecs_task_credentials(
     client: &reqwest::Client,
     endpoint: &str,
     token: &str,
 ) -> Result<RoleCreds, String> {
-    let mut req = client.get(endpoint);
-    if !token.is_empty() {
-        req = req.header("Authorization", token);
+    let mut last_err = String::new();
+    for attempt in 0..=CREDENTIAL_HTTP_RETRIES {
+        let mut req = client.get(endpoint);
+        if !token.is_empty() {
+            req = req.header("Authorization", token);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status == reqwest::StatusCode::OK {
+                    let body = resp.bytes().await.map_err(|e| e.to_string())?;
+                    return parse_role_creds(&body);
+                }
+                last_err = status_text(status);
+                if attempt < CREDENTIAL_HTTP_RETRIES && is_cred_http_status_retryable(status) {
+                    tokio::time::sleep(cred_retry_delay(attempt, Some(resp.headers()))).await;
+                    continue;
+                }
+                return Err(last_err);
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < CREDENTIAL_HTTP_RETRIES {
+                    tokio::time::sleep(cred_retry_delay(attempt, None)).await;
+                    continue;
+                }
+                return Err(last_err);
+            }
+        }
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    if resp.status() != reqwest::StatusCode::OK {
-        return Err(status_text(resp.status()));
-    }
-    let body = resp.bytes().await.map_err(|e| e.to_string())?;
-    parse_role_creds(&body)
+    Err(last_err)
 }
 
 const DEFAULT_IAM_ROLE_ENDPOINT: &str = "http://169.254.169.254";
@@ -380,35 +439,56 @@ async fn get_imds_credentials(client: &reqwest::Client, endpoint: &str) -> Resul
         }
         Err(e) => return Err(e.to_string()),
     };
-    let mut req = client.get(base.clone());
-    if !token.is_empty() {
-        req = req.header("X-aws-ec2-metadata-token", &token);
-    }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    if resp.status() != reqwest::StatusCode::OK {
-        return Err(status_text(resp.status()));
-    }
-    let list = resp.text().await.map_err(|e| e.to_string())?;
+    let list = imds_get_text(client, base.clone(), &token).await?;
     let roles: Vec<&str> = list.lines().collect();
     let Some(role) = roles.first() else {
         return Err("No IAM roles attached to this EC2 service".to_string());
     };
     let mut u = base;
     u.set_path(&format!("{}{}", DEFAULT_IAM_SECURITY_CREDS_PATH.trim_end_matches('/'), format_args!("/{role}")));
-    let mut req = client.get(u);
-    if !token.is_empty() {
-        req = req.header("X-aws-ec2-metadata-token", &token);
-    }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    if resp.status() != reqwest::StatusCode::OK {
-        return Err(status_text(resp.status()));
-    }
-    let body = resp.bytes().await.map_err(|e| e.to_string())?;
-    let creds = parse_role_creds(&body)?;
+    let body = imds_get_text(client, u, &token).await?;
+    let creds = parse_role_creds(body.as_bytes())?;
     if creds.code != "Success" {
         return Err(creds.message);
     }
     Ok(creds)
+}
+
+async fn imds_get_text(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    token: &str,
+) -> Result<String, String> {
+    let mut last_err = String::new();
+    for attempt in 0..=CREDENTIAL_HTTP_RETRIES {
+        let mut req = client.get(url.clone());
+        if !token.is_empty() {
+            req = req.header("X-aws-ec2-metadata-token", token);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status == reqwest::StatusCode::OK {
+                    return resp.text().await.map_err(|e| e.to_string());
+                }
+                last_err = status_text(status);
+                if attempt < CREDENTIAL_HTTP_RETRIES && is_cred_http_status_retryable(status) {
+                    tokio::time::sleep(cred_retry_delay(attempt, Some(resp.headers()))).await;
+                    continue;
+                }
+                return Err(last_err);
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < CREDENTIAL_HTTP_RETRIES {
+                    tokio::time::sleep(cred_retry_delay(attempt, None)).await;
+                    continue;
+                }
+                return Err(last_err);
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// `isLoopback`.
@@ -459,24 +539,61 @@ async fn sts_web_identity(
         .map(|(k, v)| format!("{}={}", super::signer::go_query_escape(k), super::signer::go_query_escape(v)))
         .collect::<Vec<_>>()
         .join("&");
-    let resp = client
-        .post(endpoint)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    let fields = xml_leaf_fields(&bytes);
-    if status != reqwest::StatusCode::OK {
-        let code = fields.get("Code").cloned().unwrap_or_default();
-        let message = fields.get("Message").cloned().unwrap_or_default();
-        if message.is_empty() {
-            return Err(format!("Error response code {code}."));
+    let mut last_err = String::new();
+    let bytes = {
+        let mut got = None;
+        for attempt in 0..=CREDENTIAL_HTTP_RETRIES {
+            match client
+                .post(endpoint)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body.clone())
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let headers = resp.headers().clone();
+                    let b = resp.bytes().await.map_err(|e| e.to_string())?;
+                    if status == reqwest::StatusCode::OK {
+                        got = Some(b);
+                        break;
+                    }
+                    let fields = xml_leaf_fields(&b);
+                    let code = fields.get("Code").cloned().unwrap_or_default();
+                    let message = fields.get("Message").cloned().unwrap_or_default();
+                    last_err = if message.is_empty() {
+                        format!("Error response code {code}.")
+                    } else {
+                        message
+                    };
+                    let sts_retryable = matches!(
+                        code.as_str(),
+                        "InvalidIdentityToken"
+                            | "InvalidIdentityTokenException"
+                            | "IDPCommunicationError"
+                            | "ServiceUnavailable"
+                            | "Throttling"
+                            | "ThrottlingException"
+                    ) || is_cred_http_status_retryable(status);
+                    if attempt < CREDENTIAL_HTTP_RETRIES && sts_retryable {
+                        tokio::time::sleep(cred_retry_delay(attempt, Some(&headers))).await;
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    if attempt < CREDENTIAL_HTTP_RETRIES {
+                        tokio::time::sleep(cred_retry_delay(attempt, None)).await;
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            }
         }
-        return Err(message);
-    }
+        got.ok_or(last_err)?
+    };
+    let fields = xml_leaf_fields(&bytes);
     let expiration = fields
         .get("Expiration")
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -546,11 +663,7 @@ impl Provider for Iam {
         let role_creds = if !identity_file.is_empty() {
             if endpoint.is_empty() {
                 endpoint = if !region.is_empty() {
-                    if region.starts_with("cn-") {
-                        format!("https://sts.{region}.amazonaws.com.cn")
-                    } else {
-                        format!("https://sts.{region}.amazonaws.com")
-                    }
+                    regional_sts_endpoint(&region)
                 } else {
                     DEFAULT_STS_ROLE_ENDPOINT.to_string()
                 };
@@ -571,7 +684,7 @@ impl Provider for Iam {
             let tok = std::fs::read_to_string(&token_file).map_err(|e| {
                 format!("getEKSPodIdentityCredentials: failed to read token file:open {token_file}: {e}")
             })?;
-            get_ecs_task_credentials(&self.client, &full_uri, &tok).await?
+            get_ecs_task_credentials(&self.client, &full_uri, tok.trim()).await?
         } else if !full_uri.is_empty() {
             if endpoint.is_empty() {
                 endpoint = full_uri.clone();
@@ -599,6 +712,9 @@ impl Provider for Iam {
     fn is_expired(&self) -> bool {
         self.expiry.is_expired()
     }
+    fn expire(&mut self) {
+        self.expiry.expiration = None;
+    }
 }
 
 /// thanos `AWSSDKAuth`: aws-sdk-go-v2 `config.LoadDefaultConfig(WithRegion(region))` +
@@ -617,11 +733,39 @@ impl Provider for Iam {
 ///
 /// Profiles using `source_profile`/`role_arn` role chaining, `credential_source` or SSO
 /// (`sso_*`) are rejected with an explicit error (tracked in PORT_STATUS.md).
+fn regional_sts_endpoint(region: &str) -> String {
+    if region.starts_with("cn-") {
+        format!("https://sts.{region}.amazonaws.com.cn")
+    } else if region.starts_with("us-isob-") {
+        format!("https://sts.{region}.sc2s.sgov.gov")
+    } else if region.starts_with("us-iso-") {
+        format!("https://sts.{region}.c2s.ic.gov")
+    } else {
+        format!("https://sts.{region}.amazonaws.com")
+    }
+}
+
+/// AWS SDK Go v2 `ExpiryWindow = 5 * time.Minute` (or 80% of TTL when TTL < 15m).
+fn aws_sdk_refresh_at(expiration: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    let ttl = expiration - now;
+    if ttl <= chrono::Duration::zero() {
+        return expiration;
+    }
+    let window = if ttl >= chrono::Duration::minutes(15) {
+        chrono::Duration::minutes(5)
+    } else {
+        let cut_ns = (ttl.num_nanoseconds().unwrap_or(i64::MAX) as f64 * 0.2) as i64;
+        chrono::Duration::nanoseconds(cut_ns)
+    };
+    expiration - window
+}
+
 pub(crate) struct AwsSdkAuth {
     env: Env,
     client: reqwest::Client,
     region: String,
     expires: Option<DateTime<Utc>>,
+    refresh_at: Option<DateTime<Utc>>,
     retrieved: bool,
 }
 
@@ -645,11 +789,7 @@ impl AwsSdkAuth {
         if region.is_empty() {
             return Err("failed to retrieve credentials: operation error STS: AssumeRoleWithWebIdentity, failed to resolve service endpoint, an AWS region is required, but was not found".to_string());
         }
-        if region.starts_with("cn-") {
-            Ok(format!("https://sts.{region}.amazonaws.com.cn"))
-        } else {
-            Ok(format!("https://sts.{region}.amazonaws.com"))
-        }
+        Ok(regional_sts_endpoint(region))
     }
 
     /// Loads the merged shared config/credentials profile (`None` if no file defines it).
@@ -829,21 +969,29 @@ impl Provider for AwsSdkAuth {
             .resolve()
             .await
             .map_err(|e| format!("retrieve AWS SDK credentials: {e}"))?;
+        let now = Utc::now();
         self.expires = v.expiration;
+        self.refresh_at = v.expiration.map(|e| aws_sdk_refresh_at(e, now));
         self.retrieved = true;
         Ok(v)
     }
     fn is_expired(&self) -> bool {
-        // aws.Credentials.Expired(): only expiring credentials expire.
+        // aws.Credentials.Expired() with 5-minute ExpiryWindow.
         if !self.retrieved {
             return true;
         }
-        matches!(self.expires, Some(e) if e <= Utc::now())
+        matches!(self.refresh_at, Some(r) if r <= Utc::now())
+    }
+    fn expire(&mut self) {
+        self.retrieved = false;
+        self.expires = None;
+        self.refresh_at = None;
     }
 }
 
-/// minio-go `credentials.Chain`: the first provider returning a non-empty key pair wins;
-/// errors are ignored and an empty chain yields anonymous credentials.
+/// minio-go `credentials.Chain`: the first provider returning a non-empty key pair wins.
+/// Once a provider has succeeded (or when `AwsSdkAuth` is the sole provider), transient
+/// refresh errors are propagated rather than silently falling back to `Anonymous`.
 pub(crate) struct Chain {
     providers: Vec<Box<dyn Provider>>,
     curr: Option<usize>,
@@ -852,10 +1000,20 @@ pub(crate) struct Chain {
 #[async_trait]
 impl Provider for Chain {
     async fn retrieve(&mut self) -> Result<Value, String> {
+        if let Some(i) = self.curr {
+            let creds = self.providers[i].retrieve().await?;
+            if !creds.access_key_id.is_empty() && !creds.secret_access_key.is_empty() {
+                return Ok(creds);
+            }
+        }
+        let sole_provider = self.providers.len() == 1;
         for (i, p) in self.providers.iter_mut().enumerate() {
             let creds = match p.retrieve().await {
                 Ok(v) => v,
                 Err(e) => {
+                    if sole_provider {
+                        return Err(e);
+                    }
                     tracing::debug!(err = %e, "S3 credential provider failed");
                     Value::default()
                 }
@@ -874,9 +1032,14 @@ impl Provider for Chain {
             None => true,
         }
     }
+    fn expire(&mut self) {
+        if let Some(i) = self.curr {
+            self.providers[i].expire();
+        }
+    }
 }
 
-/// minio-go `credentials.Credentials` (cached value + `forceRefresh`).
+/// minio-go `credentials.Credentials` (cached value + `expire` / `forceRefresh`).
 pub(crate) struct Credentials {
     inner: Mutex<(Chain, Option<Value>)>,
 }
@@ -886,10 +1049,29 @@ impl Credentials {
         let mut guard = self.inner.lock().await;
         let (chain, cached) = &mut *guard;
         if cached.is_none() || chain.is_expired() {
-            let v = chain.retrieve().await?;
-            *cached = Some(v);
+            match chain.retrieve().await {
+                Ok(v) => *cached = Some(v),
+                Err(e) => {
+                    if let Some(prev) = cached.as_ref() {
+                        let still_valid = prev.signer_type != SignerType::Anonymous
+                            && prev.expiration.is_some_and(|exp| exp > Utc::now());
+                        if still_valid {
+                            tracing::warn!(err = %e, "S3 credential refresh failed; retaining still-unexpired credentials");
+                            return Ok(prev.clone());
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         }
         Ok(cached.clone().unwrap_or_default())
+    }
+
+    pub async fn expire(&self) {
+        let mut guard = self.inner.lock().await;
+        let (chain, cached) = &mut *guard;
+        *cached = None;
+        chain.expire();
     }
 }
 
@@ -905,13 +1087,14 @@ pub(crate) struct CredentialsConfig {
 
 /// thanos `NewBucketWithConfig` credential chain.
 pub(crate) fn new_credentials(cfg: &CredentialsConfig, env: Env) -> Credentials {
-    let iam_client = HttpTransport::go_default().client;
+    let iam_client = iam_http_client();
     let providers: Vec<Box<dyn Provider>> = if cfg.aws_sdk_auth {
         vec![Box::new(AwsSdkAuth {
             env,
             client: iam_client,
             region: cfg.region.clone(),
             expires: None,
+            refresh_at: None,
             retrieved: false,
         })]
     } else if !cfg.access_key.is_empty() {
@@ -1260,9 +1443,10 @@ mod tests {
             async move {
                 let mut p = AwsSdkAuth {
                     env,
-                    client: reqwest::Client::new(),
+                    client: iam_http_client(),
                     region: c.region.clone(),
                     expires: None,
+                    refresh_at: None,
                     retrieved: false,
                 };
                 p.retrieve().await
@@ -1281,6 +1465,87 @@ mod tests {
         let e = get(env_of(&[("HOME", &home), ("AWS_PROFILE", "sso")])).await.unwrap_err();
         assert!(e.contains("not supported by mimir-rs"), "{e}");
         let _ = c;
+    }
+
+    #[tokio::test]
+    async fn aws_sdk_auth_5min_expiry_window_and_iso_sts() {
+        assert_eq!(
+            AwsSdkAuth::sts_endpoint("us-iso-east-1").unwrap(),
+            "https://sts.us-iso-east-1.c2s.ic.gov"
+        );
+        assert_eq!(
+            AwsSdkAuth::sts_endpoint("us-isob-east-1").unwrap(),
+            "https://sts.us-isob-east-1.sc2s.sgov.gov"
+        );
+        let now = Utc::now();
+        // 1h token -> refresh_at is 5m before expiration.
+        let exp_1h = now + chrono::Duration::hours(1);
+        let refresh = aws_sdk_refresh_at(exp_1h, now);
+        let diff = (exp_1h - refresh).num_seconds();
+        assert!((299..=301).contains(&diff), "expected ~300s window, got {diff}");
+
+        // Pod Identity returning a 4-minute TTL (< 5m) -> 80% window, NOT immediately expired,
+        // and token file trailing newline is trimmed.
+        let exp_4m = (Utc::now() + chrono::Duration::minutes(4)).to_rfc3339();
+        let body = format!(
+            r#"{{"AccessKeyId":"ak1","SecretAccessKey":"sk1","Token":"tok1","Expiration":"{exp_4m}"}}"#
+        );
+        let (base, log) = fake_endpoint(move |_, _, _, _| (200, body.clone())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("pod-tok");
+        std::fs::write(&tok, "pod-token-with-nl\n").unwrap();
+        let creds = new_credentials(
+            &CredentialsConfig { aws_sdk_auth: true, ..cfg() },
+            env_of(&[
+                ("HOME", "/nonexistent"),
+                ("AWS_CONTAINER_CREDENTIALS_FULL_URI", &format!("{base}/creds")),
+                ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", tok.to_str().unwrap()),
+            ]),
+        );
+        let v = creds.get().await.unwrap();
+        assert_eq!(v.access_key_id, "ak1");
+        // Second call uses cache (not expired immediately despite TTL < 5m).
+        let _ = creds.get().await.unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(log.lock().unwrap()[0], "GET /creds auth=pod-token-with-nl ");
+
+        // Force expire() invalidates cache.
+        creds.expire().await;
+        let _ = creds.get().await.unwrap();
+        assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn chain_does_not_fallback_to_anonymous_on_refresh_error() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let (base, log) = fake_endpoint(move |_, _, _, _| {
+            let n = calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // Already expired in 1s? Use past expiration so cached is expired on next check
+                (200, r#"{"AccessKeyId":"ak1","SecretAccessKey":"sk1","Token":"t1","Expiration":"2000-01-01T00:00:00Z"}"#.to_string())
+            } else {
+                (400, "bad".to_string())
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("pod-tok");
+        std::fs::write(&tok, "pod-tok\n").unwrap();
+        let creds = new_credentials(
+            &cfg(),
+            env_of(&[
+                ("HOME", "/nonexistent"),
+                ("AWS_CONTAINER_CREDENTIALS_FULL_URI", &format!("{base}/creds")),
+                ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", tok.to_str().unwrap()),
+            ]),
+        );
+        let v = creds.get().await.unwrap();
+        assert_eq!(v.access_key_id, "ak1");
+        assert_eq!(log.lock().unwrap()[0], "GET /creds auth=pod-tok ");
+        // Next get() sees expired cached token and fails refresh -> MUST error, NOT return Anonymous!
+        let err = creds.get().await.unwrap_err();
+        assert!(err.contains("400"), "{err}");
     }
 
     #[test]
