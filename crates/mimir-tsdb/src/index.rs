@@ -55,6 +55,14 @@ pub enum IndexError {
     SeriesNotFound(u64),
     #[error("corrupt index: {0}")]
     Corrupt(String),
+    #[error("symbol table size {0} exceeds 4 GiB limit")]
+    SymbolTableTooLarge(u64),
+    #[error("index file size {0} exceeds max size of 64 GiB")]
+    IndexExceeds64GiB(u64),
+    #[error("postings offset table length {0} exceeds 4 bytes")]
+    PostingsOffsetTableTooLarge(u64),
+    #[error("posting size {0} exceeds 4 bytes")]
+    PostingSizeTooLarge(usize),
 }
 
 /// 6-entry Table of Contents at the end of a Prometheus index file.
@@ -130,6 +138,7 @@ pub struct IndexWriter {
 
     label_names: BTreeMap<String, u64>,
     last_series: Option<Labels>,
+    last_series_ref: u64,
     last_chunk_ref: u64,
 
     buf1: Encbuf,
@@ -187,6 +196,7 @@ impl IndexWriter {
             symbol_index: HashMap::with_capacity(256),
             label_names: BTreeMap::new(),
             last_series: None,
+            last_series_ref: 0,
             last_chunk_ref: 0,
             buf1: Encbuf::with_capacity(4096),
             buf2: Encbuf::with_capacity(4096),
@@ -202,6 +212,9 @@ impl IndexWriter {
             .ok_or(IndexError::InvalidStage("writer closed"))?;
         f.write_all(bytes)?;
         self.pos += bytes.len() as u64;
+        if self.pos > 16 * u64::from(u32::MAX) {
+            return Err(IndexError::IndexExceeds64GiB(self.pos));
+        }
         Ok(())
     }
 
@@ -303,7 +316,9 @@ impl IndexWriter {
     }
 
     fn finish_symbols(&mut self) -> Result<(), IndexError> {
-        let sym_table_size = (self.pos - self.toc.symbols - 4) as u32;
+        let sym_table_len = self.pos - self.toc.symbols - 4;
+        let sym_table_size = u32::try_from(sym_table_len)
+            .map_err(|_| IndexError::SymbolTableTooLarge(sym_table_len))?;
         self.buf1.reset();
         self.buf1.put_be32(sym_table_size);
         self.buf1.put_be32(self.num_symbols);
@@ -331,14 +346,23 @@ impl IndexWriter {
     /// Adds a series with its chunk metadata. Must be called in strictly ascending label order!
     pub fn add_series(
         &mut self,
-        _ref_id: u64,
+        ref_id: u64,
         labels: &Labels,
         chunks: &[ChunkMeta],
     ) -> Result<(), IndexError> {
         self.ensure_stage(WriterStage::Series)?;
+        if labels.is_empty() {
+            return Err(IndexError::OutOfOrderSeries(labels.to_string()));
+        }
         if let Some(ref prev) = self.last_series {
             if labels <= prev {
                 return Err(IndexError::OutOfOrderSeries(labels.to_string()));
+            }
+            if ref_id < self.last_series_ref {
+                return Err(IndexError::InvalidChunkOrder(format!(
+                    "series with reference greater than {ref_id} already added (previous {})",
+                    self.last_series_ref
+                )));
             }
         }
 
@@ -352,9 +376,9 @@ impl IndexWriter {
                 )));
             }
             last_chunk_ref = c.ref_id;
-            if ix > 0 && c.min_time < last_maxt {
+            if ix > 0 && c.min_time <= last_maxt {
                 return Err(IndexError::InvalidChunkOrder(format!(
-                    "chunk min_time {} < previous max_time {}",
+                    "chunk min_time {} <= previous max_time {}",
                     c.min_time, last_maxt
                 )));
             }
@@ -413,6 +437,7 @@ impl IndexWriter {
         self.write_main(&body_bytes)?;
 
         self.last_series = Some(labels.clone());
+        self.last_series_ref = ref_id;
         self.last_chunk_ref = last_chunk_ref;
         Ok(())
     }
@@ -444,7 +469,9 @@ impl IndexWriter {
                     "series not 16-byte aligned at {cur}"
                 )));
             }
-            all_offsets.push((cur / SERIES_BYTE_ALIGN) as u32);
+            let sid = u32::try_from(cur / SERIES_BYTE_ALIGN)
+                .map_err(|_| IndexError::IndexExceeds64GiB(cur as u64))?;
+            all_offsets.push(sid);
             let mut dec = Decbuf::new(&series_region[cur..]);
             let entry_len = dec.uvarint()?;
             let consumed = (series_region.len() - cur) - dec.len();
@@ -494,7 +521,8 @@ impl IndexWriter {
                 if cur >= series_region.len() {
                     break;
                 }
-                let series_id = (cur / SERIES_BYTE_ALIGN) as u32;
+                let series_id = u32::try_from(cur / SERIES_BYTE_ALIGN)
+                    .map_err(|_| IndexError::IndexExceeds64GiB(cur as u64))?;
                 let mut dec = Decbuf::new(&series_region[cur..]);
                 let entry_len = dec.uvarint()?;
                 let header_consumed = (series_region.len() - cur) - dec.len();
@@ -554,12 +582,15 @@ impl IndexWriter {
         self.cnt_po += 1;
 
         // Encode raw postings: <4B BE len><4B BE count><count * 4B BE off><4B BE crc32c>
+        let count_u32 = u32::try_from(offs.len())
+            .map_err(|_| IndexError::PostingSizeTooLarge(offs.len()))?;
         self.buf1.reset();
-        self.buf1.put_be32(offs.len() as u32);
+        self.buf1.put_be32(count_u32);
         for &off in offs {
             self.buf1.put_be32(off);
         }
-        let body_len = self.buf1.len() as u32;
+        let body_len = u32::try_from(self.buf1.len())
+            .map_err(|_| IndexError::PostingSizeTooLarge(self.buf1.len()))?;
         self.buf1.put_crc32c();
 
         let fp = self.fp.as_mut().unwrap();
@@ -630,7 +661,9 @@ impl IndexWriter {
         drop(fpo_file);
         let _ = fs::remove_file(&self.tmp_po_path);
 
-        let table_len = (self.pos - start_pos - 4) as u32;
+        let table_len_u64 = self.pos - start_pos - 4;
+        let table_len = u32::try_from(table_len_u64)
+            .map_err(|_| IndexError::PostingsOffsetTableTooLarge(table_len_u64))?;
         self.write_main_at(&table_len.to_be_bytes(), start_pos)?;
         self.write_main(&crc.to_be_bytes())
     }
@@ -720,11 +753,9 @@ impl IndexReader {
             if name.is_empty() {
                 continue;
             }
-            if let Ok(sid) =
-                reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name.as_str())
-            {
-                name_cache.insert(sid, name.clone());
-            }
+            let sid =
+                reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name.as_str())?;
+            name_cache.insert(sid, name.clone());
         }
 
         Ok(Self {
@@ -1105,7 +1136,10 @@ impl IndexReader {
     pub fn label_names_for(&self, postings: &[u64]) -> Result<Vec<String>, IndexError> {
         let mut name_ids: HashSet<u32> = HashSet::new();
         for &id in postings {
-            let offset = (id as usize) * SERIES_BYTE_ALIGN;
+            let offset = usize::try_from(id)
+                .ok()
+                .and_then(|u| u.checked_mul(SERIES_BYTE_ALIGN))
+                .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
             let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
             let mut dec = Decbuf::new(payload);
             let k = dec.uvarint()?;
@@ -1420,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn index_allows_touching_chunk_boundaries_and_rejects_overlap() {
+    fn index_rejects_touching_and_overlapping_chunk_boundaries() {
         let dir = tempfile::tempdir().unwrap();
         let idx_path = dir.path().join(INDEX_FILENAME);
         let l = Labels::from_pairs([("__name__", "m")]);
@@ -1428,27 +1462,32 @@ mod tests {
         w.add_symbol("").unwrap();
         w.add_symbol("__name__").unwrap();
         w.add_symbol("m").unwrap();
-        // Touching boundaries (c2.min_time == c1.max_time) must be accepted.
-        w.add_series(
-            0,
-            &l,
-            &[
-                ChunkMeta {
-                    ref_id: 1,
-                    min_time: 100,
-                    max_time: 200,
-                    chunk: None,
-                },
-                ChunkMeta {
-                    ref_id: 2,
-                    min_time: 200,
-                    max_time: 300,
-                    chunk: None,
-                },
-            ],
-        )
-        .unwrap();
-        w.close().unwrap();
+        // Touching boundaries (c2.min_time == c1.max_time) must be rejected (Go index.go:463).
+        let err_touch = w
+            .add_series(
+                0,
+                &l,
+                &[
+                    ChunkMeta {
+                        ref_id: 1,
+                        min_time: 100,
+                        max_time: 200,
+                        chunk: None,
+                    },
+                    ChunkMeta {
+                        ref_id: 2,
+                        min_time: 200,
+                        max_time: 300,
+                        chunk: None,
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(err_touch, IndexError::InvalidChunkOrder(_)));
+
+        // Empty labels on first series must be rejected.
+        let err_empty = w.add_series(0, &Labels::empty(), &[]).unwrap_err();
+        assert!(matches!(err_empty, IndexError::OutOfOrderSeries(_)));
 
         // Overlapping (c2.min_time < c1.max_time) must be rejected.
         let idx_path2 = dir.path().join("index2");

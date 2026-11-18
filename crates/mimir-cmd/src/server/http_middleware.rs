@@ -27,7 +27,12 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::{header, HeaderMap, StatusCode};
 use http_body::Frame;
-use mimir_common::logging::{LogLevel, Logger};
+use mimir_common::logging::{LogLevel, LogValue, Logger};
+use mimir_common::tracing::{
+    export_span, extract_from_http_headers, global_tracing, now_unix_nanos,
+    start_server_span_context, with_trace_context, ExportedSpan, SpanAttrValue, SpanAttribute,
+    TraceContext,
+};
 use mimir_config::GoDuration;
 use parking_lot::Mutex;
 use regex::Regex;
@@ -200,7 +205,11 @@ pub struct HttpMiddlewareConfig {
     pub log_request_headers: bool,
     pub log_request_at_info_level: bool,
     pub log_source_ips: Option<SourceIps>,
+    pub trace_source_ips: Option<SourceIps>,
     pub exclude_headers: Vec<String>,
+    pub trace_request_headers: bool,
+    pub trace_exclude_headers: Vec<String>,
+    pub create_new_traces: bool,
     pub cluster_validation: Option<HttpClusterValidation>,
 }
 
@@ -247,12 +256,62 @@ fn dump_headers(headers: &HeaderMap, exclude: &[String]) -> String {
     lines.iter().map(|l| format!("{l}; ")).collect()
 }
 
-/// The dskit HTTP middleware chain (`Log` + `Instrument` + cluster validation).
-pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>, req: Request, next: Next) -> Response {
+fn build_http_span_attributes(
+    req: &Request,
+    route: Option<&str>,
+    trace_source_ips: Option<&SourceIps>,
+    remote: &str,
+    trace_headers: bool,
+    trace_exclude_headers: &[String],
+) -> Vec<SpanAttribute> {
+    let mut attrs = Vec::new();
+    if let Some(r) = route.filter(|r| !r.is_empty()) {
+        attrs.push(SpanAttribute {
+            key: "http.route".to_string(),
+            value: SpanAttrValue::String(r.to_string()),
+        });
+    }
+    if let Some(sips) = trace_source_ips {
+        attrs.push(SpanAttribute {
+            key: "source_ips".to_string(),
+            value: SpanAttrValue::String(sips.get(req.headers(), remote)),
+        });
+    }
+    if trace_headers {
+        const MAX_HEADERS: usize = 100;
+        for name in req.headers().keys().take(MAX_HEADERS) {
+            let canon = crate::grpc::http_canonical_header_key(name.as_str());
+            if ALWAYS_EXCLUDED_HEADERS.contains(&canon.as_str())
+                || trace_exclude_headers.contains(&canon)
+            {
+                attrs.push(SpanAttribute {
+                    key: format!("http.header.{canon}.present"),
+                    value: SpanAttrValue::String("true".to_string()),
+                });
+            } else {
+                let vals: Vec<String> = req
+                    .headers()
+                    .get_all(name)
+                    .iter()
+                    .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                    .collect();
+                attrs.push(SpanAttribute {
+                    key: format!("http.header.{canon}"),
+                    value: SpanAttrValue::StringArray(vals),
+                });
+            }
+        }
+    }
+    attrs
+}
+
+/// The dskit HTTP middleware chain (`Tracer` + `Log` + `Instrument` + cluster validation).
+pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>, mut req: Request, next: Next) -> Response {
     let Some(served) = req.extensions().get::<ServedOverHttp>().copied() else {
         return next.run(req).await;
     };
     let begin = Instant::now();
+    let start_unix_nano = now_unix_nanos();
     let method = req.method().as_str().to_string();
     let matched_route = route_name(&req);
     let route = matched_route.clone().unwrap_or_else(|| "other".to_string());
@@ -265,6 +324,25 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
     let remote = served.remote_addr.to_string();
     let source_ips = cfg.log_source_ips.as_ref().map(|s| s.get(req.headers(), &remote));
     let headers_dump = cfg.log_request_headers.then(|| dump_headers(req.headers(), &cfg.exclude_headers));
+
+    let extracted_trace = extract_from_http_headers(req.headers());
+    let (span_ctx, parent_span_id) = start_server_span_context(&extracted_trace, cfg.create_new_traces);
+    let should_export = span_ctx.is_sampled() && global_tracing().is_some_and(|t| t.exporter.is_some());
+    let span_attrs = if should_export {
+        build_http_span_attributes(
+            &req,
+            matched_route.as_deref(),
+            cfg.trace_source_ips.as_ref(),
+            &remote,
+            cfg.trace_request_headers,
+            &cfg.trace_exclude_headers,
+        )
+    } else {
+        Vec::new()
+    };
+    if span_ctx.is_valid() {
+        req.extensions_mut().insert(span_ctx.clone());
+    }
 
     let inflight = cfg.metrics.inflight_requests.with_label_values(&[&method, &route]);
     inflight.inc();
@@ -279,13 +357,16 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
     })));
     let req = Request::from_parts(parts, body);
 
-    let resp = match &cfg.cluster_validation {
-        Some(cv) => match check_cluster(&req, cv, matched_route.as_deref(), &cfg) {
-            Some(rejection) => rejection,
+    let resp = with_trace_context(span_ctx.clone(), async {
+        match &cfg.cluster_validation {
+            Some(cv) => match check_cluster(&req, cv, matched_route.as_deref(), &cfg, &span_ctx) {
+                Some(rejection) => rejection,
+                None => next.run(req).await,
+            },
             None => next.run(req).await,
-        },
-        None => next.run(req).await,
-    };
+        }
+    })
+    .await;
 
     let status = resp.status();
     // gorilla/mux reports a method mismatch as an unmatched route.
@@ -311,8 +392,28 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
     });
     let m = cfg.metrics.clone();
     let cfg2 = Arc::clone(&cfg);
+    let span_name = match matched_route.as_deref() {
+        Some(r) if !r.is_empty() => format!("HTTP {method} - {r}"),
+        _ => format!("HTTP {method}"),
+    };
     let on_done = Box::new(move |_completed: bool| {
         let elapsed = begin.elapsed();
+        if should_export {
+            if let Some(rt) = global_tracing() {
+                export_span(ExportedSpan {
+                    service_name: rt.service_name.clone(),
+                    trace_id: span_ctx.trace_id,
+                    span_id: span_ctx.span_id,
+                    parent_span_id,
+                    name: span_name.clone(),
+                    kind: 2,
+                    start_time_unix_nano: start_unix_nano,
+                    end_time_unix_nano: start_unix_nano.saturating_add(elapsed.as_nanos() as u64),
+                    attributes: span_attrs.clone(),
+                    status_error: code >= 500,
+                });
+            }
+        }
         m.received_message_size
             .with_label_values(&[&method, &route])
             .observe(read.load(std::sync::atomic::Ordering::Relaxed) as f64);
@@ -323,7 +424,7 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
             .with_label_values(&[&method, &route, &code.to_string(), &ws.to_string()])
             .observe(elapsed.as_secs_f64());
         inflight.dec();
-        log_request(&cfg2, &method, &uri, code, elapsed, ws, &captured.lock(), source_ips.as_deref(), headers_dump.as_deref());
+        log_request(&cfg2, &method, &uri, code, elapsed, ws, &captured.lock(), source_ips.as_deref(), headers_dump.as_deref(), &span_ctx);
     });
     let (parts, body) = resp.into_parts();
     Response::from_parts(parts, Body::new(TrackedBody::new(body).on_frame(on_frame).on_done(on_done)))
@@ -340,6 +441,7 @@ fn log_request(
     body: &[u8],
     source_ips: Option<&str>,
     headers: Option<&str>,
+    span_ctx: &TraceContext,
 ) {
     // Mimir sets DisableRequestSuccessLog.
     if (200..300).contains(&code) {
@@ -361,7 +463,13 @@ fn log_request(
         };
         (LogLevel::Warn, msg)
     };
+    let (trace_id, sampled) = span_ctx.extract_sampled_trace_id();
     let mut kvs: Vec<(&str, &str)> = Vec::new();
+    if sampled {
+        kvs.push(("trace_id", &trace_id));
+    } else if !trace_id.is_empty() {
+        kvs.push(("trace_id_unsampled", &trace_id));
+    }
     if let Some(ips) = source_ips.filter(|s| !s.is_empty()) {
         kvs.push(("sourceIPs", ips));
     }
@@ -374,6 +482,7 @@ fn check_cluster(
     cv: &HttpClusterValidation,
     route: Option<&str>,
     cfg: &HttpMiddlewareConfig,
+    span_ctx: &TraceContext,
 ) -> Option<Response> {
     let path = req.uri().path();
     if cv.excluded_path.is_match(path) {
@@ -394,26 +503,29 @@ fn check_cluster(
         .collect();
     let expected = format!("[{}]", cv.allowed.join(" "));
     let first = cv.allowed.first().cloned().unwrap_or_default();
-    let soft = cv.soft.to_string();
-    let base: Vec<(String, String)> = vec![
-        ("path".into(), path.to_string()),
-        ("method".into(), req.method().to_string()),
-        ("cluster_validation_labels".into(), expected.clone()),
-        ("soft_validation".into(), soft),
-        ("tenant".into(), get("X-Scope-OrgID")),
-        ("user_agent".into(), get("User-Agent")),
-        ("host".into(), req.uri().host().map(|h| h.to_string()).unwrap_or_else(|| get("Host"))),
-        (
-            "client_address".into(),
-            req.extensions().get::<ServedOverHttp>().map(|s| s.remote_addr.to_string()).unwrap_or_default(),
-        ),
-    ];
+    let tenant = get("X-Scope-OrgID");
+    let ua = get("User-Agent");
+    let host = req.uri().host().map(|h| h.to_string()).unwrap_or_else(|| get("Host"));
+    let client_addr = req.extensions().get::<ServedOverHttp>().map(|s| s.remote_addr.to_string()).unwrap_or_default();
+    let (trace_id, trace_sampled) = span_ctx.extract_sampled_trace_id();
     let log = |extra: Vec<(&str, String)>| {
-        let mut kvs: Vec<(&str, &str)> = base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        for (k, v) in &extra {
-            kvs.push((k, v.as_str()));
+        let mut kvs: Vec<(&str, LogValue<'_>)> = vec![
+            ("path", LogValue::from(path)),
+            ("method", LogValue::from(req.method().as_str())),
+            ("cluster_validation_labels", LogValue::from(expected.as_str())),
+            ("soft_validation", LogValue::Bool(cv.soft)),
+            ("tenant", LogValue::from(tenant.as_str())),
+            ("user_agent", LogValue::from(ua.as_str())),
+            ("host", LogValue::from(host.as_str())),
+            ("client_address", LogValue::from(client_addr.as_str())),
+        ];
+        if trace_sampled {
+            kvs.push(("trace_id", LogValue::from(trace_id.as_str())));
         }
-        cfg.logger.log(LogLevel::Warn, &kvs);
+        for (k, v) in &extra {
+            kvs.push((k, LogValue::from(v.as_str())));
+        }
+        cfg.logger.log_values(LogLevel::Warn, &kvs);
     };
     let err = if values.len() > 1 {
         cfg.metrics.invalid_cluster_requests.with_label_values(&["http", &route, &first, ""]).inc();

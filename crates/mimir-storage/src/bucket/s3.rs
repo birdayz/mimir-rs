@@ -325,7 +325,7 @@ fn optimal_part_info(object_size: u64, configured_part_size: u64) -> Result<(u64
         }
         configured_part_size as f64
     } else {
-        let p = (object_size / MAX_PARTS_COUNT) as f64;
+        let p = (object_size as f64) / (MAX_PARTS_COUNT as f64);
         (p / MIN_PART_SIZE as f64).ceil() * MIN_PART_SIZE as f64
     };
     let total = (object_size as f64 / part_size_flt).ceil() as u64;
@@ -824,6 +824,7 @@ impl S3Bucket {
         check_valid_object_name(name)?;
         let (total, part_size, last_part_size) = optimal_part_info(size, opts.part_size)?;
         let upload_id = self.initiate_multipart_upload(name, opts).await?;
+        let mut abort_guard = S3AbortOnDrop::new(&self.client, &self.name, name, upload_id.clone());
         let result = async {
             let next = std::sync::atomic::AtomicU64::new(1);
             let results = parking_lot::Mutex::new(Vec::<(u64, String)>::new());
@@ -854,6 +855,7 @@ impl S3Bucket {
         let parts = match result {
             Ok(p) => p,
             Err(e) => {
+                abort_guard.disarm();
                 self.abort_multipart_upload(name, &upload_id).await;
                 return Err(e);
             }
@@ -862,9 +864,11 @@ impl S3Bucket {
             .complete_multipart_upload(name, &upload_id, &parts, &opts.sse)
             .await
         {
+            abort_guard.disarm();
             self.abort_multipart_upload(name, &upload_id).await;
             return Err(e);
         }
+        abort_guard.disarm();
         Ok(())
     }
 
@@ -880,6 +884,7 @@ impl S3Bucket {
         check_valid_object_name(name)?;
         let (total, part_size, last_part_size) = optimal_part_info(size, opts.part_size)?;
         let upload_id = self.initiate_multipart_upload(name, opts).await?;
+        let mut abort_guard = S3AbortOnDrop::new(&self.client, &self.name, name, upload_id.clone());
         let mut parts = Vec::new();
         for n in 1..=total {
             let (offset, len) = if n == total {
@@ -890,6 +895,7 @@ impl S3Bucket {
             let data = match source.section(offset, len).read_all().await {
                 Ok(d) => d,
                 Err(e) => {
+                    abort_guard.disarm();
                     self.abort_multipart_upload(name, &upload_id).await;
                     return Err(S3Error::Other(e.to_string()));
                 }
@@ -902,6 +908,7 @@ impl S3Bucket {
             match self.upload_part(name, &upload_id, n, Body::Bytes(data), md5).await {
                 Ok(etag) => parts.push((n, etag)),
                 Err(e) => {
+                    abort_guard.disarm();
                     self.abort_multipart_upload(name, &upload_id).await;
                     return Err(e);
                 }
@@ -911,9 +918,11 @@ impl S3Bucket {
             .complete_multipart_upload(name, &upload_id, &parts, &opts.sse)
             .await
         {
+            abort_guard.disarm();
             self.abort_multipart_upload(name, &upload_id).await;
             return Err(e);
         }
+        abort_guard.disarm();
         Ok(())
     }
 
@@ -1153,6 +1162,46 @@ fn to_object_info(resp: &client::Response, bucket: &str, object: &str) -> Result
         last_modified: mtime,
         etag: trim_etag(resp.header("etag")),
     })
+}
+
+struct S3AbortOnDrop {
+    client: Arc<Client>,
+    bucket: String,
+    key: String,
+    upload_id: Option<String>,
+}
+
+impl S3AbortOnDrop {
+    fn new(client: &Arc<Client>, bucket: &str, key: &str, upload_id: String) -> Self {
+        Self {
+            client: Arc::clone(client),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: Some(upload_id),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.upload_id = None;
+    }
+}
+
+impl Drop for S3AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(upload_id) = self.upload_id.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let client = Arc::clone(&self.client);
+                let bucket = std::mem::take(&mut self.bucket);
+                let key = std::mem::take(&mut self.key);
+                handle.spawn(async move {
+                    let mut meta = RequestMetadata::new(&bucket, &key);
+                    meta.query = vec![("uploadId".into(), upload_id)];
+                    meta.content_sha256_hex = signer::EMPTY_SHA256_HEX.to_string();
+                    let _ = client.execute_method("DELETE", meta).await;
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

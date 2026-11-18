@@ -60,7 +60,7 @@ use crate::symbols::{SymbolId, SymbolTable, SymbolTableError};
 use crate::tombstones::{is_completely_deleted, Interval, MemTombstones};
 use crate::wlog::{
     create_checkpoint, decompress_record_into, delete_checkpoints,
-    delete_temp_checkpoints, last_checkpoint, segments_range,
+    delete_temp_checkpoints, last_checkpoint, read_min_valid_time, segments_range,
     CompressionType, SegmentRange, SegmentTracker, WlogError, WlogReader, WlogWriter,
     DEFAULT_SEGMENT_SIZE, WBL_DIR_NAME,
 };
@@ -2763,6 +2763,54 @@ pub type SeriesChunkMetasNoBytes = Option<(Labels, SmallVec<[(i64, i64); 4]>, bo
 /// Lightweight candidate list + `[min_time, max_time_inclusive]` range for streaming compaction.
 pub type CompactionCandidatesRange = (Vec<(u64, Labels)>, i64, i64);
 
+/// Chunk-shape snapshot of a series used to detect concurrent appends between
+/// candidate selection and post-compaction eviction (Go `Head.seriesFingerprint`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeriesFingerprint {
+    pub total_chunks: usize,
+    pub active_min_time: i64,
+    pub active_chunk_samples: usize,
+    pub had_pending_commits: bool,
+}
+
+impl SeriesFingerprint {
+    fn capture(entry: &SeriesEntry, st: &SeriesState) -> Self {
+        let total_chunks = st.mmapped().len() + st.head_chunks_len();
+        let (active_chunk_samples, active_min_time) = st
+            .active_chunk
+            .as_ref()
+            .map_or((0, i64::MAX), |c| (c.num_samples(), st.active_min_time));
+        Self {
+            total_chunks,
+            active_min_time,
+            active_chunk_samples,
+            had_pending_commits: entry.pending_commits_count() > 0,
+        }
+    }
+
+    fn has_mutated(
+        entry: &SeriesEntry,
+        st: &SeriesState,
+        fingerprints: &HashMap<u64, SeriesFingerprint>,
+    ) -> bool {
+        let Some(fp) = fingerprints.get(&entry.ref_id) else {
+            return true;
+        };
+        if fp.had_pending_commits {
+            return true;
+        }
+        let total_chunks = st.mmapped().len() + st.head_chunks_len();
+        if total_chunks != fp.total_chunks {
+            return true;
+        }
+        let (active_chunk_samples, active_min_time) = st
+            .active_chunk
+            .as_ref()
+            .map_or((0, i64::MAX), |c| (c.num_samples(), st.active_min_time));
+        active_chunk_samples != fp.active_chunk_samples || active_min_time != fp.active_min_time
+    }
+}
+
 /// Snapshot of OOO compaction candidates bounded by `last_mmap_ref` and `last_wbl_file`
 /// (matching Prometheus `OOOCompactionHead`).
 #[derive(Clone, Debug)]
@@ -3041,6 +3089,7 @@ pub struct Head {
     chunk_writer: Mutex<Option<HeadChunksWriter>>,
     chunk_reader: RwLock<Option<HeadChunksReader>>,
     mmap_mtx: Mutex<()>,
+    chunk_snapshot_mtx: Mutex<()>,
     ooo_wbl_gate: RwLock<()>,
     ooo_compact_wbl_cut_seg: Mutex<Option<usize>>,
 
@@ -3099,6 +3148,13 @@ impl Head {
         fs::create_dir_all(&wal_dir)?;
         fs::create_dir_all(&chunks_dir)?;
         let _ = delete_temp_checkpoints(&wal_dir);
+
+        let mut min_valid_time = min_valid_time;
+        if let Ok(Some(cp_mvt)) = read_min_valid_time(&wal_dir) {
+            if cp_mvt > min_valid_time {
+                min_valid_time = cp_mvt;
+            }
+        }
 
         let lifecycle_cb = opts.series_lifecycle_callback.clone();
         let (series_gauge, series_created_total, series_removed_total) =
@@ -3164,6 +3220,7 @@ impl Head {
             chunk_writer: Mutex::new(None),
             chunk_reader: RwLock::new(None),
             mmap_mtx: Mutex::new(()),
+            chunk_snapshot_mtx: Mutex::new(()),
             ooo_wbl_gate: RwLock::new(()),
             ooo_compact_wbl_cut_seg: Mutex::new(None),
             min_time: AtomicI64::new(i64::MAX),
@@ -6727,7 +6784,18 @@ impl Head {
         &self,
         refs: &[u64],
     ) -> Result<CompactionCandidatesRange, HeadError> {
+        let (range, _) = self.collect_selected_compaction_candidates_with_fingerprints(refs)?;
+        Ok(range)
+    }
+
+    /// Collects candidates for selected-series compaction along with per-series chunk-shape
+    /// fingerprints (Go `Head.snapshotFingerprints`) captured under each series lock.
+    pub fn collect_selected_compaction_candidates_with_fingerprints(
+        &self,
+        refs: &[u64],
+    ) -> Result<(CompactionCandidatesRange, HashMap<u64, SeriesFingerprint>), HeadError> {
         let mut out = Vec::with_capacity(refs.len());
+        let mut fingerprints = HashMap::with_capacity(refs.len());
         let mut mint = i64::MAX;
         let mut maxt = i64::MIN;
 
@@ -6755,10 +6823,11 @@ impl Head {
                 has_any = true;
             });
             if has_any {
+                fingerprints.insert(entry.ref_id, SeriesFingerprint::capture(&entry, &st));
                 out.push((entry.ref_id, entry.labels.clone()));
             }
         }
-        Ok((out, mint, maxt))
+        Ok(((out, mint, maxt), fingerprints))
     }
 
     /// Collects all series with chunks overlapping `[mint, maxt_inclusive]` for block compaction.
@@ -7082,6 +7151,7 @@ impl Head {
         if last_wbl_file.is_none() && min_ooo_mmap_ref.as_u64() == 0 {
             return Ok(());
         }
+        let _snap_guard = self.chunk_snapshot_mtx.lock();
         if min_ooo_mmap_ref.as_u64() > 0 {
             let _mmap_guard = self.mmap_mtx.lock();
             let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
@@ -7212,6 +7282,7 @@ impl Head {
     /// samples `> maxt_inclusive` that arrived during compaction), truncates WBL segments, and
     /// cleans up empty series and unused `chunks_head` files.
     pub fn clear_ooo_data_before(&self, maxt_inclusive: i64) -> Result<(), HeadError> {
+        let _snap_guard = self.chunk_snapshot_mtx.lock();
         let _mmap_guard = self.mmap_mtx.lock();
         let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
         let head_maxt = self.max_time();
@@ -7482,6 +7553,27 @@ impl Head {
         refs: &[u64],
         maxt_inclusive: i64,
     ) -> Result<(), HeadError> {
+        self.evict_series_refs_inner(refs, maxt_inclusive, None)
+    }
+
+    /// Evicts `refs` from Head memory ONLY if `pending_commits == 0`, `state.max_time() <= maxt_inclusive`,
+    /// and the series has not mutated since `fingerprints` was captured (Go `truncateSelectedSeries`).
+    pub fn evict_series_refs_with_fingerprints(
+        &self,
+        refs: &[u64],
+        maxt_inclusive: i64,
+        fingerprints: &HashMap<u64, SeriesFingerprint>,
+    ) -> Result<(), HeadError> {
+        self.evict_series_refs_inner(refs, maxt_inclusive, Some(fingerprints))
+    }
+
+    fn evict_series_refs_inner(
+        &self,
+        refs: &[u64],
+        maxt_inclusive: i64,
+        fingerprints: Option<&HashMap<u64, SeriesFingerprint>>,
+    ) -> Result<(), HeadError> {
+        let _snap_guard = self.chunk_snapshot_mtx.lock();
         let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
         let has_wal = self.wal.lock().is_some();
         let _pending_tomb_guard =
@@ -7492,6 +7584,11 @@ impl Head {
                 let mut st = entry.inner.lock();
                 if entry.pending_commits_count() > 0 || st.max_time() > maxt_inclusive {
                     continue;
+                }
+                if let Some(fps) = fingerprints {
+                    if SeriesFingerprint::has_mutated(&entry, &st, fps) {
+                        continue;
+                    }
                 }
                 let has_ooo = st.ooo().is_some_and(|o| {
                     o.ooo_head_chunk.is_some()
@@ -7568,6 +7665,7 @@ impl Head {
     }
 
     fn truncate_memory_inner(&self, mint: i64) -> Result<(), HeadError> {
+        let _snap_guard = self.chunk_snapshot_mtx.lock();
         let initialized = self.initialized();
         if initialized && self.min_time() >= mint {
             if self.symbol_arena_grew_past_gc_threshold() {
@@ -7627,6 +7725,7 @@ impl Head {
 
     /// Garbage-collects chunks `< mint` and empty series (used on startup after WAL/WBL replay).
     pub fn gc(&self, mint: i64) -> Result<(), HeadError> {
+        let _snap_guard = self.chunk_snapshot_mtx.lock();
         let _mmap_guard = self.mmap_mtx.lock();
         let (to_delete, actual_mint, _min_ooo_time, min_mmap_seq) =
             self.gc_collect_and_unlink(mint);
@@ -7754,6 +7853,7 @@ impl Head {
     /// drops them. A failed segment truncation or old-checkpoint deletion is only logged
     /// (and counted), like Go.
     pub fn truncate_wal(&self, mint: i64) -> Result<(), HeadError> {
+        let _snap_guard = self.chunk_snapshot_mtx.lock();
         if mint <= self.last_wal_truncation_time.load(Ordering::Acquire) {
             return Ok(());
         }

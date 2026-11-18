@@ -451,8 +451,12 @@ pub fn sharded_retry_backoff(
     (not_timed_out && should_retry(tries, err)).then_some(backoff)
 }
 
-/// `broker.handleReq` connection loading: "It is rare, but it is possible that the broker has an
-/// immediate issue on a new connection. We retry once." (only for retryable errors).
+fn is_transient_sasl_auth_failed(err: &KafkaClientError) -> bool {
+    matches!(err, KafkaClientError::Sasl(msg) if msg.contains("SASL_AUTHENTICATION_FAILED"))
+}
+
+/// `broker.handleReq` connection loading: retries once on retryable broker errors or a
+/// transient `SASL_AUTHENTICATION_FAILED` (AWS MSK IAM principal/STS race, franz-go #249).
 pub async fn load_connection_retrying_once<C, Fut>(
     mut connect: impl FnMut() -> Fut,
 ) -> Result<C, KafkaClientError>
@@ -460,7 +464,9 @@ where
     Fut: Future<Output = Result<C, KafkaClientError>>,
 {
     match connect().await {
-        Err(e) if is_retryable_broker_err(&e) => connect().await,
+        Err(e) if is_retryable_broker_err(&e) || is_transient_sasl_auth_failed(&e) => {
+            connect().await
+        }
         other => other,
     }
 }

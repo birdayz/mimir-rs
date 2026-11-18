@@ -177,10 +177,8 @@ impl HistogramChunk {
             Some(s) => HistogramAppender { chunk: self, state: s },
             None => self.appender()?,
         };
-        let out = app.append_histogram(prev, st, t, h, false)?;
-        if matches!(out, AppendHistogramOutcome::Appended { .. }) {
-            *state = Some(app.state);
-        }
+        let (out, next_state) = app.append_histogram_with_state(prev, st, t, h, false)?;
+        *state = Some(next_state);
         Ok(out)
     }
 }
@@ -621,11 +619,40 @@ impl<'a> HistogramAppender<'a> {
     pub fn append_histogram(
         &mut self,
         prev: Option<&HistogramAppenderState>,
-        _st: i64,
+        st: i64,
         t: i64,
         h: &Histogram,
         append_only: bool,
     ) -> Result<AppendHistogramOutcome, ChunkError> {
+        let (out, _) = self.append_histogram_inner(prev, st, t, h, append_only, false)?;
+        Ok(out)
+    }
+
+    fn append_histogram_with_state(
+        &mut self,
+        prev: Option<&HistogramAppenderState>,
+        st: i64,
+        t: i64,
+        h: &Histogram,
+        append_only: bool,
+    ) -> Result<(AppendHistogramOutcome, HistogramAppenderState), ChunkError> {
+        let (out, next_state) = self.append_histogram_inner(prev, st, t, h, append_only, true)?;
+        let st_out = match next_state {
+            Some(s) => s,
+            None => self.state.clone(),
+        };
+        Ok((out, st_out))
+    }
+
+    fn append_histogram_inner(
+        &mut self,
+        prev: Option<&HistogramAppenderState>,
+        _st: i64,
+        t: i64,
+        h: &Histogram,
+        append_only: bool,
+        return_new_state: bool,
+    ) -> Result<(AppendHistogramOutcome, Option<HistogramAppenderState>), ChunkError> {
         let num_samples = self.chunk.num_samples();
         if num_samples == u16::MAX as usize {
             return Err(ChunkError::CapacityExceeded);
@@ -636,7 +663,7 @@ impl<'a> HistogramAppender<'a> {
             self.set_num_samples(new_num);
             if h.counter_reset_hint == CounterResetHint::GaugeType {
                 self.set_counter_reset_header(CounterResetHeader::GaugeType);
-                return Ok(AppendHistogramOutcome::Appended { recoded: false });
+                return Ok((AppendHistogramOutcome::Appended { recoded: false }, None));
             }
             if h.counter_reset_hint == CounterResetHint::CounterReset {
                 self.set_counter_reset_header(CounterResetHeader::CounterReset);
@@ -644,7 +671,7 @@ impl<'a> HistogramAppender<'a> {
                 let (_, _, _, _, _, cr) = p.appendable(h);
                 self.set_counter_reset_header(cr);
             }
-            return Ok(AppendHistogramOutcome::Appended { recoded: false });
+            return Ok((AppendHistogramOutcome::Appended { recoded: false }, None));
         }
 
         let mut h_owned;
@@ -661,13 +688,14 @@ impl<'a> HistogramAppender<'a> {
                     };
                 }
                 let mut new_chunk = HistogramChunk::new();
-                {
+                let new_state = {
                     let mut app = new_chunk.appender()?;
                     app.set_counter_reset_header(cr_hint);
                     let n = app.append_raw(0, t, h);
                     app.set_num_samples(n);
-                }
-                return Ok(AppendHistogramOutcome::NewChunk(new_chunk));
+                    return_new_state.then_some(app.state)
+                };
+                return Ok((AppendHistogramOutcome::NewChunk(new_chunk), new_state));
             }
 
             if !p_bwd.is_empty() || !n_bwd.is_empty() {
@@ -692,12 +720,12 @@ impl<'a> HistogramAppender<'a> {
                 self.recode_in_place(&p_fwd, &n_fwd, &h_ref.positive_spans, &h_ref.negative_spans)?;
                 let n = self.append_raw(self.chunk.num_samples(), t, h_ref);
                 self.set_num_samples(n);
-                return Ok(AppendHistogramOutcome::Appended { recoded: true });
+                return Ok((AppendHistogramOutcome::Appended { recoded: true }, None));
             }
 
             let n = self.append_raw(num_samples, t, h_ref);
             self.set_num_samples(n);
-            return Ok(AppendHistogramOutcome::Appended { recoded: false });
+            return Ok((AppendHistogramOutcome::Appended { recoded: false }, None));
         }
 
         // Gauge histogram
@@ -715,13 +743,14 @@ impl<'a> HistogramAppender<'a> {
                 return Err(ChunkError::HistogramSchemaChange);
             }
             let mut new_chunk = HistogramChunk::new();
-            {
+            let new_state = {
                 let mut app = new_chunk.appender()?;
                 app.set_counter_reset_header(CounterResetHeader::GaugeType);
                 let n = app.append_raw(0, t, h);
                 app.set_num_samples(n);
-            }
-            return Ok(AppendHistogramOutcome::NewChunk(new_chunk));
+                return_new_state.then_some(app.state)
+            };
+            return Ok((AppendHistogramOutcome::NewChunk(new_chunk), new_state));
         }
 
         if !p_bwd.is_empty() || !n_bwd.is_empty() {
@@ -744,12 +773,12 @@ impl<'a> HistogramAppender<'a> {
             self.recode_in_place(&p_fwd, &n_fwd, &h_ref.positive_spans, &h_ref.negative_spans)?;
             let n = self.append_raw(self.chunk.num_samples(), t, h_ref);
             self.set_num_samples(n);
-            return Ok(AppendHistogramOutcome::Appended { recoded: true });
+            return Ok((AppendHistogramOutcome::Appended { recoded: true }, None));
         }
 
         let n = self.append_raw(num_samples, t, h_ref);
         self.set_num_samples(n);
-        Ok(AppendHistogramOutcome::Appended { recoded: false })
+        Ok((AppendHistogramOutcome::Appended { recoded: false }, None))
     }
 }
 
@@ -1037,7 +1066,7 @@ impl<'a> HistogramIterator<'a> {
             custom_values: self.custom_values.clone(),
         };
         if h.schema > EXPONENTIAL_SCHEMA_MAX && h.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED {
-            reduce_int_resolution(&mut h, EXPONENTIAL_SCHEMA_MAX);
+            let _ = reduce_int_resolution(&mut h, EXPONENTIAL_SCHEMA_MAX);
         }
         (self.t, h)
     }
@@ -1100,6 +1129,12 @@ impl<'a> HistogramIterator<'a> {
             for i in 0..num_n {
                 self.n_buckets[i] = read_varbit_int(&mut self.br)?;
             }
+            if self.schema > EXPONENTIAL_SCHEMA_MAX
+                && self.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED
+            {
+                validate_spans_for_reduce(&self.p_spans, self.p_buckets.len())?;
+                validate_spans_for_reduce(&self.n_spans, self.n_buckets.len())?;
+            }
 
             self.num_read += 1;
             return Ok(Some(self.t));
@@ -1161,25 +1196,45 @@ impl<'a> HistogramIterator<'a> {
     }
 }
 
-pub(crate) fn reduce_int_resolution(h: &mut Histogram, target_schema: i32) {
+pub(crate) fn validate_spans_for_reduce(
+    spans: &[HistogramSpan],
+    num_buckets: usize,
+) -> Result<(), ChunkError> {
+    for (n, span) in spans.iter().enumerate() {
+        if n > 0 && span.offset < 0 {
+            return Err(ChunkError::InvalidChunk);
+        }
+    }
+    if checked_count_spans(spans) != Some(num_buckets) {
+        return Err(ChunkError::InvalidChunk);
+    }
+    Ok(())
+}
+
+pub(crate) fn reduce_int_resolution(
+    h: &mut Histogram,
+    target_schema: i32,
+) -> Result<(), ChunkError> {
     if h.schema <= target_schema || h.schema == super::CUSTOM_BUCKETS_SCHEMA {
-        return;
+        return Ok(());
     }
     let shift = (h.schema - target_schema) as u32;
     (h.positive_spans, h.positive_buckets) =
-        reduce_int_side(&h.positive_spans, &h.positive_buckets, shift);
+        reduce_int_side(&h.positive_spans, &h.positive_buckets, shift)?;
     (h.negative_spans, h.negative_buckets) =
-        reduce_int_side(&h.negative_spans, &h.negative_buckets, shift);
+        reduce_int_side(&h.negative_spans, &h.negative_buckets, shift)?;
     h.schema = target_schema;
+    Ok(())
 }
 
 fn reduce_int_side(
     spans: &[HistogramSpan],
     buckets: &[i64],
     shift: u32,
-) -> (Vec<HistogramSpan>, Vec<i64>) {
+) -> Result<(Vec<HistogramSpan>, Vec<i64>), ChunkError> {
+    validate_spans_for_reduce(spans, buckets.len())?;
     if spans.is_empty() {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let mut it = BucketIterator::new(spans);
     let mut new_spans: Vec<HistogramSpan> = Vec::new();
@@ -1194,15 +1249,16 @@ fn reduce_int_side(
 
     for &d in buckets {
         let Some(orig_idx) = it.next_idx() else {
-            break;
+            return Err(ChunkError::InvalidChunk);
         };
         cur_abs = cur_abs.wrapping_add(d);
-        // Arithmetic right shift toward -inf: floor(orig_idx / 2^shift)
-        let target_idx = if shift >= 32 {
-            if orig_idx < 0 { -1 } else { 0 }
+        // Prometheus targetIdx: ((idx - 1) >> shift) + 1
+        let shifted = if shift >= 64 {
+            if orig_idx <= 0 { -1 } else { 0 }
         } else {
-            orig_idx >> shift
+            (i64::from(orig_idx) - 1) >> shift
         };
+        let target_idx = (shifted + 1) as i32;
         match acc_idx {
             Some(idx) if idx == target_idx => {
                 acc_count = acc_count.wrapping_add(cur_abs);
@@ -1235,7 +1291,7 @@ fn reduce_int_side(
             &mut new_deltas,
         );
     }
-    (new_spans, new_deltas)
+    Ok((new_spans, new_deltas))
 }
 
 fn flush_int_bucket(
@@ -1313,7 +1369,7 @@ mod tests {
             positive_buckets: vec![i64::MAX, i64::MAX],
             ..Default::default()
         };
-        reduce_int_resolution(&mut h, super::super::EXPONENTIAL_SCHEMA_MAX);
+        reduce_int_resolution(&mut h, super::super::EXPONENTIAL_SCHEMA_MAX).unwrap();
         assert_eq!(h.schema, super::super::EXPONENTIAL_SCHEMA_MAX);
     }
 }

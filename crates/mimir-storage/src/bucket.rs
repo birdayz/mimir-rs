@@ -19,7 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::stream::FuturesUnordered;
+use futures::{StreamExt, TryStreamExt};
 use mimir_config::BucketConfig;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -691,53 +692,145 @@ impl BucketClient {
     }
 }
 
-/// `object_store` upload of a byte buffer or a file (files above 16 MiB are streamed with a
-/// multipart upload in 8 MiB parts).
+struct UploadAbortGuard(Option<Box<dyn object_store::MultipartUpload>>);
+
+impl Drop for UploadAbortGuard {
+    fn drop(&mut self) {
+        if let Some(mut upload) = self.0.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = upload.abort().await;
+                });
+            }
+        }
+    }
+}
+
+/// `object_store` upload of a byte buffer or a file (payloads above 16 MiB are streamed with a
+/// multipart upload using dynamically sized parts and 4-way concurrency).
 async fn store_upload(
     store: &Arc<dyn ObjectStore>,
     path: &ObjectPath,
     source: s3::UploadSource,
 ) -> Result<(), BucketError> {
     const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
-    const CHUNK_SIZE: usize = 8 * 1024 * 1024;
-    let (src_path, len) = match source {
-        s3::UploadSource::Bytes(data) => {
-            store.put(path, PutPayload::from_bytes(data)).await?;
-            return Ok(());
-        }
-        s3::UploadSource::File { path, len } => (path, len),
+    const BASE_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+    const MAX_PARTS: u64 = 10_000;
+    const PART_CONCURRENCY: usize = 4;
+
+    let len = match &source {
+        s3::UploadSource::Bytes(data) => data.len() as u64,
+        s3::UploadSource::File { len, .. } => *len,
     };
     if len <= MULTIPART_THRESHOLD {
-        let data = tokio::fs::read(&src_path).await?;
-        store.put(path, PutPayload::from_bytes(Bytes::from(data))).await?;
+        let data = match source {
+            s3::UploadSource::Bytes(data) => data,
+            s3::UploadSource::File { path: src_path, .. } => {
+                Bytes::from(tokio::fs::read(&src_path).await?)
+            }
+        };
+        store.put(path, PutPayload::from_bytes(data)).await?;
         return Ok(());
     }
-    let mut file = tokio::fs::File::open(&src_path).await?;
-    let mut upload = store.put_multipart(path).await?;
-    let mut buf = vec![0u8; CHUNK_SIZE];
-    loop {
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            match file.read(&mut buf[filled..]).await {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) => {
-                    let _ = upload.abort().await;
-                    return Err(BucketError::Io(e));
+
+    let chunk_size = BASE_CHUNK_SIZE.max(len.div_ceil(MAX_PARTS) as usize);
+    let upload = store.put_multipart(path).await?;
+    let mut guard = UploadAbortGuard(Some(upload));
+    let mut in_flight: FuturesUnordered<object_store::UploadPart> = FuturesUnordered::new();
+
+    match source {
+        s3::UploadSource::Bytes(data) => {
+            let mut off = 0usize;
+            while off < data.len() {
+                let end = (off + chunk_size).min(data.len());
+                let chunk = data.slice(off..end);
+                off = end;
+                let Some(upload_ref) = guard.0.as_mut() else {
+                    return Err(BucketError::Config("multipart upload missing".into()));
+                };
+                let fut = upload_ref.put_part(PutPayload::from_bytes(chunk));
+                in_flight.push(fut);
+                if in_flight.len() >= PART_CONCURRENCY {
+                    if let Some(Err(e)) = in_flight.next().await {
+                        if let Some(mut u) = guard.0.take() {
+                            let _ = u.abort().await;
+                        }
+                        return Err(BucketError::Store(e));
+                    }
                 }
             }
         }
-        if filled == 0 {
-            break;
+        s3::UploadSource::File { path: src_path, .. } => {
+            let mut file = match tokio::fs::File::open(&src_path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    if let Some(mut u) = guard.0.take() {
+                        let _ = u.abort().await;
+                    }
+                    return Err(BucketError::Io(e));
+                }
+            };
+            let mut buf = vec![0u8; chunk_size];
+            loop {
+                let mut filled = 0usize;
+                while filled < buf.len() {
+                    match file.read(&mut buf[filled..]).await {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) => {
+                            if let Some(mut u) = guard.0.take() {
+                                let _ = u.abort().await;
+                            }
+                            return Err(BucketError::Io(e));
+                        }
+                    }
+                }
+                if filled == 0 {
+                    break;
+                }
+                let chunk = Bytes::copy_from_slice(&buf[..filled]);
+                let Some(upload_ref) = guard.0.as_mut() else {
+                    return Err(BucketError::Config("multipart upload missing".into()));
+                };
+                let fut = upload_ref.put_part(PutPayload::from_bytes(chunk));
+                in_flight.push(fut);
+                if in_flight.len() >= PART_CONCURRENCY {
+                    if let Some(Err(e)) = in_flight.next().await {
+                        if let Some(mut u) = guard.0.take() {
+                            let _ = u.abort().await;
+                        }
+                        return Err(BucketError::Store(e));
+                    }
+                }
+            }
         }
-        let chunk = Bytes::copy_from_slice(&buf[..filled]);
-        if let Err(e) = upload.put_part(PutPayload::from_bytes(chunk)).await {
-            let _ = upload.abort().await;
+    }
+
+    while let Some(res) = in_flight.next().await {
+        if let Err(e) = res {
+            if let Some(mut u) = guard.0.take() {
+                let _ = u.abort().await;
+            }
             return Err(BucketError::Store(e));
         }
     }
-    upload.complete().await?;
-    Ok(())
+
+    let Some(upload_ref) = guard.0.as_mut() else {
+        return Err(BucketError::Config("multipart upload missing".into()));
+    };
+    let res = upload_ref.complete().await;
+    match res {
+        Ok(_) => {
+            guard.0 = None;
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(mut u) = guard.0.take() {
+                let _ = u.abort().await;
+            }
+            Err(BucketError::Store(e))
+        }
+    }
 }
 
 /// Ported from `TenantDeletionMark` in `pkg/storage/tsdb/tenant_deletion_mark.go`.

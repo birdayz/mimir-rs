@@ -56,6 +56,14 @@ mod ulid_serde {
     }
 }
 
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 mod ulid_vec_serde {
     use super::*;
 
@@ -69,7 +77,7 @@ mod ulid_vec_serde {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<Ulid>, D::Error> {
-        let strs = Vec::<String>::deserialize(de)?;
+        let strs = Option::<Vec<String>>::deserialize(de)?.unwrap_or_default();
         strs.into_iter()
             .map(|s| Ulid::from_string(&s).map_err(serde::de::Error::custom))
             .collect()
@@ -80,17 +88,17 @@ mod ulid_vec_serde {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockStats {
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_zero_u64")]
     pub num_samples: u64,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_zero_u64")]
     pub num_float_samples: u64,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_zero_u64")]
     pub num_histogram_samples: u64,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_zero_u64")]
     pub num_series: u64,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_zero_u64")]
     pub num_chunks: u64,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_zero_u64")]
     pub num_tombstones: u64,
 }
 
@@ -122,16 +130,17 @@ pub struct BlockDesc {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockMetaCompaction {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub level: i32,
     #[serde(default, skip_serializing_if = "Vec::is_empty", with = "ulid_vec_serde")]
     pub sources: Vec<Ulid>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_false")]
     pub deletable: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<BlockDesc>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_false")]
     pub failed: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "Vec::is_empty")]
     pub hints: Vec<String>,
 }
 
@@ -176,14 +185,16 @@ impl BlockMetaCompaction {
 /// Thanos downsample metadata (`block.ThanosDownsample`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThanosDownsample {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub resolution: i64,
 }
 
 /// Thanos file entry (`block.File`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThanosFile {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub rel_path: String,
-    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_zero_i64")]
     pub size_bytes: i64,
 }
 
@@ -194,17 +205,17 @@ fn is_zero_i64(v: &i64) -> bool {
 /// Thanos extension in `meta.json` (`block.ThanosMeta`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThanosMeta {
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "is_zero_i32")]
     pub version: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub labels: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub downsample: ThanosDownsample,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub source: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "Vec::is_empty")]
     pub segment_files: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<ThanosFile>,
 }
 
@@ -221,11 +232,12 @@ pub struct BlockMeta {
     pub min_time: i64,
     #[serde(rename = "maxTime")]
     pub max_time: i64,
-    #[serde(default, skip_serializing_if = "BlockStats::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "BlockStats::is_empty")]
     pub stats: BlockStats,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub compaction: BlockMetaCompaction,
     pub version: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub out_of_order: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thanos: Option<ThanosMeta>,

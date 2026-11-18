@@ -8,8 +8,9 @@ use crate::chunkenc::histogram_model::{
     is_custom_buckets_schema, is_known_schema, CounterResetHint, FloatHistogram, Histogram,
     HistogramSpan, EXPONENTIAL_SCHEMA_MAX, EXPONENTIAL_SCHEMA_MAX_RESERVED,
 };
-use crate::chunkenc::histogram::{reduce_int_resolution};
-use crate::chunkenc::float_histogram::{reduce_float_resolution};
+use crate::chunkenc::float_histogram::reduce_float_resolution;
+use crate::chunkenc::histogram::reduce_int_resolution;
+use crate::chunkenc::ChunkError;
 use crate::encoding::{Decbuf, Encbuf, EncodingError};
 use crate::labels::Labels;
 
@@ -28,6 +29,8 @@ pub enum RecordError {
     InvalidType { found: u8, expected: &'static str },
     #[error("unexpected {remaining} trailing bytes in record")]
     TrailingBytes { remaining: usize },
+    #[error("invalid histogram record: {0}")]
+    Chunk(#[from] ChunkError),
 }
 
 /// WAL / WBL / Checkpoint record type tag (`tsdb/record/record.go`).
@@ -503,7 +506,7 @@ impl RecordDecoder {
                 continue;
             }
             if h.schema > EXPONENTIAL_SCHEMA_MAX && h.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED {
-                reduce_int_resolution(&mut h, EXPONENTIAL_SCHEMA_MAX);
+                reduce_int_resolution(&mut h, EXPONENTIAL_SCHEMA_MAX)?;
             }
             out.push(RefHistogramSample {
                 ref_id: base_ref.wrapping_add(dref as u64),
@@ -547,7 +550,7 @@ impl RecordDecoder {
                 continue;
             }
             if h.schema > EXPONENTIAL_SCHEMA_MAX && h.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED {
-                reduce_int_resolution(&mut h, EXPONENTIAL_SCHEMA_MAX);
+                reduce_int_resolution(&mut h, EXPONENTIAL_SCHEMA_MAX)?;
             }
             out.push(RefHistogramSample { ref_id, st, t, h });
         }
@@ -599,7 +602,7 @@ impl RecordDecoder {
                 continue;
             }
             if fh.schema > EXPONENTIAL_SCHEMA_MAX && fh.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED {
-                reduce_float_resolution(&mut fh, EXPONENTIAL_SCHEMA_MAX);
+                reduce_float_resolution(&mut fh, EXPONENTIAL_SCHEMA_MAX)?;
             }
             out.push(RefFloatHistogramSample {
                 ref_id: base_ref.wrapping_add(dref as u64),
@@ -643,7 +646,7 @@ impl RecordDecoder {
                 continue;
             }
             if fh.schema > EXPONENTIAL_SCHEMA_MAX && fh.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED {
-                reduce_float_resolution(&mut fh, EXPONENTIAL_SCHEMA_MAX);
+                reduce_float_resolution(&mut fh, EXPONENTIAL_SCHEMA_MAX)?;
             }
             out.push(RefFloatHistogramSample { ref_id, st, t, fh });
         }
@@ -679,7 +682,25 @@ pub fn decode_labels(dec: &mut Decbuf<'_>) -> Result<Labels, EncodingError> {
         let value = dec.uvarint_str()?;
         pairs.push((name, value));
     }
-    Ok(Labels::from_sorted_slice(&pairs))
+    if pairs.windows(2).all(|w| w[0].0 < w[1].0) && pairs.iter().all(|(_, v)| !v.is_empty()) {
+        return Ok(Labels::from_sorted_slice(&pairs));
+    }
+    // Canonicalize: sort by label name (stable so last duplicate wins, matching Go
+    // labels.Builder), deduplicate keeping last, and drop empty values.
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut deduped: smallvec::SmallVec<[(&str, &str); 24]> =
+        smallvec::SmallVec::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        if let Some(last) = deduped.last_mut() {
+            if last.0 == name {
+                last.1 = value;
+                continue;
+            }
+        }
+        deduped.push((name, value));
+    }
+    deduped.retain(|(_, v)| !v.is_empty());
+    Ok(Labels::from_sorted_slice(&deduped))
 }
 
 pub fn encode_labels(buf: &mut Encbuf, labels: &Labels) {

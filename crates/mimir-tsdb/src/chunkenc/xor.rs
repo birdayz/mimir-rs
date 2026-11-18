@@ -267,7 +267,7 @@ impl<'a> XorIterator<'a> {
                 br: BitReader::new(&[]),
                 num_total: 0,
                 num_read: 0,
-                leading: 0xff,
+                leading: 0,
                 trailing: 0,
                 t: i64::MIN,
                 val: 0.0,
@@ -279,7 +279,7 @@ impl<'a> XorIterator<'a> {
             br: BitReader::new(&b[CHUNK_HEADER_SIZE..]),
             num_total,
             num_read: 0,
-            leading: 0xff,
+            leading: 0,
             trailing: 0,
             t: i64::MIN,
             val: 0.0,
@@ -517,9 +517,11 @@ mod tests {
         }
 
         let mut c_ref = XorChunk::new();
-        for &(ts, val) in &samples {
+        {
             let mut app = c_ref.appender().unwrap();
-            app.append(0, ts, val).unwrap();
+            for &(ts, val) in &samples {
+                app.append(0, ts, val).unwrap();
+            }
         }
 
         let mut c_fast = XorChunk::new();
@@ -537,8 +539,11 @@ mod tests {
 
         // Cold recovery after loading raw bytes with invalid state
         let mut c_ref2 = XorChunk::new();
-        for &(ts, val) in &samples[..150] {
-            c_ref2.appender().unwrap().append(0, ts, val).unwrap();
+        {
+            let mut app = c_ref2.appender().unwrap();
+            for &(ts, val) in &samples[..150] {
+                app.append(0, ts, val).unwrap();
+            }
         }
         let mut c_cold2 = XorChunk::from_bytes(c_ref2.as_bytes().to_vec());
         let mut cold_state = XorAppendState::default(); // valid == false
@@ -562,8 +567,11 @@ mod tests {
             (1_000 + huge_step * 2 + 15_000, 4.0),
         ];
         let mut c_huge_ref = XorChunk::new();
-        for &(ts, val) in &large_samples {
-            c_huge_ref.appender().unwrap().append(0, ts, val).unwrap();
+        {
+            let mut app = c_huge_ref.appender().unwrap();
+            for &(ts, val) in &large_samples {
+                app.append(0, ts, val).unwrap();
+            }
         }
         let mut c_huge_fast = XorChunk::new();
         let mut h_state = XorAppendState::new_empty();
@@ -600,7 +608,7 @@ mod tests {
         assert!(it.next_sample().is_ok()); // sample 0
         assert!(matches!(it.next_sample(), Err(ChunkError::InvalidChunk)));
 
-        // Also test ctrl '10' before leading/trailing is initialized (leading == 0xff).
+        // Ctrl '10' with truncated 64-bit payload when leading=0, trailing=0 returns UnexpectedEof.
         let mut bs2 = BitStream::new();
         bs2.write_byte(0);
         bs2.write_byte(2);
@@ -608,10 +616,26 @@ mod tests {
         bs2.write_bits(1.0f64.to_bits(), 64);
         bs2.write_uvarint(10);
         bs2.write_bit(true);
-        bs2.write_bit(false); // ctrl '10' with leading == 0xff
+        bs2.write_bit(false); // ctrl '10' expecting 64 bits (leading=0, trailing=0)
         let chunk2 = XorChunk::from_bytes(bs2.into_bytes());
         let mut it2 = chunk2.iter();
         assert!(it2.next_sample().is_ok());
-        assert!(matches!(it2.next_sample(), Err(ChunkError::InvalidChunk)));
+        assert!(matches!(it2.next_sample(), Err(ChunkError::UnexpectedEof)));
+
+        // Ctrl '10' with full 64-bit payload (matching Go reopened constant-prefix chunk) succeeds.
+        let mut bs3 = BitStream::new();
+        bs3.write_byte(0);
+        bs3.write_byte(2);
+        bs3.write_varint(100);
+        bs3.write_bits(1.0f64.to_bits(), 64);
+        bs3.write_uvarint(10);
+        bs3.write_bit(true);
+        bs3.write_bit(false); // ctrl '10' reusing leading=0, trailing=0 (mb=64)
+        bs3.write_bits(1.0f64.to_bits() ^ 2.5f64.to_bits(), 64);
+        let chunk3 = XorChunk::from_bytes(bs3.into_bytes());
+        let mut it3 = chunk3.iter();
+        assert_eq!(it3.next_sample().unwrap(), Some((100, 1.0)));
+        assert_eq!(it3.next_sample().unwrap(), Some((110, 2.5)));
+        assert_eq!(it3.next_sample().unwrap(), None);
     }
 }

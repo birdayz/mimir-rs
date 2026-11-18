@@ -746,7 +746,6 @@ impl<'a> Xor2Iterator<'a> {
             }
             if self.first_st_known {
                 let st_diff = self.br.read_varint()?;
-                self.st_diff = st_diff;
                 self.st = t.wrapping_sub(st_diff);
             }
             self.num_read += 1;

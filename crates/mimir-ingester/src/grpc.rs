@@ -941,10 +941,11 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         Box::pin(async move {
                             let user_id = tenant_from_req(&ingester, &request)?;
                             let (md, ext, inner) = request.into_parts();
+                            let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
                             let act = ingester.insert_activity(|| {
                                 request_activity(
                                     &user_id,
-                                    "",
+                                    &trace_id,
                                     "Ingester/QueryStream",
                                     ActivityRequest::Query(&inner),
                                 )
@@ -1183,10 +1184,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<Self::QueryStreamStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/QueryStream",
                 ActivityRequest::Query(&inner),
             )
@@ -1208,10 +1210,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::ExemplarQueryResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/QueryExemplars",
                 ActivityRequest::None,
             )
@@ -1230,10 +1233,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::LabelValuesResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/LabelValues",
                 ActivityRequest::None,
             )
@@ -1252,10 +1256,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::LabelNamesResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/LabelNames",
                 ActivityRequest::None,
             )
@@ -1274,10 +1279,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::UserStatsResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/UserStats",
                 ActivityRequest::None,
             )
@@ -1297,8 +1303,9 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         // Not per-tenant, but still behind the gRPC auth middleware.
         org_id_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
-            request_activity("", "", "Ingester/AllUserStats", ActivityRequest::None)
+            request_activity("", &trace_id, "Ingester/AllUserStats", ActivityRequest::None)
         });
         let resp = self
             .ingester
@@ -1314,10 +1321,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::MetricsForLabelMatchersResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/MetricsForLabelMatchers",
                 ActivityRequest::None,
             )
@@ -1336,10 +1344,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<ingesterpb::MetricsMetadataResponse>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/MetricsMetadata",
                 ActivityRequest::MetricsMetadata(&inner),
             )
@@ -1362,10 +1371,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<Self::LabelNamesAndValuesStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/LabelNamesAndValues",
                 ActivityRequest::None,
             )
@@ -1395,10 +1405,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<Self::LabelValuesCardinalityStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/LabelValuesCardinality",
                 ActivityRequest::LabelValuesCardinality(&inner),
             )
@@ -1423,10 +1434,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
     ) -> Result<Response<Self::ActiveSeriesStream>, Status> {
         let user_id = tenant_from_req(&self.ingester, &request)?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/ActiveSeries",
                 ActivityRequest::None,
             )
@@ -1458,10 +1470,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/SearchLabelNames",
                 ActivityRequest::None,
             )
@@ -1493,10 +1506,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
+        let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let act = self.ingester.insert_activity(|| {
             request_activity(
                 &user_id,
-                "",
+                &trace_id,
                 "Ingester/SearchLabelValues",
                 ActivityRequest::None,
             )

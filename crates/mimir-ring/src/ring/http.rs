@@ -6,18 +6,24 @@
 //! - Go `net/http` `Request.ParseForm` / `Request.FormValue` / `http.Error`, `net/url.ParseQuery`
 //!   and `mime.ParseMediaType` (shared by every admin handler that reads Go form values)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use axum::extract::{Request, State};
+use axum::extract::{RawQuery, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::Router;
+use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 use mimir_common::logging::format_rfc3339_nano_utc;
 use mimir_proto::ringpb::{Desc, InstanceDesc};
 use serde::{Deserialize, Serialize};
+
+use crate::kv::memberlist::gofmt::{
+    format_go_time_string, format_rfc3339_nano, format_time_millis, go_zero_time, GoJson,
+};
 
 use super::model::{DescExt, InstanceDescExt};
 use super::replication_strategy::REPORTING;
@@ -51,8 +57,8 @@ pub struct IngesterHttpDesc {
     pub read_only_updated_timestamp: String,
     pub zone: String,
     pub tokens: Vec<u32>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub versions: HashMap<u64, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub versions: BTreeMap<u64, u64>,
 }
 
 #[derive(Deserialize)]
@@ -97,18 +103,20 @@ pub fn ring_router(ring: Arc<Ring>, config: StatusPageConfig) -> Router {
     let state = RingPageState { ring, config };
     Router::new()
         .route("/ingester/ring", get(handle_ring_get).post(handle_ring_post))
-        .route("/ring", get(handle_ring_get).post(handle_ring_post))
         .with_state(state)
 }
 
 pub async fn handle_ring_get(
     State(state): State<RingPageState>,
     headers: HeaderMap,
-    axum::extract::Query(query): axum::extract::Query<RingQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
     let desc = state.ring.desc_snapshot();
     let hb_timeout = state.ring.heartbeat_timeout();
     let now = SystemTime::now();
+    let now_local = chrono::DateTime::<Utc>::from(now)
+        .with_timezone(&chrono::Local)
+        .fixed_offset();
     let owned_tokens = desc.count_tokens();
 
     let mut ids: Vec<String> = desc.ingesters.keys().cloned().collect();
@@ -126,18 +134,18 @@ pub async fn handle_ring_get(
             id: id.clone(),
             state: st_str,
             address: ing.addr.clone(),
-            timestamp: format_unix_secs_rfc3339(ing.timestamp),
+            timestamp: format_unix_secs_rfc3339_utc(ing.timestamp),
             registered_timestamp: ing
                 .get_registered_at()
                 .map(format_rfc3339_nano_utc)
-                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
+                .unwrap_or_else(|| "0001-01-01T00:00:00Z".to_string()),
             read_only: ro,
             read_only_updated_timestamp: ro_ts
                 .map(format_rfc3339_nano_utc)
                 .unwrap_or_else(|| "0001-01-01T00:00:00Z".to_string()),
             zone: ing.zone.clone(),
             tokens: ing.tokens.clone(),
-            versions: ing.versions.clone(),
+            versions: ing.versions.iter().map(|(&k, &v)| (k, v)).collect(),
         });
     }
 
@@ -146,16 +154,28 @@ pub async fn handle_ring_get(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if accept.contains("application/json") {
-        let resp = RingHttpResponse {
-            shards,
-            now: format_rfc3339_nano_utc(now),
+        let json_shards = if shards.is_empty() {
+            GoJson::Null
+        } else {
+            GoJson::Array(shards.iter().map(ingester_desc_to_go_json).collect())
         };
-        return Json(resp).into_response();
+        let body = GoJson::Object(vec![
+            ("shards".to_string(), json_shards),
+            ("now".to_string(), GoJson::time(&now_local)),
+        ])
+        .encode();
+        return ([(header::CONTENT_TYPE, "application/json")], body).into_response();
     }
 
-    let show_tokens = query.tokens.as_deref() == Some("true");
-    let html = render_ring_html(&shards, &owned_tokens, now, show_tokens, &state.config, &desc);
-    Html(html).into_response()
+    let mut query_values = HashMap::new();
+    let _ = go_parse_query(&mut query_values, raw_query.as_deref().unwrap_or(""));
+    let show_tokens = query_values
+        .get("tokens")
+        .and_then(|v| v.first())
+        .map(String::as_str)
+        == Some("true");
+    let html = render_ring_html(&shards, &owned_tokens, now, now_local, show_tokens, &state.config, &desc);
+    ([(header::CONTENT_TYPE, "text/html")], html).into_response()
 }
 
 /// Go `ringPageHandler.handle` for `POST`: `req.FormValue("forget")` (URL query merged with an
@@ -205,101 +225,248 @@ pub async fn handle_ring_post(State(state): State<RingPageState>, req: Request) 
     }
 }
 
-fn format_unix_secs_rfc3339(secs: i64) -> String {
-    if secs <= 0 {
-        return "1970-01-01T00:00:00Z".to_string();
+fn format_unix_secs_rfc3339_utc(secs: i64) -> String {
+    match DateTime::<Utc>::from_timestamp(secs, 0) {
+        Some(dt) => format_rfc3339_nano(&dt.fixed_offset()),
+        None => "0001-01-01T00:00:00Z".to_string(),
     }
-    format_rfc3339_nano_utc(std::time::UNIX_EPOCH + Duration::from_secs(secs as u64))
+}
+
+fn ingester_desc_to_go_json(d: &IngesterHttpDesc) -> GoJson {
+    let tokens = if d.tokens.is_empty() {
+        GoJson::Null
+    } else {
+        GoJson::Array(d.tokens.iter().map(|&t| GoJson::int(i128::from(t))).collect())
+    };
+    let mut fields = vec![
+        ("id".to_string(), GoJson::str(&d.id)),
+        ("state".to_string(), GoJson::str(&d.state)),
+        ("address".to_string(), GoJson::str(&d.address)),
+        ("timestamp".to_string(), GoJson::str(&d.timestamp)),
+        ("registered_timestamp".to_string(), GoJson::str(&d.registered_timestamp)),
+        ("read_only".to_string(), GoJson::Bool(d.read_only)),
+        (
+            "read_only_updated_timestamp".to_string(),
+            GoJson::str(&d.read_only_updated_timestamp),
+        ),
+        ("zone".to_string(), GoJson::str(&d.zone)),
+        ("tokens".to_string(), tokens),
+    ];
+    if !d.versions.is_empty() {
+        let entries = d
+            .versions
+            .iter()
+            .map(|(k, v)| (k.to_string(), GoJson::int(i128::from(*v))))
+            .collect();
+        fields.push(("versions".to_string(), GoJson::sorted_map(entries)));
+    }
+    GoJson::Object(fields)
+}
+
+/// Go `fmt.Sprintf("%.3g", f)` for finite non-negative percentages.
+pub(crate) fn go_format_g3(f: f64) -> String {
+    if !f.is_finite() {
+        return if f.is_nan() { "NaN" } else { "+Inf" }.to_string();
+    }
+    if f == 0.0 {
+        return "0".to_string();
+    }
+    let abs = f.abs();
+    let exp = abs.log10().floor() as i32;
+    let factor = 10f64.powi(2 - exp);
+    let rounded = (abs * factor).round() / factor;
+    let rounded_exp = rounded.log10().floor() as i32;
+    let sign = if f.is_sign_negative() { "-" } else { "" };
+    if !(-4..3).contains(&rounded_exp) {
+        let mant = rounded / 10f64.powi(rounded_exp);
+        let s = format!("{mant:.2}");
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        let esign = if rounded_exp < 0 { '-' } else { '+' };
+        format!("{sign}{s}e{esign}{:02}", rounded_exp.unsigned_abs())
+    } else {
+        let dec = (2 - rounded_exp).max(0) as usize;
+        let s = format!("{rounded:.dec$}");
+        let s = if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            s.as_str()
+        };
+        format!("{sign}{s}")
+    }
+}
+
+/// Go `time.Since(t).Truncate(time.Second).String()`.
+fn go_duration_since(now: SystemTime, t: DateTime<FixedOffset>) -> String {
+    let now_dt = DateTime::<Utc>::from(now);
+    let diff = now_dt.signed_duration_since(t.with_timezone(&Utc));
+    let total_secs = diff.num_seconds();
+    if total_secs == 0 {
+        return "0s".to_string();
+    }
+    let sign = if total_secs < 0 { "-" } else { "" };
+    let mut rem = total_secs.unsigned_abs();
+    let h = rem / 3600;
+    rem %= 3600;
+    let m = rem / 60;
+    let s = rem % 60;
+    let mut out = String::from(sign);
+    if h > 0 {
+        let _ = write!(out, "{h}h{m}m{s}s");
+    } else if m > 0 {
+        let _ = write!(out, "{m}m{s}s");
+    } else {
+        let _ = write!(out, "{s}s");
+    }
+    out
+}
+
+fn time_or_empty_string_unix(secs: i64) -> String {
+    if secs <= 0 {
+        return String::new();
+    }
+    let Some(dt) = DateTime::<Utc>::from_timestamp(secs, 0) else {
+        return String::new();
+    };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    )
+}
+
+fn utc_from_unix_or_zero(secs: i64) -> DateTime<FixedOffset> {
+    if secs == 0 {
+        return go_zero_time();
+    }
+    DateTime::<Utc>::from_timestamp(secs, 0)
+        .map(|d| d.fixed_offset())
+        .unwrap_or_else(go_zero_time)
 }
 
 fn render_ring_html(
     shards: &[IngesterHttpDesc],
     owned_tokens: &HashMap<String, i64>,
     now: SystemTime,
+    now_local: DateTime<FixedOffset>,
     show_tokens: bool,
     config: &StatusPageConfig,
     desc: &Desc,
 ) -> String {
     let mut out = String::from(
-        "<!DOCTYPE html>\n<html>\n<head><meta charset=\"UTF-8\"><title>Ring Status</title></head>\n<body>\n<h1>Ring Status</h1>\n",
+        "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"UTF-8\">\n    <title>Ring Status</title>\n</head>\n<body>\n<h1>Ring Status</h1>\n",
     );
-    out.push_str(&format!("<p>Current time: {}</p>\n", format_rfc3339_nano_utc(now)));
+    out.push_str(&format!(
+        "<p>Current time: {}</p>\n",
+        html_escape(&format_go_time_string(&now_local))
+    ));
     out.push_str("<form action=\"\" method=\"POST\">\n");
-    out.push_str("<table width=\"100%\" border=\"1\">\n<thead><tr>\n");
-    out.push_str("<th>Instance ID</th><th>Availability Zone</th><th>State</th><th>Address</th><th>Registered At</th><th>Read-Only</th><th>Read-Only Updated</th><th>Last Heartbeat</th>");
+    out.push_str("    <input type=\"hidden\" name=\"csrf_token\" value=\"$__CSRF_TOKEN_PLACEHOLDER__\">\n");
+    out.push_str("    <table width=\"100%\" border=\"1\">\n        <thead>\n        <tr>\n");
+    out.push_str("            <th>Instance ID</th>\n            <th>Availability Zone</th>\n            <th>State</th>\n            <th>Address</th>\n            <th>Registered At</th>\n            <th>Read-Only</th>\n            <th>Read-Only Updated</th>\n            <th>Last Heartbeat</th>\n");
     if !config.hide_tokens_ui_elements {
-        out.push_str("<th>Tokens</th><th>Ownership</th>");
+        out.push_str("            <th>Tokens</th>\n            <th>Ownership</th>\n");
     }
     if config.show_versions {
-        out.push_str("<th>Versions</th>");
+        out.push_str("            <th>Versions</th>\n");
     }
-    out.push_str("<th>Actions</th></tr></thead>\n<tbody>\n");
+    out.push_str("            <th>Actions</th>\n        </tr>\n        </thead>\n        <tbody>\n");
 
     for (i, s) in shards.iter().enumerate() {
+        let ing_raw = desc.ingesters.get(&s.id);
+        let reg_ts = ing_raw.map_or(0, |d| d.registered_timestamp);
+        let hb_ts = ing_raw.map_or(0, |d| d.timestamp);
+        let ro_ts = ing_raw.map_or(0, |d| d.read_only_updated_timestamp);
+
         let row_attr = if i % 2 == 0 { "" } else { " bgcolor=\"#BEBEBE\"" };
-        out.push_str(&format!("<tr{row_attr}>"));
+        out.push_str(&format!("            <tr{row_attr}>\n"));
         let link_html = config
             .instance_link
             .as_ref()
-            .and_then(|f| desc.ingesters.get(&s.id).map(|d| f(&s.id, d)))
+            .and_then(|f| ing_raw.map(|d| f(&s.id, d)))
             .filter(|l| !l.is_empty());
         match link_html {
             Some(l) => out.push_str(&format!(
-                "<td><a href=\"{}\">{}</a></td>",
+                "            <td><a href=\"{}\">{}</a></td>\n",
                 html_url_attr_escape(&l),
                 html_escape(&s.id)
             )),
-            None => out.push_str(&format!("<td>{}</td>", html_escape(&s.id))),
+            None => out.push_str(&format!("            <td>{}</td>\n", html_escape(&s.id))),
         }
-        out.push_str(&format!("<td>{}</td>", html_escape(&s.zone)));
-        out.push_str(&format!("<td>{}</td>", html_escape(&s.state)));
-        out.push_str(&format!("<td>{}</td>", html_escape(&s.address)));
-        out.push_str(&format!("<td>{}</td>", html_escape(&s.registered_timestamp)));
-        out.push_str(&format!("<td>{}</td>", s.read_only));
-        out.push_str(&format!("<td>{}</td>", html_escape(&s.read_only_updated_timestamp)));
-        out.push_str(&format!("<td>{}</td>", html_escape(&s.timestamp)));
+        out.push_str(&format!("            <td>{}</td>\n", html_escape(&s.zone)));
+        out.push_str(&format!("            <td>{}</td>\n", html_escape(&s.state)));
+        out.push_str(&format!("            <td>{}</td>\n", html_escape(&s.address)));
+        out.push_str(&format!(
+            "            <td>{}</td>\n",
+            html_escape(&time_or_empty_string_unix(reg_ts))
+        ));
+        out.push_str(&format!("            <td>{}</td>\n", s.read_only));
+        if s.read_only {
+            let dt = if ro_ts > 0 { utc_from_unix_or_zero(ro_ts) } else { go_zero_time() };
+            out.push_str(&format!(
+                "            <td>{} ago ({})</td>\n",
+                go_duration_since(now, dt),
+                format_time_millis(&dt)
+            ));
+        } else {
+            let empty_or_ts = if ro_ts > 0 { time_or_empty_string_unix(ro_ts) } else { String::new() };
+            out.push_str(&format!("            <td>{}</td>\n", html_escape(&empty_or_ts)));
+        }
+        let hb_dt = utc_from_unix_or_zero(hb_ts);
+        out.push_str(&format!(
+            "            <td>{} ago ({})</td>\n",
+            go_duration_since(now, hb_dt),
+            format_time_millis(&hb_dt)
+        ));
         if !config.hide_tokens_ui_elements {
             let owned = owned_tokens.get(&s.id).copied().unwrap_or(0);
             let pct = (owned as f64 / u32::MAX as f64) * 100.0;
-            out.push_str(&format!("<td>{}</td><td>{:.3}%</td>", s.tokens.len(), pct));
+            out.push_str(&format!(
+                "            <td>{}</td>\n            <td>{}%</td>\n",
+                s.tokens.len(),
+                go_format_g3(pct)
+            ));
         }
         if config.show_versions {
-            out.push_str("<td>");
+            out.push_str("            <td>\n");
             for (k, v) in &s.versions {
                 if let Some(cname) = config.component_names.get(k) {
-                    out.push_str(&format!("{k} ({}): v{v}<br/>", html_escape(cname)));
+                    out.push_str(&format!("              {k} ({}): v{v}<br/>\n", html_escape(cname)));
                 } else {
-                    out.push_str(&format!("{k}: v{v}<br/>"));
+                    out.push_str(&format!("              {k}: v{v}<br/>\n"));
                 }
             }
-            out.push_str("</td>");
+            out.push_str("            </td>\n");
         }
         out.push_str(&format!(
-            "<td><button name=\"forget\" value=\"{}\" type=\"submit\">Forget</button></td></tr>\n",
+            "            <td>\n                <button name=\"forget\" value=\"{}\" type=\"submit\">Forget</button>\n            </td>\n            </tr>\n",
             html_escape(&s.id)
         ));
     }
-    out.push_str("</tbody></table><br>\n");
+    out.push_str("        </tbody>\n    </table>\n    <br>\n");
     if !config.hide_tokens_ui_elements {
         if show_tokens {
-            out.push_str("<input type=\"button\" value=\"Hide Tokens\" onclick=\"window.location.href = '?tokens=false'\"/>\n");
+            out.push_str("        <input type=\"button\" value=\"Hide Tokens\" onclick=\"window.location.href = '?tokens=false' \"/>\n");
             for s in shards {
-                out.push_str(&format!("<h2>Instance: {}</h2><p>Tokens:<br/>", html_escape(&s.id)));
+                out.push_str(&format!("        <h2>Instance: {}</h2>\n        <p>\n            Tokens:<br/>\n", html_escape(&s.id)));
                 for t in &s.tokens {
-                    out.push_str(&format!("{t} "));
+                    out.push_str(&format!("                {t}\n"));
                 }
-                out.push_str("</p>\n");
+                out.push_str("        </p>\n");
             }
         } else {
-            out.push_str("<input type=\"button\" value=\"Show Tokens\" onclick=\"window.location.href = '?tokens=true'\"/>\n");
+            out.push_str("        <input type=\"button\" value=\"Show Tokens\" onclick=\"window.location.href = '?tokens=true'\"/>\n");
         }
     }
-    out.push_str("</form></body></html>\n");
+    out.push_str("</form>\n</body>\n</html>\n");
     out
 }
 
 /// Go `html/template` `htmlEscaper` / `attrEscaper` (`htmlReplacementTable`).
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -841,17 +1008,20 @@ mod tests {
             read_only_updated_timestamp: String::new(),
             zone: String::new(),
             tokens: Vec::new(),
-            versions: HashMap::new(),
+            versions: BTreeMap::new(),
         };
         let shards = [shard("ingester-1"), shard("ingester-2")];
         let mut cfg = mimir_config::ingester::RingConfig {
             status_page_ingester_link_template: "http://{host}:8080/{ingester}/x?a=1&b=2".to_string(),
             ..Default::default()
         };
+        let now = SystemTime::now();
+        let now_local = chrono::DateTime::<Utc>::from(now).with_timezone(&chrono::Local).fixed_offset();
         let page = render_ring_html(
             &shards,
             &HashMap::new(),
-            SystemTime::now(),
+            now,
+            now_local,
             false,
             &super::super::to_status_page_config(&cfg),
             &desc,
@@ -870,7 +1040,8 @@ mod tests {
         let page = render_ring_html(
             &shards,
             &HashMap::new(),
-            SystemTime::now(),
+            now,
+            now_local,
             false,
             &super::super::to_status_page_config(&cfg),
             &desc,

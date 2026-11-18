@@ -184,10 +184,8 @@ impl HistogramStChunk {
             },
             None => self.appender()?,
         };
-        let out = app.append_histogram(prev, st, t, h, false)?;
-        if matches!(out, AppendHistogramStOutcome::Appended { .. }) {
-            *cached = Some((app.state, app.st_enc));
-        }
+        let (out, next_cached) = app.append_histogram_with_state(prev, st, t, h, false)?;
+        *cached = Some(next_cached);
         Ok(out)
     }
 }
@@ -289,6 +287,36 @@ impl<'a> HistogramStAppender<'a> {
         h: &Histogram,
         append_only: bool,
     ) -> Result<AppendHistogramStOutcome, ChunkError> {
+        let (out, _) = self.append_histogram_inner(prev, st, t, h, append_only, false)?;
+        Ok(out)
+    }
+
+    fn append_histogram_with_state(
+        &mut self,
+        prev: Option<&HistogramAppenderState>,
+        st: i64,
+        t: i64,
+        h: &Histogram,
+        append_only: bool,
+    ) -> Result<(AppendHistogramStOutcome, (HistogramAppenderState, StEncoder)), ChunkError> {
+        let (out, next_cached) = self.append_histogram_inner(prev, st, t, h, append_only, true)?;
+        let cached = match next_cached {
+            Some(c) => c,
+            None => (self.state.clone(), self.st_enc.clone()),
+        };
+        Ok((out, cached))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn append_histogram_inner(
+        &mut self,
+        prev: Option<&HistogramAppenderState>,
+        st: i64,
+        t: i64,
+        h: &Histogram,
+        append_only: bool,
+        return_new_state: bool,
+    ) -> Result<(AppendHistogramStOutcome, Option<(HistogramAppenderState, StEncoder)>), ChunkError> {
         let num_samples = self.chunk.num_samples();
         if num_samples == HISTOGRAM_ST_SAMPLE_COUNT_MASK as usize {
             return Err(ChunkError::CapacityExceeded);
@@ -299,7 +327,7 @@ impl<'a> HistogramStAppender<'a> {
             self.set_num_samples(new_num);
             if h.counter_reset_hint == CounterResetHint::GaugeType {
                 self.set_counter_reset_header(CounterResetHeader::GaugeType);
-                return Ok(AppendHistogramStOutcome::Appended { recoded: false });
+                return Ok((AppendHistogramStOutcome::Appended { recoded: false }, None));
             }
             if h.counter_reset_hint == CounterResetHint::CounterReset {
                 self.set_counter_reset_header(CounterResetHeader::CounterReset);
@@ -307,7 +335,7 @@ impl<'a> HistogramStAppender<'a> {
                 let (_, _, _, _, _, cr) = p.appendable(h);
                 self.set_counter_reset_header(cr);
             }
-            return Ok(AppendHistogramStOutcome::Appended { recoded: false });
+            return Ok((AppendHistogramStOutcome::Appended { recoded: false }, None));
         }
 
         let mut h_owned;
@@ -324,13 +352,14 @@ impl<'a> HistogramStAppender<'a> {
                     };
                 }
                 let mut new_chunk = HistogramStChunk::new();
-                {
+                let new_cached = {
                     let mut app = new_chunk.appender()?;
                     app.set_counter_reset_header(cr_hint);
                     let n = app.append_histogram_st(0, st, t, h);
                     app.set_num_samples(n);
-                }
-                return Ok(AppendHistogramStOutcome::NewChunk(new_chunk));
+                    return_new_state.then_some((app.state, app.st_enc))
+                };
+                return Ok((AppendHistogramStOutcome::NewChunk(new_chunk), new_cached));
             }
 
             if !p_bwd.is_empty() || !n_bwd.is_empty() {
@@ -355,12 +384,12 @@ impl<'a> HistogramStAppender<'a> {
                 self.recode_in_place(&p_fwd, &n_fwd, &h_ref.positive_spans, &h_ref.negative_spans)?;
                 let n = self.append_histogram_st(self.chunk.num_samples(), st, t, h_ref);
                 self.set_num_samples(n);
-                return Ok(AppendHistogramStOutcome::Appended { recoded: true });
+                return Ok((AppendHistogramStOutcome::Appended { recoded: true }, None));
             }
 
             let n = self.append_histogram_st(num_samples, st, t, h_ref);
             self.set_num_samples(n);
-            return Ok(AppendHistogramStOutcome::Appended { recoded: false });
+            return Ok((AppendHistogramStOutcome::Appended { recoded: false }, None));
         }
 
         // Gauge histogram
@@ -378,13 +407,14 @@ impl<'a> HistogramStAppender<'a> {
                 return Err(ChunkError::HistogramSchemaChange);
             }
             let mut new_chunk = HistogramStChunk::new();
-            {
+            let new_cached = {
                 let mut app = new_chunk.appender()?;
                 app.set_counter_reset_header(CounterResetHeader::GaugeType);
                 let n = app.append_histogram_st(0, st, t, h);
                 app.set_num_samples(n);
-            }
-            return Ok(AppendHistogramStOutcome::NewChunk(new_chunk));
+                return_new_state.then_some((app.state, app.st_enc))
+            };
+            return Ok((AppendHistogramStOutcome::NewChunk(new_chunk), new_cached));
         }
 
         if !p_bwd.is_empty() || !n_bwd.is_empty() {
@@ -407,12 +437,12 @@ impl<'a> HistogramStAppender<'a> {
             self.recode_in_place(&p_fwd, &n_fwd, &h_ref.positive_spans, &h_ref.negative_spans)?;
             let n = self.append_histogram_st(self.chunk.num_samples(), st, t, h_ref);
             self.set_num_samples(n);
-            return Ok(AppendHistogramStOutcome::Appended { recoded: true });
+            return Ok((AppendHistogramStOutcome::Appended { recoded: true }, None));
         }
 
         let n = self.append_histogram_st(num_samples, st, t, h_ref);
         self.set_num_samples(n);
-        Ok(AppendHistogramStOutcome::Appended { recoded: false })
+        Ok((AppendHistogramStOutcome::Appended { recoded: false }, None))
     }
 }
 

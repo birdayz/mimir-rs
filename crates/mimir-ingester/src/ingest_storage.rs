@@ -205,6 +205,7 @@ struct ShardMetadataItem {
     tenant_idx: u32,
     record_offset: i64,
     metric_type: i32,
+    trace_id_idx: u32,
     /// `[name_start, help_start, unit_start, unit_end)` offsets into `MetadataStash::bytes`.
     bounds: [u32; 4],
 }
@@ -218,6 +219,7 @@ struct WorkerArena {
     exemplars_arena: Vec<Result<(i64, f64, Labels, String), crate::errors::IngesterError>>,
     shard_buckets: Vec<Vec<ShardSeriesItem>>,
     metadata: MetadataStash,
+    trace_ids: Vec<String>,
     empty_tenant_errors: usize,
     invalid_tenant_indices: Vec<u32>,
     total_series: usize,
@@ -322,6 +324,7 @@ impl WorkerArena {
             exemplars_arena: Vec::new(),
             shard_buckets: (0..num_shards).map(|_| Vec::with_capacity(128)).collect(),
             metadata: MetadataStash::new(num_shards),
+            trace_ids: Vec::new(),
             empty_tenant_errors: 0,
             invalid_tenant_indices: Vec::new(),
             total_series: 0,
@@ -342,6 +345,7 @@ impl WorkerArena {
             b.clear();
         }
         self.metadata.reset_for(num_shards);
+        self.trace_ids.clear();
         self.empty_tenant_errors = 0;
         self.invalid_tenant_indices.clear();
         self.total_series = 0;
@@ -645,10 +649,15 @@ impl IngesterShardedBatchConsumer {
                 exemplars_arena,
                 shard_buckets,
                 metadata,
+                trace_ids,
                 empty_tenant_errors,
                 invalid_tenant_indices,
                 total_series,
             } = arena;
+            let propagators = mimir_common::tracing::global_tracing()
+                .map(|t| t.propagators.clone())
+                .unwrap_or_default();
+            let topic_name = &self.kafka_cfg.topic;
             let mut tmp_ex: Vec<Result<(i64, f64, Labels, String), crate::errors::IngesterError>> =
                 Vec::new();
             let mut bucket_bases = [0usize; 16];
@@ -662,6 +671,58 @@ impl IngesterShardedBatchConsumer {
                     invalid_tenant_indices.push(tenant_idx);
                     continue;
                 }
+
+                let rec_trace_idx = if rec.headers.is_empty() {
+                    u32::MAX
+                } else {
+                    let extracted = mimir_common::tracing::extract_from_headers(
+                        rec.headers.iter().filter_map(|(k, v)| {
+                            std::str::from_utf8(v).ok().map(|vs| (k.as_str(), vs))
+                        }),
+                        &propagators,
+                    );
+                    let (span_ctx, parent_span_id) =
+                        mimir_common::tracing::start_server_span_context(&extracted, false);
+                    if span_ctx.is_sampled() {
+                        if let Some(rt) = mimir_common::tracing::global_tracing() {
+                            if rt.exporter.is_some() {
+                                let now_ns = mimir_common::tracing::now_unix_nanos();
+                                mimir_common::tracing::export_span(
+                                    mimir_common::tracing::ExportedSpan {
+                                        service_name: rt.service_name.clone(),
+                                        trace_id: span_ctx.trace_id,
+                                        span_id: span_ctx.span_id,
+                                        parent_span_id,
+                                        name: format!("{topic_name} receive"),
+                                        kind: 5,
+                                        start_time_unix_nano: now_ns,
+                                        end_time_unix_nano: now_ns,
+                                        attributes: vec![
+                                            mimir_common::tracing::SpanAttribute {
+                                                key: "messaging.system".to_string(),
+                                                value: mimir_common::tracing::SpanAttrValue::String(
+                                                    "kafka".to_string(),
+                                                ),
+                                            },
+                                            mimir_common::tracing::SpanAttribute {
+                                                key: "messaging.destination.name".to_string(),
+                                                value: mimir_common::tracing::SpanAttrValue::String(
+                                                    topic_name.clone(),
+                                                ),
+                                            },
+                                        ],
+                                        status_error: false,
+                                    },
+                                );
+                            }
+                        }
+                        let idx = trace_ids.len() as u32;
+                        trace_ids.push(span_ctx.trace_id_hex());
+                        idx
+                    } else {
+                        u32::MAX
+                    }
+                };
 
                 let version = parse_record_version(
                     rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
@@ -770,6 +831,7 @@ impl IngesterShardedBatchConsumer {
                                         tenant_idx,
                                         record_offset: rec.offset,
                                         metric_type: 0,
+                                        trace_id_idx: rec_trace_idx,
                                         bounds: [0; 4],
                                     },
                                     rec_first_shard,
@@ -941,6 +1003,7 @@ impl IngesterShardedBatchConsumer {
                             tenant_idx,
                             record_offset: rec.offset,
                             metric_type: 0,
+                            trace_id_idx: rec_trace_idx,
                             bounds: [0; 4],
                         },
                         rec_first_shard,
@@ -1065,15 +1128,26 @@ impl IngesterShardedBatchConsumer {
                 m.batching_queue_metrics.flush_total.inc();
                 m.time_series_per_flush.observe(batch_vec.len() as f64);
 
+                let sampled_trace_id = metas.iter().find_map(|it| {
+                    (it.trace_id_idx != u32::MAX)
+                        .then(|| {
+                            arenas_ref
+                                .get(it.worker_idx as usize)
+                                .and_then(|a| a.trace_ids.get(it.trace_id_idx as usize))
+                                .map(String::as_str)
+                        })
+                        .flatten()
+                });
                 let proc_t0 = Instant::now();
                 let res = self
                     .ingester
-                    .ingest_prehashed_shard_batch(
+                    .ingest_prehashed_shard_batch_with_trace(
                         tenant_id,
                         norm_source,
                         min_ts,
                         batch_vec,
                         &meta_views,
+                        sampled_trace_id,
                     )
                     .map_err(ingester_err_to_pusher_err);
                 processing_hist.observe(proc_t0.elapsed().as_secs_f64());

@@ -34,7 +34,12 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use mimir_common::grpc_deadline;
 use mimir_common::grpc_log::{GrpcErrorLog, GrpcErrorLogEntry};
-use mimir_common::logging::{LogLevel, Logger};
+use mimir_common::logging::{LogLevel, LogValue, Logger};
+use mimir_common::tracing::{
+    export_span, extract_from_http_headers, global_tracing, now_unix_nanos,
+    start_server_span_context, with_trace_context, ExportedSpan, SpanAttrValue, SpanAttribute,
+    TraceContext,
+};
 use mimir_common::native_histogram::Histogram;
 use mimir_config::GoDuration;
 use parking_lot::Mutex;
@@ -63,6 +68,7 @@ pub struct GrpcServerConfig {
     /// `-auth.multitenancy-enabled`: require `x-scope-orgid` on every RPC except Mimir's
     /// `noGRPCAuthOn` methods.
     pub multitenancy_enabled: bool,
+    pub no_auth_tenant: String,
 }
 
 #[derive(Clone)]
@@ -798,6 +804,12 @@ where
         done: false,
     };
 
+    let extracted_trace = extract_from_http_headers(req.headers());
+    let (span_ctx, parent_span_id) = start_server_span_context(&extracted_trace, false);
+    let span_start_unix_nano = now_unix_nanos();
+    if span_ctx.is_valid() {
+        req.extensions_mut().insert(span_ctx.clone());
+    }
     req.extensions_mut().insert(tonic::transport::server::TcpConnectInfo {
         local_addr: None,
         remote_addr: Some(remote),
@@ -830,7 +842,16 @@ where
             if skip {
                 return None;
             }
-            check_cluster(req.headers(), &guard.method, remote, cv, &cache)
+            check_cluster(
+                req.headers(),
+                &guard.method,
+                remote,
+                cv,
+                &cache,
+                cfg.multitenancy_enabled,
+                &cfg.no_auth_tenant,
+                &span_ctx,
+            )
         })
     });
 
@@ -851,7 +872,8 @@ where
     let resp: GrpcResponse = match rejection {
         Some(status) => status.into_http(),
         None => {
-            let call = routes.oneshot(req);
+            let method_for_span = guard.method.clone();
+            let call = with_trace_context(span_ctx.clone(), routes.oneshot(req));
             let res = match deadline {
                 // grpc-go: at the deadline the stream is closed with RST_STREAM(CANCEL) and the
                 // handler's context is canceled; dropping the handler future cancels its waits.
@@ -861,6 +883,27 @@ where
                 },
                 None => call.await,
             };
+            if span_ctx.is_sampled() {
+                if let Some(rt) = global_tracing() {
+                    if rt.exporter.is_some() {
+                        export_span(ExportedSpan {
+                            service_name: rt.service_name.clone(),
+                            trace_id: span_ctx.trace_id,
+                            span_id: span_ctx.span_id,
+                            parent_span_id,
+                            name: method_for_span.trim_start_matches('/').to_string(),
+                            kind: 2,
+                            start_time_unix_nano: span_start_unix_nano,
+                            end_time_unix_nano: now_unix_nanos(),
+                            attributes: vec![SpanAttribute {
+                                key: "rpc.system".to_string(),
+                                value: SpanAttrValue::String("grpc".to_string()),
+                            }],
+                            status_error: res.is_err(),
+                        });
+                    }
+                }
+            }
             match res {
                 Ok(r) => r,
                 Err(e) => tonic::Status::internal(e.to_string()).into_http(),
@@ -943,12 +986,16 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// dskit `checkClusterFromIncomingContext`.
+#[allow(clippy::too_many_arguments)]
 fn check_cluster(
     headers: &http::HeaderMap,
     method: &str,
     remote: SocketAddr,
     cv: &GrpcClusterValidation,
     cache: &GrpcMetricsCache,
+    multitenancy_enabled: bool,
+    no_auth_tenant: &str,
+    span_ctx: &TraceContext,
 ) -> Option<tonic::Status> {
     let values: Vec<&str> = headers
         .get_all("x-cluster")
@@ -967,26 +1014,33 @@ fn check_cluster(
         )
     };
     let client_addr = remote.to_string();
-    let tenant_id = {
+    let tenant_id = if multitenancy_enabled {
         let mut orgs = headers.get_all(mimir_common::tenant::LOWER_ORG_ID_HEADER_NAME).iter();
         match (orgs.next(), orgs.next()) {
             (Some(v), None) => v.to_str().ok().map(str::to_owned),
             _ => None,
         }
+    } else {
+        Some(no_auth_tenant.to_string())
     };
+    let (trace_id, trace_sampled) = span_ctx.extract_sampled_trace_id();
     let log = |extra: &[(&str, &str)]| {
-        let soft = cv.soft.to_string();
-        let mut kvs: Vec<(&str, &str)> = vec![
-            ("method", method),
-            ("cluster_validation_labels", &expected),
-            ("soft_validation", &soft),
-            ("client_address", &client_addr),
+        let mut kvs: Vec<(&str, LogValue<'_>)> = vec![
+            ("method", LogValue::from(method)),
+            ("cluster_validation_labels", LogValue::from(expected.as_str())),
+            ("soft_validation", LogValue::Bool(cv.soft)),
         ];
         if let Some(ref tid) = tenant_id {
-            kvs.push(("tenant", tid.as_str()));
+            kvs.push(("tenant", LogValue::from(tid.as_str())));
         }
-        kvs.extend_from_slice(extra);
-        cache.logger.log(LogLevel::Warn, &kvs);
+        kvs.push(("client_address", LogValue::from(client_addr.as_str())));
+        if trace_sampled {
+            kvs.push(("trace_id", LogValue::from(trace_id.as_str())));
+        }
+        for &(k, v) in extra {
+            kvs.push((k, LogValue::from(v)));
+        }
+        cache.logger.log_values(LogLevel::Warn, &kvs);
     };
     if values.len() > 1 {
         let msg = format!(
@@ -1107,6 +1161,7 @@ mod tests {
             report_grpc_status: true,
             cluster_validation: None,
             multitenancy_enabled,
+            no_auth_tenant: "anonymous".to_string(),
         };
         let cache = Arc::new(GrpcMetricsCache::new(
             &ctx,
@@ -1404,6 +1459,7 @@ mod tests {
             report_grpc_status: true,
             cluster_validation: None,
             multitenancy_enabled: false,
+            no_auth_tenant: "anonymous".to_string(),
         };
         let cache = Arc::new(GrpcMetricsCache::new(
             &ctx,

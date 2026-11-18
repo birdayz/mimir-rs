@@ -1258,13 +1258,13 @@ fn list_checkpoints(dir: &Path) -> Result<Vec<CheckpointRef>, WlogError> {
         if !name_str.starts_with(CHECKPOINT_PREFIX) {
             continue;
         }
+        if !entry.file_type()?.is_dir() {
+            return Err(WlogError::CheckpointNotDir(name_str.to_string()));
+        }
         let suffix = &name_str[CHECKPOINT_PREFIX.len()..];
         let Ok(index) = suffix.parse::<usize>() else {
             continue;
         };
-        if !entry.file_type()?.is_dir() {
-            return Err(WlogError::CheckpointNotDir(name_str.to_string()));
-        }
         refs.push(CheckpointRef {
             name: name_str.to_string(),
             index,

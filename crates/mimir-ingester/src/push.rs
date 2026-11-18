@@ -1443,7 +1443,12 @@ impl Ingester {
         self.metrics.ingested_metadata.inc_by(ingested as f64);
         self.metrics.ingested_metadata_fail.inc_by(failed as f64);
         if let Some(err) = first_err {
-            warn!(user = %user_id, err = %err, "failed to ingest some metadata");
+            let (trace_id, sampled) = mimir_common::tracing::current_sampled_trace_id();
+            if sampled && !trace_id.is_empty() {
+                warn!(user = %user_id, traceID = %trace_id, err = %err, "failed to ingest some metadata");
+            } else {
+                warn!(user = %user_id, err = %err, "failed to ingest some metadata");
+            }
         }
         ingested
     }
@@ -1492,15 +1497,21 @@ impl Ingester {
         self.metrics.ingested_metadata.inc_by(ingested as f64);
         self.metrics.ingested_metadata_fail.inc_by(failed as f64);
         if let Some(err) = first_err {
-            warn!(user = %user_id, err = %err, "failed to ingest some metadata");
+            let (trace_id, sampled) = mimir_common::tracing::current_sampled_trace_id();
+            if sampled && !trace_id.is_empty() {
+                warn!(user = %user_id, traceID = %trace_id, err = %err, "failed to ingest some metadata");
+            } else {
+                warn!(user = %user_id, err = %err, "failed to ingest some metadata");
+            }
         }
         ingested
     }
 
-    pub(crate) fn push_metadata_items(
+    pub(crate) fn push_metadata_items_with_trace(
         &self,
         user_id: &str,
         items: &[BorrowedMetadata<'_>],
+        explicit_sampled_trace_id: Option<&str>,
     ) -> usize {
         if items.is_empty() {
             return 0;
@@ -1533,18 +1544,28 @@ impl Ingester {
         self.metrics.ingested_metadata.inc_by(ingested as f64);
         self.metrics.ingested_metadata_fail.inc_by(failed as f64);
         if let Some(err) = first_err {
-            warn!(user = %user_id, err = %err, "failed to ingest some metadata");
+            if let Some(trace_id) = explicit_sampled_trace_id.filter(|s| !s.is_empty()) {
+                warn!(user = %user_id, traceID = %trace_id, err = %err, "failed to ingest some metadata");
+            } else {
+                let (trace_id, sampled) = mimir_common::tracing::current_sampled_trace_id();
+                if sampled && !trace_id.is_empty() {
+                    warn!(user = %user_id, traceID = %trace_id, err = %err, "failed to ingest some metadata");
+                } else {
+                    warn!(user = %user_id, err = %err, "failed to ingest some metadata");
+                }
+            }
         }
         ingested
     }
 
-    pub(crate) fn ingest_prehashed_shard_batch(
+    pub(crate) fn ingest_prehashed_shard_batch_with_trace(
         &self,
         user_id: &str,
         source: cortexpb::write_request::SourceEnum,
         min_ts: i64,
         items: &[PrehashedSeriesItem<'_>],
         metadata: &[BorrowedMetadata<'_>],
+        sampled_trace_id: Option<&str>,
     ) -> Result<(), IngesterError> {
         if items.is_empty() && metadata.is_empty() {
             return Ok(());
@@ -1571,7 +1592,7 @@ impl Ingester {
         let permit = self.start_push_request_sync(req_size)?;
         // Go `PushWithCleanup`: metadata is best-effort and ingested before samples, under the
         // same `startPushRequest`; metadata-only requests return before touching the TSDB.
-        let meta_count = self.push_metadata_items(user_id, metadata);
+        let meta_count = self.push_metadata_items_with_trace(user_id, metadata, sampled_trace_id);
         if meta_count > 0 {
             self.ingestion_rate.add(meta_count as i64);
         }

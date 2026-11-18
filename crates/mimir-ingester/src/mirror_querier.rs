@@ -165,6 +165,8 @@ pub struct RecordedSelectRequest {
     pub hints: Option<SelectHints>,
     pub sort_series: bool,
     pub tenant_id: String,
+    pub trace_id: String,
+    pub trace_sampled: bool,
 }
 
 pub struct MirroredChunkQuerier {
@@ -190,10 +192,13 @@ impl MirroredChunkQuerier {
         delegate: Box<dyn ChunkQuerier>,
     ) -> Self {
         let uid = user_id.into();
+        let (trace_id, trace_sampled) = mimir_common::tracing::current_sampled_trace_id();
         let recorded_request = RecordedSelectRequest {
             min_t,
             max_t,
             tenant_id: uid.clone(),
+            trace_id,
+            trace_sampled,
             ..Default::default()
         };
         Self {
@@ -234,6 +239,11 @@ impl MirroredChunkQuerier {
         self.recorded_request.sort_series = sort_series;
         self.recorded_request.hints = hints.copied();
         self.recorded_request.matchers = matchers.to_vec();
+        if self.recorded_request.trace_id.is_empty() {
+            let (tid, sampled) = mimir_common::tracing::current_sampled_trace_id();
+            self.recorded_request.trace_id = tid;
+            self.recorded_request.trace_sampled = sampled;
+        }
 
         let ss = self.delegate.select(sort_series, hints, matchers);
         self.recorded_request.finished_at_ms = SystemTime::now()
@@ -436,11 +446,21 @@ impl MirroredChunkQuerier {
         self.inc_outcome(outcome);
 
         if !extra_series.is_empty() || !missing_series.is_empty() {
+            let request_matchers = self
+                .recorded_request
+                .matchers
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             warn!(
                 user = %self.user_id,
+                trace_id = %self.recorded_request.trace_id,
+                trace_sampled = self.recorded_request.trace_sampled,
                 request_min_time = self.recorded_request.min_t,
                 request_max_time = self.recorded_request.max_t,
                 request_sort_series = self.recorded_request.sort_series,
+                request_matchers = %request_matchers,
                 block_ulid = %self.block_meta.ulid,
                 block_min_time = self.block_meta.min_time,
                 block_max_time = self.block_meta.max_time,

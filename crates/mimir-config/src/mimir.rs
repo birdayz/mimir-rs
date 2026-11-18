@@ -1038,13 +1038,13 @@ impl MimirConfig {
     }
 
     fn validate_filesystem_paths(&self) -> Result<(), ConfigError> {
-        struct PathEntry<'a> {
+        struct PathEntry {
             name: &'static str,
-            cfg_value: &'a str,
+            cfg_value: String,
             check_value: PathBuf,
         }
 
-        let mut entries: Vec<PathEntry<'_>> = Vec::new();
+        let mut entries: Vec<PathEntry> = Vec::new();
 
         if (self.is_ingester_enabled()
             || self.is_querier_enabled()
@@ -1054,14 +1054,10 @@ impl MimirConfig {
             && self.blocks_storage.bucket.backend_cfg.backend == "filesystem"
         {
             let dir = &self.blocks_storage.bucket.backend_cfg.filesystem.dir;
-            let joined = if self.blocks_storage.bucket.storage_prefix.is_empty() {
-                PathBuf::from(dir)
-            } else {
-                Path::new(dir).join(&self.blocks_storage.bucket.storage_prefix)
-            };
+            let joined = go_filepath_join(dir, &self.blocks_storage.bucket.storage_prefix);
             entries.push(PathEntry {
                 name: "blocks storage filesystem directory",
-                cfg_value: dir,
+                cfg_value: dir.clone(),
                 check_value: joined,
             });
         }
@@ -1069,7 +1065,7 @@ impl MimirConfig {
         if self.is_ingester_enabled() {
             entries.push(PathEntry {
                 name: "tsdb directory",
-                cfg_value: &self.blocks_storage.tsdb.dir,
+                cfg_value: self.blocks_storage.tsdb.dir.clone(),
                 check_value: PathBuf::from(&self.blocks_storage.tsdb.dir),
             });
         }
@@ -1077,9 +1073,89 @@ impl MimirConfig {
         if self.is_store_gateway_enabled() {
             entries.push(PathEntry {
                 name: "bucket store sync directory",
-                cfg_value: &self.blocks_storage.bucket_store.sync_dir,
+                cfg_value: self.blocks_storage.bucket_store.sync_dir.clone(),
                 check_value: PathBuf::from(&self.blocks_storage.bucket_store.sync_dir),
             });
+        }
+
+        if self.is_compactor_enabled() {
+            let dir = self.extra_storage_str(&["compactor"], &["data_dir"], "compactor.data-dir", "./data-compactor/");
+            entries.push(PathEntry {
+                name: "compactor data directory",
+                cfg_value: dir.clone(),
+                check_value: PathBuf::from(&dir),
+            });
+        }
+
+        if self.is_ruler_enabled() {
+            let rule_path = self.extra_storage_str(&["ruler"], &["rule_path"], "ruler.rule-path", "./data-ruler/");
+            entries.push(PathEntry {
+                name: "ruler data directory",
+                cfg_value: rule_path.clone(),
+                check_value: PathBuf::from(&rule_path),
+            });
+            let backend = self.extra_storage_str(&["ruler_storage"], &["backend"], "ruler-storage.backend", "filesystem");
+            if backend == "filesystem" {
+                let dir = self.extra_storage_str(&["ruler_storage"], &["filesystem", "dir"], "ruler-storage.filesystem.dir", "ruler");
+                let check_value = go_filepath_join(&dir, "rules");
+                entries.push(PathEntry {
+                    name: "ruler storage filesystem directory",
+                    cfg_value: dir,
+                    check_value,
+                });
+            }
+            if backend == "local" {
+                let dir = self.extra_storage_str(&["ruler_storage"], &["local", "directory"], "ruler-storage.local.directory", "");
+                entries.push(PathEntry {
+                    name: "ruler storage local directory",
+                    cfg_value: dir.clone(),
+                    check_value: PathBuf::from(&dir),
+                });
+            }
+        }
+
+        if self.is_module_explicitly_targeted("alertmanager") {
+            let data_dir = self.extra_storage_str(&["alertmanager"], &["data_dir"], "alertmanager.storage.path", "./data-alertmanager/");
+            entries.push(PathEntry {
+                name: "alertmanager data directory",
+                cfg_value: data_dir.clone(),
+                check_value: PathBuf::from(&data_dir),
+            });
+            let backend = self.extra_storage_str(&["alertmanager_storage"], &["backend"], "alertmanager-storage.backend", "filesystem");
+            if backend == "filesystem" {
+                let dir = self.extra_storage_str(&["alertmanager_storage"], &["filesystem", "dir"], "alertmanager-storage.filesystem.dir", "alertmanager");
+                entries.push(PathEntry {
+                    name: "alertmanager storage filesystem directory",
+                    cfg_value: dir.clone(),
+                    check_value: go_filepath_join(&dir, "alerts"),
+                });
+                entries.push(PathEntry {
+                    name: "alertmanager storage filesystem directory",
+                    cfg_value: dir.clone(),
+                    check_value: go_filepath_join(&dir, "alertmanager"),
+                });
+            }
+            if backend == "local" {
+                let dir = self.extra_storage_str(&["alertmanager_storage"], &["local", "path"], "alertmanager-storage.local.path", "");
+                entries.push(PathEntry {
+                    name: "alertmanager storage local directory",
+                    cfg_value: dir.clone(),
+                    check_value: PathBuf::from(&dir),
+                });
+            }
+        }
+
+        if self.is_module_explicitly_targeted("usage-tracker") {
+            let backend = self.extra_storage_str(&["usage_tracker", "snapshots_storage"], &["backend"], "usage-tracker.snapshots-storage.backend", "filesystem");
+            if backend == "filesystem" {
+                let dir = self.extra_storage_str(&["usage_tracker", "snapshots_storage"], &["filesystem", "dir"], "usage-tracker.snapshots-storage.filesystem.dir", "usagetrackersnapshots");
+                let check_value = go_filepath_join(&dir, "usage-tracker-snapshots");
+                entries.push(PathEntry {
+                    name: "usage tracker snapshot storage filesystem directory",
+                    cfg_value: dir,
+                    check_value,
+                });
+            }
         }
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
@@ -1124,6 +1200,22 @@ fn wrap_validation(prefix: &'static str) -> impl FnOnce(ConfigError) -> ConfigEr
     move |err| match err {
         ConfigError::Validation(msg) => ConfigError::Validation(format!("{prefix}: {msg}")),
         other => ConfigError::Validation(format!("{prefix}: {other}")),
+    }
+}
+
+/// Go `filepath.Join(base, elem)`: a leading `/` in `elem` does not discard `base`.
+fn go_filepath_join(base: &str, elem: &str) -> PathBuf {
+    if elem.is_empty() {
+        PathBuf::from(base)
+    } else if base.is_empty() {
+        PathBuf::from(elem)
+    } else {
+        let trimmed = elem.trim_start_matches('/');
+        if trimmed.is_empty() {
+            PathBuf::from(base)
+        } else {
+            Path::new(base).join(trimmed)
+        }
     }
 }
 
@@ -1661,5 +1753,38 @@ mod yaml_defaults_tests {
             .unwrap();
         assert_eq!(cfg.ingest_storage.kafka.sasl_password, "keep");
         assert_eq!(cfg.ingest_storage.kafka.topic, "t");
+    }
+
+    #[test]
+    fn validate_filesystem_paths_handles_leading_slash_prefix_and_non_ingester_dirs() {
+        // Leading '/' in storage_prefix must join onto dir like Go filepath.Join, not discard dir.
+        let mut cfg = MimirConfig {
+            target: StringSliceCSV(vec!["ingester".to_string()]),
+            ..Default::default()
+        };
+        cfg.blocks_storage.bucket.backend_cfg.backend = "filesystem".to_string();
+        cfg.blocks_storage.bucket.backend_cfg.filesystem.dir = "/tmp/bucket".to_string();
+        cfg.blocks_storage.bucket.storage_prefix = "/sub".to_string();
+        cfg.blocks_storage.tsdb.dir = "/tmp/bucket/sub".to_string();
+        let err = cfg.validate_filesystem_paths().unwrap_err().to_string();
+        assert!(err.contains("cannot overlap"), "expected overlap error, got: {err}");
+
+        // Non-overlapping when prefix resolves to /tmp/bucket/blocks and tsdb is /tmp/bucket/tsdb.
+        cfg.blocks_storage.bucket.storage_prefix = "/blocks".to_string();
+        cfg.blocks_storage.tsdb.dir = "/tmp/bucket/tsdb".to_string();
+        cfg.validate_filesystem_paths().unwrap();
+
+        // Store-gateway + compactor overlap check.
+        let yaml = r#"
+target: store-gateway,compactor
+blocks_storage:
+  bucket_store:
+    sync_dir: /tmp/data
+compactor:
+  data_dir: /tmp/data/compactor
+"#;
+        let mut parsed: MimirConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = parsed.validate().unwrap_err().to_string();
+        assert!(err.contains("bucket store sync directory"), "got: {err}");
     }
 }
