@@ -15,7 +15,17 @@ use crate::matcher::LabelMatcher;
 /// OpenMetrics maximum combined rune length of an exemplar's label names and values.
 pub const EXEMPLAR_MAX_LABEL_SET_LENGTH: usize = 128;
 
-const NO_EXEMPLAR: usize = usize::MAX;
+const NO_EXEMPLAR: u32 = u32::MAX;
+
+#[inline]
+fn next_exemplar_cap(cur_cap: usize, max_exemplars: usize) -> usize {
+    let next = if cur_cap == 0 {
+        64
+    } else {
+        cur_cap.saturating_add((cur_cap / 2).max(16))
+    };
+    next.min(max_exemplars)
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExemplarError {
@@ -72,26 +82,25 @@ pub struct ExemplarQueryResult {
 
 #[derive(Clone, Debug)]
 struct SeriesIndexEntry {
-    oldest: usize,
-    newest: usize,
-    series_labels: Labels,
+    oldest: u32,
+    newest: u32,
 }
 
 #[derive(Clone, Debug)]
 struct CircularBufferEntry {
     exemplar: Option<Exemplar>,
-    next: usize,
-    prev: usize,
-    series_key: Option<Vec<u8>>,
+    series_labels: Option<Labels>,
+    next: u32,
+    prev: u32,
 }
 
 impl Default for CircularBufferEntry {
     fn default() -> Self {
         Self {
             exemplar: None,
+            series_labels: None,
             next: NO_EXEMPLAR,
             prev: NO_EXEMPLAR,
-            series_key: None,
         }
     }
 }
@@ -172,7 +181,7 @@ struct CircularExemplarInner {
     max_exemplars: usize,
     next_index: usize,
     ooo_time_window_ms: i64,
-    index: HashMap<Vec<u8>, SeriesIndexEntry>,
+    index: HashMap<Labels, SeriesIndexEntry>,
     out_of_order_count: u64,
     appended_count: u64,
 }
@@ -215,7 +224,7 @@ impl CircularExemplarStorage {
             return;
         }
         if inner.exemplars.len() == inner.max_exemplars
-            && inner.exemplars[inner.next_index].series_key.is_some()
+            && inner.exemplars[inner.next_index].series_labels.is_some()
         {
             self.metrics
                 .exemplars_in_storage
@@ -256,7 +265,7 @@ impl CircularExemplarStorage {
     /// Validates an exemplar without inserting it.
     pub fn validate_exemplar(&self, series_labels: &Labels, e: &Exemplar) -> Result<(), ExemplarError> {
         let inner = self.inner.read();
-        let entry = inner.index.get(series_labels.as_bytes());
+        let entry = inner.index.get(series_labels);
         inner.validate_exemplar(entry, e)
     }
 
@@ -267,9 +276,8 @@ impl CircularExemplarStorage {
             return Err(ExemplarError::Disabled);
         }
 
-        let key = series_labels.as_bytes();
         let validation = {
-            let entry = inner.index.get(key);
+            let entry = inner.index.get(series_labels);
             inner.validate_exemplar(entry, &e)
         };
         if let Err(err) = validation {
@@ -286,7 +294,7 @@ impl CircularExemplarStorage {
 
         // If we insert an out-of-order exemplar, preemptively find the insertion index to check
         // for duplicates *before* evicting anything from the buffer (Go `AddExemplar`).
-        let (mut ooo, mut insertion) = match inner.index.get(key) {
+        let (mut ooo, mut insertion) = match inner.index.get(series_labels) {
             Some(entry) => {
                 let oldest_ts = inner.ts_at(entry.oldest);
                 let newest_ts = inner.ts_at(entry.newest);
@@ -306,16 +314,22 @@ impl CircularExemplarStorage {
 
         let idx = if inner.exemplars.len() < inner.max_exemplars {
             let i = inner.exemplars.len();
+            let len = inner.exemplars.len();
+            if len == inner.exemplars.capacity() {
+                let cap_limit = inner.max_exemplars.min((u32::MAX as usize) - 1);
+                let target = next_exemplar_cap(inner.exemplars.capacity(), cap_limit);
+                inner.exemplars.reserve_exact(target - len);
+            }
             inner.exemplars.push(CircularBufferEntry::default());
-            i
+            i as u32
         } else {
-            let i = inner.next_index;
-            if let Some(prev_key) = inner.exemplars[i].series_key.clone() {
+            let i = inner.next_index as u32;
+            if let Some(prev_labels) = inner.exemplars[i as usize].series_labels.clone() {
                 inner.remove_at(i);
-                if prev_key.as_slice() == key && ooo && insertion == i {
+                if &prev_labels == series_labels && ooo && insertion == i {
                     // The entry we were going to insert after was removed from the same series:
                     // recalculate the insertion point in the updated linked list.
-                    match inner.index.get(key) {
+                    match inner.index.get(series_labels) {
                         Some(entry) => insertion = inner.find_insertion_index(&e, entry),
                         None => ooo = false,
                     }
@@ -324,8 +338,7 @@ impl CircularExemplarStorage {
             i
         };
 
-        let key_vec = key.to_vec();
-        let (oldest, newest) = match inner.index.get(key) {
+        let (oldest, newest) = match inner.index.get(series_labels) {
             Some(entry) => (entry.oldest, entry.newest),
             None => (NO_EXEMPLAR, NO_EXEMPLAR),
         };
@@ -334,32 +347,34 @@ impl CircularExemplarStorage {
             (NO_EXEMPLAR, NO_EXEMPLAR)
         } else if e.timestamp_ms >= inner.ts_at(newest) {
             // At the tip (after newest).
-            inner.exemplars[newest].next = idx;
+            inner.exemplars[newest as usize].next = idx;
             (newest, NO_EXEMPLAR)
         } else if e.timestamp_ms < inner.ts_at(oldest) || !ooo {
             // At the tail (before oldest).
-            inner.exemplars[oldest].prev = idx;
+            inner.exemplars[oldest as usize].prev = idx;
             (NO_EXEMPLAR, oldest)
         } else {
             // After the most recent in-order exemplar preceding it.
-            let next = inner.exemplars[insertion].next;
-            inner.exemplars[insertion].next = idx;
+            let next = inner.exemplars[insertion as usize].next;
+            inner.exemplars[insertion as usize].next = idx;
             if next != NO_EXEMPLAR {
-                inner.exemplars[next].prev = idx;
+                inner.exemplars[next as usize].prev = idx;
             }
             (insertion, next)
         };
-        inner.exemplars[idx] = CircularBufferEntry {
+        inner.exemplars[idx as usize] = CircularBufferEntry {
             exemplar: Some(e),
+            series_labels: Some(series_labels.clone()),
             next,
             prev,
-            series_key: Some(key_vec.clone()),
         };
-        let entry = inner.index.entry(key_vec).or_insert_with(|| SeriesIndexEntry {
-            oldest: idx,
-            newest: idx,
-            series_labels: series_labels.clone(),
-        });
+        let entry = inner
+            .index
+            .entry(series_labels.clone())
+            .or_insert_with(|| SeriesIndexEntry {
+                oldest: idx,
+                newest: idx,
+            });
         if prev == NO_EXEMPLAR {
             entry.oldest = idx;
         }
@@ -367,7 +382,7 @@ impl CircularExemplarStorage {
             entry.newest = idx;
         }
 
-        inner.next_index = (idx + 1) % inner.max_exemplars;
+        inner.next_index = ((idx as usize) + 1) % inner.max_exemplars;
         inner.appended_count += 1;
         self.metrics.exemplars_appended.inc();
         self.compute_metrics(&inner);
@@ -387,26 +402,26 @@ impl CircularExemplarStorage {
         }
 
         let mut ret = Vec::new();
-        for entry in inner.index.values() {
-            let oldest_ex = match inner.exemplars[entry.oldest].exemplar.as_ref() {
+        for (series_labels, entry) in &inner.index {
+            let oldest_ex = match inner.exemplars[entry.oldest as usize].exemplar.as_ref() {
                 Some(ex) => ex,
                 None => continue,
             };
-            let newest_ex = match inner.exemplars[entry.newest].exemplar.as_ref() {
+            let newest_ex = match inner.exemplars[entry.newest as usize].exemplar.as_ref() {
                 Some(ex) => ex,
                 None => continue,
             };
             if oldest_ex.timestamp_ms > end || newest_ex.timestamp_ms < start {
                 continue;
             }
-            if !matches_some_matcher_set(&entry.series_labels, matcher_sets) {
+            if !matches_some_matcher_set(series_labels, matcher_sets) {
                 continue;
             }
 
             let mut exemplars = Vec::new();
             let mut cur = entry.oldest;
             while cur != NO_EXEMPLAR {
-                let Some(ex) = inner.exemplars[cur].exemplar.as_ref() else {
+                let Some(ex) = inner.exemplars[cur as usize].exemplar.as_ref() else {
                     break;
                 };
                 if ex.timestamp_ms > end {
@@ -415,11 +430,11 @@ impl CircularExemplarStorage {
                 if ex.timestamp_ms >= start {
                     exemplars.push(ex.clone());
                 }
-                cur = inner.exemplars[cur].next;
+                cur = inner.exemplars[cur as usize].next;
             }
             if !exemplars.is_empty() {
                 ret.push(ExemplarQueryResult {
-                    series_labels: entry.series_labels.clone(),
+                    series_labels: series_labels.clone(),
                     exemplars,
                 });
             }
@@ -448,10 +463,8 @@ impl CircularExemplarStorage {
         for offset in 0..len {
             let idx = (start + offset) % len;
             let slot = &inner.exemplars[idx];
-            if let (Some(ref ex), Some(ref key)) = (&slot.exemplar, &slot.series_key) {
-                if let Some(entry) = inner.index.get(key) {
-                    f(&entry.series_labels, ex);
-                }
+            if let (Some(ref ex), Some(ref lbls)) = (&slot.exemplar, &slot.series_labels) {
+                f(lbls, ex);
             }
         }
     }
@@ -493,40 +506,41 @@ impl CircularExemplarStorage {
         let mut active_positions = Vec::with_capacity(cur_len);
         for offset in 0..cur_len {
             let pos = (start + offset) % cur_len;
-            if inner.exemplars[pos].series_key.is_some() {
+            if inner.exemplars[pos].series_labels.is_some() {
                 active_positions.push(pos);
             }
         }
 
         let drop_count = active_positions.len().saturating_sub(new_size);
         for &pos in &active_positions[..drop_count] {
-            inner.remove_at(pos);
+            inner.remove_at(pos as u32);
         }
 
         let kept = &active_positions[drop_count..];
         let migrated = kept.len();
         let mut slot_remap = vec![NO_EXEMPLAR; cur_len];
         for (new_idx, &old_pos) in kept.iter().enumerate() {
-            slot_remap[old_pos] = new_idx;
+            slot_remap[old_pos] = new_idx as u32;
         }
 
-        let mut new_exemplars = Vec::with_capacity(migrated);
+        let mut new_exemplars = Vec::new();
+        new_exemplars.reserve_exact(migrated);
         for &old_pos in kept {
             let mut entry = std::mem::take(&mut inner.exemplars[old_pos]);
             if entry.prev != NO_EXEMPLAR {
-                entry.prev = slot_remap[entry.prev];
+                entry.prev = slot_remap[entry.prev as usize];
             }
             if entry.next != NO_EXEMPLAR {
-                entry.next = slot_remap[entry.next];
+                entry.next = slot_remap[entry.next as usize];
             }
             new_exemplars.push(entry);
         }
         for idx_entry in inner.index.values_mut() {
             if idx_entry.oldest != NO_EXEMPLAR {
-                idx_entry.oldest = slot_remap[idx_entry.oldest];
+                idx_entry.oldest = slot_remap[idx_entry.oldest as usize];
             }
             if idx_entry.newest != NO_EXEMPLAR {
-                idx_entry.newest = slot_remap[idx_entry.newest];
+                idx_entry.newest = slot_remap[idx_entry.newest as usize];
             }
         }
 
@@ -540,21 +554,24 @@ impl CircularExemplarStorage {
 
 impl CircularExemplarInner {
     /// Timestamp of the exemplar stored at buffer slot `i` (`i64::MIN` for an empty slot).
-    fn ts_at(&self, i: usize) -> i64 {
+    fn ts_at(&self, i: u32) -> i64 {
+        if i == NO_EXEMPLAR {
+            return i64::MIN;
+        }
         self.exemplars
-            .get(i)
+            .get(i as usize)
             .and_then(|c| c.exemplar.as_ref())
             .map_or(i64::MIN, |e| e.timestamp_ms)
     }
 
     /// Go `findInsertionIndex`: the most recent exemplar of the series not newer than `e`.
-    fn find_insertion_index(&self, e: &Exemplar, entry: &SeriesIndexEntry) -> usize {
+    fn find_insertion_index(&self, e: &Exemplar, entry: &SeriesIndexEntry) -> u32 {
         let mut i = entry.newest;
         while i != NO_EXEMPLAR {
             if self.ts_at(i) <= e.timestamp_ms {
                 return i;
             }
-            i = self.exemplars[i].prev;
+            i = self.exemplars[i as usize].prev;
         }
         entry.oldest
     }
@@ -584,16 +601,20 @@ impl CircularExemplarInner {
             return Ok(());
         };
 
-        let newest = self.exemplars[entry.newest]
-            .exemplar
-            .as_ref()
-            .expect("newest index valid");
+        let Some(newest) = self
+            .exemplars
+            .get(entry.newest as usize)
+            .and_then(|c| c.exemplar.as_ref())
+        else {
+            return Ok(());
+        };
         if newest.prom_equals(e) {
             return Err(ExemplarError::DuplicateExemplar);
         }
 
         if (e.timestamp_ms < newest.timestamp_ms
-            && e.timestamp_ms <= newest.timestamp_ms - self.ooo_time_window_ms)
+            && (e.timestamp_ms as i128)
+                <= (newest.timestamp_ms as i128) - (self.ooo_time_window_ms as i128))
             || (e.timestamp_ms == newest.timestamp_ms && e.value < newest.value)
             || (e.timestamp_ms == newest.timestamp_ms
                 && e.value == newest.value
@@ -605,26 +626,27 @@ impl CircularExemplarInner {
         Ok(())
     }
 
-    fn remove_at(&mut self, idx: usize) {
-        let Some(key) = self.exemplars[idx].series_key.take() else {
+    fn remove_at(&mut self, idx: u32) {
+        let idx_u = idx as usize;
+        let Some(lbls) = self.exemplars[idx_u].series_labels.take() else {
             return;
         };
-        self.exemplars[idx].exemplar = None;
-        let prev = self.exemplars[idx].prev;
-        let next = self.exemplars[idx].next;
-        self.exemplars[idx].prev = NO_EXEMPLAR;
-        self.exemplars[idx].next = NO_EXEMPLAR;
+        self.exemplars[idx_u].exemplar = None;
+        let prev = self.exemplars[idx_u].prev;
+        let next = self.exemplars[idx_u].next;
+        self.exemplars[idx_u].prev = NO_EXEMPLAR;
+        self.exemplars[idx_u].next = NO_EXEMPLAR;
 
         if prev != NO_EXEMPLAR {
-            self.exemplars[prev].next = next;
+            self.exemplars[prev as usize].next = next;
         }
         if next != NO_EXEMPLAR {
-            self.exemplars[next].prev = prev;
+            self.exemplars[next as usize].prev = prev;
         }
 
         if prev == NO_EXEMPLAR && next == NO_EXEMPLAR {
-            self.index.remove(&key);
-        } else if let Some(ent) = self.index.get_mut(&key) {
+            self.index.remove(&lbls);
+        } else if let Some(ent) = self.index.get_mut(&lbls) {
             if ent.oldest == idx {
                 ent.oldest = next;
             }
@@ -762,5 +784,41 @@ mod tests {
             store.add_exemplar(&s, Exemplar::new(ex_lbls2, 1.0, 200)),
             Err(ExemplarError::LabelLengthExceeded)
         );
+    }
+
+    #[test]
+    fn circular_exemplar_validate_near_i64_min_no_underflow() {
+        let store = CircularExemplarStorage::new(10, 3_600_000);
+        let s = Labels::from_pairs([("__name__", "m")]);
+        let l = |v: &str| Labels::from_pairs([("trace_id", v)]);
+        store
+            .add_exemplar(&s, Exemplar::new(l("a"), 1.0, i64::MIN + 1_000))
+            .unwrap();
+        // Within OOO window (500ms earlier) must succeed without i64 underflow!
+        store
+            .add_exemplar(&s, Exemplar::new(l("b"), 2.0, i64::MIN + 500))
+            .unwrap();
+        store
+            .add_exemplar(&s, Exemplar::new(l("c"), 3.0, i64::MIN))
+            .unwrap();
+    }
+
+    #[test]
+    fn circular_exemplar_storage_exact_capacity_and_compact_slot_size() {
+        assert_eq!(std::mem::size_of::<CircularBufferEntry>(), 96);
+        assert_eq!(std::mem::size_of::<SeriesIndexEntry>(), 8);
+
+        let max = 1000;
+        let store = CircularExemplarStorage::new(max, 0);
+        let ex_lbls = Labels::from_pairs([("trace_id", "1")]);
+        for i in 0..max {
+            let s = Labels::from_pairs([("__name__", "m"), ("id", &i.to_string())]);
+            store
+                .add_exemplar(&s, Exemplar::new(ex_lbls.clone(), i as f64, i as i64))
+                .unwrap();
+        }
+        let inner = store.inner.read();
+        assert_eq!(inner.exemplars.len(), max);
+        assert_eq!(inner.exemplars.capacity(), max);
     }
 }

@@ -274,11 +274,11 @@ pub fn remove_shard_from_matchers(
                     message: format!("invalid shard ID: {:?}", m.value),
                 });
             }
-            let one_based = parts[0].parse::<u64>().map_err(|_| IngesterError::BadRequest {
-                message: format!("invalid shard ID: {:?}", m.value),
+            let one_based = parts[0].parse::<u64>().map_err(|e| IngesterError::BadRequest {
+                message: format!("invalid shard ID: {:?}: {e}", m.value),
             })?;
-            let count = parts[2].parse::<u64>().map_err(|_| IngesterError::BadRequest {
-                message: format!("invalid shard ID: {:?}", m.value),
+            let count = parts[2].parse::<u64>().map_err(|e| IngesterError::BadRequest {
+                message: format!("invalid shard ID: {:?}: {e}", m.value),
             })?;
             if one_based == 0 || count == 0 || one_based > count {
                 return Err(IngesterError::BadRequest {
@@ -766,7 +766,7 @@ impl Ingester {
 
         let start_ts = req.start_timestamp_ms;
         let end_ts = req.end_timestamp_ms;
-        let batch_limit = req.streaming_chunks_batch_size as usize;
+        let batch_limit = (req.streaming_chunks_batch_size as i64).max(0) as usize;
         let mut chunk_series = if !self
             .blocks_cfg
             .tsdb
@@ -1169,7 +1169,7 @@ impl Ingester {
 
         let start_ts = req.start_timestamp_ms;
         let end_ts = req.end_timestamp_ms;
-        let batch_limit = req.streaming_chunks_batch_size as usize;
+        let batch_limit = (req.streaming_chunks_batch_size as i64).max(0) as usize;
         let chunk_series = if !self
             .blocks_cfg
             .tsdb
@@ -1619,7 +1619,7 @@ impl Ingester {
         let user_id_owned = user_id.to_string();
         let start_ts = req.start_timestamp_ms;
         let end_ts = req.end_timestamp_ms;
-        let batch_limit = req.streaming_chunks_batch_size as usize;
+        let batch_limit = (req.streaming_chunks_batch_size as i64).max(0) as usize;
 
         tokio::spawn(async move {
             let res = ingester
@@ -1706,7 +1706,7 @@ impl Ingester {
                     .with_label_values(&["unknown"])
                     .inc();
             } else {
-                let gen = ((head_min_time - st.block_min_time) / block_range).max(1);
+                let gen = (head_min_time.saturating_sub(st.block_min_time) / block_range).max(1);
                 if gen > 100 {
                     self.metrics
                         .queried_blocks
@@ -2095,7 +2095,7 @@ impl Ingester {
         let mut num_samples = 0usize;
 
         // Phase 2: stream QueryStreamSeriesChunks batches respecting streaming_chunks_batch_size & 1MiB cap.
-        let batch_limit = req.streaming_chunks_batch_size as usize;
+        let batch_limit = (req.streaming_chunks_batch_size as i64).max(0) as usize;
         let mut chunks_batch = Vec::with_capacity(batch_limit.min(1024));
         let mut batch_bytes = 0usize;
 
@@ -2344,6 +2344,11 @@ impl Ingester {
         user_id: &str,
         req: ingesterpb::LabelNamesRequest,
     ) -> Result<ingesterpb::LabelNamesResponse, IngesterError> {
+        self.enforce_read_consistency(md, user_id).await?;
+
+        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
+            return Ok(ingesterpb::LabelNamesResponse::default());
+        };
         let matchers = match req.matchers {
             Some(ref m) => from_proto_matchers(&m.matchers)?,
             None => Vec::new(),
@@ -2352,11 +2357,6 @@ impl Ingester {
             Some(req.limit as usize)
         } else {
             None
-        };
-        self.enforce_read_consistency(md, user_id).await?;
-
-        let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
-            return Ok(ingesterpb::LabelNamesResponse::default());
         };
         let start_ts = req.start_timestamp_ms;
         let end_ts = req.end_timestamp_ms;
@@ -2525,6 +2525,153 @@ impl Ingester {
         res
     }
 
+    pub async fn handle_label_names_and_values_rx(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::LabelNamesAndValuesRequest,
+    ) -> Result<
+        ReceiverStream<Result<ingesterpb::LabelNamesAndValuesResponse, Status>>,
+        IngesterError,
+    > {
+        let permit = self.start_read_request(md).await?;
+        if let Err(e) = self.enforce_read_consistency(md, user_id).await {
+            permit.finish(e.is_deadline_exceeded());
+            return Err(e);
+        }
+        let db = match self.get_open_tsdb_for_query(user_id) {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                permit.finish(false);
+                let (_tx, rx) = mpsc::channel(1);
+                return Ok(ReceiverStream::new(rx));
+            }
+            Err(e) => {
+                permit.finish(e.is_deadline_exceeded());
+                return Err(e);
+            }
+        };
+        let matchers = match from_proto_matchers(&req.matchers) {
+            Ok(m) => m,
+            Err(e) => {
+                permit.finish(false);
+                return Err(e);
+            }
+        };
+        let active_only = match ingesterpb::CountMethod::try_from(req.count_method) {
+            Ok(ingesterpb::CountMethod::InMemory) => false,
+            Ok(ingesterpb::CountMethod::Active) => true,
+            Err(_) => {
+                permit.finish(false);
+                return Err(IngesterError::Internal {
+                    message: format!("unknown count method \"{}\"", req.count_method),
+                });
+            }
+        };
+        let (tx, rx) = mpsc::channel(8);
+        tokio::task::spawn_blocking(move || {
+            let head = db.db.head();
+            let base_refs_arc = if !matchers.is_empty() {
+                match head.postings_for_matchers_arc(&matchers) {
+                    Ok(refs) if refs.is_empty() => {
+                        permit.finish(false);
+                        return;
+                    }
+                    Ok(refs) => Some(refs),
+                    Err(e) => {
+                        let err = IngesterError::Internal {
+                            message: e.to_string(),
+                        };
+                        let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                        permit.finish(false);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let label_names = match head.label_names(&[]) {
+                Ok(n) => n,
+                Err(e) => {
+                    let err = IngesterError::Internal {
+                        message: e.to_string(),
+                    };
+                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                    permit.finish(false);
+                    return;
+                }
+            };
+            let mut resp = ingesterpb::LabelNamesAndValuesResponse::default();
+            let mut resp_bytes = 0usize;
+            for label_name in label_names {
+                let mut filtered = Vec::new();
+                head.visit_all_values_postings_for_name(&label_name, |val_str, small, large| {
+                    if val_str.is_empty() {
+                        return;
+                    }
+                    let matched = match base_refs_arc.as_deref() {
+                        Some(base) => mimir_tsdb::postings::intersect_sorted_any(small, large, base),
+                        None => !small.is_empty() || !large.is_empty(),
+                    };
+                    if !matched {
+                        return;
+                    }
+                    let is_active = !active_only
+                        || small
+                            .iter()
+                            .any(|&r| db.active_series.is_ref_active_fast(r as u64, i64::MIN))
+                        || large
+                            .iter()
+                            .any(|&r| db.active_series.is_ref_active_fast(r, i64::MIN));
+                    if is_active {
+                        filtered.push(val_str.to_owned());
+                    }
+                });
+                if filtered.is_empty() {
+                    continue;
+                }
+                filtered.sort_unstable();
+                resp_bytes += label_name.len();
+                if resp_bytes >= LABEL_NAMES_AND_VALUES_TARGET_SIZE_BYTES && !resp.items.is_empty() {
+                    if tx.blocking_send(Ok(std::mem::take(&mut resp))).is_err() {
+                        permit.finish(false);
+                        return;
+                    }
+                    resp_bytes = label_name.len();
+                }
+                let mut cur_vals = Vec::new();
+                for val in filtered {
+                    resp_bytes += val.len();
+                    cur_vals.push(val);
+                    if resp_bytes >= LABEL_NAMES_AND_VALUES_TARGET_SIZE_BYTES {
+                        resp.items.push(ingesterpb::LabelValues {
+                            label_name: label_name.clone(),
+                            values: std::mem::take(&mut cur_vals),
+                        });
+                        if tx.blocking_send(Ok(std::mem::take(&mut resp))).is_err() {
+                            permit.finish(false);
+                            return;
+                        }
+                        resp_bytes = label_name.len();
+                    }
+                }
+                if !cur_vals.is_empty() {
+                    resp.items.push(ingesterpb::LabelValues {
+                        label_name: label_name.clone(),
+                        values: cur_vals,
+                    });
+                } else {
+                    resp_bytes = 0;
+                }
+            }
+            if !resp.items.is_empty() {
+                let _ = tx.blocking_send(Ok(resp));
+            }
+            permit.finish(false);
+        });
+        Ok(ReceiverStream::new(rx))
+    }
+
     pub async fn handle_label_names_and_values(
         &self,
         md: &MetadataMap,
@@ -2656,6 +2803,199 @@ impl Ingester {
         .map_err(|e| IngesterError::Internal {
             message: format!("label_names_and_values task join error: {e}"),
         })?
+    }
+
+    pub async fn handle_label_values_cardinality_rx(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::LabelValuesCardinalityRequest,
+    ) -> Result<
+        ReceiverStream<Result<ingesterpb::LabelValuesCardinalityResponse, Status>>,
+        IngesterError,
+    > {
+        let permit = self.start_read_request(md).await?;
+        if let Err(e) = self.enforce_read_consistency(md, user_id).await {
+            permit.finish(e.is_deadline_exceeded());
+            return Err(e);
+        }
+        let db = match self.get_open_tsdb_for_query(user_id) {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                permit.finish(false);
+                let (_tx, rx) = mpsc::channel(1);
+                return Ok(ReceiverStream::new(rx));
+            }
+            Err(e) => {
+                permit.finish(e.is_deadline_exceeded());
+                return Err(e);
+            }
+        };
+        let matchers = match from_proto_matchers(&req.matchers) {
+            Ok(m) => m,
+            Err(e) => {
+                permit.finish(false);
+                return Err(e);
+            }
+        };
+        let active_only = match ingesterpb::CountMethod::try_from(req.count_method) {
+            Ok(ingesterpb::CountMethod::InMemory) => false,
+            Ok(ingesterpb::CountMethod::Active) => true,
+            Err(_) => {
+                permit.finish(false);
+                return Err(IngesterError::Internal {
+                    message: format!("unknown count method \"{}\"", req.count_method),
+                });
+            }
+        };
+        let label_names = req.label_names;
+        let pool = Arc::clone(&self.compute_worker_pool);
+        let chunk_size = self.cfg.label_values_count.chunk_size.max(1) as usize;
+        let tenant_id = user_id.to_string();
+        let (tx, rx) = mpsc::channel(8);
+        tokio::task::spawn_blocking(move || {
+            struct CancelOnDrop(Arc<AtomicBool>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, AtomicOrdering::Release);
+                }
+            }
+            let canceled = Arc::new(AtomicBool::new(false));
+            let _cancel_guard = CancelOnDrop(Arc::clone(&canceled));
+            let is_canceled: Arc<dyn Fn() -> bool + Send + Sync> = {
+                let c = Arc::clone(&canceled);
+                Arc::new(move || c.load(AtomicOrdering::Acquire))
+            };
+            let to_err = |e: LabelNamesAndValuesError| IngesterError::Internal {
+                message: e.to_string(),
+            };
+            let head = db.db.head();
+            let eligible_refs: Option<Arc<[u64]>> = if !matchers.is_empty() {
+                let base_refs = match head.postings_for_matchers_arc(&matchers) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let err = IngesterError::Internal { message: e.to_string() };
+                        let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                        permit.finish(false);
+                        return;
+                    }
+                };
+                if active_only {
+                    let mut filtered = Vec::with_capacity(base_refs.len());
+                    for &r in base_refs.iter() {
+                        if db.active_series.is_ref_active_fast(r, i64::MIN) {
+                            filtered.push(r);
+                        }
+                    }
+                    if filtered.is_empty() {
+                        permit.finish(false);
+                        return;
+                    }
+                    Some(Arc::from(filtered))
+                } else if base_refs.is_empty() {
+                    permit.finish(false);
+                    return;
+                } else {
+                    Some(base_refs)
+                }
+            } else {
+                None
+            };
+            let mut resp = ingesterpb::LabelValuesCardinalityResponse::default();
+            let mut resp_bytes = 0usize;
+            for lbl_name in &label_names {
+                let lbl_values = if let Some(ref elig) = eligible_refs {
+                    let mut vals = Vec::new();
+                    head.visit_all_values_postings_for_name(lbl_name, |val_str, small, large| {
+                        if !val_str.is_empty()
+                            && mimir_tsdb::postings::intersect_sorted_any(small, large, elig)
+                        {
+                            vals.push(val_str.to_owned());
+                        }
+                    });
+                    vals.sort_unstable();
+                    vals
+                } else {
+                    match head.label_values(lbl_name, &[]) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let err = IngesterError::Internal { message: e.to_string() };
+                            let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                            permit.finish(false);
+                            return;
+                        }
+                    }
+                };
+                let count_fn: LabelValueCountFn = {
+                    let (db, eligible_refs, lbl_name) =
+                        (Arc::clone(&db), eligible_refs.clone(), lbl_name.clone());
+                    Arc::new(move |val: &str| -> Result<u64, LabelNamesAndValuesError> {
+                        let head = db.db.head();
+                        Ok(head.visit_postings_for_label_value(
+                            &lbl_name,
+                            val,
+                            |small, large| match eligible_refs.as_deref() {
+                                Some(elig) => {
+                                    mimir_tsdb::postings::intersect_sorted_count(small, large, elig)
+                                }
+                                None => {
+                                    if active_only {
+                                        db.active_series.count_active_in_slices(small, large)
+                                    } else {
+                                        (small.len() + large.len()) as u64
+                                    }
+                                }
+                            },
+                        ))
+                    })
+                };
+                let mut count_rx = compute_label_values_counts(
+                    Arc::clone(&is_canceled),
+                    &pool,
+                    &tenant_id,
+                    chunk_size,
+                    Arc::new(lbl_values),
+                    count_fn,
+                );
+                let mut item: Option<ingesterpb::LabelValueSeriesCount> = None;
+                while let Some(res) = count_rx.blocking_recv() {
+                    if let Some(e) = res.err {
+                        let _ = tx.blocking_send(Err(to_err(e).map_read_error_to_status()));
+                        permit.finish(false);
+                        return;
+                    }
+                    if res.count == 0 {
+                        continue;
+                    }
+                    resp_bytes += res.val.len();
+                    item.get_or_insert_with(|| ingesterpb::LabelValueSeriesCount {
+                        label_name: lbl_name.clone(),
+                        label_value_series: HashMap::new(),
+                    })
+                    .label_value_series
+                    .insert(res.val, res.count);
+                    if resp_bytes < LABEL_VALUES_CARDINALITY_TARGET_SIZE_BYTES {
+                        continue;
+                    }
+                    if let Some(it) = item.take() {
+                        resp.items.push(it);
+                    }
+                    if tx.blocking_send(Ok(std::mem::take(&mut resp))).is_err() {
+                        permit.finish(false);
+                        return;
+                    }
+                    resp_bytes = 0;
+                }
+                if let Some(it) = item.take() {
+                    resp.items.push(it);
+                }
+            }
+            if !resp.items.is_empty() {
+                let _ = tx.blocking_send(Ok(resp));
+            }
+            permit.finish(false);
+        });
+        Ok(ReceiverStream::new(rx))
     }
 
     pub async fn handle_label_values_cardinality(
@@ -3070,6 +3410,69 @@ impl Ingester {
 
     /// `SearchLabelNames` after its input was validated by [`build_search_hints`] (Go validates
     /// before the tenant and the deferred read error mapping).
+    pub async fn handle_search_label_names_with_hints_rx(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::SearchLabelNamesRequest,
+        hints: SearchHints,
+        matchers: Vec<LabelMatcher>,
+    ) -> Result<ReceiverStream<Result<ingesterpb::SearchResultBatch, Status>>, IngesterError> {
+        let permit = self.start_read_request(md).await?;
+        if let Err(e) = self.enforce_read_consistency(md, user_id).await {
+            permit.finish(e.is_deadline_exceeded());
+            return Err(e);
+        }
+        let db = match self.get_open_tsdb_for_query(user_id) {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                permit.finish(false);
+                let (_tx, rx) = mpsc::channel(1);
+                return Ok(ReceiverStream::new(rx));
+            }
+            Err(e) => {
+                permit.finish(e.is_deadline_exceeded());
+                return Err(e);
+            }
+        };
+        let start_ts = req.start_timestamp_ms;
+        let end_ts = req.end_timestamp_ms;
+        let (tx, rx) = mpsc::channel(8);
+        tokio::task::spawn_blocking(move || {
+            let q = db.db.querier(start_ts, end_ts);
+            let results = match q.search_label_names(&hints, &matchers) {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = IngesterError::Internal { message: e.to_string() };
+                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                    permit.finish(false);
+                    return;
+                }
+            };
+            let mut rs = VecSearchResultSet::new(results, Vec::new(), None);
+            let mut receiver_closed = false;
+            let stream_res = stream_search_results(
+                &|| false,
+                &mut rs,
+                &mut |b| {
+                    if tx.blocking_send(Ok(b)).is_err() {
+                        receiver_closed = true;
+                        return Err("receiver closed".to_string());
+                    }
+                    Ok(())
+                },
+            );
+            if let Err(message) = stream_res {
+                if !receiver_closed {
+                    let err = IngesterError::Internal { message };
+                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                }
+            }
+            permit.finish(false);
+        });
+        Ok(ReceiverStream::new(rx))
+    }
+
     pub async fn handle_search_label_names_with_hints(
         &self,
         md: &MetadataMap,
@@ -3131,6 +3534,70 @@ impl Ingester {
 
     /// `SearchLabelValues` after its input was validated by [`build_search_hints`] (Go validates
     /// before the tenant and the deferred read error mapping).
+    pub async fn handle_search_label_values_with_hints_rx(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::SearchLabelValuesRequest,
+        hints: SearchHints,
+        matchers: Vec<LabelMatcher>,
+    ) -> Result<ReceiverStream<Result<ingesterpb::SearchResultBatch, Status>>, IngesterError> {
+        let permit = self.start_read_request(md).await?;
+        if let Err(e) = self.enforce_read_consistency(md, user_id).await {
+            permit.finish(e.is_deadline_exceeded());
+            return Err(e);
+        }
+        let db = match self.get_open_tsdb_for_query(user_id) {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                permit.finish(false);
+                let (_tx, rx) = mpsc::channel(1);
+                return Ok(ReceiverStream::new(rx));
+            }
+            Err(e) => {
+                permit.finish(e.is_deadline_exceeded());
+                return Err(e);
+            }
+        };
+        let start_ts = req.start_timestamp_ms;
+        let end_ts = req.end_timestamp_ms;
+        let name = req.name;
+        let (tx, rx) = mpsc::channel(8);
+        tokio::task::spawn_blocking(move || {
+            let q = db.db.querier(start_ts, end_ts);
+            let results = match q.search_label_values(&name, &hints, &matchers) {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = IngesterError::Internal { message: e.to_string() };
+                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                    permit.finish(false);
+                    return;
+                }
+            };
+            let mut rs = VecSearchResultSet::new(results, Vec::new(), None);
+            let mut receiver_closed = false;
+            let stream_res = stream_search_results(
+                &|| false,
+                &mut rs,
+                &mut |b| {
+                    if tx.blocking_send(Ok(b)).is_err() {
+                        receiver_closed = true;
+                        return Err("receiver closed".to_string());
+                    }
+                    Ok(())
+                },
+            );
+            if let Err(message) = stream_res {
+                if !receiver_closed {
+                    let err = IngesterError::Internal { message };
+                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                }
+            }
+            permit.finish(false);
+        });
+        Ok(ReceiverStream::new(rx))
+    }
+
     pub async fn handle_search_label_values_with_hints(
         &self,
         md: &MetadataMap,
@@ -3815,46 +4282,32 @@ pub type LabelValueCountFn =
 /// Values are split into `chunk_size` chunks, each submitted to the shared pool on behalf of
 /// `tenant_id`. Results arrive in completion order; the receiver ends once every submitted chunk
 /// has finished. Submission stops at the first cancellation (`context canceled`) or pool error.
-pub fn compute_label_values_counts(
-    is_canceled: Arc<dyn Fn() -> bool + Send + Sync>,
+fn submit_label_values_chunk(
     pool: &ComputeWorkerPool,
     tenant_id: &str,
-    chunk_size: usize,
-    lbl_values: Arc<Vec<String>>,
-    count_fn: LabelValueCountFn,
-) -> mpsc::Receiver<LabelValueCountResult> {
-    let (tx, rx) = mpsc::channel(lbl_values.len().max(1));
-    if lbl_values.is_empty() {
-        return rx;
-    }
-    let chunk_size = chunk_size.max(1);
-    let mut start = 0usize;
-    while start < lbl_values.len() {
-        if is_canceled() {
-            let _ = tx.try_send(LabelValueCountResult {
-                val: String::new(),
-                count: 0,
-                err: Some(LabelNamesAndValuesError::Canceled),
-            });
-            return rx;
-        }
-        let end = (start + chunk_size).min(lbl_values.len());
-        let (values, cancel, count_fn, tx_c) = (
-            Arc::clone(&lbl_values),
-            Arc::clone(&is_canceled),
-            Arc::clone(&count_fn),
-            tx.clone(),
-        );
-        let submitted = pool.submit(DIMENSION_LABEL_VALUES_SERIES_COUNT, tenant_id, move || {
-            for v in &values[start..end] {
+    lbl_values: &Arc<Vec<String>>,
+    range: std::ops::Range<usize>,
+    is_canceled: &Arc<dyn Fn() -> bool + Send + Sync>,
+    count_fn: &LabelValueCountFn,
+    tx: &mpsc::Sender<LabelValueCountResult>,
+) -> bool {
+    let (values, cancel, count_fn, tx_c) = (
+        Arc::clone(lbl_values),
+        Arc::clone(is_canceled),
+        Arc::clone(count_fn),
+        tx.clone(),
+    );
+    pool.submit_with_done(
+        DIMENSION_LABEL_VALUES_SERIES_COUNT,
+        tenant_id,
+        move || {
+            for v in &values[range] {
                 let res = if cancel() {
                     Err(LabelNamesAndValuesError::Canceled)
                 } else {
                     count_fn(v)
                 };
-                // The channel has room for every value, so this never fails while the
-                // receiver is alive.
-                let _ = tx_c.try_send(match res {
+                let msg = match res {
                     Ok(count) => LabelValueCountResult {
                         val: v.clone(),
                         count,
@@ -3865,18 +4318,113 @@ pub fn compute_label_values_counts(
                         count: 0,
                         err: Some(err),
                     },
-                });
+                };
+                if tx_c.blocking_send(msg).is_err() {
+                    break;
+                }
+            }
+            tx_c
+        },
+        drop,
+    )
+    .is_ok()
+}
+
+/// Go: `computeLabelValuesSeriesCount`, generic over the per-value counting function.
+///
+/// Values are split into `chunk_size` chunks, each submitted to the shared pool on behalf of
+/// `tenant_id`. Results arrive in completion order; the receiver ends once every submitted chunk
+/// has finished. Submission stops at the first cancellation (`context canceled`) or pool error.
+pub fn compute_label_values_counts(
+    is_canceled: Arc<dyn Fn() -> bool + Send + Sync>,
+    pool: &Arc<ComputeWorkerPool>,
+    tenant_id: &str,
+    chunk_size: usize,
+    lbl_values: Arc<Vec<String>>,
+    count_fn: LabelValueCountFn,
+) -> mpsc::Receiver<LabelValueCountResult> {
+    let chunk_size = chunk_size.max(1);
+    let chan_cap = chunk_size.saturating_mul(4).clamp(64, 4096);
+    let (tx, rx) = mpsc::channel(chan_cap);
+    if lbl_values.is_empty() {
+        return rx;
+    }
+    let pool = Arc::clone(pool);
+    let tenant_id = tenant_id.to_string();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let mut start = 0usize;
+            while start < lbl_values.len() {
+                if tx.is_closed() {
+                    return;
+                }
+                if is_canceled() {
+                    let _ = tx
+                        .send(LabelValueCountResult {
+                            val: String::new(),
+                            count: 0,
+                            err: Some(LabelNamesAndValuesError::Canceled),
+                        })
+                        .await;
+                    return;
+                }
+                let end = (start + chunk_size).min(lbl_values.len());
+                if !submit_label_values_chunk(
+                    &pool,
+                    &tenant_id,
+                    &lbl_values,
+                    start..end,
+                    &is_canceled,
+                    &count_fn,
+                    &tx,
+                ) {
+                    let _ = tx
+                        .send(LabelValueCountResult {
+                            val: String::new(),
+                            count: 0,
+                            err: Some(LabelNamesAndValuesError::PoolStopped),
+                        })
+                        .await;
+                    return;
+                }
+                start = end;
             }
         });
-        if submitted.is_err() {
-            let _ = tx.try_send(LabelValueCountResult {
-                val: String::new(),
-                count: 0,
-                err: Some(LabelNamesAndValuesError::PoolStopped),
-            });
-            return rx;
-        }
-        start = end;
+    } else {
+        std::thread::spawn(move || {
+            let mut start = 0usize;
+            while start < lbl_values.len() {
+                if tx.is_closed() {
+                    return;
+                }
+                if is_canceled() {
+                    let _ = tx.blocking_send(LabelValueCountResult {
+                        val: String::new(),
+                        count: 0,
+                        err: Some(LabelNamesAndValuesError::Canceled),
+                    });
+                    return;
+                }
+                let end = (start + chunk_size).min(lbl_values.len());
+                if !submit_label_values_chunk(
+                    &pool,
+                    &tenant_id,
+                    &lbl_values,
+                    start..end,
+                    &is_canceled,
+                    &count_fn,
+                    &tx,
+                ) {
+                    let _ = tx.blocking_send(LabelValueCountResult {
+                        val: String::new(),
+                        count: 0,
+                        err: Some(LabelNamesAndValuesError::PoolStopped),
+                    });
+                    return;
+                }
+                start = end;
+            }
+        });
     }
     rx
 }
@@ -3885,7 +4433,7 @@ pub fn compute_label_values_counts(
 #[allow(clippy::too_many_arguments)]
 pub fn compute_label_values_series_count(
     is_canceled: Arc<dyn Fn() -> bool + Send + Sync>,
-    pool: &ComputeWorkerPool,
+    pool: &Arc<ComputeWorkerPool>,
     tenant_id: &str,
     chunk_size: usize,
     lbl_name: String,
@@ -4504,5 +5052,147 @@ mod tests {
             active_count += resp.unwrap().metric.len();
         }
         assert_eq!(active_count, 2);
+    }
+
+    async fn single_worker_thread_id(pool: &ComputeWorkerPool) -> std::thread::ThreadId {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pool.submit("probe", "probe", move || {
+            let _ = tx.send(std::thread::current().id());
+        })
+        .unwrap();
+        rx.await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compute_label_values_counts_does_not_drop_errors_when_channel_is_full() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        // Case 1: Canceled after all 64 channel slots are already occupied.
+        {
+            let pool = Arc::new(ComputeWorkerPool::new(1, "test-full-cancel", None).unwrap());
+            pool.start().unwrap();
+            let worker_tid = single_worker_thread_id(&pool).await;
+            let lbl_values: Vec<String> = (0..80).map(|i| i.to_string()).collect();
+            let entered = Arc::new(AtomicUsize::new(0));
+            let checks = Arc::new(AtomicUsize::new(0));
+            let canceled = Arc::new(AtomicBool::new(false));
+
+            let entered_c = Arc::clone(&entered);
+            let count_fn: LabelValueCountFn = Arc::new(move |_| {
+                entered_c.fetch_add(1, Ordering::AcqRel);
+                Ok(1)
+            });
+
+            let checks_c = Arc::clone(&checks);
+            let entered_chk = Arc::clone(&entered);
+            let canceled_c = Arc::clone(&canceled);
+            let is_canceled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                if std::thread::current().id() == worker_tid {
+                    return canceled_c.load(Ordering::Acquire);
+                }
+                if canceled_c.load(Ordering::Acquire) {
+                    return true;
+                }
+                let n = checks_c.fetch_add(1, Ordering::AcqRel) + 1;
+                if n == 66 {
+                    // Item 64 only enters count_fn after items 0..63 are pushed into tx.
+                    while entered_chk.load(Ordering::Acquire) < 65 {
+                        std::thread::yield_now();
+                    }
+                    canceled_c.store(true, Ordering::Release);
+                    return true;
+                }
+                false
+            });
+
+            let mut rx = compute_label_values_counts(
+                is_canceled,
+                &pool,
+                "t1",
+                1,
+                Arc::new(lbl_values),
+                count_fn,
+            );
+            while !canceled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+
+            let mut saw_canceled = false;
+            let mut ok_count = 0usize;
+            while let Some(res) = rx.recv().await {
+                match res.err {
+                    None => ok_count += 1,
+                    Some(LabelNamesAndValuesError::Canceled) => saw_canceled = true,
+                    Some(other) => panic!("unexpected error: {other:?}"),
+                }
+            }
+            assert!(ok_count >= 64, "expected channel to have been saturated: {ok_count}");
+            assert!(saw_canceled, "Canceled error must not be dropped when channel is full");
+            pool.stop();
+        }
+
+        // Case 2: PoolStopped after all 64 channel slots are already occupied.
+        {
+            let pool = Arc::new(ComputeWorkerPool::new(1, "test-full-stop", None).unwrap());
+            pool.start().unwrap();
+            let worker_tid = single_worker_thread_id(&pool).await;
+            let lbl_values: Vec<String> = (0..80).map(|i| i.to_string()).collect();
+            let entered = Arc::new(AtomicUsize::new(0));
+            let checks = Arc::new(AtomicUsize::new(0));
+            let stopped_triggered = Arc::new(AtomicBool::new(false));
+
+            let entered_c = Arc::clone(&entered);
+            let count_fn: LabelValueCountFn = Arc::new(move |_| {
+                entered_c.fetch_add(1, Ordering::AcqRel);
+                Ok(1)
+            });
+
+            let checks_c = Arc::clone(&checks);
+            let entered_chk = Arc::clone(&entered);
+            let pool_c = Arc::clone(&pool);
+            let stopped_c = Arc::clone(&stopped_triggered);
+            let is_canceled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                if std::thread::current().id() == worker_tid {
+                    return false;
+                }
+                let n = checks_c.fetch_add(1, Ordering::AcqRel) + 1;
+                if n == 66 {
+                    while entered_chk.load(Ordering::Acquire) < 65 {
+                        std::thread::yield_now();
+                    }
+                    let pool_stop = Arc::clone(&pool_c);
+                    std::thread::spawn(move || pool_stop.stop());
+                    while pool_c.submit("probe", "t2", || {}).is_ok() {
+                        std::thread::yield_now();
+                    }
+                    stopped_c.store(true, Ordering::Release);
+                }
+                false
+            });
+
+            let mut rx = compute_label_values_counts(
+                is_canceled,
+                &pool,
+                "t1",
+                1,
+                Arc::new(lbl_values),
+                count_fn,
+            );
+            while !stopped_triggered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+
+            let mut saw_pool_stopped = false;
+            let mut ok_count = 0usize;
+            while let Some(res) = rx.recv().await {
+                match res.err {
+                    None => ok_count += 1,
+                    Some(LabelNamesAndValuesError::PoolStopped) => saw_pool_stopped = true,
+                    Some(other) => panic!("unexpected error: {other:?}"),
+                }
+            }
+            assert!(ok_count >= 64, "expected channel to have been saturated: {ok_count}");
+            assert!(saw_pool_stopped, "PoolStopped error must not be dropped when channel is full");
+        }
     }
 }

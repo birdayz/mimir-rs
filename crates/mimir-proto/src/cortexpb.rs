@@ -127,19 +127,31 @@ pub fn is_client_error(status: &tonic::Status) -> bool {
             return true;
         }
     }
-    if let Ok(rpc_status) = crate::grpcutilpb::decode_status_details(status) {
-        if rpc_status.code / 100 == 4 {
+    if let Some(raw_code) = status
+        .metadata()
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i32>().ok())
+    {
+        if raw_code / 100 == 4 {
             return true;
         }
-        for any in &rpc_status.details {
-            if let Some(Ok(err_details)) = crate::grpcutilpb::unpack_any::<ErrorDetails>(
-                any,
-                crate::grpcutilpb::CORTEXPB_ERROR_DETAILS_TYPE_URL,
-            ) {
-                if let Ok(cause) = ErrorCause::try_from(err_details.cause) {
-                    return is_client_error_cause(cause);
+    }
+    if !status.details().is_empty() {
+        if let Ok(rpc_status) = crate::grpcutilpb::decode_status_details(status) {
+            if rpc_status.code / 100 == 4 {
+                return true;
+            }
+            for any in &rpc_status.details {
+                if let Some(Ok(err_details)) = crate::grpcutilpb::unpack_any::<ErrorDetails>(
+                    any,
+                    crate::grpcutilpb::CORTEXPB_ERROR_DETAILS_TYPE_URL,
+                ) {
+                    if let Ok(cause) = ErrorCause::try_from(err_details.cause) {
+                        return is_client_error_cause(cause);
+                    }
+                    return false;
                 }
-                return false;
             }
         }
     }

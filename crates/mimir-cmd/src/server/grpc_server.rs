@@ -818,8 +818,11 @@ where
 
     // Interceptor order (dskit server.New): ..., Mimir's GRPCMiddleware (multitenant auth), then
     // cluster validation (unary RPCs only, never health checks).
-    let auth_rejection = cfg
-        .multitenancy_enabled
+    // For `/cortex.Ingester/Push`, Go's gRPC server runs `dec(in)` before the auth
+    // interceptor (`dec(in) -> org_id`), so `IngesterZeroCopyServer` enforces `tenant_from_req`
+    // right after wire decoding.
+    let auth_rejection = (cfg.multitenancy_enabled
+        && known_method != Some(KnownGrpcMethod::IngesterPush))
         .then(|| check_org_id_known(req.headers(), known_method, &guard.method))
         .flatten();
     if auth_rejection.is_some() {

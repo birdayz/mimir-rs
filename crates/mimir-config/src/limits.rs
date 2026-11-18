@@ -836,14 +836,30 @@ impl LimitsConfig {
 
     /// Validates limits matching `pkg/util/validation/limits.go:Limits.Validate()`.
     pub fn validate(&mut self) -> Result<(), ConfigError> {
-        let validation_scheme = match self.name_validation_scheme {
+        self.validate_with_defaults(None)
+    }
+
+    /// Validates limits, falling back `name_validation_scheme` and
+    /// `otel_metric_suffixes_enabled` to `defaults` when unset on a per-tenant override
+    /// (without mutating `self` so `/runtime_config` preserves unset fields like Go).
+    pub fn validate_with_defaults(&mut self, defaults: Option<&LimitsConfig>) -> Result<(), ConfigError> {
+        let effective_scheme = match self.name_validation_scheme {
+            NameValidationScheme::Unset => defaults
+                .map(|d| d.name_validation_scheme)
+                .unwrap_or(NameValidationScheme::Unset),
+            other => other,
+        };
+        let validation_scheme = match effective_scheme {
             NameValidationScheme::Unset | NameValidationScheme::Legacy => {
                 NameValidationScheme::Legacy
             }
             NameValidationScheme::Utf8 => NameValidationScheme::Utf8,
         };
 
-        let otel_suffixes = self.otel_metric_suffixes_enabled.unwrap_or(false);
+        let otel_suffixes = self
+            .otel_metric_suffixes_enabled
+            .or_else(|| defaults.and_then(|d| d.otel_metric_suffixes_enabled))
+            .unwrap_or(false);
         match self.otel_translation_strategy.0.as_str() {
             "UnderscoreEscapingWithoutSuffixes" => {
                 if validation_scheme != NameValidationScheme::Legacy {

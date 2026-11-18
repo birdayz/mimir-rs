@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimir_config::{BlocksStorageConfig, IngesterConfig, Overrides};
 use mimir_proto::cortexpb;
@@ -24,7 +24,6 @@ use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::metadata::MetadataLimits;
 use mimir_tsdb::postings_cache::{PostingsForMatchersCacheConfig, PostingsForMatchersCacheMetrics};
-use mimir_tsdb::record::MetricType;
 use mimir_tsdb::wlog::CompressionType;
 use parking_lot::{Mutex, RwLock};
 use prometheus::{CounterVec, Registry};
@@ -329,6 +328,7 @@ pub struct UserTsdb {
     early_compaction_non_owned_enabled: AtomicBool,
 
     lifecycle_adapter: Arc<LifecycleCallbackAdapter>,
+    current_metadata_limits: Arc<Mutex<MetadataLimits>>,
 
     /// `userTSDB.plannerProvider`: set when index lookup planning is enabled.
     planner_provider: std::sync::OnceLock<Arc<PlannerProvider>>,
@@ -465,6 +465,10 @@ impl UserTsdb {
         let enable_histogram_st_encoding =
             tenant_limits.histogram_chunk_encoding == "histogram_st";
 
+        let initial_metadata_limits = MetadataLimits {
+            max_metrics_with_metadata_per_user: limiter.max_metadata_per_user(&user_id),
+            max_metadata_per_metric: limiter.max_metadata_per_metric(&user_id),
+        };
         let head_opts = HeadOptions {
             chunk_range_ms: block_duration_ms,
             samples_per_chunk: mimir_tsdb::head::DEFAULT_SAMPLES_PER_CHUNK,
@@ -491,27 +495,10 @@ impl UserTsdb {
                 as usize,
             timely_compaction: blocks_cfg.tsdb.timely_head_compaction_enabled,
             // Go `headPostingsForMatchersCacheFactory` (MaxItems: math.MaxInt).
-            postings_cache: PostingsForMatchersCacheConfig {
-                ttl: Duration::from_nanos(
-                    blocks_cfg.tsdb.head_postings_for_matchers_cache_ttl.as_nanos().max(0) as u64,
-                ),
-                max_items: usize::MAX,
-                max_bytes: blocks_cfg.tsdb.head_postings_for_matchers_cache_max_bytes.max(0)
-                    as usize,
-                enable_invalidation: true,
-                num_metric_versions: blocks_cfg.tsdb.head_postings_for_matchers_cache_versions.max(0)
-                    as usize,
-                metrics: shared_metrics.head_postings_cache.clone(),
-                // Go tracks metric versions only for a shared cache with invalidation.
-                report_invalidations: blocks_cfg.tsdb.shared_postings_for_matchers_cache
-                    && blocks_cfg.tsdb.head_postings_for_matchers_cache_invalidation,
-            },
-            metadata_limits: MetadataLimits {
-                max_metrics_with_metadata_per_user: limiter.max_metadata_per_user(&user_id),
-                max_metadata_per_metric: limiter.max_metadata_per_metric(&user_id),
-            },
+            postings_cache: head_postings_for_matchers_cache_config(blocks_cfg, shared_metrics),
+            metadata_limits: initial_metadata_limits,
             series_lifecycle_callback: Some(lifecycle_adapter.clone()),
-            registry: tsdb_prom_reg,
+            registry: tsdb_prom_reg.clone(),
         };
 
         // Go `blocksToDelete` closure + `userTSDB.blocksToDelete`: nothing is deleted until
@@ -575,7 +562,15 @@ impl UserTsdb {
             },
         };
 
+        if let Some(ref reg) = tsdb_prom_reg {
+            if let Some(collector) = HeadChunksStorageSizeCollector::new(udir.join("chunks_head")) {
+                let _ = reg.register(Box::new(collector));
+            }
+        }
+
         let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
+        db.head()
+            .set_chunk_end_time_variance(blocks_cfg.tsdb.head_chunks_end_time_variance);
         let weak_db = Arc::downgrade(&db);
         *lifecycle_adapter.num_series_fn.write() = Some(Arc::new(move || {
             weak_db.upgrade().map_or(0, |d| d.head().num_series())
@@ -683,6 +678,7 @@ impl UserTsdb {
                 ingester_cfg.early_compaction_non_owned_series_enabled,
             ),
             lifecycle_adapter,
+            current_metadata_limits: Arc::new(Mutex::new(initial_metadata_limits)),
             planner_provider: std::sync::OnceLock::new(),
             ingested_samples_counter: std::sync::OnceLock::new(),
             ingested_samples_fail_counter: std::sync::OnceLock::new(),
@@ -978,6 +974,10 @@ impl UserTsdb {
         res.map_err(|e| e.to_string())
     }
 
+    pub fn current_metadata_limits(&self) -> MetadataLimits {
+        *self.current_metadata_limits.lock()
+    }
+
     pub fn apply_tsdb_settings(&self) {
         let limits = self.overrides.for_tenant(&self.user_id);
         let ooo_ms = (limits.out_of_order_time_window.0 / 1_000_000).max(0);
@@ -992,6 +992,12 @@ impl UserTsdb {
             Encoding::Xor
         };
         self.db.head().set_float_chunk_encoding(float_enc);
+        let metadata_limits = MetadataLimits {
+            max_metrics_with_metadata_per_user: self.limiter.max_metadata_per_user(&self.user_id),
+            max_metadata_per_metric: self.limiter.max_metadata_per_metric(&self.user_id),
+        };
+        self.db.head().set_metadata_limits(metadata_limits);
+        *self.current_metadata_limits.lock() = metadata_limits;
     }
 
     pub fn owned_series_state(&self) -> OwnedSeriesState {
@@ -1149,29 +1155,73 @@ impl UserTsdb {
     pub fn recompute_owned_series_with_compute_fn(
         &self,
         shard_size: usize,
-        _reason: &str,
+        reason: &str,
         mut compute_fn: impl FnMut() -> usize,
     ) -> (bool, usize) {
         pub const MAX_ATTEMPTS: usize = 3;
         pub const MAX_DIFF: isize = 1000;
 
+        let start = Instant::now();
         let mut attempts = 0usize;
-        for _ in 0..MAX_ATTEMPTS {
+        let mut success = false;
+        let mut owned_before = 0usize;
+        let mut shard_before = 0usize;
+        let mut local_limit_before = 0usize;
+        let mut owned_new = 0usize;
+        let mut local_limit_new = 0usize;
+
+        while !success && attempts < MAX_ATTEMPTS {
             attempts += 1;
-            let owned_before = self.owned_series_state().owned_series_count as isize;
-            let local_limit_new = self.limiter.max_series_per_user(&self.user_id, 0);
-            let owned_new = compute_fn();
+            let prev = self.owned_series_state();
+            owned_before = prev.owned_series_count;
+            shard_before = prev.shard_size;
+            local_limit_before = prev.local_series_limit;
+
+            local_limit_new = self.limiter.max_series_per_user(&self.user_id, 0);
+            owned_new = compute_fn();
 
             let mut os = self.owned_state.lock();
-            let diff = (os.owned_series_count as isize) - owned_before;
+            let diff = (os.owned_series_count as isize) - (owned_before as isize);
             os.owned_series_count = owned_new;
             os.shard_size = shard_size;
             os.local_series_limit = local_limit_new;
             if (0..=MAX_DIFF).contains(&diff) {
-                return (true, attempts);
+                success = true;
             }
         }
-        (false, attempts)
+        let duration_ms = start.elapsed().as_millis() as u64;
+        if success {
+            info!(
+                user = %self.user_id,
+                reason = %reason,
+                owned_series_before = owned_before,
+                owned_series_new = owned_new,
+                shard_size_before = shard_before,
+                shard_size_new = shard_size,
+                local_limit_before = local_limit_before,
+                local_limit_new = local_limit_new,
+                duration_ms,
+                attempts,
+                success,
+                "owned series: recomputed owned series for user"
+            );
+        } else {
+            warn!(
+                user = %self.user_id,
+                reason = %reason,
+                owned_series_before = owned_before,
+                owned_series_new = owned_new,
+                shard_size_before = shard_before,
+                shard_size_new = shard_size,
+                local_limit_before = local_limit_before,
+                local_limit_new = local_limit_new,
+                duration_ms,
+                attempts,
+                success,
+                "owned series: recomputed owned series for user"
+            );
+        }
+        (success, attempts)
     }
 
     pub fn update_owned_series_if_needed(
@@ -1296,10 +1346,15 @@ pub fn next_forced_head_compaction_range(
     if max_time < min_time {
         return None;
     }
-    let min_bucket = min_time.div_euclid(block_duration);
-    let max_bucket = max_time.div_euclid(block_duration);
-    if min_bucket != max_bucket {
-        let split_max = (min_bucket + 1) * block_duration - 1;
+    if block_duration <= 0 {
+        return Some((min_time, max_time, true));
+    }
+    let min_bucket = min_time / block_duration;
+    let max_bucket = max_time / block_duration;
+    if min_bucket.saturating_mul(block_duration) != max_bucket.saturating_mul(block_duration) {
+        let split_max = (min_bucket + 1)
+            .saturating_mul(block_duration)
+            .saturating_sub(1);
         Some((min_time, split_max, false))
     } else {
         Some((min_time, max_time, true))
@@ -1307,7 +1362,7 @@ pub fn next_forced_head_compaction_range(
 }
 
 struct MetadataEntry {
-    metric_type: MetricType,
+    raw_type: i32,
     help: String,
     unit: String,
     last_seen_nanos: AtomicI64,
@@ -1325,33 +1380,7 @@ fn system_time_to_nanos(t: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
-#[inline]
-fn proto_metric_type_to_tsdb(t: i32) -> MetricType {
-    match cortexpb::metric_metadata::MetricType::try_from(t) {
-        Ok(cortexpb::metric_metadata::MetricType::Counter) => MetricType::Counter,
-        Ok(cortexpb::metric_metadata::MetricType::Gauge) => MetricType::Gauge,
-        Ok(cortexpb::metric_metadata::MetricType::Histogram) => MetricType::HistogramSample,
-        Ok(cortexpb::metric_metadata::MetricType::Gaugehistogram) => MetricType::GaugeHistogram,
-        Ok(cortexpb::metric_metadata::MetricType::Summary) => MetricType::Summary,
-        Ok(cortexpb::metric_metadata::MetricType::Info) => MetricType::Info,
-        Ok(cortexpb::metric_metadata::MetricType::Stateset) => MetricType::Stateset,
-        _ => MetricType::Unknown,
-    }
-}
 
-#[inline]
-fn tsdb_metric_type_to_proto(t: MetricType) -> i32 {
-    match t {
-        MetricType::Counter => cortexpb::metric_metadata::MetricType::Counter as i32,
-        MetricType::Gauge => cortexpb::metric_metadata::MetricType::Gauge as i32,
-        MetricType::HistogramSample => cortexpb::metric_metadata::MetricType::Histogram as i32,
-        MetricType::GaugeHistogram => cortexpb::metric_metadata::MetricType::Gaugehistogram as i32,
-        MetricType::Summary => cortexpb::metric_metadata::MetricType::Summary as i32,
-        MetricType::Info => cortexpb::metric_metadata::MetricType::Info as i32,
-        MetricType::Stateset => cortexpb::metric_metadata::MetricType::Stateset as i32,
-        MetricType::Unknown => cortexpb::metric_metadata::MetricType::Unknown as i32,
-    }
-}
 
 /// Per-tenant metric metadata wrapper tracking metrics & limits (`user_metrics_metadata.go`).
 pub struct TenantMetadataStore {
@@ -1406,7 +1435,6 @@ impl TenantMetadataStore {
         unit: &str,
         now_nanos: i64,
     ) -> Result<(), IngesterError> {
-        let metric_type = proto_metric_type_to_tsdb(raw_type);
 
         let max_per_user = self.limiter.max_metadata_per_user(&self.user_id);
         let max_per_metric = self.limiter.max_metadata_per_metric(&self.user_id);
@@ -1417,7 +1445,7 @@ impl TenantMetadataStore {
             if let Some(entries) = guard.metrics.get(metric_family_name) {
                 if max_per_metric == 0 || entries.len() < max_per_metric {
                     for e in entries {
-                        if e.metric_type == metric_type && e.help == help && e.unit == unit {
+                        if e.raw_type == raw_type && e.help == help && e.unit == unit {
                             e.last_seen_nanos.store(now_nanos, Ordering::Relaxed);
                             return Ok(());
                         }
@@ -1442,7 +1470,7 @@ impl TenantMetadataStore {
                 ));
             }
             for e in entries {
-                if e.metric_type == metric_type && e.help == help && e.unit == unit {
+                if e.raw_type == raw_type && e.help == help && e.unit == unit {
                     e.last_seen_nanos.store(now_nanos, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -1459,7 +1487,7 @@ impl TenantMetadataStore {
         }
 
         let entry = MetadataEntry {
-            metric_type,
+            raw_type,
             help: help.to_owned(),
             unit: unit.to_owned(),
             last_seen_nanos: AtomicI64::new(now_nanos),
@@ -1522,7 +1550,7 @@ impl TenantMetadataStore {
                         break;
                     }
                     out.push(cortexpb::MetricMetadata {
-                        r#type: tsdb_metric_type_to_proto(e.metric_type),
+                        r#type: e.raw_type,
                         metric_family_name: name.to_owned(),
                         help: e.help.clone(),
                         unit: e.unit.clone(),
@@ -1558,6 +1586,109 @@ impl TenantMetadataStore {
             push_entries(&mut out, name, entries);
         }
         out
+    }
+}
+
+/// Builds the Head `PostingsForMatchersCacheConfig` matching Go's `headPostingsForMatchersCacheFactory`.
+///
+/// Go only allocates `metricVersions` (`head_postings_for_matchers_cache_versions`, default 2M * 8B = 16 MiB)
+/// when both `shared_postings_for_matchers_cache` and `head_postings_for_matchers_cache_invalidation` are true.
+/// Passing 0 otherwise ensures `Head::open` allocates only the minimum 64-slot table (512 B per tenant).
+pub(crate) fn head_postings_for_matchers_cache_config(
+    blocks_cfg: &BlocksStorageConfig,
+    shared_metrics: &SharedTsdbMetrics,
+) -> PostingsForMatchersCacheConfig {
+    let invalidation = blocks_cfg.tsdb.head_postings_for_matchers_cache_invalidation;
+    let shared_invalidation =
+        blocks_cfg.tsdb.shared_postings_for_matchers_cache && invalidation;
+    PostingsForMatchersCacheConfig {
+        ttl: Duration::from_nanos(
+            blocks_cfg
+                .tsdb
+                .head_postings_for_matchers_cache_ttl
+                .as_nanos()
+                .max(0) as u64,
+        ),
+        max_items: usize::MAX,
+        max_bytes: blocks_cfg
+            .tsdb
+            .head_postings_for_matchers_cache_max_bytes
+            .max(0) as usize,
+        enable_invalidation: invalidation,
+        num_metric_versions: if shared_invalidation {
+            blocks_cfg
+                .tsdb
+                .head_postings_for_matchers_cache_versions
+                .max(0) as usize
+        } else {
+            0
+        },
+        metrics: shared_metrics.head_postings_cache.clone(),
+        report_invalidations: shared_invalidation,
+    }
+}
+
+/// Dynamic gauge collector for `prometheus_tsdb_head_chunks_storage_size_bytes`
+/// (Go `prometheus/tsdb/head.go:850` -> `h.chunkDiskMapper.Size()`).
+struct HeadChunksStorageSizeCollector {
+    desc: prometheus::core::Desc,
+    chunks_head_dir: PathBuf,
+}
+
+impl HeadChunksStorageSizeCollector {
+    fn new(chunks_head_dir: PathBuf) -> Option<Self> {
+        let desc = prometheus::core::Desc::new(
+            "prometheus_tsdb_head_chunks_storage_size_bytes".to_string(),
+            "Size of the chunks_head directory.".to_string(),
+            Vec::new(),
+            HashMap::new(),
+        )
+        .ok()?;
+        Some(Self {
+            desc,
+            chunks_head_dir,
+        })
+    }
+}
+
+fn dir_size_bytes(root: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+impl prometheus::core::Collector for HeadChunksStorageSizeCollector {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        vec![&self.desc]
+    }
+
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        let size = dir_size_bytes(&self.chunks_head_dir);
+        let mut g = prometheus::proto::Gauge::default();
+        g.set_value(size as f64);
+        let mut m = prometheus::proto::Metric::default();
+        m.set_gauge(g);
+        let mut mf = prometheus::proto::MetricFamily::default();
+        mf.set_name(self.desc.fq_name.clone());
+        mf.set_help(self.desc.help.clone());
+        mf.set_field_type(prometheus::proto::MetricType::GAUGE);
+        mf.set_metric(vec![m].into());
+        vec![mf]
     }
 }
 
@@ -1620,5 +1751,158 @@ mod tests {
 
         let err = store.add_parts_at(1, "up", "h1", "", 200).unwrap_err();
         assert!(matches!(err, IngesterError::PerMetricMetadataLimitReached { .. }));
+    }
+
+    #[test]
+    fn user_tsdb_wires_chunk_end_time_variance_and_dynamic_metadata_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = dir.path().to_string_lossy().into_owned();
+        blocks_cfg.tsdb.ship_interval = mimir_config::GoDuration::ZERO;
+        blocks_cfg.tsdb.head_chunks_end_time_variance = 0.25;
+
+        let limits = mimir_config::LimitsConfig {
+            max_global_metadata_per_user: 10,
+            max_global_metadata_per_metric: 3,
+            ..Default::default()
+        };
+        let overrides = Overrides::new(limits);
+        let limiter = Arc::new(Limiter::new(
+            overrides.clone(),
+            Arc::new(OneInstanceStrategy),
+        ));
+        let reg = Registry::new();
+        let shared = SharedTsdbMetrics::new(Some(&reg));
+        let shipper_metrics = ShipperMetrics::new(Some(&reg));
+        let rejected = CounterVec::new(prometheus::Opts::new("t_rej", "h"), &["reason"]).unwrap();
+        let ingester_cfg = mimir_config::IngesterConfig::default();
+        let db = UserTsdb::open(
+            "u-w13".to_string(),
+            &ingester_cfg,
+            &blocks_cfg,
+            overrides.clone(),
+            limiter,
+            None,
+            shipper_metrics,
+            &shared,
+            None,
+            1,
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(|| 0),
+            rejected,
+            HashSet::new(),
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(db.db.head().chunk_end_time_variance(), 0.25);
+        assert_eq!(
+            db.db.head().metadata_limits(),
+            MetadataLimits {
+                max_metrics_with_metadata_per_user: 10,
+                max_metadata_per_metric: 3,
+            }
+        );
+
+        overrides.set_defaults(mimir_config::LimitsConfig {
+            max_global_metadata_per_user: 42,
+            max_global_metadata_per_metric: 7,
+            ..Default::default()
+        });
+        db.apply_tsdb_settings();
+
+        let expected = MetadataLimits {
+            max_metrics_with_metadata_per_user: 42,
+            max_metadata_per_metric: 7,
+        };
+        assert_eq!(db.current_metadata_limits(), expected);
+        assert_eq!(db.db.head().metadata_limits(), expected);
+    }
+
+    #[test]
+    fn head_postings_cache_config_respects_invalidation_and_shared_flags() {
+        let shared = SharedTsdbMetrics::default();
+        let default_cfg = mimir_config::BlocksStorageConfig::default();
+        let pc_default = head_postings_for_matchers_cache_config(&default_cfg, &shared);
+        assert!(!pc_default.enable_invalidation);
+        assert_eq!(pc_default.num_metric_versions, 0);
+        assert!(!pc_default.report_invalidations);
+
+        let mut inv_only_cfg = mimir_config::BlocksStorageConfig::default();
+        inv_only_cfg.tsdb.head_postings_for_matchers_cache_invalidation = true;
+        let pc_inv = head_postings_for_matchers_cache_config(&inv_only_cfg, &shared);
+        assert!(pc_inv.enable_invalidation);
+        assert_eq!(pc_inv.num_metric_versions, 0);
+        assert!(!pc_inv.report_invalidations);
+
+        let mut shared_inv_cfg = mimir_config::BlocksStorageConfig::default();
+        shared_inv_cfg.tsdb.shared_postings_for_matchers_cache = true;
+        shared_inv_cfg.tsdb.head_postings_for_matchers_cache_invalidation = true;
+        shared_inv_cfg.tsdb.head_postings_for_matchers_cache_versions = 4096;
+        let pc_shared = head_postings_for_matchers_cache_config(&shared_inv_cfg, &shared);
+        assert!(pc_shared.enable_invalidation);
+        assert_eq!(pc_shared.num_metric_versions, 4096);
+        assert!(pc_shared.report_invalidations);
+    }
+
+    #[test]
+    fn tenant_tsdb_registry_exposes_head_chunks_storage_size_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = dir.path().to_string_lossy().into_owned();
+        blocks_cfg.tsdb.ship_interval = mimir_config::GoDuration::ZERO;
+
+        let main_reg = Registry::new();
+        let tenant_reg = Arc::new(Registry::new());
+        let shared = SharedTsdbMetrics::new(Some(&main_reg));
+        let shipper_metrics = ShipperMetrics::new(Some(&main_reg));
+        let overrides = Overrides::new(mimir_config::LimitsConfig::default());
+        let limiter = Arc::new(Limiter::new(
+            overrides.clone(),
+            Arc::new(OneInstanceStrategy),
+        ));
+        let rejected = CounterVec::new(prometheus::Opts::new("t_rej2", "h"), &["reason"]).unwrap();
+
+        let _db = UserTsdb::open(
+            "t-chunks-size".to_string(),
+            &mimir_config::IngesterConfig::default(),
+            &blocks_cfg,
+            overrides,
+            limiter,
+            None,
+            shipper_metrics,
+            &shared,
+            Some(Arc::clone(&tenant_reg)),
+            1,
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(|| 0),
+            rejected,
+            HashSet::new(),
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+
+        let chunks_head = dir.path().join("t-chunks-size").join("chunks_head");
+        std::fs::create_dir_all(&chunks_head).unwrap();
+        std::fs::write(chunks_head.join("000001"), vec![0u8; 4096]).unwrap();
+
+        let fam = tenant_reg
+            .gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "prometheus_tsdb_head_chunks_storage_size_bytes")
+            .expect("prometheus_tsdb_head_chunks_storage_size_bytes must be in tenant registry");
+        assert!(fam.get_metric()[0].get_gauge().get_value() >= 4096.0);
+
+        assert!(
+            main_reg
+                .gather()
+                .into_iter()
+                .all(|mf| mf.get_name() != "prometheus_tsdb_head_chunks_storage_size_bytes"),
+            "prometheus_tsdb_head_chunks_storage_size_bytes must not be registered on main /metrics"
+        );
     }
 }

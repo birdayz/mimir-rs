@@ -282,4 +282,29 @@ impl EncodedChunk {
             Self::FloatHistogramSt(c) => c.num_samples(),
         }
     }
+
+    #[inline]
+    pub(crate) fn into_bstream(self) -> (Encoding, bstream::BitStream) {
+        match self {
+            Self::Xor(c) => (Encoding::Xor, c.b),
+            Self::Xor2(c) => (Encoding::Xor2, c.b),
+            Self::Histogram(c) => (Encoding::Histogram, c.b),
+            Self::HistogramSt(c) => (Encoding::HistogramSt, c.b),
+            Self::FloatHistogram(c) => (Encoding::FloatHistogram, c.b),
+            Self::FloatHistogramSt(c) => (Encoding::FloatHistogramSt, c.b),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_bstream(enc: Encoding, b: bstream::BitStream) -> Self {
+        match enc {
+            Encoding::Xor => Self::Xor(XorChunk { b }),
+            Encoding::Xor2 => Self::Xor2(Xor2Chunk { b }),
+            Encoding::Histogram => Self::Histogram(HistogramChunk { b }),
+            Encoding::HistogramSt => Self::HistogramSt(HistogramStChunk { b }),
+            Encoding::FloatHistogram => Self::FloatHistogram(FloatHistogramChunk { b }),
+            Encoding::FloatHistogramSt => Self::FloatHistogramSt(FloatHistogramStChunk { b }),
+            Encoding::None => unreachable!("Encoding::None cannot form an EncodedChunk"),
+        }
+    }
 }

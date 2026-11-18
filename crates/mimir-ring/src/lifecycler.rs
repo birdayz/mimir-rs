@@ -203,6 +203,7 @@ impl BasicLifecyclerMetrics {
 }
 
 pub struct BasicLifecycler {
+    me: std::sync::Weak<BasicLifecycler>,
     cfg: BasicLifecyclerConfig,
     ring_name: String,
     ring_key: String,
@@ -233,7 +234,8 @@ impl BasicLifecycler {
         let metrics = BasicLifecyclerMetrics::new(ring_name, reg.as_ref());
         metrics.tokens_to_own.set(cfg.num_tokens as f64);
 
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             keep_on_shutdown: AtomicBool::new(cfg.keep_instance_in_the_ring_on_shutdown),
             cfg,
             ring_name: ring_name.to_string(),
@@ -470,16 +472,19 @@ impl BasicLifecycler {
         let zone = self.cfg.zone.clone();
         let versions = self.cfg.versions.clone();
         let delegate = self.delegate.clone();
-        let token_generator = self.token_generator.clone();
-        let num_tokens = self.cfg.num_tokens;
+        let me = self.me.clone();
         let last_desc: Arc<Mutex<Option<InstanceDesc>>> = Arc::new(Mutex::new(None));
         let last_desc_cb = last_desc.clone();
 
-        let store = self.store.clone();
         self.store
             .cas(
                 &self.ring_key,
                 Box::new(move |in_val| {
+                    let Some(this) = me.upgrade() else {
+                        return Err(CasCallbackError::fatal(KvError::Other(
+                            "BasicLifecycler dropped".to_string(),
+                        )));
+                    };
                     let mut ring_desc = in_val
                         .and_then(|a| a.downcast_ref::<Desc>())
                         .cloned()
@@ -487,27 +492,8 @@ impl BasicLifecycler {
                     let existing = ring_desc.ingesters.get(&id).cloned();
                     let exists = existing.is_some();
 
-                    let tmp_lc = BasicLifecycler::new(
-                        BasicLifecyclerConfig {
-                            id: id.clone(),
-                            addr: addr.clone(),
-                            zone: zone.clone(),
-                            heartbeat_period: Duration::ZERO,
-                            heartbeat_timeout: Duration::ZERO,
-                            tokens_observe_period: Duration::ZERO,
-                            num_tokens,
-                            keep_instance_in_the_ring_on_shutdown: false,
-                            token_generator: Some(token_generator.clone()),
-                            versions: versions.clone(),
-                        },
-                        "",
-                        "",
-                        store.clone(),
-                        delegate.clone(),
-                        None,
-                    );
                     let (state, mut tokens) = delegate.on_ring_instance_register(
-                        &tmp_lc,
+                        &this,
                         &ring_desc,
                         exists,
                         &id,
@@ -707,31 +693,12 @@ impl BasicLifecycler {
 
     async fn heartbeat(&self) {
         let delegate = self.delegate.clone();
-        let store = self.store.clone();
-        let cfg = self.cfg.clone();
-        let token_generator = self.token_generator.clone();
+        let me = self.me.clone();
         let res = self
             .update_instance(move |ring, inst| {
-                let tmp_lc = BasicLifecycler::new(
-                    BasicLifecyclerConfig {
-                        id: cfg.id.clone(),
-                        addr: cfg.addr.clone(),
-                        zone: cfg.zone.clone(),
-                        heartbeat_period: cfg.heartbeat_period,
-                        heartbeat_timeout: cfg.heartbeat_timeout,
-                        tokens_observe_period: cfg.tokens_observe_period,
-                        num_tokens: cfg.num_tokens,
-                        keep_instance_in_the_ring_on_shutdown: cfg.keep_instance_in_the_ring_on_shutdown,
-                        token_generator: Some(token_generator.clone()),
-                        versions: cfg.versions.clone(),
-                    },
-                    "",
-                    "",
-                    store.clone(),
-                    delegate.clone(),
-                    None,
-                );
-                delegate.on_ring_instance_heartbeat(&tmp_lc, ring, inst);
+                if let Some(this) = me.upgrade() {
+                    delegate.on_ring_instance_heartbeat(&this, ring, inst);
+                }
                 inst.timestamp = system_time_to_unix_secs(SystemTime::now());
                 true
             })
@@ -2576,5 +2543,78 @@ mod tests {
             .downcast::<Desc>()
             .unwrap();
         assert!(!desc.ingesters.contains_key("zombie-1"));
+    }
+
+    #[tokio::test]
+    async fn test_basic_lifecycler_passes_real_self_to_delegate() {
+        use mimir_common::services::Service;
+        use std::sync::atomic::AtomicBool;
+
+        struct CheckDelegate {
+            reg_saw_keep: AtomicBool,
+            hb_saw_keep: AtomicBool,
+        }
+        impl BasicLifecyclerDelegate for CheckDelegate {
+            fn on_ring_instance_register(
+                &self,
+                lifecycler: &BasicLifecycler,
+                _ring_desc: &Desc,
+                _instance_exists: bool,
+                _instance_id: &str,
+                _instance_desc: Option<&InstanceDesc>,
+            ) -> (InstanceState, Vec<u32>) {
+                self.reg_saw_keep.store(
+                    lifecycler.should_keep_instance_in_the_ring_on_shutdown(),
+                    Ordering::Release,
+                );
+                (InstanceState::Active, vec![10, 20])
+            }
+            fn on_ring_instance_tokens(&self, _lifecycler: &BasicLifecycler, _tokens: &[u32]) {}
+            fn on_ring_instance_stopping<'a>(
+                &'a self,
+                _lifecycler: &'a BasicLifecycler,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async {})
+            }
+            fn on_ring_instance_heartbeat(
+                &self,
+                lifecycler: &BasicLifecycler,
+                _ring_desc: &mut Desc,
+                _instance_desc: &mut InstanceDesc,
+            ) {
+                self.hb_saw_keep.store(
+                    lifecycler.should_keep_instance_in_the_ring_on_shutdown(),
+                    Ordering::Release,
+                );
+            }
+        }
+
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(ring_desc_codec()));
+        let del = Arc::new(CheckDelegate {
+            reg_saw_keep: AtomicBool::new(false),
+            hb_saw_keep: AtomicBool::new(false),
+        });
+        let cfg = BasicLifecyclerConfig {
+            id: "self-check".to_string(),
+            addr: "127.0.0.1:9095".to_string(),
+            zone: "zone-a".to_string(),
+            heartbeat_period: Duration::from_millis(20),
+            heartbeat_timeout: Duration::from_secs(1),
+            tokens_observe_period: Duration::ZERO,
+            num_tokens: 2,
+            keep_instance_in_the_ring_on_shutdown: true,
+            token_generator: None,
+            versions: HashMap::new(),
+        };
+        let lc = BasicLifecycler::new(cfg, "ingester", "ring", kv, del.clone(), None);
+        let svc = lc.into_service();
+        svc.start_async(ServiceContext::background()).await.unwrap();
+        svc.await_running().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        svc.stop_async();
+        svc.await_terminated().await.unwrap();
+
+        assert!(del.reg_saw_keep.load(Ordering::Acquire));
+        assert!(del.hb_saw_keep.load(Ordering::Acquire));
     }
 }

@@ -13,7 +13,8 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering,
+    AtomicBool, AtomicI64, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
+    Ordering,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,6 +26,7 @@ use prometheus::{CounterVec, Histogram as PromHistogram, HistogramOpts, Opts, Re
 use smallvec::SmallVec;
 use thiserror::Error;
 
+use crate::chunkenc::bstream::BitStream;
 use crate::chunkenc::float_histogram::AppendFloatHistogramOutcome;
 use crate::chunkenc::float_histogram_st::AppendFloatHistogramStOutcome;
 use crate::chunkenc::histogram::AppendHistogramOutcome;
@@ -282,16 +284,67 @@ fn format_go_g(v: f64) -> String {
 
 #[inline]
 pub const fn range_for_timestamp(t: i64, width: i64) -> i64 {
-    (t / width) * width + width
+    if width <= 0 {
+        return t;
+    }
+    let t128 = t as i128;
+    let w128 = width as i128;
+    let res = (t128 / w128) * w128 + w128;
+    if res > i64::MAX as i128 {
+        i64::MAX
+    } else if res < i64::MIN as i128 {
+        i64::MIN
+    } else {
+        res as i64
+    }
 }
 
 #[inline]
 fn compute_chunk_end_time(start: i64, cur: i64, max_t: i64, ratio_to_full: f64) -> i64 {
-    let n = ((max_t - start) as f64) / (((cur - start + 1) as f64) * ratio_to_full);
-    if n <= 1.0 {
+    let span = (max_t as i128).saturating_sub(start as i128);
+    let elapsed = (cur as i128).saturating_sub(start as i128).saturating_add(1);
+    if span <= 0 || elapsed <= 0 || ratio_to_full <= 0.0 {
         return max_t;
     }
-    start + (((max_t - start) as f64) / n.floor()) as i64
+    let n = (span as f64) / ((elapsed as f64) * ratio_to_full);
+    if !n.is_finite() || n <= 1.0 {
+        return max_t;
+    }
+    let step = ((span as f64) / n.floor()) as i128;
+    let end = (start as i128).saturating_add(step);
+    end.clamp(start as i128, max_t as i128) as i64
+}
+
+/// Ported from `addJitterToChunkEndTime` in `prometheus/tsdb/head_append.go`.
+#[inline]
+pub fn add_jitter_to_chunk_end_time(
+    series_hash: u64,
+    chunk_min_time: i64,
+    next_at: i64,
+    max_next_at: i64,
+    variance: f64,
+) -> i64 {
+    if !variance.is_finite() || variance <= 0.0 || next_at >= max_next_at {
+        return next_at;
+    }
+    let chunk_duration = (next_at as i128) - (chunk_min_time as i128);
+    if chunk_duration <= 0 {
+        return next_at;
+    }
+    let max_var_f = (chunk_duration as f64) * variance;
+    if !max_var_f.is_finite() || max_var_f < 1.0 {
+        return next_at;
+    }
+    let chunk_duration_max_variance = max_var_f.min(i64::MAX as f64) as i64;
+    if chunk_duration_max_variance <= 0 {
+        return next_at;
+    }
+    let chunk_duration_variance = (series_hash % (chunk_duration_max_variance as u64)) as i128;
+    let adjusted =
+        (next_at as i128) + chunk_duration_variance - ((chunk_duration_max_variance as i128) / 2);
+    adjusted
+        .min(max_next_at as i128)
+        .clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 /// Zero-allocation hash of sorted `(&str, &str)` pairs matching Prometheus `stringlabels.Labels.Hash()`.
@@ -414,14 +467,67 @@ struct SeriesOooState {
     ooo_mmapped_chunks: Vec<MmappedChunk>,
 }
 
+#[inline]
+const fn next_mmapped_cap(cur_cap: usize) -> usize {
+    match cur_cap {
+        0 => 2,
+        1..=3 => 4,
+        4..=5 => 6,
+        6..=7 => 8,
+        8..=11 => 12,
+        n => n + (n / 2),
+    }
+}
+
+#[inline]
+fn push_mmapped_chunk(v: &mut Vec<MmappedChunk>, mc: MmappedChunk) {
+    if v.len() == v.capacity() {
+        let target = next_mmapped_cap(v.capacity());
+        v.reserve_exact(target - v.len());
+    }
+    v.push(mc);
+}
+
+#[inline]
+fn shrink_mmapped_vec(v: &mut Vec<MmappedChunk>) {
+    if v.is_empty() {
+        if v.capacity() > 0 {
+            *v = Vec::new();
+        }
+    } else if v.capacity() > next_mmapped_cap(v.len()) {
+        v.shrink_to(v.len());
+    }
+}
+
 impl SeriesOooState {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.ooo_head_chunk.is_none()
+            && self.ooo_pending_mmapped.is_empty()
+            && self.ooo_mmapped_chunks.is_empty()
+    }
+
+    fn shrink_oversized_vecs(&mut self) {
+        shrink_mmapped_vec(&mut self.ooo_mmapped_chunks);
+        if self.ooo_pending_mmapped.is_empty() {
+            if self.ooo_pending_mmapped.capacity() > 0 {
+                self.ooo_pending_mmapped = Vec::new();
+            }
+        } else if self.ooo_pending_mmapped.capacity()
+            > (self.ooo_pending_mmapped.len() * 2).max(4)
+        {
+            self.ooo_pending_mmapped
+                .shrink_to(self.ooo_pending_mmapped.len());
+        }
+    }
+
     fn promote_pending_up_to(&mut self, flushed_ref: ChunkDiskMapperRef) {
         if self.ooo_pending_mmapped.is_empty() {
             return;
         }
         for (mc, chk) in std::mem::take(&mut self.ooo_pending_mmapped) {
             if mc.ref_id <= flushed_ref {
-                self.ooo_mmapped_chunks.push(mc);
+                push_mmapped_chunk(&mut self.ooo_mmapped_chunks, mc);
             } else {
                 self.ooo_pending_mmapped.push((mc, chk));
             }
@@ -466,6 +572,7 @@ const ACTIVE_DELTA_COLD: u32 = u32::MAX - 1;
 // - bit  19      (1 bit):  FLAG_COMPUTED_HIST_END_TIME
 // - bit  20      (1 bit):  FLAG_GCED
 // - bit  21      (1 bit):  FLAG_HAS_LAST_EXEMPLAR
+// - bits 22..=24 (3 bits): active_chunk Encoding (0=None..=6=FloatHistogramSt)
 const XOR_LEADING_MASK: u32 = 0x3f;
 const XOR_LEADING_UNINIT: u32 = 0x3f;
 const XOR_TRAILING_SHIFT: u32 = 6;
@@ -479,6 +586,8 @@ const FLAG_HAS_METADATA: u32 = 1 << 18;
 const FLAG_COMPUTED_HIST_END_TIME: u32 = 1 << 19;
 const FLAG_GCED: u32 = 1 << 20;
 const FLAG_HAS_LAST_EXEMPLAR: u32 = 1 << 21;
+const ACTIVE_ENC_SHIFT: u32 = 22;
+const ACTIVE_ENC_MASK: u32 = 0b111 << ACTIVE_ENC_SHIFT;
 
 #[inline(always)]
 pub fn prefetch_read_data<T>(ptr: *const T) {
@@ -665,11 +774,10 @@ struct SeriesColdState {
 
 #[derive(Debug)]
 struct SeriesState {
-    active_chunk: Option<EncodedChunk>,
+    active_bstream: BitStream,
     active_min_time: i64,
     last_float_bits: u64,
-    #[allow(clippy::box_collection)]
-    mmapped_chunks: Option<Box<Vec<MmappedChunk>>>,
+    mmapped_chunks: Vec<MmappedChunk>,
     cold: Option<Box<SeriesColdState>>,
     active_max_time_delta: u32,
     next_at_delta: u32,
@@ -682,10 +790,10 @@ struct SeriesState {
 impl SeriesState {
     fn new() -> Self {
         Self {
-            active_chunk: None,
+            active_bstream: BitStream::new(),
             active_min_time: i64::MAX,
             last_float_bits: 0,
-            mmapped_chunks: None,
+            mmapped_chunks: Vec::new(),
             cold: None,
             active_max_time_delta: ACTIVE_DELTA_NONE,
             next_at_delta: ACTIVE_DELTA_NONE,
@@ -694,6 +802,74 @@ impl SeriesState {
             meta_unit: SymbolId::EMPTY,
             meta_help: SymbolId::EMPTY,
         }
+    }
+
+    #[inline(always)]
+    fn active_encoding(&self) -> Encoding {
+        match (self.flags & ACTIVE_ENC_MASK) >> ACTIVE_ENC_SHIFT {
+            1 => Encoding::Xor,
+            2 => Encoding::Histogram,
+            3 => Encoding::FloatHistogram,
+            4 => Encoding::Xor2,
+            5 => Encoding::HistogramSt,
+            6 => Encoding::FloatHistogramSt,
+            _ => Encoding::None,
+        }
+    }
+
+    #[inline(always)]
+    fn set_active_encoding(&mut self, enc: Encoding) {
+        self.flags = (self.flags & !ACTIVE_ENC_MASK) | (u32::from(enc.as_u8()) << ACTIVE_ENC_SHIFT);
+    }
+
+    #[inline(always)]
+    fn has_active_chunk(&self) -> bool {
+        (self.flags & ACTIVE_ENC_MASK) != 0
+    }
+
+    #[inline]
+    fn active_chunk_num_samples(&self) -> usize {
+        let enc = self.active_encoding();
+        let min_hdr = match enc {
+            Encoding::None => return 0,
+            Encoding::Xor => 2,
+            _ => 3,
+        };
+        let bytes = self.active_bstream.bytes();
+        if bytes.len() < min_hdr {
+            return 0;
+        }
+        let raw = u16::from_be_bytes([bytes[0], bytes[1]]);
+        match enc {
+            Encoding::HistogramSt | Encoding::FloatHistogramSt => {
+                (raw & crate::chunkenc::st::HISTOGRAM_ST_SAMPLE_COUNT_MASK) as usize
+            }
+            _ => raw as usize,
+        }
+    }
+
+    #[inline]
+    fn take_active_chunk(&mut self) -> Option<EncodedChunk> {
+        let enc = self.active_encoding();
+        if enc == Encoding::None {
+            return None;
+        }
+        let b = std::mem::take(&mut self.active_bstream);
+        self.set_active_encoding(Encoding::None);
+        Some(EncodedChunk::from_bstream(enc, b))
+    }
+
+    #[inline]
+    fn set_active_chunk(&mut self, chunk: EncodedChunk) {
+        let (enc, b) = chunk.into_bstream();
+        self.set_active_encoding(enc);
+        self.active_bstream = b;
+    }
+
+    #[inline]
+    fn clear_active_chunk(&mut self) {
+        self.active_bstream = BitStream::new();
+        self.set_active_encoding(Encoding::None);
     }
 
     #[inline]
@@ -722,6 +898,37 @@ impl SeriesState {
     fn clear_ooo(&mut self) {
         if let Some(ref mut c) = self.cold {
             c.ooo = None;
+        }
+        self.maybe_drop_cold();
+    }
+
+    #[inline]
+    fn clear_ooo_if_empty(&mut self) {
+        let should_clear = self.ooo().is_some_and(SeriesOooState::is_empty);
+        if should_clear {
+            self.clear_ooo();
+        } else if let Some(ooo) = self.ooo_mut() {
+            ooo.shrink_oversized_vecs();
+        }
+    }
+
+    #[inline]
+    fn maybe_drop_cold(&mut self) {
+        let should_drop = if let Some(ref c) = self.cold {
+            c.extra_head_chunks.is_empty()
+                && c.ooo.is_none()
+                && c.created_timestamp == 0
+                && (self.flags & FLAG_HAS_LAST_EXEMPLAR) == 0
+                && self.active_max_time_delta != ACTIVE_DELTA_COLD
+                && self.next_at_delta != ACTIVE_DELTA_COLD
+                && matches!(c.last_hist, LastColdSample::None)
+                && c.xor2_state.is_none()
+                && c.hist_state.is_none()
+        } else {
+            false
+        };
+        if should_drop {
+            self.cold = None;
         }
     }
 
@@ -794,13 +1001,24 @@ impl SeriesState {
 
     #[inline]
     fn head_chunks_is_empty(&self) -> bool {
-        self.active_chunk.is_none()
+        !self.has_active_chunk()
     }
 
     #[inline]
     fn head_chunks_len(&self) -> usize {
-        usize::from(self.active_chunk.is_some())
+        usize::from(self.has_active_chunk())
             + self.cold.as_ref().map_or(0, |c| c.extra_head_chunks.len())
+    }
+
+    #[inline]
+    fn head_chunks_samples(&self) -> u64 {
+        let mut samples = self.active_chunk_num_samples() as u64;
+        if let Some(ref c) = self.cold {
+            for mc in &c.extra_head_chunks {
+                samples += mc.chunk.num_samples() as u64;
+            }
+        }
+        samples
     }
 
     #[inline]
@@ -811,7 +1029,7 @@ impl SeriesState {
             .and_then(|c| c.extra_head_chunks.first())
         {
             Some(c.min_time)
-        } else if self.active_chunk.is_some() {
+        } else if self.has_active_chunk() {
             Some(self.active_min_time)
         } else {
             None
@@ -819,36 +1037,45 @@ impl SeriesState {
     }
 
     #[inline]
-    fn for_each_head_chunk(&self, mut f: impl FnMut(&EncodedChunk, i64, i64)) {
+    fn for_each_head_chunk_cloned(&self, mut f: impl FnMut(EncodedChunk, i64, i64)) {
         if let Some(ref c) = self.cold {
             for mc in &c.extra_head_chunks {
-                f(&mc.chunk, mc.min_time, mc.max_time);
+                f(mc.chunk.clone(), mc.min_time, mc.max_time);
             }
         }
-        if let Some(ref chunk) = self.active_chunk {
+        let enc = self.active_encoding();
+        if enc != Encoding::None {
+            let chunk = EncodedChunk::from_bstream(enc, self.active_bstream.clone());
             f(chunk, self.active_min_time, self.active_max_time());
         }
     }
 
     #[inline]
-    fn any_head_chunk(&self, mut pred: impl FnMut(&EncodedChunk, i64, i64) -> bool) -> bool {
+    fn for_each_head_chunk_bounds(&self, mut f: impl FnMut(i64, i64)) {
         if let Some(ref c) = self.cold {
             for mc in &c.extra_head_chunks {
-                if pred(&mc.chunk, mc.min_time, mc.max_time) {
+                f(mc.min_time, mc.max_time);
+            }
+        }
+        if self.has_active_chunk() {
+            f(self.active_min_time, self.active_max_time());
+        }
+    }
+
+    #[inline]
+    fn any_head_chunk_bounds(&self, mut pred: impl FnMut(i64, i64) -> bool) -> bool {
+        if let Some(ref c) = self.cold {
+            for mc in &c.extra_head_chunks {
+                if pred(mc.min_time, mc.max_time) {
                     return true;
                 }
             }
         }
-        if let Some(ref chunk) = self.active_chunk {
-            if pred(chunk, self.active_min_time, self.active_max_time()) {
-                return true;
-            }
-        }
-        false
+        self.has_active_chunk() && pred(self.active_min_time, self.active_max_time())
     }
 
     fn push_head_chunk(&mut self, chunk: EncodedChunk, min_time: i64, max_time: i64) {
-        if let Some(prev_chunk) = self.active_chunk.take() {
+        if let Some(prev_chunk) = self.take_active_chunk() {
             let prev_min = self.active_min_time;
             let prev_max = self.active_max_time();
             self.cold_mut().extra_head_chunks.push(MemChunk {
@@ -857,20 +1084,22 @@ impl SeriesState {
                 max_time: prev_max,
             });
         }
-        self.active_chunk = Some(chunk);
+        self.set_active_chunk(chunk);
         self.active_min_time = min_time;
         self.set_active_max_time(max_time);
     }
 
     fn clear_head_chunks(&mut self) {
-        self.active_chunk = None;
+        self.clear_active_chunk();
         self.active_min_time = i64::MAX;
         self.active_max_time_delta = ACTIVE_DELTA_NONE;
         self.next_at_delta = ACTIVE_DELTA_NONE;
         if let Some(ref mut c) = self.cold {
-            c.extra_head_chunks.clear();
-            c.extra_head_chunks.shrink_to_fit();
+            if c.extra_head_chunks.capacity() > 0 {
+                c.extra_head_chunks = Vec::new();
+            }
         }
+        self.maybe_drop_cold();
     }
 
     fn retain_head_chunks(&mut self, mint: i64) -> usize {
@@ -880,18 +1109,23 @@ impl SeriesState {
             c.extra_head_chunks.retain(|hc| hc.max_time >= mint);
             removed += before - c.extra_head_chunks.len();
         }
-        if self.active_chunk.is_some() && self.active_max_time() < mint {
-            self.active_chunk = None;
+        if self.has_active_chunk() && self.active_max_time() < mint {
+            self.clear_active_chunk();
             self.active_min_time = i64::MAX;
             self.active_max_time_delta = ACTIVE_DELTA_NONE;
             self.next_at_delta = ACTIVE_DELTA_NONE;
             removed += 1;
             if let Some(ref mut c) = self.cold {
                 if let Some(promoted) = c.extra_head_chunks.pop() {
-                    self.active_chunk = Some(promoted.chunk);
+                    self.set_active_chunk(promoted.chunk);
                     self.active_min_time = promoted.min_time;
                     self.set_active_max_time(promoted.max_time);
                 }
+            }
+        }
+        if let Some(ref mut c) = self.cold {
+            if c.extra_head_chunks.is_empty() && c.extra_head_chunks.capacity() > 0 {
+                c.extra_head_chunks = Vec::new();
             }
         }
         removed
@@ -952,6 +1186,13 @@ impl SeriesState {
             if let Some(ref mut s) = c.xor2_state {
                 s.valid = false;
             }
+        }
+    }
+
+    #[inline]
+    fn clear_xor2_state(&mut self) {
+        if let Some(ref mut c) = self.cold {
+            c.xor2_state = None;
         }
     }
 
@@ -1055,12 +1296,7 @@ impl SeriesState {
 
     #[inline]
     fn mmapped(&self) -> &[MmappedChunk] {
-        self.mmapped_chunks.as_deref().map_or(&[], Vec::as_slice)
-    }
-
-    #[inline]
-    fn mmapped_mut(&mut self) -> &mut Vec<MmappedChunk> {
-        self.mmapped_chunks.get_or_insert_with(Default::default)
+        &self.mmapped_chunks
     }
 
     #[inline]
@@ -1113,7 +1349,7 @@ impl SeriesState {
 
     #[inline]
     fn max_time(&self) -> i64 {
-        if self.active_chunk.is_some() {
+        if self.has_active_chunk() {
             self.active_max_time()
         } else if let Some(c) = self.mmapped().last() {
             c.max_time
@@ -1140,8 +1376,9 @@ impl SeriesState {
 
     #[inline]
     fn latest_in_order_encoding(&self) -> Option<Encoding> {
-        if let Some(ref c) = self.active_chunk {
-            Some(c.encoding())
+        let enc = self.active_encoding();
+        if enc != Encoding::None {
+            Some(enc)
         } else {
             self.mmapped().last().map(|c| c.encoding)
         }
@@ -1342,6 +1579,7 @@ impl SeriesState {
     #[allow(clippy::too_many_arguments)]
     fn append_float_in_order(
         &mut self,
+        series_labels: &Labels,
         st: i64,
         t: i64,
         v: f64,
@@ -1349,6 +1587,7 @@ impl SeriesState {
         samples_per_chunk: usize,
         float_enc: Encoding,
         store_st: bool,
+        chunk_end_time_variance: f64,
     ) -> Result<(bool, bool), ChunkError> {
         let target_enc = if float_enc == Encoding::Xor2 {
             Encoding::Xor2
@@ -1357,7 +1596,7 @@ impl SeriesState {
         };
         // Returns (appended, chunk_created)
         let mut chunk_created = false;
-        if self.active_chunk.is_none() {
+        if !self.has_active_chunk() {
             if let Some(last_mm) = self.mmapped().last() {
                 if last_mm.max_time >= t {
                     return Ok((false, false));
@@ -1367,22 +1606,50 @@ impl SeriesState {
             chunk_created = true;
         }
 
-        let need_cut = {
-            let cur = self.active_chunk.as_ref().unwrap();
+        let pre_cut = {
             let cur_max = self.active_max_time();
             if cur_max >= t {
                 return Ok((false, chunk_created));
             }
-            let cur_enc = cur.encoding();
-            let num_samples = cur.num_samples();
-            (!chunk_created && cur.as_bytes().len() > MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND)
+            let cur_enc = self.active_encoding();
+            (!chunk_created
+                && self.active_bstream.bytes().len() > MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND)
                 || (cur_enc != target_enc
                     && (!cur_enc.compatible_values(target_enc) || store_st))
-                || (num_samples > 0
-                    && (t >= self.next_at() || num_samples >= samples_per_chunk * 2))
         };
 
-        if need_cut {
+        if pre_cut {
+            self.cut_new_head_chunk(t, target_enc, chunk_range_ms);
+            chunk_created = true;
+        }
+
+        let num_samples = self.active_chunk_num_samples();
+        if num_samples == 0 {
+            self.active_min_time = t;
+            self.set_next_at(range_for_timestamp(t, chunk_range_ms));
+        } else if num_samples == samples_per_chunk / 4 {
+            let max_next_at = self.next_at();
+            let computed = compute_chunk_end_time(
+                self.active_min_time,
+                self.active_max_time(),
+                max_next_at,
+                4.0,
+            );
+            let next_at = if chunk_end_time_variance > 0.0 {
+                add_jitter_to_chunk_end_time(
+                    series_labels.stable_hash(),
+                    self.active_min_time,
+                    computed,
+                    max_next_at,
+                    chunk_end_time_variance,
+                )
+            } else {
+                computed
+            };
+            self.set_next_at(next_at);
+        }
+
+        if num_samples > 0 && (t >= self.next_at() || num_samples >= samples_per_chunk * 2) {
             self.cut_new_head_chunk(t, target_enc, chunk_range_ms);
             chunk_created = true;
         }
@@ -1393,41 +1660,31 @@ impl SeriesState {
             self.invalidate_xor_state();
             0.0
         };
-        let num_samples = self.active_chunk.as_ref().unwrap().num_samples();
         let cur_max_time = self.active_max_time();
-        if num_samples == 0 {
-            self.active_min_time = t;
-            self.set_next_at(range_for_timestamp(t, chunk_range_ms));
-        } else if num_samples == samples_per_chunk / 4 {
-            let max_next_at = self.next_at();
-            let computed = compute_chunk_end_time(
-                self.active_min_time,
-                cur_max_time,
-                max_next_at,
-                4.0,
-            );
-            self.set_next_at(computed);
-        }
 
         let mut xor_st = self.xor_state();
-        match self.active_chunk {
-            Some(EncodedChunk::Xor(ref mut xc)) => {
-                xc.append_with_state(&mut xor_st, cur_max_time, prev_v, t, v)?;
+        match self.active_encoding() {
+            Encoding::Xor => {
+                let mut xc = XorChunk {
+                    b: std::mem::take(&mut self.active_bstream),
+                };
+                let res = xc.append_with_state(&mut xor_st, cur_max_time, prev_v, t, v);
+                self.active_bstream = xc.b;
+                res?;
                 self.set_xor_state(xor_st);
             }
-            Some(EncodedChunk::Xor2(_)) => {
-                let mut chunk_opt = self.active_chunk.take();
+            Encoding::Xor2 => {
+                let mut xc2 = Xor2Chunk {
+                    b: std::mem::take(&mut self.active_bstream),
+                };
                 let res = {
-                    let Some(EncodedChunk::Xor2(ref mut xc2)) = chunk_opt else {
-                        unreachable!();
-                    };
                     let s = self
                         .cold_mut()
                         .xor2_state
                         .get_or_insert_with(|| Box::new(Xor2AppendState::default()));
                     xc2.append_with_state(s, st, t, v)
                 };
-                self.active_chunk = chunk_opt;
+                self.active_bstream = xc2.b;
                 res?;
             }
             _ => unreachable!(),
@@ -1439,28 +1696,35 @@ impl SeriesState {
     }
 
     fn prev_int_histogram_state(&mut self) -> Result<Option<HistogramAppenderState>, ChunkError> {
-        let Some(ref mut cur_chunk) = self.active_chunk else {
-            return Ok(None);
-        };
-        if cur_chunk.num_samples() == 0 {
+        if self.active_chunk_num_samples() == 0 {
             return Ok(None);
         }
-        match cur_chunk {
-            EncodedChunk::Histogram(ref mut hc) => {
+        match self.active_encoding() {
+            Encoding::Histogram => {
                 if let Some(HistAppendCache::Histogram(Some(ref st))) =
                     self.cold.as_ref().and_then(|c| c.hist_state.as_deref())
                 {
                     return Ok(Some(st.clone()));
                 }
-                Ok(Some(hc.appender()?.into_state()))
+                let mut hc = HistogramChunk {
+                    b: std::mem::take(&mut self.active_bstream),
+                };
+                let res = hc.appender().map(|a| Some(a.into_state()));
+                self.active_bstream = hc.b;
+                res
             }
-            EncodedChunk::HistogramSt(ref mut hc) => {
+            Encoding::HistogramSt => {
                 if let Some(HistAppendCache::HistogramSt(Some((ref st, _)))) =
                     self.cold.as_ref().and_then(|c| c.hist_state.as_deref())
                 {
                     return Ok(Some(st.clone()));
                 }
-                Ok(Some(hc.appender()?.into_state()))
+                let mut hc = HistogramStChunk {
+                    b: std::mem::take(&mut self.active_bstream),
+                };
+                let res = hc.appender().map(|a| Some(a.into_state()));
+                self.active_bstream = hc.b;
+                res
             }
             _ => Ok(None),
         }
@@ -1469,28 +1733,35 @@ impl SeriesState {
     fn prev_float_histogram_state(
         &mut self,
     ) -> Result<Option<FloatHistogramAppenderState>, ChunkError> {
-        let Some(ref mut cur_chunk) = self.active_chunk else {
-            return Ok(None);
-        };
-        if cur_chunk.num_samples() == 0 {
+        if self.active_chunk_num_samples() == 0 {
             return Ok(None);
         }
-        match cur_chunk {
-            EncodedChunk::FloatHistogram(ref mut fhc) => {
+        match self.active_encoding() {
+            Encoding::FloatHistogram => {
                 if let Some(HistAppendCache::FloatHistogram(Some(ref st))) =
                     self.cold.as_ref().and_then(|c| c.hist_state.as_deref())
                 {
                     return Ok(Some(st.clone()));
                 }
-                Ok(Some(fhc.appender()?.into_state()))
+                let mut fhc = FloatHistogramChunk {
+                    b: std::mem::take(&mut self.active_bstream),
+                };
+                let res = fhc.appender().map(|a| Some(a.into_state()));
+                self.active_bstream = fhc.b;
+                res
             }
-            EncodedChunk::FloatHistogramSt(ref mut fhc) => {
+            Encoding::FloatHistogramSt => {
                 if let Some(HistAppendCache::FloatHistogramSt(Some((ref st, _)))) =
                     self.cold.as_ref().and_then(|c| c.hist_state.as_deref())
                 {
                     return Ok(Some(st.clone()));
                 }
-                Ok(Some(fhc.appender()?.into_state()))
+                let mut fhc = FloatHistogramStChunk {
+                    b: std::mem::take(&mut self.active_bstream),
+                };
+                let res = fhc.appender().map(|a| Some(a.into_state()));
+                self.active_bstream = fhc.b;
+                res
             }
             _ => Ok(None),
         }
@@ -1510,7 +1781,7 @@ impl SeriesState {
             Encoding::Histogram
         };
         let mut chunk_created = false;
-        if self.active_chunk.is_none() {
+        if !self.has_active_chunk() {
             if let Some(last_mm) = self.mmapped().last() {
                 if last_mm.max_time >= t {
                     return Ok((false, false));
@@ -1525,7 +1796,7 @@ impl SeriesState {
         }
 
         let mut prev_state: Option<HistogramAppenderState> = None;
-        let cur_enc = self.active_chunk.as_ref().unwrap().encoding();
+        let cur_enc = self.active_encoding();
         if cur_enc != target_enc {
             prev_state = self.prev_int_histogram_state()?;
             self.cut_new_head_chunk(t, target_enc, chunk_range_ms);
@@ -1533,14 +1804,14 @@ impl SeriesState {
         }
 
         let (num_samples, num_bytes, c_min, c_max) = {
-            let ns = self.active_chunk.as_ref().unwrap().num_samples();
+            let ns = self.active_chunk_num_samples();
             if ns == 0 {
                 self.active_min_time = t;
                 self.set_next_at(range_for_timestamp(t, chunk_range_ms));
             }
             (
                 ns,
-                self.active_chunk.as_ref().unwrap().as_bytes().len(),
+                self.active_bstream.bytes().len(),
                 self.active_min_time,
                 self.active_max_time(),
             )
@@ -1574,9 +1845,11 @@ impl SeriesState {
         } else {
             None
         };
-        let mut active = self.active_chunk.take().unwrap();
-        let outcome = match active {
-            EncodedChunk::Histogram(ref mut hc) => {
+        let active_enc = self.active_encoding();
+        let active_bs = std::mem::take(&mut self.active_bstream);
+        let (returned_bs, outcome) = match active_enc {
+            Encoding::Histogram => {
+                let mut hc = HistogramChunk { b: active_bs };
                 let cache = self
                     .cold_mut()
                     .hist_state
@@ -1587,15 +1860,17 @@ impl SeriesState {
                 let HistAppendCache::Histogram(ref mut st_opt) = **cache else {
                     unreachable!();
                 };
-                match hc.append_with_state_prev(st_opt, prev_ref, st, t, h) {
+                let outcome = match hc.append_with_state_prev(st_opt, prev_ref, st, t, h) {
                     Ok(AppendHistogramOutcome::Appended { .. }) => Ok(None),
                     Ok(AppendHistogramOutcome::NewChunk(new_chk)) => {
                         Ok(Some(EncodedChunk::Histogram(new_chk)))
                     }
                     Err(e) => Err(e),
-                }
+                };
+                (hc.b, outcome)
             }
-            EncodedChunk::HistogramSt(ref mut hc) => {
+            Encoding::HistogramSt => {
+                let mut hc = HistogramStChunk { b: active_bs };
                 let cache = self
                     .cold_mut()
                     .hist_state
@@ -1606,17 +1881,18 @@ impl SeriesState {
                 let HistAppendCache::HistogramSt(ref mut st_opt) = **cache else {
                     unreachable!();
                 };
-                match hc.append_with_state_prev(st_opt, prev_ref, st, t, h) {
+                let outcome = match hc.append_with_state_prev(st_opt, prev_ref, st, t, h) {
                     Ok(AppendHistogramStOutcome::Appended { .. }) => Ok(None),
                     Ok(AppendHistogramStOutcome::NewChunk(new_chk)) => {
                         Ok(Some(EncodedChunk::HistogramSt(new_chk)))
                     }
                     Err(e) => Err(e),
-                }
+                };
+                (hc.b, outcome)
             }
             _ => unreachable!(),
         };
-        self.active_chunk = Some(active);
+        self.active_bstream = returned_bs;
         match outcome? {
             None => self.set_active_max_time(t),
             Some(new_chk) => {
@@ -1645,7 +1921,7 @@ impl SeriesState {
             Encoding::FloatHistogram
         };
         let mut chunk_created = false;
-        if self.active_chunk.is_none() {
+        if !self.has_active_chunk() {
             if let Some(last_mm) = self.mmapped().last() {
                 if last_mm.max_time >= t {
                     return Ok((false, false));
@@ -1660,7 +1936,7 @@ impl SeriesState {
         }
 
         let mut prev_state: Option<FloatHistogramAppenderState> = None;
-        let cur_enc = self.active_chunk.as_ref().unwrap().encoding();
+        let cur_enc = self.active_encoding();
         if cur_enc != target_enc {
             prev_state = self.prev_float_histogram_state()?;
             self.cut_new_head_chunk(t, target_enc, chunk_range_ms);
@@ -1668,14 +1944,14 @@ impl SeriesState {
         }
 
         let (num_samples, num_bytes, c_min, c_max) = {
-            let ns = self.active_chunk.as_ref().unwrap().num_samples();
+            let ns = self.active_chunk_num_samples();
             if ns == 0 {
                 self.active_min_time = t;
                 self.set_next_at(range_for_timestamp(t, chunk_range_ms));
             }
             (
                 ns,
-                self.active_chunk.as_ref().unwrap().as_bytes().len(),
+                self.active_bstream.bytes().len(),
                 self.active_min_time,
                 self.active_max_time(),
             )
@@ -1709,9 +1985,11 @@ impl SeriesState {
         } else {
             None
         };
-        let mut active = self.active_chunk.take().unwrap();
-        let outcome = match active {
-            EncodedChunk::FloatHistogram(ref mut fhc) => {
+        let active_enc = self.active_encoding();
+        let active_bs = std::mem::take(&mut self.active_bstream);
+        let (returned_bs, outcome) = match active_enc {
+            Encoding::FloatHistogram => {
+                let mut fhc = FloatHistogramChunk { b: active_bs };
                 let cache = self
                     .cold_mut()
                     .hist_state
@@ -1722,15 +2000,17 @@ impl SeriesState {
                 let HistAppendCache::FloatHistogram(ref mut st_opt) = **cache else {
                     unreachable!();
                 };
-                match fhc.append_with_state_prev(st_opt, prev_ref, st, t, fh) {
+                let outcome = match fhc.append_with_state_prev(st_opt, prev_ref, st, t, fh) {
                     Ok(AppendFloatHistogramOutcome::Appended { .. }) => Ok(None),
                     Ok(AppendFloatHistogramOutcome::NewChunk(new_chk)) => {
                         Ok(Some(EncodedChunk::FloatHistogram(new_chk)))
                     }
                     Err(e) => Err(e),
-                }
+                };
+                (fhc.b, outcome)
             }
-            EncodedChunk::FloatHistogramSt(ref mut fhc) => {
+            Encoding::FloatHistogramSt => {
+                let mut fhc = FloatHistogramStChunk { b: active_bs };
                 let cache = self
                     .cold_mut()
                     .hist_state
@@ -1741,17 +2021,18 @@ impl SeriesState {
                 let HistAppendCache::FloatHistogramSt(ref mut st_opt) = **cache else {
                     unreachable!();
                 };
-                match fhc.append_with_state_prev(st_opt, prev_ref, st, t, fh) {
+                let outcome = match fhc.append_with_state_prev(st_opt, prev_ref, st, t, fh) {
                     Ok(AppendFloatHistogramStOutcome::Appended { .. }) => Ok(None),
                     Ok(AppendFloatHistogramStOutcome::NewChunk(new_chk)) => {
                         Ok(Some(EncodedChunk::FloatHistogramSt(new_chk)))
                     }
                     Err(e) => Err(e),
-                }
+                };
+                (fhc.b, outcome)
             }
             _ => unreachable!(),
         };
-        self.active_chunk = Some(active);
+        self.active_bstream = returned_bs;
         match outcome? {
             None => self.set_active_max_time(t),
             Some(new_chk) => {
@@ -1837,7 +2118,7 @@ impl SeriesState {
         }
 
         let cur = ooo.ooo_head_chunk.as_mut().unwrap();
-        let inserted = cur.chunk.insert(st, t, val);
+        let inserted = cur.chunk.insert_capped(st, t, val, ooo_cap_max);
         if inserted {
             if chunk_created || t < cur.min_time {
                 cur.min_time = t;
@@ -1899,7 +2180,7 @@ impl SeriesState {
                 false
             };
             if found {
-                self.mmapped_mut().push(mc);
+                push_mmapped_chunk(&mut self.mmapped_chunks, mc);
                 matched += 1;
             }
         }
@@ -1908,8 +2189,9 @@ impl SeriesState {
                 cold.extra_head_chunks = Vec::new();
             }
         }
-        if matched > 0 && self.mmapped().len() > 1 {
-            self.mmapped_mut().sort_by_key(|c| (c.min_time, c.max_time));
+        self.maybe_drop_cold();
+        if matched > 0 && self.mmapped_chunks.len() > 1 {
+            self.mmapped_chunks.sort_by_key(|c| (c.min_time, c.max_time));
         }
     }
 }
@@ -2776,10 +3058,11 @@ pub struct SeriesFingerprint {
 impl SeriesFingerprint {
     fn capture(entry: &SeriesEntry, st: &SeriesState) -> Self {
         let total_chunks = st.mmapped().len() + st.head_chunks_len();
-        let (active_chunk_samples, active_min_time) = st
-            .active_chunk
-            .as_ref()
-            .map_or((0, i64::MAX), |c| (c.num_samples(), st.active_min_time));
+        let (active_chunk_samples, active_min_time) = if st.has_active_chunk() {
+            (st.active_chunk_num_samples(), st.active_min_time)
+        } else {
+            (0, i64::MAX)
+        };
         Self {
             total_chunks,
             active_min_time,
@@ -2803,10 +3086,11 @@ impl SeriesFingerprint {
         if total_chunks != fp.total_chunks {
             return true;
         }
-        let (active_chunk_samples, active_min_time) = st
-            .active_chunk
-            .as_ref()
-            .map_or((0, i64::MAX), |c| (c.num_samples(), st.active_min_time));
+        let (active_chunk_samples, active_min_time) = if st.has_active_chunk() {
+            (st.active_chunk_num_samples(), st.active_min_time)
+        } else {
+            (0, i64::MAX)
+        };
         active_chunk_samples != fp.active_chunk_samples || active_min_time != fp.active_min_time
     }
 }
@@ -3099,6 +3383,9 @@ pub struct Head {
     min_ooo_time: AtomicI64,
     max_ooo_time: AtomicI64,
     ooo_time_window_ms: AtomicI64,
+    chunk_end_time_variance_bits: AtomicU64,
+    metadata_limits_max_metrics: AtomicUsize,
+    metadata_limits_max_per_metric: AtomicUsize,
     float_chunk_encoding: AtomicU8,
     last_series_id: AtomicU64,
     num_series: AtomicU64,
@@ -3121,8 +3408,18 @@ impl Head {
     /// Opens (or initializes) a [`Head`] in `dir`, replaying `chunks_head`, `wal`, and `wbl`.
     pub fn open(
         dir: impl AsRef<Path>,
+        opts: HeadOptions,
+        min_valid_time: i64,
+    ) -> Result<Self, HeadError> {
+        Self::open_with_chunk_end_time_variance(dir, opts, min_valid_time, 0.0)
+    }
+
+    /// Opens a [`Head`] with Go's `ChunkEndTimeVariance` (0.0 disables jitter).
+    pub fn open_with_chunk_end_time_variance(
+        dir: impl AsRef<Path>,
         mut opts: HeadOptions,
         min_valid_time: i64,
+        chunk_end_time_variance: f64,
     ) -> Result<Self, HeadError> {
         if opts.chunk_range_ms < 1 {
             return Err(HeadError::InvalidOption(format!(
@@ -3229,6 +3526,13 @@ impl Head {
             min_ooo_time: AtomicI64::new(i64::MAX),
             max_ooo_time: AtomicI64::new(i64::MIN),
             ooo_time_window_ms: AtomicI64::new(opts.ooo_time_window_ms),
+            chunk_end_time_variance_bits: AtomicU64::new(chunk_end_time_variance.to_bits()),
+            metadata_limits_max_metrics: AtomicUsize::new(
+                opts.metadata_limits.max_metrics_with_metadata_per_user,
+            ),
+            metadata_limits_max_per_metric: AtomicUsize::new(
+                opts.metadata_limits.max_metadata_per_metric,
+            ),
             float_chunk_encoding: AtomicU8::new(float_enc.as_u8()),
             last_series_id: AtomicU64::new(0),
             num_series: AtomicU64::new(0),
@@ -3788,7 +4092,7 @@ impl Head {
             return;
         }
         let mut st = entry.inner.lock();
-        let old_mmc = st.mmapped_chunks.take().map(|b| *b).unwrap_or_default();
+        let old_mmc = std::mem::take(&mut st.mmapped_chunks);
         let old_ooo_mmc = st
             .ooo_mut()
             .map(|o| std::mem::take(&mut o.ooo_mmapped_chunks))
@@ -3812,21 +4116,20 @@ impl Head {
         if !merged_mmc.is_empty() {
             *mint = (*mint).min(merged_mmc[0].min_time);
             *maxt = (*maxt).max(merged_mmc[merged_mmc.len() - 1].max_time);
-            st.mmapped_chunks = Some(Box::new(merged_mmc));
+            let mut merged_mmc = merged_mmc;
+            shrink_mmapped_vec(&mut merged_mmc);
+            st.mmapped_chunks = merged_mmc;
         }
 
         if merged_ooo.is_empty() {
-            let keep_ooo = st.ooo().is_some_and(|o| {
-                o.ooo_head_chunk.is_some() || !o.ooo_pending_mmapped.is_empty()
-            });
-            if !keep_ooo {
-                st.clear_ooo();
-            }
+            st.clear_ooo_if_empty();
         } else {
             for m in &merged_ooo {
                 *ooo_mint = (*ooo_mint).min(m.min_time);
                 *ooo_maxt = (*ooo_maxt).max(m.max_time);
             }
+            let mut merged_ooo = merged_ooo;
+            shrink_mmapped_vec(&mut merged_ooo);
             st.ooo_or_insert().ooo_mmapped_chunks = merged_ooo;
         }
 
@@ -3917,6 +4220,7 @@ impl Head {
             }
         }
         if self.metrics.track_append(state.append_float_in_order(
+                &entry.labels,
                 st,
                 s.t,
                 s.v,
@@ -3924,6 +4228,7 @@ impl Head {
                 self.opts.samples_per_chunk,
                 self.float_chunk_encoding(),
                 self.opts.enable_st_storage,
+                self.chunk_end_time_variance(),
             )?) {
             *mint = (*mint).min(s.t);
             *maxt = (*maxt).max(s.t);
@@ -5287,6 +5592,37 @@ impl Head {
     }
 
     #[inline]
+    pub fn chunk_end_time_variance(&self) -> f64 {
+        f64::from_bits(self.chunk_end_time_variance_bits.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn set_chunk_end_time_variance(&self, variance: f64) {
+        self.chunk_end_time_variance_bits
+            .store(variance.to_bits(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn metadata_limits(&self) -> MetadataLimits {
+        MetadataLimits {
+            max_metrics_with_metadata_per_user: self
+                .metadata_limits_max_metrics
+                .load(Ordering::Relaxed),
+            max_metadata_per_metric: self
+                .metadata_limits_max_per_metric
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    #[inline]
+    pub fn set_metadata_limits(&self, limits: MetadataLimits) {
+        self.metadata_limits_max_metrics
+            .store(limits.max_metrics_with_metadata_per_user, Ordering::Relaxed);
+        self.metadata_limits_max_per_metric
+            .store(limits.max_metadata_per_metric, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub fn exemplars(&self) -> &CircularExemplarStorage {
         &self.exemplars
     }
@@ -5567,7 +5903,8 @@ impl Head {
             let min_block_end = range_for_timestamp(self.min_time(), self.opts.chunk_range_ms);
             return min_block_end < self.appendable_min_valid_time();
         }
-        self.max_time() - self.min_time() > self.opts.chunk_range_ms / 2 * 3
+        (self.max_time() as i128) - (self.min_time() as i128)
+            > ((self.opts.chunk_range_ms / 2) as i128) * 3
     }
 
     fn init_time(&self, t: i64) {
@@ -6147,7 +6484,7 @@ impl Head {
             {
                 let mut st = e.inner.lock();
                 chunks_removed += (st.mmapped().len() + st.head_chunks_len()) as u64;
-                st.mmapped_chunks = None;
+                st.mmapped_chunks = Vec::new();
                 st.clear_head_chunks();
                 st.set_gced(true);
                 if let Some(keep_until) = {
@@ -6272,8 +6609,9 @@ impl Head {
                 if let Some(ref mut ooo) = st.ooo_mut() {
                     if !ooo.ooo_pending_mmapped.is_empty() {
                         for (mc, _) in ooo.ooo_pending_mmapped.drain(..) {
-                            ooo.ooo_mmapped_chunks.push(mc);
+                            push_mmapped_chunk(&mut ooo.ooo_mmapped_chunks, mc);
                         }
+                        ooo.ooo_pending_mmapped = Vec::new();
                     }
                 }
             }
@@ -6401,7 +6739,7 @@ impl Head {
                         .mmapped()
                         .iter()
                         .any(|mc| mc.overlaps_closed_interval(mint, maxt_inclusive))
-                        || st.any_head_chunk(|_, hc_min, hc_max| {
+                        || st.any_head_chunk_bounds(|hc_min, hc_max| {
                             hc_min <= maxt_inclusive && mint <= hc_max
                         });
                     if has_overlap {
@@ -6412,7 +6750,7 @@ impl Head {
                     let has_overlap = st.mmapped().iter().any(|mc| {
                         mc.overlaps_closed_interval(mint, maxt_inclusive)
                             && !is_completely_deleted(&tombs_buf, mc.min_time, mc.max_time)
-                    }) || st.any_head_chunk(|_, hc_min, hc_max| {
+                    }) || st.any_head_chunk_bounds(|hc_min, hc_max| {
                         hc_min <= maxt_inclusive
                             && mint <= hc_max
                             && !is_completely_deleted(&tombs_buf, hc_min, hc_max)
@@ -6447,13 +6785,13 @@ impl Head {
                     mmapped_refs.push(*mc);
                 }
             }
-            st.for_each_head_chunk(|hc_chunk, hc_min, hc_max| {
+            st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
                 if hc_min <= maxt_inclusive && mint <= hc_max {
                     out_chunks.push(ChunkMeta {
                         ref_id: 0,
                         min_time: hc_min,
                         max_time: hc_max,
-                        chunk: Some(hc_chunk.clone()),
+                        chunk: Some(hc_chunk),
                     });
                 }
             });
@@ -6817,7 +7155,7 @@ impl Head {
                 maxt = maxt.max(mc.max_time);
                 has_any = true;
             }
-            st.for_each_head_chunk(|_, hc_min, hc_max| {
+            st.for_each_head_chunk_bounds(|hc_min, hc_max| {
                 mint = mint.min(hc_min);
                 maxt = maxt.max(hc_max);
                 has_any = true;
@@ -6856,13 +7194,13 @@ impl Head {
                 }
             }
             let mut head_chks = Vec::new();
-            st.for_each_head_chunk(|hc_chunk, hc_min, hc_max| {
+            st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
                 if hc_min <= maxt_inclusive && mint <= hc_max {
                     head_chks.push(ChunkMeta {
                         ref_id: 0,
                         min_time: hc_min,
                         max_time: hc_max,
-                        chunk: Some(hc_chunk.clone()),
+                        chunk: Some(hc_chunk),
                     });
                 }
             });
@@ -7169,7 +7507,6 @@ impl Head {
                 StripeSeries::collect_stripe_into(stripe, &mut stripe_buf);
                 for entry in stripe_buf.drain(..) {
                     let mut st = entry.inner.lock();
-                    let mut drop_ooo = false;
                     if let Some(ref mut ooo) = st.ooo_mut() {
                         let before =
                             ooo.ooo_mmapped_chunks.len() + ooo.ooo_pending_mmapped.len();
@@ -7181,16 +7518,9 @@ impl Head {
                             - ooo.ooo_mmapped_chunks.len()
                             - ooo.ooo_pending_mmapped.len())
                             as u64;
-                        if ooo.ooo_mmapped_chunks.is_empty()
-                            && ooo.ooo_pending_mmapped.is_empty()
-                            && ooo.ooo_head_chunk.is_none()
-                        {
-                            drop_ooo = true;
-                        }
                     }
-                    if drop_ooo {
-                        st.clear_ooo();
-                    }
+                    st.clear_ooo_if_empty();
+                    st.maybe_drop_cold();
 
                     let has_ooo = st.ooo().is_some();
                     let has_recent_exemplar =
@@ -7330,7 +7660,6 @@ impl Head {
                     continue;
                 }
 
-                let mut drop_ooo = false;
                 if let Some(ref mut ooo) = st.ooo_mut() {
                     let before = ooo.ooo_mmapped_chunks.len() + ooo.ooo_pending_mmapped.len();
                     ooo.ooo_mmapped_chunks
@@ -7354,16 +7683,9 @@ impl Head {
                             }
                         }
                     }
-                    if ooo.ooo_mmapped_chunks.is_empty()
-                        && ooo.ooo_pending_mmapped.is_empty()
-                        && ooo.ooo_head_chunk.is_none()
-                    {
-                        drop_ooo = true;
-                    }
                 }
-                if drop_ooo {
-                    st.clear_ooo();
-                }
+                st.clear_ooo_if_empty();
+                st.maybe_drop_cold();
 
                 let has_ooo = st.ooo().is_some();
                 let has_recent_exemplar =
@@ -7478,14 +7800,14 @@ impl Head {
                 any_mmapped = true;
             }
             let mut head_chks = Vec::new();
-            st.for_each_head_chunk(|hc_chunk, hc_min, hc_max| {
+            st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
                 mint = mint.min(hc_min);
                 maxt = maxt.max(hc_max);
                 head_chks.push(ChunkMeta {
                     ref_id: 0,
                     min_time: hc_min,
                     max_time: hc_max,
-                    chunk: Some(hc_chunk.clone()),
+                    chunk: Some(hc_chunk),
                 });
             });
             if !mmapped_refs.is_empty() || !head_chks.is_empty() {
@@ -7601,7 +7923,7 @@ impl Head {
                         // Keep the series identity while its exemplar can still be replayed,
                         // matching Prometheus `gcSeries`.
                         self.metrics.chunks_removed(removed);
-                        st.mmapped_chunks = None;
+                        st.mmapped_chunks = Vec::new();
                         st.clear_head_chunks();
                         entry
                             .in_order_max_time
@@ -7793,13 +8115,11 @@ impl Head {
 
                 let prev_max_time = st.max_time();
                 let mut removed = 0usize;
-                if let Some(ref mut mv) = st.mmapped_chunks {
-                    let before = mv.len();
-                    mv.retain(|mc| mc.max_time >= mint);
-                    removed += before - mv.len();
-                    if mv.is_empty() {
-                        st.mmapped_chunks = None;
-                    }
+                if !st.mmapped_chunks.is_empty() {
+                    let before = st.mmapped_chunks.len();
+                    st.mmapped_chunks.retain(|mc| mc.max_time >= mint);
+                    removed += before - st.mmapped_chunks.len();
+                    shrink_mmapped_vec(&mut st.mmapped_chunks);
                 }
                 removed += st.retain_head_chunks(mint);
                 chunks_removed += removed as u64;
@@ -7808,19 +8128,20 @@ impl Head {
                     .store(st.max_time(), Ordering::Release);
                 if st.head_chunks_is_empty() {
                     st.invalidate_xor_state();
-                    st.invalidate_xor2_state();
+                    st.clear_xor2_state();
                     st.clear_hist_state();
                     if st.mmapped().is_empty() {
                         st.clear_last_sample();
                     }
                 }
 
-                let has_ooo = st.ooo().is_some_and(|o| {
-                    o.ooo_head_chunk.is_some()
-                        || !o.ooo_mmapped_chunks.is_empty()
-                        || !o.ooo_pending_mmapped.is_empty()
-                });
+                st.clear_ooo_if_empty();
+                let has_ooo = st.ooo().is_some();
                 let has_recent_exemplar = st.last_exemplar_ts().is_some_and(|ts| ts >= mint);
+                if !has_recent_exemplar {
+                    st.flags &= !FLAG_HAS_LAST_EXEMPLAR;
+                }
+                st.maybe_drop_cold();
 
                 if st.mmapped().is_empty()
                     && st.head_chunks_is_empty()
@@ -7962,9 +8283,7 @@ impl Head {
                 for mc in st.mmapped() {
                     samples += mc.num_samples as u64;
                 }
-                st.for_each_head_chunk(|hc_chunk, _, _| {
-                    samples += hc_chunk.num_samples() as u64;
-                });
+                samples += st.head_chunks_samples();
             }
         }
         (
@@ -8074,7 +8393,7 @@ impl Head {
         };
         let tombs = self.tombstones.get(ref_id);
         let st = entry.inner.lock();
-        let has_chunk = st.any_head_chunk(|_, hc_min, hc_max| {
+        let has_chunk = st.any_head_chunk_bounds(|hc_min, hc_max| {
             hc_min <= maxt
                 && mint <= hc_max
                 && !tombs.iter().any(|iv| iv.is_subrange(hc_min, hc_max))
@@ -8159,13 +8478,13 @@ impl Head {
                     }
                 }
                 let mut head_chks = Vec::with_capacity(st.head_chunks_len());
-                st.for_each_head_chunk(|hc_chunk, hc_min, hc_max| {
+                st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
                     if hc_min <= maxt && mint <= hc_max {
                         head_chks.push(ChunkMeta {
                             ref_id: in_order_pos,
                             min_time: hc_min,
                             max_time: hc_max,
-                            chunk: Some(hc_chunk.clone()),
+                            chunk: Some(hc_chunk),
                         });
                         in_order_pos += 1;
                     }
@@ -8400,7 +8719,7 @@ impl Head {
                     count += 1;
                 }
             }
-            st.for_each_head_chunk(|_, hc_min, hc_max| {
+            st.for_each_head_chunk_bounds(|hc_min, hc_max| {
                 if hc_min <= maxt && mint <= hc_max {
                     if has_prev && (hc_min < prev_min || hc_min <= prev_max) {
                         sorted_disjoint = false;
@@ -8481,7 +8800,7 @@ impl Head {
                     intervals.push((mc.min_time, mc.max_time));
                 }
             }
-            st.for_each_head_chunk(|_, hc_min, hc_max| {
+            st.for_each_head_chunk_bounds(|hc_min, hc_max| {
                 if hc_min <= maxt && mint <= hc_max {
                     if has_prev && (hc_min < prev_min || hc_min <= prev_max) {
                         sorted_disjoint = false;
@@ -10214,7 +10533,7 @@ impl<'a> HeadAppender<'a> {
                 metric_type,
                 help,
                 unit,
-                self.head.opts.metadata_limits,
+                self.head.metadata_limits(),
             )?;
         }
 
@@ -10393,6 +10712,7 @@ impl<'a> HeadAppender<'a> {
                         v = 0.0;
                     }
                     if self.head.metrics.track_append(state.append_float_in_order(
+                        &pf.entry.labels,
                         pf.st,
                         pf.t,
                         v,
@@ -10400,6 +10720,7 @@ impl<'a> HeadAppender<'a> {
                         samples_per_chunk,
                         float_enc,
                         store_st,
+                        self.head.chunk_end_time_variance(),
                     )?) {
                         in_order_mint = in_order_mint.min(pf.t);
                         in_order_maxt = in_order_maxt.max(pf.t);
@@ -10688,6 +11009,7 @@ impl<'a> HeadAppender<'a> {
                         v = 0.0;
                     }
                     if self.head.metrics.track_append(state.append_float_in_order(
+                        &pf.entry.labels,
                         pf.st,
                         pf.t,
                         v,
@@ -10695,6 +11017,7 @@ impl<'a> HeadAppender<'a> {
                         samples_per_chunk,
                         float_enc,
                         store_st,
+                        self.head.chunk_end_time_variance(),
                     )?) {
                         in_order_mint = in_order_mint.min(pf.t);
                         in_order_maxt = in_order_maxt.max(pf.t);
@@ -13112,6 +13435,210 @@ mod tests {
         let mut on_disk = 0usize;
         reader.iterate_all_chunks(|_| { on_disk += 1; Ok(()) }).unwrap();
         assert_eq!(on_disk, mmapped_count, "no duplicate chunks may be written on retry");
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn w13_p1_2_and_p1_3_extreme_timestamps_jitter_and_cut_order() {
+        assert_eq!(range_for_timestamp(i64::MAX, 7_200_000), i64::MAX);
+        assert_eq!(range_for_timestamp(i64::MAX - 1, 7_200_000), i64::MAX);
+        assert_eq!(
+            compute_chunk_end_time(0, i64::MAX, i64::MAX, 4.0),
+            i64::MAX
+        );
+        assert_eq!(
+            compute_chunk_end_time(i64::MIN + 2, 0, i64::MAX, 4.0),
+            i64::MAX
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+        {
+            let mut app = head.appender();
+            let p = [("__name__", "extreme_span")];
+            app.append_float(None, &p, i64::MIN + 1000, 1.0).unwrap();
+            app.append_float(None, &p, 1_700_000_000_000, 2.0).unwrap();
+            app.commit().unwrap();
+        }
+        assert!(head.compactable());
+        head.close().unwrap();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            chunk_range_ms: 100_000,
+            samples_per_chunk: 8,
+            ..HeadOptions::default()
+        };
+        let head2 = Head::open(dir2.path(), opts, i64::MIN).unwrap();
+        let p = [("__name__", "cut_order")];
+        {
+            let mut app = head2.appender();
+            app.append_float(None, &p, 0, 1.0).unwrap();
+            app.append_float(None, &p, 5_000, 2.0).unwrap();
+            app.append_float(None, &p, 26_000, 3.0).unwrap();
+            app.commit().unwrap();
+        }
+        let entry = head2.get_entry_by_sorted_pairs(&p).unwrap();
+        let (_, chks) = head2
+            .series_final_chunks(entry.ref_id, i64::MIN, i64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chks.len(), 2, "must cut chunk on sample #2 after recomputing next_at");
+        assert_eq!(chks[0].max_time, 5_000);
+        assert_eq!(chks[1].min_time, 26_000);
+        head2.close().unwrap();
+
+        let lbls = Labels::from_pairs([("__name__", "jitter_metric"), ("job", "api")]);
+        let h = lbls.stable_hash();
+        let j = add_jitter_to_chunk_end_time(h, 0, 20_000, 100_000, 0.2);
+        assert!((18_000..=22_000).contains(&j));
+        assert_eq!(add_jitter_to_chunk_end_time(h, 0, 20_000, 100_000, 0.0), 20_000);
+        assert_eq!(add_jitter_to_chunk_end_time(h, 0, 100_000, 100_000, 0.2), 100_000);
+    }
+
+    #[test]
+    fn mmapped_chunks_stepped_capacity_and_cold_state_drop_on_truncate() {
+        let mut mv: Vec<MmappedChunk> = Vec::new();
+        let mut caps = Vec::new();
+        for i in 0..12u64 {
+            push_mmapped_chunk(
+                &mut mv,
+                MmappedChunk {
+                    ref_id: ChunkDiskMapperRef(i + 1),
+                    min_time: (i as i64) * 100,
+                    max_time: (i as i64) * 100 + 50,
+                    num_samples: 10,
+                    encoding: Encoding::Xor,
+                },
+            );
+            if caps.last() != Some(&mv.capacity()) {
+                caps.push(mv.capacity());
+            }
+        }
+        assert_eq!(caps, vec![2, 4, 6, 8, 12]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 100_000,
+            ooo_cap_max: 4,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let p = [("__name__", "cold_drop_metric"), ("job", "api")];
+        {
+            let mut app = head.appender();
+            app.append_float(None, &p, 10_000, 1.0).unwrap();
+            app.append_float(None, &p, 20_000, 2.0).unwrap();
+            // OOO sample creates SeriesColdState -> SeriesOooState.
+            app.append_float(None, &p, 15_000, 1.5).unwrap();
+            app.commit().unwrap();
+        }
+        let entry = head.get_entry_by_sorted_pairs(&p).unwrap();
+        assert!(entry.inner.lock().cold.is_some());
+
+        // Clear OOO data before 16_000: OOO state becomes empty -> SeriesColdState dropped to None.
+        head.clear_ooo_data_before(16_000).unwrap();
+        {
+            let st = entry.inner.lock();
+            assert!(st.ooo().is_none());
+            assert!(st.cold.is_none());
+        }
+
+        // Report struct sizes for visibility.
+        eprintln!(
+            "sizes: SeriesEntry={} SeriesState={} SeriesColdState={} MmappedChunk={}",
+            std::mem::size_of::<SeriesEntry>(),
+            std::mem::size_of::<SeriesState>(),
+            std::mem::size_of::<SeriesColdState>(),
+            std::mem::size_of::<MmappedChunk>(),
+        );
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn active_chunk_num_samples_masks_histogram_st_and_checks_xor2_min_hdr() {
+        use crate::chunkenc::{CounterResetHint, HistogramSpan};
+
+        // Verify direct SeriesState header masking on HistogramSt / FloatHistogramSt
+        // where top 2 bits store CounterResetHeader (0x40=NotCounterReset, 0x80=CounterReset, 0xC0=GaugeType).
+        let mut st = SeriesState::new();
+        for (enc, hdr0) in [
+            (Encoding::HistogramSt, 0x40u8),
+            (Encoding::HistogramSt, 0x80u8),
+            (Encoding::HistogramSt, 0xC0u8),
+            (Encoding::FloatHistogramSt, 0x40u8),
+            (Encoding::FloatHistogramSt, 0x80u8),
+            (Encoding::FloatHistogramSt, 0xC0u8),
+        ] {
+            // Raw u16 would be 16_385 / 32_769 / 49_153 without HISTOGRAM_ST_SAMPLE_COUNT_MASK.
+            st.set_active_chunk(EncodedChunk::from_bstream(
+                enc,
+                BitStream::from_bytes(vec![hdr0, 0x01, 0x00], 0),
+            ));
+            assert_eq!(
+                st.active_chunk_num_samples(),
+                1,
+                "failed for {enc:?} with header byte {hdr0:#x}"
+            );
+        }
+
+        // Verify min_hdr = 3 is enforced for Xor2 (2-byte truncated header -> 0, 3-byte -> count).
+        st.set_active_chunk(EncodedChunk::from_bstream(
+            Encoding::Xor2,
+            BitStream::from_bytes(vec![0x00, 0x01], 0),
+        ));
+        assert_eq!(st.active_chunk_num_samples(), 0);
+        st.set_active_chunk(EncodedChunk::from_bstream(
+            Encoding::Xor2,
+            BitStream::from_bytes(vec![0x00, 0x01, 0x00], 0),
+        ));
+        assert_eq!(st.active_chunk_num_samples(), 1);
+
+        // End-to-end Head test with enable_histogram_st_encoding = true.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            enable_histogram_st_encoding: true,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let hp = [("__name__", "hist_st_active_samples")];
+        let fhp = [("__name__", "fhist_st_active_samples")];
+
+        let int_h = Histogram {
+            count: 5,
+            sum: 7.5,
+            schema: 1,
+            counter_reset_hint: CounterResetHint::NotCounterReset,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![5],
+            ..Histogram::default()
+        };
+
+        let float_h = FloatHistogram {
+            count: 5.0,
+            sum: 7.5,
+            schema: 1,
+            counter_reset_hint: CounterResetHint::CounterReset,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![5.0],
+            ..FloatHistogram::default()
+        };
+
+        {
+            let mut app = head.appender();
+            app.append_histogram(None, &hp, 0, 10_000, int_h).unwrap();
+            app.append_float_histogram(None, &fhp, 0, 10_000, float_h)
+                .unwrap();
+            app.commit().unwrap();
+        }
+
+        let he = head.get_entry_by_sorted_pairs(&hp).unwrap();
+        assert_eq!(he.inner.lock().active_chunk_num_samples(), 1);
+
+        let fhe = head.get_entry_by_sorted_pairs(&fhp).unwrap();
+        assert_eq!(fhe.inner.lock().active_chunk_num_samples(), 1);
+        assert_eq!(head.head_stats().2, 2);
+
         head.close().unwrap();
     }
 }

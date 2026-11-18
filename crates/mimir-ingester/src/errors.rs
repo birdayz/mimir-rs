@@ -519,7 +519,7 @@ impl IngesterError {
     }
 
     /// Go dskit `GRPCServerLog` appends ` (sampled 1/N)` to the returned error of sampled errors.
-    fn sampling_reason(&self) -> Option<String> {
+    pub(crate) fn sampling_reason(&self) -> Option<String> {
         match self {
             Self::Sampled { rate, inner, .. } => {
                 if *rate != 0 {

@@ -128,7 +128,12 @@ impl SliceRef {
                 let e = s + len as usize;
                 &input[s..e]
             }
-            SliceRef::Common { idx, len } => &common_symbols[idx as usize].as_bytes()[..len as usize],
+            SliceRef::Common { idx, len } => common_symbols
+                .get(idx as usize)
+                .map_or(&[][..], |s| {
+                    let b = s.as_bytes();
+                    &b[..(len as usize).min(b.len())]
+                }),
             SliceRef::Scratch { .. } => &[],
         }
     }
@@ -147,7 +152,12 @@ impl SliceRef {
                 let e = s + len as usize;
                 &input[s..e]
             }
-            SliceRef::Common { idx, len } => &common_symbols[idx as usize].as_bytes()[..len as usize],
+            SliceRef::Common { idx, len } => common_symbols
+                .get(idx as usize)
+                .map_or(&[][..], |s| {
+                    let b = s.as_bytes();
+                    &b[..(len as usize).min(b.len())]
+                }),
             SliceRef::Scratch { start, len } => {
                 let s = start as usize;
                 let e = s + len as usize;
@@ -170,7 +180,9 @@ impl SliceRef {
                 let e = s + len as usize;
                 std::str::from_utf8(&input[s..e]).unwrap_or("")
             }
-            SliceRef::Common { idx, len } => &common_symbols[idx as usize][..len as usize],
+            SliceRef::Common { idx, len } => common_symbols
+                .get(idx as usize)
+                .map_or("", |s| &s[..(len as usize).min(s.len())]),
             SliceRef::Scratch { start, len } => {
                 let s = start as usize;
                 let e = s + len as usize;
@@ -193,7 +205,9 @@ impl SliceRef {
                 // SAFETY: caller guarantees `SliceRef::Input` was validated as UTF-8 on decode.
                 unsafe { std::str::from_utf8_unchecked(&input[s..e]) }
             }
-            SliceRef::Common { idx, len } => &common_symbols[idx as usize][..len as usize],
+            SliceRef::Common { idx, len } => common_symbols
+                .get(idx as usize)
+                .map_or("", |s| &s[..(len as usize).min(s.len())]),
             SliceRef::Scratch { .. } => "",
         }
     }
@@ -243,6 +257,31 @@ fn ensure_utf8_slice_ref(
             let s = start as usize;
             let e = s + len as usize;
             push_utf8_or_lossy(&input[s..e], s, utf8_arena)
+        }
+        other => other,
+    }
+}
+
+#[inline]
+fn materialize_common_into_scratch(
+    r: SliceRef,
+    common_symbols: &[&str],
+    utf8_arena: &mut Vec<u8>,
+) -> SliceRef {
+    match r {
+        SliceRef::Common { idx, len } => {
+            let sym = common_symbols.get(idx as usize).copied().unwrap_or("");
+            let slice = &sym[..(len as usize).min(sym.len())];
+            if slice.is_empty() {
+                SliceRef::Empty
+            } else {
+                let start = utf8_arena.len();
+                utf8_arena.extend_from_slice(slice.as_bytes());
+                SliceRef::Scratch {
+                    start: start as u32,
+                    len: slice.len() as u32,
+                }
+            }
         }
         other => other,
     }
@@ -374,6 +413,7 @@ pub struct StreamedRw2Series<'v, 'a> {
     pub exemplars_range: Range<usize>,
     pub source: i32,
     pub skip_label_validation: bool,
+    pub skip_label_count_validation: bool,
     scratch: &'v WriteRequestScratch,
     input: &'a [u8],
     common_symbols: &'a [&'a str],
@@ -438,6 +478,7 @@ pub struct StreamedClassicSeries<'v, 'a> {
     pub exemplars_range: Range<usize>,
     pub source: i32,
     pub skip_label_validation: bool,
+    pub skip_label_count_validation: bool,
     scratch: &'v WriteRequestScratch,
     input: &'a [u8],
 }
@@ -482,15 +523,20 @@ pub struct WriteRequestScratch {
     exemplars: Vec<ExemplarMeta>,
     exemplar_labels: Vec<LabelRefPair>,
     histograms: Vec<HistogramMeta>,
-    spans: Vec<cortexpb::BucketSpan>,
-    deltas: Vec<i64>,
-    floats: Vec<f64>,
+    neg_spans: Vec<cortexpb::BucketSpan>,
+    pos_spans: Vec<cortexpb::BucketSpan>,
+    neg_deltas: Vec<i64>,
+    pos_deltas: Vec<i64>,
+    neg_counts: Vec<f64>,
+    pos_counts: Vec<f64>,
+    custom_values: Vec<f64>,
     timeseries: Vec<TimeSeriesMeta>,
     metadata: Vec<MetadataMeta>,
     rw2_symbols: Vec<SliceRef>,
     rw2_label_refs: Vec<u32>,
     dedup_hashes: HashMap<u64, Vec<usize>>,
     utf8_arena: Vec<u8>,
+    uses_v2_common_symbols: bool,
 }
 
 impl WriteRequestScratch {
@@ -501,15 +547,20 @@ impl WriteRequestScratch {
             exemplars: Vec::with_capacity(32),
             exemplar_labels: Vec::with_capacity(64),
             histograms: Vec::with_capacity(32),
-            spans: Vec::with_capacity(64),
-            deltas: Vec::with_capacity(128),
-            floats: Vec::with_capacity(128),
+            neg_spans: Vec::with_capacity(32),
+            pos_spans: Vec::with_capacity(32),
+            neg_deltas: Vec::with_capacity(64),
+            pos_deltas: Vec::with_capacity(64),
+            neg_counts: Vec::with_capacity(64),
+            pos_counts: Vec::with_capacity(64),
+            custom_values: Vec::with_capacity(16),
             timeseries: Vec::with_capacity(100),
             metadata: Vec::with_capacity(32),
             rw2_symbols: Vec::with_capacity(128),
             rw2_label_refs: Vec::with_capacity(64),
             dedup_hashes: HashMap::with_capacity(32),
             utf8_arena: Vec::new(),
+            uses_v2_common_symbols: false,
         }
     }
 
@@ -519,15 +570,20 @@ impl WriteRequestScratch {
         self.exemplars.clear();
         self.exemplar_labels.clear();
         self.histograms.clear();
-        self.spans.clear();
-        self.deltas.clear();
-        self.floats.clear();
+        self.neg_spans.clear();
+        self.pos_spans.clear();
+        self.neg_deltas.clear();
+        self.pos_deltas.clear();
+        self.neg_counts.clear();
+        self.pos_counts.clear();
+        self.custom_values.clear();
         self.timeseries.clear();
         self.metadata.clear();
         self.rw2_symbols.clear();
         self.rw2_label_refs.clear();
         self.dedup_hashes.clear();
         self.utf8_arena.clear();
+        self.uses_v2_common_symbols = false;
     }
 
     #[inline]
@@ -536,13 +592,18 @@ impl WriteRequestScratch {
     }
 
     pub fn metadata<'a>(&'a self, input: &'a [u8]) -> impl ExactSizeIterator<Item = BorrowedMetadata<'a>> + 'a {
+        let common: &'a [&'a str] = if self.uses_v2_common_symbols {
+            V2_COMMON_SYMBOLS_LIST
+        } else {
+            &[]
+        };
         self.metadata.iter().map(move |m| BorrowedMetadata {
             metric_type: m.metric_type,
             metric_family_name: m
                 .family_name
-                .resolve_str(input, &[], &self.utf8_arena),
-            help: m.help.resolve_str(input, &[], &self.utf8_arena),
-            unit: m.unit.resolve_str(input, &[], &self.utf8_arena),
+                .resolve_str(input, common, &self.utf8_arena),
+            help: m.help.resolve_str(input, common, &self.utf8_arena),
+            unit: m.unit.resolve_str(input, common, &self.utf8_arena),
         })
     }
 }
@@ -813,32 +874,32 @@ impl<'v> BorrowedHistogramView<'v> {
 
     #[inline]
     pub fn negative_spans(&self) -> &[cortexpb::BucketSpan] {
-        &self.scratch.spans[self.meta.negative_spans.clone()]
+        &self.scratch.neg_spans[self.meta.negative_spans.clone()]
     }
 
     #[inline]
     pub fn negative_deltas(&self) -> &[i64] {
-        &self.scratch.deltas[self.meta.negative_deltas.clone()]
+        &self.scratch.neg_deltas[self.meta.negative_deltas.clone()]
     }
 
     #[inline]
     pub fn negative_counts(&self) -> &[f64] {
-        &self.scratch.floats[self.meta.negative_counts.clone()]
+        &self.scratch.neg_counts[self.meta.negative_counts.clone()]
     }
 
     #[inline]
     pub fn positive_spans(&self) -> &[cortexpb::BucketSpan] {
-        &self.scratch.spans[self.meta.positive_spans.clone()]
+        &self.scratch.pos_spans[self.meta.positive_spans.clone()]
     }
 
     #[inline]
     pub fn positive_deltas(&self) -> &[i64] {
-        &self.scratch.deltas[self.meta.positive_deltas.clone()]
+        &self.scratch.pos_deltas[self.meta.positive_deltas.clone()]
     }
 
     #[inline]
     pub fn positive_counts(&self) -> &[f64] {
-        &self.scratch.floats[self.meta.positive_counts.clone()]
+        &self.scratch.pos_counts[self.meta.positive_counts.clone()]
     }
 
     #[inline]
@@ -853,7 +914,7 @@ impl<'v> BorrowedHistogramView<'v> {
 
     #[inline]
     pub fn custom_values(&self) -> &[f64] {
-        &self.scratch.floats[self.meta.custom_values.clone()]
+        &self.scratch.custom_values[self.meta.custom_values.clone()]
     }
 
     pub fn to_owned_histogram(&self) -> cortexpb::Histogram {
@@ -891,7 +952,10 @@ pub fn decode_write_request<'a, 's>(
     let (is_rw2, rw2_offset, common_symbols): (bool, u32, &'a [&'a str]) = match opts.mode {
         DecodeMode::Classic => (false, 0, &[]),
         DecodeMode::Rw2 => (true, 0, &[]),
-        DecodeMode::KafkaV2 => (true, V2_RECORD_SYMBOL_OFFSET, V2_COMMON_SYMBOLS_LIST),
+        DecodeMode::KafkaV2 => {
+            scratch.uses_v2_common_symbols = true;
+            (true, V2_RECORD_SYMBOL_OFFSET, V2_COMMON_SYMBOLS_LIST)
+        }
         DecodeMode::Rw2Custom {
             offset,
             common_symbols,
@@ -1197,6 +1261,7 @@ where
                         samples_arena,
                         source,
                         skip_label_validation,
+                        skip_label_count_validation,
                     )?;
                     emitted_any_series = true;
                     on_series(series);
@@ -1247,7 +1312,11 @@ where
                             wire_type,
                         });
                     }
-                    skip_label_count_validation = read_varint(input, &mut pos)? != 0;
+                    let val = read_varint(input, &mut pos)? != 0;
+                    if emitted_any_series && val != skip_label_count_validation {
+                        header_changed_after_series = true;
+                    }
+                    skip_label_count_validation = val;
                 }
                 _ => {
                     skip_field_bounded(input, &mut pos, len, wire_type)?;
@@ -1281,6 +1350,7 @@ fn decode_timeseries_classic_stream<'v, 'a>(
     samples_arena: &mut Vec<cortexpb::Sample>,
     source: i32,
     skip_label_validation: bool,
+    skip_label_count_validation: bool,
 ) -> Result<StreamedClassicSeries<'v, 'a>, DecodeError> {
     let label_bytes_start = label_bytes_arena.len();
     let samples_start = samples_arena.len();
@@ -1399,6 +1469,7 @@ fn decode_timeseries_classic_stream<'v, 'a>(
         exemplars_range: exemplars_start..scratch.exemplars.len(),
         source,
         skip_label_validation,
+        skip_label_count_validation,
         scratch,
         input,
     })
@@ -1489,11 +1560,17 @@ where
     }
     scratch.clear();
     meta_out.clear();
+    let label_base = label_bytes_arena.len();
+    let samples_base = samples_arena.len();
+    let meta_base = meta_out.len();
 
     let (rw2_offset, common_symbols, is_kafka_v2): (u32, &'a [&'a str], bool) = match opts.mode {
         DecodeMode::Classic => return Err(DecodeError::UnexpectedRw1Timeseries),
         DecodeMode::Rw2 => (0, &[], false),
-        DecodeMode::KafkaV2 => (V2_RECORD_SYMBOL_OFFSET, V2_COMMON_SYMBOLS_LIST, true),
+        DecodeMode::KafkaV2 => {
+            scratch.uses_v2_common_symbols = true;
+            (V2_RECORD_SYMBOL_OFFSET, V2_COMMON_SYMBOLS_LIST, true)
+        }
         DecodeMode::Rw2Custom {
             offset,
             common_symbols,
@@ -1535,6 +1612,9 @@ where
                 resolved[i] = Some(sym);
             }
         }
+        if !resolved.is_empty() {
+            resolved[0] = Some("");
+        }
     }
 
     let mut source: i32 = 0;
@@ -1545,156 +1625,171 @@ where
     let mut emitted_any_series = false;
     let mut header_changed_after_series = false;
 
-    let mut pos = 0usize;
-    let len = input.len();
-    while pos < len {
-        let (field_num, wire_type) = read_key_bounded(input, &mut pos, len)?;
-        match field_num {
-            1 => return Err(DecodeError::UnexpectedRw1Timeseries),
-            2 => {
-                if wire_type != 0 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 2,
-                        wire_type,
-                    });
-                }
-                let new_src = read_varint(input, &mut pos)? as i32;
-                if emitted_any_series && new_src != source {
-                    header_changed_after_series = true;
-                }
-                source = new_src;
-            }
-            3 => return Err(DecodeError::UnexpectedRw1Metadata),
-            4 => {
-                if wire_type != 2 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 4,
-                        wire_type,
-                    });
-                }
-                let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
-                if !prescanned_symbols {
-                    let sym_str: &'r str = match std::str::from_utf8(&input[sub.clone()]) {
-                        Ok(s) => {
-                            if !seen_first_symbol && !s.is_empty() {
-                                return Err(DecodeError::InvalidFirstSymbol);
-                            }
-                            s
-                        }
-                        Err(_) => {
-                            if !seen_first_symbol && !sub.is_empty() {
-                                return Err(DecodeError::InvalidFirstSymbol);
-                            }
-                            let lossy: Box<str> =
-                                String::from_utf8_lossy(&input[sub]).into_owned().into_boxed_str();
-                            lossy_strings.push(lossy);
-                            let ptr: *const str = &**lossy_strings.last().unwrap();
-                            // SAFETY: `Box<str>` heap allocation does not move when `Vec<Box<str>>`
-                            // pushes, and `lossy_strings` lives in `resolved_scratch` for `'r`.
-                            unsafe { &*ptr }
-                        }
-                    };
-                    seen_first_symbol = true;
-                    resolved.push(Some(sym_str));
-                }
-            }
-            5 => {
-                if wire_type != 2 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 5,
-                        wire_type,
-                    });
-                }
-                let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
-                if !seen_first_symbol && !prescanned_symbols {
-                    prescanned_symbols = true;
-                    let mut scan_pos = pos;
-                    while scan_pos < len {
-                        let (sf, sw) = read_key_bounded(input, &mut scan_pos, len)?;
-                        if sf == 4 {
-                            if sw != 2 {
-                                return Err(DecodeError::InvalidWireType {
-                                    field: 4,
-                                    wire_type: sw,
-                                });
-                            }
-                            let sym_range =
-                                read_length_delimited_range_bounded(input, &mut scan_pos, len)?;
-                            let sym_str: &'r str =
-                                match std::str::from_utf8(&input[sym_range.clone()]) {
-                                    Ok(s) => {
-                                        if !seen_first_symbol && !s.is_empty() {
-                                            return Err(DecodeError::InvalidFirstSymbol);
-                                        }
-                                        s
-                                    }
-                                    Err(_) => {
-                                        if !seen_first_symbol && !sym_range.is_empty() {
-                                            return Err(DecodeError::InvalidFirstSymbol);
-                                        }
-                                        let lossy: Box<str> =
-                                            String::from_utf8_lossy(&input[sym_range])
-                                                .into_owned()
-                                                .into_boxed_str();
-                                        lossy_strings.push(lossy);
-                                        let ptr: *const str = &**lossy_strings.last().unwrap();
-                                        // SAFETY: see above.
-                                        unsafe { &*ptr }
-                                    }
-                                };
-                            seen_first_symbol = true;
-                            resolved.push(Some(sym_str));
-                        } else {
-                            skip_field_bounded(input, &mut scan_pos, len, sw)?;
-                        }
+    let res: Result<(), DecodeError> = (|| {
+        let mut pos = 0usize;
+        let len = input.len();
+        while pos < len {
+            let (field_num, wire_type) = read_key_bounded(input, &mut pos, len)?;
+            match field_num {
+                1 => return Err(DecodeError::UnexpectedRw1Timeseries),
+                2 => {
+                    if wire_type != 0 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 2,
+                            wire_type,
+                        });
                     }
-                    if resolved.is_empty() && rw2_offset == 0 {
-                        resolved.push(Some(""));
+                    let new_src = read_varint(input, &mut pos)? as i32;
+                    if emitted_any_series && new_src != source {
+                        header_changed_after_series = true;
+                    }
+                    source = new_src;
+                }
+                3 => return Err(DecodeError::UnexpectedRw1Metadata),
+                4 => {
+                    if wire_type != 2 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 4,
+                            wire_type,
+                        });
+                    }
+                    let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
+                    if !prescanned_symbols {
+                        let sym_str: &'r str = match std::str::from_utf8(&input[sub.clone()]) {
+                            Ok(s) => {
+                                if !seen_first_symbol && !s.is_empty() {
+                                    return Err(DecodeError::InvalidFirstSymbol);
+                                }
+                                s
+                            }
+                            Err(_) => {
+                                if !seen_first_symbol && !sub.is_empty() {
+                                    return Err(DecodeError::InvalidFirstSymbol);
+                                }
+                                let lossy: Box<str> =
+                                    String::from_utf8_lossy(&input[sub]).into_owned().into_boxed_str();
+                                lossy_strings.push(lossy);
+                                let ptr: *const str = &**lossy_strings.last().unwrap();
+                                // SAFETY: `Box<str>` heap allocation does not move when `Vec<Box<str>>`
+                                // pushes, and `lossy_strings` lives in `resolved_scratch` for `'r`.
+                                unsafe { &*ptr }
+                            }
+                        };
+                        seen_first_symbol = true;
+                        resolved.push(Some(sym_str));
                     }
                 }
-                let series = decode_timeseries_rw2_stream(
-                    input,
-                    sub,
-                    rw2_offset,
-                    common_symbols,
-                    resolved,
-                    &opts,
-                    scratch,
-                    label_bytes_arena,
-                    samples_arena,
-                    meta_out,
-                    source,
-                    skip_label_validation,
-                )?;
-                emitted_any_series = true;
-                on_series(series);
-            }
-            1000 => {
-                if wire_type != 0 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 1000,
-                        wire_type,
-                    });
+                5 => {
+                    if wire_type != 2 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 5,
+                            wire_type,
+                        });
+                    }
+                    let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
+                    if !seen_first_symbol && !prescanned_symbols {
+                        prescanned_symbols = true;
+                        let mut scan_pos = pos;
+                        while scan_pos < len {
+                            let (sf, sw) = read_key_bounded(input, &mut scan_pos, len)?;
+                            if sf == 4 {
+                                if sw != 2 {
+                                    return Err(DecodeError::InvalidWireType {
+                                        field: 4,
+                                        wire_type: sw,
+                                    });
+                                }
+                                let sym_range =
+                                    read_length_delimited_range_bounded(input, &mut scan_pos, len)?;
+                                let sym_str: &'r str =
+                                    match std::str::from_utf8(&input[sym_range.clone()]) {
+                                        Ok(s) => {
+                                            if !seen_first_symbol && !s.is_empty() {
+                                                return Err(DecodeError::InvalidFirstSymbol);
+                                            }
+                                            s
+                                        }
+                                        Err(_) => {
+                                            if !seen_first_symbol && !sym_range.is_empty() {
+                                                return Err(DecodeError::InvalidFirstSymbol);
+                                            }
+                                            let lossy: Box<str> =
+                                                String::from_utf8_lossy(&input[sym_range])
+                                                    .into_owned()
+                                                    .into_boxed_str();
+                                            lossy_strings.push(lossy);
+                                            let ptr: *const str = &**lossy_strings.last().unwrap();
+                                            // SAFETY: see above.
+                                            unsafe { &*ptr }
+                                        }
+                                    };
+                                seen_first_symbol = true;
+                                resolved.push(Some(sym_str));
+                            } else {
+                                skip_field_bounded(input, &mut scan_pos, len, sw)?;
+                            }
+                        }
+                        if resolved.is_empty() && rw2_offset == 0 {
+                            resolved.push(Some(""));
+                        }
+                    }
+                    let series = decode_timeseries_rw2_stream(
+                        input,
+                        sub,
+                        rw2_offset,
+                        common_symbols,
+                        resolved,
+                        &opts,
+                        scratch,
+                        label_bytes_arena,
+                        samples_arena,
+                        meta_out,
+                        source,
+                        skip_label_validation,
+                        skip_label_count_validation,
+                    )?;
+                    emitted_any_series = true;
+                    on_series(series);
                 }
-                let val = read_varint(input, &mut pos)? != 0;
-                if emitted_any_series && val != skip_label_validation {
-                    header_changed_after_series = true;
+                1000 => {
+                    if wire_type != 0 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 1000,
+                            wire_type,
+                        });
+                    }
+                    let val = read_varint(input, &mut pos)? != 0;
+                    if emitted_any_series && val != skip_label_validation {
+                        header_changed_after_series = true;
+                    }
+                    skip_label_validation = val;
                 }
-                skip_label_validation = val;
-            }
-            1001 => {
-                if wire_type != 0 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 1001,
-                        wire_type,
-                    });
+                1001 => {
+                    if wire_type != 0 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 1001,
+                            wire_type,
+                        });
+                    }
+                    let val = read_varint(input, &mut pos)? != 0;
+                    if emitted_any_series && val != skip_label_count_validation {
+                        header_changed_after_series = true;
+                    }
+                    skip_label_count_validation = val;
                 }
-                skip_label_count_validation = read_varint(input, &mut pos)? != 0;
-            }
-            _ => {
-                skip_field_bounded(input, &mut pos, len, wire_type)?;
+                _ => {
+                    skip_field_bounded(input, &mut pos, len, wire_type)?;
+                }
             }
         }
+        Ok(())
+    })();
+
+    if let Err(e) = res {
+        label_bytes_arena.truncate(label_base);
+        samples_arena.truncate(samples_base);
+        meta_out.truncate(meta_base);
+        return Err(e);
     }
 
     Ok(StreamedRw2Header {
@@ -1719,6 +1814,7 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
     meta_out: &mut Vec<BorrowedMetadata<'r>>,
     source: i32,
     skip_label_validation: bool,
+    skip_label_count_validation: bool,
 ) -> Result<StreamedRw2Series<'v, 'a>, DecodeError> {
     let label_bytes_start = label_bytes_arena.len();
     let samples_start = samples_arena.len();
@@ -1745,23 +1841,23 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
                     label_bytes_arena
                         .reserve((packed.end - p).saturating_mul(16).clamp(64, 65536));
                     while p < packed.end {
-                        let name_idx = read_varint_bounded(input, &mut p, packed.end)? as usize;
+                        let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
                         if p >= packed.end {
                             return Err(DecodeError::OddNumberOfLabelRefs);
                         }
-                        let val_idx = read_varint_bounded(input, &mut p, packed.end)? as usize;
+                        let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
                         let k = *resolved
-                            .get(name_idx)
+                            .get(name_idx as usize)
                             .and_then(|o| o.as_ref())
                             .ok_or(DecodeError::InvalidLabelRef {
-                                index: name_idx as u32,
+                                index: name_idx,
                                 offset: symbol_offset,
                             })?;
                         let v = *resolved
-                            .get(val_idx)
+                            .get(val_idx as usize)
                             .and_then(|o| o.as_ref())
                             .ok_or(DecodeError::InvalidLabelRef {
-                                index: val_idx as u32,
+                                index: val_idx,
                                 offset: symbol_offset,
                             })?;
                         if k == "__name__" {
@@ -1877,6 +1973,7 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
         exemplars_range: exemplars_start..scratch.exemplars.len(),
         source,
         skip_label_validation,
+        skip_label_count_validation,
         scratch,
         input,
         common_symbols,
@@ -1942,29 +2039,39 @@ fn decode_exemplar_rw2_resolved<'a>(
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
                     let mut p = packed.start;
                     while p < packed.end {
-                        let name_idx = read_varint_bounded(input, &mut p, packed.end)? as usize;
+                        let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
                         if p >= packed.end {
                             return Err(DecodeError::OddNumberOfExemplarLabelRefs);
                         }
-                        let val_idx = read_varint_bounded(input, &mut p, packed.end)? as usize;
+                        let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
                         let k = *resolved
-                            .get(name_idx)
+                            .get(name_idx as usize)
                             .and_then(|o| o.as_ref())
                             .ok_or(DecodeError::InvalidExemplarLabelRef {
-                                index: name_idx as u32,
+                                index: name_idx,
                                 offset: symbol_offset,
                             })?;
                         let v = *resolved
-                            .get(val_idx)
+                            .get(val_idx as usize)
                             .and_then(|o| o.as_ref())
                             .ok_or(DecodeError::InvalidExemplarLabelRef {
-                                index: val_idx as u32,
+                                index: val_idx,
                                 offset: symbol_offset,
                             })?;
-                        let name_ref =
-                            str_to_slice_ref(k, name_idx, symbol_offset, input, &mut scratch.utf8_arena);
-                        let val_ref =
-                            str_to_slice_ref(v, val_idx, symbol_offset, input, &mut scratch.utf8_arena);
+                        let name_ref = str_to_slice_ref(
+                            k,
+                            name_idx as usize,
+                            symbol_offset,
+                            input,
+                            &mut scratch.utf8_arena,
+                        );
+                        let val_ref = str_to_slice_ref(
+                            v,
+                            val_idx as usize,
+                            symbol_offset,
+                            input,
+                            &mut scratch.utf8_arena,
+                        );
                         scratch.exemplar_labels.push(LabelRefPair {
                             name: name_ref,
                             value: val_ref,
@@ -2043,12 +2150,12 @@ fn decode_metadata_rw2_stream<'r>(
                         wire_type,
                     });
                 }
-                let help_ref = read_varint_bounded(input, &mut pos, end)? as usize;
+                let help_ref = read_varint_bounded(input, &mut pos, end)? as u32;
                 help = *resolved
-                    .get(help_ref)
+                    .get(help_ref as usize)
                     .and_then(|o| o.as_ref())
                     .ok_or(DecodeError::InvalidHelpRef {
-                        index: help_ref as u32,
+                        index: help_ref,
                         offset: symbol_offset,
                     })?;
             }
@@ -2059,12 +2166,12 @@ fn decode_metadata_rw2_stream<'r>(
                         wire_type,
                     });
                 }
-                let unit_ref = read_varint_bounded(input, &mut pos, end)? as usize;
+                let unit_ref = read_varint_bounded(input, &mut pos, end)? as u32;
                 unit = *resolved
-                    .get(unit_ref)
+                    .get(unit_ref as usize)
                     .and_then(|o| o.as_ref())
                     .ok_or(DecodeError::InvalidUnitRef {
-                        index: unit_ref as u32,
+                        index: unit_ref,
                         offset: symbol_offset,
                     })?;
             }
@@ -2606,24 +2713,13 @@ fn decode_histogram(
     let mut reset_hint = 0i32;
     let mut timestamp = 0i64;
 
-    // Note: spans/deltas/floats for negative/positive/custom might appear interleaved across
-    // different fields, though in practice each field's items appear contiguously.
-    // To guarantee contiguous slices even if fields are interleaved or split across messages,
-    // wait: usually each repeated field in proto appears contiguously. If a field repeats later
-    // in the same Histogram message after another field used the same pool vec, we should decode
-    // cleanly. Let's check: spans are only tags 8 & 11; deltas are tags 9 & 12; floats are tags 10, 13, 16.
-    // Using temporary small vecs or checking contiguity? Even simpler:
-    // Record if another field wrote to the shared vec since our last write; in the 99.99% case
-    // tags are ascending (8, 9, 10, 11, 12, 13, 14, 15, 16) so every repeated field IS contiguous!
-    // If out-of-order/interleaved ever occurs, we can still handle it by only extending when
-    // contiguous, or relocating if non-contiguous! Let's implement that cleanly in 5 lines.
-    let mut neg_spans = scratch.spans.len()..scratch.spans.len();
-    let mut pos_spans = scratch.spans.len()..scratch.spans.len();
-    let mut neg_deltas = scratch.deltas.len()..scratch.deltas.len();
-    let mut pos_deltas = scratch.deltas.len()..scratch.deltas.len();
-    let mut neg_counts = scratch.floats.len()..scratch.floats.len();
-    let mut pos_counts = scratch.floats.len()..scratch.floats.len();
-    let mut custom_values = scratch.floats.len()..scratch.floats.len();
+    let neg_spans_start = scratch.neg_spans.len();
+    let pos_spans_start = scratch.pos_spans.len();
+    let neg_deltas_start = scratch.neg_deltas.len();
+    let pos_deltas_start = scratch.pos_deltas.len();
+    let neg_counts_start = scratch.neg_counts.len();
+    let pos_counts_start = scratch.pos_counts.len();
+    let custom_values_start = scratch.custom_values.len();
 
     let mut pos = range.start;
     let end = range.end;
@@ -2710,29 +2806,13 @@ fn decode_histogram(
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
                 let span = decode_bucket_span(input, sub)?;
-                push_contiguous(&mut scratch.spans, &mut neg_spans, span);
+                scratch.neg_spans.push(span);
             }
             9 => {
-                decode_sint64_repeated(
-                    input,
-                    &mut pos,
-                    end,
-                    wire_type,
-                    9,
-                    &mut scratch.deltas,
-                    &mut neg_deltas,
-                )?;
+                decode_sint64_repeated(input, &mut pos, end, wire_type, 9, &mut scratch.neg_deltas)?;
             }
             10 => {
-                decode_f64_repeated(
-                    input,
-                    &mut pos,
-                    end,
-                    wire_type,
-                    10,
-                    &mut scratch.floats,
-                    &mut neg_counts,
-                )?;
+                decode_f64_repeated(input, &mut pos, end, wire_type, 10, &mut scratch.neg_counts)?;
             }
             11 => {
                 if wire_type != 2 {
@@ -2743,29 +2823,13 @@ fn decode_histogram(
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
                 let span = decode_bucket_span(input, sub)?;
-                push_contiguous(&mut scratch.spans, &mut pos_spans, span);
+                scratch.pos_spans.push(span);
             }
             12 => {
-                decode_sint64_repeated(
-                    input,
-                    &mut pos,
-                    end,
-                    wire_type,
-                    12,
-                    &mut scratch.deltas,
-                    &mut pos_deltas,
-                )?;
+                decode_sint64_repeated(input, &mut pos, end, wire_type, 12, &mut scratch.pos_deltas)?;
             }
             13 => {
-                decode_f64_repeated(
-                    input,
-                    &mut pos,
-                    end,
-                    wire_type,
-                    13,
-                    &mut scratch.floats,
-                    &mut pos_counts,
-                )?;
+                decode_f64_repeated(input, &mut pos, end, wire_type, 13, &mut scratch.pos_counts)?;
             }
             14 => {
                 if wire_type != 0 {
@@ -2786,15 +2850,7 @@ fn decode_histogram(
                 timestamp = read_varint_bounded(input, &mut pos, end)? as i64;
             }
             16 => {
-                decode_f64_repeated(
-                    input,
-                    &mut pos,
-                    end,
-                    wire_type,
-                    16,
-                    &mut scratch.floats,
-                    &mut custom_values,
-                )?;
+                decode_f64_repeated(input, &mut pos, end, wire_type, 16, &mut scratch.custom_values)?;
             }
             _ => {
                 skip_field_bounded(input, &mut pos, end, wire_type)?;
@@ -2808,42 +2864,16 @@ fn decode_histogram(
         schema,
         zero_threshold,
         zero_count,
-        negative_spans: neg_spans,
-        negative_deltas: neg_deltas,
-        negative_counts: neg_counts,
-        positive_spans: pos_spans,
-        positive_deltas: pos_deltas,
-        positive_counts: pos_counts,
+        negative_spans: neg_spans_start..scratch.neg_spans.len(),
+        negative_deltas: neg_deltas_start..scratch.neg_deltas.len(),
+        negative_counts: neg_counts_start..scratch.neg_counts.len(),
+        positive_spans: pos_spans_start..scratch.pos_spans.len(),
+        positive_deltas: pos_deltas_start..scratch.pos_deltas.len(),
+        positive_counts: pos_counts_start..scratch.pos_counts.len(),
         reset_hint,
         timestamp,
-        custom_values,
+        custom_values: custom_values_start..scratch.custom_values.len(),
     })
-}
-
-fn push_contiguous<T: Copy>(vec: &mut Vec<T>, range: &mut Range<usize>, val: T) {
-    if range.start == range.end {
-        *range = vec.len()..vec.len() + 1;
-        vec.push(val);
-    } else if range.end == vec.len() {
-        vec.push(val);
-        range.end += 1;
-    } else {
-        // Relocate previous items to end of vec so the slice remains contiguous.
-        let new_start = vec.len();
-        vec.extend_from_within(range.clone());
-        vec.push(val);
-        *range = new_start..vec.len();
-    }
-}
-
-fn prepare_contiguous_append<T: Copy>(vec: &mut Vec<T>, range: &mut Range<usize>) {
-    if range.start == range.end {
-        *range = vec.len()..vec.len();
-    } else if range.end != vec.len() {
-        let new_start = vec.len();
-        vec.extend_from_within(range.clone());
-        *range = new_start..vec.len();
-    }
 }
 
 fn decode_sint64_repeated(
@@ -2853,13 +2883,10 @@ fn decode_sint64_repeated(
     wire_type: u8,
     field: u32,
     vec: &mut Vec<i64>,
-    range: &mut Range<usize>,
 ) -> Result<(), DecodeError> {
-    prepare_contiguous_append(vec, range);
     if wire_type == 0 {
         let v = zigzag_i64(read_varint_bounded(input, pos, end)?);
         vec.push(v);
-        range.end = vec.len();
         Ok(())
     } else if wire_type == 2 {
         let packed = read_length_delimited_range_bounded(input, pos, end)?;
@@ -2868,7 +2895,6 @@ fn decode_sint64_repeated(
             let v = zigzag_i64(read_varint_bounded(input, &mut p, packed.end)?);
             vec.push(v);
         }
-        range.end = vec.len();
         Ok(())
     } else {
         Err(DecodeError::InvalidWireType { field, wire_type })
@@ -2882,13 +2908,10 @@ fn decode_f64_repeated(
     wire_type: u8,
     field: u32,
     vec: &mut Vec<f64>,
-    range: &mut Range<usize>,
 ) -> Result<(), DecodeError> {
-    prepare_contiguous_append(vec, range);
     if wire_type == 1 {
         let v = read_f64_bounded(input, pos, end)?;
         vec.push(v);
-        range.end = vec.len();
         Ok(())
     } else if wire_type == 2 {
         let packed = read_length_delimited_range_bounded(input, pos, end)?;
@@ -2900,7 +2923,6 @@ fn decode_f64_repeated(
             let v = read_f64_bounded(input, &mut p, packed.end)?;
             vec.push(v);
         }
-        range.end = vec.len();
         Ok(())
     } else {
         Err(DecodeError::InvalidWireType { field, wire_type })
@@ -3137,9 +3159,19 @@ fn decode_metadata_rw2(
         bucket.push(idx);
     }
 
+    let (family_name, help, unit) = if !scratch.uses_v2_common_symbols && !common_symbols.is_empty() {
+        (
+            materialize_common_into_scratch(final_family_ref, common_symbols, &mut scratch.utf8_arena),
+            materialize_common_into_scratch(help, common_symbols, &mut scratch.utf8_arena),
+            materialize_common_into_scratch(unit, common_symbols, &mut scratch.utf8_arena),
+        )
+    } else {
+        (final_family_ref, help, unit)
+    };
+
     scratch.metadata.push(MetadataMeta {
         metric_type,
-        family_name: final_family_ref,
+        family_name,
         help,
         unit,
     });
@@ -3236,7 +3268,8 @@ fn resolve_symbol_ref(
 #[inline(always)]
 fn read_key_bounded(input: &[u8], pos: &mut usize, end: usize) -> Result<(u32, u8), DecodeError> {
     let wire = read_varint_bounded(input, pos, end)?;
-    let field_num = (wire >> 3) as u32;
+    let raw_field_num = wire >> 3;
+    let field_num = raw_field_num as u32;
     let wire_type = (wire & 0x7) as u8;
     if wire_type == 4 || wire_type > 5 {
         return Err(DecodeError::InvalidWireType {
@@ -3244,7 +3277,7 @@ fn read_key_bounded(input: &[u8], pos: &mut usize, end: usize) -> Result<(u32, u
             wire_type,
         });
     }
-    if field_num == 0 {
+    if raw_field_num == 0 || raw_field_num >= (1u64 << 29) {
         return Err(DecodeError::InvalidFieldNumber(field_num));
     }
     Ok((field_num, wire_type))
@@ -3510,7 +3543,7 @@ pub fn from_write_request_to_rw2(
             refs.push(symbols.symbolize(value));
         }
 
-        let mut metadata = None;
+        let mut metadata = Some(cortexpb::MetadataRw2::default());
         if !metadata_map.is_empty() {
             if let Some(&meta_idx) = metadata_map.get(metric_name) {
                 metadata = Some(from_metric_metadata_to_metadata_rw2(
@@ -4591,5 +4624,328 @@ mod tests {
                 (Err(e), Ok(_)) => panic!("ref Err({e:?}), stream Ok on iter {iter}"),
             }
         }
+    }
+
+    #[test]
+    fn w13_p0_1_interleaved_histogram_repeated_fields_linear_decode() {
+        // Build a single Histogram with 20,000 interleaved unpacked neg_deltas (tag 9)
+        // and pos_deltas (tag 12) + interleaved neg_counts (tag 10), pos_counts (tag 13),
+        // custom_values (tag 16), and neg_spans (tag 8) / pos_spans (tag 11).
+        let pairs = if cfg!(miri) { 64usize } else { 20_000usize };
+        let mut hist_bytes = Vec::with_capacity(pairs * 10);
+        // tag 4 (schema = 0): 0x20 0x00
+        hist_bytes.extend_from_slice(&[0x20, 0x00]);
+        for i in 0..pairs {
+            // tag 9 (negative_deltas, sint64, wire type 0 -> key 0x48), zigzag(1) = 2
+            hist_bytes.extend_from_slice(&[0x48, 0x02]);
+            // tag 12 (positive_deltas, sint64, wire type 0 -> key 0x60), zigzag(2) = 4
+            hist_bytes.extend_from_slice(&[0x60, 0x04]);
+            if i % 100 == 0 {
+                // tag 10 (negative_counts, fixed64 -> key 0x51)
+                hist_bytes.push(0x51);
+                hist_bytes.extend_from_slice(&1.5f64.to_le_bytes());
+                // tag 13 (positive_counts, fixed64 -> key 0x69)
+                hist_bytes.push(0x69);
+                hist_bytes.extend_from_slice(&2.5f64.to_le_bytes());
+                // tag 16 (custom_values, fixed64 -> key 0x81, 0x01)
+                hist_bytes.extend_from_slice(&[0x81, 0x01]);
+                hist_bytes.extend_from_slice(&3.5f64.to_le_bytes());
+            }
+        }
+        let mut ts_bytes = Vec::new();
+        // tag 1 (LabelPair __name__=h)
+        let lp = cortexpb::LabelPair::from_static("__name__", "h").encode_to_vec();
+        ts_bytes.push(0x0a);
+        prost::encoding::encode_varint(lp.len() as u64, &mut ts_bytes);
+        ts_bytes.extend_from_slice(&lp);
+        // tag 4 (histograms)
+        ts_bytes.push(0x22);
+        prost::encoding::encode_varint(hist_bytes.len() as u64, &mut ts_bytes);
+        ts_bytes.extend_from_slice(&hist_bytes);
+        let mut wr_bytes = Vec::new();
+        wr_bytes.push(0x0a);
+        prost::encoding::encode_varint(ts_bytes.len() as u64, &mut wr_bytes);
+        wr_bytes.extend_from_slice(&ts_bytes);
+
+        let start = std::time::Instant::now();
+        let mut scratch = WriteRequestScratch::new();
+        let borrowed = decode_write_request(&wr_bytes, DecodeOptions::classic(), &mut scratch)
+            .expect("decode_write_request");
+        assert_eq!(borrowed.timeseries_len(), 1);
+        let ts0 = borrowed.timeseries_at(0);
+        let h = ts0.histograms().next().unwrap();
+        assert_eq!(h.negative_deltas().len(), pairs);
+        assert_eq!(h.positive_deltas().len(), pairs);
+        assert_eq!(h.negative_counts().len(), pairs.div_ceil(100));
+        assert_eq!(h.positive_counts().len(), pairs.div_ceil(100));
+        assert_eq!(h.custom_values().len(), pairs.div_ceil(100));
+        assert!(h.negative_deltas().iter().all(|&d| d == 1));
+        assert!(h.positive_deltas().iter().all(|&d| d == 2));
+
+        let mut label_bytes = Vec::new();
+        let mut samples = Vec::new();
+        let mut count = 0usize;
+        decode_classic_stream(
+            &wr_bytes,
+            DecodeOptions::classic(),
+            &mut scratch,
+            &mut label_bytes,
+            &mut samples,
+            |s| {
+                let h = s.histograms().next().unwrap();
+                assert_eq!(h.negative_deltas().len(), pairs);
+                assert_eq!(h.positive_deltas().len(), pairs);
+                count += 1;
+            },
+        )
+        .expect("decode_classic_stream");
+        assert_eq!(count, 1);
+        if !cfg!(miri) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "interleaved histogram decode took {:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn w13_p1_1_rw2_zero_ref_and_metadata_common_symbol_no_panic() {
+        // 1) Rw2Custom with offset > 0 and empty common_symbols: ref 0 must resolve to "".
+        let syms = ["", "__name__", "m_total", "job", "api"];
+        let mut packed_refs = Vec::new();
+        for r in [257u64, 258, 259, 0] {
+            prost::encoding::encode_varint(r, &mut packed_refs);
+        }
+        let mut ts_rw2 = Vec::new();
+        ts_rw2.push(0x0a);
+        prost::encoding::encode_varint(packed_refs.len() as u64, &mut ts_rw2);
+        ts_rw2.extend_from_slice(&packed_refs);
+        // MetadataRw2 with type=1, help_ref=0, unit_ref=0 -> [0x2a, 0x02, 0x08, 0x01]
+        ts_rw2.extend_from_slice(&[0x2a, 0x02, 0x08, 0x01]);
+
+        let mut wire = Vec::new();
+        for s in syms {
+            wire.push(0x22);
+            prost::encoding::encode_varint(s.len() as u64, &mut wire);
+            wire.extend_from_slice(s.as_bytes());
+        }
+        wire.push(0x2a);
+        prost::encoding::encode_varint(ts_rw2.len() as u64, &mut wire);
+        wire.extend_from_slice(&ts_rw2);
+
+        let opts = DecodeOptions {
+            mode: DecodeMode::Rw2Custom {
+                offset: 256,
+                common_symbols: &[],
+            },
+            ..DecodeOptions::rw2()
+        };
+        let mut scratch = WriteRequestScratch::new();
+        let mut resolved = Rw2ResolvedScratch::new();
+        let mut label_bytes = Vec::new();
+        let mut samples = Vec::new();
+        let mut meta_out = Vec::new();
+        decode_rw2_stream(
+            &wire,
+            opts,
+            &mut scratch,
+            &mut resolved,
+            &mut label_bytes,
+            &mut samples,
+            &mut meta_out,
+            |_| {},
+        )
+        .expect("ref == 0 with offset > 0 and empty common_symbols must succeed");
+        assert_eq!(meta_out.len(), 1);
+        assert_eq!(meta_out[0].metric_family_name, "m_total");
+        assert_eq!(meta_out[0].help, "");
+        assert_eq!(meta_out[0].unit, "");
+
+        // 2) Rw2Custom with common_symbols[0] non-empty: ref 0 still resolves to "".
+        let opts_nonempty0 = DecodeOptions {
+            mode: DecodeMode::Rw2Custom {
+                offset: 256,
+                common_symbols: &["SHOULD_NOT_USE", "custom_help"],
+            },
+            ..DecodeOptions::rw2()
+        };
+        // Also test WriteRequestScratch::metadata on SliceRef::Common (KafkaV2 & Rw2Custom).
+        let rw1 = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![cortexpb::LabelPair::from_static("__name__", "up")],
+                samples: vec![cortexpb::Sample {
+                    value: 1.0,
+                    timestamp_ms: 1000,
+                }],
+                ..Default::default()
+            }],
+            metadata: vec![cortexpb::MetricMetadata {
+                r#type: 2,
+                metric_family_name: "up".to_string(),
+                help: "seconds".to_string(),
+                unit: "seconds".to_string(),
+            }],
+            ..Default::default()
+        };
+        let mut kv2_wire = Vec::new();
+        encode_write_request_rw2_bytes(&rw1, V2_RECORD_SYMBOL_OFFSET, Some(v2_common_symbols()), &mut kv2_wire).unwrap();
+        decode_write_request(&kv2_wire, DecodeOptions::kafka_v2(), &mut scratch).unwrap();
+        let metas: Vec<_> = scratch.metadata(&kv2_wire).collect();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].metric_family_name, "up");
+        assert_eq!(metas[0].unit, "seconds");
+
+        // Rw2Custom metadata referencing common_symbols[1] = "custom_help"
+        let mut ts_custom = Vec::new();
+        ts_custom.push(0x0a);
+        prost::encoding::encode_varint(packed_refs.len() as u64, &mut ts_custom);
+        ts_custom.extend_from_slice(&packed_refs);
+        // MetadataRw2 { type: 1, help_ref: 1, unit_ref: 0 }
+        ts_custom.extend_from_slice(&[0x2a, 0x04, 0x08, 0x01, 0x18, 0x01]);
+        let mut wire_custom = Vec::new();
+        for s in syms {
+            wire_custom.push(0x22);
+            prost::encoding::encode_varint(s.len() as u64, &mut wire_custom);
+            wire_custom.extend_from_slice(s.as_bytes());
+        }
+        wire_custom.push(0x2a);
+        prost::encoding::encode_varint(ts_custom.len() as u64, &mut wire_custom);
+        wire_custom.extend_from_slice(&ts_custom);
+        decode_write_request(&wire_custom, opts_nonempty0, &mut scratch).unwrap();
+        let custom_metas: Vec<_> = scratch.metadata(&wire_custom).collect();
+        assert_eq!(custom_metas.len(), 1);
+        assert_eq!(custom_metas[0].help, "custom_help");
+        assert_eq!(custom_metas[0].unit, "");
+    }
+
+    #[test]
+    fn w13_p1_2_p1_5_p1_6_varint32_illegal_fieldnum_nonnull_metadata_and_tag1001() {
+        // 1) uint32 truncation on (1 << 32) | 1 in decode_rw2_stream
+        let syms = ["", "__name__", "metric_a"];
+        let mut packed = Vec::new();
+        prost::encoding::encode_varint((1u64 << 32) | 1, &mut packed);
+        prost::encoding::encode_varint((1u64 << 32) | 2, &mut packed);
+        let mut ts_rw2 = Vec::new();
+        ts_rw2.push(0x0a);
+        prost::encoding::encode_varint(packed.len() as u64, &mut ts_rw2);
+        ts_rw2.extend_from_slice(&packed);
+        let mut wire = Vec::new();
+        for s in syms {
+            wire.push(0x22);
+            prost::encoding::encode_varint(s.len() as u64, &mut wire);
+            wire.extend_from_slice(s.as_bytes());
+        }
+        wire.push(0x2a);
+        prost::encoding::encode_varint(ts_rw2.len() as u64, &mut wire);
+        wire.extend_from_slice(&ts_rw2);
+
+        let mut scratch = WriteRequestScratch::new();
+        let mut label_bytes = Vec::new();
+        let mut samples = Vec::new();
+        {
+            let mut resolved = Rw2ResolvedScratch::new();
+            let mut meta_out = Vec::new();
+            decode_rw2_stream(
+                &wire,
+                DecodeOptions::rw2(),
+                &mut scratch,
+                &mut resolved,
+                &mut label_bytes,
+                &mut samples,
+                &mut meta_out,
+                |s| {
+                    // Encoded stringlabels: [8, "__name__", 8, "metric_a"]
+                    assert_eq!(s.encoded_labels, b"__name__metric_a");
+                },
+            )
+            .expect("32-bit truncated varint refs must match Go");
+        }
+
+        // 2) Illegal field numbers >= 2^29 rejected in all decoders
+        let mut bad_tag_wire = Vec::new();
+        prost::encoding::encode_varint((1u64 << 29) << 3, &mut bad_tag_wire);
+        bad_tag_wire.push(0x00);
+        assert!(matches!(
+            decode_write_request(&bad_tag_wire, DecodeOptions::classic(), &mut scratch),
+            Err(DecodeError::InvalidFieldNumber(_))
+        ));
+        assert!(matches!(
+            decode_classic_stream(
+                &bad_tag_wire,
+                DecodeOptions::classic(),
+                &mut scratch,
+                &mut label_bytes,
+                &mut samples,
+                |_| {},
+            ),
+            Err(DecodeError::InvalidFieldNumber(_))
+        ));
+        {
+            let mut resolved = Rw2ResolvedScratch::new();
+            let mut meta_out = Vec::new();
+            assert!(matches!(
+                decode_rw2_stream(
+                    &bad_tag_wire,
+                    DecodeOptions::rw2(),
+                    &mut scratch,
+                    &mut resolved,
+                    &mut label_bytes,
+                    &mut samples,
+                    &mut meta_out,
+                    |_| {},
+                ),
+                Err(DecodeError::InvalidFieldNumber(_))
+            ));
+        }
+
+        // 3) Non-nullable MetadataRW2 (0x2a 0x00) emitted when no metadata
+        let rw1 = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![cortexpb::LabelPair::from_static("__name__", "m")],
+                samples: vec![cortexpb::Sample { value: 1.0, timestamp_ms: 10 }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rw2 = from_write_request_to_rw2(&rw1, 0, None).unwrap();
+        assert!(rw2.timeseries_rw2[0].metadata.is_some());
+        let rw2_bytes = rw2.encode_to_vec();
+        assert!(rw2_bytes.windows(2).any(|w| w == [0x2a, 0x00]));
+
+        // 4) Tag 1001 after series sets header_changed_after_series in both stream decoders
+        let mut classic_tag1001 = rw1.encode_to_vec();
+        prost::encoding::encode_varint(1001u64 << 3, &mut classic_tag1001);
+        classic_tag1001.push(1);
+        let hdr_c = decode_classic_stream(
+            &classic_tag1001,
+            DecodeOptions::classic(),
+            &mut scratch,
+            &mut label_bytes,
+            &mut samples,
+            |s| assert!(!s.skip_label_count_validation),
+        )
+        .unwrap();
+        assert!(hdr_c.skip_label_count_validation);
+        assert!(hdr_c.header_changed_after_series);
+
+        let mut rw2_tag1001 = rw2_bytes;
+        prost::encoding::encode_varint(1001u64 << 3, &mut rw2_tag1001);
+        rw2_tag1001.push(1);
+        let mut resolved = Rw2ResolvedScratch::new();
+        let mut meta_out = Vec::new();
+        let hdr_r = decode_rw2_stream(
+            &rw2_tag1001,
+            DecodeOptions::rw2(),
+            &mut scratch,
+            &mut resolved,
+            &mut label_bytes,
+            &mut samples,
+            &mut meta_out,
+            |s| assert!(!s.skip_label_count_validation),
+        )
+        .unwrap();
+        assert!(hdr_r.skip_label_count_validation);
+        assert!(hdr_r.header_changed_after_series);
     }
 }

@@ -36,6 +36,42 @@ const fn next_bitstream_capacity(cur_cap: usize) -> usize {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum BitCount {
+    C0 = 0,
+    C1 = 1,
+    C2 = 2,
+    C3 = 3,
+    C4 = 4,
+    C5 = 5,
+    C6 = 6,
+    C7 = 7,
+    C8 = 8,
+}
+
+impl BitCount {
+    #[inline(always)]
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::C0,
+            1 => Self::C1,
+            2 => Self::C2,
+            3 => Self::C3,
+            4 => Self::C4,
+            5 => Self::C5,
+            6 => Self::C6,
+            7 => Self::C7,
+            _ => Self::C8,
+        }
+    }
+
+    #[inline(always)]
+    const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 /// Bit-level writer matching `chunkenc.bstream` in Prometheus TSDB.
 #[derive(Debug)]
 pub struct BitStream {
@@ -43,7 +79,7 @@ pub struct BitStream {
     len: u32,
     cap: u32,
     /// Number of unused right-most bits remaining in the last byte of `stream` (`0..=8`).
-    pub(crate) count: u8,
+    count: BitCount,
     _marker: PhantomData<Vec<u8>>,
 }
 
@@ -101,7 +137,7 @@ impl Clone for BitStream {
                 _marker: PhantomData,
             }
         } else {
-            Self::from_bytes(self.bytes().to_vec(), self.count)
+            Self::from_bytes(self.bytes().to_vec(), self.count.as_u8())
         }
     }
 }
@@ -122,7 +158,7 @@ impl BitStream {
             ptr: NonNull::dangling(),
             len: 0,
             cap: 0,
-            count: 0,
+            count: BitCount::C0,
             _marker: PhantomData,
         }
     }
@@ -154,9 +190,14 @@ impl BitStream {
             ptr,
             len,
             cap,
-            count,
+            count: BitCount::from_u8(count),
             _marker: PhantomData,
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_count(&mut self, count: u8) {
+        self.count = BitCount::from_u8(count);
     }
 
     #[inline]
@@ -241,31 +282,33 @@ impl BitStream {
     /// Appends a single bit to the stream.
     #[inline]
     pub fn write_bit(&mut self, bit: bool) {
-        if self.count == 0 {
+        if self.count == BitCount::C0 {
             self.push_byte(0);
-            self.count = 8;
+            self.count = BitCount::C8;
         }
+        let c = self.count.as_u8();
         if bit {
-            let mask = 1u8 << (self.count - 1);
+            let mask = 1u8 << (c - 1);
             if let Some(last) = self.bytes_mut().last_mut() {
                 *last |= mask;
             }
         }
-        self.count -= 1;
+        self.count = BitCount::from_u8(c - 1);
     }
 
     /// Appends a full byte to the stream (aligned or unaligned).
     #[inline]
     pub fn write_byte(&mut self, byt: u8) {
-        if self.count == 0 {
+        let c = self.count.as_u8();
+        if c == 0 {
             self.push_byte(byt);
             return;
         }
-        let shift = 8 - self.count;
+        let shift = 8 - c;
         if let Some(last) = self.bytes_mut().last_mut() {
             *last |= byt >> shift;
         }
-        self.push_byte(byt << self.count);
+        self.push_byte(byt << c);
     }
 
     /// Appends the `nbits` right-most bits of `u` in MSB-first order (`0 <= nbits <= 64`).
@@ -278,19 +321,20 @@ impl BitStream {
         let mut u = u << (64 - nbits);
         let mut rem = nbits;
 
-        if self.count > 0 {
-            let free = self.count as usize;
+        let c = self.count.as_u8();
+        if c > 0 {
+            let free = c as usize;
             let hi = (u >> (64 - free)) as u8;
             if let Some(last) = self.bytes_mut().last_mut() {
                 *last |= hi;
             }
             if rem < free {
-                self.count = (free - rem) as u8;
+                self.count = BitCount::from_u8((free - rem) as u8);
                 return;
             }
             u <<= free;
             rem -= free;
-            self.count = 0;
+            self.count = BitCount::C0;
         }
 
         while rem >= 8 {
@@ -301,7 +345,7 @@ impl BitStream {
 
         if rem > 0 {
             self.push_byte((u >> 56) as u8);
-            self.count = (8 - rem) as u8;
+            self.count = BitCount::from_u8((8 - rem) as u8);
         }
     }
 

@@ -77,48 +77,79 @@ async fn decrypt_remote_state<R: AsyncRead + Unpin + Send>(
     decrypt(&cipher_bytes, &aad)
 }
 
-pub(super) async fn read_stream_header_with_metrics<R: AsyncRead + Unpin + Send>(
-    reader: &mut R,
-    go_metrics: Option<&GoMetrics>,
-    decrypt: Option<&StreamDecryptFn>,
-) -> Result<(MessageType, String, Option<Vec<u8>>), String> {
-    let mut b = [0u8; 1];
-    reader
-        .read_exact(&mut b)
-        .await
-        .map_err(|e| format!("read stream byte: {e}"))?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamFirstByte {
+    Eof,
+    Next,
+    Byte(u8),
+}
 
-    let mut label = String::new();
-    if b[0] == MessageType::HasLabel as u8 {
-        let mut sz = [0u8; 1];
-        reader
-            .read_exact(&mut sz)
-            .await
-            .map_err(|e| format!("read label size: {e}"))?;
-        if sz[0] == 0 {
-            return Err("empty label header".to_string());
+/// memberlist `RemoveLabelHeaderFromStream`: reads and strips the optional `[HasLabel, len, label]`
+/// prefix on an accepted inbound stream before checking the label and before reading/decompressing.
+pub(super) async fn remove_label_header_from_stream<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+) -> Result<(String, StreamFirstByte), String> {
+    let mut b = [0u8; 1];
+    match reader.read_exact(&mut b).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Ok((String::new(), StreamFirstByte::Eof));
         }
-        let mut lbuf = vec![0u8; sz[0] as usize];
-        reader
-            .read_exact(&mut lbuf)
-            .await
-            .map_err(|e| format!("read label: {e}"))?;
-        label = String::from_utf8(lbuf).map_err(|e| format!("label utf8: {e}"))?;
-        reader
-            .read_exact(&mut b)
-            .await
-            .map_err(|e| format!("read msg type after label: {e}"))?;
+        Err(e) => return Err(format!("read stream byte: {e}")),
     }
 
-    let mut msg_type = MessageType::try_from(b[0])
-        .map_err(|v| format!("unsupported stream msgType {v}"))?;
+    if b[0] != MessageType::HasLabel as u8 {
+        return Ok((String::new(), StreamFirstByte::Byte(b[0])));
+    }
+
+    let mut sz = [0u8; 1];
+    reader
+        .read_exact(&mut sz)
+        .await
+        .map_err(|e| format!("read label size: {e}"))?;
+    if sz[0] == 0 {
+        return Err("label header cannot be empty when present".to_string());
+    }
+    let mut lbuf = vec![0u8; sz[0] as usize];
+    reader
+        .read_exact(&mut lbuf)
+        .await
+        .map_err(|e| format!("read label: {e}"))?;
+    let label = String::from_utf8(lbuf).map_err(|e| format!("label utf8: {e}"))?;
+    Ok((label, StreamFirstByte::Next))
+}
+
+/// memberlist `readStream`: reads the stream message type (or uses `first_byte` if already
+/// peeked by `remove_label_header_from_stream`), decrypts if `Encrypt`, and decompresses if `Compress`.
+/// Does NOT strip `HasLabel` (Go `readStream` never strips label headers).
+pub(super) async fn read_stream_with_first_byte<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+    first_byte: Option<u8>,
+    stream_label: &str,
+    go_metrics: Option<&GoMetrics>,
+    decrypt: Option<&StreamDecryptFn>,
+) -> Result<(MessageType, Option<Vec<u8>>), String> {
+    let first = match first_byte {
+        Some(v) => v,
+        None => {
+            let mut b = [0u8; 1];
+            reader
+                .read_exact(&mut b)
+                .await
+                .map_err(|e| format!("read stream byte: {e}"))?;
+            b[0]
+        }
+    };
+
+    let mut msg_type =
+        MessageType::try_from(first).map_err(|v| format!("unsupported stream msgType {v}"))?;
 
     let mut plain_body: Option<Vec<u8>> = None;
     if msg_type == MessageType::Encrypt {
         let Some(decrypt_fn) = decrypt else {
             return Err("remote state is encrypted and encryption is not configured".to_string());
         };
-        let plain = decrypt_remote_state(reader, &label, go_metrics, decrypt_fn).await?;
+        let plain = decrypt_remote_state(reader, stream_label, go_metrics, decrypt_fn).await?;
         if plain.is_empty() {
             return Err("empty decrypted stream payload".to_string());
         }
@@ -142,10 +173,27 @@ pub(super) async fn read_stream_header_with_metrics<R: AsyncRead + Unpin + Send>
         }
         let inner_type = MessageType::try_from(decomp[0])
             .map_err(|v| format!("unsupported inner stream msgType {v}"))?;
-        return Ok((inner_type, label, Some(decomp[1..].to_vec())));
+        return Ok((inner_type, Some(decomp[1..].to_vec())));
     }
 
-    Ok((msg_type, label, plain_body))
+    Ok((msg_type, plain_body))
+}
+
+#[cfg(test)]
+pub(super) async fn read_stream_header_with_metrics<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+    go_metrics: Option<&GoMetrics>,
+    decrypt: Option<&StreamDecryptFn>,
+) -> Result<(MessageType, String, Option<Vec<u8>>), String> {
+    let (label, first) = remove_label_header_from_stream(reader).await?;
+    let first_byte = match first {
+        StreamFirstByte::Byte(b) => Some(b),
+        StreamFirstByte::Next => None,
+        StreamFirstByte::Eof => return Err("read stream byte: eof".to_string()),
+    };
+    let (msg_type, body) =
+        read_stream_with_first_byte(reader, first_byte, &label, go_metrics, decrypt).await?;
+    Ok((msg_type, label, body))
 }
 
 
@@ -286,6 +334,9 @@ fn parse_push_node_state_only(bytes: &[u8]) -> Result<PushNodeState, String> {
             "Vsn" => ns.vsn = read_sync_bytes(bytes, &mut pos)?,
             _ => skip_sync_val(bytes, &mut pos)?,
         }
+    }
+    if ns.port == 0 {
+        ns.port = 7946;
     }
     Ok(ns)
 }

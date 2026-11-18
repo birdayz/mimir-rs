@@ -1058,12 +1058,24 @@ fn w10_01_rust_s3_blocks_go_compactor_store_gateway_querier_head_boundary() {
                 Ok((200, _, b)) => b.contains("ACTIVE") && b.contains("store-gateway-0"),
                 _ => false,
             };
-            if loaded >= 1.0 && ing_ok && sg_ok {
+            let (_, _, q_m) = http_get(&client, q_http, "/metrics", false)
+                .await
+                .unwrap_or((0, Default::default(), String::new()));
+            let q_sg_ok = q_m.lines().any(|line| {
+                line.starts_with("cortex_ring_members{")
+                    && line.contains(r#"name="store-gateway-client""#)
+                    && line.contains(r#"state="ACTIVE""#)
+                    && line
+                        .rsplit_once(' ')
+                        .and_then(|(_, v)| v.parse::<f64>().ok())
+                        .is_some_and(|v| v >= 1.0)
+            });
+            if loaded >= 1.0 && ing_ok && sg_ok && q_sg_ok {
                 break;
             }
             if Instant::now() >= ready_deadline {
                 panic!(
-                    "store-gateway/querier did not converge (loaded={loaded}, ing_ok={ing_ok}, sg_ok={sg_ok}).\nSG log:\n{}\nQ log:\n{}",
+                    "store-gateway/querier did not converge (loaded={loaded}, ing_ok={ing_ok}, sg_ok={sg_ok}, q_sg_ok={q_sg_ok}).\nSG log:\n{}\nQ log:\n{}",
                     sg_proc.log(),
                     q_proc.log()
                 );
@@ -1083,14 +1095,25 @@ fn w10_01_rust_s3_blocks_go_compactor_store_gateway_querier_head_boundary() {
         };
 
         // 1. Instant queries across historical S3 blocks AND live Rust Head:
-        let q_w1 = prom_get_json(
-            &client,
-            q_http,
-            TENANT,
-            &format!("/prometheus/api/v1/query?query=eco_float_gauge&time={}", (w1 + 60_000) / 1000),
-        )
-        .await
-        .unwrap();
+        // Poll up to 10s for Go querier to observe the healthy store-gateway replica in memberlist
+        // (retrying transient "at least 1 healthy replica required" 500 during gossip propagation).
+        let q_w1_path = format!(
+            "/prometheus/api/v1/query?query=eco_float_gauge&time={}",
+            (w1 + 60_000) / 1000
+        );
+        let q_sg_poll_deadline = Instant::now() + Duration::from_secs(10);
+        let q_w1 = loop {
+            match prom_get_json(&client, q_http, TENANT, &q_w1_path).await {
+                Ok(v) => break v,
+                Err(err)
+                    if err.to_string().contains("at least 1 healthy replica required")
+                        && Instant::now() < q_sg_poll_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(err) => panic!("w1 eco_float_gauge failed: {err:#}"),
+            }
+        };
         assert_scalar(&q_w1, 13.0, "w1 eco_float_gauge");
 
         let q_w2 = prom_get_json(

@@ -640,25 +640,46 @@ async fn shutdown_handler(AxumState(st): AxumState<HttpState>) -> Response {
             crate::activity::ActivityRequest::None,
         )
     });
-    let orig_ing_flush = st
-        .ingester
-        .flush_on_shutdown
-        .swap(true, Ordering::AcqRel);
-    let orig_lc = st.ingester.lifecycler.as_ref().map(|lc| {
-        let orig_flush = lc.flush_on_shutdown();
-        let orig_unreg = lc.should_unregister_on_shutdown();
-        lc.set_flush_on_shutdown(true);
-        lc.set_unregister_on_shutdown(true);
-        (orig_flush, orig_unreg)
+    // Run shutdown + flag restoration inside a detached task so an HTTP client
+    // disconnecting mid-request cannot cancel `stop()` or leave mutated shutdown
+    // flags behind.
+    let ing = Arc::clone(&st.ingester);
+    let handle = tokio::spawn(async move {
+        let _shutdown_guard = ing.shutdown_mtx.lock().await;
+        struct RestoreFlagsGuard {
+            ing: Arc<Ingester>,
+            orig_ing_flush: bool,
+            orig_lc: Option<(bool, bool)>,
+        }
+        impl Drop for RestoreFlagsGuard {
+            fn drop(&mut self) {
+                self.ing
+                    .flush_on_shutdown
+                    .store(self.orig_ing_flush, Ordering::Release);
+                if let (Some(ref lc), Some((orig_flush, orig_unreg))) =
+                    (&self.ing.lifecycler, self.orig_lc)
+                {
+                    lc.set_flush_on_shutdown(orig_flush);
+                    lc.set_unregister_on_shutdown(orig_unreg);
+                }
+            }
+        }
+        let orig_ing_flush = ing.flush_on_shutdown.swap(true, Ordering::AcqRel);
+        let orig_lc = ing.lifecycler.as_ref().map(|lc| {
+            let orig_flush = lc.flush_on_shutdown();
+            let orig_unreg = lc.should_unregister_on_shutdown();
+            lc.set_flush_on_shutdown(true);
+            lc.set_unregister_on_shutdown(true);
+            (orig_flush, orig_unreg)
+        });
+        let _restore_guard = RestoreFlagsGuard {
+            ing: Arc::clone(&ing),
+            orig_ing_flush,
+            orig_lc,
+        };
+        let _ = ing.stop().await;
     });
-    let _ = st.ingester.stop().await;
-    st.ingester
-        .flush_on_shutdown
-        .store(orig_ing_flush, Ordering::Release);
-    if let (Some(ref lc), Some((orig_flush, orig_unreg))) = (&st.ingester.lifecycler, orig_lc) {
-        lc.set_flush_on_shutdown(orig_flush);
-        lc.set_unregister_on_shutdown(orig_unreg);
-    }
+    let _ = handle.await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1539,5 +1560,44 @@ mod tests {
         assert_eq!(decode_prepare_unregister_body(br#"{"UNREGISTER":false}"#), Some(false));
         assert_eq!(decode_prepare_unregister_body(br#"{"unregister":null}"#), None);
         assert_eq!(decode_prepare_unregister_body(br#"{}"#), None);
+    }
+
+    #[tokio::test]
+    async fn shutdown_handler_and_stop_survive_client_disconnect_and_restore_flags() {
+        use mimir_common::services::State;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = test_ingester(&tmp);
+        ing.flush_on_shutdown.store(false, Ordering::Release);
+        ing.start().await.unwrap();
+        let _ = ing.get_or_create_tsdb("t-disc").unwrap();
+        let app = ingester_router(Arc::clone(&ing));
+
+        // Simulate a client disconnecting immediately after sending POST /ingester/shutdown.
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/ingester/shutdown")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let fut = app.oneshot(req);
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => {}
+            _ = tokio::task::yield_now() => {
+                // Dropped fut mid-flight to simulate client disconnect.
+            }
+        }
+
+        // Subsequent SIGTERM (ing.stop()) must cleanly await the detached stop task.
+        ing.stop().await.unwrap();
+        assert_eq!(ing.state(), State::Terminated);
+        assert!(ing.tsdbs.is_empty());
+
+        // Wait for the detached shutdown_handler task to release shutdown_mtx after restoring flags.
+        let _guard = ing.shutdown_mtx.lock().await;
+        assert!(
+            !ing.flush_on_shutdown.load(Ordering::Acquire),
+            "flush_on_shutdown must be restored even after HTTP client disconnect"
+        );
     }
 }

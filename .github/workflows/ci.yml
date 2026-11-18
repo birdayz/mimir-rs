@@ -90,7 +90,7 @@ jobs:
         run: |
           cargo +nightly miri test -p mimir-common --lib -- thread_pool labels_hash
           cargo +nightly miri test -p mimir-proto --lib -- zerocopy snappy s2 query_stream_enc
-          cargo +nightly miri test -p mimir-tsdb --lib -- bstream paged_by_id hash_sorted_pairs labels:: symbols:: postings::
+          cargo +nightly miri test -p mimir-tsdb --lib -- bstream paged_by_id hash_sorted_pairs labels:: symbols:: postings:: postings_cache:: ooo::
           cargo +nightly miri test -p mimir-ingester --lib -- nanos_slab
 
   parity:

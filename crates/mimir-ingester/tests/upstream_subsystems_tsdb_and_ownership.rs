@@ -1035,155 +1035,430 @@ async fn test_owned_series_service_with_partitions_ring() {
         .as_millis() as i64;
     let (series_to_write, _) = generate_series_with_tokens_at(user, now_ms);
 
-    // 1) empty ingester & partition ring strategy tests covering 0/1/2 partitions, shard size changes, limits changes, and WAL replay
-    let dir = TempDir::new().unwrap();
-    let rt_file = dir.path().join("runtime.yaml");
-    let mut rt_map = BTreeMap::new();
-    rt_map.insert(user.to_string(), (OWNED_SERVICE_TEST_USER_LIMIT as i64, 0));
-    write_runtime_limits_file(&rt_file, &rt_map, true);
+    #[derive(Clone, Copy)]
+    enum PartCase {
+        EmptyIngester,
+        NewUserTrigger,
+        NewUserWalReplay,
+        Shard1ScaleUpDownNoMove,
+        Shard1ScaleUpDownMove,
+        Shard0ScaleUpDown,
+        Shard0ToPartitionCount,
+        ShardLtPartitionsUpDown,
+        ShardLtPartitionsStartOther,
+        SeriesLimitUpDown,
+        LimitAndShardTandem,
+        EarlyCompactionTrigger,
+        PreviousRingCheckFailed,
+    }
 
-    let rt_mgr = Arc::new(
-        RuntimeConfigManager::new(
-            RuntimeConfigConfig {
-                file: StringSliceCSV(vec![rt_file.to_string_lossy().to_string()]),
-                period: GoDuration::from_secs(3600),
-                ..Default::default()
-            },
-            default_limits_test_config(),
-            InstanceLimits::default(),
-        )
-        .unwrap(),
-    );
-    let overrides = rt_mgr.overrides();
+    let cases = [
+        (PartCase::EmptyIngester, 0i32, 0i64),
+        (PartCase::NewUserTrigger, 0, 0),
+        (PartCase::NewUserWalReplay, 0, 0),
+        (PartCase::Shard1ScaleUpDownNoMove, 2, 1),
+        (PartCase::Shard1ScaleUpDownMove, 1, 1),
+        (PartCase::Shard0ScaleUpDown, 0, 0),
+        (PartCase::Shard0ToPartitionCount, 0, 0),
+        (PartCase::ShardLtPartitionsUpDown, 2, 1),
+        (PartCase::ShardLtPartitionsStartOther, 1, 1),
+        (PartCase::SeriesLimitUpDown, 0, 0),
+        (PartCase::LimitAndShardTandem, 1, 1),
+        (PartCase::EarlyCompactionTrigger, 0, 0),
+        (PartCase::PreviousRingCheckFailed, 0, 0),
+    ];
 
-    let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(partition_ring_desc_codec()));
-    cas_typed::<PartitionRingDesc, _>(kv.as_ref(), "ingester-partitions", move |cur| {
-        let mut d = cur.cloned().unwrap_or_default();
-        d.add_partition(0, PartitionState::PartitionActive, SystemTime::now());
-        Ok(Some((d, true)))
-    })
-    .await
-    .unwrap();
+    for (case, register_pid, init_shard) in cases {
+        let dir = TempDir::new().unwrap();
+        let rt_file = dir.path().join("runtime.yaml");
+        let mut rt_map = BTreeMap::new();
+        if !matches!(case, PartCase::EmptyIngester) {
+            rt_map.insert(
+                user.to_string(),
+                (OWNED_SERVICE_TEST_USER_LIMIT as i64, init_shard),
+            );
+        }
+        write_runtime_limits_file(&rt_file, &rt_map, true);
 
-    let watcher = PartitionRingWatcher::new(
-        "ingester-partitions",
-        "ingester-partitions",
-        Arc::clone(&kv),
-        PartitionRingOptions::default(),
-        None,
-    );
-    let w_svc = Arc::clone(&watcher).into_service();
-    start_and_await_running(ServiceContext::background(), w_svc.as_ref())
+        let rt_mgr = Arc::new(
+            RuntimeConfigManager::new(
+                RuntimeConfigConfig {
+                    file: StringSliceCSV(vec![rt_file.to_string_lossy().to_string()]),
+                    period: GoDuration::from_secs(3600),
+                    ..Default::default()
+                },
+                default_limits_test_config(),
+                InstanceLimits::default(),
+            )
+            .unwrap(),
+        );
+        let overrides = rt_mgr.overrides();
+
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(partition_ring_desc_codec()));
+        cas_typed::<PartitionRingDesc, _>(kv.as_ref(), "ingester-partitions", move |cur| {
+            let mut d = cur.cloned().unwrap_or_default();
+            d.add_partition(register_pid, PartitionState::PartitionActive, SystemTime::now());
+            Ok(Some((d, true)))
+        })
         .await
         .unwrap();
 
-    let (cfg, blocks_cfg, ingest_cfg) = default_ingester_test_config(dir.path());
-    let (ing, _) = prepare_ingester_with_kv_and_overrides(
-        cfg.clone(),
-        blocks_cfg.clone(),
-        ingest_cfg,
-        overrides.clone(),
-        Arc::new(InMemoryKv::new(ring_desc_codec())),
-        None,
-    );
-    start_and_wait_healthy(&ing).await;
-
-    let i_u = Arc::clone(&ing);
-    let i_g = Arc::clone(&ing);
-    let oss = OwnedSeriesService::new(
-        Duration::from_secs(600),
-        Arc::new(OwnedSeriesPartitionRingStrategy::new(
-            0,
-            Arc::clone(&watcher),
-            overrides.clone(),
-        )),
-        None,
-        Arc::new(move || i_u.get_tsdb_users()),
-        Arc::new(move |u| i_g.get_tsdb(u)),
-    );
-
-    // Empty ingester
-    assert_eq!(oss.update_all_tenants(false), 0);
-
-    // Push all series -> new user trigger
-    for (lbls, ts) in &series_to_write {
-        ing.push_grpc(user, &mock_write_request(lbls, 0.0, *ts))
+        let watcher = PartitionRingWatcher::new(
+            "ingester-partitions",
+            "ingester-partitions",
+            Arc::clone(&kv),
+            PartitionRingOptions::default(),
+            None,
+        );
+        let w_svc = Arc::clone(&watcher).into_service();
+        start_and_await_running(ServiceContext::background(), w_svc.as_ref())
             .await
             .unwrap();
+
+        let (mut cfg, mut blocks_cfg, mut ingest_cfg) = default_ingester_test_config(dir.path());
+        cfg.ring.instance_id = format!("ingester-zone-a-{register_pid}");
+        cfg.active_series.active_series_metrics_enabled = true;
+        cfg.use_ingester_owned_series_for_limits = true;
+        blocks_cfg.tsdb.ship_interval = GoDuration(0);
+        ingest_cfg.enabled = true;
+
+        let mk_ing = || {
+            let ing = mimir_ingester::Ingester::new(
+                cfg.clone(),
+                blocks_cfg.clone(),
+                ingest_cfg.clone(),
+                overrides.clone(),
+                None,
+                None,
+                Some(Arc::clone(&watcher)),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            ing.set_state_for_test(mimir_common::services::State::Running);
+            ing
+        };
+
+        let ing = mk_ing();
+        let mk_oss = |ing_ref: &Arc<mimir_ingester::Ingester>| {
+            let i_u = Arc::clone(ing_ref);
+            let i_g = Arc::clone(ing_ref);
+            OwnedSeriesService::new(
+                Duration::from_secs(600),
+                Arc::new(OwnedSeriesPartitionRingStrategy::new(
+                    register_pid,
+                    Arc::clone(&watcher),
+                    overrides.clone(),
+                )),
+                None,
+                Arc::new(move || i_u.get_tsdb_users()),
+                Arc::new(move |u| i_g.get_tsdb(u)),
+            )
+        };
+        let oss = mk_oss(&ing);
+
+        let push_items = |ing_ref: &Arc<mimir_ingester::Ingester>, items: &[(Labels, i64)]| {
+            let ing_c = Arc::clone(ing_ref);
+            let items_c = items.to_vec();
+            async move {
+                for (lbls, ts) in items_c {
+                    ing_c
+                        .push_grpc(user, &mock_write_request(&lbls, 0.0, ts))
+                        .await
+                        .unwrap();
+                }
+            }
+        };
+
+        let add_part = |pid: i32| {
+            let kv_c = Arc::clone(&kv);
+            let w_c = Arc::clone(&watcher);
+            async move {
+                cas_typed::<PartitionRingDesc, _>(kv_c.as_ref(), "ingester-partitions", move |cur| {
+                    let mut d = cur.cloned().unwrap_or_default();
+                    d.add_partition(pid, PartitionState::PartitionActive, SystemTime::now());
+                    Ok(Some((d, true)))
+                })
+                .await
+                .unwrap();
+                let dl = tokio::time::Instant::now() + Duration::from_secs(2);
+                while !w_c.partition_ring().active_partition_ids().contains(&pid)
+                    && tokio::time::Instant::now() < dl
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(w_c.partition_ring().active_partition_ids().contains(&pid));
+            }
+        };
+
+        let remove_part = |pid: i32| {
+            let kv_c = Arc::clone(&kv);
+            let w_c = Arc::clone(&watcher);
+            async move {
+                cas_typed::<PartitionRingDesc, _>(kv_c.as_ref(), "ingester-partitions", move |cur| {
+                    let mut d = cur.cloned().unwrap_or_default();
+                    d.remove_partition(pid);
+                    Ok(Some((d, true)))
+                })
+                .await
+                .unwrap();
+                let dl = tokio::time::Instant::now() + Duration::from_secs(2);
+                while w_c.partition_ring().active_partition_ids().contains(&pid)
+                    && tokio::time::Instant::now() < dl
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(!w_c.partition_ring().active_partition_ids().contains(&pid));
+            }
+        };
+
+        let check_state = |db: &UserTsdb, exp_owned: usize, exp_shard: usize, exp_limit: usize| {
+            let os = db.owned_series_state();
+            assert_eq!(
+                (os.owned_series_count, os.shard_size, os.local_series_limit),
+                (exp_owned, exp_shard, exp_limit),
+            );
+        };
+
+        match case {
+            PartCase::EmptyIngester => {
+                assert_eq!(oss.update_all_tenants(false), 0);
+            }
+            PartCase::NewUserTrigger => {
+                push_items(&ing, &series_to_write).await;
+                let db = ing.get_tsdb(user).unwrap();
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 0, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, OWNED_SERVICE_SERIES_COUNT);
+                assert_eq!(
+                    db.peek_reason_for_recompute_owned_series().as_deref(),
+                    Some(RECOMPUTE_OWNED_SERIES_REASON_NEW_USER)
+                );
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_NEW_USER]);
+                assert!(db.peek_reason_for_recompute_owned_series().is_none());
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 0, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, OWNED_SERVICE_SERIES_COUNT);
+                assert_eq!(oss.update_all_tenants(false), 0);
+            }
+            PartCase::NewUserWalReplay => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                ing.stop().await.unwrap();
+
+                let ing2 = mk_ing();
+                ing2.open_existing_tsdbs().await.unwrap();
+                let db2 = ing2.get_tsdb(user).unwrap();
+                check_state(&db2, OWNED_SERVICE_SERIES_COUNT, 0, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(
+                    db2.peek_reason_for_recompute_owned_series().as_deref(),
+                    Some(RECOMPUTE_OWNED_SERIES_REASON_NEW_USER)
+                );
+                assert_eq!(db2.active_series.active().0, 0);
+                let _ = ing2.stop().await;
+                let _ = stop_and_await_terminated(ServiceContext::background(), w_svc.as_ref()).await;
+                continue;
+            }
+            PartCase::Shard1ScaleUpDownNoMove => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                let db = ing.get_tsdb(user).unwrap();
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+
+                add_part(1).await;
+                assert_eq!(oss.update_all_tenants(false), 0);
+                assert_eq!(oss.update_all_tenants(true), 0);
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+
+                remove_part(1).await;
+                assert_eq!(oss.update_all_tenants(false), 0);
+                assert_eq!(oss.update_all_tenants(true), 0);
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, OWNED_SERVICE_SERIES_COUNT);
+            }
+            PartCase::Shard1ScaleUpDownMove => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                let db = ing.get_tsdb(user).unwrap();
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+
+                add_part(2).await;
+                assert_eq!(oss.update_all_tenants(false), 0);
+                assert_eq!(oss.update_all_tenants(true), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_RING_CHANGED]);
+                check_state(&db, 0, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, 0);
+
+                remove_part(2).await;
+                assert_eq!(oss.update_all_tenants(false), 0);
+                assert_eq!(oss.update_all_tenants(true), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_RING_CHANGED]);
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, 0);
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(db.active_series.active().0, OWNED_SERVICE_SERIES_COUNT);
+            }
+            PartCase::Shard0ScaleUpDown => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                let db = ing.get_tsdb(user).unwrap();
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 0, OWNED_SERVICE_TEST_USER_LIMIT);
+
+                add_part(1).await;
+                assert_eq!(oss.update_all_tenants(true), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_LOCAL_LIMIT_CHANGED]);
+                check_state(&db, 3, 0, OWNED_SERVICE_TEST_USER_LIMIT / 2);
+                assert_eq!(db.active_series.active().0, 3);
+
+                remove_part(1).await;
+                assert_eq!(oss.update_all_tenants(true), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_LOCAL_LIMIT_CHANGED]);
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 0, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, 3);
+            }
+            PartCase::Shard0ToPartitionCount => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                let db = ing.get_tsdb(user).unwrap();
+                add_part(1).await;
+                assert_eq!(oss.update_all_tenants(true), 1);
+                check_state(&db, 3, 0, OWNED_SERVICE_TEST_USER_LIMIT / 2);
+
+                rt_map.insert(user.to_string(), (OWNED_SERVICE_TEST_USER_LIMIT as i64, 2));
+                write_runtime_limits_file(&rt_file, &rt_map, true);
+                rt_mgr.reload().unwrap();
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_SHARD_SIZE_CHANGED]);
+                check_state(&db, 3, 2, OWNED_SERVICE_TEST_USER_LIMIT / 2);
+                assert_eq!(db.active_series.active().0, 3);
+            }
+            PartCase::ShardLtPartitionsUpDown => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                let db = ing.get_tsdb(user).unwrap();
+                add_part(1).await;
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+
+                rt_map.insert(user.to_string(), (OWNED_SERVICE_TEST_USER_LIMIT as i64, 2));
+                write_runtime_limits_file(&rt_file, &rt_map, true);
+                rt_mgr.reload().unwrap();
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_SHARD_SIZE_CHANGED]);
+                check_state(&db, 8, 2, OWNED_SERVICE_TEST_USER_LIMIT / 2);
+                assert_eq!(db.active_series.active().0, 8);
+
+                rt_map.insert(user.to_string(), (OWNED_SERVICE_TEST_USER_LIMIT as i64, 1));
+                write_runtime_limits_file(&rt_file, &rt_map, true);
+                rt_mgr.reload().unwrap();
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_SHARD_SIZE_CHANGED]);
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, 8);
+            }
+            PartCase::ShardLtPartitionsStartOther => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                let db = ing.get_tsdb(user).unwrap();
+                add_part(2).await;
+                assert_eq!(oss.update_all_tenants(true), 1);
+                check_state(&db, 0, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, 0);
+
+                rt_map.insert(user.to_string(), (OWNED_SERVICE_TEST_USER_LIMIT as i64, 2));
+                write_runtime_limits_file(&rt_file, &rt_map, true);
+                rt_mgr.reload().unwrap();
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_SHARD_SIZE_CHANGED]);
+                check_state(&db, 2, 2, OWNED_SERVICE_TEST_USER_LIMIT / 2);
+                assert_eq!(db.active_series.active().0, 0);
+
+                rt_map.insert(user.to_string(), (OWNED_SERVICE_TEST_USER_LIMIT as i64, 1));
+                write_runtime_limits_file(&rt_file, &rt_map, true);
+                rt_mgr.reload().unwrap();
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_SHARD_SIZE_CHANGED]);
+                check_state(&db, 0, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, 0);
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(db.active_series.active().0, OWNED_SERVICE_SERIES_COUNT);
+            }
+            PartCase::SeriesLimitUpDown => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                let db = ing.get_tsdb(user).unwrap();
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 0, OWNED_SERVICE_TEST_USER_LIMIT);
+
+                rt_map.insert(user.to_string(), ((OWNED_SERVICE_TEST_USER_LIMIT * 2) as i64, 0));
+                write_runtime_limits_file(&rt_file, &rt_map, true);
+                rt_mgr.reload().unwrap();
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_LOCAL_LIMIT_CHANGED]);
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 0, OWNED_SERVICE_TEST_USER_LIMIT * 2);
+
+                rt_map.insert(user.to_string(), (OWNED_SERVICE_TEST_USER_LIMIT as i64, 0));
+                write_runtime_limits_file(&rt_file, &rt_map, true);
+                rt_mgr.reload().unwrap();
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_LOCAL_LIMIT_CHANGED]);
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 0, OWNED_SERVICE_TEST_USER_LIMIT);
+            }
+            PartCase::LimitAndShardTandem => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                let db = ing.get_tsdb(user).unwrap();
+                add_part(0).await;
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+
+                rt_map.insert(user.to_string(), ((OWNED_SERVICE_TEST_USER_LIMIT * 2) as i64, 2));
+                write_runtime_limits_file(&rt_file, &rt_map, true);
+                rt_mgr.reload().unwrap();
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_SHARD_SIZE_CHANGED]);
+                check_state(&db, 7, 2, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, 7);
+
+                rt_map.insert(user.to_string(), (OWNED_SERVICE_TEST_USER_LIMIT as i64, 1));
+                write_runtime_limits_file(&rt_file, &rt_map, true);
+                rt_mgr.reload().unwrap();
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_SHARD_SIZE_CHANGED]);
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 1, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, 7);
+            }
+            PartCase::EarlyCompactionTrigger => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                let db = ing.get_tsdb(user).unwrap();
+                let max_before = db.db.head().max_time();
+                ing.compact_blocks(true, max_before + 60_000, None).await;
+                assert_eq!(db.db.head().num_series(), 0);
+                assert_eq!(
+                    db.peek_reason_for_recompute_owned_series().as_deref(),
+                    Some(RECOMPUTE_OWNED_SERIES_REASON_EARLY_COMPACTION)
+                );
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_EARLY_COMPACTION]);
+                check_state(&db, 0, 0, OWNED_SERVICE_TEST_USER_LIMIT);
+                assert_eq!(db.active_series.active().0, OWNED_SERVICE_SERIES_COUNT);
+
+                let (next_series, _) = generate_series_with_tokens_at(user, max_before + 1);
+                push_items(&ing, &next_series).await;
+                assert_eq!(db.active_series.active().0, OWNED_SERVICE_SERIES_COUNT);
+            }
+            PartCase::PreviousRingCheckFailed => {
+                push_items(&ing, &series_to_write).await;
+                assert_eq!(oss.update_all_tenants(false), 1);
+                let db = ing.get_tsdb(user).unwrap();
+                db.trigger_recompute_owned_series(RECOMPUTE_OWNED_SERIES_REASON_GET_TOKEN_RANGES_FAILED);
+                assert_eq!(oss.update_all_tenants(false), 1);
+                assert_eq!(oss.last_update_reasons(), vec![RECOMPUTE_OWNED_SERIES_REASON_GET_TOKEN_RANGES_FAILED]);
+                check_state(&db, OWNED_SERVICE_SERIES_COUNT, 0, OWNED_SERVICE_TEST_USER_LIMIT);
+            }
+        }
+
+        let _ = stop_and_await_terminated(ServiceContext::background(), w_svc.as_ref()).await;
+        let _ = ing.stop().await;
     }
-    assert_eq!(oss.update_all_tenants(false), 1);
-    assert_eq!(
-        oss.last_update_reasons(),
-        vec![RECOMPUTE_OWNED_SERIES_REASON_NEW_USER]
-    );
-    let db = ing.get_tsdb(user).unwrap();
-    assert_eq!(
-        db.owned_series_state().owned_series_count,
-        OWNED_SERVICE_SERIES_COUNT
-    );
-
-    // Add partition 1 -> split 3/7 across partitions 0 & 1
-    cas_typed::<PartitionRingDesc, _>(kv.as_ref(), "ingester-partitions", move |cur| {
-        let mut d = cur.cloned().unwrap_or_default();
-        d.add_partition(1, PartitionState::PartitionActive, SystemTime::now());
-        Ok(Some((d, true)))
-    })
-    .await
-    .unwrap();
-    let dl = tokio::time::Instant::now() + Duration::from_secs(2);
-    while watcher.partition_ring().active_partition_ids().len() < 2
-        && tokio::time::Instant::now() < dl
-    {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    // With shard size=0, local limit changes -> recomputes and partition 0 owns 3 series
-    // Update overrides via Limiter-compatible check: here OwnedSeriesPartitionRingStrategy reads overrides;
-    // since shard size=0 uses both partitions, local_limit in UserTsdb uses ingester's limiter.
-    assert_eq!(oss.update_all_tenants(true), 1);
-    assert_eq!(db.owned_series_state().owned_series_count, 3);
-    assert_eq!(db.active_series.active().0, 3);
-
-    // Change shard size to 1 -> partition 1 owns all 10 (partition 0 owns 0)
-    rt_map.insert(user.to_string(), (OWNED_SERVICE_TEST_USER_LIMIT as i64, 1));
-    write_runtime_limits_file(&rt_file, &rt_map, true);
-    rt_mgr.reload().unwrap();
-    assert_eq!(oss.update_all_tenants(false), 1);
-    assert_eq!(
-        oss.last_update_reasons(),
-        vec![RECOMPUTE_OWNED_SERIES_REASON_SHARD_SIZE_CHANGED]
-    );
-    assert_eq!(db.owned_series_state().owned_series_count, 0);
-
-    // Change shard size to 2 -> partition 0 owns 3 again
-    rt_map.insert(user.to_string(), (OWNED_SERVICE_TEST_USER_LIMIT as i64, 2));
-    write_runtime_limits_file(&rt_file, &rt_map, true);
-    rt_mgr.reload().unwrap();
-    assert_eq!(oss.update_all_tenants(false), 1);
-    assert_eq!(db.owned_series_state().owned_series_count, 3);
-
-    // Remove partition 1 -> partition 0 owns all 10 again
-    cas_typed::<PartitionRingDesc, _>(kv.as_ref(), "ingester-partitions", move |cur| {
-        let mut d = cur.cloned().unwrap_or_default();
-        d.remove_partition(1);
-        Ok(Some((d, true)))
-    })
-    .await
-    .unwrap();
-    let dl2 = tokio::time::Instant::now() + Duration::from_secs(2);
-    while watcher.partition_ring().active_partition_ids().len() > 1
-        && tokio::time::Instant::now() < dl2
-    {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(oss.update_all_tenants(true), 1);
-    assert_eq!(
-        db.owned_series_state().owned_series_count,
-        OWNED_SERVICE_SERIES_COUNT
-    );
-
-    let _ = stop_and_await_terminated(ServiceContext::background(), w_svc.as_ref()).await;
-    let _ = ing.stop().await;
 }
 
 // Upstream: pkg/ingester/owned_series_test.go::TestOwnedSeriesStartsQuicklyWithEmptyIngesterRing
@@ -2155,6 +2430,10 @@ fn test_next_forced_head_compaction_range() {
         (12, 21, 12, Some((12, 12, true))),
         (i64::MAX, 20, 12, None),
         (0, i64::MIN, 12, None),
+        // Negative timestamps follow Go truncated `/` division across bucket 0: [-9, 9] is 1 range.
+        (-5, 5, 50, Some((-5, 5, true))),
+        (-15, 5, 50, Some((-15, -1, false))),
+        (-15, -11, 50, Some((-15, -11, true))),
     ];
 
     for (h_min, h_max, forced_max, expected) in cases {

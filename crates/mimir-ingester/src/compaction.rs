@@ -14,7 +14,7 @@ use futures::StreamExt;
 use mimir_common::services::{ServiceContext, State};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::active_series::{merged_custom_trackers, parse_custom_tracker_matchers, Matchers};
 use crate::ingester::{Ingester, TriggerRequest, INSTANCE_INGESTION_RATE_TICK_INTERVAL};
@@ -574,9 +574,17 @@ impl Ingester {
 
             let refs = if local_threshold > 0 && db.db.head().num_series() >= local_threshold as u64
             {
-                db.take_pending_non_owned_refs(now - min_grace - jitter)
+                let cutoff = now
+                    .checked_sub(min_grace)
+                    .and_then(|t| t.checked_sub(jitter))
+                    .unwrap_or(UNIX_EPOCH);
+                db.take_pending_non_owned_refs(cutoff)
             } else if !max_grace.is_zero() {
-                db.take_pending_non_owned_refs(now - max_grace - jitter)
+                let cutoff = now
+                    .checked_sub(max_grace)
+                    .and_then(|t| t.checked_sub(jitter))
+                    .unwrap_or(UNIX_EPOCH);
+                db.take_pending_non_owned_refs(cutoff)
             } else {
                 Vec::new()
             };
@@ -729,6 +737,9 @@ impl Ingester {
             warn!(user = %user_id, dir = %dir.display(), err = %e, "failed to remove closed idle TSDB directory");
             return TsdbCloseCheckResult::DataRemovalFailed;
         }
+
+        drop(_remove_guard);
+        drop(user_db);
 
         if tenant_deleted {
             info!(user = %user_id, "deleted local TSDB, user marked for deletion");
@@ -1298,18 +1309,30 @@ pub fn spawn_owned_series_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> 
                         Ok(changed) => {
                             cur_interval = normal_interval;
                             let start = Instant::now();
+                            let mut updated_users = 0usize;
                             for uid in ingester.get_tsdb_users() {
                                 if let Some(db) = ingester.get_tsdb(&uid) {
-                                    db.update_owned_series_if_needed(strategy.as_ref(), changed);
+                                    if db.update_owned_series_if_needed(strategy.as_ref(), changed) {
+                                        updated_users += 1;
+                                    }
                                 }
+                            }
+                            let elapsed = start.elapsed();
+                            if updated_users > 0 {
+                                info!(
+                                    updated_users,
+                                    duration_ms = elapsed.as_millis() as u64,
+                                    ring_changed = changed,
+                                    "updated owned series for users"
+                                );
                             }
                             ingester
                                 .owned_series_metrics
                                 .check_duration
-                                .observe(start.elapsed().as_secs_f64());
+                                .observe(elapsed.as_secs_f64());
                         }
                         Err(e) => {
-                            debug!(err = %e, "owned series ring check failed");
+                            error!(err = %e, "can't check ring for updates");
                         }
                     }
                 }

@@ -217,7 +217,7 @@ fn test_config_validate() {
 #[test]
 fn test_config_validate_rejects_unsupported_tsdb_settings() {
     type SetupFn = fn(&mut BlocksStorageConfig);
-    let cases: [(&str, SetupFn, &str); 3] = [
+    let cases: [(&str, SetupFn, &str); 2] = [
         (
             "multiple block ranges",
             |cfg| {
@@ -227,17 +227,15 @@ fn test_config_validate_rejects_unsupported_tsdb_settings() {
             "block-ranges-period",
         ),
         (
-            "head chunks end time variance",
-            |cfg| cfg.tsdb.head_chunks_end_time_variance = 0.5,
-            "head-chunks-end-time-variance",
-        ),
-        (
             "memory snapshot on shutdown",
             |cfg| cfg.tsdb.memory_snapshot_on_shutdown = true,
             "memory-snapshot-on-shutdown",
         ),
     ];
     assert!(BlocksStorageConfig::default().validate(true).is_ok());
+    let mut variance_cfg = BlocksStorageConfig::default();
+    variance_cfg.tsdb.head_chunks_end_time_variance = 0.5;
+    assert!(variance_cfg.validate(true).is_ok());
     for (name, setup, want) in cases {
         let mut cfg = BlocksStorageConfig::default();
         setup(&mut cfg);

@@ -2153,7 +2153,7 @@ fn plan_class(
     let mid_range = ranges_ms[ranges_ms.len() / 2];
     for v in dms.iter().rev() {
         let meta = &v.meta;
-        if meta.max_time - meta.min_time < mid_range {
+        if (meta.max_time as i128) - (meta.min_time as i128) < (mid_range as i128) {
             if meta.stats.num_tombstones > 0 && meta.stats.num_tombstones >= meta.stats.num_series {
                 return Some(vec![v.dir.clone()]);
             }
@@ -2205,7 +2205,9 @@ fn select_dirs<'a>(ds: &'a [DirMeta], ranges_ms: &[i64]) -> Vec<&'a DirMeta> {
             }
             let mint = p[0].meta.min_time;
             let maxt = p[p.len() - 1].meta.max_time;
-            if (maxt - mint == iv || maxt <= high_time) && p.len() > 1 {
+            if ((maxt as i128) - (mint as i128) == (iv as i128) || maxt <= high_time)
+                && p.len() > 1
+            {
                 return p;
             }
         }
@@ -2214,22 +2216,26 @@ fn select_dirs<'a>(ds: &'a [DirMeta], ranges_ms: &[i64]) -> Vec<&'a DirMeta> {
 }
 
 fn split_by_range(ds: &[DirMeta], tr: i64) -> Vec<Vec<&DirMeta>> {
+    if tr <= 0 {
+        return Vec::new();
+    }
+    let tr128 = tr as i128;
     let mut split_dirs = Vec::new();
     let mut i = 0usize;
     while i < ds.len() {
         let mut group = Vec::new();
         let m = &ds[i].meta;
-        let t0 = if m.min_time >= 0 {
-            tr * (m.min_time / tr)
+        let t0: i128 = if m.min_time >= 0 {
+            tr128 * ((m.min_time as i128) / tr128)
         } else {
-            tr * ((m.min_time - tr + 1) / tr)
+            tr128 * (((m.min_time as i128) - tr128 + 1) / tr128)
         };
-        if m.max_time > t0 + tr {
+        if (m.max_time as i128) > t0 + tr128 {
             i += 1;
             continue;
         }
         while i < ds.len() {
-            if ds[i].meta.max_time > t0 + tr {
+            if (ds[i].meta.max_time as i128) > t0 + tr128 {
                 break;
             }
             group.push(&ds[i]);
@@ -2554,5 +2560,29 @@ mod tests {
             &[Interval { mint: 200, maxt: 200 }],
         );
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn split_by_range_extreme_i64_no_overflow() {
+        let make_dm = |min_time: i64, max_time: i64| DirMeta {
+            dir: std::path::PathBuf::from("dummy"),
+            meta: BlockMeta {
+                ulid: Ulid::new(),
+                min_time,
+                max_time,
+                stats: BlockStats::default(),
+                compaction: BlockMetaCompaction::default(),
+                version: META_VERSION_1,
+                out_of_order: false,
+                thanos: None,
+            },
+        };
+        let ds = vec![
+            make_dm(i64::MIN + 100, i64::MIN + 200),
+            make_dm(i64::MAX - 200, i64::MAX - 100),
+        ];
+        let parts = split_by_range(&ds, 7_200_000);
+        assert_eq!(parts.len(), 2);
+        assert!(split_by_range(&ds, 0).is_empty());
     }
 }

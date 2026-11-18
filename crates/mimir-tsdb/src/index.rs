@@ -414,16 +414,21 @@ impl IndexWriter {
         self.buf2.put_uvarint(chunks.len());
         if let Some(c0) = chunks.first() {
             self.buf2.put_varint64(c0.min_time);
-            self.buf2.put_uvarint64((c0.max_time - c0.min_time) as u64);
+            self.buf2
+                .put_uvarint64(u64::from_ne_bytes(c0.max_time.wrapping_sub(c0.min_time).to_ne_bytes()));
             self.buf2.put_uvarint64(c0.ref_id);
             let mut t0 = c0.max_time;
-            let mut ref0 = c0.ref_id as i64;
+            let mut ref0 = i64::from_ne_bytes(c0.ref_id.to_ne_bytes());
             for c in &chunks[1..] {
-                self.buf2.put_uvarint64((c.min_time - t0) as u64);
-                self.buf2.put_uvarint64((c.max_time - c.min_time) as u64);
+                self.buf2
+                    .put_uvarint64(u64::from_ne_bytes(c.min_time.wrapping_sub(t0).to_ne_bytes()));
+                self.buf2.put_uvarint64(u64::from_ne_bytes(
+                    c.max_time.wrapping_sub(c.min_time).to_ne_bytes(),
+                ));
                 t0 = c.max_time;
-                self.buf2.put_varint64((c.ref_id as i64) - ref0);
-                ref0 = c.ref_id as i64;
+                let cur_ref = i64::from_ne_bytes(c.ref_id.to_ne_bytes());
+                self.buf2.put_varint64(cur_ref.wrapping_sub(ref0));
+                ref0 = cur_ref;
             }
         }
 
@@ -709,9 +714,12 @@ impl Drop for IndexWriter {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct PostingOffsetEntry {
-    value: String,
+    name_off: u32,
+    name_len: u32,
+    val_off: u32,
+    val_len: u32,
     table_rel_off: usize,
 }
 
@@ -723,8 +731,8 @@ pub struct IndexReader {
     toc: IndexToc,
     symbol_offsets: Vec<usize>,
     num_symbols: usize,
-    name_cache: HashMap<u32, String>,
-    postings_index: BTreeMap<String, Vec<PostingOffsetEntry>>,
+    name_cache: HashMap<u32, (u32, u32)>,
+    postings_index: Vec<Box<[PostingOffsetEntry]>>,
 }
 
 impl IndexReader {
@@ -746,16 +754,27 @@ impl IndexReader {
 
         let toc = IndexToc::parse(&mmap)?;
         let (symbol_offsets, num_symbols) = parse_symbols_index(&mmap, toc.symbols as usize)?;
-        let postings_index = parse_postings_offset_table(&mmap, toc.postings_table as usize)?;
+        let postings_table_off = usize::try_from(toc.postings_table)
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+        let postings_payload_start = postings_table_off
+            .checked_add(4)
+            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+        let postings_index = parse_postings_offset_table(&mmap, postings_table_off)?;
 
         let mut name_cache = HashMap::with_capacity(postings_index.len());
-        for name in postings_index.keys() {
-            if name.is_empty() {
+        for entries in &postings_index {
+            let Some(first) = entries.first() else {
+                continue;
+            };
+            if first.name_len == 0 {
                 continue;
             }
-            let sid =
-                reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name.as_str())?;
-            name_cache.insert(sid, name.clone());
+            let (start, end) =
+                resolve_posting_str_range(postings_payload_start, first.name_off, first.name_len);
+            // SAFETY: `parse_postings_offset_table` validated UTF-8 and slice bounds on `mmap`.
+            let name = unsafe { std::str::from_utf8_unchecked(&mmap[start..end]) };
+            let sid = reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name)?;
+            name_cache.insert(sid, (first.name_off, first.name_len));
         }
 
         Ok(Self {
@@ -767,6 +786,28 @@ impl IndexReader {
             name_cache,
             postings_index,
         })
+    }
+
+    #[inline]
+    fn mmap_str(&self, off: u32, len: u32) -> &str {
+        let payload_start = (self.toc.postings_table as usize) + 4;
+        let (start, end) = resolve_posting_str_range(payload_start, off, len);
+        // SAFETY: offsets/lengths are derived from validated UTF-8 subslices of `self.mmap` at open.
+        unsafe { std::str::from_utf8_unchecked(&self.mmap[start..end]) }
+    }
+
+    #[inline]
+    fn postings_entries(&self, name: &str) -> Option<&[PostingOffsetEntry]> {
+        let idx = self
+            .postings_index
+            .binary_search_by(|entries| {
+                let Some(first) = entries.first() else {
+                    return std::cmp::Ordering::Less;
+                };
+                self.mmap_str(first.name_off, first.name_len).cmp(name)
+            })
+            .ok()?;
+        Some(&self.postings_index[idx])
     }
 
     #[inline]
@@ -834,25 +875,31 @@ impl IndexReader {
     /// Returns all unique label names present in the index (sorted, excluding `""`).
     pub fn label_names(&self) -> Vec<String> {
         self.postings_index
-            .keys()
-            .filter(|k| !k.is_empty())
-            .cloned()
+            .iter()
+            .filter_map(|entries| {
+                let first = entries.first()?;
+                if first.name_len == 0 {
+                    None
+                } else {
+                    Some(self.mmap_str(first.name_off, first.name_len).to_string())
+                }
+            })
             .collect()
     }
 
     /// Returns all sorted label values for `name`.
     pub fn label_values(&self, name: &str) -> Result<Vec<String>, IndexError> {
-        let Some(entries) = self.postings_index.get(name) else {
+        let Some(entries) = self.postings_entries(name) else {
             return Ok(Vec::new());
         };
-        if entries.is_empty() {
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
             return Ok(Vec::new());
-        }
-        let last_val = &entries.last().unwrap().value;
+        };
+        let last_val = self.mmap_str(last.val_off, last.val_len);
         let mut out = Vec::with_capacity(entries.len() * SYMBOL_FACTOR);
-        self.traverse_posting_offsets(entries[0].table_rel_off, |val, _| {
+        self.traverse_posting_offsets(first.table_rel_off, |val, _| {
             out.push(val.to_string());
-            Ok(val != last_val.as_str())
+            Ok(val != last_val)
         })?;
         Ok(out)
     }
@@ -871,7 +918,7 @@ impl IndexReader {
             let lno = dec.uvarint32()?;
             let lvo = dec.uvarint32()?;
             let ln = match self.name_cache.get(&lno) {
-                Some(s) => s.as_str(),
+                Some(&(off, len)) => self.mmap_str(off, len),
                 None => self.lookup_symbol(lno)?,
             };
             let lv = self.lookup_symbol(lvo)?;
@@ -922,34 +969,25 @@ impl IndexReader {
         let mut chks = Vec::with_capacity(num_chunks.min(dec.len()));
         if num_chunks > 0 {
             let t0 = dec.varint64()?;
-            let dt0 = i64::try_from(dec.uvarint64()?)
-                .map_err(|_| IndexError::Corrupt("chunk time delta overflow".to_string()))?;
-            let maxt0 = t0
-                .checked_add(dt0)
-                .ok_or_else(|| IndexError::Corrupt("chunk maxt overflow".to_string()))?;
-            let mut ref0 = dec.uvarint64()? as i64;
+            let dt0 = i64::from_ne_bytes(dec.uvarint64()?.to_ne_bytes());
+            let maxt0 = t0.wrapping_add(dt0);
+            let mut ref0 = i64::from_ne_bytes(dec.uvarint64()?.to_ne_bytes());
             chks.push(ChunkMeta {
-                ref_id: ref0 as u64,
+                ref_id: u64::from_ne_bytes(ref0.to_ne_bytes()),
                 min_time: t0,
                 max_time: maxt0,
                 chunk: None,
             });
             let mut prev_maxt = maxt0;
             for _ in 1..num_chunks {
-                let d_mint = i64::try_from(dec.uvarint64()?)
-                    .map_err(|_| IndexError::Corrupt("chunk mint delta overflow".to_string()))?;
-                let mint = prev_maxt
-                    .checked_add(d_mint)
-                    .ok_or_else(|| IndexError::Corrupt("chunk mint overflow".to_string()))?;
-                let d_maxt = i64::try_from(dec.uvarint64()?)
-                    .map_err(|_| IndexError::Corrupt("chunk maxt delta overflow".to_string()))?;
-                let maxt = mint
-                    .checked_add(d_maxt)
-                    .ok_or_else(|| IndexError::Corrupt("chunk maxt overflow".to_string()))?;
+                let d_mint = i64::from_ne_bytes(dec.uvarint64()?.to_ne_bytes());
+                let mint = prev_maxt.wrapping_add(d_mint);
+                let d_maxt = i64::from_ne_bytes(dec.uvarint64()?.to_ne_bytes());
+                let maxt = mint.wrapping_add(d_maxt);
                 ref0 = ref0.wrapping_add(dec.varint64()?);
                 prev_maxt = maxt;
                 chks.push(ChunkMeta {
-                    ref_id: ref0 as u64,
+                    ref_id: u64::from_ne_bytes(ref0.to_ne_bytes()),
                     min_time: mint,
                     max_time: maxt,
                     chunk: None,
@@ -1041,7 +1079,7 @@ impl IndexReader {
     }
 
     pub fn postings(&self, name: &str, values: &[&str]) -> Result<Vec<u64>, IndexError> {
-        let Some(entries) = self.postings_index.get(name) else {
+        let Some(entries) = self.postings_entries(name) else {
             return Ok(Vec::new());
         };
         if entries.is_empty() || values.is_empty() {
@@ -1052,23 +1090,26 @@ impl IndexReader {
         sorted_vals.sort_unstable();
         sorted_vals.dedup();
 
+        let first_val = self.mmap_str(entries[0].val_off, entries[0].val_len);
         let mut vi = 0usize;
-        while vi < sorted_vals.len() && sorted_vals[vi] < entries[0].value.as_str() {
+        while vi < sorted_vals.len() && sorted_vals[vi] < first_val {
             vi += 1;
         }
 
         let mut lists: Vec<Vec<u64>> = Vec::new();
         while vi < sorted_vals.len() {
             let target = sorted_vals[vi];
-            let mut idx = entries.partition_point(|e| e.value.as_str() < target);
+            let mut idx = entries.partition_point(|e| self.mmap_str(e.val_off, e.val_len) < target);
             if idx == entries.len() {
                 break;
             }
-            if idx > 0 && entries[idx].value.as_str() != target {
+            if idx > 0 && self.mmap_str(entries[idx].val_off, entries[idx].val_len) != target {
                 idx -= 1;
             }
 
-            let next_anchor = entries.get(idx + 1).map(|e| e.value.as_str());
+            let next_anchor = entries
+                .get(idx + 1)
+                .map(|e| self.mmap_str(e.val_off, e.val_len));
             self.traverse_posting_offsets(entries[idx].table_rel_off, |val, postings_off| {
                 while vi < sorted_vals.len() && val >= sorted_vals[vi] {
                     if val == sorted_vals[vi] {
@@ -1093,17 +1134,17 @@ impl IndexReader {
     }
 
     pub fn postings_for_all_values(&self, name: &str) -> Result<Vec<u64>, IndexError> {
-        let Some(entries) = self.postings_index.get(name) else {
+        let Some(entries) = self.postings_entries(name) else {
             return Ok(Vec::new());
         };
-        if entries.is_empty() {
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
             return Ok(Vec::new());
-        }
-        let last_val = &entries.last().unwrap().value;
+        };
+        let last_val = self.mmap_str(last.val_off, last.val_len);
         let mut lists = Vec::new();
-        self.traverse_posting_offsets(entries[0].table_rel_off, |val, postings_off| {
+        self.traverse_posting_offsets(first.table_rel_off, |val, postings_off| {
             lists.push(self.decode_postings_at(postings_off)?);
-            Ok(val != last_val.as_str())
+            Ok(val != last_val)
         })?;
         let slices: Vec<&[u64]> = lists.iter().map(|v| v.as_slice()).collect();
         Ok(merge_postings(&slices))
@@ -1114,19 +1155,19 @@ impl IndexReader {
         name: &str,
         pred: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Vec<u64>, IndexError> {
-        let Some(entries) = self.postings_index.get(name) else {
+        let Some(entries) = self.postings_entries(name) else {
             return Ok(Vec::new());
         };
-        if entries.is_empty() {
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
             return Ok(Vec::new());
-        }
-        let last_val = &entries.last().unwrap().value;
+        };
+        let last_val = self.mmap_str(last.val_off, last.val_len);
         let mut lists = Vec::new();
-        self.traverse_posting_offsets(entries[0].table_rel_off, |val, postings_off| {
+        self.traverse_posting_offsets(first.table_rel_off, |val, postings_off| {
             if pred(val) {
                 lists.push(self.decode_postings_at(postings_off)?);
             }
-            Ok(val != last_val.as_str())
+            Ok(val != last_val)
         })?;
         let slices: Vec<&[u64]> = lists.iter().map(|v| v.as_slice()).collect();
         Ok(merge_postings(&slices))
@@ -1152,10 +1193,10 @@ impl IndexReader {
         let mut names = Vec::with_capacity(name_ids.len());
         for lno in name_ids {
             let s = match self.name_cache.get(&lno) {
-                Some(s) => s.clone(),
-                None => self.lookup_symbol(lno)?.to_string(),
+                Some(&(off, len)) => self.mmap_str(off, len),
+                None => self.lookup_symbol(lno)?,
             };
-            names.push(s);
+            names.push(s.to_string());
         }
         names.sort_unstable();
         Ok(names)
@@ -1313,19 +1354,31 @@ fn reverse_lookup_symbol(
     Err(IndexError::UnknownSymbol(sym.to_string()))
 }
 
+#[inline]
+fn resolve_posting_str_range(payload_start: usize, off: u32, len: u32) -> (usize, usize) {
+    let start = payload_start + (off as usize);
+    let end = start + (len as usize);
+    (start, end)
+}
+
 fn parse_postings_offset_table(
     buf: &[u8],
     table_off: usize,
-) -> Result<BTreeMap<String, Vec<PostingOffsetEntry>>, IndexError> {
+) -> Result<Vec<Box<[PostingOffsetEntry]>>, IndexError> {
     let payload = checked_decbuf_at(buf, table_off)?;
+    parse_postings_offset_table_payload(payload)
+}
+
+fn parse_postings_offset_table_payload(
+    payload: &[u8],
+) -> Result<Vec<Box<[PostingOffsetEntry]>>, IndexError> {
     let mut dec = Decbuf::new(payload);
     let orig_len = dec.len();
     let cnt = dec.be32()? as usize;
 
-    let mut result: BTreeMap<String, Vec<PostingOffsetEntry>> = BTreeMap::new();
-    let mut last_name: Option<String> = None;
-    let mut last_value = String::new();
-    let mut last_rel_off = 0usize;
+    let mut result: BTreeMap<&str, Vec<PostingOffsetEntry>> = BTreeMap::new();
+    let mut last_name: Option<&str> = None;
+    let mut last_entry: Option<PostingOffsetEntry> = None;
     let mut value_count = 0usize;
 
     for _ in 0..cnt {
@@ -1337,40 +1390,59 @@ fn parse_postings_offset_table(
             )));
         }
         let name = dec.uvarint_str()?;
+        let name_end = orig_len - dec.len();
+        let name_off = u32::try_from(name_end - name.len())
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+        let name_len =
+            u32::try_from(name.len()).map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+
         let value = dec.uvarint_str()?;
+        let val_end = orig_len - dec.len();
+        let val_off = u32::try_from(val_end - value.len())
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+        let val_len = u32::try_from(value.len())
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+
         let _postings_off = dec.uvarint64()?;
 
+        let entry = PostingOffsetEntry {
+            name_off,
+            name_len,
+            val_off,
+            val_len,
+            table_rel_off: rel_off,
+        };
+
         if !result.contains_key(name) {
-            result.insert(name.to_string(), Vec::new());
+            result.insert(name, Vec::new());
             if let Some(prev_name) = last_name.take() {
-                result.get_mut(&prev_name).unwrap().push(PostingOffsetEntry {
-                    value: std::mem::take(&mut last_value),
-                    table_rel_off: last_rel_off,
-                });
+                if let (Some(prev_vec), Some(pending)) =
+                    (result.get_mut(prev_name), last_entry.take())
+                {
+                    prev_vec.push(pending);
+                }
             }
             value_count = 0;
         }
         if value_count.is_multiple_of(SYMBOL_FACTOR) {
-            result.get_mut(name).unwrap().push(PostingOffsetEntry {
-                value: value.to_string(),
-                table_rel_off: rel_off,
-            });
+            if let Some(vec) = result.get_mut(name) {
+                vec.push(entry);
+            }
             last_name = None;
+            last_entry = None;
         } else {
-            last_name = Some(name.to_string());
-            last_value = value.to_string();
-            last_rel_off = rel_off;
+            last_name = Some(name);
+            last_entry = Some(entry);
         }
         value_count += 1;
     }
 
     if let Some(prev_name) = last_name {
-        result.get_mut(&prev_name).unwrap().push(PostingOffsetEntry {
-            value: last_value,
-            table_rel_off: last_rel_off,
-        });
+        if let (Some(prev_vec), Some(pending)) = (result.get_mut(prev_name), last_entry.take()) {
+            prev_vec.push(pending);
+        }
     }
-    Ok(result)
+    Ok(result.into_values().map(Vec::into_boxed_slice).collect())
 }
 
 #[cfg(test)]
@@ -1426,6 +1498,7 @@ mod tests {
             w.close().unwrap();
         }
 
+        assert!(std::mem::size_of::<PostingOffsetEntry>() <= 24);
         let r = IndexReader::open(&idx_path).unwrap();
         assert_eq!(r.version(), INDEX_FORMAT_V2);
         assert_eq!(r.label_names(), vec!["__name__", "job"]);
@@ -1636,5 +1709,97 @@ mod tests {
             let r3 = IndexReader::open(&idx_path3).unwrap();
             assert!(r3.series(p[0]).is_err());
         }
+    }
+
+    #[test]
+    fn index_unsigned_chunk_time_delta_spanning_i64_min_to_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx_path = dir.path().join("index_wide_span");
+        let l = Labels::from_pairs([("__name__", "wide_span")]);
+        let chunks = vec![
+            ChunkMeta {
+                ref_id: 10,
+                min_time: i64::MIN + 1000,
+                max_time: 1_700_000_000_000,
+                chunk: None,
+            },
+            ChunkMeta {
+                ref_id: 20,
+                min_time: i64::MAX - 100,
+                max_time: i64::MAX,
+                chunk: None,
+            },
+        ];
+        {
+            let mut w = IndexWriter::new(&idx_path).unwrap();
+            for s in ["", "__name__", "wide_span"] {
+                w.add_symbol(s).unwrap();
+            }
+            w.add_series(0, &l, &chunks).unwrap();
+            w.close().unwrap();
+        }
+        let r = IndexReader::open(&idx_path).unwrap();
+        let p = r.postings("__name__", &["wide_span"]).unwrap();
+        assert_eq!(p.len(), 1);
+        let (got_lbls, got_chunks) = r.series(p[0]).unwrap();
+        assert_eq!(got_lbls, l);
+        assert_eq!(got_chunks.len(), 2);
+        assert_eq!(got_chunks[0].min_time, i64::MIN + 1000);
+        assert_eq!(got_chunks[0].max_time, 1_700_000_000_000);
+        assert_eq!(got_chunks[1].min_time, i64::MAX - 100);
+        assert_eq!(got_chunks[1].max_time, i64::MAX);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn postings_offset_table_relative_offsets_above_4gib() {
+        let mut payload = Encbuf::new();
+        let records = [
+            ("__name__", "http_requests_total", 100u64),
+            ("job", "api", 200u64),
+            ("job", "db", 300u64),
+        ];
+        payload.put_be32(records.len() as u32);
+        for &(name, val, off) in &records {
+            payload.put_uvarint(2);
+            payload.put_uvarint_str(name);
+            payload.put_uvarint_str(val);
+            payload.put_uvarint64(off);
+        }
+        let payload_bytes = payload.as_slice();
+
+        let entries = parse_postings_offset_table_payload(payload_bytes).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Simulate a >= 4 GiB ULID index file where toc.postings_table + 4 > u32::MAX.
+        let sim_payload_start = (u32::MAX as usize) + 64;
+
+        let e_name = entries[0][0];
+        let (ns, ne) = resolve_posting_str_range(sim_payload_start, e_name.name_off, e_name.name_len);
+        let (vs, ve) = resolve_posting_str_range(sim_payload_start, e_name.val_off, e_name.val_len);
+        assert!(ns > u32::MAX as usize);
+        assert!(vs > u32::MAX as usize);
+        assert_eq!(
+            std::str::from_utf8(&payload_bytes[ns - sim_payload_start..ne - sim_payload_start]).unwrap(),
+            "__name__"
+        );
+        assert_eq!(
+            std::str::from_utf8(&payload_bytes[vs - sim_payload_start..ve - sim_payload_start]).unwrap(),
+            "http_requests_total"
+        );
+
+        let e_job = entries[1][0];
+        let (ns2, ne2) = resolve_posting_str_range(sim_payload_start, e_job.name_off, e_job.name_len);
+        let (vs2, ve2) = resolve_posting_str_range(sim_payload_start, e_job.val_off, e_job.val_len);
+        assert!(ns2 > u32::MAX as usize);
+        assert!(vs2 > u32::MAX as usize);
+        assert_eq!(
+            std::str::from_utf8(&payload_bytes[ns2 - sim_payload_start..ne2 - sim_payload_start]).unwrap(),
+            "job"
+        );
+        assert_eq!(
+            std::str::from_utf8(&payload_bytes[vs2 - sim_payload_start..ve2 - sim_payload_start]).unwrap(),
+            "api"
+        );
     }
 }
