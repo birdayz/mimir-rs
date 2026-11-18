@@ -99,19 +99,23 @@ fn replication_set_changed_without_state_or_addr(
     if p.instances.len() != curr.instances.len() {
         return true;
     }
-    let mut p_ids: Vec<(&str, &[u32], &str)> = p
-        .instances
-        .iter()
-        .map(|i| (i.id.as_str(), i.tokens.as_slice(), i.zone.as_str()))
-        .collect();
-    let mut c_ids: Vec<(&str, &[u32], &str)> = curr
-        .instances
-        .iter()
-        .map(|i| (i.id.as_str(), i.tokens.as_slice(), i.zone.as_str()))
-        .collect();
-    p_ids.sort_unstable();
-    c_ids.sort_unstable();
-    p_ids != c_ids
+    let mut p_insts: Vec<_> = p.instances.iter().collect();
+    let mut c_insts: Vec<_> = curr.instances.iter().collect();
+    p_insts.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+    c_insts.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+    for (a, b) in p_insts.into_iter().zip(c_insts) {
+        if a.id != b.id
+            || a.tokens != b.tokens
+            || a.zone != b.zone
+            || a.registered_timestamp != b.registered_timestamp
+            || a.read_only != b.read_only
+            || a.read_only_updated_timestamp != b.read_only_updated_timestamp
+            || a.versions != b.versions
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl OwnedSeriesRingStrategy for OwnedSeriesIngesterRingStrategy {

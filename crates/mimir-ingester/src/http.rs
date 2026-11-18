@@ -640,6 +640,7 @@ async fn shutdown_handler(AxumState(st): AxumState<HttpState>) -> Response {
             crate::activity::ActivityRequest::None,
         )
     });
+    let _shutdown_guard = st.ingester.shutdown_mtx.lock().await;
     let orig_ing_flush = st
         .ingester
         .flush_on_shutdown

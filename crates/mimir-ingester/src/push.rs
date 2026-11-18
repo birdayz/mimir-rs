@@ -444,10 +444,12 @@ pub(crate) fn convert_borrowed_histogram(h: &BorrowedHistogramView<'_>) -> Conve
         };
         let zero_count = match h.zero_count() {
             Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(v)) => v,
-            Some(cortexpb::histogram::ZeroCount::ZeroCountInt(v)) => v as f64,
-            None => 0.0,
+            Some(cortexpb::histogram::ZeroCount::ZeroCountInt(_)) | None => 0.0,
         };
-        let buckets = h.positive_counts().len() + h.negative_counts().len();
+        let buckets = h.positive_counts().len()
+            + h.negative_counts().len()
+            + h.positive_deltas().len()
+            + h.negative_deltas().len();
         let fh = FloatHistogram {
             counter_reset_hint: hint,
             schema: h.schema(),
@@ -470,10 +472,12 @@ pub(crate) fn convert_borrowed_histogram(h: &BorrowedHistogramView<'_>) -> Conve
         };
         let zero_count = match h.zero_count() {
             Some(cortexpb::histogram::ZeroCount::ZeroCountInt(v)) => v,
-            Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(v)) => v as u64,
-            None => 0,
+            Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(_)) | None => 0,
         };
-        let buckets = h.positive_deltas().len() + h.negative_deltas().len();
+        let buckets = h.positive_counts().len()
+            + h.negative_counts().len()
+            + h.positive_deltas().len()
+            + h.negative_deltas().len();
         let ih = Histogram {
             counter_reset_hint: hint,
             schema: h.schema(),
@@ -582,10 +586,12 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
             };
             let zero_count = match h.zero_count {
                 Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(v)) => v,
-                Some(cortexpb::histogram::ZeroCount::ZeroCountInt(v)) => v as f64,
-                None => 0.0,
+                Some(cortexpb::histogram::ZeroCount::ZeroCountInt(_)) | None => 0.0,
             };
-            let buckets = h.positive_counts.len() + h.negative_counts.len();
+            let buckets = h.positive_counts.len()
+                + h.negative_counts.len()
+                + h.positive_deltas.len()
+                + h.negative_deltas.len();
             let fh = FloatHistogram {
                 counter_reset_hint: hint,
                 schema: h.schema,
@@ -608,10 +614,12 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
             };
             let zero_count = match h.zero_count {
                 Some(cortexpb::histogram::ZeroCount::ZeroCountInt(v)) => v,
-                Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(v)) => v as u64,
-                None => 0,
+                Some(cortexpb::histogram::ZeroCount::ZeroCountFloat(_)) | None => 0,
             };
-            let buckets = h.positive_deltas.len() + h.negative_deltas.len();
+            let buckets = h.positive_counts.len()
+                + h.negative_counts.len()
+                + h.positive_deltas.len()
+                + h.negative_deltas.len();
             let ih = Histogram {
                 counter_reset_hint: hint,
                 schema: h.schema,
@@ -972,6 +980,26 @@ impl Ingester {
         self.push_grpc_raw_inner(user_id, raw_bytes).await
     }
 
+    /// Validates classic gRPC Push wire bytes without ingesting, matching Go's
+    /// `dec(in) -> tenant interceptor` order when tenant metadata is absent or invalid.
+    pub fn validate_grpc_push_wire(&self, raw_bytes: &[u8]) -> Result<(), IngesterError> {
+        let mut wr_scratch = mimir_proto::zerocopy::WriteRequestScratch::new();
+        let mut label_bytes_arena = Vec::new();
+        let mut samples_arena = Vec::new();
+        mimir_proto::zerocopy::decode_classic_stream(
+            raw_bytes,
+            mimir_proto::zerocopy::DecodeOptions::classic(),
+            &mut wr_scratch,
+            &mut label_bytes_arena,
+            &mut samples_arena,
+            |_| {},
+        )
+        .map(|_| ())
+        .map_err(|e| IngesterError::Internal {
+            message: format!("grpc: failed to unmarshal the received message: {e}"),
+        })
+    }
+
     async fn push_grpc_raw_inner(
         self: &Arc<Self>,
         user_id: &str,
@@ -1128,26 +1156,9 @@ impl Ingester {
 
             let header = match stream_res {
                 Ok(h) => h,
-                Err(
-                    mimir_proto::zerocopy::DecodeError::UnexpectedRw2Timeseries
-                    | mimir_proto::zerocopy::DecodeError::UnexpectedRw2Symbols,
-                ) => {
-                    histograms_arena.clear();
-                    exemplars_arena.clear();
-                    series_metas.clear();
-                    let borrowed = mimir_proto::zerocopy::decode_write_request(
-                        raw_bytes,
-                        mimir_proto::zerocopy::DecodeOptions::rw2(),
-                        wr_scratch,
-                    )
-                    .map_err(|e| IngesterError::BadRequest {
-                        message: e.to_string(),
-                    })?;
-                    return self.push_borrowed_inner(user_id, &borrowed);
-                }
                 Err(e) => {
-                    return Err(IngesterError::BadRequest {
-                        message: e.to_string(),
+                    return Err(IngesterError::Internal {
+                        message: format!("grpc: failed to unmarshal the received message: {e}"),
                     });
                 }
             };
@@ -1170,6 +1181,8 @@ impl Ingester {
 
             let source = cortexpb::write_request::SourceEnum::try_from(header.source)
                 .unwrap_or(cortexpb::write_request::SourceEnum::Api);
+            let _skip_label_validation = header.skip_label_validation;
+            let _skip_label_count_validation = header.skip_label_count_validation;
 
             let mut items: Vec<PrehashedSeriesItem<'_>> = Vec::with_capacity(ts_len);
             for m in series_metas.iter() {
@@ -1678,12 +1691,21 @@ impl Ingester {
         };
 
         let head = db.db.head();
-        let user_series_limit = db.limiter.max_series_per_user(user_id, 0);
+        let (cur_series_count, min_local_limit) = db.get_series_count_and_min_local_limit();
+        let user_series_limit = db.limiter.max_series_per_user(user_id, min_local_limit);
         let metric_series_limit = db.limiter.max_series_per_metric(user_id);
-        let may_cross_user_limit = user_series_limit < usize::MAX
-            && (head.num_series() as usize).saturating_add(items.len()) > user_series_limit;
-        let may_cross_metric_limit = metric_series_limit < usize::MAX;
-        if !head.initialized() || may_cross_user_limit || may_cross_metric_limit {
+        let may_cross_user_limit = user_series_limit < i32::MAX as usize
+            && cur_series_count.saturating_add(items.len()) > user_series_limit;
+        let may_cross_metric_limit = metric_series_limit < i32::MAX as usize;
+        let has_cost_attribution = self
+            .cost_attribution_manager()
+            .and_then(|m| m.sample_tracker(user_id))
+            .is_some();
+        if !head.initialized()
+            || may_cross_user_limit
+            || may_cross_metric_limit
+            || has_cost_attribution
+        {
             return self.ingest_prehashed_shard_batch_with_lock(
                 user_id,
                 &db,
@@ -1692,6 +1714,7 @@ impl Ingester {
                 items,
             );
         }
+        let verify_ownership = self.verify_ring_ownership.load(Ordering::Relaxed);
 
         let min_append_time_available = head.initialized();
         let min_append_time = head.appendable_min_valid_time();
@@ -1858,6 +1881,21 @@ impl Ingester {
                         None
                     };
                 let mut series_ref = series_entry.as_ref().map(|e| e.ref_id);
+                if series_ref.is_none()
+                    && verify_ownership
+                    && !self.check_ring_ownership_iter(user_id, iter_stringlabels(encoded_labels))
+                {
+                    hard_err = Some(
+                        IngesterError::Internal {
+                            message: format!(
+                                "series {} is not owned by this ingester",
+                                make_series_str(encoded_labels)
+                            ),
+                        }
+                        .with_user(user_id, 0),
+                    );
+                    break;
+                }
 
                 let prev_succeeded = stats.succeeded_samples;
                 let mut created_ts = item.created_timestamp;
