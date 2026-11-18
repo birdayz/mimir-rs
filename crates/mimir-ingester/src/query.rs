@@ -4282,9 +4282,56 @@ pub type LabelValueCountFn =
 /// Values are split into `chunk_size` chunks, each submitted to the shared pool on behalf of
 /// `tenant_id`. Results arrive in completion order; the receiver ends once every submitted chunk
 /// has finished. Submission stops at the first cancellation (`context canceled`) or pool error.
+fn submit_label_values_chunk(
+    pool: &ComputeWorkerPool,
+    tenant_id: &str,
+    lbl_values: &Arc<Vec<String>>,
+    range: std::ops::Range<usize>,
+    is_canceled: &Arc<dyn Fn() -> bool + Send + Sync>,
+    count_fn: &LabelValueCountFn,
+    tx: &mpsc::Sender<LabelValueCountResult>,
+) -> bool {
+    let (values, cancel, count_fn, tx_c) = (
+        Arc::clone(lbl_values),
+        Arc::clone(is_canceled),
+        Arc::clone(count_fn),
+        tx.clone(),
+    );
+    pool.submit(DIMENSION_LABEL_VALUES_SERIES_COUNT, tenant_id, move || {
+        for v in &values[range] {
+            let res = if cancel() {
+                Err(LabelNamesAndValuesError::Canceled)
+            } else {
+                count_fn(v)
+            };
+            let msg = match res {
+                Ok(count) => LabelValueCountResult {
+                    val: v.clone(),
+                    count,
+                    err: None,
+                },
+                Err(err) => LabelValueCountResult {
+                    val: v.clone(),
+                    count: 0,
+                    err: Some(err),
+                },
+            };
+            if tx_c.blocking_send(msg).is_err() {
+                break;
+            }
+        }
+    })
+    .is_ok()
+}
+
+/// Go: `computeLabelValuesSeriesCount`, generic over the per-value counting function.
+///
+/// Values are split into `chunk_size` chunks, each submitted to the shared pool on behalf of
+/// `tenant_id`. Results arrive in completion order; the receiver ends once every submitted chunk
+/// has finished. Submission stops at the first cancellation (`context canceled`) or pool error.
 pub fn compute_label_values_counts(
     is_canceled: Arc<dyn Fn() -> bool + Send + Sync>,
-    pool: &ComputeWorkerPool,
+    pool: &Arc<ComputeWorkerPool>,
     tenant_id: &str,
     chunk_size: usize,
     lbl_values: Arc<Vec<String>>,
@@ -4296,56 +4343,82 @@ pub fn compute_label_values_counts(
     if lbl_values.is_empty() {
         return rx;
     }
-    let mut start = 0usize;
-    while start < lbl_values.len() {
-        if is_canceled() {
-            let _ = tx.try_send(LabelValueCountResult {
-                val: String::new(),
-                count: 0,
-                err: Some(LabelNamesAndValuesError::Canceled),
-            });
-            return rx;
-        }
-        let end = (start + chunk_size).min(lbl_values.len());
-        let (values, cancel, count_fn, tx_c) = (
-            Arc::clone(&lbl_values),
-            Arc::clone(&is_canceled),
-            Arc::clone(&count_fn),
-            tx.clone(),
-        );
-        let submitted = pool.submit(DIMENSION_LABEL_VALUES_SERIES_COUNT, tenant_id, move || {
-            for v in &values[start..end] {
-                let res = if cancel() {
-                    Err(LabelNamesAndValuesError::Canceled)
-                } else {
-                    count_fn(v)
-                };
-                let msg = match res {
-                    Ok(count) => LabelValueCountResult {
-                        val: v.clone(),
-                        count,
-                        err: None,
-                    },
-                    Err(err) => LabelValueCountResult {
-                        val: v.clone(),
-                        count: 0,
-                        err: Some(err),
-                    },
-                };
-                if tx_c.blocking_send(msg).is_err() {
-                    break;
+    let pool = Arc::clone(pool);
+    let tenant_id = tenant_id.to_string();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let mut start = 0usize;
+            while start < lbl_values.len() {
+                if tx.is_closed() {
+                    return;
                 }
+                if is_canceled() {
+                    let _ = tx
+                        .send(LabelValueCountResult {
+                            val: String::new(),
+                            count: 0,
+                            err: Some(LabelNamesAndValuesError::Canceled),
+                        })
+                        .await;
+                    return;
+                }
+                let end = (start + chunk_size).min(lbl_values.len());
+                if !submit_label_values_chunk(
+                    &pool,
+                    &tenant_id,
+                    &lbl_values,
+                    start..end,
+                    &is_canceled,
+                    &count_fn,
+                    &tx,
+                ) {
+                    let _ = tx
+                        .send(LabelValueCountResult {
+                            val: String::new(),
+                            count: 0,
+                            err: Some(LabelNamesAndValuesError::PoolStopped),
+                        })
+                        .await;
+                    return;
+                }
+                start = end;
             }
         });
-        if submitted.is_err() {
-            let _ = tx.try_send(LabelValueCountResult {
-                val: String::new(),
-                count: 0,
-                err: Some(LabelNamesAndValuesError::PoolStopped),
-            });
-            return rx;
-        }
-        start = end;
+    } else {
+        std::thread::spawn(move || {
+            let mut start = 0usize;
+            while start < lbl_values.len() {
+                if tx.is_closed() {
+                    return;
+                }
+                if is_canceled() {
+                    let _ = tx.blocking_send(LabelValueCountResult {
+                        val: String::new(),
+                        count: 0,
+                        err: Some(LabelNamesAndValuesError::Canceled),
+                    });
+                    return;
+                }
+                let end = (start + chunk_size).min(lbl_values.len());
+                if !submit_label_values_chunk(
+                    &pool,
+                    &tenant_id,
+                    &lbl_values,
+                    start..end,
+                    &is_canceled,
+                    &count_fn,
+                    &tx,
+                ) {
+                    let _ = tx.blocking_send(LabelValueCountResult {
+                        val: String::new(),
+                        count: 0,
+                        err: Some(LabelNamesAndValuesError::PoolStopped),
+                    });
+                    return;
+                }
+                start = end;
+            }
+        });
     }
     rx
 }
@@ -4354,7 +4427,7 @@ pub fn compute_label_values_counts(
 #[allow(clippy::too_many_arguments)]
 pub fn compute_label_values_series_count(
     is_canceled: Arc<dyn Fn() -> bool + Send + Sync>,
-    pool: &ComputeWorkerPool,
+    pool: &Arc<ComputeWorkerPool>,
     tenant_id: &str,
     chunk_size: usize,
     lbl_name: String,
@@ -4973,5 +5046,147 @@ mod tests {
             active_count += resp.unwrap().metric.len();
         }
         assert_eq!(active_count, 2);
+    }
+
+    async fn single_worker_thread_id(pool: &ComputeWorkerPool) -> std::thread::ThreadId {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pool.submit("probe", "probe", move || {
+            let _ = tx.send(std::thread::current().id());
+        })
+        .unwrap();
+        rx.await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compute_label_values_counts_does_not_drop_errors_when_channel_is_full() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        // Case 1: Canceled after all 64 channel slots are already occupied.
+        {
+            let pool = Arc::new(ComputeWorkerPool::new(1, "test-full-cancel", None).unwrap());
+            pool.start().unwrap();
+            let worker_tid = single_worker_thread_id(&pool).await;
+            let lbl_values: Vec<String> = (0..80).map(|i| i.to_string()).collect();
+            let entered = Arc::new(AtomicUsize::new(0));
+            let checks = Arc::new(AtomicUsize::new(0));
+            let canceled = Arc::new(AtomicBool::new(false));
+
+            let entered_c = Arc::clone(&entered);
+            let count_fn: LabelValueCountFn = Arc::new(move |_| {
+                entered_c.fetch_add(1, Ordering::AcqRel);
+                Ok(1)
+            });
+
+            let checks_c = Arc::clone(&checks);
+            let entered_chk = Arc::clone(&entered);
+            let canceled_c = Arc::clone(&canceled);
+            let is_canceled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                if std::thread::current().id() == worker_tid {
+                    return canceled_c.load(Ordering::Acquire);
+                }
+                if canceled_c.load(Ordering::Acquire) {
+                    return true;
+                }
+                let n = checks_c.fetch_add(1, Ordering::AcqRel) + 1;
+                if n == 66 {
+                    // Item 64 only enters count_fn after items 0..63 are pushed into tx.
+                    while entered_chk.load(Ordering::Acquire) < 65 {
+                        std::thread::yield_now();
+                    }
+                    canceled_c.store(true, Ordering::Release);
+                    return true;
+                }
+                false
+            });
+
+            let mut rx = compute_label_values_counts(
+                is_canceled,
+                &pool,
+                "t1",
+                1,
+                Arc::new(lbl_values),
+                count_fn,
+            );
+            while !canceled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+
+            let mut saw_canceled = false;
+            let mut ok_count = 0usize;
+            while let Some(res) = rx.recv().await {
+                match res.err {
+                    None => ok_count += 1,
+                    Some(LabelNamesAndValuesError::Canceled) => saw_canceled = true,
+                    Some(other) => panic!("unexpected error: {other:?}"),
+                }
+            }
+            assert!(ok_count >= 64, "expected channel to have been saturated: {ok_count}");
+            assert!(saw_canceled, "Canceled error must not be dropped when channel is full");
+            pool.stop();
+        }
+
+        // Case 2: PoolStopped after all 64 channel slots are already occupied.
+        {
+            let pool = Arc::new(ComputeWorkerPool::new(1, "test-full-stop", None).unwrap());
+            pool.start().unwrap();
+            let worker_tid = single_worker_thread_id(&pool).await;
+            let lbl_values: Vec<String> = (0..80).map(|i| i.to_string()).collect();
+            let entered = Arc::new(AtomicUsize::new(0));
+            let checks = Arc::new(AtomicUsize::new(0));
+            let stopped_triggered = Arc::new(AtomicBool::new(false));
+
+            let entered_c = Arc::clone(&entered);
+            let count_fn: LabelValueCountFn = Arc::new(move |_| {
+                entered_c.fetch_add(1, Ordering::AcqRel);
+                Ok(1)
+            });
+
+            let checks_c = Arc::clone(&checks);
+            let entered_chk = Arc::clone(&entered);
+            let pool_c = Arc::clone(&pool);
+            let stopped_c = Arc::clone(&stopped_triggered);
+            let is_canceled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                if std::thread::current().id() == worker_tid {
+                    return false;
+                }
+                let n = checks_c.fetch_add(1, Ordering::AcqRel) + 1;
+                if n == 66 {
+                    while entered_chk.load(Ordering::Acquire) < 65 {
+                        std::thread::yield_now();
+                    }
+                    let pool_stop = Arc::clone(&pool_c);
+                    std::thread::spawn(move || pool_stop.stop());
+                    while pool_c.submit("probe", "t2", || {}).is_ok() {
+                        std::thread::yield_now();
+                    }
+                    stopped_c.store(true, Ordering::Release);
+                }
+                false
+            });
+
+            let mut rx = compute_label_values_counts(
+                is_canceled,
+                &pool,
+                "t1",
+                1,
+                Arc::new(lbl_values),
+                count_fn,
+            );
+            while !stopped_triggered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+
+            let mut saw_pool_stopped = false;
+            let mut ok_count = 0usize;
+            while let Some(res) = rx.recv().await {
+                match res.err {
+                    None => ok_count += 1,
+                    Some(LabelNamesAndValuesError::PoolStopped) => saw_pool_stopped = true,
+                    Some(other) => panic!("unexpected error: {other:?}"),
+                }
+            }
+            assert!(ok_count >= 64, "expected channel to have been saturated: {ok_count}");
+            assert!(saw_pool_stopped, "PoolStopped error must not be dropped when channel is full");
+        }
     }
 }

@@ -4631,7 +4631,7 @@ mod tests {
         // Build a single Histogram with 20,000 interleaved unpacked neg_deltas (tag 9)
         // and pos_deltas (tag 12) + interleaved neg_counts (tag 10), pos_counts (tag 13),
         // custom_values (tag 16), and neg_spans (tag 8) / pos_spans (tag 11).
-        let pairs = 20_000usize;
+        let pairs = if cfg!(miri) { 64usize } else { 20_000usize };
         let mut hist_bytes = Vec::with_capacity(pairs * 10);
         // tag 4 (schema = 0): 0x20 0x00
         hist_bytes.extend_from_slice(&[0x20, 0x00]);
@@ -4676,9 +4676,9 @@ mod tests {
         let h = ts0.histograms().next().unwrap();
         assert_eq!(h.negative_deltas().len(), pairs);
         assert_eq!(h.positive_deltas().len(), pairs);
-        assert_eq!(h.negative_counts().len(), pairs / 100);
-        assert_eq!(h.positive_counts().len(), pairs / 100);
-        assert_eq!(h.custom_values().len(), pairs / 100);
+        assert_eq!(h.negative_counts().len(), pairs.div_ceil(100));
+        assert_eq!(h.positive_counts().len(), pairs.div_ceil(100));
+        assert_eq!(h.custom_values().len(), pairs.div_ceil(100));
         assert!(h.negative_deltas().iter().all(|&d| d == 1));
         assert!(h.positive_deltas().iter().all(|&d| d == 2));
 
@@ -4700,11 +4700,13 @@ mod tests {
         )
         .expect("decode_classic_stream");
         assert_eq!(count, 1);
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "interleaved histogram decode took {:?}",
-            start.elapsed()
-        );
+        if !cfg!(miri) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "interleaved histogram decode took {:?}",
+                start.elapsed()
+            );
+        }
     }
 
     #[test]

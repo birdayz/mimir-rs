@@ -182,7 +182,7 @@ pub struct Ingester {
 
     state: RwLock<State>,
     service_ctx: RwLock<Option<ServiceContext>>,
-    startup_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    startup_handle: Mutex<Option<JoinHandle<()>>>,
     startup_done_tx: tokio::sync::watch::Sender<Option<Result<(), String>>>,
     _startup_done_rx: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
     stop_done_tx: tokio::sync::watch::Sender<Option<Result<(), String>>>,
@@ -519,7 +519,7 @@ impl Ingester {
             ignored_series_limit_metrics,
             state: RwLock::new(State::New),
             service_ctx: RwLock::new(None),
-            startup_handle: tokio::sync::Mutex::new(None),
+            startup_handle: Mutex::new(None),
             startup_done_tx,
             _startup_done_rx,
             stop_done_tx,
@@ -1443,16 +1443,13 @@ impl Ingester {
         self: &Arc<Self>,
         ctx: ServiceContext,
     ) -> Result<(), IngesterError> {
-        {
-            let mut st = self.state.write();
-            if *st != State::New {
-                return Err(IngesterError::Internal {
-                    message: format!("invalid ingester state on start: {}", *st),
-                });
-            }
-            *st = State::Starting;
+        let mut st = self.state.write();
+        if *st != State::New {
+            return Err(IngesterError::Internal {
+                message: format!("invalid ingester state on start: {}", *st),
+            });
         }
-
+        *st = State::Starting;
         self.startup_done_tx.send_replace(None);
         *self.service_ctx.write() = Some(ctx.clone());
 
@@ -1481,7 +1478,7 @@ impl Ingester {
                 res.as_ref().map(|&()| ()).map_err(ToString::to_string),
             ));
         });
-        *self.startup_handle.lock().await = Some(handle);
+        *self.startup_handle.lock() = Some(handle);
         Ok(())
     }
 
@@ -1520,6 +1517,10 @@ impl Ingester {
         let res = self.run_starting_inner(&ctx).await;
         if let Err(ref _e) = res {
             ctx.cancel();
+            let reader_opt = self.ingest_reader.write().take();
+            if let Some(r) = reader_opt {
+                r.stop().await;
+            }
             let lc_svc_opt = self.lifecycler_svc.lock().clone();
             if let Some(svc) = lc_svc_opt {
                 svc.stop_async();
@@ -1855,7 +1856,10 @@ impl Ingester {
             }
         }
 
-        *self.state.write() = State::Running;
+        let mut st = self.state.write();
+        if *st == State::Starting {
+            *st = State::Running;
+        }
         Ok(())
     }
 
@@ -1881,41 +1885,43 @@ impl Ingester {
             }
         };
 
-        if !should_run_stop {
-            loop {
-                if let Some(res) = rx.borrow_and_update().clone() {
-                    return res.map_err(|message| IngesterError::Internal { message });
+        if should_run_stop {
+            let ing = Arc::clone(self);
+            tokio::spawn(async move {
+                struct StopDoneGuard {
+                    tx: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+                    sent: bool,
                 }
-                if rx.changed().await.is_err() {
-                    return Ok(());
+                impl Drop for StopDoneGuard {
+                    fn drop(&mut self) {
+                        if !self.sent {
+                            self.tx.send_replace(Some(Err(
+                                "ingester stop aborted before completion".to_string(),
+                            )));
+                        }
+                    }
                 }
-            }
+                let mut stop_guard = StopDoneGuard {
+                    tx: ing.stop_done_tx.clone(),
+                    sent: false,
+                };
+
+                let res = ing.stop_inner().await;
+                stop_guard.sent = true;
+                ing.stop_done_tx.send_replace(Some(
+                    res.as_ref().map(|&()| ()).map_err(ToString::to_string),
+                ));
+            });
         }
 
-        struct StopDoneGuard {
-            tx: tokio::sync::watch::Sender<Option<Result<(), String>>>,
-            sent: bool,
-        }
-        impl Drop for StopDoneGuard {
-            fn drop(&mut self) {
-                if !self.sent {
-                    self.tx.send_replace(Some(Err(
-                        "ingester stop aborted before completion".to_string(),
-                    )));
-                }
+        loop {
+            if let Some(res) = rx.borrow_and_update().clone() {
+                return res.map_err(|message| IngesterError::Internal { message });
+            }
+            if rx.changed().await.is_err() {
+                return Ok(());
             }
         }
-        let mut stop_guard = StopDoneGuard {
-            tx: self.stop_done_tx.clone(),
-            sent: false,
-        };
-
-        let res = self.stop_inner().await;
-        stop_guard.sent = true;
-        self.stop_done_tx.send_replace(Some(
-            res.as_ref().map(|&()| ()).map_err(ToString::to_string),
-        ));
-        res
     }
 
     async fn stop_inner(self: &Arc<Self>) -> Result<(), IngesterError> {
@@ -1934,7 +1940,7 @@ impl Ingester {
         }
 
         let startup_res = {
-            let handle_opt = self.startup_handle.lock().await.take();
+            let handle_opt = self.startup_handle.lock().take();
             if let Some(handle) = handle_opt {
                 match handle.await {
                     Ok(()) => match self.startup_done_tx.borrow().clone() {
@@ -1986,7 +1992,10 @@ impl Ingester {
             let _ = svc.await_terminated().await;
         }
 
-        let _ = self.ingest_reader.write().take();
+        let reader_opt = self.ingest_reader.write().take();
+        if let Some(r) = reader_opt {
+            r.stop().await;
+        }
 
         // 6. Remove shutdown marker only if startup succeeded (so a canceled/failed startup that
         // never flushed preserves the marker for the next restart).
