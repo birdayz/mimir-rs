@@ -352,6 +352,8 @@ impl MultiKv {
         codec: &Arc<dyn Codec>,
         bytes: Vec<u8>,
     ) {
+        let deadline = (!self.mirror_timeout.is_zero())
+            .then(|| tokio::time::Instant::now() + self.mirror_timeout);
         let bytes = Arc::new(bytes);
         for kv in &self.clients {
             if kv.name == primary.name {
@@ -361,17 +363,16 @@ impl MultiKv {
             let (b, c) = (Arc::clone(&bytes), Arc::clone(codec));
             let sec_cb: CasFn = Box::new(move |_| {
                 c.decode(&b)
-                    .map(CasOutcome::Update)
+                    .map(CasOutcome::UpdateOnce)
                     .map_err(CasCallbackError::fatal)
             });
             let fut = kv.client.cas(key, sec_cb);
-            let r = if !self.mirror_timeout.is_zero() {
-                match tokio::time::timeout(self.mirror_timeout, fut).await {
+            let r = match deadline {
+                Some(dl) => match tokio::time::timeout_at(dl, fut).await {
                     Ok(r) => r,
                     Err(_) => Err(KvError::Other("context deadline exceeded".to_string())),
-                }
-            } else {
-                fut.await
+                },
+                None => fut.await,
             };
             match r {
                 Err(err) => {
@@ -423,21 +424,22 @@ impl MultiKv {
         if res.is_ok() && self.mirroring_enabled.load(Ordering::Acquire) {
             let maybe_val = last_written.lock().take();
             if let Some(val) = maybe_val {
+                let deadline = (!self.mirror_timeout.is_zero())
+                    .then(|| tokio::time::Instant::now() + self.mirror_timeout);
                 for kv in &self.clients {
                     if kv.name == primary.name {
                         continue;
                     }
                     self.metrics.mirror_writes.inc();
                     let v_clone = val.clone();
-                    let sec_cb: CasFn = Box::new(move |_| Ok(CasOutcome::Update(Box::new(v_clone.clone()))));
+                    let sec_cb: CasFn = Box::new(move |_| Ok(CasOutcome::UpdateOnce(Box::new(v_clone.clone()))));
                     let fut = kv.client.cas(key, sec_cb);
-                    let r = if !self.mirror_timeout.is_zero() {
-                        match tokio::time::timeout(self.mirror_timeout, fut).await {
+                    let r = match deadline {
+                        Some(dl) => match tokio::time::timeout_at(dl, fut).await {
                             Ok(r) => r,
                             Err(_) => Err(KvError::Other("mirror write timeout".to_string())),
-                        }
-                    } else {
-                        fut.await
+                        },
+                        None => fut.await,
                     };
                     if let Err(err) = r {
                         self.metrics.mirror_failures.inc();
@@ -492,8 +494,9 @@ impl KvClient for MultiKv {
 
             // Go keeps the last value returned by `f` and, if mirroring is enabled after a
             // successful CAS, writes it to every secondary. Values are `Box<dyn Any>` here, so
-            // the value is captured in its codec encoding (only when it can be mirrored).
-            let Some(codec) = self.codec.clone().filter(|_| self.mirroring_enabled()) else {
+            // capture the encoded bytes whenever a codec is available (even if mirroring flips
+            // false -> true while primary CAS is in flight).
+            let Some(codec) = self.codec.clone() else {
                 return primary.client.cas(key, f).await;
             };
             let updated: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
@@ -502,13 +505,15 @@ impl KvClient for MultiKv {
             let wrapped: CasFn = Box::new(move |cur| {
                 let out = f(cur);
                 *updated_cb.lock() = match &out {
-                    Ok(CasOutcome::Update(v)) => match cb_codec.encode(v.as_ref()) {
-                        Ok(b) => Some(b),
-                        Err(err) => {
-                            warn!(component = "multikv", %err, "failed to encode value for mirroring");
-                            None
+                    Ok(CasOutcome::Update(v) | CasOutcome::UpdateOnce(v)) => {
+                        match cb_codec.encode(v.as_ref()) {
+                            Ok(b) => Some(b),
+                            Err(err) => {
+                                warn!(component = "multikv", %err, "failed to encode value for mirroring");
+                                None
+                            }
                         }
-                    },
+                    }
                     _ => None,
                 };
                 out
@@ -622,5 +627,132 @@ impl KvClient for MultiKv {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv::inmemory::InMemoryKv;
+    use crate::kv::memberlist::{MemberlistKv, MemberlistKvClient};
+    use crate::kv::StringCodec;
+    use mimir_config::server::MemberlistConfig;
+    use mimir_config::GoDuration;
+    use mimir_proto::ringpb::{Desc, InstanceDesc, InstanceState};
+
+    #[tokio::test]
+    async fn multi_kv_memberlist_secondary_zero_stall_and_mid_cas_mirror_toggle() {
+        let codec: Arc<dyn Codec> = crate::ring::model::ring_desc_codec();
+        let primary = Arc::new(InMemoryKv::new(Arc::clone(&codec)));
+
+        let ml_cfg = MemberlistConfig {
+            bind_addr: vec!["127.0.0.1".to_string()],
+            bind_port: 0,
+            node_name: "multi-ml-sec".to_string(),
+            randomize_node_name: false,
+            ..Default::default()
+        };
+        let ml = MemberlistKv::start(ml_cfg, vec![Arc::clone(&codec)], "test", None)
+            .await
+            .unwrap();
+        let secondary: Arc<dyn KvClient> =
+            Arc::new(MemberlistKvClient::new(Arc::clone(&ml), Arc::clone(&codec)).unwrap());
+
+        let mut multi_cfg = MultiKVConfig::default();
+        multi_cfg.primary = "inmemory".to_string();
+        multi_cfg.secondary = "memberlist".to_string();
+        multi_cfg.mirror_enabled = true;
+        multi_cfg.mirror_timeout = GoDuration::from_secs(5);
+
+        let multi = MultiKv::with_registerer_and_options(
+            multi_cfg,
+            vec![
+                NamedKvClient {
+                    name: "inmemory".to_string(),
+                    client: Arc::clone(&primary) as Arc<dyn KvClient>,
+                },
+                NamedKvClient {
+                    name: "memberlist".to_string(),
+                    client: Arc::clone(&secondary),
+                },
+            ],
+            Some(Arc::clone(&codec)),
+            None,
+            None,
+        );
+
+        let mut d = Desc::default();
+        d.ingesters.insert(
+            "ing-1".to_string(),
+            InstanceDesc {
+                id: "ing-1".to_string(),
+                addr: "127.0.0.1:9095".to_string(),
+                timestamp: 1000,
+                state: InstanceState::Active as i32,
+                tokens: vec![1, 2, 3],
+                ..Default::default()
+            },
+        );
+
+        // Pre-seed secondary with identical state so secondary merge produces new_ver == 0.
+        let d_sec = d.clone();
+        secondary
+            .cas("ring", Box::new(move |_| Ok(CasOutcome::Update(Box::new(d_sec.clone())))))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let d_pri = d.clone();
+        multi
+            .cas("ring", Box::new(move |_| Ok(CasOutcome::Update(Box::new(d_pri.clone())))))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "MultiKv::cas stalled {:?} on memberlist secondary no-change",
+            started.elapsed()
+        );
+
+        // Now test mid-CAS mirror_enabled false -> true toggle!
+        let multi_rc = MultiKv::with_registerer_and_options(
+            MultiKVConfig {
+                primary: "inmemory".to_string(),
+                secondary: "memberlist".to_string(),
+                mirror_enabled: false,
+                mirror_timeout: GoDuration::from_secs(2),
+            },
+            vec![
+                NamedKvClient {
+                    name: "inmemory".to_string(),
+                    client: Arc::new(InMemoryKv::new(Arc::new(StringCodec))),
+                },
+                NamedKvClient {
+                    name: "memberlist".to_string(),
+                    client: Arc::new(InMemoryKv::new(Arc::new(StringCodec))),
+                },
+            ],
+            Some(Arc::new(StringCodec)),
+            None,
+            None,
+        );
+        let multi_rc_cb = Arc::clone(&multi_rc);
+        multi_rc
+            .cas(
+                "k",
+                Box::new(move |_| {
+                    multi_rc_cb
+                        .apply_runtime_config(MultiRuntimeConfig {
+                            primary_store: String::new(),
+                            mirroring: Some(true),
+                        })
+                        .unwrap();
+                    Ok(CasOutcome::Update(Box::new("hello".to_string())))
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(multi_rc.metrics.mirror_writes.get(), 1.0);
+
+        ml.shutdown().await;
     }
 }

@@ -130,9 +130,12 @@ impl PartitionRingWatcher {
         &self,
         desc: PartitionRingDesc,
     ) -> Result<(), PartitionRingError> {
-        let new_ring = PartitionRing::with_options(desc.clone(), self.opts.clone())?;
+        let mut new_ring = PartitionRing::with_options(desc.clone(), self.opts.clone())?;
         let old_ring = {
             let mut guard = self.ring.lock();
+            if let Some(nr) = Arc::get_mut(&mut new_ring) {
+                nr.inherit_shards(&guard);
+            }
             let old = guard.clone();
             *guard = new_ring.clone();
             old
@@ -242,5 +245,69 @@ impl PartitionRingWatcher {
             None,
         )
         .with_name("partitions-ring-watcher")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv::inmemory::InMemoryKv;
+    use crate::partition_ring::model::partition_ring_desc_codec;
+    use mimir_proto::ringpb::{OwnerDesc, PartitionDesc, PartitionState};
+
+    #[test]
+    fn test_update_partition_ring_inherits_shards_on_pending_change() {
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(partition_ring_desc_codec()));
+        let w = PartitionRingWatcher::new(
+            "ingester-partitions",
+            "ingester-partitions",
+            kv,
+            PartitionRingOptions::default(),
+            None,
+        );
+
+        let mut d1 = PartitionRingDesc::default();
+        d1.partitions.insert(
+            0,
+            PartitionDesc {
+                state: PartitionState::PartitionActive as i32,
+                tokens: vec![100, 200],
+                ..Default::default()
+            },
+        );
+        d1.partitions.insert(
+            1,
+            PartitionDesc {
+                state: PartitionState::PartitionActive as i32,
+                tokens: vec![300, 400],
+                ..Default::default()
+            },
+        );
+        w.update_partition_ring(d1.clone()).unwrap();
+        let shard_before = w.partition_ring().shuffle_shard("tenant-a", 1).unwrap();
+
+        // Add a PENDING partition + owner -> sameExceptPending is true -> cache must be inherited.
+        let mut d2 = d1.clone();
+        d2.partitions.insert(
+            2,
+            PartitionDesc {
+                state: PartitionState::PartitionPending as i32,
+                tokens: vec![500, 600],
+                ..Default::default()
+            },
+        );
+        d2.owners.insert(
+            "owner-p2".to_string(),
+            OwnerDesc {
+                owned_partition: 2,
+                ..Default::default()
+            },
+        );
+        w.update_partition_ring(d2).unwrap();
+        let shard_after = w.partition_ring().shuffle_shard("tenant-a", 1).unwrap();
+        assert!(
+            Arc::ptr_eq(&shard_before, &shard_after),
+            "shuffle shard cache must be inherited across PENDING-only changes"
+        );
     }
 }

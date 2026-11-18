@@ -30,6 +30,7 @@ use crate::error::ConfigError;
 use crate::ingester::InstanceLimits;
 use crate::limits::LimitsConfig;
 use crate::server::RuntimeConfigConfig;
+use crate::types::{NameValidationScheme, OTelTranslationStrategy};
 use crate::sha256::{sha256, sha256_hex};
 
 use self::provider::{HttpFetcher, Provider};
@@ -395,8 +396,10 @@ fn parse_runtime_config_value(
                     );
                 }
                 if let Value::Mapping(ref tenant_map) = tenant_v {
-                    // Map fields (`flagext.LimitsMap` + custom trackers) replace the base map
-                    // instead of deep-merging keys (`dskit/flagext/map.go:clear(m.data)`).
+                    // Map fields with custom `UnmarshalYAML` (`flagext.LimitsMap`, `asmodel.CustomTrackersConfig`)
+                    // replace the base map (`dskit/flagext/map.go:clear(m.data)`). Plain Go maps
+                    // (`cost_attribution_trackers`, `additional_cost_attribution_trackers`) are cloned from
+                    // `defaultLimits` and overlaid per key by `yaml.v3` unless explicitly `null`.
                     if let (Some(merged_map), Some(override_map)) =
                         (merged.as_mapping_mut(), Some(tenant_map))
                     {
@@ -406,8 +409,6 @@ fn parse_runtime_config_value(
                                 key_str,
                                 "active_series_custom_trackers"
                                     | "active_series_additional_custom_trackers"
-                                    | "cost_attribution_trackers"
-                                    | "additional_cost_attribution_trackers"
                                     | "ruler_max_rules_per_rule_group_by_namespace"
                                     | "ruler_max_rule_groups_per_tenant_by_namespace"
                                     | "alertmanager_notification_rate_limit_per_integration"
@@ -418,6 +419,36 @@ fn parse_runtime_config_value(
                                     v.clone()
                                 };
                                 merged_map.insert(k.clone(), val);
+                            } else if matches!(
+                                key_str,
+                                "cost_attribution_trackers" | "additional_cost_attribution_trackers"
+                            ) {
+                                if v.is_null() {
+                                    merged_map.insert(k.clone(), Value::Mapping(Mapping::new()));
+                                } else if let Some(override_entries) = v.as_mapping() {
+                                    let entry = merged_map
+                                        .entry(k.clone())
+                                        .or_insert_with(|| Value::Mapping(Mapping::new()));
+                                    if !entry.is_mapping() {
+                                        *entry = Value::Mapping(Mapping::new());
+                                    }
+                                    if let Some(base_entries) = entry.as_mapping_mut() {
+                                        for (tk, tv) in override_entries {
+                                            if tv.is_null() {
+                                                if !base_entries.contains_key(tk) {
+                                                    base_entries.insert(
+                                                        tk.clone(),
+                                                        Value::Mapping(Mapping::new()),
+                                                    );
+                                                }
+                                            } else {
+                                                base_entries.insert(tk.clone(), tv.clone());
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    merged_map.insert(k.clone(), v.clone());
+                                }
                             } else if key_str == "ruler_alertmanager_client_config" {
                                 if let Some(existing) = merged_map.get_mut(k) {
                                     merge_ruler_am_client_config(existing, v.clone());
@@ -442,10 +473,18 @@ fn parse_runtime_config_value(
                     )));
                 }
 
+                let tenant_set_otel_strategy = tenant_v.as_mapping().is_some_and(|m| {
+                    m.contains_key(Value::String("otel_translation_strategy".to_string()))
+                });
                 let mut limits: LimitsConfig = serde_yaml::from_value(merged).map_err(|e| {
                     ConfigError::RuntimeConfig(format!("tenant {tenant_id:?}: {e}"))
                 })?;
-                limits.validate().map_err(|e| {
+                let validation_res = if tenant_set_otel_strategy {
+                    limits.validate()
+                } else {
+                    limits.validate_with_defaults(Some(default_limits))
+                };
+                validation_res.map_err(|e| {
                     ConfigError::RuntimeConfig(format!("tenant {tenant_id:?}: {e}"))
                 })?;
                 if limits.query_ingesters_within.0 != 0
@@ -1157,6 +1196,58 @@ impl Overrides {
     pub fn max_native_histogram_buckets(&self, tenant_id: &str) -> i64 {
         self.for_tenant(tenant_id).max_native_histogram_buckets
     }
+
+    /// Go `Overrides.OTelMetricSuffixesEnabled`: falls back to `default_limits` when unset (`None`).
+    #[inline]
+    pub fn otel_metric_suffixes_enabled(&self, tenant_id: &str) -> bool {
+        if let Some(v) = self.for_tenant(tenant_id).otel_metric_suffixes_enabled {
+            return v;
+        }
+        self.defaults().otel_metric_suffixes_enabled.unwrap_or(false)
+    }
+
+    /// Go `Overrides.NameValidationScheme`: falls back to `default_limits` when `Unset`,
+    /// then to `Legacy`.
+    #[inline]
+    pub fn name_validation_scheme(&self, tenant_id: &str) -> NameValidationScheme {
+        let scheme = self.for_tenant(tenant_id).name_validation_scheme;
+        if scheme != NameValidationScheme::Unset {
+            return scheme;
+        }
+        let def_scheme = self.defaults().name_validation_scheme;
+        if def_scheme != NameValidationScheme::Unset {
+            return def_scheme;
+        }
+        NameValidationScheme::Legacy
+    }
+
+    /// Go `Overrides.OTelTranslationStrategy`: returns explicit strategy if non-empty, otherwise
+    /// derives it from `name_validation_scheme` + `otel_metric_suffixes_enabled`.
+    #[inline]
+    pub fn otel_translation_strategy(&self, tenant_id: &str) -> OTelTranslationStrategy {
+        let strategy = self.for_tenant(tenant_id).otel_translation_strategy.clone();
+        if !strategy.0.is_empty() {
+            return strategy;
+        }
+        let suffixes = self.otel_metric_suffixes_enabled(tenant_id);
+        let s = match self.name_validation_scheme(tenant_id) {
+            NameValidationScheme::Legacy | NameValidationScheme::Unset => {
+                if suffixes {
+                    "UnderscoreEscapingWithSuffixes"
+                } else {
+                    "UnderscoreEscapingWithoutSuffixes"
+                }
+            }
+            NameValidationScheme::Utf8 => {
+                if suffixes {
+                    "NoUTF8EscapingWithSuffixes"
+                } else {
+                    "NoTranslation"
+                }
+            }
+        };
+        OTelTranslationStrategy(s.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1218,5 +1309,100 @@ mod null_override_tests {
         assert_eq!(overrides.max_global_series_per_user("t_null"), 42);
         assert_eq!(overrides.max_global_series_per_user("t1"), 5);
         assert_eq!(overrides.max_global_series_per_user("other"), 42);
+    }
+
+    #[test]
+    fn cost_attribution_trackers_overlay_and_otel_inheritance() {
+        use crate::limits::{CostAttributionLabel, CostAttributionTrackerConfig};
+
+        let mut defaults = LimitsConfig::default();
+        defaults.cost_attribution_trackers.insert(
+            "global_base".to_string(),
+            CostAttributionTrackerConfig {
+                labels: vec![CostAttributionLabel {
+                    input: "team".to_string(),
+                    output: "team".to_string(),
+                }],
+                internal: false,
+            },
+        );
+        defaults.additional_cost_attribution_trackers.insert(
+            "global_add".to_string(),
+            CostAttributionTrackerConfig {
+                labels: vec![CostAttributionLabel {
+                    input: "env".to_string(),
+                    output: "env".to_string(),
+                }],
+                internal: false,
+            },
+        );
+        defaults.name_validation_scheme = NameValidationScheme::Utf8;
+        defaults.otel_metric_suffixes_enabled = Some(true);
+        defaults.otel_translation_strategy =
+            OTelTranslationStrategy("NoUTF8EscapingWithSuffixes".to_string());
+
+        let out = parse_runtime_config_yaml(
+            br#"
+overrides:
+  t_overlay:
+    max_global_series_per_user: 100
+    cost_attribution_trackers:
+      tenant_base:
+        labels:
+          - input: service
+            output: svc
+    additional_cost_attribution_trackers:
+      tenant_add:
+        labels:
+          - input: region
+            output: region
+  t_null_ca:
+    cost_attribution_trackers: null
+    otel_metric_suffixes_enabled: false
+    name_validation_scheme: legacy
+    otel_translation_strategy: UnderscoreEscapingWithoutSuffixes
+"#,
+            &defaults,
+            &InstanceLimits::default(),
+        )
+        .unwrap();
+
+        let t_ov = out.overrides["t_overlay"].as_ref().unwrap();
+        assert!(t_ov.cost_attribution_trackers.contains_key("global_base"));
+        assert!(t_ov.cost_attribution_trackers.contains_key("tenant_base"));
+        assert!(t_ov
+            .additional_cost_attribution_trackers
+            .contains_key("global_add"));
+        assert!(t_ov
+            .additional_cost_attribution_trackers
+            .contains_key("tenant_add"));
+
+        let t_null = out.overrides["t_null_ca"].as_ref().unwrap();
+        assert!(t_null.cost_attribution_trackers.is_empty());
+
+        let mgr = RuntimeConfigManager::new(
+            RuntimeConfigConfig::default(),
+            defaults,
+            InstanceLimits::default(),
+        )
+        .unwrap();
+        mgr.set_values_for_tests(out);
+        let ov = mgr.overrides();
+
+        assert!(ov.otel_metric_suffixes_enabled("t_overlay"));
+        assert_eq!(ov.name_validation_scheme("t_overlay"), NameValidationScheme::Utf8);
+        assert_eq!(
+            ov.otel_translation_strategy("t_overlay").0,
+            "NoUTF8EscapingWithSuffixes"
+        );
+        assert!(!ov.otel_metric_suffixes_enabled("t_null_ca"));
+        assert_eq!(
+            ov.name_validation_scheme("t_null_ca"),
+            NameValidationScheme::Legacy
+        );
+        assert_eq!(
+            ov.otel_translation_strategy("t_null_ca").0,
+            "UnderscoreEscapingWithoutSuffixes"
+        );
     }
 }

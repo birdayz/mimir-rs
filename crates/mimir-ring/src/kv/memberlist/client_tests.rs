@@ -306,3 +306,103 @@
         watcher.await.unwrap();
         kv.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn test_cluster_label_over_255_rejected_at_startup() {
+        let mut cfg = local_cfg("too-long-label");
+        cfg.cluster_label = "a".repeat(256);
+        let err = MemberlistKv::start(cfg, vec![], "test", None)
+            .await
+            .err()
+            .expect("label > 255 must fail startup");
+        assert!(err.to_string().contains("too long"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_alive_node_empty_meta_none_vs_some_empty_does_not_refute() {
+        let cfg = local_cfg("local-node");
+        let kv = MemberlistKv::start(cfg, vec![], "test", None)
+            .await
+            .unwrap();
+        let (ip, port) = kv.advertise();
+        let inc_before = kv.incarnation.load(Ordering::Acquire);
+        let alive = super::super::wire::Alive {
+            incarnation: inc_before,
+            node: "local-node".to_string(),
+            addr: super::ip_to_bytes(ip),
+            port,
+            meta: Some(Vec::new()),
+            vsn: vec![
+                super::super::wire::PROTOCOL_VERSION_MIN,
+                super::super::wire::PROTOCOL_VERSION_MAX,
+                super::super::wire::PROTOCOL_VERSION_MAX,
+                1,
+                2,
+                1,
+            ],
+        };
+        kv.alive_node(&alive, None, false);
+        assert_eq!(
+            kv.incarnation.load(Ordering::Acquire),
+            inc_before,
+            "Some(&[]) meta must equal None without refutation"
+        );
+        kv.shutdown().await;
+    }
+
+    #[test]
+    fn test_decode_push_pull_normalizes_port_zero_to_7946() {
+        let ns = super::super::wire::PushNodeState {
+            name: "p0".to_string(),
+            addr: vec![127, 0, 0, 1],
+            port: 0,
+            meta: None,
+            incarnation: 1,
+            state: super::super::wire::NodeStateType::Alive,
+            vsn: vec![1, 5, 2, 0, 0, 0],
+        };
+        let enc = super::super::wire::encode_push_pull(&[ns], b"", true);
+        let (_join, nodes, _user) = super::super::wire::decode_push_pull(&enc[1..]).unwrap();
+        assert_eq!(nodes[0].port, 7946);
+    }
+
+    #[tokio::test]
+    async fn test_handle_conn_discards_bad_label_before_decompress_and_server_reply_has_no_label() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut cfg = local_cfg("srv-label");
+        cfg.cluster_label = "prod-a".to_string();
+        let kv = MemberlistKv::start(cfg, vec![], "test", None)
+            .await
+            .unwrap();
+        let port = kv.listening_port();
+
+        // 1. Send wrong label followed by invalid Compress payload; server must reject before decompressing.
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut frame = vec![2u8]; // STREAM_BYTE
+        frame.extend_from_slice(&super::super::wire::add_label_header(&[super::super::wire::MessageType::Compress as u8, 0xff], "wrong").unwrap());
+        s.write_all(&frame).await.unwrap();
+        let mut resp = Vec::new();
+        let _ = s.read_to_end(&mut resp).await;
+        assert!(resp.is_empty(), "wrong label must be dropped before reading/decompressing");
+
+        // 2. Send valid PushPull with label "prod-a"; reply must start with PushPull (or Compress wrapping PushPull), NEVER HasLabel (244).
+        let mut s2 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let pp = super::super::wire::encode_push_pull(&[], b"", true);
+        let labeled = super::super::wire::add_label_header(&pp, "prod-a").unwrap();
+        s2.write_all(&[2u8]).await.unwrap();
+        s2.write_all(&labeled).await.unwrap();
+        let mut first = [0u8; 1];
+        s2.read_exact(&mut first).await.unwrap();
+        assert_ne!(
+            first[0],
+            super::super::wire::MessageType::HasLabel as u8,
+            "server reply must NOT prepend HasLabel (244)"
+        );
+
+        kv.shutdown().await;
+    }

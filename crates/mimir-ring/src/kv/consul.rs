@@ -20,7 +20,7 @@ use mimir_common::tls::{go_read_err, parse_server_name, system_roots, CachedRelo
 use mimir_config::ingester::ConsulConfig;
 use prometheus::{HistogramOpts, HistogramVec, Registry};
 use rand::Rng;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, HOST};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_rustls::rustls;
@@ -287,6 +287,50 @@ impl ServerCertVerifier for ConsulTlsVerifier {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.algorithms.supported_schemes()
     }
+}
+
+struct ConsulSniResolver {
+    sni_host: String,
+    target_host: String,
+}
+
+impl reqwest::dns::Resolve for ConsulSniResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let lookup_host = if name.as_str().eq_ignore_ascii_case(&self.sni_host) {
+            self.target_host.clone()
+        } else {
+            name.as_str().to_string()
+        };
+        Box::pin(async move {
+            if let Ok(ip) = lookup_host.parse::<std::net::IpAddr>() {
+                let addrs: reqwest::dns::Addrs =
+                    Box::new(std::iter::once(std::net::SocketAddr::new(ip, 0)));
+                return Ok(addrs);
+            }
+            let resolved: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((lookup_host.as_str(), 0))
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                    .collect();
+            let addrs: reqwest::dns::Addrs = Box::new(resolved.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+fn split_authority_host_port(authority: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some((host, after)) = rest.split_once(']') {
+            let port = after.strip_prefix(':');
+            return (host, port);
+        }
+    }
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if !host.contains(':') {
+            return (host, Some(port));
+        }
+    }
+    (authority, None)
 }
 
 fn build_consul_tls_config(env: &ConsulEnv) -> Result<rustls::ClientConfig, KvError> {
@@ -580,9 +624,38 @@ impl ConsulKv {
 
         let tls_config = build_consul_tls_config(env)?;
         let timeout: Duration = cfg.http_client_timeout.as_std().unwrap_or(Duration::ZERO);
+        let mut connect_authority = host_authority.clone();
+        let mut sni_resolver: Option<Arc<ConsulSniResolver>> = None;
+        if scheme == "https" && !env.tls_server_name.is_empty() {
+            let sni_host =
+                extract_tls_server_host(&env.tls_server_name).map_err(KvError::InvalidConfig)?;
+            let (target_host, target_port) = split_authority_host_port(&host_authority);
+            if matches!(
+                parse_server_name(&sni_host),
+                Ok(ServerName::DnsName(_))
+            ) && !sni_host.eq_ignore_ascii_case(target_host)
+            {
+                connect_authority = match target_port {
+                    Some(p) => format!("{sni_host}:{p}"),
+                    None => sni_host.clone(),
+                };
+                let host_hdr = HeaderValue::from_str(&host_authority).map_err(|e| {
+                    KvError::InvalidConfig(format!("invalid consul host header: {e}"))
+                })?;
+                headers.insert(HOST, host_hdr);
+                sni_resolver = Some(Arc::new(ConsulSniResolver {
+                    sni_host,
+                    target_host: target_host.to_string(),
+                }));
+            }
+        }
+
         let mut builder = reqwest::Client::builder()
             .use_preconfigured_tls(tls_config)
             .default_headers(headers);
+        if let Some(resolver) = sni_resolver {
+            builder = builder.dns_resolver(resolver);
+        }
         if !timeout.is_zero() {
             builder = builder.timeout(timeout);
         }
@@ -607,7 +680,7 @@ impl ConsulKv {
         Ok(Self {
             http,
             scheme,
-            host_authority,
+            host_authority: connect_authority,
             path_prefix,
             namespace: env.namespace.clone(),
             partition: env.partition.clone(),
@@ -695,7 +768,9 @@ impl ConsulKv {
         let res = self
             .get_raw_untracked(key, wait_index, allow_consistency, cancel)
             .await;
-        self.observe_op("Get", res.is_ok(), start);
+        if !matches!(res, Err(KvError::Canceled)) {
+            self.observe_op("Get", res.is_ok(), start);
+        }
         res
     }
 
@@ -763,7 +838,9 @@ impl ConsulKv {
     ) -> Result<(Vec<ConsulKvPair>, u64), KvError> {
         let start = Instant::now();
         let res = self.list_raw_untracked(prefix, wait_index, cancel).await;
-        self.observe_op("List", res.is_ok(), start);
+        if !matches!(res, Err(KvError::Canceled)) {
+            self.observe_op("List", res.is_ok(), start);
+        }
         res
     }
 
@@ -954,7 +1031,7 @@ impl ConsulKv {
 
             let new_val = match outcome {
                 CasOutcome::NoChange => return Ok(()),
-                CasOutcome::Update(v) => v,
+                CasOutcome::Update(v) | CasOutcome::UpdateOnce(v) => v,
             };
 
             let bytes = match self.codec.encode(new_val.as_ref()) {
@@ -2137,5 +2214,113 @@ mod tests {
         assert_eq!(get_count("List"), 2);
         assert_eq!(get_count("Put"), 1);
         assert_eq!(get_count("Delete"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_consul_tls_sni_client_hello_and_canceled_watch_skips_500() {
+        // 1. Verify CONSUL_TLS_SERVER_NAME actually sets TLS ClientHello SNI on the wire.
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cert_pem = std::fs::read(tls_fixture("sni.crt")).unwrap();
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
+            .map(|c| c.unwrap())
+            .collect();
+        let key_pem = std::fs::read(tls_fixture("sni.key")).unwrap();
+        let key = PrivateKeyDer::from_pem_slice(&key_pem).unwrap();
+        let server_cfg = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        );
+
+        let observed_sni: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let observed_sni_srv = Arc::clone(&observed_sni);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = listener.local_addr().unwrap();
+        let tls_srv = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((tcp, _)) = listener.accept().await {
+                let conn = tokio_rustls::LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    tcp,
+                )
+                .await
+                .unwrap();
+                *observed_sni_srv.lock().unwrap() =
+                    conn.client_hello().server_name().map(str::to_string);
+                let mut stream = conn.into_stream(server_cfg).await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nX-Consul-Index: 1\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let env = ConsulEnv {
+            http_ssl: "true".to_string(),
+            ca_cert: tls_fixture("ca.crt"),
+            tls_server_name: "kafka.mimir-rs.test:8501".to_string(),
+            ..Default::default()
+        };
+        let cfg = ConsulConfig {
+            host: tls_addr.to_string(),
+            ..Default::default()
+        };
+        let c_tls = ConsulKv::with_registerer_and_env(cfg, Arc::new(StringCodec), None, &env)
+            .unwrap();
+        assert_eq!(get_typed::<String>(&c_tls, "k").await.unwrap(), None);
+        tls_srv.abort();
+        assert_eq!(
+            observed_sni.lock().unwrap().as_deref(),
+            Some("kafka.mimir-rs.test")
+        );
+
+        // 2. Verify canceled long-poll watches do not record status_code="500".
+        let mut st = MockConsulState::new();
+        st.max_wait = Duration::from_secs(10);
+        let (http_addr, http_srv) = spawn_http_mock(st).await;
+
+        let reg = Registry::new();
+        let kv_reg = registerer_with_kv_name(Some(&Registerer::new(&reg)), "watch-cancel");
+        let c_http = ConsulKv::with_registerer(
+            ConsulConfig {
+                host: http_addr.to_string(),
+                watch_rate_limit: 0.0,
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+            kv_reg.as_ref(),
+        )
+        .unwrap();
+
+        let ctx = ServiceContext::background();
+        let ctx_w = ctx.clone();
+        let c_w = Arc::new(c_http);
+        let c_w2 = Arc::clone(&c_w);
+        let h1 = tokio::spawn(async move {
+            c_w2.watch_key("missing", ctx_w, Box::new(|_| true)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        ctx.cancel();
+        h1.await.unwrap();
+        http_srv.abort();
+
+        let gathered = reg.gather();
+        for mf in &gathered {
+            if mf.get_name() == "consul_request_duration_seconds" {
+                for m in mf.get_metric() {
+                    let is_500 = m
+                        .get_label()
+                        .iter()
+                        .any(|lp| lp.get_name() == "status_code" && lp.get_value() == "500");
+                    assert!(!is_500, "canceled watch must not record status_code=500");
+                }
+            }
+        }
     }
 }

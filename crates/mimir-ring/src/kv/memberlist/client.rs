@@ -42,7 +42,8 @@ use super::node_meta::{encode_node_metadata, NodeRole};
 use super::queue::{Broadcast, TransmitLimitedQueue};
 use super::stream::{
     default_hostname, read_msgpack_map_bytes, read_push_pull_from_stream,
-    read_stream_header_with_metrics, read_user_msg_from_stream, StreamDecryptFn,
+    read_stream_with_first_byte, read_user_msg_from_stream, remove_label_header_from_stream,
+    StreamDecryptFn, StreamFirstByte,
 };
 use super::suspicion::Awareness;
 use super::tcp_transport::{MemberlistConn, ReceivedPacket, TcpTransport};
@@ -53,7 +54,8 @@ use super::wire::{
     decode_suspect, decompress_buffer, encode_ack_resp, encode_err_resp, encode_push_pull,
     make_compound_messages, remove_label_header, unwrap_crc32, wrap_crc32, AckResp, Alive,
     CompressionType, ErrResp, MessageType, NodeStateType, PushNodeState, COMPOUND_HEADER_OVERHEAD,
-    COMPOUND_OVERHEAD, PROTOCOL_VERSION_2_COMPATIBLE, PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN,
+    COMPOUND_OVERHEAD, LABEL_MAX_SIZE, PROTOCOL_VERSION_2_COMPATIBLE, PROTOCOL_VERSION_MAX,
+    PROTOCOL_VERSION_MIN,
 };
 use super::zone_aware::ZoneAwareNodeSelection;
 use crate::dns::{DnsProvider, Provider, GOLANG_RESOLVER_TYPE};
@@ -650,6 +652,12 @@ impl MemberlistKv {
                     .to_string(),
             );
         }
+        if self.cfg.cluster_label.len() > LABEL_MAX_SIZE {
+            return Err(format!(
+                "failed to create memberlist: could not use {:?} as a label: too long",
+                self.cfg.cluster_label
+            ));
+        }
         info!(
             cluster_label = %self.cfg.cluster_label,
             node = %self.node_name,
@@ -1088,7 +1096,21 @@ impl MemberlistKv {
         msg: Vec<u8>,
     ) -> Result<(), KvError> {
         let mut msg = self.maybe_compress(msg);
-        if node.is_some_and(|n| n.pmax() >= 5) {
+        let looked_up: Option<NodeState>;
+        let node_ref = match node {
+            Some(n) => Some(n),
+            None => {
+                if let Some((host, _port)) = crate::dns::split_host_port(addr) {
+                    let table = self.nodes.read();
+                    looked_up = table.map.get(host).cloned();
+                    looked_up.as_ref()
+                } else {
+                    error!(addr, "memberlist: Failed to parse address");
+                    return Err(KvError::Other(format!("Failed to parse address {addr:?}")));
+                }
+            }
+        };
+        if node_ref.is_some_and(|n| n.pmax() >= 5) {
             msg = wrap_crc32(&msg);
         }
         self.go_metrics
@@ -1098,19 +1120,18 @@ impl MemberlistKv {
         Ok(())
     }
 
-    /// memberlist `rawSendMsgStream`.
+    /// memberlist `rawSendMsgStream` (never writes a label header; outbound stream dials
+    /// prepend the label header once on connection setup).
     async fn send_raw_stream<W: tokio::io::AsyncWrite + Unpin>(
         &self,
         writer: &mut W,
         send_buf: Vec<u8>,
-        label: &str,
+        _label: &str,
     ) -> Result<(), io::Error> {
         let send_buf = self.maybe_compress(send_buf);
-        let framed = add_label_header(&send_buf, label)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         self.go_metrics
-            .incr_counter(&["memberlist", "tcp", "sent"], framed.len() as f64, &[]);
-        writer.write_all(&framed).await?;
+            .incr_counter(&["memberlist", "tcp", "sent"], send_buf.len() as f64, &[]);
+        writer.write_all(&send_buf).await?;
         writer.flush().await?;
         Ok(())
     }
@@ -1131,16 +1152,10 @@ impl MemberlistKv {
         let (read_half, mut write_half) = conn.split();
         let mut reader = BufReader::new(read_half);
 
-        let (msg_type, stream_label, body_opt) = match read_stream_header_with_metrics(
-            &mut reader,
-            Some(&self.go_metrics),
-            self.stream_decryptor.as_ref(),
-        )
-        .await
-        {
+        let (stream_label, first_byte) = match remove_label_header_from_stream(&mut reader).await {
             Ok(v) => v,
             Err(err) => {
-                error!(%err, "memberlist: failed to receive");
+                error!(%err, "memberlist: failed to receive and remove the stream label header");
                 return;
             }
         };
@@ -1153,6 +1168,29 @@ impl MemberlistKv {
             error!(label, "memberlist: discarding stream with unacceptable label");
             return;
         }
+        let first = match first_byte {
+            StreamFirstByte::Eof => return,
+            StreamFirstByte::Next => None,
+            StreamFirstByte::Byte(b) => Some(b),
+        };
+
+        let (msg_type, body_opt) = match read_stream_with_first_byte(
+            &mut reader,
+            first,
+            &label,
+            Some(&self.go_metrics),
+            self.stream_decryptor.as_ref(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                error!(%err, "memberlist: failed to receive");
+                let err_msg = encode_err_resp(&ErrResp { error: err });
+                let _ = self.send_raw_stream(&mut write_half, err_msg, &label).await;
+                return;
+            }
+        };
 
         match msg_type {
             MessageType::PushPull => {
@@ -1281,12 +1319,18 @@ impl MemberlistKv {
         self.go_metrics.incr_counter(&["memberlist", "tcp", "connect"], 1.0, &[]);
         let label = self.cfg.cluster_label.clone();
         let (read_half, mut write_half) = conn.split();
+        if !label.is_empty() {
+            let label_hdr = add_label_header(&[], &label).map_err(KvError::Other)?;
+            write_half.write_all(&label_hdr).await?;
+        }
         self.send_local_state(&mut write_half, join, &label).await?;
 
         let mut reader = BufReader::new(read_half);
         let read_fut = async {
-            let (msg_type, _label, body_opt) = read_stream_header_with_metrics(
+            let (msg_type, body_opt) = read_stream_with_first_byte(
                 &mut reader,
+                None,
+                &label,
                 Some(&self.go_metrics),
                 self.stream_decryptor.as_ref(),
             )
@@ -1827,9 +1871,10 @@ impl MemberlistKv {
                     continue;
                 }
             };
-            let incoming_any = match outcome {
+            let (incoming_any, retry_on_err) = match outcome {
                 CasOutcome::NoChange => return Ok(()),
-                CasOutcome::Update(v) => v,
+                CasOutcome::Update(v) => (v, true),
+                CasOutcome::UpdateOnce(v) => (v, false),
             };
             let encoded = codec.encode(incoming_any.as_ref())?;
             let mut incoming = codec.decode_mergeable(&encoded)?;
@@ -1845,6 +1890,9 @@ impl MemberlistKv {
                     if new_ver == 0 {
                         last_was_no_change = true;
                         last_err = Some("no change detected".to_string());
+                        if !retry_on_err {
+                            break;
+                        }
                         continue;
                     }
                     self.metrics.cas_successes.inc();
@@ -1857,9 +1905,15 @@ impl MemberlistKv {
                 Err(KvError::CasFailed { .. }) => {
                     version_mismatch = true;
                     last_err = Some("version mismatch".to_string());
+                    if !retry_on_err {
+                        break;
+                    }
                 }
                 Err(e) => {
                     last_err = Some(format!("merge failed: {e}"));
+                    if !retry_on_err {
+                        break;
+                    }
                 }
             }
         }

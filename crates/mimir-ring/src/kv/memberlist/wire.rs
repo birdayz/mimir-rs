@@ -1006,6 +1006,9 @@ pub fn decode_push_pull(buf: &[u8]) -> Result<(bool, Vec<PushNodeState>, &[u8]),
                 _ => r.skip_value()?,
             }
         }
+        if ns.port == 0 {
+            ns.port = 7946;
+        }
         nodes.push(ns);
     }
 
