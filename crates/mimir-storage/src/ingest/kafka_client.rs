@@ -197,6 +197,8 @@ struct ClusterMetadata {
     partition_leaders: HashMap<(String, i32), i32>,
     /// `(topic, partition) -> leader epoch` (`-1` when the broker does not report it).
     partition_leader_epochs: HashMap<(String, i32), i32>,
+    /// `(topic, partition) -> metadata load error` (e.g. `LEADER_NOT_AVAILABLE`).
+    partition_load_errors: HashMap<(String, i32), ResponseError>,
     /// `topic -> topic ID` (all zeros when the broker does not report it).
     topic_ids: HashMap<String, [u8; 16]>,
     /// `topic -> sorted partition ids`
@@ -665,14 +667,23 @@ impl KafkaClient {
     /// `kgo.Client.PartitionLeader`: the cached `(leader, leader_epoch)` of a partition, or
     /// `(-1, -1)` if it is unknown.
     pub fn cached_partition_leader(&self, topic: &str, partition: i32) -> (i32, i32) {
+        let (leader, epoch, _) = self.partition_leader(topic, partition);
+        (leader, epoch)
+    }
+
+    /// `kgo.Client.PartitionLeader`: the cached `(leader, leader_epoch, load_err)` of a
+    /// partition, or `(-1, -1, None)` if it is unknown.
+    pub fn partition_leader(&self, topic: &str, partition: i32) -> (i32, i32, Option<ResponseError>) {
         let md = self.metadata.read();
         let key = (topic.to_string(), partition);
+        let load_err = md.partition_load_errors.get(&key).copied();
         match md.partition_leaders.get(&key) {
             Some(&leader) => (
                 leader,
                 md.partition_leader_epochs.get(&key).copied().unwrap_or(-1),
+                load_err,
             ),
-            None => (-1, -1),
+            None => (-1, -1, load_err),
         }
     }
 
@@ -894,10 +905,11 @@ impl KafkaClient {
     }
 
     fn invalidate_partition_leader(&self, topic: &str, partition: i32) {
-        self.metadata
-            .write()
-            .partition_leaders
-            .remove(&(topic.to_string(), partition));
+        let mut md = self.metadata.write();
+        let key = (topic.to_string(), partition);
+        md.partition_leaders.remove(&key);
+        md.partition_leader_epochs.remove(&key);
+        md.partition_load_errors.remove(&key);
     }
 
     /// Returns a pooled connection, dialing a new one if needed. A new connection failing with a
@@ -1156,10 +1168,17 @@ impl KafkaClient {
             let mut pids = Vec::with_capacity(t.partitions.len());
             for p in t.partitions {
                 pids.push(p.partition_index);
-                md.partition_leaders
-                    .insert((topic_name.clone(), p.partition_index), p.leader_id.0);
-                md.partition_leader_epochs
-                    .insert((topic_name.clone(), p.partition_index), p.leader_epoch);
+                let key = (topic_name.clone(), p.partition_index);
+                md.partition_leaders.insert(key.clone(), p.leader_id.0);
+                md.partition_leader_epochs.insert(key.clone(), p.leader_epoch);
+                if let Some(err) = p.error_code.err() {
+                    md.partition_load_errors.insert(key, err);
+                } else if p.leader_id.0 < 0 {
+                    md.partition_load_errors
+                        .insert(key, ResponseError::LeaderNotAvailable);
+                } else {
+                    md.partition_load_errors.remove(&key);
+                }
             }
             pids.sort();
             md.topic_partitions.insert(topic_name, pids);
@@ -1334,18 +1353,21 @@ impl KafkaClient {
             match res {
                 Ok(v) => return Ok(v),
                 Err(err) => {
-                    let err = handle_dial_err(&err, || {
-                        self.invalidate_partition_leader(topic, partition);
-                    })
-                    .unwrap_or(err);
+                    // Only invalidate the cached leader on broker stale-leader response errors,
+                    // never on transient socket/dial errors (matching franz-go PartitionLeader
+                    // retention so ConcurrentFetchers sharing this KafkaClient is not wiped).
+                    let err = handle_dial_err(&err, || {}).unwrap_or(err);
                     let stale_leader = matches!(
                         err,
                         KafkaClientError::Broker(
                             ResponseError::NotLeaderOrFollower
                                 | ResponseError::UnknownTopicOrPartition
+                                | ResponseError::LeaderNotAvailable
+                                | ResponseError::FencedLeaderEpoch
+                                | ResponseError::UnknownLeaderEpoch
                         )
                     );
-                    if stale_leader || is_leader_or_io_error(&err) {
+                    if stale_leader {
                         self.invalidate_partition_leader(topic, partition);
                     }
                     // listOffsetsSharder.onResp only asks for a retry on stale-leader partition
@@ -1356,6 +1378,9 @@ impl KafkaClient {
                             sharded_retry_backoff(start, retry_timeout, tries, &err)
                         {
                             tokio::time::sleep(backoff).await;
+                            if !stale_leader {
+                                let _ = self.refresh_metadata(&[topic]).await;
+                            }
                             continue;
                         }
                     }
@@ -1509,6 +1534,7 @@ impl KafkaClient {
 
             let mut retry_pending: HashMap<String, Vec<i32>> = HashMap::new();
             let mut last_err: Option<KafkaClientError> = None;
+            let mut need_metadata_refresh = false;
 
             for (shard_topics, res) in results {
                 match res {
@@ -1531,6 +1557,8 @@ impl KafkaClient {
                                         ResponseError::NotLeaderOrFollower
                                             | ResponseError::UnknownTopicOrPartition
                                             | ResponseError::LeaderNotAvailable
+                                            | ResponseError::FencedLeaderEpoch
+                                            | ResponseError::UnknownLeaderEpoch
                                     );
                                     if stale_leader {
                                         self.invalidate_partition_leader(topic_name, pid);
@@ -1568,20 +1596,9 @@ impl KafkaClient {
                         }
                     }
                     Err(err) => {
-                        let err = handle_dial_err(&err, || {
-                            for (topic, pids) in &shard_topics {
-                                for &pid in pids {
-                                    self.invalidate_partition_leader(topic, pid);
-                                }
-                            }
-                        })
-                        .unwrap_or(err);
+                        // Never invalidate cached partition leaders on transport/dial errors.
+                        let err = handle_dial_err(&err, || {}).unwrap_or(err);
                         let retryable = !matches!(err, KafkaClientError::Broker(_));
-                        for (topic, pids) in &shard_topics {
-                            for &pid in pids {
-                                self.invalidate_partition_leader(topic, pid);
-                            }
-                        }
                         if !retryable {
                             return Err(err);
                         }
@@ -1589,6 +1606,7 @@ impl KafkaClient {
                             retry_pending.entry(topic).or_default().extend(pids);
                         }
                         last_err = Some(err);
+                        need_metadata_refresh = true;
                     }
                 }
             }
@@ -1605,6 +1623,10 @@ impl KafkaClient {
                 return Err(err);
             };
             tokio::time::sleep(backoff).await;
+            if need_metadata_refresh {
+                let topics: Vec<&str> = retry_pending.keys().map(String::as_str).collect();
+                let _ = self.refresh_metadata(&topics).await;
+            }
             pending = retry_pending;
         }
     }

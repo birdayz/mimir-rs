@@ -215,7 +215,7 @@ pub struct Ingester {
 
     pub verify_ring_ownership: AtomicBool,
     pub read_only_override: AtomicBool,
-    weak_self: Arc<Mutex<Option<Weak<Ingester>>>>,
+    weak_self: Arc<std::sync::OnceLock<Weak<Ingester>>>,
     multitenancy_enabled: AtomicBool,
     no_auth_tenant: RwLock<String>,
     cost_attribution_mgr: RwLock<Option<Arc<crate::costattribution::Manager>>>,
@@ -405,7 +405,8 @@ impl Ingester {
             Duration::ZERO
         };
 
-        let weak_slot: Arc<Mutex<Option<Weak<Ingester>>>> = Arc::new(Mutex::new(None));
+        let weak_slot: Arc<std::sync::OnceLock<Weak<Ingester>>> =
+            Arc::new(std::sync::OnceLock::new());
         let w_limits = Arc::clone(&weak_slot);
         let w_min = Arc::clone(&weak_slot);
         let w_max = Arc::clone(&weak_slot);
@@ -419,26 +420,26 @@ impl Ingester {
             Arc::clone(&inflight_push_requests_bytes),
             move || rate_ref.rate(),
             move || {
-                let g = w_limits.lock();
-                g.as_ref()
+                w_limits
+                    .get()
                     .and_then(Weak::upgrade)
                     .and_then(|ing| ing.get_instance_limits())
             },
             move || {
-                let g = w_min.lock();
-                g.as_ref()
+                w_min
+                    .get()
                     .and_then(Weak::upgrade)
                     .map_or(0.0, |ing| ing.min_tsdb_head_timestamp())
             },
             move || {
-                let g = w_max.lock();
-                g.as_ref()
+                w_max
+                    .get()
                     .and_then(Weak::upgrade)
                     .map_or(0.0, |ing| ing.max_tsdb_head_timestamp())
             },
             move || {
-                let g = w_ship.lock();
-                g.as_ref()
+                w_ship
+                    .get()
                     .and_then(Weak::upgrade)
                     .map_or(0.0, |ing| ing.oldest_unshipped_block_timestamp())
             },
@@ -556,7 +557,7 @@ impl Ingester {
             activity_tracker: RwLock::new(None),
         });
 
-        *weak_slot.lock() = Some(Arc::downgrade(&ingester));
+        let _ = weak_slot.set(Arc::downgrade(&ingester));
 
         // Go passes the Ingester as the lifecycler's FlushTransferer (classic) / flush callback
         // (tokenless): on shutdown the lifecycler switches to LEAVING, then calls `Flush()` while
@@ -930,8 +931,7 @@ impl Ingester {
         let weak_self = {
             let weak_slot = Arc::clone(&self.weak_self);
             let max_series_fn: Arc<dyn Fn() -> i64 + Send + Sync> = Arc::new(move || {
-                let ing_opt = weak_slot.lock().as_ref().and_then(Weak::upgrade);
-                match ing_opt {
+                match weak_slot.get().and_then(Weak::upgrade) {
                     Some(ing) => ing.get_instance_limits().map_or(0, |l| l.max_series),
                     None => 0,
                 }
@@ -1048,9 +1048,10 @@ impl Ingester {
     }
 
     pub fn min_tsdb_head_timestamp(&self) -> f64 {
+        let dbs: Vec<Arc<UserTsdb>> = self.tsdbs.iter().map(|e| Arc::clone(e.value())).collect();
         let mut min_t = i64::MAX;
-        for entry in self.tsdbs.iter() {
-            let h = entry.value().db.head();
+        for db in dbs {
+            let h = db.db.head();
             if h.initialized() {
                 min_t = min_t.min(h.min_time());
             }
@@ -1063,9 +1064,10 @@ impl Ingester {
     }
 
     pub fn max_tsdb_head_timestamp(&self) -> f64 {
+        let dbs: Vec<Arc<UserTsdb>> = self.tsdbs.iter().map(|e| Arc::clone(e.value())).collect();
         let mut max_t = i64::MIN;
-        for entry in self.tsdbs.iter() {
-            let h = entry.value().db.head();
+        for db in dbs {
+            let h = db.db.head();
             if h.initialized() {
                 max_t = max_t.max(h.max_time());
             }
@@ -1078,9 +1080,10 @@ impl Ingester {
     }
 
     pub fn oldest_unshipped_block_timestamp(&self) -> f64 {
+        let dbs: Vec<Arc<UserTsdb>> = self.tsdbs.iter().map(|e| Arc::clone(e.value())).collect();
         let mut oldest = 0u64;
-        for entry in self.tsdbs.iter() {
-            let ts = entry.value().oldest_unshipped_block_time_ms();
+        for db in dbs {
+            let ts = db.oldest_unshipped_block_time_ms();
             if ts > 0 && (oldest == 0 || ts < oldest) {
                 oldest = ts;
             }

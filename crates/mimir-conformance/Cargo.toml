@@ -41,3 +41,4 @@ hyper = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { workspace = true }
 testcontainers = { workspace = true, features = ["docker-compose"] }
+tracing = { workspace = true }

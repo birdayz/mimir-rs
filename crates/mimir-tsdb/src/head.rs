@@ -3399,9 +3399,76 @@ pub struct Head {
     wbl_pinned_refs: Mutex<HashSet<u64>>,
     appender_pool: Mutex<Vec<AppenderScratch>>,
     lifecycle_callback: RwLock<Option<Arc<dyn SeriesLifecycleCallback>>>,
+    active_reads: Arc<HeadActiveReads>,
     series_gauge: Option<prometheus::Gauge>,
     series_created_total: Option<prometheus::Counter>,
     series_removed_total: Option<prometheus::Counter>,
+}
+
+#[derive(Debug, Default)]
+struct HeadActiveReads {
+    reads: Mutex<Vec<(u64, i64, i64)>>,
+    next_id: AtomicU64,
+    cv: Condvar,
+}
+
+impl HeadActiveReads {
+    fn start(&self, mint: i64, maxt: i64) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.reads.lock().push((id, mint, maxt));
+        id
+    }
+
+    fn finish(&self, id: u64) {
+        let mut reads = self.reads.lock();
+        if let Some(pos) = reads.iter().position(|(rid, _, _)| *rid == id) {
+            reads.swap_remove(pos);
+            self.cv.notify_all();
+        }
+    }
+
+    fn wait_for_range(&self, mint: i64, maxt_exclusive: i64) {
+        if maxt_exclusive <= mint {
+            return;
+        }
+        let maxt_inclusive = maxt_exclusive - 1;
+        let mut reads = self.reads.lock();
+        while reads
+            .iter()
+            .any(|&(_, r_mint, r_maxt)| r_mint <= maxt_inclusive && mint <= r_maxt)
+        {
+            self.cv.wait(&mut reads);
+        }
+    }
+}
+
+/// Active reader guard on [`Head`] preventing `truncate_memory` from unlinking Head
+/// chunks for `[mint, maxt]` while a concurrent querier is reading them after releasing
+/// `blocks_lock.read()` (matching Go `Head.WaitForPendingReadersInTimeRange`).
+#[derive(Debug)]
+pub struct HeadReadGuard {
+    id: u64,
+    mint: i64,
+    maxt: i64,
+    reads: Arc<HeadActiveReads>,
+}
+
+impl Clone for HeadReadGuard {
+    fn clone(&self) -> Self {
+        let id = self.reads.start(self.mint, self.maxt);
+        Self {
+            id,
+            mint: self.mint,
+            maxt: self.maxt,
+            reads: Arc::clone(&self.reads),
+        }
+    }
+}
+
+impl Drop for HeadReadGuard {
+    fn drop(&mut self) {
+        self.reads.finish(self.id);
+    }
 }
 
 impl Head {
@@ -3546,6 +3613,7 @@ impl Head {
             wbl_pinned_refs: Mutex::new(HashSet::new()),
             appender_pool: Mutex::new(Vec::new()),
             lifecycle_callback: RwLock::new(lifecycle_cb),
+            active_reads: Arc::new(HeadActiveReads::default()),
             series_gauge,
             series_created_total,
             series_removed_total,
@@ -7986,14 +8054,33 @@ impl Head {
         res
     }
 
+    /// Registers an active reader over `[mint, maxt]` on this `Head`.
+    pub fn start_read(&self, mint: i64, maxt: i64) -> HeadReadGuard {
+        let id = self.active_reads.start(mint, maxt);
+        HeadReadGuard {
+            id,
+            mint,
+            maxt,
+            reads: Arc::clone(&self.active_reads),
+        }
+    }
+
     fn truncate_memory_inner(&self, mint: i64) -> Result<(), HeadError> {
         let _snap_guard = self.chunk_snapshot_mtx.lock();
         let initialized = self.initialized();
-        if initialized && self.min_time() >= mint {
+        let old_min_time = self.min_time();
+        if initialized && old_min_time >= mint {
             if self.symbol_arena_grew_past_gc_threshold() {
                 self.maybe_gc_symbols();
             }
             return Ok(());
+        }
+
+        if initialized {
+            // Wait for any active queriers overlapping `[old_min_time, mint)` whose
+            // snapshot of blocks predated `reload_after_write` before unlinking Head
+            // chunks (matching Go `Head.WaitForPendingReadersInTimeRange`).
+            self.active_reads.wait_for_range(old_min_time, mint);
         }
 
         self.min_time.store(mint, Ordering::Release);

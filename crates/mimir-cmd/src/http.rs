@@ -263,13 +263,17 @@ async fn metrics_handler(
     headers: HeaderMap,
     cache: Arc<MetricsCache>,
 ) -> Response {
-    let families = cache.gather(&st.registry);
-    let created = st
-        .config
-        .server
-        .enable_open_metrics_text_created_samples
-        .then_some(cache.as_ref());
-    encode_families(&families, &headers, true, created)
+    tokio::task::spawn_blocking(move || {
+        let families = cache.gather(&st.registry);
+        let created = st
+            .config
+            .server
+            .enable_open_metrics_text_created_samples
+            .then_some(cache.as_ref());
+        encode_families(&families, &headers, true, created)
+    })
+    .await
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 fn encode_families(

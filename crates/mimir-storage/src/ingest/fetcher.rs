@@ -155,6 +155,8 @@ pub enum KafkaFetchError {
     #[error("first read EOF")]
     FirstReadEOF,
     #[error("{0}")]
+    TransientTransport(String),
+    #[error("{0}")]
     Other(String),
 }
 
@@ -346,7 +348,8 @@ async fn handle_kafka_fetch_err_with_log_start(
             | ResponseError::LeaderNotAvailable
             | ResponseError::BrokerNotAvailable,
         )
-        | KafkaFetchError::UnknownPartitionLeader => {
+        | KafkaFetchError::UnknownPartitionLeader
+        | KafkaFetchError::TransientTransport(_) => {
             refresher.force_metadata_refresh().await;
             long_backoff.wait().await;
         }
@@ -516,6 +519,26 @@ pub(crate) fn kafka_fetch_error_from_client(err: KafkaClientError) -> KafkaFetch
             KafkaFetchError::Other("fetching from kafka: i/o timeout".to_string())
         }
         KafkaClientError::FirstReadEof(_) => KafkaFetchError::FirstReadEOF,
+        ref dial @ KafkaClientError::Dial(_)
+            if !super::kgo_retry::is_permanent_dial_err(dial) =>
+        {
+            KafkaFetchError::TransientTransport(format!("fetching from kafka: {dial}"))
+        }
+        KafkaClientError::Io(ref io_err)
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            KafkaFetchError::TransientTransport(format!("fetching from kafka: {err}"))
+        }
         other => KafkaFetchError::Other(format!("fetching from kafka: {other}")),
     }
 }
@@ -936,11 +959,14 @@ impl WorkerCtx {
     }
 
     async fn fetch_single_inner(&self, fw: &FetchWant) -> FetchResult {
-        // Lookup the leader broker for the topic partition.
-        let (leader_id, leader_epoch) = self
+        // Lookup the leader broker for the topic partition (matching kgo PartitionLeader).
+        let (leader_id, leader_epoch, part_err) = self
             .client
-            .cached_partition_leader(&self.topic_name, self.partition_id);
-        if leader_id == -1 && leader_epoch == -1 {
+            .partition_leader(&self.topic_name, self.partition_id);
+        if let Some(err) = part_err {
+            return FetchResult::error(self.partition_id, Some(KafkaFetchError::Broker(err)));
+        }
+        if leader_id < 0 {
             return FetchResult::error(self.partition_id, Some(KafkaFetchError::UnknownPartitionLeader));
         }
 
@@ -1152,6 +1178,9 @@ async fn run_worker(
         let mut buffered = FetchResult::empty(partition_id);
 
         while w.end_offset > w.start_offset {
+            if *stop_rx.borrow() {
+                return;
+            }
             let res = tokio::select! {
                 biased;
                 _ = stop_rx.changed() => return,
@@ -1163,6 +1192,9 @@ async fn run_worker(
             }
 
             if let Some(ref err) = res.err {
+                if *stop_rx.borrow() {
+                    return;
+                }
                 let response_lso = Some(res.log_start_offset).filter(|&o| o >= 0);
                 // We got an error: handle it and discard this fetch result content.
                 let handled = tokio::select! {
@@ -1661,5 +1693,350 @@ mod tests {
             start_reader.stop().await;
             srv.abort();
         }
+    }
+    struct CountingRefresher(AtomicUsize);
+    impl MetadataRefresher for CountingRefresher {
+        fn force_metadata_refresh(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_transport_dial_and_io_errors_refresh_metadata_and_back_off() {
+        use crate::ingest::kgo_retry::{DialError, DialErrorKind};
+
+        let make_dial = |kind: DialErrorKind| {
+            KafkaClientError::Dial(DialError {
+                addr: "127.0.0.1:9092".to_string(),
+                kind,
+                source: std::io::Error::other("dial err"),
+            })
+        };
+        for kind in [
+            DialErrorKind::Refused,
+            DialErrorKind::Unreachable,
+            DialErrorKind::TimedOut,
+            DialErrorKind::DnsTemporary,
+        ] {
+            let mapped = kafka_fetch_error_from_client(make_dial(kind));
+            assert!(
+                matches!(mapped, KafkaFetchError::TransientTransport(_)),
+                "expected TransientTransport for {kind:?}, got {mapped:?}"
+            );
+        }
+        for kind in [DialErrorKind::DnsNotFound, DialErrorKind::PermissionDenied] {
+            let mapped = kafka_fetch_error_from_client(make_dial(kind));
+            assert!(
+                matches!(mapped, KafkaFetchError::Other(_)),
+                "expected Other for permanent {kind:?}, got {mapped:?}"
+            );
+        }
+        for io_kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let mapped = kafka_fetch_error_from_client(KafkaClientError::Io(
+                std::io::Error::from(io_kind),
+            ));
+            assert!(
+                matches!(mapped, KafkaFetchError::TransientTransport(_)),
+                "expected TransientTransport for {io_kind:?}, got {mapped:?}"
+            );
+        }
+
+        let offset_reader = GenericOffsetReader::new(
+            Arc::new(|| Box::pin(async { Ok(0) })),
+            Duration::from_secs(60),
+        );
+        let waiter = CountingWaiter(AtomicUsize::new(0));
+        let refresher = CountingRefresher(AtomicUsize::new(0));
+        let fw = FetchWant::from_offset(0, 1_000_000, 100);
+        let err = kafka_fetch_error_from_client(make_dial(DialErrorKind::Refused));
+        let adjusted = handle_kafka_fetch_err_with_log_start(
+            Some(&err),
+            fw.clone(),
+            &waiter,
+            RangeErrorPolicy::ResumeFromStart,
+            &offset_reader,
+            &refresher,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(adjusted, fw);
+        assert_eq!(refresher.0.load(Ordering::SeqCst), 1);
+        assert_eq!(waiter.0.load(Ordering::SeqCst), 1);
+        offset_reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_partition_load_error_and_leaderless_epoch_do_not_spin_unknown_broker() {
+        // Mode 0: LEADER_NOT_AVAILABLE with leader_id=-1, leader_epoch=7
+        // Mode 1: error_code=0 with leader_id=-1, leader_epoch=7 (synthesizes LEADER_NOT_AVAILABLE)
+        // Mode 2: error_code=0 with leader_id=0, leader_epoch=8 (healthy)
+        let mode = Arc::new(AtomicI64::new(0));
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let list_offsets_stale = Arc::new(AtomicBool::new(false));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let topic_uuid = uuid::Uuid::from_bytes([9u8; 16]);
+        let (srv_stop_tx, mut srv_stop_rx) = watch::channel(false);
+        let mode_srv = Arc::clone(&mode);
+        let fc_srv = Arc::clone(&fetch_count);
+        let lo_stale_srv = Arc::clone(&list_offsets_stale);
+        let srv_stop_tx_outer = srv_stop_tx.clone();
+        let srv = tokio::spawn(async move {
+            let port = addr.port() as i32;
+            loop {
+                let stream = tokio::select! {
+                    biased;
+                    _ = srv_stop_rx.changed() => break,
+                    res = listener.accept() => match res {
+                        Ok((s, _)) => s,
+                        Err(_) => break,
+                    },
+                };
+                let m = Arc::clone(&mode_srv);
+                let fc = Arc::clone(&fc_srv);
+                let lo_stale = Arc::clone(&lo_stale_srv);
+                let mut conn_stop = srv_stop_tx.subscribe();
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = stream.into_split();
+                    let mut len_buf = [0u8; 4];
+                    loop {
+                        let read_res = tokio::select! {
+                            biased;
+                            _ = conn_stop.changed() => break,
+                            r = rd.read_exact(&mut len_buf) => r,
+                        };
+                        if read_res.is_err() {
+                            break;
+                        }
+                        let sz = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; sz];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = Bytes::from(payload);
+                        let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let Ok(api_key) = ApiKey::try_from(key_i16) else {
+                            break;
+                        };
+                        let hdr_ver = match api_key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                            ApiKey::Metadata => MetadataRequest::header_version(ver),
+                            ApiKey::ListOffsets => ListOffsetsRequest::header_version(ver),
+                            ApiKey::Fetch => FetchRequest::header_version(ver),
+                            _ => break,
+                        };
+                        let Ok(req_hdr) = RequestHeader::decode(&mut buf, hdr_ver) else {
+                            break;
+                        };
+                        let mut out = BytesMut::new();
+                        out.put_u32(0);
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr
+                            .encode(&mut out, api_key.response_header_version(ver))
+                            .unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut resp = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 1, 12),
+                                    (ApiKey::ListOffsets as i16, 0, 7),
+                                    (ApiKey::Fetch as i16, 4, 13),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    resp.api_keys.push(av);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                let mut resp = MetadataResponse::default();
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = port;
+                                resp.brokers.push(b);
+                                resp.controller_id = BrokerId(0);
+                                let mut mt = MetadataResponseTopic::default();
+                                mt.name = Some(TopicName(StrBytes::from_static_str("ingest")));
+                                mt.topic_id = topic_uuid;
+                                let mut mp = MetadataResponsePartition::default();
+                                mp.partition_index = 0;
+                                match m.load(Ordering::SeqCst) {
+                                    0 => {
+                                        mp.error_code = ResponseError::LeaderNotAvailable.code();
+                                        mp.leader_id = BrokerId(-1);
+                                        mp.leader_epoch = 7;
+                                    }
+                                    1 => {
+                                        mp.error_code = 0;
+                                        mp.leader_id = BrokerId(-1);
+                                        mp.leader_epoch = 7;
+                                    }
+                                    _ => {
+                                        mp.error_code = 0;
+                                        mp.leader_id = BrokerId(0);
+                                        mp.leader_epoch = 8;
+                                    }
+                                }
+                                mt.partitions.push(mp);
+                                resp.topics.push(mt);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::ListOffsets => {
+                                let _ = ListOffsetsRequest::decode(&mut buf, ver);
+                                let mut resp = ListOffsetsResponse::default();
+                                let mut lt = ListOffsetsTopicResponse::default();
+                                lt.name = TopicName(StrBytes::from_static_str("ingest"));
+                                let mut lp = ListOffsetsPartitionResponse::default();
+                                lp.partition_index = 0;
+                                if lo_stale.swap(false, Ordering::SeqCst) {
+                                    lp.error_code = ResponseError::FencedLeaderEpoch.code();
+                                } else {
+                                    lp.offset = 0;
+                                    lp.timestamp = -1;
+                                }
+                                lt.partitions.push(lp);
+                                resp.topics.push(lt);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Fetch => {
+                                let _ = FetchRequest::decode(&mut buf, ver).unwrap();
+                                fc.fetch_add(1, Ordering::SeqCst);
+                                let mut pd = PartitionData::default();
+                                pd.partition_index = 0;
+                                pd.log_start_offset = 0;
+                                pd.high_watermark = 1;
+                                pd.records = Some(encode_single_record_batch(0, b"ok"));
+                                let mut ft = FetchableTopicResponse::default();
+                                ft.topic_id = topic_uuid;
+                                ft.topic = TopicName(StrBytes::from_static_str("ingest"));
+                                ft.partitions.push(pd);
+                                let mut resp = FetchResponse::default();
+                                resp.responses.push(ft);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "ingest".to_string(),
+            dial_timeout: GoDuration::from_secs(2),
+            last_produced_offset_retry_timeout: GoDuration::from_millis(300),
+            ..Default::default()
+        };
+        let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+        let oc = PartitionOffsetClient::with_config(Arc::clone(&client), &cfg, None);
+        let start_reader = Arc::new(GenericOffsetReader::new(
+            Arc::new(|| Box::pin(async { Ok(0) })),
+            Duration::from_secs(60),
+        ));
+        start_reader.start().await;
+
+        let f = ConcurrentFetchers::new(
+            Arc::clone(&client),
+            "ingest",
+            0,
+            0,
+            1,
+            1024 * 1024,
+            false,
+            Duration::from_millis(20),
+            &oc,
+            RangeErrorPolicy::ResumeFromStart,
+            Arc::clone(&start_reader),
+            BackoffConfig {
+                min_backoff: Duration::from_millis(50),
+                max_backoff: Duration::from_millis(100),
+                max_retries: 0,
+            },
+            FetcherMetrics::new(None),
+        )
+        .await
+        .unwrap();
+
+        // Mode 0: LEADER_NOT_AVAILABLE with leader_epoch=7 must NOT hit fetch_from_broker(-1).
+        assert_eq!(
+            client.partition_leader("ingest", 0),
+            (-1, 7, Some(ResponseError::LeaderNotAvailable))
+        );
+        let r0 = f.fetch_single(&FetchWant::from_offset(0, 1_000_000, 100)).await;
+        assert_eq!(r0.err, Some(KafkaFetchError::Broker(ResponseError::LeaderNotAvailable)));
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 0);
+
+        // Mode 1: error_code=0, leader_id=-1, leader_epoch=7 synthesizes LEADER_NOT_AVAILABLE.
+        mode.store(1, Ordering::SeqCst);
+        client.refresh_metadata(&["ingest"]).await.unwrap();
+        assert_eq!(
+            client.partition_leader("ingest", 0),
+            (-1, 7, Some(ResponseError::LeaderNotAvailable))
+        );
+        let r1 = f.fetch_single(&FetchWant::from_offset(0, 1_000_000, 100)).await;
+        assert_eq!(r1.err, Some(KafkaFetchError::Broker(ResponseError::LeaderNotAvailable)));
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 0);
+
+        // Mode 2: leader_id=0, leader_epoch=8 clears partition_load_errors and fetches cleanly.
+        mode.store(2, Ordering::SeqCst);
+        client.refresh_metadata(&["ingest"]).await.unwrap();
+        assert_eq!(client.partition_leader("ingest", 0), (0, 8, None));
+        let r2 = f.fetch_single(&FetchWant::from_offset(0, 1_000_000, 100)).await;
+        assert!(r2.err.is_none());
+        assert_eq!(r2.records.len(), 1);
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+
+        // Chain B2: broker stale-leader on ListOffsets invalidates leader + epoch.
+        list_offsets_stale.store(true, Ordering::SeqCst);
+        let off = client.list_offset_with_timestamp("ingest", 0, -1).await.unwrap();
+        assert_eq!(off.offset, 0);
+        assert_eq!(client.partition_leader("ingest", 0), (0, 8, None));
+
+        // Chain B2: transport/dial error in ListOffsets must NOT wipe cached partition leader.
+        let _ = srv_stop_tx_outer.send(true);
+        let _ = srv.await;
+        let mut parts = std::collections::HashMap::new();
+        parts.insert("ingest".to_string(), vec![0]);
+        let _ = client.list_offset_with_timestamp("ingest", 0, -1).await.unwrap_err();
+        assert_eq!(
+            client.partition_leader("ingest", 0),
+            (0, 8, None),
+            "single-partition ListOffsets transport error must preserve cached leader"
+        );
+        let _ = client.list_offsets_sharded(&parts, -1).await.unwrap_err();
+        assert_eq!(
+            client.partition_leader("ingest", 0),
+            (0, 8, None),
+            "sharded ListOffsets transport error must preserve cached leader"
+        );
+
+        start_reader.stop().await;
     }
 }

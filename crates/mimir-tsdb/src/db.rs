@@ -64,6 +64,10 @@ pub type BlocksToDeleteFn = Arc<
     dyn Fn(&[Arc<Block>], &dyn Fn(&[Arc<Block>]) -> HashSet<Ulid>) -> HashSet<Ulid> + Send + Sync,
 >;
 
+/// Optional callback invoked outside `blocks.write()` whenever `reload_blocks_locked`
+/// swaps in a changed block slice.
+pub type BlocksReloadedFn = Arc<dyn Fn(&[Arc<Block>]) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct TsdbOptions {
     pub head: HeadOptions,
@@ -73,6 +77,8 @@ pub struct TsdbOptions {
     pub retention_duration_ms: i64,
     /// Go `Options.BlocksToDelete` (`None` = `DefaultBlocksToDelete`).
     pub blocks_to_delete: Option<BlocksToDeleteFn>,
+    /// Invoked after `blocks` changes on reload.
+    pub on_blocks_reload: Option<BlocksReloadedFn>,
     /// Go `Options.EnableBiggerOOOBlockForOldSamples`.
     pub enable_bigger_ooo_block_for_old_samples: bool,
     /// Per-block `PostingsForMatchersCache` (Mimir `block_postings_for_matchers_cache_*`).
@@ -110,6 +116,7 @@ impl Default for TsdbOptions {
             no_lockfile: true,
             retention_duration_ms: 0,
             blocks_to_delete: None,
+            on_blocks_reload: None,
             enable_bigger_ooo_block_for_old_samples: false,
             block_postings_cache: PostingsForMatchersCacheConfig::default(),
         }
@@ -768,18 +775,38 @@ impl TsdbInner {
         Ok(())
     }
 
-    /// Go `DB.reloadBlocks` under `cmtx`: swaps in the reloaded block set and drops all
-    /// obsolete `Arc<Block>` references BEFORE deleting their directories on disk so
-    /// every block index/chunk mmap is unmapped before unlink.
+    /// Go `DB.reloadBlocks` under `cmtx`: skips `blocks.write()` when nothing changed,
+    /// otherwise swaps in `to_load`, drops `blocks.write()` immediately, waits for active
+    /// `BlockReadGuard`s on `deletable` blocks outside `blocks.write()`, drops `old_blocks`
+    /// so every obsolete mmap is unmapped, and only then unlinks `deletable` directories.
     fn reload_blocks_locked(&self) -> Result<(), TsdbError> {
         let res = (|| -> Result<(), TsdbError> {
-            let (to_load, deletable) = {
+            let (to_load, deletable, unchanged) = {
                 let current = self.blocks.read().clone();
-                Self::prepare_reload_blocks(&self.dir, &self.opts, &self.metrics, &current)?
+                let (to_load, deletable) =
+                    Self::prepare_reload_blocks(&self.dir, &self.opts, &self.metrics, &current)?;
+                let unchanged = deletable.is_empty()
+                    && current.len() == to_load.len()
+                    && current.iter().zip(&to_load).all(|(a, b)| Arc::ptr_eq(a, b));
+                (to_load, deletable, unchanged)
             };
-            {
-                let _old = std::mem::replace(&mut *self.blocks.write(), to_load);
+            if unchanged {
+                return Ok(());
             }
+            let old_blocks = {
+                let mut guard = self.blocks.write();
+                std::mem::replace(&mut *guard, to_load)
+            };
+            if let Some(ref cb) = self.opts.on_blocks_reload {
+                let new_blocks = self.blocks.read().clone();
+                cb(&new_blocks);
+            }
+            for b in &old_blocks {
+                if deletable.contains(&b.ulid()) {
+                    b.close_and_wait();
+                }
+            }
+            drop(old_blocks);
             Self::delete_blocks(&self.dir, &deletable)?;
             Ok(())
         })();
@@ -1093,6 +1120,8 @@ impl TsdbInner {
             let meta_opt = self.timed_write(|| compact_blocks(&self.dir, &block_refs))?;
             match meta_opt {
                 Some(meta) => {
+                    drop(plan_blocks);
+                    drop(loaded_blocks);
                     self.reload_after_write(&[meta.ulid])?;
                     created.push(meta.ulid);
                 }

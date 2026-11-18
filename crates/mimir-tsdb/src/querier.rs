@@ -13,14 +13,14 @@ use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::block::{Block, BlockError};
+use crate::block::{Block, BlockError, BlockReadGuard};
 use crate::chunkenc::{ChunkError, EncodedChunk};
 use crate::chunks_block::{BlockChunksError, ChunkMeta};
 use crate::compact::{
     decode_chunk_samples, merge_chunks_with_tombstones, merge_head_chunks_with_tombstones,
     DecodedSample,
 };
-use crate::head::{Head, HeadError};
+use crate::head::{Head, HeadError, HeadReadGuard};
 use crate::index::IndexError;
 use crate::labels::{decode_stringlabel_size, Labels};
 use crate::matcher::LabelMatcher;
@@ -97,6 +97,8 @@ pub struct PreparedChunkSelect {
     pub mint: i64,
     pub maxt: i64,
     pub unordered: bool,
+    _block_guards: Vec<BlockReadGuard>,
+    _head_guard: Option<HeadReadGuard>,
 }
 
 impl PreparedChunkSelect {
@@ -265,18 +267,89 @@ impl<'a> TsdbQuerier<'a> {
         }));
     }
 
-    fn effective_blocks<'b>(
-        &'b self,
-        guard: &'b Option<parking_lot::RwLockReadGuard<'a, Vec<Arc<Block>>>>,
-    ) -> Vec<Arc<Block>> {
-        match guard {
-            Some(g) => g
-                .iter()
-                .filter(|b| b.overlaps_closed_interval(self.mint, self.maxt))
-                .cloned()
-                .collect(),
-            None => self.blocks.clone(),
+    fn snapshot_blocks(
+        &self,
+        guard: Option<&parking_lot::RwLockReadGuard<'a, Vec<Arc<Block>>>>,
+    ) -> (Vec<Arc<Block>>, Vec<BlockReadGuard>) {
+        let slice: &[Arc<Block>] = match guard {
+            Some(g) => g.as_slice(),
+            None => self.blocks.as_slice(),
+        };
+        let mut blocks = Vec::new();
+        let mut guards = Vec::new();
+        for b in slice {
+            if b.overlaps_closed_interval(self.mint, self.maxt) {
+                if let Some(bg) = Block::start_read(b) {
+                    blocks.push(Arc::clone(b));
+                    guards.push(bg);
+                }
+            }
         }
+        (blocks, guards)
+    }
+
+    /// Holds `blocks_lock.read()` ONLY long enough to check `check_open()`, clone
+    /// overlapping `Block`s with `BlockReadGuard`s, and register a `HeadReadGuard`, then
+    /// drops `blocks_lock.read()` immediately.
+    #[allow(clippy::type_complexity)]
+    fn snapshot_sources(
+        &self,
+        in_order_only: bool,
+    ) -> Result<(Vec<Arc<Block>>, Vec<BlockReadGuard>, Option<HeadReadGuard>), QuerierError> {
+        let lock_guard = self.blocks_lock.map(|l| l.read());
+        self.check_open()?;
+        let (blocks, block_guards) = self.snapshot_blocks(lock_guard.as_ref());
+        let head_guard = if in_order_only {
+            self.effective_in_order_head()
+        } else {
+            self.effective_head()
+        }
+        .map(|h| h.start_read(self.mint, self.maxt));
+        drop(lock_guard);
+        Ok((blocks, block_guards, head_guard))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn try_snapshot_sources(
+        &self,
+    ) -> Result<Option<(Vec<Arc<Block>>, Vec<BlockReadGuard>, Option<HeadReadGuard>)>, QuerierError> {
+        let lock_guard = match self.blocks_lock {
+            Some(l) => match l.try_read() {
+                Some(g) => Some(g),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        self.check_open()?;
+        let (blocks, block_guards) = self.snapshot_blocks(lock_guard.as_ref());
+        let head_guard = self
+            .effective_head()
+            .map(|h| h.start_read(self.mint, self.maxt));
+        drop(lock_guard);
+        Ok(Some((blocks, block_guards, head_guard)))
+    }
+
+    fn blocks_match_prepared(&self, prepared: &PreparedChunkSelect) -> Result<bool, QuerierError> {
+        let Some(lock) = self.blocks_lock else {
+            self.check_open()?;
+            return Ok(true);
+        };
+        let lock_guard = lock.read();
+        self.check_open()?;
+        let mut idx = 0usize;
+        let mut all_match = true;
+        for b in lock_guard.iter() {
+            if b.overlaps_closed_interval(self.mint, self.maxt) {
+                match prepared.overlapping_blocks.get(idx) {
+                    Some(prev) if Arc::ptr_eq(b, prev) => idx += 1,
+                    _ => {
+                        all_match = false;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(all_match && idx == prepared.overlapping_blocks.len())
     }
 
     fn effective_in_order_head(&self) -> Option<&'a Head> {
@@ -345,6 +418,8 @@ impl<'a> TsdbQuerier<'a> {
     fn prepare_select_locked(
         &self,
         blocks: Vec<Arc<Block>>,
+        block_guards: Vec<BlockReadGuard>,
+        head_guard: Option<HeadReadGuard>,
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<PreparedChunkSelect, QuerierError> {
@@ -364,6 +439,8 @@ impl<'a> TsdbQuerier<'a> {
             head_refs,
             block_refs,
             overlapping_blocks: blocks,
+            _block_guards: block_guards,
+            _head_guard: head_guard,
             mint: self.mint,
             maxt: self.maxt,
             unordered,
@@ -371,23 +448,20 @@ impl<'a> TsdbQuerier<'a> {
     }
 
     /// Evaluates postings matchers across `Head` and overlapping `Block`s (hitting
-    /// `PostingsForMatchersCache` when cached) without loading any chunk bytes.
+    /// `PostingsForMatchersCache` when cached) without loading any chunk bytes or holding
+    /// `blocks_lock.read()`.
     pub fn prepare_select_chunks(
         &self,
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<PreparedChunkSelect, QuerierError> {
-        let lock_guard = self.blocks_lock.map(|l| l.read());
-        self.check_open()?;
-        let blocks = self.effective_blocks(&lock_guard);
-        drop(lock_guard);
-        self.prepare_select_locked(blocks, matchers, unordered)
+        let (blocks, block_guards, head_guard) = self.snapshot_sources(false)?;
+        self.prepare_select_locked(blocks, block_guards, head_guard, matchers, unordered)
     }
 
-    /// Evaluates postings inline under `blocks_lock.read()`. If the matched series count is small
-    /// (`<= max_source_series` and `<= max_total_refs`), materializes chunks immediately while still
-    /// holding `blocks_lock.read()` and returns `Ok(Ok(series))`. Otherwise releases the lock and
-    /// returns `Ok(Err(prepared))` so the caller can offload chunk loading to a blocking pool.
+    /// Snapshots blocks & guards under `blocks_lock.read()`, drops the lock immediately, and
+    /// evaluates postings. If matched series are small (`<= max_source_series` and
+    /// `<= max_total_refs`), materializes chunks inline; otherwise returns `Ok(Err(prepared))`.
     pub fn select_chunks_adaptive(
         &self,
         sort_series: bool,
@@ -396,10 +470,9 @@ impl<'a> TsdbQuerier<'a> {
         max_source_series: usize,
         max_total_refs: usize,
     ) -> Result<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>, QuerierError> {
-        let lock_guard = self.blocks_lock.map(|l| l.read());
-        self.check_open()?;
-        let blocks = self.effective_blocks(&lock_guard);
-        let prepared = self.prepare_select_locked(blocks, matchers, unordered)?;
+        let (blocks, block_guards, head_guard) = self.snapshot_sources(false)?;
+        let prepared =
+            self.prepare_select_locked(blocks, block_guards, head_guard, matchers, unordered)?;
         if prepared.is_empty() {
             let empty_min_times: Vec<i64> = prepared
                 .overlapping_blocks
@@ -424,13 +497,12 @@ impl<'a> TsdbQuerier<'a> {
             let series = self.execute_prepared_select_locked(prepared, sort_series)?;
             return Ok(Ok(series));
         }
-        drop(lock_guard);
         Ok(Err(prepared))
     }
 
     /// Non-blocking variant of [`Self::select_chunks_adaptive`]: returns `Ok(None)` immediately
-    /// if `blocks_lock` is currently contended by a compaction writer, so async RPC threads never
-    /// block on `blocks_lock.read()`.
+    /// if `blocks_lock` is currently contended by a compaction writer, and otherwise drops
+    /// `blocks_lock.read()` immediately after snapshotting block/head guards.
     pub fn try_select_chunks_adaptive(
         &self,
         sort_series: bool,
@@ -439,16 +511,11 @@ impl<'a> TsdbQuerier<'a> {
         max_source_series: usize,
         max_total_refs: usize,
     ) -> Result<Option<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>>, QuerierError> {
-        let lock_guard = match self.blocks_lock {
-            Some(l) => match l.try_read() {
-                Some(g) => Some(g),
-                None => return Ok(None),
-            },
-            None => None,
+        let Some((blocks, block_guards, head_guard)) = self.try_snapshot_sources()? else {
+            return Ok(None);
         };
-        self.check_open()?;
-        let blocks = self.effective_blocks(&lock_guard);
-        let prepared = self.prepare_select_locked(blocks, matchers, unordered)?;
+        let prepared =
+            self.prepare_select_locked(blocks, block_guards, head_guard, matchers, unordered)?;
         if prepared.is_empty() {
             let empty_min_times: Vec<i64> = prepared
                 .overlapping_blocks
@@ -473,11 +540,10 @@ impl<'a> TsdbQuerier<'a> {
             let series = self.execute_prepared_select_locked(prepared, sort_series)?;
             return Ok(Some(Ok(series)));
         }
-        drop(lock_guard);
         Ok(Some(Err(prepared)))
     }
 
-    /// Materializes chunks for a [`PreparedChunkSelect`] while holding `blocks_lock.read()`,
+    /// Materializes chunks for a [`PreparedChunkSelect`] without holding `blocks_lock.read()`,
     /// refreshing the selection if concurrent compaction updated `blocks`.
     pub fn execute_prepared_select_with_matchers(
         &self,
@@ -485,19 +551,17 @@ impl<'a> TsdbQuerier<'a> {
         matchers: &[LabelMatcher],
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
-        let lock_guard = self.blocks_lock.map(|l| l.read());
-        self.check_open()?;
-        if self.blocks_lock.is_some() {
-            let current_blocks = self.effective_blocks(&lock_guard);
-            let same = current_blocks.len() == prepared.overlapping_blocks.len()
-                && current_blocks
-                    .iter()
-                    .zip(prepared.overlapping_blocks.iter())
-                    .all(|(a, b)| Arc::ptr_eq(a, b));
-            if !same {
-                prepared =
-                    self.prepare_select_locked(current_blocks, matchers, prepared.unordered)?;
-            }
+        if !self.blocks_match_prepared(&prepared)? {
+            let unordered = prepared.unordered;
+            drop(prepared);
+            let (blocks, block_guards, head_guard) = self.snapshot_sources(false)?;
+            prepared = self.prepare_select_locked(
+                blocks,
+                block_guards,
+                head_guard,
+                matchers,
+                unordered,
+            )?;
         }
         self.execute_prepared_select_locked(prepared, sort_series)
     }
@@ -508,7 +572,6 @@ impl<'a> TsdbQuerier<'a> {
         prepared: PreparedChunkSelect,
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
-        let _lock_guard = self.blocks_lock.map(|l| l.read());
         self.check_open()?;
         self.execute_prepared_select_locked(prepared, sort_series)
     }
@@ -686,7 +749,8 @@ impl<'a> TsdbQuerier<'a> {
         Ok(out)
     }
 
-    /// Two-phase lazy `QueryStream` executor holding `blocks_lock.read()` across Phase 1 and Phase 2:
+    /// Two-phase lazy `QueryStream` executor without holding `blocks_lock.read()` across
+    /// Phase 1 / Phase 2 or `on_event` (`tx.blocking_send`):
     /// - Phase 1 builds lightweight `LazySeriesEntry` descriptors (`chunk_count` without cloning chunk bytes
     ///   on the fast path), sorts if requested, streams `(Labels, chunk_count)` via `on_series` (dropping
     ///   `Labels` immediately), and calls `on_series_end`.
@@ -703,20 +767,19 @@ impl<'a> TsdbQuerier<'a> {
     where
         F: FnMut(LazyStreamEvent) -> Result<bool, QuerierError>,
     {
-        let lock_guard = self.blocks_lock.map(|l| l.read());
-        self.check_open()?;
-        if self.blocks_lock.is_some() {
-            let current_blocks = self.effective_blocks(&lock_guard);
-            let same = current_blocks.len() == prepared.overlapping_blocks.len()
-                && current_blocks
-                    .iter()
-                    .zip(prepared.overlapping_blocks.iter())
-                    .all(|(a, b)| Arc::ptr_eq(a, b));
-            if !same {
-                prepared =
-                    self.prepare_select_locked(current_blocks, matchers, prepared.unordered)?;
-            }
+        if !self.blocks_match_prepared(&prepared)? {
+            let unordered = prepared.unordered;
+            drop(prepared);
+            let (blocks, block_guards, head_guard) = self.snapshot_sources(false)?;
+            prepared = self.prepare_select_locked(
+                blocks,
+                block_guards,
+                head_guard,
+                matchers,
+                unordered,
+            )?;
         }
+
 
         let head = self.effective_head();
         let mint = prepared.mint;
@@ -1049,10 +1112,9 @@ impl<'a> TsdbQuerier<'a> {
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
-        let _lock_guard = self.blocks_lock.map(|l| l.read());
-        self.check_open()?;
-        let blocks = self.effective_blocks(&_lock_guard);
-        let prepared = self.prepare_select_locked(blocks, matchers, unordered)?;
+        let (blocks, block_guards, head_guard) = self.snapshot_sources(false)?;
+        let prepared =
+            self.prepare_select_locked(blocks, block_guards, head_guard, matchers, unordered)?;
         self.execute_prepared_select_locked(prepared, sort_series)
     }
 
@@ -1062,9 +1124,7 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<Labels>, QuerierError> {
-        let lock_guard = self.blocks_lock.map(|l| l.read());
-        self.check_open()?;
-        let blocks = self.effective_blocks(&lock_guard);
+        let (blocks, _block_guards, _head_guard) = self.snapshot_sources(false)?;
         let head = self.effective_head();
 
         if blocks.is_empty() {
@@ -1114,9 +1174,7 @@ impl<'a> TsdbQuerier<'a> {
 
     /// Returns sorted unique label names across in-order Head and overlapping Blocks matching `matchers`.
     pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {
-        let lock_guard = self.blocks_lock.map(|l| l.read());
-        self.check_open()?;
-        let blocks = self.effective_blocks(&lock_guard);
+        let (blocks, _block_guards, _head_guard) = self.snapshot_sources(true)?;
         let head = self.effective_in_order_head();
         let mut set: BTreeSet<String> = BTreeSet::new();
 
@@ -1149,9 +1207,7 @@ impl<'a> TsdbQuerier<'a> {
         limit: Option<usize>,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<String>, QuerierError> {
-        let lock_guard = self.blocks_lock.map(|l| l.read());
-        self.check_open()?;
-        let blocks = self.effective_blocks(&lock_guard);
+        let (blocks, _block_guards, _head_guard) = self.snapshot_sources(true)?;
         let head = self.effective_in_order_head();
 
         if blocks.is_empty() {
@@ -1220,9 +1276,7 @@ impl<'a> TsdbQuerier<'a> {
 
     /// Returns the number of active series in Head (plus series in overlapping blocks if queried).
     pub fn series_count(&self) -> Result<usize, QuerierError> {
-        let lock_guard = self.blocks_lock.map(|l| l.read());
-        self.check_open()?;
-        let blocks = self.effective_blocks(&lock_guard);
+        let (blocks, _block_guards, _head_guard) = self.snapshot_sources(false)?;
         let mut set: BTreeSet<Labels> = BTreeSet::new();
         if let Some(head) = self.head {
             let all = LabelMatcher::new(crate::matcher::MatchType::RegexMatch, "__name__", ".*")

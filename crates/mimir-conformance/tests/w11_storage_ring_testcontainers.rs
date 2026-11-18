@@ -50,7 +50,12 @@ use mimir_ring::kv::{cas_typed, get_typed, is_key_deleted, KvClient, StringCodec
 use mimir_ring::partition_ring::model::partition_ring_desc_codec;
 use mimir_ring::ring::model::ring_desc_codec;
 use mimir_storage::bucket::BucketClient;
-use mimir_storage::ingest::{KafkaClient, KafkaCompression, PartitionOffsetClient, ProduceRecord};
+use mimir_common::backoff::BackoffConfig;
+use mimir_storage::ingest::{
+    ConcurrentFetchers, FetcherMetrics, GenericOffsetReader, KafkaClient, KafkaCompression,
+    PartitionOffsetClient, ProduceRecord, RangeErrorPolicy,
+    SingleClusterPartitionOffsetReader,
+};
 use mimir_storage::shipper::{
     upload_block_to_bucket, BlockMeta, BlockMetaCompaction, BlockStats, Shipper, ShipperError,
     ShipperMeta, ShipperMetrics, SourceType, ThanosMeta, INDEX_FILENAME, META_FILENAME,
@@ -982,6 +987,271 @@ fn test_w11_p1_3_and_p1_4_shipper_go_nulls_and_delete_order() -> Result<()> {
             !bkt.exists(&format!("tenant-null/{fail_id}/chunks/000001"))
                 .await?,
             "partial upload cleanup must have deleted chunks"
+        );
+        Ok(())
+    })
+}
+
+struct LogCaptureVisitor(String);
+
+impl tracing::field::Visit for LogCaptureVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            let _ = write!(self.0, "{value:?}");
+        }
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0.push_str(value);
+        }
+    }
+}
+
+struct CaptureErrorsSubscriber(Arc<parking_lot::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for CaptureErrorsSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::ERROR
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut v = LogCaptureVisitor(String::new());
+        event.record(&mut v);
+        self.0.lock().push(v.0);
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+#[test]
+fn test_w11_redpanda_restart_concurrent_fetchers_and_50ms_offset_reader_recovers() -> Result<()> {
+    if skip_docker("test_w11_redpanda_restart_concurrent_fetchers_and_50ms_offset_reader_recovers") {
+        return Ok(());
+    }
+    block_on_for_tests(async {
+        static LOGS: std::sync::OnceLock<Arc<parking_lot::Mutex<Vec<String>>>> =
+            std::sync::OnceLock::new();
+        let logs = Arc::clone(LOGS.get_or_init(|| {
+            let buf = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let _ = tracing::subscriber::set_global_default(CaptureErrorsSubscriber(Arc::clone(&buf)));
+            buf
+        }));
+        logs.lock().clear();
+
+        let port = free_test_port();
+        let yaml = format!(
+            "redpanda:\n  data_directory: /var/lib/redpanda/data\n  empty_seed_starts_cluster: true\n  seed_servers: []\n  rpc_server: {{address: 0.0.0.0, port: 33145}}\n  advertised_rpc_api: {{address: 127.0.0.1, port: 33145}}\n  admin: [{{address: 0.0.0.0, port: 9644}}]\n  developer_mode: true\n  kafka_api:\n    - {{name: external, address: 0.0.0.0, port: {port}}}\n  advertised_kafka_api:\n    - {{name: external, address: 127.0.0.1, port: {port}}}\n"
+        );
+        let container = GenericImage::new(REDPANDA_IMAGE, REDPANDA_TAG)
+            .with_entrypoint("/bin/sh")
+            .with_cmd([
+                "-c",
+                "cp /config/redpanda.yaml /etc/redpanda/redpanda.yaml && exec rpk redpanda start --mode dev-container --smp 1 --memory 1G --reserve-memory 0M --default-log-level=warn",
+            ])
+            .with_label(CONTAINER_LABEL.0, CONTAINER_LABEL.1)
+            .with_startup_timeout(Duration::from_secs(180))
+            .with_copy_to(
+                CopyTargetOptions::new("/config/redpanda.yaml").with_mode(0o644),
+                yaml.into_bytes(),
+            )
+            .with_mapped_port(port, ContainerPort::Tcp(port))
+            .start()
+            .await
+            .context("starting Redpanda for restart test")?;
+
+        let topic = "w11-rp-restart";
+        let dl = Instant::now() + Duration::from_secs(60);
+        loop {
+            let res = container
+                .exec(ExecCommand::new(["rpk", "topic", "create", topic, "-p", "1", "-r", "1"]))
+                .await?;
+            let code = loop {
+                if let Some(c) = res.exit_code().await? {
+                    break c;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            if code == 0 {
+                break;
+            }
+            ensure!(Instant::now() < dl, "timed out creating topic on Redpanda");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec![format!("127.0.0.1:{port}")]),
+            topic: topic.to_string(),
+            client_id: "w11-restart".to_string(),
+            dial_timeout: GoDuration::from_secs(2),
+            last_produced_offset_retry_timeout: GoDuration::from_secs(10),
+            ..Default::default()
+        };
+        let client = Arc::new(KafkaClient::from_config(&cfg)?);
+        let offset_client = PartitionOffsetClient::with_config(
+            Arc::clone(&client),
+            &cfg,
+            None,
+        );
+
+        // Produce initial records 0..5.
+        for i in 0..5 {
+            client
+                .produce(
+                    topic,
+                    0,
+                    KafkaCompression::None,
+                    vec![ProduceRecord {
+                        key: Some(Bytes::from("k")),
+                        value: Some(Bytes::from(format!("pre-{i}"))),
+                        headers: Vec::new(),
+                        timestamp_ms: None,
+                    }],
+                )
+                .await?;
+        }
+
+        // Share the exact same Arc<KafkaClient> between a 50ms offset reader and ConcurrentFetchers.
+        let offset_reader = SingleClusterPartitionOffsetReader::new(
+            offset_client.clone(),
+            topic,
+            0,
+            Duration::from_millis(50),
+        );
+        offset_reader.start().await;
+        let start_offsets_reader = Arc::new(GenericOffsetReader::new(
+            {
+                let oc = offset_client.clone();
+                Arc::new(move || {
+                    let oc = oc.clone();
+                    Box::pin(async move {
+                        oc.fetch_partition_start_offset(topic, 0)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                })
+            },
+            Duration::from_secs(10),
+        ));
+        start_offsets_reader.start().await;
+
+        let fetchers = ConcurrentFetchers::new(
+            Arc::clone(&client),
+            topic,
+            0,
+            0,
+            2,
+            1024 * 1024,
+            false,
+            Duration::from_millis(100),
+            &offset_client,
+            RangeErrorPolicy::ResumeFromStart,
+            Arc::clone(&start_offsets_reader),
+            BackoffConfig {
+                min_backoff: Duration::from_millis(100),
+                max_backoff: Duration::from_millis(500),
+                max_retries: 0,
+            },
+            FetcherMetrics::new(None),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+        fetchers.start().await;
+
+        let mut got_pre = Vec::new();
+        let pre_dl = Instant::now() + Duration::from_secs(15);
+        while got_pre.len() < 5 {
+            ensure!(Instant::now() < pre_dl, "timed out reading pre-restart records: {got_pre:?}");
+            if let Some(res) = fetchers.poll_fetches(Duration::from_secs(2)).await {
+                if res.err.is_none() {
+                    for r in res.records {
+                        got_pre.push(r.offset);
+                    }
+                }
+            }
+        }
+        assert_eq!(got_pre, vec![0, 1, 2, 3, 4]);
+
+        // Stop Redpanda for 1.5s so both the 50ms offset reader and ConcurrentFetchers hit
+        // ConnectionRefused, then start Redpanda again (hitting LEADER_NOT_AVAILABLE during Raft startup).
+        container.stop().await.context("stopping Redpanda")?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        container.start().await.context("restarting Redpanda")?;
+
+        // Wait until broker is accepting produces again and produce records 5..10.
+        let prod_dl = Instant::now() + Duration::from_secs(60);
+        for i in 5..10 {
+            loop {
+                match client
+                    .produce(
+                        topic,
+                        0,
+                        KafkaCompression::None,
+                        vec![ProduceRecord {
+                            key: Some(Bytes::from("k")),
+                            value: Some(Bytes::from(format!("post-{i}"))),
+                            headers: Vec::new(),
+                            timestamp_ms: None,
+                        }],
+                    )
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(_) if Instant::now() < prod_dl => {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    Err(e) => return Err(e).context("producing post-restart record"),
+                }
+            }
+        }
+
+        let mut got_post = Vec::new();
+        let post_dl = Instant::now() + Duration::from_secs(30);
+        while got_post.len() < 5 {
+            ensure!(
+                Instant::now() < post_dl,
+                "timed out reading post-restart records: {got_post:?}"
+            );
+            if let Some(res) = fetchers.poll_fetches(Duration::from_secs(2)).await {
+                if res.err.is_none() {
+                    for r in res.records {
+                        got_post.push(r.offset);
+                    }
+                }
+            }
+        }
+        assert_eq!(got_post, vec![5, 6, 7, 8, 9]);
+
+        // Verify the 50ms offset reader also recovered and sees offset 9.
+        let off_dl = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < off_dl {
+            if matches!(offset_reader.cached_offset(), Some(Ok(9))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        ensure!(
+            matches!(offset_reader.cached_offset(), Some(Ok(9))),
+            "expected 50ms offset reader to see 9, got {:?}",
+            offset_reader.cached_offset()
+        );
+
+        fetchers.stop().await;
+        start_offsets_reader.stop().await;
+        offset_reader.stop().await;
+
+        let unhandled: Vec<String> = logs
+            .lock()
+            .iter()
+            .filter(|m| m.contains("received an error we're not prepared to handle"))
+            .cloned()
+            .collect();
+        ensure!(
+            unhandled.is_empty(),
+            "unexpected unhandled fetcher error logs: {unhandled:?}"
         );
         Ok(())
     })

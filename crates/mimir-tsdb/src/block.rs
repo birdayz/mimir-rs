@@ -9,6 +9,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use parking_lot::{Condvar, Mutex};
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use ulid::Ulid;
@@ -331,6 +333,78 @@ pub fn list_block_dirs(dir: &Path) -> Result<Vec<(Ulid, PathBuf)>, BlockError> {
     Ok(blocks)
 }
 
+#[derive(Debug, Default)]
+struct BlockReaderState {
+    closing: bool,
+    pending: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BlockReaders {
+    state: Mutex<BlockReaderState>,
+    cv: Condvar,
+}
+
+impl BlockReaders {
+    fn try_start_read(&self) -> bool {
+        let mut st = self.state.lock();
+        if st.closing {
+            return false;
+        }
+        st.pending += 1;
+        true
+    }
+
+    fn inc_unconditional(&self) {
+        let mut st = self.state.lock();
+        st.pending += 1;
+    }
+
+    fn finish_read(&self) {
+        let mut st = self.state.lock();
+        st.pending = st.pending.saturating_sub(1);
+        if st.pending == 0 {
+            self.cv.notify_all();
+        }
+    }
+
+    fn close_and_wait(&self) {
+        let mut st = self.state.lock();
+        st.closing = true;
+        while st.pending > 0 {
+            self.cv.wait(&mut st);
+        }
+    }
+}
+
+/// Active reader guard on a [`Block`], ensuring `reload_blocks_locked` waits for
+/// concurrent queriers to finish and drop their `Arc<Block>` mmaps before unlinking
+/// obsolete block directories (matching Go `Block.Close()`).
+#[derive(Debug)]
+pub struct BlockReadGuard {
+    block: Option<Arc<Block>>,
+    readers: Arc<BlockReaders>,
+}
+
+impl Clone for BlockReadGuard {
+    fn clone(&self) -> Self {
+        self.readers.inc_unconditional();
+        Self {
+            block: self.block.clone(),
+            readers: Arc::clone(&self.readers),
+        }
+    }
+}
+
+impl Drop for BlockReadGuard {
+    fn drop(&mut self) {
+        // Drop the `Arc<Block>` BEFORE decrementing `pending` so the caller of
+        // `close_and_wait()` is guaranteed no reader thread still holds a live mmap.
+        drop(self.block.take());
+        self.readers.finish_read();
+    }
+}
+
 /// Opened immutable on-disk Prometheus ULID block (`tsdb.Block`).
 #[derive(Debug)]
 pub struct Block {
@@ -341,6 +415,7 @@ pub struct Block {
     tombstones: MemTombstones,
     total_size: u64,
     postings_cache: PostingsForMatchersCache,
+    readers: Arc<BlockReaders>,
 }
 
 impl Block {
@@ -378,7 +453,25 @@ impl Block {
             tombstones,
             total_size,
             postings_cache: PostingsForMatchersCache::new(postings_cache),
+            readers: Arc::new(BlockReaders::default()),
         })
+    }
+
+    /// Registers an active reader on this block unless it is already closing.
+    pub fn start_read(block: &Arc<Block>) -> Option<BlockReadGuard> {
+        if block.readers.try_start_read() {
+            Some(BlockReadGuard {
+                block: Some(Arc::clone(block)),
+                readers: Arc::clone(&block.readers),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Marks this block as closing and waits until all active [`BlockReadGuard`]s drop.
+    pub fn close_and_wait(&self) {
+        self.readers.close_and_wait();
     }
 
     /// Evaluates `matchers` against this block's index using its `PostingsForMatchersCache`.
