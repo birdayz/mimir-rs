@@ -536,9 +536,10 @@ impl UserTsdb {
         let on_blocks_reload: BlocksReloadedFn = {
             let shipped_blocks = Arc::clone(&shipped_blocks);
             let oldest_ts = Arc::clone(&oldest_unshipped_block_ts_ms);
-            Arc::new(move |blocks| {
+            Arc::new(move |get_blocks| {
                 let shipped = shipped_blocks.lock();
-                let oldest = compute_oldest_unshipped_ms(blocks, &shipped);
+                let blocks = get_blocks();
+                let oldest = compute_oldest_unshipped_ms(&blocks, &shipped);
                 oldest_ts.store(oldest, Ordering::Release);
             })
         };
@@ -881,8 +882,8 @@ impl UserTsdb {
             .into_iter()
             .map(|(k, mt)| (k, UNIX_EPOCH + Duration::from_millis(mt.0.max(0) as u64)))
             .collect();
-        let blocks = self.db.blocks();
         let mut guard = self.shipped_blocks.lock();
+        let blocks = self.db.blocks();
         *guard = new_map;
         let oldest = compute_oldest_unshipped_ms(&blocks, &guard);
         self.oldest_unshipped_block_ts_ms
@@ -891,8 +892,8 @@ impl UserTsdb {
     }
 
     pub fn refresh_oldest_unshipped_block_time_ms(&self) {
-        let blocks = self.db.blocks();
         let shipped = self.shipped_blocks.lock();
+        let blocks = self.db.blocks();
         let oldest = compute_oldest_unshipped_ms(&blocks, &shipped);
         self.oldest_unshipped_block_ts_ms
             .store(oldest, Ordering::Release);
@@ -1323,6 +1324,7 @@ impl UserTsdb {
     pub fn close(&self) -> Result<(), TsdbError> {
         self.lifecycle_adapter.limiter_slot.write().take();
         let res = self.db.close();
+        self.oldest_unshipped_block_ts_ms.store(0, Ordering::Release);
         self.lifecycle_adapter.num_series_fn.write().take();
         self.db.head().clear_lifecycle_callback();
         res

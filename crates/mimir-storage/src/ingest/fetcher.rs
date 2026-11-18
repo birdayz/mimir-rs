@@ -333,8 +333,7 @@ async fn handle_kafka_fetch_err_with_log_start(
             | ResponseError::UnsupportedVersion
             | ResponseError::KafkaStorageError
             | ResponseError::UnknownTopicId,
-        )
-        | KafkaFetchError::FirstReadEOF => {
+        ) => {
             long_backoff.wait().await;
         }
         KafkaFetchError::Other(msg) if msg.contains("OFFSET_MOVED_TO_TIERED_STORAGE") => {
@@ -348,6 +347,7 @@ async fn handle_kafka_fetch_err_with_log_start(
             | ResponseError::LeaderNotAvailable
             | ResponseError::BrokerNotAvailable,
         )
+        | KafkaFetchError::FirstReadEOF
         | KafkaFetchError::UnknownPartitionLeader
         | KafkaFetchError::TransientTransport(_) => {
             refresher.force_metadata_refresh().await;
@@ -510,10 +510,15 @@ pub(crate) fn kafka_fetch_error_from_client(err: KafkaClientError) -> KafkaFetch
         KafkaClientError::UnknownBroker => KafkaFetchError::Other(format!(
             "fetching from kafka: {UNKNOWN_BROKER}"
         )),
-        // The connection died: kgo fails the request with errChosenBrokerDead and a new
-        // connection is dialed on the next attempt.
-        KafkaClientError::ConnectionClosed | KafkaClientError::ChosenBrokerDead => {
+        // An established connection died (had prior successes): kgo fails with
+        // errChosenBrokerDead for immediate retry on a fresh connection. A freshly dialed
+        // connection closing before any successful response is TransientTransport (or
+        // FirstReadEof when SASL is absent) so run_worker refreshes metadata + backs off.
+        KafkaClientError::ChosenBrokerDead => {
             KafkaFetchError::Other(format!("fetching from kafka: {CHOSEN_BROKER_DIED}"))
+        }
+        KafkaClientError::ConnectionClosed => {
+            KafkaFetchError::TransientTransport(format!("fetching from kafka: {err}"))
         }
         KafkaClientError::RequestTimeout(_) | KafkaClientError::ConnectTimeout { .. } => {
             KafkaFetchError::Other("fetching from kafka: i/o timeout".to_string())

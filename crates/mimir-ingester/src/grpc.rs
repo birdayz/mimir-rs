@@ -143,6 +143,38 @@ impl Codec for RawQueryStreamCodec {
     }
 }
 
+#[derive(Clone, Default)]
+struct MetricsForLabelMatchersRequestDecoder;
+
+impl Decoder for MetricsForLabelMatchersRequestDecoder {
+    type Item = ingesterpb::MetricsForLabelMatchersRequest;
+    type Error = Status;
+
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+        ingesterpb::MetricsForLabelMatchersRequest::decode(src)
+            .map(Some)
+            .map_err(|e| Status::internal(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default)]
+struct RawMetricsForLabelMatchersCodec;
+
+impl Codec for RawMetricsForLabelMatchersCodec {
+    type Encode = Bytes;
+    type Decode = ingesterpb::MetricsForLabelMatchersRequest;
+    type Encoder = RawBytesEncoder;
+    type Decoder = MetricsForLabelMatchersRequestDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        RawBytesEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        MetricsForLabelMatchersRequestDecoder
+    }
+}
+
 /// `cortex.Ingester` Tonic server wrapper that decodes `/cortex.Ingester/Push`
 /// directly from raw gRPC frame bytes using the zero-copy `WriteRequestScratch` decoder.
 #[derive(Clone)]
@@ -308,7 +340,6 @@ impl hyper::body::Body for SingleChunkBody {
 struct SnappyCompressBody {
     inner: tonic::body::BoxBody,
     in_buf: BytesMut,
-    comp_buf: Vec<u8>,
     pending_trailers: Option<http::HeaderMap>,
     done: bool,
 }
@@ -318,7 +349,6 @@ impl SnappyCompressBody {
         Self {
             inner,
             in_buf: BytesMut::new(),
-            comp_buf: Vec::new(),
             pending_trailers: None,
             done: false,
         }
@@ -341,22 +371,20 @@ impl SnappyCompressBody {
                 break;
             }
             if flag == 0 {
-                self.comp_buf.clear();
-                if mimir_proto::snappy::compress_framed_into(
-                    &self.in_buf[5..frame_end],
-                    &mut self.comp_buf,
-                )
-                .is_ok()
+                let hdr_pos = out.len();
+                out.extend_from_slice(&[1, 0, 0, 0, 0]);
+                if mimir_proto::snappy::compress_framed_buf(&self.in_buf[5..frame_end], &mut out)
+                    .is_ok()
                 {
-                    if let Ok(comp_len) = u32::try_from(self.comp_buf.len()) {
-                        out.reserve(5 + self.comp_buf.len());
-                        out.put_u8(1);
-                        out.put_u32(comp_len);
-                        out.extend_from_slice(&self.comp_buf);
+                    let comp_len = out.len() - (hdr_pos + 5);
+                    if let Ok(comp_len_u32) = u32::try_from(comp_len) {
+                        out[hdr_pos + 1..hdr_pos + 5]
+                            .copy_from_slice(&comp_len_u32.to_be_bytes());
                         self.in_buf.advance(frame_end);
                         continue;
                     }
                 }
+                out.truncate(hdr_pos);
             }
             out.extend_from_slice(&self.in_buf[..frame_end]);
             self.in_buf.advance(frame_end);
@@ -756,8 +784,11 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
         let path = req.uri().path();
         let is_push = path == "/cortex.Ingester/Push";
         let is_query_stream = path == "/cortex.Ingester/QueryStream";
+        let is_metrics_for_label_matchers = path == "/cortex.Ingester/MetricsForLabelMatchers";
         let is_ingester_rpc = path.starts_with("/cortex.Ingester/");
-        let qs_echo_encoding = if is_query_stream && self.send_compression.is_none() {
+        let qs_echo_encoding = if (is_query_stream || is_metrics_for_label_matchers)
+            && self.send_compression.is_none()
+        {
             let req_enc = req
                 .headers()
                 .get("grpc-encoding")
@@ -1054,6 +1085,117 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     }
                 } else {
                     qs_resp
+                }
+            } else if is_metrics_for_label_matchers {
+                struct RawMetricsForLabelMatchersSvc(Arc<Ingester>);
+                impl tonic::server::UnaryService<ingesterpb::MetricsForLabelMatchersRequest>
+                    for RawMetricsForLabelMatchersSvc
+                {
+                    type Response = Bytes;
+                    type Future = Pin<
+                        Box<dyn Future<Output = Result<Response<Self::Response>, Status>> + Send + 'static>,
+                    >;
+
+                    fn call(
+                        &mut self,
+                        request: Request<ingesterpb::MetricsForLabelMatchersRequest>,
+                    ) -> Self::Future {
+                        let ingester = Arc::clone(&self.0);
+                        Box::pin(async move {
+                            let user_id = tenant_from_req(&ingester, &request)?;
+                            let (md, ext, inner) = request.into_parts();
+                            let trace_id =
+                                mimir_common::tracing::current_trace_id().unwrap_or_default();
+                            let _act = ingester.insert_activity(|| {
+                                request_activity(
+                                    &user_id,
+                                    &trace_id,
+                                    "Ingester/MetricsForLabelMatchers",
+                                    ActivityRequest::None,
+                                )
+                            });
+                            let bytes = ingester
+                                .handle_metrics_for_label_matchers_raw(&md, &user_id, inner)
+                                .await
+                                .map_err(|e| read_error_status(&ext, e))?;
+                            Ok(Response::new(bytes))
+                        })
+                    }
+                }
+
+                let mut mflm_grpc = tonic::server::Grpc::new(RawMetricsForLabelMatchersCodec);
+                for enc in accept_compression[..accept_compression_len]
+                    .iter()
+                    .flatten()
+                {
+                    mflm_grpc = mflm_grpc.accept_compressed(*enc);
+                }
+                let effective_tonic_send = send_compression.or_else(|| match qs_echo_encoding {
+                    Some("gzip")
+                        if accept_compression[..accept_compression_len]
+                            .iter()
+                            .flatten()
+                            .any(|e| *e == CompressionEncoding::Gzip) =>
+                    {
+                        Some(CompressionEncoding::Gzip)
+                    }
+                    Some("zstd")
+                        if accept_compression[..accept_compression_len]
+                            .iter()
+                            .flatten()
+                            .any(|e| *e == CompressionEncoding::Zstd) =>
+                    {
+                        Some(CompressionEncoding::Zstd)
+                    }
+                    _ => None,
+                });
+                if let Some(enc) = effective_tonic_send {
+                    mflm_grpc = mflm_grpc.send_compressed(enc);
+                }
+                if let Some(lim) = max_decoding_message_size {
+                    mflm_grpc = mflm_grpc.max_decoding_message_size(lim);
+                }
+                if let Some(lim) = max_encoding_message_size {
+                    mflm_grpc = mflm_grpc.max_encoding_message_size(lim);
+                }
+                let mflm_resp = READ_TAP_ADMITTED
+                    .scope(true, mflm_grpc.unary(RawMetricsForLabelMatchersSvc(ingester), req))
+                    .await;
+                let mflm_resp = if let Some(custom_resp_enc @ ("snappy" | "s2")) = qs_echo_encoding
+                {
+                    if mflm_resp.status() == http::StatusCode::OK
+                        && !mflm_resp.headers().contains_key("grpc-status")
+                        && mflm_resp.headers().get("grpc-encoding").is_none()
+                    {
+                        let (mut parts, body) = mflm_resp.into_parts();
+                        parts.headers.insert(
+                            "grpc-encoding",
+                            http::HeaderValue::from_static(custom_resp_enc),
+                        );
+                        http::Response::from_parts(
+                            parts,
+                            tonic::body::BoxBody::new(SnappyCompressBody::new(body)),
+                        )
+                    } else {
+                        mflm_resp
+                    }
+                } else {
+                    mflm_resp
+                };
+                if let Some(tap) = read_tap.take() {
+                    if mflm_resp.headers().contains_key("grpc-status") {
+                        tap.finish(false);
+                        mflm_resp
+                    } else {
+                        mflm_resp.map(|body| {
+                            tonic::body::BoxBody::new(ReadTapDropBody {
+                                inner: body,
+                                permit: Some(tap),
+                            })
+                        })
+                    }
+                } else {
+                    mflm_resp
                 }
             } else if is_ingester_rpc {
                 let resp = READ_TAP_ADMITTED
@@ -2059,5 +2201,86 @@ mod tests {
             1,
             "normal completion on Frame::trailers must call rp.record()"
         );
+    }
+
+    #[tokio::test]
+    async fn raw_metrics_for_label_matchers_svc_wire_parity_and_snappy() {
+        use mimir_proto::prost::Message;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = test_ingester(tmp.path(), true);
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let write_req = cortexpb::WriteRequest {
+            timeseries: vec![
+                cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair { name: Bytes::from_static(b"__name__"), value: Bytes::from_static(b"mflm_raw_metric") },
+                        cortexpb::LabelPair { name: Bytes::from_static(b"pod"), value: Bytes::from_static(b"pod-2") },
+                    ],
+                    samples: vec![cortexpb::Sample { value: 1.0, timestamp_ms: now }],
+                    ..Default::default()
+                },
+                cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair { name: Bytes::from_static(b"__name__"), value: Bytes::from_static(b"mflm_raw_metric") },
+                        cortexpb::LabelPair { name: Bytes::from_static(b"pod"), value: Bytes::from_static(b"pod-1") },
+                    ],
+                    samples: vec![cortexpb::Sample { value: 2.0, timestamp_ms: now }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        ing.push_write_request("t-mflm", &write_req).await.unwrap();
+
+        let mflm_req = ingesterpb::MetricsForLabelMatchersRequest {
+            start_timestamp_ms: now - 60_000,
+            end_timestamp_ms: now + 60_000,
+            matchers_set: vec![ingesterpb::LabelMatchers {
+                matchers: vec![ingesterpb::LabelMatcher {
+                    r#type: ingesterpb::MatchType::Equal as i32,
+                    name: "__name__".into(),
+                    value: "mflm_raw_metric".into(),
+                }],
+            }],
+            limit: 0,
+        };
+        let req_bytes = mflm_req.encode_to_vec();
+        let comp_req = mimir_proto::snappy::encode_grpc_frame(&req_bytes, true).unwrap();
+
+        let svc = IngesterService::new(Arc::clone(&ing)).into_server();
+        let http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/cortex.Ingester/MetricsForLabelMatchers")
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-encoding", "snappy")
+            .header("grpc-accept-encoding", "snappy,identity")
+            .header("x-scope-orgid", "t-mflm")
+            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(comp_req))))
+            .unwrap();
+
+        let resp = svc.oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(resp.headers().get("grpc-encoding").unwrap(), "snappy");
+        let mut resp_body = resp.into_body();
+        let mut body = BytesMut::new();
+        while let Some(frame_res) =
+            futures::future::poll_fn(|cx| hyper::body::Body::poll_frame(Pin::new(&mut resp_body), cx)).await
+        {
+            if let Ok(data) = frame_res.unwrap().into_data() {
+                body.extend_from_slice(&data);
+            }
+        }
+        let payload = mimir_proto::snappy::decode_grpc_frame(&body).unwrap();
+        let decoded = ingesterpb::MetricsForLabelMatchersResponse::decode(&payload[..]).unwrap();
+        assert_eq!(decoded.metric.len(), 2);
+        assert_eq!(decoded.metric[0].labels[1].value.as_ref(), b"pod-1");
+        assert_eq!(decoded.metric[1].labels[1].value.as_ref(), b"pod-2");
     }
 }

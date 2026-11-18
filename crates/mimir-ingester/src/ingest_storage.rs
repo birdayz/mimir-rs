@@ -1463,23 +1463,10 @@ impl RecordBatchConsumer for ShardedConsumerHandle {
         let this = Arc::clone(&self.0);
         Box::pin(async move {
             let start = Instant::now();
-            let res = match tokio::runtime::Handle::current().runtime_flavor() {
-                tokio::runtime::RuntimeFlavor::MultiThread => {
-                    tokio::task::block_in_place(|| this.consume_records_sync(&records))
-                }
-                tokio::runtime::RuntimeFlavor::CurrentThread => {
-                    let t = Arc::clone(&this);
-                    tokio::task::spawn_blocking(move || t.consume_records_sync(&records))
-                        .await
-                        .map_err(|e| format!("ingest consumer task join error: {e}"))?
-                }
-                _ => {
-                    let t = Arc::clone(&this);
-                    tokio::task::spawn_blocking(move || t.consume_records_sync(&records))
-                        .await
-                        .map_err(|e| format!("ingest consumer task join error: {e}"))?
-                }
-            };
+            let t = Arc::clone(&this);
+            let res = tokio::task::spawn_blocking(move || t.consume_records_sync(&records))
+                .await
+                .map_err(|e| format!("ingest consumer task join error: {e}"))?;
             this.metrics
                 .processing_time_seconds
                 .observe(start.elapsed().as_secs_f64());

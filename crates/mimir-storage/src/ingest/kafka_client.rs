@@ -678,6 +678,9 @@ impl KafkaClient {
         let key = (topic.to_string(), partition);
         let load_err = md.partition_load_errors.get(&key).copied();
         match md.partition_leaders.get(&key) {
+            Some(&leader) if leader >= 0 && !md.brokers.contains_key(&leader) => {
+                (-1, -1, load_err)
+            }
             Some(&leader) => (
                 leader,
                 md.partition_leader_epochs.get(&key).copied().unwrap_or(-1),
@@ -720,13 +723,17 @@ impl KafkaClient {
         };
         let conn = self.load_conn_kind(&addr, ConnKind::Fetch).await?;
         let ver = conn.pick_version(ApiKey::Fetch, min_version, max_version);
-        let res = conn.send_raw_timeout(ApiKey::Fetch, ver, req, timeout).await;
-        if let Err(ref e) = res {
-            if is_transport_error(e) {
-                self.drop_conn(&conn).await;
+        let had_successes = conn.successes.load(Ordering::Relaxed) > 0;
+        let res = self
+            .send_on(&conn, ApiKey::Fetch, ver, req, timeout)
+            .await;
+        match res {
+            Ok(r) => Ok((r, ver)),
+            Err(KafkaClientError::ConnectionClosed) if had_successes => {
+                Err(KafkaClientError::ChosenBrokerDead)
             }
+            Err(e) => Err(e),
         }
-        res.map(|r| (r, ver))
     }
 
     /// Decodes the record batches of a fetched partition (kgo `ProcessFetchPartition`), invoking
@@ -1161,6 +1168,24 @@ impl KafkaClient {
             };
             let topic_name = name.0.as_str().to_owned();
             if let Some(err) = t.error_code.err() {
+                let mut keys: Vec<(String, i32)> = md
+                    .topic_partitions
+                    .get(&topic_name)
+                    .into_iter()
+                    .flatten()
+                    .map(|&pid| (topic_name.clone(), pid))
+                    .collect();
+                for (t_name, pid) in md.partition_leaders.keys() {
+                    if t_name == &topic_name {
+                        let k = (t_name.clone(), *pid);
+                        if !keys.contains(&k) {
+                            keys.push(k);
+                        }
+                    }
+                }
+                for key in keys {
+                    md.partition_load_errors.insert(key, err);
+                }
                 return Err(KafkaClientError::Broker(err));
             }
             md.topic_ids
@@ -1173,7 +1198,7 @@ impl KafkaClient {
                 md.partition_leader_epochs.insert(key.clone(), p.leader_epoch);
                 if let Some(err) = p.error_code.err() {
                     md.partition_load_errors.insert(key, err);
-                } else if p.leader_id.0 < 0 {
+                } else if p.leader_id.0 < 0 || !md.brokers.contains_key(&p.leader_id.0) {
                     md.partition_load_errors
                         .insert(key, ResponseError::LeaderNotAvailable);
                 } else {
@@ -3203,6 +3228,130 @@ mod tests {
             assert!(!map.contains_key(&("10.0.0.99:9092".to_string(), ConnKind::Normal)));
             assert!(map.contains_key(&(addr.to_string(), ConnKind::Normal)));
         }
+
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn p1_2_and_p1_3_missing_broker_and_fetch_first_read_eof_vs_chosen_dead() {
+        use super::super::fetcher::{kafka_fetch_error_from_client, KafkaFetchError};
+        use kafka_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+        use kafka_protocol::messages::ApiVersionsRequest;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Mode: 0 = close on first Fetch; 1 = succeed 1 Fetch then close on 2nd Fetch.
+        let fetch_mode = Arc::new(AtomicI32::new(0));
+        let fetch_mode_srv = Arc::clone(&fetch_mode);
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mode = Arc::clone(&fetch_mode_srv);
+                tokio::spawn(async move {
+                    let mut fetch_seen = 0i32;
+                    while let Ok(frame_len) = sock.read_u32().await {
+                        let mut buf = vec![0u8; frame_len as usize];
+                        if sock.read_exact(&mut buf).await.is_err() {
+                            break;
+                        }
+                        let mut slice = &buf[..];
+                        let api_key = ApiKey::try_from(i16::from_be_bytes([slice[0], slice[1]])).unwrap();
+                        let api_ver = i16::from_be_bytes([slice[2], slice[3]]);
+                        let hdr_ver = match api_key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(api_ver),
+                            ApiKey::Fetch => FetchRequest::header_version(api_ver),
+                            _ => break,
+                        };
+                        let hdr = RequestHeader::decode(&mut slice, hdr_ver).unwrap();
+                        let mut out = Vec::with_capacity(64);
+                        out.extend_from_slice(&[0u8; 4]);
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = hdr.correlation_id;
+                        resp_hdr.encode(&mut out, api_key.response_header_version(api_ver)).unwrap();
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let mut r = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [(ApiKey::ApiVersions as i16, 0, 3), (ApiKey::Fetch as i16, 4, 12)] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    r.api_keys.push(av);
+                                }
+                                r.encode(&mut out, api_ver).unwrap();
+                            }
+                            ApiKey::Fetch => {
+                                fetch_seen += 1;
+                                if mode.load(Ordering::SeqCst) == 0 || fetch_seen > 1 {
+                                    drop(sock);
+                                    break;
+                                }
+                                let r = FetchResponse::default();
+                                r.encode(&mut out, api_ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let flen = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&flen.to_be_bytes());
+                        if sock.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = KafkaClient::new(
+            vec![addr.to_string()],
+            "test-p1",
+            "",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        // P1-2: cached leader absent from md.brokers must yield (-1, -1, load_err).
+        {
+            let mut md = client.metadata.write();
+            md.brokers.insert(0, BrokerInfo { addr: addr.to_string() });
+            md.partition_leaders.insert(("t".to_string(), 0), 1);
+            md.partition_leader_epochs.insert(("t".to_string(), 0), 5);
+        }
+        assert_eq!(client.partition_leader("t", 0), (-1, -1, None));
+        {
+            let mut md = client.metadata.write();
+            md.partition_leaders.insert(("t".to_string(), 0), 0);
+        }
+        assert_eq!(client.partition_leader("t", 0), (0, 5, None));
+
+        // P1-3: 1st Fetch EOF on fresh connection (successes==0) -> FirstReadEof (NOT ChosenBrokerDead).
+        let req = FetchRequest::default();
+        let err0 = client
+            .fetch_from_broker(0, &req, 4, 12, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err0, KafkaClientError::FirstReadEof(_)), "got {err0:?}");
+        assert_eq!(kafka_fetch_error_from_client(err0), KafkaFetchError::FirstReadEOF);
+
+        // P1-3: Fetch succeeds once (successes==1), then 2nd Fetch EOF -> ChosenBrokerDead.
+        fetch_mode.store(1, Ordering::SeqCst);
+        client
+            .fetch_from_broker(0, &req, 4, 12, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let err1 = client
+            .fetch_from_broker(0, &req, 4, 12, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err1, KafkaClientError::ChosenBrokerDead), "got {err1:?}");
+
+        // ConnectionClosed with 0 successes (e.g. SASL path) maps to TransientTransport, not CHOSEN_BROKER_DIED.
+        assert!(matches!(
+            kafka_fetch_error_from_client(KafkaClientError::ConnectionClosed),
+            KafkaFetchError::TransientTransport(_)
+        ));
 
         srv.abort();
     }

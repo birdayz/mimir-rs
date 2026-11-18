@@ -20,7 +20,7 @@ use crate::compact::{
     decode_chunk_samples, merge_chunks_with_tombstones, merge_head_chunks_with_tombstones,
     DecodedSample,
 };
-use crate::head::{Head, HeadError, HeadReadGuard};
+use crate::head::{Head, HeadError, HeadReadGuard, SeriesEntry};
 use crate::index::IndexError;
 use crate::labels::{decode_stringlabel_size, Labels};
 use crate::matcher::LabelMatcher;
@@ -74,13 +74,24 @@ pub enum LazyChunkSource {
 #[derive(Clone, Debug)]
 pub struct LazySeriesEntry {
     pub labels: Labels,
+    pub head_entry: Option<Arc<SeriesEntry>>,
     pub source: LazyChunkSource,
     pub chunk_count: u32,
 }
 
+impl LazySeriesEntry {
+    #[inline]
+    pub fn entry_labels(&self) -> &Labels {
+        match self.head_entry {
+            Some(ref entry) => &entry.labels,
+            None => &self.labels,
+        }
+    }
+}
+
 /// Incremental event emitted by [`TsdbQuerier::stream_prepared_chunks_lazy`].
-pub enum LazyStreamEvent {
-    Series(Labels, u32),
+pub enum LazyStreamEvent<'a> {
+    Series(&'a Labels, u32),
     SeriesEnd,
     SeriesChunks(usize, Vec<ChunkMeta>),
 }
@@ -156,6 +167,13 @@ pub struct TsdbQuerier<'a> {
     maxt: i64,
     select_stats: Option<BlockSelectStatsSink>,
     select_stats_filter: Option<SeriesStatsFilter>,
+}
+
+#[derive(Clone, Copy)]
+enum HeadSnapshotMode {
+    Effective,
+    InOrderOnly,
+    FullRange,
 }
 
 impl<'a> TsdbQuerier<'a> {
@@ -291,28 +309,34 @@ impl<'a> TsdbQuerier<'a> {
     /// Holds `blocks_lock.read()` ONLY long enough to check `check_open()`, clone
     /// overlapping `Block`s with `BlockReadGuard`s, and register a `HeadReadGuard`, then
     /// drops `blocks_lock.read()` immediately.
+    ///
+    /// Guards are returned BEFORE `Vec<Arc<Block>>` so LIFO local destructuring drops
+    /// `Arc<Block>` mmaps before `BlockReadGuard` wakes `close_and_wait()`.
     #[allow(clippy::type_complexity)]
     fn snapshot_sources(
         &self,
-        in_order_only: bool,
-    ) -> Result<(Vec<Arc<Block>>, Vec<BlockReadGuard>, Option<HeadReadGuard>), QuerierError> {
+        mode: HeadSnapshotMode,
+    ) -> Result<(Vec<BlockReadGuard>, Option<HeadReadGuard>, Vec<Arc<Block>>), QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
         self.check_open()?;
         let (blocks, block_guards) = self.snapshot_blocks(lock_guard.as_ref());
-        let head_guard = if in_order_only {
-            self.effective_in_order_head()
-        } else {
-            self.effective_head()
-        }
-        .map(|h| h.start_read(self.mint, self.maxt));
+        let head_guard = match mode {
+            HeadSnapshotMode::Effective => self
+                .effective_head()
+                .map(|h| h.start_read(self.mint, self.maxt)),
+            HeadSnapshotMode::InOrderOnly => self
+                .effective_in_order_head()
+                .map(|h| h.start_read(self.mint, self.maxt)),
+            HeadSnapshotMode::FullRange => self.head.map(|h| h.start_read(i64::MIN, i64::MAX)),
+        };
         drop(lock_guard);
-        Ok((blocks, block_guards, head_guard))
+        Ok((block_guards, head_guard, blocks))
     }
 
     #[allow(clippy::type_complexity)]
     fn try_snapshot_sources(
         &self,
-    ) -> Result<Option<(Vec<Arc<Block>>, Vec<BlockReadGuard>, Option<HeadReadGuard>)>, QuerierError> {
+    ) -> Result<Option<(Vec<BlockReadGuard>, Option<HeadReadGuard>, Vec<Arc<Block>>)>, QuerierError> {
         let lock_guard = match self.blocks_lock {
             Some(l) => match l.try_read() {
                 Some(g) => Some(g),
@@ -326,7 +350,7 @@ impl<'a> TsdbQuerier<'a> {
             .effective_head()
             .map(|h| h.start_read(self.mint, self.maxt));
         drop(lock_guard);
-        Ok(Some((blocks, block_guards, head_guard)))
+        Ok(Some((block_guards, head_guard, blocks)))
     }
 
     fn blocks_match_prepared(&self, prepared: &PreparedChunkSelect) -> Result<bool, QuerierError> {
@@ -417,13 +441,13 @@ impl<'a> TsdbQuerier<'a> {
 
     fn prepare_select_locked(
         &self,
-        blocks: Vec<Arc<Block>>,
         block_guards: Vec<BlockReadGuard>,
         head_guard: Option<HeadReadGuard>,
+        blocks: Vec<Arc<Block>>,
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<PreparedChunkSelect, QuerierError> {
-        let head = self.effective_head();
+        let head = head_guard.as_ref().and(self.head);
         let head_refs = match head {
             Some(h) => Some(h.postings_for_matchers_arc(matchers)?),
             None => None,
@@ -455,8 +479,8 @@ impl<'a> TsdbQuerier<'a> {
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<PreparedChunkSelect, QuerierError> {
-        let (blocks, block_guards, head_guard) = self.snapshot_sources(false)?;
-        self.prepare_select_locked(blocks, block_guards, head_guard, matchers, unordered)
+        let (block_guards, head_guard, blocks) = self.snapshot_sources(HeadSnapshotMode::Effective)?;
+        self.prepare_select_locked(block_guards, head_guard, blocks, matchers, unordered)
     }
 
     /// Snapshots blocks & guards under `blocks_lock.read()`, drops the lock immediately, and
@@ -470,9 +494,9 @@ impl<'a> TsdbQuerier<'a> {
         max_source_series: usize,
         max_total_refs: usize,
     ) -> Result<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>, QuerierError> {
-        let (blocks, block_guards, head_guard) = self.snapshot_sources(false)?;
+        let (block_guards, head_guard, blocks) = self.snapshot_sources(HeadSnapshotMode::Effective)?;
         let prepared =
-            self.prepare_select_locked(blocks, block_guards, head_guard, matchers, unordered)?;
+            self.prepare_select_locked(block_guards, head_guard, blocks, matchers, unordered)?;
         if prepared.is_empty() {
             let empty_min_times: Vec<i64> = prepared
                 .overlapping_blocks
@@ -480,7 +504,7 @@ impl<'a> TsdbQuerier<'a> {
                 .map(|b| b.min_time())
                 .collect();
             self.record_select_stats(
-                self.effective_head().map(|_| BlockSelectStats {
+                prepared._head_guard.as_ref().map(|_| BlockSelectStats {
                     selected_postings: 0,
                     series: 0,
                     head: true,
@@ -511,11 +535,11 @@ impl<'a> TsdbQuerier<'a> {
         max_source_series: usize,
         max_total_refs: usize,
     ) -> Result<Option<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>>, QuerierError> {
-        let Some((blocks, block_guards, head_guard)) = self.try_snapshot_sources()? else {
+        let Some((block_guards, head_guard, blocks)) = self.try_snapshot_sources()? else {
             return Ok(None);
         };
         let prepared =
-            self.prepare_select_locked(blocks, block_guards, head_guard, matchers, unordered)?;
+            self.prepare_select_locked(block_guards, head_guard, blocks, matchers, unordered)?;
         if prepared.is_empty() {
             let empty_min_times: Vec<i64> = prepared
                 .overlapping_blocks
@@ -523,7 +547,7 @@ impl<'a> TsdbQuerier<'a> {
                 .map(|b| b.min_time())
                 .collect();
             self.record_select_stats(
-                self.effective_head().map(|_| BlockSelectStats {
+                prepared._head_guard.as_ref().map(|_| BlockSelectStats {
                     selected_postings: 0,
                     series: 0,
                     head: true,
@@ -554,11 +578,12 @@ impl<'a> TsdbQuerier<'a> {
         if !self.blocks_match_prepared(&prepared)? {
             let unordered = prepared.unordered;
             drop(prepared);
-            let (blocks, block_guards, head_guard) = self.snapshot_sources(false)?;
+            let (block_guards, head_guard, blocks) =
+                self.snapshot_sources(HeadSnapshotMode::Effective)?;
             prepared = self.prepare_select_locked(
-                blocks,
                 block_guards,
                 head_guard,
+                blocks,
                 matchers,
                 unordered,
             )?;
@@ -582,7 +607,7 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
         self.check_open()?;
-        let head = self.effective_head();
+        let head = prepared._head_guard.as_ref().and(self.head);
         let mint = prepared.mint;
         let maxt = prepared.maxt;
         let unordered = prepared.unordered;
@@ -765,23 +790,23 @@ impl<'a> TsdbQuerier<'a> {
         mut on_event: F,
     ) -> Result<(), QuerierError>
     where
-        F: FnMut(LazyStreamEvent) -> Result<bool, QuerierError>,
+        F: FnMut(LazyStreamEvent<'_>) -> Result<bool, QuerierError>,
     {
         if !self.blocks_match_prepared(&prepared)? {
             let unordered = prepared.unordered;
             drop(prepared);
-            let (blocks, block_guards, head_guard) = self.snapshot_sources(false)?;
+            let (block_guards, head_guard, blocks) =
+                self.snapshot_sources(HeadSnapshotMode::Effective)?;
             prepared = self.prepare_select_locked(
-                blocks,
                 block_guards,
                 head_guard,
+                blocks,
                 matchers,
                 unordered,
             )?;
         }
 
-
-        let head = self.effective_head();
+        let head = prepared._head_guard.as_ref().and(self.head);
         let mint = prepared.mint;
         let maxt = prepared.maxt;
         let unordered = prepared.unordered;
@@ -807,12 +832,13 @@ impl<'a> TsdbQuerier<'a> {
                 (Some(h), Some(refs)) => {
                     let mut v = Vec::with_capacity(refs.len());
                     for &r in refs.iter() {
-                        if let Some((labels, chunk_count)) =
-                            h.series_lazy_chunk_count(r, mint, maxt, series_filter)?
+                        if let Some((entry, chunk_count)) =
+                            h.series_lazy_chunk_count_with_entry(r, mint, maxt, series_filter)?
                         {
                             if chunk_count > 0 {
                                 v.push(LazySeriesEntry {
-                                    labels,
+                                    labels: Labels::empty(),
+                                    head_entry: Some(entry),
                                     source: LazyChunkSource::Head(r),
                                     chunk_count,
                                 });
@@ -838,9 +864,8 @@ impl<'a> TsdbQuerier<'a> {
                 sort_lazy_entries(&mut entries);
             }
 
-            for entry in entries.iter_mut() {
-                let labels = std::mem::take(&mut entry.labels);
-                if !on_event(LazyStreamEvent::Series(labels, entry.chunk_count))? {
+            for entry in entries.iter() {
+                if !on_event(LazyStreamEvent::Series(entry.entry_labels(), entry.chunk_count))? {
                     return Ok(());
                 }
             }
@@ -850,11 +875,13 @@ impl<'a> TsdbQuerier<'a> {
 
             if let Some(h) = head {
                 for (series_idx, entry) in entries.into_iter().enumerate() {
-                    let r = match entry.source {
-                        LazyChunkSource::Head(r) => r,
-                        _ => continue,
+                    let chks = if let Some(ref head_entry) = entry.head_entry {
+                        h.series_final_chunks_for_entry(head_entry, mint, maxt)?
+                    } else if let LazyChunkSource::Head(r) = entry.source {
+                        h.series_final_chunks_only(r, mint, maxt)?
+                    } else {
+                        continue;
                     };
-                    let chks = h.series_final_chunks_only(r, mint, maxt)?;
                     if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
                         return Ok(());
                     }
@@ -1065,6 +1092,7 @@ impl<'a> TsdbQuerier<'a> {
             };
             entries.push(LazySeriesEntry {
                 labels,
+                head_entry: None,
                 source,
                 chunk_count,
             });
@@ -1074,9 +1102,8 @@ impl<'a> TsdbQuerier<'a> {
             sort_lazy_entries(&mut entries);
         }
 
-        for entry in entries.iter_mut() {
-            let labels = std::mem::take(&mut entry.labels);
-            if !on_event(LazyStreamEvent::Series(labels, entry.chunk_count))? {
+        for entry in entries.iter() {
+            if !on_event(LazyStreamEvent::Series(entry.entry_labels(), entry.chunk_count))? {
                 return Ok(());
             }
         }
@@ -1112,9 +1139,9 @@ impl<'a> TsdbQuerier<'a> {
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
-        let (blocks, block_guards, head_guard) = self.snapshot_sources(false)?;
+        let (block_guards, head_guard, blocks) = self.snapshot_sources(HeadSnapshotMode::Effective)?;
         let prepared =
-            self.prepare_select_locked(blocks, block_guards, head_guard, matchers, unordered)?;
+            self.prepare_select_locked(block_guards, head_guard, blocks, matchers, unordered)?;
         self.execute_prepared_select_locked(prepared, sort_series)
     }
 
@@ -1124,8 +1151,9 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<Labels>, QuerierError> {
-        let (blocks, _block_guards, _head_guard) = self.snapshot_sources(false)?;
-        let head = self.effective_head();
+        let (_block_guards, head_guard, blocks) =
+            self.snapshot_sources(HeadSnapshotMode::Effective)?;
+        let head = head_guard.as_ref().and(self.head);
 
         if blocks.is_empty() {
             let Some(head) = head else {
@@ -1138,8 +1166,8 @@ impl<'a> TsdbQuerier<'a> {
                     out.push(labels);
                 }
             }
-            if sort_series {
-                out.sort();
+            if sort_series && out.len() > 1 {
+                sort_labels(&mut out);
             }
             return Ok(out);
         }
@@ -1174,8 +1202,9 @@ impl<'a> TsdbQuerier<'a> {
 
     /// Returns sorted unique label names across in-order Head and overlapping Blocks matching `matchers`.
     pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {
-        let (blocks, _block_guards, _head_guard) = self.snapshot_sources(true)?;
-        let head = self.effective_in_order_head();
+        let (_block_guards, head_guard, blocks) =
+            self.snapshot_sources(HeadSnapshotMode::InOrderOnly)?;
+        let head = head_guard.as_ref().and(self.head);
         let mut set: BTreeSet<String> = BTreeSet::new();
 
         if let Some(head) = head {
@@ -1207,8 +1236,9 @@ impl<'a> TsdbQuerier<'a> {
         limit: Option<usize>,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<String>, QuerierError> {
-        let (blocks, _block_guards, _head_guard) = self.snapshot_sources(true)?;
-        let head = self.effective_in_order_head();
+        let (_block_guards, head_guard, blocks) =
+            self.snapshot_sources(HeadSnapshotMode::InOrderOnly)?;
+        let head = head_guard.as_ref().and(self.head);
 
         if blocks.is_empty() {
             return match head {
@@ -1276,9 +1306,10 @@ impl<'a> TsdbQuerier<'a> {
 
     /// Returns the number of active series in Head (plus series in overlapping blocks if queried).
     pub fn series_count(&self) -> Result<usize, QuerierError> {
-        let (blocks, _block_guards, _head_guard) = self.snapshot_sources(false)?;
+        let (_block_guards, head_guard, blocks) =
+            self.snapshot_sources(HeadSnapshotMode::FullRange)?;
         let mut set: BTreeSet<Labels> = BTreeSet::new();
-        if let Some(head) = self.head {
+        if let Some(head) = head_guard.as_ref().and(self.head) {
             let all = LabelMatcher::new(crate::matcher::MatchType::RegexMatch, "__name__", ".*")
                 .map_err(PostingsError::from)?;
             for &r in head.postings_for_matchers_arc(&[all])?.iter() {
@@ -1478,7 +1509,7 @@ impl<'a> TsdbChunkQuerier<'a> {
         on_event: F,
     ) -> Result<(), QuerierError>
     where
-        F: FnMut(LazyStreamEvent) -> Result<bool, QuerierError>,
+        F: FnMut(LazyStreamEvent<'_>) -> Result<bool, QuerierError>,
     {
         self.inner.stream_prepared_chunks_lazy(
             prepared,
@@ -1570,64 +1601,220 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 }
 
 #[inline]
-fn pack_u64_prefix(bytes: &[u8]) -> u64 {
-    if bytes.len() >= 8 {
-        u64::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ])
-    } else {
-        let mut buf = [0u8; 8];
-        buf[..bytes.len()].copy_from_slice(bytes);
-        u64::from_be_bytes(buf)
-    }
+fn pack_24_be(buf: &[u8; 24]) -> [u64; 3] {
+    [
+        u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
+        u64::from_be_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
+        u64::from_be_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]),
+    ]
 }
 
 #[inline]
-fn extract_lazy_sort_key(
-    labels: &Labels,
+fn extract_sort_key_24(
+    b: &[u8],
     skip_bytes: usize,
     value_offset: Option<usize>,
-) -> u64 {
-    let b = labels.as_bytes();
-    if let Some(vlen_pos) = value_offset {
+) -> ([u64; 3], bool) {
+    let mut buf = [0u8; 24];
+    let mut out = 0usize;
+    let mut has_nul = false;
+
+    let mut pos = if let Some(vlen_pos) = value_offset {
+        if vlen_pos >= b.len() {
+            return ([0; 3], false);
+        }
         let (vlen, vstart) = decode_stringlabel_size(b, vlen_pos);
-        pack_u64_prefix(&b[vstart..vstart + vlen])
-    } else if skip_bytes >= b.len() {
-        0
+        let vend = vstart + vlen;
+        for &byte in &b[vstart..vend] {
+            if byte == 0 {
+                has_nul = true;
+            }
+            if out < 24 {
+                buf[out] = byte;
+                out += 1;
+            } else {
+                break;
+            }
+        }
+        if out < 24 {
+            out += 1;
+        }
+        vend
     } else {
-        let (nlen, nstart) = decode_stringlabel_size(b, skip_bytes);
-        pack_u64_prefix(&b[nstart..nstart + nlen])
+        skip_bytes
+    };
+
+    while out < 24 && pos < b.len() {
+        let (nlen, nstart) = decode_stringlabel_size(b, pos);
+        let nend = nstart + nlen;
+        for &byte in &b[nstart..nend] {
+            if byte == 0 {
+                has_nul = true;
+            }
+            if out < 24 {
+                buf[out] = byte;
+                out += 1;
+            } else {
+                break;
+            }
+        }
+        if out >= 24 {
+            break;
+        }
+        out += 1;
+        if out >= 24 {
+            break;
+        }
+        let (vlen, vstart) = decode_stringlabel_size(b, nend);
+        let vend = vstart + vlen;
+        for &byte in &b[vstart..vend] {
+            if byte == 0 {
+                has_nul = true;
+            }
+            if out < 24 {
+                buf[out] = byte;
+                out += 1;
+            } else {
+                break;
+            }
+        }
+        if out < 24 {
+            out += 1;
+        }
+        pos = vend;
     }
+
+    (pack_24_be(&buf), has_nul)
+}
+
+#[inline(always)]
+fn cmp_raw_stringlabels_from(a: &[u8], b: &[u8], pair_offset: usize) -> Ordering {
+    let mut pa = pair_offset;
+    let mut pb = pair_offset;
+    while pa < a.len() && pb < b.len() {
+        let ba = a[pa];
+        let bb = b[pb];
+        if ba < 128 && bb < 128 {
+            let an_len = ba as usize;
+            let bn_len = bb as usize;
+            let an_start = pa + 1;
+            let bn_start = pb + 1;
+            let an_end = an_start + an_len;
+            let bn_end = bn_start + bn_len;
+            let vba = a[an_end];
+            let vbb = b[bn_end];
+            if vba < 128 && vbb < 128 {
+                let av_end = an_end + 1 + vba as usize;
+                let bv_end = bn_end + 1 + vbb as usize;
+                // Fast skip if the entire (name, val) pair including lengths is byte-identical.
+                if av_end - pa == bv_end - pb && a[pa..av_end] == b[pb..bv_end] {
+                    pa = av_end;
+                    pb = bv_end;
+                    continue;
+                }
+                match a[an_start..an_end].cmp(&b[bn_start..bn_end]) {
+                    Ordering::Equal => {
+                        match a[an_end + 1..av_end].cmp(&b[bn_end + 1..bv_end]) {
+                            Ordering::Equal => {
+                                pa = av_end;
+                                pb = bv_end;
+                                continue;
+                            }
+                            ord => return ord,
+                        }
+                    }
+                    ord => return ord,
+                }
+            }
+        }
+        let (an_len, an_start) = decode_stringlabel_size(a, pa);
+        let (bn_len, bn_start) = decode_stringlabel_size(b, pb);
+        let an_end = an_start + an_len;
+        let bn_end = bn_start + bn_len;
+        match a[an_start..an_end].cmp(&b[bn_start..bn_end]) {
+            Ordering::Equal => {}
+            ord => return ord,
+        }
+        let (av_len, av_start) = decode_stringlabel_size(a, an_end);
+        let (bv_len, bv_start) = decode_stringlabel_size(b, bn_end);
+        let av_end = av_start + av_len;
+        let bv_end = bv_start + bv_len;
+        match a[av_start..av_end].cmp(&b[bv_start..bv_end]) {
+            Ordering::Equal => {}
+            ord => return ord,
+        }
+        pa = av_end;
+        pb = bv_end;
+    }
+    (pa < a.len()).cmp(&(pb < b.len()))
+}
+
+/// Packs up to 16 bytes of values from uniform-schema columns where `varying_mask` has bit `j` set.
+/// Returns `(key, has_nul)`.
+#[inline]
+fn extract_uniform_varying_key_24(
+    b: &[u8],
+    skip_bytes: usize,
+    varying_mask: u32,
+) -> ([u64; 3], bool) {
+    let mut buf = [0u8; 24];
+    let mut out = 0usize;
+    let mut has_nul = false;
+    let mut pos = skip_bytes;
+    let mut col = 0u32;
+    while out < 24 && pos < b.len() {
+        let (nlen, nstart) = decode_stringlabel_size(b, pos);
+        let nend = nstart + nlen;
+        let (vlen, vstart) = decode_stringlabel_size(b, nend);
+        let vend = vstart + vlen;
+        if (varying_mask & (1u32 << col)) != 0 {
+            for &byte in &b[vstart..vend] {
+                if byte == 0 {
+                    has_nul = true;
+                }
+                if out < 24 {
+                    buf[out] = byte;
+                    out += 1;
+                } else {
+                    break;
+                }
+            }
+            if out < 24 {
+                out += 1;
+            }
+        }
+        pos = vend;
+        col += 1;
+    }
+    (pack_24_be(&buf), has_nul)
 }
 
 #[inline]
-fn cmp_lazy_keys(
-    entries: &[LazySeriesEntry],
+fn cmp_sort_keys_raw(
+    slices: &[&[u8]],
     skip_bytes: usize,
-    a: &(u64, u32),
-    b: &(u64, u32),
+    a: &([u64; 3], u32),
+    b: &([u64; 3], u32),
 ) -> Ordering {
     if a.0 != b.0 {
         return a.0.cmp(&b.0);
     }
-    entries[a.1 as usize]
-        .labels
-        .cmp_from_pair_offset(&entries[b.1 as usize].labels, skip_bytes)
+    cmp_raw_stringlabels_from(slices[a.1 as usize], slices[b.1 as usize], skip_bytes)
 }
 
-fn merge_sorted_keys(
-    entries: &[LazySeriesEntry],
+fn merge_sorted_keys_raw(
+    slices: &[&[u8]],
     skip_bytes: usize,
-    left: &[(u64, u32)],
-    right: &[(u64, u32)],
-    out: &mut Vec<(u64, u32)>,
+    left: &[([u64; 3], u32)],
+    right: &[([u64; 3], u32)],
+    out: &mut Vec<([u64; 3], u32)>,
 ) {
     out.clear();
     out.reserve(left.len() + right.len());
     let mut i = 0usize;
     let mut j = 0usize;
     while i < left.len() && j < right.len() {
-        if cmp_lazy_keys(entries, skip_bytes, &left[i], &right[j]) != Ordering::Greater {
+        if cmp_sort_keys_raw(slices, skip_bytes, &left[i], &right[j]) != Ordering::Greater {
             out.push(left[i]);
             i += 1;
         } else {
@@ -1643,105 +1830,190 @@ fn merge_sorted_keys(
     }
 }
 
-/// Sorts `entries` in exact `Labels::cmp` lexicographical order, skipping the shared
-/// pair-aligned prefix across all entries, using an 8-byte big-endian `u64` prefix key
-/// for single-instruction comparisons, and sorting in parallel across 4 threads when large.
-fn sort_lazy_entries(entries: &mut [LazySeriesEntry]) {
-    let n = entries.len();
+/// Sorts `items` in exact `Labels::cmp` lexicographical order, skipping the shared
+/// pair-aligned prefix across all entries, packing a 16-byte `u128` prefix key
+/// for fast comparisons, and sorting in parallel across 4 threads when large.
+fn sort_by_labels<T, F>(items: &mut [T], get_labels: F)
+where
+    T: Sync,
+    F: Fn(&T) -> &Labels + Sync,
+{
+    let n = items.len();
     if n <= 1 {
         return;
     }
     if u32::try_from(n).is_err() {
-        entries.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+        items.sort_unstable_by(|a, b| get_labels(a).cmp(get_labels(b)));
         return;
     }
 
-    // 1. Find longest common byte prefix across all entries in 1 linear pass.
-    let b0 = entries[0].labels.as_bytes();
-    let mut lcp = b0.len();
-    for entry in &entries[1..] {
-        lcp = common_prefix_len(&b0[..lcp], entry.labels.as_bytes());
-        if lcp == 0 {
-            break;
-        }
-    }
+    let mut keys: Vec<([u64; 3], u32)>;
+    let mut any_nul = false;
+    {
+        // Collect raw byte slices once so the entire sort avoids entry_labels() / Bytes::as_slice().
+        let slices: Vec<&[u8]> = items.iter().map(|it| get_labels(it).as_bytes()).collect();
 
-    // 2. Snap `lcp` down to the largest pair boundary in `b0` and check if the next
-    //    label's name is also identical across all entries.
-    let mut skip_bytes = 0usize;
-    let mut pos = 0usize;
-    let mut value_offset: Option<usize> = None;
-    while pos < b0.len() {
-        let (nlen, nstart) = decode_stringlabel_size(b0, pos);
-        let name_end = nstart + nlen;
-        let (vlen, vstart) = decode_stringlabel_size(b0, name_end);
-        let next_pos = vstart + vlen;
-        if next_pos <= lcp {
-            skip_bytes = next_pos;
-            pos = next_pos;
-        } else {
-            if name_end <= lcp {
-                value_offset = Some(name_end);
+        // 1. Find longest common byte prefix across all entries in 1 linear pass.
+        let b0 = slices[0];
+        let mut lcp = b0.len();
+        for &s in &slices[1..] {
+            lcp = common_prefix_len(&b0[..lcp], s);
+            if lcp == 0 {
+                break;
             }
-            break;
         }
-    }
 
-    // 3. Extract 8-byte sort keys once per entry into compact 16-byte `(key, idx)` tuples.
-    let mut keys: Vec<(u64, u32)> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            (
-                extract_lazy_sort_key(&e.labels, skip_bytes, value_offset),
-                i as u32,
-            )
-        })
-        .collect();
-
-    if n < PARALLEL_SORT_THRESHOLD {
-        keys.sort_unstable_by(|a, b| cmp_lazy_keys(entries, skip_bytes, a, b));
-    } else {
-        let pool = read_sort_pool();
-        let q1_end = n / 4;
-        let q2_end = n / 2;
-        let q3_end = (3 * n) / 4;
-        let (s0, rest) = keys.split_at_mut(q1_end);
-        let (s1, rest) = rest.split_at_mut(q2_end - q1_end);
-        let (s2, s3) = rest.split_at_mut(q3_end - q2_end);
-
-        let entries_ref: &[LazySeriesEntry] = entries;
-        let slices = [
-            Mutex::new(Some(s0)),
-            Mutex::new(Some(s1)),
-            Mutex::new(Some(s2)),
-            Mutex::new(Some(s3)),
-        ];
-        pool.scoped_execute(4, |tid| {
-            if let Some(slice) = slices[tid].lock().take() {
-                slice.sort_unstable_by(|a, b| cmp_lazy_keys(entries_ref, skip_bytes, a, b));
-            }
-        });
-
-        let (left_in, right_in) = keys.split_at(q2_end);
-        let (q0, q1) = left_in.split_at(q1_end);
-        let (q2, q3) = right_in.split_at(q3_end - q2_end);
-
-        let mut left = Vec::with_capacity(q0.len() + q1.len());
-        let mut right = Vec::with_capacity(q2.len() + q3.len());
-        {
-            let pairs = [(q0, q1), (q2, q3)];
-            let outs = [Mutex::new(Some(&mut left)), Mutex::new(Some(&mut right))];
-            pool.scoped_execute(2, |tid| {
-                if let Some(out) = outs[tid].lock().take() {
-                    merge_sorted_keys(entries_ref, skip_bytes, pairs[tid].0, pairs[tid].1, out);
+        // 2. Snap `lcp` down to the largest pair boundary in `b0` and check if the next
+        //    label's name is also identical across all entries.
+        let mut skip_bytes = 0usize;
+        let mut pos = 0usize;
+        let mut value_offset: Option<usize> = None;
+        while pos < b0.len() {
+            let (nlen, nstart) = decode_stringlabel_size(b0, pos);
+            let name_end = nstart + nlen;
+            let (vlen, vstart) = decode_stringlabel_size(b0, name_end);
+            let next_pos = vstart + vlen;
+            if next_pos <= lcp {
+                skip_bytes = next_pos;
+                pos = next_pos;
+            } else {
+                if name_end <= lcp {
+                    value_offset = Some(name_end);
                 }
-            });
+                break;
+            }
         }
-        merge_sorted_keys(entries_ref, skip_bytes, &left, &right, &mut keys);
+
+        // 2b. Fast uniform-schema check: if all series share identical label names after `skip_bytes`
+        //     (<= 32 labels), pack ONLY varying values into `u128` (skipping identical columns like
+        //     `cluster="prod-eu"`, `env="prod"`, `namespace="ns-3"`).
+        let mut schema: SmallVec<[(&[u8], &[u8]); 16]> = SmallVec::new();
+        let mut p = skip_bytes;
+        while p < b0.len() && schema.len() < 32 {
+            let (nlen, nstart) = decode_stringlabel_size(b0, p);
+            let nend = nstart + nlen;
+            let (vlen, vstart) = decode_stringlabel_size(b0, nend);
+            let vend = vstart + vlen;
+            schema.push((&b0[nstart..nend], &b0[vstart..vend]));
+            p = vend;
+        }
+        let mut uniform_schema = p == b0.len() && !schema.is_empty();
+        let mut varying_mask = 0u32;
+        if uniform_schema {
+            for &s in &slices[1..] {
+                let mut sp = skip_bytes;
+                let mut ok = true;
+                for (col, &(sname, sval0)) in schema.iter().enumerate() {
+                    if sp >= s.len() {
+                        ok = false;
+                        break;
+                    }
+                    let (nlen, nstart) = decode_stringlabel_size(s, sp);
+                    let nend = nstart + nlen;
+                    if &s[nstart..nend] != sname {
+                        ok = false;
+                        break;
+                    }
+                    let (vlen, vstart) = decode_stringlabel_size(s, nend);
+                    let vend = vstart + vlen;
+                    if &s[vstart..vend] != sval0 {
+                        varying_mask |= 1u32 << col;
+                    }
+                    sp = vend;
+                }
+                if !ok || sp != s.len() {
+                    uniform_schema = false;
+                    break;
+                }
+            }
+        }
+        drop(schema);
+
+        // 3. Extract 24-byte `[u64; 3]` sort keys once per entry.
+        keys = if uniform_schema {
+            slices
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    let (k, has_nul) = extract_uniform_varying_key_24(s, skip_bytes, varying_mask);
+                    if has_nul {
+                        any_nul = true;
+                    }
+                    (k, i as u32)
+                })
+                .collect()
+        } else {
+            slices
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    let (k, has_nul) = extract_sort_key_24(s, skip_bytes, value_offset);
+                    if has_nul {
+                        any_nul = true;
+                    }
+                    (k, i as u32)
+                })
+                .collect()
+        };
+
+        if !any_nul {
+            let slices_ref: &[&[u8]] = &slices;
+            if n < PARALLEL_SORT_THRESHOLD {
+                keys.sort_unstable_by(|a, b| cmp_sort_keys_raw(slices_ref, skip_bytes, a, b));
+            } else {
+                let pool = read_sort_pool();
+                let q1_end = n / 4;
+                let q2_end = n / 2;
+                let q3_end = (3 * n) / 4;
+                let (s0, rest) = keys.split_at_mut(q1_end);
+                let (s1, rest) = rest.split_at_mut(q2_end - q1_end);
+                let (s2, s3) = rest.split_at_mut(q3_end - q2_end);
+
+                let slice_tasks = [
+                    Mutex::new(Some(s0)),
+                    Mutex::new(Some(s1)),
+                    Mutex::new(Some(s2)),
+                    Mutex::new(Some(s3)),
+                ];
+                pool.scoped_execute(4, |tid| {
+                    if let Some(slice) = slice_tasks[tid].lock().take() {
+                        slice.sort_unstable_by(|a, b| {
+                            cmp_sort_keys_raw(slices_ref, skip_bytes, a, b)
+                        });
+                    }
+                });
+
+                let (left_in, right_in) = keys.split_at(q2_end);
+                let (q0, q1) = left_in.split_at(q1_end);
+                let (q2, q3) = right_in.split_at(q3_end - q2_end);
+
+                let mut left = Vec::with_capacity(q0.len() + q1.len());
+                let mut right = Vec::with_capacity(q2.len() + q3.len());
+                {
+                    let pairs = [(q0, q1), (q2, q3)];
+                    let outs = [Mutex::new(Some(&mut left)), Mutex::new(Some(&mut right))];
+                    pool.scoped_execute(2, |tid| {
+                        if let Some(out) = outs[tid].lock().take() {
+                            merge_sorted_keys_raw(
+                                slices_ref,
+                                skip_bytes,
+                                pairs[tid].0,
+                                pairs[tid].1,
+                                out,
+                            );
+                        }
+                    });
+                }
+                merge_sorted_keys_raw(slices_ref, skip_bytes, &left, &right, &mut keys);
+            }
+        }
+    }
+    if any_nul {
+        items.sort_unstable_by(|a, b| get_labels(a).cmp(get_labels(b)));
+        return;
     }
 
-    // 4. Permute `entries` in-place via cycle decomposition (0 extra allocations).
+    // 4. Permute `items` in-place via cycle decomposition (0 extra allocations).
     for i in 0..n {
         let mut cur = i;
         loop {
@@ -1750,10 +2022,18 @@ fn sort_lazy_entries(entries: &mut [LazySeriesEntry]) {
             if next == i {
                 break;
             }
-            entries.swap(cur, next);
+            items.swap(cur, next);
             cur = next;
         }
     }
+}
+
+fn sort_lazy_entries(entries: &mut [LazySeriesEntry]) {
+    sort_by_labels(entries, LazySeriesEntry::entry_labels);
+}
+
+pub fn sort_labels(labels: &mut [Labels]) {
+    sort_by_labels(labels, |l| l);
 }
 
 #[cfg(test)]
@@ -1764,6 +2044,7 @@ mod sort_tests {
     fn make_entry(lbls: Labels) -> LazySeriesEntry {
         LazySeriesEntry {
             labels: lbls,
+            head_entry: None,
             source: LazyChunkSource::Head(0),
             chunk_count: 1,
         }
@@ -2171,7 +2452,7 @@ mod wave4_tests {
         let mut lazy_chunks: Vec<Vec<ChunkMeta>> = Vec::new();
         q.stream_prepared_chunks_lazy(prep, &all_m, true, None, |ev| {
             match ev {
-                LazyStreamEvent::Series(l, c) => lazy_series.push((l, c)),
+                LazyStreamEvent::Series(l, c) => lazy_series.push((l.clone(), c)),
                 LazyStreamEvent::SeriesEnd => {}
                 LazyStreamEvent::SeriesChunks(_, chks) => lazy_chunks.push(chks),
             }
@@ -2516,5 +2797,31 @@ mod wave4_tests {
         );
 
         head.close().unwrap();
+    }
+
+    #[test]
+    fn sort_labels_multi_label_u128_matches_std_sort() {
+        let mut actual = Vec::new();
+        for app_id in 0..4 {
+            for ns_id in (0..8).rev() {
+                for pod_id in (0..50).rev() {
+                    actual.push(Labels::from_pairs([
+                        ("__name__", "container_cpu_usage_seconds_total"),
+                        ("app", &format!("svc-{app_id}")),
+                        ("namespace", &format!("ns-{ns_id}")),
+                        ("pod", &format!("pod-{pod_id:04}")),
+                    ]));
+                }
+            }
+        }
+        // Also include label name prefix edge case: a="x", b="y" vs aa="x"
+        actual.push(Labels::from_pairs([("aa", "x")]));
+        actual.push(Labels::from_pairs([("a", "x"), ("b", "y")]));
+        actual.push(Labels::from_pairs([("a", "x")]));
+
+        let mut expected = actual.clone();
+        expected.sort();
+        sort_labels(&mut actual);
+        assert_eq!(actual, expected);
     }
 }

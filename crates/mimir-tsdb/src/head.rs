@@ -7559,6 +7559,12 @@ impl Head {
         }
         let _snap_guard = self.chunk_snapshot_mtx.lock();
         if min_ooo_mmap_ref.as_u64() > 0 {
+            let old_min_ooo = self.min_ooo_time();
+            let old_max_ooo = self.max_ooo_time();
+            if old_min_ooo != i64::MAX && old_min_ooo <= old_max_ooo {
+                let wait_maxt = old_max_ooo.min(i64::MAX - 1) + 1;
+                self.active_reads.wait_for_range(old_min_ooo, wait_maxt);
+            }
             let _mmap_guard = self.mmap_mtx.lock();
             let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
             let head_maxt = self.max_time();
@@ -7681,6 +7687,12 @@ impl Head {
     /// cleans up empty series and unused `chunks_head` files.
     pub fn clear_ooo_data_before(&self, maxt_inclusive: i64) -> Result<(), HeadError> {
         let _snap_guard = self.chunk_snapshot_mtx.lock();
+        let old_min_ooo = self.min_ooo_time();
+        let old_max_ooo = self.max_ooo_time().min(maxt_inclusive);
+        if old_min_ooo != i64::MAX && old_min_ooo <= old_max_ooo {
+            let wait_maxt = old_max_ooo.min(i64::MAX - 1) + 1;
+            self.active_reads.wait_for_range(old_min_ooo, wait_maxt);
+        }
         let _mmap_guard = self.mmap_mtx.lock();
         let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
         let head_maxt = self.max_time();
@@ -7964,6 +7976,10 @@ impl Head {
         fingerprints: Option<&HashMap<u64, SeriesFingerprint>>,
     ) -> Result<(), HeadError> {
         let _snap_guard = self.chunk_snapshot_mtx.lock();
+        if self.initialized() {
+            let wait_maxt = maxt_inclusive.min(i64::MAX - 1) + 1;
+            self.active_reads.wait_for_range(self.min_time(), wait_maxt);
+        }
         let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
         let has_wal = self.wal.lock().is_some();
         let _pending_tomb_guard =
@@ -8537,7 +8553,18 @@ impl Head {
             self.metrics.series_not_found.inc();
             return Ok(None);
         };
+        self.series_chunks_for_entry_inner(&entry, mint, maxt, need_labels)
+    }
 
+    #[allow(clippy::type_complexity)]
+    fn series_chunks_for_entry_inner(
+        &self,
+        entry: &SeriesEntry,
+        mint: i64,
+        maxt: i64,
+        need_labels: bool,
+    ) -> Result<Option<(Option<Labels>, Vec<ChunkMeta>, Vec<Interval>)>, HeadError> {
+        let ref_id = entry.ref_id;
         const OOO_HEAD_CHUNK_REF_BIT: u64 = 1u64 << 31;
 
         'retry: loop {
@@ -8751,15 +8778,33 @@ impl Head {
         Ok(merge_head_chunks_with_tombstones(chks, &tombs)?)
     }
 
-    /// Computes `(labels, exact_chunk_count)` for `ref_id` in `[mint, maxt]` without cloning any
-    /// chunk bytes or reading mmap files on the normal in-order disjoint fast path.
-    pub fn series_lazy_chunk_count(
+    /// Loads and overlap-merges all chunks for a pre-resolved `SeriesEntry` overlapping
+    /// `[mint, maxt]` without a second `StripeSeries::get_by_id` lookup or `Labels` clone.
+    pub fn series_final_chunks_for_entry(
+        &self,
+        entry: &SeriesEntry,
+        mint: i64,
+        maxt: i64,
+    ) -> Result<Vec<ChunkMeta>, HeadError> {
+        let Some((_, chks, tombs)) = self.series_chunks_for_entry_inner(entry, mint, maxt, false)?
+        else {
+            return Ok(Vec::new());
+        };
+        if chks.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(merge_head_chunks_with_tombstones(chks, &tombs)?)
+    }
+
+    /// Computes `(entry, exact_chunk_count)` for `ref_id` in `[mint, maxt]` without cloning
+    /// `Labels`, chunk bytes, or reading mmap files on the normal in-order disjoint fast path.
+    pub fn series_lazy_chunk_count_with_entry(
         &self,
         ref_id: u64,
         mint: i64,
         maxt: i64,
         filter: Option<&dyn Fn(&Labels) -> bool>,
-    ) -> Result<Option<(Labels, u32)>, HeadError> {
+    ) -> Result<Option<(Arc<SeriesEntry>, u32)>, HeadError> {
         if self.is_closed() {
             return Err(HeadChunksError::Closed.into());
         }
@@ -8824,13 +8869,30 @@ impl Head {
             return Ok(if fast_count == 0 {
                 None
             } else {
-                Some((entry.labels.clone(), fast_count))
+                Some((entry, fast_count))
             });
         }
 
+        let chks = self.series_final_chunks_for_entry(&entry, mint, maxt)?;
+        Ok(if chks.is_empty() {
+            None
+        } else {
+            Some((entry, chks.len() as u32))
+        })
+    }
+
+    /// Computes `(labels, exact_chunk_count)` for `ref_id` in `[mint, maxt]` without cloning any
+    /// chunk bytes or reading mmap files on the normal in-order disjoint fast path.
+    pub fn series_lazy_chunk_count(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+    ) -> Result<Option<(Labels, u32)>, HeadError> {
         Ok(self
-            .series_final_chunks(ref_id, mint, maxt)?
-            .map(|(labels, chks)| (labels, chks.len() as u32)))
+            .series_lazy_chunk_count_with_entry(ref_id, mint, maxt, filter)?
+            .map(|(entry, cnt)| (entry.labels.clone(), cnt)))
     }
 
     /// Returns `(labels, chunk_intervals, needs_chunk_load_for_count)` for `ref_id` in `[mint, maxt]`
@@ -13725,6 +13787,56 @@ mod tests {
         let fhe = head.get_entry_by_sorted_pairs(&fhp).unwrap();
         assert_eq!(fhe.inner.lock().active_chunk_num_samples(), 1);
         assert_eq!(head.head_stats().2, 2);
+
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn evict_and_ooo_truncate_wait_for_active_head_read_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 2 * 3_600_000,
+            ..HeadOptions::default()
+        };
+        let head = Arc::new(Head::open(dir.path(), opts, i64::MIN).unwrap());
+        let ref_id = {
+            let mut app = head.appender();
+            let r = app.append_float(None, &[("__name__", "p11_m")], 10_000, 1.0).unwrap();
+            app.append_float(Some(r), &[("__name__", "p11_m")], 5_000, 0.5).unwrap();
+            app.commit().unwrap();
+            r
+        };
+
+        // 1. clear_ooo_data_before waits on active HeadReadGuard overlapping OOO range.
+        let guard_ooo = head.start_read(4_000, 6_000);
+        let h1 = Arc::clone(&head);
+        let cleared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c1 = Arc::clone(&cleared);
+        let t1 = std::thread::spawn(move || {
+            h1.clear_ooo_data_before(6_000).unwrap();
+            c1.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!cleared.load(Ordering::SeqCst), "clear_ooo_data_before must wait on HeadReadGuard");
+        drop(guard_ooo);
+        t1.join().unwrap();
+        assert!(cleared.load(Ordering::SeqCst));
+
+        // 2. evict_series_refs_with_fingerprints waits on active HeadReadGuard overlapping [min_time, maxt_inclusive].
+        let guard_in_order = head.start_read(9_000, 11_000);
+        let h2 = Arc::clone(&head);
+        let evicted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c2 = Arc::clone(&evicted);
+        let fps = HashMap::new();
+        let t2 = std::thread::spawn(move || {
+            h2.evict_series_refs_with_fingerprints(&[ref_id], 10_000, &fps).unwrap();
+            c2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!evicted.load(Ordering::SeqCst), "evict_series_refs_inner must wait on HeadReadGuard");
+        drop(guard_in_order);
+        t2.join().unwrap();
+        assert!(evicted.load(Ordering::SeqCst));
 
         head.close().unwrap();
     }

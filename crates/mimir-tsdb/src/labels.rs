@@ -115,16 +115,22 @@ fn try_decode_stringlabel_size(data: &[u8], pos: usize) -> Result<(usize, usize)
     }
 }
 
-#[inline]
+#[cold]
+#[inline(never)]
+fn decode_stringlabel_size_slow(data: &[u8], pos: usize) -> (usize, usize) {
+    let len = (data[pos + 1] as usize)
+        | ((data[pos + 2] as usize) << 8)
+        | ((data[pos + 3] as usize) << 16);
+    (len, pos + 4)
+}
+
+#[inline(always)]
 pub fn decode_stringlabel_size(data: &[u8], pos: usize) -> (usize, usize) {
     let b = data[pos];
-    if b == 255 {
-        let len = (data[pos + 1] as usize)
-            | ((data[pos + 2] as usize) << 8)
-            | ((data[pos + 3] as usize) << 16);
-        (len, pos + 4)
-    } else {
+    if b < 255 {
         (b as usize, pos + 1)
+    } else {
+        decode_stringlabel_size_slow(data, pos)
     }
 }
 
@@ -478,27 +484,51 @@ impl Labels {
     /// `0..pair_offset` (so all label pairs before `pair_offset` are identical).
     #[inline]
     pub fn cmp_from_pair_offset(&self, other: &Self, pair_offset: usize) -> Ordering {
-        let mut a = LabelsIter {
-            data: &self.data,
-            pos: pair_offset,
-        };
-        let mut b = LabelsIter {
-            data: &other.data,
-            pos: pair_offset,
-        };
-        loop {
-            match (a.next(), b.next()) {
-                (None, None) => return Ordering::Equal,
-                (None, Some(_)) => return Ordering::Less,
-                (Some(_), None) => return Ordering::Greater,
-                (Some((an, av)), Some((bn, bv))) => {
-                    match an.cmp(bn).then_with(|| av.cmp(bv)) {
-                        Ordering::Equal => continue,
-                        ord => return ord,
-                    }
-                }
+        let a = &self.data;
+        let b = &other.data;
+        let mut pa = pair_offset;
+        let mut pb = pair_offset;
+        while pa < a.len() && pb < b.len() {
+            let ba = a[pa];
+            let bb = b[pb];
+            let (an_len, an_start) = if ba < 128 {
+                (ba as usize, pa + 1)
+            } else {
+                decode_stringlabel_size(a, pa)
+            };
+            let (bn_len, bn_start) = if bb < 128 {
+                (bb as usize, pb + 1)
+            } else {
+                decode_stringlabel_size(b, pb)
+            };
+            let an_end = an_start + an_len;
+            let bn_end = bn_start + bn_len;
+            match a[an_start..an_end].cmp(&b[bn_start..bn_end]) {
+                Ordering::Equal => {}
+                ord => return ord,
             }
+            let vba = a[an_end];
+            let vbb = b[bn_end];
+            let (av_len, av_start) = if vba < 128 {
+                (vba as usize, an_end + 1)
+            } else {
+                decode_stringlabel_size(a, an_end)
+            };
+            let (bv_len, bv_start) = if vbb < 128 {
+                (vbb as usize, bn_end + 1)
+            } else {
+                decode_stringlabel_size(b, bn_end)
+            };
+            let av_end = av_start + av_len;
+            let bv_end = bv_start + bv_len;
+            match a[av_start..av_end].cmp(&b[bv_start..bv_end]) {
+                Ordering::Equal => {}
+                ord => return ord,
+            }
+            pa = av_end;
+            pb = bv_end;
         }
+        (pa < a.len()).cmp(&(pb < b.len()))
     }
 }
 
@@ -557,13 +587,30 @@ pub struct LabelsIter<'a> {
 impl<'a> Iterator for LabelsIter<'a> {
     type Item = (&'a str, &'a str);
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.data.len() {
+        let pos = self.pos;
+        let data = self.data;
+        if pos >= data.len() {
             return None;
         }
-        let (name, p1) = decode_stringlabel_str(self.data, self.pos);
-        let (value, p2) = decode_stringlabel_str(self.data, p1);
+        let b0 = data[pos];
+        if b0 < 128 {
+            let nstart = pos + 1;
+            let nend = nstart + b0 as usize;
+            let b1 = data[nend];
+            if b1 < 128 {
+                let vstart = nend + 1;
+                let vend = vstart + b1 as usize;
+                self.pos = vend;
+                // SAFETY: `Labels` only ever encodes valid UTF-8 strings.
+                let name = unsafe { std::str::from_utf8_unchecked(&data[nstart..nend]) };
+                let value = unsafe { std::str::from_utf8_unchecked(&data[vstart..vend]) };
+                return Some((name, value));
+            }
+        }
+        let (name, p1) = decode_stringlabel_str(data, pos);
+        let (value, p2) = decode_stringlabel_str(data, p1);
         self.pos = p2;
         Some((name, value))
     }

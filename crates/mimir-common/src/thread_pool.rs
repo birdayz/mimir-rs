@@ -6,8 +6,51 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+
+#[cfg(not(miri))]
+mod sync_impl {
+    pub use parking_lot::{Condvar, Mutex, MutexGuard};
+
+    #[inline]
+    pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock()
+    }
+
+    #[inline]
+    pub fn into_inner<T>(m: Mutex<T>) -> T {
+        m.into_inner()
+    }
+
+    #[inline]
+    pub fn wait<'a, T>(cv: &Condvar, mut guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        cv.wait(&mut guard);
+        guard
+    }
+}
+
+#[cfg(miri)]
+mod sync_impl {
+    pub use std::sync::{Condvar, Mutex, MutexGuard};
+
+    #[inline]
+    pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[inline]
+    pub fn into_inner<T>(m: Mutex<T>) -> T {
+        m.into_inner().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[inline]
+    pub fn wait<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        cv.wait(guard).unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+use sync_impl::{Condvar, Mutex};
 
 thread_local! {
     static ACTIVE_POOLS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
@@ -18,6 +61,7 @@ struct TaskDescriptor {
     ctx: *const (),
     num_jobs: usize,
     workers_to_use: usize,
+    claimed_workers: AtomicUsize,
     next_job: AtomicUsize,
     remaining_workers: AtomicUsize,
     panic: Mutex<Option<Box<dyn Any + Send>>>,
@@ -74,7 +118,7 @@ impl ScopedWorkerPool {
             let name = format!("{name_prefix}-{worker_id}");
             let handle = thread::Builder::new()
                 .name(name)
-                .spawn(move || worker_loop(worker_id, shared_clone))
+                .spawn(move || worker_loop(shared_clone))
                 .expect("spawn persistent worker pool thread");
             handles.push(handle);
         }
@@ -134,7 +178,7 @@ impl ScopedWorkerPool {
             f(idx);
         }
 
-        let _exec_guard = self.exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _exec_guard = sync_impl::lock(&self.exec_lock);
         ACTIVE_POOLS.with(|p| p.borrow_mut().push(shared_addr));
         let _active_guard = ActivePoolGuard { active: true };
         let workers_to_use = (num_jobs - 1).min(self.num_workers);
@@ -143,6 +187,7 @@ impl ScopedWorkerPool {
             ctx: (&f as *const F).cast(),
             num_jobs,
             workers_to_use,
+            claimed_workers: AtomicUsize::new(0),
             next_job: AtomicUsize::new(0),
             remaining_workers: AtomicUsize::new(workers_to_use),
             panic: Mutex::new(None),
@@ -156,24 +201,12 @@ impl ScopedWorkerPool {
         impl Drop for WaitAndClearGuard<'_> {
             fn drop(&mut self) {
                 if self.task.remaining_workers.load(Ordering::Acquire) != 0 {
-                    let mut done_guard = self
-                        .shared
-                        .done_mu
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut done_guard = sync_impl::lock(&self.shared.done_mu);
                     while self.task.remaining_workers.load(Ordering::Acquire) != 0 {
-                        done_guard = self
-                            .shared
-                            .done_cvar
-                            .wait(done_guard)
-                            .unwrap_or_else(|e| e.into_inner());
+                        done_guard = sync_impl::wait(&self.shared.done_cvar, done_guard);
                     }
                 }
-                let mut st = self
-                    .shared
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut st = sync_impl::lock(&self.shared.state);
                 st.task = None;
             }
         }
@@ -184,15 +217,17 @@ impl ScopedWorkerPool {
         };
 
         {
-            let mut st = self
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut st = sync_impl::lock(&self.shared.state);
             st.task = Some(&task as *const TaskDescriptor);
             st.generation = st.generation.wrapping_add(1);
         }
-        self.shared.work_cvar.notify_all();
+        if workers_to_use >= self.num_workers {
+            self.shared.work_cvar.notify_all();
+        } else {
+            for _ in 0..workers_to_use {
+                self.shared.work_cvar.notify_one();
+            }
+        }
 
         let caller_res = catch_unwind(AssertUnwindSafe(|| loop {
             let idx = task.next_job.fetch_add(1, Ordering::Relaxed);
@@ -208,7 +243,7 @@ impl ScopedWorkerPool {
         if let Err(payload) = caller_res {
             resume_unwind(payload);
         }
-        if let Some(payload) = task.panic.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(payload) = sync_impl::into_inner(task.panic) {
             resume_unwind(payload);
         }
     }
@@ -217,7 +252,7 @@ impl ScopedWorkerPool {
 impl Drop for ScopedWorkerPool {
     fn drop(&mut self) {
         {
-            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = sync_impl::lock(&self.shared.state);
             st.shutdown = true;
             st.generation = st.generation.wrapping_add(1);
         }
@@ -228,12 +263,12 @@ impl Drop for ScopedWorkerPool {
     }
 }
 
-fn worker_loop(worker_id: usize, shared: Arc<SharedPool>) {
+fn worker_loop(shared: Arc<SharedPool>) {
     ACTIVE_POOLS.with(|p| p.borrow_mut().push(Arc::as_ptr(&shared) as usize));
     let mut seen_gen = 0u64;
     loop {
         let task_ptr: *const TaskDescriptor = {
-            let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = sync_impl::lock(&shared.state);
             loop {
                 if st.shutdown {
                     return;
@@ -243,13 +278,15 @@ fn worker_loop(worker_id: usize, shared: Arc<SharedPool>) {
                     if let Some(ptr) = st.task {
                         // SAFETY: caller holds `WaitAndClearGuard` keeping `*ptr` alive until
                         // `remaining_workers` reaches 0.
-                        let workers_to_use = unsafe { (*ptr).workers_to_use };
-                        if worker_id < workers_to_use {
+                        let task = unsafe { &*ptr };
+                        if task.claimed_workers.fetch_add(1, Ordering::Relaxed)
+                            < task.workers_to_use
+                        {
                             break ptr;
                         }
                     }
                 }
-                st = shared.work_cvar.wait(st).unwrap_or_else(|e| e.into_inner());
+                st = sync_impl::wait(&shared.work_cvar, st);
             }
         };
 
@@ -262,7 +299,7 @@ fn worker_loop(worker_id: usize, shared: Arc<SharedPool>) {
         impl Drop for WorkerExit<'_> {
             fn drop(&mut self) {
                 if self.task.remaining_workers.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    let _g = self.shared.done_mu.lock().unwrap_or_else(|e| e.into_inner());
+                    let _g = sync_impl::lock(&self.shared.done_mu);
                     self.shared.done_cvar.notify_one();
                 }
             }
@@ -281,7 +318,7 @@ fn worker_loop(worker_id: usize, shared: Arc<SharedPool>) {
             unsafe { (task.func)(task.ctx, idx) };
         }));
         if let Err(payload) = res {
-            let mut p = task.panic.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = sync_impl::lock(&task.panic);
             if p.is_none() {
                 *p = Some(payload);
             }

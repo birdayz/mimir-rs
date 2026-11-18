@@ -65,8 +65,10 @@ pub type BlocksToDeleteFn = Arc<
 >;
 
 /// Optional callback invoked outside `blocks.write()` whenever `reload_blocks_locked`
-/// swaps in a changed block slice.
-pub type BlocksReloadedFn = Arc<dyn Fn(&[Arc<Block>]) + Send + Sync>;
+/// swaps in a changed block slice. Receives a closure that reads the live `blocks`
+/// snapshot so callers can serialize external locks (e.g. `shipped_blocks`) BEFORE
+/// reading `blocks`.
+pub type BlocksReloadedFn = Arc<dyn Fn(&dyn Fn() -> Vec<Arc<Block>>) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct TsdbOptions {
@@ -798,8 +800,8 @@ impl TsdbInner {
                 std::mem::replace(&mut *guard, to_load)
             };
             if let Some(ref cb) = self.opts.on_blocks_reload {
-                let new_blocks = self.blocks.read().clone();
-                cb(&new_blocks);
+                let get_blocks = || self.blocks.read().clone();
+                cb(&get_blocks);
             }
             for b in &old_blocks {
                 if deletable.contains(&b.ulid()) {

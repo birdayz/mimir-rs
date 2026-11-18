@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::Router;
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::Future;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request as HttpRequestMsg, Uri};
 use crate::modules::ModuleStates;
@@ -516,51 +516,62 @@ fn client_accepts_grpc_encoding(headers: &HeaderMap, enc: &str) -> bool {
     val.split(',').any(|s| s.trim().eq_ignore_ascii_case(enc))
 }
 
-fn s2_compress_framed(input: &[u8]) -> Vec<u8> {
+fn s2_compress_framed_into(input: &[u8], out: &mut BytesMut) {
     const MAX_BLOCK: usize = 4 << 20;
-    let mut out = Vec::with_capacity(10 + 8 + input.len());
-    out.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+    out.reserve(10 + 8 + input.len());
+    out.put_slice(b"\xff\x06\x00\x00S2sTwO");
     if input.is_empty() {
         let chunk_len = 4usize;
-        out.push(0x01);
-        out.push((chunk_len & 0xff) as u8);
-        out.push(((chunk_len >> 8) & 0xff) as u8);
-        out.push(((chunk_len >> 16) & 0xff) as u8);
-        out.extend_from_slice(&mimir_proto::s2::masked_crc32c(&[]).to_le_bytes());
-        return out;
+        out.put_u8(0x01);
+        out.put_u8((chunk_len & 0xff) as u8);
+        out.put_u8(((chunk_len >> 8) & 0xff) as u8);
+        out.put_u8(((chunk_len >> 16) & 0xff) as u8);
+        out.put_slice(&mimir_proto::s2::masked_crc32c(&[]).to_le_bytes());
+        return;
     }
     for chunk in input.chunks(MAX_BLOCK) {
         let chunk_len = 4 + chunk.len();
-        out.push(0x01);
-        out.push((chunk_len & 0xff) as u8);
-        out.push(((chunk_len >> 8) & 0xff) as u8);
-        out.push(((chunk_len >> 16) & 0xff) as u8);
-        out.extend_from_slice(&mimir_proto::s2::masked_crc32c(chunk).to_le_bytes());
-        out.extend_from_slice(chunk);
+        out.put_u8(0x01);
+        out.put_u8((chunk_len & 0xff) as u8);
+        out.put_u8(((chunk_len >> 8) & 0xff) as u8);
+        out.put_u8(((chunk_len >> 16) & 0xff) as u8);
+        out.put_slice(&mimir_proto::s2::masked_crc32c(chunk).to_le_bytes());
+        out.put_slice(chunk);
     }
-    out
 }
 
-fn compress_grpc_payload(enc: &str, payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+fn compress_grpc_payload_into(
+    enc: &str,
+    payload: &[u8],
+    out: &mut BytesMut,
+) -> Result<(), std::io::Error> {
     use std::io::Write as _;
     match enc {
         "gzip" => {
             let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                flate2::write::GzEncoder::new(out.writer(), flate2::Compression::default());
             encoder.write_all(payload)?;
-            encoder.finish()
+            encoder.finish()?;
+            Ok(())
         }
-        "zstd" => zstd::stream::encode_all(payload, 0),
-        "snappy" => mimir_proto::snappy::compress_framed(payload),
-        "s2" => Ok(s2_compress_framed(payload)),
-        _ => Ok(payload.to_vec()),
+        "zstd" => zstd::stream::copy_encode(payload, out.writer(), 0),
+        "snappy" => mimir_proto::snappy::compress_framed_buf(payload, out),
+        "s2" => {
+            s2_compress_framed_into(payload, out);
+            Ok(())
+        }
+        _ => {
+            out.put_slice(payload);
+            Ok(())
+        }
     }
 }
 
 struct CompressGrpcBody {
     inner: tonic::body::BoxBody,
     encoding: &'static str,
-    buf: Vec<u8>,
+    buf: BytesMut,
+    out_buf: BytesMut,
     out_queue: std::collections::VecDeque<Bytes>,
     pending_trailers: Option<http::HeaderMap>,
     done: bool,
@@ -571,7 +582,8 @@ impl CompressGrpcBody {
         Self {
             inner,
             encoding,
-            buf: Vec::new(),
+            buf: BytesMut::new(),
+            out_buf: BytesMut::new(),
             out_queue: std::collections::VecDeque::new(),
             pending_trailers: None,
             done: false,
@@ -583,22 +595,40 @@ impl CompressGrpcBody {
             let flag = self.buf[0];
             let msg_len =
                 u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
-            if self.buf.len() < 5 + msg_len {
+            let Some(frame_end) = 5usize.checked_add(msg_len) else {
+                break;
+            };
+            if self.buf.len() < frame_end {
                 break;
             }
-            let frame: Vec<u8> = self.buf.drain(..5 + msg_len).collect();
-            let payload = &frame[5..];
             if flag == 0 {
-                let compressed = compress_grpc_payload(self.encoding, payload)
-                    .map_err(|e| Box::new(Status::internal(format!("compress gRPC response: {e}"))))?;
-                let mut out = Vec::with_capacity(5 + compressed.len());
-                out.push(1);
-                out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
-                out.extend_from_slice(&compressed);
-                self.out_queue.push_back(Bytes::from(out));
+                let hdr_pos = self.out_buf.len();
+                self.out_buf.extend_from_slice(&[1, 0, 0, 0, 0]);
+                if let Err(e) = compress_grpc_payload_into(
+                    self.encoding,
+                    &self.buf[5..frame_end],
+                    &mut self.out_buf,
+                ) {
+                    self.out_buf.truncate(hdr_pos);
+                    return Err(Box::new(Status::internal(format!(
+                        "compress gRPC response: {e}"
+                    ))));
+                }
+                let comp_len = self.out_buf.len() - (hdr_pos + 5);
+                let comp_len_u32 = u32::try_from(comp_len).map_err(|_| {
+                    Box::new(Status::internal(
+                        "compressed gRPC response frame exceeds u32::MAX",
+                    ))
+                })?;
+                self.out_buf[hdr_pos + 1..hdr_pos + 5]
+                    .copy_from_slice(&comp_len_u32.to_be_bytes());
             } else {
-                self.out_queue.push_back(Bytes::from(frame));
+                self.out_buf.extend_from_slice(&self.buf[..frame_end]);
             }
+            self.buf.advance(frame_end);
+        }
+        if !self.out_buf.is_empty() {
+            self.out_queue.push_back(self.out_buf.split().freeze());
         }
         Ok(())
     }
@@ -638,10 +668,8 @@ impl hyper::body::Body for CompressGrpcBody {
                             Ok(trailers) => {
                                 if !self.buf.is_empty() {
                                     self.pending_trailers = Some(trailers);
-                                    let rem = std::mem::take(&mut self.buf);
-                                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(
-                                        Bytes::from(rem),
-                                    ))));
+                                    let rem = self.buf.split().freeze();
+                                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(rem))));
                                 }
                                 self.done = true;
                                 return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(
@@ -650,10 +678,8 @@ impl hyper::body::Body for CompressGrpcBody {
                             }
                             Err(other_frame) => {
                                 if !self.buf.is_empty() {
-                                    let rem = std::mem::take(&mut self.buf);
-                                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(
-                                        Bytes::from(rem),
-                                    ))));
+                                    let rem = self.buf.split().freeze();
+                                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(rem))));
                                 }
                                 return Poll::Ready(Some(Ok(other_frame)));
                             }
@@ -663,8 +689,8 @@ impl hyper::body::Body for CompressGrpcBody {
                 Poll::Ready(None) => {
                     self.done = true;
                     if !self.buf.is_empty() {
-                        let rem = std::mem::take(&mut self.buf);
-                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(rem)))));
+                        let rem = self.buf.split().freeze();
+                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(rem))));
                     }
                     return Poll::Ready(None);
                 }
@@ -1293,7 +1319,8 @@ mod tests {
 
         for enc in ["snappy", "s2", "gzip", "zstd"] {
             for accept_hdr in [Some(enc), Some("identity,gzip,zstd,snappy,s2"), None] {
-                let comp = compress_grpc_payload(enc, &raw_req).unwrap();
+                let mut comp = BytesMut::new();
+                compress_grpc_payload_into(enc, &raw_req, &mut comp).unwrap();
                 let mut framed = Vec::with_capacity(5 + comp.len());
                 framed.push(1);
                 framed.extend_from_slice(&(comp.len() as u32).to_be_bytes());
