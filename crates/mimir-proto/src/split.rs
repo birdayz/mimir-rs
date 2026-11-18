@@ -267,7 +267,9 @@ fn resolved_symbol_size(ref_id: u32, symbols: &[String], offset: u32) -> usize {
     if ref_id > 0 && ref_id < offset {
         return 0;
     }
-    let l = symbols[(ref_id - offset) as usize].len();
+    let l = symbols
+        .get((ref_id - offset) as usize)
+        .map_or(0, String::len);
     1 + l + prost::encoding::encoded_len_varint(l as u64)
 }
 
@@ -315,9 +317,41 @@ fn resolve_ref<'a>(
     common_symbols: &'a [String],
     offset: u32,
 ) -> &'a str {
+    if ref_id == 0 {
+        return "";
+    }
     if ref_id < offset {
-        common_symbols[ref_id as usize].as_str()
+        common_symbols
+            .get(ref_id as usize)
+            .map_or("", String::as_str)
     } else {
-        symbols[(ref_id - offset) as usize].as_str()
+        symbols
+            .get((ref_id - offset) as usize)
+            .map_or("", String::as_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_ref_zero_with_offset_and_empty_common_symbols() {
+        let syms = vec!["".to_string(), "m".to_string()];
+        let ts = cortexpb::TimeSeriesRw2 {
+            labels_refs: vec![257, 0],
+            metadata: Some(cortexpb::MetadataRw2 {
+                r#type: 1,
+                help_ref: 0,
+                unit_ref: 0,
+            }),
+            ..Default::default()
+        };
+        let mut table = FastSymbolsTable::new(16);
+        table.configure_common_symbols(256, None);
+        let res = resymbolize_timeseries_rw2(&ts, &syms, None, &mut table);
+        assert_eq!(res.labels_refs, vec![257, 0]);
+        assert_eq!(res.metadata.unwrap().help_ref, 0);
+        assert_eq!(res.metadata.unwrap().unit_ref, 0);
     }
 }

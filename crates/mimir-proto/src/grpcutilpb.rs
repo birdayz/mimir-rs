@@ -61,12 +61,20 @@ pub fn pack_any<M: Message>(type_url: &str, msg: &M) -> prost_types::Any {
     }
 }
 
-/// Unpack a `prost_types::Any` if its `type_url` matches `expected_type_url` (or suffix).
+/// Unpack a `prost_types::Any` if its `type_url` matches `expected_type_url` (or suffix after `'/'`).
 pub fn unpack_any<M: Message + Default>(
     any: &prost_types::Any,
     expected_type_url: &str,
 ) -> Option<Result<M, prost::DecodeError>> {
-    if any.type_url == expected_type_url {
+    let expected_name = expected_type_url
+        .rsplit_once('/')
+        .map_or(expected_type_url, |(_, name)| name);
+    let matches = any.type_url == expected_type_url
+        || any
+            .type_url
+            .rsplit_once('/')
+            .is_some_and(|(_, actual_name)| !actual_name.is_empty() && actual_name == expected_name);
+    if matches {
         Some(M::decode(any.value.as_slice()))
     } else {
         None
@@ -240,5 +248,48 @@ mod tests {
         );
         let extracted = extract_grpcutil_error_details(&status).expect("extract grpcutil details");
         assert_eq!(extracted, details);
+    }
+
+    #[test]
+    fn test_unpack_any_suffix_and_detail_free_4xx_is_client_error() {
+        let details = cortexpb::ErrorDetails {
+            cause: cortexpb::ErrorCause::BadData as i32,
+            soft: false,
+            rejected_samples: 1,
+        };
+        let any_custom_prefix = pack_any("https://example.com/custom/cortexpb.ErrorDetails", &details);
+        let unpacked = unpack_any::<cortexpb::ErrorDetails>(
+            &any_custom_prefix,
+            CORTEXPB_ERROR_DETAILS_TYPE_URL,
+        )
+        .expect("suffix match")
+        .expect("decode");
+        assert_eq!(unpacked, details);
+
+        let any_short_prefix = pack_any("/cortexpb.ErrorDetails", &details);
+        assert!(unpack_any::<cortexpb::ErrorDetails>(
+            &any_short_prefix,
+            CORTEXPB_ERROR_DETAILS_TYPE_URL,
+        )
+        .is_some());
+
+        let any_wrong_suffix = pack_any("type.googleapis.com/other.ErrorDetails", &details);
+        assert!(unpack_any::<cortexpb::ErrorDetails>(
+            &any_wrong_suffix,
+            CORTEXPB_ERROR_DETAILS_TYPE_URL,
+        )
+        .is_none());
+
+        let mut detail_free_400 = tonic::Status::unknown("bad request");
+        detail_free_400
+            .metadata_mut()
+            .insert("grpc-status", "400".parse().unwrap());
+        assert!(cortexpb::is_client_error(&detail_free_400));
+
+        let mut detail_free_500 = tonic::Status::unknown("internal error");
+        detail_free_500
+            .metadata_mut()
+            .insert("grpc-status", "500".parse().unwrap());
+        assert!(!cortexpb::is_client_error(&detail_free_500));
     }
 }

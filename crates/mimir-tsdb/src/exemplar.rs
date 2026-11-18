@@ -593,7 +593,8 @@ impl CircularExemplarInner {
         }
 
         if (e.timestamp_ms < newest.timestamp_ms
-            && e.timestamp_ms <= newest.timestamp_ms - self.ooo_time_window_ms)
+            && (e.timestamp_ms as i128)
+                <= (newest.timestamp_ms as i128) - (self.ooo_time_window_ms as i128))
             || (e.timestamp_ms == newest.timestamp_ms && e.value < newest.value)
             || (e.timestamp_ms == newest.timestamp_ms
                 && e.value == newest.value
@@ -762,5 +763,22 @@ mod tests {
             store.add_exemplar(&s, Exemplar::new(ex_lbls2, 1.0, 200)),
             Err(ExemplarError::LabelLengthExceeded)
         );
+    }
+
+    #[test]
+    fn circular_exemplar_validate_near_i64_min_no_underflow() {
+        let store = CircularExemplarStorage::new(10, 3_600_000);
+        let s = Labels::from_pairs([("__name__", "m")]);
+        let l = |v: &str| Labels::from_pairs([("trace_id", v)]);
+        store
+            .add_exemplar(&s, Exemplar::new(l("a"), 1.0, i64::MIN + 1_000))
+            .unwrap();
+        // Within OOO window (500ms earlier) must succeed without i64 underflow!
+        store
+            .add_exemplar(&s, Exemplar::new(l("b"), 2.0, i64::MIN + 500))
+            .unwrap();
+        store
+            .add_exemplar(&s, Exemplar::new(l("c"), 3.0, i64::MIN))
+            .unwrap();
     }
 }
