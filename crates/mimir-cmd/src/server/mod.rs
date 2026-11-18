@@ -289,7 +289,7 @@ impl Server {
         let http_router =
             router.layer(axum::middleware::from_fn_with_state(middleware, http_middleware::dskit_http_middleware));
 
-        let rpc_workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 8));
+        let rpc_workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 16));
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(rpc_workers)
             .thread_name("mimir-rpc")

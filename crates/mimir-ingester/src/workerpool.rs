@@ -36,7 +36,7 @@ impl std::fmt::Display for ErrPoolStopped {
 
 impl std::error::Error for ErrPoolStopped {}
 
-type TaskFn = Box<dyn FnOnce() + Send + 'static>;
+type TaskFn = Box<dyn FnOnce() -> Option<Box<dyn FnOnce() + Send>> + Send + 'static>;
 
 struct Task {
     dimension: String,
@@ -251,10 +251,11 @@ pub struct Pool {
     handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// Go: `runtime.GOMAXPROCS(0)` default (cgroup-aware CPU count), clamped to `[1, 8]`
-/// so unconstrained 24+ core hosts do not spawn excessive idle worker threads.
+/// Go: `runtime.GOMAXPROCS(0)` default (cgroup-aware CPU count), clamped to `[2, 16]`
+/// so 16-vCPU pods are never bottlenecked while unconstrained 24+ core hosts do not spawn
+/// excessive idle worker threads.
 fn default_workers() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 8))
+    std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 16))
 }
 
 impl Pool {
@@ -392,6 +393,36 @@ impl Pool {
         tenant_id: &str,
         f: impl FnOnce() + Send + 'static,
     ) -> Result<(), ErrPoolStopped> {
+        self.submit_inner(dimension, tenant_id, move || {
+            f();
+            None
+        })
+    }
+
+    /// Like [`Pool::submit`], but invokes `done(result)` *after*
+    /// `mimir_workerpool_task_duration_seconds` has been recorded for the task.
+    ///
+    /// Callers that signal completion or drop channel senders from `done` are guaranteed that
+    /// the duration observation is already visible to Prometheus scrapes when the signal arrives.
+    pub fn submit_with_done<R: Send + 'static>(
+        &self,
+        dimension: &str,
+        tenant_id: &str,
+        f: impl FnOnce() -> R + Send + 'static,
+        done: impl FnOnce(R) + Send + 'static,
+    ) -> Result<(), ErrPoolStopped> {
+        self.submit_inner(dimension, tenant_id, move || {
+            let res = f();
+            Some(Box::new(move || done(res)) as Box<dyn FnOnce() + Send>)
+        })
+    }
+
+    fn submit_inner(
+        &self,
+        dimension: &str,
+        tenant_id: &str,
+        f: impl FnOnce() -> Option<Box<dyn FnOnce() + Send>> + Send + 'static,
+    ) -> Result<(), ErrPoolStopped> {
         let start = Instant::now();
         let res = {
             let mut st = self.shared.state.lock();
@@ -469,13 +500,19 @@ fn worker_loop(worker_id: usize, shared: &Shared, metrics: &PoolMetrics) {
         metrics.max_queue_length.dec(&task.tenant);
         let start = Instant::now();
         // A panicking task is not recovered in Go: it crashes the process.
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task.f)).is_err() {
-            std::process::abort();
-        }
+        let post = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(task.f)) {
+            Ok(post) => post,
+            Err(_) => std::process::abort(),
+        };
         metrics
             .task_duration
             .with_label_values(&[&task.dimension])
             .observe(start.elapsed().as_secs_f64());
+        if let Some(done) = post {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(done)).is_err() {
+                std::process::abort();
+            }
+        }
     }
 }
 
@@ -740,7 +777,7 @@ mod tests {
                 st.enqueue(Task {
                     dimension: d.to_string(),
                     tenant: "t".to_string(),
-                    f: Box::new(|| {}),
+                    f: Box::new(|| None),
                 });
             }
         }
@@ -750,8 +787,39 @@ mod tests {
     }
 
     #[test]
+    fn submit_with_done_observes_task_duration_before_done() {
+        let reg = Registry::new();
+        let p = Pool::new(2, "test", Some(&reg)).unwrap();
+        p.start().unwrap();
+        let (tx, rx) = mpsc::channel::<()>();
+        for _ in 0..3 {
+            let tx = tx.clone();
+            p.submit_with_done("mydim", "tenant", || 42usize, move |v| {
+                assert_eq!(v, 42);
+                drop(tx);
+            })
+            .unwrap();
+        }
+        drop(tx);
+        while rx.recv().is_ok() {}
+        let count = reg
+            .gather()
+            .into_iter()
+            .filter(|mf| mf.get_name() == "mimir_workerpool_task_duration_seconds")
+            .flat_map(|mf| mf.get_metric().to_vec())
+            .find(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.get_name() == "dimension" && l.get_value() == "mydim")
+            })
+            .map_or(0, |m| m.get_histogram().get_sample_count());
+        assert_eq!(count, 3);
+        p.stop();
+    }
+
+    #[test]
     fn default_workers_is_bounded() {
         let w = default_workers();
-        assert!((1..=8).contains(&w), "default_workers={w} out of [1, 8]");
+        assert!((2..=16).contains(&w), "default_workers={w} out of [2, 16]");
     }
 }

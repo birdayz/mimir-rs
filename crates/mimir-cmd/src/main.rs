@@ -16,7 +16,7 @@ unsafe impl Sync for MallocConfPtr {}
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
 static _rjem_malloc_conf_override: MallocConfPtr = MallocConfPtr(
-    c"background_thread:true,dirty_decay_ms:250,muzzy_decay_ms:0,narenas:4".as_ptr(),
+    c"background_thread:true,dirty_decay_ms:250,muzzy_decay_ms:0,narenas:8".as_ptr(),
 );
 
 #[cfg(target_os = "linux")]
@@ -79,7 +79,7 @@ fn main() {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 8)));
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 16)));
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(main_workers)

@@ -4297,30 +4297,36 @@ fn submit_label_values_chunk(
         Arc::clone(count_fn),
         tx.clone(),
     );
-    pool.submit(DIMENSION_LABEL_VALUES_SERIES_COUNT, tenant_id, move || {
-        for v in &values[range] {
-            let res = if cancel() {
-                Err(LabelNamesAndValuesError::Canceled)
-            } else {
-                count_fn(v)
-            };
-            let msg = match res {
-                Ok(count) => LabelValueCountResult {
-                    val: v.clone(),
-                    count,
-                    err: None,
-                },
-                Err(err) => LabelValueCountResult {
-                    val: v.clone(),
-                    count: 0,
-                    err: Some(err),
-                },
-            };
-            if tx_c.blocking_send(msg).is_err() {
-                break;
+    pool.submit_with_done(
+        DIMENSION_LABEL_VALUES_SERIES_COUNT,
+        tenant_id,
+        move || {
+            for v in &values[range] {
+                let res = if cancel() {
+                    Err(LabelNamesAndValuesError::Canceled)
+                } else {
+                    count_fn(v)
+                };
+                let msg = match res {
+                    Ok(count) => LabelValueCountResult {
+                        val: v.clone(),
+                        count,
+                        err: None,
+                    },
+                    Err(err) => LabelValueCountResult {
+                        val: v.clone(),
+                        count: 0,
+                        err: Some(err),
+                    },
+                };
+                if tx_c.blocking_send(msg).is_err() {
+                    break;
+                }
             }
-        }
-    })
+            tx_c
+        },
+        drop,
+    )
     .is_ok()
 }
 
