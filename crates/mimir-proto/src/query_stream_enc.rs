@@ -183,10 +183,13 @@ fn encode_stringlabels_message_single_pass(
                     let pair_len = 4 + klen + vlen;
                     if pair_len < 128 {
                         let total = 6 + klen + vlen;
-                        let cur = dst.len();
-                        // SAFETY: `max_needed >= 3 + 2*sl_len + 28` guarantees capacity.
+                        // SAFETY: `max_needed >= 3 + 2*sl_len + 28` guarantees spare capacity >= `total`.
+                        // `BufMut::chunk_mut` returns `&mut UninitSlice` covering spare capacity
+                        // `[dst.len()..dst.capacity()]` with valid Stacked-Borrows provenance.
                         unsafe {
-                            let ptr = dst.as_mut_ptr().add(cur);
+                            let spare = BufMut::chunk_mut(dst);
+                            debug_assert!(spare.len() >= total);
+                            let ptr = spare.as_mut_ptr();
                             *ptr = 0x0a;
                             *ptr.add(1) = pair_len as u8;
                             *ptr.add(2) = 0x0a;
@@ -203,7 +206,7 @@ fn encode_stringlabels_message_single_pass(
                                 ptr.add(6 + klen),
                                 vlen,
                             );
-                            dst.set_len(cur + total);
+                            BufMut::advance_mut(dst, total);
                         }
                         continue;
                     }
