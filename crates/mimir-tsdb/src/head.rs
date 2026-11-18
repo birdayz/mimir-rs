@@ -1065,10 +1065,7 @@ impl SeriesState {
                 }
             }
         }
-        if self.has_active_chunk() && pred(self.active_min_time, self.active_max_time()) {
-            return true;
-        }
-        false
+        self.has_active_chunk() && pred(self.active_min_time, self.active_max_time())
     }
 
     fn push_head_chunk(&mut self, chunk: EncodedChunk, min_time: i64, max_time: i64) {
