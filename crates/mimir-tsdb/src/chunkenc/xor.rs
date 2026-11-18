@@ -34,7 +34,7 @@ impl XorAppendState {
 /// Gorilla/Prometheus XOR-encoded float64 chunk (`EncXOR = 1`).
 #[derive(Clone, Debug)]
 pub struct XorChunk {
-    b: BitStream,
+    pub(crate) b: BitStream,
 }
 
 impl PartialEq for XorChunk {
@@ -119,7 +119,7 @@ impl XorChunk {
             )
         };
 
-        self.b.count = valid_bits;
+        self.b.set_count(valid_bits);
         Ok(XorAppender {
             b: &mut self.b,
             t,

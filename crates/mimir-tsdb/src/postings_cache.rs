@@ -3,8 +3,8 @@
 //! Ported from github.com/prometheus/prometheus/tsdb/postings_for_matchers_cache.go.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use hashbrown::{HashMap, HashTable};
@@ -236,12 +236,137 @@ struct CacheInner {
     next_id: u64,
 }
 
+const METRIC_VERSION_PAGE_BITS: usize = 13;
+const METRIC_VERSION_PAGE_SLOTS: usize = 1 << METRIC_VERSION_PAGE_BITS; // 8192 * 8 B = 64 KiB
+
+struct PagedMetricVersions {
+    slots_mask: usize,
+    page_len: usize,
+    pages: Box<[AtomicPtr<AtomicU64>]>,
+}
+
+// SAFETY: Every non-null pointer in `pages` points to an owned `Box<[AtomicU64]>` of length
+// `page_len`, which is `Sync` and reclaimed only in `Drop`.
+unsafe impl Send for PagedMetricVersions {}
+unsafe impl Sync for PagedMetricVersions {}
+
+impl Drop for PagedMetricVersions {
+    fn drop(&mut self) {
+        for page in self.pages.iter_mut() {
+            let ptr = *page.get_mut();
+            if !ptr.is_null() {
+                // SAFETY: `ptr` came from `Box::into_raw` on a `Box<[AtomicU64]>` of length
+                // `self.page_len`.
+                unsafe {
+                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                        ptr,
+                        self.page_len,
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl PagedMetricVersions {
+    fn new(num_metric_versions: usize) -> Self {
+        let slots = num_metric_versions.max(64).next_power_of_two();
+        let page_len = slots.min(METRIC_VERSION_PAGE_SLOTS);
+        let num_pages = slots.div_ceil(page_len);
+        let mut pages = Vec::with_capacity(num_pages);
+        for _ in 0..num_pages {
+            pages.push(AtomicPtr::new(std::ptr::null_mut()));
+        }
+        Self {
+            slots_mask: slots - 1,
+            page_len,
+            pages: pages.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    fn slot_coords(&self, metric_name: &str) -> (usize, usize) {
+        // FNV-1a matching Prometheus metricVersions.getIndex.
+        let mut h: u64 = 14695981039346656037;
+        for &b in metric_name.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(1099511628211);
+        }
+        let idx = (h as usize) & self.slots_mask;
+        (
+            idx >> METRIC_VERSION_PAGE_BITS,
+            idx & (METRIC_VERSION_PAGE_SLOTS - 1),
+        )
+    }
+
+    #[inline]
+    fn load(&self, metric_name: &str) -> u64 {
+        let (page_idx, off) = self.slot_coords(metric_name);
+        let ptr = self.pages[page_idx].load(Ordering::Acquire);
+        if ptr.is_null() {
+            return 0;
+        }
+        // SAFETY: `ptr` is non-null, published with `Release`, and points to `page_len`
+        // `AtomicU64` elements where `off < page_len`.
+        unsafe { (&*ptr.add(off)).load(Ordering::Acquire) }
+    }
+
+    #[inline]
+    fn fetch_add(&self, metric_name: &str) {
+        let (page_idx, off) = self.slot_coords(metric_name);
+        let ptr = self.get_or_alloc_page(page_idx);
+        // SAFETY: `ptr` is non-null and points to `page_len` `AtomicU64` elements where
+        // `off < page_len`.
+        unsafe {
+            (&*ptr.add(off)).fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[cold]
+    fn get_or_alloc_page(&self, page_idx: usize) -> *mut AtomicU64 {
+        let slot = &self.pages[page_idx];
+        let ptr = slot.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            return ptr;
+        }
+        let mut page = Vec::with_capacity(self.page_len);
+        page.resize_with(self.page_len, || AtomicU64::new(0));
+        let raw = Box::into_raw(page.into_boxed_slice()) as *mut AtomicU64;
+        match slot.compare_exchange(
+            std::ptr::null_mut(),
+            raw,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => raw,
+            Err(existing) => {
+                // SAFETY: `raw` was just allocated by this thread and never published.
+                unsafe {
+                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                        raw,
+                        self.page_len,
+                    )));
+                }
+                existing
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn allocated_pages(&self) -> usize {
+        self.pages
+            .iter()
+            .filter(|p| !p.load(Ordering::Relaxed).is_null())
+            .count()
+    }
+}
+
 /// Concurrent TTL + byte-bounded cache for `postings_for_matchers` evaluations.
 pub struct PostingsForMatchersCache {
     config: PostingsForMatchersCacheConfig,
     global_epoch: AtomicU64,
     postings_generation: AtomicU64,
-    metric_versions: Option<Box<[AtomicU64]>>,
+    metric_versions: OnceLock<PagedMetricVersions>,
     inner: RwLock<CacheInner>,
     in_flight: Mutex<HashMap<InFlightKey, Arc<InFlightCall>>>,
     metrics: Option<PostingsForMatchersCacheMetrics>,
@@ -274,47 +399,25 @@ impl Drop for PostingsForMatchersCache {
 
 impl PostingsForMatchersCache {
     pub fn new(config: PostingsForMatchersCacheConfig) -> Self {
-        let metric_versions = if config.enable_invalidation {
-            let slots = config.num_metric_versions.max(64).next_power_of_two();
-            let mut v = Vec::with_capacity(slots);
-            for _ in 0..slots {
-                v.push(AtomicU64::new(0));
-            }
-            Some(v.into_boxed_slice())
-        } else {
-            None
-        };
         let metrics = config.metrics.clone();
         Self {
             config,
             global_epoch: AtomicU64::new(0),
             postings_generation: AtomicU64::new(0),
-            metric_versions,
+            metric_versions: OnceLock::new(),
             inner: RwLock::new(CacheInner::default()),
             in_flight: Mutex::new(HashMap::new()),
             metrics,
         }
     }
 
-    #[inline]
-    fn metric_slot(&self, metric_name: &str, len: usize) -> usize {
-        // FNV-1a matching Prometheus metricVersions.getIndex.
-        let mut h: u64 = 14695981039346656037;
-        for &b in metric_name.as_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(1099511628211);
-        }
-        (h as usize) & (len - 1)
-    }
-
     /// Invalidates cached Head postings affected by creating or deleting a series with `metric_name`.
     #[inline]
     pub fn invalidate_metric(&self, metric_name: &str) {
         self.postings_generation.fetch_add(1, Ordering::Release);
-        if let Some(ref mv) = self.metric_versions {
-            if !metric_name.is_empty() {
-                let idx = self.metric_slot(metric_name, mv.len());
-                mv[idx].fetch_add(1, Ordering::Release);
+        if self.config.enable_invalidation && !metric_name.is_empty() {
+            if let Some(mv) = self.metric_versions.get() {
+                mv.fetch_add(metric_name);
             }
         }
         if self.config.report_invalidations {
@@ -341,13 +444,15 @@ impl PostingsForMatchersCache {
 
     #[inline]
     fn version_for_matchers(&self, matchers: &[LabelMatcher]) -> (u64, bool) {
-        let Some(ref mv) = self.metric_versions else {
+        if !self.config.enable_invalidation {
             return (0, false);
-        };
+        }
+        let mv = self
+            .metric_versions
+            .get_or_init(|| PagedMetricVersions::new(self.config.num_metric_versions));
         let epoch = self.global_epoch.load(Ordering::Acquire);
         if let Some(metric_name) = exact_metric_name_from_matchers(matchers) {
-            let idx = self.metric_slot(metric_name, mv.len());
-            let ver = mv[idx].load(Ordering::Acquire);
+            let ver = mv.load(metric_name);
             ((epoch << 32) ^ ver, true)
         } else {
             let gen = self.postings_generation.load(Ordering::Acquire);
@@ -860,5 +965,34 @@ mod tests {
         drop(b);
         assert_eq!(sample(&reg, &format!("{p}entries_total"), None), 0.0);
         assert_eq!(sample(&reg, &format!("{p}bytes_total"), None), 0.0);
+    }
+
+    #[test]
+    fn lazy_paged_metric_versions_avoids_eager_allocation() {
+        let cache = PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            enable_invalidation: true,
+            num_metric_versions: 2_097_152,
+            ..Default::default()
+        });
+
+        // Write-only / unqueried tenant: 0 bytes & 0 pages allocated even across many invalidations.
+        for i in 0..1000 {
+            cache.invalidate_metric(&format!("metric_{i}"));
+        }
+        assert!(cache.metric_versions.get().is_none());
+
+        // First query initializes directory, but reads allocate 0 64 KiB pages.
+        let m = [LabelMatcher::new(MatchType::Equal, "__name__", "hot_metric").unwrap()];
+        let r1 = cache.get_or_compute::<_, ()>(&m, || Ok(vec![10, 20])).unwrap();
+        assert_eq!(&*r1, &[10, 20]);
+        let mv = cache.metric_versions.get().unwrap();
+        assert_eq!(mv.pages.len(), 256);
+        assert_eq!(mv.allocated_pages(), 0);
+
+        // Invalidating a single metric faults only 1 64 KiB page (instead of 16 MiB!).
+        cache.invalidate_metric("hot_metric");
+        assert_eq!(mv.allocated_pages(), 1);
+        let r2 = cache.get_or_compute::<_, ()>(&m, || Ok(vec![10, 20, 30])).unwrap();
+        assert_eq!(&*r2, &[10, 20, 30]);
     }
 }

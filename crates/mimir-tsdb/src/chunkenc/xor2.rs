@@ -53,7 +53,7 @@ impl Xor2AppendState {
 /// Prometheus `EncXOR2` (`4`) encoded float64 chunk with optional start timestamp support.
 #[derive(Clone, Debug)]
 pub struct Xor2Chunk {
-    b: BitStream,
+    pub(crate) b: BitStream,
 }
 
 impl PartialEq for Xor2Chunk {
@@ -160,7 +160,7 @@ impl Xor2Chunk {
             )
         };
 
-        self.b.count = valid_bits;
+        self.b.set_count(valid_bits);
         Ok(Xor2Appender {
             b: &mut self.b,
             st,

@@ -28,7 +28,7 @@ pub enum AppendHistogramStOutcome {
 /// Prometheus `EncHistogramST` (`5`) encoded integer native histogram chunk with ST support.
 #[derive(Clone, Debug)]
 pub struct HistogramStChunk {
-    b: BitStream,
+    pub(crate) b: BitStream,
 }
 
 impl PartialEq for HistogramStChunk {
@@ -147,7 +147,7 @@ impl HistogramStChunk {
             )
         };
 
-        self.b.count = valid_bits;
+        self.b.set_count(valid_bits);
         Ok(HistogramStAppender {
             chunk: self,
             state,
