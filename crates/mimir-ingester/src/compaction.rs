@@ -50,6 +50,7 @@ impl Ingester {
             .into_iter()
             .filter(|u| allowed.is_none_or(|a| a.contains(u)))
             .collect();
+        let has_users = !user_ids.is_empty();
         futures::stream::iter(user_ids)
             .for_each_concurrent(concurrency, |user_id| async move {
                 self.compact_user_blocks(&user_id, force, forced_compaction_max_time)
@@ -57,6 +58,9 @@ impl Ingester {
             })
             .await;
         self.metrics.reset_forced_compactions();
+        if has_users {
+            mimir_common::purge_allocator_arenas();
+        }
     }
 
     async fn compact_user_blocks(
@@ -556,6 +560,7 @@ impl Ingester {
                 .max(0) as u64,
         );
 
+        let mut compacted_any = false;
         for user_id in self.get_tsdb_users() {
             let threshold = self
                 .overrides
@@ -602,7 +607,9 @@ impl Ingester {
             })
             .await;
             match compact_res {
-                Ok(Ok(_)) => {}
+                Ok(Ok(_)) => {
+                    compacted_any = true;
+                }
                 Ok(Err(e)) => {
                     warn!(user = %user_id, err = %e, "selected series compaction failed");
                     continue;
@@ -619,6 +626,9 @@ impl Ingester {
                     .with_label_values(&[&user_id])
                     .inc();
             }
+        }
+        if compacted_any {
+            mimir_common::purge_allocator_arenas();
         }
     }
 
@@ -737,6 +747,10 @@ impl Ingester {
             warn!(user = %user_id, dir = %dir.display(), err = %e, "failed to remove closed idle TSDB directory");
             return TsdbCloseCheckResult::DataRemovalFailed;
         }
+
+        drop(_remove_guard);
+        drop(user_db);
+        mimir_common::purge_allocator_arenas();
 
         if tenant_deleted {
             info!(user = %user_id, "deleted local TSDB, user marked for deletion");
