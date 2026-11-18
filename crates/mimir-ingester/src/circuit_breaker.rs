@@ -63,6 +63,7 @@ impl BreakerError {
         match self {
             Self::DeadlineExceeded => true,
             Self::Status(code) => *code == tonic::Code::DeadlineExceeded,
+            Self::Ingester(e) => e.is_deadline_exceeded(),
             _ => false,
         }
     }
@@ -261,18 +262,7 @@ impl CircuitBreaker {
         }));
         let inner_for_gauge = Arc::clone(&inner);
         let metrics = BreakerMetrics::new(reg, request_type, move || {
-            let mut g = inner_for_gauge.lock();
-            if g.state == BreakerState::Open {
-                if let Some(opened_at) = g.opened_at {
-                    if opened_at.elapsed() >= cooldown {
-                        g.state = BreakerState::HalfOpen;
-                        g.half_open_in_flight = 0;
-                        g.half_open_successes = 0;
-                        g.half_open_failures = 0;
-                    }
-                }
-            }
-            g.state
+            inner_for_gauge.lock().state
         });
 
         Some(Arc::new(Self {
@@ -967,6 +957,47 @@ mod tests {
         let p = cb.try_acquire_permit().unwrap().unwrap();
         p.finish(Duration::from_millis(1), false);
         assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    #[test]
+    fn scrape_does_not_suppress_half_open_transition_metric_and_ingester_deadline_counted() {
+        let cfg = CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold_percentage: 2,
+            failure_execution_threshold: 5,
+            cooldown_period: mimir_config::GoDuration::from_millis(20),
+            request_timeout: mimir_config::GoDuration::from_millis(100),
+            ..Default::default()
+        };
+        let reg = Registry::new();
+        let cb = CircuitBreaker::new(&cfg, Some(&reg), "push", true).unwrap();
+        cb.activate();
+        cb.force_open();
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Scraping /metrics before a request arrives must not skip the half-open transition counter.
+        let _ = reg.gather();
+        let p = cb.try_acquire_permit().unwrap().unwrap();
+        p.finish(Duration::from_millis(1), false);
+
+        let families = reg.gather();
+        let half_open_count = families
+            .iter()
+            .find(|f| f.get_name() == "cortex_ingester_circuit_breaker_transitions_total")
+            .and_then(|f| {
+                f.get_metric().iter().find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|lp| lp.get_name() == "state" && lp.get_value() == "half-open")
+                })
+            })
+            .map(|m| m.get_counter().get_value());
+        assert_eq!(half_open_count, Some(1.0));
+
+        let be = BreakerError::Ingester(IngesterError::DeadlineExceeded {
+            message: "deadline".to_string(),
+        });
+        assert!(be.is_deadline_exceeded());
     }
 
     #[test]

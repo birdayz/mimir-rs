@@ -891,6 +891,14 @@ impl SeriesIndexReader for mimir_tsdb::head::Head {
     }
 }
 
+struct ExactLabelsIndex<'a>(u64, &'a Labels);
+
+impl SeriesIndexReader for ExactLabelsIndex<'_> {
+    fn series_labels(&self, ref_id: u64) -> Option<Labels> {
+        (ref_id == self.0).then(|| self.1.clone())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lock-free 2-level paged NanosSlab for zero-lock ActiveSeries timestamp updates
 // ---------------------------------------------------------------------------
@@ -2600,7 +2608,8 @@ impl ActiveSeries {
             let lbls = Labels::from_pairs(pairs.iter().copied());
             if let Some(deleted_ref) = self.deleted.find(lbls.as_bytes()) {
                 let d_stripe = (deleted_ref as usize) & STRIPE_MASK;
-                self.stripes[d_stripe].remove(deleted_ref, None, &self.deleted, &self.slab);
+                let exact = ExactLabelsIndex(deleted_ref, &lbls);
+                self.stripes[d_stripe].remove(deleted_ref, Some(&exact), &self.deleted, &self.slab);
             }
         }
     }
@@ -2651,7 +2660,8 @@ impl ActiveSeries {
         if created && !self.deleted.is_empty() {
             if let Some(deleted_ref) = self.deleted.find(encoded_labels) {
                 let d_stripe = (deleted_ref as usize) & STRIPE_MASK;
-                self.stripes[d_stripe].remove(deleted_ref, None, &self.deleted, &self.slab);
+                let exact = ExactLabelsIndex(deleted_ref, series_labels);
+                self.stripes[d_stripe].remove(deleted_ref, Some(&exact), &self.deleted, &self.slab);
             }
         }
     }

@@ -48,9 +48,11 @@ impl std::hash::BuildHasher for FastU64BuildHasher {
     }
 }
 
+type MetricCountBucket = smallvec::SmallVec<[(Box<str>, usize); 1]>;
+
 #[derive(Default)]
 struct MetricCounterShard {
-    counts: hashbrown::HashMap<u64, usize, FastU64BuildHasher>,
+    counts: hashbrown::HashMap<u64, MetricCountBucket, FastU64BuildHasher>,
 }
 
 /// Thread-safe 128-shard counter enforcing `max_series_per_metric`.
@@ -88,25 +90,42 @@ impl MetricCounter {
         }
         let (shard, fp) = self.shard_and_fp(metric);
         let guard = shard.lock();
-        let current = guard.counts.get(&fp).copied().unwrap_or(0);
+        let current = guard
+            .counts
+            .get(&fp)
+            .and_then(|bucket| bucket.iter().find(|(k, _)| k.as_ref() == metric).map(|(_, v)| *v))
+            .unwrap_or(0);
         self.limiter.is_within_max_series_per_metric(user_id, current)
     }
 
     pub fn increase_series_for_metric(&self, metric: &str) {
         let (shard, fp) = self.shard_and_fp(metric);
         let mut guard = shard.lock();
-        *guard.counts.entry(fp).or_insert(0) += 1;
+        let bucket = guard.counts.entry(fp).or_default();
+        if let Some((_, c)) = bucket.iter_mut().find(|(k, _)| k.as_ref() == metric) {
+            *c += 1;
+        } else {
+            bucket.push((metric.into(), 1));
+        }
     }
 
     pub fn decrease_series_for_metric(&self, metric: &str) {
         let (shard, fp) = self.shard_and_fp(metric);
         let mut guard = shard.lock();
-        if let Some(c) = guard.counts.get_mut(&fp) {
-            if *c <= 1 {
-                guard.counts.remove(&fp);
-            } else {
-                *c -= 1;
+        let remove_bucket = if let Some(bucket) = guard.counts.get_mut(&fp) {
+            if let Some(pos) = bucket.iter().position(|(k, _)| k.as_ref() == metric) {
+                if bucket[pos].1 <= 1 {
+                    bucket.swap_remove(pos);
+                } else {
+                    bucket[pos].1 -= 1;
+                }
             }
+            bucket.is_empty()
+        } else {
+            false
+        };
+        if remove_bucket {
+            guard.counts.remove(&fp);
         }
     }
 }
@@ -130,4 +149,40 @@ fn fnv64a(data: &[u8]) -> u64 {
 #[inline]
 fn hash_fp(fp: u64) -> u32 {
     (fp ^ (fp >> 32) ^ (fp >> 16)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mimir_config::{LimitsConfig, Overrides};
+    use crate::limiter::{Limiter, NoopRingLimiterStrategy};
+
+    #[test]
+    fn metric_counter_handles_hash_collisions_without_conflation() {
+        let limits = LimitsConfig {
+            max_global_series_per_metric: 1,
+            ..Default::default()
+        };
+        let limiter = Arc::new(Limiter::new(
+            Overrides::new(limits),
+            Arc::new(NoopRingLimiterStrategy),
+        ));
+        let mc = MetricCounter::new(limiter, HashSet::new());
+        // Simulate a 64-bit FNV-1a collision inside the same shard bucket.
+        let fp = hash_metric_name("metric_a");
+        let shard = &mc.shards[hash_fp(fp) as usize % NUM_METRIC_COUNTER_SHARDS];
+        shard.lock().counts.insert(
+            fp,
+            smallvec::smallvec![("metric_b".into(), 1)],
+        );
+        assert!(mc.can_add_series_for("u1", "metric_a"));
+        mc.increase_series_for_metric("metric_a");
+        assert!(!mc.can_add_series_for("u1", "metric_a"));
+        mc.decrease_series_for_metric("metric_a");
+        assert!(mc.can_add_series_for("u1", "metric_a"));
+        assert_eq!(
+            shard.lock().counts.get(&fp).map(|b| b.as_slice()),
+            Some([("metric_b".into(), 1)].as_slice())
+        );
+    }
 }
