@@ -841,6 +841,11 @@ fn optimal_part_info_matches_minio() {
     let (n, p, _) = optimal_part_info(200 * gib, 0).unwrap();
     assert_eq!(p, 32 * 1024 * 1024);
     assert!(n <= 10000);
+    // F10 boundary: 10000 * 16MiB + 5 bytes must NOT produce 10001 parts.
+    let boundary = 167_772_160_005u64;
+    let (n, p, _) = optimal_part_info(boundary, 0).unwrap();
+    assert!(n <= 10000, "parts={n}, part_size={p}");
+    assert_eq!(p, 32 * 1024 * 1024);
 }
 
 #[test]

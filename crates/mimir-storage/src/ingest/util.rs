@@ -6,47 +6,21 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use kafka_protocol::error::{ParseResponseErrorCode, ResponseError};
-use kafka_protocol::indexmap::IndexMap;
-use kafka_protocol::messages::{
-    ApiKey, BrokerId, FetchRequest, FetchResponse, FindCoordinatorRequest,
-    FindCoordinatorResponse, GroupId, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest,
-    MetadataResponse, OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest,
-    OffsetFetchResponse, ProduceRequest, ProduceResponse, RequestHeader, ResponseHeader,
-    TopicName,
-};
-use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
-use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
-use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
-use kafka_protocol::messages::offset_commit_request::{
-    OffsetCommitRequestPartition, OffsetCommitRequestTopic,
-};
-use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
-use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
-use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
-use kafka_protocol::records::{
-    Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType, NO_PARTITION_LEADER_EPOCH,
-    NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
-};
-use mimir_common::thread_pool::ScopedWorkerPool;
 use mimir_config::KafkaConfig;
-use parking_lot::{Mutex as SyncMutex, RwLock};
+use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::watch;
 
-use super::compression::{compress_record_batch, KafkaCompression};
-use super::transport::KafkaTransport;
-use super::kafka_client::{
-    decode_fetch_records_with_pool, FetchPartitionResult, KafkaClientError, ListedOffset,
-    ProduceRecord, KAFKA_OFFSET_END, KAFKA_OFFSET_START,
-};
+use super::compression::KafkaCompression;
+use super::kafka_client::{FetchPartitionResult, KafkaClientError, ListedOffset, ProduceRecord};
 
 /// Parses the partition ID suffix from an ingester instance ID (e.g. `"ingester-zone-a-0"` -> `0`).
 /// Matches `IngesterPartitionID` in `pkg/storage/ingest/util.go` using `-([0-9]+)$`.
@@ -364,7 +338,7 @@ pub async fn request_json_from_socket<T: for<'de> Deserialize<'de>>(
             ));
         };
         let status_line = head.lines().next().unwrap_or("");
-        if !status_line.contains(" 200 ") {
+        if status_line.split_whitespace().nth(1) != Some("200") {
             return Err(format!(
                 "requesting credentials from HTTP socket {socket_path}: unexpected status {status_line}"
             ));
@@ -857,253 +831,14 @@ pub async fn create_topics(cfg: &KafkaConfig, topics: &[&str]) -> Result<(), Str
 }
 
 // ---------------------------------------------------------------------------
-// TLS- and SASL-capable Kafka Client (dial/TLS/SASL via super::transport)
+// TLS- and SASL-capable Kafka Client (unified onto super::kafka_client::KafkaClient)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct BrokerInfo {
-    addr: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ClusterMetadata {
-    brokers: HashMap<i32, BrokerInfo>,
-    partition_leaders: HashMap<(String, i32), i32>,
-    topic_partitions: HashMap<String, Vec<i32>>,
-}
-
-struct SaslBrokerConn {
-    addr: String,
-    client_id: String,
-    next_corr_id: AtomicI32,
-    write_tx: mpsc::Sender<Bytes>,
-    pending: Arc<SyncMutex<HashMap<i32, oneshot::Sender<Bytes>>>>,
-    api_versions: RwLock<HashMap<i16, (i16, i16)>>,
-    alive: Arc<AtomicBool>,
-    /// SASL session expiry: past it the connection is replaced instead of reused.
-    sasl_expiry: Option<Instant>,
-    metrics: Option<KafkaClientExtendedMetrics>,
-}
-
-struct SaslPendingGuard<'a> {
-    pending: &'a SyncMutex<HashMap<i32, oneshot::Sender<Bytes>>>,
-    corr_id: i32,
-    completed: bool,
-}
-
-impl Drop for SaslPendingGuard<'_> {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.pending.lock().remove(&self.corr_id);
-        }
-    }
-}
-
-impl SaslBrokerConn {
-    async fn connect(
-        addr: String,
-        client_id: String,
-        transport: &KafkaTransport,
-        request_timeout: Duration,
-        metrics: Option<KafkaClientExtendedMetrics>,
-    ) -> Result<Arc<Self>, KafkaClientError> {
-        let established = transport.connect(&addr, &client_id, request_timeout).await?;
-        if let Some(ref m) = metrics {
-            m.connects_total.inc();
-        }
-
-        let (mut reader, mut writer) = established.stream.into_split();
-        let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(512);
-        let pending: Arc<SyncMutex<HashMap<i32, oneshot::Sender<Bytes>>>> =
-            Arc::new(SyncMutex::new(HashMap::new()));
-        let alive = Arc::new(AtomicBool::new(true));
-
-        let alive_w = Arc::clone(&alive);
-        let metrics_w = metrics.clone();
-        tokio::spawn(async move {
-            while let Some(frame) = write_rx.recv().await {
-                let len = frame.len() as f64;
-                if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
-                    break;
-                }
-                if let Some(ref m) = metrics_w {
-                    m.write_bytes_total.inc_by(len);
-                }
-            }
-            alive_w.store(false, Ordering::SeqCst);
-        });
-
-        let pending_r = Arc::clone(&pending);
-        let alive_r = Arc::clone(&alive);
-        let metrics_r = metrics.clone();
-        tokio::spawn(async move {
-            while let Some(payload) = super::kafka_client::read_kafka_frame_bounded(
-                &mut reader,
-                super::kafka_client::MAX_KAFKA_FRAME_BYTES,
-            )
-            .await
-            {
-                let frame_len = payload.len();
-                if let Some(ref m) = metrics_r {
-                    m.read_bytes_total.inc_by((frame_len + 4) as f64);
-                }
-                let corr_id = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let tx = pending_r.lock().remove(&corr_id);
-                if let Some(tx) = tx {
-                    let _ = tx.send(Bytes::from(payload));
-                }
-            }
-            alive_r.store(false, Ordering::SeqCst);
-            pending_r.lock().clear();
-        });
-
-        Ok(Arc::new(Self {
-            addr,
-            client_id,
-            next_corr_id: AtomicI32::new(established.next_correlation_id),
-            write_tx,
-            pending,
-            api_versions: RwLock::new(established.api_versions),
-            alive,
-            sasl_expiry: established.sasl_expiry,
-            metrics,
-        }))
-    }
-
-    fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::SeqCst)
-    }
-
-    /// Alive and its SASL session (if any) has not expired: may be handed out for new requests.
-    fn is_usable(&self) -> bool {
-        self.is_alive() && self.sasl_expiry.is_none_or(|e| Instant::now() < e)
-    }
-
-    fn mark_dead(&self) {
-        self.alive.store(false, Ordering::SeqCst);
-    }
-
-    fn pick_version(&self, key: ApiKey, our_min: i16, our_max: i16) -> i16 {
-        let map = self.api_versions.read();
-        if let Some(&(b_min, b_max)) = map.get(&(key as i16)) {
-            let negotiated = our_max.min(b_max);
-            if negotiated >= b_min && negotiated >= our_min {
-                return negotiated;
-            }
-        }
-        our_min
-    }
-
-    async fn send_raw<Req, Resp>(
-        &self,
-        api_key: ApiKey,
-        api_version: i16,
-        req: &Req,
-    ) -> Result<Resp, KafkaClientError>
-    where
-        Req: Request + Encodable,
-        Resp: Decodable + HeaderVersion,
-    {
-        if !self.is_alive() {
-            return Err(KafkaClientError::ConnectionClosed);
-        }
-
-        let e2e_start = Instant::now();
-        let corr_id = self.next_corr_id.fetch_add(1, Ordering::Relaxed);
-        let req_header_ver = Req::header_version(api_version);
-        let mut header = RequestHeader::default();
-        header.request_api_key = api_key as i16;
-        header.request_api_version = api_version;
-        header.correlation_id = corr_id;
-        header.client_id = if self.client_id.is_empty() {
-            None
-        } else {
-            Some(StrBytes::from_string(self.client_id.clone()))
-        };
-
-        let mut body = BytesMut::with_capacity(256);
-        body.put_u32(0);
-        header.encode(&mut body, req_header_ver)?;
-        req.encode(&mut body, api_version)?;
-
-        let frame_len = (body.len() - 4) as u32;
-        body[0..4].copy_from_slice(&frame_len.to_be_bytes());
-
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(corr_id, tx);
-        let mut guard = SaslPendingGuard {
-            pending: &self.pending,
-            corr_id,
-            completed: false,
-        };
-
-        let write_start = Instant::now();
-        if self.write_tx.send(body.freeze()).await.is_err() {
-            return Err(KafkaClientError::ConnectionClosed);
-        }
-        if let Some(ref m) = self.metrics {
-            let w_dur = write_start.elapsed().as_secs_f64();
-            m.kafka_write_wait_seconds.observe(0.0);
-            m.kafka_write_time_seconds.observe(w_dur);
-        }
-
-        let read_start = Instant::now();
-        let mut resp_buf = rx.await.map_err(|_| KafkaClientError::ConnectionClosed)?;
-        guard.completed = true;
-        if let Some(ref m) = self.metrics {
-            let r_dur = read_start.elapsed().as_secs_f64();
-            m.kafka_read_wait_seconds.observe(r_dur);
-            m.kafka_read_time_seconds.observe(0.0);
-            m.kafka_request_duration_e2e_seconds
-                .observe(e2e_start.elapsed().as_secs_f64());
-        }
-
-        let resp_header_ver = if api_key == ApiKey::ApiVersions {
-            0
-        } else {
-            Resp::header_version(api_version)
-        };
-        let _resp_header = ResponseHeader::decode(&mut resp_buf, resp_header_ver)?;
-        let resp = Resp::decode(&mut resp_buf, api_version)?;
-        Ok(resp)
-    }
-}
-
-fn sasl_is_transport_error(err: &KafkaClientError) -> bool {
-    matches!(
-        err,
-        KafkaClientError::Io(_)
-            | KafkaClientError::ConnectionClosed
-            | KafkaClientError::RequestTimeout(_)
-            | KafkaClientError::ConnectTimeout { .. }
-    )
-}
-
-fn sasl_is_leader_or_io_error(err: &KafkaClientError) -> bool {
-    sasl_is_transport_error(err)
-        || matches!(
-            err,
-            KafkaClientError::Broker(
-                ResponseError::NotLeaderOrFollower
-                    | ResponseError::UnknownTopicOrPartition
-                    | ResponseError::LeaderNotAvailable
-                    | ResponseError::FencedLeaderEpoch
-            )
-        )
-}
-
-/// TLS- and SASL-capable async Kafka client sharing wire framing with
-/// [`super::kafka_client::KafkaClient`], extended with strict `CreateTopics`, `ping()`, and metrics.
+/// TLS- and SASL-capable async Kafka client delegating connection pooling, SASL lifecycle,
+/// singleflight reconnect, task cleanup, and kgo retries to [`super::kafka_client::KafkaClient`],
+/// with extended client metrics.
 pub struct IngestKafkaClient {
-    seed_brokers: Vec<String>,
-    client_id: String,
-    client_rack: String,
-    request_timeout: Duration,
-    transport: Arc<KafkaTransport>,
-    conns_by_addr: Mutex<HashMap<String, Arc<SaslBrokerConn>>>,
-    metadata: RwLock<ClusterMetadata>,
-    metrics: Option<KafkaClientExtendedMetrics>,
-    decode_pool: OnceLock<ScopedWorkerPool>,
+    inner: super::kafka_client::KafkaClient,
 }
 
 impl IngestKafkaClient {
@@ -1111,240 +846,31 @@ impl IngestKafkaClient {
         cfg: &KafkaConfig,
         metrics: Option<KafkaClientExtendedMetrics>,
     ) -> Result<Self, KafkaClientError> {
-        let mut addrs = Vec::new();
-        for raw in &cfg.address.0 {
-            for part in raw.split(',') {
-                let trimmed = part.trim();
-                if !trimmed.is_empty() {
-                    addrs.push(trimmed.to_string());
-                }
-            }
-        }
-        if addrs.is_empty() {
-            return Err(KafkaClientError::NoSeedBrokers);
-        }
-        let transport = Arc::new(KafkaTransport::from_kafka_config(cfg)?);
         let write_timeout = Duration::from_nanos(cfg.write_timeout.as_nanos().max(0) as u64);
         let overhead =
             Duration::from_nanos(cfg.write_timeout_overhead.as_nanos().max(0) as u64);
         let request_timeout = (write_timeout + overhead).max(Duration::from_secs(5));
-        Ok(Self {
-            seed_brokers: addrs,
-            client_id: cfg.client_id.clone(),
-            client_rack: cfg.client_rack.clone(),
-            request_timeout,
-            transport,
-            conns_by_addr: Mutex::new(HashMap::new()),
-            metadata: RwLock::new(ClusterMetadata::default()),
-            metrics,
-            decode_pool: OnceLock::new(),
-        })
-    }
-
-    fn get_decode_pool(&self) -> &ScopedWorkerPool {
-        self.decode_pool.get_or_init(|| {
-            let hw = std::thread::available_parallelism().map_or(4, |n| n.get());
-            ScopedWorkerPool::new("kafka-decode", hw.clamp(2, 8).saturating_sub(1))
-        })
+        let inner = super::kafka_client::KafkaClient::from_config(cfg)?
+            .with_request_timeout(request_timeout)
+            .with_extended_metrics(metrics);
+        Ok(Self { inner })
     }
 
     pub fn extended_metrics(&self) -> Option<&KafkaClientExtendedMetrics> {
-        self.metrics.as_ref()
-    }
-
-    async fn get_conn_for_addr(&self, addr: &str) -> Result<Arc<SaslBrokerConn>, KafkaClientError> {
-        {
-            let mut map = self.conns_by_addr.lock().await;
-            if let Some(c) = map.get(addr) {
-                if c.is_usable() {
-                    return Ok(Arc::clone(c));
-                }
-                map.remove(addr);
-            }
-        }
-
-        let conn = SaslBrokerConn::connect(
-            addr.to_string(),
-            self.client_id.clone(),
-            &self.transport,
-            self.request_timeout,
-            self.metrics.clone(),
-        )
-        .await
-        .map_err(|e| super::kgo_retry::classify_connect_error(addr, e))?;
-
-        let mut map = self.conns_by_addr.lock().await;
-        if let Some(existing) = map.get(addr) {
-            if existing.is_usable() {
-                conn.mark_dead();
-                return Ok(Arc::clone(existing));
-            }
-        }
-        map.insert(addr.to_string(), Arc::clone(&conn));
-        Ok(conn)
-    }
-
-    async fn drop_conn(&self, conn: &Arc<SaslBrokerConn>) {
-        conn.mark_dead();
-        let mut map = self.conns_by_addr.lock().await;
-        if let Some(existing) = map.get(&conn.addr) {
-            if Arc::ptr_eq(existing, conn) {
-                map.remove(&conn.addr);
-            }
-        }
-    }
-
-    fn invalidate_partition_leader(&self, topic: &str, partition: i32) {
-        self.metadata
-            .write()
-            .partition_leaders
-            .remove(&(topic.to_string(), partition));
-    }
-
-    async fn any_conn(&self) -> Result<Arc<SaslBrokerConn>, KafkaClientError> {
-        let mut last_err = None;
-        for seed in &self.seed_brokers {
-            match self.get_conn_for_addr(seed).await {
-                Ok(c) => return Ok(c),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(last_err.unwrap_or(KafkaClientError::NoSeedBrokers))
-    }
-
-    async fn conn_for_node(&self, node_id: i32) -> Result<Arc<SaslBrokerConn>, KafkaClientError> {
-        let addr = self
-            .metadata
-            .read()
-            .brokers
-            .get(&node_id)
-            .map(|b| b.addr.clone());
-        if let Some(addr) = addr {
-            if let Ok(conn) = self.get_conn_for_addr(&addr).await {
-                return Ok(conn);
-            }
-        }
-        self.any_conn().await
-    }
-
-    async fn leader_conn(
-        &self,
-        topic: &str,
-        partition: i32,
-    ) -> Result<Arc<SaslBrokerConn>, KafkaClientError> {
-        let leader = self
-            .metadata
-            .read()
-            .partition_leaders
-            .get(&(topic.to_string(), partition))
-            .copied();
-        if let Some(node_id) = leader {
-            if node_id >= 0 {
-                return self.conn_for_node(node_id).await;
-            }
-        }
-        self.refresh_metadata(&[topic]).await?;
-        let leader = self
-            .metadata
-            .read()
-            .partition_leaders
-            .get(&(topic.to_string(), partition))
-            .copied();
-        if let Some(node_id) = leader {
-            if node_id >= 0 {
-                return self.conn_for_node(node_id).await;
-            }
-        }
-        self.any_conn().await
+        self.inner.extended_metrics()
     }
 
     /// Verifies broker reachability and SASL authentication by connecting and fetching metadata.
     pub async fn ping(&self) -> Result<(), KafkaClientError> {
-        let conn = self.any_conn().await?;
-        let ver = conn.pick_version(ApiKey::Metadata, 1, 9);
-        let req = MetadataRequest::default();
-        let _resp: MetadataResponse = tokio::time::timeout(
-            self.request_timeout,
-            conn.send_raw(ApiKey::Metadata, ver, &req),
-        )
-        .await
-        .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
-        Ok(())
+        self.inner.ping().await
     }
 
     pub async fn refresh_metadata(&self, topics: &[&str]) -> Result<(), KafkaClientError> {
-        let conn = self.any_conn().await?;
-        let ver = conn.pick_version(ApiKey::Metadata, 1, 9);
-
-        let mut req = MetadataRequest::default();
-        req.allow_auto_topic_creation = false;
-        if topics.is_empty() {
-            req.topics = None;
-        } else {
-            req.topics = Some(
-                topics
-                    .iter()
-                    .map(|t| {
-                        let mut mt = MetadataRequestTopic::default();
-                        mt.name = Some(TopicName(StrBytes::from_string((*t).to_owned())));
-                        mt
-                    })
-                    .collect(),
-            );
-        }
-
-        let resp: MetadataResponse = tokio::time::timeout(
-            self.request_timeout,
-            conn.send_raw(ApiKey::Metadata, ver, &req),
-        )
-        .await
-        .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
-
-        let mut md = self.metadata.write();
-        for b in resp.brokers {
-            let addr = format!("{}:{}", b.host.as_str(), b.port);
-            md.brokers.insert(b.node_id.0, BrokerInfo { addr });
-        }
-        for t in resp.topics {
-            let Some(name) = t.name else { continue };
-            let topic_name = name.0.as_str().to_owned();
-            if let Some(err) = t.error_code.err() {
-                return Err(KafkaClientError::Broker(err));
-            }
-            let mut pids = Vec::with_capacity(t.partitions.len());
-            for p in t.partitions {
-                pids.push(p.partition_index);
-                md.partition_leaders
-                    .insert((topic_name.clone(), p.partition_index), p.leader_id.0);
-            }
-            pids.sort();
-            md.topic_partitions.insert(topic_name, pids);
-        }
-        Ok(())
+        self.inner.refresh_metadata(topics).await
     }
 
     pub async fn list_topics(&self) -> Result<Vec<String>, KafkaClientError> {
-        let conn = self.any_conn().await?;
-        let ver = conn.pick_version(ApiKey::Metadata, 1, 9);
-        let mut req = MetadataRequest::default();
-        req.topics = None;
-        let resp: MetadataResponse = tokio::time::timeout(
-            self.request_timeout,
-            conn.send_raw(ApiKey::Metadata, ver, &req),
-        )
-        .await
-        .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
-        Ok(resp
-            .topics
-            .into_iter()
-            .filter_map(|t| {
-                if t.error_code == 0 {
-                    t.name.map(|n| n.0.as_str().to_owned())
-                } else {
-                    None
-                }
-            })
-            .collect())
+        self.inner.list_topics().await
     }
 
     pub async fn produce(
@@ -1354,131 +880,9 @@ impl IngestKafkaClient {
         compression: KafkaCompression,
         records: Vec<ProduceRecord>,
     ) -> Result<i64, KafkaClientError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-
-        let mut uncompressed_bytes = 0usize;
-        let num_records = records.len();
-        let proto_records: Vec<Record> = records
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| {
-                uncompressed_bytes +=
-                    r.key.as_ref().map_or(0, Bytes::len) + r.value.as_ref().map_or(0, Bytes::len);
-                let mut headers = IndexMap::with_capacity(r.headers.len());
-                for (k, v) in r.headers {
-                    headers.insert(StrBytes::from_string(k), Some(v));
-                }
-                Record {
-                    transactional: false,
-                    control: false,
-                    partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
-                    producer_id: NO_PRODUCER_ID,
-                    producer_epoch: NO_PRODUCER_EPOCH,
-                    timestamp_type: TimestampType::Creation,
-                    offset: i as i64,
-                    sequence: (i as i32).wrapping_add(NO_SEQUENCE),
-                    timestamp: r.timestamp_ms.unwrap_or(now_ms),
-                    key: r.key,
-                    value: r.value,
-                    headers,
-                }
-            })
-            .collect();
-
-        let mut batch_buf = BytesMut::new();
-        let encode_opts = RecordEncodeOptions {
-            version: 2,
-            compression: compression.to_protocol(),
-        };
-        RecordBatchEncoder::encode_with_custom_compression(
-            &mut batch_buf,
-            proto_records.iter(),
-            &encode_opts,
-            Some(compress_record_batch),
-        )?;
-        let compressed_len = batch_buf.len();
-
-        let payload = batch_buf.freeze();
-        for attempt in 0..2 {
-            let conn = self.leader_conn(topic, partition).await?;
-            let ver = conn.pick_version(ApiKey::Produce, 3, 9);
-
-            let mut pp = PartitionProduceData::default();
-            pp.index = partition;
-            pp.records = Some(payload.clone());
-
-            let mut tp = TopicProduceData::default();
-            tp.name = TopicName(StrBytes::from_string(topic.to_owned()));
-            tp.partition_data = vec![pp];
-
-            let mut req = ProduceRequest::default();
-            req.transactional_id = None;
-            req.acks = -1;
-            req.timeout_ms = self.request_timeout.as_millis().min(i32::MAX as u128) as i32;
-            req.topic_data = vec![tp];
-
-            let res: Result<i64, KafkaClientError> = async {
-                let resp: ProduceResponse = tokio::time::timeout(
-                    self.request_timeout,
-                    conn.send_raw(ApiKey::Produce, ver, &req),
-                )
-                .await
-                .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
-
-                if let Some(ref m) = self.metrics {
-                    m.kafka_request_throttled_seconds
-                        .observe((resp.throttle_time_ms.max(0) as f64) / 1000.0);
-                }
-
-                for rt in resp.responses {
-                    if rt.name.0.as_str() != topic {
-                        continue;
-                    }
-                    for rp in rt.partition_responses {
-                        if rp.index != partition {
-                            continue;
-                        }
-                        if let Some(err) = rp.error_code.err() {
-                            return Err(KafkaClientError::Broker(err));
-                        }
-                        if let Some(ref m) = self.metrics {
-                            m.produce_records_total.inc_by(num_records as f64);
-                            m.produce_batches_total.inc();
-                            m.produce_bytes_total.inc_by(uncompressed_bytes as f64);
-                            m.produce_compressed_bytes_total.inc_by(compressed_len as f64);
-                        }
-                        return Ok(rp.base_offset);
-                    }
-                }
-                Err(KafkaClientError::UnexpectedResponse(format!(
-                    "missing partition {partition} in ProduceResponse for {topic}"
-                )))
-            }
-            .await;
-
-            match res {
-                Ok(v) => return Ok(v),
-                Err(err) => {
-                    if sasl_is_transport_error(&err) {
-                        self.drop_conn(&conn).await;
-                    }
-                    if attempt == 0 && sasl_is_leader_or_io_error(&err) {
-                        self.invalidate_partition_leader(topic, partition);
-                        let _ = self.refresh_metadata(&[topic]).await;
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        unreachable!()
+        self.inner
+            .produce(topic, partition, compression, records)
+            .await
     }
 
     pub async fn fetch(
@@ -1490,104 +894,9 @@ impl IngestKafkaClient {
         min_bytes: i32,
         max_bytes: i32,
     ) -> Result<FetchPartitionResult, KafkaClientError> {
-        let wait_timeout = self.request_timeout.max(max_wait + Duration::from_secs(5));
-        for attempt in 0..2 {
-            let conn = self.leader_conn(topic, partition).await?;
-            let ver = conn.pick_version(ApiKey::Fetch, 4, 12);
-
-            let mut fp = FetchPartition::default();
-            fp.partition = partition;
-            fp.current_leader_epoch = -1;
-            fp.fetch_offset = fetch_offset;
-            fp.last_fetched_epoch = -1;
-            fp.log_start_offset = -1;
-            fp.partition_max_bytes = max_bytes;
-
-            let mut ft = FetchTopic::default();
-            ft.topic = TopicName(StrBytes::from_string(topic.to_owned()));
-            ft.partitions = vec![fp];
-
-            let mut req = FetchRequest::default();
-            req.replica_id = BrokerId(-1);
-            req.max_wait_ms = max_wait.as_millis().min(i32::MAX as u128) as i32;
-            req.min_bytes = min_bytes;
-            req.max_bytes = max_bytes;
-            req.isolation_level = 0;
-            req.session_id = 0;
-            req.session_epoch = -1;
-            req.topics = vec![ft];
-            if !self.client_rack.is_empty() {
-                req.rack_id = StrBytes::from_string(self.client_rack.clone());
-            }
-
-            let res: Result<FetchPartitionResult, KafkaClientError> = async {
-                let resp: FetchResponse = tokio::time::timeout(
-                    wait_timeout,
-                    conn.send_raw(ApiKey::Fetch, ver, &req),
-                )
-                .await
-                .map_err(|_| KafkaClientError::RequestTimeout(wait_timeout))??;
-
-                if let Some(err) = resp.error_code.err() {
-                    return Err(KafkaClientError::Broker(err));
-                }
-
-                for rt in resp.responses {
-                    if rt.topic.0.as_str() != topic {
-                        continue;
-                    }
-                    for rp in rt.partitions {
-                        if rp.partition_index != partition {
-                            continue;
-                        }
-                        if let Some(err) = rp.error_code.err() {
-                            return Err(KafkaClientError::Broker(err));
-                        }
-
-                        let (decoded_records, next_fetch_offset, last_batch_end_offset) =
-                            match rp.records {
-                                Some(raw_records) if !raw_records.is_empty() => {
-                                    decode_fetch_records_with_pool(
-                                        raw_records,
-                                        fetch_offset,
-                                        || self.get_decode_pool(),
-                                        None,
-                                    )?
-                                }
-                                _ => (Vec::new(), fetch_offset, None),
-                            };
-
-                        return Ok(FetchPartitionResult {
-                            high_watermark: rp.high_watermark,
-                            log_start_offset: rp.log_start_offset,
-                            records: decoded_records,
-                            next_fetch_offset,
-                            last_batch_end_offset,
-                        });
-                    }
-                }
-                Err(KafkaClientError::UnexpectedResponse(format!(
-                    "missing partition {partition} in FetchResponse for {topic}"
-                )))
-            }
-            .await;
-
-            match res {
-                Ok(v) => return Ok(v),
-                Err(err) => {
-                    if sasl_is_transport_error(&err) {
-                        self.drop_conn(&conn).await;
-                    }
-                    if attempt == 0 && sasl_is_leader_or_io_error(&err) {
-                        self.invalidate_partition_leader(topic, partition);
-                        let _ = self.refresh_metadata(&[topic]).await;
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        unreachable!()
+        self.inner
+            .fetch(topic, partition, fetch_offset, max_wait, min_bytes, max_bytes)
+            .await
     }
 
     pub async fn list_offset_with_timestamp(
@@ -1596,56 +905,9 @@ impl IngestKafkaClient {
         partition: i32,
         timestamp: i64,
     ) -> Result<ListedOffset, KafkaClientError> {
-        let conn = self.leader_conn(topic, partition).await?;
-        let ver = conn.pick_version(ApiKey::ListOffsets, 2, 7);
-
-        let mut p = ListOffsetsPartition::default();
-        p.partition_index = partition;
-        p.current_leader_epoch = -1;
-        p.timestamp = timestamp;
-        p.max_num_offsets = 1;
-
-        let mut t = ListOffsetsTopic::default();
-        t.name = TopicName(StrBytes::from_string(topic.to_owned()));
-        t.partitions = vec![p];
-
-        let mut req = ListOffsetsRequest::default();
-        req.replica_id = BrokerId(-1);
-        req.isolation_level = 0;
-        req.topics = vec![t];
-
-        let resp: ListOffsetsResponse = tokio::time::timeout(
-            self.request_timeout,
-            conn.send_raw(ApiKey::ListOffsets, ver, &req),
-        )
-        .await
-        .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
-
-        for rt in resp.topics {
-            if rt.name.0.as_str() != topic {
-                continue;
-            }
-            for rp in rt.partitions {
-                if rp.partition_index != partition {
-                    continue;
-                }
-                if let Some(err) = rp.error_code.err() {
-                    return Err(KafkaClientError::Broker(err));
-                }
-                let offset = if ver == 0 {
-                    rp.old_style_offsets.first().copied().unwrap_or(0)
-                } else {
-                    rp.offset
-                };
-                return Ok(ListedOffset {
-                    offset,
-                    timestamp: rp.timestamp,
-                });
-            }
-        }
-        Err(KafkaClientError::UnexpectedResponse(format!(
-            "missing partition {partition} in ListOffsetsResponse for {topic}"
-        )))
+        self.inner
+            .list_offset_with_timestamp(topic, partition, timestamp)
+            .await
     }
 
     pub async fn fetch_partition_start_offset(
@@ -1653,10 +915,7 @@ impl IngestKafkaClient {
         topic: &str,
         partition: i32,
     ) -> Result<i64, KafkaClientError> {
-        Ok(self
-            .list_offset_with_timestamp(topic, partition, KAFKA_OFFSET_START)
-            .await?
-            .offset)
+        self.inner.fetch_partition_start_offset(topic, partition).await
     }
 
     pub async fn fetch_partition_last_produced_offset(
@@ -1664,34 +923,9 @@ impl IngestKafkaClient {
         topic: &str,
         partition: i32,
     ) -> Result<i64, KafkaClientError> {
-        let next_offset = self
-            .list_offset_with_timestamp(topic, partition, KAFKA_OFFSET_END)
-            .await?
-            .offset;
-        Ok(next_offset - 1)
-    }
-
-    async fn find_group_coordinator(
-        &self,
-        group_id: &str,
-    ) -> Result<Arc<SaslBrokerConn>, KafkaClientError> {
-        let conn = self.any_conn().await?;
-        let ver = conn.pick_version(ApiKey::FindCoordinator, 0, 3);
-        let mut req = FindCoordinatorRequest::default();
-        req.key = StrBytes::from_string(group_id.to_owned());
-        req.key_type = 0;
-
-        let resp: FindCoordinatorResponse = tokio::time::timeout(
-            self.request_timeout,
-            conn.send_raw(ApiKey::FindCoordinator, ver, &req),
-        )
-        .await
-        .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
-        if let Some(err) = resp.error_code.err() {
-            return Err(KafkaClientError::Broker(err));
-        }
-        let addr = format!("{}:{}", resp.host.as_str(), resp.port);
-        self.get_conn_for_addr(&addr).await
+        self.inner
+            .fetch_partition_last_produced_offset(topic, partition)
+            .await
     }
 
     pub async fn commit_offset(
@@ -1701,48 +935,9 @@ impl IngestKafkaClient {
         partition: i32,
         offset: i64,
     ) -> Result<(), KafkaClientError> {
-        if group_id.is_empty() {
-            return Ok(());
-        }
-        let conn = self.find_group_coordinator(group_id).await?;
-        let ver = conn.pick_version(ApiKey::OffsetCommit, 2, 8);
-
-        let mut p = OffsetCommitRequestPartition::default();
-        p.partition_index = partition;
-        p.committed_offset = offset;
-        p.committed_leader_epoch = -1;
-        p.commit_timestamp = -1;
-
-        let mut t = OffsetCommitRequestTopic::default();
-        t.name = TopicName(StrBytes::from_string(topic.to_owned()));
-        t.partitions = vec![p];
-
-        let mut req = OffsetCommitRequest::default();
-        req.group_id = GroupId(StrBytes::from_string(group_id.to_owned()));
-        req.generation_id_or_member_epoch = -1;
-        req.topics = vec![t];
-
-        let resp: OffsetCommitResponse = tokio::time::timeout(
-            self.request_timeout,
-            conn.send_raw(ApiKey::OffsetCommit, ver, &req),
-        )
-        .await
-        .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
-
-        for rt in resp.topics {
-            if rt.name.0.as_str() != topic {
-                continue;
-            }
-            for rp in rt.partitions {
-                if rp.partition_index == partition {
-                    if let Some(err) = rp.error_code.err() {
-                        return Err(KafkaClientError::Broker(err));
-                    }
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
+        self.inner
+            .commit_offset(group_id, topic, partition, offset)
+            .await
     }
 
     pub async fn fetch_committed_offset(
@@ -1751,59 +946,13 @@ impl IngestKafkaClient {
         topic: &str,
         partition: i32,
     ) -> Result<Option<i64>, KafkaClientError> {
-        if group_id.is_empty() {
-            return Ok(None);
-        }
-        let conn = self.find_group_coordinator(group_id).await?;
-        let ver = conn.pick_version(ApiKey::OffsetFetch, 1, 7);
-
-        let mut t = OffsetFetchRequestTopic::default();
-        t.name = TopicName(StrBytes::from_string(topic.to_owned()));
-        t.partition_indexes = vec![partition];
-
-        let mut req = OffsetFetchRequest::default();
-        req.group_id = GroupId(StrBytes::from_string(group_id.to_owned()));
-        req.topics = Some(vec![t]);
-
-        let resp: OffsetFetchResponse = tokio::time::timeout(
-            self.request_timeout,
-            conn.send_raw(ApiKey::OffsetFetch, ver, &req),
-        )
-        .await
-        .map_err(|_| KafkaClientError::RequestTimeout(self.request_timeout))??;
-
-        if let Some(err) = resp.error_code.err() {
-            if err == ResponseError::GroupIdNotFound {
-                return Ok(None);
-            }
-            return Err(KafkaClientError::Broker(err));
-        }
-        for rt in resp.topics {
-            if rt.name.0.as_str() != topic {
-                continue;
-            }
-            for rp in rt.partitions {
-                if rp.partition_index == partition {
-                    if let Some(err) = rp.error_code.err() {
-                        if err == ResponseError::UnknownTopicOrPartition
-                            || err == ResponseError::GroupIdNotFound
-                        {
-                            return Ok(None);
-                        }
-                        return Err(KafkaClientError::Broker(err));
-                    }
-                    if rp.committed_offset < 0 {
-                        return Ok(None);
-                    }
-                    return Ok(Some(rp.committed_offset));
-                }
-            }
-        }
-        Ok(None)
+        self.inner
+            .fetch_committed_offset(group_id, topic, partition)
+            .await
     }
 
     pub async fn close(&self) {
-        self.conns_by_addr.lock().await.clear();
+        self.inner.close().await;
     }
 }
 

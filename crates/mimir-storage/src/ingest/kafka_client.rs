@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use mimir_common::thread_pool::ScopedWorkerPool;
@@ -57,6 +57,7 @@ use super::kgo_retry::{
 };
 use super::kprom::{self, FetchBatchMetrics, KpromMetrics};
 use super::transport::{KafkaTransport, SaslAuthConfig};
+use super::util::KafkaClientExtendedMetrics;
 
 pub const KAFKA_OFFSET_START: i64 = -2;
 pub const KAFKA_OFFSET_END: i64 = -1;
@@ -228,6 +229,7 @@ struct BrokerConn {
     alive: Arc<std::sync::atomic::AtomicBool>,
     disconnected: Arc<std::sync::atomic::AtomicBool>,
     reader_abort: tokio::task::AbortHandle,
+    writer_abort: tokio::task::AbortHandle,
     /// SASL session expiry: past it the connection is replaced instead of reused.
     sasl_expiry: Option<std::time::Instant>,
     /// Responses successfully read on this connection after its setup (kgo `cxn.successes`).
@@ -235,11 +237,13 @@ struct BrokerConn {
     /// kprom `node_id` label value (`kgo.NodeName`) and hooks, when the client has them.
     node: String,
     kprom: Option<Arc<KpromMetrics>>,
+    extended_metrics: Option<KafkaClientExtendedMetrics>,
 }
 
 impl Drop for BrokerConn {
     fn drop(&mut self) {
         self.reader_abort.abort();
+        self.writer_abort.abort();
     }
 }
 
@@ -267,6 +271,7 @@ impl BrokerConn {
         request_timeout: Duration,
         node: String,
         kprom: Option<Arc<KpromMetrics>>,
+        extended_metrics: Option<KafkaClientExtendedMetrics>,
     ) -> Result<Arc<Self>, KafkaClientError> {
         let established = match transport.connect(&addr, &client_id, request_timeout).await {
             Ok(e) => e,
@@ -280,32 +285,47 @@ impl BrokerConn {
         if let Some(ref k) = kprom {
             k.on_broker_connect(&node, true);
         }
+        if let Some(ref m) = extended_metrics {
+            m.connects_total.inc();
+        }
 
         let (mut reader, mut writer) = established.stream.into_split();
-        let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(256);
+        let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(512);
         let pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>> =
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let alive_w = Arc::clone(&alive);
-        tokio::spawn(async move {
+        let ext_w = extended_metrics.clone();
+        let writer_handle = tokio::spawn(async move {
             while let Some(frame) = write_rx.recv().await {
+                let len = frame.len() as f64;
                 if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
                     break;
                 }
+                if let Some(ref m) = ext_w {
+                    m.write_bytes_total.inc_by(len);
+                }
             }
+            let _ = writer.shutdown().await;
             alive_w.store(false, Ordering::SeqCst);
         });
+        let writer_abort = writer_handle.abort_handle();
 
         let pending_r = Arc::clone(&pending);
         let alive_r = Arc::clone(&alive);
         let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let disconnected_r = Arc::clone(&disconnected);
         let disconnect_hook = kprom.clone().map(|k| (k, node.clone()));
+        let ext_r = extended_metrics.clone();
         let reader_handle = tokio::spawn(async move {
             while let Some(payload) =
                 read_kafka_frame_bounded(&mut reader, MAX_KAFKA_FRAME_BYTES).await
             {
+                let frame_len = payload.len();
+                if let Some(ref m) = ext_r {
+                    m.read_bytes_total.inc_by((frame_len + 4) as f64);
+                }
                 let corr_id = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 let tx = pending_r.lock().remove(&corr_id);
                 if let Some(tx) = tx {
@@ -333,10 +353,12 @@ impl BrokerConn {
             alive,
             disconnected,
             reader_abort,
+            writer_abort,
             sasl_expiry: established.sasl_expiry,
             successes: std::sync::atomic::AtomicU64::new(0),
             node,
             kprom,
+            extended_metrics,
         }))
     }
 
@@ -376,6 +398,7 @@ impl BrokerConn {
     fn mark_dead(&self) {
         self.alive.store(false, Ordering::SeqCst);
         self.reader_abort.abort();
+        self.writer_abort.abort();
         self.pending.lock().clear();
         if let Some(ref k) = self.kprom {
             if !self.disconnected.swap(true, Ordering::SeqCst) {
@@ -437,14 +460,22 @@ impl BrokerConn {
             completed: false,
         };
 
+        let e2e_start = Instant::now();
         let written = body.len();
+        let write_start = Instant::now();
         if self.write_tx.send(body.freeze()).await.is_err() {
             if let Some(ref k) = self.kprom {
                 k.on_write_error(&self.node);
             }
             return Err(KafkaClientError::ConnectionClosed);
         }
+        if let Some(ref m) = self.extended_metrics {
+            m.kafka_write_wait_seconds.observe(0.0);
+            m.kafka_write_time_seconds
+                .observe(write_start.elapsed().as_secs_f64());
+        }
 
+        let read_start = Instant::now();
         let mut resp_buf = match rx.await {
             Ok(b) => b,
             Err(_) => {
@@ -455,6 +486,13 @@ impl BrokerConn {
             }
         };
         guard.completed = true;
+        if let Some(ref m) = self.extended_metrics {
+            m.kafka_read_wait_seconds
+                .observe(read_start.elapsed().as_secs_f64());
+            m.kafka_read_time_seconds.observe(0.0);
+            m.kafka_request_duration_e2e_seconds
+                .observe(e2e_start.elapsed().as_secs_f64());
+        }
         if let Some(ref k) = self.kprom {
             k.on_e2e(&self.node, written, resp_buf.len() + 4);
         }
@@ -503,6 +541,8 @@ fn sorted_brokers(md: &ClusterMetadata) -> Vec<(i32, String)> {
 
 /// Pure-Rust async TCP Kafka client supporting broker pooling, metadata routing, SASL,
 /// `ListOffsets`, `Fetch`, `Produce`, `CreateTopics`, `OffsetFetch`, and `OffsetCommit`.
+type ConnectLocks = parking_lot::Mutex<HashMap<(String, ConnKind), Arc<Mutex<()>>>>;
+
 pub struct KafkaClient {
     seed_brokers: Vec<String>,
     client_id: String,
@@ -510,6 +550,7 @@ pub struct KafkaClient {
     request_timeout: Duration,
     transport: Arc<KafkaTransport>,
     conns_by_addr: Mutex<HashMap<(String, ConnKind), Arc<BrokerConn>>>,
+    connect_locks: ConnectLocks,
     metadata: RwLock<ClusterMetadata>,
     decode_pool: OnceLock<ScopedWorkerPool>,
     /// `-ingest-storage.kafka.last-produced-offset-retry-timeout`: the `ListOffsets` retry timeout
@@ -520,6 +561,7 @@ pub struct KafkaClient {
     any_broker: parking_lot::Mutex<AnyBrokerRotation>,
     /// kprom client hooks (`kgo.WithHooks(metrics)`), set once by the client's owner.
     kprom: OnceLock<Arc<KpromMetrics>>,
+    extended_metrics: Option<KafkaClientExtendedMetrics>,
 }
 
 impl KafkaClient {
@@ -544,12 +586,14 @@ impl KafkaClient {
             },
             transport: Arc::new(KafkaTransport::plaintext(dial_timeout)),
             conns_by_addr: Mutex::new(HashMap::new()),
+            connect_locks: parking_lot::Mutex::new(HashMap::new()),
             metadata: RwLock::new(ClusterMetadata::default()),
             decode_pool: OnceLock::new(),
             last_produced_offset_retry_timeout: Duration::from_secs(10),
             controller_id: AtomicI32::new(-1),
             any_broker: parking_lot::Mutex::new(AnyBrokerRotation::default()),
             kprom: OnceLock::new(),
+            extended_metrics: None,
         })
     }
 
@@ -561,6 +605,46 @@ impl KafkaClient {
 
     pub fn kprom(&self) -> Option<&Arc<KpromMetrics>> {
         self.kprom.get()
+    }
+
+    pub fn with_extended_metrics(mut self, metrics: Option<KafkaClientExtendedMetrics>) -> Self {
+        self.extended_metrics = metrics;
+        self
+    }
+
+    pub fn extended_metrics(&self) -> Option<&KafkaClientExtendedMetrics> {
+        self.extended_metrics.as_ref()
+    }
+
+    /// Verifies broker reachability and SASL authentication by fetching cluster metadata.
+    pub async fn ping(&self) -> Result<(), KafkaClientError> {
+        self.fetch_metadata(Some(&[]), 0).await.map(|_| ())
+    }
+
+    /// Lists topic names visible to the client.
+    pub async fn list_topics(&self) -> Result<Vec<String>, KafkaClientError> {
+        let resp = self
+            .fetch_metadata(None, kgo_retry::METADATA_LIMIT_RETRIES)
+            .await?;
+        Ok(resp
+            .topics
+            .into_iter()
+            .filter_map(|t| {
+                if t.error_code == 0 {
+                    t.name.map(|n| n.0.as_str().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Closes all pooled broker connections and aborts their background reader/writer tasks.
+    pub async fn close(&self) {
+        let mut map = self.conns_by_addr.lock().await;
+        for (_, conn) in map.drain() {
+            conn.mark_dead();
+        }
     }
 
     /// `kgo.NodeName` of the broker a connection to `addr` belongs to.
@@ -733,6 +817,30 @@ impl KafkaClient {
                 if c.is_usable() {
                     return Ok(Arc::clone(c));
                 }
+                c.mark_dead();
+                map.remove(&key);
+            }
+        }
+
+        // Singleflight per (addr, kind) so concurrent callers hitting sasl_expiry coalesce
+        // into a single TCP/TLS/SASL handshake instead of opening N connections.
+        let per_key_lock = {
+            let mut locks = self.connect_locks.lock();
+            Arc::clone(
+                locks
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _connect_guard = per_key_lock.lock().await;
+
+        {
+            let mut map = self.conns_by_addr.lock().await;
+            if let Some(c) = map.get(&key) {
+                if c.is_usable() {
+                    return Ok(Arc::clone(c));
+                }
+                c.mark_dead();
                 map.remove(&key);
             }
         }
@@ -746,6 +854,7 @@ impl KafkaClient {
             self.request_timeout,
             self.node_name_for_addr(addr),
             self.kprom.get().cloned(),
+            self.extended_metrics.clone(),
         )
         .await
         .map_err(|e| {
@@ -1652,10 +1761,14 @@ impl KafkaClient {
             .unwrap_or_default()
             .as_millis() as i64;
 
+        let num_records = records.len();
+        let mut uncompressed_bytes = 0usize;
         let proto_records: Vec<Record> = records
             .into_iter()
             .enumerate()
             .map(|(i, r)| {
+                uncompressed_bytes +=
+                    r.key.as_ref().map_or(0, Bytes::len) + r.value.as_ref().map_or(0, Bytes::len);
                 let mut headers = IndexMap::with_capacity(r.headers.len());
                 for (k, v) in r.headers {
                     headers.insert(StrBytes::from_string(k), Some(v));
@@ -1688,6 +1801,7 @@ impl KafkaClient {
             &encode_opts,
             Some(compress_record_batch),
         )?;
+        let compressed_len = batch_buf.len();
         let payload = batch_buf.freeze();
 
         for attempt in 0..2 {
@@ -1709,7 +1823,14 @@ impl KafkaClient {
             req.topic_data = vec![tp];
 
             let res: Result<i64, KafkaClientError> = async {
-                let resp: ProduceResponse = conn.send_raw_timeout(ApiKey::Produce, ver, &req, self.request_timeout).await?;
+                let resp: ProduceResponse = self
+                    .send_on(&conn, ApiKey::Produce, ver, &req, self.request_timeout)
+                    .await?;
+
+                if let Some(ref m) = self.extended_metrics {
+                    m.kafka_request_throttled_seconds
+                        .observe((resp.throttle_time_ms.max(0) as f64) / 1000.0);
+                }
 
                 for rt in resp.responses {
                     if rt.name.0.as_str() != topic {
@@ -1721,6 +1842,13 @@ impl KafkaClient {
                         }
                         if let Some(err) = rp.error_code.err() {
                             return Err(KafkaClientError::Broker(err));
+                        }
+                        if let Some(ref m) = self.extended_metrics {
+                            m.produce_records_total.inc_by(num_records as f64);
+                            m.produce_batches_total.inc();
+                            m.produce_bytes_total.inc_by(uncompressed_bytes as f64);
+                            m.produce_compressed_bytes_total
+                                .inc_by(compressed_len as f64);
                         }
                         return Ok(rp.base_offset);
                     }
@@ -1760,7 +1888,9 @@ impl KafkaClient {
         req.key = StrBytes::from_string(group_id.to_owned());
         req.key_type = 0; // GROUP
 
-        let resp: FindCoordinatorResponse = conn.send_raw_timeout(ApiKey::FindCoordinator, ver, &req, self.request_timeout).await?;
+        let resp: FindCoordinatorResponse = self
+            .send_on(&conn, ApiKey::FindCoordinator, ver, &req, self.request_timeout)
+            .await?;
 
         if let Some(err) = resp.error_code.err() {
             return Err(KafkaClientError::Broker(err));
@@ -1812,7 +1942,9 @@ impl KafkaClient {
             req.topics = vec![t];
 
             let res: Result<(), KafkaClientError> = async {
-                let resp: OffsetCommitResponse = conn.send_raw_timeout(ApiKey::OffsetCommit, ver, &req, self.request_timeout).await?;
+                let resp: OffsetCommitResponse = self
+                    .send_on(&conn, ApiKey::OffsetCommit, ver, &req, self.request_timeout)
+                    .await?;
 
                 for rt in resp.topics {
                     if rt.name.0.as_str() != topic {
@@ -1888,7 +2020,9 @@ impl KafkaClient {
             req.topics = Some(vec![t]);
 
             let res: Result<Option<i64>, KafkaClientError> = async {
-                let resp: OffsetFetchResponse = conn.send_raw_timeout(ApiKey::OffsetFetch, ver, &req, self.request_timeout).await?;
+                let resp: OffsetFetchResponse = self
+                    .send_on(&conn, ApiKey::OffsetFetch, ver, &req, self.request_timeout)
+                    .await?;
 
                 if let Some(err) = resp.error_code.err() {
                     if err == ResponseError::GroupIdNotFound {
@@ -3021,10 +3155,12 @@ mod tests {
                 alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 reader_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                writer_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 sasl_expiry: None,
                 successes: std::sync::atomic::AtomicU64::new(0),
                 node: "99".to_string(),
                 kprom: None,
+                extended_metrics: None,
             })
         };
 

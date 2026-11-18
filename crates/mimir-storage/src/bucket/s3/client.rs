@@ -539,6 +539,7 @@ const RETRYABLE_S3_CODES: &[&str] = &[
     "InternalError",
     "ExpiredToken",
     "ExpiredTokenException",
+    "TokenRefreshRequired",
     "SlowDown",
     "SlowDownWrite",
     "SlowDownRead",
@@ -941,6 +942,12 @@ impl Client {
         let (req, raw_query, body) = match self.new_request(method, meta).await {
             Ok(r) => r,
             Err(e) => {
+                if matches!(
+                    e.code(),
+                    "ExpiredToken" | "ExpiredTokenException" | "TokenRefreshRequired"
+                ) {
+                    self.credentials.expire().await;
+                }
                 if is_s3_code_retryable(e.code()) {
                     return Attempt::Retry(e);
                 }
@@ -995,7 +1002,16 @@ impl Client {
                 return Attempt::Retry(S3Error::Response(Box::new(api_err)));
             }
         }
-        if is_s3_code_retryable(&api_err.code) || is_http_status_retryable(res.status) {
+        if matches!(
+            api_err.code.as_str(),
+            "ExpiredToken" | "ExpiredTokenException" | "TokenRefreshRequired"
+        ) {
+            self.credentials.expire().await;
+        }
+        if (meta.expect_200_ok_with_error && res.status == 200 && api_err.code == "200 OK")
+            || is_s3_code_retryable(&api_err.code)
+            || is_http_status_retryable(res.status)
+        {
             return Attempt::Retry(S3Error::Response(Box::new(api_err)));
         }
         Attempt::Done(Err(S3Error::Response(Box::new(api_err))))
