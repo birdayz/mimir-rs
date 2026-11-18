@@ -11,8 +11,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::block::{
-    sync_dir, write_meta_file, Block, BlockDesc, BlockError, BlockMeta, BlockMetaCompaction,
-    BlockStats, META_VERSION_1,
+    list_block_dirs, read_meta_file, sync_dir, write_meta_file, Block, BlockDesc, BlockError,
+    BlockMeta, BlockMetaCompaction, BlockStats, META_VERSION_1,
 };
 use crate::chunkenc::{
     ChunkError, EncodedChunk, Encoding, FloatHistogram, FloatHistogramChunk,
@@ -20,10 +20,15 @@ use crate::chunkenc::{
     MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND, MIN_SAMPLES_PER_HISTOGRAM_CHUNK,
     TARGET_BYTES_PER_HISTOGRAM_CHUNK,
 };
-use crate::chunkenc::float_histogram::AppendFloatHistogramOutcome;
+use crate::chunkenc::float_histogram::{
+    AppendFloatHistogramOutcome, FloatHistogramAppenderState,
+};
 use crate::chunkenc::float_histogram_st::AppendFloatHistogramStOutcome;
-use crate::chunkenc::histogram::AppendHistogramOutcome;
+use crate::chunkenc::histogram::{AppendHistogramOutcome, HistogramAppenderState};
 use crate::chunkenc::histogram_st::AppendHistogramStOutcome;
+use crate::chunkenc::st::StEncoder;
+use crate::chunkenc::xor::XorAppendState;
+use crate::chunkenc::xor2::Xor2AppendState;
 use crate::chunks_block::{BlockChunksError, BlockChunksWriter, ChunkMeta, DEFAULT_CHUNK_SEGMENT_SIZE};
 use crate::head::DEFAULT_SAMPLES_PER_CHUNK;
 use crate::index::{IndexError, IndexWriter, INDEX_FILENAME};
@@ -183,35 +188,43 @@ pub fn encode_samples_into_chunks_with_encodings(
             mint: i64,
             maxt: i64,
             chunk: XorChunk,
+            state: XorAppendState,
+            prev_t: i64,
+            prev_v: f64,
         },
         Xor2 {
             mint: i64,
             maxt: i64,
             chunk: Xor2Chunk,
+            state: Xor2AppendState,
         },
         Hist {
             mint: i64,
             maxt: i64,
             chunk: HistogramChunk,
-            prev_state: Option<crate::chunkenc::histogram::HistogramAppenderState>,
+            state: Option<HistogramAppenderState>,
+            prev_state: Option<HistogramAppenderState>,
         },
         HistSt {
             mint: i64,
             maxt: i64,
             chunk: HistogramStChunk,
-            prev_state: Option<crate::chunkenc::histogram::HistogramAppenderState>,
+            state: Option<(HistogramAppenderState, StEncoder)>,
+            prev_state: Option<HistogramAppenderState>,
         },
         FloatHist {
             mint: i64,
             maxt: i64,
             chunk: FloatHistogramChunk,
-            prev_state: Option<crate::chunkenc::float_histogram::FloatHistogramAppenderState>,
+            state: Option<FloatHistogramAppenderState>,
+            prev_state: Option<FloatHistogramAppenderState>,
         },
         FloatHistSt {
             mint: i64,
             maxt: i64,
             chunk: FloatHistogramStChunk,
-            prev_state: Option<crate::chunkenc::float_histogram::FloatHistogramAppenderState>,
+            state: Option<(FloatHistogramAppenderState, StEncoder)>,
+            prev_state: Option<FloatHistogramAppenderState>,
         },
     }
 
@@ -224,6 +237,7 @@ pub fn encode_samples_into_chunks_with_encodings(
                 mint,
                 maxt,
                 mut chunk,
+                ..
             } => {
                 chunk.compact();
                 out.push(ChunkMeta {
@@ -237,6 +251,7 @@ pub fn encode_samples_into_chunks_with_encodings(
                 mint,
                 maxt,
                 mut chunk,
+                ..
             } => {
                 chunk.compact();
                 out.push(ChunkMeta {
@@ -322,11 +337,11 @@ pub fn encode_samples_into_chunks_with_encodings(
                             mint: s.t,
                             maxt: s.t,
                             chunk: Xor2Chunk::new(),
+                            state: Xor2AppendState::new_empty(),
                         };
                     }
-                    if let Active::Xor2 { maxt, chunk, .. } = &mut active {
-                        let mut app = chunk.appender()?;
-                        app.append(s.st, s.t, *v)?;
+                    if let Active::Xor2 { maxt, chunk, state, .. } = &mut active {
+                        chunk.append_with_state(state, s.st, s.t, *v)?;
                         *maxt = s.t;
                     }
                 } else {
@@ -343,11 +358,23 @@ pub fn encode_samples_into_chunks_with_encodings(
                             mint: s.t,
                             maxt: s.t,
                             chunk: XorChunk::new(),
+                            state: XorAppendState::new_empty(),
+                            prev_t: i64::MIN,
+                            prev_v: 0.0,
                         };
                     }
-                    if let Active::Xor { maxt, chunk, .. } = &mut active {
-                        let mut app = chunk.appender()?;
-                        app.append(s.st, s.t, *v)?;
+                    if let Active::Xor {
+                        maxt,
+                        chunk,
+                        state,
+                        prev_t,
+                        prev_v,
+                        ..
+                    } = &mut active
+                    {
+                        chunk.append_with_state(state, *prev_t, *prev_v, s.t, *v)?;
+                        *prev_t = s.t;
+                        *prev_v = *v;
                         *maxt = s.t;
                     }
                 }
@@ -361,25 +388,35 @@ pub fn encode_samples_into_chunks_with_encodings(
                         _ => true,
                     };
                     if need_cut {
+                        let prev_from_cut = if let Active::HistSt { ref mut state, .. } = active {
+                            state.take().map(|(hs, _)| hs)
+                        } else {
+                            None
+                        };
                         flush_active(&mut active, &mut out);
                         active = Active::HistSt {
                             mint: s.t,
                             maxt: s.t,
                             chunk: HistogramStChunk::new(),
-                            prev_state: None,
+                            state: None,
+                            prev_state: prev_from_cut,
                         };
                     }
                     if let Active::HistSt {
                         mint,
                         maxt,
                         chunk,
+                        state,
                         prev_state,
                     } = &mut active
                     {
-                        let mut app = chunk.appender()?;
-                        let outcome =
-                            app.append_histogram(prev_state.as_ref(), s.st, s.t, h, false)?;
-                        let next_prev = app.state().clone();
+                        let outcome = chunk.append_with_state_prev(
+                            state,
+                            prev_state.as_ref(),
+                            s.st,
+                            s.t,
+                            h,
+                        )?;
                         match outcome {
                             AppendHistogramStOutcome::Appended { .. } => {
                                 *maxt = s.t;
@@ -397,7 +434,7 @@ pub fn encode_samples_into_chunks_with_encodings(
                                 });
                                 *mint = s.t;
                                 *maxt = s.t;
-                                *prev_state = Some(next_prev);
+                                *prev_state = None;
                             }
                         }
                     }
@@ -409,25 +446,35 @@ pub fn encode_samples_into_chunks_with_encodings(
                         _ => true,
                     };
                     if need_cut {
+                        let prev_from_cut = if let Active::Hist { ref mut state, .. } = active {
+                            state.take()
+                        } else {
+                            None
+                        };
                         flush_active(&mut active, &mut out);
                         active = Active::Hist {
                             mint: s.t,
                             maxt: s.t,
                             chunk: HistogramChunk::new(),
-                            prev_state: None,
+                            state: None,
+                            prev_state: prev_from_cut,
                         };
                     }
                     if let Active::Hist {
                         mint,
                         maxt,
                         chunk,
+                        state,
                         prev_state,
                     } = &mut active
                     {
-                        let mut app = chunk.appender()?;
-                        let outcome =
-                            app.append_histogram(prev_state.as_ref(), s.st, s.t, h, false)?;
-                        let next_prev = app.state().clone();
+                        let outcome = chunk.append_with_state_prev(
+                            state,
+                            prev_state.as_ref(),
+                            s.st,
+                            s.t,
+                            h,
+                        )?;
                         match outcome {
                             AppendHistogramOutcome::Appended { .. } => {
                                 *maxt = s.t;
@@ -445,7 +492,7 @@ pub fn encode_samples_into_chunks_with_encodings(
                                 });
                                 *mint = s.t;
                                 *maxt = s.t;
-                                *prev_state = Some(next_prev);
+                                *prev_state = None;
                             }
                         }
                     }
@@ -460,25 +507,35 @@ pub fn encode_samples_into_chunks_with_encodings(
                         _ => true,
                     };
                     if need_cut {
+                        let prev_from_cut = if let Active::FloatHistSt { ref mut state, .. } = active {
+                            state.take().map(|(fhs, _)| fhs)
+                        } else {
+                            None
+                        };
                         flush_active(&mut active, &mut out);
                         active = Active::FloatHistSt {
                             mint: s.t,
                             maxt: s.t,
                             chunk: FloatHistogramStChunk::new(),
-                            prev_state: None,
+                            state: None,
+                            prev_state: prev_from_cut,
                         };
                     }
                     if let Active::FloatHistSt {
                         mint,
                         maxt,
                         chunk,
+                        state,
                         prev_state,
                     } = &mut active
                     {
-                        let mut app = chunk.appender()?;
-                        let outcome =
-                            app.append_float_histogram(prev_state.as_ref(), s.st, s.t, fh, false)?;
-                        let next_prev = app.state().clone();
+                        let outcome = chunk.append_with_state_prev(
+                            state,
+                            prev_state.as_ref(),
+                            s.st,
+                            s.t,
+                            fh,
+                        )?;
                         match outcome {
                             AppendFloatHistogramStOutcome::Appended { .. } => {
                                 *maxt = s.t;
@@ -496,7 +553,7 @@ pub fn encode_samples_into_chunks_with_encodings(
                                 });
                                 *mint = s.t;
                                 *maxt = s.t;
-                                *prev_state = Some(next_prev);
+                                *prev_state = None;
                             }
                         }
                     }
@@ -508,25 +565,35 @@ pub fn encode_samples_into_chunks_with_encodings(
                         _ => true,
                     };
                     if need_cut {
+                        let prev_from_cut = if let Active::FloatHist { ref mut state, .. } = active {
+                            state.take()
+                        } else {
+                            None
+                        };
                         flush_active(&mut active, &mut out);
                         active = Active::FloatHist {
                             mint: s.t,
                             maxt: s.t,
                             chunk: FloatHistogramChunk::new(),
-                            prev_state: None,
+                            state: None,
+                            prev_state: prev_from_cut,
                         };
                     }
                     if let Active::FloatHist {
                         mint,
                         maxt,
                         chunk,
+                        state,
                         prev_state,
                     } = &mut active
                     {
-                        let mut app = chunk.appender()?;
-                        let outcome =
-                            app.append_float_histogram(prev_state.as_ref(), s.st, s.t, fh, false)?;
-                        let next_prev = app.state().clone();
+                        let outcome = chunk.append_with_state_prev(
+                            state,
+                            prev_state.as_ref(),
+                            s.st,
+                            s.t,
+                            fh,
+                        )?;
                         match outcome {
                             AppendFloatHistogramOutcome::Appended { .. } => {
                                 *maxt = s.t;
@@ -544,7 +611,7 @@ pub fn encode_samples_into_chunks_with_encodings(
                                 });
                                 *mint = s.t;
                                 *maxt = s.t;
-                                *prev_state = Some(next_prev);
+                                *prev_state = None;
                             }
                         }
                     }
@@ -725,31 +792,39 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
             mint: i64,
             maxt: i64,
             chunk: XorChunk,
+            state: XorAppendState,
+            prev_t: i64,
+            prev_v: f64,
         },
         Xor2 {
             mint: i64,
             maxt: i64,
             chunk: Xor2Chunk,
+            state: Xor2AppendState,
         },
         Hist {
             mint: i64,
             maxt: i64,
             chunk: HistogramChunk,
+            state: Option<HistogramAppenderState>,
         },
         HistSt {
             mint: i64,
             maxt: i64,
             chunk: HistogramStChunk,
+            state: Option<(HistogramAppenderState, StEncoder)>,
         },
         FloatHist {
             mint: i64,
             maxt: i64,
             chunk: FloatHistogramChunk,
+            state: Option<FloatHistogramAppenderState>,
         },
         FloatHistSt {
             mint: i64,
             maxt: i64,
             chunk: FloatHistogramStChunk,
+            state: Option<(FloatHistogramAppenderState, StEncoder)>,
         },
     }
 
@@ -764,6 +839,7 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                 mint,
                 maxt,
                 mut chunk,
+                ..
             } => {
                 chunk.compact();
                 out.push(ChunkMeta {
@@ -777,6 +853,7 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                 mint,
                 maxt,
                 mut chunk,
+                ..
             } => {
                 chunk.compact();
                 out.push(ChunkMeta {
@@ -790,6 +867,7 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                 mint,
                 maxt,
                 mut chunk,
+                ..
             } => {
                 chunk.compact();
                 out.push(ChunkMeta {
@@ -803,6 +881,7 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                 mint,
                 maxt,
                 mut chunk,
+                ..
             } => {
                 chunk.compact();
                 out.push(ChunkMeta {
@@ -816,6 +895,7 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                 mint,
                 maxt,
                 mut chunk,
+                ..
             } => {
                 chunk.compact();
                 out.push(ChunkMeta {
@@ -829,6 +909,7 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                 mint,
                 maxt,
                 mut chunk,
+                ..
             } => {
                 chunk.compact();
                 out.push(ChunkMeta {
@@ -865,24 +946,35 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                             mint: s.t,
                             maxt: s.t,
                             chunk: Xor2Chunk::new(),
+                            state: Xor2AppendState::new_empty(),
                         }
                     } else {
                         Active::Xor {
                             mint: s.t,
                             maxt: s.t,
                             chunk: XorChunk::new(),
+                            state: XorAppendState::new_empty(),
+                            prev_t: i64::MIN,
+                            prev_v: 0.0,
                         }
                     };
                 }
                 match &mut active {
-                    Active::Xor { maxt, chunk, .. } => {
-                        let mut app = chunk.appender()?;
-                        app.append(s.st, s.t, *v)?;
+                    Active::Xor {
+                        maxt,
+                        chunk,
+                        state,
+                        prev_t,
+                        prev_v,
+                        ..
+                    } => {
+                        chunk.append_with_state(state, *prev_t, *prev_v, s.t, *v)?;
+                        *prev_t = s.t;
+                        *prev_v = *v;
                         *maxt = s.t;
                     }
-                    Active::Xor2 { maxt, chunk, .. } => {
-                        let mut app = chunk.appender()?;
-                        app.append(s.st, s.t, *v)?;
+                    Active::Xor2 { maxt, chunk, state, .. } => {
+                        chunk.append_with_state(state, s.st, s.t, *v)?;
                         *maxt = s.t;
                     }
                     _ => unreachable!(),
@@ -912,12 +1004,14 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                             mint: s.t,
                             maxt: s.t,
                             chunk: HistogramStChunk::new(),
+                            state: None,
                         }
                     } else {
                         Active::Hist {
                             mint: s.t,
                             maxt: s.t,
                             chunk: HistogramChunk::new(),
+                            state: None,
                         }
                     };
                 }
@@ -926,8 +1020,9 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                         mint,
                         maxt,
                         chunk,
+                        state,
                     } => {
-                        let outcome = chunk.appender()?.append_histogram(None, s.st, s.t, h, false)?;
+                        let outcome = chunk.append_with_state(state, s.st, s.t, h)?;
                         match outcome {
                             AppendHistogramOutcome::Appended { .. } => *maxt = s.t,
                             AppendHistogramOutcome::NewChunk(new_chk) => {
@@ -950,8 +1045,9 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                         mint,
                         maxt,
                         chunk,
+                        state,
                     } => {
-                        let outcome = chunk.appender()?.append_histogram(None, s.st, s.t, h, false)?;
+                        let outcome = chunk.append_with_state(state, s.st, s.t, h)?;
                         match outcome {
                             AppendHistogramStOutcome::Appended { .. } => *maxt = s.t,
                             AppendHistogramStOutcome::NewChunk(new_chk) => {
@@ -998,12 +1094,14 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                             mint: s.t,
                             maxt: s.t,
                             chunk: FloatHistogramStChunk::new(),
+                            state: None,
                         }
                     } else {
                         Active::FloatHist {
                             mint: s.t,
                             maxt: s.t,
                             chunk: FloatHistogramChunk::new(),
+                            state: None,
                         }
                     };
                 }
@@ -1012,11 +1110,9 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                         mint,
                         maxt,
                         chunk,
+                        state,
                     } => {
-                        let outcome =
-                            chunk
-                                .appender()?
-                                .append_float_histogram(None, s.st, s.t, fh, false)?;
+                        let outcome = chunk.append_with_state(state, s.st, s.t, fh)?;
                         match outcome {
                             AppendFloatHistogramOutcome::Appended { .. } => *maxt = s.t,
                             AppendFloatHistogramOutcome::NewChunk(new_chk) => {
@@ -1039,11 +1135,9 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                         mint,
                         maxt,
                         chunk,
+                        state,
                     } => {
-                        let outcome =
-                            chunk
-                                .appender()?
-                                .append_float_histogram(None, s.st, s.t, fh, false)?;
+                        let outcome = chunk.append_with_state(state, s.st, s.t, fh)?;
                         match outcome {
                             AppendFloatHistogramStOutcome::Appended { .. } => *maxt = s.t,
                             AppendFloatHistogramStOutcome::NewChunk(new_chk) => {
@@ -1864,16 +1958,26 @@ pub fn compact_blocks(dest: &Path, blocks: &[&Block]) -> Result<Option<BlockMeta
     let mut mint = i64::MAX;
     let mut maxt = i64::MIN;
     let mut max_level = 0i32;
-    let mut sources = Vec::new();
+    let mut sources_set = std::collections::BTreeSet::new();
     let mut parents = Vec::with_capacity(blocks.len());
     let mut all_ooo = true;
+    let mut any_stale = false;
+    let mut any_selected = false;
 
     for b in blocks {
         let m = b.meta();
         mint = mint.min(m.min_time);
         maxt = maxt.max(m.max_time);
         max_level = max_level.max(m.compaction.level);
-        sources.extend_from_slice(&m.compaction.sources);
+        for &s in &m.compaction.sources {
+            sources_set.insert(s);
+        }
+        if m.compaction.from_stale_series() {
+            any_stale = true;
+        }
+        if m.compaction.from_selected_series() {
+            any_selected = true;
+        }
         if !m.compaction.from_out_of_order() {
             all_ooo = false;
         }
@@ -1883,6 +1987,7 @@ pub fn compact_blocks(dest: &Path, blocks: &[&Block]) -> Result<Option<BlockMeta
             max_time: m.max_time,
         });
     }
+    let sources: Vec<Ulid> = sources_set.into_iter().collect();
 
     if maxt <= mint {
         return Ok(None);
@@ -1940,11 +2045,201 @@ pub fn compact_blocks(dest: &Path, blocks: &[&Block]) -> Result<Option<BlockMeta
         failed: false,
         hints: Vec::new(),
     };
+    if any_stale {
+        comp.set_stale_series();
+    }
+    if any_selected {
+        comp.set_selected_series();
+    }
     if all_ooo {
         comp.set_out_of_order();
     }
 
-    write_prepared_block(dest, mint, maxt, prepared, comp, all_ooo, 0)
+    write_prepared_block(dest, mint, maxt, prepared, comp, false, 0)
+}
+
+#[derive(Clone)]
+struct DirMeta {
+    dir: std::path::PathBuf,
+    meta: BlockMeta,
+}
+
+/// Plans the next on-disk block compaction in `dir` matching Go `LeveledCompactor.Plan`.
+pub fn plan_block_compactions(
+    dir: &Path,
+    ranges_ms: &[i64],
+    enable_overlapping: bool,
+) -> Result<Option<Vec<std::path::PathBuf>>, CompactError> {
+    if ranges_ms.is_empty() {
+        return Ok(None);
+    }
+    let dirs = list_block_dirs(dir)?;
+    if dirs.is_empty() {
+        return Ok(None);
+    }
+    let mut dms = Vec::with_capacity(dirs.len());
+    for (_, path) in dirs {
+        let meta = read_meta_file(&path)?;
+        dms.push(DirMeta { dir: path, meta });
+    }
+    plan_from_metas(dms, ranges_ms, enable_overlapping)
+}
+
+fn plan_from_metas(
+    dms: Vec<DirMeta>,
+    ranges_ms: &[i64],
+    enable_overlapping: bool,
+) -> Result<Option<Vec<std::path::PathBuf>>, CompactError> {
+    if dms.is_empty() {
+        return Ok(None);
+    }
+    let mut stale = Vec::new();
+    let mut selected = Vec::new();
+    let mut non_hint = Vec::new();
+    for dm in dms {
+        if dm.meta.compaction.from_stale_series() {
+            stale.push(dm);
+        } else if dm.meta.compaction.from_selected_series() {
+            selected.push(dm);
+        } else {
+            non_hint.push(dm);
+        }
+    }
+    let classes =
+        usize::from(!stale.is_empty()) + usize::from(!selected.is_empty()) + usize::from(!non_hint.is_empty());
+    if classes > 1 {
+        if let Some(res) = plan_class(non_hint, ranges_ms, enable_overlapping) {
+            return Ok(Some(res));
+        }
+        if let Some(res) = plan_class(stale, ranges_ms, enable_overlapping) {
+            return Ok(Some(res));
+        }
+        return Ok(plan_class(selected, ranges_ms, enable_overlapping));
+    }
+    let single = if !non_hint.is_empty() {
+        non_hint
+    } else if !stale.is_empty() {
+        stale
+    } else {
+        selected
+    };
+    Ok(plan_class(single, ranges_ms, enable_overlapping))
+}
+
+fn plan_class(
+    mut dms: Vec<DirMeta>,
+    ranges_ms: &[i64],
+    enable_overlapping: bool,
+) -> Option<Vec<std::path::PathBuf>> {
+    if dms.is_empty() {
+        return None;
+    }
+    dms.sort_by_key(|dm| dm.meta.min_time);
+    if enable_overlapping {
+        let overlapping = select_overlapping_dirs(&dms);
+        if !overlapping.is_empty() {
+            return Some(overlapping);
+        }
+    }
+    // Exclude the most recent block (Go compact.go:398).
+    dms.pop();
+    if dms.is_empty() {
+        return None;
+    }
+    let selected = select_dirs(&dms, ranges_ms);
+    if !selected.is_empty() {
+        return Some(selected.into_iter().map(|dm| dm.dir.clone()).collect());
+    }
+    let mid_range = ranges_ms[ranges_ms.len() / 2];
+    for v in dms.iter().rev() {
+        let meta = &v.meta;
+        if meta.max_time - meta.min_time < mid_range {
+            if meta.stats.num_tombstones > 0 && meta.stats.num_tombstones >= meta.stats.num_series {
+                return Some(vec![v.dir.clone()]);
+            }
+            break;
+        }
+        if (meta.stats.num_tombstones as f64) / ((meta.stats.num_series + 1) as f64) > 0.05 {
+            return Some(vec![v.dir.clone()]);
+        }
+    }
+    None
+}
+
+fn select_overlapping_dirs(ds: &[DirMeta]) -> Vec<std::path::PathBuf> {
+    if ds.len() < 2 {
+        return Vec::new();
+    }
+    let mut overlapping = Vec::new();
+    let mut global_maxt = ds[0].meta.max_time;
+    for i in 0..ds.len() - 1 {
+        let d = &ds[i + 1];
+        if d.meta.min_time < global_maxt {
+            if overlapping.is_empty() {
+                overlapping.push(ds[i].dir.clone());
+            }
+            overlapping.push(d.dir.clone());
+        } else if !overlapping.is_empty() {
+            break;
+        }
+        if d.meta.max_time > global_maxt {
+            global_maxt = d.meta.max_time;
+        }
+    }
+    overlapping
+}
+
+fn select_dirs<'a>(ds: &'a [DirMeta], ranges_ms: &[i64]) -> Vec<&'a DirMeta> {
+    if ranges_ms.len() < 2 || ds.is_empty() {
+        return Vec::new();
+    }
+    let high_time = ds[ds.len() - 1].meta.min_time;
+    for &iv in &ranges_ms[1..] {
+        if iv <= 0 {
+            continue;
+        }
+        let parts = split_by_range(ds, iv);
+        for p in parts {
+            if p.iter().any(|dm| dm.meta.compaction.failed) {
+                continue;
+            }
+            let mint = p[0].meta.min_time;
+            let maxt = p[p.len() - 1].meta.max_time;
+            if (maxt - mint == iv || maxt <= high_time) && p.len() > 1 {
+                return p;
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn split_by_range(ds: &[DirMeta], tr: i64) -> Vec<Vec<&DirMeta>> {
+    let mut split_dirs = Vec::new();
+    let mut i = 0usize;
+    while i < ds.len() {
+        let mut group = Vec::new();
+        let m = &ds[i].meta;
+        let t0 = if m.min_time >= 0 {
+            tr * (m.min_time / tr)
+        } else {
+            tr * ((m.min_time - tr + 1) / tr)
+        };
+        if m.max_time > t0 + tr {
+            i += 1;
+            continue;
+        }
+        while i < ds.len() {
+            if ds[i].meta.max_time > t0 + tr {
+                break;
+            }
+            group.push(&ds[i]);
+            i += 1;
+        }
+        if !group.is_empty() {
+            split_dirs.push(group);
+        }
+    }
+    split_dirs
 }
 
 #[cfg(test)]

@@ -16,8 +16,13 @@ use prometheus::{Histogram, HistogramOpts, Registry};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::block::{parse_block_dir_name, read_meta_file, Block, BlockError, BlockMetaCompaction};
-use crate::compact::{write_head_block_streaming, CompactError};
+use crate::block::{
+    parse_block_dir_name, read_meta_file, write_meta_file, Block, BlockDesc, BlockError,
+    BlockMetaCompaction,
+};
+use crate::compact::{
+    compact_blocks, plan_block_compactions, write_head_block_streaming, CompactError,
+};
 use crate::exemplar::{CircularExemplarStorage, ExemplarQueryResult};
 use crate::head::{range_for_timestamp, Head, HeadAppender, HeadError, HeadOptions};
 use crate::matcher::LabelMatcher;
@@ -241,6 +246,8 @@ struct TsdbInner {
     blocks: RwLock<Vec<Arc<Block>>>,
     closed: AtomicBool,
     compact_mtx: Mutex<()>,
+    block_ranges_ms: RwLock<Vec<i64>>,
+    enable_overlapping_compaction: AtomicBool,
     metrics: DbMetrics,
 }
 
@@ -309,6 +316,7 @@ impl Tsdb {
             min_valid_time = min_valid_time.max(stored_mvt);
         }
 
+        let initial_ranges = vec![opts.head.chunk_range_ms];
         let head = Head::open(&dir, opts.head.clone(), min_valid_time)?;
 
         let inner = Arc::new(TsdbInner {
@@ -318,6 +326,8 @@ impl Tsdb {
             blocks: RwLock::new(blocks),
             closed: AtomicBool::new(false),
             compact_mtx: Mutex::new(()),
+            block_ranges_ms: RwLock::new(initial_ranges),
+            enable_overlapping_compaction: AtomicBool::new(false),
             metrics,
         });
         let bg_stop = Arc::new((Mutex::new(false), Condvar::new()));
@@ -408,6 +418,34 @@ impl Tsdb {
     /// compacts the OOO head. Errors count `prometheus_tsdb_compactions_failed_total`.
     pub fn compact(&self) -> Result<Vec<Ulid>, TsdbError> {
         self.inner.compact()
+    }
+
+    /// Configures multi-level on-disk compaction block ranges in milliseconds
+    /// (Mimir `-blocks-storage.tsdb.block-ranges-period`).
+    pub fn set_block_ranges(&self, ranges_ms: Vec<i64>) {
+        if !ranges_ms.is_empty() {
+            *self.inner.block_ranges_ms.write() = ranges_ms;
+        }
+    }
+
+    /// Returns the configured on-disk compaction block ranges in milliseconds.
+    pub fn block_ranges(&self) -> Vec<i64> {
+        self.inner.block_ranges_ms.read().clone()
+    }
+
+    /// Configures whether overlapping on-disk block compaction is enabled.
+    pub fn set_enable_overlapping_compaction(&self, enabled: bool) {
+        self.inner
+            .enable_overlapping_compaction
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Runs on-disk multi-block and tombstone compaction (`DB.compactBlocks`).
+    pub fn compact_blocks(&self) -> Result<Vec<Ulid>, TsdbError> {
+        let _guard = self.inner.compact_mtx.lock();
+        let mut created = Vec::new();
+        self.inner.compact_blocks_locked(&mut created)?;
+        Ok(created)
     }
 
     /// Compacts the half-open time range `[mint, maxt)` of Head into a ULID block on disk,
@@ -643,7 +681,7 @@ impl TsdbInner {
                     continue;
                 }
             };
-            match loaded.iter().find(|b| b.ulid() == meta.ulid) {
+            match loaded.iter().find(|b| b.ulid() == meta.ulid && b.meta() == &meta) {
                 Some(b) => blocks.push(Arc::clone(b)),
                 None => to_open.push((meta.ulid, bdir)),
             }
@@ -821,6 +859,7 @@ impl TsdbInner {
                 created.extend(self.compact_ooo_head_locked()?);
             }
             self.head.mmap_head_chunks().map_err(HeadError::from)?;
+            self.compact_blocks_locked(&mut created)?;
             Ok(())
         })();
 
@@ -930,6 +969,11 @@ impl TsdbInner {
             let mut run = |mint: i64, maxt: i64| -> Result<(), TsdbError> {
                 let mut compaction = BlockMetaCompaction::default();
                 compaction.set_out_of_order();
+                compaction.parents.push(BlockDesc {
+                    ulid: Ulid::nil(),
+                    min_time: 0,
+                    max_time: 0,
+                });
                 let meta = self.timed_write(|| {
                     write_head_block_streaming(
                         &self.dir,
@@ -937,7 +981,7 @@ impl TsdbInner {
                         maxt,
                         snap.candidates.clone(),
                         compaction,
-                        true,
+                        false,
                         self.opts.max_block_chunk_segment_size,
                         |ref_id, chks, tombs| {
                             self.head
@@ -1011,13 +1055,64 @@ impl TsdbInner {
     /// Go `DB.CompactSelectedSeries` -> `compactHeadViewLocked`: writes the selected series
     /// into one block per `chunk_range` window between the head's aligned min time and
     /// its max time, then evicts them from Head.
+    fn compact_blocks_locked(&self, created: &mut Vec<Ulid>) -> Result<(), TsdbError> {
+        let ranges = self.block_ranges_ms.read().clone();
+        let enable_overlapping = self.enable_overlapping_compaction.load(Ordering::Acquire);
+        loop {
+            if self.closed.load(Ordering::Acquire) || self.head.compactable() {
+                return Ok(());
+            }
+            let Some(plan_dirs) = plan_block_compactions(&self.dir, &ranges, enable_overlapping)? else {
+                break;
+            };
+            let loaded_blocks = self.blocks.read().clone();
+            let mut plan_blocks: Vec<Arc<Block>> = Vec::with_capacity(plan_dirs.len());
+            for dir in &plan_dirs {
+                let name = dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .and_then(parse_block_dir_name);
+                if let Some(uid) = name {
+                    if let Some(existing) = loaded_blocks.iter().find(|b| b.ulid() == uid) {
+                        plan_blocks.push(Arc::clone(existing));
+                        continue;
+                    }
+                }
+                plan_blocks.push(Arc::new(Block::open_with_postings_cache(
+                    dir,
+                    self.opts.block_postings_cache.clone(),
+                )?));
+            }
+            let block_refs: Vec<&Block> = plan_blocks.iter().map(|b| b.as_ref()).collect();
+            let meta_opt = self.timed_write(|| compact_blocks(&self.dir, &block_refs))?;
+            match meta_opt {
+                Some(meta) => {
+                    self.reload_after_write(&[meta.ulid])?;
+                    created.push(meta.ulid);
+                }
+                None => {
+                    // All samples deleted by tombstones: mark input blocks deletable (Go compact.go:714-725).
+                    for b in &plan_blocks {
+                        let mut m = b.meta().clone();
+                        m.compaction.deletable = true;
+                        write_meta_file(b.dir(), &mut m)?;
+                    }
+                    drop(plan_blocks);
+                    drop(loaded_blocks);
+                    self.reload_blocks_locked()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn compact_selected_series(&self, refs: &[u64]) -> Result<Vec<Ulid>, TsdbError> {
         if refs.is_empty() {
             return Ok(Vec::new());
         }
         let _guard = self.compact_mtx.lock();
-        let (candidates, data_mint, data_maxt) =
-            self.head.collect_selected_compaction_candidates(refs)?;
+        let ((candidates, data_mint, data_maxt), fingerprints) =
+            self.head.collect_selected_compaction_candidates_with_fingerprints(refs)?;
         if candidates.is_empty() || data_mint > data_maxt {
             return Ok(Vec::new());
         }
@@ -1031,6 +1126,11 @@ impl TsdbInner {
             let maxt_inclusive = maxt - 1;
             let mut compaction = BlockMetaCompaction::default();
             compaction.set_selected_series();
+            compaction.parents.push(BlockDesc {
+                ulid: Ulid::nil(),
+                min_time: 0,
+                max_time: 0,
+            });
             let meta = self.timed_write(|| {
                 write_head_block_streaming(
                     &self.dir,
@@ -1061,7 +1161,8 @@ impl TsdbInner {
             self.reload_after_write(&[meta.ulid])?;
             created.push(meta.ulid);
         }
-        self.head.evict_series_refs_before(refs, head_maxt)?;
+        self.head
+            .evict_series_refs_with_fingerprints(refs, head_maxt, &fingerprints)?;
         Ok(created)
     }
 
