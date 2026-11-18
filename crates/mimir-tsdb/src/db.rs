@@ -570,7 +570,7 @@ impl TsdbInner {
         if !sorted.is_empty() && retention != 0 {
             let newest = sorted[0].max_time();
             for (i, b) in sorted.iter().enumerate() {
-                if i > 0 && newest - b.max_time() >= retention {
+                if i > 0 && (newest as i128) - (b.max_time() as i128) >= (retention as i128) {
                     for d in &sorted[i..] {
                         deletable.insert(d.ulid());
                     }
@@ -1003,21 +1003,27 @@ impl TsdbInner {
 
             let mut ooo_start = ooo_mint;
             if self.opts.enable_bigger_ooo_block_for_old_samples {
-                let maxt_for_24h_block = DAY_MS * (self.head.max_time() / DAY_MS);
+                let day128 = DAY_MS as i128;
+                let maxt_for_24h_block = floor_align_i128(self.head.max_time(), DAY_MS);
                 // 24h blocks for data that is for the previous days.
-                let mut t = DAY_MS * (ooo_mint / DAY_MS);
+                let mut t = floor_align_i128(ooo_mint, DAY_MS);
                 while t < maxt_for_24h_block {
-                    run(t, t + DAY_MS)?;
-                    t += DAY_MS;
+                    let mint = t.max(i64::MIN as i128) as i64;
+                    let maxt = (t + day128).min(i64::MAX as i128) as i64;
+                    run(mint, maxt)?;
+                    t += day128;
                 }
-                if ooo_start < maxt_for_24h_block {
-                    ooo_start = maxt_for_24h_block;
+                if (ooo_start as i128) < maxt_for_24h_block {
+                    ooo_start = maxt_for_24h_block.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
                 }
             }
-            let mut t = block_size * (ooo_start / block_size);
-            while t <= ooo_maxt {
-                run(t, t + block_size)?;
-                t += block_size;
+            let block_size128 = block_size as i128;
+            let mut t = floor_align_i128(ooo_start, block_size);
+            while t <= ooo_maxt as i128 {
+                let mint = t.max(i64::MIN as i128) as i64;
+                let maxt = (t + block_size128).min(i64::MAX as i128) as i64;
+                run(mint, maxt)?;
+                t += block_size128;
             }
             Ok(())
         })();
@@ -1117,13 +1123,18 @@ impl TsdbInner {
             return Ok(Vec::new());
         }
         let range = self.head.options().chunk_range_ms;
+        let range128 = range as i128;
         let head_maxt = self.head.max_time();
         let mut created = Vec::new();
-        let mut t = range * (self.head.min_time() / range);
-        while t <= head_maxt {
-            let mint = t;
-            let maxt = t + range;
-            let maxt_inclusive = maxt - 1;
+        let mut t = floor_align_i128(self.head.min_time(), range);
+        while t <= head_maxt as i128 {
+            let mint = t.max(i64::MIN as i128) as i64;
+            let maxt = (t + range128).min(i64::MAX as i128) as i64;
+            let maxt_inclusive = if t + range128 > i64::MAX as i128 {
+                i64::MAX
+            } else {
+                maxt.saturating_sub(1)
+            };
             let mut compaction = BlockMetaCompaction::default();
             compaction.set_selected_series();
             compaction.parents.push(BlockDesc {
@@ -1153,7 +1164,7 @@ impl TsdbInner {
                     },
                 )
             })?;
-            t += range;
+            t += range128;
             // No block when the window holds no data for the selected series.
             let Some(meta) = meta else {
                 continue;
@@ -1172,6 +1183,12 @@ impl TsdbInner {
         self.head.truncate(mint)?;
         Ok(())
     }
+}
+
+#[inline]
+fn floor_align_i128(t: i64, range: i64) -> i128 {
+    let r = range as i128;
+    (t as i128).div_euclid(r) * r
 }
 
 #[cfg(test)]
@@ -1539,5 +1556,50 @@ mod tests {
         assert!(matches!(q.select(false, &matchers), Err(crate::querier::QuerierError::Closed)));
         assert!(matches!(q.label_names(&[]), Err(crate::querier::QuerierError::Closed)));
         assert!(matches!(q.label_values("__name__", None, &[]), Err(crate::querier::QuerierError::Closed)));
+    }
+
+    #[test]
+    fn w13_p0_5_negative_timestamp_ooo_and_selected_series_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = TsdbOptions::default();
+        opts.head.chunk_range_ms = 7_200_000;
+        opts.head.ooo_time_window_ms = 7_200_000;
+        let db = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO).unwrap();
+
+        let pairs_sel = [("__name__", "neg_sel"), ("job", "a")];
+        let pairs_ooo = [("__name__", "neg_ooo"), ("job", "b")];
+        {
+            let mut app = db.appender();
+            app.append_float(None, &pairs_sel, -1_000, 11.0).unwrap();
+            app.append_float(None, &pairs_sel, -500, 22.0).unwrap();
+            // Establish in-order high-water mark for neg_ooo, then insert OOO negative samples.
+            app.append_float(None, &pairs_ooo, -100, 33.0).unwrap();
+            app.commit().unwrap();
+        }
+        {
+            let mut app = db.appender();
+            app.append_float(None, &pairs_ooo, -1_000, 44.0).unwrap();
+            app.append_float(None, &pairs_ooo, -500, 55.0).unwrap();
+            app.commit().unwrap();
+        }
+
+        let sel_ref = db.head().get_entry_by_sorted_pairs(&pairs_sel).unwrap().ref_id;
+        let sel_ulids = db.compact_selected_series(&[sel_ref]).unwrap();
+        assert!(!sel_ulids.is_empty(), "selected negative series must compact into block");
+
+        let ooo_ulids = db.compact_ooo_head().unwrap();
+        assert!(!ooo_ulids.is_empty(), "negative OOO head must compact into block");
+
+        let m_sel = LabelMatcher::new(crate::matcher::MatchType::Equal, "__name__", "neg_sel").unwrap();
+        let res_sel = db.querier(i64::MIN, i64::MAX).select(true, &[m_sel]).unwrap();
+        assert_eq!(res_sel.len(), 1);
+        assert_eq!(res_sel[0].samples.len(), 2);
+
+        let m_ooo = LabelMatcher::new(crate::matcher::MatchType::Equal, "__name__", "neg_ooo").unwrap();
+        let res_ooo = db.querier(i64::MIN, i64::MAX).select(true, &[m_ooo]).unwrap();
+        assert_eq!(res_ooo.len(), 1);
+        assert_eq!(res_ooo[0].samples.len(), 3);
+
+        db.close().unwrap();
     }
 }

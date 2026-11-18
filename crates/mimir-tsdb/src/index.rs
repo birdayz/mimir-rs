@@ -414,16 +414,21 @@ impl IndexWriter {
         self.buf2.put_uvarint(chunks.len());
         if let Some(c0) = chunks.first() {
             self.buf2.put_varint64(c0.min_time);
-            self.buf2.put_uvarint64((c0.max_time - c0.min_time) as u64);
+            self.buf2
+                .put_uvarint64(u64::from_ne_bytes(c0.max_time.wrapping_sub(c0.min_time).to_ne_bytes()));
             self.buf2.put_uvarint64(c0.ref_id);
             let mut t0 = c0.max_time;
-            let mut ref0 = c0.ref_id as i64;
+            let mut ref0 = i64::from_ne_bytes(c0.ref_id.to_ne_bytes());
             for c in &chunks[1..] {
-                self.buf2.put_uvarint64((c.min_time - t0) as u64);
-                self.buf2.put_uvarint64((c.max_time - c.min_time) as u64);
+                self.buf2
+                    .put_uvarint64(u64::from_ne_bytes(c.min_time.wrapping_sub(t0).to_ne_bytes()));
+                self.buf2.put_uvarint64(u64::from_ne_bytes(
+                    c.max_time.wrapping_sub(c.min_time).to_ne_bytes(),
+                ));
                 t0 = c.max_time;
-                self.buf2.put_varint64((c.ref_id as i64) - ref0);
-                ref0 = c.ref_id as i64;
+                let cur_ref = i64::from_ne_bytes(c.ref_id.to_ne_bytes());
+                self.buf2.put_varint64(cur_ref.wrapping_sub(ref0));
+                ref0 = cur_ref;
             }
         }
 
@@ -922,34 +927,25 @@ impl IndexReader {
         let mut chks = Vec::with_capacity(num_chunks.min(dec.len()));
         if num_chunks > 0 {
             let t0 = dec.varint64()?;
-            let dt0 = i64::try_from(dec.uvarint64()?)
-                .map_err(|_| IndexError::Corrupt("chunk time delta overflow".to_string()))?;
-            let maxt0 = t0
-                .checked_add(dt0)
-                .ok_or_else(|| IndexError::Corrupt("chunk maxt overflow".to_string()))?;
-            let mut ref0 = dec.uvarint64()? as i64;
+            let dt0 = i64::from_ne_bytes(dec.uvarint64()?.to_ne_bytes());
+            let maxt0 = t0.wrapping_add(dt0);
+            let mut ref0 = i64::from_ne_bytes(dec.uvarint64()?.to_ne_bytes());
             chks.push(ChunkMeta {
-                ref_id: ref0 as u64,
+                ref_id: u64::from_ne_bytes(ref0.to_ne_bytes()),
                 min_time: t0,
                 max_time: maxt0,
                 chunk: None,
             });
             let mut prev_maxt = maxt0;
             for _ in 1..num_chunks {
-                let d_mint = i64::try_from(dec.uvarint64()?)
-                    .map_err(|_| IndexError::Corrupt("chunk mint delta overflow".to_string()))?;
-                let mint = prev_maxt
-                    .checked_add(d_mint)
-                    .ok_or_else(|| IndexError::Corrupt("chunk mint overflow".to_string()))?;
-                let d_maxt = i64::try_from(dec.uvarint64()?)
-                    .map_err(|_| IndexError::Corrupt("chunk maxt delta overflow".to_string()))?;
-                let maxt = mint
-                    .checked_add(d_maxt)
-                    .ok_or_else(|| IndexError::Corrupt("chunk maxt overflow".to_string()))?;
+                let d_mint = i64::from_ne_bytes(dec.uvarint64()?.to_ne_bytes());
+                let mint = prev_maxt.wrapping_add(d_mint);
+                let d_maxt = i64::from_ne_bytes(dec.uvarint64()?.to_ne_bytes());
+                let maxt = mint.wrapping_add(d_maxt);
                 ref0 = ref0.wrapping_add(dec.varint64()?);
                 prev_maxt = maxt;
                 chks.push(ChunkMeta {
-                    ref_id: ref0 as u64,
+                    ref_id: u64::from_ne_bytes(ref0.to_ne_bytes()),
                     min_time: mint,
                     max_time: maxt,
                     chunk: None,
@@ -1636,5 +1632,44 @@ mod tests {
             let r3 = IndexReader::open(&idx_path3).unwrap();
             assert!(r3.series(p[0]).is_err());
         }
+    }
+
+    #[test]
+    fn index_unsigned_chunk_time_delta_spanning_i64_min_to_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx_path = dir.path().join("index_wide_span");
+        let l = Labels::from_pairs([("__name__", "wide_span")]);
+        let chunks = vec![
+            ChunkMeta {
+                ref_id: 10,
+                min_time: i64::MIN + 1000,
+                max_time: 1_700_000_000_000,
+                chunk: None,
+            },
+            ChunkMeta {
+                ref_id: 20,
+                min_time: i64::MAX - 100,
+                max_time: i64::MAX,
+                chunk: None,
+            },
+        ];
+        {
+            let mut w = IndexWriter::new(&idx_path).unwrap();
+            for s in ["", "__name__", "wide_span"] {
+                w.add_symbol(s).unwrap();
+            }
+            w.add_series(0, &l, &chunks).unwrap();
+            w.close().unwrap();
+        }
+        let r = IndexReader::open(&idx_path).unwrap();
+        let p = r.postings("__name__", &["wide_span"]).unwrap();
+        assert_eq!(p.len(), 1);
+        let (got_lbls, got_chunks) = r.series(p[0]).unwrap();
+        assert_eq!(got_lbls, l);
+        assert_eq!(got_chunks.len(), 2);
+        assert_eq!(got_chunks[0].min_time, i64::MIN + 1000);
+        assert_eq!(got_chunks[0].max_time, 1_700_000_000_000);
+        assert_eq!(got_chunks[1].min_time, i64::MAX - 100);
+        assert_eq!(got_chunks[1].max_time, i64::MAX);
     }
 }

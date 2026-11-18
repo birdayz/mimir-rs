@@ -306,6 +306,41 @@ impl Labels {
         xxh64(&self.data, 0)
     }
 
+    /// Exact Prometheus `stringlabels.StableHash(ls)`.
+    pub fn stable_hash(&self) -> u64 {
+        let mut stack_buf = [0u8; 1024];
+        let mut pos = 0usize;
+        let mut hasher: Option<xxhash_rust::xxh64::Xxh64> = None;
+        for (name, value) in self.iter() {
+            let nb = name.as_bytes();
+            let vb = value.as_bytes();
+            if hasher.is_none() && pos + nb.len() + vb.len() + 2 >= stack_buf.len() {
+                let mut h = xxhash_rust::xxh64::Xxh64::new(0);
+                h.update(&stack_buf[..pos]);
+                hasher = Some(h);
+            }
+            if let Some(ref mut h) = hasher {
+                h.update(nb);
+                h.update(&[0xff]);
+                h.update(vb);
+                h.update(&[0xff]);
+            } else {
+                stack_buf[pos..pos + nb.len()].copy_from_slice(nb);
+                pos += nb.len();
+                stack_buf[pos] = 0xff;
+                pos += 1;
+                stack_buf[pos..pos + vb.len()].copy_from_slice(vb);
+                pos += vb.len();
+                stack_buf[pos] = 0xff;
+                pos += 1;
+            }
+        }
+        match hasher {
+            Some(h) => h.digest(),
+            None => xxh64(&stack_buf[..pos], 0),
+        }
+    }
+
     /// Returns the value for `name`, or `""` if the label does not exist.
     pub fn get(&self, name: &str) -> &str {
         if name.is_empty() {
