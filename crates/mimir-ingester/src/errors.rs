@@ -25,7 +25,9 @@ use mimir_common::errors::{
     SERIES_INVALID_LABEL_VALUE, SERIES_LABELS_NOT_SORTED, SERIES_LABEL_NAME_TOO_LONG,
     SERIES_LABEL_VALUE_TOO_LONG, MAX_LABEL_NAMES_PER_SERIES,
 };
+use chrono::{DateTime, Utc};
 use mimir_common::logging::format_rfc3339_nano_utc;
+use mimir_ring::kv::memberlist::gofmt::format_go_time_string;
 use mimir_common::services::State;
 use mimir_proto::cortexpb;
 use mimir_proto::grpcutilpb;
@@ -98,6 +100,14 @@ pub fn format_labels_string<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a st
         out.push('}');
     }
     out
+}
+
+/// Formats `ts_ms` matching Go `time.UnixMilli(ts_ms).String()`.
+pub fn format_timestamp_ms_go_time_string(ts_ms: i64) -> String {
+    match DateTime::<Utc>::from_timestamp_millis(ts_ms) {
+        Some(dt) => format_go_time_string(&dt.with_timezone(&chrono::Local).fixed_offset()),
+        None => format_timestamp_ms_rfc3339(ts_ms),
+    }
 }
 
 pub fn format_timestamp_ms_rfc3339(ts_ms: i64) -> String {
@@ -468,9 +478,9 @@ impl IngesterError {
     pub fn tsdb_early_compaction(request_min_ts: i64, allowed_min_ts: i64) -> Self {
         Self::TsdbUnavailable {
             message: format!(
-                "TSDB Head early compaction in progress and the write request contains samples overlapping with it: request_min_timestamp: {} allowed_min_timestamp: {}",
-                format_timestamp_ms_rfc3339(request_min_ts),
-                format_timestamp_ms_rfc3339(allowed_min_ts),
+                "request_min_timestamp: {} allowed_min_timestamp: {}: TSDB Head early compaction in progress and the write request contains samples overlapping with it",
+                format_timestamp_ms_go_time_string(request_min_ts),
+                format_timestamp_ms_go_time_string(allowed_min_ts),
             ),
         }
     }
@@ -669,7 +679,8 @@ impl IngesterError {
             cortexpb::ErrorCause::InstanceLimit => tonic::Code::Unavailable,
             cortexpb::ErrorCause::TsdbUnavailable => tonic::Code::Internal,
             cortexpb::ErrorCause::MethodNotAllowed => tonic::Code::Unimplemented,
-            cortexpb::ErrorCause::CircuitBreakerOpen => tonic::Code::Unavailable,
+            cortexpb::ErrorCause::CircuitBreakerOpen
+            | cortexpb::ErrorCause::RequestRateLimited => tonic::Code::Unavailable,
             _ => tonic::Code::Internal,
         };
         match self.error_details() {
@@ -704,9 +715,10 @@ impl IngesterError {
         }
         let code = match self.error_cause() {
             cortexpb::ErrorCause::TooBusy => tonic::Code::ResourceExhausted,
-            cortexpb::ErrorCause::ServiceUnavailable => tonic::Code::Unavailable,
+            cortexpb::ErrorCause::ServiceUnavailable
+            | cortexpb::ErrorCause::CircuitBreakerOpen
+            | cortexpb::ErrorCause::RequestRateLimited => tonic::Code::Unavailable,
             cortexpb::ErrorCause::MethodNotAllowed => tonic::Code::Unimplemented,
-            cortexpb::ErrorCause::CircuitBreakerOpen => tonic::Code::Unavailable,
             _ => tonic::Code::Internal,
         };
         match self.error_details() {
@@ -1006,5 +1018,23 @@ mod tests {
         assert_eq!(s5.code(), tonic::Code::ResourceExhausted);
         let d5 = grpcutilpb::extract_cortex_error_details(&s5).unwrap();
         assert_eq!(d5.cause, cortexpb::ErrorCause::TooBusy as i32);
+
+        let e6 = IngesterError::ReactiveLimiterExceeded {
+            message: "limit exceeded".to_string(),
+        };
+        assert_eq!(e6.map_push_error_to_status().code(), tonic::Code::Unavailable);
+        assert_eq!(e6.map_read_error_to_status().code(), tonic::Code::Unavailable);
+
+        let e7 = IngesterError::tsdb_early_compaction(1_700_000_000_000, 1_700_000_060_000)
+            .with_user("t1", 0);
+        let s7 = e7.to_string();
+        assert!(
+            s7.starts_with("user=t1: request_min_timestamp: "),
+            "unexpected order: {s7}"
+        );
+        assert!(
+            s7.ends_with(": TSDB Head early compaction in progress and the write request contains samples overlapping with it"),
+            "unexpected suffix: {s7}"
+        );
     }
 }

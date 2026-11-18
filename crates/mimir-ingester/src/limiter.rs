@@ -275,6 +275,18 @@ impl Limiter {
         self.convert_global_to_local_or_unlimited(user_id, global, 0)
     }
 
+    pub fn max_global_metadata_per_metric(&self, user_id: &str) -> i64 {
+        self.overrides
+            .for_tenant(user_id)
+            .max_global_metadata_per_metric
+    }
+
+    pub fn max_global_metrics_with_metadata_per_user(&self, user_id: &str) -> i64 {
+        self.overrides
+            .for_tenant(user_id)
+            .max_global_metadata_per_user
+    }
+
     pub fn max_exemplars_per_user(&self, user_id: &str) -> usize {
         let global = self
             .overrides

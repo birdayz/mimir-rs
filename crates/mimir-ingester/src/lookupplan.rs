@@ -20,12 +20,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use mimir_common::native_histogram::{
+    HistogramOpts as NativeHistogramOpts, HistogramVec as NativeHistogramVec,
+};
 use mimir_tsdb::index::IndexReader;
 use mimir_tsdb::matcher::{LabelMatcher, MatchType};
 use parking_lot::RwLock;
-use prometheus::{HistogramOpts, HistogramVec, Registry};
+use prometheus::Registry;
 use ulid::Ulid;
 
 // ---------------------------------------------------------------------------
@@ -91,49 +94,55 @@ impl CostConfig {
 // Metrics (`lookupplan/metrics.go`)
 // ---------------------------------------------------------------------------
 
+const RATIO_HISTOGRAM_BUCKET_FACTOR: f64 = 1.19;
+
 #[derive(Clone)]
 pub struct Metrics {
-    pub planning_duration: HistogramVec,
-    pub filtered_ratio: HistogramVec,
-    pub intersection_size_ratio: HistogramVec,
-    pub final_cardinality_ratio: HistogramVec,
+    pub planning_duration: NativeHistogramVec,
+    pub filtered_ratio: NativeHistogramVec,
+    pub intersection_size_ratio: NativeHistogramVec,
+    pub final_cardinality_ratio: NativeHistogramVec,
     user_id: Option<String>,
 }
 
 impl Metrics {
     pub fn new(reg: Option<&Registry>) -> Self {
-        let planning_duration = HistogramVec::new(
-            HistogramOpts::new(
+        let planning_duration = NativeHistogramVec::new(
+            NativeHistogramOpts::new(
                 "cortex_tsdb_index_lookup_planning_duration_seconds",
                 "Time spent planning query requests.",
-            ),
+            )
+            .native(1.1, 100, Duration::from_secs(3600)),
             &["outcome", "user"],
         )
         .expect("valid planning_duration histogram");
 
-        let filtered_ratio = HistogramVec::new(
-            HistogramOpts::new(
+        let filtered_ratio = NativeHistogramVec::new(
+            NativeHistogramOpts::new(
                 "cortex_tsdb_index_lookup_planning_filtered_ratio",
                 "Ratio of series retrieved from the index which were also matching the vector selectors from the query. This should always be 1.0 when index_lookup_planning_enabled: true.",
-            ),
+            )
+            .native(RATIO_HISTOGRAM_BUCKET_FACTOR, 0, Duration::ZERO),
             &["user"],
         )
         .expect("valid filtered_ratio histogram");
 
-        let intersection_size_ratio = HistogramVec::new(
-            HistogramOpts::new(
+        let intersection_size_ratio = NativeHistogramVec::new(
+            NativeHistogramOpts::new(
                 "cortex_tsdb_index_lookup_planning_index_selection_accuracy_ratio",
                 "Ratio between estimated number of series selected from the index and the actual number of series selected from the index.",
-            ),
+            )
+            .native(RATIO_HISTOGRAM_BUCKET_FACTOR, 0, Duration::ZERO),
             &["user"],
         )
         .expect("valid intersection_size_ratio histogram");
 
-        let final_cardinality_ratio = HistogramVec::new(
-            HistogramOpts::new(
+        let final_cardinality_ratio = NativeHistogramVec::new(
+            NativeHistogramOpts::new(
                 "cortex_tsdb_index_lookup_planning_block_cardinality_accuracy_ratio",
                 "Ratio between estimated final number of series after all filtering and the actual final number of series after all filtering.",
-            ),
+            )
+            .native(RATIO_HISTOGRAM_BUCKET_FACTOR, 0, Duration::ZERO),
             &["user"],
         )
         .expect("valid final_cardinality_ratio histogram");

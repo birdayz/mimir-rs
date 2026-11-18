@@ -806,6 +806,7 @@ impl IngesterMetrics {
             .attributed_active_series_failures_per_user
             .remove_label_values(&[user_id]);
         self.delete_per_user_custom_tracker_metrics(user_id, custom_tracker_names);
+        self.delete_user_label_value_bytes_metrics(user_id, &[]);
     }
 
     pub fn record_label_value_bytes_over_threshold(&self, user_id: &str, label_name: &str) {

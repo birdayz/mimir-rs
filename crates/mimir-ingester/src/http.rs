@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, Request, State as AxumState};
+use axum::extract::{Request, State as AxumState};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -39,7 +39,7 @@ use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 use mimir_common::services::State;
 use mimir_common::shutdownmarker;
 use mimir_common::tenant::{parse_single_tenant_id, parse_tenant_ids, ORG_ID_HEADER_NAME};
-use mimir_config::{parse_go_duration, GoDuration};
+use mimir_config::{parse_model_duration, GoDuration};
 use mimir_proto::ringpb::PartitionState;
 use mimir_ring::partition_ring::http::{partition_ring_router, partition_ring_router_at};
 use mimir_ring::partition_ring::{PartitionRingEditor, PartitionRingError, PartitionRingReader};
@@ -185,6 +185,14 @@ fn compartments_index_page_html(
 /// `r.Form["tenant"]` (an empty `tenant=` allows only the empty tenant, an absent one allows all)
 /// and the flush is synchronous only when the first `wait` value is `"true"`.
 async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Response {
+    let _act = st.ingester.insert_activity(|| {
+        crate::activity::request_activity(
+            "",
+            "",
+            "Ingester/FlushHandler",
+            crate::activity::ActivityRequest::None,
+        )
+    });
     let ing_state = st.ingester.state();
     if ing_state != State::Running && ing_state != State::Starting {
         return (
@@ -194,12 +202,17 @@ async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Res
             .into_response();
     }
 
-    let Some(fc_tx) = st.ingester.force_compact_tx.read().clone() else {
-        return (
+    if st.ingester.compaction_service_state() != State::Running {
+        return go_http_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "compaction service is not running",
-        )
-            .into_response();
+        );
+    }
+    let Some(fc_tx) = st.ingester.force_compact_tx.read().clone() else {
+        return go_http_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "compaction service is not running",
+        );
     };
     let form = parse_go_form(req).await;
     if let Some(err) = form.error() {
@@ -259,6 +272,14 @@ async fn prepare_shutdown_handler(
     AxumState(st): AxumState<HttpState>,
     method: Method,
 ) -> Response {
+    let _act = st.ingester.insert_activity(|| {
+        crate::activity::request_activity(
+            "",
+            "",
+            "Ingester/PrepareShutdownHandler",
+            crate::activity::ActivityRequest::None,
+        )
+    });
     if st.ingester.state() != State::Running {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -300,6 +321,14 @@ async fn prepare_unregister_handler(
     method: Method,
     body: Bytes,
 ) -> Response {
+    let _act = st.ingester.insert_activity(|| {
+        crate::activity::request_activity(
+            "",
+            "",
+            "Ingester/PrepareUnregisterHandler",
+            crate::activity::ActivityRequest::None,
+        )
+    });
     if st.ingester.state() != State::Running {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -339,6 +368,14 @@ async fn prepare_partition_downscale_handler(
     AxumState(st): AxumState<HttpState>,
     method: Method,
 ) -> Response {
+    let _act = st.ingester.insert_activity(|| {
+        crate::activity::request_activity(
+            "",
+            "",
+            "Ingester/PreparePartitionDownscaleHandler",
+            crate::activity::ActivityRequest::None,
+        )
+    });
     if st.ingester.state() != State::Running {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -367,7 +404,7 @@ async fn prepare_partition_downscale_handler(
                 } else {
                     StatusCode::INTERNAL_SERVER_ERROR
                 };
-                return (status, e.to_string()).into_response();
+                return go_http_error(status, &e.to_string());
             }
         }
         Method::DELETE => {
@@ -385,7 +422,7 @@ async fn prepare_partition_downscale_handler(
                     } else {
                         StatusCode::INTERNAL_SERVER_ERROR
                     };
-                    return (status, e.to_string()).into_response();
+                    return go_http_error(status, &e.to_string());
                 }
             }
         }
@@ -409,6 +446,14 @@ async fn prepare_instance_ring_downscale_handler(
     AxumState(st): AxumState<HttpState>,
     method: Method,
 ) -> Response {
+    let _act = st.ingester.insert_activity(|| {
+        crate::activity::request_activity(
+            "",
+            "",
+            "Ingester/PrepareInstanceRingDownscaleHandler",
+            crate::activity::ActivityRequest::None,
+        )
+    });
     if st.ingester.state() != State::Running {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -422,7 +467,7 @@ async fn prepare_instance_ring_downscale_handler(
     match method {
         Method::POST => {
             if let Err(e) = lc.change_read_only_state(true).await {
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                return go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
             }
             if let Some(ref pcb) = st.ingester.circuit_breaker.push {
                 pcb.deactivate();
@@ -437,14 +482,13 @@ async fn prepare_instance_ring_downscale_handler(
                     .load(Ordering::Acquire)
                     != 0
             {
-                return (
+                return go_http_error(
                     StatusCode::CONFLICT,
                     "cannot clear read-only mode while compaction is pending or in progress",
-                )
-                    .into_response();
+                );
             }
             if let Err(e) = lc.change_read_only_state(false).await {
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                return go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
             }
             if let Some(ref pcb) = st.ingester.circuit_breaker.push {
                 pcb.activate();
@@ -465,14 +509,33 @@ async fn prepare_instance_ring_downscale_handler(
 }
 
 async fn shutdown_handler(AxumState(st): AxumState<HttpState>) -> Response {
-    st.ingester
+    let _act = st.ingester.insert_activity(|| {
+        crate::activity::request_activity(
+            "",
+            "",
+            "Ingester/ShutdownHandler",
+            crate::activity::ActivityRequest::None,
+        )
+    });
+    let orig_ing_flush = st
+        .ingester
         .flush_on_shutdown
-        .store(true, Ordering::Release);
-    if let Some(ref lc) = st.ingester.lifecycler {
+        .swap(true, Ordering::AcqRel);
+    let orig_lc = st.ingester.lifecycler.as_ref().map(|lc| {
+        let orig_flush = lc.flush_on_shutdown();
+        let orig_unreg = lc.should_unregister_on_shutdown();
         lc.set_flush_on_shutdown(true);
         lc.set_unregister_on_shutdown(true);
-    }
+        (orig_flush, orig_unreg)
+    });
     let _ = st.ingester.stop().await;
+    st.ingester
+        .flush_on_shutdown
+        .store(orig_ing_flush, Ordering::Release);
+    if let (Some(ref lc), Some((orig_flush, orig_unreg))) = (&st.ingester.lifecycler, orig_lc) {
+        lc.set_flush_on_shutdown(orig_flush);
+        lc.set_unregister_on_shutdown(orig_unreg);
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -514,6 +577,14 @@ async fn user_registry_handler(
         Ok(id) => id,
         Err((status, msg)) => return go_http_error(status, &msg),
     };
+    let _act = st.ingester.insert_activity(|| {
+        crate::activity::request_activity(
+            &user_id,
+            "",
+            "Ingester/UserRegistryHandler",
+            crate::activity::ActivityRequest::None,
+        )
+    });
     let Some(reg) = st.ingester.tsdb_metrics.registry_for_tenant(&user_id) else {
         return go_http_error(StatusCode::NOT_FOUND, "user registry not found");
     };
@@ -636,6 +707,14 @@ async fn tenants_handler(
     AxumState(st): AxumState<HttpState>,
     headers: HeaderMap,
 ) -> Response {
+    let _act = st.ingester.insert_activity(|| {
+        crate::activity::request_activity(
+            "",
+            "",
+            "Ingester/TenantsHandler",
+            crate::activity::ActivityRequest::None,
+        )
+    });
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
@@ -823,6 +902,14 @@ async fn tenant_tsdb_handler(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
+    let _act = st.ingester.insert_activity(|| {
+        crate::activity::request_activity(
+            "",
+            "",
+            "Ingester/TenantTSDBHandler",
+            crate::activity::ActivityRequest::None,
+        )
+    });
     let tenant = uri
         .path()
         .strip_prefix("/ingester/tsdb/")
@@ -949,25 +1036,77 @@ async fn tenant_tsdb_handler(
     Html(out).into_response()
 }
 
-#[derive(Deserialize)]
-struct LabelChurnQuery {
-    lookback: Option<String>,
-    limit: Option<i64>,
+fn percent_decode_form(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |b: u8| match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                };
+                if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn query_first_value(query: &str, target: &str) -> Option<String> {
+    for part in query.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+        let (raw_k, raw_v) = match part.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (part, ""),
+        };
+        if percent_decode_form(raw_k) == target {
+            return Some(percent_decode_form(raw_v));
+        }
+    }
+    None
 }
 
 async fn label_churn_handler(
     AxumState(st): AxumState<HttpState>,
-    Path(tenant): Path<String>,
-    Query(q): Query<LabelChurnQuery>,
+    uri: Uri,
 ) -> Response {
+    let _act = st.ingester.insert_activity(|| {
+        crate::activity::request_activity(
+            "",
+            "",
+            "Ingester/LabelChurnHandler",
+            crate::activity::ActivityRequest::None,
+        )
+    });
     if !st.ingester.cfg.label_churn_enabled {
         return go_http_error(
             StatusCode::NOT_FOUND,
             "label churn detection is disabled, enable it with -ingester.label-churn-enabled",
         );
     }
-    let lookback = if let Some(ref lb) = q.lookback {
-        match parse_go_duration(lb) {
+    let query_str = uri.query().unwrap_or_default();
+    let lookback = match query_first_value(query_str, "lookback") {
+        Some(ref lb) if !lb.is_empty() => match parse_model_duration(lb) {
             Ok(d_ns) if d_ns > 0 => Duration::from_nanos(d_ns as u64),
             _ => {
                 return go_http_error(
@@ -975,23 +1114,28 @@ async fn label_churn_handler(
                     "the lookback parameter must be a positive duration",
                 );
             }
-        }
-    } else {
-        DEFAULT_LABEL_CHURN_LOOKBACK
+        },
+        _ => DEFAULT_LABEL_CHURN_LOOKBACK,
     };
 
-    let limit = if let Some(l) = q.limit {
-        if l < 0 {
-            return go_http_error(
-                StatusCode::BAD_REQUEST,
-                "the limit parameter must be a non-negative integer",
-            );
-        }
-        l as usize
-    } else {
-        DEFAULT_LABEL_CHURN_LIMIT
+    let limit = match query_first_value(query_str, "limit") {
+        Some(ref lim_str) if !lim_str.is_empty() => match lim_str.parse::<i64>() {
+            Ok(l) if l >= 0 => l as usize,
+            _ => {
+                return go_http_error(
+                    StatusCode::BAD_REQUEST,
+                    "the limit parameter must be a non-negative integer",
+                );
+            }
+        },
+        _ => DEFAULT_LABEL_CHURN_LIMIT,
     };
 
+    let tenant = uri
+        .path()
+        .strip_prefix("/ingester/label_churn/")
+        .unwrap_or_default()
+        .to_string();
     let Some(db) = st.ingester.get_tsdb(&tenant) else {
         return go_http_error(
             StatusCode::NOT_FOUND,

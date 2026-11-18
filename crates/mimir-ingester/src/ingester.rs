@@ -12,6 +12,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use mimir_common::activitytracker::ActivityTracker;
 use mimir_common::limiter::InflightLimiter;
 use mimir_common::services::{
     describe_service, FnListener, ManagedBasicService, Service, ServiceContext, State,
@@ -191,6 +192,7 @@ pub struct Ingester {
 
     compaction_service_state: AtomicU8,
     owned_series_service_state: AtomicU8,
+    owned_series_initial_ring_check_succeeded: AtomicBool,
     owned_series_paused: AtomicBool,
     metrics_updater_service_state: AtomicU8,
     metadata_purger_service_state: AtomicU8,
@@ -212,6 +214,18 @@ pub struct Ingester {
     no_auth_tenant: RwLock<String>,
     cost_attribution_mgr: RwLock<Option<Arc<crate::costattribution::Manager>>>,
     active_groups: RwLock<Option<Arc<crate::active_groups::ActiveGroupsCleanupService>>>,
+    activity_tracker: RwLock<Option<Arc<ActivityTracker>>>,
+}
+
+pub(crate) struct ActivityGuard {
+    tracker: Arc<ActivityTracker>,
+    idx: isize,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        self.tracker.delete(self.idx);
+    }
 }
 
 impl Ingester {
@@ -496,6 +510,7 @@ impl Ingester {
             usage_stats: Mutex::new(UsageStatsSnapshot::default()),
             compaction_service_state: AtomicU8::new(State::New as u8),
             owned_series_service_state: AtomicU8::new(State::New as u8),
+            owned_series_initial_ring_check_succeeded: AtomicBool::new(false),
             owned_series_paused: AtomicBool::new(false),
             metrics_updater_service_state: AtomicU8::new(State::New as u8),
             metadata_purger_service_state: AtomicU8::new(State::New as u8),
@@ -516,6 +531,7 @@ impl Ingester {
             no_auth_tenant: RwLock::new("fake".to_string()),
             cost_attribution_mgr: RwLock::new(None),
             active_groups: RwLock::new(None),
+            activity_tracker: RwLock::new(None),
         });
 
         *weak_slot.lock() = Some(Arc::downgrade(&ingester));
@@ -680,6 +696,27 @@ impl Ingester {
 
     pub fn is_owned_series_paused(&self) -> bool {
         self.owned_series_paused.load(Ordering::Acquire)
+    }
+
+    pub fn owned_series_initial_ring_check_succeeded(&self) -> bool {
+        self.owned_series_initial_ring_check_succeeded
+            .load(Ordering::Acquire)
+    }
+
+    /// Attaches an [`ActivityTracker`] for recording active gRPC read RPCs and HTTP admin handlers
+    /// (`ingester.NewIngesterActivityTracker`).
+    pub fn set_activity_tracker(&self, tracker: Option<Arc<ActivityTracker>>) {
+        *self.activity_tracker.write() = tracker;
+    }
+
+    pub fn activity_tracker(&self) -> Option<Arc<ActivityTracker>> {
+        self.activity_tracker.read().clone()
+    }
+
+    pub(crate) fn insert_activity(&self, f: impl FnOnce() -> String) -> Option<ActivityGuard> {
+        let tracker = self.activity_tracker.read().clone()?;
+        let idx = tracker.insert(f);
+        Some(ActivityGuard { tracker, idx })
     }
 
     pub fn set_metrics_updater_service_state(&self, s: State) {
@@ -1215,12 +1252,53 @@ impl Ingester {
 
     /// Flushes WAL & WBL segments for all open tenant TSDBs (`NotifyPreCommit`).
     pub fn notify_pre_commit(&self) -> Result<(), IngesterError> {
-        for user_id in self.get_tsdb_users() {
-            if let Some(db) = self.get_tsdb(&user_id) {
-                db.db.head().sync().map_err(|e| IngesterError::Internal {
-                    message: format!("failed to sync TSDB WAL for user {user_id}: {e}"),
-                })?;
+        let users = self.get_tsdb_users();
+        if users.is_empty() {
+            return Ok(());
+        }
+        let concurrency = self
+            .ingest_cfg
+            .write_logs_fsync_before_kafka_commit_concurrency
+            .max(1) as usize;
+        if concurrency <= 1 || users.len() == 1 {
+            for user_id in users {
+                if let Some(db) = self.get_tsdb(&user_id) {
+                    db.db.head().sync().map_err(|e| IngesterError::Internal {
+                        message: format!("failed to sync TSDB WAL for user {user_id}: {e}"),
+                    })?;
+                }
             }
+            return Ok(());
+        }
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let first_err: Mutex<Option<IngesterError>> = Mutex::new(None);
+        let workers = concurrency.min(users.len());
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    if first_err.lock().is_some() {
+                        break;
+                    }
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    let Some(user_id) = users.get(idx) else {
+                        break;
+                    };
+                    if let Some(db) = self.get_tsdb(user_id) {
+                        if let Err(e) = db.db.head().sync() {
+                            let mut g = first_err.lock();
+                            if g.is_none() {
+                                *g = Some(IngesterError::Internal {
+                                    message: format!("failed to sync TSDB WAL for user {user_id}: {e}"),
+                                });
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(err) = first_err.into_inner() {
+            return Err(err);
         }
         Ok(())
     }
@@ -1385,9 +1463,17 @@ impl Ingester {
         })?;
 
         let marker_path = shutdownmarker::get_path(&tsdb_dir);
-        if shutdownmarker::exists(&marker_path).unwrap_or(false) {
-            info!(path = %marker_path.display(), "detected existing shutdown marker");
-            self.set_prepare_shutdown();
+        match shutdownmarker::exists(&marker_path) {
+            Ok(true) => {
+                info!(path = %marker_path.display(), "detected existing shutdown marker");
+                self.set_prepare_shutdown();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(IngesterError::Internal {
+                    message: format!("failed to check ingester shutdown marker: {e}"),
+                });
+            }
         }
 
         self.open_existing_tsdbs().await?;
@@ -1395,11 +1481,29 @@ impl Ingester {
         // Start owned series loop before partition replay and lifecycler.
         if self.owned_series_strategy.is_some() {
             if let Some(ref strategy) = self.owned_series_strategy {
-                if let Ok(changed) = strategy.check_ring_for_changes() {
-                    for user_id in self.get_tsdb_users() {
-                        if let Some(db) = self.get_tsdb(&user_id) {
-                            db.update_owned_series_if_needed(strategy.as_ref(), changed);
+                match strategy.check_ring_for_changes() {
+                    Ok(changed) => {
+                        self.owned_series_initial_ring_check_succeeded
+                            .store(true, Ordering::Release);
+                        let start = Instant::now();
+                        for user_id in self.get_tsdb_users() {
+                            if let Some(db) = self.get_tsdb(&user_id) {
+                                db.update_owned_series_if_needed(strategy.as_ref(), changed);
+                            }
                         }
+                        self.owned_series_metrics
+                            .check_duration
+                            .observe(start.elapsed().as_secs_f64());
+                    }
+                    Err(e) if e.contains("empty") => {
+                        warn!("skipped initial owned series computation, ring is empty");
+                        self.owned_series_initial_ring_check_succeeded
+                            .store(false, Ordering::Release);
+                    }
+                    Err(e) => {
+                        return Err(IngesterError::Internal {
+                            message: format!("can't read ring: {e}"),
+                        });
                     }
                 }
             }
