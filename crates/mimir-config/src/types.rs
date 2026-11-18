@@ -347,10 +347,10 @@ impl OTelTranslationStrategy {
     pub fn parse(s: &str) -> Result<Self, ConfigError> {
         match s {
             ""
-            | "underscore_escaping_with_suffixes"
-            | "underscore_escaping_without_suffixes"
-            | "no_utf8_escaping_with_suffixes"
-            | "no_translation" => Ok(Self(s.to_string())),
+            | "UnderscoreEscapingWithSuffixes"
+            | "UnderscoreEscapingWithoutSuffixes"
+            | "NoUTF8EscapingWithSuffixes"
+            | "NoTranslation" => Ok(Self(s.to_string())),
             _ => Err(ConfigError::Flag(format!(
                 "unrecognized OTel translation strategy {s:?}"
             ))),
@@ -381,13 +381,26 @@ pub enum NameValidationScheme {
 }
 
 impl NameValidationScheme {
+    /// Parses `ValidationScheme` for YAML/JSON deserialization: `""` yields `Unset`, `"unset"` is rejected.
     pub fn parse(s: &str) -> Result<Self, ConfigError> {
         match s {
-            "" | "unset" => Ok(Self::Unset),
+            "" => Ok(Self::Unset),
             "legacy" => Ok(Self::Legacy),
             "utf8" => Ok(Self::Utf8),
             _ => Err(ConfigError::Flag(format!(
-                "unrecognized name validation scheme: {s}"
+                "unrecognized ValidationScheme: {s:?}"
+            ))),
+        }
+    }
+
+    /// Go `ValidationScheme.Set`: `""` is a no-op (keeps `current`); `"unset"` is rejected.
+    pub fn parse_cli(s: &str, current: Self) -> Result<Self, ConfigError> {
+        match s {
+            "" => Ok(current),
+            "legacy" => Ok(Self::Legacy),
+            "utf8" => Ok(Self::Utf8),
+            _ => Err(ConfigError::Flag(format!(
+                "unrecognized ValidationScheme: {s:?}"
             ))),
         }
     }
@@ -410,7 +423,7 @@ impl fmt::Display for NameValidationScheme {
 impl Serialize for NameValidationScheme {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            Self::Unset => serializer.serialize_i32(0),
+            Self::Unset => serializer.serialize_str(""),
             Self::Legacy => serializer.serialize_str("legacy"),
             Self::Utf8 => serializer.serialize_str("utf8"),
         }
@@ -427,17 +440,6 @@ impl<'de> Deserialize<'de> for NameValidationScheme {
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
                 NameValidationScheme::parse(v).map_err(E::custom)
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                match v {
-                    0 => Ok(NameValidationScheme::Unset),
-                    1 => Ok(NameValidationScheme::Legacy),
-                    2 => Ok(NameValidationScheme::Utf8),
-                    _ => Err(E::custom(format!("unrecognized name validation scheme: {v}"))),
-                }
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-                self.visit_i64(v as i64)
             }
             fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
                 Ok(NameValidationScheme::Unset)
@@ -545,6 +547,146 @@ impl<'de> Deserialize<'de> for S3BucketLookupType {
         let s = String::deserialize(deserializer)?;
         Self::parse(&s).map_err(de::Error::custom)
     }
+}
+
+/// `flagext.CIDRSliceCSV`: comma-separated list of network CIDRs (parsed like Go `net.ParseCIDR`,
+/// canonicalized to masked network addresses, and appended on repeated CLI invocations).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CIDRSliceCSV(pub Vec<String>);
+
+impl CIDRSliceCSV {
+    pub fn parse_cidr(part: &str) -> Result<String, ConfigError> {
+        let Some((ip_str, prefix_str)) = part.split_once('/') else {
+            return Err(ConfigError::Flag(format!(
+                "cidr: {part}: invalid CIDR address: {part}"
+            )));
+        };
+        let ip: std::net::IpAddr = ip_str.parse().map_err(|_| {
+            ConfigError::Flag(format!("cidr: {part}: invalid CIDR address: {part}"))
+        })?;
+        if prefix_str.is_empty() || !prefix_str.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ConfigError::Flag(format!(
+                "cidr: {part}: invalid CIDR address: {part}"
+            )));
+        }
+        let prefix: u32 = prefix_str.parse().map_err(|_| {
+            ConfigError::Flag(format!("cidr: {part}: invalid CIDR address: {part}"))
+        })?;
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if prefix > 32 {
+                    return Err(ConfigError::Flag(format!(
+                        "cidr: {part}: invalid CIDR address: {part}"
+                    )));
+                }
+                let mask = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+                let masked = std::net::Ipv4Addr::from(u32::from(v4) & mask);
+                Ok(format!("{masked}/{prefix}"))
+            }
+            std::net::IpAddr::V6(v6) => {
+                if prefix > 128 {
+                    return Err(ConfigError::Flag(format!(
+                        "cidr: {part}: invalid CIDR address: {part}"
+                    )));
+                }
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    !0u128 << (128 - prefix)
+                };
+                let masked = std::net::Ipv6Addr::from(u128::from(v6) & mask);
+                Ok(format!("{masked}/{prefix}"))
+            }
+        }
+    }
+
+    /// CLI `CIDRSliceCSV.Set`: splits on comma, validates each CIDR, and appends.
+    pub fn set(&mut self, s: &str) -> Result<(), ConfigError> {
+        for part in s.split(',') {
+            self.0.push(Self::parse_cidr(part)?);
+        }
+        Ok(())
+    }
+
+    /// YAML `CIDRSliceCSV.UnmarshalYAML`: empty string clears, otherwise splits and validates.
+    pub fn set_yaml(&mut self, s: &str) -> Result<(), ConfigError> {
+        self.0.clear();
+        if s.is_empty() {
+            return Ok(());
+        }
+        self.set(s)
+    }
+}
+
+impl Deref for CIDRSliceCSV {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for CIDRSliceCSV {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl fmt::Display for CIDRSliceCSV {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.join(","))
+    }
+}
+
+impl Serialize for CIDRSliceCSV {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for CIDRSliceCSV {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CidrVisitor;
+        impl<'de> Visitor<'de> for CidrVisitor {
+            type Value = CIDRSliceCSV;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a comma-separated list of CIDRs")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                let mut out = CIDRSliceCSV::default();
+                out.set_yaml(v).map_err(E::custom)?;
+                Ok(out)
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(CIDRSliceCSV::default())
+            }
+        }
+        deserializer.deserialize_any(CidrVisitor)
+    }
+}
+
+/// Validates a YAML/Go `time.Time` timestamp string (RFC3339 / RFC3339Nano / ISO date / space-separated datetime).
+pub fn parse_go_yaml_timestamp(s: &str) -> Result<(), ConfigError> {
+    if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+        return Ok(());
+    }
+    if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok() {
+        return Ok(());
+    }
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f %z",
+        "%Y-%m-%d %H:%M:%S%.fZ",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+    ] {
+        if chrono::NaiveDateTime::parse_from_str(s, fmt).is_ok()
+            || chrono::DateTime::parse_from_str(s, fmt).is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err(ConfigError::Validation(format!(
+        "cannot parse {s:?} as time.Time"
+    )))
 }
 
 /// `flagext.LimitsMap[T]`: YAML map or JSON object on CLI.

@@ -458,18 +458,16 @@ impl MimirConfig {
         };
 
         // Go decodes with yaml.v3 `KnownFields(true)`: reject exactly what it rejects, with its
-        // error texts (all decode errors, in document order), before building values with serde.
-        crate::yaml_v3::check_config_document(bytes_to_parse).map_err(ConfigError::Yaml)?;
-
-        let mut root: Value = serde_yaml::from_slice(bytes_to_parse)
-            .map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        // error texts (all decode errors, in document order), and convert scalars according to
+        // Go yaml.v3 rules (e.g. int/bool -> string, float -> int, YAML 1.1 bools -> bool).
+        let Some(doc) = crate::yaml_v3::check_config_document(bytes_to_parse).map_err(ConfigError::Yaml)? else {
+            return Ok(hash_hex);
+        };
+        let mut root: Value = crate::yaml_v3::doc_to_serde_value(&doc).map_err(ConfigError::Yaml)?;
 
         if root.is_null() {
             return Ok(hash_hex);
         }
-
-        root.apply_merge()
-            .map_err(|e| ConfigError::Yaml(e.to_string()))?;
 
         let root_map = root.as_mapping_mut().ok_or_else(|| {
             ConfigError::Yaml("expected YAML mapping at document root".to_string())
@@ -554,8 +552,12 @@ impl MimirConfig {
         .map_err(|e| ConfigError::Yaml(e.to_string()))?;
         merge_yaml_onto(&mut merged_core, core_val);
 
-        let core: CoreMimirConfig = serde_yaml::from_value(merged_core)
+        let prev_name_validation_scheme = self.limits.name_validation_scheme;
+        let mut core: CoreMimirConfig = serde_yaml::from_value(merged_core)
             .map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        if core.limits.name_validation_scheme == crate::types::NameValidationScheme::Unset {
+            core.limits.name_validation_scheme = prev_name_validation_scheme;
+        }
         // Go fails in CustomTrackersConfig.UnmarshalYAML (i.e. while parsing the file).
         crate::limits::validate_custom_trackers_yaml(&core.limits)?;
 
@@ -647,9 +649,9 @@ impl MimirConfig {
                 if fs.is_set(&dest) {
                     continue;
                 }
-                if fs.get_value(target, &dest).as_deref() == Some(origin_val.as_str()) {
-                    continue;
-                }
+                // Note: do NOT skip when `fs.get_value(target, &dest) == Some(origin_val)` for
+                // extra_sections, because `fs.get_value` only reads CLI flags/defaults and would
+                // fail to override a non-default YAML value in `extra_sections`.
                 fs.set_value(target, &dest, &origin_val).map_err(|e| {
                     ConfigError::CommonInheritance(format!(
                         "can't inherit common flags for {dest_prefix:?}: {e}"
@@ -663,9 +665,6 @@ impl MimirConfig {
             if let Some(origin_val) = fs.get_value(target, ccv_origin) {
                 for dest in COMMON_CLIENT_CLUSTER_VALIDATION_FLAGS {
                     if fs.is_set(dest) {
-                        continue;
-                    }
-                    if fs.get_value(target, dest).as_deref() == Some(origin_val.as_str()) {
                         continue;
                     }
                     fs.set_value(target, dest, &origin_val).map_err(|e| {
@@ -702,10 +701,95 @@ impl MimirConfig {
         Ok(())
     }
 
+    /// Effective `distributor.instance_limits` from YAML `extra_sections` + CLI overrides
+    /// (`pkg/mimir/runtime_config.go`: `SetDefaultInstanceLimitsForYAMLUnmarshalling`).
+    pub fn distributor_instance_limits(
+        &self,
+    ) -> Result<crate::runtime_config::DistributorInstanceLimits, ConfigError> {
+        let mut lim = match self
+            .extra_sections
+            .get("distributor")
+            .and_then(|d| d.get("instance_limits"))
+        {
+            Some(val) if !val.is_null() => serde_yaml::from_value(val.clone()).map_err(|e| {
+                ConfigError::Validation(format!("invalid distributor.instance_limits: {e}"))
+            })?,
+            _ => crate::runtime_config::DistributorInstanceLimits::default(),
+        };
+        if let Some(v) = self.extra_cli_flag_value("distributor.instance-limits.max-ingestion-rate") {
+            lim.max_ingestion_rate = crate::flags::go_parse_float(v)?;
+        }
+        if let Some(v) = self.extra_cli_flag_value("distributor.instance-limits.max-inflight-push-requests") {
+            lim.max_inflight_push_requests = crate::flags::go_parse_int(v)?;
+        }
+        if let Some(v) = self.extra_cli_flag_value("distributor.instance-limits.max-inflight-push-requests-bytes") {
+            lim.max_inflight_push_requests_bytes = crate::flags::go_parse_int(v)?;
+        }
+        Ok(lim)
+    }
+
+    /// Effective `querier.query_store_after` from CLI or YAML (default 12h).
+    pub fn querier_query_store_after(&self) -> GoDuration {
+        if let Some(v) = self.extra_cli_flag_value("querier.query-store-after") {
+            if let Ok(d) = v.parse::<GoDuration>() {
+                return d;
+            }
+        }
+        if let Some(v) = self
+            .extra_sections
+            .get("querier")
+            .and_then(|q| q.get("query_store_after"))
+            .and_then(Value::as_str)
+        {
+            if let Ok(d) = v.parse::<GoDuration>() {
+                return d;
+            }
+        }
+        GoDuration::from_hours(12)
+    }
+
+    /// Effective `(tenant_federation.enabled, tenant_federation.max_tenants)` from CLI or YAML.
+    pub fn tenant_federation_config(&self) -> (bool, i64) {
+        let enabled = if let Some(v) = self.extra_cli_flag_value("tenant-federation.enabled") {
+            crate::types::parse_go_bool(v).unwrap_or(false)
+        } else {
+            self.extra_sections
+                .get("tenant_federation")
+                .and_then(|tf| tf.get("enabled"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let max_tenants = if let Some(v) = self.extra_cli_flag_value("tenant-federation.max-tenants") {
+            crate::flags::go_parse_int(v).unwrap_or(0)
+        } else {
+            self.extra_sections
+                .get("tenant_federation")
+                .and_then(|tf| tf.get("max_tenants"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+        };
+        (enabled, max_tenants)
+    }
+
+    /// Validates `limits` against cross-component rules (`pkg/mimir/mimir.go:Config.ValidateLimits`).
+    pub fn validate_limits(&self, limits: &LimitsConfig) -> Result<(), ConfigError> {
+        let query_store_after = self.querier_query_store_after();
+        if limits.query_ingesters_within.0 != 0
+            && query_store_after.0 != 0
+            && query_store_after.0 >= limits.query_ingesters_within.0
+        {
+            return Err(ConfigError::Validation(
+                "invalid limits config for querier: the -validation.query-ingesters-within setting must be greater than -querier.query-store-after otherwise queries might return partial results".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validates the full configuration, matching `pkg/mimir/mimir.go:Config.Validate`.
     pub fn validate(&mut self) -> Result<(), ConfigError> {
 
         self.server.validate()?;
+        self.validate_bucket_configs()?;
         self.validate_filesystem_paths()?;
         self.ingest_storage
             .validate()
@@ -813,6 +897,7 @@ impl MimirConfig {
         }
 
         self.limits.validate()?;
+        self.validate_limits(&self.limits)?;
 
         // Go fetches keys and certificates from Vault in the `vault` module (initVault) of every
         // target; mimir-rs has no Vault client, so refuse to start instead of silently using the
@@ -854,6 +939,102 @@ impl MimirConfig {
             .and_then(|api| api.get("response_compression_level"))
             .and_then(Value::as_i64)
             .unwrap_or(-1))
+    }
+
+    fn extra_storage_str(
+        &self,
+        section_path: &[&str],
+        field_path: &[&str],
+        flag_name: &str,
+        default_val: &str,
+    ) -> String {
+        if let Some(v) = self.extra_cli_flag_value(flag_name) {
+            return v.to_string();
+        }
+        let mut cur = section_path
+            .first()
+            .and_then(|top| self.extra_sections.get(*top));
+        for seg in section_path.iter().skip(1).chain(field_path.iter()) {
+            cur = cur.and_then(|v| v.get(*seg));
+        }
+        cur.and_then(Value::as_str)
+            .unwrap_or(default_val)
+            .to_string()
+    }
+
+    /// Validates that ruler / alertmanager / usage-tracker do not reuse the blocks_storage
+    /// bucket + storage_prefix (`pkg/mimir/mimir.go:validateBucketConfigs`).
+    fn validate_bucket_configs(&self) -> Result<(), ConfigError> {
+        let mut errs: Vec<String> = Vec::new();
+        let blocks = &self.blocks_storage.bucket;
+        let check = |errs: &mut Vec<String>,
+                     label: &str,
+                     section_path: &[&str],
+                     flag_prefix: &str,
+                     default_backend: &str| {
+            let backend = self.extra_storage_str(section_path, &["backend"], &format!("{flag_prefix}.backend"), default_backend);
+            if (default_backend == "local" && backend == "local")
+                || (default_backend == "filesystem" && backend == "filesystem")
+            {
+                return;
+            }
+            if backend != blocks.backend_cfg.backend {
+                return;
+            }
+            let prefix = self.extra_storage_str(section_path, &["storage_prefix"], &format!("{flag_prefix}.storage-prefix"), "");
+            if prefix != blocks.storage_prefix {
+                return;
+            }
+            match backend.as_str() {
+                "s3" => {
+                    let b = self.extra_storage_str(section_path, &["s3", "bucket_name"], &format!("{flag_prefix}.s3.bucket-name"), "");
+                    if b == blocks.backend_cfg.s3.bucket_name {
+                        errs.push(format!("{label}: S3 bucket name and storage prefix cannot be the same as the one used in blocks storage config"));
+                    }
+                }
+                "gcs" => {
+                    let b = self.extra_storage_str(section_path, &["gcs", "bucket_name"], &format!("{flag_prefix}.gcs.bucket-name"), "");
+                    if b == blocks.backend_cfg.gcs.bucket_name {
+                        errs.push(format!("{label}: GCS bucket name and storage prefix cannot be the same as the one used in blocks storage config"));
+                    }
+                }
+                "azure" => {
+                    let c = self.extra_storage_str(section_path, &["azure", "container_name"], &format!("{flag_prefix}.azure.container-name"), "");
+                    let a = self.extra_storage_str(section_path, &["azure", "account_name"], &format!("{flag_prefix}.azure.account-name"), "");
+                    if c == blocks.backend_cfg.azure.container_name && a == blocks.backend_cfg.azure.account_name {
+                        errs.push(format!("{label}: Azure container and account names and storage prefix cannot be the same as the one used in blocks storage config"));
+                    }
+                }
+                "swift" => {
+                    let c = self.extra_storage_str(section_path, &["swift", "container_name"], &format!("{flag_prefix}.swift.container-name"), "");
+                    let p = self.extra_storage_str(section_path, &["swift", "project_name"], &format!("{flag_prefix}.swift.project-name"), "");
+                    if c == blocks.backend_cfg.swift.container_name && p == blocks.backend_cfg.swift.project_name {
+                        errs.push(format!("{label}: Swift container and project names and storage prefix cannot be the same as the one used in blocks storage config"));
+                    }
+                }
+                _ => {}
+            }
+        };
+
+        if self.is_module_explicitly_targeted("alertmanager") {
+            check(&mut errs, "alertmanager storage", &["alertmanager_storage"], "alertmanager-storage", "local");
+        }
+        if self.is_ruler_enabled() {
+            check(&mut errs, "ruler storage", &["ruler_storage"], "ruler-storage", "local");
+        }
+        if self.is_module_explicitly_targeted("usage-tracker") {
+            check(&mut errs, "usage-tracker snapshots storage", &["usage_tracker", "snapshots_storage"], "usage-tracker.snapshots-storage", "filesystem");
+        }
+
+        if !errs.is_empty() {
+            let msg = if errs.len() == 1 {
+                format!("invalid bucket config: {}", errs[0])
+            } else {
+                format!("invalid bucket config: {} errors occurred:\n\t* {}\n", errs.len(), errs.join("\n\t* "))
+            };
+            return Err(ConfigError::Validation(msg));
+        }
+        Ok(())
     }
 
     fn validate_filesystem_paths(&self) -> Result<(), ConfigError> {
@@ -1243,6 +1424,7 @@ pub struct LoadedConfig {
     pub config_hash_sha256: Option<String>,
     pub action: CliAction,
     pub usage_text: Option<String>,
+    pub validation_error: Option<String>,
 }
 
 /// Flag target of the `cmd/mimir/main.go` command line (`mimir.Config` + `mainFlags`).
@@ -1296,6 +1478,23 @@ pub fn parse_cli_and_load_config(
     prog_name: &str,
     args: &[String],
 ) -> Result<LoadedConfig, ConfigError> {
+    parse_cli_and_load_config_inner(prog_name, args, false)
+}
+
+/// Like [`parse_cli_and_load_config`], but mirrors Go `cmd/mimir/main.go` with `testMode = true`:
+/// `cfg.Validate()` errors are recorded in `validation_error` instead of aborting before `DumpYaml`.
+pub fn parse_cli_and_load_config_test_mode(
+    prog_name: &str,
+    args: &[String],
+) -> Result<LoadedConfig, ConfigError> {
+    parse_cli_and_load_config_inner(prog_name, args, true)
+}
+
+fn parse_cli_and_load_config_inner(
+    prog_name: &str,
+    args: &[String],
+    test_mode: bool,
+) -> Result<LoadedConfig, ConfigError> {
     let mut state = CliTarget {
         cfg: MimirConfig::default(),
         main_flags: MainFlags::default(),
@@ -1331,6 +1530,7 @@ pub fn parse_cli_and_load_config(
                 all: state.main_flags.print_help_all,
             },
             usage_text: Some(usage),
+            validation_error: None,
         });
     }
 
@@ -1341,18 +1541,30 @@ pub fn parse_cli_and_load_config(
             config_hash_sha256,
             action: CliAction::PrintVersion,
             usage_text: None,
+            validation_error: None,
         });
     }
 
     MimirConfig::inherit_common_flag_values(&mut state, &mut fs)?;
-    state.cfg.validate()?;
+    let validation_error = match state.cfg.validate() {
+        Ok(()) => None,
+        Err(err) if test_mode => Some(err.to_string()),
+        Err(err) => return Err(err),
+    };
+
+    // Go `mimir.New` fails on empty `-target` before `-print.config` or `-modules`.
+    if state.cfg.target.0.is_empty() && !test_mode {
+        state.cfg.validate_targets()?;
+    }
 
     let action = if state.cfg.print_config {
         CliAction::PrintConfig
     } else if state.main_flags.print_modules {
         CliAction::PrintModules
     } else {
-        state.cfg.validate_targets()?;
+        if !test_mode {
+            state.cfg.validate_targets()?;
+        }
         CliAction::Run
     };
 
@@ -1362,6 +1574,7 @@ pub fn parse_cli_and_load_config(
         config_hash_sha256,
         action,
         usage_text: None,
+        validation_error,
     })
 }
 

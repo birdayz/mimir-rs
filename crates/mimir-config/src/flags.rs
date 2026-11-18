@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use crate::duration::{GoDuration, ModelDuration};
 use crate::error::ConfigError;
 use crate::types::{
-    parse_go_bool, HumanBytes, LabelValueLengthOverLimitStrategy, LimitsMap, LogLevel,
+    parse_go_bool, CIDRSliceCSV, HumanBytes, LabelValueLengthOverLimitStrategy, LimitsMap, LogLevel,
     NameValidationScheme, OTelTranslationStrategy, S3BucketLookupType, SASLMechanism,
     StringSliceCSV, StringSliceCSVMulti,
 };
@@ -431,7 +431,7 @@ impl<T> FlagSet<T> {
         name: &str,
         default_val: NameValidationScheme,
         usage: &str,
-        get: impl Fn(&T) -> &NameValidationScheme + 'static,
+        get: impl Fn(&T) -> &NameValidationScheme + Copy + 'static,
         get_mut: impl Fn(&mut T) -> &mut NameValidationScheme + 'static,
     ) {
         self.register_raw(
@@ -441,7 +441,8 @@ impl<T> FlagSet<T> {
             default_val.to_string(),
             usage,
             move |t, s| {
-                *get_mut(t) = NameValidationScheme::parse(s)?;
+                let cur = *get(t);
+                *get_mut(t) = NameValidationScheme::parse_cli(s, cur)?;
                 Ok(())
             },
             move |t| (*get(t)).to_string(),
@@ -489,6 +490,56 @@ impl<T> FlagSet<T> {
                 Ok(())
             },
             move |t| (*get(t)).to_string(),
+        );
+    }
+
+    pub fn cidr_slice_csv_var(
+        &mut self,
+        name: &str,
+        default_val: &CIDRSliceCSV,
+        usage: &str,
+        get: impl Fn(&T) -> &CIDRSliceCSV + 'static,
+        get_mut: impl Fn(&mut T) -> &mut CIDRSliceCSV + 'static,
+    ) {
+        self.register_raw(
+            name,
+            false,
+            "value",
+            default_val.to_string(),
+            usage,
+            move |t, s| get_mut(t).set(s),
+            move |t| get(t).to_string(),
+        );
+    }
+
+    pub fn limits_map_var_validated<V>(
+        &mut self,
+        name: &str,
+        default_val: &LimitsMap<V>,
+        usage: &str,
+        validator: fn(&str, &V) -> Result<(), ConfigError>,
+        get: impl Fn(&T) -> &LimitsMap<V> + 'static,
+        get_mut: impl Fn(&mut T) -> &mut LimitsMap<V> + 'static,
+    ) where
+        V: serde::de::DeserializeOwned + serde::Serialize + 'static,
+    {
+        let def = serde_json::to_string(default_val).unwrap_or_else(|_| "{}".to_string());
+        self.register_raw(
+            name,
+            false,
+            "value",
+            def,
+            usage,
+            move |t, s| {
+                let m: LimitsMap<V> = serde_json::from_str(s)
+                    .map_err(|e| ConfigError::Flag(format!("invalid JSON map: {e}")))?;
+                for (k, v) in &m {
+                    validator(k, v)?;
+                }
+                *get_mut(t) = m;
+                Ok(())
+            },
+            move |t| serde_json::to_string(get(t)).unwrap_or_else(|_| "{}".to_string()),
         );
     }
 

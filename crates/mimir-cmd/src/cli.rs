@@ -4,10 +4,10 @@
 //! - github.com/grafana/mimir/cmd/mimir/main.go
 //! - github.com/grafana/mimir/pkg/util/yaml.go (`DiffConfig`)
 
-use mimir_config::schema::{FieldKind, SchemaBlock, SchemaField, EXTRA_TOP_BLOCKS};
+use mimir_config::schema::{FieldKind, SchemaBlock, SchemaField, EXTRA_TOP_BLOCKS, HIDDEN_TOP_BLOCKS};
 use mimir_config::{
-    format_go_duration, format_modules, format_version, parse_cli_and_load_config, CliAction,
-    ConfigError, GoDuration, MimirConfig,
+    format_go_duration, format_modules, format_version, parse_cli_and_load_config,
+    parse_cli_and_load_config_test_mode, CliAction, ConfigError, GoDuration, MimirConfig,
 };
 use serde_yaml::{Mapping, Value};
 
@@ -40,7 +40,12 @@ fn execute_cli_inner(prog_name: &str, args: &[String], test_mode: bool) -> CliOu
     mimir_config::limits::set_active_series_custom_trackers_validator(
         mimir_ingester::active_series::validate_custom_trackers,
     );
-    match parse_cli_and_load_config(prog_name, args) {
+    let res = if test_mode {
+        parse_cli_and_load_config_test_mode(prog_name, args)
+    } else {
+        parse_cli_and_load_config(prog_name, args)
+    };
+    match res {
         Err(ConfigError::Flag(msg)) => CliOutcome {
             stdout: String::new(),
             stderr: format!("{msg}\nRun with -help to get a list of available parameters\n"),
@@ -95,9 +100,14 @@ fn execute_cli_inner(prog_name: &str, args: &[String], test_mode: bool) -> CliOu
                 }
             };
 
+            let stderr = loaded
+                .validation_error
+                .as_ref()
+                .map(|e| format!("error validating config: {e}\n"))
+                .unwrap_or_default();
             CliOutcome {
                 stdout,
-                stderr: String::new(),
+                stderr,
                 exit_code,
                 config: Some(loaded.config),
                 config_hash_sha256: loaded.config_hash_sha256,
@@ -119,16 +129,14 @@ pub fn effective_config_yaml(cfg: &MimirConfig) -> Value {
         return val;
     };
 
-    for block in EXTRA_TOP_BLOCKS {
+    for block in EXTRA_TOP_BLOCKS.iter().chain(HIDDEN_TOP_BLOCKS.iter()) {
         let existing = cfg.extra_sections.get(block.name);
         let merged = build_block_yaml(block, existing, cfg);
         root_map.insert(Value::String(block.name.to_string()), Value::Mapping(merged));
     }
 
-    // Sections without a schema (hidden `usage_tracker`, `block_builder*`) are rendered from the
-    // raw YAML; mask their `flagext.Secret` values like Go's MarshalYAML does.
     for name in cfg.extra_sections.keys() {
-        if EXTRA_TOP_BLOCKS.iter().any(|b| b.name == name) {
+        if EXTRA_TOP_BLOCKS.iter().chain(HIDDEN_TOP_BLOCKS.iter()).any(|b| b.name == name) {
             continue;
         }
         if let Some(v) = root_map.get_mut(Value::String(name.clone())) {
@@ -301,9 +309,8 @@ fn default_yaml_value(kind: FieldKind, default_str: &str) -> Value {
 
 fn parse_cli_value_for_yaml(kind: FieldKind, raw: &str) -> Value {
     match kind {
-        FieldKind::Bool => Value::Bool(raw == "true" || raw == "1" || raw == "t" || raw == "T"),
-        FieldKind::Int => raw
-            .parse::<i64>()
+        FieldKind::Bool => Value::Bool(mimir_config::parse_go_bool(raw).unwrap_or(false)),
+        FieldKind::Int => mimir_config::flags::go_parse_int(raw)
             .map(|n| Value::Number(n.into()))
             .unwrap_or_else(|_| Value::String(raw.to_string())),
         FieldKind::Float => raw

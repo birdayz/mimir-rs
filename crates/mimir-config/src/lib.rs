@@ -20,6 +20,7 @@ pub mod limits;
 pub mod mimir;
 pub mod runtime_config;
 pub mod schema;
+mod schema_hidden;
 pub mod secret;
 pub mod server;
 pub mod sha256;
@@ -49,11 +50,16 @@ pub use limits::{
     CostAttributionTrackerConfig, CostAttributionTrackerConfigs, LimitedQuery, LimitsConfig,
     MetricRelabelConfig, OAuth2ClientConfig, RulerAlertmanagerClientConfig,
 };
-pub use mimir::{parse_cli_and_load_config, CommonConfig, LoadedConfig, MimirConfig};
+pub use mimir::{
+    parse_cli_and_load_config, parse_cli_and_load_config_test_mode, CommonConfig,
+    LoadedConfig, MimirConfig,
+};
 pub use runtime_config::{
-    parse_runtime_config_yaml, runtime_config_source_ids, DistributorInstanceLimits,
-    MultiRuntimeConfig, Overrides, RuntimeConfigLoadEvent, RuntimeConfigManager,
-    RuntimeConfigObserver, RuntimeConfigSourceStatus, RuntimeConfigValues,
+    is_url, parse_runtime_config_yaml, parse_runtime_config_yaml_with_defaults,
+    runtime_config_source_ids, DistributorInstanceLimits, MultiRuntimeConfig, Overrides,
+    RuntimeConfigHttpObserver, RuntimeConfigLoadEvent, RuntimeConfigManager,
+    RuntimeConfigManagerOptions, RuntimeConfigObserver, RuntimeConfigSourceStatus,
+    RuntimeConfigValues,
 };
 pub use server::{
     ActivityTrackerConfig, ClusterValidationProtocolConfig, ClusterValidationProtocolConfigForHTTP,
@@ -72,7 +78,8 @@ pub use storage::{
     StorageBackendConfig, SwiftConfig, TSDBConfig,
 };
 pub use types::{
-    parse_go_bool, HumanBytes, LabelValueLengthOverLimitStrategy, LimitsMap, LogLevel,
-    NameValidationScheme, OTelTranslationStrategy, S3BucketLookupType, SASLMechanism,
-    StringSliceCSV, StringSliceCSVMulti,
+    parse_go_bool, parse_go_yaml_timestamp, CIDRSliceCSV, HumanBytes,
+    LabelValueLengthOverLimitStrategy, LimitsMap, LogLevel, NameValidationScheme,
+    OTelTranslationStrategy, S3BucketLookupType, SASLMechanism, StringSliceCSV,
+    StringSliceCSVMulti,
 };

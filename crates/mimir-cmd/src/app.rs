@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use mimir_common::activitytracker::{
-    load_unfinished_entries, ActivityTracker, ActivityTrackerConfig,
+    load_unfinished_entries_partial, ActivityTracker, ActivityTrackerConfig,
 };
 use mimir_common::logging::{
     format_rfc3339_nano_utc, global_logger, init_global_logger, LogFormat, LogLevel, LogSink,
@@ -20,7 +20,10 @@ use mimir_common::logging::{
 };
 use mimir_common::services::{FnListener, ManagedBasicService, Service, ServiceContext, State};
 use mimir_config::ingester::KVStoreConfig;
-use mimir_config::{MimirConfig, Overrides, RuntimeConfigManager};
+use mimir_config::{
+    MimirConfig, Overrides, RuntimeConfigHttpObserver, RuntimeConfigManager,
+    RuntimeConfigManagerOptions, RuntimeConfigObserver,
+};
 use mimir_ingester::ingest_storage::{
     ingester_partition_id_from_instance_id, IngesterPartitionRingDelegate,
 };
@@ -48,7 +51,9 @@ use prometheus::Registry;
 use tonic::codec::CompressionEncoding;
 
 use crate::cli::CliOutcome;
-use crate::grpc::{HealthService, HttpGrpcBridge, HttpGrpcStatusFixService};
+use crate::grpc::{
+    GrpcCompressionEchoService, HealthService, HttpGrpcBridge, HttpGrpcStatusFixService,
+};
 use crate::http::{build_http_router, AppHttpState};
 use crate::metrics::{register_global_metrics, version_info};
 use crate::modules::{ModuleStates, StateCell, StateFn};
@@ -153,39 +158,36 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     // 1. Activity tracker (matching initActivityTracker in pkg/mimir/modules.go).
     let activity_tracker: Option<Arc<ActivityTracker>> = if !cfg.activity_tracker.filepath.is_empty()
     {
-        match load_unfinished_entries(&cfg.activity_tracker.filepath) {
-            Ok(entries) => {
-                if !entries.is_empty() {
-                    let count_str = entries.len().to_string();
-                    logger.log(
-                        LogLevel::Warn,
-                        &[
-                            ("component", "activity-tracker"),
-                            ("msg", "found unfinished activities from previous run"),
-                            ("count", &count_str),
-                        ],
-                    );
-                    for e in &entries {
-                        let ts = format_rfc3339_nano_utc(e.timestamp);
-                        logger.log(
-                            LogLevel::Warn,
-                            &[
-                                ("component", "activity-tracker"),
-                                ("start", &ts),
-                                ("activity", &e.activity),
-                            ],
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                let err_s = err.to_string();
+        let (entries, err) = load_unfinished_entries_partial(&cfg.activity_tracker.filepath);
+        if let Some(err) = err {
+            let err_s = err.to_string();
+            logger.log(
+                LogLevel::Warn,
+                &[
+                    ("component", "activity-tracker"),
+                    ("msg", "failed to fully read file with unfinished activities"),
+                    ("err", &err_s),
+                ],
+            );
+        }
+        if !entries.is_empty() {
+            let count_str = entries.len().to_string();
+            logger.log(
+                LogLevel::Warn,
+                &[
+                    ("component", "activity-tracker"),
+                    ("msg", "found unfinished activities from previous run"),
+                    ("count", &count_str),
+                ],
+            );
+            for e in &entries {
+                let ts = format_rfc3339_nano_utc(e.timestamp);
                 logger.log(
                     LogLevel::Warn,
                     &[
                         ("component", "activity-tracker"),
-                        ("msg", "failed to fully read file with unfinished activities"),
-                        ("err", &err_s),
+                        ("start", &ts),
+                        ("activity", &e.activity),
                     ],
                 );
             }
@@ -208,18 +210,29 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let (runtime_config_mgr, overrides) = if !cfg.runtime_config.file.0.is_empty() {
         let sources = mimir_config::runtime_config_source_ids(&cfg.runtime_config)
             .context("initializing runtime config manager")?;
-        let observer = crate::runtime_config_metrics::RuntimeConfigMetrics::new(
-            &registry,
-            Arc::clone(&logger) as Arc<dyn Logger>,
-            &sources,
-        )
-        .context("registering runtime config metrics")?;
-        let mgr = RuntimeConfigManager::new_with_observer(
-            cfg.runtime_config.clone(),
-            cfg.limits.clone(),
-            cfg.ingester.instance_limits.clone(),
-            Some(Arc::new(observer)),
-        )
+        let observer = Arc::new(
+            crate::runtime_config_metrics::RuntimeConfigMetrics::new_with_http(
+                &registry,
+                Arc::clone(&logger) as Arc<dyn Logger>,
+                &sources,
+                &cfg.runtime_config.file.0,
+                &cfg.runtime_config.http_client_cluster_validation.label,
+            )
+            .context("registering runtime config metrics")?,
+        );
+        let default_distributor_limits = cfg
+            .distributor_instance_limits()
+            .context("reading distributor.instance_limits")?;
+        let querier_query_store_after = cfg.querier_query_store_after();
+        let mgr = RuntimeConfigManager::new_with_options(RuntimeConfigManagerOptions {
+            cfg: cfg.runtime_config.clone(),
+            default_limits: cfg.limits.clone(),
+            default_ingester_limits: cfg.ingester.instance_limits.clone(),
+            default_distributor_limits,
+            querier_query_store_after,
+            observer: Some(Arc::clone(&observer) as Arc<dyn RuntimeConfigObserver>),
+            http_observer: Some(observer as Arc<dyn RuntimeConfigHttpObserver>),
+        })
         .context("initializing runtime config manager")?;
         let _reloader = mgr.start_reloader();
         let ov = mgr.overrides();
@@ -756,11 +769,22 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
     // 7. Start HTTP & gRPC servers BEFORE awaiting ingester.start() so /metrics and /ready (503 -> 200)
     // are live during WAL replay and Kafka catch-up.
-    let max_recv = (cfg.server.grpc_server_max_recv_msg_size.max(1024)) as usize;
-    let max_send = (cfg.server.grpc_server_max_send_msg_size.max(1024)) as usize;
+    let max_recv = cfg.server.grpc_server_max_recv_msg_size.max(0) as usize;
+    let max_send = cfg.server.grpc_server_max_send_msg_size.max(0) as usize;
 
-    let http_grpc_svc = HttpGrpcStatusFixService::new(SnappyDecompressService::new(
-        HttpServer::new(HttpGrpcBridge::new(http_router.clone()))
+    let http_grpc_svc = GrpcCompressionEchoService::new(HttpGrpcStatusFixService::new(
+        SnappyDecompressService::new(
+            HttpServer::new(HttpGrpcBridge::new(http_router.clone()))
+                .max_decoding_message_size(max_recv)
+                .max_encoding_message_size(max_send)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd),
+            max_recv,
+        ),
+    ));
+
+    let health_svc = GrpcCompressionEchoService::new(SnappyDecompressService::new(
+        HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules))
             .max_decoding_message_size(max_recv)
             .max_encoding_message_size(max_send)
             .accept_compressed(CompressionEncoding::Gzip)
@@ -768,24 +792,17 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         max_recv,
     ));
 
-    let health_svc = SnappyDecompressService::new(
-        HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules))
-            .max_decoding_message_size(max_recv)
-            .max_encoding_message_size(max_send)
-            .accept_compressed(CompressionEncoding::Gzip)
-            .accept_compressed(CompressionEncoding::Zstd),
-        max_recv,
-    );
-
     let mut grpc_routes = tonic::service::Routes::new(health_svc).add_service(http_grpc_svc);
 
     if let Some(ref ing) = ingester_opt {
-        let ing_svc = IngesterService::new(Arc::clone(ing))
-            .into_server()
-            .max_decoding_message_size(max_recv)
-            .max_encoding_message_size(max_send)
-            .accept_compressed(CompressionEncoding::Gzip)
-            .accept_compressed(CompressionEncoding::Zstd);
+        let ing_svc = GrpcCompressionEchoService::new(
+            IngesterService::new(Arc::clone(ing))
+                .into_server()
+                .max_decoding_message_size(max_recv)
+                .max_encoding_message_size(max_send)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd),
+        );
         grpc_routes = grpc_routes.add_service(ing_svc);
     }
 
@@ -1092,28 +1109,38 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     runtime_config_state.set(State::Terminated);
     if let Some(at) = activity_tracker {
         if !cfg.activity_tracker.filepath.is_empty() {
-            if let Ok(entries) = load_unfinished_entries(&cfg.activity_tracker.filepath) {
-                if !entries.is_empty() {
-                    let count_s = entries.len().to_string();
+            let (entries, err) = load_unfinished_entries_partial(&cfg.activity_tracker.filepath);
+            if let Some(err) = err {
+                let err_s = err.to_string();
+                logger.log(
+                    LogLevel::Warn,
+                    &[
+                        ("component", "activity-tracker"),
+                        ("msg", "failed to fully read file with unfinished activities during shutdown"),
+                        ("err", &err_s),
+                    ],
+                );
+            }
+            if !entries.is_empty() {
+                let count_s = entries.len().to_string();
+                logger.log(
+                    LogLevel::Warn,
+                    &[
+                        ("component", "activity-tracker"),
+                        ("msg", "found unfinished activities during shutdown"),
+                        ("count", &count_s),
+                    ],
+                );
+                for e in &entries {
+                    let ts = format_rfc3339_nano_utc(e.timestamp);
                     logger.log(
                         LogLevel::Warn,
                         &[
                             ("component", "activity-tracker"),
-                            ("msg", "found unfinished activities during shutdown"),
-                            ("count", &count_s),
+                            ("start", &ts),
+                            ("activity", &e.activity),
                         ],
                     );
-                    for e in &entries {
-                        let ts = format_rfc3339_nano_utc(e.timestamp);
-                        logger.log(
-                            LogLevel::Warn,
-                            &[
-                                ("component", "activity-tracker"),
-                                ("start", &ts),
-                                ("activity", &e.activity),
-                            ],
-                        );
-                    }
                 }
             }
         }

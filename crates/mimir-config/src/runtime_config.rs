@@ -25,6 +25,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Deserializer as YamlDeserializer, Mapping, Value};
 
+use crate::duration::GoDuration;
 use crate::error::ConfigError;
 use crate::ingester::InstanceLimits;
 use crate::limits::LimitsConfig;
@@ -195,6 +196,22 @@ pub fn parse_runtime_config_yaml(
     default_limits: &LimitsConfig,
     default_ingester_limits: &InstanceLimits,
 ) -> Result<RuntimeConfigValues, ConfigError> {
+    parse_runtime_config_yaml_with_defaults(
+        bytes,
+        default_limits,
+        default_ingester_limits,
+        &DistributorInstanceLimits::default(),
+        GoDuration::from_hours(12),
+    )
+}
+
+pub fn parse_runtime_config_yaml_with_defaults(
+    bytes: &[u8],
+    default_limits: &LimitsConfig,
+    default_ingester_limits: &InstanceLimits,
+    default_distributor_limits: &DistributorInstanceLimits,
+    querier_query_store_after: GoDuration,
+) -> Result<RuntimeConfigValues, ConfigError> {
     let mut docs = Vec::new();
     for doc in YamlDeserializer::from_slice(bytes) {
         let mut val = Value::deserialize(doc)
@@ -218,14 +235,20 @@ pub fn parse_runtime_config_yaml(
         return Ok(RuntimeConfigValues::default());
     }
 
-    parse_runtime_config_value(root, default_limits, default_ingester_limits)
+    parse_runtime_config_value(
+        root,
+        default_limits,
+        default_ingester_limits,
+        default_distributor_limits,
+        querier_query_store_after,
+    )
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRuntimeConfigCheck {
     #[serde(default)]
-    overrides: BTreeMap<String, LimitsConfig>,
+    overrides: BTreeMap<String, Option<LimitsConfig>>,
     #[serde(default)]
     #[allow(dead_code)]
     multi_kv_config: MultiRuntimeConfig,
@@ -253,12 +276,45 @@ fn stringify_override_keys(mut root: Value) -> Value {
     root
 }
 
+fn merge_ruler_am_client_config(dst: &mut Value, src: Value) {
+    let (Some(dst_map), Value::Mapping(src_map)) = (dst.as_mapping_mut(), src) else {
+        return;
+    };
+    for (k, v) in src_map {
+        if k.as_str() == Some("oauth2") {
+            if let (Some(Value::Mapping(dst_oauth)), Value::Mapping(src_oauth)) =
+                (dst_map.get_mut(&k), &v)
+            {
+                for (ok, ov) in src_oauth {
+                    // `oauth2.endpoint_params` is `flagext.LimitsMap[string]`: replaces instead of merging.
+                    if ok.as_str() == Some("endpoint_params") {
+                        let val = if ov.is_null() {
+                            Value::Mapping(Mapping::new())
+                        } else {
+                            ov.clone()
+                        };
+                        dst_oauth.insert(ok.clone(), val);
+                    } else {
+                        dst_oauth.insert(ok.clone(), ov.clone());
+                    }
+                }
+                continue;
+            }
+        }
+        dst_map.insert(k, v);
+    }
+}
+
 fn parse_runtime_config_value(
     root: Value,
     default_limits: &LimitsConfig,
     default_ingester_limits: &InstanceLimits,
+    default_distributor_limits: &DistributorInstanceLimits,
+    querier_query_store_after: GoDuration,
 ) -> Result<RuntimeConfigValues, ConfigError> {
-    let root = stringify_override_keys(root);
+    let mut root = stringify_override_keys(root);
+    crate::yaml_v3::normalize_value_for_type("mimir.runtimeConfigValues", &mut root)
+        .map_err(ConfigError::RuntimeConfig)?;
     let root_map = root.as_mapping().ok_or_else(|| {
         ConfigError::RuntimeConfig("expected YAML mapping at runtime config root".to_string())
     })?;
@@ -290,7 +346,10 @@ fn parse_runtime_config_value(
 
     if let Some(dist_val) = check.distributor_limits {
         if !dist_val.is_null() {
-            let parsed: DistributorInstanceLimits = serde_yaml::from_value(dist_val)
+            let mut merged = serde_yaml::to_value(default_distributor_limits)
+                .map_err(|e| ConfigError::RuntimeConfig(e.to_string()))?;
+            merge_yaml_values(&mut merged, dist_val);
+            let parsed: DistributorInstanceLimits = serde_yaml::from_value(merged)
                 .map_err(|e| ConfigError::RuntimeConfig(format!("distributor_limits: {e}")))?;
             out.distributor_limits = Some(parsed);
         }
@@ -323,20 +382,46 @@ fn parse_runtime_config_value(
                 }
 
                 let mut merged = base_limits_val.clone();
+                if let Some(merged_map) = merged.as_mapping_mut() {
+                    // Go `Limits.unmarshal` resets these two fields before decoding per-tenant
+                    // overrides (`limits.go:671-674`), since they are set during RegisterFlags.
+                    merged_map.insert(
+                        Value::String("otel_metric_suffixes_enabled".to_string()),
+                        Value::Null,
+                    );
+                    merged_map.insert(
+                        Value::String("name_validation_scheme".to_string()),
+                        Value::String(String::new()),
+                    );
+                }
                 if let Value::Mapping(ref tenant_map) = tenant_v {
-                    // For `active_series_custom_trackers` and `active_series_additional_custom_trackers`,
-                    // explicit empty `{}` replaces the base map instead of merging keys.
+                    // Map fields (`flagext.LimitsMap` + custom trackers) replace the base map
+                    // instead of deep-merging keys (`dskit/flagext/map.go:clear(m.data)`).
                     if let (Some(merged_map), Some(override_map)) =
                         (merged.as_mapping_mut(), Some(tenant_map))
                     {
                         for (k, v) in override_map {
                             let key_str = k.as_str().unwrap_or_default();
-                            if key_str == "active_series_custom_trackers"
-                                || key_str == "active_series_additional_custom_trackers"
-                                || key_str == "cost_attribution_trackers"
-                                || key_str == "additional_cost_attribution_trackers"
-                            {
-                                merged_map.insert(k.clone(), v.clone());
+                            if matches!(
+                                key_str,
+                                "active_series_custom_trackers"
+                                    | "active_series_additional_custom_trackers"
+                                    | "cost_attribution_trackers"
+                                    | "additional_cost_attribution_trackers"
+                                    | "ruler_max_rules_per_rule_group_by_namespace"
+                                    | "ruler_max_rule_groups_per_tenant_by_namespace"
+                                    | "alertmanager_notification_rate_limit_per_integration"
+                            ) {
+                                let val = if v.is_null() {
+                                    Value::Mapping(Mapping::new())
+                                } else {
+                                    v.clone()
+                                };
+                                merged_map.insert(k.clone(), val);
+                            } else if key_str == "ruler_alertmanager_client_config" {
+                                if let Some(existing) = merged_map.get_mut(k) {
+                                    merge_ruler_am_client_config(existing, v.clone());
+                                }
                             } else {
                                 match merged_map.get_mut(k) {
                                     Some(existing)
@@ -363,6 +448,14 @@ fn parse_runtime_config_value(
                 limits.validate().map_err(|e| {
                     ConfigError::RuntimeConfig(format!("tenant {tenant_id:?}: {e}"))
                 })?;
+                if limits.query_ingesters_within.0 != 0
+                    && querier_query_store_after.0 != 0
+                    && querier_query_store_after.0 >= limits.query_ingesters_within.0
+                {
+                    return Err(ConfigError::RuntimeConfig(format!(
+                        "tenant {tenant_id:?}: invalid limits config for querier: the -validation.query-ingesters-within setting must be greater than -querier.query-store-after otherwise queries might return partial results"
+                    )));
+                }
 
                 out.overrides
                     .insert(tenant_id.to_string(), Some(Arc::new(limits)));
@@ -448,11 +541,23 @@ fn numbers_to_f64(v: &mut Value) {
 
 /// Manages loading and periodic hot-reloading of `runtime_config.file` sources (local files and
 /// HTTP/HTTPS URLs), like `dskit/runtimeconfig.Manager`.
+pub struct RuntimeConfigManagerOptions {
+    pub cfg: RuntimeConfigConfig,
+    pub default_limits: LimitsConfig,
+    pub default_ingester_limits: InstanceLimits,
+    pub default_distributor_limits: DistributorInstanceLimits,
+    pub querier_query_store_after: GoDuration,
+    pub observer: Option<Arc<dyn RuntimeConfigObserver>>,
+    pub http_observer: Option<Arc<dyn RuntimeConfigHttpObserver>>,
+}
+
 pub struct RuntimeConfigManager {
     cfg: RuntimeConfigConfig,
     loader: LoaderKind,
     default_limits: Arc<LimitsConfig>,
     default_ingester_limits: InstanceLimits,
+    default_distributor_limits: DistributorInstanceLimits,
+    querier_query_store_after: GoDuration,
     sources: RwLock<Vec<ConfigSource>>,
     current: RwLock<Arc<RuntimeConfigValues>>,
     last_hash: RwLock<Option<String>>,
@@ -481,6 +586,29 @@ impl RuntimeConfigManager {
         default_ingester_limits: InstanceLimits,
         observer: Option<Arc<dyn RuntimeConfigObserver>>,
     ) -> Result<Arc<Self>, ConfigError> {
+        Self::new_with_options(RuntimeConfigManagerOptions {
+            cfg,
+            default_limits,
+            default_ingester_limits,
+            default_distributor_limits: DistributorInstanceLimits::default(),
+            querier_query_store_after: GoDuration::from_hours(12),
+            observer,
+            http_observer: None,
+        })
+    }
+
+    /// Full constructor allowing caller-supplied `distributor.instance_limits`,
+    /// `querier.query_store_after`, reload observer, and HTTP observer (wired before initial load).
+    pub fn new_with_options(opts: RuntimeConfigManagerOptions) -> Result<Arc<Self>, ConfigError> {
+        let RuntimeConfigManagerOptions {
+            cfg,
+            default_limits,
+            default_ingester_limits,
+            default_distributor_limits,
+            querier_query_store_after,
+            observer,
+            http_observer: initial_http_observer,
+        } = opts;
         // pkg/mimir/runtime_config.go:NewRuntimeManager.
         let loader = match cfg.loader.as_str() {
             "map" => LoaderKind::Map,
@@ -502,7 +630,7 @@ impl RuntimeConfigManager {
 
         // dskit builds one HTTP client shared by all URL sources, only if there is one.
         let http_observer: Arc<RwLock<Option<Arc<dyn RuntimeConfigHttpObserver>>>> =
-            Arc::new(RwLock::new(None));
+            Arc::new(RwLock::new(initial_http_observer));
         let mut http: Option<Arc<HttpFetcher>> = None;
         for src in &mut sources {
             if is_url(&src.path) {
@@ -518,6 +646,8 @@ impl RuntimeConfigManager {
             loader,
             default_limits: Arc::new(default_limits),
             default_ingester_limits,
+            default_distributor_limits,
+            querier_query_store_after,
             sources: RwLock::new(sources),
             current: RwLock::new(Arc::new(RuntimeConfigValues::default())),
             last_hash: RwLock::new(None),
@@ -791,6 +921,8 @@ impl RuntimeConfigManager {
                     root,
                     &self.default_limits,
                     &self.default_ingester_limits,
+                    &self.default_distributor_limits,
+                    self.querier_query_store_after,
                 )
                 .map_err(|e| ConfigError::RuntimeConfig(format!("load file: {}", strip_rc(e))))?;
                 (values, hash)
@@ -831,6 +963,8 @@ impl RuntimeConfigManager {
             Value::Mapping(merged),
             &self.default_limits,
             &self.default_ingester_limits,
+            &self.default_distributor_limits,
+            self.querier_query_store_after,
         )
         .map_err(strip_rc)
     }

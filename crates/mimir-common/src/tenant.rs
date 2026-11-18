@@ -137,18 +137,24 @@ pub enum TenantError {
 /// - Length <= `MAX_TENANT_ID_LENGTH` (150)
 /// - Not `"."` or `".."`
 pub fn valid_tenant_id(s: &str) -> Result<(), TenantError> {
-    for &b in s.as_bytes() {
+    valid_tenant_id_bytes(s.as_bytes())
+}
+
+/// Byte-slice variant of [`valid_tenant_id`] matching Go `tenant.ValidTenantID`, which inspects
+/// raw header bytes (including non-UTF-8 bytes) before rejecting unsupported characters.
+pub fn valid_tenant_id_bytes(bytes: &[u8]) -> Result<(), TenantError> {
+    for &b in bytes {
         if !VALID_TENANT_ID_CHARS[b as usize] {
             return Err(TenantError::UnsupportedCharacter {
-                tenant_id: s.to_string(),
+                tenant_id: String::from_utf8_lossy(bytes).into_owned(),
                 ch: char::from(b),
             });
         }
     }
-    if s.len() > MAX_TENANT_ID_LENGTH {
+    if bytes.len() > MAX_TENANT_ID_LENGTH {
         return Err(TenantError::TooLong);
     }
-    if s == "." || s == ".." {
+    if bytes == b"." || bytes == b".." {
         return Err(TenantError::UnsafeTenantId);
     }
     Ok(())
@@ -168,6 +174,40 @@ pub fn valid_metadata(s: &str) -> Result<(), TenantError> {
         return Err(TenantError::MetadataTooLong { len: s.len() });
     }
     Ok(())
+}
+
+fn trim_metadata_bytes(org_id: &[u8]) -> &[u8] {
+    match org_id.iter().position(|&b| b == METADATA_SEPARATOR as u8) {
+        Some(idx) => &org_id[..idx],
+        None => org_id,
+    }
+}
+
+/// Extracts, validates, and normalizes all `|`-separated tenant IDs from raw orgID bytes
+/// (stripping any `:key=value` metadata from each part).
+pub fn parse_tenant_ids_bytes(org_id: &[u8]) -> Result<Vec<String>, TenantError> {
+    let mut ids = Vec::new();
+    for part in org_id.split(|&b| b == TENANT_IDS_SEPARATOR as u8) {
+        let tenant_bytes = trim_metadata_bytes(part);
+        valid_tenant_id_bytes(tenant_bytes)?;
+        // valid_tenant_id_bytes accepts only ASCII bytes, so UTF-8 conversion is lossless.
+        ids.push(String::from_utf8_lossy(tenant_bytes).into_owned());
+    }
+    Ok(normalize_tenant_ids(ids))
+}
+
+/// Extracts and validates a single tenant ID from raw orgID bytes (stripping metadata).
+pub fn parse_single_tenant_id_bytes(org_id: &[u8]) -> Result<String, TenantError> {
+    let mut parts = org_id.split(|&b| b == TENANT_IDS_SEPARATOR as u8);
+    let first = parts.next().unwrap_or(b"");
+    let tenant_bytes = trim_metadata_bytes(first);
+    valid_tenant_id_bytes(tenant_bytes)?;
+    for part in parts {
+        if tenant_bytes != trim_metadata_bytes(part) {
+            return Err(TenantError::TooManyOrgIDs);
+        }
+    }
+    Ok(String::from_utf8_lossy(tenant_bytes).into_owned())
 }
 
 /// Removes metadata from an orgID without validating the input.
@@ -454,35 +494,45 @@ where
     found.map(|s| s.to_string()).ok_or(TenantError::NoOrgID)
 }
 
-/// Extracts the org ID from a [`hyper::HeaderMap`] (case-insensitive `X-Scope-OrgID`).
+/// Extracts the raw org ID bytes from the first `X-Scope-OrgID` HTTP header, matching Go's
+/// `r.Header.Get("X-Scope-OrgID")`.
+pub fn extract_org_id_bytes_from_http_headers(headers: &HeaderMap) -> Result<&[u8], TenantError> {
+    let Some(value) = headers.get(LOWER_ORG_ID_HEADER_NAME) else {
+        return Err(TenantError::NoOrgID);
+    };
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return Err(TenantError::NoOrgID);
+    }
+    Ok(bytes)
+}
+
+/// Extracts the org ID from a [`hyper::HeaderMap`] (case-insensitive `X-Scope-OrgID`, reading
+/// only the first header value like Go `r.Header.Get`).
 pub fn extract_org_id_from_http_headers(headers: &HeaderMap) -> Result<String, TenantError> {
-    let mut found: Option<&str> = None;
-    for value in headers.get_all(LOWER_ORG_ID_HEADER_NAME) {
-        let val_str = value.to_str().map_err(|_| TenantError::NoOrgID)?;
-        if val_str.is_empty() {
-            return Err(TenantError::NoOrgID);
-        }
-        match found {
-            None => found = Some(val_str),
-            Some(prev) if prev == val_str => {}
-            Some(_) => return Err(TenantError::TooManyOrgIDs),
+    let bytes = extract_org_id_bytes_from_http_headers(headers)?;
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Ok(s.to_string()),
+        Err(_) => {
+            // Go passes raw bytes into ValidTenantID, which rejects the first non-ASCII byte.
+            valid_tenant_id_bytes(trim_metadata_bytes(bytes))?;
+            Ok(String::from_utf8_lossy(bytes).into_owned())
         }
     }
-    found.map(|s| s.to_string()).ok_or(TenantError::NoOrgID)
 }
 
 /// Extracts a validated single tenant ID directly from HTTP headers.
 pub fn extract_tenant_id_from_http_headers(headers: &HeaderMap) -> Result<String, TenantError> {
-    let org_id = extract_org_id_from_http_headers(headers)?;
-    parse_single_tenant_id(&org_id)
+    let bytes = extract_org_id_bytes_from_http_headers(headers)?;
+    parse_single_tenant_id_bytes(bytes)
 }
 
 /// Extracts validated, normalized tenant IDs from HTTP headers.
 pub fn extract_tenant_ids_from_http_headers(
     headers: &HeaderMap,
 ) -> Result<Vec<String>, TenantError> {
-    let org_id = extract_org_id_from_http_headers(headers)?;
-    parse_tenant_ids(&org_id)
+    let bytes = extract_org_id_bytes_from_http_headers(headers)?;
+    parse_tenant_ids_bytes(bytes)
 }
 
 /// Injects `org_id` into HTTP headers under `X-Scope-OrgID`, returning
@@ -661,11 +711,22 @@ mod tests {
             "tenant-1"
         );
 
+        // Go r.Header.Get("X-Scope-OrgID") reads only the first header value.
         headers.append("X-Scope-OrgID", "tenant-2".parse().unwrap());
         assert_eq!(
-            extract_org_id_from_http_headers(&headers).unwrap_err(),
-            TenantError::TooManyOrgIDs
+            extract_org_id_from_http_headers(&headers).unwrap(),
+            "tenant-1"
         );
+
+        let mut bad_utf8 = HeaderMap::new();
+        bad_utf8.insert(
+            LOWER_ORG_ID_HEADER_NAME,
+            HeaderValue::from_bytes(b"bad\xfftenant").unwrap(),
+        );
+        assert!(matches!(
+            extract_tenant_id_from_http_headers(&bad_utf8),
+            Err(TenantError::UnsupportedCharacter { ch: '\u{ff}', .. })
+        ));
 
         assert_eq!(
             extract_org_id_from_headers([

@@ -33,9 +33,10 @@ const DEFAULT_MIN_SIZE: usize = 1400;
 pub const NOT_GZIPPED_ROUTES: &[&str] = &["/ready", "/metrics", "/ingester/unregister-on-shutdown"];
 
 /// `-http.response-compression-level` (`gzip.DefaultCompression` = -1, or 1..=9).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct GzipConfig {
     pub level: i64,
+    pub cost_attribution_path: Option<String>,
 }
 
 impl GzipConfig {
@@ -48,8 +49,16 @@ impl GzipConfig {
     }
 }
 
-fn route_is_gzipped(path: &str) -> bool {
-    !(path.contains("/debug/pprof") || NOT_GZIPPED_ROUTES.iter().any(|r| path.ends_with(r)))
+fn route_is_gzipped(path: &str, cost_attribution_path: Option<&str>) -> bool {
+    if path.contains("/debug/pprof") || NOT_GZIPPED_ROUTES.iter().any(|r| path.ends_with(r)) {
+        return false;
+    }
+    if let Some(ca) = cost_attribution_path {
+        if path == ca || path.ends_with(ca) {
+            return false;
+        }
+    }
+    true
 }
 
 /// gziphandler `parseCoding`: the q-value of the last parameter wins (each parameter resets it
@@ -151,7 +160,7 @@ pub async fn gzip_handler(State(cfg): State<GzipConfig>, req: Request, next: Nex
     let gzipped_route = req
         .extensions()
         .get::<MatchedPath>()
-        .is_some_and(|p| route_is_gzipped(p.as_str()));
+        .is_some_and(|p| route_is_gzipped(p.as_str(), cfg.cost_attribution_path.as_deref()));
     if !gzipped_route {
         return next.run(req).await;
     }
@@ -229,12 +238,13 @@ mod tests {
 
     #[test]
     fn excluded_routes() {
-        assert!(route_is_gzipped("/config"));
-        assert!(route_is_gzipped("/ingester/ring"));
-        assert!(!route_is_gzipped("/ready"));
-        assert!(!route_is_gzipped("/prefix/metrics"));
-        assert!(!route_is_gzipped("/debug/pprof/profile"));
-        assert!(!route_is_gzipped("/ingester/unregister-on-shutdown"));
+        assert!(route_is_gzipped("/config", None));
+        assert!(route_is_gzipped("/ingester/ring", None));
+        assert!(!route_is_gzipped("/ready", None));
+        assert!(!route_is_gzipped("/prefix/metrics", None));
+        assert!(!route_is_gzipped("/debug/pprof/profile", None));
+        assert!(!route_is_gzipped("/ingester/unregister-on-shutdown", None));
+        assert!(!route_is_gzipped("/usage-metrics", Some("/usage-metrics")));
     }
 
     #[test]

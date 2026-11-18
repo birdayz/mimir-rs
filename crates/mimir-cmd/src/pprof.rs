@@ -120,13 +120,38 @@ pub async fn symbol_handler() -> Response {
         .into_response()
 }
 
-/// Form value lookup (`r.FormValue`: first value of the query parameter).
-fn form_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+fn decode_query_component(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Form value lookup (`r.FormValue`: first value of the query parameter, percent-decoded).
+fn form_value(query: Option<&str>, key: &str) -> Option<String> {
     query?
-        .split('&')
+        .split(['&', ';'])
+        .filter(|p| !p.is_empty())
         .filter_map(|kv| kv.split_once('=').or(Some((kv, ""))))
-        .find(|(k, _)| *k == key)
-        .map(|(_, v)| v)
+        .find(|(k, _)| decode_query_component(k) == key)
+        .map(|(_, v)| decode_query_component(v))
 }
 
 /// net/http/pprof `Profile`.
@@ -372,7 +397,8 @@ mod tests {
 
     #[test]
     fn form_values() {
-        assert_eq!(form_value(Some("seconds=5&x=1"), "seconds"), Some("5"));
+        assert_eq!(form_value(Some("seconds=5&x=1"), "seconds").as_deref(), Some("5"));
+        assert_eq!(form_value(Some("seconds=%35&x=1"), "seconds").as_deref(), Some("5"));
         assert_eq!(form_value(Some("x=1"), "seconds"), None);
         assert_eq!(form_value(None, "seconds"), None);
     }
