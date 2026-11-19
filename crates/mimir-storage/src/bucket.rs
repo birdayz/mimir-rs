@@ -13,7 +13,7 @@
 //! - github.com/grafana/mimir/pkg/storage/bucket/azure/bucket_client.go
 //! - github.com/grafana/mimir/pkg/storage/tsdb/tenant_deletion_mark.go
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
@@ -130,6 +130,7 @@ pub struct BucketClient {
     prefix: Option<String>,
     name: String,
     provider: String,
+    fs_root: Option<PathBuf>,
     metrics: Option<Arc<metrics::BucketMetrics>>,
     tenant_sse: Option<TenantSse>,
     expected_not_found: bool,
@@ -152,6 +153,7 @@ impl BucketClient {
             prefix: None,
             name,
             provider: provider.to_string(),
+            fs_root: None,
             metrics: None,
             tenant_sse: None,
             expected_not_found: false,
@@ -167,14 +169,16 @@ impl BucketClient {
     pub fn new_filesystem(dir: impl AsRef<Path>) -> Result<Self, BucketError> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
-        let fs = LocalFileSystem::new_with_prefix(dir)?;
+        let fs = LocalFileSystem::new_with_prefix(dir)?.with_automatic_cleanup(true);
         let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
         // thanos filesystem `Name()`: "fs: <absolute root dir>".
-        Ok(Self::from_backend(
+        let mut client = Self::from_backend(
             Backend::Store(Arc::new(fs)),
             format!("fs: {}", abs.to_string_lossy()),
             "FILESYSTEM",
-        ))
+        );
+        client.fs_root = Some(abs);
+        Ok(client)
     }
 
     /// Wraps an arbitrary `Arc<dyn ObjectStore>` (useful for decorators/fault injection in tests).
@@ -447,30 +451,43 @@ impl BucketClient {
             }
             Backend::Store(store) => async {
                 let path = self.object_path(name)?;
-                let res = match range {
-                    None => store.get(&path).await,
+                match range {
+                    None => match store.get(&path).await {
+                        Ok(res) => Ok(res.bytes().await?),
+                        Err(object_store::Error::NotFound { .. }) => {
+                            Err(BucketError::NotFound(name.to_string()))
+                        }
+                        Err(e) => Err(BucketError::Store(e)),
+                    },
+                    Some((_, 0)) => match store.head(&path).await {
+                        Ok(_) => Ok(Bytes::new()),
+                        Err(object_store::Error::NotFound { .. }) => {
+                            Err(BucketError::NotFound(name.to_string()))
+                        }
+                        Err(e) => Err(BucketError::Store(e)),
+                    },
                     Some((off, len)) => {
                         let opts = GetOptions {
                             range: Some(GetRange::Bounded(
-                                (off as usize)..((off + len) as usize),
+                                (off as usize)..(off.saturating_add(len) as usize),
                             )),
                             ..Default::default()
                         };
-                        store.get_opts(&path, opts).await
+                        match store.get_opts(&path, opts).await {
+                            Ok(res) => Ok(res.bytes().await?),
+                            Err(object_store::Error::NotFound { .. }) => {
+                                Err(BucketError::NotFound(name.to_string()))
+                            }
+                            Err(e) => Err(BucketError::Store(e)),
+                        }
                     }
-                };
-                match res {
-                    Ok(res) => Ok(res.bytes().await?),
-                    Err(object_store::Error::NotFound { .. }) => {
-                        Err(BucketError::NotFound(name.to_string()))
-                    }
-                    Err(e) => Err(BucketError::Store(e)),
                 }
             }
             .await,
         };
         if let Some(t) = timer {
-            let expected = self.expected_not_found && matches!(result, Err(BucketError::NotFound(_)));
+            let expected =
+                self.expected_not_found && result.as_ref().is_err_and(BucketError::is_not_found);
             t.finish_read(result.as_ref().map(|b| b.len() as u64).map_err(|_| ()), expected);
         }
         result
@@ -508,7 +525,9 @@ impl BucketClient {
             .await,
         };
         if let Some(t) = timer {
-            t.finish_simple(result.is_ok());
+            let expected =
+                self.expected_not_found && result.as_ref().is_err_and(BucketError::is_not_found);
+            t.finish_simple(result.is_ok(), expected);
         }
         result
     }
@@ -532,7 +551,9 @@ impl BucketClient {
             .await,
         };
         if let Some(t) = timer {
-            t.finish_simple(result.is_ok());
+            let expected =
+                self.expected_not_found && result.as_ref().is_err_and(BucketError::is_not_found);
+            t.finish_simple(result.is_ok(), expected);
         }
         result
     }
@@ -583,7 +604,9 @@ impl BucketClient {
             .await,
         };
         if let Some(t) = timer {
-            t.finish_simple(result.is_ok());
+            let expected =
+                self.expected_not_found && result.as_ref().is_err_and(BucketError::is_not_found);
+            t.finish_simple(result.is_ok(), expected);
         }
         result
     }
@@ -641,6 +664,15 @@ impl BucketClient {
         let mut entries =
             Vec::with_capacity(list_res.common_prefixes.len() + list_res.objects.len());
         for cp in list_res.common_prefixes {
+            if let Some(root) = &self.fs_root {
+                let mut dir_path = root.clone();
+                for part in cp.parts() {
+                    dir_path.push(part.as_ref());
+                }
+                if is_dir_empty(&dir_path)? {
+                    continue;
+                }
+            }
             let stripped = self.strip_prefix(cp.as_ref());
             if stripped.is_empty() {
                 continue;
@@ -689,6 +721,18 @@ impl BucketClient {
             }
             Ok(deleted)
         })
+    }
+}
+
+fn is_dir_empty(path: &Path) -> std::io::Result<bool> {
+    match std::fs::read_dir(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+        Ok(mut rd) => match rd.next() {
+            None => Ok(true),
+            Some(Ok(_)) => Ok(false),
+            Some(Err(e)) => Err(e),
+        },
     }
 }
 

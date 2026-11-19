@@ -166,7 +166,14 @@ pub async fn gzip_handler(State(cfg): State<GzipConfig>, req: Request, next: Nex
     }
     let (accepts_gzip, rejects_identity) = request_acceptance(req.headers());
     let mut resp = next.run(req).await;
-    if !resp.headers().contains_key(header::VARY) {
+    let has_vary_accept_encoding = resp
+        .headers()
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(|tok| tok.trim().eq_ignore_ascii_case("Accept-Encoding"));
+    if !has_vary_accept_encoding {
         resp.headers_mut()
             .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }
@@ -252,5 +259,90 @@ mod tests {
         assert_eq!(detect_content_type(b"  <html><body>"), "text/html; charset=utf-8");
         assert_eq!(detect_content_type(b"{\"a\":1}"), "text/plain; charset=utf-8");
         assert_eq!(detect_content_type(b"\x00\x01"), "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn apc06_gzip_appends_vary_accept_encoding_alongside_vary_accept() {
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt as _;
+
+        let big_body = "metric_line 1\n".repeat(200);
+        let app = Router::new()
+            .route(
+                "/ingester/tsdb_metrics",
+                get(move || {
+                    let body = big_body.clone();
+                    async move {
+                        let mut resp = Response::new(Body::from(body));
+                        resp.headers_mut()
+                            .insert(header::VARY, HeaderValue::from_static("Accept"));
+                        resp
+                    }
+                }),
+            )
+            .route(
+                "/already-has-vary-ae",
+                get(|| async move {
+                    let mut resp = Response::new(Body::from("ok"));
+                    resp.headers_mut().insert(
+                        header::VARY,
+                        HeaderValue::from_static("Accept, accept-encoding"),
+                    );
+                    resp
+                }),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                GzipConfig {
+                    level: -1,
+                    cost_attribution_path: None,
+                },
+                gzip_handler,
+            ));
+
+        // 1. With Vary: Accept and Accept-Encoding: gzip -> compressed + both Vary headers present.
+        let req = axum::http::Request::builder()
+            .uri("/ingester/tsdb_metrics")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.headers().get(header::CONTENT_ENCODING).unwrap(), "gzip");
+        let vary_vals: Vec<&str> = resp
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(vary_vals, vec!["Accept", "Accept-Encoding"]);
+
+        // 2. Without Accept-Encoding: gzip -> uncompressed, still has both Vary headers.
+        let req = axum::http::Request::builder()
+            .uri("/ingester/tsdb_metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
+        let vary_vals: Vec<&str> = resp
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(vary_vals, vec!["Accept", "Accept-Encoding"]);
+
+        // 3. When Accept-Encoding is already a token in Vary (case-insensitive), do not duplicate.
+        let req = axum::http::Request::builder()
+            .uri("/already-has-vary-ae")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let vary_vals: Vec<&str> = resp
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(vary_vals, vec!["Accept, accept-encoding"]);
     }
 }

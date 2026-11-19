@@ -38,7 +38,9 @@ use axum::{Json, Router};
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 use mimir_common::services::State;
 use mimir_common::shutdownmarker;
-use mimir_common::tenant::{parse_single_tenant_id, parse_tenant_ids, ORG_ID_HEADER_NAME};
+use mimir_common::tenant::{
+    extract_org_id_bytes_from_http_headers, parse_single_tenant_id_bytes, parse_tenant_ids_bytes,
+};
 use mimir_config::{parse_model_duration, GoDuration};
 use mimir_proto::ringpb::PartitionState;
 use mimir_ring::partition_ring::http::{partition_ring_router, partition_ring_router_at};
@@ -685,23 +687,20 @@ async fn shutdown_handler(AxumState(st): AxumState<HttpState>) -> Response {
 
 /// The tenant of an `auth=true` route: dskit `AuthenticateUser` (`401 no org id` without
 /// `X-Scope-OrgID`) followed by Mimir's `newTenantValidationMiddleware` (`401` on an invalid
-/// tenant ID, `422` on more than one tenant since federation is disabled on ingesters) and the
-/// handler's own `tenant.TenantID`. Without multi-tenancy `noauth` injects the no-auth tenant and
-/// ignores the header.
+/// tenant ID, `422` when `!federation && n > 1` or `federation && max_tenants > 0 && n > max_tenants`)
+/// and the handler's own `tenant.TenantID` (`401 multiple org IDs present` when federation allows
+/// multiple tenants through the middleware). Without multi-tenancy `noauth` injects the no-auth
+/// tenant and ignores the header.
 fn authenticated_tenant(st: &HttpState, headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
     if !st.ingester.is_multitenancy_enabled() {
         return Ok(st.ingester.no_auth_tenant());
     }
-    // `r.Header.Get("X-Scope-OrgID")`: the first value only.
-    let org_id = headers
-        .get(ORG_ID_HEADER_NAME)
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
-        .unwrap_or_default();
-    if org_id.is_empty() {
-        return Err((StatusCode::UNAUTHORIZED, "no org id".to_string()));
-    }
-    let ids = parse_tenant_ids(&org_id).map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
-    if ids.len() > 1 {
+    let org_bytes = extract_org_id_bytes_from_http_headers(headers)
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+    let ids =
+        parse_tenant_ids_bytes(org_bytes).map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+    let (federation, max_tenants) = st.ingester.tenant_federation();
+    if !federation && ids.len() > 1 {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             format!(
@@ -710,7 +709,16 @@ fn authenticated_tenant(st: &HttpState, headers: &HeaderMap) -> Result<String, (
             ),
         ));
     }
-    parse_single_tenant_id(&org_id).map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))
+    if federation && max_tenants > 0 && ids.len() > max_tenants as usize {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "too many tenant IDs present in the request. max: {max_tenants} actual: {}",
+                ids.len()
+            ),
+        ));
+    }
+    parse_single_tenant_id_bytes(org_bytes).map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))
 }
 
 async fn user_registry_handler(

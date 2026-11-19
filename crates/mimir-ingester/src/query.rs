@@ -29,7 +29,7 @@ use mimir_storage::ingest::PartitionOffsets;
 use mimir_tsdb::block::Block;
 use mimir_tsdb::chunkenc::Encoding;
 use mimir_tsdb::chunks_block::ChunkMeta;
-use mimir_tsdb::compact::merge_chunks_with_tombstones_and_float_encoding;
+use mimir_tsdb::compact::compact_chunk_series_merge;
 use mimir_tsdb::db::Tsdb;
 use mimir_tsdb::querier::TsdbChunkQuerier;
 use mimir_tsdb::labels::Labels;
@@ -2992,16 +2992,26 @@ impl Ingester {
             let mut resp_bytes = 0usize;
             for lbl_name in &label_names {
                 let lbl_values = if let Some(ref elig) = eligible_refs {
-                    let mut vals = Vec::new();
-                    head.visit_all_values_postings_for_name(lbl_name, |val_str, small, large| {
-                        if !val_str.is_empty()
-                            && mimir_tsdb::postings::intersect_sorted_any(small, large, elig)
-                        {
-                            vals.push(val_str.to_owned());
+                    if lbl_name.is_empty() {
+                        if head.visit_postings_for_label_value("", "", |small, large| {
+                            mimir_tsdb::postings::intersect_sorted_any(small, large, elig)
+                        }) {
+                            vec![String::new()]
+                        } else {
+                            Vec::new()
                         }
-                    });
-                    vals.sort_unstable();
-                    vals
+                    } else {
+                        let mut vals = Vec::new();
+                        head.visit_all_values_postings_for_name(lbl_name, |val_str, small, large| {
+                            if !val_str.is_empty()
+                                && mimir_tsdb::postings::intersect_sorted_any(small, large, elig)
+                            {
+                                vals.push(val_str.to_owned());
+                            }
+                        });
+                        vals.sort_unstable();
+                        vals
+                    }
                 } else {
                     match head.label_values(lbl_name, &[]) {
                         Ok(v) => v,
@@ -3176,16 +3186,26 @@ impl Ingester {
 
             for lbl_name in &label_names {
                 let lbl_values = if let Some(ref elig) = eligible_refs {
-                    let mut vals = Vec::new();
-                    head.visit_all_values_postings_for_name(lbl_name, |val_str, small, large| {
-                        if !val_str.is_empty()
-                            && mimir_tsdb::postings::intersect_sorted_any(small, large, elig)
-                        {
-                            vals.push(val_str.to_owned());
+                    if lbl_name.is_empty() {
+                        if head.visit_postings_for_label_value("", "", |small, large| {
+                            mimir_tsdb::postings::intersect_sorted_any(small, large, elig)
+                        }) {
+                            vec![String::new()]
+                        } else {
+                            Vec::new()
                         }
-                    });
-                    vals.sort_unstable();
-                    vals
+                    } else {
+                        let mut vals = Vec::new();
+                        head.visit_all_values_postings_for_name(lbl_name, |val_str, small, large| {
+                            if !val_str.is_empty()
+                                && mimir_tsdb::postings::intersect_sorted_any(small, large, elig)
+                            {
+                                vals.push(val_str.to_owned());
+                            }
+                        });
+                        vals.sort_unstable();
+                        vals
+                    }
                 } else {
                     head.label_values(lbl_name, &[]).map_err(|e| {
                         IngesterError::Internal {
@@ -3858,15 +3878,10 @@ pub(crate) fn merge_per_block_chunk_series(
             chunks.sort_by_key(|c| (c.min_time, c.max_time));
             let has_overlap = chunks.windows(2).any(|w| w[1].min_time <= w[0].max_time);
             if has_overlap {
-                let items: Vec<(ChunkMeta, Vec<mimir_tsdb::tombstones::Interval>)> =
-                    chunks.into_iter().map(|c| (c, Vec::new())).collect();
-                chunks = merge_chunks_with_tombstones_and_float_encoding(
-                    items,
-                    false,
-                    float_encoding,
-                )
-                .map_err(|e| IngesterError::Internal {
-                    message: format!("merging block chunks: {e}"),
+                chunks = compact_chunk_series_merge(chunks, float_encoding).map_err(|e| {
+                    IngesterError::Internal {
+                        message: format!("merging block chunks: {e}"),
+                    }
                 })?;
             }
         }
@@ -5284,5 +5299,96 @@ mod tests {
             assert!(ok_count >= 64, "expected channel to have been saturated: {ok_count}");
             assert!(saw_pool_stopped, "PoolStopped error must not be dropped when channel is full");
         }
+    }
+
+    #[test]
+    fn w16_icw_02_merge_per_block_chunk_series_matches_go_tie_break_and_120_split() {
+        use mimir_tsdb::chunkenc::{EncodedChunk, Encoding, Xor2Chunk, XorChunk};
+        use mimir_tsdb::chunks_block::ChunkMeta;
+        use mimir_tsdb::compact::{decode_chunk_samples, SampleValue};
+        use mimir_tsdb::labels::Labels;
+
+        let lbls = Labels::from_pairs([("__name__", "up"), ("job", "api")]);
+
+        // Block A: [150, 200] with (150, 1.0), (200, 1.9)
+        let mut c0 = XorChunk::new();
+        {
+            let mut app = c0.appender().unwrap();
+            app.append(0, 150, 1.0).unwrap();
+            app.append(0, 200, 1.9).unwrap();
+        }
+        // Block B: [150, 300] with (150, 2.0), (300, 3.0)
+        let mut c1 = XorChunk::new();
+        {
+            let mut app = c1.appender().unwrap();
+            app.append(0, 150, 2.0).unwrap();
+            app.append(0, 300, 3.0).unwrap();
+        }
+        let s0 = vec![QueryChunkSeries {
+            labels: lbls.clone(),
+            chunks: vec![ChunkMeta {
+                ref_id: 1,
+                min_time: 150,
+                max_time: 200,
+                chunk: Some(EncodedChunk::Xor(c0)),
+            }],
+        }];
+        let s1 = vec![QueryChunkSeries {
+            labels: lbls.clone(),
+            chunks: vec![ChunkMeta {
+                ref_id: 1,
+                min_time: 150,
+                max_time: 300,
+                chunk: Some(EncodedChunk::Xor(c1)),
+            }],
+        }];
+        let merged = merge_per_block_chunk_series(vec![s1, s0], false, Encoding::Xor).unwrap();
+        assert_eq!(merged.len(), 1);
+        let samples: Vec<(i64, f64)> = merged[0]
+            .chunks
+            .iter()
+            .flat_map(|c| decode_chunk_samples(c.chunk.as_ref().unwrap()).unwrap())
+            .map(|s| match s.value {
+                SampleValue::Float(v) => (s.t, v),
+                _ => panic!("expected float"),
+            })
+            .collect();
+        // c0=[150, 200] sorts before c1=[150, 300] by (min_time, max_time) and is passed LAST
+        // to chain_sample_merge, so (150, 1.0) wins.
+        assert_eq!(samples, vec![(150, 1.0), (200, 1.9), (300, 3.0)]);
+
+        // Byte-identical EncXOR2 chunks elided verbatim without re-encoding even under Encoding::Xor.
+        let mut dup = Xor2Chunk::new();
+        {
+            let mut app = dup.appender().unwrap();
+            app.append(0, 100, 42.0).unwrap();
+            app.append(0, 200, 43.0).unwrap();
+        }
+        let dup_meta = ChunkMeta {
+            ref_id: 7,
+            min_time: 100,
+            max_time: 200,
+            chunk: Some(EncodedChunk::Xor2(dup)),
+        };
+        let merged_dup = merge_per_block_chunk_series(
+            vec![
+                vec![QueryChunkSeries {
+                    labels: lbls.clone(),
+                    chunks: vec![dup_meta.clone()],
+                }],
+                vec![QueryChunkSeries {
+                    labels: lbls,
+                    chunks: vec![dup_meta],
+                }],
+            ],
+            false,
+            Encoding::Xor,
+        )
+        .unwrap();
+        assert_eq!(merged_dup[0].chunks.len(), 1);
+        assert_eq!(
+            merged_dup[0].chunks[0].chunk.as_ref().unwrap().encoding(),
+            Encoding::Xor2
+        );
     }
 }

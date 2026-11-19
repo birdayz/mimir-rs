@@ -391,20 +391,83 @@ fn sorted_labels(m: &proto::Metric) -> Vec<&proto::LabelPair> {
     l
 }
 
+/// Legacy Prometheus metric name check (`^[a-zA-Z_:][a-zA-Z0-9_:]*$`, Go `model.LegacyValidation.IsValidMetricName`).
+pub fn is_valid_legacy_metric_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let first = bytes[0];
+    if !(first.is_ascii_alphabetic() || first == b'_' || first == b':') {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
+}
+
+/// Legacy Prometheus label name check (`^[a-zA-Z_][a-zA-Z0-9_]*$`, Go `model.LegacyValidation.IsValidLabelName`).
+pub fn is_valid_legacy_label_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let first = bytes[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Writes a metric name as-is if legacy-valid, or double-quoted and escaped per Go `expfmt.writeName`.
+pub fn write_metric_name(out: &mut Vec<u8>, name: &str) {
+    if is_valid_legacy_metric_name(name) {
+        out.extend_from_slice(name.as_bytes());
+    } else {
+        out.push(b'"');
+        out.extend_from_slice(escape(name, true).as_bytes());
+        out.push(b'"');
+    }
+}
+
+/// Writes a label name as-is if legacy-valid, or double-quoted and escaped per Go `expfmt`.
+pub fn write_label_name(out: &mut Vec<u8>, name: &str) {
+    if is_valid_legacy_label_name(name) {
+        out.extend_from_slice(name.as_bytes());
+    } else {
+        out.push(b'"');
+        out.extend_from_slice(escape(name, true).as_bytes());
+        out.push(b'"');
+    }
+}
+
 fn write_name_and_labels(
     out: &mut Vec<u8>,
     name: &str,
     labels: &[&proto::LabelPair],
     extra: Option<(&str, String)>,
 ) {
-    out.extend_from_slice(name.as_bytes());
+    let mut sep = b'{';
+    let mut metric_inside_braces = false;
+    if !name.is_empty() {
+        if !is_valid_legacy_metric_name(name) {
+            metric_inside_braces = true;
+            out.push(sep);
+            sep = b',';
+        }
+        write_metric_name(out, name);
+    }
     if labels.is_empty() && extra.is_none() {
+        if metric_inside_braces {
+            out.push(b'}');
+        }
         return;
     }
-    let mut sep = b'{';
     for lp in labels {
         out.push(sep);
-        out.extend_from_slice(lp.get_name().as_bytes());
+        write_label_name(out, lp.get_name());
         out.extend_from_slice(b"=\"");
         out.extend_from_slice(escape(lp.get_value(), true).as_bytes());
         out.push(b'"');
@@ -412,7 +475,7 @@ fn write_name_and_labels(
     }
     if let Some((k, v)) = extra {
         out.push(sep);
-        out.extend_from_slice(k.as_bytes());
+        write_label_name(out, k);
         out.extend_from_slice(b"=\"");
         out.extend_from_slice(v.as_bytes());
         out.push(b'"');
@@ -446,7 +509,7 @@ pub fn encode_text(families: &[MetricFamily]) -> Vec<u8> {
             continue;
         }
         out.extend_from_slice(b"# HELP ");
-        out.extend_from_slice(name.as_bytes());
+        write_metric_name(&mut out, name);
         out.push(b' ');
         out.extend_from_slice(escape(mf.get_help(), false).as_bytes());
         out.push(b'\n');
@@ -457,7 +520,11 @@ pub fn encode_text(families: &[MetricFamily]) -> Vec<u8> {
             MetricType::UNTYPED => "untyped",
             MetricType::HISTOGRAM => "histogram",
         };
-        let _ = writeln!(out, "# TYPE {name} {typ}");
+        out.extend_from_slice(b"# TYPE ");
+        write_metric_name(&mut out, name);
+        out.push(b' ');
+        out.extend_from_slice(typ.as_bytes());
+        out.push(b'\n');
         for m in mf.get_metric() {
             let labels = sorted_labels(m);
             let ts = m.has_timestamp_ms().then(|| m.get_timestamp_ms());
@@ -581,7 +648,7 @@ pub fn encode_openmetrics(families: &[MetricFamily]) -> Vec<u8> {
             compliant.truncate(name.len() - 6);
         }
         out.extend_from_slice(b"# HELP ");
-        out.extend_from_slice(compliant.as_bytes());
+        write_metric_name(&mut out, &compliant);
         out.push(b' ');
         out.extend_from_slice(escape(mf.get_help(), true).as_bytes());
         out.push(b'\n');
@@ -592,7 +659,11 @@ pub fn encode_openmetrics(families: &[MetricFamily]) -> Vec<u8> {
             MetricType::SUMMARY => "summary",
             MetricType::HISTOGRAM => "histogram",
         };
-        let _ = writeln!(out, "# TYPE {compliant} {t}");
+        out.extend_from_slice(b"# TYPE ");
+        write_metric_name(&mut out, &compliant);
+        out.push(b' ');
+        out.extend_from_slice(t.as_bytes());
+        out.push(b'\n');
         if typ == MetricType::COUNTER && name.ends_with("_total") {
             compliant.push_str("_total");
         }
@@ -823,6 +894,39 @@ mod tests {
             "# HELP x help \\\\ \\\"q\\\"\\nl\n# TYPE x counter\nx_total{a=\"1\",b=\"2\"} 3.0\n\
              # HELP y_seconds h\n# TYPE y_seconds histogram\ny_seconds_bucket{le=\"0.5\"} 1\ny_seconds_bucket{le=\"1e+06\"} 1\n\
              y_seconds_bucket{le=\"+Inf\"} 1\ny_seconds_sum 0.25\ny_seconds_count 1\n# EOF\n"
+        );
+    }
+
+    #[test]
+    fn utf8_metric_and_label_names_quoted_per_go_expfmt() {
+        assert!(is_valid_legacy_metric_name("a:b_1"));
+        assert!(!is_valid_legacy_metric_name("a.b"));
+        assert!(!is_valid_legacy_metric_name("1abc"));
+        assert!(is_valid_legacy_label_name("a_b1"));
+        assert!(!is_valid_legacy_label_name("a:b"));
+        assert!(!is_valid_legacy_label_name("k8s.namespace.name"));
+
+        let mut mf = MetricFamily::default();
+        mf.set_name("metric.name".to_string());
+        mf.set_help("h".to_string());
+        mf.set_field_type(MetricType::GAUGE);
+        let mut lp1 = proto::LabelPair::default();
+        lp1.set_name("k8s.namespace.name".to_string());
+        lp1.set_value("prod".to_string());
+        let mut lp2 = proto::LabelPair::default();
+        lp2.set_name("label".to_string());
+        lp2.set_value("val".to_string());
+        let mut m = proto::Metric::default();
+        m.set_label(vec![lp1, lp2].into());
+        let mut g = proto::Gauge::default();
+        g.set_value(1.0);
+        m.set_gauge(g);
+        mf.mut_metric().push(m);
+
+        let text = String::from_utf8(encode_text(&[mf])).unwrap();
+        assert_eq!(
+            text,
+            "# HELP \"metric.name\" h\n# TYPE \"metric.name\" gauge\n{\"metric.name\",\"k8s.namespace.name\"=\"prod\",label=\"val\"} 1\n"
         );
     }
 }

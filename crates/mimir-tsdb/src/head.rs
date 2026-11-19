@@ -3493,23 +3493,30 @@ pub struct Head {
 }
 
 #[derive(Debug, Default)]
+struct HeadActiveReadsState {
+    reads: Vec<(u64, i64, i64)>,
+    next_id: u64,
+}
+
+#[derive(Debug, Default)]
 struct HeadActiveReads {
-    reads: Mutex<Vec<(u64, i64, i64)>>,
-    next_id: AtomicU64,
+    state: Mutex<HeadActiveReadsState>,
     cv: Condvar,
 }
 
 impl HeadActiveReads {
     fn start(&self, mint: i64, maxt: i64) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.reads.lock().push((id, mint, maxt));
+        let mut state = self.state.lock();
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        state.reads.push((id, mint, maxt));
         id
     }
 
     fn finish(&self, id: u64) {
-        let mut reads = self.reads.lock();
-        if let Some(pos) = reads.iter().position(|(rid, _, _)| *rid == id) {
-            reads.swap_remove(pos);
+        let mut state = self.state.lock();
+        if let Some(pos) = state.reads.iter().position(|(rid, _, _)| *rid == id) {
+            state.reads.swap_remove(pos);
             self.cv.notify_all();
         }
     }
@@ -3519,12 +3526,14 @@ impl HeadActiveReads {
             return;
         }
         let maxt_inclusive = maxt_exclusive - 1;
-        let mut reads = self.reads.lock();
-        while reads
+        let mut state = self.state.lock();
+        let cutoff = state.next_id;
+        while state
+            .reads
             .iter()
-            .any(|&(_, r_mint, r_maxt)| r_mint <= maxt_inclusive && mint <= r_maxt)
+            .any(|&(id, r_mint, r_maxt)| id < cutoff && r_mint <= maxt_inclusive && mint <= r_maxt)
         {
-            self.cv.wait(&mut reads);
+            self.cv.wait(&mut state);
         }
     }
 }
@@ -3732,7 +3741,9 @@ impl Head {
             chunk_writer.set_queue_metrics(m);
         }
         *head.chunk_writer.lock() = Some(chunk_writer);
-        head.refresh_chunk_reader()?;
+        if head.mmap_head_chunks_inner(false)? == 0 {
+            head.refresh_chunk_reader()?;
+        }
 
         Ok(head)
     }
@@ -3799,6 +3810,9 @@ impl Head {
                             chunks_dir,
                             self.opts.max_head_chunk_file_size,
                         )?;
+                        if let Some(m) = self.metrics.chunk_write_queue.clone() {
+                            replay_cw.set_queue_metrics(m);
+                        }
                         let wbl_res = self.replay_wbl_reader(
                             &mut r,
                             &multi_ref,
@@ -4038,6 +4052,23 @@ impl Head {
     pub fn set_wal_write_fault_hook_for_test(&self, hook: Option<crate::wlog::WriteFaultHook>) {
         if let Some(ref mut wal) = *self.wal.lock() {
             wal.set_write_fault_hook(hook);
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_wbl_write_fault_hook_for_test(&self, hook: Option<crate::wlog::WriteFaultHook>) {
+        if let Some(ref mut wbl) = *self.wbl.lock() {
+            wbl.set_write_fault_hook(hook);
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_chunk_writer_write_fault_hook_for_test(
+        &self,
+        hook: Option<crate::head_chunks::WriteFaultHook>,
+    ) {
+        if let Some(ref mut cw) = *self.chunk_writer.lock() {
+            cw.set_write_fault_hook(hook);
         }
     }
 
@@ -6832,6 +6863,10 @@ impl Head {
 
     /// Flushes all sealed head chunks (`head_chunks[..len-1]`) to `HeadChunksWriter` (`chunks_head/`).
     pub fn mmap_head_chunks(&self) -> Result<usize, HeadChunksError> {
+        self.mmap_head_chunks_inner(true)
+    }
+
+    fn mmap_head_chunks_inner(&self, update_mmap_metrics: bool) -> Result<usize, HeadChunksError> {
         let _mmap_guard = self.mmap_mtx.lock();
         let mut count = 0usize;
         let mut max_mmapped_chunks = 0usize;
@@ -6882,11 +6917,13 @@ impl Head {
                 st.promote_sealed_head_chunks(mmapped);
             }
         }
-        // Go `mmapHeadChunks`.
-        self.metrics
-            .head_chunks_max_mmapped
-            .set(max_mmapped_chunks as f64);
-        self.metrics.mmap_chunks_total.inc_by(count as f64);
+        // Go `mmapHeadChunks` only updates these on live runs, not during Head::open WAL replay.
+        if update_mmap_metrics {
+            self.metrics
+                .head_chunks_max_mmapped
+                .set(max_mmapped_chunks as f64);
+            self.metrics.mmap_chunks_total.inc_by(count as f64);
+        }
         Ok(count)
     }
 
@@ -7677,7 +7714,6 @@ impl Head {
             let mut min_mmap_seq = usize::MAX;
             let mut actual_mint = i64::MAX;
             let mut rem_ooo_mint = i64::MAX;
-            let mut rem_ooo_maxt = i64::MIN;
             let mut chunks_removed = 0u64;
 
             for stripe in &self.series.stripes {
@@ -7727,17 +7763,14 @@ impl Head {
                             let (seq, _) = mc.ref_id.unpack();
                             min_mmap_seq = min_mmap_seq.min(seq as usize);
                             rem_ooo_mint = rem_ooo_mint.min(mc.min_time);
-                            rem_ooo_maxt = rem_ooo_maxt.max(mc.max_time);
                         }
                         for (mc, _) in &ooo.ooo_pending_mmapped {
                             let (seq, _) = mc.ref_id.unpack();
                             min_mmap_seq = min_mmap_seq.min(seq as usize);
                             rem_ooo_mint = rem_ooo_mint.min(mc.min_time);
-                            rem_ooo_maxt = rem_ooo_maxt.max(mc.max_time);
                         }
                         if let Some(ref ohc) = ooo.ooo_head_chunk {
                             rem_ooo_mint = rem_ooo_mint.min(ohc.min_time);
-                            rem_ooo_maxt = rem_ooo_maxt.max(ohc.max_time);
                         }
                     }
                 }
@@ -7753,7 +7786,6 @@ impl Head {
                 min_ooo_time = head_maxt.wrapping_sub(ooo_window);
             }
             self.min_ooo_time.store(min_ooo_time, Ordering::Release);
-            self.max_ooo_time.store(rem_ooo_maxt, Ordering::Release);
 
             if !to_delete.is_empty() {
                 // Go `Head.gc()`: keep deleted series records in WAL checkpoints through
@@ -7804,10 +7836,9 @@ impl Head {
         let mut to_delete: Vec<(Arc<SeriesEntry>, i64)> = Vec::new();
         let mut min_mmap_seq = usize::MAX;
         let mut rem_ooo_mint = i64::MAX;
-        let mut rem_ooo_maxt = i64::MIN;
 
         let record_series_refs =
-            |st: &SeriesState, min_mmap_seq: &mut usize, rem_mint: &mut i64, rem_maxt: &mut i64| {
+            |st: &SeriesState, min_mmap_seq: &mut usize, rem_mint: &mut i64| {
                 for mc in st.mmapped() {
                     let (seq, _) = mc.ref_id.unpack();
                     *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
@@ -7817,17 +7848,14 @@ impl Head {
                         let (seq, _) = mc.ref_id.unpack();
                         *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
                         *rem_mint = (*rem_mint).min(mc.min_time);
-                        *rem_maxt = (*rem_maxt).max(mc.max_time);
                     }
                     for (mc, _) in &ooo.ooo_pending_mmapped {
                         let (seq, _) = mc.ref_id.unpack();
                         *min_mmap_seq = (*min_mmap_seq).min(seq as usize);
                         *rem_mint = (*rem_mint).min(mc.min_time);
-                        *rem_maxt = (*rem_maxt).max(mc.max_time);
                     }
                     if let Some(ref ohc) = ooo.ooo_head_chunk {
                         *rem_mint = (*rem_mint).min(ohc.min_time);
-                        *rem_maxt = (*rem_maxt).max(ohc.max_time);
                     }
                 }
             };
@@ -7840,7 +7868,7 @@ impl Head {
                 if entry.pending_commits_count() > 0 {
                     // Series has an in-flight append: do not drop OOO data, and still count its
                     // chunks_head sequence numbers so chunk files are never deleted prematurely.
-                    record_series_refs(&st, &mut min_mmap_seq, &mut rem_ooo_mint, &mut rem_ooo_maxt);
+                    record_series_refs(&st, &mut min_mmap_seq, &mut rem_ooo_mint);
                     continue;
                 }
 
@@ -7886,7 +7914,7 @@ impl Head {
                         continue;
                     }
                 }
-                record_series_refs(&st, &mut min_mmap_seq, &mut rem_ooo_mint, &mut rem_ooo_maxt);
+                record_series_refs(&st, &mut min_mmap_seq, &mut rem_ooo_mint);
             }
         }
 
@@ -7896,7 +7924,6 @@ impl Head {
             min_ooo_time = head_maxt.wrapping_sub(ooo_window);
         }
         self.min_ooo_time.store(min_ooo_time, Ordering::Release);
-        self.max_ooo_time.store(rem_ooo_maxt, Ordering::Release);
 
         let cut_seg_opt = self.ooo_compact_wbl_cut_seg.lock().take();
         if let Some(ref mut wbl) = *self.wbl.lock() {
@@ -8598,6 +8625,30 @@ impl Head {
         if matchers.is_empty() {
             let syms = self.symbols.read();
             return Ok(self.postings.sorted_label_values_with_limit(name, &syms, limit));
+        }
+        if name.is_empty() {
+            if self.postings.is_all_empty()
+                || !matchers
+                    .iter()
+                    .filter(|m| m.name.is_empty())
+                    .all(|m| m.matches(""))
+            {
+                return Ok(Vec::new());
+            }
+            let other_matchers: Vec<LabelMatcher> = matchers
+                .iter()
+                .filter(|m| !m.name.is_empty())
+                .cloned()
+                .collect();
+            if other_matchers.is_empty() {
+                return Ok(vec![String::new()]);
+            }
+            let refs = self.postings_for_matchers_direct(&other_matchers)?;
+            return Ok(if refs.is_empty() {
+                Vec::new()
+            } else {
+                vec![String::new()]
+            });
         }
         let refs = self.postings_for_matchers_direct(matchers)?;
         {
@@ -10952,6 +11003,7 @@ impl<'a> HeadAppender<'a> {
         let mut h_start = 0usize;
         let mut fh_start = 0usize;
 
+        let apply_res: Result<(), HeadError> = (|| {
         for batch_idx in 0..total_batches {
             let (f_end, h_end, fh_end) = if batch_idx < self.batch_boundaries.len() {
                 let b = self.batch_boundaries[batch_idx];
@@ -11499,27 +11551,41 @@ impl<'a> HeadAppender<'a> {
         self.hists_committed = 0;
         self.float_histograms.clear();
         self.fhists_committed = 0;
+        Ok(())
+        })();
 
         if in_order_mint <= in_order_maxt {
             self.head.update_min_max_time(in_order_mint, in_order_maxt);
         }
 
         // Flush chunk_writer and log WBL BEFORE exposing any OOO MmappedChunk or OOO bounds.
+        // Run the entire OOO tail unconditionally so partial OOO inserts prior to an error
+        // are still persisted to the WBL and visible via min_ooo_time / max_ooo_time.
         let mut flushed_ref = None;
-        if !pending_ooo_promote.is_empty() {
+        let flush_res: Result<(), HeadError> = if !pending_ooo_promote.is_empty() {
             if let Some(ref mut cw) = *self.head.chunk_writer.lock() {
                 if cw_start_epoch.is_some_and(|e| cw.discard_epoch() != e) {
-                    return Err(HeadChunksError::Io(io::Error::other(
+                    Err(HeadChunksError::Io(io::Error::other(
                         "unflushed OOO head chunks discarded by prior flush error",
                     ))
-                    .into());
+                    .into())
+                } else {
+                    match cw.flush() {
+                        Ok(()) => {
+                            flushed_ref = Some(cw.last_flushed_ref());
+                            Ok(())
+                        }
+                        Err(e) => Err(e.into()),
+                    }
                 }
-                cw.flush()?;
-                flushed_ref = Some(cw.last_flushed_ref());
+            } else {
+                Ok(())
             }
-        }
+        } else {
+            Ok(())
+        };
 
-        // 3. Log OOO records to WBL if any (samples before their corresponding MmapMarkers).
+        // 3. Log OOO records to WBL (best-effort matching Go `head_append.go:1994-2001`).
         flush_ooo_records(
             &mut wbl_samples,
             &mut wbl_histograms,
@@ -11531,20 +11597,27 @@ impl<'a> HeadAppender<'a> {
             if let Some(ref mut wbl) = *self.head.wbl.lock() {
                 let slices: Vec<&[u8]> = ooo_records.iter().map(|v| v.as_slice()).collect();
                 if !slices.is_empty() {
-                    wbl.log(&slices)?;
+                    if let Err(err) = wbl.log(&slices) {
+                        tracing::error!(err = %err, "Failed to log out of order samples into the WAL");
+                    }
                 }
             }
         }
         drop(ooo_wbl_guard);
 
-        if !pending_ooo_promote.is_empty() {
+        let mut refresh_res: Result<(), HeadError> = Ok(());
+        if flush_res.is_ok() && !pending_ooo_promote.is_empty() {
             if let Some(flushed_ref) = flushed_ref {
-                self.head.refresh_chunk_reader()?;
-                for entry in pending_ooo_promote {
-                    let mut st = entry.inner.lock();
-                    if let Some(ref mut ooo) = st.ooo_mut() {
-                        ooo.promote_pending_up_to(flushed_ref);
+                match self.head.refresh_chunk_reader() {
+                    Ok(()) => {
+                        for entry in pending_ooo_promote {
+                            let mut st = entry.inner.lock();
+                            if let Some(ref mut ooo) = st.ooo_mut() {
+                                ooo.promote_pending_up_to(flushed_ref);
+                            }
+                        }
                     }
+                    Err(e) => refresh_res = Err(e.into()),
                 }
             }
         }
@@ -11552,6 +11625,9 @@ impl<'a> HeadAppender<'a> {
             self.head.update_min_ooo_max_ooo_time(ooo_mint, ooo_maxt);
         }
 
+        apply_res?;
+        flush_res?;
+        refresh_res?;
         Ok(())
     }
 

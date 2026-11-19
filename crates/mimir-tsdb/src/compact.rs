@@ -1295,6 +1295,484 @@ pub fn merge_chunks_with_tombstones(
     merge_chunks_with_tombstones_and_float_encoding(items, allow_non_overlapping_raw, Encoding::Xor)
 }
 
+/// Maximum samples per chunk emitted by Prometheus `storage.seriesToChunkEncoder`
+/// (`storage/series.go:338`).
+pub const SERIES_TO_CHUNK_ENCODER_SPLIT: usize = 120;
+
+/// Re-encodes a sorted, deduplicated sample stream matching Prometheus `storage.seriesToChunkEncoder`
+/// (`storage/series.go:348-455`): splits chunks every `SERIES_TO_CHUNK_ENCODER_SPLIT` (120) samples,
+/// honours `float_encoding` (`Xor` vs `Xor2`) for `st == 0` floats, and preserves compatible
+/// already-open `Xor2` chunks when `st == 0`.
+pub fn series_to_chunk_encoder_encode(
+    samples: &[DecodedSample],
+    float_encoding: Encoding,
+) -> Result<Vec<ChunkMeta>, ChunkError> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prefer_xor2 = float_encoding == Encoding::Xor2;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ValType {
+        Float,
+        Histogram,
+        FloatHistogram,
+    }
+
+    enum Active {
+        None,
+        Xor {
+            mint: i64,
+            maxt: i64,
+            chunk: XorChunk,
+            state: XorAppendState,
+            prev_t: i64,
+            prev_v: f64,
+        },
+        Xor2 {
+            mint: i64,
+            maxt: i64,
+            chunk: Xor2Chunk,
+            state: Xor2AppendState,
+        },
+        Hist {
+            mint: i64,
+            maxt: i64,
+            chunk: HistogramChunk,
+            state: Option<HistogramAppenderState>,
+        },
+        HistSt {
+            mint: i64,
+            maxt: i64,
+            chunk: HistogramStChunk,
+            state: Option<(HistogramAppenderState, StEncoder)>,
+        },
+        FloatHist {
+            mint: i64,
+            maxt: i64,
+            chunk: FloatHistogramChunk,
+            state: Option<FloatHistogramAppenderState>,
+        },
+        FloatHistSt {
+            mint: i64,
+            maxt: i64,
+            chunk: FloatHistogramStChunk,
+            state: Option<(FloatHistogramAppenderState, StEncoder)>,
+        },
+    }
+
+    impl Active {
+        fn encoding(&self) -> Encoding {
+            match self {
+                Self::None => Encoding::None,
+                Self::Xor { .. } => Encoding::Xor,
+                Self::Xor2 { .. } => Encoding::Xor2,
+                Self::Hist { .. } => Encoding::Histogram,
+                Self::HistSt { .. } => Encoding::HistogramSt,
+                Self::FloatHist { .. } => Encoding::FloatHistogram,
+                Self::FloatHistSt { .. } => Encoding::FloatHistogramSt,
+            }
+        }
+    }
+
+    let flush_active = |active: &mut Active, out: &mut Vec<ChunkMeta>| {
+        match std::mem::replace(active, Active::None) {
+            Active::None => {}
+            Active::Xor {
+                mint,
+                maxt,
+                mut chunk,
+                ..
+            } => {
+                chunk.compact();
+                out.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: mint,
+                    max_time: maxt,
+                    chunk: Some(EncodedChunk::Xor(chunk)),
+                });
+            }
+            Active::Xor2 {
+                mint,
+                maxt,
+                mut chunk,
+                ..
+            } => {
+                chunk.compact();
+                out.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: mint,
+                    max_time: maxt,
+                    chunk: Some(EncodedChunk::Xor2(chunk)),
+                });
+            }
+            Active::Hist {
+                mint,
+                maxt,
+                mut chunk,
+                ..
+            } => {
+                chunk.compact();
+                out.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: mint,
+                    max_time: maxt,
+                    chunk: Some(EncodedChunk::Histogram(chunk)),
+                });
+            }
+            Active::HistSt {
+                mint,
+                maxt,
+                mut chunk,
+                ..
+            } => {
+                chunk.compact();
+                out.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: mint,
+                    max_time: maxt,
+                    chunk: Some(EncodedChunk::HistogramSt(chunk)),
+                });
+            }
+            Active::FloatHist {
+                mint,
+                maxt,
+                mut chunk,
+                ..
+            } => {
+                chunk.compact();
+                out.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: mint,
+                    max_time: maxt,
+                    chunk: Some(EncodedChunk::FloatHistogram(chunk)),
+                });
+            }
+            Active::FloatHistSt {
+                mint,
+                maxt,
+                mut chunk,
+                ..
+            } => {
+                chunk.compact();
+                out.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: mint,
+                    max_time: maxt,
+                    chunk: Some(EncodedChunk::FloatHistogramSt(chunk)),
+                });
+            }
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut active = Active::None;
+    let mut last_type: Option<ValType> = None;
+    let mut count_in_chunk = 0usize;
+
+    for s in samples {
+        let has_st = s.st != 0;
+        let (typ, desired) = match &s.value {
+            SampleValue::Float(_) => (
+                ValType::Float,
+                if has_st || prefer_xor2 {
+                    Encoding::Xor2
+                } else {
+                    Encoding::Xor
+                },
+            ),
+            SampleValue::Histogram(_) => (
+                ValType::Histogram,
+                if has_st {
+                    Encoding::HistogramSt
+                } else {
+                    Encoding::Histogram
+                },
+            ),
+            SampleValue::FloatHistogram(_) => (
+                ValType::FloatHistogram,
+                if has_st {
+                    Encoding::FloatHistogramSt
+                } else {
+                    Encoding::FloatHistogram
+                },
+            ),
+        };
+
+        let mut cut = last_type != Some(typ) || count_in_chunk >= SERIES_TO_CHUNK_ENCODER_SPLIT;
+        if !cut {
+            let cur_enc = active.encoding();
+            if cur_enc != desired {
+                let compatible = matches!(
+                    (cur_enc, desired),
+                    (Encoding::Xor | Encoding::Xor2, Encoding::Xor | Encoding::Xor2)
+                );
+                cut = !compatible || (has_st && cur_enc == Encoding::Xor);
+            }
+        }
+
+        if cut {
+            flush_active(&mut active, &mut out);
+            active = match desired {
+                Encoding::Xor => Active::Xor {
+                    mint: s.t,
+                    maxt: s.t,
+                    chunk: XorChunk::new(),
+                    state: XorAppendState::new_empty(),
+                    prev_t: i64::MIN,
+                    prev_v: 0.0,
+                },
+                Encoding::Xor2 => Active::Xor2 {
+                    mint: s.t,
+                    maxt: s.t,
+                    chunk: Xor2Chunk::new(),
+                    state: Xor2AppendState::new_empty(),
+                },
+                Encoding::Histogram => Active::Hist {
+                    mint: s.t,
+                    maxt: s.t,
+                    chunk: HistogramChunk::new(),
+                    state: None,
+                },
+                Encoding::HistogramSt => Active::HistSt {
+                    mint: s.t,
+                    maxt: s.t,
+                    chunk: HistogramStChunk::new(),
+                    state: None,
+                },
+                Encoding::FloatHistogram => Active::FloatHist {
+                    mint: s.t,
+                    maxt: s.t,
+                    chunk: FloatHistogramChunk::new(),
+                    state: None,
+                },
+                Encoding::FloatHistogramSt => Active::FloatHistSt {
+                    mint: s.t,
+                    maxt: s.t,
+                    chunk: FloatHistogramStChunk::new(),
+                    state: None,
+                },
+                Encoding::None => unreachable!(),
+            };
+            count_in_chunk = 0;
+        }
+        last_type = Some(typ);
+
+        match &s.value {
+            SampleValue::Float(v) => match &mut active {
+                Active::Xor {
+                    maxt,
+                    chunk,
+                    state,
+                    prev_t,
+                    prev_v,
+                    ..
+                } => {
+                    chunk.append_with_state(state, *prev_t, *prev_v, s.t, *v)?;
+                    *prev_t = s.t;
+                    *prev_v = *v;
+                    *maxt = s.t;
+                }
+                Active::Xor2 {
+                    maxt,
+                    chunk,
+                    state,
+                    ..
+                } => {
+                    chunk.append_with_state(state, s.st, s.t, *v)?;
+                    *maxt = s.t;
+                }
+                _ => unreachable!(),
+            },
+            SampleValue::Histogram(h) => match &mut active {
+                Active::Hist {
+                    mint,
+                    maxt,
+                    chunk,
+                    state,
+                } => match chunk.append_with_state(state, s.st, s.t, h)? {
+                    AppendHistogramOutcome::Appended { .. } => *maxt = s.t,
+                    AppendHistogramOutcome::NewChunk(new_chk) => {
+                        let cur_mint = *mint;
+                        let cur_maxt = *maxt;
+                        let mut old = std::mem::replace(chunk, new_chk);
+                        old.compact();
+                        out.push(ChunkMeta {
+                            ref_id: 0,
+                            min_time: cur_mint,
+                            max_time: cur_maxt,
+                            chunk: Some(EncodedChunk::Histogram(old)),
+                        });
+                        *mint = s.t;
+                        *maxt = s.t;
+                        count_in_chunk = 0;
+                    }
+                },
+                Active::HistSt {
+                    mint,
+                    maxt,
+                    chunk,
+                    state,
+                } => match chunk.append_with_state(state, s.st, s.t, h)? {
+                    AppendHistogramStOutcome::Appended { .. } => *maxt = s.t,
+                    AppendHistogramStOutcome::NewChunk(new_chk) => {
+                        let cur_mint = *mint;
+                        let cur_maxt = *maxt;
+                        let mut old = std::mem::replace(chunk, new_chk);
+                        old.compact();
+                        out.push(ChunkMeta {
+                            ref_id: 0,
+                            min_time: cur_mint,
+                            max_time: cur_maxt,
+                            chunk: Some(EncodedChunk::HistogramSt(old)),
+                        });
+                        *mint = s.t;
+                        *maxt = s.t;
+                        count_in_chunk = 0;
+                    }
+                },
+                _ => unreachable!(),
+            },
+            SampleValue::FloatHistogram(fh) => match &mut active {
+                Active::FloatHist {
+                    mint,
+                    maxt,
+                    chunk,
+                    state,
+                } => match chunk.append_with_state(state, s.st, s.t, fh)? {
+                    AppendFloatHistogramOutcome::Appended { .. } => *maxt = s.t,
+                    AppendFloatHistogramOutcome::NewChunk(new_chk) => {
+                        let cur_mint = *mint;
+                        let cur_maxt = *maxt;
+                        let mut old = std::mem::replace(chunk, new_chk);
+                        old.compact();
+                        out.push(ChunkMeta {
+                            ref_id: 0,
+                            min_time: cur_mint,
+                            max_time: cur_maxt,
+                            chunk: Some(EncodedChunk::FloatHistogram(old)),
+                        });
+                        *mint = s.t;
+                        *maxt = s.t;
+                        count_in_chunk = 0;
+                    }
+                },
+                Active::FloatHistSt {
+                    mint,
+                    maxt,
+                    chunk,
+                    state,
+                } => match chunk.append_with_state(state, s.st, s.t, fh)? {
+                    AppendFloatHistogramStOutcome::Appended { .. } => *maxt = s.t,
+                    AppendFloatHistogramStOutcome::NewChunk(new_chk) => {
+                        let cur_mint = *mint;
+                        let cur_maxt = *maxt;
+                        let mut old = std::mem::replace(chunk, new_chk);
+                        old.compact();
+                        out.push(ChunkMeta {
+                            ref_id: 0,
+                            min_time: cur_mint,
+                            max_time: cur_maxt,
+                            chunk: Some(EncodedChunk::FloatHistogramSt(old)),
+                        });
+                        *mint = s.t;
+                        *maxt = s.t;
+                        count_in_chunk = 0;
+                    }
+                },
+                _ => unreachable!(),
+            },
+        }
+        count_in_chunk += 1;
+    }
+
+    flush_active(&mut active, &mut out);
+    Ok(out)
+}
+
+/// Merges chunks across multiple blocks / sources matching Go
+/// `storage.NewCompactingChunkSeriesMergerWithFloatEncoding(storage.ChainedSeriesMerge, ...)`
+/// (`storage/merge.go:804-895` + `storage/series.go:348-455`):
+/// 1. Orders chunks by `(min_time, max_time)`.
+/// 2. Elides exact byte-identical duplicate chunks without decoding/re-encoding.
+/// 3. Passes `[c1, c2, ..., c0]` (`curr` LAST after `overlapping`) to `chain_sample_merge` so `c0` wins duplicate-timestamp ties.
+/// 4. Re-encodes overlapping runs via `series_to_chunk_encoder_encode` (`120`-sample split, `float_encoding`).
+pub fn compact_chunk_series_merge(
+    mut chunks: Vec<ChunkMeta>,
+    float_encoding: Encoding,
+) -> Result<Vec<ChunkMeta>, ChunkError> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    if chunks.len() == 1 {
+        return Ok(chunks);
+    }
+
+    chunks.sort_by_key(|c| (c.min_time, c.max_time));
+    let mut slots: Vec<Option<ChunkMeta>> = chunks.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(slots.len());
+    let mut i = 0usize;
+
+    while i < slots.len() {
+        let Some(curr) = slots[i].take() else {
+            i += 1;
+            continue;
+        };
+        let mut o_max = curr.max_time;
+        let mut overlapping: Vec<ChunkMeta> = Vec::new();
+        let mut j = i + 1;
+
+        while j < slots.len() {
+            let Some(ref next) = slots[j] else {
+                j += 1;
+                continue;
+            };
+            if next.min_time > o_max {
+                break;
+            }
+            let prev = overlapping.last().unwrap_or(&curr);
+            let is_exact_dup = next.min_time == prev.min_time
+                && next.max_time == prev.max_time
+                && next.chunk.as_ref().map(|c| (c.encoding(), c.as_bytes()))
+                    == prev.chunk.as_ref().map(|c| (c.encoding(), c.as_bytes()));
+            let Some(next_taken) = slots[j].take() else {
+                j += 1;
+                continue;
+            };
+            j += 1;
+            if !is_exact_dup {
+                o_max = o_max.max(next_taken.max_time);
+                overlapping.push(next_taken);
+            }
+        }
+        i = j;
+
+        if overlapping.is_empty() {
+            out.push(curr);
+            continue;
+        }
+
+        // Go `compactChunkIterator.Next()`: `c.curr` is appended LAST after `overlapping`
+        // so `chainSampleIterator` gives `c.curr` precedence on duplicate timestamps.
+        let mut streams = Vec::with_capacity(overlapping.len() + 1);
+        for cm in overlapping.into_iter().chain(std::iter::once(curr)) {
+            let Some(ref enc) = cm.chunk else {
+                continue;
+            };
+            let stream = decode_chunk_samples(enc)?;
+            if !stream.is_empty() {
+                streams.push(stream);
+            }
+        }
+        let merged = chain_sample_merge(streams);
+        if !merged.is_empty() {
+            out.extend(series_to_chunk_encoder_encode(&merged, float_encoding)?);
+        }
+    }
+
+    Ok(out)
+}
+
 /// Like [`merge_chunks_with_tombstones`], respecting `float_encoding` (`Xor` vs `Xor2`) on
 /// merged float clusters with `st == 0`.
 pub fn merge_chunks_with_tombstones_and_float_encoding(
@@ -1738,89 +2216,29 @@ where
 }
 
 fn trim_and_merge_chunks_per_chunk(
-    mut chunks: Vec<(ChunkMeta, std::sync::Arc<[Interval]>)>,
+    chunks: Vec<(ChunkMeta, std::sync::Arc<[Interval]>)>,
     mint: i64,
     maxt_inclusive: i64,
+    float_encoding: Encoding,
 ) -> Result<Vec<ChunkMeta>, ChunkError> {
     if chunks.is_empty() || mint > maxt_inclusive {
         return Ok(Vec::new());
     }
 
-    chunks.retain(|(c, tombs)| {
-        c.overlaps_closed_interval(mint, maxt_inclusive)
-            && !tombs
-                .iter()
-                .any(|iv| iv.is_subrange(c.min_time, c.max_time))
-    });
-    if chunks.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    chunks.sort_by_key(|(c, _)| (c.min_time, c.ref_id));
-
-    let mut out = Vec::with_capacity(chunks.len());
-    let mut cluster: Vec<(ChunkMeta, std::sync::Arc<[Interval]>)> = Vec::new();
-    let mut cluster_max = i64::MIN;
-
-    let flush_cluster =
-        |cluster: &mut Vec<(ChunkMeta, std::sync::Arc<[Interval]>)>,
-         out: &mut Vec<ChunkMeta>|
-         -> Result<(), ChunkError> {
-            if cluster.is_empty() {
-                return Ok(());
-            }
-            if cluster.len() == 1 {
-                let Some((cm, tombs)) = cluster.pop() else {
-                    return Ok(());
-                };
-                if let Some(c) =
-                    reencode_single_chunk_filtered(cm, &tombs, mint, maxt_inclusive)?
-                {
-                    out.push(c);
-                }
-                return Ok(());
-            }
-            let mut streams = Vec::with_capacity(cluster.len());
-            for (cm, tombs) in cluster.drain(..) {
-                let Some(ref encoded) = cm.chunk else {
-                    continue;
-                };
-                let mut stream = Vec::new();
-                for s in decode_chunk_samples(encoded)? {
-                    if s.t < mint || s.t > maxt_inclusive {
-                        continue;
-                    }
-                    if !tombs.is_empty() && tombs.iter().any(|iv| iv.in_bounds(s.t)) {
-                        continue;
-                    }
-                    stream.push(s);
-                }
-                if !stream.is_empty() {
-                    streams.push(stream);
-                }
-            }
-            let merged = chain_sample_merge(streams);
-            if !merged.is_empty() {
-                out.extend(encode_iterable_chunks(&merged)?);
-            }
-            Ok(())
-        };
-
+    let mut filtered = Vec::with_capacity(chunks.len());
     for (cm, tombs) in chunks {
-        if cluster.is_empty() {
-            cluster_max = cm.max_time;
-            cluster.push((cm, tombs));
-        } else if cm.min_time > cluster_max {
-            flush_cluster(&mut cluster, &mut out)?;
-            cluster_max = cm.max_time;
-            cluster.push((cm, tombs));
-        } else {
-            cluster_max = cluster_max.max(cm.max_time);
-            cluster.push((cm, tombs));
+        if !cm.overlaps_closed_interval(mint, maxt_inclusive)
+            || tombs
+                .iter()
+                .any(|iv| iv.is_subrange(cm.min_time, cm.max_time))
+        {
+            continue;
+        }
+        if let Some(c) = reencode_single_chunk_filtered(cm, &tombs, mint, maxt_inclusive)? {
+            filtered.push(c);
         }
     }
-    flush_cluster(&mut cluster, &mut out)?;
-    Ok(out)
+    compact_chunk_series_merge(filtered, float_encoding)
 }
 
 /// Writes a single Prometheus ULID block directory into `dest` from sorted [`CompactionSeries`]
@@ -1986,6 +2404,16 @@ fn write_prepared_block(
 
 /// Compacts multiple existing on-disk [`Block`]s into a single merged ULID block directory.
 pub fn compact_blocks(dest: &Path, blocks: &[&Block]) -> Result<Option<BlockMeta>, CompactError> {
+    compact_blocks_with_float_encoding(dest, blocks, Encoding::Xor)
+}
+
+/// Compacts multiple existing on-disk [`Block`]s into a single merged ULID block directory,
+/// using `float_encoding` (`Xor` vs `Xor2`) when re-encoding overlapping float chunks.
+pub fn compact_blocks_with_float_encoding(
+    dest: &Path,
+    blocks: &[&Block],
+    float_encoding: Encoding,
+) -> Result<Option<BlockMeta>, CompactError> {
     if blocks.is_empty() {
         return Ok(None);
     }
@@ -2062,7 +2490,7 @@ pub fn compact_blocks(dest: &Path, blocks: &[&Block]) -> Result<Option<BlockMeta
 
     let mut prepared: Vec<(Labels, Vec<ChunkMeta>)> = Vec::with_capacity(series_map.len());
     for (labels, chks) in series_map {
-        let trimmed = trim_and_merge_chunks_per_chunk(chks, mint, maxt_inclusive)?;
+        let trimmed = trim_and_merge_chunks_per_chunk(chks, mint, maxt_inclusive, float_encoding)?;
         if !trimmed.is_empty() {
             prepared.push((labels, trimmed));
         }

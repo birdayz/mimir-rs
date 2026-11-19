@@ -807,11 +807,25 @@ impl WlogWriter {
     }
 }
 
+struct SegmentEntry {
+    dir: PathBuf,
+    index: usize,
+    path: PathBuf,
+}
+
 /// Multi-segment buffered reader matching Prometheus `wlog.segmentBufReader`.
+///
+/// Validates the sequential segment list upfront in `open_ranges`, then opens
+/// at most one segment `File` at a time lazily using a single reusable `16 * PAGE_SIZE`
+/// (512 KiB) read buffer.
 pub struct SegmentBufReader {
-    segs: Vec<(PathBuf, usize, Option<BufReader<File>>)>,
+    segs: Vec<SegmentEntry>,
     cur: usize,
     off: usize,
+    cur_file: Option<File>,
+    buf: Box<[u8]>,
+    buf_pos: usize,
+    buf_len: usize,
 }
 
 impl SegmentBufReader {
@@ -838,28 +852,35 @@ impl SegmentBufReader {
                         break;
                     }
                 }
-                let path = range.dir.join(&r.name);
-                let file = File::open(&path)?;
-                segs.push((
-                    range.dir.clone(),
-                    r.index,
-                    Some(BufReader::with_capacity(16 * PAGE_SIZE, file)),
-                ));
+                segs.push(SegmentEntry {
+                    dir: range.dir.clone(),
+                    index: r.index,
+                    path: range.dir.join(&r.name),
+                });
             }
         }
+        let buf = if segs.is_empty() {
+            Box::new([])
+        } else {
+            vec![0u8; 16 * PAGE_SIZE].into_boxed_slice()
+        };
         Ok(Self {
             segs,
             cur: 0,
             off: 0,
+            cur_file: None,
+            buf,
+            buf_pos: 0,
+            buf_len: 0,
         })
     }
 
     pub fn current_dir(&self) -> Option<&Path> {
-        self.segs.get(self.cur).map(|(d, _, _)| d.as_path())
+        self.segs.get(self.cur).map(|s| s.dir.as_path())
     }
 
     pub fn current_segment(&self) -> Option<usize> {
-        self.segs.get(self.cur).map(|(_, idx, _)| *idx)
+        self.segs.get(self.cur).map(|s| s.index)
     }
 
     pub fn current_offset(&self) -> usize {
@@ -868,39 +889,58 @@ impl SegmentBufReader {
 }
 
 impl Read for SegmentBufReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.segs.is_empty() || self.cur >= self.segs.len() {
-            return Ok(0);
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.segs.is_empty() || self.cur >= self.segs.len() || out.is_empty() {
+                return Ok(0);
+            }
+
+            if self.buf_pos == self.buf_len {
+                let file = match self.cur_file.as_mut() {
+                    Some(f) => f,
+                    None => {
+                        let f = File::open(&self.segs[self.cur].path)?;
+                        self.buf_pos = 0;
+                        self.buf_len = 0;
+                        self.cur_file.insert(f)
+                    }
+                };
+                let n = loop {
+                    match file.read(&mut self.buf) {
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        res => break res?,
+                    }
+                };
+                if n > 0 {
+                    self.buf_pos = 0;
+                    self.buf_len = n;
+                } else {
+                    // Hit EOF on current segment. If short of a page boundary, fake zero-padding up to PAGE_SIZE.
+                    if !self.off.is_multiple_of(PAGE_SIZE) {
+                        let rem = PAGE_SIZE - (self.off % PAGE_SIZE);
+                        let pad = rem.min(out.len());
+                        out[..pad].fill(0);
+                        self.off += pad;
+                        return Ok(pad);
+                    }
+
+                    // Drop finished segment FD immediately and reuse the single 512 KiB buffer.
+                    self.cur_file = None;
+                    self.buf_pos = 0;
+                    self.buf_len = 0;
+                    self.cur += 1;
+                    self.off = 0;
+                    continue;
+                }
+            }
+
+            let avail = self.buf_len - self.buf_pos;
+            let take = avail.min(out.len());
+            out[..take].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + take]);
+            self.buf_pos += take;
+            self.off += take;
+            return Ok(take);
         }
-
-        let Some(ref mut rdr) = self.segs[self.cur].2 else {
-            return Ok(0);
-        };
-        let n = rdr.read(buf)?;
-        self.off += n;
-        if n > 0 {
-            return Ok(n);
-        }
-
-        // Hit EOF on current segment. If short of a page boundary, fake zero-padding up to PAGE_SIZE.
-        if !self.off.is_multiple_of(PAGE_SIZE) {
-            let rem = PAGE_SIZE - (self.off % PAGE_SIZE);
-            let pad = rem.min(buf.len());
-            buf[..pad].fill(0);
-            self.off += pad;
-            return Ok(pad);
-        }
-
-        // Release finished segment FD & 512 KiB read buffer immediately.
-        self.segs[self.cur].2 = None;
-
-        if self.cur + 1 >= self.segs.len() {
-            return Ok(0);
-        }
-
-        self.cur += 1;
-        self.off = 0;
-        self.read(buf)
     }
 }
 

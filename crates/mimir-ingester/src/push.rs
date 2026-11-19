@@ -1425,10 +1425,10 @@ impl Ingester {
         user_id: &str,
         metadata: &[cortexpb::MetricMetadata],
     ) -> usize {
+        let store = self.get_or_create_user_metadata(user_id);
         if metadata.is_empty() {
             return 0;
         }
-        let store = self.get_or_create_user_metadata(user_id);
         let now_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
@@ -1479,10 +1479,10 @@ impl Ingester {
         user_id: &str,
         metadata: impl ExactSizeIterator<Item = mimir_proto::zerocopy::BorrowedMetadata<'a>>,
     ) -> usize {
+        let store = self.get_or_create_user_metadata(user_id);
         if metadata.len() == 0 {
             return 0;
         }
-        let store = self.get_or_create_user_metadata(user_id);
         let now_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
@@ -1526,10 +1526,10 @@ impl Ingester {
         items: &[BorrowedMetadata<'_>],
         explicit_sampled_trace_id: Option<&str>,
     ) -> usize {
+        let store = self.get_or_create_user_metadata(user_id);
         if items.is_empty() {
             return 0;
         }
-        let store = self.get_or_create_user_metadata(user_id);
         let now_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
@@ -4432,5 +4432,45 @@ mod wave3_tests {
             1.0
         );
         assert_eq!(ing.metrics.ingested_exemplars_fail.get(), 1.0);
+    }
+
+    #[test]
+    fn oem04_push_metadata_items_with_trace_creates_store_when_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = prometheus::Registry::new();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            mimir_config::IngesterConfig::default(),
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&reg),
+        )
+        .unwrap();
+
+        assert_eq!(ing.push_metadata_items_with_trace("t-empty-meta", &[], None), 0);
+        assert!(ing.get_user_metadata("t-empty-meta").is_some());
+        ing.purge_user_metrics_metadata();
+        let val = reg
+            .gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "cortex_ingester_memory_metadata_removed_total")
+            .and_then(|mf| {
+                mf.get_metric()
+                    .iter()
+                    .find(|m| {
+                        m.get_label()
+                            .iter()
+                            .any(|l| l.get_name() == "user" && l.get_value() == "t-empty-meta")
+                    })
+                    .map(|m| m.get_counter().get_value())
+            });
+        assert_eq!(val, Some(0.0));
     }
 }
