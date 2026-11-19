@@ -1319,12 +1319,11 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                                 }
                                 Err(tenant_status) => {
                                     let wire_err = ingester.validate_grpc_push_wire(&raw).err();
-                                    if let Some(permit) = tap {
-                                        permit.finish_with_duration(
-                                            std::time::Duration::ZERO,
-                                            wire_err.as_ref(),
-                                        );
-                                    }
+                                    // Go rejects in `dec(in)` / the tenant interceptor before the
+                                    // limiter's `UnaryServerInterceptor` (`RPCCallProcessing`) and
+                                    // before `PushWithCleanup`: `FinishPushRequest` records a
+                                    // zero-duration success and no reactive-limiter RTT sample.
+                                    drop(tap);
                                     if let Some(e) = wire_err {
                                         record_push_error(
                                             &ingester,

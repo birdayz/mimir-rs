@@ -690,7 +690,9 @@ pub fn start_server_span_context(
             trace_id,
             span_id,
             sampled,
-            trace_flags: if sampled { 0x01 } else { 0x00 },
+            // OTel SDK `tracer.newSpan`: `psc.TraceFlags() | FlagsSampled` / `&^ FlagsSampled`
+            // (the parent's W3C random bit 0x02 is inherited by the child span context).
+            trace_flags: (effective_parent.trace_flags & 0x02) | u8::from(sampled),
             remote: false,
             jaeger_debug_id: effective_parent.jaeger_debug_id,
             tracestate: effective_parent.tracestate,

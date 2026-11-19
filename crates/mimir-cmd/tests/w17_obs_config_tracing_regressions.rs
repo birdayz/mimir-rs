@@ -315,6 +315,14 @@ fn w17_obs_04_ingest_storage_trace_and_error_log_parity() {
     let sc = TraceSpanContext::from_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").unwrap();
     assert!(sc.sampled);
 
+    // 1b. OTel SDK `tracer.newSpan` derives the child flags from the parent
+    //     (`psc.TraceFlags() | FlagsSampled`), so the W3C random bit (0x02) is inherited.
+    let (child, parent_span_id) = mimir_common::tracing::start_server_span_context(&tc, false);
+    assert_eq!(parent_span_id, Some(tc.span_id));
+    assert!(child.is_sampled());
+    assert_eq!(child.trace_flags, 0x03);
+    assert!(child.to_traceparent().ends_with("-03"));
+
     // 2. End-to-end IngesterShardedBatchConsumer on series-only record with tenant metadata suffix
     //    ("123456:product=k6") and W3C traceparent.
     let tmp = tempdir().unwrap();
@@ -397,6 +405,22 @@ fn w17_obs_04_ingest_storage_trace_and_error_log_parity() {
         timestamp_ms: 0,
     };
     consumer.consume_records_sync(&[rec1]).unwrap();
+    // Go `sampledOnlyTracer.OnFetchRecordBuffered`: a record without a sampled W3C span
+    // context never starts a "receive" span (and never gets a fresh root trace), even
+    // though the record still carries non-tracing headers (`Version`).
+    let receive_spans = |spans: &Arc<Mutex<Vec<ExportedSpan>>>| -> Vec<ExportedSpan> {
+        spans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|s| s.name.ends_with(" receive"))
+            .cloned()
+            .collect()
+    };
+    assert!(
+        receive_spans(_spans).is_empty(),
+        "untraced Kafka record must not start a root receive span"
+    );
 
     let mut headers2 = r2[0].headers.clone();
     headers2.push(("traceparent".to_string(), Bytes::from(traceparent)));
@@ -423,6 +447,46 @@ fn w17_obs_04_ingest_storage_trace_and_error_log_parity() {
     assert!(
         line.contains(&format!("trace_id={trace_id} ")),
         "missing sampled trace_id in series-only client error log: {line}"
+    );
+    drop(logs);
+    let recv = receive_spans(_spans);
+    assert_eq!(recv.len(), 1, "expected exactly 1 receive span for the sampled record");
+    assert_eq!(
+        recv[0].trace_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        trace_id
+    );
+
+    // 3. Go `batchingQueue` overwrites the batch context on every append: a batch whose LAST
+    //    record is untraced logs no trace_id, even when an earlier record in it was sampled.
+    let (r3, _) = ser.to_records("t", 0, "123456:product=k6", &req2, 16 << 20).unwrap();
+    let mut headers3 = r3[0].headers.clone();
+    headers3.push((
+        "traceparent".to_string(),
+        Bytes::from(format!("00-{trace_id}-00f067aa0ba902b7-01")),
+    ));
+    let rec3 = FetchedRecord {
+        key: r3[0].key.clone(),
+        value: r3[0].value.clone(),
+        headers: headers3,
+        offset: 3,
+        timestamp_ms: 0,
+    };
+    let rec4 = FetchedRecord {
+        key: r3[0].key.clone(),
+        value: r3[0].value.clone(),
+        headers: r3[0].headers.clone(),
+        offset: 4,
+        timestamp_ms: 0,
+    };
+    log_sink.lock().clear();
+    consumer.consume_records_sync(&[rec3, rec4]).unwrap();
+    let logs = log_sink.lock();
+    assert!(!logs.is_empty(), "expected client error logs for the out-of-bounds batch");
+    let last = logs.last().unwrap();
+    assert!(last.contains("user=123456 "), "expected canonical tenant_id in log: {last}");
+    assert!(
+        !last.contains("trace_id="),
+        "flush ending with an untraced record must not log a trace_id: {last}"
     );
 }
 
@@ -596,6 +660,52 @@ fn w17_obs_06_hidden_cli_flags_registered_validated_and_hidden_from_help() {
             bad.stderr
         );
     }
+
+    // Go registers these hidden flags through validating `flag.Value`s
+    // (`ingest.SASLMechanism`, `flagext.LimitsMap[string]`, S3 `bucketLookupTypeValue`):
+    // verified against `target/go-mimir` (exit 2 + identical `invalid value` prefix).
+    for (bad_flag, want_err) in [
+        (
+            "-usage-tracker.events-storage.writer.sasl-mechanism=x",
+            "the configured SASL mechanism is invalid, must be one of: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER, AWS_MSK_IAM",
+        ),
+        (
+            "-usage-tracker.snapshots-metadata.reader.sasl-mechanism=",
+            "the configured SASL mechanism is invalid",
+        ),
+        (
+            "-usage-tracker.events-storage.reader.sasl-oauthbearer-extensions={\"a\":1}",
+            "invalid value",
+        ),
+        (
+            "-usage-tracker.snapshots-storage.s3.bucket-lookup-type=x",
+            "unsupported bucket lookup type: x",
+        ),
+        (
+            "-ruler-storage.s3.bucket-lookup-type=virtual-host",
+            "unsupported bucket lookup type: virtual-host",
+        ),
+    ] {
+        let bad = run_cli_test_mode("mimir", &[cfg_arg.clone(), bad_flag.to_string()]);
+        assert_eq!(bad.exit_code, 2, "expected exit 2 for {bad_flag}, stderr: {}", bad.stderr);
+        assert!(
+            bad.stderr.contains(want_err),
+            "expected {want_err:?} for {bad_flag}, got: {}",
+            bad.stderr
+        );
+    }
+    let ok_values = run_cli_test_mode(
+        "mimir",
+        &[
+            cfg_arg.clone(),
+            "-usage-tracker.events-storage.writer.sasl-mechanism=SCRAM-SHA-512".to_string(),
+            "-usage-tracker.events-storage.writer.sasl-oauthbearer-extensions={\"a\":\"b\"}".to_string(),
+            "-usage-tracker.events-storage.writer.sasl-oauthbearer-extensions=null".to_string(),
+            "-usage-tracker.snapshots-storage.s3.bucket-lookup-type=virtual-hosted".to_string(),
+            "-print.config".to_string(),
+        ],
+    );
+    assert_eq!(ok_values.exit_code, 0, "expected exit 0, stderr:\n{}", ok_values.stderr);
 
     let help_all = run_cli_test_mode("mimir", &["-help-all".to_string()]);
     assert_eq!(help_all.exit_code, 2);

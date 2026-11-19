@@ -331,7 +331,11 @@ struct TimedBucket {
 /// O(1) 10-bucket sliding time window matching `failsafe-go/internal/util/stats.go:timedStats`
 /// and `windows.go:BucketedWindow`.
 struct TimedStats {
+    /// Monotonic anchor paired with `epoch_unix_nanos`: Go's `BucketedWindow` derives the head
+    /// bucket from `Clock.Now().UnixNano() / BucketNanos`, i.e. bucket boundaries are aligned to
+    /// the Unix epoch rather than to the breaker's creation time.
     epoch: Instant,
+    epoch_unix_nanos: u128,
     bucket_nanos: u128,
     buckets: [TimedBucket; DEFAULT_BUCKET_COUNT],
     summary: TimedBucket,
@@ -339,12 +343,13 @@ struct TimedStats {
 }
 
 impl TimedStats {
-    fn new(thresholding_period: Duration, epoch: Instant) -> Self {
+    fn new(thresholding_period: Duration, epoch: Instant, epoch_unix_nanos: u128) -> Self {
         let bucket_nanos = (thresholding_period / DEFAULT_BUCKET_COUNT as u32)
             .as_nanos()
             .max(1);
         Self {
             epoch,
+            epoch_unix_nanos,
             bucket_nanos,
             buckets: [TimedBucket::default(); DEFAULT_BUCKET_COUNT],
             summary: TimedBucket::default(),
@@ -353,8 +358,8 @@ impl TimedStats {
     }
 
     fn expire_buckets(&mut self, now: Instant) -> &mut TimedBucket {
-        let new_head =
-            (now.saturating_duration_since(self.epoch).as_nanos() / self.bucket_nanos) as u64;
+        let unix_nanos = self.epoch_unix_nanos + now.saturating_duration_since(self.epoch).as_nanos();
+        let new_head = (unix_nanos / self.bucket_nanos) as u64;
         if new_head > self.head_time {
             let buckets_to_move = (DEFAULT_BUCKET_COUNT as u64).min(new_head - self.head_time);
             for i in 0..buckets_to_move {
@@ -462,6 +467,9 @@ pub struct CircuitBreaker {
     request_type: &'static str,
     cooldown: Duration,
     thresholding_period: Duration,
+    /// `(Instant, UnixNano)` pair captured at construction, used to align `TimedStats` buckets
+    /// to the Unix epoch like failsafe-go's wall-clock `BucketedWindow`.
+    unix_anchor: (Instant, u128),
     request_timeout: Duration,
     initial_delay: Duration,
     test_mode_count_based: AtomicBool,
@@ -495,12 +503,19 @@ impl CircuitBreaker {
         let initial_delay = Duration::from_nanos(cfg.initial_delay.as_nanos().max(0) as u64);
 
         let now = Instant::now();
+        let unix_anchor = (
+            now,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
         let closed_stats = if test_mode_count_based {
             ClosedStats::Counting(CountingStats::new(
                 cfg.failure_threshold_percentage.max(1) as usize,
             ))
         } else {
-            ClosedStats::Timed(TimedStats::new(thresholding_period, now))
+            ClosedStats::Timed(TimedStats::new(thresholding_period, unix_anchor.0, unix_anchor.1))
         };
         let half_open_cap = if test_mode_count_based {
             cfg.failure_threshold_percentage.max(1) as usize
@@ -524,6 +539,7 @@ impl CircuitBreaker {
             request_type,
             cooldown,
             thresholding_period,
+            unix_anchor,
             request_timeout,
             initial_delay,
             test_mode_count_based: AtomicBool::new(test_mode_count_based),
@@ -540,25 +556,27 @@ impl CircuitBreaker {
         }))
     }
 
-    fn new_closed_stats(&self, now: Instant) -> ClosedStats {
+    fn new_closed_stats(&self) -> ClosedStats {
         if self.test_mode_count_based.load(Ordering::Acquire) {
             ClosedStats::Counting(CountingStats::new(
                 self.cfg.failure_threshold_percentage.max(1) as usize,
             ))
         } else {
-            ClosedStats::Timed(TimedStats::new(self.thresholding_period, now))
+            ClosedStats::Timed(TimedStats::new(
+                self.thresholding_period,
+                self.unix_anchor.0,
+                self.unix_anchor.1,
+            ))
         }
     }
 
     pub fn enable_test_mode(&self) {
         self.test_mode_count_based.store(true, Ordering::Release);
-        let now = Instant::now();
         let mut inner = self.inner.lock();
         inner.closed_stats = ClosedStats::Counting(CountingStats::new(
             self.cfg.failure_threshold_percentage.max(1) as usize,
         ));
         inner.half_open_stats = CountingStats::new(self.half_open_capacity());
-        let _ = now;
     }
 
     pub fn set_test_request_delay(&self, delay: Duration) {
@@ -624,7 +642,7 @@ impl CircuitBreaker {
             inner.opened_at = Some(now);
             inner.half_open_in_flight = 0;
             inner.half_open_stats.reset();
-            inner.closed_stats = self.new_closed_stats(now);
+            inner.closed_stats = self.new_closed_stats();
             self.metrics
                 .transitions
                 .with_label_values(&[BreakerState::Open.as_str()])
@@ -633,14 +651,13 @@ impl CircuitBreaker {
     }
 
     pub fn force_close(&self) {
-        let now = Instant::now();
         let mut inner = self.inner.lock();
         if inner.state != BreakerState::Closed {
             inner.state = BreakerState::Closed;
             inner.opened_at = None;
             inner.half_open_in_flight = 0;
             inner.half_open_stats.reset();
-            inner.closed_stats = self.new_closed_stats(now);
+            inner.closed_stats = self.new_closed_stats();
             self.metrics
                 .transitions
                 .with_label_values(&[BreakerState::Closed.as_str()])
@@ -958,7 +975,7 @@ impl CircuitBreaker {
         if should_open {
             inner.state = BreakerState::Open;
             inner.opened_at = Some(now);
-            inner.closed_stats = self.new_closed_stats(now);
+            inner.closed_stats = self.new_closed_stats();
             self.metrics
                 .transitions
                 .with_label_values(&[BreakerState::Open.as_str()])
@@ -993,7 +1010,7 @@ impl CircuitBreaker {
             inner.opened_at = None;
             inner.half_open_in_flight = 0;
             inner.half_open_stats.reset();
-            inner.closed_stats = self.new_closed_stats(now);
+            inner.closed_stats = self.new_closed_stats();
             self.metrics
                 .transitions
                 .with_label_values(&[BreakerState::Closed.as_str()])
@@ -1296,7 +1313,7 @@ mod tests {
     #[test]
     fn timed_stats_10_buckets_expires_old_buckets_in_o1() {
         let epoch = Instant::now();
-        let mut stats = TimedStats::new(Duration::from_secs(10), epoch);
+        let mut stats = TimedStats::new(Duration::from_secs(10), epoch, 0);
 
         // Bucket 0: 50 failures + 50 successes at +0.5s
         let t0 = epoch + Duration::from_millis(500);

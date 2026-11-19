@@ -555,9 +555,12 @@ async fn bug_w17_cmp_01_non_owned_ooo_only_series_evicted_after_compact_ooo_head
 }
 
 #[tokio::test]
-async fn bug_w17_cmp_02_close_idle_tsdb_serializes_with_compaction_and_preserves_series_count_on_error()
+async fn bug_w17_cmp_02_close_idle_tsdb_serializes_with_compaction_and_matches_go_series_count_on_error()
 {
-    // Part A: close_and_delete_user_tsdb_if_idle must preserve series_count when UserTsdb::close() fails.
+    // Part A: close_and_delete_user_tsdb_if_idle must report CloseFailed and keep the tenant when
+    // UserTsdb::close() fails, with Go's seriesCount accounting (pkg/ingester/ingester_tsdb.go:
+    // `i.seriesCount.Sub(int64(userDB.Head().NumSeries()))` runs before `userDB.Close()` and is
+    // not restored on `tsdbCloseFailed`).
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut blocks_cfg = BlocksStorageConfig::default();
     blocks_cfg.tsdb.close_idle_tsdb_when_shipping_disabled = true;
@@ -595,10 +598,11 @@ async fn bug_w17_cmp_02_close_idle_tsdb_serializes_with_compaction_and_preserves
         .close_and_delete_user_tsdb_if_idle("u-fail", Duration::from_secs(60))
         .await;
     assert_eq!(res, TsdbCloseCheckResult::CloseFailed);
+    assert!(ing.get_tsdb("u-fail").is_some(), "tenant must stay registered after CloseFailed");
     assert_eq!(
         ing.series_count.load(Ordering::Relaxed),
-        2,
-        "series_count must never underflow on close() error"
+        0,
+        "Go subtracts Head().NumSeries() before Close() and does not restore it on close error"
     );
 
     // Part B: Concurrent compaction + close_and_delete_user_tsdb_if_idle must serialize cleanly via compact_mtx
@@ -616,7 +620,7 @@ async fn bug_w17_cmp_02_close_idle_tsdb_serializes_with_compaction_and_preserves
         }
         app.commit().expect("commit");
     }
-    assert_eq!(ing.series_count.load(Ordering::Relaxed), 22);
+    assert_eq!(ing.series_count.load(Ordering::Relaxed), 20);
     udb2.deletion_mark_found.store(true, Ordering::Release);
 
     let db_compact = Arc::clone(&udb2.db);
@@ -632,7 +636,7 @@ async fn bug_w17_cmp_02_close_idle_tsdb_serializes_with_compaction_and_preserves
         "close must serialize with compaction and remove dir cleanly"
     );
     assert!(!u2_dir.exists(), "closed TSDB dir must be completely removed");
-    assert_eq!(ing.series_count.load(Ordering::Relaxed), 2);
+    assert_eq!(ing.series_count.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -653,6 +657,30 @@ async fn bug_w17_cmp_03_flush_re_reads_ship_tx_and_user_tsdb_sets_block_ranges()
         vec![7_200_000, 21_600_000, 64_800_000],
         "UserTsdb::open must preserve multi-range block_ranges_period"
     );
+
+    // 1b. Go `createTSDB` only forwards MinBlockDuration/MaxBlockDuration (first/last entry);
+    //     Prometheus derives `ExponentialBlockRanges(min, 10, 3)` capped at MaxBlockDuration,
+    //     so intermediate configured entries never become compactor ranges.
+    for (cfg_hours, want_ms) in [
+        (vec![2i64, 12, 24], vec![7_200_000i64, 21_600_000, 64_800_000]),
+        (vec![2, 6], vec![7_200_000, 21_600_000]),
+        (vec![2], vec![7_200_000]),
+        (vec![1, 4], vec![3_600_000, 10_800_000]),
+    ] {
+        let tmp_r = tempfile::tempdir().expect("tempdir");
+        let mut bc = BlocksStorageConfig::default();
+        bc.tsdb.block_ranges_period = cfg_hours
+            .iter()
+            .map(|h| GoDuration::from_secs(h * 3600))
+            .collect();
+        let ing_r = test_ingester_with_blocks(&tmp_r, bc);
+        let udb_r = ing_r.get_or_create_tsdb("u-ranges").expect("user tsdb");
+        assert_eq!(
+            udb_r.db.block_ranges(),
+            want_ms,
+            "block_ranges_period {cfg_hours:?} must map to Prometheus exponential ranges"
+        );
+    }
 
     // 2. POST /ingester/flush?wait=true while State::Starting must re-read ship_tx AFTER compaction completes.
     ing.set_state_for_test(State::Starting);

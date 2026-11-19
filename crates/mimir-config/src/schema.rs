@@ -2499,7 +2499,22 @@ pub fn register_extra_flags<T: 'static>(
                         | FieldKind::StringList
                         | FieldKind::Other
                         | FieldKind::Secret
-                        | FieldKind::SecretOmitEmpty => {}
+                        | FieldKind::SecretOmitEmpty => {
+                            // Go registers these through validating `flag.Value`s on every
+                            // prefix, so an invalid value fails flag parsing (exit 2):
+                            // `ingest.SASLMechanism.Set`, `flagext.LimitsMap[string].Set` and
+                            // the S3 `bucketLookupTypeValue.Set`.
+                            if name_for_set.ends_with(".sasl-mechanism") {
+                                crate::types::SASLMechanism::parse(s)?;
+                            } else if name_for_set.ends_with(".sasl-oauthbearer-extensions") {
+                                serde_json::from_str::<Option<BTreeMap<String, String>>>(s)
+                                    .map_err(|e| {
+                                        ConfigError::Flag(format!("invalid JSON map: {e}"))
+                                    })?;
+                            } else if name_for_set.ends_with(".s3.bucket-lookup-type") {
+                                crate::types::S3BucketLookupType::parse(s)?;
+                            }
+                        }
                     }
                     get_mut(t).insert(name_for_set.clone(), s.to_string());
                     Ok(())

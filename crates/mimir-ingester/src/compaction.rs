@@ -678,6 +678,10 @@ impl Ingester {
         }
         let tenant_deleted = recheck == TsdbCloseCheckResult::TenantMarkedForDeletion;
 
+        // Go `closeAndDeleteUserTSDBIfIdle` runs `i.seriesCount.Sub(userDB.Head().NumSeries())`
+        // BEFORE `userDB.Close()` and never restores it when `Close()` fails (`tsdbCloseFailed`).
+        let num_series = user_db.db.head().num_series() as i64;
+        self.series_count.fetch_sub(num_series, Ordering::Relaxed);
         let dir = user_db.db.dir().to_path_buf();
         let tracker_names = user_db.active_series.current_matcher_names();
         let label_value_bytes_names: Vec<String> = user_db
@@ -701,8 +705,6 @@ impl Ingester {
                 return TsdbCloseCheckResult::CloseFailed;
             }
         }
-        let num_series = user_db.db.head().num_series() as i64;
-        self.series_count.fetch_sub(num_series, Ordering::Relaxed);
 
         struct RemoveTsdbGuard<'a> {
             ingester: &'a Ingester,

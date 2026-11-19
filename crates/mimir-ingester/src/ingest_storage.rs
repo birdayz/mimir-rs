@@ -751,8 +751,14 @@ impl IngesterShardedBatchConsumer {
                         }),
                         &propagators,
                     );
-                    let (span_ctx, parent_span_id) =
-                        mimir_common::tracing::start_server_span_context(&extracted, false);
+                    // Go `sampledOnlyTracer.OnFetchRecordBuffered`: records whose headers carry no
+                    // sampled W3C span context keep the (absent/unsampled) remote context and never
+                    // start a "receive" span, so they must not get a fresh root trace either.
+                    let (span_ctx, parent_span_id) = if extracted.is_sampled() {
+                        mimir_common::tracing::start_server_span_context(&extracted, false)
+                    } else {
+                        (mimir_common::tracing::TraceContext::default(), None)
+                    };
                     if span_ctx.is_sampled() {
                         if let Some(rt) = mimir_common::tracing::global_tracing() {
                             if rt.exporter.is_some() {
@@ -1206,7 +1212,7 @@ impl IngesterShardedBatchConsumer {
                                    source_raw: i32,
                                    min_ts: i64,
                                    last_off: i64,
-                                   series_trace_id: Option<(u16, u32)>,
+                                   last_series_rec: Option<(u32, u16, u32)>,
                                    batch_vec: &mut Vec<PrehashedSeriesItem<'_>>,
                                    metas: &[ShardMetadataItem]|
              -> Result<(), String> {
@@ -1243,25 +1249,27 @@ impl IngesterShardedBatchConsumer {
                 }
                 m.time_series_per_flush.observe(batch_vec.len() as f64);
 
-                let sampled_trace_id = series_trace_id
-                    .and_then(|(w_idx, t_idx)| {
-                        arenas_ref
-                            .get(w_idx as usize)
-                            .and_then(|a| a.trace_ids.get(t_idx as usize))
-                            .map(String::as_str)
-                    })
-                    .or_else(|| {
-                        metas.iter().rev().find_map(|it| {
-                            (it.trace_id_idx != u32::MAX)
-                                .then(|| {
-                                    arenas_ref
-                                        .get(it.worker_idx as usize)
-                                        .and_then(|a| a.trace_ids.get(it.trace_id_idx as usize))
-                                        .map(String::as_str)
-                                })
-                                .flatten()
-                        })
-                    });
+                // Go `batchingQueue.AddToBatch` / `AddMetadataToBatch` overwrite
+                // `currentBatch.Context` on every append, so the flush runs under the context
+                // of the LAST record that contributed to the batch (a record's metadata is added
+                // after its series); an unsampled last record means no `trace_id`.
+                let last_meta_rec = metas
+                    .iter()
+                    .max_by_key(|it| it.rec_seq)
+                    .map(|it| (it.rec_seq, it.worker_idx, it.trace_id_idx));
+                let batch_ctx_rec = match (last_series_rec, last_meta_rec) {
+                    (Some(s), Some(m)) => Some(if m.0 >= s.0 { m } else { s }),
+                    (s, m) => s.or(m),
+                };
+                let sampled_trace_id = batch_ctx_rec.and_then(|(_, w_idx, t_idx)| {
+                    if t_idx == u32::MAX {
+                        return None;
+                    }
+                    arenas_ref
+                        .get(w_idx as usize)
+                        .and_then(|a| a.trace_ids.get(t_idx as usize))
+                        .map(String::as_str)
+                });
                 let proc_t0 = Instant::now();
                 let res = self
                     .ingester
@@ -1346,7 +1354,7 @@ impl IngesterShardedBatchConsumer {
             let mut batch: Vec<PrehashedSeriesItem<'_>> =
                 Vec::with_capacity(items_for_shard.len().min(max_batch_series));
             let mut batch_min_ts = i64::MAX;
-            let mut batch_trace_id: Option<(u16, u32)> = None;
+            let mut batch_last_rec: Option<(u32, u16, u32)> = None;
             let mut cur_tenant_idx = first_item.tenant_idx;
             let mut cur_rec_seq = first_item.rec_seq;
             let mut cur_source = first_item.source;
@@ -1377,13 +1385,13 @@ impl IngesterShardedBatchConsumer {
                         norm_cur_src,
                         batch_min_ts,
                         last_offset,
-                        batch_trace_id,
+                        batch_last_rec,
                         &mut batch,
                         &metas_for_shard[meta_pos..meta_end],
                     )?;
                     meta_pos = meta_end;
                     batch_min_ts = i64::MAX;
-                    batch_trace_id = None;
+                    batch_last_rec = None;
                     cur_tenant_idx = item.tenant_idx;
                     cur_rec_seq = item.rec_seq;
                     cur_source = item.source;
@@ -1419,8 +1427,8 @@ impl IngesterShardedBatchConsumer {
                     histograms,
                     exemplars,
                 });
-                if item.trace_id_idx != u32::MAX {
-                    batch_trace_id = Some((item.worker_idx, item.trace_id_idx));
+                if batch_last_rec.is_none_or(|(seq, _, _)| item.rec_seq >= seq) {
+                    batch_last_rec = Some((item.rec_seq, item.worker_idx, item.trace_id_idx));
                 }
                 batch_min_ts = batch_min_ts.min(item.min_ts);
                 last_offset = item.record_offset;
@@ -1439,7 +1447,7 @@ impl IngesterShardedBatchConsumer {
                 norm_cur_src,
                 batch_min_ts,
                 last_offset,
-                batch_trace_id,
+                batch_last_rec,
                 &mut batch,
                 &metas_for_shard[meta_pos..meta_end],
             )?;
