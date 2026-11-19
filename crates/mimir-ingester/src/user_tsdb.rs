@@ -322,6 +322,7 @@ pub struct UserTsdb {
     pub offset_catalogue: Option<OffsetCatalogue>,
 
     state_mtx: parking_lot::RwLock<()>,
+    pub(crate) compaction_mtx: tokio::sync::Mutex<()>,
     state: AtomicU8,
     forced_compaction_max_time: AtomicI64,
     in_flight_appends: AtomicI64,
@@ -723,6 +724,7 @@ impl UserTsdb {
             shipper: RwLock::new(shipper),
             offset_catalogue,
             state_mtx: parking_lot::RwLock::new(()),
+            compaction_mtx: tokio::sync::Mutex::new(()),
             state: AtomicU8::new(TsdbState::Active as u8),
             forced_compaction_max_time: AtomicI64::new(i64::MAX),
             in_flight_appends: AtomicI64::new(0),

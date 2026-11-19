@@ -5,18 +5,12 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
-
-fn free_tcp_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
 
 /// Minimal memberlist-backed ingester whose memberlist join target (`127.0.0.1:1`) refuses
 /// connections, so the binary logs memberlist join failures, then becomes ACTIVE alone.
@@ -29,14 +23,14 @@ fn write_memberlist_ingester_config(dir: &Path) -> std::path::PathBuf {
 target: ingester
 server:
   http_listen_address: 127.0.0.1
-  http_listen_port: {http}
+  http_listen_port: 0
   grpc_listen_address: 127.0.0.1
-  grpc_listen_port: {grpc}
+  grpc_listen_port: 0
 memberlist:
   node_name: logtest
   randomize_node_name: false
   bind_addr: [127.0.0.1]
-  bind_port: {ml}
+  bind_port: 0
   join_members: [127.0.0.1:1]
   min_join_backoff: 50ms
   max_join_backoff: 50ms
@@ -60,9 +54,6 @@ blocks_storage:
 activity_tracker:
   filepath: ""
 "#,
-            http = free_tcp_port(),
-            grpc = free_tcp_port(),
-            ml = free_tcp_port(),
             dir = dir.display(),
         ),
     )
@@ -310,9 +301,9 @@ fn test_binary_fatal_error_logged_like_check_fatal() {
 target: ingester
 server:
   http_listen_address: 127.0.0.1
-  http_listen_port: {http}
+  http_listen_port: 0
   grpc_listen_address: 127.0.0.1
-  grpc_listen_port: {grpc}
+  grpc_listen_port: 0
 ingester:
   ring:
     kvstore:
@@ -330,8 +321,6 @@ blocks_storage:
 activity_tracker:
   filepath: ""
 "#,
-            http = free_tcp_port(),
-            grpc = free_tcp_port(),
             dir = dir.path().display(),
         ),
     )

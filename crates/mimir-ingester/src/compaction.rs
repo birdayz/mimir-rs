@@ -68,6 +68,7 @@ impl Ingester {
         let Some(user_db) = self.get_tsdb(user_id) else {
             return;
         };
+        let _compaction_guard = user_db.compaction_mtx.lock().await;
         let head = user_db.db.head();
         if head.num_series() == 0 {
             return;
@@ -592,6 +593,7 @@ impl Ingester {
                 continue;
             }
 
+            let _compaction_guard = db.compaction_mtx.lock().await;
             let series_before = db.db.head().num_series();
             let db_c = Arc::clone(&db);
             let compact_res = tokio::task::spawn_blocking(move || {
