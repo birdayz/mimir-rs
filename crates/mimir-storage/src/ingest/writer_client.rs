@@ -415,7 +415,7 @@ impl KafkaWriterClient {
             if !has_items {
                 tokio::select! {
                     _ = notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {},
                 }
                 continue;
             }
@@ -478,10 +478,19 @@ impl KafkaWriterClient {
                 } else {
                     extra_permits.pop()
                 };
-                let this = Arc::clone(&this_strong);
+                let weak_this = Arc::downgrade(&this_strong);
                 tokio::spawn(async move {
                     let _permit = p;
-                    this.send_partition_batch(topic, partition, items).await;
+                    if let Some(this) = weak_this.upgrade() {
+                        this.send_partition_batch(topic, partition, items).await;
+                    } else {
+                        for item in items {
+                            (item.on_done)(
+                                item.record,
+                                Err(ProducerError::Other("client closed".to_string())),
+                            );
+                        }
+                    }
                 });
             }
         }
