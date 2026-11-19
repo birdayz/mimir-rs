@@ -21,7 +21,8 @@ use crate::block::{
     BlockMetaCompaction,
 };
 use crate::compact::{
-    compact_blocks, plan_block_compactions, write_head_block_streaming, CompactError,
+    compact_blocks_with_float_encoding, plan_block_compactions, write_head_block_streaming,
+    CompactError,
 };
 use crate::exemplar::{CircularExemplarStorage, ExemplarQueryResult};
 use crate::head::{range_for_timestamp, Head, HeadAppender, HeadError, HeadOptions};
@@ -1160,7 +1161,13 @@ impl TsdbInner {
                 )?));
             }
             let block_refs: Vec<&Block> = plan_blocks.iter().map(|b| b.as_ref()).collect();
-            let meta_opt = self.timed_write(|| compact_blocks(&self.dir, &block_refs))?;
+            let meta_opt = self.timed_write(|| {
+                compact_blocks_with_float_encoding(
+                    &self.dir,
+                    &block_refs,
+                    self.head.float_chunk_encoding(),
+                )
+            })?;
             match meta_opt {
                 Some(meta) => {
                     drop(plan_blocks);
@@ -1671,6 +1678,81 @@ mod tests {
         let res_ooo = db.querier(i64::MIN, i64::MAX).select(true, &[m_ooo]).unwrap();
         assert_eq!(res_ooo.len(), 1);
         assert_eq!(res_ooo[0].samples.len(), 3);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn w16_icw_02_compact_blocks_honors_float_chunk_encoding_xor2() {
+        use crate::chunkenc::Encoding;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = TsdbOptions::default();
+        opts.head.chunk_range_ms = 7_200_000;
+        opts.head.ooo_time_window_ms = 7_200_000;
+        opts.head.float_chunk_encoding = Encoding::Xor2;
+        let db = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO).unwrap();
+        db.set_enable_overlapping_compaction(true);
+
+        let pairs = [("__name__", "xor2_overlap"), ("job", "a")];
+        {
+            let mut app = db.appender();
+            let r = app.append_float_with_st(None, &pairs, 500, 1_000, 1.0).unwrap();
+            app.append_float_with_st(Some(r), &pairs, 500, 3_000, 3.0).unwrap();
+            app.append_float_with_st(Some(r), &pairs, 500, 7_200_000, 4.0).unwrap();
+            app.commit().unwrap();
+        }
+        {
+            let mut app = db.appender();
+            // OOO sample in the same [0, 7_200_000) block window as 1_000 and 3_000.
+            app.append_float_with_st(None, &pairs, 500, 2_000, 2.0).unwrap();
+            app.commit().unwrap();
+        }
+
+        let head_uid = db
+            .compact_head_range(0, 7_200_000)
+            .unwrap()
+            .expect("head block created");
+        let ooo_ulids = db.compact_ooo_head().unwrap();
+        assert_eq!(ooo_ulids.len(), 1);
+        assert_eq!(db.block_ulids().len(), 2);
+        assert_ne!(head_uid, ooo_ulids[0]);
+
+        let merged_ulids = db.compact_blocks().unwrap();
+        assert_eq!(merged_ulids.len(), 1);
+        let blocks = db.blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].ulid(), merged_ulids[0]);
+
+        let idx = blocks[0].index();
+        let chk_r = blocks[0].chunks();
+        let ids = idx.postings("", &[""]).unwrap();
+        assert_eq!(ids.len(), 1);
+        let (_lbls, chks) = idx.series(ids[0]).unwrap();
+        assert!(!chks.is_empty());
+        for c in chks {
+            let chunk = chk_r.chunk(c.ref_id).unwrap();
+            assert_eq!(chunk.encoding(), Encoding::Xor2);
+        }
+
+        let m = LabelMatcher::new(MatchType::Equal, "__name__", "xor2_overlap").unwrap();
+        let res = db.querier(0, 7_199_999).select(true, &[m]).unwrap();
+        assert_eq!(res.len(), 1);
+        let got: Vec<(i64, i64, SampleValue)> = res[0]
+            .samples
+            .iter()
+            .map(|s| (s.st, s.t, s.value.clone()))
+            .collect();
+        // With enable_st_storage = false (default), st is normalized to 0, yet float_chunk_encoding = Xor2
+        // must still produce Encoding::Xor2 chunks after overlapping block compaction.
+        assert_eq!(
+            got,
+            vec![
+                (0, 1_000, SampleValue::Float(1.0)),
+                (0, 2_000, SampleValue::Float(2.0)),
+                (0, 3_000, SampleValue::Float(3.0)),
+            ]
+        );
 
         db.close().unwrap();
     }
