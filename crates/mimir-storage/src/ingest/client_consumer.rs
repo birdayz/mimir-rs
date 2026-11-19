@@ -202,13 +202,13 @@ enum Step {
 
 impl Worker {
     fn stopped(&self) -> bool {
-        *self.stop_rx.borrow()
+        self.stop_rx.has_changed().is_err() || *self.stop_rx.borrow()
     }
 
     /// Sleeps `d` unless stopped first; returns `false` if stopped.
     async fn sleep(&mut self, d: Duration) -> bool {
         tokio::select! {
-            _ = self.stop_rx.changed() => !self.stopped(),
+            res = self.stop_rx.changed() => res.is_ok() && !self.stopped(),
             _ = tokio::time::sleep(d) => true,
         }
     }
@@ -261,8 +261,8 @@ impl Worker {
         loop {
             // A source only fetches again once its buffered fetch has been drained.
             let permit = tokio::select! {
-                _ = self.stop_rx.changed() => {
-                    if self.stopped() { return; }
+                res = self.stop_rx.changed() => {
+                    if res.is_err() || self.stopped() { return; }
                     continue;
                 }
                 p = tx.reserve() => match p {

@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -15,7 +15,7 @@ use prometheus::core::{Collector, Desc};
 use prometheus::proto::{Metric as ProtoMetric, MetricFamily, MetricType, Quantile, Summary as ProtoSummary};
 use prometheus::{Counter, CounterVec, Gauge, Histogram, HistogramOpts, Opts, Registry};
 use thiserror::Error;
-use tokio::sync::{watch, Mutex, Notify, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
 
 use super::compression::KafkaCompression;
 use super::kafka_client::{KafkaClientError, ProduceRecord};
@@ -336,9 +336,12 @@ impl KafkaWriterClient {
             extended_metrics,
         });
 
-        let c_bg = Arc::clone(&client);
+        let c_bg = Arc::downgrade(&client);
+        let notify = Arc::clone(&client.notify);
+        let closed = Arc::clone(&client.closed);
+        let max_inflight = client.max_inflight;
         tokio::spawn(async move {
-            c_bg.dispatch_loop().await;
+            Self::dispatch_loop(c_bg, max_inflight, notify, closed).await;
         });
 
         Ok(client)
@@ -377,27 +380,41 @@ impl KafkaWriterClient {
         (r.key.len() + r.value.len()) as i64
     }
 
-    async fn dispatch_loop(self: Arc<Self>) {
-        let inflight_sem = Arc::new(Semaphore::new(self.max_inflight));
+    async fn dispatch_loop(
+        weak: Weak<Self>,
+        max_inflight: usize,
+        notify: Arc<Notify>,
+        closed: Arc<AtomicBool>,
+    ) {
+        let inflight_sem = Arc::new(Semaphore::new(max_inflight));
         loop {
-            if self.closed.load(Ordering::SeqCst) {
-                let drained: Vec<QueuedItem> = self.queue.lock().drain(..).collect();
-                for item in drained {
-                    let bytes = Self::record_buf_bytes(&item.record);
-                    self.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
-                    self.buffered_records.fetch_sub(1, Ordering::SeqCst);
-                    (item.on_done)(
-                        item.record,
-                        Err(ProducerError::Other("client closed".to_string())),
-                    );
+            if closed.load(Ordering::SeqCst) {
+                if let Some(this) = weak.upgrade() {
+                    let drained: Vec<QueuedItem> = this.queue.lock().drain(..).collect();
+                    for item in drained {
+                        let bytes = Self::record_buf_bytes(&item.record);
+                        this.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
+                        this.buffered_records.fetch_sub(1, Ordering::SeqCst);
+                        (item.on_done)(
+                            item.record,
+                            Err(ProducerError::Other("client closed".to_string())),
+                        );
+                    }
                 }
                 break;
             }
 
-            let has_items = !self.queue.lock().is_empty();
+            let (has_items, linger) = {
+                let Some(this) = weak.upgrade() else {
+                    break;
+                };
+                let has_items = !this.queue.lock().is_empty();
+                (has_items, this.linger)
+            };
+
             if !has_items {
                 tokio::select! {
-                    _ = self.notify.notified() => {},
+                    _ = notify.notified() => {},
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {},
                 }
                 continue;
@@ -407,47 +424,61 @@ impl KafkaWriterClient {
                 break;
             };
 
-            if !self.linger.is_zero() {
-                tokio::time::sleep(self.linger).await;
+            if !linger.is_zero() {
+                tokio::time::sleep(linger).await;
             }
 
             // Drain all queued items and group by (topic, partition)
-            let batch_items: Vec<QueuedItem> = self.queue.lock().drain(..).collect();
-            if batch_items.is_empty() {
-                drop(permit);
-                continue;
-            }
-
-            let mut groups: HashMap<(String, i32), Vec<QueuedItem>> = HashMap::new();
-            for mut item in batch_items {
-                if item.record.topic.is_empty() {
-                    if let Some(ref t) = self.default_topic {
-                        item.record.topic = t.clone();
-                    }
+            let (groups, extra_permits_needed) = {
+                let Some(this) = weak.upgrade() else {
+                    drop(permit);
+                    break;
+                };
+                if closed.load(Ordering::SeqCst) {
+                    drop(permit);
+                    continue;
                 }
-                groups
-                    .entry((item.record.topic.clone(), item.record.partition))
-                    .or_default()
-                    .push(item);
-            }
+                let batch_items: Vec<QueuedItem> = this.queue.lock().drain(..).collect();
+                if batch_items.is_empty() {
+                    drop(permit);
+                    continue;
+                }
 
-            let mut first = true;
-            let mut extra_permits = Vec::new();
-            for _ in 1..groups.len() {
+                let mut groups: HashMap<(String, i32), Vec<QueuedItem>> = HashMap::new();
+                for mut item in batch_items {
+                    if item.record.topic.is_empty() {
+                        if let Some(ref t) = this.default_topic {
+                            item.record.topic = t.clone();
+                        }
+                    }
+                    groups
+                        .entry((item.record.topic.clone(), item.record.partition))
+                        .or_default()
+                        .push(item);
+                }
+                let extra = groups.len().saturating_sub(1);
+                (groups, extra)
+            };
+
+            let mut extra_permits = Vec::with_capacity(extra_permits_needed);
+            for _ in 0..extra_permits_needed {
                 if let Ok(p) = Arc::clone(&inflight_sem).acquire_owned().await {
                     extra_permits.push(p);
                 }
             }
+            let Some(this_strong) = weak.upgrade() else {
+                drop(permit);
+                break;
+            };
             let mut permit_opt = Some(permit);
 
             for ((topic, partition), items) in groups {
-                let p = if first {
-                    first = false;
+                let p = if permit_opt.is_some() {
                     permit_opt.take()
                 } else {
                     extra_permits.pop()
                 };
-                let this = Arc::clone(&self);
+                let this = Arc::clone(&this_strong);
                 tokio::spawn(async move {
                     let _permit = p;
                     this.send_partition_batch(topic, partition, items).await;
@@ -642,6 +673,13 @@ impl KafkaProducerClient for KafkaWriterClient {
     }
 }
 
+impl Drop for KafkaWriterClient {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
+
 /// Sliding-window Prometheus Summary collector for `buffered_produce_bytes_distribution`.
 #[derive(Clone)]
 pub struct SlidingWindowSummary {
@@ -750,6 +788,7 @@ impl Collector for SlidingWindowSummary {
 pub struct KafkaProducer {
     client: Arc<dyn KafkaProducerClient>,
     closed: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
     buffered_bytes: Arc<AtomicI64>,
     max_buffered_bytes: i64,
 
@@ -825,6 +864,7 @@ impl KafkaProducer {
         let producer = Arc::new(Self {
             client,
             closed: Arc::new(AtomicBool::new(false)),
+            stop_notify: Arc::new(Notify::new()),
             buffered_bytes: Arc::new(AtomicI64::new(0)),
             max_buffered_bytes,
             buffered_produce_bytes,
@@ -835,9 +875,11 @@ impl KafkaProducer {
             produce_remaining_deadline,
         });
 
-        let p_bg = Arc::clone(&producer);
+        let p_bg = Arc::downgrade(&producer);
+        let closed = Arc::clone(&producer.closed);
+        let stop_notify = Arc::clone(&producer.stop_notify);
         tokio::spawn(async move {
-            p_bg.update_metrics_loop().await;
+            Self::update_metrics_loop(p_bg, closed, stop_notify).await;
         });
 
         producer
@@ -892,18 +934,34 @@ impl KafkaProducer {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        self.stop_notify.notify_waiters();
         self.client.close();
     }
 
-    async fn update_metrics_loop(self: Arc<Self>) {
-        let mut ticker = tokio::time::interval(Duration::from_millis(25));
+    async fn update_metrics_loop(
+        weak: Weak<Self>,
+        closed: Arc<AtomicBool>,
+        stop_notify: Arc<Notify>,
+    ) {
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
         loop {
-            ticker.tick().await;
-            if self.closed.load(Ordering::SeqCst) {
-                break;
+            tokio::select! {
+                _ = stop_notify.notified() => {
+                    if closed.load(Ordering::SeqCst) || weak.strong_count() == 0 {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if closed.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Some(this) = weak.upgrade() else {
+                        break;
+                    };
+                    this.buffered_produce_bytes
+                        .observe(this.client.buffered_produce_bytes() as f64);
+                }
             }
-            self.buffered_produce_bytes
-                .observe(self.client.buffered_produce_bytes() as f64);
         }
     }
 
@@ -979,7 +1037,7 @@ impl KafkaProducer {
 
         let partitions: Vec<i32> = records.iter().map(|r| r.partition).collect();
         let remaining = Arc::new(AtomicUsize::new(records.len()));
-        let results = Arc::new(Mutex::new(Vec::with_capacity(records.len())));
+        let results = Arc::new(SyncMutex::new(Vec::with_capacity(records.len())));
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let done_tx = Arc::new(SyncMutex::new(Some(done_tx)));
 
@@ -1008,28 +1066,14 @@ impl KafkaProducer {
                             Some(e)
                         }
                     };
-                    let done_now = rem.fetch_sub(1, Ordering::SeqCst) == 1;
-                    if let Ok(mut guard) = res_vec.try_lock() {
+                    {
+                        let mut guard = res_vec.lock();
                         guard.push(ProduceResult {
                             record: rec,
                             err: err_opt,
                         });
-                    } else {
-                        let rv = Arc::clone(&res_vec);
-                        tokio::spawn(async move {
-                            rv.lock().await.push(ProduceResult {
-                                record: rec,
-                                err: err_opt,
-                            });
-                            if done_now {
-                                if let Some(tx) = dtx.lock().take() {
-                                    let _ = tx.send(());
-                                }
-                            }
-                        });
-                        return;
                     }
-                    if done_now {
+                    if rem.fetch_sub(1, Ordering::AcqRel) == 1 {
                         if let Some(tx) = dtx.lock().take() {
                             let _ = tx.send(());
                         }
@@ -1042,7 +1086,7 @@ impl KafkaProducer {
 
         tokio::select! {
             _ = done_rx => {
-                let mut guard = results.lock().await;
+                let mut guard = results.lock();
                 std::mem::take(&mut *guard)
             }
             cause = ctx.done() => {
@@ -1059,6 +1103,13 @@ impl KafkaProducer {
                     .collect()
             }
         }
+    }
+}
+
+impl Drop for KafkaProducer {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.stop_notify.notify_waiters();
     }
 }
 

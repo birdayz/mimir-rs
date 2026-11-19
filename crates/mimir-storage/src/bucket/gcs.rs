@@ -9,15 +9,17 @@
 //! - cloud.google.com/go/storage invoke.go (`run`: retry policy, idempotency, max attempts,
 //!   default backoff, 408/429/5xx retries + Retry-After) and storage.go
 //! - golang.org/x/oauth2/google default.go / google.go (`CredentialsFromJSON`,
-//!   `FindDefaultCredentials` credential file types)
+//!   `FindDefaultCredentials` credential file types), `jwt/jwt.go`, `google/externalaccount`,
+//!   `google/internal/impersonate`, `google/internal/stsexchange`
 
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream};
@@ -45,7 +47,11 @@ use super::BucketError;
 
 const STORE: &str = "GCS";
 const DEFAULT_GCS_BASE_URL: &str = "https://storage.googleapis.com";
-const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+const STORAGE_FULL_CONTROL_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.full_control";
+const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+const DEFAULT_SCOPES_SPACE: &str = "https://www.googleapis.com/auth/devstorage.full_control https://www.googleapis.com/auth/cloud-platform";
+const DEFAULT_SCOPES_COMMA: &str = "https://www.googleapis.com/auth/devstorage.full_control,https://www.googleapis.com/auth/cloud-platform";
+const DEFAULT_STS_TOKEN_URL: &str = "https://sts.googleapis.com/v1/token";
 const DEFAULT_METADATA_HOST: &str = "metadata.google.internal";
 const DEFAULT_METADATA_IP: &str = "169.254.169.254";
 const VERSION_HEADER: &str = "x-goog-generation";
@@ -62,6 +68,8 @@ pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 pub enum CredentialKind {
     ServiceAccount,
     AuthorizedUser,
+    ExternalAccount,
+    ImpersonatedServiceAccount,
 }
 
 /// Classifies a credentials JSON like Go `CredentialsFromJSONWithParams`, failing explicitly for
@@ -77,10 +85,11 @@ pub fn credential_kind(json: &str) -> Result<CredentialKind, String> {
     match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "service_account" => Ok(CredentialKind::ServiceAccount),
         "authorized_user" => Ok(CredentialKind::AuthorizedUser),
-        t @ ("external_account"
-        | "external_account_authorized_user"
-        | "impersonated_service_account"
-        | "gdch_service_account") => Err(unsupported_kind(&format!("{t:?}"))),
+        "external_account" => Ok(CredentialKind::ExternalAccount),
+        "impersonated_service_account" => Ok(CredentialKind::ImpersonatedServiceAccount),
+        t @ ("external_account_authorized_user" | "gdch_service_account") => {
+            Err(unsupported_kind(&format!("{t:?}")))
+        }
         "" => Err("missing 'type' field in credentials".to_string()),
         t => Err(format!("unknown credential type: {t:?}")),
     }
@@ -115,6 +124,8 @@ pub fn retry_config(max_attempts: i64, retry: bool) -> RetryConfig {
 enum CredentialSource {
     ServiceAccountKey(String),
     AuthorizedUserJson(String),
+    ExternalAccountJson(String),
+    ImpersonatedServiceAccountJson(String),
     ApplicationCredentialsFile(String),
     Metadata,
 }
@@ -134,6 +145,12 @@ fn credential_source(
             CredentialKind::AuthorizedUser => {
                 Ok(CredentialSource::AuthorizedUserJson(cfg.service_account.clone()))
             }
+            CredentialKind::ExternalAccount => {
+                Ok(CredentialSource::ExternalAccountJson(cfg.service_account.clone()))
+            }
+            CredentialKind::ImpersonatedServiceAccount => Ok(
+                CredentialSource::ImpersonatedServiceAccountJson(cfg.service_account.clone()),
+            ),
         };
     }
     if let Some(path) = env("GOOGLE_APPLICATION_CREDENTIALS").filter(|p| !p.is_empty()) {
@@ -189,6 +206,10 @@ struct ServiceAccountJson {
     #[serde(default)]
     private_key_id: String,
     #[serde(default)]
+    token_uri: String,
+    #[serde(default)]
+    audience: String,
+    #[serde(default)]
     gcs_base_url: Option<String>,
     #[serde(default)]
     disable_oauth: bool,
@@ -198,14 +219,15 @@ struct ServiceAccountJson {
 struct JwtHeader<'a> {
     alg: &'a str,
     typ: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     kid: &'a str,
 }
 
 #[derive(serde::Serialize)]
 struct JwtClaims<'a> {
     iss: &'a str,
-    sub: &'a str,
     scope: &'a str,
+    aud: &'a str,
     iat: u64,
     exp: u64,
 }
@@ -214,13 +236,18 @@ struct ServiceAccountJwtProvider {
     issuer: String,
     key_id: String,
     private_key: RsaKeyPair,
-    cache: tokio::sync::Mutex<Option<(String, Instant)>>,
+    token_uri: String,
+    audience: String,
+    scopes: String,
+    client: reqwest::Client,
+    cache: tokio::sync::Mutex<Option<(String, Option<Instant>)>>,
 }
 
 impl fmt::Debug for ServiceAccountJwtProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServiceAccountJwtProvider")
             .field("issuer", &self.issuer)
+            .field("token_uri", &self.token_uri)
             .finish()
     }
 }
@@ -235,28 +262,36 @@ impl ServiceAccountJwtProvider {
             _ => return Err("unsupported private key format in service account".to_string()),
         }
         .map_err(|e| format!("invalid RSA private key: {e}"))?;
+        let token_uri = if j.token_uri.is_empty() {
+            GOOGLE_TOKEN_URL.to_string()
+        } else {
+            j.token_uri.clone()
+        };
         Ok(Self {
             issuer: j.client_email.clone(),
             key_id: j.private_key_id.clone(),
             private_key: pair,
+            token_uri,
+            audience: j.audience.clone(),
+            scopes: DEFAULT_SCOPES_SPACE.to_string(),
+            client: exthttp::bounded_auth_client(),
             cache: tokio::sync::Mutex::new(None),
         })
     }
-}
 
-#[async_trait]
-impl GcpAuth for ServiceAccountJwtProvider {
-    async fn get_token(&self) -> object_store::Result<String> {
-        let mut cache = self.cache.lock().await;
-        if let Some((tok, exp)) = cache.as_ref() {
-            if Instant::now() + TOKEN_MIN_TTL < *exp {
-                return Ok(tok.clone());
-            }
-        }
+    fn build_signed_jwt(&self) -> object_store::Result<String> {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        // Go jws.go subtracts 10s from iat for minor clock skew.
+        let iat = now_secs.saturating_sub(10);
+        let exp = iat + 3600;
+        let aud = if self.audience.is_empty() {
+            self.token_uri.as_str()
+        } else {
+            self.audience.as_str()
+        };
         let hdr = serde_json::to_vec(&JwtHeader {
             alg: "RS256",
             typ: "JWT",
@@ -268,10 +303,10 @@ impl GcpAuth for ServiceAccountJwtProvider {
         })?;
         let claims = serde_json::to_vec(&JwtClaims {
             iss: &self.issuer,
-            sub: &self.issuer,
-            scope: DEFAULT_SCOPE,
-            iat: now_secs,
-            exp: now_secs + 3600,
+            scope: &self.scopes,
+            aud,
+            iat,
+            exp,
         })
         .map_err(|e| object_store::Error::Generic {
             store: STORE,
@@ -294,9 +329,74 @@ impl GcpAuth for ServiceAccountJwtProvider {
                 store: STORE,
                 source: format!("JWT sign failed: {e:?}").into(),
             })?;
-        let jwt = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig));
-        *cache = Some((jwt.clone(), Instant::now() + Duration::from_secs(3600)));
-        Ok(jwt)
+        Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig)))
+    }
+}
+
+#[async_trait]
+impl GcpAuth for ServiceAccountJwtProvider {
+    async fn get_token(&self) -> object_store::Result<String> {
+        let mut cache = self.cache.lock().await;
+        if let Some((tok, exp)) = cache.as_ref() {
+            if exp.is_none_or(|e| Instant::now() + EXPIRY_DELTA < e) {
+                return Ok(tok.clone());
+            }
+        }
+        let jwt = self.build_signed_jwt()?;
+        let generic = |e: String| object_store::Error::Generic {
+            store: STORE,
+            source: format!("oauth2: cannot fetch token: {e}").into(),
+        };
+        let mut last_err = String::new();
+        for attempt in 0..=3usize {
+            let started = Instant::now();
+            match self
+                .client
+                .post(&self.token_uri)
+                .form(&[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                    ("assertion", jwt.as_str()),
+                ])
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let headers = resp.headers().clone();
+                    let body = resp.text().await.map_err(|e| generic(e.to_string()))?;
+                    if status.is_success() {
+                        let tok: TokenResponse =
+                            serde_json::from_str(&body).map_err(|e| generic(e.to_string()))?;
+                        if tok.access_token.is_empty() {
+                            return Err(generic("response missing access_token".to_string()));
+                        }
+                        let expiry = tok
+                            .expires_in
+                            .filter(|s| *s > 0)
+                            .map(|s| started + Duration::from_secs(s));
+                        *cache = Some((tok.access_token.clone(), expiry));
+                        return Ok(tok.access_token);
+                    }
+                    last_err = format!("{status}\nResponse: {body}");
+                    if attempt < 3 && is_retryable_status(status) {
+                        let delay = exthttp::parse_retry_after(&headers)
+                            .unwrap_or_else(|| Duration::from_millis(200 << attempt));
+                        tokio::time::sleep(delay.min(Duration::from_secs(5))).await;
+                        continue;
+                    }
+                    return Err(generic(last_err));
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(200 << attempt)).await;
+                        continue;
+                    }
+                    return Err(generic(last_err));
+                }
+            }
+        }
+        Err(generic(last_err))
     }
 
     async fn invalidate(&self) {
@@ -320,13 +420,14 @@ impl GceMetadataProvider {
 
     async fn fetch_from_host(&self, host: &str) -> Result<(String, Duration), String> {
         let url = format!(
-            "http://{host}/computeMetadata/v1/instance/service-accounts/default/token?audience=https://www.googleapis.com/oauth2/v4/token"
+            "http://{host}/computeMetadata/v1/instance/service-accounts/default/token"
         );
         let mut last_err = String::new();
         for attempt in 0..=3usize {
             match self
                 .client
                 .get(&url)
+                .query(&[("scopes", DEFAULT_SCOPES_COMMA)])
                 .header("Metadata-Flavor", "Google")
                 .send()
                 .await
@@ -336,8 +437,11 @@ impl GceMetadataProvider {
                     let headers = resp.headers().clone();
                     let body = resp.text().await.map_err(|e| e.to_string())?;
                     if status.is_success() {
-                        let tok: TokenResponse =
-                            serde_json::from_str(&body).map_err(|e| e.to_string())?;
+                        let tok: TokenResponse = serde_json::from_str(&body)
+                            .map_err(|e| format!("oauth2/google: invalid token JSON from metadata: {e}"))?;
+                        if tok.access_token.is_empty() || tok.expires_in.unwrap_or(0) == 0 {
+                            return Err("oauth2/google: incomplete token received from metadata".to_string());
+                        }
                         let ttl = Duration::from_secs(tok.expires_in.unwrap_or(3600));
                         return Ok((tok.access_token, ttl));
                     }
@@ -442,6 +546,7 @@ struct AuthorizedUserJson {
 
 #[derive(serde::Deserialize)]
 struct TokenResponse {
+    #[serde(default)]
     access_token: String,
     #[serde(default)]
     expires_in: Option<u64>,
@@ -549,6 +654,1094 @@ impl GcpAuth for AuthorizedUserProvider {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ImpersonatedServiceAccountJson {
+    #[serde(default)]
+    service_account_impersonation_url: String,
+    #[serde(default)]
+    source_credentials: Option<serde_json::Value>,
+    #[serde(default)]
+    delegates: Vec<String>,
+    #[serde(default)]
+    gcs_base_url: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct GenerateAccessTokenReq<'a> {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    delegates: &'a Vec<String>,
+    lifetime: String,
+    scope: &'a [String],
+}
+
+#[derive(serde::Deserialize)]
+struct ImpersonateTokenResponse {
+    #[serde(rename = "accessToken", default)]
+    access_token: String,
+    #[serde(rename = "expireTime", default)]
+    expire_time: String,
+}
+
+/// Go `oauth2/google/internal/impersonate.ImpersonateTokenSource`.
+struct ImpersonatedServiceAccountProvider {
+    impersonation_url: String,
+    delegates: Vec<String>,
+    scopes: Vec<String>,
+    lifetime_seconds: Option<u64>,
+    source: Arc<dyn GcpAuth>,
+    client: reqwest::Client,
+    cache: tokio::sync::Mutex<Option<(String, Option<Instant>)>>,
+}
+
+impl fmt::Debug for ImpersonatedServiceAccountProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImpersonatedServiceAccountProvider")
+            .field("impersonation_url", &self.impersonation_url)
+            .finish()
+    }
+}
+
+impl ImpersonatedServiceAccountProvider {
+    fn from_json(json: &str) -> Result<(Self, Option<String>), String> {
+        let j: ImpersonatedServiceAccountJson =
+            serde_json::from_str(json).map_err(|e| e.to_string())?;
+        if j.service_account_impersonation_url.is_empty() || j.source_credentials.is_none() {
+            return Err(
+                "missing 'source_credentials' field or 'service_account_impersonation_url' in credentials"
+                    .to_string(),
+            );
+        }
+        let source_val = j.source_credentials.as_ref().ok_or_else(|| {
+            "missing 'source_credentials' field or 'service_account_impersonation_url' in credentials"
+                .to_string()
+        })?;
+        let source_json = serde_json::to_string(source_val).map_err(|e| e.to_string())?;
+        let (source, _) = auth_from_json(&source_json)?;
+        Ok((
+            Self {
+                impersonation_url: j.service_account_impersonation_url,
+                delegates: j.delegates,
+                scopes: vec![
+                    STORAGE_FULL_CONTROL_SCOPE.to_string(),
+                    CLOUD_PLATFORM_SCOPE.to_string(),
+                ],
+                lifetime_seconds: None,
+                source,
+                client: exthttp::bounded_auth_client(),
+                cache: tokio::sync::Mutex::new(None),
+            },
+            j.gcs_base_url.filter(|s| !s.is_empty()),
+        ))
+    }
+}
+
+#[async_trait]
+impl GcpAuth for ImpersonatedServiceAccountProvider {
+    async fn get_token(&self) -> object_store::Result<String> {
+        let mut cache = self.cache.lock().await;
+        if let Some((tok, exp)) = cache.as_ref() {
+            if exp.is_none_or(|e| Instant::now() + EXPIRY_DELTA < e) {
+                return Ok(tok.clone());
+            }
+        }
+        let generic = |e: String| object_store::Error::Generic {
+            store: STORE,
+            source: format!("oauth2/google: {e}").into(),
+        };
+        let lifetime = format!("{}s", self.lifetime_seconds.filter(|&s| s > 0).unwrap_or(3600));
+        let req_body = GenerateAccessTokenReq {
+            delegates: &self.delegates,
+            lifetime,
+            scope: &self.scopes,
+        };
+        let mut source_refreshed = false;
+        let mut last_err = String::new();
+        for attempt in 0..=3usize {
+            let src_token = self.source.get_token().await?;
+            let started = Instant::now();
+            match self
+                .client
+                .post(&self.impersonation_url)
+                .bearer_auth(&src_token)
+                .json(&req_body)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let headers = resp.headers().clone();
+                    let body = resp.text().await.map_err(|e| generic(e.to_string()))?;
+                    if status == StatusCode::UNAUTHORIZED && !source_refreshed {
+                        self.source.invalidate().await;
+                        source_refreshed = true;
+                        continue;
+                    }
+                    if status.is_success() {
+                        let parsed: ImpersonateTokenResponse = serde_json::from_str(&body)
+                            .map_err(|e| generic(format!("unable to parse response: {e}")))?;
+                        if parsed.access_token.is_empty() {
+                            return Err(generic(
+                                "unable to parse response: empty accessToken".to_string(),
+                            ));
+                        }
+                        let exp_dt = chrono::DateTime::parse_from_rfc3339(&parsed.expire_time)
+                            .map_err(|e| generic(format!("unable to parse expiry: {e}")))?;
+                        let ttl = exp_dt
+                            .with_timezone(&chrono::Utc)
+                            .signed_duration_since(chrono::Utc::now())
+                            .to_std()
+                            .unwrap_or(Duration::ZERO);
+                        let expiry = Some(started + ttl);
+                        *cache = Some((parsed.access_token.clone(), expiry));
+                        return Ok(parsed.access_token);
+                    }
+                    last_err = format!("status code {}: {body}", status.as_u16());
+                    if attempt < 3 && is_retryable_status(status) {
+                        let delay = exthttp::parse_retry_after(&headers)
+                            .unwrap_or_else(|| Duration::from_millis(200 << attempt));
+                        tokio::time::sleep(delay.min(Duration::from_secs(5))).await;
+                        continue;
+                    }
+                    return Err(generic(last_err));
+                }
+                Err(e) => {
+                    last_err = format!("unable to generate access token: {e}");
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(200 << attempt)).await;
+                        continue;
+                    }
+                    return Err(generic(last_err));
+                }
+            }
+        }
+        Err(generic(last_err))
+    }
+
+    async fn invalidate(&self) {
+        *self.cache.lock().await = None;
+        self.source.invalidate().await;
+    }
+}
+
+#[derive(serde::Deserialize, Default, Clone, Debug)]
+struct ExternalCredentialFormat {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    subject_token_field_name: String,
+}
+
+#[derive(serde::Deserialize, Default, Clone, Debug)]
+struct ExternalExecutableConfig {
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    timeout_millis: Option<i64>,
+    #[serde(default)]
+    output_file: String,
+}
+
+#[derive(serde::Deserialize, Default, Clone, Debug)]
+struct ExternalCredentialSourceJson {
+    #[serde(default)]
+    file: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    executable: Option<ExternalExecutableConfig>,
+    #[serde(default)]
+    environment_id: String,
+    #[serde(default)]
+    region_url: String,
+    #[serde(default)]
+    regional_cred_verification_url: String,
+    #[serde(default)]
+    imdsv2_session_token_url: String,
+    #[serde(default)]
+    format: ExternalCredentialFormat,
+}
+
+#[derive(serde::Deserialize, Default, Clone)]
+struct ServiceAccountImpersonationInfoJson {
+    #[serde(default)]
+    token_lifetime_seconds: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExternalAccountJson {
+    #[serde(default)]
+    audience: String,
+    #[serde(default)]
+    subject_token_type: String,
+    #[serde(default)]
+    token_url: String,
+    #[serde(default)]
+    service_account_impersonation_url: String,
+    #[serde(default)]
+    service_account_impersonation: ServiceAccountImpersonationInfoJson,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    client_secret: String,
+    #[serde(default)]
+    credential_source: Option<ExternalCredentialSourceJson>,
+    #[serde(default)]
+    workforce_pool_user_project: String,
+    #[serde(default)]
+    universe_domain: String,
+    #[serde(default)]
+    gcs_base_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum ParsedExternalSource {
+    File {
+        path: String,
+        format: ExternalCredentialFormat,
+    },
+    Url {
+        url: String,
+        headers: HashMap<String, String>,
+        format: ExternalCredentialFormat,
+    },
+    Aws {
+        region_url: String,
+        regional_cred_verification_url: String,
+        cred_verification_url: String,
+        imdsv2_session_token_url: String,
+        target_resource: String,
+    },
+    Executable {
+        command: String,
+        timeout: Duration,
+        output_file: String,
+        audience: String,
+        subject_token_type: String,
+        impersonation_url: String,
+    },
+}
+
+fn extract_subject_token(
+    bytes: &[u8],
+    format: &ExternalCredentialFormat,
+    trim: bool,
+) -> Result<String, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| format!("oauth2/google/externalaccount: invalid UTF-8 subject token: {e}"))?;
+    let trimmed = if trim { text.trim() } else { text };
+    match format.kind.as_str() {
+        "json" => {
+            let v: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+                format!("oauth2/google/externalaccount: failed to unmarshal subject token file: {e}")
+            })?;
+            let field = v.get(&format.subject_token_field_name).ok_or_else(|| {
+                "oauth2/google/externalaccount: provided subject_token_field_name not found in credentials".to_string()
+            })?;
+            field.as_str().map(str::to_string).ok_or_else(|| {
+                "oauth2/google/externalaccount: improperly formatted subject token".to_string()
+            })
+        }
+        "" | "text" => {
+            if trimmed.is_empty() {
+                Err("oauth2/google/externalaccount: missing subject token".to_string())
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        _ => Err(
+            "oauth2/google/externalaccount: invalid credential_source file format type".to_string(),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ExecutableResponseJson {
+    #[serde(default)]
+    version: i64,
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default)]
+    token_type: String,
+    #[serde(default)]
+    expiration_time: i64,
+    #[serde(default)]
+    id_token: String,
+    #[serde(default)]
+    saml_response: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    message: String,
+}
+
+fn parse_executable_response(bytes: &[u8], source: &str) -> Result<String, (bool, String)> {
+    let text = String::from_utf8_lossy(bytes);
+    let parsed: ExecutableResponseJson = serde_json::from_slice(bytes).map_err(|_| {
+        (
+            false,
+            format!("oauth2/google/externalaccount: unable to parse {source}\nResponse: {text}"),
+        )
+    })?;
+    if parsed.version == 0 {
+        return Err((
+            false,
+            format!("oauth2/google/externalaccount: {source} missing `\"version\"` field"),
+        ));
+    }
+    let Some(success) = parsed.success else {
+        return Err((
+            false,
+            format!("oauth2/google/externalaccount: {source} missing `\"success\"` field"),
+        ));
+    };
+    if !success {
+        if parsed.code.is_empty() || parsed.message.is_empty() {
+            return Err((
+                true,
+                "oauth2/google/externalaccount: response must include `error` and `message` fields when unsuccessful".to_string(),
+            ));
+        }
+        return Err((
+            true,
+            format!(
+                "oauth2/google/externalaccount: response contains unsuccessful response: ({}) {}",
+                parsed.code, parsed.message
+            ),
+        ));
+    }
+    if parsed.version > 1 || parsed.version < 0 {
+        return Err((
+            false,
+            format!(
+                "oauth2/google/externalaccount: {source} contains unsupported version: {}",
+                parsed.version
+            ),
+        ));
+    }
+    if parsed.expiration_time == 0 && source == "output file" {
+        return Err((
+            false,
+            format!("oauth2/google/externalaccount: {source} missing `\"expiration_time\"` field"),
+        ));
+    }
+    if parsed.token_type.is_empty() {
+        return Err((
+            false,
+            format!("oauth2/google/externalaccount: {source} missing `\"token_type\"` field"),
+        ));
+    }
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if parsed.expiration_time != 0 && parsed.expiration_time < now_secs {
+        return Err((
+            true,
+            "oauth2/google/externalaccount: the token returned by the executable is expired"
+                .to_string(),
+        ));
+    }
+    match parsed.token_type.as_str() {
+        "urn:ietf:params:oauth:token-type:jwt" | "urn:ietf:params:oauth:token-type:id_token" => {
+            if parsed.id_token.is_empty() {
+                Err((
+                    false,
+                    format!("oauth2/google/externalaccount: {source} missing `\"id_token\"` field"),
+                ))
+            } else {
+                Ok(parsed.id_token)
+            }
+        }
+        "urn:ietf:params:oauth:token-type:saml2" => {
+            if parsed.saml_response.is_empty() {
+                Err((
+                    false,
+                    format!(
+                        "oauth2/google/externalaccount: {source} missing `\"saml_response\"` field"
+                    ),
+                ))
+            } else {
+                Ok(parsed.saml_response)
+            }
+        }
+        _ => Err((
+            false,
+            format!("oauth2/google/externalaccount: {source} contains unsupported token type"),
+        )),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AwsSecurityCredentialsJson {
+    #[serde(rename = "AccessKeyID", default)]
+    access_key_id: String,
+    #[serde(rename = "SecretAccessKey", default)]
+    secret_access_key: String,
+    #[serde(rename = "Token", default)]
+    session_token: String,
+}
+
+#[derive(serde::Serialize)]
+struct AwsSignedHeader {
+    key: String,
+    value: String,
+}
+
+#[derive(serde::Serialize)]
+struct AwsSignedRequest {
+    url: String,
+    method: &'static str,
+    headers: Vec<AwsSignedHeader>,
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    hex::encode(digest.as_ref())
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    ring::hmac::sign(&k, data).as_ref().to_vec()
+}
+
+fn query_escape_form(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// Go `oauth2/google/externalaccount` STS token provider.
+struct ExternalStsTokenProvider {
+    audience: String,
+    subject_token_type: String,
+    token_url: String,
+    scopes: String,
+    client_id: String,
+    client_secret: String,
+    workforce_pool_user_project: String,
+    source: ParsedExternalSource,
+    client: reqwest::Client,
+    cache: tokio::sync::Mutex<Option<(String, Option<Instant>)>>,
+}
+
+impl fmt::Debug for ExternalStsTokenProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalStsTokenProvider")
+            .field("audience", &self.audience)
+            .field("token_url", &self.token_url)
+            .finish()
+    }
+}
+
+impl ExternalStsTokenProvider {
+    async fn fetch_subject_token(&self) -> Result<String, String> {
+        match &self.source {
+            ParsedExternalSource::File { path, format } => {
+                let bytes = tokio::fs::read(path).await.map_err(|_| {
+                    format!(
+                        "oauth2/google/externalaccount: failed to open credential file {path:?}"
+                    )
+                })?;
+                let limited = &bytes[..bytes.len().min(1 << 20)];
+                extract_subject_token(limited, format, true)
+            }
+            ParsedExternalSource::Url {
+                url,
+                headers,
+                format,
+            } => {
+                let mut req = self.client.get(url);
+                for (k, v) in headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                let resp = req.send().await.map_err(|e| {
+                    format!(
+                        "oauth2/google/externalaccount: invalid response when retrieving subject token: {e}"
+                    )
+                })?;
+                let status = resp.status();
+                let body = resp.bytes().await.map_err(|e| {
+                    format!(
+                        "oauth2/google/externalaccount: invalid body in subject token URL query: {e}"
+                    )
+                })?;
+                if !status.is_success() {
+                    return Err(format!(
+                        "oauth2/google/externalaccount: status code {}: {}",
+                        status.as_u16(),
+                        String::from_utf8_lossy(&body)
+                    ));
+                }
+                let limited = &body[..body.len().min(1 << 20)];
+                extract_subject_token(limited, format, false)
+            }
+            ParsedExternalSource::Aws {
+                region_url,
+                regional_cred_verification_url,
+                cred_verification_url,
+                imdsv2_session_token_url,
+                target_resource,
+            } => {
+                self.fetch_aws_subject_token(
+                    region_url,
+                    regional_cred_verification_url,
+                    cred_verification_url,
+                    imdsv2_session_token_url,
+                    target_resource,
+                )
+                .await
+            }
+            ParsedExternalSource::Executable {
+                command,
+                timeout,
+                output_file,
+                audience,
+                subject_token_type,
+                impersonation_url,
+            } => {
+                if !output_file.is_empty() {
+                    if let Ok(data) = tokio::fs::read(output_file).await {
+                        if !data.is_empty() {
+                            match parse_executable_response(&data, "output file") {
+                                Ok(tok) => return Ok(tok),
+                                Err((true, _)) => {}
+                                Err((false, e)) => return Err(e),
+                            }
+                        }
+                    }
+                }
+                if std::env::var("GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES").as_deref() != Ok("1")
+                {
+                    return Err(
+                        "oauth2/google/externalaccount: executables need to be explicitly allowed (set GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES to '1') to run"
+                            .to_string(),
+                    );
+                }
+                let mut parts = command.split_whitespace();
+                let Some(prog) = parts.next() else {
+                    return Err(
+                        "oauth2/google/externalaccount: missing `command` field — executable command must be provided"
+                            .to_string(),
+                    );
+                };
+                let mut cmd = tokio::process::Command::new(prog);
+                cmd.args(parts);
+                cmd.env("GOOGLE_EXTERNAL_ACCOUNT_AUDIENCE", audience);
+                cmd.env("GOOGLE_EXTERNAL_ACCOUNT_TOKEN_TYPE", subject_token_type);
+                cmd.env("GOOGLE_EXTERNAL_ACCOUNT_INTERACTIVE", "0");
+                if !impersonation_url.is_empty() {
+                    if let Some(rest) =
+                        impersonation_url.split("/v1/projects/-/serviceAccounts/").nth(1)
+                    {
+                        if let Some(email) = rest.strip_suffix(":generateAccessToken") {
+                            cmd.env("GOOGLE_EXTERNAL_ACCOUNT_IMPERSONATED_EMAIL", email);
+                        }
+                    }
+                }
+                if !output_file.is_empty() {
+                    cmd.env("GOOGLE_EXTERNAL_ACCOUNT_OUTPUT_FILE", output_file);
+                }
+                let out = tokio::time::timeout(*timeout, cmd.output())
+                    .await
+                    .map_err(|_| {
+                        "oauth2/google/externalaccount: executable command timed out".to_string()
+                    })?
+                    .map_err(|e| {
+                        format!("oauth2/google/externalaccount: executable command failed: {e}")
+                    })?;
+                if !out.status.success() {
+                    let code = out.status.code().unwrap_or(-1);
+                    return Err(format!(
+                        "oauth2/google/externalaccount: executable command failed with exit code {code}"
+                    ));
+                }
+                let payload = if !out.stdout.trim_ascii().is_empty() {
+                    out.stdout.trim_ascii()
+                } else {
+                    out.stderr.trim_ascii()
+                };
+                parse_executable_response(payload, "response").map_err(|(_, e)| e)
+            }
+        }
+    }
+
+    async fn fetch_aws_subject_token(
+        &self,
+        region_url: &str,
+        regional_cred_verification_url: &str,
+        cred_verification_url: &str,
+        imdsv2_session_token_url: &str,
+        target_resource: &str,
+    ) -> Result<String, String> {
+        let env_region = std::env::var("AWS_REGION")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok().filter(|s| !s.is_empty()));
+        let env_ak = std::env::var("AWS_ACCESS_KEY_ID").ok().filter(|s| !s.is_empty());
+        let env_sk = std::env::var("AWS_SECRET_ACCESS_KEY").ok().filter(|s| !s.is_empty());
+        let env_st = std::env::var("AWS_SESSION_TOKEN").ok().unwrap_or_default();
+
+        let use_imds = env_region.is_none() || env_ak.is_none() || env_sk.is_none();
+        let imds_token = if use_imds && !imdsv2_session_token_url.is_empty() {
+            let resp = self
+                .client
+                .put(imdsv2_session_token_url)
+                .header("X-aws-ec2-metadata-token-ttl-seconds", "300")
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = resp.status();
+            let body = resp.text().await.map_err(|e| e.to_string())?;
+            if status != StatusCode::OK {
+                return Err(format!(
+                    "oauth2/google/externalaccount: unable to retrieve AWS session token - {body}"
+                ));
+            }
+            body
+        } else {
+            String::new()
+        };
+
+        let region = if let Some(r) = env_region {
+            r
+        } else {
+            if region_url.is_empty() {
+                return Err(
+                    "oauth2/google/externalaccount: unable to determine AWS region".to_string(),
+                );
+            }
+            let mut req = self.client.get(region_url);
+            if !imds_token.is_empty() {
+                req = req.header("X-aws-ec2-metadata-token", &imds_token);
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            let status = resp.status();
+            let body = resp.text().await.map_err(|e| e.to_string())?;
+            if status != StatusCode::OK {
+                return Err(format!(
+                    "oauth2/google/externalaccount: unable to retrieve AWS region - {body}"
+                ));
+            }
+            if body.len() > 1 {
+                body[..body.len() - 1].to_string()
+            } else {
+                String::new()
+            }
+        };
+
+        let creds = if let (Some(ak), Some(sk)) = (env_ak, env_sk) {
+            AwsSecurityCredentialsJson {
+                access_key_id: ak,
+                secret_access_key: sk,
+                session_token: env_st,
+            }
+        } else {
+            if cred_verification_url.is_empty() {
+                return Err(
+                    "oauth2/google/externalaccount: unable to determine the AWS metadata server security credentials endpoint"
+                        .to_string(),
+                );
+            }
+            let mut req = self.client.get(cred_verification_url);
+            if !imds_token.is_empty() {
+                req = req.header("X-aws-ec2-metadata-token", &imds_token);
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            let status = resp.status();
+            let role = resp.text().await.map_err(|e| e.to_string())?;
+            if status != StatusCode::OK {
+                return Err(format!(
+                    "oauth2/google/externalaccount: unable to retrieve AWS role name - {role}"
+                ));
+            }
+            let cred_url = format!("{cred_verification_url}/{role}");
+            let mut req2 = self.client.get(&cred_url);
+            if !imds_token.is_empty() {
+                req2 = req2.header("X-aws-ec2-metadata-token", &imds_token);
+            }
+            let resp2 = req2.send().await.map_err(|e| e.to_string())?;
+            let status2 = resp2.status();
+            let body2 = resp2.text().await.map_err(|e| e.to_string())?;
+            if status2 != StatusCode::OK {
+                return Err(format!(
+                    "oauth2/google/externalaccount: unable to retrieve AWS security credentials - {body2}"
+                ));
+            }
+            let parsed: AwsSecurityCredentialsJson =
+                serde_json::from_str(&body2).map_err(|e| e.to_string())?;
+            if parsed.access_key_id.is_empty() {
+                return Err(
+                    "oauth2/google/externalaccount: missing AccessKeyId credential".to_string(),
+                );
+            }
+            if parsed.secret_access_key.is_empty() {
+                return Err(
+                    "oauth2/google/externalaccount: missing SecretAccessKey credential".to_string(),
+                );
+            }
+            parsed
+        };
+
+        let tpl = if regional_cred_verification_url.is_empty() {
+            "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
+        } else {
+            regional_cred_verification_url
+        };
+        let target_url = tpl.replace("{region}", &region);
+        let parsed_url = reqwest::Url::parse(&target_url).map_err(|e| e.to_string())?;
+        let host = match (parsed_url.host_str(), parsed_url.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_string(),
+            _ => String::new(),
+        };
+        let service_name = host.split('.').next().unwrap_or("").to_string();
+        let canonical_uri = if parsed_url.path().is_empty() {
+            "/"
+        } else {
+            parsed_url.path()
+        };
+        let mut qp: Vec<(String, String)> = parsed_url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        qp.sort();
+        let canonical_query = qp
+            .iter()
+            .map(|(k, v)| format!("{}={}", query_escape_form(k), query_escape_form(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let now = chrono::Utc::now();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date_stamp = now.format("%Y%m%d").to_string();
+
+        let mut hdr_map: std::collections::BTreeMap<String, (String, String)> =
+            std::collections::BTreeMap::new();
+        hdr_map.insert("host".to_string(), ("host".to_string(), host));
+        hdr_map.insert(
+            "x-amz-date".to_string(),
+            ("x-amz-date".to_string(), amz_date.clone()),
+        );
+        if !creds.session_token.is_empty() {
+            hdr_map.insert(
+                "x-amz-security-token".to_string(),
+                ("x-amz-security-token".to_string(), creds.session_token),
+            );
+        }
+        if !target_resource.is_empty() {
+            hdr_map.insert(
+                "x-goog-cloud-target-resource".to_string(),
+                (
+                    "x-goog-cloud-target-resource".to_string(),
+                    target_resource.to_string(),
+                ),
+            );
+        }
+
+        let signed_headers = hdr_map.keys().cloned().collect::<Vec<_>>().join(";");
+        let mut canonical_headers = String::new();
+        for (k, (_, v)) in &hdr_map {
+            canonical_headers.push_str(k);
+            canonical_headers.push(':');
+            canonical_headers.push_str(v);
+            canonical_headers.push('\n');
+        }
+        let payload_hash = sha256_hex(b"");
+        let canonical_request = format!(
+            "POST\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+        );
+        let credential_scope = format!("{date_stamp}/{region}/{service_name}/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
+
+        let k_date = hmac_sha256(
+            format!("AWS4{}", creds.secret_access_key).as_bytes(),
+            date_stamp.as_bytes(),
+        );
+        let k_region = hmac_sha256(&k_date, region.as_bytes());
+        let k_service = hmac_sha256(&k_region, service_name.as_bytes());
+        let k_signing = hmac_sha256(&k_service, b"aws4_request");
+        let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+        let auth_header = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            creds.access_key_id
+        );
+
+        let mut out_headers: Vec<AwsSignedHeader> = hdr_map
+            .into_values()
+            .map(|(key, value)| AwsSignedHeader { key, value })
+            .collect();
+        out_headers.push(AwsSignedHeader {
+            key: "Authorization".to_string(),
+            value: auth_header,
+        });
+        out_headers.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+
+        let signed_req = AwsSignedRequest {
+            url: target_url,
+            method: "POST",
+            headers: out_headers,
+        };
+        let json = serde_json::to_string(&signed_req).map_err(|e| e.to_string())?;
+        Ok(query_escape_form(&json))
+    }
+}
+
+#[async_trait]
+impl GcpAuth for ExternalStsTokenProvider {
+    async fn get_token(&self) -> object_store::Result<String> {
+        let mut cache = self.cache.lock().await;
+        if let Some((tok, exp)) = cache.as_ref() {
+            if exp.is_none_or(|e| Instant::now() + EXPIRY_DELTA < e) {
+                return Ok(tok.clone());
+            }
+        }
+        let generic = |e: String| object_store::Error::Generic {
+            store: STORE,
+            source: e.into(),
+        };
+        let subject_token = self.fetch_subject_token().await.map_err(generic)?;
+        let mut params: Vec<(&str, String)> = vec![
+            ("audience", self.audience.clone()),
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
+            ),
+            (
+                "requested_token_type",
+                "urn:ietf:params:oauth:token-type:access_token".to_string(),
+            ),
+            ("subject_token_type", self.subject_token_type.clone()),
+            ("subject_token", subject_token),
+            ("scope", self.scopes.clone()),
+        ];
+        let options_json =
+            if !self.workforce_pool_user_project.is_empty() && self.client_id.is_empty() {
+                Some(
+                    serde_json::json!({ "userProject": self.workforce_pool_user_project })
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+        if let Some(opts) = options_json {
+            params.push(("options", opts));
+        }
+
+        let mut last_err = String::new();
+        for attempt in 0..=3usize {
+            let started = Instant::now();
+            let mut rb = self.client.post(&self.token_url).form(&params);
+            if !self.client_id.is_empty() && !self.client_secret.is_empty() {
+                let creds = STANDARD.encode(format!("{}:{}", self.client_id, self.client_secret));
+                rb = rb.header(reqwest::header::AUTHORIZATION, format!("Basic {creds}"));
+            }
+            match rb.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let headers = resp.headers().clone();
+                    let body = resp.text().await.map_err(|e| generic(e.to_string()))?;
+                    if status.is_success() {
+                        let tok: TokenResponse = serde_json::from_str(&body).map_err(|e| {
+                            generic(format!(
+                                "oauth2/google: failed to unmarshal response body from Secure Token Server: {e}"
+                            ))
+                        })?;
+                        let secs = tok.expires_in.unwrap_or(0);
+                        if secs == 0 || tok.access_token.is_empty() {
+                            return Err(generic(
+                                "oauth2/google/externalaccount: got invalid expiry from security token service"
+                                    .to_string(),
+                            ));
+                        }
+                        let expiry = Some(started + Duration::from_secs(secs));
+                        *cache = Some((tok.access_token.clone(), expiry));
+                        return Ok(tok.access_token);
+                    }
+                    last_err = format!("oauth2/google: status code {}: {body}", status.as_u16());
+                    if attempt < 3 && is_retryable_status(status) {
+                        let delay = exthttp::parse_retry_after(&headers)
+                            .unwrap_or_else(|| Duration::from_millis(200 << attempt));
+                        tokio::time::sleep(delay.min(Duration::from_secs(5))).await;
+                        continue;
+                    }
+                    return Err(generic(last_err));
+                }
+                Err(e) => {
+                    last_err = format!(
+                        "oauth2/google: invalid response from Secure Token Server: {e}"
+                    );
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(200 << attempt)).await;
+                        continue;
+                    }
+                    return Err(generic(last_err));
+                }
+            }
+        }
+        Err(generic(last_err))
+    }
+
+    async fn invalidate(&self) {
+        *self.cache.lock().await = None;
+    }
+}
+
+fn external_account_auth_from_json(json: &str) -> Result<(Arc<dyn GcpAuth>, Option<String>), String> {
+    let j: ExternalAccountJson = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    if j.audience.is_empty() {
+        return Err("oauth2/google/externalaccount: Audience must be set".to_string());
+    }
+    if j.subject_token_type.is_empty() {
+        return Err("oauth2/google/externalaccount: Subject token type must be set".to_string());
+    }
+    if !j.workforce_pool_user_project.is_empty() {
+        let re = regex::Regex::new(r"//iam\.googleapis\.com/locations/[^/]+/workforcePools/")
+            .map_err(|e| e.to_string())?;
+        if !re.is_match(&j.audience) {
+            return Err(
+                "oauth2/google/externalaccount: Workforce pool user project should not be set for non-workforce pool credentials"
+                    .to_string(),
+            );
+        }
+    }
+    let cs = j.credential_source.ok_or_else(|| {
+        "oauth2/google/externalaccount: One of CredentialSource, SubjectTokenSupplier, or AwsSecurityCredentialsSupplier must be set"
+            .to_string()
+    })?;
+    let parsed_source = if let Some(ver) = cs.environment_id.strip_prefix("aws") {
+        if ver != "1" {
+            return Err(format!(
+                "oauth2/google/externalaccount: aws version '{ver}' is not supported in the current build"
+            ));
+        }
+        ParsedExternalSource::Aws {
+            region_url: cs.region_url,
+            regional_cred_verification_url: cs.regional_cred_verification_url,
+            cred_verification_url: cs.url,
+            imdsv2_session_token_url: cs.imdsv2_session_token_url,
+            target_resource: j.audience.clone(),
+        }
+    } else if !cs.file.is_empty() {
+        ParsedExternalSource::File {
+            path: cs.file,
+            format: cs.format,
+        }
+    } else if !cs.url.is_empty() {
+        ParsedExternalSource::Url {
+            url: cs.url,
+            headers: cs.headers,
+            format: cs.format,
+        }
+    } else if let Some(exec) = cs.executable {
+        if exec.command.is_empty() {
+            return Err(
+                "oauth2/google/externalaccount: missing `command` field — executable command must be provided"
+                    .to_string(),
+            );
+        }
+        let timeout = match exec.timeout_millis {
+            None => Duration::from_secs(30),
+            Some(ms) if !(5_000..=120_000).contains(&ms) => {
+                return Err(
+                    "oauth2/google/externalaccount: invalid `timeout_millis` field — executable timeout must be between 5 and 120 seconds"
+                        .to_string(),
+                );
+            }
+            Some(ms) => Duration::from_millis(ms as u64),
+        };
+        ParsedExternalSource::Executable {
+            command: exec.command,
+            timeout,
+            output_file: exec.output_file,
+            audience: j.audience.clone(),
+            subject_token_type: j.subject_token_type.clone(),
+            impersonation_url: j.service_account_impersonation_url.clone(),
+        }
+    } else {
+        return Err("oauth2/google/externalaccount: unable to parse credential source".to_string());
+    };
+
+    let token_url = if !j.token_url.is_empty() {
+        j.token_url
+    } else if !j.universe_domain.is_empty() {
+        format!("https://sts.{}/v1/token", j.universe_domain)
+    } else {
+        DEFAULT_STS_TOKEN_URL.to_string()
+    };
+
+    let has_impersonation = !j.service_account_impersonation_url.is_empty();
+    let sts = Arc::new(ExternalStsTokenProvider {
+        audience: j.audience,
+        subject_token_type: j.subject_token_type,
+        token_url,
+        scopes: if has_impersonation {
+            CLOUD_PLATFORM_SCOPE.to_string()
+        } else {
+            DEFAULT_SCOPES_SPACE.to_string()
+        },
+        client_id: j.client_id,
+        client_secret: j.client_secret,
+        workforce_pool_user_project: j.workforce_pool_user_project,
+        source: parsed_source,
+        client: exthttp::bounded_auth_client(),
+        cache: tokio::sync::Mutex::new(None),
+    });
+
+    let override_url = j.gcs_base_url.filter(|s| !s.is_empty());
+    if has_impersonation {
+        let imp = ImpersonatedServiceAccountProvider {
+            impersonation_url: j.service_account_impersonation_url,
+            delegates: Vec::new(),
+            scopes: vec![
+                STORAGE_FULL_CONTROL_SCOPE.to_string(),
+                CLOUD_PLATFORM_SCOPE.to_string(),
+            ],
+            lifetime_seconds: j.service_account_impersonation.token_lifetime_seconds,
+            source: sts,
+            client: exthttp::bounded_auth_client(),
+            cache: tokio::sync::Mutex::new(None),
+        };
+        Ok((Arc::new(imp), override_url))
+    } else {
+        Ok((sts, override_url))
+    }
+}
+
+fn auth_from_json(json: &str) -> Result<(Arc<dyn GcpAuth>, Option<String>), String> {
+    match credential_kind(json)? {
+        CredentialKind::ServiceAccount => auth_from_service_account_json(json),
+        CredentialKind::AuthorizedUser => {
+            let j: AuthorizedUserJson = serde_json::from_str(json).map_err(|e| e.to_string())?;
+            let override_url = j.gcs_base_url.filter(|s| !s.is_empty());
+            Ok((
+                Arc::new(AuthorizedUserProvider::from_json(json)?),
+                override_url,
+            ))
+        }
+        CredentialKind::ExternalAccount => external_account_auth_from_json(json),
+        CredentialKind::ImpersonatedServiceAccount => {
+            let (imp, override_url) = ImpersonatedServiceAccountProvider::from_json(json)?;
+            Ok((Arc::new(imp), override_url))
+        }
+    }
+}
+
 /// Builds the GCS object store for `cfg` (Go `gcs.NewBucketClient`).
 pub fn new_store(cfg: &GCSConfig) -> Result<Arc<dyn ObjectStore>, BucketError> {
     let wrap = |e: String| BucketError::Config(format!("NewBucketClient: create bucket: {e}"));
@@ -576,39 +1769,23 @@ pub fn new_store(cfg: &GCSConfig) -> Result<Arc<dyn ObjectStore>, BucketError> {
 
     let mut base_url = DEFAULT_GCS_BASE_URL.to_string();
     let auth: Arc<dyn GcpAuth> = match source {
-        CredentialSource::ServiceAccountKey(json) => {
-            let (auth, override_url) = auth_from_service_account_json(&json).map_err(wrap)?;
+        CredentialSource::ServiceAccountKey(json)
+        | CredentialSource::AuthorizedUserJson(json)
+        | CredentialSource::ExternalAccountJson(json)
+        | CredentialSource::ImpersonatedServiceAccountJson(json) => {
+            let (auth, override_url) = auth_from_json(&json).map_err(wrap)?;
             if let Some(u) = override_url {
                 base_url = u;
             }
             auth
         }
-        CredentialSource::AuthorizedUserJson(json) => {
-            let j: AuthorizedUserJson = serde_json::from_str(&json).map_err(|e| wrap(e.to_string()))?;
-            if let Some(u) = j.gcs_base_url.filter(|s| !s.is_empty()) {
-                base_url = u;
-            }
-            Arc::new(AuthorizedUserProvider::from_json(&json).map_err(wrap)?)
-        }
         CredentialSource::ApplicationCredentialsFile(path) => {
             let content = std::fs::read_to_string(&path).map_err(|e| wrap(e.to_string()))?;
-            match credential_kind(&content).map_err(wrap)? {
-                CredentialKind::ServiceAccount => {
-                    let (auth, override_url) =
-                        auth_from_service_account_json(&content).map_err(wrap)?;
-                    if let Some(u) = override_url {
-                        base_url = u;
-                    }
-                    auth
-                }
-                CredentialKind::AuthorizedUser => {
-                    let j: AuthorizedUserJson = serde_json::from_str(&content).map_err(|e| wrap(e.to_string()))?;
-                    if let Some(u) = j.gcs_base_url.filter(|s| !s.is_empty()) {
-                        base_url = u;
-                    }
-                    Arc::new(AuthorizedUserProvider::from_json(&content).map_err(wrap)?)
-                }
+            let (auth, override_url) = auth_from_json(&content).map_err(wrap)?;
+            if let Some(u) = override_url {
+                base_url = u;
             }
+            auth
         }
         CredentialSource::Metadata => Arc::new(GceMetadataProvider::new()),
     };
@@ -1575,12 +2752,15 @@ mod tests {
             credential_kind(r#"{"type":"authorized_user"}"#),
             Ok(CredentialKind::AuthorizedUser)
         );
-        for t in [
-            "external_account",
-            "external_account_authorized_user",
-            "impersonated_service_account",
-            "gdch_service_account",
-        ] {
+        assert_eq!(
+            credential_kind(r#"{"type":"external_account"}"#),
+            Ok(CredentialKind::ExternalAccount)
+        );
+        assert_eq!(
+            credential_kind(r#"{"type":"impersonated_service_account"}"#),
+            Ok(CredentialKind::ImpersonatedServiceAccount)
+        );
+        for t in ["external_account_authorized_user", "gdch_service_account"] {
             let err = credential_kind(&format!(r#"{{"type":"{t}"}}"#)).unwrap_err();
             assert!(
                 err.contains(t) && err.contains("not supported by mimir-rs"),
@@ -1606,6 +2786,8 @@ mod tests {
         let sa = r#"{"type":"service_account"}"#;
         let au = r#"{"type":"authorized_user"}"#;
         let ext = r#"{"type":"external_account"}"#;
+        let imp = r#"{"type":"impersonated_service_account"}"#;
+        let gdch = r#"{"type":"gdch_service_account"}"#;
         let cfg_sa = GCSConfig {
             bucket_name: "b".into(),
             service_account: sa.into(),
@@ -1615,7 +2797,7 @@ mod tests {
             ("GOOGLE_APPLICATION_CREDENTIALS", "/adc.json"),
             ("GOOGLE_SERVICE_ACCOUNT", "/other.json"),
         ]);
-        let files = files_of(&[("/adc.json", ext)]);
+        let files = files_of(&[("/adc.json", gdch)]);
         assert_eq!(
             credential_source(&cfg_sa, &env, &files),
             Ok(CredentialSource::ServiceAccountKey(sa.into()))
@@ -1632,9 +2814,25 @@ mod tests {
             service_account: ext.into(),
             ..cfg_sa.clone()
         };
-        let err = credential_source(&cfg_ext, &env, &files).unwrap_err();
+        assert_eq!(
+            credential_source(&cfg_ext, &env, &files),
+            Ok(CredentialSource::ExternalAccountJson(ext.into()))
+        );
+        let cfg_imp = GCSConfig {
+            service_account: imp.into(),
+            ..cfg_sa.clone()
+        };
+        assert_eq!(
+            credential_source(&cfg_imp, &env, &files),
+            Ok(CredentialSource::ImpersonatedServiceAccountJson(imp.into()))
+        );
+        let cfg_gdch = GCSConfig {
+            service_account: gdch.into(),
+            ..cfg_sa.clone()
+        };
+        let err = credential_source(&cfg_gdch, &env, &files).unwrap_err();
         assert!(
-            err.starts_with("failed to create credentials from JSON: GCS credential type \"external_account\""),
+            err.starts_with("failed to create credentials from JSON: GCS credential type \"gdch_service_account\""),
             "{err}"
         );
 
@@ -1644,7 +2842,7 @@ mod tests {
         };
         let err = credential_source(&cfg, &env, &files).unwrap_err();
         assert!(err.contains("GOOGLE_APPLICATION_CREDENTIALS"), "{err}");
-        assert!(err.contains("external_account"), "{err}");
+        assert!(err.contains("gdch_service_account"), "{err}");
         let files = files_of(&[("/adc.json", au)]);
         assert_eq!(
             credential_source(&cfg, &env, &files),
@@ -1830,5 +3028,37 @@ mod tests {
         assert!(req.contains("refresh_token=rt"), "{req}");
         assert!(req.contains("client_id=cid"), "{req}");
         assert!(req.contains("client_secret=csec"), "{req}");
+    }
+
+    #[tokio::test]
+    async fn gce_metadata_requests_scopes_not_audience() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = r#"{"access_token":"gce_tok","expires_in":3600,"token_type":"Bearer"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(resp.as_bytes()).await.unwrap();
+            req
+        });
+        let provider = GceMetadataProvider::new();
+        let (tok, ttl) = provider.fetch_from_host(&addr.to_string()).await.unwrap();
+        assert_eq!(tok, "gce_tok");
+        assert_eq!(ttl, Duration::from_secs(3600));
+        let req = server.await.unwrap();
+        let first_line = req.lines().next().unwrap_or("");
+        assert!(
+            first_line.starts_with("GET /computeMetadata/v1/instance/service-accounts/default/token?scopes="),
+            "expected ?scopes= query param, got: {first_line}"
+        );
+        assert!(first_line.contains("devstorage.full_control"), "{first_line}");
+        assert!(!first_line.contains("audience="), "{first_line}");
     }
 }
