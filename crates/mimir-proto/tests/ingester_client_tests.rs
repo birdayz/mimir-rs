@@ -1391,3 +1391,59 @@ fn test_merge_histogram_sets() {
         assert_eq!(merge_histogram_sets(&a, &b), exp);
     }
 }
+
+#[tokio::test]
+async fn w18_wpe_11_final_series_limit_error_is_wrapped() {
+    struct LimitAfterFinalSeriesClient {
+        step: usize,
+    }
+
+    #[tonic::async_trait]
+    impl QueryStreamClient for LimitAfterFinalSeriesClient {
+        async fn recv(&mut self) -> Result<Option<ingesterpb::QueryStreamResponse>, StreamError> {
+            let cur = self.step;
+            self.step += 1;
+            if cur == 0 {
+                Ok(Some(ingesterpb::QueryStreamResponse {
+                    streaming_series_chunks: vec![ingesterpb::QueryStreamSeriesChunks {
+                        series_index: 0,
+                        chunks: vec![create_test_chunk(1000, 1.0)],
+                    }],
+                    ..Default::default()
+                }))
+            } else {
+                Err(StreamError::Limit(mimir_proto::client::streaming::LimitError(
+                    "the query hit the max number of chunks limit".to_string(),
+                )))
+            }
+        }
+
+        fn close_send(&mut self) {}
+    }
+
+    let (_tx, rx) = watch::channel(false);
+    let mut reader = SeriesChunksStreamReader::new(
+        rx,
+        Box::new(LimitAfterFinalSeriesClient { step: 0 }),
+        "ingester",
+        1,
+        Arc::new(QueryLimiter::new(0, 0, 0, 0)),
+        Arc::new(MemoryConsumptionTracker::unlimited()),
+        Arc::new(|| {}),
+    );
+    reader.start_buffering();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let err = reader.get_chunks(0).await.unwrap_err();
+    assert!(
+        matches!(err, StreamError::Limit(_)),
+        "expected StreamError::Limit, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with(
+            "attempted to read series at index 0 from ingester chunks stream, but the stream has failed: "
+        ),
+        "expected wrapped final-series limit error message, got: {msg}"
+    );
+    assert!(msg.contains("the query hit the max number of chunks limit"), "{msg}");
+}

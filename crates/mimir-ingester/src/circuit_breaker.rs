@@ -457,7 +457,7 @@ impl ClosedStats {
 struct BreakerInner {
     state: BreakerState,
     opened_at: Option<Instant>,
-    half_open_in_flight: usize,
+    half_open_permitted_executions: usize,
     half_open_stats: CountingStats,
     closed_stats: ClosedStats,
 }
@@ -491,13 +491,21 @@ impl CircuitBreaker {
         reg: Option<&Registry>,
         request_type: &'static str,
         test_mode_count_based: bool,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, IngesterError> {
         if !cfg.enabled {
-            return None;
+            return Ok(None);
+        }
+        if !test_mode_count_based && cfg.failure_threshold_percentage > 100 {
+            return Err(IngesterError::Internal {
+                message: format!(
+                    "failureRateThreshold must be between 0 and 1 (got {}%)",
+                    cfg.failure_threshold_percentage
+                ),
+            });
         }
         let cooldown = Duration::from_nanos(cfg.cooldown_period.as_nanos().max(1) as u64);
         let thresholding_period =
-            Duration::from_nanos(cfg.thresholding_period.as_nanos().max(1) as u64);
+            Duration::from_nanos(cfg.thresholding_period.as_nanos().max(0) as u64);
         let request_timeout =
             Duration::from_nanos(cfg.request_timeout.as_nanos().max(1) as u64);
         let initial_delay = Duration::from_nanos(cfg.initial_delay.as_nanos().max(0) as u64);
@@ -514,6 +522,10 @@ impl CircuitBreaker {
             ClosedStats::Counting(CountingStats::new(
                 cfg.failure_threshold_percentage.max(1) as usize,
             ))
+        } else if thresholding_period.is_zero() {
+            ClosedStats::Counting(CountingStats::new(
+                cfg.failure_execution_threshold.max(1) as usize,
+            ))
         } else {
             ClosedStats::Timed(TimedStats::new(thresholding_period, unix_anchor.0, unix_anchor.1))
         };
@@ -525,7 +537,7 @@ impl CircuitBreaker {
         let inner = Arc::new(Mutex::new(BreakerInner {
             state: BreakerState::Closed,
             opened_at: None,
-            half_open_in_flight: 0,
+            half_open_permitted_executions: 0,
             half_open_stats: CountingStats::new(half_open_cap),
             closed_stats,
         }));
@@ -534,7 +546,7 @@ impl CircuitBreaker {
             inner_for_gauge.lock().state
         });
 
-        Some(Arc::new(Self {
+        Ok(Some(Arc::new(Self {
             cfg: cfg.clone(),
             request_type,
             cooldown,
@@ -553,13 +565,17 @@ impl CircuitBreaker {
             state_mtx: Mutex::new(()),
             inner,
             metrics,
-        }))
+        })))
     }
 
     fn new_closed_stats(&self) -> ClosedStats {
         if self.test_mode_count_based.load(Ordering::Acquire) {
             ClosedStats::Counting(CountingStats::new(
                 self.cfg.failure_threshold_percentage.max(1) as usize,
+            ))
+        } else if self.thresholding_period.is_zero() {
+            ClosedStats::Counting(CountingStats::new(
+                self.cfg.failure_execution_threshold.max(1) as usize,
             ))
         } else {
             ClosedStats::Timed(TimedStats::new(
@@ -576,7 +592,11 @@ impl CircuitBreaker {
         inner.closed_stats = ClosedStats::Counting(CountingStats::new(
             self.cfg.failure_threshold_percentage.max(1) as usize,
         ));
-        inner.half_open_stats = CountingStats::new(self.half_open_capacity());
+        let cap = self.half_open_capacity();
+        inner.half_open_stats = CountingStats::new(cap);
+        if inner.state == BreakerState::HalfOpen {
+            inner.half_open_permitted_executions = cap;
+        }
     }
 
     pub fn set_test_request_delay(&self, delay: Duration) {
@@ -614,9 +634,7 @@ impl CircuitBreaker {
     }
 
     pub fn state(&self) -> BreakerState {
-        let mut inner = self.inner.lock();
-        self.maybe_transition_to_half_open(&mut inner, Instant::now());
-        inner.state
+        self.inner.lock().state
     }
 
     pub fn is_open(&self) -> bool {
@@ -640,7 +658,7 @@ impl CircuitBreaker {
         if inner.state != BreakerState::Open {
             inner.state = BreakerState::Open;
             inner.opened_at = Some(now);
-            inner.half_open_in_flight = 0;
+            inner.half_open_permitted_executions = 0;
             inner.half_open_stats.reset();
             inner.closed_stats = self.new_closed_stats();
             self.metrics
@@ -655,7 +673,7 @@ impl CircuitBreaker {
         if inner.state != BreakerState::Closed {
             inner.state = BreakerState::Closed;
             inner.opened_at = None;
-            inner.half_open_in_flight = 0;
+            inner.half_open_permitted_executions = 0;
             inner.half_open_stats.reset();
             inner.closed_stats = self.new_closed_stats();
             self.metrics
@@ -668,10 +686,11 @@ impl CircuitBreaker {
     pub fn force_half_open(&self) {
         let mut inner = self.inner.lock();
         if inner.state != BreakerState::HalfOpen {
+            let cap = self.half_open_capacity();
             inner.state = BreakerState::HalfOpen;
             inner.opened_at = None;
-            inner.half_open_in_flight = 0;
-            inner.half_open_stats = CountingStats::new(self.half_open_capacity());
+            inner.half_open_permitted_executions = cap;
+            inner.half_open_stats = CountingStats::new(cap);
             self.metrics
                 .transitions
                 .with_label_values(&[BreakerState::HalfOpen.as_str()])
@@ -761,9 +780,10 @@ impl CircuitBreaker {
         if inner.state == BreakerState::Open {
             if let Some(opened_at) = inner.opened_at {
                 if now.saturating_duration_since(opened_at) >= self.cooldown {
+                    let cap = self.half_open_capacity();
                     inner.state = BreakerState::HalfOpen;
-                    inner.half_open_in_flight = 0;
-                    inner.half_open_stats = CountingStats::new(self.half_open_capacity());
+                    inner.half_open_permitted_executions = cap;
+                    inner.half_open_stats = CountingStats::new(cap);
                     self.metrics
                         .transitions
                         .with_label_values(&[BreakerState::HalfOpen.as_str()])
@@ -811,15 +831,14 @@ impl CircuitBreaker {
                 })
             }
             BreakerState::HalfOpen => {
-                let cap = self.half_open_capacity();
-                if inner.half_open_in_flight >= cap {
+                if inner.half_open_permitted_executions == 0 {
                     self.metrics.results.with_label_values(&[RESULT_OPEN]).inc();
                     return Err(IngesterError::CircuitBreakerOpen {
                         request_type: self.request_type.to_string(),
                         remaining_delay: Duration::ZERO,
                     });
                 }
-                inner.half_open_in_flight += 1;
+                inner.half_open_permitted_executions -= 1;
                 self.acquired_permits.fetch_add(1, Ordering::AcqRel);
                 Ok(Some(BreakerPermit {
                     breaker: Arc::clone(self),
@@ -910,22 +929,22 @@ impl CircuitBreaker {
         if is_half_open {
             let mut inner = self.inner.lock();
             if inner.state == BreakerState::HalfOpen {
-                inner.half_open_in_flight = inner.half_open_in_flight.saturating_sub(1);
+                inner.half_open_permitted_executions += 1;
             }
         }
     }
 
-    fn record_failure_inner(&self, is_half_open: bool) {
+    fn record_failure_inner(&self, _is_half_open: bool) {
         self.recorded_failures.fetch_add(1, Ordering::AcqRel);
         let now = Instant::now();
         let mut inner = self.inner.lock();
-        if is_half_open && inner.state == BreakerState::HalfOpen {
-            inner.half_open_in_flight = inner.half_open_in_flight.saturating_sub(1);
-        }
         match inner.state {
             BreakerState::HalfOpen => {
                 inner.half_open_stats.record_failure();
                 self.check_half_open_threshold(&mut inner, now);
+                if inner.state == BreakerState::HalfOpen {
+                    inner.half_open_permitted_executions += 1;
+                }
             }
             BreakerState::Closed => {
                 inner.closed_stats.record_failure(now);
@@ -935,17 +954,17 @@ impl CircuitBreaker {
         }
     }
 
-    fn record_success_inner(&self, is_half_open: bool) {
+    fn record_success_inner(&self, _is_half_open: bool) {
         self.recorded_successes.fetch_add(1, Ordering::AcqRel);
         let now = Instant::now();
         let mut inner = self.inner.lock();
-        if is_half_open && inner.state == BreakerState::HalfOpen {
-            inner.half_open_in_flight = inner.half_open_in_flight.saturating_sub(1);
-        }
         match inner.state {
             BreakerState::HalfOpen => {
                 inner.half_open_stats.record_success();
                 self.check_half_open_threshold(&mut inner, now);
+                if inner.state == BreakerState::HalfOpen {
+                    inner.half_open_permitted_executions += 1;
+                }
             }
             BreakerState::Closed => {
                 inner.closed_stats.record_success(now);
@@ -966,7 +985,7 @@ impl CircuitBreaker {
                 if rate_threshold != 0.0 {
                     inner.closed_stats.failure_rate() >= rate_threshold
                 } else {
-                    true
+                    inner.closed_stats.failure_count() >= 1
                 }
             } else {
                 false
@@ -1002,13 +1021,16 @@ impl CircuitBreaker {
                         exec_exceeded && inner.half_open_stats.success_rate() > 1.0 - rate_threshold,
                     )
                 } else {
-                    (true, inner.half_open_stats.success_count() > 0)
+                    (
+                        inner.half_open_stats.failure_count() >= 1,
+                        inner.half_open_stats.success_count() > 0,
+                    )
                 }
             };
         if successes_exceeded {
             inner.state = BreakerState::Closed;
             inner.opened_at = None;
-            inner.half_open_in_flight = 0;
+            inner.half_open_permitted_executions = 0;
             inner.half_open_stats.reset();
             inner.closed_stats = self.new_closed_stats();
             self.metrics
@@ -1019,7 +1041,7 @@ impl CircuitBreaker {
         } else if failures_exceeded {
             inner.state = BreakerState::Open;
             inner.opened_at = Some(now);
-            inner.half_open_in_flight = 0;
+            inner.half_open_permitted_executions = 0;
             inner.half_open_stats.reset();
             self.metrics
                 .transitions
@@ -1148,7 +1170,7 @@ impl IngesterCircuitBreaker {
         push_cfg: &CircuitBreakerConfig,
         read_cfg: &CircuitBreakerConfig,
         reg: Option<&Registry>,
-    ) -> Self {
+    ) -> Result<Self, IngesterError> {
         Self::new_with_test_mode(push_cfg, read_cfg, reg, false)
     }
 
@@ -1157,21 +1179,21 @@ impl IngesterCircuitBreaker {
         read_cfg: &CircuitBreakerConfig,
         reg: Option<&Registry>,
         test_mode_count_based: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, IngesterError> {
+        Ok(Self {
             push: CircuitBreaker::new(
                 push_cfg,
                 reg,
                 CIRCUIT_BREAKER_PUSH_REQUEST_TYPE,
                 test_mode_count_based,
-            ),
+            )?,
             read: CircuitBreaker::new(
                 read_cfg,
                 reg,
                 CIRCUIT_BREAKER_READ_REQUEST_TYPE,
                 test_mode_count_based,
-            ),
-        }
+            )?,
+        })
     }
 
     pub fn try_acquire_push_permit(&self) -> Result<Option<BreakerPermit>, IngesterError> {
@@ -1216,7 +1238,7 @@ mod tests {
         };
 
         let reg = Registry::new();
-        let cb = CircuitBreaker::new(&cfg, Some(&reg), "push", true).unwrap();
+        let cb = CircuitBreaker::new(&cfg, Some(&reg), "push", true).unwrap().unwrap();
         cb.activate();
         assert_eq!(cb.state(), BreakerState::Closed);
 
@@ -1229,10 +1251,12 @@ mod tests {
         assert!(cb.try_acquire_permit().is_err());
 
         std::thread::sleep(Duration::from_millis(35));
-        assert_eq!(cb.state(), BreakerState::HalfOpen);
+        // state() / is_open() must not perform Open -> HalfOpen; try_acquire_permit() does.
+        assert_eq!(cb.state(), BreakerState::Open);
 
         // First half-open probe succeeds -> Closed
         let p = cb.try_acquire_permit().unwrap().unwrap();
+        assert_eq!(cb.state(), BreakerState::HalfOpen);
         p.finish(Duration::from_millis(1), false);
         assert_eq!(cb.state(), BreakerState::Closed);
     }
@@ -1248,7 +1272,7 @@ mod tests {
             ..Default::default()
         };
         let reg = Registry::new();
-        let cb = CircuitBreaker::new(&cfg, Some(&reg), "push", true).unwrap();
+        let cb = CircuitBreaker::new(&cfg, Some(&reg), "push", true).unwrap().unwrap();
         cb.activate();
         cb.force_open();
         std::thread::sleep(Duration::from_millis(30));
@@ -1288,7 +1312,7 @@ mod tests {
             request_timeout: mimir_config::GoDuration::from_millis(100),
             ..Default::default()
         };
-        let cb = CircuitBreaker::new(&cfg, None, "push", false).unwrap();
+        let cb = CircuitBreaker::new(&cfg, None, "push", false).unwrap().unwrap();
         cb.activate();
         cb.force_half_open();
 
@@ -1372,7 +1396,7 @@ mod tests {
         };
 
         // 94 / 1000 = 0.094 -> Round = 0.09 < 0.10 -> stays Closed.
-        let cb1 = CircuitBreaker::new(&cfg, None, "push", false).unwrap();
+        let cb1 = CircuitBreaker::new(&cfg, None, "push", false).unwrap().unwrap();
         cb1.activate();
         for _ in 0..94 {
             let p = cb1.try_acquire_permit().unwrap().unwrap();
@@ -1385,7 +1409,7 @@ mod tests {
         assert_eq!(cb1.state(), BreakerState::Closed);
 
         // 95 / 1000 = 0.095 -> Round = 0.10 >= 0.10 -> opens (even when the 1000th is a success).
-        let cb2 = CircuitBreaker::new(&cfg, None, "push", false).unwrap();
+        let cb2 = CircuitBreaker::new(&cfg, None, "push", false).unwrap().unwrap();
         cb2.activate();
         for _ in 0..95 {
             let p = cb2.try_acquire_permit().unwrap().unwrap();
@@ -1412,7 +1436,7 @@ mod tests {
 
         // 10 failures then 90 successes: at the 100th record (the 90th success),
         // failure_rate = 0.10 >= 0.10 and success_rate = 0.90 is NOT > 0.90 -> re-opens immediately!
-        let cb = CircuitBreaker::new(&cfg, None, "push", false).unwrap();
+        let cb = CircuitBreaker::new(&cfg, None, "push", false).unwrap().unwrap();
         cb.activate();
         cb.force_half_open();
         for _ in 0..10 {

@@ -470,7 +470,10 @@ impl SeriesChunksStreamReader {
             if let Some(err_rx) = self.error_rx.take() {
                 if let Ok(Some(err)) = err_rx.await {
                     return Err(match err {
-                        StreamError::Limit(l) => StreamError::Limit(l),
+                        StreamError::Limit(l) => StreamError::Limit(LimitError(format!(
+                            "attempted to read series at index {series_index} from ingester chunks stream, but the stream has failed: {}",
+                            l.0
+                        ))),
                         StreamError::Canceled(m) => StreamError::Canceled(format!(
                             "attempted to read series at index {series_index} from ingester chunks stream, but the stream has failed: {m}"
                         )),

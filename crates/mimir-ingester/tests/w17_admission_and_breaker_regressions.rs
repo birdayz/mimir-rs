@@ -445,7 +445,7 @@ fn w17_lsh_03_circuit_breaker_2_decimal_rounding_and_half_open_100th_record() {
         request_timeout: GoDuration::from_secs(10),
         ..Default::default()
     };
-    let cb = CircuitBreaker::new(&cfg_closed, None, "push", false).unwrap();
+    let cb = CircuitBreaker::new(&cfg_closed, None, "push", false).unwrap().unwrap();
     cb.activate();
     for _ in 0..95 {
         cb.try_acquire_permit()
@@ -480,7 +480,7 @@ fn w17_lsh_03_circuit_breaker_2_decimal_rounding_and_half_open_100th_record() {
         request_timeout: GoDuration::from_secs(10),
         ..Default::default()
     };
-    let cb_ho = CircuitBreaker::new(&cfg_ho, None, "push", false).unwrap();
+    let cb_ho = CircuitBreaker::new(&cfg_ho, None, "push", false).unwrap().unwrap();
     cb_ho.activate();
     cb_ho.force_half_open();
     for _ in 0..10 {

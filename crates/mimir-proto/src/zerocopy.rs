@@ -404,7 +404,9 @@ pub struct StreamedRw2Header {
 /// format, and samples are appended directly into `samples_arena`.
 pub struct StreamedRw2Series<'v, 'a> {
     pub label_bytes_range: Range<usize>,
+    pub raw_label_bytes_range: Option<Range<usize>>,
     pub encoded_labels: &'v [u8],
+    pub raw_encoded_labels: &'v [u8],
     pub labels_sorted_unique: bool,
     pub bad_utf8: bool,
     pub samples_range: Range<usize>,
@@ -468,7 +470,9 @@ pub struct StreamedClassicHeader {
 /// precomputed when labels are valid UTF-8 and sorted/unique.
 pub struct StreamedClassicSeries<'v, 'a> {
     pub label_bytes_range: Range<usize>,
+    pub raw_label_bytes_range: Option<Range<usize>>,
     pub encoded_labels: &'v [u8],
+    pub raw_encoded_labels: &'v [u8],
     pub prom_hash: u64,
     pub labels_sorted_unique: bool,
     pub bad_utf8: bool,
@@ -1184,13 +1188,11 @@ fn decode_label_pair_slices<'a>(
 
 #[cold]
 #[inline(never)]
-fn reemit_raw_classic_labels(
+fn append_raw_classic_labels(
     input: &[u8],
     range: Range<usize>,
     label_bytes_arena: &mut Vec<u8>,
-    label_bytes_start: usize,
 ) -> Result<(), DecodeError> {
-    label_bytes_arena.truncate(label_bytes_start);
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
@@ -1199,6 +1201,48 @@ fn reemit_raw_classic_labels(
             let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
             let (name, value) = decode_label_pair_slices(input, sub)?;
             append_stringlabel_pair_proto(label_bytes_arena, name, value)?;
+        } else {
+            skip_field_bounded(input, &mut pos, end, wire_type)?;
+        }
+    }
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn append_raw_rw2_labels(
+    input: &[u8],
+    range: Range<usize>,
+    symbol_offset: u32,
+    resolved: &[Option<(&[u8], bool)>],
+    label_bytes_arena: &mut Vec<u8>,
+) -> Result<(), DecodeError> {
+    let mut pos = range.start;
+    let end = range.end;
+    while pos < end {
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
+        if field_num == 1 && wire_type == 2 {
+            let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
+            let mut p = packed.start;
+            while p < packed.end {
+                let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
+                let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
+                let &(k_bytes, _) = resolved
+                    .get(name_idx as usize)
+                    .and_then(|o| o.as_ref())
+                    .ok_or(DecodeError::InvalidLabelRef {
+                        index: name_idx,
+                        offset: symbol_offset,
+                    })?;
+                let &(v_bytes, _) = resolved
+                    .get(val_idx as usize)
+                    .and_then(|o| o.as_ref())
+                    .ok_or(DecodeError::InvalidLabelRef {
+                        index: val_idx,
+                        offset: symbol_offset,
+                    })?;
+                append_stringlabel_pair_proto(label_bytes_arena, k_bytes, v_bytes)?;
+            }
         } else {
             skip_field_bounded(input, &mut pos, end, wire_type)?;
         }
@@ -1445,12 +1489,29 @@ fn decode_timeseries_classic_stream<'v, 'a>(
         }
     }
 
-    if !bad_utf8 && !labels_sorted_unique && dropped_empty {
-        reemit_raw_classic_labels(input, range, label_bytes_arena, label_bytes_start)?;
-    }
-
-    let label_bytes_end = label_bytes_arena.len();
-    let encoded_labels = &label_bytes_arena[label_bytes_start..label_bytes_end];
+    let mut raw_label_bytes_range = None;
+    let label_bytes_end = if !bad_utf8 && !labels_sorted_unique && dropped_empty {
+        label_bytes_arena.truncate(label_bytes_start);
+        append_raw_classic_labels(input, range, label_bytes_arena)?;
+        label_bytes_arena.len()
+    } else if !bad_utf8 && labels_sorted_unique && dropped_empty {
+        let enc_end = label_bytes_arena.len();
+        append_raw_classic_labels(input, range, label_bytes_arena)?;
+        raw_label_bytes_range = Some(enc_end..label_bytes_arena.len());
+        enc_end
+    } else {
+        label_bytes_arena.len()
+    };
+    let (encoded_labels, raw_encoded_labels) = match raw_label_bytes_range {
+        Some(ref rr) => (
+            &label_bytes_arena[label_bytes_start..label_bytes_end],
+            &label_bytes_arena[rr.start..rr.end],
+        ),
+        None => {
+            let enc = &label_bytes_arena[label_bytes_start..label_bytes_end];
+            (enc, enc)
+        }
+    };
     let prom_hash = if !bad_utf8 && labels_sorted_unique && !encoded_labels.is_empty() {
         xxhash_rust::xxh64::xxh64(encoded_labels, 0)
     } else {
@@ -1459,7 +1520,9 @@ fn decode_timeseries_classic_stream<'v, 'a>(
 
     Ok(StreamedClassicSeries {
         label_bytes_range: label_bytes_start..label_bytes_end,
+        raw_label_bytes_range,
         encoded_labels,
+        raw_encoded_labels,
         prom_hash,
         labels_sorted_unique,
         bad_utf8,
@@ -1798,6 +1861,7 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
     let mut prev_name: Option<&'r [u8]> = None;
     let mut labels_sorted_unique = true;
     let mut bad_utf8 = false;
+    let mut dropped_empty = false;
 
     let mut pos = range.start;
     let end = range.end;
@@ -1852,6 +1916,8 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
                                     k_bytes,
                                     v_bytes,
                                 )?;
+                            } else {
+                                dropped_empty = true;
                             }
                         }
                     }
@@ -1940,14 +2006,37 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
         }
     }
 
-    if bad_utf8 {
+    let mut raw_label_bytes_range = None;
+    let label_bytes_end = if bad_utf8 {
         label_bytes_arena.truncate(label_bytes_start);
-    }
-    let label_bytes_end = label_bytes_arena.len();
-    let encoded_labels = &label_bytes_arena[label_bytes_start..label_bytes_end];
+        label_bytes_start
+    } else if !labels_sorted_unique && dropped_empty {
+        label_bytes_arena.truncate(label_bytes_start);
+        append_raw_rw2_labels(input, range, symbol_offset, resolved, label_bytes_arena)?;
+        label_bytes_arena.len()
+    } else if labels_sorted_unique && dropped_empty {
+        let enc_end = label_bytes_arena.len();
+        append_raw_rw2_labels(input, range, symbol_offset, resolved, label_bytes_arena)?;
+        raw_label_bytes_range = Some(enc_end..label_bytes_arena.len());
+        enc_end
+    } else {
+        label_bytes_arena.len()
+    };
+    let (encoded_labels, raw_encoded_labels) = match raw_label_bytes_range {
+        Some(ref rr) => (
+            &label_bytes_arena[label_bytes_start..label_bytes_end],
+            &label_bytes_arena[rr.start..rr.end],
+        ),
+        None => {
+            let enc = &label_bytes_arena[label_bytes_start..label_bytes_end];
+            (enc, enc)
+        }
+    };
     Ok(StreamedRw2Series {
         label_bytes_range: label_bytes_start..label_bytes_end,
+        raw_label_bytes_range,
         encoded_labels,
+        raw_encoded_labels,
         labels_sorted_unique,
         bad_utf8,
         samples_range: samples_start..samples_arena.len(),
@@ -5013,5 +5102,121 @@ mod tests {
         .unwrap();
         assert!(hdr_r.skip_label_count_validation);
         assert!(hdr_r.header_changed_after_series);
+    }
+
+    #[test]
+    fn w18_wpe_04_decode_rw2_stream_preserves_empty_labels_on_unsorted_and_raw_slice() {
+        // 1) Unsorted RW2 labels with an empty-value label: must re-emit raw wire labels including empty=""
+        let rw1_unsorted = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair::from_static("__name__", "up"),
+                    cortexpb::LabelPair::from_static("z", "1"),
+                    cortexpb::LabelPair::from_static("a", ""),
+                ],
+                samples: vec![cortexpb::Sample {
+                    value: 1.0,
+                    timestamp_ms: 100,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rw2_unsorted = from_write_request_to_rw2(&rw1_unsorted, 0, None)
+            .unwrap()
+            .encode_to_vec();
+        let mut scratch = WriteRequestScratch::new();
+        let mut resolved = Rw2ResolvedScratch::new();
+        let mut label_bytes = Vec::new();
+        let mut samples = Vec::new();
+        let mut got_unsorted = Vec::new();
+        {
+            let mut meta_out = Vec::new();
+            decode_rw2_stream(
+                &rw2_unsorted,
+                DecodeOptions::rw2(),
+                &mut scratch,
+                &mut resolved,
+                &mut label_bytes,
+                &mut samples,
+                &mut meta_out,
+                |s| {
+                    assert!(!s.labels_sorted_unique);
+                    assert!(s.raw_label_bytes_range.is_none());
+                    assert_eq!(s.encoded_labels, s.raw_encoded_labels);
+                    got_unsorted.push(s.encoded_labels.to_vec());
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(got_unsorted.len(), 1);
+        // Should contain all 3 pairs including a=""
+        let mut pairs = Vec::new();
+        let mut p = 0usize;
+        let enc = &got_unsorted[0];
+        while p < enc.len() {
+            let kl = enc[p] as usize;
+            p += 1;
+            let k = std::str::from_utf8(&enc[p..p + kl]).unwrap().to_string();
+            p += kl;
+            let vl = enc[p] as usize;
+            p += 1;
+            let v = std::str::from_utf8(&enc[p..p + vl]).unwrap().to_string();
+            p += vl;
+            pairs.push((k, v));
+        }
+        assert_eq!(
+            pairs,
+            vec![
+                ("__name__".to_string(), "up".to_string()),
+                ("z".to_string(), "1".to_string()),
+                ("a".to_string(), String::new()),
+            ]
+        );
+
+        // 2) Sorted RW2 labels with an empty-value label: encoded_labels strips empty, raw_encoded_labels preserves it
+        let rw1_sorted = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair::from_static("__name__", "up"),
+                    cortexpb::LabelPair::from_static("empty", ""),
+                    cortexpb::LabelPair::from_static("job", "api"),
+                ],
+                samples: vec![cortexpb::Sample {
+                    value: 1.0,
+                    timestamp_ms: 100,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rw2_sorted = from_write_request_to_rw2(&rw1_sorted, 0, None)
+            .unwrap()
+            .encode_to_vec();
+        scratch.clear();
+        label_bytes.clear();
+        samples.clear();
+        let mut saw_sorted = false;
+        {
+            let mut meta_out = Vec::new();
+            decode_rw2_stream(
+                &rw2_sorted,
+                DecodeOptions::rw2(),
+                &mut scratch,
+                &mut resolved,
+                &mut label_bytes,
+                &mut samples,
+                &mut meta_out,
+                |s| {
+                    saw_sorted = true;
+                    assert!(s.labels_sorted_unique);
+                    assert!(s.raw_label_bytes_range.is_some());
+                    assert!(!s.encoded_labels.windows(5).any(|w| w == b"empty"));
+                    assert!(s.raw_encoded_labels.windows(5).any(|w| w == b"empty"));
+                },
+            )
+            .unwrap();
+        }
+        assert!(saw_sorted);
     }
 }

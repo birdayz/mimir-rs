@@ -1674,3 +1674,24 @@ fn test_labels_are_sorted() {
     assert!(are_label_names_sorted_and_unique(&[LabelAdapter::new("a", "z")]));
     assert!(are_label_names_sorted_and_unique(&[]));
 }
+
+#[test]
+fn w18_wpe_03_go_quote_escapes_control_chars_and_empty_labels() {
+    assert_eq!(mimir_proto::compat::from_label_adapters_to_string(&[]), "{}");
+    assert_eq!(
+        mimir_proto::compat::from_label_adapters_to_string(&[LabelAdapter::new("__name__", "")]),
+        "{}"
+    );
+    let ls = vec![
+        LabelAdapter::new("__name__", "m"),
+        LabelAdapter::new(
+            "v",
+            "a\x07b\x08c\x0cd\ne\rf\tg\x0bh\x00i\x1fj\x7fk\u{0085}l\u{00ad}m",
+        ),
+    ];
+    let formatted = mimir_proto::compat::from_label_adapters_to_string(&ls);
+    assert_eq!(
+        formatted,
+        r#"m{v="a\ab\bc\fd\ne\rf\tg\vh\x00i\x1fj\x7fk\u0085l\u00adm"}"#
+    );
+}
