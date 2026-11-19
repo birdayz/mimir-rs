@@ -427,24 +427,13 @@ impl TraceSpanContext {
     }
 
     pub fn from_traceparent(header: &str) -> Option<Self> {
-        let parts: Vec<&str> = header.trim().split('-').collect();
-        if parts.len() < 4 || parts[0] != "00" {
-            return None;
-        }
-        let trace_id = hex_decode_16(parts[1])?;
-        let span_id = hex_decode_8(parts[2])?;
-        let flags = u8::from_str_radix(parts[3], 16).ok()?;
-        let sc = Self {
-            trace_id,
-            span_id,
-            sampled: (flags & 0x01) != 0,
-            remote: true,
-        };
-        if sc.is_valid() {
-            Some(sc)
-        } else {
-            None
-        }
+        let tc = mimir_common::tracing::parse_traceparent(header)?;
+        Some(Self {
+            trace_id: tc.trace_id,
+            span_id: tc.span_id,
+            sampled: tc.sampled,
+            remote: tc.remote,
+        })
     }
 }
 
@@ -456,41 +445,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
-}
-
-fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_decode_8(s: &str) -> Option<[u8; 8]> {
-    if s.len() != 16 {
-        return None;
-    }
-    let mut out = [0u8; 8];
-    for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -549,12 +503,21 @@ pub struct TracedKafkaRecord {
     pub topic: String,
     pub headers: Vec<(String, Bytes)>,
     pub span_ctx: Option<TraceSpanContext>,
+    pub tracestate: Option<String>,
     pub active_span_id: Option<u64>,
 }
 
-/// Propagation wrapper that only injects `traceparent` when the span context is sampled.
+/// Propagation wrapper that only injects W3C TraceContext (`traceparent` + `tracestate`)
+/// when the span context is sampled, matching Go `recordsPropagator()`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SampledOnlyPropagator;
+
+const KAFKA_TRACECONTEXT_PROPAGATORS: mimir_common::tracing::PropagatorSet =
+    mimir_common::tracing::PropagatorSet {
+        tracecontext: true,
+        baggage: false,
+        jaeger: false,
+    };
 
 impl SampledOnlyPropagator {
     pub fn inject(&self, ctx: Option<&TraceSpanContext>, headers: &mut Vec<(String, Bytes)>) {
@@ -568,17 +531,44 @@ impl SampledOnlyPropagator {
         }
     }
 
-    pub fn extract(&self, headers: &[(String, Bytes)]) -> Option<TraceSpanContext> {
-        for (k, v) in headers {
-            if k.eq_ignore_ascii_case("traceparent") {
-                if let Ok(s) = std::str::from_utf8(v) {
-                    if let Some(sc) = TraceSpanContext::from_traceparent(s) {
-                        return Some(sc);
+    pub fn inject_trace_context(
+        &self,
+        ctx: Option<&mimir_common::tracing::TraceContext>,
+        headers: &mut Vec<(String, Bytes)>,
+    ) {
+        if let Some(tc) = ctx {
+            if tc.is_sampled() {
+                headers.push(("traceparent".to_string(), Bytes::from(tc.to_traceparent())));
+                if let Some(ref ts) = tc.tracestate {
+                    if !ts.is_empty() {
+                        headers.push(("tracestate".to_string(), Bytes::from(ts.clone())));
                     }
                 }
             }
         }
-        None
+    }
+
+    pub fn extract(&self, headers: &[(String, Bytes)]) -> Option<TraceSpanContext> {
+        let tc = self.extract_trace_context(headers)?;
+        Some(TraceSpanContext {
+            trace_id: tc.trace_id,
+            span_id: tc.span_id,
+            sampled: tc.sampled,
+            remote: tc.remote,
+        })
+    }
+
+    pub fn extract_trace_context(
+        &self,
+        headers: &[(String, Bytes)],
+    ) -> Option<mimir_common::tracing::TraceContext> {
+        let tc = mimir_common::tracing::extract_from_headers(
+            headers
+                .iter()
+                .filter_map(|(k, v)| std::str::from_utf8(v).ok().map(|vs| (k.as_str(), vs))),
+            &KAFKA_TRACECONTEXT_PROPAGATORS,
+        );
+        tc.is_valid().then_some(tc)
     }
 }
 
@@ -608,6 +598,11 @@ impl SampledOnlyTracer {
             .start_span(format!("{} publish", rec.topic), Some(sc.trace_id));
         rec.active_span_id = Some(span_id);
         self.propagator.inject(Some(&sc), &mut rec.headers);
+        if let Some(ref ts) = rec.tracestate {
+            if !ts.is_empty() {
+                rec.headers.push(("tracestate".to_string(), Bytes::from(ts.clone())));
+            }
+        }
     }
 
     pub fn on_produce_record_unbuffered(&self, rec: &mut TracedKafkaRecord) {
@@ -623,7 +618,14 @@ impl SampledOnlyTracer {
         if rec.span_ctx.is_none() {
             rec.span_ctx = Some(TraceSpanContext::default());
         }
-        if let Some(extracted) = self.propagator.extract(&rec.headers) {
+        if let Some(tc) = self.propagator.extract_trace_context(&rec.headers) {
+            rec.tracestate = tc.tracestate.clone();
+            let extracted = TraceSpanContext {
+                trace_id: tc.trace_id,
+                span_id: tc.span_id,
+                sampled: tc.sampled,
+                remote: tc.remote,
+            };
             rec.span_ctx = Some(extracted);
             if !extracted.is_sampled() {
                 return;

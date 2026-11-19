@@ -464,10 +464,15 @@ async fn config_handler(
     // their field order, the diff is a `map[string]interface{}` and therefore sorted.
     let yaml = match mode.as_deref() {
         Some("diff") => {
-            let def = effective_config_yaml(&st.default_config);
-            let act = effective_config_yaml(&st.config);
-            let diff = diff_yaml_values(&def, &act).unwrap_or_else(|| Value::Mapping(Mapping::new()));
-            yaml_v3_emit::marshal_generic(&diff)
+            let mut def = effective_config_yaml(&st.default_config);
+            let mut act = effective_config_yaml(&st.config);
+            mimir_config::yaml_v3::order_like_go_config(&mut def)
+                .and_then(|()| mimir_config::yaml_v3::order_like_go_config(&mut act))
+                .and_then(|()| {
+                    let diff = diff_yaml_values(&def, &act)
+                        .unwrap_or_else(|| Value::Mapping(Mapping::new()));
+                    yaml_v3_emit::marshal_generic(&diff)
+                })
         }
         Some("defaults") => marshal_config_yaml(&st.default_config),
         _ => marshal_config_yaml(&st.config),
@@ -506,8 +511,12 @@ async fn runtime_config_handler(
     let yaml = match mode.as_deref() {
         Some("diff") => {
             let mut default_overrides = Mapping::new();
-            let default_limit_val =
+            let mut default_limit_val =
                 serde_yaml::to_value(&st.config.limits).unwrap_or(Value::Mapping(Mapping::new()));
+            let _ = mimir_config::yaml_v3::order_like_go_type(
+                "validation.Limits",
+                &mut default_limit_val,
+            );
             // Go only seeds defaults for non-nil tenant limits, so `t: null` shows in the diff.
             for (tenant, limits) in &cfg.overrides {
                 if limits.is_some() {
@@ -885,11 +894,7 @@ async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
     }
 
     if let Some(ref ing) = st.ingester {
-        let mut links = vec![IndexLink {
-            desc: "Ingester Tenants",
-            path: "ingester/tenants",
-            dangerous: true,
-        }];
+        let mut links = Vec::new();
         if ing.partition_ring_watcher.is_some() {
             links.push(IndexLink {
                 desc: "Partition ring status",
@@ -897,6 +902,11 @@ async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
                 dangerous: false,
             });
         }
+        links.push(IndexLink {
+            desc: "Ingester Tenants",
+            path: "ingester/tenants",
+            dangerous: true,
+        });
         if ing.instance_ring.is_some() {
             links.push(IndexLink {
                 desc: "Ring status",

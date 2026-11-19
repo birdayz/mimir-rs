@@ -7385,6 +7385,7 @@ impl Head {
             }) {
                 continue;
             }
+            fingerprints.insert(entry.ref_id, SeriesFingerprint::capture(&entry, &st));
             let mut has_any = false;
             for mc in st.mmapped() {
                 mint = mint.min(mc.min_time);
@@ -7397,7 +7398,6 @@ impl Head {
                 has_any = true;
             });
             if has_any {
-                fingerprints.insert(entry.ref_id, SeriesFingerprint::capture(&entry, &st));
                 out.push((entry.ref_id, entry.labels.clone()));
             }
         }

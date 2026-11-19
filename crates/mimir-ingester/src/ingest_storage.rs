@@ -179,6 +179,7 @@ struct ShardSeriesItem {
     rec_seq: u32,
     record_offset: i64,
     tenant_idx: u32,
+    trace_id_idx: u32,
     source: i32,
     skip_label_validation: bool,
     labels_sorted_unique: bool,
@@ -472,6 +473,22 @@ impl IngesterShardedBatchConsumer {
         }
     }
 
+    pub fn with_error_log_sink(mut self, sink: Arc<Mutex<Vec<String>>>) -> Self {
+        let sampler = if self.ingester.cfg.error_sample_rate > 0 {
+            Some(Arc::new(StorageErrorSampler::new(
+                self.ingester.cfg.error_sample_rate,
+            )))
+        } else {
+            None
+        };
+        self.error_handler = Arc::new(PushErrorHandler::new(
+            self.metrics.storage_pusher_metrics.clone(),
+            sampler,
+            Some(sink),
+        ));
+        self
+    }
+
     fn take_arenas(&self, count: usize, num_shards: usize) -> ArenaPoolGuard<'_> {
         let mut arenas = Vec::with_capacity(count);
         {
@@ -658,9 +675,11 @@ impl IngesterShardedBatchConsumer {
                 tenant_key_errors,
                 total_series,
             } = arena;
-            let propagators = mimir_common::tracing::global_tracing()
-                .map(|t| t.propagators.clone())
-                .unwrap_or_default();
+            let propagators = mimir_common::tracing::PropagatorSet {
+                tracecontext: true,
+                baggage: false,
+                jaeger: false,
+            };
             let topic_name = &self.kafka_cfg.topic;
             let mut tmp_ex: Vec<Result<(i64, f64, Labels, String), crate::errors::IngesterError>> =
                 Vec::new();
@@ -732,8 +751,14 @@ impl IngesterShardedBatchConsumer {
                         }),
                         &propagators,
                     );
-                    let (span_ctx, parent_span_id) =
-                        mimir_common::tracing::start_server_span_context(&extracted, false);
+                    // Go `sampledOnlyTracer.OnFetchRecordBuffered`: records whose headers carry no
+                    // sampled W3C span context keep the (absent/unsampled) remote context and never
+                    // start a "receive" span, so they must not get a fresh root trace either.
+                    let (span_ctx, parent_span_id) = if extracted.is_sampled() {
+                        mimir_common::tracing::start_server_span_context(&extracted, false)
+                    } else {
+                        (mimir_common::tracing::TraceContext::default(), None)
+                    };
                     if span_ctx.is_sampled() {
                         if let Some(rt) = mimir_common::tracing::global_tracing() {
                             if rt.exporter.is_some() {
@@ -846,6 +871,7 @@ impl IngesterShardedBatchConsumer {
                                 rec_seq,
                                 record_offset: rec.offset,
                                 tenant_idx,
+                                trace_id_idx: rec_trace_idx,
                                 source: ts.source,
                                 skip_label_validation: ts.skip_label_validation,
                                 labels_sorted_unique: ts.labels_sorted_unique,
@@ -1036,6 +1062,7 @@ impl IngesterShardedBatchConsumer {
                         rec_seq,
                         record_offset: rec.offset,
                         tenant_idx,
+                        trace_id_idx: rec_trace_idx,
                         source,
                         skip_label_validation,
                         labels_sorted_unique,
@@ -1137,7 +1164,7 @@ impl IngesterShardedBatchConsumer {
                 m.batching_queue_metrics.flush_total.inc();
                 m.batching_queue_metrics.flush_errors_total.inc();
             }
-            let _ = self.error_handler.is_server_error(tid, Some(&err));
+            let _ = self.error_handler.is_server_error(tid, None, Some(&err));
             return Err(format!(
                 "consuming record at offset {offset} for tenant {tid}: {err}"
             ));
@@ -1185,6 +1212,7 @@ impl IngesterShardedBatchConsumer {
                                    source_raw: i32,
                                    min_ts: i64,
                                    last_off: i64,
+                                   last_series_rec: Option<(u32, u16, u32)>,
                                    batch_vec: &mut Vec<PrehashedSeriesItem<'_>>,
                                    metas: &[ShardMetadataItem]|
              -> Result<(), String> {
@@ -1221,15 +1249,26 @@ impl IngesterShardedBatchConsumer {
                 }
                 m.time_series_per_flush.observe(batch_vec.len() as f64);
 
-                let sampled_trace_id = metas.iter().find_map(|it| {
-                    (it.trace_id_idx != u32::MAX)
-                        .then(|| {
-                            arenas_ref
-                                .get(it.worker_idx as usize)
-                                .and_then(|a| a.trace_ids.get(it.trace_id_idx as usize))
-                                .map(String::as_str)
-                        })
-                        .flatten()
+                // Go `batchingQueue.AddToBatch` / `AddMetadataToBatch` overwrite
+                // `currentBatch.Context` on every append, so the flush runs under the context
+                // of the LAST record that contributed to the batch (a record's metadata is added
+                // after its series); an unsampled last record means no `trace_id`.
+                let last_meta_rec = metas
+                    .iter()
+                    .max_by_key(|it| it.rec_seq)
+                    .map(|it| (it.rec_seq, it.worker_idx, it.trace_id_idx));
+                let batch_ctx_rec = match (last_series_rec, last_meta_rec) {
+                    (Some(s), Some(m)) => Some(if m.0 >= s.0 { m } else { s }),
+                    (s, m) => s.or(m),
+                };
+                let sampled_trace_id = batch_ctx_rec.and_then(|(_, w_idx, t_idx)| {
+                    if t_idx == u32::MAX {
+                        return None;
+                    }
+                    arenas_ref
+                        .get(w_idx as usize)
+                        .and_then(|a| a.trace_ids.get(t_idx as usize))
+                        .map(String::as_str)
                 });
                 let proc_t0 = Instant::now();
                 let res = self
@@ -1248,11 +1287,15 @@ impl IngesterShardedBatchConsumer {
 
                 match res {
                     Ok(()) => {
-                        self.error_handler.is_server_error(tenant_key, None);
+                        self.error_handler
+                            .is_server_error(tenant_id, sampled_trace_id, None);
                         Ok(())
                     }
                     Err(err) => {
-                        if self.error_handler.is_server_error(tenant_key, Some(&err)) {
+                        if self
+                            .error_handler
+                            .is_server_error(tenant_id, sampled_trace_id, Some(&err))
+                        {
                             if !is_sequential {
                                 m.batching_queue_metrics.flush_errors_total.inc();
                             }
@@ -1295,6 +1338,7 @@ impl IngesterShardedBatchConsumer {
                             first.source as i32,
                             i64::MAX,
                             last_off,
+                            None,
                             &mut Vec::new(),
                             &metas_for_shard[*pos..end],
                         )?;
@@ -1310,6 +1354,7 @@ impl IngesterShardedBatchConsumer {
             let mut batch: Vec<PrehashedSeriesItem<'_>> =
                 Vec::with_capacity(items_for_shard.len().min(max_batch_series));
             let mut batch_min_ts = i64::MAX;
+            let mut batch_last_rec: Option<(u32, u16, u32)> = None;
             let mut cur_tenant_idx = first_item.tenant_idx;
             let mut cur_rec_seq = first_item.rec_seq;
             let mut cur_source = first_item.source;
@@ -1340,11 +1385,13 @@ impl IngesterShardedBatchConsumer {
                         norm_cur_src,
                         batch_min_ts,
                         last_offset,
+                        batch_last_rec,
                         &mut batch,
                         &metas_for_shard[meta_pos..meta_end],
                     )?;
                     meta_pos = meta_end;
                     batch_min_ts = i64::MAX;
+                    batch_last_rec = None;
                     cur_tenant_idx = item.tenant_idx;
                     cur_rec_seq = item.rec_seq;
                     cur_source = item.source;
@@ -1380,6 +1427,9 @@ impl IngesterShardedBatchConsumer {
                     histograms,
                     exemplars,
                 });
+                if batch_last_rec.is_none_or(|(seq, _, _)| item.rec_seq >= seq) {
+                    batch_last_rec = Some((item.rec_seq, item.worker_idx, item.trace_id_idx));
+                }
                 batch_min_ts = batch_min_ts.min(item.min_ts);
                 last_offset = item.record_offset;
             }
@@ -1397,6 +1447,7 @@ impl IngesterShardedBatchConsumer {
                 norm_cur_src,
                 batch_min_ts,
                 last_offset,
+                batch_last_rec,
                 &mut batch,
                 &metas_for_shard[meta_pos..meta_end],
             )?;

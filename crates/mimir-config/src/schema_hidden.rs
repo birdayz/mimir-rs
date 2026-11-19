@@ -7,9 +7,9 @@ use crate::schema::{FieldKind, SchemaBlock, SchemaField};
 // ---- block_builder ----
 
 static BB_GRPC_BACKOFF_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "min_period", flag: "", kind: FieldKind::Duration, default_str: "100ms", usage: "" },
-    SchemaField { name: "max_period", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
-    SchemaField { name: "max_retries", flag: "", kind: FieldKind::Int, default_str: "10", usage: "" },
+    SchemaField { name: "min_period", flag: "block-builder.scheduler.grpc-client-config.backoff-min-period", kind: FieldKind::Duration, default_str: "100ms", usage: "" },
+    SchemaField { name: "max_period", flag: "block-builder.scheduler.grpc-client-config.backoff-max-period", kind: FieldKind::Duration, default_str: "10s", usage: "" },
+    SchemaField { name: "max_retries", flag: "block-builder.scheduler.grpc-client-config.backoff-retries", kind: FieldKind::Int, default_str: "10", usage: "" },
 ];
 
 static BB_GRPC_CCV_FIELDS: &[SchemaField] = &[
@@ -22,27 +22,27 @@ static BB_GRPC_BLOCKS: &[SchemaBlock] = &[
 ];
 
 static BB_GRPC_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "max_recv_msg_size", flag: "", kind: FieldKind::Int, default_str: "104857600", usage: "" },
-    SchemaField { name: "max_send_msg_size", flag: "", kind: FieldKind::Int, default_str: "104857600", usage: "" },
-    SchemaField { name: "grpc_compression", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "rate_limit", flag: "", kind: FieldKind::Float, default_str: "0", usage: "" },
-    SchemaField { name: "rate_limit_burst", flag: "", kind: FieldKind::Int, default_str: "0", usage: "" },
-    SchemaField { name: "backoff_on_ratelimits", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "initial_stream_window_size", flag: "", kind: FieldKind::Bytes, default_str: "63KiB1023B", usage: "" },
-    SchemaField { name: "initial_connection_window_size", flag: "", kind: FieldKind::Bytes, default_str: "63KiB1023B", usage: "" },
-    SchemaField { name: "tls_enabled", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "tls_cert_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_key_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_ca_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_server_name", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_insecure_skip_verify", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "tls_cipher_suites", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_min_version", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "connect_timeout", flag: "", kind: FieldKind::Duration, default_str: "5s", usage: "" },
-    SchemaField { name: "connect_backoff_base_delay", flag: "", kind: FieldKind::Duration, default_str: "1s", usage: "" },
-    SchemaField { name: "connect_backoff_max_delay", flag: "", kind: FieldKind::Duration, default_str: "5s", usage: "" },
-    SchemaField { name: "keepalive_time", flag: "", kind: FieldKind::Duration, default_str: "20s", usage: "" },
-    SchemaField { name: "keepalive_timeout", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
+    SchemaField { name: "max_recv_msg_size", flag: "block-builder.scheduler.grpc-client-config.grpc-max-recv-msg-size", kind: FieldKind::Int, default_str: "104857600", usage: "" },
+    SchemaField { name: "max_send_msg_size", flag: "block-builder.scheduler.grpc-client-config.grpc-max-send-msg-size", kind: FieldKind::Int, default_str: "104857600", usage: "" },
+    SchemaField { name: "grpc_compression", flag: "block-builder.scheduler.grpc-client-config.grpc-compression", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "rate_limit", flag: "block-builder.scheduler.grpc-client-config.grpc-client-rate-limit", kind: FieldKind::Float, default_str: "0", usage: "" },
+    SchemaField { name: "rate_limit_burst", flag: "block-builder.scheduler.grpc-client-config.grpc-client-rate-limit-burst", kind: FieldKind::Int, default_str: "0", usage: "" },
+    SchemaField { name: "backoff_on_ratelimits", flag: "block-builder.scheduler.grpc-client-config.backoff-on-ratelimits", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "initial_stream_window_size", flag: "block-builder.scheduler.grpc-client-config.initial-stream-window-size", kind: FieldKind::Bytes, default_str: "63KiB1023B", usage: "" },
+    SchemaField { name: "initial_connection_window_size", flag: "block-builder.scheduler.grpc-client-config.initial-connection-window-size", kind: FieldKind::Bytes, default_str: "63KiB1023B", usage: "" },
+    SchemaField { name: "tls_enabled", flag: "block-builder.scheduler.grpc-client-config.tls-enabled", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "tls_cert_path", flag: "block-builder.scheduler.grpc-client-config.tls-cert-path", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "tls_key_path", flag: "block-builder.scheduler.grpc-client-config.tls-key-path", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "tls_ca_path", flag: "block-builder.scheduler.grpc-client-config.tls-ca-path", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "tls_server_name", flag: "block-builder.scheduler.grpc-client-config.tls-server-name", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "tls_insecure_skip_verify", flag: "block-builder.scheduler.grpc-client-config.tls-insecure-skip-verify", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "tls_cipher_suites", flag: "block-builder.scheduler.grpc-client-config.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "tls_min_version", flag: "block-builder.scheduler.grpc-client-config.tls-min-version", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "connect_timeout", flag: "block-builder.scheduler.grpc-client-config.connect-timeout", kind: FieldKind::Duration, default_str: "5s", usage: "" },
+    SchemaField { name: "connect_backoff_base_delay", flag: "block-builder.scheduler.grpc-client-config.connect-backoff-base-delay", kind: FieldKind::Duration, default_str: "1s", usage: "" },
+    SchemaField { name: "connect_backoff_max_delay", flag: "block-builder.scheduler.grpc-client-config.connect-backoff-max-delay", kind: FieldKind::Duration, default_str: "5s", usage: "" },
+    SchemaField { name: "keepalive_time", flag: "block-builder.scheduler.grpc-client-config.keepalive-time", kind: FieldKind::Duration, default_str: "20s", usage: "" },
+    SchemaField { name: "keepalive_timeout", flag: "block-builder.scheduler.grpc-client-config.keepalive-timeout", kind: FieldKind::Duration, default_str: "10s", usage: "" },
 ];
 
 static BB_SCHEDULER_CONFIG_FIELDS: &[SchemaField] = &[
@@ -84,136 +84,167 @@ static BLOCK_BUILDER_SCHEDULER_FIELDS: &[SchemaField] = &[
 
 // ---- usage_tracker ----
 
-static UT_KV_CONSUL_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "host", flag: "", kind: FieldKind::String, default_str: "localhost:8500", usage: "" },
-    SchemaField { name: "acl_token", flag: "", kind: FieldKind::Secret, default_str: "", usage: "" },
-    SchemaField { name: "http_client_timeout", flag: "", kind: FieldKind::Duration, default_str: "20s", usage: "" },
-    SchemaField { name: "consistent_reads", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "watch_rate_limit", flag: "", kind: FieldKind::Float, default_str: "1", usage: "" },
-    SchemaField { name: "watch_burst_size", flag: "", kind: FieldKind::Int, default_str: "1", usage: "" },
-    SchemaField { name: "cas_retry_delay", flag: "", kind: FieldKind::Duration, default_str: "1s", usage: "" },
+macro_rules! ut_kv_consul_fields {
+    ($prefix:expr) => {
+        &[
+            SchemaField { name: "host", flag: concat!($prefix, "consul.hostname"), kind: FieldKind::String, default_str: "localhost:8500", usage: "" },
+            SchemaField { name: "acl_token", flag: concat!($prefix, "consul.acl-token"), kind: FieldKind::Secret, default_str: "", usage: "" },
+            SchemaField { name: "http_client_timeout", flag: concat!($prefix, "consul.client-timeout"), kind: FieldKind::Duration, default_str: "20s", usage: "" },
+            SchemaField { name: "consistent_reads", flag: concat!($prefix, "consul.consistent-reads"), kind: FieldKind::Bool, default_str: "false", usage: "" },
+            SchemaField { name: "watch_rate_limit", flag: concat!($prefix, "consul.watch-rate-limit"), kind: FieldKind::Float, default_str: "1", usage: "" },
+            SchemaField { name: "watch_burst_size", flag: concat!($prefix, "consul.watch-burst-size"), kind: FieldKind::Int, default_str: "1", usage: "" },
+            SchemaField { name: "cas_retry_delay", flag: concat!($prefix, "consul.cas-retry-delay"), kind: FieldKind::Duration, default_str: "1s", usage: "" },
+        ]
+    };
+}
+
+macro_rules! ut_kv_etcd_fields {
+    ($prefix:expr) => {
+        &[
+            SchemaField { name: "endpoints", flag: concat!($prefix, "etcd.endpoints"), kind: FieldKind::StringList, default_str: "", usage: "" },
+            SchemaField { name: "dial_timeout", flag: concat!($prefix, "etcd.dial-timeout"), kind: FieldKind::Duration, default_str: "10s", usage: "" },
+            SchemaField { name: "max_retries", flag: concat!($prefix, "etcd.max-retries"), kind: FieldKind::Int, default_str: "10", usage: "" },
+            SchemaField { name: "tls_enabled", flag: concat!($prefix, "etcd.tls-enabled"), kind: FieldKind::Bool, default_str: "false", usage: "" },
+            SchemaField { name: "tls_cert_path", flag: concat!($prefix, "etcd.tls-cert-path"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "tls_key_path", flag: concat!($prefix, "etcd.tls-key-path"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "tls_ca_path", flag: concat!($prefix, "etcd.tls-ca-path"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "tls_server_name", flag: concat!($prefix, "etcd.tls-server-name"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "tls_insecure_skip_verify", flag: concat!($prefix, "etcd.tls-insecure-skip-verify"), kind: FieldKind::Bool, default_str: "false", usage: "" },
+            SchemaField { name: "tls_cipher_suites", flag: concat!($prefix, "etcd.tls-cipher-suites"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "tls_min_version", flag: concat!($prefix, "etcd.tls-min-version"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "username", flag: concat!($prefix, "etcd.username"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "password", flag: concat!($prefix, "etcd.password"), kind: FieldKind::Secret, default_str: "", usage: "" },
+        ]
+    };
+}
+
+macro_rules! ut_kv_multi_fields {
+    ($prefix:expr) => {
+        &[
+            SchemaField { name: "primary", flag: concat!($prefix, "multi.primary"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "secondary", flag: concat!($prefix, "multi.secondary"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "mirror_enabled", flag: concat!($prefix, "multi.mirror-enabled"), kind: FieldKind::Bool, default_str: "false", usage: "" },
+            SchemaField { name: "mirror_timeout", flag: concat!($prefix, "multi.mirror-timeout"), kind: FieldKind::Duration, default_str: "2s", usage: "" },
+        ]
+    };
+}
+
+macro_rules! ut_kv_fields {
+    ($prefix:expr) => {
+        &[
+            SchemaField { name: "store", flag: concat!($prefix, "store"), kind: FieldKind::String, default_str: "memberlist", usage: "" },
+            SchemaField { name: "prefix", flag: concat!($prefix, "prefix"), kind: FieldKind::String, default_str: "collectors/", usage: "" },
+        ]
+    };
+}
+
+static UT_IR_KV_BLOCKS: &[SchemaBlock] = &[
+    SchemaBlock { name: "consul", fields: ut_kv_consul_fields!("usage-tracker.instance-ring."), blocks: &[] },
+    SchemaBlock { name: "etcd", fields: ut_kv_etcd_fields!("usage-tracker.instance-ring."), blocks: &[] },
+    SchemaBlock { name: "multi", fields: ut_kv_multi_fields!("usage-tracker.instance-ring."), blocks: &[] },
 ];
 
-static UT_KV_ETCD_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "endpoints", flag: "", kind: FieldKind::StringList, default_str: "", usage: "" },
-    SchemaField { name: "dial_timeout", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
-    SchemaField { name: "max_retries", flag: "", kind: FieldKind::Int, default_str: "10", usage: "" },
-    SchemaField { name: "tls_enabled", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "tls_cert_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_key_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_ca_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_server_name", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_insecure_skip_verify", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "tls_cipher_suites", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_min_version", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "username", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "password", flag: "", kind: FieldKind::Secret, default_str: "", usage: "" },
-];
-
-static UT_KV_MULTI_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "primary", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "secondary", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "mirror_enabled", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "mirror_timeout", flag: "", kind: FieldKind::Duration, default_str: "2s", usage: "" },
-];
-
-static UT_KV_BLOCKS: &[SchemaBlock] = &[
-    SchemaBlock { name: "consul", fields: UT_KV_CONSUL_FIELDS, blocks: &[] },
-    SchemaBlock { name: "etcd", fields: UT_KV_ETCD_FIELDS, blocks: &[] },
-    SchemaBlock { name: "multi", fields: UT_KV_MULTI_FIELDS, blocks: &[] },
-];
-
-static UT_KV_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "store", flag: "", kind: FieldKind::String, default_str: "memberlist", usage: "" },
-    SchemaField { name: "prefix", flag: "", kind: FieldKind::String, default_str: "collectors/", usage: "" },
+static UT_PR_KV_BLOCKS: &[SchemaBlock] = &[
+    SchemaBlock { name: "consul", fields: ut_kv_consul_fields!("usage-tracker.partition-ring."), blocks: &[] },
+    SchemaBlock { name: "etcd", fields: ut_kv_etcd_fields!("usage-tracker.partition-ring."), blocks: &[] },
+    SchemaBlock { name: "multi", fields: ut_kv_multi_fields!("usage-tracker.partition-ring."), blocks: &[] },
 ];
 
 static UT_INSTANCE_RING_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "heartbeat_period", flag: "", kind: FieldKind::Duration, default_str: "15s", usage: "" },
-    SchemaField { name: "heartbeat_timeout", flag: "", kind: FieldKind::Duration, default_str: "1m0s", usage: "" },
-    SchemaField { name: "auto_forget_unhealthy_periods", flag: "", kind: FieldKind::Int, default_str: "4", usage: "" },
-    SchemaField { name: "instance_id", flag: "", kind: FieldKind::String, default_str: "<hostname>", usage: "" },
-    SchemaField { name: "instance_interface_names", flag: "", kind: FieldKind::StringList, default_str: "", usage: "" },
-    SchemaField { name: "instance_port", flag: "", kind: FieldKind::Int, default_str: "0", usage: "" },
-    SchemaField { name: "instance_addr", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "instance_availability_zone", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "instance_enable_ipv6", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "heartbeat_period", flag: "usage-tracker.instance-ring.heartbeat-period", kind: FieldKind::Duration, default_str: "15s", usage: "" },
+    SchemaField { name: "heartbeat_timeout", flag: "usage-tracker.instance-ring.heartbeat-timeout", kind: FieldKind::Duration, default_str: "1m0s", usage: "" },
+    SchemaField { name: "auto_forget_unhealthy_periods", flag: "usage-tracker.auto-forget-unhealthy-periods", kind: FieldKind::Int, default_str: "4", usage: "" },
+    SchemaField { name: "instance_id", flag: "usage-tracker.instance-ring.instance-id", kind: FieldKind::String, default_str: "<hostname>", usage: "" },
+    SchemaField { name: "instance_interface_names", flag: "usage-tracker.instance-ring.instance-interface-names", kind: FieldKind::StringList, default_str: "", usage: "" },
+    SchemaField { name: "instance_port", flag: "usage-tracker.instance-ring.instance-port", kind: FieldKind::Int, default_str: "0", usage: "" },
+    SchemaField { name: "instance_addr", flag: "usage-tracker.instance-ring.instance-addr", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "instance_availability_zone", flag: "usage-tracker.instance-ring.instance-availability-zone", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "instance_enable_ipv6", flag: "usage-tracker.instance-ring.instance-enable-ipv6", kind: FieldKind::Bool, default_str: "false", usage: "" },
 ];
 
 static UT_INSTANCE_RING_BLOCKS: &[SchemaBlock] = &[
-    SchemaBlock { name: "kvstore", fields: UT_KV_FIELDS, blocks: UT_KV_BLOCKS },
+    SchemaBlock { name: "kvstore", fields: ut_kv_fields!("usage-tracker.instance-ring."), blocks: UT_IR_KV_BLOCKS },
 ];
 
 static UT_PARTITION_RING_BLOCKS: &[SchemaBlock] = &[
-    SchemaBlock { name: "kvstore", fields: UT_KV_FIELDS, blocks: UT_KV_BLOCKS },
+    SchemaBlock { name: "kvstore", fields: ut_kv_fields!("usage-tracker.partition-ring."), blocks: UT_PR_KV_BLOCKS },
 ];
 
-static UT_KAFKA_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "backend", flag: "", kind: FieldKind::String, default_str: "kafka", usage: "" },
-    SchemaField { name: "address", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "topic", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "client_id", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "client_rack", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "dial_timeout", flag: "", kind: FieldKind::Duration, default_str: "2s", usage: "" },
-    SchemaField { name: "write_timeout", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
-    SchemaField { name: "write_timeout_overhead", flag: "", kind: FieldKind::Duration, default_str: "2s", usage: "" },
-    SchemaField { name: "warpstream_health_check_slow_multiplier", flag: "", kind: FieldKind::Int, default_str: "2", usage: "" },
-    SchemaField { name: "warpstream_health_check_max_slow_fraction", flag: "", kind: FieldKind::Float, default_str: "0.3", usage: "" },
-    SchemaField { name: "warpstream_health_check_faulty_threshold", flag: "", kind: FieldKind::Float, default_str: "0.2", usage: "" },
-    SchemaField { name: "warpstream_health_check_max_faulty_fraction", flag: "", kind: FieldKind::Float, default_str: "0.3", usage: "" },
-    SchemaField { name: "warpstream_hedge_min_delay", flag: "", kind: FieldKind::Duration, default_str: "500ms", usage: "" },
-    SchemaField { name: "warpstream_hedge_max_agents", flag: "", kind: FieldKind::Int, default_str: "3", usage: "" },
-    SchemaField { name: "warpstream_demoter_probe_interval", flag: "", kind: FieldKind::Duration, default_str: "1s", usage: "" },
-    SchemaField { name: "sasl_mechanism", flag: "", kind: FieldKind::String, default_str: "PLAIN", usage: "" },
-    SchemaField { name: "sasl_username", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "sasl_password", flag: "", kind: FieldKind::Secret, default_str: "", usage: "" },
-    SchemaField { name: "sasl_oauthbearer_token", flag: "", kind: FieldKind::Secret, default_str: "", usage: "" },
-    SchemaField { name: "sasl_oauthbearer_zid", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "sasl_oauthbearer_extensions", flag: "", kind: FieldKind::Other, default_str: "{}", usage: "" },
-    SchemaField { name: "sasl_oauthbearer_file_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "sasl_oauthbearer_http_socket_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "sasl_oauthbearer_http_socket_timeout", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
-    SchemaField { name: "sasl_msk_iam_access_key", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "sasl_msk_iam_secret_key", flag: "", kind: FieldKind::Secret, default_str: "", usage: "" },
-    SchemaField { name: "sasl_msk_iam_session_token", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "sasl_msk_iam_user_agent", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "sasl_msk_iam_file_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "sasl_msk_iam_http_socket_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "sasl_msk_iam_http_socket_timeout", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
-    SchemaField { name: "tls_enabled", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "tls_cert_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_key_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_ca_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_server_name", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_insecure_skip_verify", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "tls_cipher_suites", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_min_version", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "consumer_group", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "consumer_group_offset_commit_interval", flag: "", kind: FieldKind::Duration, default_str: "1s", usage: "" },
-    SchemaField { name: "consumer_group_offset_commit_file_enforced", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "last_produced_offset_poll_interval", flag: "", kind: FieldKind::Duration, default_str: "1s", usage: "" },
-    SchemaField { name: "last_produced_offset_retry_timeout", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
-    SchemaField { name: "consume_from_position_at_startup", flag: "", kind: FieldKind::String, default_str: "last-offset", usage: "" },
-    SchemaField { name: "consume_from_timestamp_at_startup", flag: "", kind: FieldKind::Int, default_str: "0", usage: "" },
-    SchemaField { name: "target_consumer_lag_at_startup", flag: "", kind: FieldKind::Duration, default_str: "2s", usage: "" },
-    SchemaField { name: "max_consumer_lag_at_startup", flag: "", kind: FieldKind::Duration, default_str: "15s", usage: "" },
-    SchemaField { name: "auto_create_topic_enabled", flag: "", kind: FieldKind::Bool, default_str: "true", usage: "" },
-    SchemaField { name: "auto_create_topic_default_partitions", flag: "", kind: FieldKind::Int, default_str: "-1", usage: "" },
-    SchemaField { name: "producer_max_record_size_bytes", flag: "", kind: FieldKind::Int, default_str: "15983616", usage: "" },
-    SchemaField { name: "producer_max_buffered_bytes", flag: "", kind: FieldKind::Int, default_str: "1073741824", usage: "" },
-    SchemaField { name: "producer_compression", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "wait_strong_read_consistency_timeout", flag: "", kind: FieldKind::Duration, default_str: "20s", usage: "" },
-    SchemaField { name: "producer_record_version", flag: "", kind: FieldKind::Int, default_str: "2", usage: "" },
-    SchemaField { name: "fetch_max_wait", flag: "", kind: FieldKind::Duration, default_str: "5s", usage: "" },
-    SchemaField { name: "fetch_concurrency_max", flag: "", kind: FieldKind::Int, default_str: "12", usage: "" },
-    SchemaField { name: "use_compressed_bytes_as_fetch_max_bytes", flag: "", kind: FieldKind::Bool, default_str: "true", usage: "" },
-    SchemaField { name: "max_buffered_bytes", flag: "", kind: FieldKind::Int, default_str: "1000000000", usage: "" },
-    SchemaField { name: "ingestion_concurrency_max", flag: "", kind: FieldKind::Int, default_str: "8", usage: "" },
-    SchemaField { name: "ingestion_concurrency_batch_size", flag: "", kind: FieldKind::Int, default_str: "150", usage: "" },
-    SchemaField { name: "ingestion_concurrency_queue_capacity", flag: "", kind: FieldKind::Int, default_str: "3", usage: "" },
-    SchemaField { name: "ingestion_concurrency_target_flushes_per_shard", flag: "", kind: FieldKind::Int, default_str: "40", usage: "" },
-    SchemaField { name: "ingestion_concurrency_estimated_bytes_per_sample", flag: "", kind: FieldKind::Int, default_str: "200", usage: "" },
-];
+macro_rules! ut_kafka_fields {
+    ($prefix:expr, $tls_prefix:expr) => {
+        &[
+            SchemaField { name: "backend", flag: concat!($prefix, "backend"), kind: FieldKind::String, default_str: "kafka", usage: "" },
+            SchemaField { name: "address", flag: concat!($prefix, "address"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "topic", flag: concat!($prefix, "topic"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "client_id", flag: concat!($prefix, "client-id"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "client_rack", flag: concat!($prefix, "client-rack"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "dial_timeout", flag: concat!($prefix, "dial-timeout"), kind: FieldKind::Duration, default_str: "2s", usage: "" },
+            SchemaField { name: "write_timeout", flag: concat!($prefix, "write-timeout"), kind: FieldKind::Duration, default_str: "10s", usage: "" },
+            SchemaField { name: "write_timeout_overhead", flag: concat!($prefix, "write-timeout-overhead"), kind: FieldKind::Duration, default_str: "2s", usage: "" },
+            SchemaField { name: "warpstream_health_check_slow_multiplier", flag: concat!($prefix, "warpstream-health-check-slow-multiplier"), kind: FieldKind::Int, default_str: "2", usage: "" },
+            SchemaField { name: "warpstream_health_check_max_slow_fraction", flag: concat!($prefix, "warpstream-health-check-max-slow-fraction"), kind: FieldKind::Float, default_str: "0.3", usage: "" },
+            SchemaField { name: "warpstream_health_check_faulty_threshold", flag: concat!($prefix, "warpstream-health-check-faulty-threshold"), kind: FieldKind::Float, default_str: "0.2", usage: "" },
+            SchemaField { name: "warpstream_health_check_max_faulty_fraction", flag: concat!($prefix, "warpstream-health-check-max-faulty-fraction"), kind: FieldKind::Float, default_str: "0.3", usage: "" },
+            SchemaField { name: "warpstream_hedge_min_delay", flag: concat!($prefix, "warpstream-hedge-min-delay"), kind: FieldKind::Duration, default_str: "500ms", usage: "" },
+            SchemaField { name: "warpstream_hedge_max_agents", flag: concat!($prefix, "warpstream-hedge-max-agents"), kind: FieldKind::Int, default_str: "3", usage: "" },
+            SchemaField { name: "warpstream_demoter_probe_interval", flag: concat!($prefix, "warpstream-demoter-probe-interval"), kind: FieldKind::Duration, default_str: "1s", usage: "" },
+            SchemaField { name: "sasl_mechanism", flag: concat!($prefix, "sasl-mechanism"), kind: FieldKind::String, default_str: "PLAIN", usage: "" },
+            SchemaField { name: "sasl_username", flag: concat!($prefix, "sasl-username"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "sasl_password", flag: concat!($prefix, "sasl-password"), kind: FieldKind::Secret, default_str: "", usage: "" },
+            SchemaField { name: "sasl_oauthbearer_token", flag: concat!($prefix, "sasl-oauthbearer-token"), kind: FieldKind::Secret, default_str: "", usage: "" },
+            SchemaField { name: "sasl_oauthbearer_zid", flag: concat!($prefix, "sasl-oauthbearer-zid"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "sasl_oauthbearer_extensions", flag: concat!($prefix, "sasl-oauthbearer-extensions"), kind: FieldKind::Other, default_str: "{}", usage: "" },
+            SchemaField { name: "sasl_oauthbearer_file_path", flag: concat!($prefix, "sasl-oauthbearer-file-path"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "sasl_oauthbearer_http_socket_path", flag: concat!($prefix, "sasl-oauthbearer-http-socket-path"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "sasl_oauthbearer_http_socket_timeout", flag: concat!($prefix, "sasl-oauthbearer-http-socket-timeout"), kind: FieldKind::Duration, default_str: "10s", usage: "" },
+            SchemaField { name: "sasl_msk_iam_access_key", flag: concat!($prefix, "sasl-msk-iam-access-key"), kind: FieldKind::Secret, default_str: "", usage: "" },
+            SchemaField { name: "sasl_msk_iam_secret_key", flag: concat!($prefix, "sasl-msk-iam-secret-key"), kind: FieldKind::Secret, default_str: "", usage: "" },
+            SchemaField { name: "sasl_msk_iam_session_token", flag: concat!($prefix, "sasl-msk-iam-session-token"), kind: FieldKind::Secret, default_str: "", usage: "" },
+            SchemaField { name: "sasl_msk_iam_user_agent", flag: concat!($prefix, "sasl-msk-iam-user-agent"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "sasl_msk_iam_file_path", flag: concat!($prefix, "sasl-msk-iam-file-path"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "sasl_msk_iam_http_socket_path", flag: concat!($prefix, "sasl-msk-iam-http-socket-path"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "sasl_msk_iam_http_socket_timeout", flag: concat!($prefix, "sasl-msk-iam-http-socket-timeout"), kind: FieldKind::Duration, default_str: "10s", usage: "" },
+            SchemaField { name: "tls_enabled", flag: concat!($prefix, "tls-enabled"), kind: FieldKind::Bool, default_str: "false", usage: "" },
+            SchemaField { name: "tls_cert_path", flag: concat!($tls_prefix, ".tls-cert-path"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "tls_key_path", flag: concat!($tls_prefix, ".tls-key-path"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "tls_ca_path", flag: concat!($tls_prefix, ".tls-ca-path"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "tls_server_name", flag: concat!($tls_prefix, ".tls-server-name"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "tls_insecure_skip_verify", flag: concat!($tls_prefix, ".tls-insecure-skip-verify"), kind: FieldKind::Bool, default_str: "false", usage: "" },
+            SchemaField { name: "tls_cipher_suites", flag: concat!($tls_prefix, ".tls-cipher-suites"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "tls_min_version", flag: concat!($tls_prefix, ".tls-min-version"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "consumer_group", flag: concat!($prefix, "consumer-group"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "consumer_group_offset_commit_interval", flag: concat!($prefix, "consumer-group-offset-commit-interval"), kind: FieldKind::Duration, default_str: "1s", usage: "" },
+            SchemaField { name: "consumer_group_offset_commit_file_enforced", flag: concat!($prefix, "consumer-group-offset-commit-file-enforced"), kind: FieldKind::Bool, default_str: "false", usage: "" },
+            SchemaField { name: "last_produced_offset_poll_interval", flag: concat!($prefix, "last-produced-offset-poll-interval"), kind: FieldKind::Duration, default_str: "1s", usage: "" },
+            SchemaField { name: "last_produced_offset_retry_timeout", flag: concat!($prefix, "last-produced-offset-retry-timeout"), kind: FieldKind::Duration, default_str: "10s", usage: "" },
+            SchemaField { name: "consume_from_position_at_startup", flag: concat!($prefix, "consume-from-position-at-startup"), kind: FieldKind::String, default_str: "last-offset", usage: "" },
+            SchemaField { name: "consume_from_timestamp_at_startup", flag: concat!($prefix, "consume-from-timestamp-at-startup"), kind: FieldKind::Int, default_str: "0", usage: "" },
+            SchemaField { name: "target_consumer_lag_at_startup", flag: concat!($prefix, "target-consumer-lag-at-startup"), kind: FieldKind::Duration, default_str: "2s", usage: "" },
+            SchemaField { name: "max_consumer_lag_at_startup", flag: concat!($prefix, "max-consumer-lag-at-startup"), kind: FieldKind::Duration, default_str: "15s", usage: "" },
+            SchemaField { name: "auto_create_topic_enabled", flag: concat!($prefix, "auto-create-topic-enabled"), kind: FieldKind::Bool, default_str: "true", usage: "" },
+            SchemaField { name: "auto_create_topic_default_partitions", flag: concat!($prefix, "auto-create-topic-default-partitions"), kind: FieldKind::Int, default_str: "-1", usage: "" },
+            SchemaField { name: "producer_max_record_size_bytes", flag: concat!($prefix, "producer-max-record-size-bytes"), kind: FieldKind::Int, default_str: "15983616", usage: "" },
+            SchemaField { name: "producer_max_buffered_bytes", flag: concat!($prefix, "producer-max-buffered-bytes"), kind: FieldKind::Int, default_str: "1073741824", usage: "" },
+            SchemaField { name: "producer_compression", flag: concat!($prefix, "producer-compression"), kind: FieldKind::String, default_str: "", usage: "" },
+            SchemaField { name: "wait_strong_read_consistency_timeout", flag: concat!($prefix, "wait-strong-read-consistency-timeout"), kind: FieldKind::Duration, default_str: "20s", usage: "" },
+            SchemaField { name: "producer_record_version", flag: concat!($prefix, "producer-record-version"), kind: FieldKind::Int, default_str: "2", usage: "" },
+            SchemaField { name: "fetch_max_wait", flag: concat!($prefix, "fetch-max-wait"), kind: FieldKind::Duration, default_str: "5s", usage: "" },
+            SchemaField { name: "fetch_concurrency_max", flag: concat!($prefix, "fetch-concurrency-max"), kind: FieldKind::Int, default_str: "12", usage: "" },
+            SchemaField { name: "use_compressed_bytes_as_fetch_max_bytes", flag: concat!($prefix, "use-compressed-bytes-as-fetch-max-bytes"), kind: FieldKind::Bool, default_str: "true", usage: "" },
+            SchemaField { name: "max_buffered_bytes", flag: concat!($prefix, "max-buffered-bytes"), kind: FieldKind::Int, default_str: "1000000000", usage: "" },
+            SchemaField { name: "ingestion_concurrency_max", flag: concat!($prefix, "ingestion-concurrency-max"), kind: FieldKind::Int, default_str: "8", usage: "" },
+            SchemaField { name: "ingestion_concurrency_batch_size", flag: concat!($prefix, "ingestion-concurrency-batch-size"), kind: FieldKind::Int, default_str: "150", usage: "" },
+            SchemaField { name: "ingestion_concurrency_queue_capacity", flag: concat!($prefix, "ingestion-concurrency-queue-capacity"), kind: FieldKind::Int, default_str: "3", usage: "" },
+            SchemaField { name: "ingestion_concurrency_target_flushes_per_shard", flag: concat!($prefix, "ingestion-concurrency-target-flushes-per-shard"), kind: FieldKind::Int, default_str: "40", usage: "" },
+            SchemaField { name: "ingestion_concurrency_estimated_bytes_per_sample", flag: concat!($prefix, "ingestion-concurrency-estimated-bytes-per-sample"), kind: FieldKind::Int, default_str: "200", usage: "" },
+        ]
+    };
+}
+
+static UT_EVENTS_STORAGE_WRITER_FIELDS: &[SchemaField] = ut_kafka_fields!("usage-tracker.events-storage.writer.", "usage-tracker.events-storage.writer");
+static UT_EVENTS_STORAGE_READER_FIELDS: &[SchemaField] = ut_kafka_fields!("usage-tracker.events-storage.reader.", "usage-tracker.events-storage.reader");
+static UT_SNAPSHOTS_METADATA_WRITER_FIELDS: &[SchemaField] = ut_kafka_fields!("usage-tracker.snapshots-metadata.writer.", "usage-tracker.snapshots-metadata.writer");
+static UT_SNAPSHOTS_METADATA_READER_FIELDS: &[SchemaField] = ut_kafka_fields!("usage-tracker.snapshots-metadata.reader.", "usage-tracker.snapshots-metadata.reader");
 
 static UT_STOR_S3_SSE_FIELDS: &[SchemaField] = &[
     SchemaField { name: "type", flag: "usage-tracker.snapshots-storage.s3.sse.type", kind: FieldKind::String, default_str: "", usage: "" },
@@ -365,42 +396,42 @@ static UT_SNAPSHOTS_STORAGE_BLOCKS: &[SchemaBlock] = &[
 ];
 
 static UT_LOAD_BACKOFF_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "min_period", flag: "", kind: FieldKind::Duration, default_str: "100ms", usage: "" },
-    SchemaField { name: "max_period", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
-    SchemaField { name: "max_retries", flag: "", kind: FieldKind::Int, default_str: "10", usage: "" },
+    SchemaField { name: "min_period", flag: "usage-tracker.snapshots-load-backoff.backoff-min-period", kind: FieldKind::Duration, default_str: "100ms", usage: "" },
+    SchemaField { name: "max_period", flag: "usage-tracker.snapshots-load-backoff.backoff-max-period", kind: FieldKind::Duration, default_str: "10s", usage: "" },
+    SchemaField { name: "max_retries", flag: "usage-tracker.snapshots-load-backoff.backoff-retries", kind: FieldKind::Int, default_str: "10", usage: "" },
 ];
 
 static USAGE_TRACKER_FIELDS: &[SchemaField] = &[
     SchemaField { name: "enabled", flag: "usage-tracker.enabled", kind: FieldKind::Bool, default_str: "false", usage: "" },
     SchemaField { name: "partitions", flag: "usage-tracker.partitions", kind: FieldKind::Int, default_str: "64", usage: "" },
-    SchemaField { name: "partition_reconcile_interval", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
-    SchemaField { name: "lost_partitions_shutdown_grace_period", flag: "", kind: FieldKind::Duration, default_str: "30s", usage: "" },
-    SchemaField { name: "max_partitions_to_create_per_reconcile", flag: "", kind: FieldKind::Int, default_str: "1", usage: "" },
-    SchemaField { name: "idle_timeout", flag: "", kind: FieldKind::Duration, default_str: "20m0s", usage: "" },
-    SchemaField { name: "max_pending_created_series_events", flag: "", kind: FieldKind::Int, default_str: "10000", usage: "" },
-    SchemaField { name: "created_series_events_max_batch_size_bytes", flag: "", kind: FieldKind::Int, default_str: "1048576", usage: "" },
-    SchemaField { name: "created_series_events_batch_ttl", flag: "", kind: FieldKind::Duration, default_str: "250ms", usage: "" },
-    SchemaField { name: "created_series_events_publish_concurrency", flag: "", kind: FieldKind::Int, default_str: "10", usage: "" },
-    SchemaField { name: "skip_snapshot_loading_at_startup", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "snapshot_interval_jitter", flag: "", kind: FieldKind::Float, default_str: "0.1", usage: "" },
-    SchemaField { name: "target_snapshot_file_size_bytes", flag: "", kind: FieldKind::Int, default_str: "104857600", usage: "" },
-    SchemaField { name: "snapshot_cleanup_interval", flag: "", kind: FieldKind::Duration, default_str: "1h0m0s", usage: "" },
-    SchemaField { name: "snapshot_cleanup_interval_jitter", flag: "", kind: FieldKind::Float, default_str: "0.25", usage: "" },
-    SchemaField { name: "max_events_fetch_size", flag: "", kind: FieldKind::Int, default_str: "100", usage: "" },
-    SchemaField { name: "user_close_to_limit_percentage_threshold", flag: "", kind: FieldKind::Int, default_str: "90", usage: "" },
-    SchemaField { name: "enable_verbose_series_creation_deletion_prometheus_metrics", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "min_time_between_shards_cleanup", flag: "", kind: FieldKind::Duration, default_str: "25ms", usage: "" },
-    SchemaField { name: "tenantshard_impl_version", flag: "", kind: FieldKind::Int, default_str: "2", usage: "" },
-    SchemaField { name: "num_shards", flag: "", kind: FieldKind::Int, default_str: "16", usage: "" },
+    SchemaField { name: "partition_reconcile_interval", flag: "usage-tracker.partition-reconcile-interval", kind: FieldKind::Duration, default_str: "10s", usage: "" },
+    SchemaField { name: "lost_partitions_shutdown_grace_period", flag: "usage-tracker.lost-partitions-shutdown-grace-period", kind: FieldKind::Duration, default_str: "30s", usage: "" },
+    SchemaField { name: "max_partitions_to_create_per_reconcile", flag: "usage-tracker.max-partitions-to-create-per-reconcile", kind: FieldKind::Int, default_str: "1", usage: "" },
+    SchemaField { name: "idle_timeout", flag: "usage-tracker.idle-timeout", kind: FieldKind::Duration, default_str: "20m0s", usage: "" },
+    SchemaField { name: "max_pending_created_series_events", flag: "usage-tracker.created-series-events-max-pending", kind: FieldKind::Int, default_str: "10000", usage: "" },
+    SchemaField { name: "created_series_events_max_batch_size_bytes", flag: "usage-tracker.created-series-events-max-batch-size-bytes", kind: FieldKind::Int, default_str: "1048576", usage: "" },
+    SchemaField { name: "created_series_events_batch_ttl", flag: "usage-tracker.created-series-events-batch-ttl", kind: FieldKind::Duration, default_str: "250ms", usage: "" },
+    SchemaField { name: "created_series_events_publish_concurrency", flag: "usage-tracker.created-series-events-publish-concurrency", kind: FieldKind::Int, default_str: "10", usage: "" },
+    SchemaField { name: "skip_snapshot_loading_at_startup", flag: "usage-tracker.skip-snapshot-loading-at-startup", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "snapshot_interval_jitter", flag: "usage-tracker.snapshot-interval-jitter", kind: FieldKind::Float, default_str: "0.1", usage: "" },
+    SchemaField { name: "target_snapshot_file_size_bytes", flag: "usage-tracker.target-snapshot-file-size-bytes", kind: FieldKind::Int, default_str: "104857600", usage: "" },
+    SchemaField { name: "snapshot_cleanup_interval", flag: "usage-tracker.snapshot-cleanup-interval", kind: FieldKind::Duration, default_str: "1h0m0s", usage: "" },
+    SchemaField { name: "snapshot_cleanup_interval_jitter", flag: "usage-tracker.snapshot-cleanup-interval-jitter", kind: FieldKind::Float, default_str: "0.25", usage: "" },
+    SchemaField { name: "max_events_fetch_size", flag: "usage-tracker.max-events-fetch-size", kind: FieldKind::Int, default_str: "100", usage: "" },
+    SchemaField { name: "user_close_to_limit_percentage_threshold", flag: "usage-tracker.user-close-to-limit-percentage-threshold", kind: FieldKind::Int, default_str: "90", usage: "" },
+    SchemaField { name: "enable_verbose_series_creation_deletion_prometheus_metrics", flag: "usage-tracker.enable-verbose-series-creation-deletion-prometheus-metrics", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "min_time_between_shards_cleanup", flag: "usage-tracker.min-time-between-shards-cleanup", kind: FieldKind::Duration, default_str: "25ms", usage: "" },
+    SchemaField { name: "tenantshard_impl_version", flag: "usage-tracker.tenantshard-impl-version", kind: FieldKind::Int, default_str: "2", usage: "" },
+    SchemaField { name: "num_shards", flag: "usage-tracker.num-shards", kind: FieldKind::Int, default_str: "16", usage: "" },
 ];
 
 static USAGE_TRACKER_BLOCKS: &[SchemaBlock] = &[
     SchemaBlock { name: "instance_ring", fields: UT_INSTANCE_RING_FIELDS, blocks: UT_INSTANCE_RING_BLOCKS },
     SchemaBlock { name: "partition_ring", fields: &[], blocks: UT_PARTITION_RING_BLOCKS },
-    SchemaBlock { name: "events_storage_writer", fields: UT_KAFKA_FIELDS, blocks: &[] },
-    SchemaBlock { name: "events_storage_reader", fields: UT_KAFKA_FIELDS, blocks: &[] },
-    SchemaBlock { name: "snapshots_metadata_writer", fields: UT_KAFKA_FIELDS, blocks: &[] },
-    SchemaBlock { name: "snapshots_metadata_reader", fields: UT_KAFKA_FIELDS, blocks: &[] },
+    SchemaBlock { name: "events_storage_writer", fields: UT_EVENTS_STORAGE_WRITER_FIELDS, blocks: &[] },
+    SchemaBlock { name: "events_storage_reader", fields: UT_EVENTS_STORAGE_READER_FIELDS, blocks: &[] },
+    SchemaBlock { name: "snapshots_metadata_writer", fields: UT_SNAPSHOTS_METADATA_WRITER_FIELDS, blocks: &[] },
+    SchemaBlock { name: "snapshots_metadata_reader", fields: UT_SNAPSHOTS_METADATA_READER_FIELDS, blocks: &[] },
     SchemaBlock { name: "snapshots_storage", fields: UT_SNAPSHOTS_STORAGE_FIELDS, blocks: UT_SNAPSHOTS_STORAGE_BLOCKS },
     SchemaBlock { name: "snapshots_load_backoff", fields: UT_LOAD_BACKOFF_FIELDS, blocks: &[] },
 ];

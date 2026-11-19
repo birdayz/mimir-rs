@@ -262,9 +262,9 @@ static BLOCK_15_FIELDS: &[SchemaField] = &[
 ];
 
 static USAGE_TRACKER_GRPC_BACKOFF_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "min_period", flag: "", kind: FieldKind::Duration, default_str: "100ms", usage: "" },
-    SchemaField { name: "max_period", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
-    SchemaField { name: "max_retries", flag: "", kind: FieldKind::Int, default_str: "10", usage: "" },
+    SchemaField { name: "min_period", flag: "distributor.usage-tracker-client.grpc-client-config.backoff-min-period", kind: FieldKind::Duration, default_str: "100ms", usage: "" },
+    SchemaField { name: "max_period", flag: "distributor.usage-tracker-client.grpc-client-config.backoff-max-period", kind: FieldKind::Duration, default_str: "10s", usage: "" },
+    SchemaField { name: "max_retries", flag: "distributor.usage-tracker-client.grpc-client-config.backoff-retries", kind: FieldKind::Int, default_str: "10", usage: "" },
 ];
 pub use crate::schema_hidden::HIDDEN_TOP_BLOCKS;
 
@@ -276,35 +276,35 @@ static USAGE_TRACKER_GRPC_BLOCKS: &[SchemaBlock] = &[
     SchemaBlock { name: "cluster_validation", fields: USAGE_TRACKER_GRPC_CCV_FIELDS, blocks: &[] },
 ];
 static USAGE_TRACKER_GRPC_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "max_recv_msg_size", flag: "", kind: FieldKind::Int, default_str: "104857600", usage: "" },
-    SchemaField { name: "max_send_msg_size", flag: "", kind: FieldKind::Int, default_str: "104857600", usage: "" },
-    SchemaField { name: "grpc_compression", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "rate_limit", flag: "", kind: FieldKind::Float, default_str: "0", usage: "" },
-    SchemaField { name: "rate_limit_burst", flag: "", kind: FieldKind::Int, default_str: "0", usage: "" },
-    SchemaField { name: "backoff_on_ratelimits", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "initial_stream_window_size", flag: "", kind: FieldKind::Bytes, default_str: "63KiB1023B", usage: "" },
-    SchemaField { name: "initial_connection_window_size", flag: "", kind: FieldKind::Bytes, default_str: "63KiB1023B", usage: "" },
-    SchemaField { name: "tls_enabled", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "tls_cert_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_key_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_ca_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_server_name", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_insecure_skip_verify", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "tls_cipher_suites", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "tls_min_version", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "connect_timeout", flag: "", kind: FieldKind::Duration, default_str: "5s", usage: "" },
-    SchemaField { name: "connect_backoff_base_delay", flag: "", kind: FieldKind::Duration, default_str: "1s", usage: "" },
-    SchemaField { name: "connect_backoff_max_delay", flag: "", kind: FieldKind::Duration, default_str: "5s", usage: "" },
-    SchemaField { name: "keepalive_time", flag: "", kind: FieldKind::Duration, default_str: "20s", usage: "" },
-    SchemaField { name: "keepalive_timeout", flag: "", kind: FieldKind::Duration, default_str: "10s", usage: "" },
-    SchemaField { name: "health_check_grace_period", flag: "", kind: FieldKind::Duration, default_str: "0s", usage: "" },
+    SchemaField { name: "max_recv_msg_size", flag: "distributor.usage-tracker-client.grpc-client-config.grpc-max-recv-msg-size", kind: FieldKind::Int, default_str: "104857600", usage: "" },
+    SchemaField { name: "max_send_msg_size", flag: "distributor.usage-tracker-client.grpc-client-config.grpc-max-send-msg-size", kind: FieldKind::Int, default_str: "104857600", usage: "" },
+    SchemaField { name: "grpc_compression", flag: "distributor.usage-tracker-client.grpc-client-config.grpc-compression", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "rate_limit", flag: "distributor.usage-tracker-client.grpc-client-config.grpc-client-rate-limit", kind: FieldKind::Float, default_str: "0", usage: "" },
+    SchemaField { name: "rate_limit_burst", flag: "distributor.usage-tracker-client.grpc-client-config.grpc-client-rate-limit-burst", kind: FieldKind::Int, default_str: "0", usage: "" },
+    SchemaField { name: "backoff_on_ratelimits", flag: "distributor.usage-tracker-client.grpc-client-config.backoff-on-ratelimits", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "initial_stream_window_size", flag: "distributor.usage-tracker-client.grpc-client-config.initial-stream-window-size", kind: FieldKind::Bytes, default_str: "63KiB1023B", usage: "" },
+    SchemaField { name: "initial_connection_window_size", flag: "distributor.usage-tracker-client.grpc-client-config.initial-connection-window-size", kind: FieldKind::Bytes, default_str: "63KiB1023B", usage: "" },
+    SchemaField { name: "tls_enabled", flag: "distributor.usage-tracker-client.grpc-client-config.tls-enabled", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "tls_cert_path", flag: "distributor.usage-tracker-client.grpc-client-config.tls-cert-path", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "tls_key_path", flag: "distributor.usage-tracker-client.grpc-client-config.tls-key-path", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "tls_ca_path", flag: "distributor.usage-tracker-client.grpc-client-config.tls-ca-path", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "tls_server_name", flag: "distributor.usage-tracker-client.grpc-client-config.tls-server-name", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "tls_insecure_skip_verify", flag: "distributor.usage-tracker-client.grpc-client-config.tls-insecure-skip-verify", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "tls_cipher_suites", flag: "distributor.usage-tracker-client.grpc-client-config.tls-cipher-suites", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "tls_min_version", flag: "distributor.usage-tracker-client.grpc-client-config.tls-min-version", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "connect_timeout", flag: "distributor.usage-tracker-client.grpc-client-config.connect-timeout", kind: FieldKind::Duration, default_str: "5s", usage: "" },
+    SchemaField { name: "connect_backoff_base_delay", flag: "distributor.usage-tracker-client.grpc-client-config.connect-backoff-base-delay", kind: FieldKind::Duration, default_str: "1s", usage: "" },
+    SchemaField { name: "connect_backoff_max_delay", flag: "distributor.usage-tracker-client.grpc-client-config.connect-backoff-max-delay", kind: FieldKind::Duration, default_str: "5s", usage: "" },
+    SchemaField { name: "keepalive_time", flag: "distributor.usage-tracker-client.grpc-client-config.keepalive-time", kind: FieldKind::Duration, default_str: "20s", usage: "" },
+    SchemaField { name: "keepalive_timeout", flag: "distributor.usage-tracker-client.grpc-client-config.keepalive-timeout", kind: FieldKind::Duration, default_str: "10s", usage: "" },
+    SchemaField { name: "health_check_grace_period", flag: "distributor.usage-tracker-client.grpc-client-config.health-check-grace-period", kind: FieldKind::Duration, default_str: "0s", usage: "" },
 ];
 static USAGE_TRACKER_CLIENT_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "ignore_rejected_series", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "ignore_errors", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
-    SchemaField { name: "prefer_availability_zone", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "requests_hedging_delay", flag: "", kind: FieldKind::Duration, default_str: "100ms", usage: "" },
-    SchemaField { name: "reusable_workers", flag: "", kind: FieldKind::Int, default_str: "500", usage: "" },
+    SchemaField { name: "ignore_rejected_series", flag: "distributor.usage-tracker-client.ignore-rejected-series", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "ignore_errors", flag: "distributor.usage-tracker-client.ignore-errors", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "prefer_availability_zone", flag: "distributor.usage-tracker-client.prefer-availability-zone", kind: FieldKind::String, default_str: "", usage: "" },
+    SchemaField { name: "requests_hedging_delay", flag: "distributor.usage-tracker-client.requests-hedging-delay", kind: FieldKind::Duration, default_str: "100ms", usage: "" },
+    SchemaField { name: "reusable_workers", flag: "distributor.usage-tracker-client.reusable-workers", kind: FieldKind::Int, default_str: "500", usage: "" },
     SchemaField { name: "tls_enabled", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
     SchemaField { name: "tls_cert_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
     SchemaField { name: "tls_key_path", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
@@ -313,14 +313,14 @@ static USAGE_TRACKER_CLIENT_FIELDS: &[SchemaField] = &[
     SchemaField { name: "tls_insecure_skip_verify", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
     SchemaField { name: "tls_cipher_suites", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
     SchemaField { name: "tls_min_version", flag: "", kind: FieldKind::String, default_str: "", usage: "" },
-    SchemaField { name: "users_close_to_limit_poll_interval", flag: "", kind: FieldKind::Duration, default_str: "1s", usage: "" },
-    SchemaField { name: "users_close_to_limit_cache_startup_retries", flag: "", kind: FieldKind::Int, default_str: "3", usage: "" },
-    SchemaField { name: "min_series_limit_for_async_tracking", flag: "", kind: FieldKind::Int, default_str: "0", usage: "" },
-    SchemaField { name: "batch_delay", flag: "", kind: FieldKind::Duration, default_str: "750ms", usage: "" },
-    SchemaField { name: "max_batch_series", flag: "", kind: FieldKind::Int, default_str: "1000000", usage: "" },
-    SchemaField { name: "track_series_batch_timeout", flag: "", kind: FieldKind::Duration, default_str: "2s", usage: "" },
-    SchemaField { name: "sync_batch_delay", flag: "", kind: FieldKind::Duration, default_str: "50ms", usage: "" },
-    SchemaField { name: "sync_batch_independent_partition_timeouts", flag: "", kind: FieldKind::Bool, default_str: "false", usage: "" },
+    SchemaField { name: "users_close_to_limit_poll_interval", flag: "distributor.usage-tracker-client.users-close-to-limit-poll-interval", kind: FieldKind::Duration, default_str: "1s", usage: "" },
+    SchemaField { name: "users_close_to_limit_cache_startup_retries", flag: "distributor.usage-tracker-client.users-close-to-limit-cache-startup-retries", kind: FieldKind::Int, default_str: "3", usage: "" },
+    SchemaField { name: "min_series_limit_for_async_tracking", flag: "distributor.usage-tracker-client.min-series-limit-for-async-tracking", kind: FieldKind::Int, default_str: "0", usage: "" },
+    SchemaField { name: "batch_delay", flag: "distributor.usage-tracker-client.batch-delay", kind: FieldKind::Duration, default_str: "750ms", usage: "" },
+    SchemaField { name: "max_batch_series", flag: "distributor.usage-tracker-client.max-batch-series", kind: FieldKind::Int, default_str: "1000000", usage: "" },
+    SchemaField { name: "track_series_batch_timeout", flag: "distributor.usage-tracker-client.track-series-batch-timeout", kind: FieldKind::Duration, default_str: "2s", usage: "" },
+    SchemaField { name: "sync_batch_delay", flag: "distributor.usage-tracker-client.sync-batch-delay", kind: FieldKind::Duration, default_str: "50ms", usage: "" },
+    SchemaField { name: "sync_batch_independent_partition_timeouts", flag: "distributor.usage-tracker-client.sync-batch-independent-partition-timeouts", kind: FieldKind::Bool, default_str: "false", usage: "" },
 ];
 static USAGE_TRACKER_CLIENT_BLOCKS: &[SchemaBlock] = &[
     SchemaBlock { name: "grpc", fields: USAGE_TRACKER_GRPC_FIELDS, blocks: USAGE_TRACKER_GRPC_BLOCKS },
@@ -2499,7 +2499,22 @@ pub fn register_extra_flags<T: 'static>(
                         | FieldKind::StringList
                         | FieldKind::Other
                         | FieldKind::Secret
-                        | FieldKind::SecretOmitEmpty => {}
+                        | FieldKind::SecretOmitEmpty => {
+                            // Go registers these through validating `flag.Value`s on every
+                            // prefix, so an invalid value fails flag parsing (exit 2):
+                            // `ingest.SASLMechanism.Set`, `flagext.LimitsMap[string].Set` and
+                            // the S3 `bucketLookupTypeValue.Set`.
+                            if name_for_set.ends_with(".sasl-mechanism") {
+                                crate::types::SASLMechanism::parse(s)?;
+                            } else if name_for_set.ends_with(".sasl-oauthbearer-extensions") {
+                                serde_json::from_str::<Option<BTreeMap<String, String>>>(s)
+                                    .map_err(|e| {
+                                        ConfigError::Flag(format!("invalid JSON map: {e}"))
+                                    })?;
+                            } else if name_for_set.ends_with(".s3.bucket-lookup-type") {
+                                crate::types::S3BucketLookupType::parse(s)?;
+                            }
+                        }
                     }
                     get_mut(t).insert(name_for_set.clone(), s.to_string());
                     Ok(())
@@ -2525,56 +2540,20 @@ pub fn register_extra_flags<T: 'static>(
         }
     }
 
-    for block in EXTRA_TOP_BLOCKS {
+    for block in EXTRA_TOP_BLOCKS.iter().chain(HIDDEN_TOP_BLOCKS.iter()) {
         walk(block, f, get, get_mut);
     }
 
-    for (name, is_bool, type_name) in [
-        ("block-builder.instance-id", false, "string"),
-        ("block-builder.data-dir", false, "string"),
-        ("block-builder.apply-max-global-series-per-user-below", false, "int"),
-        ("block-builder.generate-sparse-index-headers", true, ""),
-        ("block-builder.verify-blocks-before-upload", true, ""),
-        ("block-builder.scheduler.address", false, "string"),
-        ("block-builder.scheduler.update-interval", false, "duration"),
-        ("block-builder.scheduler.max-update-age", false, "duration"),
-        ("block-builder.scheduler.grpc-client-config.cluster-validation.label", false, "string"),
-        ("block-builder-scheduler.consumer-group", false, "string"),
-        ("block-builder-scheduler.scheduling-interval", false, "duration"),
-        ("block-builder-scheduler.job-size", false, "duration"),
-        ("block-builder-scheduler.startup-observe-time", false, "duration"),
-        ("block-builder-scheduler.job-lease-expiry", false, "duration"),
-        ("block-builder-scheduler.lookback-on-no-commit", false, "duration"),
-        ("block-builder-scheduler.max-scan-age", false, "duration"),
-        ("block-builder-scheduler.max-jobs-per-partition", false, "int"),
-        ("block-builder-scheduler.enqueue-interval", false, "duration"),
-        ("block-builder-scheduler.job-failures-allowed", false, "int"),
-        ("usage-tracker.enabled", true, ""),
-        ("usage-tracker.partitions", false, "int"),
-    ] {
-        let name_s = name.to_string();
-        let name_get = name_s.clone();
-        f.register_raw(
-            name_s.clone(),
-            is_bool,
-            type_name,
-            if is_bool { "false" } else { "" },
-            "",
-            move |t, s| {
-                if is_bool {
-                    parse_go_bool(s)?;
-                } else if type_name == "int" {
-                    crate::flags::go_parse_int(s)?;
-                } else if type_name == "duration" {
-                    s.parse::<GoDuration>()
-                        .map_err(|_| ConfigError::Flag("parse error".to_string()))?;
-                }
-                get_mut(t).insert(name_s.clone(), s.to_string());
-                Ok(())
-            },
-            move |t| get(t).get(&name_get).cloned().unwrap_or_default(),
-        );
-    }
+    // Deprecated flag registered unconditionally by pkg/usagetracker/tracker.go.
+    f.register_raw(
+        "usage-tracker.use-global-series-limits",
+        false,
+        "value",
+        "deprecated",
+        "",
+        move |_t, _s| Ok(()),
+        move |_t| "deprecated".to_string(),
+    );
 
     // `continuoustest.Config` (`yaml:"-"`, pkg/continuoustest/{manager,client,*_test}.go): flags
     // are registered for every target in Go and only consumed by `-target=continuous-test`
@@ -2643,42 +2622,6 @@ pub fn register_extra_flags<T: 'static>(
                         return Err(ConfigError::Flag(format!("invalid write protocol {s:?}")));
                     }
                     _ => {}
-                }
-                get_mut(t).insert(name_s.clone(), s.to_string());
-                Ok(())
-            },
-            move |t| get(t).get(&name_get).cloned().unwrap_or_default(),
-        );
-    }
-
-    for suffix in crate::storage::StorageBackendConfig::common_flag_suffixes() {
-        let name_s = format!("usage-tracker.snapshots-storage.{suffix}");
-        let name_get = name_s.clone();
-        let is_bool = matches!(
-            *suffix,
-            "s3.insecure"
-                | "s3.native-aws-auth-enabled"
-                | "s3.send-content-md5"
-                | "s3.dualstack-enabled"
-                | "s3.http.insecure-skip-verify"
-                | "s3.http.force-attempt-http2"
-                | "s3.trace.enabled"
-                | "gcs.enable-upload-retries"
-                | "gcs.http.insecure-skip-verify"
-                | "gcs.http.force-attempt-http2"
-                | "azure.http.insecure-skip-verify"
-                | "azure.http.force-attempt-http2"
-        );
-        let type_name = if is_bool { "" } else { "string" };
-        f.register_raw(
-            name_s.clone(),
-            is_bool,
-            type_name,
-            if is_bool { "false" } else { "" },
-            "",
-            move |t, s| {
-                if is_bool {
-                    parse_go_bool(s)?;
                 }
                 get_mut(t).insert(name_s.clone(), s.to_string());
                 Ok(())

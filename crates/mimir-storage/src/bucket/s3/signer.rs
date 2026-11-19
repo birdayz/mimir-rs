@@ -50,10 +50,13 @@ pub(crate) struct SignableRequest {
 }
 
 impl SignableRequest {
-    pub fn set_header(&mut self, name: &str, value: &str) {
-        let name = HeaderName::from_bytes(name.as_bytes()).expect("valid header name");
-        let value = HeaderValue::from_str(value).expect("valid header value");
+    pub fn set_header(&mut self, name: &str, value: &str) -> Result<(), String> {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| format!("invalid header name {name:?}: {e}"))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|e| format!("invalid header value for {name}: {e}"))?;
         self.headers.insert(name, value);
+        Ok(())
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -146,6 +149,23 @@ pub(crate) fn canonical_query(query: &[(String, String)]) -> String {
     out.replace('+', "%20")
 }
 
+/// Encodes `raw_path` via [`encode_path`] and normalizes dot-segments identically to
+/// `reqwest::Url::parse` (WHATWG URL) so SigV4 `CanonicalURI` always matches the wire path.
+pub(crate) fn canonical_uri_path(raw_path: &str) -> String {
+    let encoded = encode_path(raw_path);
+    if !encoded.contains('.') && !encoded.contains("%2e") && !encoded.contains("%2E") {
+        return encoded;
+    }
+    let probe = if encoded.starts_with('/') {
+        format!("http://localhost{encoded}")
+    } else {
+        format!("http://localhost/{encoded}")
+    };
+    reqwest::Url::parse(&probe)
+        .map(|u| u.path().to_string())
+        .unwrap_or(encoded)
+}
+
 /// `s3utils.EncodePath`.
 pub(crate) fn encode_path(path_name: &str) -> String {
     let reserved = path_name.bytes().all(|b| {
@@ -232,7 +252,7 @@ fn hashed_payload(req: &SignableRequest) -> String {
 fn canonical_request(req: &SignableRequest, streaming: bool, hashed_payload: &str) -> String {
     [
         req.method.to_string(),
-        encode_path(&req.path),
+        canonical_uri_path(&req.path),
         canonical_query(&req.query),
         canonical_headers(req, streaming),
         signed_headers(req, streaming),
@@ -260,13 +280,13 @@ pub(crate) fn sign_v4(
     location: &str,
     service_type: &str,
     t: DateTime<Utc>,
-) {
+) -> Result<(), String> {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
-        return;
+        return Ok(());
     }
-    req.set_header("X-Amz-Date", &t.format(ISO8601_DATE_FORMAT).to_string());
+    req.set_header("X-Amz-Date", &t.format(ISO8601_DATE_FORMAT).to_string())?;
     if !session_token.is_empty() && req.header("x-amz-s3session-token").is_none() {
-        req.set_header("X-Amz-Security-Token", session_token);
+        req.set_header("X-Amz-Security-Token", session_token)?;
     }
     let hashed = hashed_payload(req);
     let canonical = canonical_request(req, false, &hashed);
@@ -280,7 +300,8 @@ pub(crate) fn sign_v4(
         &format!(
             "{SIGN_V4_ALGORITHM} Credential={credential}, SignedHeaders={signed}, Signature={signature}"
         ),
-    );
+    )?;
+    Ok(())
 }
 
 /// `getSignedChunkLength`.
@@ -363,14 +384,14 @@ pub(crate) fn streaming_sign_v4(
     data_len: u64,
     req_time: DateTime<Utc>,
     service_type: &'static str,
-) -> (ChunkSigner, u64) {
-    req.set_header("X-Amz-Content-Sha256", STREAMING_SIGN_ALGORITHM);
+) -> Result<(ChunkSigner, u64), String> {
+    req.set_header("X-Amz-Content-Sha256", STREAMING_SIGN_ALGORITHM)?;
     if !session_token.is_empty() {
-        req.set_header("X-Amz-Security-Token", session_token);
+        req.set_header("X-Amz-Security-Token", session_token)?;
     }
-    req.set_header("X-Amz-Date", &req_time.format(ISO8601_DATE_FORMAT).to_string());
+    req.set_header("X-Amz-Date", &req_time.format(ISO8601_DATE_FORMAT).to_string())?;
     let content_length = stream_length(data_len, PAYLOAD_CHUNK_SIZE);
-    req.set_header("x-amz-decoded-content-length", &data_len.to_string());
+    req.set_header("x-amz-decoded-content-length", &data_len.to_string())?;
 
     let hashed = hashed_payload(req);
     let canonical = canonical_request(req, true, &hashed);
@@ -383,8 +404,8 @@ pub(crate) fn streaming_sign_v4(
         "{SIGN_V4_ALGORITHM} Credential={credential},SignedHeaders={},Signature={seed_signature}",
         signed_headers(req, true)
     );
-    req.set_header("Authorization", &auth);
-    (
+    req.set_header("Authorization", &auth)?;
+    Ok((
         ChunkSigner {
             secret_access_key: secret_access_key.to_string(),
             region: region.to_string(),
@@ -394,7 +415,7 @@ pub(crate) fn streaming_sign_v4(
             seed_signature,
         },
         content_length,
-    )
+    ))
 }
 
 /// Encodes a whole payload as minio-go's `StreamingReader` would emit it.
@@ -428,7 +449,7 @@ mod tests {
             query: vec![],
             headers: HeaderMap::new(),
         };
-        r.set_header("x-amz-storage-class", "REDUCED_REDUNDANCY");
+        r.set_header("x-amz-storage-class", "REDUCED_REDUNDANCY").unwrap();
         r
     }
 
@@ -436,7 +457,7 @@ mod tests {
     #[test]
     fn test_get_seed_signature() {
         let mut req = put_req();
-        let (signer, _) = streaming_sign_v4(&mut req, AK, SK, "", "us-east-1", 66560, t(), SERVICE_TYPE_S3);
+        let (signer, _) = streaming_sign_v4(&mut req, AK, SK, "", "us-east-1", 66560, t(), SERVICE_TYPE_S3).unwrap();
         assert_eq!(
             signer.seed_signature,
             "38cab3af09aa15ddf29e26e36236f60fb6bfb6243a20797ae9a8183674526079"
@@ -465,7 +486,7 @@ mod tests {
     #[test]
     fn test_set_streaming_authorization() {
         let mut req = put_req();
-        streaming_sign_v4(&mut req, AK, SK, "", "us-east-1", 65 * 1024, t(), SERVICE_TYPE_S3);
+        streaming_sign_v4(&mut req, AK, SK, "", "us-east-1", 65 * 1024, t(), SERVICE_TYPE_S3).unwrap();
         assert_eq!(
             req.header("authorization").unwrap(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-storage-class,Signature=38cab3af09aa15ddf29e26e36236f60fb6bfb6243a20797ae9a8183674526079"
@@ -477,7 +498,7 @@ mod tests {
     fn test_streaming_body_matches_aws_example() {
         let mut req = put_req();
         let (mut signer, content_length) =
-            streaming_sign_v4(&mut req, AK, SK, "", "us-east-1", 66560, t(), SERVICE_TYPE_S3);
+            streaming_sign_v4(&mut req, AK, SK, "", "us-east-1", 66560, t(), SERVICE_TYPE_S3).unwrap();
         let body = encode_streaming_body(&mut signer, &vec![b'a'; 66560]);
         assert_eq!(body.len() as u64, content_length);
         assert_eq!(content_length, 66824);
@@ -511,9 +532,9 @@ mod tests {
             query: vec![],
             headers: HeaderMap::new(),
         };
-        req.set_header("Range", "bytes=0-9");
-        req.set_header("X-Amz-Content-Sha256", EMPTY_SHA256_HEX);
-        sign_v4(&mut req, AK, SK, "", "us-east-1", SERVICE_TYPE_S3, t());
+        req.set_header("Range", "bytes=0-9").unwrap();
+        req.set_header("X-Amz-Content-Sha256", EMPTY_SHA256_HEX).unwrap();
+        sign_v4(&mut req, AK, SK, "", "us-east-1", SERVICE_TYPE_S3, t()).unwrap();
         // Expected values from the AWS "GET Object" SigV4 example.
         assert_eq!(
             req.header("authorization").unwrap(),
@@ -531,8 +552,8 @@ mod tests {
             query: vec![("prefix".into(), "J".into()), ("max-keys".into(), "2".into())],
             headers: HeaderMap::new(),
         };
-        req.set_header("X-Amz-Content-Sha256", EMPTY_SHA256_HEX);
-        sign_v4(&mut req, AK, SK, "", "us-east-1", SERVICE_TYPE_S3, t());
+        req.set_header("X-Amz-Content-Sha256", EMPTY_SHA256_HEX).unwrap();
+        sign_v4(&mut req, AK, SK, "", "us-east-1", SERVICE_TYPE_S3, t()).unwrap();
         assert_eq!(
             req.header("authorization").unwrap(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"

@@ -129,7 +129,7 @@ fn validate_supported_targets(cfg: &MimirConfig) -> Result<()> {
 
 /// Runs the configured Mimir application until SIGTERM/SIGINT or `/ingester/shutdown`.
 pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
-    let mut cfg = outcome
+    let cfg = outcome
         .config
         .clone()
         .context("missing parsed MimirConfig")?;
@@ -261,10 +261,8 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let mut server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
         .context("error initialising module: server")?;
     server.set_grpc_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
-    let bound_http_addr = server.http_addr()?;
+    let _bound_http_addr = server.http_addr()?;
     let bound_grpc_addr = server.grpc_addr()?;
-    cfg.server.http_listen_port = i64::from(bound_http_addr.port());
-    cfg.server.grpc_listen_port = i64::from(bound_grpc_addr.port());
 
     let ingester_enabled = cfg.is_ingester_enabled();
     let service_ctx = ServiceContext::background();
@@ -1305,7 +1303,24 @@ fn install_shutdown_signal(
 }
 
 
-fn span_to_otlp_json(span: &ExportedSpan) -> serde_json::Value {
+fn span_attr_to_otlp_json(a: &mimir_common::tracing::SpanAttribute) -> serde_json::Value {
+    let v = match &a.value {
+        SpanAttrValue::String(s) => serde_json::json!({ "stringValue": s }),
+        SpanAttrValue::Bool(b) => serde_json::json!({ "boolValue": b }),
+        SpanAttrValue::Int(i) => serde_json::json!({ "intValue": i.to_string() }),
+        SpanAttrValue::StringArray(arr) => serde_json::json!({
+            "arrayValue": {
+                "values": arr.iter().map(|s| serde_json::json!({ "stringValue": s })).collect::<Vec<_>>()
+            }
+        }),
+    };
+    serde_json::json!({ "key": a.key, "value": v })
+}
+
+pub fn span_to_otlp_json_with_resource(
+    span: &ExportedSpan,
+    extra_resource_attrs: &[mimir_common::tracing::SpanAttribute],
+) -> serde_json::Value {
     let hex_bytes = |b: &[u8]| -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut s = String::with_capacity(b.len() * 2);
@@ -1318,19 +1333,7 @@ fn span_to_otlp_json(span: &ExportedSpan) -> serde_json::Value {
     let attrs: Vec<serde_json::Value> = span
         .attributes
         .iter()
-        .map(|a| {
-            let v = match &a.value {
-                SpanAttrValue::String(s) => serde_json::json!({ "stringValue": s }),
-                SpanAttrValue::Bool(b) => serde_json::json!({ "boolValue": b }),
-                SpanAttrValue::Int(i) => serde_json::json!({ "intValue": i.to_string() }),
-                SpanAttrValue::StringArray(arr) => serde_json::json!({
-                    "arrayValue": {
-                        "values": arr.iter().map(|s| serde_json::json!({ "stringValue": s })).collect::<Vec<_>>()
-                    }
-                }),
-            };
-            serde_json::json!({ "key": a.key, "value": v })
-        })
+        .map(span_attr_to_otlp_json)
         .collect();
     let mut span_obj = serde_json::json!({
         "traceId": hex_bytes(&span.trace_id),
@@ -1347,13 +1350,20 @@ fn span_to_otlp_json(span: &ExportedSpan) -> serde_json::Value {
             obj.insert("parentSpanId".to_string(), serde_json::json!(hex_bytes(&pid)));
         }
     }
+    let mut resource_attrs = Vec::with_capacity(1 + extra_resource_attrs.len());
+    resource_attrs.push(serde_json::json!({
+        "key": "service.name",
+        "value": { "stringValue": span.service_name }
+    }));
+    for attr in extra_resource_attrs {
+        if attr.key != "service.name" {
+            resource_attrs.push(span_attr_to_otlp_json(attr));
+        }
+    }
     serde_json::json!({
         "resourceSpans": [{
             "resource": {
-                "attributes": [{
-                    "key": "service.name",
-                    "value": { "stringValue": span.service_name }
-                }]
+                "attributes": resource_attrs
             },
             "scopeSpans": [{
                 "scope": { "name": "mimir-rs" },
@@ -1361,6 +1371,13 @@ fn span_to_otlp_json(span: &ExportedSpan) -> serde_json::Value {
             }]
         }]
     })
+}
+
+pub fn span_to_otlp_json(span: &ExportedSpan) -> serde_json::Value {
+    let extra = mimir_common::tracing::global_tracing()
+        .map(|rt| rt.resource_attributes.as_slice())
+        .unwrap_or(&[]);
+    span_to_otlp_json_with_resource(span, extra)
 }
 
 fn build_span_exporter() -> Option<SpanExporterFn> {

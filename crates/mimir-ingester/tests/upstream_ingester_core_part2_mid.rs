@@ -2545,7 +2545,12 @@ async fn test_ingester_close_and_delete_user_tsdb_if_idle_should_not_close_if_sh
 }
 
 // Upstream: pkg/ingester/ingester_test.go::TestIngester_closingAndOpeningTsdbConcurrently
-#[tokio::test]
+//
+// Go runs the opener in a preemptible goroutine truly concurrent with the closer. The opener
+// loop has no natural await point, so it needs its own worker thread plus an explicit yield:
+// on a current-thread runtime it would starve the closer forever as soon as
+// `close_and_delete_user_tsdb_if_idle` suspends (it awaits the blocking TSDB close).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ingester_closing_and_opening_tsdb_concurrently() {
     let tmp = tempfile::tempdir().unwrap();
     let (cfg, mut blocks_cfg) = default_ingester_test_config(tmp.path());
@@ -2560,6 +2565,7 @@ async fn test_ingester_closing_and_opening_tsdb_concurrently() {
     let open_task = tokio::spawn(async move {
         while !flag_open.load(Ordering::Acquire) {
             ing_open.get_or_create_tsdb(USER_ID).unwrap();
+            tokio::task::yield_now().await;
         }
     });
 

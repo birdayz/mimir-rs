@@ -68,6 +68,7 @@ impl Ingester {
         let Some(user_db) = self.get_tsdb(user_id) else {
             return;
         };
+        let _compaction_guard = user_db.compaction_mtx.lock().await;
         let head = user_db.db.head();
         if head.num_series() == 0 {
             return;
@@ -592,6 +593,7 @@ impl Ingester {
                 continue;
             }
 
+            let _compaction_guard = db.compaction_mtx.lock().await;
             let series_before = db.db.head().num_series();
             let db_c = Arc::clone(&db);
             let compact_res = tokio::task::spawn_blocking(move || {
@@ -678,6 +680,8 @@ impl Ingester {
         }
         let tenant_deleted = recheck == TsdbCloseCheckResult::TenantMarkedForDeletion;
 
+        // Go `closeAndDeleteUserTSDBIfIdle` runs `i.seriesCount.Sub(userDB.Head().NumSeries())`
+        // BEFORE `userDB.Close()` and never restores it when `Close()` fails (`tsdbCloseFailed`).
         let num_series = user_db.db.head().num_series() as i64;
         self.series_count.fetch_sub(num_series, Ordering::Relaxed);
         let dir = user_db.db.dir().to_path_buf();
@@ -689,10 +693,19 @@ impl Ingester {
             .into_keys()
             .collect();
 
-        if let Err(e) = user_db.close() {
-            warn!(user = %user_id, err = %e, "failed to close idle TSDB");
-            let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
-            return TsdbCloseCheckResult::CloseFailed;
+        let user_db_close = Arc::clone(&user_db);
+        match tokio::task::spawn_blocking(move || user_db_close.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(user = %user_id, err = %e, "failed to close idle TSDB");
+                let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
+                return TsdbCloseCheckResult::CloseFailed;
+            }
+            Err(e) => {
+                warn!(user = %user_id, err = %e, "idle TSDB close join error");
+                let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
+                return TsdbCloseCheckResult::CloseFailed;
+            }
         }
 
         struct RemoveTsdbGuard<'a> {
@@ -733,9 +746,17 @@ impl Ingester {
             mgr.remove_tenant(user_id);
         }
 
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            warn!(user = %user_id, dir = %dir.display(), err = %e, "failed to remove closed idle TSDB directory");
-            return TsdbCloseCheckResult::DataRemovalFailed;
+        let dir_remove = dir.clone();
+        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir_remove)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(user = %user_id, dir = %dir.display(), err = %e, "failed to remove closed idle TSDB directory");
+                return TsdbCloseCheckResult::DataRemovalFailed;
+            }
+            Err(e) => {
+                warn!(user = %user_id, dir = %dir.display(), err = %e, "idle TSDB directory removal join error");
+                return TsdbCloseCheckResult::DataRemovalFailed;
+            }
         }
 
         drop(_remove_guard);

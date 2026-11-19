@@ -246,6 +246,9 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for HealthService {
 /// Bridges `/httpgrpc.HTTP/Handle` calls directly onto the Axum HTTP `Router`,
 /// matching `dskit/httpgrpc/server/server.go` (`WithReturn4XXErrors`).
 #[derive(Clone)]
+struct CapturedMatchedRoute(Arc<parking_lot::Mutex<Option<String>>>);
+
+#[derive(Clone)]
 pub struct HttpGrpcBridge {
     router: Router,
     return_4xx_errors: bool,
@@ -253,6 +256,29 @@ pub struct HttpGrpcBridge {
 
 impl HttpGrpcBridge {
     pub fn new(router: Router) -> Self {
+        let router = router.route_layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if let (Some(cell), Some(mp)) = (
+                    req.extensions().get::<CapturedMatchedRoute>(),
+                    req.extensions().get::<axum::extract::MatchedPath>(),
+                ) {
+                    let mut p = mp.as_str();
+                    if let Some(i) = p.rfind("/*") {
+                        p = &p[..i];
+                    }
+                    const PPROF: &str = "/debug/pprof";
+                    if let Some(i) = p.find(PPROF) {
+                        if &p[i + PPROF.len()..] != "/cmdline" {
+                            p = &p[..i + PPROF.len()];
+                        }
+                    }
+                    *cell.0.lock() = Some(crate::server::metrics::make_label_value(
+                        &p.replace(':', ""),
+                    ));
+                }
+                next.run(req).await
+            },
+        ));
         Self {
             router,
             return_4xx_errors: true,
@@ -326,23 +352,31 @@ impl Http for HttpGrpcBridge {
             }
         }
 
-        let effective_trace = match outer_trace {
+        let (effective_trace, parent_span_id) = match outer_trace {
             Some(ref t) if t.is_valid() => {
-                let (child, _) = mimir_common::tracing::start_server_span_context(t, false);
-                child
+                mimir_common::tracing::start_server_span_context(t, false)
             }
             _ => {
                 let from_inner = mimir_common::tracing::extract_from_http_headers(&req_headers);
-                let (ctx, _) = mimir_common::tracing::start_server_span_context(&from_inner, false);
-                ctx
+                mimir_common::tracing::start_server_span_context(&from_inner, false)
             }
         };
+        let url_path = uri.path().to_string();
+        let user_agent = req_headers
+            .get(http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let matched_route_cell = Arc::new(parking_lot::Mutex::new(None));
         let mut http_req = HttpRequestMsg::builder()
             .method(method.clone())
             .uri(uri)
             .body(Body::from(req.body))
             .map_err(|e| Status::internal(format!("failed to construct HTTP request: {e}")))?;
         *http_req.headers_mut() = req_headers;
+        http_req
+            .extensions_mut()
+            .insert(CapturedMatchedRoute(Arc::clone(&matched_route_cell)));
         if effective_trace.is_valid() {
             http_req.extensions_mut().insert(effective_trace.clone());
         }
@@ -357,16 +391,55 @@ impl Http for HttpGrpcBridge {
         if effective_trace.is_sampled() {
             if let Some(rt) = mimir_common::tracing::global_tracing() {
                 if rt.exporter.is_some() {
+                    let route_name = matched_route_cell
+                        .lock()
+                        .take()
+                        .unwrap_or_else(|| {
+                            if resp.status() == http::StatusCode::NOT_FOUND {
+                                "notfound".to_string()
+                            } else {
+                                String::new()
+                            }
+                        });
+                    let span_name = if route_name.is_empty() {
+                        format!("HTTP {method}")
+                    } else {
+                        format!("HTTP {method} - {route_name}")
+                    };
+                    let mut attributes = vec![
+                        mimir_common::tracing::SpanAttribute {
+                            key: "http.request.method".to_string(),
+                            value: mimir_common::tracing::SpanAttrValue::String(method.to_string()),
+                        },
+                        mimir_common::tracing::SpanAttribute {
+                            key: "http.route".to_string(),
+                            value: mimir_common::tracing::SpanAttrValue::String(route_name),
+                        },
+                        mimir_common::tracing::SpanAttribute {
+                            key: "user_agent.original".to_string(),
+                            value: mimir_common::tracing::SpanAttrValue::String(user_agent),
+                        },
+                        mimir_common::tracing::SpanAttribute {
+                            key: "url.path".to_string(),
+                            value: mimir_common::tracing::SpanAttrValue::String(url_path),
+                        },
+                    ];
+                    if let Some(ref dbg) = effective_trace.jaeger_debug_id {
+                        attributes.push(mimir_common::tracing::SpanAttribute {
+                            key: "jaeger-debug-id".to_string(),
+                            value: mimir_common::tracing::SpanAttrValue::String(dbg.clone()),
+                        });
+                    }
                     mimir_common::tracing::export_span(mimir_common::tracing::ExportedSpan {
                         service_name: rt.service_name.clone(),
                         trace_id: effective_trace.trace_id,
                         span_id: effective_trace.span_id,
-                        parent_span_id: outer_trace.as_ref().map(|t| t.span_id),
-                        name: format!("HTTP {method}"),
+                        parent_span_id,
+                        name: span_name,
                         kind: 2,
                         start_time_unix_nano: span_start,
                         end_time_unix_nano: mimir_common::tracing::now_unix_nanos(),
-                        attributes: Vec::new(),
+                        attributes,
                         status_error: resp.status().as_u16() >= 500,
                     });
                 }

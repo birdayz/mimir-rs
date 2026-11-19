@@ -322,6 +322,7 @@ pub struct UserTsdb {
     pub offset_catalogue: Option<OffsetCatalogue>,
 
     state_mtx: parking_lot::RwLock<()>,
+    pub(crate) compaction_mtx: tokio::sync::Mutex<()>,
     state: AtomicU8,
     forced_compaction_max_time: AtomicI64,
     in_flight_appends: AtomicI64,
@@ -600,6 +601,34 @@ impl UserTsdb {
         }
 
         let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
+        // Go `createTSDB` only forwards `MinBlockDuration: blockRanges[0]` and
+        // `MaxBlockDuration: blockRanges[len-1]`; Prometheus `tsdb.validateOpts` + `open` then
+        // derive the compactor ranges as `ExponentialBlockRanges(min, 10, 3)` truncated at the
+        // first range exceeding `MaxBlockDuration` (intermediate configured entries are unused).
+        let configured_ranges_ms: Vec<i64> = blocks_cfg
+            .tsdb
+            .block_ranges_period
+            .iter()
+            .map(|d| d.as_millis().max(1))
+            .collect();
+        if let (Some(&min_ms), Some(&last_ms)) =
+            (configured_ranges_ms.first(), configured_ranges_ms.last())
+        {
+            let max_ms = last_ms.max(min_ms);
+            let mut block_ranges_ms = Vec::with_capacity(10);
+            let mut cur = min_ms;
+            for _ in 0..10 {
+                if cur > max_ms {
+                    break;
+                }
+                block_ranges_ms.push(cur);
+                match cur.checked_mul(3) {
+                    Some(next) => cur = next,
+                    None => break,
+                }
+            }
+            db.set_block_ranges(block_ranges_ms);
+        }
         db.set_postings_cache_eligibility(
             blocks_cfg.tsdb.head_postings_for_matchers_cache_force,
             blocks_cfg.tsdb.shared_postings_for_matchers_cache,
@@ -695,6 +724,7 @@ impl UserTsdb {
             shipper: RwLock::new(shipper),
             offset_catalogue,
             state_mtx: parking_lot::RwLock::new(()),
+            compaction_mtx: tokio::sync::Mutex::new(()),
             state: AtomicU8::new(TsdbState::Active as u8),
             forced_compaction_max_time: AtomicI64::new(i64::MAX),
             in_flight_appends: AtomicI64::new(0),

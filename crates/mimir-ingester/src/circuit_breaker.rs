@@ -1,6 +1,6 @@
 //! Server-side push & read circuit breakers matching `pkg/ingester/circuitbreaker.go`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -206,13 +206,260 @@ impl BreakerMetrics {
     }
 }
 
+const DEFAULT_BUCKET_COUNT: usize = 10;
+
+/// Matches `failsafe-go/internal/util/util.go:Round`: 2-decimal rounding.
+#[inline]
+fn round_2_decimals(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+/// Circular bit-ring stats matching `failsafe-go/internal/util/stats.go:countingStats`.
+struct CountingStats {
+    bits: Vec<u64>,
+    len: usize,
+    head: usize,
+    occupied_bits: usize,
+    successes: usize,
+    failures: usize,
+}
+
+impl CountingStats {
+    fn new(size: usize) -> Self {
+        let len = size.max(1);
+        Self {
+            bits: vec![0; len.div_ceil(64)],
+            len,
+            head: 0,
+            occupied_bits: 0,
+            successes: 0,
+            failures: 0,
+        }
+    }
+
+    #[inline]
+    fn get_bit(&self, idx: usize) -> bool {
+        (self.bits[idx / 64] >> (idx % 64)) & 1 != 0
+    }
+
+    #[inline]
+    fn set_bit(&mut self, idx: usize, val: bool) {
+        let word = &mut self.bits[idx / 64];
+        let mask = 1u64 << (idx % 64);
+        if val {
+            *word |= mask;
+        } else {
+            *word &= !mask;
+        }
+    }
+
+    fn set_next(&mut self, value: bool) {
+        if self.occupied_bits < self.len {
+            self.occupied_bits += 1;
+        } else if self.get_bit(self.head) {
+            self.successes = self.successes.saturating_sub(1);
+        } else {
+            self.failures = self.failures.saturating_sub(1);
+        }
+        if value {
+            self.successes += 1;
+        } else {
+            self.failures += 1;
+        }
+        self.set_bit(self.head, value);
+        self.head = (self.head + 1) % self.len;
+    }
+
+    #[inline]
+    fn execution_count(&self) -> usize {
+        self.occupied_bits
+    }
+
+    #[inline]
+    fn failure_count(&self) -> usize {
+        self.failures
+    }
+
+    #[inline]
+    fn success_count(&self) -> usize {
+        self.successes
+    }
+
+    #[inline]
+    fn failure_rate(&self) -> f64 {
+        if self.occupied_bits == 0 {
+            0.0
+        } else {
+            round_2_decimals(self.failures as f64 / self.occupied_bits as f64)
+        }
+    }
+
+    #[inline]
+    fn success_rate(&self) -> f64 {
+        if self.occupied_bits == 0 {
+            0.0
+        } else {
+            round_2_decimals(self.successes as f64 / self.occupied_bits as f64)
+        }
+    }
+
+    #[inline]
+    fn record_failure(&mut self) {
+        self.set_next(false);
+    }
+
+    #[inline]
+    fn record_success(&mut self) {
+        self.set_next(true);
+    }
+
+    fn reset(&mut self) {
+        self.bits.fill(0);
+        self.head = 0;
+        self.occupied_bits = 0;
+        self.successes = 0;
+        self.failures = 0;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TimedBucket {
+    successes: usize,
+    failures: usize,
+}
+
+/// O(1) 10-bucket sliding time window matching `failsafe-go/internal/util/stats.go:timedStats`
+/// and `windows.go:BucketedWindow`.
+struct TimedStats {
+    /// Monotonic anchor paired with `epoch_unix_nanos`: Go's `BucketedWindow` derives the head
+    /// bucket from `Clock.Now().UnixNano() / BucketNanos`, i.e. bucket boundaries are aligned to
+    /// the Unix epoch rather than to the breaker's creation time.
+    epoch: Instant,
+    epoch_unix_nanos: u128,
+    bucket_nanos: u128,
+    buckets: [TimedBucket; DEFAULT_BUCKET_COUNT],
+    summary: TimedBucket,
+    head_time: u64,
+}
+
+impl TimedStats {
+    fn new(thresholding_period: Duration, epoch: Instant, epoch_unix_nanos: u128) -> Self {
+        let bucket_nanos = (thresholding_period / DEFAULT_BUCKET_COUNT as u32)
+            .as_nanos()
+            .max(1);
+        Self {
+            epoch,
+            epoch_unix_nanos,
+            bucket_nanos,
+            buckets: [TimedBucket::default(); DEFAULT_BUCKET_COUNT],
+            summary: TimedBucket::default(),
+            head_time: 0,
+        }
+    }
+
+    fn expire_buckets(&mut self, now: Instant) -> &mut TimedBucket {
+        let unix_nanos = self.epoch_unix_nanos + now.saturating_duration_since(self.epoch).as_nanos();
+        let new_head = (unix_nanos / self.bucket_nanos) as u64;
+        if new_head > self.head_time {
+            let buckets_to_move = (DEFAULT_BUCKET_COUNT as u64).min(new_head - self.head_time);
+            for i in 0..buckets_to_move {
+                let idx = ((self.head_time + i + 1) % DEFAULT_BUCKET_COUNT as u64) as usize;
+                let bucket = &mut self.buckets[idx];
+                self.summary.successes = self.summary.successes.saturating_sub(bucket.successes);
+                self.summary.failures = self.summary.failures.saturating_sub(bucket.failures);
+                *bucket = TimedBucket::default();
+            }
+            self.head_time = new_head;
+        }
+        &mut self.buckets[(self.head_time % DEFAULT_BUCKET_COUNT as u64) as usize]
+    }
+
+    #[inline]
+    fn execution_count(&self) -> usize {
+        self.summary.successes + self.summary.failures
+    }
+
+    #[inline]
+    fn failure_count(&self) -> usize {
+        self.summary.failures
+    }
+
+    #[inline]
+    fn failure_rate(&self) -> f64 {
+        let executions = self.execution_count();
+        if executions == 0 {
+            0.0
+        } else {
+            round_2_decimals(self.summary.failures as f64 / executions as f64)
+        }
+    }
+
+    #[inline]
+    fn record_failure(&mut self, now: Instant) {
+        self.expire_buckets(now).failures += 1;
+        self.summary.failures += 1;
+    }
+
+    #[inline]
+    fn record_success(&mut self, now: Instant) {
+        self.expire_buckets(now).successes += 1;
+        self.summary.successes += 1;
+    }
+}
+
+enum ClosedStats {
+    Timed(TimedStats),
+    Counting(CountingStats),
+}
+
+impl ClosedStats {
+    #[inline]
+    fn execution_count(&self) -> usize {
+        match self {
+            Self::Timed(s) => s.execution_count(),
+            Self::Counting(s) => s.execution_count(),
+        }
+    }
+
+    #[inline]
+    fn failure_count(&self) -> usize {
+        match self {
+            Self::Timed(s) => s.failure_count(),
+            Self::Counting(s) => s.failure_count(),
+        }
+    }
+
+    #[inline]
+    fn failure_rate(&self) -> f64 {
+        match self {
+            Self::Timed(s) => s.failure_rate(),
+            Self::Counting(s) => s.failure_rate(),
+        }
+    }
+
+    #[inline]
+    fn record_failure(&mut self, now: Instant) {
+        match self {
+            Self::Timed(s) => s.record_failure(now),
+            Self::Counting(s) => s.record_failure(),
+        }
+    }
+
+    #[inline]
+    fn record_success(&mut self, now: Instant) {
+        match self {
+            Self::Timed(s) => s.record_success(now),
+            Self::Counting(s) => s.record_success(),
+        }
+    }
+}
+
 struct BreakerInner {
     state: BreakerState,
     opened_at: Option<Instant>,
     half_open_in_flight: usize,
-    half_open_successes: usize,
-    half_open_failures: usize,
-    outcomes: VecDeque<(Instant, bool)>, // (timestamp, is_failure)
+    half_open_stats: CountingStats,
+    closed_stats: ClosedStats,
 }
 
 pub struct CircuitBreaker {
@@ -220,6 +467,9 @@ pub struct CircuitBreaker {
     request_type: &'static str,
     cooldown: Duration,
     thresholding_period: Duration,
+    /// `(Instant, UnixNano)` pair captured at construction, used to align `TimedStats` buckets
+    /// to the Unix epoch like failsafe-go's wall-clock `BucketedWindow`.
+    unix_anchor: (Instant, u128),
     request_timeout: Duration,
     initial_delay: Duration,
     test_mode_count_based: AtomicBool,
@@ -252,13 +502,32 @@ impl CircuitBreaker {
             Duration::from_nanos(cfg.request_timeout.as_nanos().max(1) as u64);
         let initial_delay = Duration::from_nanos(cfg.initial_delay.as_nanos().max(0) as u64);
 
+        let now = Instant::now();
+        let unix_anchor = (
+            now,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let closed_stats = if test_mode_count_based {
+            ClosedStats::Counting(CountingStats::new(
+                cfg.failure_threshold_percentage.max(1) as usize,
+            ))
+        } else {
+            ClosedStats::Timed(TimedStats::new(thresholding_period, unix_anchor.0, unix_anchor.1))
+        };
+        let half_open_cap = if test_mode_count_based {
+            cfg.failure_threshold_percentage.max(1) as usize
+        } else {
+            cfg.failure_execution_threshold.max(1) as usize
+        };
         let inner = Arc::new(Mutex::new(BreakerInner {
             state: BreakerState::Closed,
             opened_at: None,
             half_open_in_flight: 0,
-            half_open_successes: 0,
-            half_open_failures: 0,
-            outcomes: VecDeque::new(),
+            half_open_stats: CountingStats::new(half_open_cap),
+            closed_stats,
         }));
         let inner_for_gauge = Arc::clone(&inner);
         let metrics = BreakerMetrics::new(reg, request_type, move || {
@@ -270,6 +539,7 @@ impl CircuitBreaker {
             request_type,
             cooldown,
             thresholding_period,
+            unix_anchor,
             request_timeout,
             initial_delay,
             test_mode_count_based: AtomicBool::new(test_mode_count_based),
@@ -286,8 +556,27 @@ impl CircuitBreaker {
         }))
     }
 
+    fn new_closed_stats(&self) -> ClosedStats {
+        if self.test_mode_count_based.load(Ordering::Acquire) {
+            ClosedStats::Counting(CountingStats::new(
+                self.cfg.failure_threshold_percentage.max(1) as usize,
+            ))
+        } else {
+            ClosedStats::Timed(TimedStats::new(
+                self.thresholding_period,
+                self.unix_anchor.0,
+                self.unix_anchor.1,
+            ))
+        }
+    }
+
     pub fn enable_test_mode(&self) {
         self.test_mode_count_based.store(true, Ordering::Release);
+        let mut inner = self.inner.lock();
+        inner.closed_stats = ClosedStats::Counting(CountingStats::new(
+            self.cfg.failure_threshold_percentage.max(1) as usize,
+        ));
+        inner.half_open_stats = CountingStats::new(self.half_open_capacity());
     }
 
     pub fn set_test_request_delay(&self, delay: Duration) {
@@ -346,14 +635,14 @@ impl CircuitBreaker {
     }
 
     pub fn force_open(&self) {
+        let now = Instant::now();
         let mut inner = self.inner.lock();
         if inner.state != BreakerState::Open {
             inner.state = BreakerState::Open;
-            inner.opened_at = Some(Instant::now());
+            inner.opened_at = Some(now);
             inner.half_open_in_flight = 0;
-            inner.half_open_successes = 0;
-            inner.half_open_failures = 0;
-            inner.outcomes.clear();
+            inner.half_open_stats.reset();
+            inner.closed_stats = self.new_closed_stats();
             self.metrics
                 .transitions
                 .with_label_values(&[BreakerState::Open.as_str()])
@@ -367,9 +656,8 @@ impl CircuitBreaker {
             inner.state = BreakerState::Closed;
             inner.opened_at = None;
             inner.half_open_in_flight = 0;
-            inner.half_open_successes = 0;
-            inner.half_open_failures = 0;
-            inner.outcomes.clear();
+            inner.half_open_stats.reset();
+            inner.closed_stats = self.new_closed_stats();
             self.metrics
                 .transitions
                 .with_label_values(&[BreakerState::Closed.as_str()])
@@ -383,8 +671,7 @@ impl CircuitBreaker {
             inner.state = BreakerState::HalfOpen;
             inner.opened_at = None;
             inner.half_open_in_flight = 0;
-            inner.half_open_successes = 0;
-            inner.half_open_failures = 0;
+            inner.half_open_stats = CountingStats::new(self.half_open_capacity());
             self.metrics
                 .transitions
                 .with_label_values(&[BreakerState::HalfOpen.as_str()])
@@ -476,8 +763,7 @@ impl CircuitBreaker {
                 if now.saturating_duration_since(opened_at) >= self.cooldown {
                     inner.state = BreakerState::HalfOpen;
                     inner.half_open_in_flight = 0;
-                    inner.half_open_successes = 0;
-                    inner.half_open_failures = 0;
+                    inner.half_open_stats = CountingStats::new(self.half_open_capacity());
                     self.metrics
                         .transitions
                         .with_label_values(&[BreakerState::HalfOpen.as_str()])
@@ -636,46 +922,16 @@ impl CircuitBreaker {
         if is_half_open && inner.state == BreakerState::HalfOpen {
             inner.half_open_in_flight = inner.half_open_in_flight.saturating_sub(1);
         }
-        if inner.state == BreakerState::HalfOpen {
-            inner.half_open_failures += 1;
-            let should_open = if self.test_mode_count_based.load(Ordering::Acquire) {
-                inner.half_open_failures >= self.cfg.failure_threshold_percentage.max(1) as usize
-                    || (inner.half_open_failures + inner.half_open_successes
-                        >= self.half_open_capacity()
-                        && inner.half_open_successes == 0)
-            } else {
-                let total = inner.half_open_successes + inner.half_open_failures;
-                total >= self.cfg.failure_execution_threshold.max(1) as usize
-                    && (inner.half_open_failures * 100)
-                        >= total * (self.cfg.failure_threshold_percentage as usize)
-            };
-            if should_open {
-                inner.state = BreakerState::Open;
-                inner.opened_at = Some(now);
-                inner.half_open_in_flight = 0;
-                inner.half_open_successes = 0;
-                inner.half_open_failures = 0;
-                self.metrics
-                    .transitions
-                    .with_label_values(&[BreakerState::Open.as_str()])
-                    .inc();
-                warn!(request_type = self.request_type, "circuit breaker is open");
+        match inner.state {
+            BreakerState::HalfOpen => {
+                inner.half_open_stats.record_failure();
+                self.check_half_open_threshold(&mut inner, now);
             }
-            return;
-        }
-        if inner.state == BreakerState::Closed {
-            inner.outcomes.push_back((now, true));
-            self.prune_outcomes(&mut inner, now);
-            if self.should_open(&inner) {
-                inner.state = BreakerState::Open;
-                inner.opened_at = Some(now);
-                inner.outcomes.clear();
-                self.metrics
-                    .transitions
-                    .with_label_values(&[BreakerState::Open.as_str()])
-                    .inc();
-                warn!(request_type = self.request_type, "circuit breaker is open");
+            BreakerState::Closed => {
+                inner.closed_stats.record_failure(now);
+                self.check_closed_threshold(&mut inner, now);
             }
+            BreakerState::Open => {}
         }
     }
 
@@ -686,69 +942,91 @@ impl CircuitBreaker {
         if is_half_open && inner.state == BreakerState::HalfOpen {
             inner.half_open_in_flight = inner.half_open_in_flight.saturating_sub(1);
         }
-        if inner.state == BreakerState::HalfOpen {
-            inner.half_open_successes += 1;
-            let should_close = if self.test_mode_count_based.load(Ordering::Acquire) {
-                inner.half_open_successes >= 1
-            } else {
-                let total = inner.half_open_successes + inner.half_open_failures;
-                total >= self.cfg.failure_execution_threshold.max(1) as usize
-                    && if self.cfg.failure_threshold_percentage == 0 {
-                        inner.half_open_failures == 0
-                    } else {
-                        (inner.half_open_failures * 100)
-                            < total * (self.cfg.failure_threshold_percentage as usize)
-                    }
-            };
-            if should_close {
-                inner.state = BreakerState::Closed;
-                inner.opened_at = None;
-                inner.half_open_in_flight = 0;
-                inner.half_open_successes = 0;
-                inner.half_open_failures = 0;
-                inner.outcomes.clear();
-                self.metrics
-                    .transitions
-                    .with_label_values(&[BreakerState::Closed.as_str()])
-                    .inc();
-                info!(request_type = self.request_type, "circuit breaker is closed");
+        match inner.state {
+            BreakerState::HalfOpen => {
+                inner.half_open_stats.record_success();
+                self.check_half_open_threshold(&mut inner, now);
             }
-        } else if inner.state == BreakerState::Closed {
-            inner.outcomes.push_back((now, false));
-            self.prune_outcomes(&mut inner, now);
+            BreakerState::Closed => {
+                inner.closed_stats.record_success(now);
+                self.check_closed_threshold(&mut inner, now);
+            }
+            BreakerState::Open => {}
         }
     }
 
-    fn prune_outcomes(&self, inner: &mut BreakerInner, now: Instant) {
-        if self.test_mode_count_based.load(Ordering::Acquire) {
-            while inner.outcomes.len() > self.cfg.failure_execution_threshold.max(1) as usize {
-                inner.outcomes.pop_front();
-            }
-            return;
-        }
-        let cutoff = now.checked_sub(self.thresholding_period);
-        if let Some(c) = cutoff {
-            while let Some(&(ts, _)) = inner.outcomes.front() {
-                if ts < c {
-                    inner.outcomes.pop_front();
+    fn check_closed_threshold(&self, inner: &mut BreakerInner, now: Instant) {
+        let should_open = if self.test_mode_count_based.load(Ordering::Acquire) {
+            inner.closed_stats.failure_count()
+                >= self.cfg.failure_threshold_percentage.max(1) as usize
+        } else {
+            let exec_threshold = self.cfg.failure_execution_threshold as usize;
+            if inner.closed_stats.execution_count() >= exec_threshold {
+                let rate_threshold = self.cfg.failure_threshold_percentage as f64 / 100.0;
+                if rate_threshold != 0.0 {
+                    inner.closed_stats.failure_rate() >= rate_threshold
                 } else {
-                    break;
+                    true
                 }
+            } else {
+                false
             }
+        };
+        if should_open {
+            inner.state = BreakerState::Open;
+            inner.opened_at = Some(now);
+            inner.closed_stats = self.new_closed_stats();
+            self.metrics
+                .transitions
+                .with_label_values(&[BreakerState::Open.as_str()])
+                .inc();
+            warn!(request_type = self.request_type, "circuit breaker is open");
         }
     }
 
-    fn should_open(&self, inner: &BreakerInner) -> bool {
-        if self.test_mode_count_based.load(Ordering::Acquire) {
-            let failures = inner.outcomes.iter().filter(|(_, f)| *f).count() as u64;
-            return failures >= self.cfg.failure_threshold_percentage.max(1);
+    fn check_half_open_threshold(&self, inner: &mut BreakerInner, now: Instant) {
+        let (failures_exceeded, successes_exceeded) =
+            if self.test_mode_count_based.load(Ordering::Acquire) {
+                let cap = self.cfg.failure_threshold_percentage.max(1) as usize;
+                (
+                    inner.half_open_stats.failure_count() >= cap,
+                    inner.half_open_stats.success_count() > 0,
+                )
+            } else {
+                let exec_threshold = self.cfg.failure_execution_threshold as usize;
+                let exec_exceeded = inner.half_open_stats.execution_count() >= exec_threshold;
+                let rate_threshold = self.cfg.failure_threshold_percentage as f64 / 100.0;
+                if rate_threshold != 0.0 {
+                    (
+                        exec_exceeded && inner.half_open_stats.failure_rate() >= rate_threshold,
+                        exec_exceeded && inner.half_open_stats.success_rate() > 1.0 - rate_threshold,
+                    )
+                } else {
+                    (true, inner.half_open_stats.success_count() > 0)
+                }
+            };
+        if successes_exceeded {
+            inner.state = BreakerState::Closed;
+            inner.opened_at = None;
+            inner.half_open_in_flight = 0;
+            inner.half_open_stats.reset();
+            inner.closed_stats = self.new_closed_stats();
+            self.metrics
+                .transitions
+                .with_label_values(&[BreakerState::Closed.as_str()])
+                .inc();
+            info!(request_type = self.request_type, "circuit breaker is closed");
+        } else if failures_exceeded {
+            inner.state = BreakerState::Open;
+            inner.opened_at = Some(now);
+            inner.half_open_in_flight = 0;
+            inner.half_open_stats.reset();
+            self.metrics
+                .transitions
+                .with_label_values(&[BreakerState::Open.as_str()])
+                .inc();
+            warn!(request_type = self.request_type, "circuit breaker is open");
         }
-        let total = inner.outcomes.len() as u64;
-        if total < self.cfg.failure_execution_threshold {
-            return false;
-        }
-        let failures = inner.outcomes.iter().filter(|(_, f)| *f).count() as u64;
-        (failures * 100) >= (total * self.cfg.failure_threshold_percentage)
     }
 }
 
@@ -1029,6 +1307,140 @@ mod tests {
         p3.finish(Duration::from_millis(1), false);
         assert_eq!(cb.state(), BreakerState::HalfOpen);
         p4.finish(Duration::from_millis(1), false);
+        assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    #[test]
+    fn timed_stats_10_buckets_expires_old_buckets_in_o1() {
+        let epoch = Instant::now();
+        let mut stats = TimedStats::new(Duration::from_secs(10), epoch, 0);
+
+        // Bucket 0: 50 failures + 50 successes at +0.5s
+        let t0 = epoch + Duration::from_millis(500);
+        for _ in 0..50 {
+            stats.record_failure(t0);
+            stats.record_success(t0);
+        }
+        assert_eq!(stats.execution_count(), 100);
+        assert_eq!(stats.failure_count(), 50);
+        assert_eq!(stats.failure_rate(), 0.50);
+
+        // Bucket 5 (+5.5s): 10 successes
+        let t5 = epoch + Duration::from_millis(5500);
+        for _ in 0..10 {
+            stats.record_success(t5);
+        }
+        assert_eq!(stats.execution_count(), 110);
+        assert_eq!(stats.failure_count(), 50);
+
+        // Bucket 10 (+10.5s): wraps to bucket 0 and expires bucket 0's 100 records.
+        let t10 = epoch + Duration::from_millis(10500);
+        stats.record_success(t10);
+        assert_eq!(stats.execution_count(), 11);
+        assert_eq!(stats.failure_count(), 0);
+    }
+
+    #[test]
+    fn counting_stats_ring_buffer_overwrites_oldest() {
+        let mut stats = CountingStats::new(4);
+        for _ in 0..4 {
+            stats.record_failure();
+        }
+        assert_eq!(stats.execution_count(), 4);
+        assert_eq!(stats.failure_count(), 4);
+        assert_eq!(stats.failure_rate(), 1.0);
+
+        stats.record_success();
+        stats.record_success();
+        assert_eq!(stats.execution_count(), 4);
+        assert_eq!(stats.failure_count(), 2);
+        assert_eq!(stats.success_count(), 2);
+        assert_eq!(stats.failure_rate(), 0.50);
+        assert_eq!(stats.success_rate(), 0.50);
+    }
+
+    #[test]
+    fn closed_state_rounds_failure_rate_to_2_decimals() {
+        let cfg = CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold_percentage: 10,
+            failure_execution_threshold: 1000,
+            thresholding_period: mimir_config::GoDuration::from_secs(60),
+            cooldown_period: mimir_config::GoDuration::from_secs(30),
+            request_timeout: mimir_config::GoDuration::from_secs(10),
+            ..Default::default()
+        };
+
+        // 94 / 1000 = 0.094 -> Round = 0.09 < 0.10 -> stays Closed.
+        let cb1 = CircuitBreaker::new(&cfg, None, "push", false).unwrap();
+        cb1.activate();
+        for _ in 0..94 {
+            let p = cb1.try_acquire_permit().unwrap().unwrap();
+            p.finish(Duration::from_secs(1), true);
+        }
+        for _ in 0..906 {
+            let p = cb1.try_acquire_permit().unwrap().unwrap();
+            p.finish(Duration::from_millis(1), false);
+        }
+        assert_eq!(cb1.state(), BreakerState::Closed);
+
+        // 95 / 1000 = 0.095 -> Round = 0.10 >= 0.10 -> opens (even when the 1000th is a success).
+        let cb2 = CircuitBreaker::new(&cfg, None, "push", false).unwrap();
+        cb2.activate();
+        for _ in 0..95 {
+            let p = cb2.try_acquire_permit().unwrap().unwrap();
+            p.finish(Duration::from_secs(1), true);
+        }
+        for _ in 0..905 {
+            let p = cb2.try_acquire_permit().unwrap().unwrap();
+            p.finish(Duration::from_millis(1), false);
+        }
+        assert_eq!(cb2.state(), BreakerState::Open);
+    }
+
+    #[test]
+    fn half_open_evaluates_both_directions_at_execution_threshold() {
+        let cfg = CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold_percentage: 10,
+            failure_execution_threshold: 100,
+            thresholding_period: mimir_config::GoDuration::from_secs(60),
+            cooldown_period: mimir_config::GoDuration::from_secs(30),
+            request_timeout: mimir_config::GoDuration::from_secs(10),
+            ..Default::default()
+        };
+
+        // 10 failures then 90 successes: at the 100th record (the 90th success),
+        // failure_rate = 0.10 >= 0.10 and success_rate = 0.90 is NOT > 0.90 -> re-opens immediately!
+        let cb = CircuitBreaker::new(&cfg, None, "push", false).unwrap();
+        cb.activate();
+        cb.force_half_open();
+        for _ in 0..10 {
+            let p = cb.try_acquire_permit().unwrap().unwrap();
+            p.finish(Duration::from_secs(1), true);
+        }
+        for _ in 0..89 {
+            let p = cb.try_acquire_permit().unwrap().unwrap();
+            p.finish(Duration::from_millis(1), false);
+            assert_eq!(cb.state(), BreakerState::HalfOpen);
+        }
+        let p100 = cb.try_acquire_permit().unwrap().unwrap();
+        p100.finish(Duration::from_millis(1), false);
+        assert_eq!(cb.state(), BreakerState::Open);
+
+        // 9 failures then 91 successes: at the 100th record, success_rate = 0.91 > 0.90 -> closes!
+        cb.force_half_open();
+        for _ in 0..9 {
+            let p = cb.try_acquire_permit().unwrap().unwrap();
+            p.finish(Duration::from_secs(1), true);
+        }
+        for _ in 0..90 {
+            let p = cb.try_acquire_permit().unwrap().unwrap();
+            p.finish(Duration::from_millis(1), false);
+            assert_eq!(cb.state(), BreakerState::HalfOpen);
+        }
+        let p100 = cb.try_acquire_permit().unwrap().unwrap();
+        p100.finish(Duration::from_millis(1), false);
         assert_eq!(cb.state(), BreakerState::Closed);
     }
 }
