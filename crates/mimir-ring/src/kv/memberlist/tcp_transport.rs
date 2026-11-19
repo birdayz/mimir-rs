@@ -966,6 +966,14 @@ impl TcpTransport {
     /// covers connect + handshake), wrapped into a metered connection.
     async fn get_connection(&self, addr: &str, timeout: Duration) -> io::Result<MemberlistConn> {
         let deadline = (!timeout.is_zero()).then(|| Instant::now() + timeout);
+        self.get_connection_until(addr, deadline).await
+    }
+
+    async fn get_connection_until(
+        &self,
+        addr: &str,
+        deadline: Option<Instant>,
+    ) -> io::Result<MemberlistConn> {
 
         let connect = TcpStream::connect(addr);
         let tcp = match deadline {
@@ -1107,18 +1115,24 @@ impl TcpTransport {
     /// the `[2]` stream header.
     pub async fn dial_timeout(&self, addr: &str, timeout: Duration) -> io::Result<MemberlistConn> {
         self.metrics.outgoing_streams.inc();
-        let mut c = match self.get_connection(addr, timeout).await {
+        let deadline = (!timeout.is_zero()).then(|| Instant::now() + timeout);
+        let mut c = match self.get_connection_until(addr, deadline).await {
             Ok(c) => c,
             Err(err) => {
                 self.metrics.outgoing_stream_errors.inc();
                 return Err(err);
             }
         };
-        let res = async {
+        let write_fut = async {
             c.write_all(&[STREAM_BYTE]).await?;
             c.flush().await
-        }
-        .await;
+        };
+        let res = match deadline {
+            None => write_fut.await,
+            Some(d) => tokio::time::timeout_at(d, write_fut)
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "i/o timeout"))?,
+        };
         if let Err(err) = res {
             self.metrics.outgoing_stream_errors.inc();
             return Err(err);

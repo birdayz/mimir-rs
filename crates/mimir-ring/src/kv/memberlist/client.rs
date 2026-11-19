@@ -43,6 +43,7 @@ use super::queue::{Broadcast, TransmitLimitedQueue};
 use super::stream::{
     default_hostname, read_msgpack_map_bytes, read_push_pull_from_stream,
     read_stream_with_first_byte, read_user_msg_from_stream, remove_label_header_from_stream,
+    StreamReadError,
     StreamDecryptFn, StreamFirstByte,
 };
 use super::suspicion::Awareness;
@@ -388,6 +389,12 @@ impl MemberlistKv {
         reg: Option<&Registry>,
         opts: KvOptions,
     ) -> Result<Arc<Self>, KvError> {
+        if cfg.watch_prefix_buffer_size <= 0 {
+            return Err(KvError::InvalidConfig(
+                "invalid WatchPrefixBufferSize: must be greater than 0".to_string(),
+            ));
+        }
+
         let mut node_name = if cfg.node_name.is_empty() {
             default_hostname()
         } else {
@@ -1189,7 +1196,8 @@ impl MemberlistKv {
         .await
         {
             Ok(v) => v,
-            Err(err) => {
+            Err(StreamReadError::Eof) => return,
+            Err(StreamReadError::Other(err)) => {
                 error!(%err, "memberlist: failed to receive");
                 let err_msg = encode_err_resp(&ErrResp { error: err });
                 let _ = self.send_raw_stream(&mut write_half, err_msg, &label).await;
@@ -1324,11 +1332,21 @@ impl MemberlistKv {
         self.go_metrics.incr_counter(&["memberlist", "tcp", "connect"], 1.0, &[]);
         let label = self.cfg.cluster_label.clone();
         let (read_half, mut write_half) = conn.split();
-        if !label.is_empty() {
-            let label_hdr = add_label_header(&[], &label).map_err(KvError::Other)?;
-            write_half.write_all(&label_hdr).await?;
+        let write_fut = async {
+            if !label.is_empty() {
+                let label_hdr = add_label_header(&[], &label).map_err(KvError::Other)?;
+                write_half.write_all(&label_hdr).await?;
+            }
+            self.send_local_state(&mut write_half, join, &label).await?;
+            Ok::<(), KvError>(())
+        };
+        if timeout.is_zero() {
+            write_fut.await?;
+        } else {
+            tokio::time::timeout(timeout, write_fut)
+                .await
+                .map_err(|_| KvError::Other("i/o timeout".to_string()))??;
         }
-        self.send_local_state(&mut write_half, join, &label).await?;
 
         let mut reader = BufReader::new(read_half);
         let read_fut = async {
@@ -1340,7 +1358,7 @@ impl MemberlistKv {
                 self.stream_decryptor.as_ref(),
             )
             .await
-            .map_err(KvError::Other)?;
+            .map_err(|e| KvError::Other(e.to_string()))?;
             match msg_type {
                 MessageType::Err => {
                     let e = match body_opt {

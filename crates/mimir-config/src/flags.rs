@@ -521,7 +521,7 @@ impl<T> FlagSet<T> {
         get: impl Fn(&T) -> &LimitsMap<V> + 'static,
         get_mut: impl Fn(&mut T) -> &mut LimitsMap<V> + 'static,
     ) where
-        V: serde::de::DeserializeOwned + serde::Serialize + 'static,
+        V: serde::de::DeserializeOwned + serde::Serialize + Default + 'static,
     {
         let def = serde_json::to_string(default_val).unwrap_or_else(|_| "{}".to_string());
         self.register_raw(
@@ -531,8 +531,13 @@ impl<T> FlagSet<T> {
             def,
             usage,
             move |t, s| {
-                let m: LimitsMap<V> = serde_json::from_str(s)
-                    .map_err(|e| ConfigError::Flag(format!("invalid JSON map: {e}")))?;
+                let raw: Option<LimitsMap<Option<V>>> =
+                    serde_json::from_str(s).map_err(|e| ConfigError::Flag(e.to_string()))?;
+                let m: LimitsMap<V> = raw
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, v)| (k, v.unwrap_or_default()))
+                    .collect();
                 for (k, v) in &m {
                     validator(k, v)?;
                 }
@@ -551,7 +556,7 @@ impl<T> FlagSet<T> {
         get: impl Fn(&T) -> &LimitsMap<V> + 'static,
         get_mut: impl Fn(&mut T) -> &mut LimitsMap<V> + 'static,
     ) where
-        V: serde::de::DeserializeOwned + serde::Serialize + 'static,
+        V: serde::de::DeserializeOwned + serde::Serialize + Default + 'static,
     {
         let def = serde_json::to_string(default_val).unwrap_or_else(|_| "{}".to_string());
         self.register_raw(
@@ -561,8 +566,13 @@ impl<T> FlagSet<T> {
             def,
             usage,
             move |t, s| {
-                let m: LimitsMap<V> = serde_json::from_str(s)
-                    .map_err(|e| ConfigError::Flag(format!("invalid JSON map: {e}")))?;
+                let raw: Option<LimitsMap<Option<V>>> =
+                    serde_json::from_str(s).map_err(|e| ConfigError::Flag(e.to_string()))?;
+                let m: LimitsMap<V> = raw
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, v)| (k, v.unwrap_or_default()))
+                    .collect();
                 *get_mut(t) = m;
                 Ok(())
             },
@@ -1244,5 +1254,63 @@ mod tests {
         let (file, expand) = parse_config_file_parameter(&args);
         assert_eq!(file, "/etc/mimir.yaml");
         assert!(expand);
+    }
+
+    #[test]
+    fn w18_sr_05_limits_map_accepts_json_null_and_null_values_without_prefix() {
+        #[derive(Default)]
+        struct MapTarget {
+            str_map: LimitsMap<String>,
+            int_map: LimitsMap<i32>,
+            validated_map: LimitsMap<f64>,
+        }
+        fn val_fn(k: &str, _v: &f64) -> Result<(), ConfigError> {
+            if k == "bad" {
+                return Err(ConfigError::Flag("bad key".to_string()));
+            }
+            Ok(())
+        }
+        let mut t = MapTarget::default();
+        t.str_map.insert("pre".to_string(), "1".to_string());
+        let mut fs: FlagSet<MapTarget> = FlagSet::new();
+        fs.limits_map_var("str-map", &LimitsMap::new(), "", |x| &x.str_map, |x| &mut x.str_map);
+        fs.limits_map_var("int-map", &LimitsMap::new(), "", |x| &x.int_map, |x| &mut x.int_map);
+        fs.limits_map_var_validated(
+            "val-map",
+            &LimitsMap::new(),
+            "",
+            val_fn,
+            |x| &x.validated_map,
+            |x| &mut x.validated_map,
+        );
+
+        fs.parse(&mut t, &["-str-map=null".to_string()]).unwrap();
+        assert!(t.str_map.is_empty());
+
+        fs.parse(
+            &mut t,
+            &[
+                r#"-str-map={"a":null,"b":"v"}"#.to_string(),
+                r#"-int-map={"ns":null}"#.to_string(),
+                r#"-val-map={"ok":null}"#.to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(t.str_map.get("a").map(String::as_str), Some(""));
+        assert_eq!(t.str_map.get("b").map(String::as_str), Some("v"));
+        assert_eq!(t.int_map.get("ns"), Some(&0));
+        assert_eq!(t.validated_map.get("ok"), Some(&0.0));
+
+        fs.parse(&mut t, &["-val-map=null".to_string()]).unwrap();
+        assert!(t.validated_map.is_empty());
+
+        let err = fs
+            .parse(&mut t, &["-str-map={bad".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("invalid JSON map: "),
+            "unexpected prefix in {err:?}"
+        );
     }
 }

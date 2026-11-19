@@ -890,7 +890,7 @@ impl CompressGrpcBody {
             if self.buf.len() < frame_end {
                 break;
             }
-            if flag == 0 {
+            if flag == 0 && msg_len > 0 {
                 if let Some(enc) = self.encoding {
                     let hdr_pos = self.out_buf.len();
                     self.out_buf.extend_from_slice(&[1, 0, 0, 0, 0]);
@@ -1805,5 +1805,31 @@ mod tests {
                 assert_eq!(total_series, 1, "enc={enc} accept={accept_hdr:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn compress_grpc_body_leaves_zero_length_frames_uncompressed() {
+        use http_body_util::BodyExt;
+
+        let frames = vec![
+            0, 0, 0, 0, 0, // 0-byte message
+            0, 0, 0, 0, 3, b'a', b'b', b'c', // 3-byte message
+        ];
+        let body = tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(frames))));
+        let compressed_body = CompressGrpcBody::new(body, Some("gzip"), 4 << 20);
+        let out = compressed_body.collect().await.unwrap().to_bytes();
+
+        // First frame must remain flag=0, len=0 (matching grpc-go rpc_util.go:831).
+        assert!(out.len() > 10, "out too short: {out:?}");
+        assert_eq!(&out[..5], &[0, 0, 0, 0, 0]);
+        // Second frame must be compressed (flag=1).
+        assert_eq!(out[5], 1);
+        let comp_len = u32::from_be_bytes([out[6], out[7], out[8], out[9]]) as usize;
+        assert_eq!(out.len(), 10 + comp_len);
+        use std::io::Read as _;
+        let mut dec = flate2::read::GzDecoder::new(&out[10..]);
+        let mut plain = Vec::new();
+        dec.read_to_end(&mut plain).unwrap();
+        assert_eq!(plain, b"abc");
     }
 }
