@@ -600,6 +600,15 @@ impl UserTsdb {
         }
 
         let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
+        let block_ranges_ms: Vec<i64> = blocks_cfg
+            .tsdb
+            .block_ranges_period
+            .iter()
+            .map(|d| d.as_millis().max(1))
+            .collect();
+        if !block_ranges_ms.is_empty() {
+            db.set_block_ranges(block_ranges_ms);
+        }
         db.set_postings_cache_eligibility(
             blocks_cfg.tsdb.head_postings_for_matchers_cache_force,
             blocks_cfg.tsdb.shared_postings_for_matchers_cache,

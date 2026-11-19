@@ -11,6 +11,8 @@
 //!   `AWSSDKAuth`, see [`AwsSdkAuth`] for the supported subset)
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -459,7 +461,17 @@ async fn imds_get_text(
     url: reqwest::Url,
     token: &str,
 ) -> Result<String, String> {
-    let mut last_err = String::new();
+    imds_get_text_with_status(client, url, token)
+        .await
+        .map_err(|(_, msg)| msg)
+}
+
+async fn imds_get_text_with_status(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    token: &str,
+) -> Result<String, (Option<reqwest::StatusCode>, String)> {
+    let mut last_err = (None, String::new());
     for attempt in 0..=CREDENTIAL_HTTP_RETRIES {
         let mut req = client.get(url.clone());
         if !token.is_empty() {
@@ -469,9 +481,9 @@ async fn imds_get_text(
             Ok(resp) => {
                 let status = resp.status();
                 if status == reqwest::StatusCode::OK {
-                    return resp.text().await.map_err(|e| e.to_string());
+                    return resp.text().await.map_err(|e| (None, e.to_string()));
                 }
-                last_err = status_text(status);
+                last_err = (Some(status), status_text(status));
                 if attempt < CREDENTIAL_HTTP_RETRIES && is_cred_http_status_retryable(status) {
                     tokio::time::sleep(cred_retry_delay(attempt, Some(resp.headers()))).await;
                     continue;
@@ -479,7 +491,7 @@ async fn imds_get_text(
                 return Err(last_err);
             }
             Err(e) => {
-                last_err = e.to_string();
+                last_err = (None, e.to_string());
                 if attempt < CREDENTIAL_HTTP_RETRIES {
                     tokio::time::sleep(cred_retry_delay(attempt, None)).await;
                     continue;
@@ -489,6 +501,194 @@ async fn imds_get_text(
         }
     }
     Err(last_err)
+}
+
+const DEFAULT_IAM_IPV6_ROLE_ENDPOINT: &str = "http://[fd00:ec2::254]";
+
+fn is_aws_container_ip_allowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4 == Ipv4Addr::new(169, 254, 170, 2)
+                || v4 == Ipv4Addr::new(169, 254, 170, 23)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x23)
+                || v6.to_ipv4_mapped().is_some_and(|v4| {
+                    v4.is_loopback()
+                        || v4 == Ipv4Addr::new(169, 254, 170, 2)
+                        || v4 == Ipv4Addr::new(169, 254, 170, 23)
+                })
+        }
+    }
+}
+
+async fn validate_aws_sdk_container_full_uri(uri: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(uri).map_err(|e| format!("invalid URL, {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "unsupported local HTTP cred provider URL scheme {:?}",
+            parsed.scheme()
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .unwrap_or("")
+        .trim_matches(['[', ']']);
+    if host.is_empty() {
+        return Err("unable to parse host from local HTTP cred provider URL".to_string());
+    }
+    if parsed.scheme() == "http" {
+        let allowed = if let Ok(ip) = host.parse::<IpAddr>() {
+            is_aws_container_ip_allowed(ip)
+        } else {
+            let lookup_target = if host.contains(':') {
+                format!("[{host}]:0")
+            } else {
+                format!("{host}:0")
+            };
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&lookup_target)
+                .await
+                .map_err(|e| format!("failed to resolve host {host:?}, {e}"))?
+                .collect();
+            !addrs.is_empty() && addrs.iter().all(|a| is_aws_container_ip_allowed(a.ip()))
+        };
+        if !allowed {
+            return Err(format!(
+                "invalid endpoint host, {host:?}, only loopback/ecs/eks hosts are allowed"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_aws_bool(s: &str) -> Result<bool, String> {
+    match s {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
+        _ => Err(format!("invalid boolean value {s:?}")),
+    }
+}
+
+async fn imds_fetch_token_aws_sdk(
+    client: &reqwest::Client,
+    endpoint: &str,
+    v1_fallback_disabled: bool,
+    token_disabled: &AtomicBool,
+) -> Result<String, String> {
+    if !v1_fallback_disabled && token_disabled.load(Ordering::Acquire) {
+        return Ok(String::new());
+    }
+    let res = tokio::time::timeout(Duration::from_secs(1), async {
+        let resp = client
+            .put(format!("{endpoint}/latest/api/token"))
+            .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+            .send()
+            .await
+            .map_err(|e| (None, e.to_string()))?;
+        let status = resp.status();
+        let data = resp.text().await.map_err(|e| (None, e.to_string()))?;
+        if status != reqwest::StatusCode::OK {
+            return Err((Some(status), status_text(status)));
+        }
+        Ok(data)
+    })
+    .await;
+    match res {
+        Ok(Ok(t)) => Ok(t),
+        Ok(Err((Some(reqwest::StatusCode::BAD_REQUEST), msg))) => {
+            Err(format!("failed to get API token, {msg}"))
+        }
+        Ok(Err((Some(status), msg))) => {
+            if matches!(
+                status,
+                reqwest::StatusCode::FORBIDDEN
+                    | reqwest::StatusCode::NOT_FOUND
+                    | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            ) {
+                if !v1_fallback_disabled {
+                    token_disabled.store(true, Ordering::Release);
+                    return Ok(String::new());
+                }
+                return Err(format!("failed to get API token, {msg}"));
+            }
+            if !v1_fallback_disabled {
+                return Ok(String::new());
+            }
+            Err(format!("failed to get API token, {msg}"))
+        }
+        Ok(Err((None, msg))) => {
+            token_disabled.store(true, Ordering::Release);
+            if !v1_fallback_disabled {
+                return Ok(String::new());
+            }
+            Err(format!("failed to get API token, {msg}"))
+        }
+        Err(_) => {
+            token_disabled.store(true, Ordering::Release);
+            if !v1_fallback_disabled {
+                return Ok(String::new());
+            }
+            Err("failed to get API token, request timeout".to_string())
+        }
+    }
+}
+
+async fn get_imds_credentials_aws_sdk(
+    client: &reqwest::Client,
+    endpoint: &str,
+    v1_fallback_disabled: bool,
+    token_disabled: &AtomicBool,
+) -> Result<RoleCreds, String> {
+    let base = reqwest::Url::parse(endpoint)
+        .map(|mut u| {
+            u.set_path(DEFAULT_IAM_SECURITY_CREDS_PATH);
+            u
+        })
+        .map_err(|e| e.to_string())?;
+
+    for attempt in 0..2 {
+        let token = imds_fetch_token_aws_sdk(client, endpoint, v1_fallback_disabled, token_disabled).await?;
+        let list = match imds_get_text_with_status(client, base.clone(), &token).await {
+            Ok(v) => v,
+            Err((Some(reqwest::StatusCode::UNAUTHORIZED), msg)) => {
+                if attempt == 0 && token.is_empty() && !v1_fallback_disabled {
+                    token_disabled.store(false, Ordering::Release);
+                    continue;
+                }
+                return Err(msg);
+            }
+            Err((_, msg)) => return Err(msg),
+        };
+        let roles: Vec<&str> = list.lines().collect();
+        let Some(role) = roles.first() else {
+            return Err("No IAM roles attached to this EC2 service".to_string());
+        };
+        let mut u = base.clone();
+        u.set_path(&format!(
+            "{}{}",
+            DEFAULT_IAM_SECURITY_CREDS_PATH.trim_end_matches('/'),
+            format_args!("/{role}")
+        ));
+        let body = match imds_get_text_with_status(client, u, &token).await {
+            Ok(v) => v,
+            Err((Some(reqwest::StatusCode::UNAUTHORIZED), msg)) => {
+                if attempt == 0 && token.is_empty() && !v1_fallback_disabled {
+                    token_disabled.store(false, Ordering::Release);
+                    continue;
+                }
+                return Err(msg);
+            }
+            Err((_, msg)) => return Err(msg),
+        };
+        let creds = parse_role_creds(body.as_bytes())?;
+        if creds.code != "Success" {
+            return Err(creds.message);
+        }
+        return Ok(creds);
+    }
+    Err("failed to get EC2 IMDS credentials".to_string())
 }
 
 /// `isLoopback`.
@@ -767,6 +967,7 @@ pub(crate) struct AwsSdkAuth {
     expires: Option<DateTime<Utc>>,
     refresh_at: Option<DateTime<Utc>>,
     retrieved: bool,
+    imds_token_disabled: AtomicBool,
 }
 
 impl AwsSdkAuth {
@@ -839,6 +1040,9 @@ impl AwsSdkAuth {
         let token_file = key(profile, "web_identity_token_file");
         let role_arn = key(profile, "role_arn");
         if !token_file.is_empty() {
+            if role_arn.is_empty() {
+                return Err("role ARN is not set".to_string());
+            }
             let endpoint = Self::sts_endpoint(&self.region(Some(profile)))?;
             let session = key(profile, "role_session_name");
             return sts_web_identity(&self.client, &endpoint, &role_arn, &session, &token_file)
@@ -868,7 +1072,54 @@ impl AwsSdkAuth {
         Ok(None)
     }
 
-    async fn container_or_imds(&self) -> Result<Value, String> {
+    fn imds_options(&self, profile: Option<&HashMap<String, String>>) -> Result<(String, bool), String> {
+        let env = &self.env;
+        let v1_disabled_env = env("AWS_EC2_METADATA_V1_DISABLED");
+        let v1_fallback_disabled = if !v1_disabled_env.is_empty() {
+            parse_aws_bool(v1_disabled_env.trim())?
+        } else if let Some(p) = profile {
+            let v = key(p, "ec2_metadata_v1_disabled");
+            if !v.is_empty() {
+                parse_aws_bool(v.trim())?
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let mut endpoint = env("AWS_EC2_METADATA_SERVICE_ENDPOINT");
+        if endpoint.is_empty() {
+            if let Some(p) = profile {
+                endpoint = key(p, "ec2_metadata_service_endpoint");
+            }
+        }
+        let resolved_endpoint = if !endpoint.is_empty() {
+            endpoint.trim_end_matches('/').to_string()
+        } else {
+            let mode_env = env("AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE");
+            let mode = if !mode_env.is_empty() {
+                mode_env
+            } else {
+                profile
+                    .map(|p| key(p, "ec2_metadata_service_endpoint_mode"))
+                    .unwrap_or_default()
+            };
+            let m = mode.trim();
+            if m.is_empty() || m.eq_ignore_ascii_case("IPv4") {
+                DEFAULT_IAM_ROLE_ENDPOINT.to_string()
+            } else if m.eq_ignore_ascii_case("IPv6") {
+                DEFAULT_IAM_IPV6_ROLE_ENDPOINT.to_string()
+            } else {
+                return Err(format!(
+                    "unknown EC2 IMDS endpoint mode, must be either IPv6 or IPv4 (got {m:?})"
+                ));
+            }
+        };
+        Ok((resolved_endpoint, v1_fallback_disabled))
+    }
+
+    async fn container_or_imds(&self, profile: Option<&HashMap<String, String>>) -> Result<Value, String> {
         let env = &self.env;
         let relative = env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
         let full = env("AWS_CONTAINER_CREDENTIALS_FULL_URI");
@@ -876,6 +1127,7 @@ impl AwsSdkAuth {
             let endpoint = if !relative.is_empty() {
                 format!("{DEFAULT_ECS_ROLE_ENDPOINT}{relative}")
             } else {
+                validate_aws_sdk_container_full_uri(&full).await?;
                 full
             };
             let mut token = env("AWS_CONTAINER_AUTHORIZATION_TOKEN");
@@ -889,8 +1141,14 @@ impl AwsSdkAuth {
             if env("AWS_EC2_METADATA_DISABLED").eq_ignore_ascii_case("true") {
                 return Err("failed to refresh cached credentials, no EC2 IMDS role found, access disabled".to_string());
             }
-            let endpoint = env("AWS_EC2_METADATA_SERVICE_ENDPOINT");
-            get_imds_credentials(&self.client, endpoint.trim_end_matches('/')).await?
+            let (endpoint, v1_fallback_disabled) = self.imds_options(profile)?;
+            get_imds_credentials_aws_sdk(
+                &self.client,
+                &endpoint,
+                v1_fallback_disabled,
+                &self.imds_token_disabled,
+            )
+            .await?
         };
         Ok(Value {
             access_key_id: rc.access_key_id,
@@ -903,7 +1161,10 @@ impl AwsSdkAuth {
 
     async fn resolve(&self) -> Result<Value, String> {
         let env = &self.env;
-        let explicit_profile = env("AWS_PROFILE");
+        let mut explicit_profile = env("AWS_PROFILE");
+        if explicit_profile.is_empty() {
+            explicit_profile = env("AWS_DEFAULT_PROFILE");
+        }
         let profile_name = if explicit_profile.is_empty() {
             "default".to_string()
         } else {
@@ -923,16 +1184,7 @@ impl AwsSdkAuth {
         if sk.is_empty() {
             sk = env("AWS_SECRET_KEY");
         }
-        let env_has_keys = !ak.is_empty() && !sk.is_empty();
-        if !explicit_profile.is_empty() && !env_has_keys {
-            if let Some(p) = &profile {
-                if let Some(v) = self.creds_from_profile(&profile_name, p).await? {
-                    return Ok(v);
-                }
-            }
-            return self.container_or_imds().await;
-        }
-        if env_has_keys {
+        if !ak.is_empty() && !sk.is_empty() {
             return Ok(Value {
                 access_key_id: ak,
                 secret_access_key: sk,
@@ -943,11 +1195,15 @@ impl AwsSdkAuth {
         }
         let token_file = env("AWS_WEB_IDENTITY_TOKEN_FILE");
         if !token_file.is_empty() {
+            let role_arn = env("AWS_ROLE_ARN");
+            if role_arn.is_empty() {
+                return Err("role ARN is not set".to_string());
+            }
             let endpoint = Self::sts_endpoint(&self.region(profile.as_ref()))?;
             return sts_web_identity(
                 &self.client,
                 &endpoint,
-                &env("AWS_ROLE_ARN"),
+                &role_arn,
                 &env("AWS_ROLE_SESSION_NAME"),
                 &token_file,
             )
@@ -958,7 +1214,7 @@ impl AwsSdkAuth {
                 return Ok(v);
             }
         }
-        self.container_or_imds().await
+        self.container_or_imds(profile.as_ref()).await
     }
 }
 
@@ -1096,6 +1352,7 @@ pub(crate) fn new_credentials(cfg: &CredentialsConfig, env: Env) -> Credentials 
             expires: None,
             refresh_at: None,
             retrieved: false,
+            imds_token_disabled: AtomicBool::new(false),
         })]
     } else if !cfg.access_key.is_empty() {
         vec![Box::new(Static(Value {
@@ -1448,6 +1705,7 @@ mod tests {
                     expires: None,
                     refresh_at: None,
                     retrieved: false,
+                    imds_token_disabled: AtomicBool::new(false),
                 };
                 p.retrieve().await
             }

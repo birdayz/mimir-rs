@@ -707,7 +707,7 @@ impl Client {
             } else {
                 signer::EMPTY_SHA256_HEX
             };
-            req.set_header("X-Amz-Content-Sha256", sha);
+            req.set_header("X-Amz-Content-Sha256", sha).map_err(S3Error::Other)?;
             let region = if s3utils::is_amazon_outposts_endpoint(&self.endpoint.hostname) {
                 s3utils::get_default_location(&self.endpoint.hostname, &self.region)
             } else {
@@ -721,7 +721,8 @@ impl Client {
                 &region,
                 self.service_type(),
                 Utc::now(),
-            );
+            )
+            .map_err(S3Error::Other)?;
             if !value.access_key_id.is_empty() && !value.secret_access_key.is_empty() {
                 raw_query = None;
             }
@@ -771,7 +772,8 @@ impl Client {
         }
         let content_length = meta.body.len();
         if !meta.content_md5_base64.is_empty() {
-            req.set_header("Content-Md5", &meta.content_md5_base64);
+            req.set_header("Content-Md5", &meta.content_md5_base64)
+                .map_err(S3Error::Other)?;
         }
         // Anonymous: unsigned, query sent in s3utils.QueryEncode form.
         if value.signer_type == SignerType::Anonymous
@@ -792,7 +794,8 @@ impl Client {
                 content_length,
                 Utc::now(),
                 service,
-            );
+            )
+            .map_err(S3Error::Other)?;
             return Ok((
                 req,
                 None,
@@ -808,7 +811,7 @@ impl Client {
         } else {
             meta.content_sha256_hex.clone()
         };
-        req.set_header("X-Amz-Content-Sha256", &sha);
+        req.set_header("X-Amz-Content-Sha256", &sha).map_err(S3Error::Other)?;
         signer::sign_v4(
             &mut req,
             &value.access_key_id,
@@ -817,7 +820,8 @@ impl Client {
             &location,
             service,
             Utc::now(),
-        );
+        )
+        .map_err(S3Error::Other)?;
         Ok((req, None, WireBody::plain(meta.body.clone())))
     }
 
@@ -836,15 +840,25 @@ impl Client {
             "{}://{}{}",
             self.endpoint.scheme,
             req.host,
-            signer::encode_path(&req.path)
+            signer::canonical_uri_path(&req.path)
         );
         if !query.is_empty() {
             url.push('?');
             url.push_str(&query);
         }
-        let method = reqwest::Method::from_bytes(req.method.as_bytes()).expect("valid method");
+        let method = reqwest::Method::from_bytes(req.method.as_bytes()).map_err(|e| SendError {
+            message: format!("invalid HTTP method {}: {e}", req.method),
+            retryable: false,
+        })?;
         let mut builder = self.http.client.request(method, &url);
         let mut headers = req.headers.clone();
+        if !req.host.is_empty() && !headers.contains_key(reqwest::header::HOST) {
+            let host_val = HeaderValue::from_str(&req.host).map_err(|e| SendError {
+                message: format!("invalid host header {:?}: {e}", req.host),
+                retryable: false,
+            })?;
+            headers.insert(reqwest::header::HOST, host_val);
+        }
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let mut done_tx = Some(done_tx);
         match body {
@@ -860,7 +874,11 @@ impl Client {
                 let (stream, len) = wire.into_stream(done_tx.take());
                 match len {
                     Some(len) => {
-                        headers.insert("content-length", header_value(&len.to_string()));
+                        let val = HeaderValue::from_str(&len.to_string()).map_err(|e| SendError {
+                            message: format!("invalid content-length header: {e}"),
+                            retryable: false,
+                        })?;
+                        headers.insert("content-length", val);
                     }
                     None => {
                         headers.remove("content-length");
@@ -875,7 +893,10 @@ impl Client {
         }
 
         let _permit = match &self.http.conn_limit {
-            Some(sem) => Some(sem.clone().acquire_owned().await.expect("semaphore open")),
+            Some(sem) => Some(sem.clone().acquire_owned().await.map_err(|e| SendError {
+                message: format!("HTTP connection limit semaphore closed: {e}"),
+                retryable: false,
+            })?),
             None => None,
         };
         let send = builder.send();

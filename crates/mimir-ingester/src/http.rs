@@ -241,7 +241,6 @@ async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Res
         .filter(|t| !t.is_empty())
         .map(|t| t.iter().cloned().collect());
     let wait = form.get("wait").and_then(|w| w.first()).is_some_and(|w| w == "true");
-    let ship_tx_opt = st.ingester.ship_tx.read().clone();
     let ing = Arc::clone(&st.ingester);
 
     let run = async move {
@@ -274,6 +273,7 @@ async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Res
         }
         tracing::info!("finished compacting TSDB blocks");
 
+        let ship_tx_opt = ing.ship_tx.read().clone();
         if let Some(ship_tx) = ship_tx_opt {
             tracing::info!("flushing TSDB blocks: triggering shipping");
             let (scb_tx, scb_rx) = oneshot::channel();

@@ -276,6 +276,21 @@ pub fn new_metrics_client(
     }))
 }
 
+struct MetricsObserveGuard<'a> {
+    client: &'a MetricsKvClient,
+    operation: &'static str,
+    start: Instant,
+    armed: bool,
+}
+
+impl Drop for MetricsObserveGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.client.observe(self.operation, "500", self.start);
+        }
+    }
+}
+
 impl MetricsKvClient {
     fn observe(&self, method: &str, code: &str, start: Instant) {
         self.request_duration
@@ -287,9 +302,15 @@ impl MetricsKvClient {
 impl KvClient for MetricsKvClient {
     fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>, KvError>> {
         Box::pin(async move {
-            let start = Instant::now();
+            let mut guard = MetricsObserveGuard {
+                client: self,
+                operation: "List",
+                start: Instant::now(),
+                armed: true,
+            };
             let res = self.c.list(prefix).await;
-            self.observe("List", &error_code(res.as_ref().err()), start);
+            guard.armed = false;
+            self.observe("List", &error_code(res.as_ref().err()), guard.start);
             res
         })
     }
@@ -299,27 +320,45 @@ impl KvClient for MetricsKvClient {
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<Box<dyn Any + Send + Sync>>, KvError>> {
         Box::pin(async move {
-            let start = Instant::now();
+            let mut guard = MetricsObserveGuard {
+                client: self,
+                operation: "GET",
+                start: Instant::now(),
+                armed: true,
+            };
             let res = self.c.get(key).await;
-            self.observe("GET", &error_code(res.as_ref().err()), start);
+            guard.armed = false;
+            self.observe("GET", &error_code(res.as_ref().err()), guard.start);
             res
         })
     }
 
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), KvError>> {
         Box::pin(async move {
-            let start = Instant::now();
+            let mut guard = MetricsObserveGuard {
+                client: self,
+                operation: "Delete",
+                start: Instant::now(),
+                armed: true,
+            };
             let res = self.c.delete(key).await;
-            self.observe("Delete", &error_code(res.as_ref().err()), start);
+            guard.armed = false;
+            self.observe("Delete", &error_code(res.as_ref().err()), guard.start);
             res
         })
     }
 
     fn cas<'a>(&'a self, key: &'a str, f: CasFn) -> BoxFuture<'a, Result<(), KvError>> {
         Box::pin(async move {
-            let start = Instant::now();
+            let mut guard = MetricsObserveGuard {
+                client: self,
+                operation: "CAS",
+                start: Instant::now(),
+                armed: true,
+            };
             let res = self.c.cas(key, f).await;
-            self.observe("CAS", &get_cas_error_code(res.as_ref().err()), start);
+            guard.armed = false;
+            self.observe("CAS", &get_cas_error_code(res.as_ref().err()), guard.start);
             res
         })
     }

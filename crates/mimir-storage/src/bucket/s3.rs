@@ -70,26 +70,30 @@ pub enum ServerSideEncryption {
 
 impl ServerSideEncryption {
     /// `ServerSide.Marshal`.
-    pub fn marshal(&self, h: &mut HeaderMap) {
-        let set = |h: &mut HeaderMap, k: &'static str, v: &str| {
-            h.insert(HeaderName::from_static(k), HeaderValue::from_str(v).expect("valid header"));
+    pub fn marshal(&self, h: &mut HeaderMap) -> Result<(), String> {
+        let set = |h: &mut HeaderMap, k: &'static str, v: &str| -> Result<(), String> {
+            let val = HeaderValue::from_str(v)
+                .map_err(|e| format!("invalid SSE header {k}: {e}"))?;
+            h.insert(HeaderName::from_static(k), val);
+            Ok(())
         };
         match self {
-            ServerSideEncryption::S3 => set(h, "x-amz-server-side-encryption", "AES256"),
+            ServerSideEncryption::S3 => set(h, "x-amz-server-side-encryption", "AES256")?,
             ServerSideEncryption::Kms { key_id, context } => {
-                set(h, "x-amz-server-side-encryption", "aws:kms");
+                set(h, "x-amz-server-side-encryption", "aws:kms")?;
                 if !key_id.is_empty() {
-                    set(h, "x-amz-server-side-encryption-aws-kms-key-id", key_id);
+                    set(h, "x-amz-server-side-encryption-aws-kms-key-id", key_id)?;
                 }
                 if let Some(ctx) = context {
                     set(
                         h,
                         "x-amz-server-side-encryption-context",
                         &base64::engine::general_purpose::STANDARD.encode(ctx),
-                    );
+                    )?;
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -146,6 +150,10 @@ pub fn build_thanos_sse(cfg: &S3SSEConfig) -> Result<Option<ServerSideEncryption
     match cfg.sse_type.as_str() {
         "" => Ok(None),
         SSE_KMS => {
+            if !cfg.kms_key_id.is_empty() {
+                HeaderValue::from_str(&cfg.kms_key_id)
+                    .map_err(|e| format!("invalid kms_key_id header value: {e}"))?;
+            }
             let ctx = parse_kms_encryption_context(&cfg.kms_encryption_context)?.unwrap_or_default();
             Ok(Some(ServerSideEncryption::Kms {
                 key_id: cfg.kms_key_id.clone(),
@@ -167,6 +175,10 @@ pub fn build_minio_sse(
     match sse_type {
         "" => Ok(None),
         SSE_KMS => {
+            if !kms_key_id.is_empty() {
+                HeaderValue::from_str(kms_key_id)
+                    .map_err(|e| format!("invalid kms_key_id header value: {e}"))?;
+            }
             let ctx = parse_kms_encryption_context(kms_encryption_context)?;
             Ok(Some(ServerSideEncryption::Kms {
                 key_id: kms_key_id.to_string(),
@@ -517,19 +529,18 @@ struct PutOptions {
 
 impl PutOptions {
     /// `PutObjectOptions.Header()`.
-    fn header(&self) -> HeaderMap {
+    fn header(&self) -> Result<HeaderMap, S3Error> {
         let mut h = HeaderMap::new();
         h.insert("content-type", HeaderValue::from_static("application/octet-stream"));
         if let Some(sse) = &self.sse {
-            sse.marshal(&mut h);
+            sse.marshal(&mut h).map_err(S3Error::Other)?;
         }
         if !self.storage_class.is_empty() {
-            h.insert(
-                "x-amz-storage-class",
-                HeaderValue::from_str(&self.storage_class).expect("validated storage class"),
-            );
+            let val = HeaderValue::from_str(&self.storage_class)
+                .map_err(|e| S3Error::Other(format!("invalid storage_class header: {e}")))?;
+            h.insert("x-amz-storage-class", val);
         }
-        h
+        Ok(h)
     }
 }
 
@@ -537,6 +548,18 @@ impl S3Bucket {
     /// thanos `NewBucketWithConfig` with the config built by Mimir `newS3Config`.
     pub fn new(cfg: &S3Config, component: &str) -> Result<Self, String> {
         Self::new_with_env(cfg, component, credentials::process_env())
+    }
+
+    /// Constructs an [`S3Bucket`] with an explicit environment map (for tests).
+    #[doc(hidden)]
+    pub fn new_with_env_map(
+        cfg: &S3Config,
+        component: &str,
+        env_map: std::collections::HashMap<String, String>,
+    ) -> Result<Self, String> {
+        let env: credentials::Env =
+            Arc::new(move |k| env_map.get(k).cloned().unwrap_or_default());
+        Self::new_with_env(cfg, component, env)
     }
 
     fn new_with_env(cfg: &S3Config, component: &str, env: credentials::Env) -> Result<Self, String> {
@@ -671,7 +694,7 @@ impl S3Bucket {
             meta.body = body;
         }
         let _ = size;
-        meta.custom_header = opts.header();
+        meta.custom_header = opts.header()?;
         meta.stream_sha256 = true;
         let resp = self.client.execute_method("PUT", meta).await?;
         if resp.status != 200 {
@@ -686,7 +709,7 @@ impl S3Bucket {
         check_valid_object_name(name)?;
         let mut meta = RequestMetadata::new(&self.name, name);
         meta.query = vec![("uploads".into(), String::new())];
-        meta.custom_header = opts.header();
+        meta.custom_header = opts.header()?;
         let resp = self.client.execute_method("POST", meta).await?;
         if resp.status != 200 {
             return Err(response_error(&resp, &self.name, name));
@@ -752,7 +775,7 @@ impl S3Bucket {
             part_size: 0,
             send_content_md5: false,
         }
-        .header();
+        .header()?;
         if s3utils::is_amazon_endpoint(&self.client.endpoint.hostname) {
             headers.remove("x-amz-server-side-encryption-aws-kms-key-id");
             headers.remove("x-amz-server-side-encryption");
@@ -932,9 +955,13 @@ impl S3Bucket {
         if length != -1 {
             let (start, end) = (off, off + length - 1);
             let range = range_header(start, end).map_err(S3BucketError::new)?;
-            headers.insert("range", HeaderValue::from_str(&range).expect("valid range"));
+            let val = HeaderValue::from_str(&range)
+                .map_err(|e| S3BucketError::new(S3Error::Other(format!("invalid range header: {e}"))))?;
+            headers.insert("range", val);
         } else if off > 0 {
-            headers.insert("range", HeaderValue::from_str(&format!("bytes={off}-")).expect("valid"));
+            let val = HeaderValue::from_str(&format!("bytes={off}-"))
+                .map_err(|e| S3BucketError::new(S3Error::Other(format!("invalid range header: {e}"))))?;
+            headers.insert("range", val);
         }
         self.bucket_check().map_err(S3BucketError::new)?;
         check_valid_object_name(name).map_err(S3BucketError::new)?;
@@ -1205,4 +1232,5 @@ impl Drop for S3AbortOnDrop {
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests;
