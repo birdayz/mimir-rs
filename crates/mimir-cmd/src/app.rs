@@ -721,6 +721,8 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         )
         .context("creating ingester")?;
         ingester.set_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
+        let (tf_enabled, tf_max_tenants) = cfg.tenant_federation_config();
+        ingester.set_tenant_federation(tf_enabled, tf_max_tenants);
         // modules.go initIngesterService: `t.Cfg.Ingester.Compartments = t.Cfg.Compartments`.
         ingester.set_compartments(cfg.compartments.clone());
         ingester.set_partition_ring_watchers(partition_ring_watchers.take());

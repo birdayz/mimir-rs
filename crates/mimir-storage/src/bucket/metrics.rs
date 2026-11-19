@@ -157,10 +157,10 @@ impl OpTimer<'_> {
     }
 
     /// `Exists` / `Attributes` / `Delete`: duration only for successful operations.
-    pub fn finish_simple(&self, ok: bool) {
+    pub fn finish_simple(&self, ok: bool, expected_failure: bool) {
         if ok {
             self.observe_duration();
-        } else {
+        } else if !expected_failure {
             self.failed();
         }
     }

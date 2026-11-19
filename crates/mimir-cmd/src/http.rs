@@ -286,7 +286,7 @@ fn encode_families(
     let format = crate::expfmt::negotiate_with_options(header_str(header::ACCEPT), enable_open_metrics);
     let encoded = if format.kind == crate::expfmt::FormatType::OpenMetrics {
         if let Some(cache) = created_tracker {
-            Ok(encode_openmetrics_with_created(families, cache))
+            Ok(encode_openmetrics_with_created(families, cache, format.escaping_scheme()))
         } else {
             crate::expfmt::encode(families, &format)
         }
@@ -1054,8 +1054,8 @@ async fn static_file_handler(AxumPath(path): AxumPath<String>) -> Response {
 fn encode_openmetrics_with_created(
     families: &[prometheus::proto::MetricFamily],
     cache: &MetricsCache,
+    scheme: crate::expfmt::EscapingScheme,
 ) -> Vec<u8> {
-    use std::io::Write as _;
     use prometheus::proto::MetricType;
 
     let now_secs = std::time::SystemTime::now()
@@ -1092,38 +1092,13 @@ fn encode_openmetrics_with_created(
         }
         out
     };
-    let write_name_labels = |
-        out: &mut Vec<u8>,
-        name: &str,
-        labels: &[&prometheus::proto::LabelPair],
-        extra: Option<(&str, &str)>,
-    | {
-        out.extend_from_slice(name.as_bytes());
-        if labels.is_empty() && extra.is_none() {
-            return;
-        }
-        let mut sep = b'{';
-        for lp in labels {
-            out.push(sep);
-            out.extend_from_slice(lp.get_name().as_bytes());
-            out.extend_from_slice(b"=\"");
-            out.extend_from_slice(escape(lp.get_value()).as_bytes());
-            out.push(b'"');
-            sep = b',';
-        }
-        if let Some((k, v)) = extra {
-            out.push(sep);
-            out.extend_from_slice(k.as_bytes());
-            out.extend_from_slice(b"=\"");
-            out.extend_from_slice(v.as_bytes());
-            out.push(b'"');
-        }
-        out.push(b'}');
-    };
+    let write_name_labels = crate::expfmt::write_name_and_label_pairs;
 
     let mut out = Vec::with_capacity(64 * 1024);
     for mf in families {
-        let name = mf.get_name();
+        // Go `expfmt.NewEncoder`: `model.EscapeMetricFamily(v, scheme)` before encoding.
+        let name = crate::expfmt::escape_family_name(mf.get_name(), scheme);
+        let name: &str = &name;
         if mf.get_metric().is_empty() {
             continue;
         }
@@ -1133,7 +1108,7 @@ fn encode_openmetrics_with_created(
             compliant.truncate(name.len() - 6);
         }
         out.extend_from_slice(b"# HELP ");
-        out.extend_from_slice(compliant.as_bytes());
+        crate::expfmt::write_metric_name(&mut out, &compliant);
         out.push(b' ');
         out.extend_from_slice(escape(mf.get_help()).as_bytes());
         out.push(b'\n');
@@ -1144,15 +1119,18 @@ fn encode_openmetrics_with_created(
             MetricType::SUMMARY => "summary",
             MetricType::HISTOGRAM => "histogram",
         };
-        let _ = writeln!(out, "# TYPE {compliant} {t}");
+        out.extend_from_slice(b"# TYPE ");
+        crate::expfmt::write_metric_name(&mut out, &compliant);
+        out.push(b' ');
+        out.extend_from_slice(t.as_bytes());
+        out.push(b'\n');
         let sample_name = if typ == MetricType::COUNTER && name.ends_with("_total") {
             format!("{compliant}_total")
         } else {
             compliant.clone()
         };
         for m in mf.get_metric() {
-            let mut labels: Vec<&prometheus::proto::LabelPair> = m.get_label().iter().collect();
-            labels.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+            let labels = crate::expfmt::escaped_sorted_labels(m, scheme);
             let ts = m.has_timestamp_ms().then(|| m.get_timestamp_ms());
             let mut key_buf = Vec::new();
             write_name_labels(&mut key_buf, &compliant, &labels, None);
@@ -1371,5 +1349,125 @@ mod tests {
         assert!(body.contains("<td>activity-tracker</td>"));
         assert!(body.contains("Current time: "));
         assert!(!body.contains("T00:") && !body.ends_with("Z</p>"));
+    }
+
+    #[test]
+    fn apc02_openmetrics_with_created_quotes_non_legacy_names() {
+        use prometheus::proto::{Counter, LabelPair, Metric, MetricFamily, MetricType};
+
+        let mut mf = MetricFamily::default();
+        mf.set_name("http.server.requests_total".to_string());
+        mf.set_help("Requests".to_string());
+        mf.set_field_type(MetricType::COUNTER);
+
+        let mut lp1 = LabelPair::default();
+        lp1.set_name("k8s.namespace.name".to_string());
+        lp1.set_value("prod".to_string());
+        let mut lp2 = LabelPair::default();
+        lp2.set_name("method".to_string());
+        lp2.set_value("GET".to_string());
+
+        let mut m = Metric::default();
+        m.set_label(vec![lp1, lp2].into());
+        let mut c = Counter::default();
+        c.set_value(7.0);
+        m.set_counter(c);
+        mf.mut_metric().push(m);
+
+        let cache = MetricsCache::new(std::time::Duration::ZERO);
+        let out = String::from_utf8(encode_openmetrics_with_created(
+            std::slice::from_ref(&mf),
+            &cache,
+            crate::expfmt::EscapingScheme::NoEscaping,
+        ))
+        .unwrap();
+        assert!(out.contains("# HELP \"http.server.requests\" Requests\n"), "{out}");
+        assert!(out.contains("# TYPE \"http.server.requests\" counter\n"), "{out}");
+        assert!(
+            out.contains("{\"http.server.requests_total\",\"k8s.namespace.name\"=\"prod\",method=\"GET\"} 7.0\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("{\"http.server.requests_created\",\"k8s.namespace.name\"=\"prod\",method=\"GET\"} "),
+            "{out}"
+        );
+        assert!(out.ends_with("# EOF\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn apc06_and_apc07_tsdb_metrics_through_cmd_router_has_vary_and_federation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = MimirConfig::default();
+        cfg.ingester.ring.instance_id = "test-0".to_string();
+        cfg.blocks_storage.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        cfg.extra_sections.insert(
+            "tenant_federation".to_string(),
+            serde_yaml::from_str("enabled: true\nmax_tenants: 2\n").unwrap(),
+        );
+
+        let ing = mimir_ingester::Ingester::new(
+            cfg.ingester.clone(),
+            cfg.blocks_storage.clone(),
+            cfg.ingest_storage.clone(),
+            Overrides::new(cfg.limits.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (tf_enabled, tf_max) = cfg.tenant_federation_config();
+        ing.set_tenant_federation(tf_enabled, tf_max);
+        let _ = ing.get_or_create_tsdb("tenant-a").unwrap();
+
+        let mut st = test_state("", false);
+        st.config = Arc::new(cfg);
+        st.ingester = Some(ing);
+        let router = build_http_router(st);
+
+        // 1. Gzip + Vary: Accept only on /ingester/tsdb_metrics (verified against the Go binary:
+        // promhttp's TimeoutHandler replaces the gzip handler's Vary: Accept-Encoding).
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/ingester/tsdb_metrics")
+            .header("X-Scope-OrgID", "tenant-a")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_ENCODING).unwrap(), "gzip");
+        let vary_vals: Vec<&str> = resp
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(vary_vals, vec!["Accept"]);
+
+        // 2. Tenant federation: 2 tenants -> 401 multiple org IDs present, 3 tenants -> 422.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/ingester/tsdb_metrics")
+            .header("X-Scope-OrgID", "tenant-a|tenant-b")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert_eq!(body, "multiple org IDs present\n");
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/ingester/tsdb_metrics")
+            .header("X-Scope-OrgID", "tenant-a|tenant-b|tenant-c")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert_eq!(body, "too many tenant IDs present in the request. max: 2 actual: 3\n");
     }
 }

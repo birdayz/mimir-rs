@@ -26,8 +26,11 @@ pub enum PartitionRingError {
     PartitionDoesNotExist,
     #[error("the partition state does not match the expected one")]
     PartitionStateMismatch,
-    #[error("partition state change not allowed")]
-    PartitionStateChangeNotAllowed,
+    #[error("change partition state from {} to {}: partition state change not allowed", clean_partition_state_name(*.from), clean_partition_state_name(*.to))]
+    PartitionStateChangeNotAllowed {
+        from: PartitionState,
+        to: PartitionState,
+    },
     #[error("partition state change is locked")]
     PartitionStateChangeLocked,
     #[error("no active partition found")]
@@ -56,6 +59,7 @@ pub fn partition_ring_desc_codec() -> Arc<dyn Codec> {
 pub trait PartitionDescExt {
     fn partition_state(&self) -> PartitionState;
     fn token_scheme(&self) -> PartitionTokenScheme;
+    fn try_token_scheme(&self) -> Result<PartitionTokenScheme, i32>;
     fn is_pending(&self) -> bool;
     fn is_active(&self) -> bool;
     fn is_inactive(&self) -> bool;
@@ -72,6 +76,10 @@ impl PartitionDescExt for PartitionDesc {
     fn token_scheme(&self) -> PartitionTokenScheme {
         PartitionTokenScheme::try_from(self.token_scheme)
             .unwrap_or(PartitionTokenScheme::PartitionTokensStored)
+    }
+
+    fn try_token_scheme(&self) -> Result<PartitionTokenScheme, i32> {
+        PartitionTokenScheme::try_from(self.token_scheme).map_err(|_| self.token_scheme)
     }
 
     fn is_pending(&self) -> bool {
@@ -117,6 +125,13 @@ pub fn clean_token_scheme_name(s: PartitionTokenScheme) -> &'static str {
     match s {
         PartitionTokenScheme::PartitionTokensStored => "Stored",
         PartitionTokenScheme::PartitionTokensSmt512 => "Smt512",
+    }
+}
+
+pub fn clean_token_scheme_raw_name(raw: i32) -> String {
+    match PartitionTokenScheme::try_from(raw) {
+        Ok(s) => clean_token_scheme_name(s).to_string(),
+        Err(_) => raw.to_string(),
     }
 }
 

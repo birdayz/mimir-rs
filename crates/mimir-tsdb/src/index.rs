@@ -922,6 +922,12 @@ impl IndexReader {
                 None => self.lookup_symbol(lno)?,
             };
             let lv = self.lookup_symbol(lvo)?;
+            if ln.len() >= (1 << 24) || lv.len() >= (1 << 24) {
+                return Err(IndexError::Corrupt(format!(
+                    "label string length exceeds max stringlabels size ({})",
+                    (1 << 24) - 1
+                )));
+            }
             let need = (if ln.len() < 255 { 1 } else { 4 })
                 + ln.len()
                 + (if lv.len() < 255 { 1 } else { 4 })
@@ -1320,7 +1326,14 @@ fn parse_symbols_index(buf: &[u8], off: usize) -> Result<(Vec<usize>, usize), In
             offsets.push(base_pos + orig_len - dec.len());
         }
         // Validate UTF-8 and bounds once at IndexReader::open so lookup_symbol can skip UTF-8 checks.
-        let _ = dec.uvarint_str()?;
+        let sym = dec.uvarint_str()?;
+        if sym.len() >= (1 << 24) {
+            return Err(IndexError::Corrupt(format!(
+                "symbol length {} exceeds max label length {}",
+                sym.len(),
+                (1 << 24) - 1
+            )));
+        }
     }
     Ok((offsets, cnt))
 }

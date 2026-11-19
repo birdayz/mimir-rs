@@ -768,9 +768,7 @@ impl ConsulKv {
         let res = self
             .get_raw_untracked(key, wait_index, allow_consistency, cancel)
             .await;
-        if !matches!(res, Err(KvError::Canceled)) {
-            self.observe_op("Get", res.is_ok(), start);
-        }
+        self.observe_op("Get", res.is_ok(), start);
         res
     }
 
@@ -838,9 +836,7 @@ impl ConsulKv {
     ) -> Result<(Vec<ConsulKvPair>, u64), KvError> {
         let start = Instant::now();
         let res = self.list_raw_untracked(prefix, wait_index, cancel).await;
-        if !matches!(res, Err(KvError::Canceled)) {
-            self.observe_op("List", res.is_ok(), start);
-        }
+        self.observe_op("List", res.is_ok(), start);
         res
     }
 
@@ -2217,7 +2213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_consul_tls_sni_client_hello_and_canceled_watch_skips_500() {
+    async fn test_consul_tls_sni_client_hello_and_canceled_watch_records_500() {
         // 1. Verify CONSUL_TLS_SERVER_NAME actually sets TLS ClientHello SNI on the wire.
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let cert_pem = std::fs::read(tls_fixture("sni.crt")).unwrap();
@@ -2280,7 +2276,7 @@ mod tests {
             Some("kafka.mimir-rs.test")
         );
 
-        // 2. Verify canceled long-poll watches do not record status_code="500".
+        // 2. Verify canceled long-poll watches record status_code="500" like Go dskit.
         let mut st = MockConsulState::new();
         st.max_wait = Duration::from_secs(10);
         let (http_addr, http_srv) = spawn_http_mock(st).await;
@@ -2311,16 +2307,24 @@ mod tests {
         http_srv.abort();
 
         let gathered = reg.gather();
+        let mut saw_get_500 = false;
         for mf in &gathered {
             if mf.get_name() == "consul_request_duration_seconds" {
                 for m in mf.get_metric() {
+                    let is_get = m
+                        .get_label()
+                        .iter()
+                        .any(|lp| lp.get_name() == "operation" && lp.get_value() == "Get");
                     let is_500 = m
                         .get_label()
                         .iter()
                         .any(|lp| lp.get_name() == "status_code" && lp.get_value() == "500");
-                    assert!(!is_500, "canceled watch must not record status_code=500");
+                    if is_get && is_500 && m.get_histogram().get_sample_count() == 1 {
+                        saw_get_500 = true;
+                    }
                 }
             }
         }
+        assert!(saw_get_500, "canceled watch must record operation=Get, status_code=500");
     }
 }
