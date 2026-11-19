@@ -321,7 +321,7 @@ impl Drop for PushTapGuard {
             let timed_out = self
                 .deadline_ctx
                 .as_ref()
-                .is_some_and(|c| c.has_timed_out());
+                .is_some_and(|c| c.is_expired());
             if timed_out && !tap.finished {
                 tap.finished = true;
                 let dur = tap.started_at.elapsed();
@@ -370,7 +370,7 @@ impl Drop for ReadTapGuard {
             let timed_out = self
                 .deadline_ctx
                 .as_ref()
-                .is_some_and(|c| c.has_timed_out());
+                .is_some_and(|c| c.is_expired());
             if timed_out {
                 tap.deadline_exceeded_flag().store(true, Ordering::Release);
                 tap.finish(false);
@@ -440,7 +440,7 @@ impl Drop for ReadTapDropBody {
             let timed_out = self
                 .deadline_ctx
                 .as_ref()
-                .is_some_and(|c| c.has_timed_out());
+                .is_some_and(|c| c.is_expired());
             if timed_out {
                 permit.deadline_exceeded_flag().store(true, Ordering::Release);
                 permit.finish(false);
@@ -2856,6 +2856,40 @@ mod tests {
         }
         assert_eq!(timeout_count(&push_reg), 0.0);
         assert_eq!(push_rl.max_inflight(), 0);
+
+        // 1b. Transport-level RST_STREAM(CANCEL) at grpc-timeout (deadline in the past, but
+        // not marked expired with DeadlineExceeded): both PushTapGuard and ReadTapGuard MUST treat
+        // the dropped future as canceled (0 breaker timeouts, drop reactive permit) to match Go's
+        // closeStream(RST_STREAM CANCEL) -> context.Canceled path.
+        {
+            let ctx = RpcDeadlineContext::new(Some(
+                std::time::Instant::now() - std::time::Duration::from_millis(10),
+            ));
+            let push_tap = crate::push::PushTapPermit {
+                started_at: std::time::Instant::now(),
+                breaker_permit: push_cb.try_acquire_permit().unwrap(),
+                reactive_permit: Some(push_rl.acquire_permit().await.unwrap()),
+                ingester: Arc::clone(&ing),
+                req_size: 10,
+                finished: false,
+            };
+            ing.inflight_push_requests.fetch_add(1, Ordering::AcqRel);
+            ing.inflight_push_requests_bytes.fetch_add(10, Ordering::AcqRel);
+            let _push_guard = PushTapGuard {
+                tap: Some(push_tap),
+                deadline_ctx: Some(Arc::clone(&ctx)),
+            };
+            let mut rtap = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+            rtap.set_reactive_permit(read_rl.acquire_permit().await.unwrap());
+            let _read_guard = ReadTapGuard {
+                tap: Some(rtap),
+                deadline_ctx: Some(ctx),
+            };
+        }
+        assert_eq!(timeout_count(&push_reg), 0.0);
+        assert_eq!(timeout_count(&read_reg), 0.0);
+        assert_eq!(push_rl.max_inflight(), 0);
+        assert_eq!(read_rl.max_inflight(), 0);
 
         // 2. Expired grpc-timeout on PushTapGuard MUST record DeadlineExceeded & rp.record() and open breaker.
         for _ in 0..2 {
