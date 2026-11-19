@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::active_series::{merged_custom_trackers, parse_custom_tracker_matchers, Matchers};
+use crate::active_series::{build_custom_trackers_config, merged_custom_trackers, Matchers};
 use crate::ingester::{Ingester, TriggerRequest, INSTANCE_INGESTION_RATE_TICK_INTERVAL};
 use crate::label_churn::LABEL_CHURN_RECORD_INTERVAL;
 use crate::owned_series::{
@@ -756,11 +756,11 @@ impl Ingester {
                 continue;
             };
             let limits = self.overrides.for_tenant(&user_id);
-            let new_matchers = parse_custom_tracker_matchers(&merged_custom_trackers(
+            let new_trackers = build_custom_trackers_config(&merged_custom_trackers(
                 &limits.active_series_custom_trackers,
                 &limits.active_series_additional_custom_trackers,
             ));
-            let new_matcher_set = Matchers::from_custom_trackers(&new_matchers);
+            let new_matcher_set = Matchers::new(new_trackers);
             let new_cat = self
                 .cost_attribution_manager()
                 .and_then(|m| m.active_series_tracker(&user_id));
@@ -1308,28 +1308,50 @@ pub fn spawn_owned_series_loop(ingester: Arc<Ingester>, ctx: ServiceContext) -> 
                     match strategy.check_ring_for_changes() {
                         Ok(changed) => {
                             cur_interval = normal_interval;
-                            let start = Instant::now();
-                            let mut updated_users = 0usize;
-                            for uid in ingester.get_tsdb_users() {
-                                if let Some(db) = ingester.get_tsdb(&uid) {
-                                    if db.update_owned_series_if_needed(strategy.as_ref(), changed) {
-                                        updated_users += 1;
+                            let ing_clone = Arc::clone(&ingester);
+                            let strat_clone = Arc::clone(strategy);
+                            let cancel_ctx = ctx.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                let start = Instant::now();
+                                let mut updated_users = 0usize;
+                                for uid in ing_clone.get_tsdb_users() {
+                                    if cancel_ctx.is_canceled() {
+                                        return (updated_users, start.elapsed());
+                                    }
+                                    if let Some(db) = ing_clone.get_tsdb(&uid) {
+                                        if db.update_owned_series_if_needed(
+                                            strat_clone.as_ref(),
+                                            changed,
+                                        ) {
+                                            updated_users += 1;
+                                        }
                                     }
                                 }
+                                (updated_users, start.elapsed())
+                            })
+                            .await
+                            {
+                                Ok((updated_users, elapsed)) => {
+                                    if updated_users > 0 {
+                                        info!(
+                                            updated_users,
+                                            duration_ms = elapsed.as_millis() as u64,
+                                            ring_changed = changed,
+                                            "updated owned series for users"
+                                        );
+                                    }
+                                    ingester
+                                        .owned_series_metrics
+                                        .check_duration
+                                        .observe(elapsed.as_secs_f64());
+                                    if ctx.is_canceled() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(err = %e, "owned series update task failed");
+                                }
                             }
-                            let elapsed = start.elapsed();
-                            if updated_users > 0 {
-                                info!(
-                                    updated_users,
-                                    duration_ms = elapsed.as_millis() as u64,
-                                    ring_changed = changed,
-                                    "updated owned series for users"
-                                );
-                            }
-                            ingester
-                                .owned_series_metrics
-                                .check_duration
-                                .observe(elapsed.as_secs_f64());
                         }
                         Err(e) => {
                             error!(err = %e, "can't check ring for updates");

@@ -222,8 +222,8 @@ impl TokenlessLifecycler {
         let state = self.basic.get_state();
         if state != InstanceState::Active {
             return Err(format!(
-                "instance not in ACTIVE state, current state: {:?}",
-                state
+                "instance not in ACTIVE state, current state: {}",
+                state.as_str_name()
             ));
         }
         Ok(())
@@ -241,10 +241,10 @@ impl TokenlessLifecycler {
         }
         let since = *ready.ready_since.get_or_insert(now);
         if now.saturating_duration_since(since) < self.min_ready_duration {
-            return Err(format!(
-                "waiting for {:?} after being ready",
-                self.min_ready_duration
-            ));
+            let dur_str = mimir_config::format_go_duration(
+                self.min_ready_duration.as_nanos().min(i64::MAX as u128) as i64,
+            );
+            return Err(format!("waiting for {dur_str} after being ready"));
         }
         ready.ready = true;
         Ok(())

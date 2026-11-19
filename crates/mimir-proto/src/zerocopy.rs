@@ -362,8 +362,8 @@ pub struct BorrowedMetadata<'a> {
 /// Reusable flat resolved symbol table scratch for `decode_rw2_stream`.
 #[derive(Debug, Default)]
 pub struct Rw2ResolvedScratch {
-    v2_resolved: Vec<Option<&'static str>>,
-    custom_resolved: Vec<Option<&'static str>>,
+    v2_resolved: Vec<Option<(&'static [u8], bool)>>,
+    custom_resolved: Vec<Option<(&'static [u8], bool)>>,
     lossy_strings: Vec<Box<str>>,
 }
 
@@ -379,11 +379,11 @@ impl Rw2ResolvedScratch {
     }
 }
 
-const V2_COMMON_SYMBOLS_64: [Option<&'static str>; 64] = {
-    let mut arr: [Option<&'static str>; 64] = [None; 64];
+const V2_COMMON_SYMBOLS_64: [Option<(&'static [u8], bool)>; 64] = {
+    let mut arr: [Option<(&'static [u8], bool)>; 64] = [None; 64];
     let mut i = 0;
     while i < V2_COMMON_SYMBOLS_LIST.len() && i < 64 {
-        arr[i] = Some(V2_COMMON_SYMBOLS_LIST[i]);
+        arr[i] = Some((V2_COMMON_SYMBOLS_LIST[i].as_bytes(), true));
         i += 1;
     }
     arr
@@ -406,6 +406,7 @@ pub struct StreamedRw2Series<'v, 'a> {
     pub label_bytes_range: Range<usize>,
     pub encoded_labels: &'v [u8],
     pub labels_sorted_unique: bool,
+    pub bad_utf8: bool,
     pub samples_range: Range<usize>,
     pub min_sample_ts: i64,
     pub created_timestamp: i64,
@@ -1476,7 +1477,7 @@ fn decode_timeseries_classic_stream<'v, 'a>(
 }
 
 struct ResolvedTableGuard<'r> {
-    vec: &'r mut Vec<Option<&'static str>>,
+    vec: &'r mut Vec<Option<(&'static [u8], bool)>>,
     base_len: usize,
 }
 
@@ -1603,17 +1604,17 @@ where
 
     // SAFETY: `guard` truncates `guard.vec` back to `base_len` (`'static` common symbols or empty)
     // on every return/unwind path before `'r` ends.
-    let resolved: &mut Vec<Option<&'r str>> = unsafe {
-        &mut *(guard.vec as *mut Vec<Option<&'static str>>).cast()
+    let resolved: &mut Vec<Option<(&'r [u8], bool)>> = unsafe {
+        &mut *(guard.vec as *mut Vec<Option<(&'static [u8], bool)>>).cast()
     };
     if !is_kafka_v2 {
         for (i, &sym) in common_symbols.iter().enumerate() {
             if i < resolved.len() {
-                resolved[i] = Some(sym);
+                resolved[i] = Some((sym.as_bytes(), true));
             }
         }
         if !resolved.is_empty() {
-            resolved[0] = Some("");
+            resolved[0] = Some((b"", true));
         }
     }
 
@@ -1655,28 +1656,13 @@ where
                     }
                     let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
                     if !prescanned_symbols {
-                        let sym_str: &'r str = match std::str::from_utf8(&input[sub.clone()]) {
-                            Ok(s) => {
-                                if !seen_first_symbol && !s.is_empty() {
-                                    return Err(DecodeError::InvalidFirstSymbol);
-                                }
-                                s
-                            }
-                            Err(_) => {
-                                if !seen_first_symbol && !sub.is_empty() {
-                                    return Err(DecodeError::InvalidFirstSymbol);
-                                }
-                                let lossy: Box<str> =
-                                    String::from_utf8_lossy(&input[sub]).into_owned().into_boxed_str();
-                                lossy_strings.push(lossy);
-                                let ptr: *const str = &**lossy_strings.last().unwrap();
-                                // SAFETY: `Box<str>` heap allocation does not move when `Vec<Box<str>>`
-                                // pushes, and `lossy_strings` lives in `resolved_scratch` for `'r`.
-                                unsafe { &*ptr }
-                            }
-                        };
+                        let sym_bytes = &input[sub];
+                        if !seen_first_symbol && !sym_bytes.is_empty() {
+                            return Err(DecodeError::InvalidFirstSymbol);
+                        }
                         seen_first_symbol = true;
-                        resolved.push(Some(sym_str));
+                        let valid_utf8 = is_valid_utf8_fast(sym_bytes);
+                        resolved.push(Some((sym_bytes, valid_utf8)));
                     }
                 }
                 5 => {
@@ -1701,36 +1687,19 @@ where
                                 }
                                 let sym_range =
                                     read_length_delimited_range_bounded(input, &mut scan_pos, len)?;
-                                let sym_str: &'r str =
-                                    match std::str::from_utf8(&input[sym_range.clone()]) {
-                                        Ok(s) => {
-                                            if !seen_first_symbol && !s.is_empty() {
-                                                return Err(DecodeError::InvalidFirstSymbol);
-                                            }
-                                            s
-                                        }
-                                        Err(_) => {
-                                            if !seen_first_symbol && !sym_range.is_empty() {
-                                                return Err(DecodeError::InvalidFirstSymbol);
-                                            }
-                                            let lossy: Box<str> =
-                                                String::from_utf8_lossy(&input[sym_range])
-                                                    .into_owned()
-                                                    .into_boxed_str();
-                                            lossy_strings.push(lossy);
-                                            let ptr: *const str = &**lossy_strings.last().unwrap();
-                                            // SAFETY: see above.
-                                            unsafe { &*ptr }
-                                        }
-                                    };
+                                let sym_bytes = &input[sym_range];
+                                if !seen_first_symbol && !sym_bytes.is_empty() {
+                                    return Err(DecodeError::InvalidFirstSymbol);
+                                }
                                 seen_first_symbol = true;
-                                resolved.push(Some(sym_str));
+                                let valid_utf8 = is_valid_utf8_fast(sym_bytes);
+                                resolved.push(Some((sym_bytes, valid_utf8)));
                             } else {
                                 skip_field_bounded(input, &mut scan_pos, len, sw)?;
                             }
                         }
                         if resolved.is_empty() && rw2_offset == 0 {
-                            resolved.push(Some(""));
+                            resolved.push(Some((b"", true)));
                         }
                     }
                     let series = decode_timeseries_rw2_stream(
@@ -1739,6 +1708,7 @@ where
                         rw2_offset,
                         common_symbols,
                         resolved,
+                        lossy_strings,
                         &opts,
                         scratch,
                         label_bytes_arena,
@@ -1806,7 +1776,8 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
     range: Range<usize>,
     symbol_offset: u32,
     common_symbols: &'a [&'a str],
-    resolved: &[Option<&'r str>],
+    resolved: &[Option<(&'r [u8], bool)>],
+    lossy_strings: &mut Vec<Box<str>>,
     opts: &DecodeOptions<'a>,
     scratch: &'v mut WriteRequestScratch,
     label_bytes_arena: &'v mut Vec<u8>,
@@ -1822,9 +1793,11 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
     let histograms_start = scratch.histograms.len();
     let mut created_timestamp = 0i64;
     let mut min_sample_ts = i64::MAX;
-    let mut metric_name: &'r str = "";
-    let mut prev_name: Option<&'r str> = None;
+    let mut metric_name_bytes: &'r [u8] = b"";
+    let mut metric_name_utf8 = true;
+    let mut prev_name: Option<&'r [u8]> = None;
     let mut labels_sorted_unique = true;
+    let mut bad_utf8 = false;
 
     let mut pos = range.start;
     let end = range.end;
@@ -1846,35 +1819,40 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
                             return Err(DecodeError::OddNumberOfLabelRefs);
                         }
                         let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        let k = *resolved
+                        let &(k_bytes, k_utf8) = resolved
                             .get(name_idx as usize)
                             .and_then(|o| o.as_ref())
                             .ok_or(DecodeError::InvalidLabelRef {
                                 index: name_idx,
                                 offset: symbol_offset,
                             })?;
-                        let v = *resolved
+                        let &(v_bytes, v_utf8) = resolved
                             .get(val_idx as usize)
                             .and_then(|o| o.as_ref())
                             .ok_or(DecodeError::InvalidLabelRef {
                                 index: val_idx,
                                 offset: symbol_offset,
                             })?;
-                        if k == "__name__" {
-                            metric_name = v;
+                        if k_bytes == b"__name__" {
+                            metric_name_bytes = v_bytes;
+                            metric_name_utf8 = v_utf8;
                         }
-                        if let Some(pn) = prev_name {
-                            if pn >= k {
-                                labels_sorted_unique = false;
+                        if !k_utf8 || !v_utf8 {
+                            bad_utf8 = true;
+                        } else if !bad_utf8 {
+                            if let Some(pn) = prev_name {
+                                if pn >= k_bytes {
+                                    labels_sorted_unique = false;
+                                }
                             }
-                        }
-                        prev_name = Some(k);
-                        if !v.is_empty() {
-                            append_stringlabel_pair_proto(
-                                label_bytes_arena,
-                                k.as_bytes(),
-                                v.as_bytes(),
-                            )?;
+                            prev_name = Some(k_bytes);
+                            if !v_bytes.is_empty() {
+                                append_stringlabel_pair_proto(
+                                    label_bytes_arena,
+                                    k_bytes,
+                                    v_bytes,
+                                )?;
+                            }
                         }
                     }
                 } else {
@@ -1939,7 +1917,9 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
                     sub,
                     symbol_offset,
                     resolved,
-                    metric_name,
+                    lossy_strings,
+                    metric_name_bytes,
+                    metric_name_utf8,
                     opts,
                     scratch,
                     meta_out,
@@ -1960,12 +1940,16 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
         }
     }
 
+    if bad_utf8 {
+        label_bytes_arena.truncate(label_bytes_start);
+    }
     let label_bytes_end = label_bytes_arena.len();
     let encoded_labels = &label_bytes_arena[label_bytes_start..label_bytes_end];
     Ok(StreamedRw2Series {
         label_bytes_range: label_bytes_start..label_bytes_end,
         encoded_labels,
         labels_sorted_unique,
+        bad_utf8,
         samples_range: samples_start..samples_arena.len(),
         min_sample_ts,
         created_timestamp,
@@ -1981,38 +1965,47 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
 }
 
 #[inline]
-fn str_to_slice_ref(
-    s: &str,
+fn bytes_to_slice_ref(
+    bytes: &[u8],
     idx: usize,
     symbol_offset: u32,
     input: &[u8],
-    utf8_arena: &mut Vec<u8>,
 ) -> SliceRef {
-    if s.is_empty() {
+    if bytes.is_empty() {
         SliceRef::Empty
     } else if idx < symbol_offset as usize {
         SliceRef::Common {
             idx: idx as u32,
-            len: s.len() as u32,
+            len: bytes.len() as u32,
         }
     } else {
         let input_start = input.as_ptr() as usize;
-        let input_end = input_start + input.len();
-        let s_ptr = s.as_ptr() as usize;
-        if s_ptr >= input_start && s_ptr + s.len() <= input_end {
-            let start = s_ptr - input_start;
-            SliceRef::Input {
-                start: start as u32,
-                len: s.len() as u32,
-            }
-        } else {
-            let start = utf8_arena.len();
-            utf8_arena.extend_from_slice(s.as_bytes());
-            SliceRef::Scratch {
-                start: start as u32,
-                len: s.len() as u32,
-            }
+        let b_ptr = bytes.as_ptr() as usize;
+        debug_assert!(b_ptr >= input_start && b_ptr + bytes.len() <= input_start + input.len());
+        let start = b_ptr - input_start;
+        SliceRef::Input {
+            start: start as u32,
+            len: bytes.len() as u32,
         }
+    }
+}
+
+#[inline]
+fn resolve_lossy_str<'r>(
+    bytes: &'r [u8],
+    valid_utf8: bool,
+    lossy_strings: &mut Vec<Box<str>>,
+) -> &'r str {
+    if valid_utf8 {
+        // SAFETY: caller verified `bytes` is valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    } else {
+        let lossy: Box<str> = String::from_utf8_lossy(bytes).into_owned().into_boxed_str();
+        lossy_strings.push(lossy);
+        let ptr: *const str = &**lossy_strings.last().unwrap();
+        // SAFETY: `Box<str>` heap allocation does not move when `Vec<Box<str>>` pushes,
+        // and `lossy_strings` lives in `resolved_scratch` for `'r`.
+        unsafe { &*ptr }
     }
 }
 
@@ -2020,7 +2013,7 @@ fn decode_exemplar_rw2_resolved<'a>(
     input: &'a [u8],
     range: Range<usize>,
     symbol_offset: u32,
-    resolved: &[Option<&'a str>],
+    resolved: &[Option<(&'a [u8], bool)>],
     scratch: &mut WriteRequestScratch,
 ) -> Result<ExemplarMeta, DecodeError> {
     let labels_start = scratch.exemplar_labels.len();
@@ -2044,33 +2037,31 @@ fn decode_exemplar_rw2_resolved<'a>(
                             return Err(DecodeError::OddNumberOfExemplarLabelRefs);
                         }
                         let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        let k = *resolved
+                        let &(k_bytes, _) = resolved
                             .get(name_idx as usize)
                             .and_then(|o| o.as_ref())
                             .ok_or(DecodeError::InvalidExemplarLabelRef {
                                 index: name_idx,
                                 offset: symbol_offset,
                             })?;
-                        let v = *resolved
+                        let &(v_bytes, _) = resolved
                             .get(val_idx as usize)
                             .and_then(|o| o.as_ref())
                             .ok_or(DecodeError::InvalidExemplarLabelRef {
                                 index: val_idx,
                                 offset: symbol_offset,
                             })?;
-                        let name_ref = str_to_slice_ref(
-                            k,
+                        let name_ref = bytes_to_slice_ref(
+                            k_bytes,
                             name_idx as usize,
                             symbol_offset,
                             input,
-                            &mut scratch.utf8_arena,
                         );
-                        let val_ref = str_to_slice_ref(
-                            v,
+                        let val_ref = bytes_to_slice_ref(
+                            v_bytes,
                             val_idx as usize,
                             symbol_offset,
                             input,
-                            &mut scratch.utf8_arena,
                         );
                         scratch.exemplar_labels.push(LabelRefPair {
                             name: name_ref,
@@ -2119,15 +2110,19 @@ fn decode_metadata_rw2_stream<'r>(
     input: &[u8],
     range: Range<usize>,
     symbol_offset: u32,
-    resolved: &[Option<&'r str>],
-    metric_name: &'r str,
+    resolved: &[Option<(&'r [u8], bool)>],
+    lossy_strings: &mut Vec<Box<str>>,
+    metric_name_bytes: &'r [u8],
+    metric_name_utf8: bool,
     opts: &DecodeOptions<'_>,
     scratch: &mut WriteRequestScratch,
     meta_out: &mut Vec<BorrowedMetadata<'r>>,
 ) -> Result<(), DecodeError> {
     let mut metric_type = 0i32;
-    let mut help: &'r str = "";
-    let mut unit: &'r str = "";
+    let mut help_bytes: &'r [u8] = b"";
+    let mut help_utf8 = true;
+    let mut unit_bytes: &'r [u8] = b"";
+    let mut unit_utf8 = true;
 
     let mut pos = range.start;
     let end = range.end;
@@ -2151,13 +2146,15 @@ fn decode_metadata_rw2_stream<'r>(
                     });
                 }
                 let help_ref = read_varint_bounded(input, &mut pos, end)? as u32;
-                help = *resolved
+                let &(bytes, ok) = resolved
                     .get(help_ref as usize)
                     .and_then(|o| o.as_ref())
                     .ok_or(DecodeError::InvalidHelpRef {
                         index: help_ref,
                         offset: symbol_offset,
                     })?;
+                help_bytes = bytes;
+                help_utf8 = ok;
             }
             4 => {
                 if wire_type != 0 {
@@ -2167,19 +2164,25 @@ fn decode_metadata_rw2_stream<'r>(
                     });
                 }
                 let unit_ref = read_varint_bounded(input, &mut pos, end)? as u32;
-                unit = *resolved
+                let &(bytes, ok) = resolved
                     .get(unit_ref as usize)
                     .and_then(|o| o.as_ref())
                     .ok_or(DecodeError::InvalidUnitRef {
                         index: unit_ref,
                         offset: symbol_offset,
                     })?;
+                unit_bytes = bytes;
+                unit_utf8 = ok;
             }
             _ => {
                 skip_field_bounded(input, &mut pos, end, wire_type)?;
             }
         }
     }
+
+    let metric_name = resolve_lossy_str(metric_name_bytes, metric_name_utf8, lossy_strings);
+    let help = resolve_lossy_str(help_bytes, help_utf8, lossy_strings);
+    let unit = resolve_lossy_str(unit_bytes, unit_utf8, lossy_strings);
 
     let normalized_name = if opts.skip_normalize_metadata_metric_name {
         metric_name
@@ -4285,6 +4288,69 @@ mod tests {
         assert_eq!(seen_labels, 1);
         assert_eq!(meta2.len(), 1);
         assert_eq!(meta2[0].help, "h9\u{FFFD}\u{FFFD}");
+
+        // Invalid UTF-8 in RW2 series labels must set bad_utf8=true and not mutate into U+FFFD.
+        let mut saw_bad_utf8 = false;
+        let mut saw_encoded_len = usize::MAX;
+        let mut ex_raw_val: Option<Vec<u8>> = None;
+        let mut bad_ex_wire = Vec::new();
+        for sym in [b"".as_slice(), b"__name__".as_slice(), b"m".as_slice(), b"trace_id".as_slice()] {
+            bad_ex_wire.push(0x22);
+            bad_ex_wire.push(sym.len() as u8);
+            bad_ex_wire.extend_from_slice(sym);
+        }
+        let ex_bad = [0xffu8, 0xfe];
+        bad_ex_wire.push(0x22);
+        bad_ex_wire.push(ex_bad.len() as u8);
+        bad_ex_wire.extend_from_slice(&ex_bad);
+        let mut ts_ex = Vec::new();
+        ts_ex.extend_from_slice(&[0x0a, 0x02, 1, 2]); // valid __name__=m
+        ts_ex.extend_from_slice(&[0x22, 0x04, 0x0a, 0x02, 3, 4]); // exemplar trace_id=0xff,0xfe
+        bad_ex_wire.push(0x2a);
+        bad_ex_wire.push(ts_ex.len() as u8);
+        bad_ex_wire.extend_from_slice(&ts_ex);
+
+        label_bytes.clear();
+        samples.clear();
+        let mut meta3 = Vec::new();
+        decode_rw2_stream(
+            &multi_lossy_wire,
+            DecodeOptions::rw2(),
+            &mut scratch,
+            &mut resolved,
+            &mut label_bytes,
+            &mut samples,
+            &mut meta3,
+            |s| {
+                saw_bad_utf8 = s.bad_utf8;
+                saw_encoded_len = s.encoded_labels.len();
+            },
+        )
+        .expect("decode_rw2_stream bad utf8 series");
+        assert!(saw_bad_utf8);
+        assert_eq!(saw_encoded_len, 0);
+
+        label_bytes.clear();
+        samples.clear();
+        let mut meta4 = Vec::new();
+        decode_rw2_stream(
+            &bad_ex_wire,
+            DecodeOptions::rw2(),
+            &mut scratch,
+            &mut resolved,
+            &mut label_bytes,
+            &mut samples,
+            &mut meta4,
+            |s| {
+                assert!(!s.bad_utf8);
+                let ex = s.exemplars().next().unwrap();
+                let lp = ex.labels().next().unwrap();
+                assert!(lp.value_str().is_err());
+                ex_raw_val = Some(lp.value.to_vec());
+            },
+        )
+        .expect("decode_rw2_stream bad utf8 exemplar");
+        assert_eq!(ex_raw_val.as_deref(), Some([0xff, 0xfe].as_slice()));
     }
 
     fn decode_stringlabels_pairs(mut data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
