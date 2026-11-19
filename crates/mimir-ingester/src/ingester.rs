@@ -218,6 +218,8 @@ pub struct Ingester {
     weak_self: Arc<std::sync::OnceLock<Weak<Ingester>>>,
     multitenancy_enabled: AtomicBool,
     no_auth_tenant: RwLock<String>,
+    tenant_federation_enabled: AtomicBool,
+    tenant_federation_max_tenants: AtomicI64,
     cost_attribution_mgr: RwLock<Option<Arc<crate::costattribution::Manager>>>,
     active_groups: RwLock<Option<Arc<crate::active_groups::ActiveGroupsCleanupService>>>,
     activity_tracker: RwLock<Option<Arc<ActivityTracker>>>,
@@ -559,6 +561,8 @@ impl Ingester {
             weak_self: Arc::clone(&weak_slot),
             multitenancy_enabled: AtomicBool::new(true),
             no_auth_tenant: RwLock::new("fake".to_string()),
+            tenant_federation_enabled: AtomicBool::new(false),
+            tenant_federation_max_tenants: AtomicI64::new(0),
             cost_attribution_mgr: RwLock::new(None),
             active_groups: RwLock::new(None),
             activity_tracker: RwLock::new(None),
@@ -689,6 +693,20 @@ impl Ingester {
 
     pub fn no_auth_tenant(&self) -> String {
         self.no_auth_tenant.read().clone()
+    }
+
+    pub fn set_tenant_federation(&self, enabled: bool, max_tenants: i64) {
+        self.tenant_federation_enabled
+            .store(enabled, Ordering::Release);
+        self.tenant_federation_max_tenants
+            .store(max_tenants, Ordering::Release);
+    }
+
+    pub fn tenant_federation(&self) -> (bool, i64) {
+        (
+            self.tenant_federation_enabled.load(Ordering::Acquire),
+            self.tenant_federation_max_tenants.load(Ordering::Acquire),
+        )
     }
 
     fn state_from_u8(v: u8) -> State {
