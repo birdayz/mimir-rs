@@ -214,9 +214,9 @@ pub fn resolve_partition_tokens<'a>(
         .get(&id)
         .ok_or(PartitionRingError::PartitionDoesNotExist)?;
 
-    match partition.token_scheme() {
-        PartitionTokenScheme::PartitionTokensStored => Ok(&partition.tokens),
-        PartitionTokenScheme::PartitionTokensSmt512 => {
+    match partition.try_token_scheme() {
+        Ok(PartitionTokenScheme::PartitionTokensStored) => Ok(&partition.tokens),
+        Ok(PartitionTokenScheme::PartitionTokensSmt512) => {
             let gen = opts.token_generator.as_ref().ok_or_else(|| {
                 PartitionRingError::Other(format!(
                     "cannot resolve tokens for partition {id}: ring has no token generator"
@@ -226,6 +226,9 @@ pub fn resolve_partition_tokens<'a>(
                 PartitionRingError::Other(format!("cannot resolve tokens for partition {id}: {e}"))
             })
         }
+        Err(raw) => Err(PartitionRingError::Other(format!(
+            "cannot resolve tokens for partition {id}: unknown token scheme {raw}"
+        ))),
     }
 }
 

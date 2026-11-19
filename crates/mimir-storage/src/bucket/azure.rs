@@ -958,6 +958,20 @@ impl AzureHttpClient {
                         tokio::time::sleep(delay).await;
                         continue;
                     }
+                    if let Some(code) = extract_azure_error_code(&headers, &body) {
+                        if code == "BlobNotFound" || code == "InvalidUri" {
+                            let source: Box<dyn std::error::Error + Send + Sync> = if body.is_empty()
+                            {
+                                format!("Azure error code {code} with status {status}").into()
+                            } else {
+                                format!("HTTP error with status {status}: {body}").into()
+                            };
+                            return Err(object_store::Error::NotFound {
+                                path: path_label.to_string(),
+                                source,
+                            });
+                        }
+                    }
                     return Err(exthttp::map_http_error(STORE, path_label, status, body));
                 }
                 Err(e) => {
@@ -975,6 +989,48 @@ impl AzureHttpClient {
             }
         }
     }
+}
+
+fn extract_azure_error_code(headers: &reqwest::header::HeaderMap, body: &str) -> Option<String> {
+    if let Some(code) = headers
+        .get("x-ms-error-code")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(code.to_string());
+    }
+    if !body.is_empty() {
+        use quick_xml::events::Event;
+        let mut reader = quick_xml::Reader::from_str(body);
+        let mut buf = Vec::new();
+        let mut in_code = false;
+        let mut code_text = String::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) if e.local_name().as_ref() == b"Code" => {
+                    in_code = true;
+                    code_text.clear();
+                }
+                Ok(Event::Text(t)) if in_code => {
+                    if let Ok(s) = t.unescape() {
+                        code_text.push_str(&s);
+                    }
+                }
+                Ok(Event::End(e)) if e.local_name().as_ref() == b"Code" => {
+                    let trimmed = code_text.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                    in_code = false;
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+    None
 }
 
 struct Resp {
@@ -1189,7 +1245,7 @@ impl MultipartUpload for AzureMultipartUpload {
         let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<BlockList>\n");
         for (_, id) in blocks {
             xml.push_str(&format!(
-                "\t<Uncommitted>{}</Uncommitted>\n",
+                "\t<Latest>{}</Latest>\n",
                 BASE64_STANDARD.encode(id.as_bytes())
             ));
         }

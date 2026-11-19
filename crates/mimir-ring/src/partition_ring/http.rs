@@ -19,7 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::instance_ring::PartitionRingReader;
 use super::lifecycler::PartitionRingEditor;
-use super::model::{clean_partition_state_name, clean_token_scheme_name};
+use super::model::{clean_partition_state_name, clean_token_scheme_raw_name};
 use crate::dns::go_quote;
 use crate::kv::memberlist::gofmt::GoJson;
 use crate::ring::http::{go_format_g3, go_http_error, go_parse_query, html_escape, parse_go_form};
@@ -390,14 +390,13 @@ fn render_partition_ring_html(
             out.push_str(&format!("                    {} <br />\n", html_escape(o)));
         }
         out.push_str("                </td>\n");
-        let scheme = PartitionTokenScheme::try_from(p.token_scheme)
-            .unwrap_or(PartitionTokenScheme::PartitionTokensStored);
         if p.corrupted {
             out.push_str("                <td></td>\n");
         } else {
+            let scheme_name = clean_token_scheme_raw_name(p.token_scheme);
             out.push_str(&format!(
                 "                <td>{}</td>\n",
-                html_escape(clean_token_scheme_name(scheme))
+                html_escape(&scheme_name)
             ));
         }
         let owned = owned_tokens.get(&p.id).copied().unwrap_or(0);
@@ -602,6 +601,19 @@ mod tests {
             "failed to change partition state: the partition does not exist\n"
         );
 
+        let (code, body) = post(
+            &app,
+            "/ingester/partition-ring?action=change_state&partition_id=0&partition_state=PartitionPending",
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            "failed to change partition state: change partition state from Active to Pending: partition state change not allowed\n"
+        );
+
         // Unknown / missing action: plain redirect.
         let (code, _) = post(&app, "/ingester/partition-ring", None, "").await;
         assert_eq!(code, StatusCode::FOUND);
@@ -621,6 +633,28 @@ mod tests {
         assert_eq!(go_parse_bool("1"), Ok(true));
         assert_eq!(go_parse_bool("False"), Ok(false));
         assert!(go_parse_bool("tRuE").is_err());
+    }
+
+    #[test]
+    fn render_html_uses_clean_token_scheme_name_and_raw_fallback() {
+        let html = render_partition_ring_html(
+            &[(
+                PartitionPageData {
+                    id: 0,
+                    corrupted: false,
+                    state: PartitionState::PartitionActive as i32,
+                    state_timestamp: "2026-01-01T00:00:00Z".to_string(),
+                    state_change_locked: false,
+                    owner_ids: vec!["ing-0".to_string()],
+                    token_scheme: 2,
+                    tokens: vec![],
+                },
+                1_700_000_000,
+            )],
+            &HashMap::new(),
+            false,
+        );
+        assert!(html.contains("<td>2</td>"), "html={html}");
     }
 
     #[tokio::test]

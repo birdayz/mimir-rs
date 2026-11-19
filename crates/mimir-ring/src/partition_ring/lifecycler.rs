@@ -104,7 +104,10 @@ pub fn change_partition_state_in_desc(
         return Ok(false);
     }
     if !is_partition_state_change_allowed(from_state, to_state) {
-        return Err(PartitionRingError::PartitionStateChangeNotAllowed);
+        return Err(PartitionRingError::PartitionStateChangeNotAllowed {
+            from: from_state,
+            to: to_state,
+        });
     }
     ring.update_partition_state(partition_id, to_state, SystemTime::now())
 }
@@ -180,7 +183,7 @@ impl PartitionInstanceLifecycler {
             && cfg.partition_id >= cfg.max_derived_token_partitions
         {
             return Err(PartitionRingError::Other(format!(
-                "invalid partition ID {}: must be below max derived token partitions ({})",
+                "invalid partition ID {}: must be below the maximum derived token partitions ({}) when creating partitions with derived tokens",
                 cfg.partition_id, cfg.max_derived_token_partitions
             )));
         }
@@ -427,15 +430,15 @@ impl PartitionInstanceLifecycler {
             .inc();
         let owned_pid = self.cfg.partition_id;
         let delete_after = self.cfg.delete_inactive_partition_after;
-        if delete_after.is_zero() {
-            return;
-        }
-        let delete_before = now
-            .checked_sub(delete_after)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
 
         let res = self
             .update_ring(move |ring| {
+                if delete_after.is_zero() {
+                    return Ok(false);
+                }
+                let delete_before = now
+                    .checked_sub(delete_after)
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
                 let to_remove: Vec<i32> = ring
                     .partitions
                     .iter()
@@ -499,13 +502,16 @@ impl PartitionInstanceLifecycler {
                             _ = ctx.canceled() => return Err(ServiceError::Canceled),
                         }
                     }
+                    if ctx.is_canceled() {
+                        return Err(ServiceError::Canceled);
+                    }
+                    l.running.store(true, Ordering::Release);
                     Ok(())
                 })
             })),
             Some(Box::new(move |ctx: ServiceContext| {
                 let l = l_run.clone();
                 Box::pin(async move {
-                    l.running.store(true, Ordering::Release);
                     l.reconcile_owned_partition(SystemTime::now()).await;
                     l.reconcile_other_partitions(SystemTime::now()).await;
 
