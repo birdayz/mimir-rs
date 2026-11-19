@@ -14,13 +14,14 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::block::{Block, BlockError, BlockReadGuard};
-use crate::chunkenc::{ChunkError, EncodedChunk};
+use crate::chunkenc::{ChunkError, EncodedChunk, Encoding};
 use crate::chunks_block::{BlockChunksError, ChunkMeta};
 use crate::compact::{
-    decode_chunk_samples, merge_chunks_with_tombstones, merge_head_chunks_with_tombstones,
+    decode_chunk_samples, merge_chunks_with_tombstones,
+    merge_chunks_with_tombstones_and_float_encoding, merge_head_chunks_with_tombstones,
     DecodedSample,
 };
-use crate::head::{Head, HeadError, HeadReadGuard, SeriesEntry};
+use crate::head::{Head, HeadChunkSnapshot, HeadError, HeadReadGuard, SeriesEntry};
 use crate::index::IndexError;
 use crate::labels::{decode_stringlabel_size, Labels};
 use crate::matcher::LabelMatcher;
@@ -68,13 +69,15 @@ pub enum LazyChunkSource {
     Head(u64),
     Block { block_idx: u16, ref_id: u64 },
     Multi(Box<[(u16, u64)]>),
+    Precomputed(Vec<ChunkMeta>),
 }
 
-/// Lightweight Phase 1 series descriptor holding zero chunk bytes.
+/// Lightweight Phase 1 series descriptor holding zero chunk bytes on the fast path.
 #[derive(Clone, Debug)]
 pub struct LazySeriesEntry {
     pub labels: Labels,
     pub head_entry: Option<Arc<SeriesEntry>>,
+    pub head_snapshot: Option<HeadChunkSnapshot>,
     pub source: LazyChunkSource,
     pub chunk_count: u32,
 }
@@ -108,6 +111,7 @@ pub struct PreparedChunkSelect {
     pub mint: i64,
     pub maxt: i64,
     pub unordered: bool,
+    head_overlaps_ooo: bool,
     _block_guards: Vec<BlockReadGuard>,
     _head_guard: Option<HeadReadGuard>,
 }
@@ -146,6 +150,8 @@ pub struct BlockSelectStats {
     pub series: u64,
     /// Whether these are the Head's stats (vs. a persisted block's).
     pub head: bool,
+    /// Whether this query range overlaps `Head::min_ooo_time..=Head::max_ooo_time` (Go `overlapsOOO`).
+    pub overlaps_ooo: bool,
     /// `BlockMeta::min_time` for persisted blocks (`0` when `head == true`).
     pub block_min_time: i64,
 }
@@ -165,6 +171,7 @@ pub struct TsdbQuerier<'a> {
     closed: Option<&'a AtomicBool>,
     mint: i64,
     maxt: i64,
+    concurrent: bool,
     select_stats: Option<BlockSelectStatsSink>,
     select_stats_filter: Option<SeriesStatsFilter>,
 }
@@ -196,6 +203,7 @@ impl<'a> TsdbQuerier<'a> {
             closed: None,
             mint,
             maxt,
+            concurrent: false,
             select_stats: None,
             select_stats_filter: None,
         }
@@ -214,6 +222,7 @@ impl<'a> TsdbQuerier<'a> {
             closed: None,
             mint,
             maxt,
+            concurrent: false,
             select_stats: None,
             select_stats_filter: None,
         }
@@ -233,19 +242,29 @@ impl<'a> TsdbQuerier<'a> {
             closed: Some(closed),
             mint,
             maxt,
+            concurrent: false,
             select_stats: None,
             select_stats_filter: None,
         }
     }
 
+    /// Sets Go `sharded` / `hints.ShardCount > 0` (`concurrent` param on
+    /// `PostingsForMatchersCache.PostingsForMatchers`).
+    pub fn with_concurrent(mut self, concurrent: bool) -> Self {
+        self.concurrent = concurrent;
+        self
+    }
+
     #[inline]
-    fn check_open(&self) -> Result<(), QuerierError> {
-        if self.closed.is_some_and(|c| c.load(AtomicOrdering::Acquire))
+    fn is_closed(&self) -> bool {
+        self.closed.is_some_and(|c| c.load(AtomicOrdering::Acquire))
             || self.head.is_some_and(Head::is_closed)
-        {
-            return Err(QuerierError::Closed);
-        }
-        Ok(())
+    }
+
+    #[inline]
+    fn head_overlaps_ooo(&self, head: &Head) -> bool {
+        let min_ooo = head.min_ooo_time();
+        min_ooo != i64::MAX && min_ooo <= self.maxt && self.mint <= head.max_ooo_time()
     }
 
     /// Records per block querier [`BlockSelectStats`] of chunk selects into `sink`.
@@ -281,6 +300,7 @@ impl<'a> TsdbQuerier<'a> {
             selected_postings: 0,
             series: 0,
             head: false,
+            overlaps_ooo: false,
             block_min_time: min_t,
         }));
     }
@@ -318,7 +338,10 @@ impl<'a> TsdbQuerier<'a> {
         mode: HeadSnapshotMode,
     ) -> Result<(Vec<BlockReadGuard>, Option<HeadReadGuard>, Vec<Arc<Block>>), QuerierError> {
         let lock_guard = self.blocks_lock.map(|l| l.read());
-        self.check_open()?;
+        if self.is_closed() {
+            drop(lock_guard);
+            return Ok((Vec::new(), None, Vec::new()));
+        }
         let (blocks, block_guards) = self.snapshot_blocks(lock_guard.as_ref());
         let head_guard = match mode {
             HeadSnapshotMode::Effective => self
@@ -344,7 +367,10 @@ impl<'a> TsdbQuerier<'a> {
             },
             None => None,
         };
-        self.check_open()?;
+        if self.is_closed() {
+            drop(lock_guard);
+            return Ok(Some((Vec::new(), None, Vec::new())));
+        }
         let (blocks, block_guards) = self.snapshot_blocks(lock_guard.as_ref());
         let head_guard = self
             .effective_head()
@@ -355,11 +381,12 @@ impl<'a> TsdbQuerier<'a> {
 
     fn blocks_match_prepared(&self, prepared: &PreparedChunkSelect) -> Result<bool, QuerierError> {
         let Some(lock) = self.blocks_lock else {
-            self.check_open()?;
-            return Ok(true);
+            return Ok(!self.is_closed());
         };
         let lock_guard = lock.read();
-        self.check_open()?;
+        if self.is_closed() {
+            return Ok(false);
+        }
         let mut idx = 0usize;
         let mut all_match = true;
         for b in lock_guard.iter() {
@@ -448,13 +475,14 @@ impl<'a> TsdbQuerier<'a> {
         unordered: bool,
     ) -> Result<PreparedChunkSelect, QuerierError> {
         let head = head_guard.as_ref().and(self.head);
+        let head_overlaps_ooo = head.is_some_and(|h| self.head_overlaps_ooo(h));
         let head_refs = match head {
-            Some(h) => Some(h.postings_for_matchers_arc(matchers)?),
+            Some(h) => Some(h.postings_for_matchers_with_concurrent(matchers, self.concurrent)?),
             None => None,
         };
         let mut block_refs = Vec::with_capacity(blocks.len());
         for blk in &blocks {
-            let refs = blk.postings_for_matchers(matchers)?;
+            let refs = blk.postings_for_matchers_with_concurrent(matchers, self.concurrent)?;
             if !refs.is_empty() {
                 block_refs.push((Arc::clone(blk), refs));
             }
@@ -468,6 +496,7 @@ impl<'a> TsdbQuerier<'a> {
             mint: self.mint,
             maxt: self.maxt,
             unordered,
+            head_overlaps_ooo,
         })
     }
 
@@ -508,6 +537,7 @@ impl<'a> TsdbQuerier<'a> {
                     selected_postings: 0,
                     series: 0,
                     head: true,
+                    overlaps_ooo: prepared.head_overlaps_ooo,
                     block_min_time: 0,
                 }),
                 &[],
@@ -551,6 +581,7 @@ impl<'a> TsdbQuerier<'a> {
                     selected_postings: 0,
                     series: 0,
                     head: true,
+                    overlaps_ooo: prepared.head_overlaps_ooo,
                     block_min_time: 0,
                 }),
                 &[],
@@ -597,7 +628,9 @@ impl<'a> TsdbQuerier<'a> {
         prepared: PreparedChunkSelect,
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
-        self.check_open()?;
+        if self.is_closed() {
+            return Ok(Vec::new());
+        }
         self.execute_prepared_select_locked(prepared, sort_series)
     }
 
@@ -606,11 +639,15 @@ impl<'a> TsdbQuerier<'a> {
         prepared: PreparedChunkSelect,
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
-        self.check_open()?;
+        if self.is_closed() {
+            return Ok(Vec::new());
+        }
         let head = prepared._head_guard.as_ref().and(self.head);
+        let float_enc = self.head.map_or(Encoding::Xor, Head::float_chunk_encoding);
         let mint = prepared.mint;
         let maxt = prepared.maxt;
         let unordered = prepared.unordered;
+        let head_overlaps_ooo = prepared.head_overlaps_ooo;
 
         let empty_block_min_times: Vec<i64> = prepared
             .overlapping_blocks
@@ -626,6 +663,8 @@ impl<'a> TsdbQuerier<'a> {
             let mut out = Vec::with_capacity(refs.len());
             for &r in refs.iter() {
                 if let Some((labels, chks, tombs)) = head.series_chunks(r, mint, maxt)? {
+                    // Go `HeadAndOOOChunkReader` / `populateChunksFromIterable` (`querier.go:1271`)
+                    // uses `Xor` for intra-head merges when `st == 0`.
                     let final_chunks = merge_head_chunks_with_tombstones(chks, &tombs)?;
                     if !final_chunks.is_empty() {
                         out.push(QueryChunkSeries {
@@ -640,6 +679,7 @@ impl<'a> TsdbQuerier<'a> {
                     selected_postings: refs.len() as u64,
                     series: out.iter().filter(|s| self.counts_for_stats(&s.labels)).count() as u64,
                     head: true,
+                    overlaps_ooo: head_overlaps_ooo,
                     block_min_time: 0,
                 }),
                 &[],
@@ -677,6 +717,7 @@ impl<'a> TsdbQuerier<'a> {
                 selected_postings: refs.len() as u64,
                 series: 0,
                 head: true,
+                overlaps_ooo: head_overlaps_ooo,
                 block_min_time: 0,
             };
             for &r in refs.iter() {
@@ -705,6 +746,7 @@ impl<'a> TsdbQuerier<'a> {
                 selected_postings: refs.len() as u64,
                 series: 0,
                 head: false,
+                overlaps_ooo: false,
                 block_min_time: blk.min_time(),
             };
             for &r in refs.iter() {
@@ -739,26 +781,35 @@ impl<'a> TsdbQuerier<'a> {
         }
         self.record_select_stats(head_stats, &block_stats, &empty_block_min_times);
 
-        let merge_or_collect = |items: Vec<(ChunkMeta, Vec<Interval>)>,
-                                allow_non_overlapping_raw: bool|
+        let merge_head = |items: Vec<(ChunkMeta, Vec<Interval>)>| -> Result<Vec<ChunkMeta>, QuerierError> {
+            Ok(merge_chunks_with_tombstones(items, false)?)
+        };
+        let merge_cross_source = |items: Vec<(ChunkMeta, Vec<Interval>)>,
+                                  allow_non_overlapping_raw: bool|
          -> Result<Vec<ChunkMeta>, QuerierError> {
-            Ok(merge_chunks_with_tombstones(
+            Ok(merge_chunks_with_tombstones_and_float_encoding(
                 items,
                 allow_non_overlapping_raw,
+                float_enc,
             )?)
         };
 
         let mut out = Vec::with_capacity(per_series.len());
         for (labels, sources) in per_series {
             let final_chunks = if unordered {
-                let mut combined = merge_or_collect(sources.head, false)?;
-                let blk_chks = merge_or_collect(sources.blocks, true)?;
+                let mut combined = merge_head(sources.head)?;
+                let blk_chks = merge_cross_source(sources.blocks, true)?;
                 combined.extend(blk_chks);
                 combined
+            } else if sources.blocks.is_empty() {
+                merge_head(sources.head)?
             } else {
-                let mut all_items = sources.head;
+                let mut all_items: Vec<(ChunkMeta, Vec<Interval>)> = merge_head(sources.head)?
+                    .into_iter()
+                    .map(|c| (c, Vec::new()))
+                    .collect();
                 all_items.extend(sources.blocks);
-                merge_or_collect(all_items, false)?
+                merge_cross_source(all_items, false)?
             };
             if !final_chunks.is_empty() {
                 out.push(QueryChunkSeries {
@@ -807,9 +858,11 @@ impl<'a> TsdbQuerier<'a> {
         }
 
         let head = prepared._head_guard.as_ref().and(self.head);
+        let float_enc = self.head.map_or(Encoding::Xor, Head::float_chunk_encoding);
         let mint = prepared.mint;
         let maxt = prepared.maxt;
         let unordered = prepared.unordered;
+        let head_overlaps_ooo = prepared.head_overlaps_ooo;
         let empty_block_min_times: Vec<i64> = prepared
             .overlapping_blocks
             .iter()
@@ -820,9 +873,10 @@ impl<'a> TsdbQuerier<'a> {
         let merge_or_collect = |items: Vec<(ChunkMeta, Vec<Interval>)>,
                                 allow_non_overlapping_raw: bool|
          -> Result<Vec<ChunkMeta>, QuerierError> {
-            Ok(merge_chunks_with_tombstones(
+            Ok(merge_chunks_with_tombstones_and_float_encoding(
                 items,
                 allow_non_overlapping_raw,
+                float_enc,
             )?)
         };
 
@@ -832,13 +886,14 @@ impl<'a> TsdbQuerier<'a> {
                 (Some(h), Some(refs)) => {
                     let mut v = Vec::with_capacity(refs.len());
                     for &r in refs.iter() {
-                        if let Some((entry, chunk_count)) =
-                            h.series_lazy_chunk_count_with_entry(r, mint, maxt, series_filter)?
+                        if let Some((entry, chunk_count, head_snapshot)) =
+                            h.series_lazy_chunk_count_with_snapshot(r, mint, maxt, series_filter)?
                         {
                             if chunk_count > 0 {
                                 v.push(LazySeriesEntry {
                                     labels: Labels::empty(),
                                     head_entry: Some(entry),
+                                    head_snapshot: Some(head_snapshot),
                                     source: LazyChunkSource::Head(r),
                                     chunk_count,
                                 });
@@ -854,6 +909,7 @@ impl<'a> TsdbQuerier<'a> {
                     selected_postings,
                     series: entries.len() as u64,
                     head: true,
+                    overlaps_ooo: head_overlaps_ooo,
                     block_min_time: 0,
                 }),
                 &[],
@@ -875,12 +931,21 @@ impl<'a> TsdbQuerier<'a> {
 
             if let Some(h) = head {
                 for (series_idx, entry) in entries.into_iter().enumerate() {
-                    let chks = if let Some(ref head_entry) = entry.head_entry {
-                        h.series_final_chunks_for_entry(head_entry, mint, maxt)?
-                    } else if let LazyChunkSource::Head(r) = entry.source {
-                        h.series_final_chunks_only(r, mint, maxt)?
-                    } else {
+                    let LazyChunkSource::Head(r) = entry.source else {
                         continue;
+                    };
+                    let chks = match entry.head_snapshot {
+                        Some(snap) => h.series_final_chunks_from_snapshot(
+                            entry.head_entry.as_deref(),
+                            r,
+                            snap,
+                        )?,
+                        None => match entry.head_entry {
+                            Some(ref head_entry) => {
+                                h.series_final_chunks_for_entry(head_entry, mint, maxt)?
+                            }
+                            None => h.series_final_chunks_only(r, mint, maxt)?,
+                        },
                     };
                     if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
                         return Ok(());
@@ -901,6 +966,7 @@ impl<'a> TsdbQuerier<'a> {
             sources: SmallVec<[(u16, u64); 2]>,
             head_ivs: SmallVec<[(i64, i64); 4]>,
             block_ivs: SmallVec<[(i64, i64); 4]>,
+            head_snapshot: Option<HeadChunkSnapshot>,
             has_block_tombstone_overlap: bool,
         }
 
@@ -925,11 +991,12 @@ impl<'a> TsdbQuerier<'a> {
                 selected_postings: refs.len() as u64,
                 series: 0,
                 head: true,
+                overlaps_ooo: head_overlaps_ooo,
                 block_min_time: 0,
             };
             for &r in refs.iter() {
-                if let Some((labels, ivs, _had_slow)) =
-                    h.series_chunk_metas_no_bytes(r, mint, maxt, series_filter)?
+                if let Some((labels, ivs, head_snapshot)) =
+                    h.series_chunk_metas_no_bytes_with_snapshot(r, mint, maxt, series_filter)?
                 {
                     if !ivs.is_empty() {
                         stats.series += 1;
@@ -938,10 +1005,12 @@ impl<'a> TsdbQuerier<'a> {
                         sources: SmallVec::new(),
                         head_ivs: SmallVec::new(),
                         block_ivs: SmallVec::new(),
+                        head_snapshot: None,
                         has_block_tombstone_overlap: false,
                     });
                     entry.sources.push((0, r));
                     entry.head_ivs.extend(ivs);
+                    entry.head_snapshot = Some(head_snapshot);
                 }
             }
             head_stats = Some(stats);
@@ -957,6 +1026,7 @@ impl<'a> TsdbQuerier<'a> {
                 selected_postings: refs.len() as u64,
                 series: 0,
                 head: false,
+                overlaps_ooo: false,
                 block_min_time: blk.min_time(),
             };
             for &r in refs.iter() {
@@ -996,6 +1066,7 @@ impl<'a> TsdbQuerier<'a> {
                         sources: SmallVec::new(),
                         head_ivs: SmallVec::new(),
                         block_ivs: SmallVec::new(),
+                        head_snapshot: None,
                         has_block_tombstone_overlap: false,
                     });
                     entry.sources.push((src_tag, r));
@@ -1009,16 +1080,20 @@ impl<'a> TsdbQuerier<'a> {
         }
         self.record_select_stats(head_stats, &block_stats, &empty_block_min_times);
 
-        let load_multi_chunks = |srcs: &[(u16, u64)]| -> Result<Vec<ChunkMeta>, QuerierError> {
+        let load_multi_chunks = |srcs: &[(u16, u64)],
+                                 mut head_snap: Option<HeadChunkSnapshot>|
+         -> Result<Vec<ChunkMeta>, QuerierError> {
             let mut head_items: Vec<(ChunkMeta, Vec<Interval>)> = Vec::new();
             let mut block_items: Vec<(ChunkMeta, Vec<Interval>)> = Vec::new();
             for &(tag, r) in srcs {
                 if tag == 0 {
                     if let Some(h) = head {
-                        if let Some((_, chks)) = h.series_final_chunks(r, mint, maxt)? {
-                            for c in chks {
-                                head_items.push((c, Vec::new()));
-                            }
+                        let chks = match head_snap.take() {
+                            Some(snap) => h.series_final_chunks_from_snapshot(None, r, snap)?,
+                            None => h.series_final_chunks_only(r, mint, maxt)?,
+                        };
+                        for c in chks {
+                            head_items.push((c, Vec::new()));
                         }
                     }
                 } else {
@@ -1042,10 +1117,12 @@ impl<'a> TsdbQuerier<'a> {
                 }
             }
             if unordered {
-                let mut combined = merge_or_collect(head_items, false)?;
+                let mut combined = merge_chunks_with_tombstones(head_items, false)?;
                 let blk_chks = merge_or_collect(block_items, true)?;
                 combined.extend(blk_chks);
                 Ok(combined)
+            } else if block_items.is_empty() {
+                Ok(merge_chunks_with_tombstones(head_items, false)?)
             } else {
                 head_items.extend(block_items);
                 merge_or_collect(head_items, false)
@@ -1053,11 +1130,11 @@ impl<'a> TsdbQuerier<'a> {
         };
 
         let mut entries: Vec<LazySeriesEntry> = Vec::with_capacity(per_series.len());
-        for (labels, meta) in per_series {
+        for (labels, mut meta) in per_series {
             let can_count_without_load = if meta.has_block_tombstone_overlap {
                 false
             } else if unordered {
-                // `head_ivs` is already post-merge from `series_chunk_metas_no_bytes`;
+                // `head_ivs` is already post-merge from `series_chunk_metas_no_bytes_with_snapshot`;
                 // `blocks` in unordered mode concatenate without overlap merging.
                 true
             } else {
@@ -1073,26 +1150,29 @@ impl<'a> TsdbQuerier<'a> {
                 }
             };
 
-            let chunk_count = if can_count_without_load {
-                (meta.head_ivs.len() + meta.block_ivs.len()) as u32
+            let (chunk_count, head_snapshot, source) = if can_count_without_load {
+                let cnt = (meta.head_ivs.len() + meta.block_ivs.len()) as u32;
+                let source = match meta.sources.as_slice() {
+                    [(0, r)] => LazyChunkSource::Head(*r),
+                    [(tag, r)] => LazyChunkSource::Block {
+                        block_idx: *tag - 1,
+                        ref_id: *r,
+                    },
+                    many => LazyChunkSource::Multi(many.to_vec().into_boxed_slice()),
+                };
+                (cnt, meta.head_snapshot.take(), source)
             } else {
-                let chks = load_multi_chunks(&meta.sources)?;
-                chks.len() as u32
+                let chks = load_multi_chunks(&meta.sources, meta.head_snapshot.take())?;
+                let cnt = chks.len() as u32;
+                (cnt, None, LazyChunkSource::Precomputed(chks))
             };
             if chunk_count == 0 {
                 continue;
             }
-            let source = match meta.sources.as_slice() {
-                [(0, r)] => LazyChunkSource::Head(*r),
-                [(tag, r)] => LazyChunkSource::Block {
-                    block_idx: *tag - 1,
-                    ref_id: *r,
-                },
-                many => LazyChunkSource::Multi(many.to_vec().into_boxed_slice()),
-            };
             entries.push(LazySeriesEntry {
                 labels,
                 head_entry: None,
+                head_snapshot,
                 source,
                 chunk_count,
             });
@@ -1113,15 +1193,16 @@ impl<'a> TsdbQuerier<'a> {
 
         for (series_idx, entry) in entries.into_iter().enumerate() {
             let chks = match entry.source {
+                LazyChunkSource::Precomputed(chks) => chks,
                 LazyChunkSource::Head(r) => {
                     let single = [(0u16, r)];
-                    load_multi_chunks(&single)?
+                    load_multi_chunks(&single, entry.head_snapshot)?
                 }
                 LazyChunkSource::Block { block_idx, ref_id } => {
                     let single = [(1u16 + block_idx, ref_id)];
-                    load_multi_chunks(&single)?
+                    load_multi_chunks(&single, None)?
                 }
-                LazyChunkSource::Multi(srcs) => load_multi_chunks(&srcs)?,
+                LazyChunkSource::Multi(srcs) => load_multi_chunks(&srcs, entry.head_snapshot)?,
             };
             if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
                 return Ok(());
@@ -1159,7 +1240,7 @@ impl<'a> TsdbQuerier<'a> {
             let Some(head) = head else {
                 return Ok(Vec::new());
             };
-            let refs = head.postings_for_matchers_arc(matchers)?;
+            let refs = head.postings_for_matchers_with_concurrent(matchers, self.concurrent)?;
             let mut out = Vec::with_capacity(refs.len());
             for &r in refs.iter() {
                 if let Some(labels) = head.series_has_chunks_in_range(r, self.mint, self.maxt) {
@@ -1174,7 +1255,7 @@ impl<'a> TsdbQuerier<'a> {
 
         let mut set: BTreeSet<Labels> = BTreeSet::new();
         if let Some(head) = head {
-            let refs = head.postings_for_matchers_arc(matchers)?;
+            let refs = head.postings_for_matchers_with_concurrent(matchers, self.concurrent)?;
             for &r in refs.iter() {
                 if let Some(labels) = head.series_has_chunks_in_range(r, self.mint, self.maxt) {
                     set.insert(labels);
@@ -1184,7 +1265,7 @@ impl<'a> TsdbQuerier<'a> {
         for blk in &blocks {
             let idx = blk.index();
             let tombr = blk.tombstones();
-            let refs = blk.postings_for_matchers(matchers)?;
+            let refs = blk.postings_for_matchers_with_concurrent(matchers, self.concurrent)?;
             for &r in refs.iter() {
                 let (labels, chks) = idx.series(r)?;
                 let tombs = tombr.get(r);
@@ -1219,7 +1300,7 @@ impl<'a> TsdbQuerier<'a> {
                     set.insert(name);
                 }
             } else {
-                let refs = blk.postings_for_matchers(matchers)?;
+                let refs = blk.postings_for_matchers_direct(matchers)?;
                 for name in idx.label_names_for(&refs)? {
                     set.insert(name);
                 }
@@ -1261,7 +1342,7 @@ impl<'a> TsdbQuerier<'a> {
                     set.insert(val);
                 }
             } else {
-                let refs = blk.postings_for_matchers(matchers)?;
+                let refs = blk.postings_for_matchers_direct(matchers)?;
                 for &r in refs.iter() {
                     let lbls = idx.series_labels(r)?;
                     let v = lbls.get(name);
@@ -1312,7 +1393,7 @@ impl<'a> TsdbQuerier<'a> {
         if let Some(head) = head_guard.as_ref().and(self.head) {
             let all = LabelMatcher::new(crate::matcher::MatchType::RegexMatch, "__name__", ".*")
                 .map_err(PostingsError::from)?;
-            for &r in head.postings_for_matchers_arc(&[all])?.iter() {
+            for &r in head.postings_for_matchers_direct_arc(&[all])?.iter() {
                 if let Some(l) = head.series_labels(r) {
                     set.insert(l);
                 }
@@ -1423,6 +1504,13 @@ impl<'a> TsdbChunkQuerier<'a> {
             inner: TsdbQuerier::with_blocks_lock_and_closed(head, blocks_lock, closed, mint, maxt),
             unordered: true,
         }
+    }
+
+    /// Sets Go `sharded` / `hints.ShardCount > 0` (`concurrent` param on
+    /// `PostingsForMatchersCache.PostingsForMatchers`).
+    pub fn with_concurrent(mut self, concurrent: bool) -> Self {
+        self.inner = self.inner.with_concurrent(concurrent);
+        self
     }
 
     /// Records per block querier [`BlockSelectStats`] of every chunk select into `sink`.
@@ -2045,6 +2133,7 @@ mod sort_tests {
         LazySeriesEntry {
             labels: lbls,
             head_entry: None,
+            head_snapshot: None,
             source: LazyChunkSource::Head(0),
             chunk_count: 1,
         }

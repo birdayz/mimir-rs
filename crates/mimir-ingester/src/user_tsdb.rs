@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use crate::active_series::{
-    merged_custom_trackers, parse_custom_tracker_matchers, ActiveSeries, CostAttributionTracker,
+    build_custom_trackers_config, merged_custom_trackers, ActiveSeries, CostAttributionTracker,
     Matchers,
 };
 use crate::errors::IngesterError;
@@ -431,14 +431,13 @@ impl UserTsdb {
                 .max(0) as u64,
         );
         let tenant_limits = overrides.for_tenant(&user_id);
-        let custom_matchers =
-            parse_custom_tracker_matchers(&merged_custom_trackers(
-                &tenant_limits.active_series_custom_trackers,
-                &tenant_limits.active_series_additional_custom_trackers,
-            ));
+        let custom_trackers = build_custom_trackers_config(&merged_custom_trackers(
+            &tenant_limits.active_series_custom_trackers,
+            &tenant_limits.active_series_additional_custom_trackers,
+        ));
 
         let active_series = Arc::new(ActiveSeries::with_matchers(
-            Matchers::from_custom_trackers(&custom_matchers),
+            Matchers::new(custom_trackers),
             active_idle,
             cost_attribution_tracker,
         ));
@@ -518,7 +517,8 @@ impl UserTsdb {
             metadata_limits: initial_metadata_limits,
             series_lifecycle_callback: Some(lifecycle_adapter.clone()),
             registry: tsdb_prom_reg.clone(),
-        };
+        }
+        .with_chunk_end_time_variance(blocks_cfg.tsdb.head_chunks_end_time_variance);
 
         // Go `blocksToDelete` closure + `userTSDB.blocksToDelete`: nothing is deleted until
         // the TSDB is ready (after the post-replay compaction); then only blocks deletable by
@@ -600,8 +600,12 @@ impl UserTsdb {
         }
 
         let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
-        db.head()
-            .set_chunk_end_time_variance(blocks_cfg.tsdb.head_chunks_end_time_variance);
+        db.set_postings_cache_eligibility(
+            blocks_cfg.tsdb.head_postings_for_matchers_cache_force,
+            blocks_cfg.tsdb.shared_postings_for_matchers_cache,
+            blocks_cfg.tsdb.block_postings_for_matchers_cache_force,
+            blocks_cfg.tsdb.shared_postings_for_matchers_cache,
+        );
         let weak_db = Arc::downgrade(&db);
         *lifecycle_adapter.num_series_fn.write() = Some(Arc::new(move || {
             weak_db.upgrade().map_or(0, |d| d.head().num_series())

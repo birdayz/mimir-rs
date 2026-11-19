@@ -257,6 +257,8 @@ struct TsdbInner {
     compact_mtx: Mutex<()>,
     block_ranges_ms: RwLock<Vec<i64>>,
     enable_overlapping_compaction: AtomicBool,
+    block_postings_cache_force: AtomicBool,
+    block_postings_cache_shared: AtomicBool,
     metrics: DbMetrics,
 }
 
@@ -326,7 +328,13 @@ impl Tsdb {
         }
 
         let initial_ranges = vec![opts.head.chunk_range_ms];
-        let head = Head::open(&dir, opts.head.clone(), min_valid_time)?;
+        let variance = opts.head.chunk_end_time_variance();
+        let head = Head::open_with_chunk_end_time_variance(
+            &dir,
+            opts.head.clone(),
+            min_valid_time,
+            variance,
+        )?;
 
         let inner = Arc::new(TsdbInner {
             dir,
@@ -337,6 +345,8 @@ impl Tsdb {
             compact_mtx: Mutex::new(()),
             block_ranges_ms: RwLock::new(initial_ranges),
             enable_overlapping_compaction: AtomicBool::new(false),
+            block_postings_cache_force: AtomicBool::new(false),
+            block_postings_cache_shared: AtomicBool::new(false),
             metrics,
         });
         let bg_stop = Arc::new((Mutex::new(false), Condvar::new()));
@@ -489,6 +499,30 @@ impl Tsdb {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
+    }
+
+    /// Configures `PostingsForMatchersCache` `force` / `shared` eligibility flags on Head and all
+    /// current & future reloaded Blocks (matching Go `headPostingsForMatchersCacheFactory` /
+    /// `blockPostingsForMatchersCacheFactory`).
+    pub fn set_postings_cache_eligibility(
+        &self,
+        head_force: bool,
+        head_shared: bool,
+        block_force: bool,
+        block_shared: bool,
+    ) {
+        self.inner
+            .head
+            .set_postings_cache_eligibility(head_force, head_shared);
+        self.inner
+            .block_postings_cache_force
+            .store(block_force, Ordering::Release);
+        self.inner
+            .block_postings_cache_shared
+            .store(block_shared, Ordering::Release);
+        for b in self.inner.blocks.read().iter() {
+            b.set_postings_cache_eligibility(block_force, block_shared);
+        }
     }
 
     /// Returns a [`TsdbQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
@@ -787,6 +821,13 @@ impl TsdbInner {
                 let current = self.blocks.read().clone();
                 let (to_load, deletable) =
                     Self::prepare_reload_blocks(&self.dir, &self.opts, &self.metrics, &current)?;
+                let bf = self.block_postings_cache_force.load(Ordering::Acquire);
+                let bs = self.block_postings_cache_shared.load(Ordering::Acquire);
+                if bf || bs {
+                    for b in &to_load {
+                        b.set_postings_cache_eligibility(bf, bs);
+                    }
+                }
                 let unchanged = deletable.is_empty()
                     && current.len() == to_load.len()
                     && current.iter().zip(&to_load).all(|(a, b)| Arc::ptr_eq(a, b));
@@ -1567,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_tsdb_rejects_queries_with_closed_error() {
+    fn closed_tsdb_returns_empty_results_matching_go() {
         let dir = tempfile::tempdir().unwrap();
         let db = Tsdb::open_with_reload_interval(dir.path(), TsdbOptions::default(), Duration::ZERO).unwrap();
         let pairs = [("__name__", "closed_tsdb_metric"), ("job", "test")];
@@ -1584,9 +1625,9 @@ mod tests {
 
         let matchers = [LabelMatcher::new(crate::matcher::MatchType::Equal, "__name__", "closed_tsdb_metric").unwrap()];
         let q = db.querier(i64::MIN, i64::MAX);
-        assert!(matches!(q.select(false, &matchers), Err(crate::querier::QuerierError::Closed)));
-        assert!(matches!(q.label_names(&[]), Err(crate::querier::QuerierError::Closed)));
-        assert!(matches!(q.label_values("__name__", None, &[]), Err(crate::querier::QuerierError::Closed)));
+        assert_eq!(q.select(false, &matchers).unwrap(), vec![]);
+        assert_eq!(q.label_names(&[]).unwrap(), Vec::<String>::new());
+        assert_eq!(q.label_values("__name__", None, &[]).unwrap(), Vec::<String>::new());
     }
 
     #[test]

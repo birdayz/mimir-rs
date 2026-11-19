@@ -815,6 +815,11 @@ where
         remote_addr: Some(remote),
     });
     req.extensions_mut().insert(error_log);
+    let deadline_ctx = mimir_ingester::grpc::RpcDeadlineContext::new(
+        deadline.map(tokio::time::Instant::into_std),
+    );
+    req.extensions_mut().insert(Arc::clone(&deadline_ctx));
+
 
     // Interceptor order (dskit server.New): ..., Mimir's GRPCMiddleware (multitenant auth), then
     // cluster validation (unary RPCs only, never health checks).
@@ -878,11 +883,16 @@ where
             let method_for_span = guard.method.clone();
             let call = with_trace_context(span_ctx.clone(), routes.oneshot(req));
             let res = match deadline {
-                // grpc-go: at the deadline the stream is closed with RST_STREAM(CANCEL) and the
-                // handler's context is canceled; dropping the handler future cancels its waits.
-                Some(d) => match tokio::time::timeout_at(d, call).await {
-                    Ok(r) => r,
-                    Err(_) => return Ok(reset_stream_response()),
+                // grpc-go: when the transport deadline timer closes the stream before the handler
+                // returns `DeadlineExceeded`, `closeStream` sends RST_STREAM(CANCEL) and cancels
+                // `s.ctx` with `context.Canceled`, so RpcGuard records `"Canceled"` and tap
+                // drop guards treat the aborted future as canceled (not `DeadlineExceeded`).
+                Some(d) => tokio::select! {
+                    biased;
+                    r = call => r,
+                    _ = tokio::time::sleep_until(d) => {
+                        return Ok(reset_stream_response());
+                    }
                 },
                 None => call.await,
             };
@@ -926,8 +936,13 @@ where
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    // grpc-go closes the stream (RST_STREAM CANCEL) when the deadline expires mid-response.
-    let body_deadline = deadline.map(tokio::time::Instant::into_std);
+    // grpc-go closes the stream (RST_STREAM CANCEL) when the deadline expires mid-response,
+    // unless the handler already returned a completed trailers-only status response.
+    let body_deadline = if guard.status_code.is_some() {
+        None
+    } else {
+        deadline.map(tokio::time::Instant::into_std)
+    };
     Ok(resp.map(|b| {
         tonic::body::boxed(
             TrackedBody::with_observer(
@@ -1121,6 +1136,20 @@ mod tests {
             Box::pin(async move {
                 if req.uri().path() == "/test.Hanging/Fast" {
                     return Ok(tonic::Status::ok("").into_http());
+                }
+                if req.uri().path() == "/test.Hanging/DeadlineStatus" {
+                    if let Some(ctx) = req
+                        .extensions()
+                        .get::<Arc<mimir_ingester::grpc::RpcDeadlineContext>>()
+                    {
+                        if let Some(dl) = ctx.deadline {
+                            // Wait past the deadline without yielding so the trailers-only
+                            // DeadlineExceeded response is returned right after `deadline`.
+                            let rem = dl.saturating_duration_since(std::time::Instant::now());
+                            std::thread::sleep(rem + Duration::from_millis(2));
+                        }
+                    }
+                    return Ok(tonic::Status::deadline_exceeded("handler deadline").into_http());
                 }
                 std::future::pending().await
             })
@@ -1329,6 +1358,17 @@ mod tests {
             fx.histogram_sample_count("cortex_response_message_bytes", route),
             Some(0)
         );
+    }
+
+    #[tokio::test]
+    async fn completed_trailers_only_deadline_response_not_reset_by_tracked_body() {
+        let fx = fixture(false);
+        let route = "/test.Hanging/DeadlineStatus";
+        let resp = fx.call(route, &[("grpc-timeout", "5m")]).await.unwrap();
+        assert_eq!(drain(resp).await.as_deref(), Some("4"));
+        assert_eq!(fx.duration_count(route, "DeadlineExceeded"), 1.0);
+        assert_eq!(fx.gauge("cortex_inflight_requests", route), 0.0);
+        assert_eq!(fx.conn.active.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

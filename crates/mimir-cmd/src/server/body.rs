@@ -48,14 +48,17 @@ impl BodyObserver for CallbackObserver {
     }
 }
 
+pub type DeadlineErrFn = Box<dyn FnMut() -> BoxError + Send + Sync>;
+
 pub struct TrackedBody<B, O: BodyObserver = CallbackObserver> {
     inner: B,
     observer: O,
     done: bool,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    deadline_at: Option<Instant>,
     deadline_msg: &'static str,
     /// Builds the deadline error instead of `deadline_msg` (e.g. an `h2` reset reason).
-    deadline_err: Option<fn() -> BoxError>,
+    deadline_err: Option<DeadlineErrFn>,
 }
 
 impl<B> TrackedBody<B, CallbackObserver> {
@@ -81,12 +84,14 @@ impl<B, O: BodyObserver> TrackedBody<B, O> {
             observer,
             done: false,
             deadline: None,
+            deadline_at: None,
             deadline_msg: "",
             deadline_err: None,
         }
     }
 
     pub fn deadline(mut self, at: Option<Instant>, msg: &'static str) -> Self {
+        self.deadline_at = at;
         self.deadline = at.map(|at| Box::pin(tokio::time::sleep_until(at.into())));
         self.deadline_msg = msg;
         self
@@ -94,8 +99,20 @@ impl<B, O: BodyObserver> TrackedBody<B, O> {
 
     /// Like [`Self::deadline`], failing the body with `err()` once `at` has passed.
     pub fn deadline_with(mut self, at: Option<Instant>, err: fn() -> BoxError) -> Self {
+        self.deadline_at = at;
         self.deadline = at.map(|at| Box::pin(tokio::time::sleep_until(at.into())));
-        self.deadline_err = Some(err);
+        self.deadline_err = Some(Box::new(err));
+        self
+    }
+
+    /// Like [`Self::deadline_with`], accepting a closure (e.g. to mark an `RpcDeadlineContext` expired).
+    pub fn deadline_with_cb<F>(mut self, at: Option<Instant>, err: F) -> Self
+    where
+        F: FnMut() -> BoxError + Send + Sync + 'static,
+    {
+        self.deadline_at = at;
+        self.deadline = at.map(|at| Box::pin(tokio::time::sleep_until(at.into())));
+        self.deadline_err = Some(Box::new(err));
         self
     }
 
@@ -128,6 +145,21 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = &mut *self;
+        if let Some(at) = this.deadline_at {
+            let expired = Instant::now() >= at
+                || this
+                    .deadline
+                    .as_mut()
+                    .is_some_and(|d| d.as_mut().poll(cx).is_ready());
+            if expired {
+                this.finish(false);
+                let err = match this.deadline_err.as_mut() {
+                    Some(f) => f(),
+                    None => this.deadline_msg.into(),
+                };
+                return Poll::Ready(Some(Err(err)));
+            }
+        }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 this.observer.on_frame(&frame);
@@ -144,19 +176,7 @@ where
                 this.finish(true);
                 Poll::Ready(None)
             }
-            Poll::Pending => {
-                if let Some(d) = this.deadline.as_mut() {
-                    if d.as_mut().poll(cx).is_ready() {
-                        this.finish(false);
-                        let err = match this.deadline_err {
-                            Some(f) => f(),
-                            None => this.deadline_msg.into(),
-                        };
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                }
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -226,5 +246,60 @@ mod tests {
             c.feed(chunk, |n| msgs.push(n));
         }
         assert_eq!(msgs, vec![8, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn tracked_body_ready_loop_enforces_deadline_and_invokes_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        struct AlwaysReadyBody;
+        impl Body for AlwaysReadyBody {
+            type Data = Bytes;
+            type Error = BoxError;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"chunk")))))
+            }
+        }
+
+        let done_completed = Arc::new(AtomicBool::new(true));
+        let done_flag = Arc::clone(&done_completed);
+        let cb_fired = Arc::new(AtomicBool::new(false));
+        let cb_flag = Arc::clone(&cb_fired);
+
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let mut body = TrackedBody::new(AlwaysReadyBody)
+            .on_done(Box::new(move |completed| {
+                done_flag.store(completed, Ordering::SeqCst);
+            }))
+            .deadline_with_cb(Some(deadline), move || {
+                cb_flag.store(true, Ordering::SeqCst);
+                "deadline exceeded".into()
+            });
+
+        let mut frames = 0usize;
+        let mut err_msg = None;
+        for _ in 0..100 {
+            match std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+                Some(Ok(_)) => {
+                    frames += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Some(Err(e)) => {
+                    err_msg = Some(e.to_string());
+                    break;
+                }
+                None => panic!("AlwaysReadyBody never ends"),
+            }
+        }
+        assert!(frames > 0, "should yield frames before deadline");
+        assert_eq!(err_msg.as_deref(), Some("deadline exceeded"));
+        assert!(cb_fired.load(Ordering::SeqCst));
+        assert!(!done_completed.load(Ordering::SeqCst));
     }
 }

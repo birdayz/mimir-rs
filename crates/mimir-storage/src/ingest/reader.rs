@@ -703,8 +703,8 @@ impl PartitionCommitter {
 
             loop {
                 tokio::select! {
-                    _ = stop_rx.changed() => {
-                        if *stop_rx.borrow() {
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
                             break;
                         }
                     }
@@ -1032,6 +1032,11 @@ impl SingleClusterPartitionReader {
 
     pub fn concurrent_fetchers_min_bytes_max_wait_time(&self) -> Duration {
         self.concurrent_fetchers_min_bytes_max_wait_time
+    }
+
+    #[doc(hidden)]
+    pub fn set_state_for_test(&self, state: ReaderState) {
+        self.state.store(state as u8, Ordering::SeqCst);
     }
 
     pub fn state(&self) -> ReaderState {
@@ -1370,7 +1375,7 @@ impl SingleClusterPartitionReader {
         }
 
         let startup_stop_rx = self.stop_tx.subscribe();
-        let canceled = |rx: &watch::Receiver<bool>| *rx.borrow();
+        let canceled = |rx: &watch::Receiver<bool>| rx.has_changed().is_err() || *rx.borrow();
 
         // getStartOffset(): resolving the start offset is retried with a dskit backoff
         // (min 100ms, max 2s, 10 retries); configuration errors are returned immediately.
@@ -1399,7 +1404,11 @@ impl SingleClusterPartitionReader {
                     }
                 }
                 tokio::select! {
-                    _ = stop_rx.changed() => {}
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            return Err(ReaderError::Canceled);
+                        }
+                    }
                     _ = retry.wait() => {}
                 }
             }
@@ -2343,7 +2352,7 @@ impl MultiClusterPartitionReader {
                 Box::pin(async move { d.consume(recs).await })
                     as Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
             });
-            Some(HeapMerger::start(
+            Some(HeapMerger::new(
                 ordered_cfg,
                 cb,
                 HeapMergerMetrics::new(registry),
@@ -2452,6 +2461,9 @@ impl MultiClusterPartitionReader {
     pub async fn start(&self) -> Result<(), ReaderError> {
         self.state
             .store(ReaderState::Starting as u8, Ordering::SeqCst);
+        if let Some(ref m) = self.merger {
+            m.ensure_started();
+        }
         let mut rxs: Vec<(usize, watch::Receiver<Option<String>>)> = self
             .readers
             .iter()
@@ -2500,8 +2512,8 @@ impl MultiClusterPartitionReader {
 
                 let wait_futs = rxs.iter_mut().map(|(_, rx)| Box::pin(rx.changed()));
                 tokio::select! {
-                    _ = stop_rx.changed() => {
-                        if *stop_rx.borrow() {
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
                             return;
                         }
                     }
@@ -2901,7 +2913,7 @@ mod tests {
                 }
                 let wait_futs = rxs.iter_mut().map(|(_, rx)| Box::pin(rx.changed()));
                 tokio::select! {
-                    _ = stop_rx.changed() => { if *stop_rx.borrow() { return; } }
+                    res = stop_rx.changed() => { if res.is_err() || *stop_rx.borrow() { return; } }
                     _ = futures::future::select_all(wait_futs) => {}
                 }
             }

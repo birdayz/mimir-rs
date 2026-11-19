@@ -782,9 +782,19 @@ fn reencode_single_chunk_filtered(
 /// - Uses `MAX_BYTES_PER_XOR_CHUNK_BEFORE_APPEND` for float chunks and
 ///   `TARGET_BYTES_PER_HISTOGRAM_CHUNK` + `MIN_SAMPLES_PER_HISTOGRAM_CHUNK` for histogram chunks.
 pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta>, ChunkError> {
+    encode_iterable_chunks_with_float_encoding(samples, Encoding::Xor)
+}
+
+/// Like [`encode_iterable_chunks`], respecting `float_encoding` (`Xor` vs `Xor2`) when `st == 0`
+/// (matching Prometheus `NewCompactingChunkSeriesMergerWithFloatEncoding`).
+pub fn encode_iterable_chunks_with_float_encoding(
+    samples: &[DecodedSample],
+    float_encoding: Encoding,
+) -> Result<Vec<ChunkMeta>, ChunkError> {
     if samples.is_empty() {
         return Ok(Vec::new());
     }
+    let prefer_xor2 = float_encoding == Encoding::Xor2;
 
     enum Active {
         None,
@@ -941,7 +951,7 @@ pub fn encode_iterable_chunks(samples: &[DecodedSample]) -> Result<Vec<ChunkMeta
                 if type_mismatch_or_st || size_cut {
                     flush_active(&mut active, &mut out);
                     has_ts = need_ts;
-                    active = if need_ts {
+                    active = if need_ts || prefer_xor2 {
                         Active::Xor2 {
                             mint: s.t,
                             maxt: s.t,
@@ -1279,8 +1289,18 @@ fn chain_sample_merge(streams: Vec<Vec<DecodedSample>>) -> Vec<DecodedSample> {
 /// overlapping chunk clusters, without trimming surviving samples to `[mint, maxt]`
 /// (matching Prometheus `ooo_head_read.go:154-175` & `querier.go:1130-1330` under `DisableTrimming = true`).
 pub fn merge_chunks_with_tombstones(
+    items: Vec<(ChunkMeta, Vec<Interval>)>,
+    allow_non_overlapping_raw: bool,
+) -> Result<Vec<ChunkMeta>, ChunkError> {
+    merge_chunks_with_tombstones_and_float_encoding(items, allow_non_overlapping_raw, Encoding::Xor)
+}
+
+/// Like [`merge_chunks_with_tombstones`], respecting `float_encoding` (`Xor` vs `Xor2`) on
+/// merged float clusters with `st == 0`.
+pub fn merge_chunks_with_tombstones_and_float_encoding(
     mut items: Vec<(ChunkMeta, Vec<Interval>)>,
     allow_non_overlapping_raw: bool,
+    float_encoding: Encoding,
 ) -> Result<Vec<ChunkMeta>, ChunkError> {
     // Drop chunks completely covered by tombstones first so they don't force unnecessary cluster merges.
     items.retain(|(cm, tombs)| {
@@ -1339,7 +1359,10 @@ pub fn merge_chunks_with_tombstones(
         }
         let samples = chain_sample_merge(streams);
         if !samples.is_empty() {
-            out.extend(encode_iterable_chunks(&samples)?);
+            out.extend(encode_iterable_chunks_with_float_encoding(
+                &samples,
+                float_encoding,
+            )?);
         }
         Ok(())
     };
@@ -1364,8 +1387,17 @@ pub fn merge_chunks_with_tombstones(
 /// Applies shared series tombstones and merges only overlapping chunk clusters for Head chunks,
 /// avoiding cloning `tombs` per chunk.
 pub fn merge_head_chunks_with_tombstones(
+    chks: Vec<ChunkMeta>,
+    tombs: &[Interval],
+) -> Result<Vec<ChunkMeta>, ChunkError> {
+    merge_head_chunks_with_tombstones_and_float_encoding(chks, tombs, Encoding::Xor)
+}
+
+/// Like [`merge_head_chunks_with_tombstones`], respecting `float_encoding` (`Xor` vs `Xor2`).
+pub fn merge_head_chunks_with_tombstones_and_float_encoding(
     mut chks: Vec<ChunkMeta>,
     tombs: &[Interval],
+    float_encoding: Encoding,
 ) -> Result<Vec<ChunkMeta>, ChunkError> {
     if !tombs.is_empty() {
         chks.retain(|cm| {
@@ -1419,7 +1451,10 @@ pub fn merge_head_chunks_with_tombstones(
             }
             let samples = chain_sample_merge(streams);
             if !samples.is_empty() {
-                out.extend(encode_iterable_chunks(&samples)?);
+                out.extend(encode_iterable_chunks_with_float_encoding(
+                    &samples,
+                    float_encoding,
+                )?);
             }
             Ok(())
         };

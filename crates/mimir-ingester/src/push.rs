@@ -1027,6 +1027,7 @@ impl Ingester {
             created_timestamp: i64,
             prom_hash: u64,
             labels_sorted_unique: bool,
+            bad_utf8: bool,
             hist_start: u32,
             hist_len: u32,
             ex_start: u32,
@@ -1090,7 +1091,6 @@ impl Ingester {
             let mut min_ts = i64::MAX;
             let mut all_sorted_unique = true;
             let mut all_sorted_have_metric_name = true;
-            let mut bad_utf8 = false;
 
             let ClassicPushScratch {
                 ref mut wr_scratch,
@@ -1108,9 +1108,7 @@ impl Ingester {
                 label_bytes_arena,
                 samples_arena,
                 |series| {
-                    if series.bad_utf8 {
-                        bad_utf8 = true;
-                    } else if !series.labels_sorted_unique {
+                    if series.bad_utf8 || !series.labels_sorted_unique {
                         all_sorted_unique = false;
                     } else if !iter_stringlabels(series.encoded_labels).any(|(k, _)| k == "__name__")
                     {
@@ -1140,12 +1138,17 @@ impl Ingester {
 
                     series_metas.push(ClassicSeriesMeta {
                         label_start: series.label_bytes_range.start as u32,
-                        label_len: series.label_bytes_range.len() as u32,
+                        label_len: if series.bad_utf8 {
+                            0
+                        } else {
+                            series.label_bytes_range.len() as u32
+                        },
                         sample_start: series.samples_range.start as u32,
                         sample_len: series.samples_range.len() as u32,
                         created_timestamp: series.created_timestamp,
                         prom_hash: series.prom_hash,
                         labels_sorted_unique: series.labels_sorted_unique,
+                        bad_utf8: series.bad_utf8,
                         hist_start,
                         hist_len,
                         ex_start,
@@ -1167,12 +1170,6 @@ impl Ingester {
             if meta_count > 0 {
                 self.ingestion_rate.add(meta_count as i64);
             }
-            if bad_utf8 {
-                return Err(IngesterError::BadRequest {
-                    message: "invalid UTF-8 in label".to_string(),
-                }
-                .with_user(user_id, 0));
-            }
 
             let ts_len = series_metas.len();
             if ts_len == 0 {
@@ -1187,8 +1184,11 @@ impl Ingester {
             let mut items: Vec<PrehashedSeriesItem<'_>> = Vec::with_capacity(ts_len);
             for m in series_metas.iter() {
                 let l_start = m.label_start as usize;
-                let encoded_labels =
-                    &label_bytes_arena[l_start..l_start + m.label_len as usize];
+                let encoded_labels = if m.bad_utf8 {
+                    &[][..]
+                } else {
+                    &label_bytes_arena[l_start..l_start + m.label_len as usize]
+                };
                 let s_start = m.sample_start as usize;
                 let samples = &samples_arena[s_start..s_start + m.sample_len as usize];
                 let histograms = if m.hist_len == 0 {
@@ -1209,7 +1209,7 @@ impl Ingester {
                     created_timestamp: m.created_timestamp,
                     prom_hash: m.prom_hash,
                     labels_sorted_unique: m.labels_sorted_unique,
-                    bad_utf8: false,
+                    bad_utf8: m.bad_utf8,
                     histograms,
                     exemplars,
                 });
@@ -1788,16 +1788,6 @@ impl Ingester {
                         prefetch_read_data((next_ptr as *const u8).wrapping_add(64));
                     }
                 }
-                if item.bad_utf8 {
-                    hard_err = Some(
-                        IngesterError::BadRequest {
-                            message: "invalid UTF-8 in label".to_string(),
-                        }
-                        .with_user(user_id, 0),
-                    );
-                    break;
-                }
-
                 let encoded_labels = item.encoded_labels;
                 let samples = item.samples;
                 let hist_count = item.histograms.len();
@@ -1819,6 +1809,24 @@ impl Ingester {
                         first_partial = Some((orig_idx, err, kind));
                     }
                 };
+
+                if item.bad_utf8 {
+                    let total_bad = samples.len() + hist_count;
+                    stats.failed_samples += total_bad;
+                    stats.failed_exemplars += item.exemplars.len();
+                    if total_bad > 0 || !item.exemplars.is_empty() {
+                        record_partial(
+                            IngesterError::Validation {
+                                err_id: mimir_common::errors::SERIES_INVALID_LABEL,
+                                message: mimir_common::errors::SERIES_INVALID_LABEL
+                                    .message("received a series with invalid UTF-8 in label"),
+                                series: String::new(),
+                            },
+                            None,
+                        );
+                    }
+                    continue;
+                }
 
                 if ooo_window_ms <= 0 && min_append_time_available && item.exemplars.is_empty() {
                     let all_samples_oob = samples.iter().all(|s| s.timestamp_ms < min_append_time);
@@ -2230,12 +2238,13 @@ impl Ingester {
                                     out_of_order_exemplars += 1;
                                     if out_of_order_exemplars == ex_count && !ignore_ooo_exemplars {
                                         let s_str = make_series_str(encoded_labels);
+                                        let sorted_ex_str = format_labels_string(ex_labels.iter());
                                         record_partial(
                                             IngesterError::TsdbIngestExemplar {
                                                 original_err: "out of order exemplar".to_string(),
                                                 timestamp_ms: ex_ts,
                                                 series_labels: s_str,
-                                                exemplar_labels: ex_str.clone(),
+                                                exemplar_labels: sorted_ex_str,
                                             },
                                             None,
                                         );
@@ -2244,12 +2253,13 @@ impl Ingester {
                                 Err(HeadError::Exemplar(ex_err)) => {
                                     stats.failed_exemplars += 1;
                                     let s_str = make_series_str(encoded_labels);
+                                    let sorted_ex_str = format_labels_string(ex_labels.iter());
                                     record_partial(
                                         IngesterError::TsdbIngestExemplar {
                                             original_err: ex_err.to_string(),
                                             timestamp_ms: ex_ts,
                                             series_labels: s_str,
-                                            exemplar_labels: ex_str.clone(),
+                                            exemplar_labels: sorted_ex_str,
                                         },
                                         None,
                                     );
@@ -2257,12 +2267,13 @@ impl Ingester {
                                 Err(e) => {
                                     stats.failed_exemplars += 1;
                                     let s_str = make_series_str(encoded_labels);
+                                    let sorted_ex_str = format_labels_string(ex_labels.iter());
                                     record_partial(
                                         IngesterError::TsdbIngestExemplar {
                                             original_err: e.to_string(),
                                             timestamp_ms: ex_ts,
                                             series_labels: s_str,
-                                            exemplar_labels: ex_str.clone(),
+                                            exemplar_labels: sorted_ex_str,
                                         },
                                         None,
                                     );
@@ -2289,12 +2300,11 @@ impl Ingester {
             .appender_add_duration
             .observe(add_timer.elapsed().as_secs_f64());
 
-        let mut prepared: SmallVec<[Mutex<Option<PreparedShard<'_>>>; 8]> =
-            SmallVec::with_capacity(active_shards.len());
+        let mut prepared: Vec<PreparedShard<'_>> = Vec::with_capacity(active_shards.len());
         let mut first_hard_err: Option<IngesterError> = None;
         for slot in shard_slots {
             match slot.into_inner() {
-                Some(Ok(ps)) => prepared.push(Mutex::new(Some(ps))),
+                Some(Ok(ps)) => prepared.push(ps),
                 Some(Err(e)) => {
                     if first_hard_err.is_none() {
                         first_hard_err = Some(e);
@@ -2313,10 +2323,8 @@ impl Ingester {
             }
         }
         if let Some(err) = first_hard_err {
-            for slot in prepared {
-                if let Some(ps) = slot.into_inner() {
-                    rollback_appender(user_id, ps.app);
-                }
+            for ps in prepared {
+                rollback_appender(user_id, ps.app);
             }
             drop(lock_guard);
             return Err(err);
@@ -2324,57 +2332,46 @@ impl Ingester {
 
         let mut stats = PushStats::default();
         let mut best_partial: Option<(usize, IngesterError, Option<SampleKind>)> = None;
-        for slot in &prepared {
-            let mut g = slot.lock();
-            if let Some(ps) = g.as_mut() {
-                stats.succeeded_samples += ps.stats.succeeded_samples;
-                stats.failed_samples += ps.stats.failed_samples;
-                stats.succeeded_exemplars += ps.stats.succeeded_exemplars;
-                stats.failed_exemplars += ps.stats.failed_exemplars;
-                stats.sample_timestamp_too_old += ps.stats.sample_timestamp_too_old;
-                stats.sample_out_of_order += ps.stats.sample_out_of_order;
-                stats.sample_too_old += ps.stats.sample_too_old;
-                stats.sample_too_far_in_future += ps.stats.sample_too_far_in_future;
-                stats.new_value_for_timestamp += ps.stats.new_value_for_timestamp;
-                stats.per_user_series_limit += ps.stats.per_user_series_limit;
-                stats.per_metric_series_limit += ps.stats.per_metric_series_limit;
-                stats.invalid_native_histogram += ps.stats.invalid_native_histogram;
-                stats.labels_not_sorted += ps.stats.labels_not_sorted;
-                stats.series_with_floats_and_histograms +=
-                    ps.stats.series_with_floats_and_histograms;
-                if let Some((orig_idx, err, kind)) = ps.first_partial.take() {
-                    if best_partial
-                        .as_ref()
-                        .is_none_or(|(best_idx, _, _)| orig_idx < *best_idx)
-                    {
-                        best_partial = Some((orig_idx, err, kind));
-                    }
+        let mut apps: Vec<HeadAppender<'_>> = Vec::with_capacity(prepared.len());
+        for mut ps in prepared {
+            stats.succeeded_samples += ps.stats.succeeded_samples;
+            stats.failed_samples += ps.stats.failed_samples;
+            stats.succeeded_exemplars += ps.stats.succeeded_exemplars;
+            stats.failed_exemplars += ps.stats.failed_exemplars;
+            stats.sample_timestamp_too_old += ps.stats.sample_timestamp_too_old;
+            stats.sample_out_of_order += ps.stats.sample_out_of_order;
+            stats.sample_too_old += ps.stats.sample_too_old;
+            stats.sample_too_far_in_future += ps.stats.sample_too_far_in_future;
+            stats.new_value_for_timestamp += ps.stats.new_value_for_timestamp;
+            stats.per_user_series_limit += ps.stats.per_user_series_limit;
+            stats.per_metric_series_limit += ps.stats.per_metric_series_limit;
+            stats.invalid_native_histogram += ps.stats.invalid_native_histogram;
+            stats.labels_not_sorted += ps.stats.labels_not_sorted;
+            stats.series_with_floats_and_histograms +=
+                ps.stats.series_with_floats_and_histograms;
+            if let Some((orig_idx, err, kind)) = ps.first_partial.take() {
+                if best_partial
+                    .as_ref()
+                    .is_none_or(|(best_idx, _, _)| orig_idx < *best_idx)
+                {
+                    best_partial = Some((orig_idx, err, kind));
                 }
             }
+            apps.push(ps.app);
         }
 
         let commit_timer = Instant::now();
-        let commit_errs: SmallVec<[Mutex<Option<String>>; 8]> =
-            (0..prepared.len()).map(|_| Mutex::new(None)).collect();
-        pool.scoped_execute(prepared.len(), |s_idx| {
-            if let Some(ps) = prepared[s_idx].lock().take() {
-                if let Err(e) = ps.app.commit() {
-                    *commit_errs[s_idx].lock() = Some(e.to_string());
-                }
-            }
-        });
+        let commit_res = HeadAppender::commit_batch(apps);
         drop(lock_guard);
         self.metrics
             .appender_commit_duration
             .observe(commit_timer.elapsed().as_secs_f64());
 
-        for err_slot in commit_errs {
-            if let Some(e) = err_slot.into_inner() {
-                return Err(IngesterError::Internal {
-                    message: format!("failed to commit TSDB appender: {e}"),
-                }
-                .with_user(user_id, stats.failed_samples as i64));
+        if let Err(e) = commit_res {
+            return Err(IngesterError::Internal {
+                message: format!("failed to commit TSDB appender: {e}"),
             }
+            .with_user(user_id, stats.failed_samples as i64));
         }
 
         if stats.succeeded_samples > 0 {
@@ -2532,15 +2529,6 @@ impl Ingester {
                     prefetch_read_data((next_ptr as *const u8).wrapping_add(64));
                 }
             }
-            if item.bad_utf8 {
-                rollback_appender(user_id, app);
-                drop(lock_guard);
-                return Err(IngesterError::BadRequest {
-                    message: "invalid UTF-8 in label".to_string(),
-                }
-                .with_user(user_id, 0));
-            }
-
             let encoded_labels = item.encoded_labels;
             let samples = item.samples;
             let hist_count = item.histograms.len();
@@ -2562,6 +2550,24 @@ impl Ingester {
                     first_partial = Some((err, kind));
                 }
             };
+
+            if item.bad_utf8 {
+                let total_bad = samples.len() + hist_count;
+                stats.failed_samples += total_bad;
+                stats.failed_exemplars += item.exemplars.len();
+                if total_bad > 0 || !item.exemplars.is_empty() {
+                    record_partial(
+                        IngesterError::Validation {
+                            err_id: mimir_common::errors::SERIES_INVALID_LABEL,
+                            message: mimir_common::errors::SERIES_INVALID_LABEL
+                                .message("received a series with invalid UTF-8 in label"),
+                            series: String::new(),
+                        },
+                        None,
+                    );
+                }
+                continue;
+            }
 
             if ooo_window_ms <= 0 && min_append_time_available && item.exemplars.is_empty() {
                 let all_samples_oob = samples.iter().all(|s| s.timestamp_ms < min_append_time);
@@ -2973,12 +2979,13 @@ impl Ingester {
                                 out_of_order_exemplars += 1;
                                 if out_of_order_exemplars == ex_count && !ignore_ooo_exemplars {
                                     let s_str = make_series_str(encoded_labels);
+                                    let sorted_ex_str = format_labels_string(ex_labels.iter());
                                     record_partial(
                                         IngesterError::TsdbIngestExemplar {
                                             original_err: "out of order exemplar".to_string(),
                                             timestamp_ms: ex_ts,
                                             series_labels: s_str,
-                                            exemplar_labels: ex_str.clone(),
+                                            exemplar_labels: sorted_ex_str,
                                         },
                                         None,
                                     );
@@ -2987,12 +2994,13 @@ impl Ingester {
                             Err(HeadError::Exemplar(ex_err)) => {
                                 stats.failed_exemplars += 1;
                                 let s_str = make_series_str(encoded_labels);
+                                let sorted_ex_str = format_labels_string(ex_labels.iter());
                                 record_partial(
                                     IngesterError::TsdbIngestExemplar {
                                         original_err: ex_err.to_string(),
                                         timestamp_ms: ex_ts,
                                         series_labels: s_str,
-                                        exemplar_labels: ex_str.clone(),
+                                        exemplar_labels: sorted_ex_str,
                                     },
                                     None,
                                 );
@@ -3000,12 +3008,13 @@ impl Ingester {
                             Err(e) => {
                                 stats.failed_exemplars += 1;
                                 let s_str = make_series_str(encoded_labels);
+                                let sorted_ex_str = format_labels_string(ex_labels.iter());
                                 record_partial(
                                     IngesterError::TsdbIngestExemplar {
                                         original_err: e.to_string(),
                                         timestamp_ms: ex_ts,
                                         series_labels: s_str,
-                                        exemplar_labels: ex_str.clone(),
+                                        exemplar_labels: sorted_ex_str,
                                     },
                                     None,
                                 );
@@ -3154,9 +3163,23 @@ impl Ingester {
                 stats.series_with_floats_and_histograms += 1;
             }
 
-            if let Err(e) = ts.fill_pairs(pairs) {
-                rollback_appender(user_id, app);
-                return Err(e.with_user(user_id, 0));
+            if let Err(_e) = ts.fill_pairs(pairs) {
+                let total_bad = samples.len() + hist_count;
+                stats.failed_samples += total_bad;
+                stats.failed_exemplars += ts.exemplar_count();
+                if total_bad > 0 || ts.exemplar_count() > 0 {
+                    record_partial(
+                        IngesterError::Validation {
+                            err_id: mimir_common::errors::SERIES_INVALID_LABEL,
+                            message: mimir_common::errors::SERIES_INVALID_LABEL
+                                .message("received a series with invalid UTF-8 in label"),
+                            series: String::new(),
+                        },
+                        None,
+                    );
+                }
+                pairs.clear();
+                continue;
             }
             if first_series {
                 first_series = false;
@@ -3564,7 +3587,7 @@ impl Ingester {
                             );
                             continue;
                         }
-                        let exemplar = Exemplar::new(ex_labels, ex_val, ex_ts);
+                        let exemplar = Exemplar::new(ex_labels.clone(), ex_val, ex_ts);
                         match app.append_exemplar(series_ref, pairs, exemplar) {
                             Ok(_) => stats.succeeded_exemplars += 1,
                             Err(HeadError::Exemplar(ExemplarError::OutOfOrderExemplar)) => {
@@ -3572,12 +3595,13 @@ impl Ingester {
                                 out_of_order_exemplars += 1;
                                 if out_of_order_exemplars == ex_count && !ignore_ooo_exemplars {
                                     let s_str = make_series_str(pairs);
+                                    let sorted_ex_str = format_labels_string(ex_labels.iter());
                                     record_partial(
                                         IngesterError::TsdbIngestExemplar {
                                             original_err: "out of order exemplar".to_string(),
                                             timestamp_ms: ex_ts,
                                             series_labels: s_str,
-                                            exemplar_labels: ex_str,
+                                            exemplar_labels: sorted_ex_str,
                                         },
                                         None,
                                     );
@@ -3586,12 +3610,13 @@ impl Ingester {
                             Err(HeadError::Exemplar(ex_err)) => {
                                 stats.failed_exemplars += 1;
                                 let s_str = make_series_str(pairs);
+                                let sorted_ex_str = format_labels_string(ex_labels.iter());
                                 record_partial(
                                     IngesterError::TsdbIngestExemplar {
                                         original_err: ex_err.to_string(),
                                         timestamp_ms: ex_ts,
                                         series_labels: s_str,
-                                        exemplar_labels: ex_str,
+                                        exemplar_labels: sorted_ex_str,
                                     },
                                     None,
                                 );
@@ -3599,12 +3624,13 @@ impl Ingester {
                             Err(e) => {
                                 stats.failed_exemplars += 1;
                                 let s_str = make_series_str(pairs);
+                                let sorted_ex_str = format_labels_string(ex_labels.iter());
                                 record_partial(
                                     IngesterError::TsdbIngestExemplar {
                                         original_err: e.to_string(),
                                         timestamp_ms: ex_ts,
                                         series_labels: s_str,
-                                        exemplar_labels: ex_str,
+                                        exemplar_labels: sorted_ex_str,
                                     },
                                     None,
                                 );

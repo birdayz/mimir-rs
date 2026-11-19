@@ -335,9 +335,9 @@ impl GCSConfig {
     ///
     /// Rejects `http.*` settings object_store 0.11 cannot honour and `service_account` JSON
     /// credential types mimir-rs cannot use (Go `google.CredentialsFromJSON` also accepts
-    /// `external_account`, `external_account_authorized_user`, `impersonated_service_account`,
-    /// `gdch_service_account` and OAuth client JSON). Malformed JSON is left to bucket client
-    /// construction, which fails like Go.
+    /// `external_account_authorized_user`, `gdch_service_account` and OAuth client JSON).
+    /// `external_account` and `impersonated_service_account` are supported by mimir-rs.
+    /// Malformed JSON is left to bucket client construction, which fails like Go.
     pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
         validate_bucket_http_mimir_rs_support(&self.http, "gcs")?;
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&self.service_account) {
@@ -346,10 +346,7 @@ impl GCSConfig {
             } else {
                 match v.get("type").and_then(|t| t.as_str()) {
                     Some(
-                        t @ ("external_account"
-                        | "external_account_authorized_user"
-                        | "impersonated_service_account"
-                        | "gdch_service_account"),
+                        t @ ("external_account_authorized_user" | "gdch_service_account"),
                     ) => Some(format!("{t:?}")),
                     _ => None,
                 }
@@ -2238,5 +2235,44 @@ impl IngestStorageConfig {
         }
         self.kafka.validate()?;
         self.ordered_consumption.validate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gcs_config_accepts_external_account_and_impersonated_service_account() {
+        for kind in [
+            "service_account",
+            "authorized_user",
+            "external_account",
+            "impersonated_service_account",
+        ] {
+            let cfg = GCSConfig {
+                bucket_name: "bkt".to_string(),
+                service_account: format!(r#"{{"type":"{kind}"}}"#),
+                ..Default::default()
+            };
+            cfg.validate_mimir_rs_support()
+                .unwrap_or_else(|e| panic!("expected {kind} to be accepted, got {e}"));
+        }
+
+        for unsupported in ["external_account_authorized_user", "gdch_service_account"] {
+            let cfg = GCSConfig {
+                bucket_name: "bkt".to_string(),
+                service_account: format!(r#"{{"type":"{unsupported}"}}"#),
+                ..Default::default()
+            };
+            let err = cfg
+                .validate_mimir_rs_support()
+                .expect_err("expected unsupported credential type to be rejected")
+                .to_string();
+            assert!(
+                err.contains(&format!("{unsupported:?} is not supported by mimir-rs")),
+                "unexpected error for {unsupported}: {err}"
+            );
+        }
     }
 }

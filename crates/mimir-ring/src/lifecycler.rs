@@ -1468,10 +1468,13 @@ impl Lifecycler {
         let token_generator = self.token_generator.clone();
         let last_desc = Arc::new(Mutex::new(None));
         let last_desc_cb = last_desc.clone();
-        let picked_state = Arc::new(Mutex::new(self.get_state()));
+        let init_state = self.get_state();
+        let init_reg = self.state.read().registered_at;
+        let init_ro = self.get_read_only_state();
+        let picked_state = Arc::new(Mutex::new(init_state));
         let picked_tokens: Arc<Mutex<Option<Vec<u32>>>> = Arc::new(Mutex::new(None));
-        let picked_reg = Arc::new(Mutex::new(self.state.read().registered_at));
-        let picked_ro = Arc::new(Mutex::new(self.get_read_only_state()));
+        let picked_reg = Arc::new(Mutex::new(init_reg));
+        let picked_ro = Arc::new(Mutex::new(init_ro));
 
         let ps_cb = picked_state.clone();
         let pt_cb = picked_tokens.clone();
@@ -1482,6 +1485,13 @@ impl Lifecycler {
             .cas(
                 &self.ring_key,
                 Box::new(move |cur| {
+                    // Reset CAS outputs at the start of every retry attempt so a failed
+                    // attempt's picked state/tokens never leak into the winning attempt.
+                    *ps_cb.lock() = init_state;
+                    *pt_cb.lock() = None;
+                    *pr_cb.lock() = init_reg;
+                    *pro_cb.lock() = init_ro;
+
                     let mut ring_desc = cur
                         .and_then(|a| a.downcast_ref::<Desc>())
                         .cloned()
@@ -1786,6 +1796,8 @@ impl Lifecycler {
         let tokens_fallback = self.get_tokens();
         let (ro, ro_ts) = self.get_read_only_state();
         let registered_at = self.state.read().registered_at;
+        let picked_reg = Arc::new(Mutex::new(registered_at));
+        let picked_reg_cb = picked_reg.clone();
         let updated_desc = Arc::new(Mutex::new(None));
         let updated_desc_cb = updated_desc.clone();
 
@@ -1798,9 +1810,12 @@ impl Lifecycler {
                         .cloned()
                         .unwrap_or_default();
                     let (toks, reg) = if let Some(ex) = desc.ingesters.get(&id) {
+                        *picked_reg_cb.lock() = registered_at;
                         (ex.tokens.clone(), registered_at)
                     } else {
-                        (tokens_fallback.clone(), Some(SystemTime::now()))
+                        let now = Some(SystemTime::now());
+                        *picked_reg_cb.lock() = now;
+                        (tokens_fallback.clone(), now)
                     };
                     desc.add_ingester(
                         &id,
@@ -1819,6 +1834,7 @@ impl Lifecycler {
             )
             .await?;
 
+        self.state.write().registered_at = *picked_reg.lock();
         if let Some(d) = updated_desc.lock().take() {
             self.update_counters(&d);
         }

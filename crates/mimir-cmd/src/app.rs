@@ -786,36 +786,40 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let max_recv = cfg.server.grpc_server_max_recv_msg_size.max(0) as usize;
     let max_send = cfg.server.grpc_server_max_send_msg_size.max(0) as usize;
 
-    let http_grpc_svc = GrpcCompressionEchoService::new(HttpGrpcStatusFixService::new(
-        SnappyDecompressService::new(
+    let http_grpc_svc = GrpcCompressionEchoService::new_with_limits(
+        HttpGrpcStatusFixService::new(SnappyDecompressService::new(
             HttpServer::new(HttpGrpcBridge::new(http_router.clone()))
-                .max_decoding_message_size(max_recv)
-                .max_encoding_message_size(max_send)
-                .accept_compressed(CompressionEncoding::Gzip)
-                .accept_compressed(CompressionEncoding::Zstd),
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX),
+            max_recv,
+        )),
+        max_recv,
+        max_send,
+    );
+
+    let health_svc = GrpcCompressionEchoService::new_with_limits(
+        SnappyDecompressService::new(
+            HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules))
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX),
             max_recv,
         ),
-    ));
-
-    let health_svc = GrpcCompressionEchoService::new(SnappyDecompressService::new(
-        HealthService::new(Arc::clone(&shutdown_requested), Arc::clone(&modules))
-            .max_decoding_message_size(max_recv)
-            .max_encoding_message_size(max_send)
-            .accept_compressed(CompressionEncoding::Gzip)
-            .accept_compressed(CompressionEncoding::Zstd),
         max_recv,
-    ));
+        max_send,
+    );
 
     let mut grpc_routes = tonic::service::Routes::new(health_svc).add_service(http_grpc_svc);
 
     if let Some(ref ing) = ingester_opt {
-        let ing_svc = GrpcCompressionEchoService::new(
+        let ing_svc = GrpcCompressionEchoService::new_with_limits(
             IngesterService::new(Arc::clone(ing))
                 .into_server()
                 .max_decoding_message_size(max_recv)
-                .max_encoding_message_size(max_send)
+                .max_encoding_message_size(usize::MAX)
                 .accept_compressed(CompressionEncoding::Gzip)
                 .accept_compressed(CompressionEncoding::Zstd),
+            max_recv,
+            max_send,
         );
         grpc_routes = grpc_routes.add_service(ing_svc);
     }

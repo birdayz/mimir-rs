@@ -280,6 +280,13 @@ impl Ingester {
         if blocks_cfg.bucket.backend_cfg.backend == "filesystem" {
             warn!("-blocks-storage.backend=filesystem is for development and testing only; you should switch to an external object store for production use or use a shared filesystem");
         }
+        if blocks_cfg.tsdb.offset_catalogue.enabled && !ingest_cfg.enabled {
+            return Err(IngesterError::Internal {
+                message: "kafka offset catalogue can only be enabled when ingest storage is enabled"
+                    .to_string(),
+            });
+        }
+
         let bucket = match BucketClient::new_client(&blocks_cfg.bucket, "ingester", registry) {
             Ok(b) => Some(Arc::new(b)),
             Err(e) => {
@@ -1245,21 +1252,35 @@ impl Ingester {
         for (_, db) in &snapshot {
             db.wait_in_flight_appends().await;
         }
-        for (k, _) in snapshot {
-            let removed = {
-                let _g = self.tsdb_create_mtx.lock();
-                self.tsdbs
-                    .remove_if(&k, |_, v| v.state() != crate::user_tsdb::TsdbState::Closed)
-            };
-            if let Some((_, db)) = removed {
-                let tracker_names = db.active_series.current_matcher_names();
-                if let Err(e) = db.close() {
+        let mut join_set = tokio::task::JoinSet::new();
+        for (k, db) in snapshot {
+            let db_close = Arc::clone(&db);
+            join_set.spawn_blocking(move || {
+                let res = db_close.close();
+                (k, db_close, res)
+            });
+        }
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((k, db, Ok(()))) => {
+                    let removed = {
+                        let _g = self.tsdb_create_mtx.lock();
+                        self.tsdbs.remove_if(&k, |_, v| Arc::ptr_eq(v, &db))
+                    };
+                    if removed.is_some() {
+                        let tracker_names = db.active_series.current_matcher_names();
+                        self.metrics.mem_users.dec();
+                        self.tsdb_metrics.remove_registry_for_tenant(&k);
+                        self.metrics
+                            .delete_per_user_custom_tracker_metrics(&k, &tracker_names);
+                    }
+                }
+                Ok((k, _, Err(e))) => {
                     warn!(user = %k, error = %e, "unable to close TSDB");
                 }
-                self.metrics.mem_users.dec();
-                self.tsdb_metrics.remove_registry_for_tenant(&k);
-                self.metrics
-                    .delete_per_user_custom_tracker_metrics(&k, &tracker_names);
+                Err(e) => {
+                    warn!(error = %e, "TSDB close task failed");
+                }
             }
         }
         if matches!(self.state(), State::New | State::Running) {

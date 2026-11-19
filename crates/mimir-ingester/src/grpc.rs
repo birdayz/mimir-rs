@@ -39,7 +39,9 @@ impl IngesterService {
     pub fn into_server(self) -> IngesterZeroCopyServer {
         let ingester = Arc::clone(&self.ingester);
         IngesterZeroCopyServer {
-            inner: ingesterpb::ingester_server::IngesterServer::new(self),
+            inner: ingesterpb::ingester_server::IngesterServer::new(self)
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX),
             ingester,
             accept_compression: [None; 4],
             accept_compression_len: 0,
@@ -207,13 +209,15 @@ impl IngesterZeroCopyServer {
 
     pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
         self.max_decoding_message_size = Some(limit);
-        self.inner = self.inner.max_decoding_message_size(limit);
+        // Keep Tonic's internal limit unbounded so pre-Tonic / post-compression enforcement emits
+        // grpc-go's `Code::ResourceExhausted` instead of Tonic's `Code::OutOfRange`.
+        self.inner = self.inner.max_decoding_message_size(usize::MAX);
         self
     }
 
     pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
         self.max_encoding_message_size = Some(limit);
-        self.inner = self.inner.max_encoding_message_size(limit);
+        self.inner = self.inner.max_encoding_message_size(usize::MAX);
         self
     }
 }
@@ -222,12 +226,165 @@ impl tonic::server::NamedService for IngesterZeroCopyServer {
     const NAME: &'static str = "cortex.Ingester";
 }
 
+/// Per-RPC deadline context attached by `grpc_server.rs` into `Request::extensions()`
+/// and propagated via `RPC_DEADLINE_CONTEXT` so circuit-breaker/reactive-limiter drop guards
+/// and `enforce_read_consistency` can distinguish `grpc-timeout` expiration from client
+/// cancellation (`RST_STREAM`).
+#[derive(Debug)]
+pub struct RpcDeadlineContext {
+    pub deadline: Option<std::time::Instant>,
+    pub expired: AtomicBool,
+}
+
+impl RpcDeadlineContext {
+    pub fn new(deadline: Option<std::time::Instant>) -> Arc<Self> {
+        Arc::new(Self {
+            deadline,
+            expired: AtomicBool::new(false),
+        })
+    }
+
+    #[inline]
+    pub fn mark_expired(&self) {
+        self.expired.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn remaining(&self) -> Option<std::time::Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    #[inline]
+    pub fn has_timed_out(&self) -> bool {
+        self.is_expired()
+            || self
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
+    }
+}
+
+tokio::task_local! {
+    pub static RPC_DEADLINE_CONTEXT: Arc<RpcDeadlineContext>;
+}
+
+/// Returns the current task's `RpcDeadlineContext`, if any.
+pub fn current_rpc_deadline_context() -> Option<Arc<RpcDeadlineContext>> {
+    RPC_DEADLINE_CONTEXT.try_with(Arc::clone).ok()
+}
+
+/// Intersects `configured_timeout` with any remaining `grpc-timeout` deadline on the current RPC.
+pub fn effective_read_consistency_timeout(
+    configured_timeout: std::time::Duration,
+) -> std::time::Duration {
+    match current_rpc_deadline_context().and_then(|ctx| ctx.remaining()) {
+        Some(rem) if configured_timeout.is_zero() => rem,
+        Some(rem) => configured_timeout.min(rem),
+        None => configured_timeout,
+    }
+}
+
+async fn scope_deadline_ctx<F, T>(ctx: Option<Arc<RpcDeadlineContext>>, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    match ctx {
+        Some(c) => RPC_DEADLINE_CONTEXT.scope(c, fut).await,
+        None => fut.await,
+    }
+}
+
 #[derive(Clone)]
 struct TapDeadlineFlag(Arc<AtomicBool>);
+
+struct PushTapGuard {
+    tap: Option<crate::push::PushTapPermit>,
+    deadline_ctx: Option<Arc<RpcDeadlineContext>>,
+}
+
+impl PushTapGuard {
+    fn finish(&mut self, err: Option<&IngesterError>) {
+        if let Some(tap) = self.tap.take() {
+            tap.finish(err);
+        }
+    }
+}
+
+impl Drop for PushTapGuard {
+    fn drop(&mut self) {
+        if let Some(mut tap) = self.tap.take() {
+            let timed_out = self
+                .deadline_ctx
+                .as_ref()
+                .is_some_and(|c| c.is_expired());
+            if timed_out && !tap.finished {
+                tap.finished = true;
+                let dur = tap.started_at.elapsed();
+                tap.ingester
+                    .inflight_push_requests
+                    .fetch_sub(1, Ordering::AcqRel);
+                if tap.req_size > 0 {
+                    tap.ingester
+                        .inflight_push_requests_bytes
+                        .fetch_sub(tap.req_size, Ordering::AcqRel);
+                }
+                if let Some(bp) = tap.breaker_permit.take() {
+                    bp.finish_with_err(
+                        dur,
+                        Some(&crate::circuit_breaker::BreakerError::DeadlineExceeded),
+                    );
+                }
+                if let Some(rp) = tap.reactive_permit.take() {
+                    rp.record();
+                }
+            }
+        }
+    }
+}
+
+struct ReadTapGuard {
+    tap: Option<ReadTapPermit>,
+    deadline_ctx: Option<Arc<RpcDeadlineContext>>,
+}
+
+impl ReadTapGuard {
+    fn finish(&mut self, canceled: bool) {
+        if let Some(tap) = self.tap.take() {
+            tap.finish(canceled);
+        }
+    }
+
+    fn take_for_body(&mut self) -> Option<ReadTapPermit> {
+        self.tap.take()
+    }
+}
+
+impl Drop for ReadTapGuard {
+    fn drop(&mut self) {
+        if let Some(tap) = self.tap.take() {
+            let timed_out = self
+                .deadline_ctx
+                .as_ref()
+                .is_some_and(|c| c.is_expired());
+            if timed_out {
+                tap.deadline_exceeded_flag().store(true, Ordering::Release);
+                tap.finish(false);
+            } else {
+                tap.finish(true);
+            }
+        }
+    }
+}
 
 struct ReadTapDropBody {
     inner: tonic::body::BoxBody,
     permit: Option<ReadTapPermit>,
+    deadline_ctx: Option<Arc<RpcDeadlineContext>>,
 }
 
 impl hyper::body::Body for ReadTapDropBody {
@@ -280,7 +437,16 @@ impl hyper::body::Body for ReadTapDropBody {
 impl Drop for ReadTapDropBody {
     fn drop(&mut self) {
         if let Some(permit) = self.permit.take() {
-            permit.finish(true);
+            let timed_out = self
+                .deadline_ctx
+                .as_ref()
+                .is_some_and(|c| c.is_expired());
+            if timed_out {
+                permit.deadline_exceeded_flag().store(true, Ordering::Release);
+                permit.finish(false);
+            } else {
+                permit.finish(true);
+            }
         }
     }
 }
@@ -337,24 +503,258 @@ impl hyper::body::Body for SingleChunkBody {
     }
 }
 
-struct SnappyCompressBody {
+#[derive(Clone, Copy)]
+enum FrameInspectState {
+    Header { buf: [u8; 5], pos: usize },
+    Payload { remaining: usize },
+}
+
+impl Default for FrameInspectState {
+    fn default() -> Self {
+        Self::Header {
+            buf: [0; 5],
+            pos: 0,
+        }
+    }
+}
+
+struct MaxRecvFrameBody {
     inner: tonic::body::BoxBody,
+    max_recv: usize,
+    state: FrameInspectState,
+}
+
+impl MaxRecvFrameBody {
+    fn new(inner: tonic::body::BoxBody, max_recv: usize) -> Self {
+        Self {
+            inner,
+            max_recv,
+            state: FrameInspectState::default(),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn check_slice(&mut self, mut data: &[u8]) -> Result<(), Status> {
+        while !data.is_empty() {
+            match &mut self.state {
+                FrameInspectState::Header { buf, pos } => {
+                    let take = (5 - *pos).min(data.len());
+                    buf[*pos..*pos + take].copy_from_slice(&data[..take]);
+                    *pos += take;
+                    data = &data[take..];
+                    if *pos == 5 {
+                        let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                        if len > self.max_recv {
+                            return Err(Status::resource_exhausted(format!(
+                                "grpc: received message larger than max ({len} vs. {})",
+                                self.max_recv
+                            )));
+                        }
+                        self.state = if len == 0 {
+                            FrameInspectState::default()
+                        } else {
+                            FrameInspectState::Payload { remaining: len }
+                        };
+                    }
+                }
+                FrameInspectState::Payload { remaining } => {
+                    let skip = (*remaining).min(data.len());
+                    *remaining -= skip;
+                    data = &data[skip..];
+                    if *remaining == 0 {
+                        self.state = FrameInspectState::default();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl hyper::body::Body for MaxRecvFrameBody {
+    type Data = Bytes;
+    type Error = Status;
+
+    #[allow(clippy::result_large_err)]
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    if let Err(status) = self.check_slice(data) {
+                        return Poll::Ready(Some(Err(status)));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn status_to_trailers(status: Status) -> http::HeaderMap {
+    let mut headers = status.into_http().into_parts().0.headers;
+    headers.remove(http::header::CONTENT_TYPE);
+    headers
+}
+
+struct MaxSendFrameBody {
+    inner: tonic::body::BoxBody,
+    max_send: usize,
     in_buf: BytesMut,
     pending_trailers: Option<http::HeaderMap>,
     done: bool,
 }
 
-impl SnappyCompressBody {
-    fn new(inner: tonic::body::BoxBody) -> Self {
+impl MaxSendFrameBody {
+    fn new(inner: tonic::body::BoxBody, max_send: usize) -> Self {
         Self {
             inner,
+            max_send,
             in_buf: BytesMut::new(),
             pending_trailers: None,
             done: false,
         }
     }
 
-    fn drain_complete_frames(&mut self) -> Option<Bytes> {
+    #[allow(clippy::result_large_err)]
+    fn drain_checked(&mut self) -> Result<Option<Bytes>, Status> {
+        let mut out = BytesMut::new();
+        while self.in_buf.len() >= 5 {
+            let len = u32::from_be_bytes([
+                self.in_buf[1],
+                self.in_buf[2],
+                self.in_buf[3],
+                self.in_buf[4],
+            ]) as usize;
+            let Some(frame_end) = 5usize.checked_add(len) else {
+                break;
+            };
+            if self.in_buf.len() < frame_end {
+                break;
+            }
+            if len > self.max_send {
+                self.in_buf.clear();
+                return Err(Status::resource_exhausted(format!(
+                    "trying to send message larger than max ({len} vs. {})",
+                    self.max_send
+                )));
+            }
+            out.extend_from_slice(&self.in_buf[..frame_end]);
+            self.in_buf.advance(frame_end);
+        }
+        if out.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(out.freeze()))
+        }
+    }
+}
+
+impl hyper::body::Body for MaxSendFrameBody {
+    type Data = Bytes;
+    type Error = Status;
+
+    #[allow(clippy::result_large_err)]
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(trailers) = self.pending_trailers.take() {
+            self.done = true;
+            return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+        }
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match self.drain_checked() {
+                Ok(Some(chunk)) => return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk)))),
+                Ok(None) => {}
+                Err(status) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(
+                        status_to_trailers(status),
+                    ))));
+                }
+            }
+            match Pin::new(&mut self.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.done = true;
+                    if !self.in_buf.is_empty() {
+                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                            self.in_buf.split().freeze(),
+                        ))));
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => {
+                        if !data.is_empty() {
+                            self.in_buf.extend_from_slice(&data);
+                        }
+                    }
+                    Err(other) => {
+                        if let Ok(trailers) = other.into_trailers() {
+                            if !self.in_buf.is_empty() {
+                                self.pending_trailers = Some(trailers);
+                                return Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                                    self.in_buf.split().freeze(),
+                                ))));
+                            }
+                            self.done = true;
+                            return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+}
+
+struct SnappyCompressBody {
+    inner: tonic::body::BoxBody,
+    encoding: CustomGrpcEncoding,
+    max_send: usize,
+    in_buf: BytesMut,
+    pending_trailers: Option<http::HeaderMap>,
+    done: bool,
+}
+
+impl SnappyCompressBody {
+    fn new(inner: tonic::body::BoxBody, encoding: CustomGrpcEncoding, max_send: usize) -> Self {
+        Self {
+            inner,
+            encoding,
+            max_send,
+            in_buf: BytesMut::new(),
+            pending_trailers: None,
+            done: false,
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn drain_complete_frames(&mut self) -> Result<Option<Bytes>, Status> {
         let mut out = BytesMut::new();
         while self.in_buf.len() >= 5 {
             let flag = self.in_buf[0];
@@ -376,7 +776,20 @@ impl SnappyCompressBody {
                 if mimir_proto::snappy::compress_framed_buf(&self.in_buf[5..frame_end], &mut out)
                     .is_ok()
                 {
+                    if matches!(self.encoding, CustomGrpcEncoding::S2)
+                        && out.len() >= hdr_pos + 15
+                    {
+                        out[hdr_pos + 9..hdr_pos + 15].copy_from_slice(b"S2sTwO");
+                    }
                     let comp_len = out.len() - (hdr_pos + 5);
+                    if comp_len > self.max_send {
+                        out.truncate(hdr_pos);
+                        self.in_buf.clear();
+                        return Err(Status::resource_exhausted(format!(
+                            "trying to send message larger than max ({comp_len} vs. {})",
+                            self.max_send
+                        )));
+                    }
                     if let Ok(comp_len_u32) = u32::try_from(comp_len) {
                         out[hdr_pos + 1..hdr_pos + 5]
                             .copy_from_slice(&comp_len_u32.to_be_bytes());
@@ -386,13 +799,20 @@ impl SnappyCompressBody {
                 }
                 out.truncate(hdr_pos);
             }
+            if len > self.max_send {
+                self.in_buf.clear();
+                return Err(Status::resource_exhausted(format!(
+                    "trying to send message larger than max ({len} vs. {})",
+                    self.max_send
+                )));
+            }
             out.extend_from_slice(&self.in_buf[..frame_end]);
             self.in_buf.advance(frame_end);
         }
         if out.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(out.freeze())
+            Ok(Some(out.freeze()))
         }
     }
 }
@@ -415,8 +835,15 @@ impl hyper::body::Body for SnappyCompressBody {
         }
 
         loop {
-            if let Some(chunk) = self.drain_complete_frames() {
-                return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
+            match self.drain_complete_frames() {
+                Ok(Some(chunk)) => return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk)))),
+                Ok(None) => {}
+                Err(status) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(
+                        status_to_trailers(status),
+                    ))));
+                }
             }
             match Pin::new(&mut self.inner).poll_frame(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -781,6 +1208,8 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
     fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
         let custom_enc = custom_grpc_encoding(req.headers());
         let max_decode_len = self.max_decoding_message_size.unwrap_or(4 * 1024 * 1024);
+        let max_send_len = self.max_encoding_message_size.unwrap_or(usize::MAX);
+        let deadline_ctx = req.extensions().get::<Arc<RpcDeadlineContext>>().cloned();
         let path = req.uri().path();
         let is_push = path == "/cortex.Ingester/Push";
         let is_query_stream = path == "/cortex.Ingester/QueryStream";
@@ -789,37 +1218,23 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
         let qs_echo_encoding = if (is_query_stream || is_metrics_for_label_matchers)
             && self.send_compression.is_none()
         {
-            let req_enc = req
-                .headers()
+            req.headers()
                 .get("grpc-encoding")
-                .and_then(|v| v.to_str().ok());
-            let accepts = req
-                .headers()
-                .get("grpc-accept-encoding")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let client_accepts = |name: &str| {
-                accepts
-                    .split(',')
-                    .any(|s| s.trim().eq_ignore_ascii_case(name))
-            };
-            req_enc.and_then(|enc| {
-                if enc.eq_ignore_ascii_case("gzip") && client_accepts("gzip") {
-                    Some("gzip")
-                } else if enc.eq_ignore_ascii_case("zstd") && client_accepts("zstd") {
-                    Some("zstd")
-                } else if enc.eq_ignore_ascii_case(mimir_proto::snappy::SNAPPY_ENCODING_NAME)
-                    && client_accepts(mimir_proto::snappy::SNAPPY_ENCODING_NAME)
-                {
-                    Some(mimir_proto::snappy::SNAPPY_ENCODING_NAME)
-                } else if enc.eq_ignore_ascii_case(mimir_proto::s2::S2_ENCODING_NAME)
-                    && client_accepts(mimir_proto::s2::S2_ENCODING_NAME)
-                {
-                    Some(mimir_proto::s2::S2_ENCODING_NAME)
-                } else {
-                    None
-                }
-            })
+                .map(str::trim)
+                .and_then(|enc| {
+                    if enc.eq_ignore_ascii_case("gzip") {
+                        Some("gzip")
+                    } else if enc.eq_ignore_ascii_case("zstd") {
+                        Some("zstd")
+                    } else if enc.eq_ignore_ascii_case(mimir_proto::snappy::SNAPPY_ENCODING_NAME) {
+                        Some(mimir_proto::snappy::SNAPPY_ENCODING_NAME)
+                    } else if enc.eq_ignore_ascii_case(mimir_proto::s2::S2_ENCODING_NAME) {
+                        Some(mimir_proto::s2::S2_ENCODING_NAME)
+                    } else {
+                        None
+                    }
+                })
         } else {
             None
         };
@@ -828,8 +1243,6 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
         let accept_compression = self.accept_compression;
         let accept_compression_len = self.accept_compression_len as usize;
         let send_compression = self.send_compression;
-        let max_decoding_message_size = self.max_decoding_message_size;
-        let max_encoding_message_size = self.max_encoding_message_size;
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
@@ -838,7 +1251,10 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
             let mut push_tap = if is_push {
                 let req_size = parse_message_size_header(req.headers());
                 match ingester.try_start_push_tap(req_size) {
-                    Ok(p) => Some(p),
+                    Ok(p) => Some(PushTapGuard {
+                        tap: Some(p),
+                        deadline_ctx: deadline_ctx.clone(),
+                    }),
                     Err(e) => return Ok(unavailable_tap_response(e)),
                 }
             } else {
@@ -846,7 +1262,10 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
             };
             let mut read_tap = if !is_push && is_ingester_rpc {
                 match ingester.try_start_read_tap(req.headers()) {
-                    Ok(p) => Some(p),
+                    Ok(p) => Some(ReadTapGuard {
+                        tap: Some(p),
+                        deadline_ctx: deadline_ctx.clone(),
+                    }),
                     Err(e) => return Ok(unavailable_tap_response(e)),
                 }
             } else {
@@ -865,26 +1284,38 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         return Ok(resp);
                     }
                 }
+            } else if max_decode_len < usize::MAX {
+                req.map(|b| tonic::body::BoxBody::new(MaxRecvFrameBody::new(b, max_decode_len)))
             } else {
                 req
             };
 
             // RPCCallProcessing: reactive limiter blocking permit acquisition.
-            if let Some(ref mut tap) = push_tap {
+            if let Some(ref mut guard) = push_tap {
                 match ingester.prepare_push_reactive().await {
-                    Ok(Some(rp)) => tap.set_reactive_permit(rp),
+                    Ok(Some(rp)) => {
+                        if let Some(ref mut tap) = guard.tap {
+                            tap.set_reactive_permit(rp);
+                        }
+                    }
                     Ok(None) => {}
                     Err(e) => return Ok(unavailable_tap_response(e)),
                 }
             }
-            if let Some(ref mut tap) = read_tap {
+            if let Some(ref mut guard) = read_tap {
                 match ingester.prepare_read_reactive(req.headers()).await {
-                    Ok(Some(rp)) => tap.set_reactive_permit(rp),
+                    Ok(Some(rp)) => {
+                        if let Some(ref mut tap) = guard.tap {
+                            tap.set_reactive_permit(rp);
+                        }
+                    }
                     Ok(None) => {}
                     Err(e) => return Ok(unavailable_tap_response(e)),
                 }
-                req.extensions_mut()
-                    .insert(TapDeadlineFlag(tap.deadline_exceeded_flag()));
+                if let Some(ref mut tap) = guard.tap {
+                    req.extensions_mut()
+                        .insert(TapDeadlineFlag(tap.deadline_exceeded_flag()));
+                }
             }
 
             let mut resp = if is_push {
@@ -952,23 +1383,22 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 if let Some(enc) = send_compression {
                     push_grpc = push_grpc.send_compressed(enc);
                 }
-                if let Some(lim) = max_decoding_message_size {
-                    push_grpc = push_grpc.max_decoding_message_size(lim);
-                }
-                if let Some(lim) = max_encoding_message_size {
-                    push_grpc = push_grpc.max_encoding_message_size(lim);
-                }
+                push_grpc = push_grpc
+                    .max_decoding_message_size(usize::MAX)
+                    .max_encoding_message_size(usize::MAX);
                 let outcome = Arc::new(parking_lot::Mutex::new(None));
-                let resp = push_grpc
-                    .unary(
+                let resp = scope_deadline_ctx(
+                    deadline_ctx.clone(),
+                    push_grpc.unary(
                         RawPushSvc {
                             ingester: Arc::clone(&ingester),
                             outcome: Arc::clone(&outcome),
                         },
                         req,
-                    )
-                    .await;
-                if let Some(tap) = push_tap.take() {
+                    ),
+                )
+                .await;
+                if let Some(mut tap) = push_tap.take() {
                     let err_guard = outcome.lock();
                     tap.finish(err_guard.as_ref());
                 }
@@ -1042,14 +1472,17 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 if let Some(enc) = effective_tonic_send {
                     qs_grpc = qs_grpc.send_compressed(enc);
                 }
-                if let Some(lim) = max_decoding_message_size {
-                    qs_grpc = qs_grpc.max_decoding_message_size(lim);
-                }
-                if let Some(lim) = max_encoding_message_size {
-                    qs_grpc = qs_grpc.max_encoding_message_size(lim);
-                }
+                qs_grpc = qs_grpc
+                    .max_decoding_message_size(usize::MAX)
+                    .max_encoding_message_size(usize::MAX);
                 let qs_resp = READ_TAP_ADMITTED
-                    .scope(true, qs_grpc.server_streaming(RawQueryStreamSvc(ingester), req))
+                    .scope(
+                        true,
+                        scope_deadline_ctx(
+                            deadline_ctx.clone(),
+                            qs_grpc.server_streaming(RawQueryStreamSvc(ingester), req),
+                        ),
+                    )
                     .await;
                 let qs_resp = if let Some(custom_resp_enc @ ("snappy" | "s2")) = qs_echo_encoding {
                     if qs_resp.status() == http::StatusCode::OK
@@ -1061,25 +1494,40 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                             "grpc-encoding",
                             http::HeaderValue::from_static(custom_resp_enc),
                         );
+                        let enc = if custom_resp_enc == "s2" {
+                            CustomGrpcEncoding::S2
+                        } else {
+                            CustomGrpcEncoding::Snappy
+                        };
                         http::Response::from_parts(
                             parts,
-                            tonic::body::BoxBody::new(SnappyCompressBody::new(body)),
+                            tonic::body::BoxBody::new(SnappyCompressBody::new(
+                                body,
+                                enc,
+                                max_send_len,
+                            )),
                         )
                     } else {
                         qs_resp
                     }
+                } else if max_send_len < usize::MAX
+                    && !qs_resp.headers().contains_key("grpc-status")
+                {
+                    qs_resp.map(|b| tonic::body::BoxBody::new(MaxSendFrameBody::new(b, max_send_len)))
                 } else {
                     qs_resp
                 };
-                if let Some(tap) = read_tap.take() {
+                if let Some(mut guard) = read_tap.take() {
                     if qs_resp.headers().contains_key("grpc-status") {
-                        tap.finish(false);
+                        guard.finish(false);
                         qs_resp
                     } else {
+                        let permit = guard.take_for_body();
                         qs_resp.map(|body| {
                             tonic::body::BoxBody::new(ReadTapDropBody {
                                 inner: body,
-                                permit: Some(tap),
+                                permit,
+                                deadline_ctx: deadline_ctx.clone(),
                             })
                         })
                     }
@@ -1152,14 +1600,17 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 if let Some(enc) = effective_tonic_send {
                     mflm_grpc = mflm_grpc.send_compressed(enc);
                 }
-                if let Some(lim) = max_decoding_message_size {
-                    mflm_grpc = mflm_grpc.max_decoding_message_size(lim);
-                }
-                if let Some(lim) = max_encoding_message_size {
-                    mflm_grpc = mflm_grpc.max_encoding_message_size(lim);
-                }
+                mflm_grpc = mflm_grpc
+                    .max_decoding_message_size(usize::MAX)
+                    .max_encoding_message_size(usize::MAX);
                 let mflm_resp = READ_TAP_ADMITTED
-                    .scope(true, mflm_grpc.unary(RawMetricsForLabelMatchersSvc(ingester), req))
+                    .scope(
+                        true,
+                        scope_deadline_ctx(
+                            deadline_ctx.clone(),
+                            mflm_grpc.unary(RawMetricsForLabelMatchersSvc(ingester), req),
+                        ),
+                    )
                     .await;
                 let mflm_resp = if let Some(custom_resp_enc @ ("snappy" | "s2")) = qs_echo_encoding
                 {
@@ -1172,25 +1623,41 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                             "grpc-encoding",
                             http::HeaderValue::from_static(custom_resp_enc),
                         );
+                        let enc = if custom_resp_enc == "s2" {
+                            CustomGrpcEncoding::S2
+                        } else {
+                            CustomGrpcEncoding::Snappy
+                        };
                         http::Response::from_parts(
                             parts,
-                            tonic::body::BoxBody::new(SnappyCompressBody::new(body)),
+                            tonic::body::BoxBody::new(SnappyCompressBody::new(
+                                body,
+                                enc,
+                                max_send_len,
+                            )),
                         )
                     } else {
                         mflm_resp
                     }
+                } else if max_send_len < usize::MAX
+                    && !mflm_resp.headers().contains_key("grpc-status")
+                {
+                    mflm_resp
+                        .map(|b| tonic::body::BoxBody::new(MaxSendFrameBody::new(b, max_send_len)))
                 } else {
                     mflm_resp
                 };
-                if let Some(tap) = read_tap.take() {
+                if let Some(mut guard) = read_tap.take() {
                     if mflm_resp.headers().contains_key("grpc-status") {
-                        tap.finish(false);
+                        guard.finish(false);
                         mflm_resp
                     } else {
+                        let permit = guard.take_for_body();
                         mflm_resp.map(|body| {
                             tonic::body::BoxBody::new(ReadTapDropBody {
                                 inner: body,
-                                permit: Some(tap),
+                                permit,
+                                deadline_ctx: deadline_ctx.clone(),
                             })
                         })
                     }
@@ -1199,17 +1666,29 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 }
             } else if is_ingester_rpc {
                 let resp = READ_TAP_ADMITTED
-                    .scope(true, async { inner.call(req).await })
+                    .scope(
+                        true,
+                        scope_deadline_ctx(deadline_ctx.clone(), async { inner.call(req).await }),
+                    )
                     .await?;
-                if let Some(tap) = read_tap.take() {
+                let resp = if max_send_len < usize::MAX
+                    && !resp.headers().contains_key("grpc-status")
+                {
+                    resp.map(|b| tonic::body::BoxBody::new(MaxSendFrameBody::new(b, max_send_len)))
+                } else {
+                    resp
+                };
+                if let Some(mut guard) = read_tap.take() {
                     if resp.headers().contains_key("grpc-status") {
-                        tap.finish(false);
+                        guard.finish(false);
                         resp
                     } else {
+                        let permit = guard.take_for_body();
                         resp.map(|body| {
                             tonic::body::BoxBody::new(ReadTapDropBody {
                                 inner: body,
-                                permit: Some(tap),
+                                permit,
+                                deadline_ctx: deadline_ctx.clone(),
                             })
                         })
                     }
@@ -2161,6 +2640,7 @@ mod tests {
         let mut body_early = ReadTapDropBody {
             inner: inner_early,
             permit: Some(tap_early),
+            deadline_ctx: None,
         };
         let _ = std::future::poll_fn(|cx| Pin::new(&mut body_early).poll_frame(cx)).await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -2186,6 +2666,7 @@ mod tests {
         let mut body_ok = ReadTapDropBody {
             inner: inner_ok,
             permit: Some(tap_ok),
+            deadline_ctx: None,
         };
         let f1 = std::future::poll_fn(|cx| Pin::new(&mut body_ok).poll_frame(cx)).await;
         assert!(f1.unwrap().unwrap().is_data());
@@ -2282,5 +2763,187 @@ mod tests {
         assert_eq!(decoded.metric.len(), 2);
         assert_eq!(decoded.metric[0].labels[1].value.as_ref(), b"pod-1");
         assert_eq!(decoded.metric[1].labels[1].value.as_ref(), b"pod-2");
+    }
+
+    #[test]
+    fn rpc_deadline_context_intersects_consistency_timeout() {
+        assert_eq!(
+            effective_read_consistency_timeout(std::time::Duration::from_secs(20)),
+            std::time::Duration::from_secs(20)
+        );
+        let ctx = RpcDeadlineContext::new(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(250),
+        ));
+        let eff = RPC_DEADLINE_CONTEXT.sync_scope(Arc::clone(&ctx), || {
+            effective_read_consistency_timeout(std::time::Duration::from_secs(20))
+        });
+        assert!(eff <= std::time::Duration::from_millis(250));
+        assert!(eff > std::time::Duration::ZERO);
+        let eff_zero = RPC_DEADLINE_CONTEXT.sync_scope(ctx, || {
+            effective_read_consistency_timeout(std::time::Duration::ZERO)
+        });
+        assert!(eff_zero <= std::time::Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn push_and_read_tap_guards_record_deadline_exceeded_only_when_expired() {
+        use crate::circuit_breaker::{BreakerState, CircuitBreaker};
+        use mimir_common::limiter::{ReactiveLimiter, ReactiveLimiterConfig};
+        use mimir_config::CircuitBreakerConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = test_ingester(tmp.path(), true);
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let cb_cfg = CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold_percentage: 2,
+            failure_execution_threshold: 5,
+            cooldown_period: mimir_config::GoDuration::from_secs(30),
+            request_timeout: mimir_config::GoDuration::from_secs(60),
+            ..Default::default()
+        };
+        let push_reg = prometheus::Registry::new();
+        let push_cb = CircuitBreaker::new(&cb_cfg, Some(&push_reg), "push", true).unwrap();
+        push_cb.activate();
+        let read_reg = prometheus::Registry::new();
+        let read_cb = CircuitBreaker::new(&cb_cfg, Some(&read_reg), "read", true).unwrap();
+        read_cb.activate();
+
+        let rl_cfg = ReactiveLimiterConfig {
+            min_limit: 1,
+            initial_limit: 2,
+            max_limit: 10,
+            max_limit_factor: 1.0,
+            min_limit_factor: 1.0,
+            recent_window_min_duration: std::time::Duration::from_millis(1),
+            recent_window_max_duration: std::time::Duration::from_millis(1),
+            recent_window_min_samples: 1,
+            initial_rejection_factor: 1.0,
+            max_rejection_factor: 1.0,
+            ..Default::default()
+        };
+        let push_rl = ReactiveLimiter::new(rl_cfg.clone()).unwrap();
+        let read_rl = ReactiveLimiter::new(rl_cfg).unwrap();
+
+        let timeout_count = |reg: &prometheus::Registry| -> f64 {
+            reg.gather()
+                .into_iter()
+                .find(|f| f.get_name() == "cortex_ingester_circuit_breaker_request_timeouts_total")
+                .map(|f| f.get_metric()[0].get_counter().get_value())
+                .unwrap_or(0.0)
+        };
+
+        // 1. Client disconnect (expired == false) must NOT record timeout or reactive sample.
+        {
+            let ctx = RpcDeadlineContext::new(Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            ));
+            let push_tap = crate::push::PushTapPermit {
+                started_at: std::time::Instant::now(),
+                breaker_permit: push_cb.try_acquire_permit().unwrap(),
+                reactive_permit: Some(push_rl.acquire_permit().await.unwrap()),
+                ingester: Arc::clone(&ing),
+                req_size: 10,
+                finished: false,
+            };
+            ing.inflight_push_requests.fetch_add(1, Ordering::AcqRel);
+            ing.inflight_push_requests_bytes.fetch_add(10, Ordering::AcqRel);
+            let _guard = PushTapGuard {
+                tap: Some(push_tap),
+                deadline_ctx: Some(ctx),
+            };
+        }
+        assert_eq!(timeout_count(&push_reg), 0.0);
+        assert_eq!(push_rl.max_inflight(), 0);
+
+        // 1b. Transport-level RST_STREAM(CANCEL) at grpc-timeout (deadline in the past, but
+        // not marked expired with DeadlineExceeded): both PushTapGuard and ReadTapGuard MUST treat
+        // the dropped future as canceled (0 breaker timeouts, drop reactive permit) to match Go's
+        // closeStream(RST_STREAM CANCEL) -> context.Canceled path.
+        {
+            let ctx = RpcDeadlineContext::new(Some(
+                std::time::Instant::now() - std::time::Duration::from_millis(10),
+            ));
+            let push_tap = crate::push::PushTapPermit {
+                started_at: std::time::Instant::now(),
+                breaker_permit: push_cb.try_acquire_permit().unwrap(),
+                reactive_permit: Some(push_rl.acquire_permit().await.unwrap()),
+                ingester: Arc::clone(&ing),
+                req_size: 10,
+                finished: false,
+            };
+            ing.inflight_push_requests.fetch_add(1, Ordering::AcqRel);
+            ing.inflight_push_requests_bytes.fetch_add(10, Ordering::AcqRel);
+            let _push_guard = PushTapGuard {
+                tap: Some(push_tap),
+                deadline_ctx: Some(Arc::clone(&ctx)),
+            };
+            let mut rtap = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+            rtap.set_reactive_permit(read_rl.acquire_permit().await.unwrap());
+            let _read_guard = ReadTapGuard {
+                tap: Some(rtap),
+                deadline_ctx: Some(ctx),
+            };
+        }
+        assert_eq!(timeout_count(&push_reg), 0.0);
+        assert_eq!(timeout_count(&read_reg), 0.0);
+        assert_eq!(push_rl.max_inflight(), 0);
+        assert_eq!(read_rl.max_inflight(), 0);
+
+        // 2. Expired grpc-timeout on PushTapGuard MUST record DeadlineExceeded & rp.record() and open breaker.
+        for _ in 0..2 {
+            let ctx = RpcDeadlineContext::new(Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            ));
+            ctx.mark_expired();
+            let push_tap = crate::push::PushTapPermit {
+                started_at: std::time::Instant::now(),
+                breaker_permit: push_cb.try_acquire_permit().unwrap(),
+                reactive_permit: Some(push_rl.acquire_permit().await.unwrap()),
+                ingester: Arc::clone(&ing),
+                req_size: 10,
+                finished: false,
+            };
+            ing.inflight_push_requests.fetch_add(1, Ordering::AcqRel);
+            ing.inflight_push_requests_bytes.fetch_add(10, Ordering::AcqRel);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let _guard = PushTapGuard {
+                tap: Some(push_tap),
+                deadline_ctx: Some(ctx),
+            };
+        }
+        assert_eq!(timeout_count(&push_reg), 2.0);
+        assert_eq!(push_cb.state(), BreakerState::Open);
+        assert!(push_rl.max_inflight() >= 1);
+
+        // 3. Expired grpc-timeout on ReadTapGuard & ReadTapDropBody MUST record DeadlineExceeded & rp.record().
+        let ctx_r1 = RpcDeadlineContext::new(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        ctx_r1.mark_expired();
+        let mut rtap1 = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+        rtap1.set_reactive_permit(read_rl.acquire_permit().await.unwrap());
+        // Simulate active read breaker via ReadTapGuard with deadline_ctx expired:
+        drop(rtap1);
+        let bp1 = read_cb.try_acquire_permit().unwrap().unwrap();
+        // Also verify ReadTapDropBody records deadline when deadline_ctx is expired:
+        {
+            let ctx_r2 = RpcDeadlineContext::new(Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            ));
+            ctx_r2.mark_expired();
+            let mut rtap2 = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+            rtap2.set_reactive_permit(read_rl.acquire_permit().await.unwrap());
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let _body = ReadTapDropBody {
+                inner: tonic::body::empty_body(),
+                permit: Some(rtap2),
+                deadline_ctx: Some(ctx_r2),
+            };
+        }
+        assert!(read_rl.max_inflight() >= 1);
+        bp1.finish(std::time::Duration::from_millis(1), true);
+        assert_eq!(timeout_count(&read_reg), 1.0);
     }
 }
