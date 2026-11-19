@@ -220,20 +220,40 @@ enum ConnKind {
     Slow,
 }
 
+enum SendOutcome<T> {
+    Ok(T),
+    ReauthFailed(KafkaClientError),
+    Err(KafkaClientError),
+}
+
+pub(crate) fn join_host_port(host: &str, port: i32) -> String {
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 struct BrokerConn {
     addr: String,
     kind: ConnKind,
     client_id: String,
+    transport: Option<Arc<KafkaTransport>>,
     next_corr_id: AtomicI32,
     write_tx: mpsc::Sender<Bytes>,
     pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>>,
+    pending_drained: Arc<tokio::sync::Notify>,
     api_versions: RwLock<HashMap<i16, (i16, i16)>>,
     alive: Arc<std::sync::atomic::AtomicBool>,
     disconnected: Arc<std::sync::atomic::AtomicBool>,
     reader_abort: tokio::task::AbortHandle,
     writer_abort: tokio::task::AbortHandle,
-    /// SASL session expiry: past it the connection is replaced instead of reused.
-    sasl_expiry: Option<std::time::Instant>,
+    /// SASL session expiry (updated in-place on KIP-368 re-authentication).
+    sasl_expiry: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Number of non-SASL requests admitted since the last authentication.
+    requests_since_auth: std::sync::atomic::AtomicU64,
+    /// Serializes KIP-368 re-authentication and gates new requests while draining/re-authing.
+    reauth_lock: tokio::sync::Mutex<()>,
     /// Responses successfully read on this connection after its setup (kgo `cxn.successes`).
     successes: std::sync::atomic::AtomicU64,
     /// kprom `node_id` label value (`kgo.NodeName`) and hooks, when the client has them.
@@ -251,6 +271,7 @@ impl Drop for BrokerConn {
 
 struct PendingGuard<'a> {
     pending: &'a parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>,
+    pending_drained: &'a tokio::sync::Notify,
     corr_id: i32,
     completed: bool,
 }
@@ -258,7 +279,14 @@ struct PendingGuard<'a> {
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
-            self.pending.lock().remove(&self.corr_id);
+            let now_empty = {
+                let mut map = self.pending.lock();
+                map.remove(&self.corr_id);
+                map.is_empty()
+            };
+            if now_empty {
+                self.pending_drained.notify_waiters();
+            }
         }
     }
 }
@@ -269,7 +297,7 @@ impl BrokerConn {
         addr: String,
         kind: ConnKind,
         client_id: String,
-        transport: &KafkaTransport,
+        transport: Arc<KafkaTransport>,
         request_timeout: Duration,
         node: String,
         kprom: Option<Arc<KpromMetrics>>,
@@ -295,6 +323,7 @@ impl BrokerConn {
         let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(512);
         let pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>> =
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let pending_drained = Arc::new(tokio::sync::Notify::new());
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let alive_w = Arc::clone(&alive);
@@ -315,6 +344,7 @@ impl BrokerConn {
         let writer_abort = writer_handle.abort_handle();
 
         let pending_r = Arc::clone(&pending);
+        let pending_drained_r = Arc::clone(&pending_drained);
         let alive_r = Arc::clone(&alive);
         let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let disconnected_r = Arc::clone(&disconnected);
@@ -329,13 +359,21 @@ impl BrokerConn {
                     m.read_bytes_total.inc_by((frame_len + 4) as f64);
                 }
                 let corr_id = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let tx = pending_r.lock().remove(&corr_id);
+                let (tx, now_empty) = {
+                    let mut map = pending_r.lock();
+                    let tx = map.remove(&corr_id);
+                    (tx, map.is_empty())
+                };
+                if now_empty {
+                    pending_drained_r.notify_waiters();
+                }
                 if let Some(tx) = tx {
                     let _ = tx.send(Bytes::from(payload));
                 }
             }
             alive_r.store(false, Ordering::SeqCst);
             pending_r.lock().clear();
+            pending_drained_r.notify_waiters();
             if let Some((k, node)) = disconnect_hook {
                 if !disconnected_r.swap(true, Ordering::SeqCst) {
                     k.on_broker_disconnect(&node);
@@ -348,15 +386,19 @@ impl BrokerConn {
             addr,
             kind,
             client_id,
+            transport: Some(transport),
             next_corr_id: AtomicI32::new(established.next_correlation_id),
             write_tx,
             pending,
+            pending_drained,
             api_versions: RwLock::new(established.api_versions),
             alive,
             disconnected,
             reader_abort,
             writer_abort,
-            sasl_expiry: established.sasl_expiry,
+            sasl_expiry: parking_lot::Mutex::new(established.sasl_expiry),
+            requests_since_auth: std::sync::atomic::AtomicU64::new(0),
+            reauth_lock: tokio::sync::Mutex::new(()),
             successes: std::sync::atomic::AtomicU64::new(0),
             node,
             kprom,
@@ -364,27 +406,85 @@ impl BrokerConn {
         }))
     }
 
-    /// `send_raw` with a read deadline: a timed-out read is a kprom read error (kgo kills the
-    /// connection and reports `ReadErr` to `OnBrokerE2E`).
-    async fn send_raw_timeout<Req, Resp>(
+    /// send_raw with a read deadline and KIP-368 in-place SASL re-authentication.
+    async fn send_raw_timeout_outcome<Req, Resp>(
         &self,
         api_key: ApiKey,
         api_version: i16,
         req: &Req,
         timeout: Duration,
-    ) -> Result<Resp, KafkaClientError>
+    ) -> SendOutcome<Resp>
     where
         Req: Request + Encodable,
         Resp: Decodable + HeaderVersion,
     {
-        match tokio::time::timeout(timeout, self.send_raw(api_key, api_version, req)).await {
-            Ok(res) => res,
+        let start = Instant::now();
+        let reauth_guard = match tokio::time::timeout(timeout, self.reauth_lock.lock()).await {
+            Ok(g) => g,
             Err(_) => {
+                if !self.pending.lock().is_empty() {
+                    return SendOutcome::ReauthFailed(KafkaClientError::RequestTimeout(timeout));
+                }
                 if let Some(ref k) = self.kprom {
                     k.on_read_error(&self.node, 0);
                 }
-                Err(KafkaClientError::RequestTimeout(timeout))
+                return SendOutcome::Err(KafkaClientError::RequestTimeout(timeout));
             }
+        };
+
+        if !self.is_alive() {
+            return SendOutcome::Err(KafkaClientError::ConnectionClosed);
+        }
+
+        if self.needs_reauth() {
+            let drain_budget = timeout.saturating_sub(start.elapsed());
+            let drain_res = tokio::time::timeout(drain_budget, async {
+                loop {
+                    let notified = self.pending_drained.notified();
+                    if self.pending.lock().is_empty() {
+                        return Ok(());
+                    }
+                    if !self.is_alive() {
+                        return Err(KafkaClientError::ConnectionClosed);
+                    }
+                    notified.await;
+                }
+            })
+            .await;
+
+            match drain_res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return SendOutcome::Err(e),
+                Err(_) => {
+                    return SendOutcome::ReauthFailed(KafkaClientError::RequestTimeout(timeout));
+                }
+            }
+
+            if let Err(e) = self
+                .perform_kip368_reauth(timeout.max(Duration::from_secs(2)))
+                .await
+            {
+                self.mark_dead();
+                return SendOutcome::ReauthFailed(e);
+            }
+        }
+
+        self.requests_since_auth.fetch_add(1, Ordering::SeqCst);
+
+        let (rx, guard, written, e2e_start, read_start) =
+            match self.enqueue_frame(api_key, api_version, req).await {
+                Ok(v) => v,
+                Err(e) => return SendOutcome::Err(e),
+            };
+        drop(reauth_guard);
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        match self
+            .await_response::<Resp>(api_key, api_version, rx, guard, written, e2e_start, read_start, remaining)
+            .await
+        {
+            Ok(r) => SendOutcome::Ok(r),
+            Err(e) => SendOutcome::Err(e),
         }
     }
 
@@ -392,9 +492,12 @@ impl BrokerConn {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// Alive and its SASL session (if any) has not expired: may be handed out for new requests.
-    fn is_usable(&self) -> bool {
-        self.is_alive() && self.sasl_expiry.is_none_or(|e| std::time::Instant::now() < e)
+    fn needs_reauth(&self) -> bool {
+        self.requests_since_auth.load(Ordering::SeqCst) > 0
+            && self
+                .sasl_expiry
+                .lock()
+                .is_some_and(|e| std::time::Instant::now() >= e)
     }
 
     fn mark_dead(&self) {
@@ -402,6 +505,7 @@ impl BrokerConn {
         self.reader_abort.abort();
         self.writer_abort.abort();
         self.pending.lock().clear();
+        self.pending_drained.notify_waiters();
         if let Some(ref k) = self.kprom {
             if !self.disconnected.swap(true, Ordering::SeqCst) {
                 k.on_broker_disconnect(&self.node);
@@ -420,11 +524,82 @@ impl BrokerConn {
         our_min
     }
 
-    async fn send_raw<Req, Resp>(
+    async fn perform_kip368_reauth(&self, timeout: Duration) -> Result<(), KafkaClientError> {
+        let Some(ref transport) = self.transport else {
+            return Err(KafkaClientError::Sasl(
+                "missing transport for SASL re-authentication".to_string(),
+            ));
+        };
+        let Some(mech) = transport.sasl().mechanism_name() else {
+            *self.sasl_expiry.lock() = None;
+            self.requests_since_auth.store(0, Ordering::SeqCst);
+            return Ok(());
+        };
+        let versions = self.api_versions.read().clone();
+        let Some((hs_ver, auth_ver)) = transport.kip368_versions(&versions) else {
+            return Err(KafkaClientError::Sasl(format!(
+                "SASL {mech} in-place re-authentication with broker {} requires SaslHandshake v1",
+                self.addr
+            )));
+        };
+
+        struct ReauthAbortGuard<'a> {
+            conn: &'a BrokerConn,
+            armed: bool,
+        }
+        impl Drop for ReauthAbortGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.conn.mark_dead();
+                }
+            }
+        }
+        let mut abort_guard = ReauthAbortGuard {
+            conn: self,
+            armed: true,
+        };
+
+        let mut hs_req = kafka_protocol::messages::SaslHandshakeRequest::default();
+        hs_req.mechanism = StrBytes::from_static_str(mech);
+        let hs_resp: kafka_protocol::messages::SaslHandshakeResponse = tokio::time::timeout(
+            timeout,
+            self.send_raw_internal(ApiKey::SaslHandshake, hs_ver, &hs_req, false),
+        )
+        .await
+        .map_err(|_| KafkaClientError::RequestTimeout(timeout))??;
+        if let Some(err) = hs_resp.error_code.err() {
+            let supported: Vec<&str> = hs_resp.mechanisms.iter().map(|m| m.as_str()).collect();
+            return Err(KafkaClientError::Sasl(format!(
+                "SASL {mech} authentication with broker {} failed: SaslHandshake: {err} (broker supported mechanisms: {supported:?})",
+                self.addr
+            )));
+        }
+
+        let mut flow = transport.start_kip368_auth(&self.addr, mech).await?;
+        while let Some(auth_req) = flow.next_authenticate_request() {
+            let auth_resp: kafka_protocol::messages::SaslAuthenticateResponse =
+                tokio::time::timeout(
+                    timeout,
+                    self.send_raw_internal(ApiKey::SaslAuthenticate, auth_ver, &auth_req, false),
+                )
+                .await
+                .map_err(|_| KafkaClientError::RequestTimeout(timeout))??;
+            flow.on_authenticate_response(auth_resp)?;
+        }
+        let new_expiry = flow.finish()?;
+        abort_guard.armed = false;
+
+        *self.sasl_expiry.lock() = new_expiry;
+        self.requests_since_auth.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn send_raw_internal<Req, Resp>(
         &self,
         api_key: ApiKey,
         api_version: i16,
         req: &Req,
+        track_success: bool,
     ) -> Result<Resp, KafkaClientError>
     where
         Req: Request + Encodable,
@@ -433,18 +608,65 @@ impl BrokerConn {
         if !self.is_alive() {
             return Err(KafkaClientError::ConnectionClosed);
         }
+        let (rx, mut guard, written, e2e_start, read_start) =
+            self.enqueue_frame(api_key, api_version, req).await?;
+        let mut resp_buf = match rx.await {
+            Ok(b) => b,
+            Err(_) => {
+                if let Some(ref k) = self.kprom {
+                    k.on_read_error(&self.node, written);
+                }
+                return Err(KafkaClientError::ConnectionClosed);
+            }
+        };
+        guard.completed = true;
+        if track_success {
+            if let Some(ref m) = self.extended_metrics {
+                m.kafka_read_wait_seconds
+                    .observe(read_start.elapsed().as_secs_f64());
+                m.kafka_read_time_seconds.observe(0.0);
+                m.kafka_request_duration_e2e_seconds
+                    .observe(e2e_start.elapsed().as_secs_f64());
+            }
+            if let Some(ref k) = self.kprom {
+                k.on_e2e(&self.node, written, resp_buf.len() + 4);
+            }
+        }
+        let resp_header_ver = if api_key == ApiKey::ApiVersions {
+            0
+        } else {
+            Resp::header_version(api_version)
+        };
+        let _resp_header = ResponseHeader::decode(&mut resp_buf, resp_header_ver)?;
+        if track_success {
+            self.successes.fetch_add(1, Ordering::Relaxed);
+        }
+        let resp = Resp::decode(&mut resp_buf, api_version)?;
+        Ok(resp)
+    }
 
+    async fn enqueue_frame<Req: Request + Encodable>(
+        &self,
+        api_key: ApiKey,
+        api_version: i16,
+        req: &Req,
+    ) -> Result<
+        (
+            oneshot::Receiver<Bytes>,
+            PendingGuard<'_>,
+            usize,
+            Instant,
+            Instant,
+        ),
+        KafkaClientError,
+    > {
         let corr_id = self.next_corr_id.fetch_add(1, Ordering::Relaxed);
         let req_header_ver = Req::header_version(api_version);
         let mut header = RequestHeader::default();
         header.request_api_key = api_key as i16;
         header.request_api_version = api_version;
         header.correlation_id = corr_id;
-        header.client_id = if self.client_id.is_empty() {
-            None
-        } else {
-            Some(StrBytes::from_string(self.client_id.clone()))
-        };
+        header.client_id = Some(StrBytes::from_string(self.client_id.clone()));
 
         let mut body = BytesMut::with_capacity(256);
         body.put_u32(0); // placeholder for 4B BE length
@@ -456,8 +678,9 @@ impl BrokerConn {
 
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(corr_id, tx);
-        let mut guard = PendingGuard {
+        let guard = PendingGuard {
             pending: &self.pending,
+            pending_drained: &self.pending_drained,
             corr_id,
             completed: false,
         };
@@ -476,15 +699,35 @@ impl BrokerConn {
             m.kafka_write_time_seconds
                 .observe(write_start.elapsed().as_secs_f64());
         }
-
         let read_start = Instant::now();
-        let mut resp_buf = match rx.await {
-            Ok(b) => b,
-            Err(_) => {
+        Ok((rx, guard, written, e2e_start, read_start))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn await_response<Resp: Decodable + HeaderVersion>(
+        &self,
+        api_key: ApiKey,
+        api_version: i16,
+        rx: oneshot::Receiver<Bytes>,
+        mut guard: PendingGuard<'_>,
+        written: usize,
+        e2e_start: Instant,
+        read_start: Instant,
+        timeout: Duration,
+    ) -> Result<Resp, KafkaClientError> {
+        let mut resp_buf = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(_)) => {
                 if let Some(ref k) = self.kprom {
                     k.on_read_error(&self.node, written);
                 }
                 return Err(KafkaClientError::ConnectionClosed);
+            }
+            Err(_) => {
+                if let Some(ref k) = self.kprom {
+                    k.on_read_error(&self.node, written);
+                }
+                return Err(KafkaClientError::RequestTimeout(timeout));
             }
         };
         guard.completed = true;
@@ -832,7 +1075,7 @@ impl KafkaClient {
         {
             let mut map = self.conns_by_addr.lock().await;
             if let Some(c) = map.get(&key) {
-                if c.is_usable() {
+                if c.is_alive() {
                     return Ok(Arc::clone(c));
                 }
                 c.mark_dead();
@@ -840,7 +1083,7 @@ impl KafkaClient {
             }
         }
 
-        // Singleflight per (addr, kind) so concurrent callers hitting sasl_expiry coalesce
+        // Singleflight per (addr, kind) so concurrent callers coalesce
         // into a single TCP/TLS/SASL handshake instead of opening N connections.
         let per_key_lock = {
             let mut locks = self.connect_locks.lock();
@@ -855,7 +1098,7 @@ impl KafkaClient {
         {
             let mut map = self.conns_by_addr.lock().await;
             if let Some(c) = map.get(&key) {
-                if c.is_usable() {
+                if c.is_alive() {
                     return Ok(Arc::clone(c));
                 }
                 c.mark_dead();
@@ -868,7 +1111,7 @@ impl KafkaClient {
             addr.to_string(),
             kind,
             self.client_id.clone(),
-            &self.transport,
+            Arc::clone(&self.transport),
             self.request_timeout,
             self.node_name_for_addr(addr),
             self.kprom.get().cloned(),
@@ -891,7 +1134,7 @@ impl KafkaClient {
 
         let mut map = self.conns_by_addr.lock().await;
         if let Some(existing) = map.get(&key) {
-            if existing.is_usable() {
+            if existing.is_alive() {
                 conn.mark_dead();
                 return Ok(Arc::clone(existing));
             }
@@ -908,6 +1151,22 @@ impl KafkaClient {
             if Arc::ptr_eq(existing, conn) {
                 map.remove(&key);
             }
+        }
+    }
+
+    /// Retires conn from the pool without killing any in-flight requests still in pending.
+    async fn retire_conn(&self, conn: &Arc<BrokerConn>) {
+        {
+            let mut map = self.conns_by_addr.lock().await;
+            let key = (conn.addr.clone(), conn.kind);
+            if let Some(existing) = map.get(&key) {
+                if Arc::ptr_eq(existing, conn) {
+                    map.remove(&key);
+                }
+            }
+        }
+        if conn.pending.lock().is_empty() {
+            conn.mark_dead();
         }
     }
 
@@ -944,6 +1203,30 @@ impl KafkaClient {
 
     /// Sends `req` on `conn` with a read deadline of `timeout`, dropping the connection on
     /// transport errors.
+    fn classify_send_err(
+        &self,
+        conn: &Arc<BrokerConn>,
+        api_key: ApiKey,
+        e: KafkaClientError,
+    ) -> KafkaClientError {
+        // kgo handleResp: EOF before any successful response on a connection without SASL
+        // is ErrFirstReadEOF ("is SASL missing?"), which is never retried.
+        if matches!(e, KafkaClientError::ConnectionClosed)
+            && conn.successes.load(Ordering::Relaxed) == 0
+            && self.transport.sasl().mechanism_name().is_none()
+        {
+            tracing::warn!(
+                component = "kafka_client",
+                req = ?api_key,
+                addr = %conn.addr,
+                err = "EOF",
+                "read from broker errored, killing connection after 0 successful responses (is SASL missing?)"
+            );
+            return KafkaClientError::FirstReadEof(kgo_retry::FirstReadEofKind::Sasl.to_string());
+        }
+        e
+    }
+
     async fn send_on<Req, Resp>(
         &self,
         conn: &Arc<BrokerConn>,
@@ -956,69 +1239,61 @@ impl KafkaClient {
         Req: Request + Encodable,
         Resp: Decodable + HeaderVersion,
     {
-        let res = conn
-            .send_raw_timeout(api_key, ver, req, timeout)
-            .await
-            .map_err(|e| {
-                // kgo handleResp: EOF before any successful response on a connection without SASL
-                // is ErrFirstReadEOF ("is SASL missing?"), which is never retried.
-                if matches!(e, KafkaClientError::ConnectionClosed)
-                    && conn.successes.load(Ordering::Relaxed) == 0
-                    && self.transport.sasl().mechanism_name().is_none()
-                {
-                    tracing::warn!(
-                        component = "kafka_client",
-                        req = ?api_key,
-                        addr = %conn.addr,
-                        err = "EOF",
-                        "read from broker errored, killing connection after 0 successful responses (is SASL missing?)"
-                    );
-                    return KafkaClientError::FirstReadEof(
-                        kgo_retry::FirstReadEofKind::Sasl.to_string(),
-                    );
+        match conn.send_raw_timeout_outcome(api_key, ver, req, timeout).await {
+            SendOutcome::Ok(resp) => Ok(resp),
+            SendOutcome::Err(e) => {
+                let e = self.classify_send_err(conn, api_key, e);
+                if is_transport_error(&e) {
+                    self.drop_conn(conn).await;
                 }
-                e
-            });
-        if let Err(ref e) = res {
-            if is_transport_error(e) {
-                self.drop_conn(conn).await;
+                Err(e)
+            }
+            SendOutcome::ReauthFailed(_reauth_err) => {
+                // Retire the expired connection without killing any old in-flight requests,
+                // then retry once on a freshly authenticated connection.
+                self.retire_conn(conn).await;
+                let fresh = self.get_conn_for_addr(&conn.addr, conn.kind).await?;
+                match fresh.send_raw_timeout_outcome(api_key, ver, req, timeout).await {
+                    SendOutcome::Ok(resp) => Ok(resp),
+                    SendOutcome::Err(e) | SendOutcome::ReauthFailed(e) => {
+                        let e = self.classify_send_err(&fresh, api_key, e);
+                        if is_transport_error(&e) {
+                            self.drop_conn(&fresh).await;
+                        }
+                        Err(e)
+                    }
+                }
             }
         }
-        res
     }
 
-    /// `cl.fetchMetadata`: a `Metadata` request to any broker with kgo's retry semantics
-    /// (`limit_retries = 3` for internal loads, 30s retry timeout). Updates the known brokers and
-    /// the controller ID from the response.
+    /// cl.fetchMetadata: a Metadata request to any broker with kgo retry semantics.
     async fn fetch_metadata(
         &self,
         topics: Option<&[&str]>,
         limit_retries: u32,
     ) -> Result<MetadataResponse, KafkaClientError> {
-        let mut req = MetadataRequest::default();
-        req.allow_auto_topic_creation = false;
-        req.topics = topics.map(|ts| {
-            ts.iter()
-                .map(|t| {
-                    let mut mt = MetadataRequestTopic::default();
-                    mt.name = Some(TopicName(StrBytes::from_string((*t).to_owned())));
-                    mt
-                })
-                .collect()
-        });
         let resp: MetadataResponse = retryable_request(
             mimir_retry_timeout(ApiKey::Metadata, self.last_produced_offset_retry_timeout),
             limit_retries,
             || std::future::ready(self.next_any_broker()),
-            |b: BrokerChoice| {
-                let req = &req;
-                async move {
-                    let conn = self.load_conn(&b.addr).await?;
-                    // v10+ carries topic IDs (kadm `ListTopics`, ConcurrentFetchers Fetch v13).
-                    let ver = conn.pick_version(ApiKey::Metadata, 1, 12);
-                    self.send_on(&conn, ApiKey::Metadata, ver, req, self.request_timeout)
-                        .await
-                }
+            |b: BrokerChoice| async move {
+                let conn = self.load_conn(&b.addr).await?;
+                // v10+ carries topic IDs (kadm ListTopics, ConcurrentFetchers Fetch v13).
+                let ver = conn.pick_version(ApiKey::Metadata, 1, 12);
+                let mut req = MetadataRequest::default();
+                req.allow_auto_topic_creation = ver < 4;
+                req.topics = topics.map(|ts| {
+                    ts.iter()
+                        .map(|t| {
+                            let mut mt = MetadataRequestTopic::default();
+                            mt.name = Some(TopicName(StrBytes::from_string((*t).to_owned())));
+                            mt
+                        })
+                        .collect()
+                });
+                self.send_on(&conn, ApiKey::Metadata, ver, &req, self.request_timeout)
+                    .await
             },
             |_, _| None,
         )
@@ -1036,7 +1311,7 @@ impl KafkaClient {
                     (
                         b.node_id.0,
                         BrokerInfo {
-                            addr: format!("{}:{}", b.host.as_str(), b.port),
+                            addr: join_host_port(b.host.as_str(), b.port),
                         },
                     )
                 })
@@ -1055,7 +1330,7 @@ impl KafkaClient {
             conns.retain(|(addr, _), conn| {
                 let keep = live_addrs.contains(addr)
                     || self.seed_brokers.iter().any(|seed| seed == addr);
-                if !keep {
+                if !keep && conn.pending.lock().is_empty() {
                     conn.mark_dead();
                 }
                 keep
@@ -1099,9 +1374,19 @@ impl KafkaClient {
     }
 
     async fn any_conn_kind(&self, kind: ConnKind) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        let discovered_len = self.metadata.read().brokers.len();
+        let max_iters = (self.seed_brokers.len() + 1) * (discovered_len + 1);
+        let mut tried = std::collections::HashSet::new();
         let mut last_err = None;
-        for seed in &self.seed_brokers {
-            match self.load_conn_kind(seed, kind).await {
+        for _ in 0..max_iters {
+            let choice = match self.next_any_broker() {
+                Ok(c) => c,
+                Err(e) => return Err(last_err.unwrap_or(e)),
+            };
+            if !tried.insert(choice.addr.clone()) {
+                continue;
+            }
+            match self.load_conn_kind(&choice.addr, kind).await {
                 Ok(c) => return Ok(c),
                 Err(e) => last_err = Some(e),
             }
@@ -1730,7 +2015,7 @@ impl KafkaClient {
             // `client_consumer.rs` (the kgo consumer path).
 
             let res: Result<FetchPartitionResult, KafkaClientError> = async {
-                let resp: FetchResponse = conn.send_raw_timeout(ApiKey::Fetch, ver, &req, wait_timeout).await?;
+                let resp: FetchResponse = self.send_on(&conn, ApiKey::Fetch, ver, &req, wait_timeout).await?;
 
                 if let Some(err) = resp.error_code.err() {
                     return Err(KafkaClientError::Broker(err));
@@ -1942,7 +2227,7 @@ impl KafkaClient {
         if let Some(err) = resp.error_code.err() {
             return Err(KafkaClientError::Broker(err));
         }
-        let addr = format!("{}:{}", resp.host.as_str(), resp.port);
+        let addr = join_host_port(resp.host.as_str(), resp.port);
         self.load_conn(&addr).await
     }
 
@@ -2006,7 +2291,9 @@ impl KafkaClient {
                         }
                     }
                 }
-                Ok(())
+                Err(KafkaClientError::UnexpectedResponse(format!(
+                    "partition missing in commit response (topic={topic}, partition={partition})"
+                )))
             }
             .await;
 
@@ -2160,11 +2447,14 @@ fn split_record_batch_v2_frames(raw: &Bytes) -> Result<Option<Vec<V2FrameInfo>>,
             }
             break;
         }
-        if raw[pos + 16] != 2 {
-            if frames.is_empty() {
-                return Ok(None);
-            }
-            break;
+        let magic = raw[pos + 16];
+        if magic == 0 || magic == 1 {
+            return Ok(None);
+        }
+        if magic != 2 {
+            return Err(KafkaClientError::UnexpectedResponse(format!(
+                "unknown RecordBatch magic {magic}"
+            )));
         }
         let batch_len =
             i32::from_be_bytes([raw[pos + 8], raw[pos + 9], raw[pos + 10], raw[pos + 11]]);
@@ -3195,15 +3485,19 @@ mod tests {
                 addr: b_addr.to_string(),
                 kind: ConnKind::Normal,
                 client_id: "test".to_string(),
+                transport: None,
                 next_corr_id: AtomicI32::new(1),
                 write_tx: tx,
                 pending: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                pending_drained: Arc::new(tokio::sync::Notify::new()),
                 api_versions: RwLock::new(HashMap::new()),
                 alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 reader_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 writer_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
-                sasl_expiry: None,
+                sasl_expiry: parking_lot::Mutex::new(None),
+                requests_since_auth: std::sync::atomic::AtomicU64::new(0),
+                reauth_lock: tokio::sync::Mutex::new(()),
                 successes: std::sync::atomic::AtomicU64::new(0),
                 node: "99".to_string(),
                 kprom: None,

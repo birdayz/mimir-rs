@@ -17,7 +17,7 @@ use mimir_config::{KafkaConfig, OrderedConsumptionConfig};
 use parking_lot::Mutex as SyncMutex;
 use prometheus::{Counter, CounterVec, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts, PullingGauge, Registry};
 use thiserror::Error;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -729,7 +729,7 @@ impl PartitionCommitter {
             let _ = h.await;
         }
         let offset = self.to_commit.load(Ordering::SeqCst);
-        if offset >= 0 && offset != self.last_committed_offset.load(Ordering::SeqCst) {
+        if offset >= 0 {
             let _ = self.commit(offset).await;
         }
     }
@@ -739,16 +739,12 @@ impl PartitionCommitter {
         self.commit_requests_total.inc();
 
         if let Err(e) = self.notifier.notify_pre_commit().await {
-            self.commit_requests_latency
-                .observe(start.elapsed().as_secs_f64());
-            error!(
+            warn!(
                 partition = self.partition_id,
                 offset,
                 err = %e,
-                "pre-commit notification failed; aborting offset commit"
+                "pre-commit notification failed, continuing with commit"
             );
-            self.commit_failures_total.inc();
-            return Err(format!("pre-commit notification failed: {e}"));
         }
 
         let kafka_res = if self.consumer_group.is_empty() {
@@ -1678,14 +1674,36 @@ impl SingleClusterPartitionReader {
     }
 
     pub async fn start_async(self: &Arc<Self>) {
+        drop(self.start_async_with_result().await);
+    }
+
+    pub async fn start_async_with_result(
+        self: &Arc<Self>,
+    ) -> oneshot::Receiver<Result<(), ReaderError>> {
+        let (tx, rx) = oneshot::channel();
         let mut guard = self.start_task.lock().await;
         if guard.is_some() {
-            return;
+            let _ = tx.send(Ok(()));
+            return rx;
         }
         self.state
             .store(ReaderState::Starting as u8, Ordering::SeqCst);
         let this = Arc::clone(self);
-        *guard = Some(tokio::spawn(async move { this.start().await }));
+        *guard = Some(tokio::spawn(async move {
+            let res = this.start().await;
+            match res {
+                Ok(()) => {
+                    let _ = tx.send(Ok(()));
+                    Ok(())
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let _ = tx.send(Err(e));
+                    Err(ReaderError::Startup(msg))
+                }
+            }
+        }));
+        rx
     }
 
     pub fn failure_error(&self) -> Option<String> {
@@ -2470,8 +2488,29 @@ impl MultiClusterPartitionReader {
             .enumerate()
             .map(|(cid, r)| (cid, r.subscribe_failure()))
             .collect();
-        let futs = self.readers.iter().map(|r| r.start());
-        if let Err(e) = try_join_all(futs).await {
+        let mut pending = Vec::with_capacity(self.readers.len());
+        for r in &self.readers {
+            pending.push(r.start_async_with_result().await);
+        }
+        let mut first_err: Option<ReaderError> = None;
+        while !pending.is_empty() {
+            let (res, _idx, remaining) = futures::future::select_all(pending).await;
+            pending = remaining;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    first_err = Some(e);
+                    break;
+                }
+                Err(_) => {
+                    first_err = Some(ReaderError::Startup(
+                        "partition reader start task panicked".to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(e) = first_err {
             self.state
                 .store(ReaderState::Failed as u8, Ordering::SeqCst);
             *self.failure_error.lock() = Some(e.to_string());
@@ -2742,31 +2781,32 @@ mod tests {
             Some(&reg),
         ));
 
-        // Direct commit must abort before Kafka commit or kafka-offset.json write.
-        let err = committer.commit(42).await.unwrap_err();
-        assert!(err.contains("ENOSPC"), "unexpected err: {err}");
-        assert_eq!(committer.last_committed_offset(), -1);
-        assert!(adm.committed.lock().is_empty());
-        assert!(!off_path.exists());
-        assert_eq!(committer.commit_failures_count(), 1.0);
-
-        // Periodic committer loop retries without panicking and commits once notify_pre_commit recovers.
-        committer.start().await;
-        committer.enqueue_offset(42);
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(committer.last_committed_offset(), -1);
-        assert!(adm.committed.lock().is_empty());
-        assert!(!off_path.exists());
-
-        notifier.fail.store(false, Ordering::SeqCst);
-        let dl = Instant::now() + Duration::from_secs(3);
-        while committer.last_committed_offset() != 42 {
-            assert!(Instant::now() < dl, "timed out waiting for retry commit");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Go 1:1 parity: pre-commit notification failure warns and continues with commit
+        // without incrementing commit_failures_total.
+        committer.commit(42).await.unwrap();
+        assert_eq!(committer.last_committed_offset(), 42);
         assert_eq!(*adm.committed.lock(), vec![42]);
         assert_eq!(off_file.read().unwrap(), 42);
+        assert_eq!(committer.commit_failures_count(), 0.0);
+
+        // Periodic committer loop also warns & commits when notify_pre_commit fails.
+        committer.start().await;
+        committer.enqueue_offset(43);
+        let dl = Instant::now() + Duration::from_secs(3);
+        while committer.last_committed_offset() != 43 {
+            assert!(Instant::now() < dl, "timed out waiting for periodic commit");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*adm.committed.lock(), vec![42, 43]);
+        assert_eq!(off_file.read().unwrap(), 43);
+        assert_eq!(committer.commit_failures_count(), 0.0);
+
+        // stop() always commits when to_commit >= 0 even if offset == last_committed_offset.
+        notifier.fail.store(false, Ordering::SeqCst);
+        let calls_before_stop = notifier.calls.load(Ordering::SeqCst);
         committer.stop().await;
+        assert!(notifier.calls.load(Ordering::SeqCst) > calls_before_stop);
+        assert_eq!(*adm.committed.lock(), vec![42, 43, 43]);
     }
 
     #[tokio::test]

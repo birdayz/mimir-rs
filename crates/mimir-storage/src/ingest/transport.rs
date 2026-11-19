@@ -918,11 +918,7 @@ impl KafkaTransport {
         let mut io = HandshakeIo {
             stream,
             next_corr_id: 0,
-            client_id: if client_id.is_empty() {
-                None
-            } else {
-                Some(StrBytes::from_string(client_id.to_string()))
-            },
+            client_id: Some(StrBytes::from_string(client_id.to_string())),
             timeout: request_timeout.max(Duration::from_secs(2)),
             addr,
         };
@@ -1031,6 +1027,123 @@ impl KafkaTransport {
             return Ok(None);
         }
         Ok(Some(session_expiry(lifetime_ms, prereq.elapsed())))
+    }
+
+    pub(crate) fn kip368_versions(&self, versions: &HashMap<i16, (i16, i16)>) -> Option<(i16, i16)> {
+        let max_version = |key: ApiKey, ours: i16| -> Option<i16> {
+            versions
+                .get(&(key as i16))
+                .map(|&(_, broker_max)| broker_max.min(ours))
+                .filter(|v| *v >= 0)
+        };
+        let hs_ver = max_version(ApiKey::SaslHandshake, 1).filter(|&v| v >= 1)?;
+        let auth_ver = max_version(ApiKey::SaslAuthenticate, 2).unwrap_or(0);
+        Some((hs_ver, auth_ver))
+    }
+
+    pub(crate) async fn start_kip368_auth(
+        &self,
+        addr: &str,
+        mech: &'static str,
+    ) -> Result<Kip368AuthFlow, KafkaClientError> {
+        let (session, client_write) = SaslSession::start(&self.sasl, addr).await.map_err(|msg| {
+            KafkaClientError::Sasl(format!(
+                "SASL {mech} authentication with broker {addr} failed: {msg}"
+            ))
+        })?;
+        if client_write.is_empty() {
+            return Err(KafkaClientError::Sasl(format!(
+                "SASL {mech} authentication with broker {addr} failed: unexpected server-write sasl with mechanism {mech}"
+            )));
+        }
+        Ok(Kip368AuthFlow {
+            addr: addr.to_string(),
+            mech,
+            session,
+            client_write,
+            done: false,
+            lifetime_ms: 0,
+            prereq: Instant::now(),
+        })
+    }
+}
+
+pub(crate) struct Kip368AuthFlow {
+    addr: String,
+    mech: &'static str,
+    session: SaslSession,
+    client_write: Vec<u8>,
+    done: bool,
+    lifetime_ms: i64,
+    prereq: Instant,
+}
+
+impl Kip368AuthFlow {
+    pub(crate) fn next_authenticate_request(&mut self) -> Option<SaslAuthenticateRequest> {
+        if self.done && self.client_write.is_empty() {
+            return None;
+        }
+        let mut req = SaslAuthenticateRequest::default();
+        req.auth_bytes = Bytes::from(std::mem::take(&mut self.client_write));
+        self.prereq = Instant::now();
+        Some(req)
+    }
+
+    pub(crate) fn on_authenticate_response(
+        &mut self,
+        resp: SaslAuthenticateResponse,
+    ) -> Result<(), KafkaClientError> {
+        if let Some(err) = resp.error_code.err() {
+            let detail = match resp.error_message {
+                Some(m) => format!("{err}: {}", m.as_str()),
+                None => err.to_string(),
+            };
+            let oauth_ctx = match &self.session {
+                SaslSession::Oauthbearer {
+                    error_challenge: Some(c),
+                } => format!(" (oauthbearer challenge: {c})"),
+                _ => String::new(),
+            };
+            let tag = if err == ResponseError::SaslAuthenticationFailed {
+                "SASL_AUTHENTICATION_FAILED: "
+            } else {
+                ""
+            };
+            return Err(self.sasl_err(format!("{tag}{detail}{oauth_ctx}")));
+        }
+        self.lifetime_ms = resp.session_lifetime_ms;
+        self.client_write.clear();
+        if !self.done {
+            let (d, next) = self
+                .session
+                .challenge(&resp.auth_bytes)
+                .map_err(|m| self.sasl_err(m))?;
+            self.done = d;
+            self.client_write = next;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<Option<Instant>, KafkaClientError> {
+        if let SaslSession::Oauthbearer {
+            error_challenge: Some(c),
+        } = &self.session
+        {
+            return Err(self.sasl_err(format!(
+                "server sent OAUTHBEARER error challenge: {c}"
+            )));
+        }
+        if self.lifetime_ms <= 0 {
+            return Ok(None);
+        }
+        Ok(Some(session_expiry(self.lifetime_ms, self.prereq.elapsed())))
+    }
+
+    fn sasl_err(&self, msg: String) -> KafkaClientError {
+        KafkaClientError::Sasl(format!(
+            "SASL {} authentication with broker {} failed: {msg}",
+            self.mech, self.addr
+        ))
     }
 }
 

@@ -119,6 +119,27 @@ pub(super) async fn remove_label_header_from_stream<R: AsyncRead + Unpin + Send>
     Ok((label, StreamFirstByte::Next))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum StreamReadError {
+    Eof,
+    Other(String),
+}
+
+impl std::fmt::Display for StreamReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eof => f.write_str("EOF"),
+            Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+impl From<String> for StreamReadError {
+    fn from(s: String) -> Self {
+        Self::Other(s)
+    }
+}
+
 /// memberlist `readStream`: reads the stream message type (or uses `first_byte` if already
 /// peeked by `remove_label_header_from_stream`), decrypts if `Encrypt`, and decompresses if `Compress`.
 /// Does NOT strip `HasLabel` (Go `readStream` never strips label headers).
@@ -128,33 +149,39 @@ pub(super) async fn read_stream_with_first_byte<R: AsyncRead + Unpin + Send>(
     stream_label: &str,
     go_metrics: Option<&GoMetrics>,
     decrypt: Option<&StreamDecryptFn>,
-) -> Result<(MessageType, Option<Vec<u8>>), String> {
+) -> Result<(MessageType, Option<Vec<u8>>), StreamReadError> {
     let first = match first_byte {
         Some(v) => v,
         None => {
             let mut b = [0u8; 1];
-            reader
-                .read_exact(&mut b)
-                .await
-                .map_err(|e| format!("read stream byte: {e}"))?;
-            b[0]
+            match reader.read_exact(&mut b).await {
+                Ok(_) => b[0],
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(StreamReadError::Eof);
+                }
+                Err(e) => return Err(StreamReadError::Other(format!("read stream byte: {e}"))),
+            }
         }
     };
 
-    let mut msg_type =
-        MessageType::try_from(first).map_err(|v| format!("unsupported stream msgType {v}"))?;
+    let mut msg_type = MessageType::try_from(first)
+        .map_err(|v| StreamReadError::Other(format!("unsupported stream msgType {v}")))?;
 
     let mut plain_body: Option<Vec<u8>> = None;
     if msg_type == MessageType::Encrypt {
         let Some(decrypt_fn) = decrypt else {
-            return Err("remote state is encrypted and encryption is not configured".to_string());
+            return Err(StreamReadError::Other(
+                "remote state is encrypted and encryption is not configured".to_string(),
+            ));
         };
         let plain = decrypt_remote_state(reader, stream_label, go_metrics, decrypt_fn).await?;
         if plain.is_empty() {
-            return Err("empty decrypted stream payload".to_string());
+            return Err(StreamReadError::Other(
+                "empty decrypted stream payload".to_string(),
+            ));
         }
         msg_type = MessageType::try_from(plain[0])
-            .map_err(|v| format!("unsupported inner stream msgType {v}"))?;
+            .map_err(|v| StreamReadError::Other(format!("unsupported inner stream msgType {v}")))?;
         plain_body = Some(plain[1..].to_vec());
     }
 
@@ -162,17 +189,45 @@ pub(super) async fn read_stream_with_first_byte<R: AsyncRead + Unpin + Send>(
         let raw_cp = match plain_body {
             Some(buf) => {
                 let mut cur = io::Cursor::new(buf);
-                read_msgpack_map_bytes(&mut cur).await?
+                read_msgpack_map_bytes(&mut cur).await
             }
-            None => read_msgpack_map_bytes(reader).await?,
+            None => read_msgpack_map_bytes(reader).await,
         };
-        let cp = super::wire::decode_compressed_payload(&raw_cp)?;
-        let decomp = decompress_buffer(cp.algo, &cp.buf)?;
+        let cp = match raw_cp.and_then(|b| super::wire::decode_compressed_payload(&b)) {
+            Ok(cp) => cp,
+            Err(err) => {
+                if let Some(gm) = go_metrics {
+                    let labels = [("algo", "unknown")];
+                    gm.incr_counter(&["memberlist", "decompress", "attempts_total"], 1.0, &labels);
+                    gm.incr_counter(&["memberlist", "decompress", "errors_total"], 1.0, &labels);
+                }
+                return Err(StreamReadError::Other(err));
+            }
+        };
+        let algo_label = match cp.algo {
+            super::wire::CompressionType::Snappy => "snappy",
+            super::wire::CompressionType::Lzw => "lzw",
+        };
+        let labels = [("algo", algo_label)];
+        if let Some(gm) = go_metrics {
+            gm.incr_counter(&["memberlist", "decompress", "attempts_total"], 1.0, &labels);
+        }
+        let decomp = match decompress_buffer(cp.algo, &cp.buf) {
+            Ok(d) => d,
+            Err(err) => {
+                if let Some(gm) = go_metrics {
+                    gm.incr_counter(&["memberlist", "decompress", "errors_total"], 1.0, &labels);
+                }
+                return Err(StreamReadError::Other(err));
+            }
+        };
         if decomp.is_empty() {
-            return Err("empty decompressed stream payload".to_string());
+            return Err(StreamReadError::Other(
+                "empty decompressed stream payload".to_string(),
+            ));
         }
         let inner_type = MessageType::try_from(decomp[0])
-            .map_err(|v| format!("unsupported inner stream msgType {v}"))?;
+            .map_err(|v| StreamReadError::Other(format!("unsupported inner stream msgType {v}")))?;
         return Ok((inner_type, Some(decomp[1..].to_vec())));
     }
 
@@ -192,7 +247,9 @@ pub(super) async fn read_stream_header_with_metrics<R: AsyncRead + Unpin + Send>
         StreamFirstByte::Eof => return Err("read stream byte: eof".to_string()),
     };
     let (msg_type, body) =
-        read_stream_with_first_byte(reader, first_byte, &label, go_metrics, decrypt).await?;
+        read_stream_with_first_byte(reader, first_byte, &label, go_metrics, decrypt)
+            .await
+            .map_err(|e| e.to_string())?;
     Ok((msg_type, label, body))
 }
 

@@ -214,7 +214,6 @@ fn test_binary_logs_tracing_events_in_go_logfmt_through_sigterm() {
             "level=info component=memberlist msg=\"fast-joining node failed\" node=127.0.0.1:1 err=",
             "level=warn component=memberlist msg=\"memberlist fast-join failed to reach minimum required seed nodes\" joined_nodes=0 required_nodes=1 elapsed_time=",
             "level=error component=memberlist msg=\"failed to fast-join the memberlist cluster at startup\" err=",
-            "level=info msg=starting module=ingester-ring",
             "level=info msg=\"ring doesn't exist in KV store yet\"",
             "level=info msg=starting module=ingester-service",
             "level=info msg=\"not loading tokens from file, tokens file path is empty\"",
@@ -235,6 +234,17 @@ fn test_binary_logs_tracing_events_in_go_logfmt_through_sigterm() {
             "level=info msg=\"module stopped\" module=sanity-check",
             "level=info msg=\"module stopped\" module=usage-stats",
             "level=info msg=\"Application stopped\"",
+        ],
+    );
+    // ingester-ring starts concurrently with memberlist background fast-join, and awaits
+    // MemberlistKv readiness before reading the ring.
+    assert_in_order(
+        &lines,
+        &[
+            "level=info msg=starting module=memberlist-kv",
+            "level=info msg=starting module=ingester-ring",
+            "level=info msg=\"ring doesn't exist in KV store yet\"",
+            "level=info msg=starting module=ingester-service",
         ],
     );
     // Background join with retries (dskit joinMembersOnStartup / joinMembersWithRetries).

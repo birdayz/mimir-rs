@@ -924,10 +924,22 @@ impl<'a> Decoder<'a> {
         }
         match name {
             // unmarshal(&s) with s string, then a custom parser.
-            "flagext.StringSliceCSV" | "flagext.Secret" | "log.Level" | "flagext.Bytes"
+            "flagext.StringSliceCSV" | "flagext.Secret" | "log.Level"
             | "flagext.CIDRSliceCSV" | "flagext.URLValue" | "model.ValidationScheme"
             | "s3.BucketLookupType" | "model.LabelName" | "relabel.Action" | "relabel.Regexp" => {
                 self.unmarshal(n, self.types.string)
+            }
+            "flagext.Bytes" => {
+                let before = self.terrors.len();
+                self.unmarshal(n, self.types.string)?;
+                if self.terrors.len() > before {
+                    return Ok(false);
+                }
+                let node = self.doc.node(self.deref_alias(n));
+                if node.kind == Kind::Scalar && self.doc.short_tag_of(n) != NULL_TAG {
+                    crate::types::HumanBytes::parse_str(&node.value).map_err(Fail)?;
+                }
+                Ok(true)
             }
             "model.Duration" => {
                 let before = self.terrors.len();
