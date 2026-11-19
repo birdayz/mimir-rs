@@ -707,7 +707,26 @@ fn test_ingester_validation_and_limit_errors_exact_details() {
         assert!(details.soft);
         assert_eq!(details.rejected_samples, 1);
 
-        // 2. Partial commit: valid sample + duplicate timestamp different value + OOO sample -> commits valid sample, returns BadData with RejectedSamples=2
+        // 2. Partial commit: Go `headAppenderV2` silently drops intra-batch conflicts on a freshly
+        // created series at Commit(), so first commit `10.0 @ base_ts+2000`, then send a second
+        // WriteRequest containing a valid newer sample + conflicting duplicate + OOO sample ->
+        // commits the valid sample, returns BadData with RejectedSamples=2.
+        let seed_req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair::from_static("__name__", "m1"),
+                    cortexpb::LabelPair::from_static("a", "1"),
+                ],
+                samples: vec![cortexpb::Sample {
+                    value: 10.0,
+                    timestamp_ms: base_ts + 2000,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        client.push(with_tenant(tenant, seed_req)).await.unwrap();
+
         let partial_req = cortexpb::WriteRequest {
             timeseries: vec![cortexpb::TimeSeries {
                 labels: vec![
@@ -716,16 +735,16 @@ fn test_ingester_validation_and_limit_errors_exact_details() {
                 ],
                 samples: vec![
                     cortexpb::Sample {
-                        value: 10.0,
-                        timestamp_ms: base_ts + 2000,
-                    },
-                    cortexpb::Sample {
                         value: 99.0, // duplicate timestamp, different value
                         timestamp_ms: base_ts + 2000,
                     },
                     cortexpb::Sample {
                         value: 5.0, // OOO outside window (OOO disabled)
                         timestamp_ms: base_ts + 1000,
+                    },
+                    cortexpb::Sample {
+                        value: 20.0, // valid newer sample
+                        timestamp_ms: base_ts + 3000,
                     },
                 ],
                 ..Default::default()
@@ -742,7 +761,7 @@ fn test_ingester_validation_and_limit_errors_exact_details() {
         assert!(details.soft);
         assert_eq!(details.rejected_samples, 2);
 
-        // Verify the valid sample (10.0 at base_ts + 2000) WAS committed!
+        // Verify the valid samples (10.0 @ +2000 and 20.0 @ +3000) WERE committed!
         let mut qs = client
             .query_stream(with_tenant(
                 tenant,

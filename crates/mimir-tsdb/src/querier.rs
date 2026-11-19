@@ -17,8 +17,9 @@ use crate::block::{Block, BlockError, BlockReadGuard};
 use crate::chunkenc::{ChunkError, EncodedChunk, Encoding};
 use crate::chunks_block::{BlockChunksError, ChunkMeta};
 use crate::compact::{
-    decode_chunk_samples, merge_chunks_with_tombstones_and_float_encoding,
-    merge_head_chunks_with_tombstones_and_float_encoding, DecodedSample,
+    decode_chunk_samples, merge_chunks_with_tombstones,
+    merge_chunks_with_tombstones_and_float_encoding, merge_head_chunks_with_tombstones,
+    DecodedSample,
 };
 use crate::head::{Head, HeadChunkSnapshot, HeadError, HeadReadGuard, SeriesEntry};
 use crate::index::IndexError;
@@ -662,11 +663,9 @@ impl<'a> TsdbQuerier<'a> {
             let mut out = Vec::with_capacity(refs.len());
             for &r in refs.iter() {
                 if let Some((labels, chks, tombs)) = head.series_chunks(r, mint, maxt)? {
-                    let final_chunks = merge_head_chunks_with_tombstones_and_float_encoding(
-                        chks,
-                        &tombs,
-                        float_enc,
-                    )?;
+                    // Go `HeadAndOOOChunkReader` / `populateChunksFromIterable` (`querier.go:1271`)
+                    // uses `Xor` for intra-head merges when `st == 0`.
+                    let final_chunks = merge_head_chunks_with_tombstones(chks, &tombs)?;
                     if !final_chunks.is_empty() {
                         out.push(QueryChunkSeries {
                             labels,
@@ -782,8 +781,11 @@ impl<'a> TsdbQuerier<'a> {
         }
         self.record_select_stats(head_stats, &block_stats, &empty_block_min_times);
 
-        let merge_or_collect = |items: Vec<(ChunkMeta, Vec<Interval>)>,
-                                allow_non_overlapping_raw: bool|
+        let merge_head = |items: Vec<(ChunkMeta, Vec<Interval>)>| -> Result<Vec<ChunkMeta>, QuerierError> {
+            Ok(merge_chunks_with_tombstones(items, false)?)
+        };
+        let merge_cross_source = |items: Vec<(ChunkMeta, Vec<Interval>)>,
+                                  allow_non_overlapping_raw: bool|
          -> Result<Vec<ChunkMeta>, QuerierError> {
             Ok(merge_chunks_with_tombstones_and_float_encoding(
                 items,
@@ -795,14 +797,19 @@ impl<'a> TsdbQuerier<'a> {
         let mut out = Vec::with_capacity(per_series.len());
         for (labels, sources) in per_series {
             let final_chunks = if unordered {
-                let mut combined = merge_or_collect(sources.head, false)?;
-                let blk_chks = merge_or_collect(sources.blocks, true)?;
+                let mut combined = merge_head(sources.head)?;
+                let blk_chks = merge_cross_source(sources.blocks, true)?;
                 combined.extend(blk_chks);
                 combined
+            } else if sources.blocks.is_empty() {
+                merge_head(sources.head)?
             } else {
-                let mut all_items = sources.head;
+                let mut all_items: Vec<(ChunkMeta, Vec<Interval>)> = merge_head(sources.head)?
+                    .into_iter()
+                    .map(|c| (c, Vec::new()))
+                    .collect();
                 all_items.extend(sources.blocks);
-                merge_or_collect(all_items, false)?
+                merge_cross_source(all_items, false)?
             };
             if !final_chunks.is_empty() {
                 out.push(QueryChunkSeries {
@@ -1110,10 +1117,12 @@ impl<'a> TsdbQuerier<'a> {
                 }
             }
             if unordered {
-                let mut combined = merge_or_collect(head_items, false)?;
+                let mut combined = merge_chunks_with_tombstones(head_items, false)?;
                 let blk_chks = merge_or_collect(block_items, true)?;
                 combined.extend(blk_chks);
                 Ok(combined)
+            } else if block_items.is_empty() {
+                Ok(merge_chunks_with_tombstones(head_items, false)?)
             } else {
                 head_items.extend(block_items);
                 merge_or_collect(head_items, false)

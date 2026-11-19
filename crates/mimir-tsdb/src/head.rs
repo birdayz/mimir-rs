@@ -40,7 +40,7 @@ use crate::chunkenc::{
 };
 use crate::chunks_block::ChunkMeta;
 use crate::compact::{
-    decode_chunk_samples, merge_head_chunks_with_tombstones_and_float_encoding, CompactionSeries,
+    decode_chunk_samples, merge_head_chunks_with_tombstones, CompactionSeries,
     SampleValue,
 };
 use crate::exemplar::{CircularExemplarStorage, Exemplar, ExemplarError};
@@ -8901,11 +8901,9 @@ impl Head {
         if chks.is_empty() {
             return Ok(None);
         }
-        let final_chunks = merge_head_chunks_with_tombstones_and_float_encoding(
-            chks,
-            &tombs,
-            self.float_chunk_encoding(),
-        )?;
+        // Go `HeadAndOOOChunkReader` / `populateChunksFromIterable` (`querier.go:1271`)
+        // ignores `floatChunkEncoding` on intra-head merges and uses `Xor` when `st == 0`.
+        let final_chunks = merge_head_chunks_with_tombstones(chks, &tombs)?;
         if final_chunks.is_empty() {
             Ok(None)
         } else {
@@ -8927,11 +8925,7 @@ impl Head {
         if chks.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(merge_head_chunks_with_tombstones_and_float_encoding(
-            chks,
-            &tombs,
-            self.float_chunk_encoding(),
-        )?)
+        Ok(merge_head_chunks_with_tombstones(chks, &tombs)?)
     }
 
     /// Loads and overlap-merges all chunks for a pre-resolved `SeriesEntry` overlapping
@@ -8949,11 +8943,7 @@ impl Head {
         if chks.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(merge_head_chunks_with_tombstones_and_float_encoding(
-            chks,
-            &tombs,
-            self.float_chunk_encoding(),
-        )?)
+        Ok(merge_head_chunks_with_tombstones(chks, &tombs)?)
     }
 
     /// Materializes Phase 2 chunks from a Phase 1 [`HeadChunkSnapshot`], guaranteeing

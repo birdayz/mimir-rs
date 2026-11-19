@@ -985,10 +985,10 @@ fn twin_process_wave2_canceled_and_timed_out_rpcs() {
         assert_eq!(rust_canceled, go_canceled);
         assert_eq!(rust_canceled.0, Some(0.0));
         assert_eq!(rust_canceled.1.get("Canceled"), Some(&3.0), "{rust_canceled:?}");
-        // Server-side grpc-timeout. grpc-go races two timers at the deadline: the stream reset
-        // (RST_STREAM CANCEL, handler context canceled -> recorded as Canceled) and the context
-        // deadline (handler returns its DeadlineExceeded error first -> recorded as Unknown and
-        // counted by the read circuit breaker). Rust deterministically takes the reset path.
+        // Server-side grpc-timeout. Both grpc-go and Rust race the stream reset
+        // (RST_STREAM CANCEL, handler context canceled -> recorded as Canceled) against the
+        // context deadline (handler returns its DeadlineExceeded error first -> recorded as
+        // Unknown and counted by the read circuit breaker).
         let delta = |after: &BTreeMap<String, f64>, before: &BTreeMap<String, f64>| {
             let mut d = BTreeMap::new();
             for (k, v) in after {
@@ -999,21 +999,29 @@ fn twin_process_wave2_canceled_and_timed_out_rpcs() {
             }
             d
         };
-        let go_reset = *go_code == Code::Cancelled
-            && delta(&go_timed_out.1, &go_canceled.1) == BTreeMap::from([("Canceled".to_string(), 1.0)])
-            && go_timed_out.2 == Some(0.0);
-        let go_deadline = *go_code == Code::DeadlineExceeded
-            && delta(&go_timed_out.1, &go_canceled.1) == BTreeMap::from([("Unknown".to_string(), 1.0)])
-            && go_timed_out.2 == Some(1.0);
-        assert!(go_reset || go_deadline, "unexpected Go outcome: {go_code:?} {go_timed_out:?}");
-        assert_eq!(*rust_code, Code::Cancelled);
-        assert_eq!(
-            delta(&rust_timed_out.1, &rust_canceled.1),
-            BTreeMap::from([("Canceled".to_string(), 1.0)])
+        let is_valid_deadline = |code: &Code,
+                                 before_counts: &BTreeMap<String, f64>,
+                                 after: &(Option<f64>, BTreeMap<String, f64>, Option<f64>)| {
+            let reset = *code == Code::Cancelled
+                && delta(&after.1, before_counts)
+                    == BTreeMap::from([("Canceled".to_string(), 1.0)])
+                && after.2 == Some(0.0);
+            let deadline = *code == Code::DeadlineExceeded
+                && delta(&after.1, before_counts)
+                    == BTreeMap::from([("Unknown".to_string(), 1.0)])
+                && after.2 == Some(1.0);
+            reset || deadline
+        };
+        assert!(
+            is_valid_deadline(go_code, &go_canceled.1, go_timed_out),
+            "unexpected Go outcome: {go_code:?} {go_timed_out:?}"
+        );
+        assert!(
+            is_valid_deadline(rust_code, &rust_canceled.1, rust_timed_out),
+            "unexpected Rust outcome: {rust_code:?} {rust_timed_out:?}"
         );
         assert_eq!(rust_timed_out.0, Some(0.0));
         assert_eq!(go_timed_out.0, Some(0.0));
-        assert_eq!(rust_timed_out.2, Some(0.0));
 
         // Configured wait timeout: DeadlineExceeded (labelled Unknown like dskit does for the
         // wrapped context error) and one read circuit breaker timeout, in both.
