@@ -525,7 +525,6 @@ fn twin_process_queried_series_head_plus_4_blocks_parity() {
 
 #[test]
 fn twin_process_tsdb_head_chunks_lifecycle_parity() {
-    let tmp = tempfile::tempdir().unwrap();
     let http = reqwest::Client::new();
     let now = (now_ms() / 60_000) * 60_000;
     let h2 = 2 * 3_600_000i64;
@@ -533,9 +532,13 @@ fn twin_process_tsdb_head_chunks_lifecycle_parity() {
     block_on_for_tests(async {
         let mut side_phases: Vec<(String, BTreeMap<String, String>)> = Vec::new();
         for which in IMPLS {
+            // Go's HeadCompactionIntervalJitterEnabled (yaml:"-", always true in binaries) picks
+            // a uniform random first check in [0, 15m). Retry if that ~1/1800 roll lands mid-Phase-1..3.
+            let phases = loop {
             let hp = free_test_port();
             let gp = free_test_port();
-            let dir = tmp.path().join(which.name());
+            let attempt_tmp = tempfile::tempdir().unwrap();
+            let dir = attempt_tmp.path().join(which.name());
             std::fs::create_dir_all(dir.join("bucket")).unwrap();
             let yaml = classic_yaml(hp, gp, &dir, "24h");
             let mut proc = start_mimir(which, "soak-b", &dir, &yaml, &[]);
@@ -619,7 +622,14 @@ fn twin_process_tsdb_head_chunks_lifecycle_parity() {
                 }
                 client.push(with_org("t-chk", req)).await.unwrap();
             }
-            phases.insert("3_after_ooo".into(), snap(&scrape_text(&http, hp).await));
+            let snap3 = snap(&scrape_text(&http, hp).await);
+            if !snap3.ends_with("blocks=0") {
+                drop(client);
+                proc.sigterm();
+                proc.wait_exit(Duration::from_secs(10));
+                continue;
+            }
+            phases.insert("3_after_ooo".into(), snap3);
 
             // Phase 4: flush/compact
             let resp = http
@@ -669,6 +679,11 @@ fn twin_process_tsdb_head_chunks_lifecycle_parity() {
             )
             .await;
             phases.insert("7_post_restart_query".into(), format!("series={qs_s} chunks={qs_c}"));
+            drop(client2);
+            proc2.sigterm();
+            proc2.wait_exit(Duration::from_secs(10));
+            break phases;
+            };
             side_phases.push((which.name().to_string(), phases));
         }
 
