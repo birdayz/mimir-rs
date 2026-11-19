@@ -717,7 +717,7 @@ impl MemberlistKv {
     fn refute(&self, me: &mut NodeState, accused_inc: u32) {
         let mut inc = self.next_incarnation();
         if accused_inc >= inc {
-            inc = self.skip_incarnation(accused_inc - inc + 1);
+            inc = self.skip_incarnation(accused_inc.wrapping_sub(inc).wrapping_add(1));
         }
         me.incarnation = inc;
         self.awareness.apply_delta(1);
@@ -1077,5 +1077,47 @@ impl NodeState {
     /// Go `Node.PMax`.
     pub fn pmax(&self) -> u8 {
         self.vsn.get(1).copied().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::KvOptions;
+    use super::*;
+    use mimir_config::server::MemberlistConfig;
+
+    #[tokio::test]
+    async fn refute_at_u32_max_wraps_without_panic() {
+        let cfg = MemberlistConfig {
+            bind_addr: vec!["127.0.0.1".to_string()],
+            bind_port: 0,
+            node_name: "refute-u32-max".to_string(),
+            randomize_node_name: false,
+            ..Default::default()
+        };
+        let kv = MemberlistKv::new(cfg, vec![], "", None, KvOptions::default()).unwrap();
+        let node_name = kv.node_name.clone();
+        kv.alive_node(
+            &Alive {
+                incarnation: u32::MAX,
+                node: node_name.clone(),
+                addr: vec![127, 0, 0, 1],
+                port: 7946,
+                meta: None,
+                vsn: vec![1, 5, 2, 1, 2, 1],
+            },
+            None,
+            true,
+        );
+        // Set local incarnation to u32::MAX so next_incarnation() wraps to 0 while accused_inc == u32::MAX.
+        kv.incarnation.store(u32::MAX, Ordering::Release);
+        kv.suspect_node(&Suspect {
+            incarnation: u32::MAX,
+            node: node_name.clone(),
+            from: "accuser".to_string(),
+        });
+        let table = kv.nodes.read();
+        let me = table.map.get(&node_name).expect("local node present");
+        assert_eq!(me.state, NodeStateType::Alive);
     }
 }

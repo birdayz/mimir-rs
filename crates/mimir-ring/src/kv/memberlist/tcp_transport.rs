@@ -482,10 +482,22 @@ fn prefixed(prefix: &str, err: io::Error) -> io::Error {
     io::Error::new(err.kind(), format!("{prefix}: {err}"))
 }
 
+fn configure_tcp_socket(tcp: &TcpStream) {
+    let _ = tcp.set_nodelay(true);
+    let sock = socket2::SockRef::from(tcp);
+    let _ = sock.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(15))
+            .with_interval(Duration::from_secs(15))
+            .with_retries(9),
+    );
+}
+
 /// Memberlist `Transport` over TCP: every packet / stream uses a new connection (dskit
 /// `TCPTransport`).
 pub struct TcpTransport {
     me: Weak<TcpTransport>,
+    stream_timeout: Duration,
     packet_dial_timeout: Duration,
     packet_write_timeout: Duration,
     acquire_writer_timeout: Duration,
@@ -579,6 +591,7 @@ impl TcpTransport {
 
         let transport = Arc::new_cyclic(|me| Self {
             me: me.clone(),
+            stream_timeout: cfg.stream_timeout.as_std().unwrap_or(Duration::ZERO),
             packet_dial_timeout: cfg.packet_dial_timeout.as_std().unwrap_or(Duration::ZERO),
             packet_write_timeout: cfg.packet_write_timeout.as_std().unwrap_or(Duration::ZERO),
             acquire_writer_timeout: cfg.acquire_writer_timeout.as_std().unwrap_or(Duration::ZERO),
@@ -772,29 +785,48 @@ impl TcpTransport {
         if self.debug_enabled() {
             debug!(component = COMPONENT, addr = ?remote, "New connection");
         }
-        // Go enables TCP_NODELAY on every TCP connection.
-        let _ = tcp.set_nodelay(true);
+        // Go enables TCP_NODELAY and 15s TCP keepalive on every TCP connection.
+        configure_tcp_socket(&tcp);
 
-        let stream = match &self.tls {
-            None => ConnStream::Plain(tcp),
-            // Go handshakes lazily on the first Read (of the message type).
-            Some(tls) => match tls.acceptor.accept(tcp).await {
-                Ok(s) => ConnStream::ServerTls(Box::new(s)),
+        let handshake_timeout = if !self.stream_timeout.is_zero() {
+            self.stream_timeout
+        } else {
+            self.packet_write_timeout
+        };
+        let handshake_fut = async {
+            let stream = match &self.tls {
+                None => ConnStream::Plain(tcp),
+                // Go handshakes lazily on the first Read (of the message type).
+                Some(tls) => ConnStream::ServerTls(Box::new(tls.acceptor.accept(tcp).await?)),
+            };
+            let mut conn = MemberlistConn::new(stream, &self.metrics);
+            let mut msg_type = [0u8; 1];
+            conn.read_exact(&mut msg_type).await?;
+            Ok::<_, io::Error>((conn, msg_type[0]))
+        };
+        let (mut conn, msg_type) = if handshake_timeout.is_zero() {
+            match handshake_fut.await {
+                Ok(v) => v,
                 Err(err) => {
                     warn!(component = COMPONENT, err = %err, remote = ?remote, "failed to read message type");
                     return;
                 }
-            },
+            }
+        } else {
+            match tokio::time::timeout(handshake_timeout, handshake_fut).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(err)) => {
+                    warn!(component = COMPONENT, err = %err, remote = ?remote, "failed to read message type");
+                    return;
+                }
+                Err(_) => {
+                    warn!(component = COMPONENT, remote = ?remote, "failed to read message type: i/o timeout");
+                    return;
+                }
+            }
         };
-        let mut conn = MemberlistConn::new(stream, &self.metrics);
 
-        let mut msg_type = [0u8; 1];
-        if let Err(err) = conn.read_exact(&mut msg_type).await {
-            warn!(component = COMPONENT, err = %err, remote = ?remote, "failed to read message type");
-            return;
-        }
-
-        match msg_type[0] {
+        match msg_type {
             STREAM_BYTE => {
                 self.metrics.incoming_streams.inc();
                 // Hand over this connection to memberlist.
@@ -802,30 +834,78 @@ impl TcpTransport {
             }
             PACKET_BYTE => {
                 self.metrics.received_packets.inc();
-                let mut addr_len_buf = [0u8; 1];
-                if let Err(err) = conn.read_exact(&mut addr_len_buf).await {
-                    self.metrics.received_packets_errors.inc();
-                    warn!(component = COMPONENT, err = %err, remote = ?remote, "error while reading node address length from packet");
-                    return;
+                let packet_timeout = if !self.packet_write_timeout.is_zero() {
+                    self.packet_write_timeout
+                } else {
+                    self.stream_timeout
+                };
+                enum PacketReadErr {
+                    AddrLen(io::Error),
+                    Addr(io::Error),
+                    Data(io::Error),
                 }
-                let mut addr_buf = vec![0u8; addr_len_buf[0] as usize];
-                if let Err(err) = conn.read_exact(&mut addr_buf).await {
-                    self.metrics.received_packets_errors.inc();
-                    warn!(component = COMPONENT, err = %err, remote = ?remote, "error while reading node address from packet");
-                    return;
-                }
-                let from = String::from_utf8_lossy(&addr_buf).into_owned();
-
-                let mut buf = Vec::new();
-                if let Err(err) = (&mut conn)
-                    .take((MAX_PUSH_STATE_BYTES + 1) as u64)
-                    .read_to_end(&mut buf)
-                    .await
-                {
-                    self.metrics.received_packets_errors.inc();
-                    warn!(component = COMPONENT, err = %err, remote = ?remote, "error while reading packet data");
-                    return;
-                }
+                let read_pkt_fut = async {
+                    let mut addr_len_buf = [0u8; 1];
+                    conn.read_exact(&mut addr_len_buf)
+                        .await
+                        .map_err(PacketReadErr::AddrLen)?;
+                    let mut addr_buf = vec![0u8; addr_len_buf[0] as usize];
+                    conn.read_exact(&mut addr_buf)
+                        .await
+                        .map_err(PacketReadErr::Addr)?;
+                    let from = String::from_utf8_lossy(&addr_buf).into_owned();
+                    let mut buf = Vec::new();
+                    (&mut conn)
+                        .take((MAX_PUSH_STATE_BYTES + 1) as u64)
+                        .read_to_end(&mut buf)
+                        .await
+                        .map_err(PacketReadErr::Data)?;
+                    Ok::<_, PacketReadErr>((from, buf))
+                };
+                let (from, mut buf) = if packet_timeout.is_zero() {
+                    match read_pkt_fut.await {
+                        Ok(v) => v,
+                        Err(PacketReadErr::AddrLen(err)) => {
+                            self.metrics.received_packets_errors.inc();
+                            warn!(component = COMPONENT, err = %err, remote = ?remote, "error while reading node address length from packet");
+                            return;
+                        }
+                        Err(PacketReadErr::Addr(err)) => {
+                            self.metrics.received_packets_errors.inc();
+                            warn!(component = COMPONENT, err = %err, remote = ?remote, "error while reading node address from packet");
+                            return;
+                        }
+                        Err(PacketReadErr::Data(err)) => {
+                            self.metrics.received_packets_errors.inc();
+                            warn!(component = COMPONENT, err = %err, remote = ?remote, "error while reading packet data");
+                            return;
+                        }
+                    }
+                } else {
+                    match tokio::time::timeout(packet_timeout, read_pkt_fut).await {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(PacketReadErr::AddrLen(err))) => {
+                            self.metrics.received_packets_errors.inc();
+                            warn!(component = COMPONENT, err = %err, remote = ?remote, "error while reading node address length from packet");
+                            return;
+                        }
+                        Ok(Err(PacketReadErr::Addr(err))) => {
+                            self.metrics.received_packets_errors.inc();
+                            warn!(component = COMPONENT, err = %err, remote = ?remote, "error while reading node address from packet");
+                            return;
+                        }
+                        Ok(Err(PacketReadErr::Data(err))) => {
+                            self.metrics.received_packets_errors.inc();
+                            warn!(component = COMPONENT, err = %err, remote = ?remote, "error while reading packet data");
+                            return;
+                        }
+                        Err(_) => {
+                            self.metrics.received_packets_errors.inc();
+                            warn!(component = COMPONENT, remote = ?remote, "error while reading packet data: i/o timeout");
+                            return;
+                        }
+                    }
+                };
                 if buf.len() > MAX_PUSH_STATE_BYTES {
                     self.metrics.received_packets_errors.inc();
                     warn!(
@@ -895,7 +975,7 @@ impl TcpTransport {
             })?,
         }
         .map_err(|e| dial_error(addr, e))?;
-        let _ = tcp.set_nodelay(true);
+        configure_tcp_socket(&tcp);
 
         let stream = match &self.tls {
             None => ConnStream::Plain(tcp),

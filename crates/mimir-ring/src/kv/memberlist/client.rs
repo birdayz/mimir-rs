@@ -932,11 +932,16 @@ impl MemberlistKv {
                 return;
             }
         };
-        self.handle_command(buf, from).await;
+        self.handle_command(buf, from, 0).await;
     }
 
-    fn handle_command<'a>(&'a self, buf: &'a [u8], from: &'a str) -> BoxFuture<'a, ()> {
+    fn handle_command<'a>(&'a self, buf: &'a [u8], from: &'a str, depth: usize) -> BoxFuture<'a, ()> {
+        const MAX_COMMAND_DEPTH: usize = 4;
         Box::pin(async move {
+            if depth > MAX_COMMAND_DEPTH {
+                warn!(depth, from, "memberlist: nested command exceeded max depth");
+                return;
+            }
             if buf.is_empty() {
                 error!(from, "memberlist: missing message type byte");
                 return;
@@ -953,12 +958,12 @@ impl MemberlistKv {
                             warn!(trunc, from, "memberlist: Compound request had truncated messages");
                         }
                         for part in parts {
-                            self.handle_command(part, from).await;
+                            self.handle_command(part, from, depth + 1).await;
                         }
                     }
                     Err(err) => error!(%err, from, "memberlist: Failed to decode compound request"),
                 },
-                MessageType::Compress => self.handle_compressed(body, from).await,
+                MessageType::Compress => self.handle_compressed(body, from, depth).await,
                 MessageType::Ping => match decode_ping(body) {
                     Ok(p) => self.handle_ping(p, from).await,
                     Err(err) => error!(%err, from, "memberlist: Failed to decode ping request"),
@@ -1018,14 +1023,14 @@ impl MemberlistKv {
     }
 
     /// memberlist `handleCompressed`.
-    async fn handle_compressed(&self, body: &[u8], from: &str) {
+    async fn handle_compressed(&self, body: &[u8], from: &str, depth: usize) {
         match super::wire::decode_compressed_payload(body) {
             Ok(cp) => {
                 let labels = [("algo", Self::decompress_algo(cp.algo))];
                 self.go_metrics
                     .incr_counter(&["memberlist", "decompress", "attempts_total"], 1.0, &labels);
                 match decompress_buffer(cp.algo, &cp.buf) {
-                    Ok(decomp) => self.handle_command(&decomp, from).await,
+                    Ok(decomp) => self.handle_command(&decomp, from, depth + 1).await,
                     Err(err) => {
                         self.go_metrics
                             .incr_counter(&["memberlist", "decompress", "errors_total"], 1.0, &labels);
@@ -1772,9 +1777,9 @@ impl MemberlistKv {
     pub fn list_keys(&self, prefix: &str) -> Vec<String> {
         let store = self.store.lock();
         store
-            .iter()
-            .filter(|(k, v)| k.starts_with(prefix) && !v.deleted)
-            .map(|(k, _)| k.clone())
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
             .collect()
     }
 
@@ -1783,9 +1788,6 @@ impl MemberlistKv {
             let store = self.store.lock();
             store.get(key).cloned()?
         };
-        if desc.deleted {
-            return None;
-        }
         desc.value.remove_tombstones(None);
         Some((desc.value.into_any(), desc.version))
     }
@@ -1957,7 +1959,7 @@ impl MemberlistKv {
         let mut new_updated = curr_update;
         let mut new_deleted = curr_deleted;
         if let Some(ut) = update_time {
-            if new_updated.is_none_or(|prev| ut > prev) && (deleted || curr_deleted) {
+            if new_updated.is_none_or(|prev| ut > prev) && deleted {
                 new_updated = Some(ut);
                 new_deleted = deleted;
             }
@@ -1965,17 +1967,9 @@ impl MemberlistKv {
 
         let (mut result, mut change) = match curr {
             Some(curr) => {
-                if curr.deleted && !new_deleted {
-                    // Re-creating a previously deleted key starts from the incoming value rather
-                    // than merging stale pre-deletion state back in.
-                    let v = incoming.clone_mergeable();
-                    let ch = Some(v.clone_mergeable());
-                    (v, ch)
-                } else {
-                    let mut v = curr.value.clone_mergeable();
-                    let ch = v.merge(incoming, cas_version > 0).map_err(KvError::Other)?;
-                    (v, ch)
-                }
+                let mut v = curr.value.clone_mergeable();
+                let ch = v.merge(incoming, cas_version > 0).map_err(KvError::Other)?;
+                (v, ch)
             }
             None => {
                 let v = incoming.clone_mergeable();
