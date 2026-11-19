@@ -247,7 +247,15 @@ impl EtcdKv {
         .map_err(|e| KvError::Other(format!("{}: {e}", super::etcd_tls::TLS_INIT_ERROR_PREFIX)))?;
 
         let timeout: Duration = cfg.dial_timeout.as_std().unwrap_or(Duration::ZERO);
-        let mut builder = reqwest::Client::builder().use_preconfigured_tls(tls);
+        let mut builder = reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .tcp_keepalive(Some(Duration::from_secs(10)))
+            .tcp_keepalive_interval(Some(Duration::from_secs(5)))
+            .tcp_keepalive_retries(Some(4));
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            builder = builder.tcp_user_timeout(Some(Duration::from_secs(30)));
+        }
         if !timeout.is_zero() {
             builder = builder.connect_timeout(timeout);
         }
@@ -283,6 +291,15 @@ impl EtcdKv {
         &self.endpoints[idx % self.endpoints.len()]
     }
 
+    fn unary_request_timeout(&self) -> Duration {
+        let dial = self.cfg.dial_timeout.as_std().unwrap_or(Duration::ZERO);
+        if !dial.is_zero() {
+            dial.saturating_mul(2)
+        } else {
+            Duration::from_secs(30)
+        }
+    }
+
     async fn invalidate_auth(&self) {
         *self.auth_token.write().await = None;
     }
@@ -305,11 +322,13 @@ impl EtcdKv {
         }
 
         let mut last_err = None;
+        let req_timeout = self.unary_request_timeout();
         for idx in 0..self.endpoints.len() {
             let url = format!("{}/v3/auth/authenticate", self.endpoint(idx));
             match self
                 .http
                 .post(&url)
+                .timeout(req_timeout)
                 .json(&AuthReq {
                     name: &self.cfg.username,
                     password: &self.cfg.password,
@@ -374,11 +393,13 @@ impl EtcdKv {
             let mut last_err = None;
             let mut responded = false;
             let mut need_auth_retry = false;
+            let req_timeout = self.unary_request_timeout();
             for idx in 0..self.endpoints.len() {
                 let url = format!("{}{path}", self.endpoint(idx));
                 match self
                     .http
                     .post(&url)
+                    .timeout(req_timeout)
                     .headers(headers.clone())
                     .json(body)
                     .send()
@@ -488,7 +509,7 @@ impl KvClient for EtcdKv {
 
     fn cas<'a>(&'a self, key: &'a str, mut f: CasFn) -> BoxFuture<'a, Result<(), KvError>> {
         Box::pin(async move {
-            let max_retries = self.cfg.max_retries.max(1) as usize;
+            let max_retries = self.cfg.max_retries.max(0) as usize;
             let mut last_err: Option<KvError> = None;
             let key_b64 = b64_encode(key.as_bytes());
 
@@ -783,9 +804,19 @@ impl EtcdKv {
             for attempt in 0..self.endpoints.len() {
                 let idx = (ep_idx + attempt) % self.endpoints.len();
                 let url = format!("{}/v3/watch", self.endpoint(idx));
+                let watch_open_timeout = self.unary_request_timeout();
                 let resp_res = tokio::select! {
                     _ = cancel.canceled() => return,
-                    r = self.http.post(&url).headers(headers.clone()).json(&req_body).send() => r,
+                    r = tokio::time::timeout(
+                        watch_open_timeout,
+                        self.http.post(&url).headers(headers.clone()).json(&req_body).send(),
+                    ) => match r {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            error!(key = key_label, endpoint = %self.endpoint(idx), "etcd watch open timed out");
+                            continue;
+                        }
+                    },
                 };
                 match resp_res {
                     Ok(r) if r.status().is_success() => {

@@ -1033,6 +1033,13 @@ impl LimitsConfig {
             ));
         }
 
+        if self.max_active_series_additional_custom_trackers < 0 {
+            return Err(ConfigError::Validation(format!(
+                "active_series_additional_custom_trackers validation failed: invalid max custom trackers limit: {}",
+                self.max_active_series_additional_custom_trackers
+            )));
+        }
+
         if self.max_active_series_additional_custom_trackers > 0
             && self.active_series_additional_custom_trackers.len()
                 > self.max_active_series_additional_custom_trackers as usize
@@ -1221,4 +1228,24 @@ fn next_power_of_two(n: i64) -> i64 {
         return n;
     }
     (n as u64).next_power_of_two() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_negative_max_active_series_additional_custom_trackers() {
+        let mut limits = LimitsConfig {
+            max_active_series_additional_custom_trackers: -1,
+            ..Default::default()
+        };
+        match limits.validate() {
+            Err(ConfigError::Validation(msg)) => assert_eq!(
+                msg,
+                "active_series_additional_custom_trackers validation failed: invalid max custom trackers limit: -1"
+            ),
+            other => panic!("expected ConfigError::Validation, got {other:?}"),
+        }
+    }
 }

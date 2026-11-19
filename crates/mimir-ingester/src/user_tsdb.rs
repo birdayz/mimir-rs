@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use crate::active_series::{
-    merged_custom_trackers, parse_custom_tracker_matchers, ActiveSeries, CostAttributionTracker,
+    build_custom_trackers_config, merged_custom_trackers, ActiveSeries, CostAttributionTracker,
     Matchers,
 };
 use crate::errors::IngesterError;
@@ -431,14 +431,13 @@ impl UserTsdb {
                 .max(0) as u64,
         );
         let tenant_limits = overrides.for_tenant(&user_id);
-        let custom_matchers =
-            parse_custom_tracker_matchers(&merged_custom_trackers(
-                &tenant_limits.active_series_custom_trackers,
-                &tenant_limits.active_series_additional_custom_trackers,
-            ));
+        let custom_trackers = build_custom_trackers_config(&merged_custom_trackers(
+            &tenant_limits.active_series_custom_trackers,
+            &tenant_limits.active_series_additional_custom_trackers,
+        ));
 
         let active_series = Arc::new(ActiveSeries::with_matchers(
-            Matchers::from_custom_trackers(&custom_matchers),
+            Matchers::new(custom_trackers),
             active_idle,
             cost_attribution_tracker,
         ));

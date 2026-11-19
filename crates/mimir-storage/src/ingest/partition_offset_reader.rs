@@ -76,8 +76,8 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
             interval.tick().await; // skip immediate first tick since we already polled above
             loop {
                 tokio::select! {
-                    _ = stop_rx.changed() => {
-                        if *stop_rx.borrow() {
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
                             break;
                         }
                     }
@@ -127,7 +127,7 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
                     return res.clone();
                 }
             }
-            if *stop_rx.borrow() {
+            if stop_rx.has_changed().is_err() || *stop_rx.borrow() {
                 return Err("partition offset reader is stopped".to_string());
             }
             tokio::select! {
@@ -136,8 +136,8 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
                         return Err("partition offset reader is stopped".to_string());
                     }
                 }
-                _ = stop_rx.changed() => {
-                    if *stop_rx.borrow() {
+                res = stop_rx.changed() => {
+                    if res.is_err() || *stop_rx.borrow() {
                         return Err("partition offset reader is stopped".to_string());
                     }
                 }

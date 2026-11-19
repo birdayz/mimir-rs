@@ -815,6 +815,11 @@ where
         remote_addr: Some(remote),
     });
     req.extensions_mut().insert(error_log);
+    let deadline_ctx = mimir_ingester::grpc::RpcDeadlineContext::new(
+        deadline.map(tokio::time::Instant::into_std),
+    );
+    req.extensions_mut().insert(Arc::clone(&deadline_ctx));
+
 
     // Interceptor order (dskit server.New): ..., Mimir's GRPCMiddleware (multitenant auth), then
     // cluster validation (unary RPCs only, never health checks).
@@ -879,10 +884,15 @@ where
             let call = with_trace_context(span_ctx.clone(), routes.oneshot(req));
             let res = match deadline {
                 // grpc-go: at the deadline the stream is closed with RST_STREAM(CANCEL) and the
-                // handler's context is canceled; dropping the handler future cancels its waits.
-                Some(d) => match tokio::time::timeout_at(d, call).await {
-                    Ok(r) => r,
-                    Err(_) => return Ok(reset_stream_response()),
+                // handler's context is canceled; mark RpcDeadlineContext expired BEFORE dropping
+                // `call` so PushTap/ReadTap drop guards record DeadlineExceeded on breakers.
+                Some(d) => tokio::select! {
+                    biased;
+                    r = call => r,
+                    _ = tokio::time::sleep_until(d) => {
+                        deadline_ctx.mark_expired();
+                        return Ok(reset_stream_response());
+                    }
                 },
                 None => call.await,
             };
@@ -928,6 +938,7 @@ where
 
     // grpc-go closes the stream (RST_STREAM CANCEL) when the deadline expires mid-response.
     let body_deadline = deadline.map(tokio::time::Instant::into_std);
+    let body_deadline_ctx = Arc::clone(&deadline_ctx);
     Ok(resp.map(|b| {
         tonic::body::boxed(
             TrackedBody::with_observer(
@@ -938,7 +949,10 @@ where
                     out_counter: GrpcFrameCounter::default(),
                 },
             )
-            .deadline_with(body_deadline, cancel_stream_error),
+            .deadline_with_cb(body_deadline, move || {
+                body_deadline_ctx.mark_expired();
+                cancel_stream_error()
+            }),
         )
     }))
 }

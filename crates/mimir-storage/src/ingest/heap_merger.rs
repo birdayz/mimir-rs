@@ -144,14 +144,26 @@ pub fn merge_records_in_timestamp_order(
 
 /// Async `HeapMerger` service receiving records from multiple cluster readers, ordering them in a
 /// min-heap by `(timestamp_ms, kafka_cluster_id, offset)`, and flushing batches downstream.
+struct HeapMergerPending {
+    input_rx: mpsc::Receiver<HeapItem>,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+    consumer: MergedBatchConsumer,
+    metrics: HeapMergerMetrics,
+    max_batch_records: usize,
+    max_batch_wait: Duration,
+}
+
 pub struct HeapMerger {
     input_tx: mpsc::Sender<HeapItem>,
     stop_tx: tokio::sync::watch::Sender<bool>,
+    pending: parking_lot::Mutex<Option<HeapMergerPending>>,
     handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl HeapMerger {
-    pub fn start(
+    /// Constructs a `HeapMerger` without spawning a background task yet.
+    /// Call [`HeapMerger::ensure_started`] inside an active Tokio runtime to start processing.
+    pub fn new(
         cfg: &OrderedConsumptionConfig,
         consumer: MergedBatchConsumer,
         metrics: HeapMergerMetrics,
@@ -165,8 +177,37 @@ impl HeapMerger {
             cfg.input_buffer_size as usize
         };
 
-        let (input_tx, mut input_rx) = mpsc::channel::<HeapItem>(buf_size);
-        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let (input_tx, input_rx) = mpsc::channel::<HeapItem>(buf_size);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+
+        Self {
+            input_tx,
+            stop_tx,
+            pending: parking_lot::Mutex::new(Some(HeapMergerPending {
+                input_rx,
+                stop_rx,
+                consumer,
+                metrics,
+                max_batch_records,
+                max_batch_wait,
+            })),
+            handle: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Spawns the background merger task if it has not been started yet.
+    pub fn ensure_started(&self) {
+        let Some(HeapMergerPending {
+            mut input_rx,
+            mut stop_rx,
+            consumer,
+            metrics,
+            max_batch_records,
+            max_batch_wait,
+        }) = self.pending.lock().take()
+        else {
+            return;
+        };
 
         let handle = tokio::spawn(async move {
             let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(max_batch_records);
@@ -179,8 +220,8 @@ impl HeapMerger {
             loop {
                 tokio::select! {
                     biased;
-                    _ = stop_rx.changed() => {
-                        if *stop_rx.borrow() {
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
                             Self::drain_heap(&mut heap, &mut input_rx, "heap merger stopped");
                             break;
                         }
@@ -233,11 +274,19 @@ impl HeapMerger {
             }
         });
 
-        Self {
-            input_tx,
-            stop_tx,
-            handle: tokio::sync::Mutex::new(Some(handle)),
+        if let Ok(mut guard) = self.handle.try_lock() {
+            *guard = Some(handle);
         }
+    }
+
+    pub fn start(
+        cfg: &OrderedConsumptionConfig,
+        consumer: MergedBatchConsumer,
+        metrics: HeapMergerMetrics,
+    ) -> Self {
+        let m = Self::new(cfg, consumer, metrics);
+        m.ensure_started();
+        m
     }
 
     fn drain_heap(
@@ -356,6 +405,10 @@ impl HeapMerger {
     /// without forwarding them downstream (matching `HeapMerger.drain` in Go).
     pub async fn shutdown_and_drain(&self) {
         let _ = self.stop_tx.send(true);
+        if let Some(mut pending) = self.pending.lock().take() {
+            let mut heap = BinaryHeap::new();
+            Self::drain_heap(&mut heap, &mut pending.input_rx, "heap merger stopped");
+        }
         if let Some(handle) = self.handle.lock().await.take() {
             let _ = handle.await;
         }
@@ -363,6 +416,7 @@ impl HeapMerger {
 
     pub async fn stop(self) {
         drop(self.input_tx);
+        drop(self.pending.lock().take());
         if let Some(handle) = self.handle.lock().await.take() {
             let _ = handle.await;
         }

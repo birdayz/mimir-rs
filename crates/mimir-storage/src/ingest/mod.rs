@@ -726,8 +726,8 @@ impl PartitionRingWatcher {
             loop {
                 tokio::select! {
                     biased;
-                    _ = stop_rx.changed() => {
-                        if *stop_rx.borrow() {
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
                             break;
                         }
                     }

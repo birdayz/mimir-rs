@@ -708,16 +708,9 @@ impl Matchers {
     }
 
     pub fn from_custom_trackers(trackers: &[CustomTrackerMatcher]) -> Self {
-        let mut names = Vec::with_capacity(trackers.len());
-        let mut unoptimized = Vec::with_capacity(trackers.len());
         let mut source = BTreeMap::new();
         let mut config = BTreeMap::new();
-        for (idx, t) in trackers.iter().enumerate() {
-            names.push(t.name.clone());
-            unoptimized.push(IndexedMatchers {
-                matchers: t.matchers.clone(),
-                index: idx,
-            });
+        for t in trackers {
             let expr = format!(
                 "{{{}}}",
                 t.matchers
@@ -730,17 +723,20 @@ impl Matchers {
             config.insert(t.name.clone(), t.matchers.clone());
         }
         let canonical_string = custom_trackers_config_string(&source);
-        Self {
-            cfg: CustomTrackersConfig {
-                source,
-                config,
-                canonical_string,
-            },
-            names,
-            unoptimized,
-            value_matchers: HashMap::new(),
-            single_label_matchers: HashMap::new(),
-        }
+        Self::new(CustomTrackersConfig {
+            source,
+            config,
+            canonical_string,
+        })
+    }
+
+    /// Returns `(unoptimized_len, value_matchers_keys_len, single_label_matchers_keys_len)`.
+    pub fn decision_tree_counts(&self) -> (usize, usize, usize) {
+        (
+            self.unoptimized.len(),
+            self.value_matchers.len(),
+            self.single_label_matchers.len(),
+        )
     }
 
     pub fn matcher_names(&self) -> &[String] {
@@ -846,6 +842,41 @@ pub fn merged_custom_trackers(
         merged.insert(k.clone(), v.clone());
     }
     merged
+}
+
+/// Builds a [`CustomTrackersConfig`] from raw `map[name]promql_matchers`, skipping any
+/// invalid tracker expression or excess entries beyond `MAX_NUMBER_OF_TRACKERS`.
+pub fn build_custom_trackers_config(raw: &BTreeMap<String, String>) -> CustomTrackersConfig {
+    let mut source = BTreeMap::new();
+    let mut config = BTreeMap::new();
+    for (name, expr) in raw {
+        if config.len() >= MAX_NUMBER_OF_TRACKERS {
+            break;
+        }
+        if let Ok(ams) = am_parse_matchers(expr) {
+            let mut prom = Vec::with_capacity(ams.len());
+            let mut ok = true;
+            for am in &ams {
+                match am_label_matcher_to_prom(am) {
+                    Ok(m) => prom.push(m),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                source.insert(name.clone(), expr.clone());
+                config.insert(name.clone(), prom);
+            }
+        }
+    }
+    let canonical_string = custom_trackers_config_string(&source);
+    CustomTrackersConfig {
+        source,
+        config,
+        canonical_string,
+    }
 }
 
 /// Parses `LimitsConfig.active_series_custom_trackers` (`map[name]promql_matchers`) into `CustomTrackerMatcher`s.
@@ -2466,6 +2497,10 @@ impl ActiveSeries {
 
     pub fn current_matcher_names(&self) -> Vec<String> {
         self.config_mtx.read().0.matcher_names().to_vec()
+    }
+
+    pub fn decision_tree_counts(&self) -> (usize, usize, usize) {
+        self.config_mtx.read().0.decision_tree_counts()
     }
 
     pub fn current_canonical_string(&self) -> String {
