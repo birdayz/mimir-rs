@@ -68,12 +68,16 @@ impl PushTapPermit {
         self.reactive_permit = Some(rp);
     }
 
-    pub fn finish(mut self, err: Option<&IngesterError>) {
+    pub fn finish(self, err: Option<&IngesterError>) {
+        let dur = self.started_at.elapsed();
+        self.finish_with_duration(dur, err);
+    }
+
+    pub fn finish_with_duration(mut self, dur: Duration, err: Option<&IngesterError>) {
         if self.finished {
             return;
         }
         self.finished = true;
-        let dur = self.started_at.elapsed();
         self.ingester
             .inflight_push_requests
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -94,6 +98,9 @@ impl PushTapPermit {
 
 impl Drop for PushTapPermit {
     fn drop(&mut self) {
+        // Pre-handler drop (request cancelled or failed before entering push handler):
+        // matches Go `FinishPushRequest(ctx)` when `PushWithCleanup` was never entered
+        // (zero-duration success on circuit breaker, drop reactive permit without RTT sample).
         if !self.finished {
             self.finished = true;
             self.ingester
@@ -104,7 +111,9 @@ impl Drop for PushTapPermit {
                     .inflight_push_requests_bytes
                     .fetch_sub(self.req_size, std::sync::atomic::Ordering::AcqRel);
             }
-            drop(self.breaker_permit.take());
+            if let Some(bp) = self.breaker_permit.take() {
+                bp.finish_with_err(Duration::ZERO, None);
+            }
             if let Some(rp) = self.reactive_permit.take() {
                 rp.drop_permit();
             }
@@ -838,7 +847,7 @@ impl Ingester {
             finished: false,
         };
         if let Err(err) = self.check_instance_limits(inflight, inflight_bytes, reject_equal) {
-            permit.finish(Some(&err));
+            permit.finish_with_duration(Duration::ZERO, Some(&err));
             return Err(err);
         }
         Ok(permit)
@@ -969,15 +978,42 @@ impl Ingester {
 
     /// Zero-copy raw protobuf gRPC `Push` entrypoint when admission was already performed by
     /// the pre-decompression gRPC tap (`IngesterZeroCopyServer`).
+    ///
+    /// Owns `permit` through the full push execution (including across `tokio::task::spawn_blocking`
+    /// for payloads `>= 2048` bytes) and finishes it with the handler-measured duration (matching
+    /// Go's `PushWithCleanup` + `FinishPushRequest`) even if the awaiting gRPC future is dropped
+    /// at a deadline or client reset.
     pub async fn push_grpc_raw_admitted(
         self: &Arc<Self>,
         user_id: &str,
         raw_bytes: Bytes,
+        permit: PushTapPermit,
     ) -> Result<(), IngesterError> {
+        let handler_started = Instant::now();
         if !self.cfg.push_grpc_method_enabled {
-            return Err(IngesterError::PushGrpcDisabled);
+            let err = IngesterError::PushGrpcDisabled;
+            permit.finish_with_duration(handler_started.elapsed(), Some(&err));
+            return Err(err);
         }
-        self.push_grpc_raw_inner(user_id, raw_bytes).await
+        if raw_bytes.len() >= 2048 {
+            let ing = Arc::clone(self);
+            let uid = user_id.to_owned();
+            tokio::task::spawn_blocking(move || {
+                let res = ing.push_grpc_raw_sync(&uid, &raw_bytes);
+                let dur = handler_started.elapsed();
+                permit.finish_with_duration(dur, res.as_ref().err());
+                res
+            })
+            .await
+            .map_err(|e| IngesterError::Internal {
+                message: format!("push worker join error: {e}"),
+            })?
+        } else {
+            let res = self.push_grpc_raw_sync(user_id, &raw_bytes);
+            let dur = handler_started.elapsed();
+            permit.finish_with_duration(dur, res.as_ref().err());
+            res
+        }
     }
 
     /// Validates classic gRPC Push wire bytes without ingesting, matching Go's

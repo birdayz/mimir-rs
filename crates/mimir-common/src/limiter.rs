@@ -936,7 +936,13 @@ impl DynamicSemaphore {
             st.waiters.push_back(n.clone());
             n
         };
+        let mut guard = WaiterGuard {
+            sem: self,
+            notify: Arc::clone(&notify),
+            done: false,
+        };
         notify.notified().await;
+        guard.done = true;
         Ok(())
     }
 
@@ -957,6 +963,11 @@ impl DynamicSemaphore {
             st.waiters.push_back(n.clone());
             n
         };
+        let mut guard = WaiterGuard {
+            sem: self,
+            notify: Arc::clone(&notify),
+            done: false,
+        };
 
         if tokio::time::timeout(max_wait, notify.notified())
             .await
@@ -966,18 +977,19 @@ impl DynamicSemaphore {
             // Remove our waiter if it wasn't already woken & given a permit
             if let Some(pos) = st.waiters.iter().position(|w| Arc::ptr_eq(w, &notify)) {
                 st.waiters.remove(pos);
+                guard.done = true;
                 return Err(ReactiveLimitError::WaitExceeded);
             }
-            // Waiter was already popped (meaning `used` was incremented for us).
-            // Release that permit so we don't leak it, or note: in Go `drainWaiter` checks `select { case <-waiter: return nil }`.
-            // Actually if popped, it's already granted! Match Go: return Ok(()).
+            // Waiter was already popped (meaning `used` was incremented for us),
+            // matching Go `drainWaiter`'s `select { case <-waiter: return nil }`.
+            guard.done = true;
             return Ok(());
         }
+        guard.done = true;
         Ok(())
     }
 
-    pub fn release(&self) {
-        let mut st = self.state.lock();
+    fn release_locked(st: &mut DynamicSemaphoreState) {
         assert!(st.used > 0, "DynamicSemaphore: release without matching acquire");
         st.used -= 1;
         while st.used < st.size {
@@ -988,6 +1000,11 @@ impl DynamicSemaphore {
                 break;
             }
         }
+    }
+
+    pub fn release(&self) {
+        let mut st = self.state.lock();
+        Self::release_locked(&mut st);
     }
 
     pub fn set_size(&self, new_size: usize) {
@@ -1016,6 +1033,29 @@ impl DynamicSemaphore {
 
     pub fn used(&self) -> usize {
         self.state.lock().used
+    }
+}
+
+/// Cancel-safe drop guard matching `failsafe-go/internal/util/semaphore.go:drainWaiter`:
+/// if the awaiting future is dropped before completing, either removes the queued waiter
+/// or releases the already-granted permit back to the next waiter / `used` counter.
+struct WaiterGuard<'a> {
+    sem: &'a DynamicSemaphore,
+    notify: Arc<Notify>,
+    done: bool,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut st = self.sem.state.lock();
+        if let Some(pos) = st.waiters.iter().position(|w| Arc::ptr_eq(w, &self.notify)) {
+            st.waiters.remove(pos);
+        } else {
+            DynamicSemaphore::release_locked(&mut st);
+        }
     }
 }
 
@@ -1446,5 +1486,83 @@ mod tests {
             }
         }
         assert!(rl.limit() > 10, "expected limit to grow, got {}", rl.limit());
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_semaphore_cancel_safe_no_permit_leak() {
+        use std::future::Future;
+
+        let sem = Arc::new(DynamicSemaphore::new(5));
+        for _ in 0..5 {
+            assert!(sem.try_acquire());
+        }
+        assert_eq!(sem.used(), 5);
+        assert_eq!(sem.waiters(), 0);
+
+        // Queue 100 waiters and cancel all of them while semaphore is full.
+        let mut futures = Vec::with_capacity(100);
+        let waker = std::task::Waker::noop();
+        for _ in 0..100 {
+            let mut fut = Box::pin(sem.acquire());
+            // Poll once so each waiter registers itself in `waiters`.
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            futures.push(fut);
+        }
+        assert_eq!(sem.waiters(), 100);
+
+        // Release 2 permits while waiters are still registered (waking the first 2 waiters),
+        // then drop ALL 100 waiter futures before they are polled again!
+        sem.release();
+        sem.release();
+        drop(futures);
+
+        // Drop guards must have returned the 2 woken-but-unpolled permits AND removed the 98 queued waiters.
+        assert_eq!(sem.waiters(), 0);
+        assert_eq!(sem.used(), 3);
+
+        // Release the remaining 3 active holders.
+        sem.release();
+        sem.release();
+        sem.release();
+        assert_eq!(sem.used(), 0);
+        assert_eq!(sem.waiters(), 0);
+
+        // All 5 permits must still be acquirable.
+        for _ in 0..5 {
+            assert!(sem.try_acquire());
+        }
+        assert!(!sem.try_acquire());
+        for _ in 0..5 {
+            sem.release();
+        }
+        assert_eq!(sem.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_semaphore_acquire_with_max_wait_cancel_safe() {
+        use std::future::Future;
+
+        let sem = Arc::new(DynamicSemaphore::new(2));
+        assert!(sem.try_acquire());
+        assert!(sem.try_acquire());
+
+        let mut f1 = Box::pin(sem.acquire_with_max_wait(Duration::from_secs(10)));
+        let mut f2 = Box::pin(sem.acquire_with_max_wait(Duration::from_secs(10)));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(f1.as_mut().poll(&mut cx).is_pending());
+        assert!(f2.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(sem.waiters(), 2);
+
+        // Release 1 permit (grants f1), then cancel both f1 and f2.
+        sem.release();
+        drop(f1);
+        drop(f2);
+        assert_eq!(sem.waiters(), 0);
+        assert_eq!(sem.used(), 1);
+
+        sem.release();
+        assert_eq!(sem.used(), 0);
     }
 }

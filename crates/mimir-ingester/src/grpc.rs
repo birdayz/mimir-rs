@@ -302,51 +302,6 @@ where
 #[derive(Clone)]
 struct TapDeadlineFlag(Arc<AtomicBool>);
 
-struct PushTapGuard {
-    tap: Option<crate::push::PushTapPermit>,
-    deadline_ctx: Option<Arc<RpcDeadlineContext>>,
-}
-
-impl PushTapGuard {
-    fn finish(&mut self, err: Option<&IngesterError>) {
-        if let Some(tap) = self.tap.take() {
-            tap.finish(err);
-        }
-    }
-}
-
-impl Drop for PushTapGuard {
-    fn drop(&mut self) {
-        if let Some(mut tap) = self.tap.take() {
-            let timed_out = self
-                .deadline_ctx
-                .as_ref()
-                .is_some_and(|c| c.is_expired());
-            if timed_out && !tap.finished {
-                tap.finished = true;
-                let dur = tap.started_at.elapsed();
-                tap.ingester
-                    .inflight_push_requests
-                    .fetch_sub(1, Ordering::AcqRel);
-                if tap.req_size > 0 {
-                    tap.ingester
-                        .inflight_push_requests_bytes
-                        .fetch_sub(tap.req_size, Ordering::AcqRel);
-                }
-                if let Some(bp) = tap.breaker_permit.take() {
-                    bp.finish_with_err(
-                        dur,
-                        Some(&crate::circuit_breaker::BreakerError::DeadlineExceeded),
-                    );
-                }
-                if let Some(rp) = tap.reactive_permit.take() {
-                    rp.record();
-                }
-            }
-        }
-    }
-}
-
 struct ReadTapGuard {
     tap: Option<ReadTapPermit>,
     deadline_ctx: Option<Arc<RpcDeadlineContext>>,
@@ -1248,13 +1203,12 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
 
         Box::pin(async move {
             // Pre-decompression gRPC TapHandle (`dskit/server/limits.go` + `pkg/mimir/grpc_call_check.go`).
-            let mut push_tap = if is_push {
+            let push_tap_slot: Option<
+                Arc<parking_lot::Mutex<Option<crate::push::PushTapPermit>>>,
+            > = if is_push {
                 let req_size = parse_message_size_header(req.headers());
                 match ingester.try_start_push_tap(req_size) {
-                    Ok(p) => Some(PushTapGuard {
-                        tap: Some(p),
-                        deadline_ctx: deadline_ctx.clone(),
-                    }),
+                    Ok(p) => Some(Arc::new(parking_lot::Mutex::new(Some(p)))),
                     Err(e) => return Ok(unavailable_tap_response(e)),
                 }
             } else {
@@ -1291,15 +1245,18 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
             };
 
             // RPCCallProcessing: reactive limiter blocking permit acquisition.
-            if let Some(ref mut guard) = push_tap {
+            if let Some(ref slot) = push_tap_slot {
                 match ingester.prepare_push_reactive().await {
                     Ok(Some(rp)) => {
-                        if let Some(ref mut tap) = guard.tap {
+                        if let Some(ref mut tap) = *slot.lock() {
                             tap.set_reactive_permit(rp);
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => return Ok(unavailable_tap_response(e)),
+                    Err(e) => {
+                        drop(slot.lock().take());
+                        return Ok(unavailable_tap_response(e));
+                    }
                 }
             }
             if let Some(ref mut guard) = read_tap {
@@ -1321,7 +1278,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
             let mut resp = if is_push {
                 struct RawPushSvc {
                     ingester: Arc<Ingester>,
-                    outcome: Arc<parking_lot::Mutex<Option<IngesterError>>>,
+                    tap_slot: Option<Arc<parking_lot::Mutex<Option<crate::push::PushTapPermit>>>>,
                 }
                 impl tonic::server::UnaryService<Bytes> for RawPushSvc {
                     type Response = cortexpb::WriteResponse;
@@ -1335,36 +1292,46 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
 
                     fn call(&mut self, request: Request<Bytes>) -> Self::Future {
                         let ingester = Arc::clone(&self.ingester);
-                        let outcome = Arc::clone(&self.outcome);
+                        let tap_slot = self.tap_slot.clone();
                         Box::pin(async move {
+                            let tap = tap_slot.as_ref().and_then(|s| s.lock().take());
                             let tenant_res = tenant_from_req(&ingester, &request);
                             let (_, extensions, raw) = request.into_parts();
                             match tenant_res {
                                 Ok(user_id) => {
-                                    if let Err(e) =
-                                        ingester.push_grpc_raw_admitted(&user_id, raw).await
-                                    {
+                                    let res = match tap {
+                                        Some(permit) => {
+                                            ingester
+                                                .push_grpc_raw_admitted(&user_id, raw, permit)
+                                                .await
+                                        }
+                                        None => ingester.push_grpc_raw(&user_id, raw).await,
+                                    };
+                                    if let Err(e) = res {
                                         record_push_error(
                                             &ingester,
                                             extensions.get::<GrpcErrorLog>(),
                                             &e,
                                         );
-                                        let status = e.map_push_error_to_grpc_server_status();
-                                        *outcome.lock() = Some(e);
-                                        return Err(status);
+                                        return Err(e.map_push_error_to_grpc_server_status());
                                     }
                                     Ok(Response::new(cortexpb::WriteResponse {}))
                                 }
                                 Err(tenant_status) => {
-                                    if let Err(e) = ingester.validate_grpc_push_wire(&raw) {
+                                    let wire_err = ingester.validate_grpc_push_wire(&raw).err();
+                                    if let Some(permit) = tap {
+                                        permit.finish_with_duration(
+                                            std::time::Duration::ZERO,
+                                            wire_err.as_ref(),
+                                        );
+                                    }
+                                    if let Some(e) = wire_err {
                                         record_push_error(
                                             &ingester,
                                             extensions.get::<GrpcErrorLog>(),
                                             &e,
                                         );
-                                        let status = e.map_push_error_to_grpc_server_status();
-                                        *outcome.lock() = Some(e);
-                                        return Err(status);
+                                        return Err(e.map_push_error_to_grpc_server_status());
                                     }
                                     Err(tenant_status)
                                 }
@@ -1386,21 +1353,19 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 push_grpc = push_grpc
                     .max_decoding_message_size(usize::MAX)
                     .max_encoding_message_size(usize::MAX);
-                let outcome = Arc::new(parking_lot::Mutex::new(None));
                 let resp = scope_deadline_ctx(
                     deadline_ctx.clone(),
                     push_grpc.unary(
                         RawPushSvc {
                             ingester: Arc::clone(&ingester),
-                            outcome: Arc::clone(&outcome),
+                            tap_slot: push_tap_slot.clone(),
                         },
                         req,
                     ),
                 )
                 .await;
-                if let Some(mut tap) = push_tap.take() {
-                    let err_guard = outcome.lock();
-                    tap.finish(err_guard.as_ref());
+                if let Some(slot) = push_tap_slot {
+                    drop(slot.lock().take());
                 }
                 resp
             } else if is_query_stream {
@@ -2786,8 +2751,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_and_read_tap_guards_record_deadline_exceeded_only_when_expired() {
-        use crate::circuit_breaker::{BreakerState, CircuitBreaker};
+    async fn push_tap_pre_handler_drop_and_read_tap_guard_behavior() {
+        use crate::circuit_breaker::CircuitBreaker;
         use mimir_common::limiter::{ReactiveLimiter, ReactiveLimiterConfig};
         use mimir_config::CircuitBreakerConfig;
 
@@ -2834,11 +2799,9 @@ mod tests {
                 .unwrap_or(0.0)
         };
 
-        // 1. Client disconnect (expired == false) must NOT record timeout or reactive sample.
+        // 1. Pre-handler drop of PushTapPermit decrements inflight counters, drops reactive permit
+        // without recording an RTT sample, and records a zero-duration success on the breaker.
         {
-            let ctx = RpcDeadlineContext::new(Some(
-                std::time::Instant::now() + std::time::Duration::from_secs(60),
-            ));
             let push_tap = crate::push::PushTapPermit {
                 started_at: std::time::Instant::now(),
                 breaker_permit: push_cb.try_acquire_permit().unwrap(),
@@ -2849,36 +2812,22 @@ mod tests {
             };
             ing.inflight_push_requests.fetch_add(1, Ordering::AcqRel);
             ing.inflight_push_requests_bytes.fetch_add(10, Ordering::AcqRel);
-            let _guard = PushTapGuard {
-                tap: Some(push_tap),
-                deadline_ctx: Some(ctx),
-            };
+            drop(push_tap);
         }
+        assert_eq!(ing.inflight_push_requests.load(Ordering::Acquire), 0);
+        assert_eq!(ing.inflight_push_requests_bytes.load(Ordering::Acquire), 0);
         assert_eq!(timeout_count(&push_reg), 0.0);
+        assert_eq!(push_cb.recorded_successes(), 1);
         assert_eq!(push_rl.max_inflight(), 0);
 
         // 1b. Transport-level RST_STREAM(CANCEL) at grpc-timeout (deadline in the past, but
-        // not marked expired with DeadlineExceeded): both PushTapGuard and ReadTapGuard MUST treat
-        // the dropped future as canceled (0 breaker timeouts, drop reactive permit) to match Go's
+        // not marked expired with DeadlineExceeded): ReadTapGuard MUST treat the dropped future
+        // as canceled (0 breaker timeouts, drop reactive permit) to match Go's
         // closeStream(RST_STREAM CANCEL) -> context.Canceled path.
         {
             let ctx = RpcDeadlineContext::new(Some(
                 std::time::Instant::now() - std::time::Duration::from_millis(10),
             ));
-            let push_tap = crate::push::PushTapPermit {
-                started_at: std::time::Instant::now(),
-                breaker_permit: push_cb.try_acquire_permit().unwrap(),
-                reactive_permit: Some(push_rl.acquire_permit().await.unwrap()),
-                ingester: Arc::clone(&ing),
-                req_size: 10,
-                finished: false,
-            };
-            ing.inflight_push_requests.fetch_add(1, Ordering::AcqRel);
-            ing.inflight_push_requests_bytes.fetch_add(10, Ordering::AcqRel);
-            let _push_guard = PushTapGuard {
-                tap: Some(push_tap),
-                deadline_ctx: Some(Arc::clone(&ctx)),
-            };
             let mut rtap = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
             rtap.set_reactive_permit(read_rl.acquire_permit().await.unwrap());
             let _read_guard = ReadTapGuard {
@@ -2886,36 +2835,8 @@ mod tests {
                 deadline_ctx: Some(ctx),
             };
         }
-        assert_eq!(timeout_count(&push_reg), 0.0);
         assert_eq!(timeout_count(&read_reg), 0.0);
-        assert_eq!(push_rl.max_inflight(), 0);
         assert_eq!(read_rl.max_inflight(), 0);
-
-        // 2. Expired grpc-timeout on PushTapGuard MUST record DeadlineExceeded & rp.record() and open breaker.
-        for _ in 0..2 {
-            let ctx = RpcDeadlineContext::new(Some(
-                std::time::Instant::now() + std::time::Duration::from_secs(60),
-            ));
-            ctx.mark_expired();
-            let push_tap = crate::push::PushTapPermit {
-                started_at: std::time::Instant::now(),
-                breaker_permit: push_cb.try_acquire_permit().unwrap(),
-                reactive_permit: Some(push_rl.acquire_permit().await.unwrap()),
-                ingester: Arc::clone(&ing),
-                req_size: 10,
-                finished: false,
-            };
-            ing.inflight_push_requests.fetch_add(1, Ordering::AcqRel);
-            ing.inflight_push_requests_bytes.fetch_add(10, Ordering::AcqRel);
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            let _guard = PushTapGuard {
-                tap: Some(push_tap),
-                deadline_ctx: Some(ctx),
-            };
-        }
-        assert_eq!(timeout_count(&push_reg), 2.0);
-        assert_eq!(push_cb.state(), BreakerState::Open);
-        assert!(push_rl.max_inflight() >= 1);
 
         // 3. Expired grpc-timeout on ReadTapGuard & ReadTapDropBody MUST record DeadlineExceeded & rp.record().
         let ctx_r1 = RpcDeadlineContext::new(Some(
