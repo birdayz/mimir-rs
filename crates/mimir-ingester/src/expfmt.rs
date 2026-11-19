@@ -4,7 +4,9 @@
 //!
 //! Ported from:
 //! - github.com/prometheus/common/expfmt/encode.go (`NegotiateAccept`, `matchFormat`)
-//! - github.com/prometheus/common/expfmt/expfmt.go (format strings)
+//! - github.com/prometheus/common/expfmt/expfmt.go (format strings, `Format.ToEscapingScheme`)
+//! - github.com/prometheus/common/model/metric.go (`EscapeMetricFamily`, `EscapeName`,
+//!   `LegacyValidation.IsValidMetricName`)
 //! - github.com/prometheus/common/expfmt/text_create.go (`MetricFamilyToText`, `writeFloat`)
 //! - github.com/prometheus/common/expfmt/openmetrics_create.go (`MetricFamilyToOpenMetrics`)
 //! - github.com/munnerz/goautoneg/autoneg.go (`ParseAccept`)
@@ -16,6 +18,7 @@
 //! offered): the debugging protobuf text formats `encoding=text` / `encoding=compact-text`, and
 //! OpenMetrics 2.0 (not offered by Go's `DefaultOpenMetricsAcceptedFormats` either).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write as _;
 
@@ -42,6 +45,41 @@ pub enum FormatType {
 pub struct Format {
     pub content_type: String,
     pub kind: FormatType,
+}
+
+/// Go `model.EscapingScheme`, selected by the negotiated `escaping` content-type parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscapingScheme {
+    /// `allow-utf-8` (`model.NoEscaping`): names are emitted verbatim, quoted when not legacy-valid.
+    NoEscaping,
+    /// `underscores` (`model.UnderscoreEscaping`, the default `model.NameEscapingScheme`).
+    Underscores,
+    /// `dots` (`model.DotsEscaping`).
+    Dots,
+    /// `values` (`model.ValueEncodingEscaping`).
+    Values,
+}
+
+impl Format {
+    /// Go `expfmt.Format.ToEscapingScheme`.
+    pub fn escaping_scheme(&self) -> EscapingScheme {
+        for p in self.content_type.split(';') {
+            let toks: Vec<&str> = p.split('=').collect();
+            if toks.len() != 2 {
+                continue;
+            }
+            if toks[0].trim() == "escaping" {
+                return match toks[1].trim() {
+                    "allow-utf-8" => EscapingScheme::NoEscaping,
+                    "dots" => EscapingScheme::Dots,
+                    "values" => EscapingScheme::Values,
+                    // "underscores", and `model.NameEscapingScheme` for anything unknown.
+                    _ => EscapingScheme::Underscores,
+                };
+            }
+        }
+        EscapingScheme::Underscores
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -385,10 +423,9 @@ fn escape(s: &str, include_double_quote: bool) -> String {
     out
 }
 
-fn sorted_labels(m: &proto::Metric) -> Vec<&proto::LabelPair> {
-    let mut l: Vec<&proto::LabelPair> = m.get_label().iter().collect();
-    l.sort_by(|a, b| a.get_name().cmp(b.get_name()));
-    l
+/// Go `model.isValidLegacyRune` (`i` is the byte offset of the rune, like Go's `range`).
+fn is_valid_legacy_rune(c: char, i: usize) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || c == ':' || (c.is_ascii_digit() && i > 0)
 }
 
 /// Legacy Prometheus metric name check (`^[a-zA-Z_:][a-zA-Z0-9_:]*$`, Go `model.LegacyValidation.IsValidMetricName`).
@@ -406,22 +443,147 @@ pub fn is_valid_legacy_metric_name(name: &str) -> bool {
         .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
 }
 
-/// Legacy Prometheus label name check (`^[a-zA-Z_][a-zA-Z0-9_]*$`, Go `model.LegacyValidation.IsValidLabelName`).
-pub fn is_valid_legacy_label_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    if bytes.is_empty() {
-        return false;
+/// Go `model.EscapeName`.
+pub fn escape_name(name: &str, scheme: EscapingScheme) -> Cow<'_, str> {
+    if name.is_empty() {
+        return Cow::Borrowed(name);
     }
-    let first = bytes[0];
-    if !(first.is_ascii_alphabetic() || first == b'_') {
-        return false;
+    match scheme {
+        EscapingScheme::NoEscaping => Cow::Borrowed(name),
+        EscapingScheme::Underscores => {
+            if is_valid_legacy_metric_name(name) {
+                return Cow::Borrowed(name);
+            }
+            let mut escaped = String::with_capacity(name.len());
+            for (i, c) in name.char_indices() {
+                escaped.push(if is_valid_legacy_rune(c, i) { c } else { '_' });
+            }
+            Cow::Owned(escaped)
+        }
+        EscapingScheme::Dots => {
+            // No early return for legacy-valid names: underscores are still escaped.
+            let mut escaped = String::with_capacity(name.len() + 8);
+            for (i, c) in name.char_indices() {
+                match c {
+                    '_' => escaped.push_str("__"),
+                    '.' => escaped.push_str("_dot_"),
+                    c if is_valid_legacy_rune(c, i) => escaped.push(c),
+                    _ => escaped.push_str("__"),
+                }
+            }
+            Cow::Owned(escaped)
+        }
+        EscapingScheme::Values => {
+            if is_valid_legacy_metric_name(name) {
+                return Cow::Borrowed(name);
+            }
+            let mut escaped = String::with_capacity(name.len() + 16);
+            escaped.push_str("U__");
+            for (i, c) in name.char_indices() {
+                match c {
+                    '_' => escaped.push_str("__"),
+                    c if is_valid_legacy_rune(c, i) => escaped.push(c),
+                    // Go's `!utf8.ValidRune` branch (`_FFFD_`) is unreachable: a `str` only holds
+                    // valid scalar values.
+                    c => escaped.push_str(&format!("_{:x}_", c as u32)),
+                }
+            }
+            Cow::Owned(escaped)
+        }
     }
-    bytes[1..]
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// Writes a metric name as-is if legacy-valid, or double-quoted and escaped per Go `expfmt.writeName`.
+/// The metric family name after Go `model.EscapeMetricFamily`: legacy-valid names are kept as-is
+/// under every scheme.
+pub fn escape_family_name(name: &str, scheme: EscapingScheme) -> Cow<'_, str> {
+    if scheme == EscapingScheme::NoEscaping || is_valid_legacy_metric_name(name) {
+        Cow::Borrowed(name)
+    } else {
+        escape_name(name, scheme)
+    }
+}
+
+/// One label after Go `model.EscapeMetricFamily`: the value of `__name__` and every other label
+/// name are escaped unless they are legacy-valid metric names.
+fn escape_label_pair<'a>(
+    name: &'a str,
+    value: &'a str,
+    scheme: EscapingScheme,
+) -> (Cow<'a, str>, Cow<'a, str>) {
+    if scheme == EscapingScheme::NoEscaping {
+        return (Cow::Borrowed(name), Cow::Borrowed(value));
+    }
+    if name == "__name__" {
+        if is_valid_legacy_metric_name(value) {
+            return (Cow::Borrowed(name), Cow::Borrowed(value));
+        }
+        return (Cow::Borrowed(name), escape_name(value, scheme));
+    }
+    if is_valid_legacy_metric_name(name) {
+        return (Cow::Borrowed(name), Cow::Borrowed(value));
+    }
+    (escape_name(name, scheme), Cow::Borrowed(value))
+}
+
+/// Go `model.metricNeedsEscaping` (an empty name or value escapes to itself).
+fn label_needs_escaping(l: &proto::LabelPair) -> bool {
+    if l.get_name() == "__name__" {
+        return !l.get_value().is_empty() && !is_valid_legacy_metric_name(l.get_value());
+    }
+    !l.get_name().is_empty() && !is_valid_legacy_metric_name(l.get_name())
+}
+
+/// Go `model.EscapeMetricFamily`: borrows `mf` when nothing needs escaping.
+pub fn escape_metric_family(mf: &MetricFamily, scheme: EscapingScheme) -> Cow<'_, MetricFamily> {
+    if scheme == EscapingScheme::NoEscaping {
+        return Cow::Borrowed(mf);
+    }
+    let name_needs_escaping =
+        !mf.get_name().is_empty() && !is_valid_legacy_metric_name(mf.get_name());
+    let labels_need_escaping = mf
+        .get_metric()
+        .iter()
+        .any(|m| m.get_label().iter().any(label_needs_escaping));
+    if !name_needs_escaping && !labels_need_escaping {
+        return Cow::Borrowed(mf);
+    }
+    let mut out = mf.clone();
+    if name_needs_escaping {
+        out.set_name(escape_name(mf.get_name(), scheme).into_owned());
+    }
+    for m in out.mut_metric().iter_mut() {
+        for l in m.mut_label().iter_mut() {
+            if !label_needs_escaping(l) {
+                continue;
+            }
+            if l.get_name() == "__name__" {
+                let v = escape_name(l.get_value(), scheme).into_owned();
+                l.set_value(v);
+            } else {
+                let n = escape_name(l.get_name(), scheme).into_owned();
+                l.set_name(n);
+            }
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// The labels of `m` in exposition order (sorted by their original name, like client_golang
+/// gathers them), escaped per `scheme` like Go `model.EscapeMetricFamily` does before encoding.
+pub fn escaped_sorted_labels(
+    m: &proto::Metric,
+    scheme: EscapingScheme,
+) -> Vec<(Cow<'_, str>, Cow<'_, str>)> {
+    let mut l: Vec<&proto::LabelPair> = m.get_label().iter().collect();
+    l.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+    l.into_iter()
+        .map(|lp| escape_label_pair(lp.get_name(), lp.get_value(), scheme))
+        .collect()
+}
+
+/// Go `expfmt.writeName`, used for metric names and label names alike: as-is when the name
+/// passes the legacy *metric* name check (so `:` never forces quoting), else double-quoted and
+/// escaped.
 pub fn write_metric_name(out: &mut Vec<u8>, name: &str) {
     if is_valid_legacy_metric_name(name) {
         out.extend_from_slice(name.as_bytes());
@@ -432,26 +594,18 @@ pub fn write_metric_name(out: &mut Vec<u8>, name: &str) {
     }
 }
 
-/// Writes a label name as-is if legacy-valid, or double-quoted and escaped per Go `expfmt`.
-pub fn write_label_name(out: &mut Vec<u8>, name: &str) {
-    if is_valid_legacy_label_name(name) {
-        out.extend_from_slice(name.as_bytes());
-    } else {
-        out.push(b'"');
-        out.extend_from_slice(escape(name, true).as_bytes());
-        out.push(b'"');
-    }
-}
-
-fn write_name_and_labels(
+/// Go `expfmt.writeNameAndLabelPairs` / `writeOpenMetricsNameAndLabelPairs`. `extra_value` is
+/// the already formatted `le` / `quantile` value.
+pub fn write_name_and_label_pairs(
     out: &mut Vec<u8>,
     name: &str,
-    labels: &[&proto::LabelPair],
-    extra: Option<(&str, String)>,
+    labels: &[(Cow<'_, str>, Cow<'_, str>)],
+    extra: Option<(&str, &str)>,
 ) {
     let mut sep = b'{';
     let mut metric_inside_braces = false;
     if !name.is_empty() {
+        // A name failing the legacy validity check goes inside the braces, quoted.
         if !is_valid_legacy_metric_name(name) {
             metric_inside_braces = true;
             out.push(sep);
@@ -465,17 +619,18 @@ fn write_name_and_labels(
         }
         return;
     }
-    for lp in labels {
+    for (k, v) in labels {
         out.push(sep);
-        write_label_name(out, lp.get_name());
+        write_metric_name(out, k);
         out.extend_from_slice(b"=\"");
-        out.extend_from_slice(escape(lp.get_value(), true).as_bytes());
+        out.extend_from_slice(escape(v, true).as_bytes());
         out.push(b'"');
         sep = b',';
     }
     if let Some((k, v)) = extra {
         out.push(sep);
-        write_label_name(out, k);
+        // Go writes the additional label name with a plain `WriteString`.
+        out.extend_from_slice(k.as_bytes());
         out.extend_from_slice(b"=\"");
         out.extend_from_slice(v.as_bytes());
         out.push(b'"');
@@ -486,12 +641,12 @@ fn write_name_and_labels(
 fn text_sample(
     out: &mut Vec<u8>,
     name: &str,
-    labels: &[&proto::LabelPair],
+    labels: &[(Cow<'_, str>, Cow<'_, str>)],
     extra: Option<(&str, String)>,
     value: f64,
     ts: Option<i64>,
 ) {
-    write_name_and_labels(out, name, labels, extra);
+    write_name_and_label_pairs(out, name, labels, extra.as_ref().map(|(k, v)| (*k, v.as_str())));
     out.push(b' ');
     out.extend_from_slice(text_float(value).as_bytes());
     if let Some(ts) = ts {
@@ -500,11 +655,19 @@ fn text_sample(
     out.push(b'\n');
 }
 
-/// Go `expfmt.MetricFamilyToText` for every family (families must be sorted by the gatherer).
+/// Go `expfmt.MetricFamilyToText` for every family (families must be sorted by the gatherer),
+/// without name escaping (`escaping=allow-utf-8`).
 pub fn encode_text(families: &[MetricFamily]) -> Vec<u8> {
+    encode_text_with_escaping(families, EscapingScheme::NoEscaping)
+}
+
+/// Go `expfmt.NewEncoder` for the text format:
+/// `MetricFamilyToText(w, model.EscapeMetricFamily(v, scheme))` for every family.
+pub fn encode_text_with_escaping(families: &[MetricFamily], scheme: EscapingScheme) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 * 1024);
     for mf in families {
-        let name = mf.get_name();
+        let name = escape_family_name(mf.get_name(), scheme);
+        let name: &str = &name;
         if mf.get_metric().is_empty() {
             continue;
         }
@@ -526,7 +689,7 @@ pub fn encode_text(families: &[MetricFamily]) -> Vec<u8> {
         out.extend_from_slice(typ.as_bytes());
         out.push(b'\n');
         for m in mf.get_metric() {
-            let labels = sorted_labels(m);
+            let labels = escaped_sorted_labels(m, scheme);
             let ts = m.has_timestamp_ms().then(|| m.get_timestamp_ms());
             match mf.get_field_type() {
                 MetricType::COUNTER => {
@@ -611,12 +774,12 @@ enum OmValue {
 fn om_sample(
     out: &mut Vec<u8>,
     name: &str,
-    labels: &[&proto::LabelPair],
+    labels: &[(Cow<'_, str>, Cow<'_, str>)],
     extra: Option<(&str, String)>,
     value: OmValue,
     ts: Option<i64>,
 ) {
-    write_name_and_labels(out, name, labels, extra);
+    write_name_and_label_pairs(out, name, labels, extra.as_ref().map(|(k, v)| (*k, v.as_str())));
     out.push(b' ');
     match value {
         OmValue::Float(f) => out.extend_from_slice(om_float(f).as_bytes()),
@@ -634,11 +797,21 @@ fn om_sample(
 /// Go `expfmt.MetricFamilyToOpenMetrics` for every family plus `FinalizeOpenMetrics` (`# EOF`).
 /// `_created` lines are only emitted with `EnableOpenMetricsTextCreatedSamples`, for which the
 /// `prometheus` crate does not record created timestamps on counters/summaries; histograms from
-/// [`mimir_common::native_histogram`] carry one.
+/// [`mimir_common::native_histogram`] carry one. No name escaping (`escaping=allow-utf-8`).
 pub fn encode_openmetrics(families: &[MetricFamily]) -> Vec<u8> {
+    encode_openmetrics_with_escaping(families, EscapingScheme::NoEscaping)
+}
+
+/// Go `expfmt.NewEncoder` for OpenMetrics 0.0.1 / 1.0.0:
+/// `MetricFamilyToOpenMetrics(w, model.EscapeMetricFamily(v, scheme))` for every family.
+pub fn encode_openmetrics_with_escaping(
+    families: &[MetricFamily],
+    scheme: EscapingScheme,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 * 1024);
     for mf in families {
-        let name = mf.get_name();
+        let name = escape_family_name(mf.get_name(), scheme);
+        let name: &str = &name;
         if mf.get_metric().is_empty() {
             continue;
         }
@@ -668,7 +841,7 @@ pub fn encode_openmetrics(families: &[MetricFamily]) -> Vec<u8> {
             compliant.push_str("_total");
         }
         for m in mf.get_metric() {
-            let labels = sorted_labels(m);
+            let labels = escaped_sorted_labels(m, scheme);
             let ts = m.has_timestamp_ms().then(|| m.get_timestamp_ms());
             match typ {
                 MetricType::COUNTER => om_sample(
@@ -785,12 +958,25 @@ pub fn encode_protobuf(families: &[MetricFamily]) -> Result<Vec<u8>, prometheus:
     Ok(out)
 }
 
-/// Encodes `families` in the negotiated format.
+/// Encodes `families` in the negotiated format (Go `expfmt.NewEncoder`): names are escaped with
+/// the format's escaping scheme before encoding.
 pub fn encode(families: &[MetricFamily], format: &Format) -> Result<Vec<u8>, prometheus::Error> {
+    let scheme = format.escaping_scheme();
     Ok(match format.kind {
-        FormatType::Text => encode_text(families),
-        FormatType::OpenMetrics => encode_openmetrics(families),
-        FormatType::ProtoDelim => encode_protobuf(families)?,
+        FormatType::Text => encode_text_with_escaping(families, scheme),
+        FormatType::OpenMetrics => encode_openmetrics_with_escaping(families, scheme),
+        FormatType::ProtoDelim => {
+            let escaped: Vec<Cow<'_, MetricFamily>> = families
+                .iter()
+                .map(|mf| escape_metric_family(mf, scheme))
+                .collect();
+            if escaped.iter().all(|mf| matches!(mf, Cow::Borrowed(_))) {
+                encode_protobuf(families)?
+            } else {
+                let owned: Vec<MetricFamily> = escaped.into_iter().map(Cow::into_owned).collect();
+                encode_protobuf(&owned)?
+            }
+        }
     })
 }
 
@@ -902,9 +1088,6 @@ mod tests {
         assert!(is_valid_legacy_metric_name("a:b_1"));
         assert!(!is_valid_legacy_metric_name("a.b"));
         assert!(!is_valid_legacy_metric_name("1abc"));
-        assert!(is_valid_legacy_label_name("a_b1"));
-        assert!(!is_valid_legacy_label_name("a:b"));
-        assert!(!is_valid_legacy_label_name("k8s.namespace.name"));
 
         let mut mf = MetricFamily::default();
         mf.set_name("metric.name".to_string());
@@ -923,10 +1106,176 @@ mod tests {
         m.set_gauge(g);
         mf.mut_metric().push(m);
 
-        let text = String::from_utf8(encode_text(&[mf])).unwrap();
+        let text = String::from_utf8(encode_text(std::slice::from_ref(&mf))).unwrap();
         assert_eq!(
             text,
             "# HELP \"metric.name\" h\n# TYPE \"metric.name\" gauge\n{\"metric.name\",\"k8s.namespace.name\"=\"prod\",label=\"val\"} 1\n"
+        );
+    }
+
+    /// prometheus/common `model/metric_test.go` `TestEscapeName`.
+    #[test]
+    fn escape_name_matches_upstream_vectors() {
+        // (input, underscores, dots, values)
+        let cases = [
+            ("", "", "", ""),
+            (
+                "no:escaping_required",
+                "no:escaping_required",
+                "no:escaping__required",
+                "no:escaping_required",
+            ),
+            (
+                "mysystem.prod.west.cpu.load",
+                "mysystem_prod_west_cpu_load",
+                "mysystem_dot_prod_dot_west_dot_cpu_dot_load",
+                "U__mysystem_2e_prod_2e_west_2e_cpu_2e_load",
+            ),
+            (
+                "mysystem.prod.west.cpu.load_total",
+                "mysystem_prod_west_cpu_load_total",
+                "mysystem_dot_prod_dot_west_dot_cpu_dot_load__total",
+                "U__mysystem_2e_prod_2e_west_2e_cpu_2e_load__total",
+            ),
+            (
+                "http.status:sum",
+                "http_status:sum",
+                "http_dot_status:sum",
+                "U__http_2e_status:sum",
+            ),
+            (
+                "label with 😱",
+                "label_with__",
+                "label__with____",
+                "U__label_20_with_20__1f631_",
+            ),
+            ("花火", "__", "____", "U___82b1__706b_"),
+            (
+                "label with \u{100}",
+                "label_with__",
+                "label__with____",
+                "U__label_20_with_20__100_",
+            ),
+        ];
+        for (input, underscores, dots, values) in cases {
+            assert_eq!(escape_name(input, EscapingScheme::NoEscaping), input);
+            assert_eq!(escape_name(input, EscapingScheme::Underscores), underscores, "{input}");
+            assert_eq!(escape_name(input, EscapingScheme::Dots), dots, "{input}");
+            assert_eq!(escape_name(input, EscapingScheme::Values), values, "{input}");
+        }
+    }
+
+    fn utf8_family() -> MetricFamily {
+        let mut mf = MetricFamily::default();
+        mf.set_name("http.requests_total".to_string());
+        mf.set_help("h".to_string());
+        mf.set_field_type(MetricType::COUNTER);
+        let lp = |n: &str, v: &str| {
+            let mut lp = proto::LabelPair::default();
+            lp.set_name(n.to_string());
+            lp.set_value(v.to_string());
+            lp
+        };
+        let mut m = proto::Metric::default();
+        // Sorted by original name, as gathered: '.' (0x2e) < '_' (0x5f) < 'a'.
+        m.set_label(
+            vec![
+                lp("__name__", "other.name"),
+                lp("a.b", "1"),
+                lp("a_a", "2"),
+                lp("team:name", "obs"),
+            ]
+            .into(),
+        );
+        let mut c = proto::Counter::default();
+        c.set_value(3.0);
+        m.set_counter(c);
+        mf.mut_metric().push(m);
+        mf
+    }
+
+    /// Go `expfmt.NewEncoder` escapes with the negotiated scheme (`model.EscapeMetricFamily`)
+    /// before encoding; only `escaping=allow-utf-8` emits quoted UTF-8 names. `writeName` checks
+    /// label names with the legacy *metric* name rule, so `team:name` is never quoted.
+    #[test]
+    fn encode_escapes_names_with_negotiated_scheme() {
+        let fams = [utf8_family()];
+        let text = |accept: Option<&str>| {
+            let format = negotiate(accept);
+            (
+                format.content_type.clone(),
+                String::from_utf8(encode(&fams, &format).unwrap()).unwrap(),
+            )
+        };
+
+        let (ct, body) = text(None);
+        assert_eq!(ct, "text/plain; version=0.0.4; charset=utf-8; escaping=underscores");
+        assert_eq!(
+            body,
+            "# HELP http_requests_total h\n# TYPE http_requests_total counter\n\
+             http_requests_total{__name__=\"other_name\",a_b=\"1\",a_a=\"2\",team:name=\"obs\"} 3\n"
+        );
+
+        let (ct, body) = text(Some("text/plain;version=0.0.4;escaping=allow-utf-8"));
+        assert_eq!(ct, "text/plain; version=0.0.4; charset=utf-8; escaping=allow-utf-8");
+        assert_eq!(
+            body,
+            "# HELP \"http.requests_total\" h\n# TYPE \"http.requests_total\" counter\n\
+             {\"http.requests_total\",__name__=\"other.name\",\"a.b\"=\"1\",a_a=\"2\",team:name=\"obs\"} 3\n"
+        );
+
+        let (_, body) = text(Some("text/plain;version=0.0.4;escaping=dots"));
+        assert_eq!(
+            body,
+            "# HELP http_dot_requests__total h\n# TYPE http_dot_requests__total counter\n\
+             http_dot_requests__total{__name__=\"other_dot_name\",a_dot_b=\"1\",a_a=\"2\",team:name=\"obs\"} 3\n"
+        );
+
+        let (_, body) = text(Some("text/plain;version=0.0.4;escaping=values"));
+        assert_eq!(
+            body,
+            "# HELP U__http_2e_requests__total h\n# TYPE U__http_2e_requests__total counter\n\
+             U__http_2e_requests__total{__name__=\"U__other_2e_name\",U__a_2e_b=\"1\",a_a=\"2\",team:name=\"obs\"} 3\n"
+        );
+
+        // OpenMetrics: the `_total` handling runs on the escaped family name.
+        let (ct, body) = text(Some("application/openmetrics-text;version=1.0.0"));
+        assert_eq!(ct, "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores");
+        assert_eq!(
+            body,
+            "# HELP http_requests h\n# TYPE http_requests counter\n\
+             http_requests_total{__name__=\"other_name\",a_b=\"1\",a_a=\"2\",team:name=\"obs\"} 3.0\n# EOF\n"
+        );
+
+        // Protobuf: the family is escaped, legacy-only families are passed through untouched.
+        let escaped = escape_metric_family(&fams[0], EscapingScheme::Underscores);
+        assert!(matches!(escaped, Cow::Owned(_)));
+        assert_eq!(escaped.get_name(), "http_requests_total");
+        let names: Vec<(&str, &str)> = escaped.get_metric()[0]
+            .get_label()
+            .iter()
+            .map(|l| (l.get_name(), l.get_value()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![("__name__", "other_name"), ("a_b", "1"), ("a_a", "2"), ("team:name", "obs")]
+        );
+        assert!(matches!(
+            escape_metric_family(&fams[0], EscapingScheme::NoEscaping),
+            Cow::Borrowed(_)
+        ));
+        for mf in sample_families() {
+            for scheme in [EscapingScheme::Underscores, EscapingScheme::Dots, EscapingScheme::Values] {
+                assert!(matches!(escape_metric_family(&mf, scheme), Cow::Borrowed(_)));
+            }
+        }
+        let format = negotiate(Some(
+            "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited",
+        ));
+        let escaped_fams = [escaped.into_owned()];
+        assert_eq!(
+            encode(&fams, &format).unwrap(),
+            encode_protobuf(&escaped_fams).unwrap()
         );
     }
 }

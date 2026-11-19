@@ -826,6 +826,9 @@ pub struct SegmentBufReader {
     buf: Box<[u8]>,
     buf_pos: usize,
     buf_len: usize,
+    /// Set once the last segment is drained. Go `segmentBufReader.Read` returns `io.EOF`
+    /// without advancing `cur`, so corruption errors keep pointing at the last segment.
+    eof: bool,
 }
 
 impl SegmentBufReader {
@@ -872,6 +875,7 @@ impl SegmentBufReader {
             buf,
             buf_pos: 0,
             buf_len: 0,
+            eof: false,
         })
     }
 
@@ -891,7 +895,7 @@ impl SegmentBufReader {
 impl Read for SegmentBufReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         loop {
-            if self.segs.is_empty() || self.cur >= self.segs.len() || out.is_empty() {
+            if self.eof || self.segs.is_empty() || self.cur >= self.segs.len() || out.is_empty() {
                 return Ok(0);
             }
 
@@ -928,6 +932,10 @@ impl Read for SegmentBufReader {
                     self.cur_file = None;
                     self.buf_pos = 0;
                     self.buf_len = 0;
+                    if self.cur + 1 >= self.segs.len() {
+                        self.eof = true;
+                        return Ok(0);
+                    }
                     self.cur += 1;
                     self.off = 0;
                     continue;

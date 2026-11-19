@@ -287,7 +287,7 @@ fn apc02_expfmt_quotes_and_escapes_non_legacy_label_and_metric_names() {
     let expected_text = concat!(
         "# HELP cortex_ingester_attributed_active_series Attributed active series\n",
         "# TYPE cortex_ingester_attributed_active_series gauge\n",
-        "cortex_ingester_attributed_active_series{\"k8s.namespace.name\"=\"prod\",\"team:name\"=\"obs\",tenant=\"user-1\",\"weird\\\"\\\\name\\nhere\"=\"v\"} 5\n",
+        "cortex_ingester_attributed_active_series{\"k8s.namespace.name\"=\"prod\",team:name=\"obs\",tenant=\"user-1\",\"weird\\\"\\\\name\\nhere\"=\"v\"} 5\n",
         "# HELP \"metric.no.labels\" Help text\n",
         "# TYPE \"metric.no.labels\" gauge\n",
         "{\"metric.no.labels\"} 2\n",
@@ -312,7 +312,7 @@ fn apc02_expfmt_quotes_and_escapes_non_legacy_label_and_metric_names() {
     let expected_om = concat!(
         "# HELP cortex_ingester_attributed_active_series Attributed active series\n",
         "# TYPE cortex_ingester_attributed_active_series gauge\n",
-        "cortex_ingester_attributed_active_series{\"k8s.namespace.name\"=\"prod\",\"team:name\"=\"obs\",tenant=\"user-1\",\"weird\\\"\\\\name\\nhere\"=\"v\"} 5.0\n",
+        "cortex_ingester_attributed_active_series{\"k8s.namespace.name\"=\"prod\",team:name=\"obs\",tenant=\"user-1\",\"weird\\\"\\\\name\\nhere\"=\"v\"} 5.0\n",
         "# HELP \"metric.no.labels\" Help text\n",
         "# TYPE \"metric.no.labels\" gauge\n",
         "{\"metric.no.labels\"} 2.0\n",

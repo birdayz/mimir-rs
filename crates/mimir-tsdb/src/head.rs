@@ -3513,6 +3513,12 @@ impl HeadActiveReads {
         id
     }
 
+    /// Registers another reader for an already registered read. It keeps the original `id`, so a
+    /// waiter whose cutoff covers the original also waits for the clone.
+    fn start_clone(&self, id: u64, mint: i64, maxt: i64) {
+        self.state.lock().reads.push((id, mint, maxt));
+    }
+
     fn finish(&self, id: u64) {
         let mut state = self.state.lock();
         if let Some(pos) = state.reads.iter().position(|(rid, _, _)| *rid == id) {
@@ -3521,6 +3527,10 @@ impl HeadActiveReads {
         }
     }
 
+    /// Waits for the readers overlapping `[mint, maxt_exclusive)` that were registered before
+    /// this call. Readers registered later are not waited for, so a steady stream of queries
+    /// cannot starve the caller; the caller must make sure those later readers are safe (see
+    /// the call sites).
     fn wait_for_range(&self, mint: i64, maxt_exclusive: i64) {
         if maxt_exclusive <= mint {
             return;
@@ -3532,6 +3542,23 @@ impl HeadActiveReads {
             .reads
             .iter()
             .any(|&(id, r_mint, r_maxt)| id < cutoff && r_mint <= maxt_inclusive && mint <= r_maxt)
+        {
+            self.cv.wait(&mut state);
+        }
+    }
+
+    /// Waits until no registered reader overlaps `[mint, maxt_exclusive)`, including readers
+    /// registered while waiting (Go `Head.WaitForPendingReadersInTimeRange`).
+    fn wait_for_range_all(&self, mint: i64, maxt_exclusive: i64) {
+        if mint >= maxt_exclusive {
+            return;
+        }
+        let maxt_inclusive = maxt_exclusive - 1;
+        let mut state = self.state.lock();
+        while state
+            .reads
+            .iter()
+            .any(|&(_, r_mint, r_maxt)| r_mint <= maxt_inclusive && mint <= r_maxt)
         {
             self.cv.wait(&mut state);
         }
@@ -3551,9 +3578,9 @@ pub struct HeadReadGuard {
 
 impl Clone for HeadReadGuard {
     fn clone(&self) -> Self {
-        let id = self.reads.start(self.mint, self.maxt);
+        self.reads.start_clone(self.id, self.mint, self.maxt);
         Self {
-            id,
+            id: self.id,
             mint: self.mint,
             maxt: self.maxt,
             reads: Arc::clone(&self.reads),
@@ -8108,8 +8135,14 @@ impl Head {
     ) -> Result<(), HeadError> {
         let _snap_guard = self.chunk_snapshot_mtx.lock();
         if self.initialized() {
+            // Go `Head.evictSeries` polls until no overlapping reader is open. Nothing tells a
+            // reader registered during the wait that these series are about to lose their
+            // chunks (Go publishes `evictingSeries` for that), so it has to be waited for too:
+            // the chunks it counted for a lazy `QueryStream` must still be there when it
+            // materializes them.
             let wait_maxt = maxt_inclusive.min(i64::MAX - 1) + 1;
-            self.active_reads.wait_for_range(self.min_time(), wait_maxt);
+            self.active_reads
+                .wait_for_range_all(self.min_time(), wait_maxt);
         }
         let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
         let has_wal = self.wal.lock().is_some();
@@ -8238,6 +8271,13 @@ impl Head {
         if !initialized {
             return Ok(());
         }
+
+        // Readers registered during the wait above still saw the old `min_time`, so they may
+        // have counted chunks below `mint` for a lazy `QueryStream` and must materialize them
+        // before the GC drops them. Readers registered from here on clamp their in-order range
+        // to the `min_time` just published (Go clamps them through
+        // `IsQuerierCollidingWithTruncation`) and are not waited for, which keeps this bounded.
+        self.active_reads.wait_for_range(old_min_time, mint);
 
         self.metrics.head_truncate_total.inc();
         let gc_start = Instant::now();

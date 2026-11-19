@@ -286,7 +286,7 @@ fn encode_families(
     let format = crate::expfmt::negotiate_with_options(header_str(header::ACCEPT), enable_open_metrics);
     let encoded = if format.kind == crate::expfmt::FormatType::OpenMetrics {
         if let Some(cache) = created_tracker {
-            Ok(encode_openmetrics_with_created(families, cache))
+            Ok(encode_openmetrics_with_created(families, cache, format.escaping_scheme()))
         } else {
             crate::expfmt::encode(families, &format)
         }
@@ -1054,6 +1054,7 @@ async fn static_file_handler(AxumPath(path): AxumPath<String>) -> Response {
 fn encode_openmetrics_with_created(
     families: &[prometheus::proto::MetricFamily],
     cache: &MetricsCache,
+    scheme: crate::expfmt::EscapingScheme,
 ) -> Vec<u8> {
     use prometheus::proto::MetricType;
 
@@ -1091,49 +1092,13 @@ fn encode_openmetrics_with_created(
         }
         out
     };
-    let write_name_labels = |
-        out: &mut Vec<u8>,
-        name: &str,
-        labels: &[&prometheus::proto::LabelPair],
-        extra: Option<(&str, &str)>,
-    | {
-        let mut sep = b'{';
-        let mut metric_inside_braces = false;
-        if !name.is_empty() {
-            if !crate::expfmt::is_valid_legacy_metric_name(name) {
-                metric_inside_braces = true;
-                out.push(sep);
-                sep = b',';
-            }
-            crate::expfmt::write_metric_name(out, name);
-        }
-        if labels.is_empty() && extra.is_none() {
-            if metric_inside_braces {
-                out.push(b'}');
-            }
-            return;
-        }
-        for lp in labels {
-            out.push(sep);
-            crate::expfmt::write_label_name(out, lp.get_name());
-            out.extend_from_slice(b"=\"");
-            out.extend_from_slice(escape(lp.get_value()).as_bytes());
-            out.push(b'"');
-            sep = b',';
-        }
-        if let Some((k, v)) = extra {
-            out.push(sep);
-            crate::expfmt::write_label_name(out, k);
-            out.extend_from_slice(b"=\"");
-            out.extend_from_slice(v.as_bytes());
-            out.push(b'"');
-        }
-        out.push(b'}');
-    };
+    let write_name_labels = crate::expfmt::write_name_and_label_pairs;
 
     let mut out = Vec::with_capacity(64 * 1024);
     for mf in families {
-        let name = mf.get_name();
+        // Go `expfmt.NewEncoder`: `model.EscapeMetricFamily(v, scheme)` before encoding.
+        let name = crate::expfmt::escape_family_name(mf.get_name(), scheme);
+        let name: &str = &name;
         if mf.get_metric().is_empty() {
             continue;
         }
@@ -1165,8 +1130,7 @@ fn encode_openmetrics_with_created(
             compliant.clone()
         };
         for m in mf.get_metric() {
-            let mut labels: Vec<&prometheus::proto::LabelPair> = m.get_label().iter().collect();
-            labels.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+            let labels = crate::expfmt::escaped_sorted_labels(m, scheme);
             let ts = m.has_timestamp_ms().then(|| m.get_timestamp_ms());
             let mut key_buf = Vec::new();
             write_name_labels(&mut key_buf, &compliant, &labels, None);
@@ -1411,7 +1375,12 @@ mod tests {
         mf.mut_metric().push(m);
 
         let cache = MetricsCache::new(std::time::Duration::ZERO);
-        let out = String::from_utf8(encode_openmetrics_with_created(&[mf], &cache)).unwrap();
+        let out = String::from_utf8(encode_openmetrics_with_created(
+            std::slice::from_ref(&mf),
+            &cache,
+            crate::expfmt::EscapingScheme::NoEscaping,
+        ))
+        .unwrap();
         assert!(out.contains("# HELP \"http.server.requests\" Requests\n"), "{out}");
         assert!(out.contains("# TYPE \"http.server.requests\" counter\n"), "{out}");
         assert!(
@@ -1458,7 +1427,8 @@ mod tests {
         st.ingester = Some(ing);
         let router = build_http_router(st);
 
-        // 1. Gzip + Vary: Accept + Vary: Accept-Encoding on /ingester/tsdb_metrics.
+        // 1. Gzip + Vary: Accept only on /ingester/tsdb_metrics (verified against the Go binary:
+        // promhttp's TimeoutHandler replaces the gzip handler's Vary: Accept-Encoding).
         let req = Request::builder()
             .method(Method::GET)
             .uri("/ingester/tsdb_metrics")
@@ -1475,11 +1445,7 @@ mod tests {
             .iter()
             .map(|v| v.to_str().unwrap())
             .collect();
-        assert!(vary_vals.contains(&"Accept"), "missing Vary: Accept in {vary_vals:?}");
-        assert!(
-            vary_vals.contains(&"Accept-Encoding"),
-            "missing Vary: Accept-Encoding in {vary_vals:?}"
-        );
+        assert_eq!(vary_vals, vec!["Accept"]);
 
         // 2. Tenant federation: 2 tenants -> 401 multiple org IDs present, 3 tenants -> 422.
         let req = Request::builder()

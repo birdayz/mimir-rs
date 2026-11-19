@@ -118,6 +118,148 @@ fn oem_01_wait_for_range_does_not_starve_on_post_cutoff_readers() {
     head.close().unwrap();
 }
 
+fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A clone of a reader registered before the cutoff is still that reader: the waiter must not
+/// treat it as a new, unprotected one.
+#[test]
+fn oem_01_clone_of_pre_cutoff_reader_is_still_waited_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = HeadOptions {
+        chunk_range_ms: 10_000,
+        ooo_time_window_ms: 60_000,
+        ooo_cap_max: 2,
+        ..HeadOptions::default()
+    };
+    let head = Arc::new(Head::open(dir.path(), opts, i64::MIN).unwrap());
+    let pairs = [("__name__", "oem01_clone_metric"), ("job", "api")];
+    {
+        let mut app = head.appender();
+        app.append_float(None, &pairs, 50_000, 1.0).unwrap();
+        app.commit().unwrap();
+    }
+    {
+        let mut app = head.appender();
+        for t in [1_000i64, 2_000, 3_000] {
+            app.append_float(None, &pairs, t, t as f64).unwrap();
+        }
+        app.commit().unwrap();
+    }
+
+    let pre_guard = head.start_read(500, 10_000);
+    let done = Arc::new(AtomicBool::new(false));
+    let done_c = Arc::clone(&done);
+    let head_c = Arc::clone(&head);
+    let handle = std::thread::spawn(move || {
+        head_c.clear_ooo_data_before(4_000).unwrap();
+        done_c.store(true, Ordering::Release);
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!done.load(Ordering::Acquire));
+
+    let cloned_guard = pre_guard.clone();
+    drop(pre_guard);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !done.load(Ordering::Acquire),
+        "clear_ooo_data_before must wait for the clone of a pre-existing reader"
+    );
+    drop(cloned_guard);
+    wait_until("clear_ooo_data_before", || done.load(Ordering::Acquire));
+
+    handle.join().unwrap();
+    head.close().unwrap();
+}
+
+/// A reader registered while `truncate_memory` waits for older readers still sees the old
+/// `min_time`, so a lazy `QueryStream` may already have announced chunks below the truncation
+/// time. The GC must not drop them before that reader is done, while readers registered after
+/// `min_time` is published are clamped and never delay the truncation.
+#[test]
+fn oem_01_truncate_memory_protects_readers_registered_during_the_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = HeadOptions {
+        chunk_range_ms: 10_000,
+        ..HeadOptions::default()
+    };
+    let head = Arc::new(Head::open(dir.path(), opts, i64::MIN).unwrap());
+    let pairs = [("__name__", "oem01_truncate_metric"), ("job", "api")];
+    let ref_id = {
+        let mut app = head.appender();
+        let r = app.append_float(None, &pairs, 1_000, 1.0).unwrap();
+        app.append_float(Some(r), &pairs, 2_000, 2.0).unwrap();
+        app.commit().unwrap();
+        r
+    };
+    {
+        // Cuts the [0, 10_000) chunk.
+        let mut app = head.appender();
+        app.append_float(Some(ref_id), &pairs, 11_000, 3.0).unwrap();
+        app.append_float(Some(ref_id), &pairs, 12_000, 4.0).unwrap();
+        app.commit().unwrap();
+    }
+    assert_eq!(head.min_time(), 1_000);
+
+    let pre_guard = head.start_read(0, 5_000);
+    let done = Arc::new(AtomicBool::new(false));
+    let done_c = Arc::clone(&done);
+    let head_c = Arc::clone(&head);
+    let handle = std::thread::spawn(move || {
+        head_c.truncate_memory(10_000).unwrap();
+        done_c.store(true, Ordering::Release);
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!done.load(Ordering::Acquire), "truncate_memory must wait for pre_guard");
+
+    // Registered during the wait: phase 1 counts both chunks.
+    let mid_guard = head.start_read(0, 20_000);
+    let (_, mid_count, mid_snapshot) = head
+        .series_lazy_chunk_count_with_snapshot(ref_id, 0, 20_000, None)
+        .unwrap()
+        .expect("series in range");
+    assert_eq!(mid_count, 2);
+
+    drop(pre_guard);
+    wait_until("min_time to be published", || head.min_time() == 10_000);
+
+    // Registered after min_time was published: clamped to the truncation time.
+    let late_guard = head.start_read(0, 20_000);
+    let (_, late_count, late_snapshot) = head
+        .series_lazy_chunk_count_with_snapshot(ref_id, 0, 20_000, None)
+        .unwrap()
+        .expect("series in range");
+    assert_eq!(late_count, 1);
+
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !done.load(Ordering::Acquire),
+        "the GC must wait for the reader registered during the first wait"
+    );
+    let mid_chunks = head
+        .series_final_chunks_from_snapshot(None, ref_id, mid_snapshot)
+        .unwrap();
+    assert_eq!(mid_chunks.len(), mid_count as usize);
+
+    // The late reader stays open: it must not hold the truncation back.
+    drop(mid_guard);
+    wait_until("truncate_memory", || done.load(Ordering::Acquire));
+    let late_chunks = head
+        .series_final_chunks_from_snapshot(None, ref_id, late_snapshot)
+        .unwrap();
+    assert_eq!(late_chunks.len(), late_count as usize);
+    assert_eq!(late_chunks[0].min_time, 11_000);
+
+    drop(late_guard);
+    handle.join().unwrap();
+    head.close().unwrap();
+}
+
 // -----------------------------------------------------------------------------
 // OEM-02: Best-effort WBL logging + unconditional OOO commit tail.
 // -----------------------------------------------------------------------------
@@ -804,4 +946,58 @@ fn w16_icw_05_segment_buf_reader_opens_only_one_fd_lazily() {
     let mut raw = Vec::new();
     sbr2.read_to_end(&mut raw).unwrap();
     assert!(!raw.is_empty());
+}
+
+/// Go `segmentBufReader.Read` never advances `cur` past the last segment, so
+/// `Reader.Err()` still reports `segs[cur]` / `off` when the final record is torn at a page
+/// boundary. `Head::open` needs that position to run `wlog.Repair`.
+#[test]
+fn w16_icw_05_torn_last_record_at_page_boundary_keeps_last_segment_position() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut w = WlogWriter::open(dir.path(), CompressionType::None).unwrap();
+        w.log(&[b"first-segment-record"]).unwrap();
+        w.next_segment().unwrap();
+        w.log(&[b"intact"]).unwrap();
+        // Spans three pages: REC_FIRST fills the rest of page 0, REC_MIDDLE page 1, REC_LAST page 2.
+        let big = vec![b'y'; 2 * PAGE_SIZE + 100];
+        w.log(&[&big]).unwrap();
+        w.close().unwrap();
+    }
+    // Crash after only the first page reached disk: the file ends on a page boundary mid-record.
+    let seg1 = dir.path().join(format!("{:08}", 1));
+    let f = fs::OpenOptions::new().write(true).open(&seg1).unwrap();
+    f.set_len(PAGE_SIZE as u64).unwrap();
+    drop(f);
+
+    let mut r = WlogReader::open_dir(dir.path()).unwrap();
+    assert_eq!(r.next_record().unwrap().unwrap(), b"first-segment-record");
+    assert_eq!(r.next_record().unwrap().unwrap(), b"intact");
+    let err = r.next_record().unwrap_err();
+    match err {
+        mimir_tsdb::wlog::WlogError::Corruption {
+            dir: err_dir,
+            segment,
+            offset,
+            ..
+        } => {
+            assert_eq!(segment, Some(1));
+            assert_eq!(offset, PAGE_SIZE);
+            assert_eq!(err_dir.as_deref(), Some(dir.path()));
+        }
+        other => panic!("expected corruption error, got {other:?}"),
+    }
+    // EOF is sticky and keeps reporting the last segment without re-reading it.
+    assert_eq!(r.segment(), Some(1));
+    assert_eq!(r.offset(), PAGE_SIZE);
+
+    // Clean EOF on an intact log also stays on the last segment.
+    let mut sbr = SegmentBufReader::open_dir(dir.path()).unwrap();
+    let mut raw = Vec::new();
+    sbr.read_to_end(&mut raw).unwrap();
+    assert_eq!(raw.len(), 2 * PAGE_SIZE);
+    assert_eq!(sbr.current_segment(), Some(1));
+    assert_eq!(sbr.current_offset(), PAGE_SIZE);
+    let mut one = [0u8; 1];
+    assert_eq!(sbr.read(&mut one).unwrap(), 0);
 }
