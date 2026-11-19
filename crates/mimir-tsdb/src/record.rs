@@ -680,6 +680,9 @@ pub fn decode_labels(dec: &mut Decbuf<'_>) -> Result<Labels, EncodingError> {
     for _ in 0..n {
         let name = dec.uvarint_str()?;
         let value = dec.uvarint_str()?;
+        if name.len() >= (1 << 24) || value.len() >= (1 << 24) {
+            return Err(EncodingError::InvalidSize);
+        }
         pairs.push((name, value));
     }
     if pairs.windows(2).all(|w| w[0].0 < w[1].0) && pairs.iter().all(|(_, v)| !v.is_empty()) {

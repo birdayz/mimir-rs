@@ -838,6 +838,13 @@ impl MemPostings {
 
     /// Returns all label values for `name` (unsorted, matching `MemPostings.LabelValues`).
     pub fn label_values(&self, name: &str, symbols: &SymbolTable) -> Vec<String> {
+        if name.is_empty() {
+            return if self.is_all_empty() {
+                Vec::new()
+            } else {
+                vec![String::new()]
+            };
+        }
         let Some(name_id) = symbols.get(name) else {
             return Vec::new();
         };
@@ -861,6 +868,13 @@ impl MemPostings {
         symbols: &SymbolTable,
         limit: Option<usize>,
     ) -> Vec<String> {
+        if name.is_empty() {
+            return if self.is_all_empty() {
+                Vec::new()
+            } else {
+                vec![String::new()]
+            };
+        }
         let Some(name_id) = symbols.get(name) else {
             return Vec::new();
         };

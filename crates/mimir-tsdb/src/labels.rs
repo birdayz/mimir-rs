@@ -45,13 +45,13 @@ impl Label {
 
 /// Encodes a label string length using Prometheus `stringlabels` varint format:
 /// - `len < 255`: 1 byte (`len as u8`)
-/// - `255 <= len <= 2^24`: `[255, le0, le1, le2]`
+/// - `255 <= len < 2^24`: `[255, le0, le1, le2]`
 #[inline]
 pub fn encode_stringlabel_size(buf: &mut Vec<u8>, len: usize) {
     if len < 255 {
         buf.push(len as u8);
     } else {
-        assert!(len <= (1 << 24), "string too long to encode as label");
+        assert!(len < (1 << 24), "string too long to encode as label");
         buf.push(255);
         buf.push((len & 0xff) as u8);
         buf.push(((len >> 8) & 0xff) as u8);

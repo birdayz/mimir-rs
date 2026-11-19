@@ -17,9 +17,9 @@ use crate::block::{Block, BlockError, BlockReadGuard};
 use crate::chunkenc::{ChunkError, EncodedChunk, Encoding};
 use crate::chunks_block::{BlockChunksError, ChunkMeta};
 use crate::compact::{
-    decode_chunk_samples, merge_chunks_with_tombstones,
+    compact_chunk_series_merge, decode_chunk_samples, merge_chunks_with_tombstones,
     merge_chunks_with_tombstones_and_float_encoding, merge_head_chunks_with_tombstones,
-    DecodedSample,
+    reencode_chunk_without_tombstones, DecodedSample,
 };
 use crate::head::{Head, HeadChunkSnapshot, HeadError, HeadReadGuard, SeriesEntry};
 use crate::index::IndexError;
@@ -804,12 +804,19 @@ impl<'a> TsdbQuerier<'a> {
             } else if sources.blocks.is_empty() {
                 merge_head(sources.head)?
             } else {
-                let mut all_items: Vec<(ChunkMeta, Vec<Interval>)> = merge_head(sources.head)?
-                    .into_iter()
-                    .map(|c| (c, Vec::new()))
-                    .collect();
-                all_items.extend(sources.blocks);
-                merge_cross_source(all_items, false)?
+                let mut all_chks = merge_head(sources.head)?;
+                for (cm, tombs) in sources.blocks {
+                    if tombs
+                        .iter()
+                        .any(|iv| iv.is_subrange(cm.min_time, cm.max_time))
+                    {
+                        continue;
+                    }
+                    if let Some(c) = reencode_chunk_without_tombstones(cm, &tombs)? {
+                        all_chks.push(c);
+                    }
+                }
+                compact_chunk_series_merge(all_chks, float_enc)?
             };
             if !final_chunks.is_empty() {
                 out.push(QueryChunkSeries {
@@ -1124,8 +1131,19 @@ impl<'a> TsdbQuerier<'a> {
             } else if block_items.is_empty() {
                 Ok(merge_chunks_with_tombstones(head_items, false)?)
             } else {
-                head_items.extend(block_items);
-                merge_or_collect(head_items, false)
+                let mut all_chks = merge_chunks_with_tombstones(head_items, false)?;
+                for (cm, tombs) in block_items {
+                    if tombs
+                        .iter()
+                        .any(|iv| iv.is_subrange(cm.min_time, cm.max_time))
+                    {
+                        continue;
+                    }
+                    if let Some(c) = reencode_chunk_without_tombstones(cm, &tombs)? {
+                        all_chks.push(c);
+                    }
+                }
+                Ok(compact_chunk_series_merge(all_chks, float_enc)?)
             }
         };
 
@@ -1340,6 +1358,24 @@ impl<'a> TsdbQuerier<'a> {
             if matchers.is_empty() {
                 for val in idx.label_values(name)? {
                     set.insert(val);
+                }
+            } else if name.is_empty() {
+                if !idx.label_values("")?.is_empty()
+                    && matchers
+                        .iter()
+                        .filter(|m| m.name.is_empty())
+                        .all(|m| m.matches(""))
+                {
+                    let other_matchers: Vec<LabelMatcher> = matchers
+                        .iter()
+                        .filter(|m| !m.name.is_empty())
+                        .cloned()
+                        .collect();
+                    if other_matchers.is_empty()
+                        || !blk.postings_for_matchers_direct(&other_matchers)?.is_empty()
+                    {
+                        set.insert(String::new());
+                    }
                 }
             } else {
                 let refs = blk.postings_for_matchers_direct(matchers)?;
