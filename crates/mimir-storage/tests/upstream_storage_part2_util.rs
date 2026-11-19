@@ -478,6 +478,7 @@ fn test_sampled_only_tracer_fetch_hooks() {
                 span_id: [1; 8],
                 sampled: true,
                 remote: true,
+                ..Default::default()
             }
             .trace_id_string(),
             TRACE_ID
@@ -521,6 +522,7 @@ fn test_sampled_only_tracer_produce_hooks() {
                 span_id: [1; 8],
                 sampled: false,
                 remote: true,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -543,6 +545,7 @@ fn test_sampled_only_tracer_produce_hooks() {
                 span_id: [3; 8],
                 sampled: true,
                 remote: false,
+                ..Default::default()
             }),
             ..Default::default()
         };

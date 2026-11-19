@@ -392,6 +392,7 @@ pub struct TraceSpanContext {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
     pub sampled: bool,
+    pub trace_flags: u8,
     pub remote: bool,
 }
 
@@ -417,12 +418,16 @@ impl TraceSpanContext {
     }
 
     pub fn to_traceparent(&self) -> String {
-        let flags = if self.sampled { "01" } else { "00" };
+        let mut flags = self.trace_flags & 0x03;
+        if self.sampled {
+            flags |= 0x01;
+        } else {
+            flags &= !0x01;
+        }
         format!(
-            "00-{}-{}-{}",
+            "00-{}-{}-{flags:02x}",
             self.trace_id_string(),
-            self.span_id_string(),
-            flags
+            self.span_id_string()
         )
     }
 
@@ -432,6 +437,7 @@ impl TraceSpanContext {
             trace_id: tc.trace_id,
             span_id: tc.span_id,
             sampled: tc.sampled,
+            trace_flags: tc.trace_flags,
             remote: tc.remote,
         })
     }
@@ -554,6 +560,7 @@ impl SampledOnlyPropagator {
             trace_id: tc.trace_id,
             span_id: tc.span_id,
             sampled: tc.sampled,
+            trace_flags: tc.trace_flags,
             remote: tc.remote,
         })
     }
@@ -624,6 +631,7 @@ impl SampledOnlyTracer {
                 trace_id: tc.trace_id,
                 span_id: tc.span_id,
                 sampled: tc.sampled,
+                trace_flags: tc.trace_flags,
                 remote: tc.remote,
             };
             rec.span_ctx = Some(extracted);
