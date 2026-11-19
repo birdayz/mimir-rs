@@ -517,7 +517,8 @@ impl UserTsdb {
             metadata_limits: initial_metadata_limits,
             series_lifecycle_callback: Some(lifecycle_adapter.clone()),
             registry: tsdb_prom_reg.clone(),
-        };
+        }
+        .with_chunk_end_time_variance(blocks_cfg.tsdb.head_chunks_end_time_variance);
 
         // Go `blocksToDelete` closure + `userTSDB.blocksToDelete`: nothing is deleted until
         // the TSDB is ready (after the post-replay compaction); then only blocks deletable by
@@ -599,8 +600,12 @@ impl UserTsdb {
         }
 
         let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
-        db.head()
-            .set_chunk_end_time_variance(blocks_cfg.tsdb.head_chunks_end_time_variance);
+        db.set_postings_cache_eligibility(
+            blocks_cfg.tsdb.head_postings_for_matchers_cache_force,
+            blocks_cfg.tsdb.shared_postings_for_matchers_cache,
+            blocks_cfg.tsdb.block_postings_for_matchers_cache_force,
+            blocks_cfg.tsdb.shared_postings_for_matchers_cache,
+        );
         let weak_db = Arc::downgrade(&db);
         *lifecycle_adapter.num_series_fn.write() = Some(Arc::new(move || {
             weak_db.upgrade().map_or(0, |d| d.head().num_series())

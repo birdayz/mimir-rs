@@ -4034,6 +4034,13 @@ impl Head {
             .store(bytes.max(1), Ordering::Release);
     }
 
+    #[doc(hidden)]
+    pub fn set_wal_write_fault_hook_for_test(&self, hook: Option<crate::wlog::WriteFaultHook>) {
+        if let Some(ref mut wal) = *self.wal.lock() {
+            wal.set_write_fault_hook(hook);
+        }
+    }
+
     #[inline]
     fn symbol_arena_grew_past_gc_threshold(&self) -> bool {
         let sym_bytes = self.symbols.read().bytes_len() as u64;

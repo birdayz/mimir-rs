@@ -261,7 +261,7 @@ impl RpcDeadlineContext {
     }
 
     #[inline]
-    fn has_timed_out(&self) -> bool {
+    pub fn has_timed_out(&self) -> bool {
         self.is_expired()
             || self
                 .deadline

@@ -535,3 +535,205 @@ async fn wll_01_closed_user_tsdb_returns_empty_ok_on_all_read_rpcs() {
 
     let _ = ing.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tsdb_06_default_user_tsdb_unsharded_query_stream_skips_postings_cache_and_sees_new_series() {
+    let dir = TempDir::new().unwrap();
+    let (cfg, blocks_cfg, ingest_cfg) = default_ingester_test_config(dir.path());
+    assert!(!blocks_cfg.tsdb.head_postings_for_matchers_cache_force);
+    assert!(!blocks_cfg.tsdb.block_postings_for_matchers_cache_force);
+    assert!(!blocks_cfg.tsdb.shared_postings_for_matchers_cache);
+
+    let limits = default_limits_test_config();
+    let reg = Registry::new();
+    let (ing, _, _) =
+        prepare_ingester_with_blocks_storage(dir.path(), cfg, blocks_cfg, ingest_cfg, limits, Some(&reg));
+    start_and_wait_healthy(&ing).await;
+
+    let user = "user-tsdb06-default";
+    ing.push_grpc(
+        user,
+        &write_req(vec![("tsdb06_m", "job_a", vec![(1_000, 1.0)])]),
+    )
+    .await
+    .unwrap();
+
+    let db = ing.get_tsdb(user).unwrap();
+    assert!(!db.db.head().postings_cache().force());
+    assert!(!db.db.head().postings_cache().shared());
+
+    let matchers = vec![proto_matcher(ingesterpb::MatchType::Equal, "__name__", "tsdb06_m")];
+    let q1 = ing
+        .handle_query_stream(
+            &MetadataMap::new(),
+            user,
+            ingesterpb::QueryRequest {
+                start_timestamp_ms: 0,
+                end_timestamp_ms: 10_000,
+                matchers: matchers.clone(),
+                streaming_chunks_batch_size: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(q1.iter().map(|r| r.streaming_series.len()).sum::<usize>(), 1);
+    assert_eq!(
+        metric_value(
+            &reg,
+            "cortex_ingester_tsdb_head_postings_for_matchers_cache_skips_total",
+            &[("reason", "ineligible")],
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        metric_value(
+            &reg,
+            "cortex_ingester_tsdb_head_postings_for_matchers_cache_misses_total",
+            &[],
+        ),
+        Some(0.0)
+    );
+
+    // Push a second series and immediately run the exact same unsharded QueryStream;
+    // because ineligible queries bypass the cache, the newly pushed series is visible at once.
+    let start = std::time::Instant::now();
+    ing.push_grpc(
+        user,
+        &write_req(vec![("tsdb06_m", "job_b", vec![(2_000, 2.0)])]),
+    )
+    .await
+    .unwrap();
+    let q2 = ing
+        .handle_query_stream(
+            &MetadataMap::new(),
+            user,
+            ingesterpb::QueryRequest {
+                start_timestamp_ms: 0,
+                end_timestamp_ms: 10_000,
+                matchers,
+                streaming_chunks_batch_size: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(q2.iter().map(|r| r.streaming_series.len()).sum::<usize>(), 2);
+    assert_eq!(
+        metric_value(
+            &reg,
+            "cortex_ingester_tsdb_head_postings_for_matchers_cache_skips_total",
+            &[("reason", "ineligible")],
+        ),
+        Some(2.0)
+    );
+
+    let _ = ing.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rkw_03_enforce_read_consistency_bounded_by_grpc_deadline_trips_read_breaker() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use mimir_config::{CircuitBreakerConfig, GoDuration, KafkaConfig, StringSliceCSV};
+    use mimir_ingester::circuit_breaker::BreakerState;
+    use mimir_ingester::grpc::{RpcDeadlineContext, RPC_DEADLINE_CONTEXT};
+    use mimir_ingester::ingest_storage::IngestReaderHandle;
+    use mimir_storage::ingest::{
+        FetchedRecord, ReaderState, RecordBatchConsumer, SingleClusterPartitionReader,
+    };
+
+    struct NoOpConsumer;
+    impl RecordBatchConsumer for NoOpConsumer {
+        fn consume(
+            &self,
+            _records: Vec<FetchedRecord>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let (mut cfg, blocks_cfg, mut ingest_cfg) = default_ingester_test_config(dir.path());
+    cfg.read_circuit_breaker = CircuitBreakerConfig {
+        enabled: true,
+        failure_threshold_percentage: 50,
+        failure_execution_threshold: 2,
+        thresholding_period: GoDuration::from_secs(10),
+        cooldown_period: GoDuration::from_secs(30),
+        request_timeout: GoDuration::from_secs(60),
+        ..Default::default()
+    };
+    ingest_cfg.kafka.wait_strong_read_consistency_timeout = GoDuration::from_secs(30);
+
+    let reg = Registry::new();
+    let (ing, _, _) = prepare_ingester_with_blocks_storage(
+        dir.path(),
+        cfg,
+        blocks_cfg,
+        ingest_cfg,
+        default_limits_test_config(),
+        Some(&reg),
+    );
+    start_and_wait_healthy(&ing).await;
+
+    let reader_cfg = KafkaConfig {
+        address: StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+        topic: "ingest-rkw03".to_string(),
+        wait_strong_read_consistency_timeout: GoDuration::from_secs(30),
+        ..Default::default()
+    };
+    let reader = SingleClusterPartitionReader::new(
+        reader_cfg,
+        0,
+        "ing-0",
+        None,
+        Arc::new(NoOpConsumer),
+        Some(&reg),
+    )
+    .unwrap();
+    reader.set_state_for_test(ReaderState::Running);
+    *ing.ingest_reader.write() = Some(Arc::new(IngestReaderHandle::Single(Arc::new(reader))));
+
+    let mut md = MetadataMap::new();
+    md.insert("__consistency_level__", "strong".parse().unwrap());
+    md.insert("__consistency_offsets__", "v1=0:10".parse().unwrap());
+    let req = ingesterpb::QueryRequest {
+        start_timestamp_ms: 0,
+        end_timestamp_ms: 10_000,
+        matchers: vec![proto_matcher(ingesterpb::MatchType::Equal, "__name__", "m")],
+        streaming_chunks_batch_size: 0,
+    };
+
+    for _ in 0..2 {
+        let deadline_ctx = RpcDeadlineContext::new(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+        ));
+        let started = std::time::Instant::now();
+        let res = RPC_DEADLINE_CONTEXT
+            .scope(
+                deadline_ctx,
+                ing.handle_query_stream(&md, "user-rkw03", req.clone()),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "enforce_read_consistency must not wait for 30s config timeout when grpc-timeout is 50ms (took {elapsed:?})"
+        );
+        let err = res.expect_err("expected DeadlineExceeded");
+        assert!(err.is_deadline_exceeded(), "unexpected error: {err:?}");
+    }
+
+    let read_cb = ing.circuit_breaker.read.as_ref().unwrap();
+    assert_eq!(read_cb.state(), BreakerState::Open);
+    assert_eq!(
+        metric_value(
+            &reg,
+            "cortex_ingester_circuit_breaker_request_timeouts_total",
+            &[("request_type", "read")],
+        ),
+        Some(2.0)
+    );
+
+    let _ = ing.stop().await;
+}

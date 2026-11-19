@@ -2300,12 +2300,11 @@ impl Ingester {
             .appender_add_duration
             .observe(add_timer.elapsed().as_secs_f64());
 
-        let mut prepared: SmallVec<[Mutex<Option<PreparedShard<'_>>>; 8]> =
-            SmallVec::with_capacity(active_shards.len());
+        let mut prepared: Vec<PreparedShard<'_>> = Vec::with_capacity(active_shards.len());
         let mut first_hard_err: Option<IngesterError> = None;
         for slot in shard_slots {
             match slot.into_inner() {
-                Some(Ok(ps)) => prepared.push(Mutex::new(Some(ps))),
+                Some(Ok(ps)) => prepared.push(ps),
                 Some(Err(e)) => {
                     if first_hard_err.is_none() {
                         first_hard_err = Some(e);
@@ -2324,10 +2323,8 @@ impl Ingester {
             }
         }
         if let Some(err) = first_hard_err {
-            for slot in prepared {
-                if let Some(ps) = slot.into_inner() {
-                    rollback_appender(user_id, ps.app);
-                }
+            for ps in prepared {
+                rollback_appender(user_id, ps.app);
             }
             drop(lock_guard);
             return Err(err);
@@ -2335,57 +2332,46 @@ impl Ingester {
 
         let mut stats = PushStats::default();
         let mut best_partial: Option<(usize, IngesterError, Option<SampleKind>)> = None;
-        for slot in &prepared {
-            let mut g = slot.lock();
-            if let Some(ps) = g.as_mut() {
-                stats.succeeded_samples += ps.stats.succeeded_samples;
-                stats.failed_samples += ps.stats.failed_samples;
-                stats.succeeded_exemplars += ps.stats.succeeded_exemplars;
-                stats.failed_exemplars += ps.stats.failed_exemplars;
-                stats.sample_timestamp_too_old += ps.stats.sample_timestamp_too_old;
-                stats.sample_out_of_order += ps.stats.sample_out_of_order;
-                stats.sample_too_old += ps.stats.sample_too_old;
-                stats.sample_too_far_in_future += ps.stats.sample_too_far_in_future;
-                stats.new_value_for_timestamp += ps.stats.new_value_for_timestamp;
-                stats.per_user_series_limit += ps.stats.per_user_series_limit;
-                stats.per_metric_series_limit += ps.stats.per_metric_series_limit;
-                stats.invalid_native_histogram += ps.stats.invalid_native_histogram;
-                stats.labels_not_sorted += ps.stats.labels_not_sorted;
-                stats.series_with_floats_and_histograms +=
-                    ps.stats.series_with_floats_and_histograms;
-                if let Some((orig_idx, err, kind)) = ps.first_partial.take() {
-                    if best_partial
-                        .as_ref()
-                        .is_none_or(|(best_idx, _, _)| orig_idx < *best_idx)
-                    {
-                        best_partial = Some((orig_idx, err, kind));
-                    }
+        let mut apps: Vec<HeadAppender<'_>> = Vec::with_capacity(prepared.len());
+        for mut ps in prepared {
+            stats.succeeded_samples += ps.stats.succeeded_samples;
+            stats.failed_samples += ps.stats.failed_samples;
+            stats.succeeded_exemplars += ps.stats.succeeded_exemplars;
+            stats.failed_exemplars += ps.stats.failed_exemplars;
+            stats.sample_timestamp_too_old += ps.stats.sample_timestamp_too_old;
+            stats.sample_out_of_order += ps.stats.sample_out_of_order;
+            stats.sample_too_old += ps.stats.sample_too_old;
+            stats.sample_too_far_in_future += ps.stats.sample_too_far_in_future;
+            stats.new_value_for_timestamp += ps.stats.new_value_for_timestamp;
+            stats.per_user_series_limit += ps.stats.per_user_series_limit;
+            stats.per_metric_series_limit += ps.stats.per_metric_series_limit;
+            stats.invalid_native_histogram += ps.stats.invalid_native_histogram;
+            stats.labels_not_sorted += ps.stats.labels_not_sorted;
+            stats.series_with_floats_and_histograms +=
+                ps.stats.series_with_floats_and_histograms;
+            if let Some((orig_idx, err, kind)) = ps.first_partial.take() {
+                if best_partial
+                    .as_ref()
+                    .is_none_or(|(best_idx, _, _)| orig_idx < *best_idx)
+                {
+                    best_partial = Some((orig_idx, err, kind));
                 }
             }
+            apps.push(ps.app);
         }
 
         let commit_timer = Instant::now();
-        let commit_errs: SmallVec<[Mutex<Option<String>>; 8]> =
-            (0..prepared.len()).map(|_| Mutex::new(None)).collect();
-        pool.scoped_execute(prepared.len(), |s_idx| {
-            if let Some(ps) = prepared[s_idx].lock().take() {
-                if let Err(e) = ps.app.commit() {
-                    *commit_errs[s_idx].lock() = Some(e.to_string());
-                }
-            }
-        });
+        let commit_res = HeadAppender::commit_batch(apps);
         drop(lock_guard);
         self.metrics
             .appender_commit_duration
             .observe(commit_timer.elapsed().as_secs_f64());
 
-        for err_slot in commit_errs {
-            if let Some(e) = err_slot.into_inner() {
-                return Err(IngesterError::Internal {
-                    message: format!("failed to commit TSDB appender: {e}"),
-                }
-                .with_user(user_id, stats.failed_samples as i64));
+        if let Err(e) = commit_res {
+            return Err(IngesterError::Internal {
+                message: format!("failed to commit TSDB appender: {e}"),
             }
+            .with_user(user_id, stats.failed_samples as i64));
         }
 
         if stats.succeeded_samples > 0 {

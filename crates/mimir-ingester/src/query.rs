@@ -678,13 +678,27 @@ impl Ingester {
         }
 
         if level == READ_CONSISTENCY_STRONG {
-            let timeout = Duration::from_nanos(
+            if crate::grpc::current_rpc_deadline_context().is_some_and(|ctx| ctx.has_timed_out()) {
+                return Err(IngesterError::DeadlineExceeded {
+                    message: "wait for read consistency: context deadline exceeded".to_string(),
+                });
+            }
+            let configured_timeout = Duration::from_nanos(
                 self.ingest_cfg
                     .kafka
                     .wait_strong_read_consistency_timeout
                     .as_nanos()
                     .max(0) as u64,
             );
+            let timeout = crate::grpc::effective_read_consistency_timeout(configured_timeout);
+            if timeout.is_zero()
+                && crate::grpc::current_rpc_deadline_context()
+                    .is_some_and(|ctx| ctx.deadline.is_some())
+            {
+                return Err(IngesterError::DeadlineExceeded {
+                    message: "wait for read consistency: context deadline exceeded".to_string(),
+                });
+            }
             let map_wait_err = map_strong_read_consistency_wait_err;
             if let Some(encoded) = md
                 .get(CONSISTENCY_OFFSETS_MD_KEY)

@@ -262,27 +262,52 @@ async fn wll04_kafka_batch_flushing_ignores_group_hash_and_2048_samples_cap() {
     // 1 shard so all series go into the single shard's batchingQueue (up to 1024 series).
     let consumer = new_kafka_consumer(Arc::clone(&ing), &reg, 1024, 1);
 
+    // Pre-seed s_001 so its committed max_time is base_ts + 1_000 (Go headAppenderV2 only
+    // reports OutOfOrderSample against already-committed state; intra-batch OOO drops silently).
+    let base_ts = now_ms();
+    ing.push_grpc(
+        "t1",
+        &cortexpb::WriteRequest {
+            timeseries: vec![make_simple_ts(
+                "s_001",
+                &[("cluster", "b")],
+                base_ts + 1000,
+                1.0,
+            )],
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
     // 100 series alternating cluster="a" / cluster="b", each with 30 samples (3,000 samples > 2048).
     // Include one OOO sample in the 2nd series (cluster="b") to verify discarded group attribution
     // comes from timeseries[0] (cluster="a"), matching Go validation.GroupLabel.
-    let base_ts = now_ms();
     let mut records = Vec::new();
     for i in 0..100i64 {
         let cluster = if i % 2 == 0 { "a" } else { "b" };
         let series_name = format!("s_{i:03}");
         let mut samples = Vec::new();
-        for s in 0..30i64 {
-            samples.push(cortexpb::Sample {
-                value: s as f64,
-                timestamp_ms: base_ts + s * 1000,
-            });
-        }
         if i == 1 {
-            // Make one sample out-of-order after the later timestamps.
+            for s in 1..=30i64 {
+                samples.push(cortexpb::Sample {
+                    value: s as f64,
+                    timestamp_ms: base_ts + s * 1000,
+                });
+            }
+            // Out-of-order relative to already-committed max_time (base_ts + 1000).
             samples.push(cortexpb::Sample {
                 value: 999.0,
                 timestamp_ms: base_ts,
             });
+        } else {
+            for s in 0..30i64 {
+                samples.push(cortexpb::Sample {
+                    value: s as f64,
+                    timestamp_ms: base_ts + s * 1000,
+                });
+            }
         }
         let wr = cortexpb::WriteRequest {
             timeseries: vec![cortexpb::TimeSeries {
@@ -958,6 +983,126 @@ async fn wll10_tsdb_ingest_exemplar_formats_exemplar_labels_in_sorted_order() {
         msg3.contains(r#"{trace_id="t3", a_key="1"}"#),
         "expected wire-order exemplar labels in ExemplarTooFarInFuture error, got: {msg3}"
     );
+
+    ing.stop().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 10. [WLL-03] >= 4096 series sharded Push via HeadAppender::commit_batch & atomic WAL rollback
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wll03_sharded_push_4096_series_commit_batch_and_atomic_wal_rollback() {
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use mimir_tsdb::head_chunks::WriteFaultAction;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, blocks_cfg, ingest_cfg) = default_ingester_test_config(tmp.path());
+    let (ing, _ring, _kv) = prepare_ingester_with_blocks_storage(
+        tmp.path(),
+        cfg,
+        blocks_cfg,
+        ingest_cfg,
+        LimitsConfig::default(),
+        None,
+    );
+    start_and_wait_healthy(&ing).await;
+
+    let base_ts = now_ms() - 60_000;
+    let build_batch = |ts_ms: i64, val_offset: f64| -> cortexpb::WriteRequest {
+        let timeseries = (0..4096usize)
+            .map(|i| {
+                let s = format!("series_{i:04}");
+                make_simple_ts("wll03_batch", &[("shard_key", &s)], ts_ms, i as f64 + val_offset)
+            })
+            .collect();
+        cortexpb::WriteRequest {
+            timeseries,
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            ..Default::default()
+        }
+    };
+
+    let user = "u-wll03";
+    // 1. Clean 4096-series sharded push commits all shards via HeadAppender::commit_batch.
+    ing.push_grpc(user, &build_batch(base_ts, 0.0))
+        .await
+        .expect("initial 4096-series sharded push must succeed");
+
+    let db = ing.get_tsdb(user).expect("user tsdb must exist");
+    let head = db.db.head();
+    assert_eq!(head.num_series(), 4096);
+
+    // 2. Arm WAL fault hook so the 2nd WAL write in commit_batch (the samples batch after series
+    //    records, or mid-batch) fails. No shard's in-memory Head chunks may be mutated!
+    let wal_calls = Arc::new(AtomicUsize::new(0));
+    let wal_calls_hook = Arc::clone(&wal_calls);
+    head.set_wal_write_fault_hook_for_test(Some(Arc::new(move |_| {
+        if wal_calls_hook.fetch_add(1, Ordering::SeqCst) >= 1 {
+            WriteFaultAction::Error(io::ErrorKind::Other)
+        } else {
+            WriteFaultAction::PassThrough
+        }
+    })));
+
+    // Push 4096 new samples across all shards (plus 16 new series to ensure series_refs WAL write runs first).
+    let mut failing_wr = build_batch(base_ts + 10_000, 10_000.0);
+    for i in 0..16usize {
+        let s = format!("new_fail_{i:02}");
+        failing_wr.timeseries.push(make_simple_ts(
+            "wll03_batch",
+            &[("shard_key", &s)],
+            base_ts + 10_000,
+            999.0,
+        ));
+    }
+    let err = ing
+        .push_grpc(user, &failing_wr)
+        .await
+        .expect_err("WAL failure must fail sharded push");
+    assert!(
+        err.to_string().contains("failed to commit TSDB appender"),
+        "unexpected error: {err}"
+    );
+    head.set_wal_write_fault_hook_for_test(None);
+
+    // Verify atomic rollback: none of the 4096 existing series received the base_ts + 10_000 sample,
+    // none of the 16 new series have any Head chunks, and pending_commits_count is 0 across all series.
+    assert_eq!(head.max_time(), base_ts);
+    for i in 0..4096usize {
+        let s = format!("series_{i:04}");
+        let entry = head
+            .get_entry_by_sorted_pairs(&[("__name__", "wll03_batch"), ("shard_key", &s)])
+            .expect("initial series must still exist");
+        assert_eq!(entry.pending_commits_count(), 0);
+        let chks_opt = head
+            .series_chunks(entry.ref_id, base_ts + 5_000, base_ts + 20_000)
+            .unwrap();
+        assert!(
+            chks_opt.is_none_or(|(_, chks, _)| chks.is_empty()),
+            "shard for {s} must not have mutated in-memory chunks after WAL error"
+        );
+    }
+    for i in 0..16usize {
+        let s = format!("new_fail_{i:02}");
+        let entry = head
+            .get_entry_by_sorted_pairs(&[("__name__", "wll03_batch"), ("shard_key", &s)])
+            .expect("new_fail series entry created in Head");
+        assert_eq!(entry.pending_commits_count(), 0);
+        assert!(
+            head.series_chunks(entry.ref_id, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_none(),
+            "new_fail series {s} must have zero chunks after WAL error"
+        );
+    }
+
+    // 3. Subsequent 4096-series push after clearing the fault hook succeeds cleanly.
+    ing.push_grpc(user, &build_batch(base_ts + 20_000, 20_000.0))
+        .await
+        .expect("subsequent 4096-series push must succeed");
+    assert_eq!(head.max_time(), base_ts + 20_000);
 
     ing.stop().await.unwrap();
 }

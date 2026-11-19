@@ -1034,6 +1034,11 @@ impl SingleClusterPartitionReader {
         self.concurrent_fetchers_min_bytes_max_wait_time
     }
 
+    #[doc(hidden)]
+    pub fn set_state_for_test(&self, state: ReaderState) {
+        self.state.store(state as u8, Ordering::SeqCst);
+    }
+
     pub fn state(&self) -> ReaderState {
         match self.state.load(Ordering::SeqCst) {
             0 => ReaderState::New,

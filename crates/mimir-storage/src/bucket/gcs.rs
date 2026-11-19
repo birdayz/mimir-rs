@@ -2964,12 +2964,19 @@ mod tests {
             ..Default::default()
         };
         assert!(ok.validate_mimir_rs_support().is_ok());
+        for supported in ["external_account", "impersonated_service_account"] {
+            let cfg = GCSConfig {
+                service_account: format!(r#"{{"type":"{supported}"}}"#),
+                ..ok.clone()
+            };
+            assert!(cfg.validate_mimir_rs_support().is_ok(), "{supported} must be accepted");
+        }
         let bad = GCSConfig {
-            service_account: r#"{"type":"external_account"}"#.into(),
+            service_account: r#"{"type":"gdch_service_account"}"#.into(),
             ..ok.clone()
         };
         let err = bad.validate_mimir_rs_support().unwrap_err().to_string();
-        assert!(err.contains("\"external_account\" is not supported by mimir-rs"), "{err}");
+        assert!(err.contains("\"gdch_service_account\" is not supported by mimir-rs"), "{err}");
         let mut bad = ok.clone();
         bad.http.tls_server_name = "x".into();
         let err = bad.validate_mimir_rs_support().unwrap_err().to_string();

@@ -272,16 +272,25 @@
         assert_eq!(rx.recv().await.unwrap().unwrap(), vec!["old-ing".to_string()]);
 
         client.delete("ring").await.unwrap();
-        assert_eq!(rx.recv().await.unwrap(), Err(()), "watch_key must notify on delete");
-        assert!(client.get("ring").await.unwrap().is_none());
+        // Go dskit/kv/memberlist: Delete sets Deleted=true and notifies watchers with m.get(key)
+        // (which still returns the stored value until ObsoleteEntriesTimeout cleans it up).
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            Ok(vec!["old-ing".to_string()]),
+            "watch_key must notify on delete"
+        );
+        assert!(kv.store_copy().get("ring").is_some_and(|v| v.deleted));
+        assert!(client.get("ring").await.unwrap().is_some());
 
-        // Re-create before obsolete_entries_timeout expires; old-ing must NOT come back.
+        // Re-create before obsolete_entries_timeout expires via CAS; old-ing is tombstoned by
+        // Merge(cas=true) and stripped by get(), leaving only new-ing.
+        let _ = is_key_deleted;
         tokio::time::sleep(Duration::from_millis(5)).await;
         client
             .cas(
                 "ring",
                 Box::new(|cur| {
-                    assert!(cur.is_none());
+                    assert!(cur.is_some());
                     let mut d = Desc::default();
                     d.ingesters.insert(
                         "new-ing".to_string(),
