@@ -3,7 +3,7 @@
 //! Ported from github.com/prometheus/prometheus/tsdb/postings_for_matchers_cache.go.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,7 @@ pub struct PostingsForMatchersCacheMetrics {
     requests: Counter,
     hits: Counter,
     misses: Counter,
+    skips_ineligible: Counter,
     skips_stale: Counter,
     invalidations: Counter,
     evictions_ttl: Counter,
@@ -137,8 +138,7 @@ impl PostingsForMatchersCacheMetrics {
             requests,
             hits,
             misses,
-            // `ineligible` (Go: non-concurrent calls without `force`, or no shared cache key) stays
-            // 0: this cache serves every call (see PORT_STATUS.md).
+            skips_ineligible: skips[0].clone(),
             // `canceled-cached-entry` (Go: the caller's context was canceled while waiting for an
             // in-flight call) is exposed but never incremented: calls are not cancellable here.
             skips_stale: skips[1].clone(),
@@ -364,6 +364,8 @@ impl PagedMetricVersions {
 /// Concurrent TTL + byte-bounded cache for `postings_for_matchers` evaluations.
 pub struct PostingsForMatchersCache {
     config: PostingsForMatchersCacheConfig,
+    force: AtomicBool,
+    shared: AtomicBool,
     global_epoch: AtomicU64,
     postings_generation: AtomicU64,
     metric_versions: OnceLock<PagedMetricVersions>,
@@ -402,6 +404,8 @@ impl PostingsForMatchersCache {
         let metrics = config.metrics.clone();
         Self {
             config,
+            force: AtomicBool::new(false),
+            shared: AtomicBool::new(false),
             global_epoch: AtomicU64::new(0),
             postings_generation: AtomicU64::new(0),
             metric_versions: OnceLock::new(),
@@ -409,6 +413,23 @@ impl PostingsForMatchersCache {
             in_flight: Mutex::new(HashMap::new()),
             metrics,
         }
+    }
+
+    /// Sets Mimir cache eligibility flags (`force` and `shared`, default `false`) matching Go
+    /// `PostingsForMatchersCacheConfig.{Force,Shared}`.
+    pub fn set_eligibility(&self, force: bool, shared: bool) {
+        self.force.store(force, Ordering::Release);
+        self.shared.store(shared, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn force(&self) -> bool {
+        self.force.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn shared(&self) -> bool {
+        self.shared.load(Ordering::Acquire)
     }
 
     /// Invalidates cached Head postings affected by creating or deleting a series with `metric_name`.
@@ -461,9 +482,14 @@ impl PostingsForMatchersCache {
     }
 
     /// Evaluates `matchers` using the cache, returning an `Arc<[u64]>` of matching series refs.
+    ///
+    /// Matches Go `PostingsForMatchersCache.PostingsForMatchers` (`postings_for_matchers_cache.go:239-280`):
+    /// skips the cache (incrementing `skips_total{reason="ineligible"}`) when
+    /// `(!concurrent && !self.force()) || (self.shared() && self.config.enable_invalidation && exact_metric_name_from_matchers(matchers).is_none())`.
     pub fn get_or_compute<F, E>(
         &self,
         matchers: &[LabelMatcher],
+        concurrent: bool,
         compute: F,
     ) -> Result<Arc<[u64]>, E>
     where
@@ -471,6 +497,17 @@ impl PostingsForMatchersCache {
     {
         if let Some(ref m) = self.metrics {
             m.requests.inc();
+        }
+
+        let skip_ineligible = (!concurrent && !self.force())
+            || (self.shared()
+                && self.config.enable_invalidation
+                && exact_metric_name_from_matchers(matchers).is_none());
+        if skip_ineligible {
+            if let Some(ref m) = self.metrics {
+                m.skips_ineligible.inc();
+            }
+            return compute().map(Arc::from);
         }
 
         if matchers.is_empty()
@@ -762,7 +799,7 @@ mod tests {
 
         let calls = AtomicUsize::new(0);
         let r1 = cache
-            .get_or_compute::<_, ()>(&m_a, || {
+            .get_or_compute::<_, ()>(&m_a, true, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(vec![1, 2, 3])
             })
@@ -772,7 +809,7 @@ mod tests {
 
         // Cache hit (reordered)
         let r2 = cache
-            .get_or_compute::<_, ()>(&m_a_reordered, || {
+            .get_or_compute::<_, ()>(&m_a_reordered, true, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(vec![999])
             })
@@ -782,7 +819,7 @@ mod tests {
 
         // Query without exact __name__
         let r_no_name = cache
-            .get_or_compute::<_, ()>(&m_no_name, || {
+            .get_or_compute::<_, ()>(&m_no_name, true, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(vec![1, 2, 3, 4])
             })
@@ -794,7 +831,7 @@ mod tests {
         cache.invalidate_metric("metric_b");
 
         let r3 = cache
-            .get_or_compute::<_, ()>(&m_a, || {
+            .get_or_compute::<_, ()>(&m_a, true, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(vec![999])
             })
@@ -804,7 +841,7 @@ mod tests {
 
         // However, query without __name__ IS invalidated by metric_b creation
         let r_no_name_2 = cache
-            .get_or_compute::<_, ()>(&m_no_name, || {
+            .get_or_compute::<_, ()>(&m_no_name, true, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(vec![1, 2, 3, 4, 5])
             })
@@ -815,7 +852,7 @@ mod tests {
         // Creating a series in metric_a invalidates metric_a
         cache.invalidate_metric("metric_a");
         let r4 = cache
-            .get_or_compute::<_, ()>(&m_a, || {
+            .get_or_compute::<_, ()>(&m_a, true, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(vec![1, 2, 3, 6])
             })
@@ -844,7 +881,7 @@ mod tests {
         let calls = AtomicUsize::new(0);
         for m in [&m1, &m2, &m3] {
             cache
-                .get_or_compute::<_, ()>(m, || {
+                .get_or_compute::<_, ()>(m, true, || {
                     calls.fetch_add(1, Ordering::Relaxed);
                     Ok(vec![1])
                 })
@@ -854,7 +891,7 @@ mod tests {
 
         // m1 should have been evicted when m3 was inserted (max_items = 2)
         cache
-            .get_or_compute::<_, ()>(&m1, || {
+            .get_or_compute::<_, ()>(&m1, true, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(vec![1])
             })
@@ -864,7 +901,7 @@ mod tests {
         // Wait for TTL expiry
         std::thread::sleep(Duration::from_millis(50));
         cache
-            .get_or_compute::<_, ()>(&m1, || {
+            .get_or_compute::<_, ()>(&m1, true, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(vec![2])
             })
@@ -931,9 +968,9 @@ mod tests {
         let m1 = [LabelMatcher::new(MatchType::Equal, "a", "1").unwrap()];
         let m2 = [LabelMatcher::new(MatchType::Equal, "a", "2").unwrap()];
         let ok = |v: Vec<u64>| move || Ok::<_, ()>(v);
-        a.get_or_compute(&m1, ok(vec![1])).unwrap();
-        a.get_or_compute(&m1, ok(vec![1])).unwrap();
-        b.get_or_compute(&m1, ok(vec![1])).unwrap();
+        a.get_or_compute(&m1, true, ok(vec![1])).unwrap();
+        a.get_or_compute(&m1, true, ok(vec![1])).unwrap();
+        b.get_or_compute(&m1, true, ok(vec![1])).unwrap();
         assert_eq!(sample(&reg, &format!("{p}requests_total"), None), 3.0);
         assert_eq!(sample(&reg, &format!("{p}hits_total"), None), 1.0);
         assert_eq!(sample(&reg, &format!("{p}misses_total"), None), 2.0);
@@ -942,7 +979,7 @@ mod tests {
         assert!(bytes > 0.0);
 
         // max_items 1: the second entry of `a` evicts its first one.
-        a.get_or_compute(&m2, ok(vec![2])).unwrap();
+        a.get_or_compute(&m2, true, ok(vec![2])).unwrap();
         assert_eq!(sample(&reg, &format!("{p}evictions_total"), Some("max-items-reached")), 1.0);
         assert_eq!(sample(&reg, &format!("{p}entries_total"), None), 2.0);
 
@@ -957,7 +994,7 @@ mod tests {
         assert_eq!(sample(&reg, &format!("{p}bytes_total"), None), bytes / 2.0);
 
         // Calls that bypass the cache are still requests (and misses, as in Go).
-        a.get_or_compute(&[], ok(vec![])).unwrap();
+        a.get_or_compute(&[], true, ok(vec![])).unwrap();
         assert_eq!(sample(&reg, &format!("{p}requests_total"), None), 5.0);
         assert_eq!(sample(&reg, &format!("{p}misses_total"), None), 4.0);
 
@@ -983,7 +1020,7 @@ mod tests {
 
         // First query initializes directory, but reads allocate 0 64 KiB pages.
         let m = [LabelMatcher::new(MatchType::Equal, "__name__", "hot_metric").unwrap()];
-        let r1 = cache.get_or_compute::<_, ()>(&m, || Ok(vec![10, 20])).unwrap();
+        let r1 = cache.get_or_compute::<_, ()>(&m, true, || Ok(vec![10, 20])).unwrap();
         assert_eq!(&*r1, &[10, 20]);
         let mv = cache.metric_versions.get().unwrap();
         assert_eq!(mv.pages.len(), 256);
@@ -992,7 +1029,83 @@ mod tests {
         // Invalidating a single metric faults only 1 64 KiB page (instead of 16 MiB!).
         cache.invalidate_metric("hot_metric");
         assert_eq!(mv.allocated_pages(), 1);
-        let r2 = cache.get_or_compute::<_, ()>(&m, || Ok(vec![10, 20, 30])).unwrap();
+        let r2 = cache.get_or_compute::<_, ()>(&m, true, || Ok(vec![10, 20, 30])).unwrap();
         assert_eq!(&*r2, &[10, 20, 30]);
+    }
+
+    #[test]
+    fn sq_01_eligibility_skips_non_concurrent_without_force_and_shared_without_metric_name() {
+        let reg = Registry::new();
+        let metrics = PostingsForMatchersCacheMetrics::new("sq01_", Some(&reg));
+        let cache = PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            enable_invalidation: true,
+            metrics: Some(metrics),
+            ..Default::default()
+        });
+        let m_named = [LabelMatcher::new(MatchType::Equal, "__name__", "up").unwrap()];
+        let m_job = [LabelMatcher::new(MatchType::Equal, "job", "api").unwrap()];
+        let calls = AtomicUsize::new(0);
+
+        // Default force=false, shared=false: non-concurrent calls bypass cache and count skips_ineligible.
+        let r1 = cache
+            .get_or_compute::<_, ()>(&m_named, false, || {
+                let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(vec![n as u64])
+            })
+            .unwrap();
+        let r2 = cache
+            .get_or_compute::<_, ()>(&m_named, false, || {
+                let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(vec![n as u64])
+            })
+            .unwrap();
+        assert_eq!(&*r1, &[1]);
+        assert_eq!(&*r2, &[2]);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            sample(&reg, "sq01_postings_for_matchers_cache_skips_total", Some("ineligible")),
+            2.0
+        );
+        assert_eq!(sample(&reg, "sq01_postings_for_matchers_cache_misses_total", None), 0.0);
+
+        // With force=true, shared=false: non-concurrent calls DO use the cache.
+        cache.set_eligibility(true, false);
+        let r3 = cache
+            .get_or_compute::<_, ()>(&m_named, false, || {
+                let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(vec![n as u64])
+            })
+            .unwrap();
+        let r4 = cache
+            .get_or_compute::<_, ()>(&m_named, false, || {
+                let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(vec![n as u64])
+            })
+            .unwrap();
+        assert_eq!(&*r3, &[3]);
+        assert_eq!(&*r4, &[3]);
+        assert_eq!(sample(&reg, "sq01_postings_for_matchers_cache_hits_total", None), 1.0);
+
+        // With shared=true + enable_invalidation=true: queries without exact __name__ skip cache
+        // even when concurrent=true or force=true.
+        cache.set_eligibility(true, true);
+        let r5 = cache
+            .get_or_compute::<_, ()>(&m_job, true, || {
+                let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(vec![n as u64])
+            })
+            .unwrap();
+        let r6 = cache
+            .get_or_compute::<_, ()>(&m_job, true, || {
+                let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(vec![n as u64])
+            })
+            .unwrap();
+        assert_eq!(&*r5, &[4]);
+        assert_eq!(&*r6, &[5]);
+        assert_eq!(
+            sample(&reg, "sq01_postings_for_matchers_cache_skips_total", Some("ineligible")),
+            4.0
+        );
     }
 }

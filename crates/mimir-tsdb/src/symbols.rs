@@ -55,6 +55,8 @@ pub struct SymbolTable {
     data: Vec<u8>,
     entries: Vec<SymbolEntry>,
     table: HashTable<u32>,
+    #[cfg(test)]
+    fail_next_intern: bool,
 }
 
 impl Default for SymbolTable {
@@ -77,6 +79,8 @@ impl SymbolTable {
             data: Vec::with_capacity(bytes_cap),
             entries,
             table: HashTable::with_capacity(symbol_cap),
+            #[cfg(test)]
+            fail_next_intern: false,
         }
     }
 
@@ -91,9 +95,19 @@ impl SymbolTable {
     ///
     /// Returns [`SymbolId::EMPTY`] when `s.is_empty()`. Returns an error if the
     /// 4 GiB arena or `u32::MAX` symbol limit would be exceeded.
+    #[cfg(test)]
+    pub(crate) fn fail_next_intern_for_test(&mut self) {
+        self.fail_next_intern = true;
+    }
+
     pub fn try_intern(&mut self, s: &str) -> Result<SymbolId, SymbolTableError> {
         if s.is_empty() {
             return Ok(SymbolId::EMPTY);
+        }
+        #[cfg(test)]
+        if self.fail_next_intern {
+            self.fail_next_intern = false;
+            return Err(SymbolTableError::TooManySymbols);
         }
         let bytes = s.as_bytes();
         let hash = xxh3_64(bytes);

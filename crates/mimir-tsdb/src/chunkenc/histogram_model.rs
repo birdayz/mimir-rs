@@ -293,8 +293,8 @@ impl Histogram {
             .map_err(|e| e.wrap("positive side"))?;
 
         let sum_of_buckets = n_count
-            .saturating_add(p_count)
-            .saturating_add(self.zero_count);
+            .wrapping_add(p_count)
+            .wrapping_add(self.zero_count);
         if self.sum.is_nan() {
             if sum_of_buckets > self.count {
                 return Err(HistogramValidationError::new(
@@ -425,7 +425,10 @@ impl FloatHistogram {
             if self.zero_count < 0.0 {
                 return Err(HistogramValidationError::new(
                     HistogramErrorKind::NegativeBucketCount,
-                    format!("zero bucket has observation count of {}", self.zero_count),
+                    format!(
+                        "zero bucket has observation count of {}",
+                        format_go_g(self.zero_count)
+                    ),
                 ));
             }
             if !self.custom_values.is_empty() {
@@ -438,7 +441,7 @@ impl FloatHistogram {
         if self.count < 0.0 {
             return Err(HistogramValidationError::new(
                 HistogramErrorKind::NegativeCount,
-                format!("observation count is  {}", self.count),
+                format!("observation count is  {}", format_go_g(self.count)),
             ));
         }
         check_histogram_float_buckets(&self.positive_buckets)
@@ -482,22 +485,22 @@ fn spans_match(s1: &[HistogramSpan], s2: &[HistogramSpan]) -> bool {
         i2 += 1;
         if c1.length == 0 {
             while i1 < s1.len() && s1[i1].length == 0 {
-                c1.offset += s1[i1].offset;
+                c1.offset = c1.offset.wrapping_add(s1[i1].offset);
                 i1 += 1;
             }
             if i1 < s1.len() {
-                c1.offset += s1[i1].offset;
+                c1.offset = c1.offset.wrapping_add(s1[i1].offset);
                 c1.length = s1[i1].length;
                 i1 += 1;
             }
         }
         if c2.length == 0 {
             while i2 < s2.len() && s2[i2].length == 0 {
-                c2.offset += s2[i2].offset;
+                c2.offset = c2.offset.wrapping_add(s2[i2].offset);
                 i2 += 1;
             }
             if i2 < s2.len() {
-                c2.offset += s2[i2].offset;
+                c2.offset = c2.offset.wrapping_add(s2[i2].offset);
                 c2.length = s2[i2].length;
                 i2 += 1;
             }
@@ -530,10 +533,14 @@ fn check_histogram_spans(spans: &[HistogramSpan], num_buckets: usize) -> Result<
         end_idx = end_idx
             .saturating_add(span.offset as i64)
             .saturating_add(span.length as i64);
-        if end_idx - 1 > i32::MAX as i64 {
+        if end_idx.saturating_sub(1) > i32::MAX as i64 {
             return Err(HistogramValidationError::new(
                 HistogramErrorKind::SpanIndexOutOfRange,
-                format!("span number {} ends at bucket index {}", n + 1, end_idx - 1),
+                format!(
+                    "span number {} ends at bucket index {}",
+                    n + 1,
+                    end_idx.saturating_sub(1)
+                ),
             ));
         }
     }
@@ -546,10 +553,52 @@ fn check_histogram_spans(spans: &[HistogramSpan], num_buckets: usize) -> Result<
     Ok(())
 }
 
+pub(crate) fn format_go_g(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_positive() { "+Inf" } else { "-Inf" }.to_string();
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
+    let sci = format!("{v:e}");
+    let Some((mant, exp_str)) = sci.split_once('e') else {
+        return sci;
+    };
+    let Ok(exp) = exp_str.parse::<i32>() else {
+        return sci;
+    };
+    if !(-4..6).contains(&exp) {
+        return if exp >= 0 {
+            format!("{mant}e+{exp:02}")
+        } else {
+            format!("{mant}e-{:02}", exp.unsigned_abs())
+        };
+    }
+    let (sign, unsigned_mant) = match mant.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mant),
+    };
+    let digits: String = unsigned_mant.chars().filter(|&c| c != '.').collect();
+    let dp = exp + 1;
+    if dp <= 0 {
+        format!("{sign}0.{}{digits}", "0".repeat((-dp) as usize))
+    } else {
+        let dp_usize = dp as usize;
+        if dp_usize >= digits.len() {
+            format!("{sign}{digits}{}", "0".repeat(dp_usize - digits.len()))
+        } else {
+            format!("{sign}{}.{}", &digits[..dp_usize], &digits[dp_usize..])
+        }
+    }
+}
+
 fn check_histogram_int_buckets(buckets: &[i64], count: &mut u64) -> Result<(), HistogramValidationError> {
     let mut last = 0i64;
     for (i, &delta) in buckets.iter().enumerate() {
-        let c = last + delta;
+        let c = last.wrapping_add(delta);
         if c < 0 {
             return Err(HistogramValidationError::new(
                 HistogramErrorKind::NegativeBucketCount,
@@ -557,7 +606,7 @@ fn check_histogram_int_buckets(buckets: &[i64], count: &mut u64) -> Result<(), H
             ));
         }
         last = c;
-        *count = count.saturating_add(c as u64);
+        *count = count.wrapping_add(c as u64);
     }
     Ok(())
 }
@@ -567,7 +616,11 @@ fn check_histogram_float_buckets(buckets: &[f64]) -> Result<(), HistogramValidat
         if c < 0.0 {
             return Err(HistogramValidationError::new(
                 HistogramErrorKind::NegativeBucketCount,
-                format!("bucket number {} has observation count of {c}", i + 1),
+                format!(
+                    "bucket number {} has observation count of {}",
+                    i + 1,
+                    format_go_g(c)
+                ),
             ));
         }
     }
@@ -630,4 +683,80 @@ fn check_histogram_custom_bounds(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tsdb_08_int_buckets_overflow_wrapping_matches_go() {
+        // positive_deltas = [i64::MAX, 1] must wrap in two's complement (no panic) and report
+        // NegativeBucketCount, matching Go c = last + buckets[i].
+        let h_signed_wrap = Histogram {
+            schema: 0,
+            count: 1,
+            sum: 1.0,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 2 }],
+            positive_buckets: vec![i64::MAX, 1],
+            ..Histogram::default()
+        };
+        let err = h_signed_wrap.validate().unwrap_err();
+        assert_eq!(err.kind, HistogramErrorKind::NegativeBucketCount);
+
+        // Unsigned bucket-sum wrap: zero_count = u64::MAX, positive_deltas = [10], count = u64::MAX.
+        // Go computes wrapping uint64 sumOfBuckets = 9 != u64::MAX -> CountMismatch.
+        let h_u64_wrap = Histogram {
+            schema: 0,
+            zero_count: u64::MAX,
+            count: u64::MAX,
+            sum: 1.0,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![10],
+            ..Histogram::default()
+        };
+        let err = h_u64_wrap.validate().unwrap_err();
+        assert_eq!(err.kind, HistogramErrorKind::CountMismatch);
+        assert!(err.to_string().contains("9 observations found in buckets"));
+    }
+
+    #[test]
+    fn tsdb_08_spans_match_wrapping_and_float_g_formatting() {
+        let s1 = [
+            HistogramSpan {
+                offset: i32::MAX,
+                length: 0,
+            },
+            HistogramSpan {
+                offset: 1,
+                length: 1,
+            },
+        ];
+        let s2 = [HistogramSpan {
+            offset: i32::MIN,
+            length: 1,
+        }];
+        assert!(spans_match(&s1, &s2));
+
+        let fh_neg = FloatHistogram {
+            schema: 0,
+            count: -1_000_000.0,
+            ..FloatHistogram::default()
+        };
+        let err = fh_neg.validate().unwrap_err();
+        assert_eq!(err.kind, HistogramErrorKind::NegativeCount);
+        assert!(err.to_string().contains("observation count is  -1e+06:"), "got: {err}");
+
+        let fh_neg_bucket = FloatHistogram {
+            schema: 0,
+            zero_count: -1_000_000.0,
+            ..FloatHistogram::default()
+        };
+        let err2 = fh_neg_bucket.validate().unwrap_err();
+        assert_eq!(err2.kind, HistogramErrorKind::NegativeBucketCount);
+        assert!(
+            err2.to_string().contains("zero bucket has observation count of -1e+06:"),
+            "got: {err2}"
+        );
+    }
 }

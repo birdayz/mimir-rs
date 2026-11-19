@@ -2221,6 +2221,11 @@ async fn query_stream_decoded(
                 let chunk = EncodedChunk::from_bytes(wire_enc_to_tsdb(c.encoding)?, c.data.to_vec())
                     .map_err(|e| anyhow!("decode chunk: {e:?}"))?;
                 for s in decode_chunk_samples(&chunk).map_err(|e| anyhow!("{e:?}"))? {
+                    // QueryStream sets DisableTrimming = true, so open head chunks may include
+                    // samples outside [start_ms, end_ms]; filter to the requested window like PromQL.
+                    if s.t < start_ms || s.t > end_ms {
+                        continue;
+                    }
                     match s.value {
                         SampleValue::Float(v) => entry.push((s.t, v.to_bits())),
                         SampleValue::Histogram(h) => entry.push((s.t, h.count)),

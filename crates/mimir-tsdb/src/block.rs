@@ -474,13 +474,40 @@ impl Block {
         self.readers.close_and_wait();
     }
 
+    #[inline]
+    pub fn postings_cache(&self) -> &PostingsForMatchersCache {
+        &self.postings_cache
+    }
+
+    pub fn set_postings_cache_eligibility(&self, force: bool, shared: bool) {
+        self.postings_cache.set_eligibility(force, shared);
+    }
+
     /// Evaluates `matchers` against this block's index using its `PostingsForMatchersCache`.
     pub fn postings_for_matchers(
         &self,
         matchers: &[LabelMatcher],
     ) -> Result<Arc<[u64]>, PostingsError> {
+        self.postings_for_matchers_with_concurrent(matchers, false)
+    }
+
+    /// Evaluates `matchers` against this block's index using its `PostingsForMatchersCache`,
+    /// passing `concurrent` (Go `sharded` / `hints.ShardCount > 0`).
+    pub fn postings_for_matchers_with_concurrent(
+        &self,
+        matchers: &[LabelMatcher],
+        concurrent: bool,
+    ) -> Result<Arc<[u64]>, PostingsError> {
         self.postings_cache
-            .get_or_compute(matchers, || postings_for_matchers(&self.index, matchers))
+            .get_or_compute(matchers, concurrent, || postings_for_matchers(&self.index, matchers))
+    }
+
+    /// Evaluates `matchers` directly against this block's index, bypassing `PostingsForMatchersCache`.
+    pub fn postings_for_matchers_direct(
+        &self,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<u64>, PostingsError> {
+        postings_for_matchers(&self.index, matchers)
     }
 
     #[inline]

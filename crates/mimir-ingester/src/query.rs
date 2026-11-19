@@ -29,7 +29,7 @@ use mimir_storage::ingest::PartitionOffsets;
 use mimir_tsdb::block::Block;
 use mimir_tsdb::chunkenc::Encoding;
 use mimir_tsdb::chunks_block::ChunkMeta;
-use mimir_tsdb::compact::merge_chunks_with_tombstones;
+use mimir_tsdb::compact::merge_chunks_with_tombstones_and_float_encoding;
 use mimir_tsdb::db::Tsdb;
 use mimir_tsdb::querier::TsdbChunkQuerier;
 use mimir_tsdb::labels::Labels;
@@ -509,13 +509,7 @@ impl Ingester {
         &self,
         user_id: &str,
     ) -> Result<Option<Arc<crate::user_tsdb::UserTsdb>>, IngesterError> {
-        let Some(db) = self.get_tsdb(user_id) else {
-            return Ok(None);
-        };
-        if db.state() == crate::user_tsdb::TsdbState::Closed || db.db.is_closed() {
-            return Err(IngesterError::tsdb_not_active());
-        }
-        Ok(Some(db))
+        Ok(self.get_tsdb(user_id))
     }
     pub fn check_read_overloaded(&self) -> Result<(), IngesterError> {
         let limiter_opt = self.utilization_based_limiter.read().clone();
@@ -795,6 +789,7 @@ impl Ingester {
             } else {
                 db.db.chunk_querier(start_ts, end_ts)
             }
+            .with_concurrent(shard.is_some())
             .with_filtered_select_stats(Arc::clone(&select_stats), shard_stats_filter(shard));
             match cq
                 .try_select_adaptive(
@@ -838,6 +833,7 @@ impl Ingester {
                         } else {
                             db_c.db.chunk_querier(start_ts, end_ts)
                         }
+                        .with_concurrent(shard.is_some())
                         .with_filtered_select_stats(
                             Arc::clone(&select_stats),
                             shard_stats_filter(shard),
@@ -1197,6 +1193,7 @@ impl Ingester {
             } else {
                 db.db.chunk_querier(start_ts, end_ts)
             }
+            .with_concurrent(shard.is_some())
             .with_filtered_select_stats(Arc::clone(&select_stats), shard_stats_filter(shard));
             match cq
                 .try_select_adaptive(
@@ -1238,6 +1235,7 @@ impl Ingester {
                         } else {
                             db_c.db.chunk_querier(start_ts, end_ts)
                         }
+                        .with_concurrent(shard.is_some())
                         .with_filtered_select_stats(
                             Arc::clone(&select_stats),
                             shard_stats_filter(shard),
@@ -1718,6 +1716,9 @@ impl Ingester {
                         .inc();
                 }
             }
+            if st.head && st.overlaps_ooo {
+                continue;
+            }
             if !postings_tracked(st.head) {
                 st.selected_postings = 0;
             }
@@ -1878,7 +1879,7 @@ impl Ingester {
                 .with_estimates_sink(Arc::clone(&est_stats));
                 per_source.push(run_planned(pq, meta)?);
             }
-            merge_per_block_chunk_series(per_source, unordered)?
+            merge_per_block_chunk_series(per_source, unordered, head.float_chunk_encoding())?
         } else {
             let cq = if unordered {
                 db.db
@@ -1886,6 +1887,7 @@ impl Ingester {
             } else {
                 db.db.chunk_querier(start_timestamp_ms, end_timestamp_ms)
             }
+            .with_concurrent(shard.is_some())
             .with_filtered_select_stats(Arc::clone(&select_stats), shard_stats_filter(shard));
             cq.select(true, matchers)
                 .map_err(|e| IngesterError::Internal {
@@ -2643,7 +2645,7 @@ impl Ingester {
         tokio::task::spawn_blocking(move || {
             let head = db.db.head();
             let base_refs_arc = if !matchers.is_empty() {
-                match head.postings_for_matchers_arc(&matchers) {
+                match head.postings_for_matchers_direct_arc(&matchers) {
                     Ok(refs) if refs.is_empty() => {
                         permit.finish(false);
                         return;
@@ -2782,7 +2784,7 @@ impl Ingester {
             let head = db.db.head();
             let base_refs_arc = if !matchers.is_empty() {
                 let refs = head
-                    .postings_for_matchers_arc(&matchers)
+                    .postings_for_matchers_direct_arc(&matchers)
                     .map_err(|e| IngesterError::Internal {
                         message: e.to_string(),
                     })?;
@@ -2942,7 +2944,7 @@ impl Ingester {
             };
             let head = db.db.head();
             let eligible_refs: Option<Arc<[u64]>> = if !matchers.is_empty() {
-                let base_refs = match head.postings_for_matchers_arc(&matchers) {
+                let base_refs = match head.postings_for_matchers_direct_arc(&matchers) {
                     Ok(r) => r,
                     Err(e) => {
                         let err = IngesterError::Internal { message: e.to_string() };
@@ -3129,7 +3131,7 @@ impl Ingester {
             let head = db.db.head();
             let eligible_refs: Option<Arc<[u64]>> = if !matchers.is_empty() {
                 let base_refs =
-                    head.postings_for_matchers_arc(&matchers)
+                    head.postings_for_matchers_direct_arc(&matchers)
                         .map_err(|e| IngesterError::Internal {
                             message: e.to_string(),
                         })?;
@@ -3305,7 +3307,7 @@ impl Ingester {
             let refs = if matchers.is_empty() {
                 Ok(Vec::new())
             } else {
-                head.postings_for_matchers(&matchers)
+                head.postings_for_matchers_direct(&matchers)
                     .map_err(|e| IngesterError::Internal {
                         message: format!("error listing active series: error getting postings: {e}"),
                     })
@@ -3406,7 +3408,7 @@ impl Ingester {
             let refs = if matchers.is_empty() {
                 Vec::new()
             } else {
-                head.postings_for_matchers(&matchers)
+                head.postings_for_matchers_direct(&matchers)
                     .map_err(|e| IngesterError::Internal {
                         message: format!("error listing active series: error getting postings: {e}"),
                     })?
@@ -3820,6 +3822,7 @@ impl ChunkSeriesSet for VecChunkSeriesSet {
 pub(crate) fn merge_per_block_chunk_series(
     mut sources: Vec<Vec<QueryChunkSeries>>,
     unordered: bool,
+    float_encoding: Encoding,
 ) -> Result<Vec<QueryChunkSeries>, IngesterError> {
     if sources.is_empty() {
         return Ok(Vec::new());
@@ -3843,7 +3846,12 @@ pub(crate) fn merge_per_block_chunk_series(
             if has_overlap {
                 let items: Vec<(ChunkMeta, Vec<mimir_tsdb::tombstones::Interval>)> =
                     chunks.into_iter().map(|c| (c, Vec::new())).collect();
-                chunks = merge_chunks_with_tombstones(items, false).map_err(|e| IngesterError::Internal {
+                chunks = merge_chunks_with_tombstones_and_float_encoding(
+                    items,
+                    false,
+                    float_encoding,
+                )
+                .map_err(|e| IngesterError::Internal {
                     message: format!("merging block chunks: {e}"),
                 })?;
             }
@@ -3988,6 +3996,13 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
     ) -> Box<dyn ChunkSeriesSet> {
         let planning_disabled = lookupplan::is_planning_disabled_in_context();
         let q_stats = Arc::new(QueryStats::new());
+        let shard = hints.and_then(|h| {
+            if h.shard_count > 0 {
+                Some((h.shard_index, h.shard_count))
+            } else {
+                None
+            }
+        });
         let plan = if planning_disabled {
             BasicLookupPlan::new(matchers.to_vec(), Vec::new())
         } else {
@@ -3996,17 +4011,11 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
                 self.planner.plan_index_lookup(&in_plan, hints)
             }) {
                 Ok(p) => p,
-                Err(e) => {
-                    return Box::new(VecChunkSeriesSet {
-                        items: Vec::new(),
-                        pos: 0,
-                        err: Some(QuerierError::Other(e)),
-                    });
-                }
+                Err(_) => in_plan,
             }
         };
 
-        let mut cq = self.build_chunk_querier();
+        let mut cq = self.build_chunk_querier().with_concurrent(shard.is_some());
         let stats_len_before = self.select_stats.as_ref().map(|(s, _)| s.lock().len());
         if !planning_disabled {
             if let Some((sink, filter)) = &self.select_stats {
@@ -4018,7 +4027,10 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
                 let items: Vec<Arc<dyn ChunkSeries>> = series
                     .into_iter()
                     .filter(|cs| {
-                        plan.scan_matchers
+                        shard.is_none_or(|(shard_idx, shard_count)| {
+                            labels_stable_hash(&cs.labels) % shard_count == shard_idx
+                        }) && plan
+                            .scan_matchers
                             .iter()
                             .all(|m| m.matches(cs.labels.get(&m.name)))
                     })
@@ -4030,18 +4042,11 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
                     })
                     .collect();
                 if !planning_disabled {
-                    if let (Some((sink, filter)), Some(before)) = (&self.select_stats, stats_len_before) {
+                    if let (Some((sink, _)), Some(before)) = (&self.select_stats, stats_len_before) {
                         let mut g = sink.lock();
                         let added = g.len().saturating_sub(before);
                         if added == 1 && !plan.scan_matchers.is_empty() {
-                            let filtered_count = items
-                                .iter()
-                                .filter(|item| {
-                                    let lbls = item.labels();
-                                    filter.as_ref().is_none_or(|f| f(&lbls))
-                                })
-                                .count() as u64;
-                            g[before].series = filtered_count;
+                            g[before].series = items.len() as u64;
                         }
                         if let Some(ref est_sink) = self.estimates_sink {
                             let est_p = QueryStats::load_estimated_selected_postings(Some(&q_stats));

@@ -40,7 +40,8 @@ use crate::chunkenc::{
 };
 use crate::chunks_block::ChunkMeta;
 use crate::compact::{
-    decode_chunk_samples, merge_head_chunks_with_tombstones, CompactionSeries, SampleValue,
+    decode_chunk_samples, merge_head_chunks_with_tombstones_and_float_encoding, CompactionSeries,
+    SampleValue,
 };
 use crate::exemplar::{CircularExemplarStorage, Exemplar, ExemplarError};
 use crate::head_chunks::{
@@ -137,6 +138,50 @@ pub trait SeriesLifecycleCallback: Send + Sync {
     fn pre_creation(&self, pairs: &[(&str, &str)]) -> Result<(), HeadError>;
     fn post_creation(&self, ref_id: u64, labels: &Labels);
     fn post_deletion(&self, deleted: &[(u64, Labels)]);
+
+    #[doc(hidden)]
+    fn chunk_end_time_variance_override(&self) -> Option<f64> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn inner_lifecycle_callback(&self) -> Option<&Arc<dyn SeriesLifecycleCallback>> {
+        None
+    }
+}
+
+struct ChunkEndTimeVarianceCallback {
+    variance: f64,
+    inner: Option<Arc<dyn SeriesLifecycleCallback>>,
+}
+
+impl SeriesLifecycleCallback for ChunkEndTimeVarianceCallback {
+    fn pre_creation(&self, pairs: &[(&str, &str)]) -> Result<(), HeadError> {
+        match self.inner {
+            Some(ref inner) => inner.pre_creation(pairs),
+            None => Ok(()),
+        }
+    }
+
+    fn post_creation(&self, ref_id: u64, labels: &Labels) {
+        if let Some(ref inner) = self.inner {
+            inner.post_creation(ref_id, labels);
+        }
+    }
+
+    fn post_deletion(&self, deleted: &[(u64, Labels)]) {
+        if let Some(ref inner) = self.inner {
+            inner.post_deletion(deleted);
+        }
+    }
+
+    fn chunk_end_time_variance_override(&self) -> Option<f64> {
+        Some(self.variance)
+    }
+
+    fn inner_lifecycle_callback(&self) -> Option<&Arc<dyn SeriesLifecycleCallback>> {
+        self.inner.as_ref()
+    }
 }
 
 #[derive(Clone)]
@@ -206,6 +251,33 @@ impl std::fmt::Debug for HeadOptions {
             )
             .field("registry", &self.registry.as_ref().map(|_| "..."))
             .finish()
+    }
+}
+
+impl HeadOptions {
+    /// Configures `ChunkEndTimeVariance` (0.0 disables jitter) without adding a struct field
+    /// that would break existing `HeadOptions` struct literals.
+    pub fn with_chunk_end_time_variance(mut self, v: f64) -> Self {
+        let inner = match self.series_lifecycle_callback.take() {
+            Some(cb) if cb.chunk_end_time_variance_override().is_some() => {
+                cb.inner_lifecycle_callback().cloned()
+            }
+            other => other,
+        };
+        self.series_lifecycle_callback = Some(Arc::new(ChunkEndTimeVarianceCallback {
+            variance: v,
+            inner,
+        }));
+        self
+    }
+
+    /// Returns the configured `ChunkEndTimeVariance` (default `0.0`).
+    #[inline]
+    pub fn chunk_end_time_variance(&self) -> f64 {
+        self.series_lifecycle_callback
+            .as_ref()
+            .and_then(|cb| cb.chunk_end_time_variance_override())
+            .unwrap_or(0.0)
     }
 }
 
@@ -3042,6 +3114,21 @@ pub type SeriesChunksResult = Option<(Labels, Vec<ChunkMeta>, Vec<Interval>)>;
 /// Lightweight series chunk intervals returned by [`Head::series_chunk_metas_no_bytes`].
 pub type SeriesChunkMetasNoBytes = Option<(Labels, SmallVec<[(i64, i64); 4]>, bool)>;
 
+/// Lightweight series chunk intervals + Phase 1 snapshot returned by
+/// [`Head::series_chunk_metas_no_bytes_with_snapshot`].
+pub type SeriesChunkMetasWithSnapshot =
+    Option<(Labels, SmallVec<[(i64, i64); 4]>, HeadChunkSnapshot)>;
+
+/// Phase 1 snapshot of Head chunks for a single series in two-phase lazy `QueryStream`
+/// (guaranteeing `QueryStreamSeries.chunk_count == QueryStreamSeriesChunks.chunks.len()`).
+#[derive(Clone, Debug)]
+pub enum HeadChunkSnapshot {
+    /// Fast path: sorted disjoint in-order chunks identified by their immutable `min_time`s.
+    InOrderByMinTime(SmallVec<[i64; 4]>),
+    /// Slow path (OOO, tombstones, or overlapping chunks): pre-merged chunks captured in Phase 1.
+    Precomputed(Vec<ChunkMeta>),
+}
+
 /// Lightweight candidate list + `[min_time, max_time_inclusive]` range for streaming compaction.
 pub type CompactionCandidatesRange = (Vec<(u64, Labels)>, i64, i64);
 
@@ -3478,7 +3565,8 @@ impl Head {
         opts: HeadOptions,
         min_valid_time: i64,
     ) -> Result<Self, HeadError> {
-        Self::open_with_chunk_end_time_variance(dir, opts, min_valid_time, 0.0)
+        let variance = opts.chunk_end_time_variance();
+        Self::open_with_chunk_end_time_variance(dir, opts, min_valid_time, variance)
     }
 
     /// Opens a [`Head`] with Go's `ChunkEndTimeVariance` (0.0 disables jitter).
@@ -3520,7 +3608,12 @@ impl Head {
             }
         }
 
-        let lifecycle_cb = opts.series_lifecycle_callback.clone();
+        let lifecycle_cb = match opts.series_lifecycle_callback.clone() {
+            Some(cb) if cb.chunk_end_time_variance_override().is_some() => {
+                cb.inner_lifecycle_callback().cloned()
+            }
+            other => other,
+        };
         let (series_gauge, series_created_total, series_removed_total) =
             if let Some(ref reg) = opts.registry {
                 let g = prometheus::Gauge::new(
@@ -3559,15 +3652,7 @@ impl Head {
             series: StripeSeries::new(opts.stripe_size),
             series_creation_mtx: Mutex::new(()),
             postings: MemPostings::new_unordered(),
-            postings_cache: PostingsForMatchersCache::new(
-                PostingsForMatchersCacheConfig {
-                    // Rust caches every head PostingsForMatchers call (Go only caches
-                    // concurrent / query-sharding calls unless `force`), so entries are
-                    // always invalidated on postings changes to keep Go's uncached results.
-                    enable_invalidation: true,
-                    ..opts.postings_cache.clone()
-                },
-            ),
+            postings_cache: PostingsForMatchersCache::new(opts.postings_cache.clone()),
             tombstones: MemTombstones::new(),
             exemplars: CircularExemplarStorage::new_with_registry(
                 if opts.enable_exemplar_storage {
@@ -4905,6 +4990,7 @@ impl Head {
                                       multi_ref: &mut HashMap<u64, u64>,
                                       mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
                                       ooo_mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
+                                      job_shards: &mut [Vec<WalSampleJob>],
                                       failed_outer: &mut bool|
              -> Result<(), HeadError> {
                 if pending.is_empty() {
@@ -5030,6 +5116,16 @@ impl Head {
                 for avec in out_attach {
                     for (entry, mmc, ooo_mmc, is_duplicate) in avec {
                         let idx = (entry.ref_id as usize) % workers;
+                        if !job_shards[idx].is_empty() {
+                            let batch = std::mem::take(&mut job_shards[idx]);
+                            if worker_txs[idx]
+                                .send(WalWorkerMsg::SampleJobs(batch))
+                                .is_err()
+                            {
+                                *failed_outer = true;
+                                return Err(HeadError::Closed);
+                            }
+                        }
                         if worker_txs[idx]
                             .send(WalWorkerMsg::AttachMmapped {
                                 entry,
@@ -5090,6 +5186,7 @@ impl Head {
                                         multi_ref,
                                         mmapped_map,
                                         ooo_mmapped_map,
+                                        &mut job_shards,
                                         &mut failed_outer,
                                     ) {
                                         if !failed_outer && coord_res.is_ok() {
@@ -5106,6 +5203,7 @@ impl Head {
                                         multi_ref,
                                         mmapped_map,
                                         ooo_mmapped_map,
+                                        &mut job_shards,
                                         &mut failed_outer,
                                     ) {
                                         if !failed_outer && coord_res.is_ok() {
@@ -5302,11 +5400,19 @@ impl Head {
                                                 continue;
                                             };
                                             let metric_type = MetricType::from_u8(m.metric_type);
-                                            let compact_meta = self.intern_metadata_symbols(
+                                            let compact_meta = match self.intern_metadata_symbols(
                                                 metric_type,
                                                 &m.unit,
                                                 &m.help,
-                                            )?;
+                                            ) {
+                                                Ok(cm) => cm,
+                                                Err(e) => {
+                                                    if coord_res.is_ok() {
+                                                        coord_res = Err(e);
+                                                    }
+                                                    break 'outer;
+                                                }
+                                            };
                                             self.has_any_metadata.store(true, Ordering::Release);
                                             let mut st = entry.inner.lock();
                                             st.set_metadata(compact_meta);
@@ -5339,6 +5445,7 @@ impl Head {
                     multi_ref,
                     mmapped_map,
                     ooo_mmapped_map,
+                    &mut job_shards,
                     &mut failed_outer,
                 ) {
                     if !failed_outer && coord_res.is_ok() {
@@ -5882,11 +5989,8 @@ impl Head {
 
     /// Returns postings list for a single `(name, value)` pair.
     pub fn postings_for_label_value(&self, name: &str, value: &str) -> Vec<u64> {
-        let ids = {
-            let syms = self.symbols.read();
-            syms.get(name).zip(syms.get(value))
-        };
-        let Some((nid, vid)) = ids else {
+        let syms = self.symbols.read();
+        let Some((nid, vid)) = syms.get(name).zip(syms.get(value)) else {
             return Vec::new();
         };
         self.postings.postings_for_id(nid, vid)
@@ -5899,11 +6003,8 @@ impl Head {
         value: &str,
         f: impl FnOnce(&[u32], &[u64]) -> R,
     ) -> R {
-        let ids = {
-            let syms = self.symbols.read();
-            syms.get(name).zip(syms.get(value))
-        };
-        let Some((nid, vid)) = ids else {
+        let syms = self.symbols.read();
+        let Some((nid, vid)) = syms.get(name).zip(syms.get(value)) else {
             return R::default();
         };
         self.postings.visit_postings_for_id(nid, vid, f)
@@ -6711,12 +6812,8 @@ impl Head {
             float_histograms: scratch.float_histograms,
             exemplars: scratch.exemplars,
             metadata: scratch.metadata,
-            batch_last_sample: scratch.batch_last_sample,
             types_in_batch: scratch.types_in_batch,
             batch_boundaries: scratch.batch_boundaries,
-            indexed_floats_len: 0,
-            indexed_hists_len: 0,
-            indexed_fhists_len: 0,
             floats_committed: 0,
             hists_committed: 0,
             fhists_committed: 0,
@@ -8398,17 +8495,52 @@ impl Head {
         )
     }
 
+    #[inline]
+    pub fn postings_cache(&self) -> &PostingsForMatchersCache {
+        &self.postings_cache
+    }
+
+    pub fn set_postings_cache_eligibility(&self, force: bool, shared: bool) {
+        self.postings_cache.set_eligibility(force, shared);
+    }
+
+    /// Evaluates label matchers against `MemPostings` (backed by `PostingsForMatchersCache`),
+    /// passing `concurrent` (Go `sharded` / `hints.ShardCount > 0`).
+    pub fn postings_for_matchers_with_concurrent(
+        &self,
+        matchers: &[LabelMatcher],
+        concurrent: bool,
+    ) -> Result<Arc<[u64]>, HeadError> {
+        self.postings_cache.get_or_compute(matchers, concurrent || self.postings_cache.force(), || {
+            let syms = self.symbols.read();
+            let view = self.postings.as_source(&syms);
+            Ok(postings_for_matchers(&view, matchers)?)
+        })
+    }
+
+    /// Evaluates label matchers against `MemPostings` directly, bypassing `PostingsForMatchersCache`
+    /// (matching Go's direct `tsdb.PostingsForMatchers` on non-`Select` RPCs).
+    pub fn postings_for_matchers_direct(&self, matchers: &[LabelMatcher]) -> Result<Vec<u64>, HeadError> {
+        let syms = self.symbols.read();
+        let view = self.postings.as_source(&syms);
+        Ok(postings_for_matchers(&view, matchers)?)
+    }
+
+    /// Direct (`PostingsForMatchersCache`-bypassing) evaluation returning `Arc<[u64]>`.
+    pub fn postings_for_matchers_direct_arc(
+        &self,
+        matchers: &[LabelMatcher],
+    ) -> Result<Arc<[u64]>, HeadError> {
+        Ok(Arc::from(self.postings_for_matchers_direct(matchers)?))
+    }
+
     /// Evaluates label matchers against `MemPostings` (backed by `PostingsForMatchersCache`),
     /// returning a shared `Arc<[u64]>` with zero slice copy on cache hits.
     pub fn postings_for_matchers_arc(
         &self,
         matchers: &[LabelMatcher],
     ) -> Result<Arc<[u64]>, HeadError> {
-        self.postings_cache.get_or_compute(matchers, || {
-            let syms = self.symbols.read();
-            let view = self.postings.as_source(&syms);
-            Ok(postings_for_matchers(&view, matchers)?)
-        })
+        self.postings_for_matchers_with_concurrent(matchers, false)
     }
 
     /// Evaluates label matchers against `MemPostings` (backed by `PostingsForMatchersCache`).
@@ -8426,7 +8558,7 @@ impl Head {
             let syms = self.symbols.read();
             return Ok(self.postings.label_names(&syms));
         }
-        let refs = self.postings_for_matchers_arc(matchers)?;
+        let refs = self.postings_for_matchers_direct(matchers)?;
         let mut names_set: hashbrown::HashSet<String> = hashbrown::HashSet::with_capacity(32);
         for &r in refs.iter() {
             if let Some(entry) = self.series.get_by_id(r) {
@@ -8460,7 +8592,7 @@ impl Head {
             let syms = self.symbols.read();
             return Ok(self.postings.sorted_label_values_with_limit(name, &syms, limit));
         }
-        let refs = self.postings_for_matchers_arc(matchers)?;
+        let refs = self.postings_for_matchers_direct(matchers)?;
         {
             let syms = self.symbols.read();
             if syms.get(name).is_none() {
@@ -8495,15 +8627,18 @@ impl Head {
             return None;
         };
         let tombs = self.tombstones.get(ref_id);
+        let ino_mint = mint.max(self.min_time());
         let st = entry.inner.lock();
-        let has_chunk = st.any_head_chunk_bounds(|hc_min, hc_max| {
-            hc_min <= maxt
-                && mint <= hc_max
-                && !tombs.iter().any(|iv| iv.is_subrange(hc_min, hc_max))
-        }) || st.mmapped().iter().any(|mc| {
-            mc.overlaps_closed_interval(mint, maxt)
-                && !tombs.iter().any(|iv| iv.is_subrange(mc.min_time, mc.max_time))
-        }) || st.ooo().is_some_and(|ooo| {
+        let has_chunk = (ino_mint <= maxt
+            && (st.any_head_chunk_bounds(|hc_min, hc_max| {
+                hc_min <= maxt
+                    && ino_mint <= hc_max
+                    && !tombs.iter().any(|iv| iv.is_subrange(hc_min, hc_max))
+            }) || st.mmapped().iter().any(|mc| {
+                mc.overlaps_closed_interval(ino_mint, maxt)
+                    && !tombs.iter().any(|iv| iv.is_subrange(mc.min_time, mc.max_time))
+            })))
+            || st.ooo().is_some_and(|ooo| {
             ooo.ooo_mmapped_chunks
                 .iter()
                 .any(|mc| mc.overlaps_closed_interval(mint, maxt))
@@ -8576,33 +8711,39 @@ impl Head {
                 if entry.is_gced() {
                     return Ok(None);
                 }
+                let ino_mint = mint.max(self.min_time());
                 let mut in_order_pos = 0u64;
-                let mmapped_count = st
-                    .mmapped()
-                    .iter()
-                    .filter(|mc| mc.overlaps_closed_interval(mint, maxt))
-                    .count();
-                let mut mmapped_in_order = Vec::with_capacity(mmapped_count);
-                if mmapped_count > 0 {
-                    for mc in st.mmapped() {
-                        if mc.overlaps_closed_interval(mint, maxt) {
-                            mmapped_in_order.push((in_order_pos, *mc));
-                            in_order_pos += 1;
+                let (mmapped_in_order, head_chks) = if ino_mint <= maxt {
+                    let mmapped_count = st
+                        .mmapped()
+                        .iter()
+                        .filter(|mc| mc.overlaps_closed_interval(ino_mint, maxt))
+                        .count();
+                    let mut mmapped_in_order = Vec::with_capacity(mmapped_count);
+                    if mmapped_count > 0 {
+                        for mc in st.mmapped() {
+                            if mc.overlaps_closed_interval(ino_mint, maxt) {
+                                mmapped_in_order.push((in_order_pos, *mc));
+                                in_order_pos += 1;
+                            }
                         }
                     }
-                }
-                let mut head_chks = Vec::with_capacity(st.head_chunks_len());
-                st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
-                    if hc_min <= maxt && mint <= hc_max {
-                        head_chks.push(ChunkMeta {
-                            ref_id: in_order_pos,
-                            min_time: hc_min,
-                            max_time: hc_max,
-                            chunk: Some(hc_chunk),
-                        });
-                        in_order_pos += 1;
-                    }
-                });
+                    let mut head_chks = Vec::with_capacity(st.head_chunks_len());
+                    st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
+                        if hc_min <= maxt && ino_mint <= hc_max {
+                            head_chks.push(ChunkMeta {
+                                ref_id: in_order_pos,
+                                min_time: hc_min,
+                                max_time: hc_max,
+                                chunk: Some(hc_chunk),
+                            });
+                            in_order_pos += 1;
+                        }
+                    });
+                    (mmapped_in_order, head_chks)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 let mut mmapped_ooo = Vec::new();
                 let mut ooo_head_chks = Vec::new();
                 if let Some(ooo) = st.ooo() {
@@ -8753,7 +8894,11 @@ impl Head {
         if chks.is_empty() {
             return Ok(None);
         }
-        let final_chunks = merge_head_chunks_with_tombstones(chks, &tombs)?;
+        let final_chunks = merge_head_chunks_with_tombstones_and_float_encoding(
+            chks,
+            &tombs,
+            self.float_chunk_encoding(),
+        )?;
         if final_chunks.is_empty() {
             Ok(None)
         } else {
@@ -8775,7 +8920,11 @@ impl Head {
         if chks.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(merge_head_chunks_with_tombstones(chks, &tombs)?)
+        Ok(merge_head_chunks_with_tombstones_and_float_encoding(
+            chks,
+            &tombs,
+            self.float_chunk_encoding(),
+        )?)
     }
 
     /// Loads and overlap-merges all chunks for a pre-resolved `SeriesEntry` overlapping
@@ -8793,18 +8942,124 @@ impl Head {
         if chks.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(merge_head_chunks_with_tombstones(chks, &tombs)?)
+        Ok(merge_head_chunks_with_tombstones_and_float_encoding(
+            chks,
+            &tombs,
+            self.float_chunk_encoding(),
+        )?)
     }
 
-    /// Computes `(entry, exact_chunk_count)` for `ref_id` in `[mint, maxt]` without cloning
-    /// `Labels`, chunk bytes, or reading mmap files on the normal in-order disjoint fast path.
-    pub fn series_lazy_chunk_count_with_entry(
+    /// Materializes Phase 2 chunks from a Phase 1 [`HeadChunkSnapshot`], guaranteeing
+    /// `chunks.len() == Phase 1 chunk_count` even under concurrent chunk cuts or OOO inserts.
+    pub fn series_final_chunks_from_snapshot(
+        &self,
+        entry_opt: Option<&SeriesEntry>,
+        ref_id: u64,
+        snapshot: HeadChunkSnapshot,
+    ) -> Result<Vec<ChunkMeta>, HeadError> {
+        let min_times = match snapshot {
+            HeadChunkSnapshot::Precomputed(chks) => return Ok(chks),
+            HeadChunkSnapshot::InOrderByMinTime(min_times) => min_times,
+        };
+        if min_times.is_empty() {
+            return Ok(Vec::new());
+        }
+        let looked_up;
+        let entry = match entry_opt {
+            Some(e) => e,
+            None => {
+                let Some(e) = self.series.get_by_id(ref_id) else {
+                    return Ok(Vec::new());
+                };
+                looked_up = e;
+                &looked_up
+            }
+        };
+
+        'retry: loop {
+            if self.is_closed() {
+                return Err(HeadChunksError::Closed.into());
+            }
+            let (mmapped_in_order, head_chks) = {
+                let st = entry.inner.lock();
+                if entry.is_gced() {
+                    return Ok(Vec::new());
+                }
+                let mut pos = 0u64;
+                let mut mmapped_in_order = Vec::new();
+                for mc in st.mmapped() {
+                    if min_times.contains(&mc.min_time) {
+                        mmapped_in_order.push((pos, *mc));
+                        pos += 1;
+                    }
+                }
+                let mut head_chks = Vec::new();
+                st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
+                    if min_times.contains(&hc_min) {
+                        head_chks.push(ChunkMeta {
+                            ref_id: pos,
+                            min_time: hc_min,
+                            max_time: hc_max,
+                            chunk: Some(hc_chunk),
+                        });
+                        pos += 1;
+                    }
+                });
+                (mmapped_in_order, head_chks)
+            };
+
+            if mmapped_in_order.is_empty() {
+                return Ok(head_chks);
+            }
+
+            let chunk_reader_guard = self.chunk_reader.read();
+            let Some(r) = chunk_reader_guard.as_ref() else {
+                return Err(HeadChunksError::Closed.into());
+            };
+            if self.is_closed() {
+                return Err(HeadChunksError::Closed.into());
+            }
+
+            let mut chks = Vec::with_capacity(mmapped_in_order.len() + head_chks.len());
+            for (sort_ref, mc) in mmapped_in_order {
+                match r.chunk(mc.ref_id) {
+                    Ok(enc) => chks.push(ChunkMeta {
+                        ref_id: sort_ref,
+                        min_time: mc.min_time,
+                        max_time: mc.max_time,
+                        chunk: Some(enc),
+                    }),
+                    Err(e) if !r.has_file(mc.ref_id.unpack().0 as usize) => {
+                        drop(chunk_reader_guard);
+                        if self.is_closed() {
+                            return Err(HeadChunksError::Closed.into());
+                        }
+                        let st = entry.inner.lock();
+                        if entry.is_gced() {
+                            return Ok(Vec::new());
+                        }
+                        if st.mmapped().iter().any(|m| m.ref_id == mc.ref_id) {
+                            return Err(e.into());
+                        }
+                        continue 'retry;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            chks.extend(head_chks);
+            return Ok(chks);
+        }
+    }
+
+    /// Computes `(entry, exact_chunk_count, snapshot)` for `ref_id` in `[mint, maxt]` without
+    /// cloning `Labels`, chunk bytes, or reading mmap files on the normal in-order disjoint fast path.
+    pub fn series_lazy_chunk_count_with_snapshot(
         &self,
         ref_id: u64,
         mint: i64,
         maxt: i64,
         filter: Option<&dyn Fn(&Labels) -> bool>,
-    ) -> Result<Option<(Arc<SeriesEntry>, u32)>, HeadError> {
+    ) -> Result<Option<(Arc<SeriesEntry>, u32, HeadChunkSnapshot)>, HeadError> {
         if self.is_closed() {
             return Err(HeadChunksError::Closed.into());
         }
@@ -8820,7 +9075,8 @@ impl Head {
         }
 
         let has_any_tombs = self.tombstones.has_any();
-        let (fast_count, needs_slow_resolve) = {
+        let ino_mint = mint.max(self.min_time());
+        let (min_times, needs_slow_resolve) = {
             let st = entry.inner.lock();
             let has_ooo = st.ooo().is_some_and(|ooo| {
                 ooo.ooo_mmapped_chunks
@@ -8835,41 +9091,44 @@ impl Head {
                         .as_ref()
                         .is_some_and(|ohc| ohc.overlaps_closed_interval(mint, maxt))
             });
-            let mut count: u32 = 0;
+            let mut min_times: SmallVec<[i64; 4]> = SmallVec::new();
             let mut prev_min: i64 = i64::MIN;
             let mut prev_max: i64 = i64::MIN;
             let mut has_prev = false;
             let mut sorted_disjoint = true;
-            for mc in st.mmapped() {
-                if mc.overlaps_closed_interval(mint, maxt) {
-                    if has_prev && (mc.min_time < prev_min || mc.min_time <= prev_max) {
-                        sorted_disjoint = false;
+            if ino_mint <= maxt {
+                for mc in st.mmapped() {
+                    if mc.overlaps_closed_interval(ino_mint, maxt) {
+                        if has_prev && (mc.min_time < prev_min || mc.min_time <= prev_max) {
+                            sorted_disjoint = false;
+                        }
+                        prev_min = mc.min_time;
+                        prev_max = mc.max_time;
+                        has_prev = true;
+                        min_times.push(mc.min_time);
                     }
-                    prev_min = mc.min_time;
-                    prev_max = mc.max_time;
-                    has_prev = true;
-                    count += 1;
                 }
+                st.for_each_head_chunk_bounds(|hc_min, hc_max| {
+                    if hc_min <= maxt && ino_mint <= hc_max {
+                        if has_prev && (hc_min < prev_min || hc_min <= prev_max) {
+                            sorted_disjoint = false;
+                        }
+                        prev_min = hc_min;
+                        prev_max = hc_max;
+                        has_prev = true;
+                        min_times.push(hc_min);
+                    }
+                });
             }
-            st.for_each_head_chunk_bounds(|hc_min, hc_max| {
-                if hc_min <= maxt && mint <= hc_max {
-                    if has_prev && (hc_min < prev_min || hc_min <= prev_max) {
-                        sorted_disjoint = false;
-                    }
-                    prev_min = hc_min;
-                    prev_max = hc_max;
-                    has_prev = true;
-                    count += 1;
-                }
-            });
-            (count, has_ooo || has_any_tombs || !sorted_disjoint)
+            (min_times, has_ooo || has_any_tombs || !sorted_disjoint)
         };
 
         if !needs_slow_resolve {
-            return Ok(if fast_count == 0 {
+            return Ok(if min_times.is_empty() {
                 None
             } else {
-                Some((entry, fast_count))
+                let cnt = min_times.len() as u32;
+                Some((entry, cnt, HeadChunkSnapshot::InOrderByMinTime(min_times)))
             });
         }
 
@@ -8877,8 +9136,23 @@ impl Head {
         Ok(if chks.is_empty() {
             None
         } else {
-            Some((entry, chks.len() as u32))
+            let cnt = chks.len() as u32;
+            Some((entry, cnt, HeadChunkSnapshot::Precomputed(chks)))
         })
+    }
+
+    /// Computes `(entry, exact_chunk_count)` for `ref_id` in `[mint, maxt]` without cloning
+    /// `Labels`, chunk bytes, or reading mmap files on the normal in-order disjoint fast path.
+    pub fn series_lazy_chunk_count_with_entry(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+    ) -> Result<Option<(Arc<SeriesEntry>, u32)>, HeadError> {
+        Ok(self
+            .series_lazy_chunk_count_with_snapshot(ref_id, mint, maxt, filter)?
+            .map(|(entry, cnt, _)| (entry, cnt)))
     }
 
     /// Computes `(labels, exact_chunk_count)` for `ref_id` in `[mint, maxt]` without cloning any
@@ -8895,15 +9169,15 @@ impl Head {
             .map(|(entry, cnt)| (entry.labels.clone(), cnt)))
     }
 
-    /// Returns `(labels, chunk_intervals, needs_chunk_load_for_count)` for `ref_id` in `[mint, maxt]`
+    /// Returns `(labels, chunk_intervals, snapshot)` for `ref_id` in `[mint, maxt]`
     /// without cloning chunk bytes on the fast path. Used when combining Head with on-disk Blocks.
-    pub fn series_chunk_metas_no_bytes(
+    pub fn series_chunk_metas_no_bytes_with_snapshot(
         &self,
         ref_id: u64,
         mint: i64,
         maxt: i64,
         filter: Option<&dyn Fn(&Labels) -> bool>,
-    ) -> Result<SeriesChunkMetasNoBytes, HeadError> {
+    ) -> Result<SeriesChunkMetasWithSnapshot, HeadError> {
         if self.is_closed() {
             return Err(HeadChunksError::Closed.into());
         }
@@ -8918,6 +9192,7 @@ impl Head {
             }
         }
         let has_any_tombs = self.tombstones.has_any();
+        let ino_mint = mint.max(self.min_time());
         let (intervals, needs_slow) = {
             let st = entry.inner.lock();
             let has_ooo = st.ooo().is_some_and(|ooo| {
@@ -8938,42 +9213,66 @@ impl Head {
             let mut prev_max = i64::MIN;
             let mut has_prev = false;
             let mut sorted_disjoint = true;
-            for mc in st.mmapped() {
-                if mc.overlaps_closed_interval(mint, maxt) {
-                    if has_prev && (mc.min_time < prev_min || mc.min_time <= prev_max) {
-                        sorted_disjoint = false;
+            if ino_mint <= maxt {
+                for mc in st.mmapped() {
+                    if mc.overlaps_closed_interval(ino_mint, maxt) {
+                        if has_prev && (mc.min_time < prev_min || mc.min_time <= prev_max) {
+                            sorted_disjoint = false;
+                        }
+                        prev_min = mc.min_time;
+                        prev_max = mc.max_time;
+                        has_prev = true;
+                        intervals.push((mc.min_time, mc.max_time));
                     }
-                    prev_min = mc.min_time;
-                    prev_max = mc.max_time;
-                    has_prev = true;
-                    intervals.push((mc.min_time, mc.max_time));
                 }
+                st.for_each_head_chunk_bounds(|hc_min, hc_max| {
+                    if hc_min <= maxt && ino_mint <= hc_max {
+                        if has_prev && (hc_min < prev_min || hc_min <= prev_max) {
+                            sorted_disjoint = false;
+                        }
+                        prev_min = hc_min;
+                        prev_max = hc_max;
+                        has_prev = true;
+                        intervals.push((hc_min, hc_max));
+                    }
+                });
             }
-            st.for_each_head_chunk_bounds(|hc_min, hc_max| {
-                if hc_min <= maxt && mint <= hc_max {
-                    if has_prev && (hc_min < prev_min || hc_min <= prev_max) {
-                        sorted_disjoint = false;
-                    }
-                    prev_min = hc_min;
-                    prev_max = hc_max;
-                    has_prev = true;
-                    intervals.push((hc_min, hc_max));
-                }
-            });
             (intervals, has_ooo || has_any_tombs || !sorted_disjoint)
         };
         if !needs_slow {
             if intervals.is_empty() {
                 return Ok(None);
             }
-            return Ok(Some((entry.labels.clone(), intervals, false)));
+            let min_times: SmallVec<[i64; 4]> = intervals.iter().map(|&(mn, _)| mn).collect();
+            return Ok(Some((
+                entry.labels.clone(),
+                intervals,
+                HeadChunkSnapshot::InOrderByMinTime(min_times),
+            )));
         }
         let Some((labels, chks)) = self.series_final_chunks(ref_id, mint, maxt)? else {
             return Ok(None);
         };
         let ivs: SmallVec<[(i64, i64); 4]> =
             chks.iter().map(|c| (c.min_time, c.max_time)).collect();
-        Ok(Some((labels, ivs, true)))
+        Ok(Some((labels, ivs, HeadChunkSnapshot::Precomputed(chks))))
+    }
+
+    /// Returns `(labels, chunk_intervals, needs_chunk_load_for_count)` for `ref_id` in `[mint, maxt]`
+    /// without cloning chunk bytes on the fast path. Used when combining Head with on-disk Blocks.
+    pub fn series_chunk_metas_no_bytes(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+    ) -> Result<SeriesChunkMetasNoBytes, HeadError> {
+        Ok(self
+            .series_chunk_metas_no_bytes_with_snapshot(ref_id, mint, maxt, filter)?
+            .map(|(labels, ivs, snap)| {
+                let is_slow = matches!(snap, HeadChunkSnapshot::Precomputed(_));
+                (labels, ivs, is_slow)
+            }))
     }
 
     pub fn series_labels(&self, ref_id: u64) -> Option<Labels> {
@@ -9021,7 +9320,6 @@ struct PendingHist {
     st: i64,
     t: i64,
     h: Histogram,
-    is_ooo: bool,
 }
 
 #[derive(Clone)]
@@ -9030,7 +9328,6 @@ struct PendingFloatHist {
     st: i64,
     t: i64,
     fh: FloatHistogram,
-    is_ooo: bool,
 }
 
 #[derive(Clone)]
@@ -9092,11 +9389,15 @@ struct AppenderScratch {
     float_histograms: Vec<PendingFloatHist>,
     exemplars: Vec<PendingExemplar>,
     metadata: Vec<PendingMetadata>,
-    batch_last_sample: FastU64Map<(i64, LastSample)>,
     types_in_batch: FastU64Map<BatchSampleType>,
     batch_boundaries: Vec<BatchBoundary>,
     wal_buf: Vec<u8>,
     wal_comp_buf: Vec<u8>,
+}
+
+struct PreparedWalPayloads {
+    series: Option<(Vec<u8>, bool)>,
+    records: Vec<(Vec<u8>, bool)>,
 }
 
 /// Transactional write appender for [`Head`] matching `tsdb.headAppender`.
@@ -9112,12 +9413,8 @@ pub struct HeadAppender<'a> {
     float_histograms: Vec<PendingFloatHist>,
     exemplars: Vec<PendingExemplar>,
     metadata: Vec<PendingMetadata>,
-    batch_last_sample: FastU64Map<(i64, LastSample)>,
     types_in_batch: FastU64Map<BatchSampleType>,
     batch_boundaries: Vec<BatchBoundary>,
-    indexed_floats_len: usize,
-    indexed_hists_len: usize,
-    indexed_fhists_len: usize,
     floats_committed: usize,
     hists_committed: usize,
     fhists_committed: usize,
@@ -9164,63 +9461,7 @@ impl<'a> HeadAppender<'a> {
             self.types_in_batch.insert(ref_id, ht);
         }
     }
-    #[inline]
-    fn upsert_batch_last(
-        map: &mut FastU64Map<(i64, LastSample)>,
-        ref_id: u64,
-        t: i64,
-        ls: LastSample,
-    ) {
-        match map.entry(ref_id) {
-            hashbrown::hash_map::Entry::Occupied(mut o) => {
-                if t >= o.get().0 {
-                    *o.get_mut() = (t, ls);
-                }
-            }
-            hashbrown::hash_map::Entry::Vacant(v) => {
-                v.insert((t, ls));
-            }
-        }
-    }
 
-    fn sync_batch_last_sample(&mut self) {
-        while self.indexed_floats_len < self.floats.len() {
-            let pf = &self.floats[self.indexed_floats_len];
-            self.indexed_floats_len += 1;
-            if !pf.is_ooo {
-                Self::upsert_batch_last(
-                    &mut self.batch_last_sample,
-                    pf.entry.ref_id,
-                    pf.t,
-                    LastSample::Float(pf.v),
-                );
-            }
-        }
-        while self.indexed_hists_len < self.histograms.len() {
-            let ph = &self.histograms[self.indexed_hists_len];
-            self.indexed_hists_len += 1;
-            if !ph.is_ooo {
-                Self::upsert_batch_last(
-                    &mut self.batch_last_sample,
-                    ph.entry.ref_id,
-                    ph.t,
-                    LastSample::Histogram(Box::new(ph.h.clone())),
-                );
-            }
-        }
-        while self.indexed_fhists_len < self.float_histograms.len() {
-            let pfh = &self.float_histograms[self.indexed_fhists_len];
-            self.indexed_fhists_len += 1;
-            if !pfh.is_ooo {
-                Self::upsert_batch_last(
-                    &mut self.batch_last_sample,
-                    pfh.entry.ref_id,
-                    pfh.t,
-                    LastSample::FloatHistogram(Box::new(pfh.fh.clone())),
-                );
-            }
-        }
-    }
 
     fn release_remaining_pending_commits(&mut self) {
         if self.floats_committed < self.floats.len() {
@@ -9257,14 +9498,10 @@ impl<'a> HeadAppender<'a> {
         self.float_histograms.clear();
         self.exemplars.clear();
         self.metadata.clear();
-        self.batch_last_sample.clear();
         self.types_in_batch.clear();
         self.batch_boundaries.clear();
         self.wal_buf.clear();
         self.wal_comp_buf.clear();
-        self.indexed_floats_len = 0;
-        self.indexed_hists_len = 0;
-        self.indexed_fhists_len = 0;
         self.floats_committed = 0;
         self.hists_committed = 0;
         self.fhists_committed = 0;
@@ -9289,9 +9526,6 @@ impl<'a> HeadAppender<'a> {
         if self.metadata.capacity() > 16_384 {
             self.metadata = Vec::new();
         }
-        if self.batch_last_sample.capacity() > 16_384 {
-            self.batch_last_sample = FastU64Map::default();
-        }
         if self.types_in_batch.capacity() > 16_384 {
             self.types_in_batch = FastU64Map::default();
         }
@@ -9311,7 +9545,6 @@ impl<'a> HeadAppender<'a> {
                 float_histograms: std::mem::take(&mut self.float_histograms),
                 exemplars: std::mem::take(&mut self.exemplars),
                 metadata: std::mem::take(&mut self.metadata),
-                batch_last_sample: std::mem::take(&mut self.batch_last_sample),
                 types_in_batch: std::mem::take(&mut self.types_in_batch),
                 batch_boundaries: std::mem::take(&mut self.batch_boundaries),
                 wal_buf: std::mem::take(&mut self.wal_buf),
@@ -9320,68 +9553,7 @@ impl<'a> HeadAppender<'a> {
         }
     }
 
-    fn check_batch_last_sample(
-        &self,
-        ref_id: u64,
-        t: i64,
-        val: &LastSample,
-        ooo_time_window: i64,
-    ) -> Result<Option<(bool, bool)>, HeadError> {
-        let Some((prev_t, prev_val)) = self.batch_last_sample.get(&ref_id) else {
-            return Ok(None);
-        };
-        if t >= self.min_valid_time {
-            if t > *prev_t {
-                return Ok(Some((false, false)));
-            }
-            if t == *prev_t {
-                let same = match (prev_val, val) {
-                    (LastSample::Float(a), LastSample::Float(b)) => {
-                        a.to_bits() == b.to_bits() || b.to_bits() == QUIET_ZERO_NAN_BITS
-                    }
-                    (LastSample::Histogram(a), LastSample::Histogram(b)) => a.prom_equals(b),
-                    (LastSample::FloatHistogram(a), LastSample::FloatHistogram(b)) => {
-                        a.prom_equals(b)
-                    }
-                    _ => false,
-                };
-                if same {
-                    return Ok(Some((false, true)));
-                }
-                if let LastSample::Float(new_v) = val {
-                    let msg = match prev_val {
-                        LastSample::Float(prev_v) => format!(
-                            "duplicate sample for timestamp {t}; overrides not allowed: existing {}, new value {}",
-                            format_go_g(*prev_v),
-                            format_go_g(*new_v)
-                        ),
-                        LastSample::Histogram(_) | LastSample::FloatHistogram(_) => format!(
-                            "duplicate sample for timestamp {t}; overrides not allowed: existing is a histogram, new value {}",
-                            format_go_g(*new_v)
-                        ),
-                        LastSample::None => "duplicate sample for timestamp".to_string(),
-                    };
-                    return Err(HeadError::DuplicateSampleWithDetails(msg));
-                }
-                return Err(HeadError::DuplicateSampleForTimestamp);
-            }
-        }
-        if let LastSample::Float(v) = val {
-            if v.to_bits() == QUIET_ZERO_NAN_BITS {
-                return Ok(Some((true, true)));
-            }
-        }
-        if ooo_time_window > 0 && t >= self.head_maxt.saturating_sub(ooo_time_window) {
-            return Ok(Some((true, false)));
-        }
-        if ooo_time_window > 0 {
-            return Err(HeadError::TooOldSample);
-        }
-        if t < self.min_valid_time {
-            return Err(HeadError::OutOfBounds);
-        }
-        Err(HeadError::OutOfOrderSample)
-    }
+
     fn resolve_sorted_pairs_prehashed(
         &mut self,
         series_ref: Option<u64>,
@@ -9911,65 +10083,9 @@ impl<'a> HeadAppender<'a> {
             entry.pending_commits.fetch_sub(1, Ordering::Release);
             return Ok(None);
         }
-        let prev = entry.pending_commits_count().saturating_sub(1);
-        let is_ooo = if prev > 0 {
-            self.sync_batch_last_sample();
-            match self.check_batch_last_sample(ref_id, t, &LastSample::Float(v), effective_ooo) {
-                Ok(Some((is_ooo, is_dup))) => {
-                    if is_ooo && v.to_bits() != QUIET_ZERO_NAN_BITS {
-                        let delta = self.head_maxt.saturating_sub(t);
-                        if delta > 0 {
-                            self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
-                        }
-                    }
-                    if is_dup {
-                        entry.pending_commits.fetch_sub(1, Ordering::Release);
-                        if take_entry {
-                            *series_entry = Some(entry);
-                        }
-                        return Ok(Some(ref_id));
-                    }
-                    is_ooo
-                }
-                Ok(None) => {
-                    let res = {
-                        let mut state = entry.inner.lock();
-                        if entry.is_gced() {
-                            drop(state);
-                            entry.pending_commits.fetch_sub(1, Ordering::Release);
-                            return Ok(None);
-                        }
-                        self.check_entry_appendable_float(&mut state, t, v, effective_ooo)
-                    };
-                    match res {
-                        Ok((is_ooo, is_dup)) => {
-                            if is_dup {
-                                entry.pending_commits.fetch_sub(1, Ordering::Release);
-                                if take_entry {
-                                    *series_entry = Some(entry);
-                                }
-                                return Ok(Some(ref_id));
-                            }
-                            is_ooo
-                        }
-                        Err(e) => {
-                            entry.pending_commits.fetch_sub(1, Ordering::Release);
-                            if take_entry {
-                                *series_entry = Some(entry);
-                            }
-                            return Err(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    entry.pending_commits.fetch_sub(1, Ordering::Release);
-                    if take_entry {
-                        *series_entry = Some(entry);
-                    }
-                    return Err(e);
-                }
-            }
-        } else {
+        // Validate strictly against already-committed SeriesState (matching Go headAppenderV2);
+        // intra-batch duplicate/OOO/conflicting samples are dropped silently during commit().
+        let is_ooo = {
             let res = {
                 let mut state = entry.inner.lock();
                 if entry.is_gced() {
@@ -10086,71 +10202,7 @@ impl<'a> HeadAppender<'a> {
         if !entry.try_inc_pending_commit() || entry.is_gced() {
             return Err(HeadError::UnknownSeriesRef(series_ref));
         }
-        let prev = entry.pending_commits_count().saturating_sub(1);
-        let is_ooo = if prev > 0 {
-            self.sync_batch_last_sample();
-            match self.check_batch_last_sample(
-                series_ref,
-                t,
-                &LastSample::Float(v),
-                self.ooo_time_window,
-            ) {
-                Ok(Some((is_ooo, is_dup))) => {
-                    if is_dup {
-                        entry.pending_commits.fetch_sub(1, Ordering::Release);
-                        return Ok(series_ref);
-                    }
-                    is_ooo
-                }
-                Ok(None) => {
-                    // Lock order: entry.inner BEFORE chunk_reader.read() (C2).
-                    let state = entry.inner.lock();
-                    if entry.is_gced() {
-                        drop(state);
-                        entry.pending_commits.fetch_sub(1, Ordering::Release);
-                        return Err(HeadError::UnknownSeriesRef(series_ref));
-                    }
-                    let res = if state.needs_chunk_reader_for_t(t) {
-                        let cr_guard = self.head.chunk_reader.read();
-                        state.appendable_float(
-                            t,
-                            v,
-                            self.head_maxt,
-                            self.min_valid_time,
-                            self.ooo_time_window,
-                            cr_guard.as_ref(),
-                        )
-                    } else {
-                        state.appendable_float(
-                            t,
-                            v,
-                            self.head_maxt,
-                            self.min_valid_time,
-                            self.ooo_time_window,
-                            None,
-                        )
-                    };
-                    drop(state);
-                    match res {
-                        Ok((is_ooo, is_dup)) => {
-                            if is_dup {
-                                entry.pending_commits.fetch_sub(1, Ordering::Release);
-                                return Ok(series_ref);
-                            }
-                            is_ooo
-                        }
-                        Err(e) => {
-                            entry.pending_commits.fetch_sub(1, Ordering::Release);
-                            return Err(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    entry.pending_commits.fetch_sub(1, Ordering::Release);
-                    return Err(e);
-                }
-            }
-        } else {
+        let is_ooo = {
             // Lock order: entry.inner BEFORE chunk_reader.read() (C2).
             let state = entry.inner.lock();
             if entry.is_gced() {
@@ -10286,39 +10338,7 @@ impl<'a> HeadAppender<'a> {
         }
 
         let ref_id = entry.ref_id;
-        let prev = entry.pending_commits_count().saturating_sub(1);
-        let batch_check = if prev > 0 {
-            let ls = LastSample::Histogram(Box::new(h.clone()));
-            self.sync_batch_last_sample();
-            match self.check_batch_last_sample(ref_id, t, &ls, effective_ooo) {
-                Ok(v) => v,
-                Err(e) => {
-                    entry.pending_commits.fetch_sub(1, Ordering::Release);
-                    if take_entry {
-                        *series_entry = Some(entry);
-                    }
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
-        let is_ooo = if let Some((is_ooo, is_dup)) = batch_check {
-            if is_ooo {
-                let delta = self.head_maxt.saturating_sub(t);
-                if delta > 0 {
-                    self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
-                }
-            }
-            if is_dup {
-                entry.pending_commits.fetch_sub(1, Ordering::Release);
-                if take_entry {
-                    *series_entry = Some(entry);
-                }
-                return Ok(Some(ref_id));
-            }
-            is_ooo
-        } else {
+        {
             // Lock order: entry.inner BEFORE chunk_reader.read() (C2).
             let state = entry.inner.lock();
             if entry.is_gced() {
@@ -10370,8 +10390,8 @@ impl<'a> HeadAppender<'a> {
                 }
                 return Ok(Some(ref_id));
             }
-            is_ooo
-        };
+            let _ = is_ooo;
+        }
         let ht = BatchSampleType::from_hist(&h);
         self.record_hist_in_batch(ref_id, ht);
         self.histograms.push(PendingHist {
@@ -10379,7 +10399,6 @@ impl<'a> HeadAppender<'a> {
             st,
             t,
             h,
-            is_ooo,
         });
         Ok(Some(ref_id))
     }
@@ -10470,39 +10489,7 @@ impl<'a> HeadAppender<'a> {
         }
 
         let ref_id = entry.ref_id;
-        let prev = entry.pending_commits_count().saturating_sub(1);
-        let batch_check = if prev > 0 {
-            let ls = LastSample::FloatHistogram(Box::new(fh.clone()));
-            self.sync_batch_last_sample();
-            match self.check_batch_last_sample(ref_id, t, &ls, effective_ooo) {
-                Ok(v) => v,
-                Err(e) => {
-                    entry.pending_commits.fetch_sub(1, Ordering::Release);
-                    if take_entry {
-                        *series_entry = Some(entry);
-                    }
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
-        let is_ooo = if let Some((is_ooo, is_dup)) = batch_check {
-            if is_ooo {
-                let delta = self.head_maxt.saturating_sub(t);
-                if delta > 0 {
-                    self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
-                }
-            }
-            if is_dup {
-                entry.pending_commits.fetch_sub(1, Ordering::Release);
-                if take_entry {
-                    *series_entry = Some(entry);
-                }
-                return Ok(Some(ref_id));
-            }
-            is_ooo
-        } else {
+        {
             // Lock order: entry.inner BEFORE chunk_reader.read() (C2).
             let state = entry.inner.lock();
             if entry.is_gced() {
@@ -10554,8 +10541,8 @@ impl<'a> HeadAppender<'a> {
                 }
                 return Ok(Some(ref_id));
             }
-            is_ooo
-        };
+            let _ = is_ooo;
+        }
         let ht = BatchSampleType::from_float_hist(&fh);
         self.record_hist_in_batch(ref_id, ht);
         self.float_histograms.push(PendingFloatHist {
@@ -10563,7 +10550,6 @@ impl<'a> HeadAppender<'a> {
             st,
             t,
             fh,
-            is_ooo,
         });
         Ok(Some(ref_id))
     }
@@ -10711,10 +10697,152 @@ impl<'a> HeadAppender<'a> {
         res
     }
 
-    fn commit_inner(&mut self) -> Result<(), HeadError> {
-        // 1. Log to WAL.
-        self.log_wal()?;
+    /// Commits a batch of appenders atomically at the WAL boundary:
+    /// encodes and writes ALL appenders' WAL records BEFORE mutating any in-memory Head chunks
+    /// or exemplars (retrying `series_refs` persistence on WAL failure), and applies in-memory
+    /// state only once all WAL writes succeed.
+    pub fn commit_batch(mut apps: Vec<HeadAppender<'_>>) -> Result<(), HeadError> {
+        if apps.is_empty() {
+            return Ok(());
+        }
+        if apps.len() == 1 {
+            return apps.into_iter().next().unwrap().commit();
+        }
+        if apps.iter().any(|a| a.closed) {
+            return Err(HeadError::AppenderClosed);
+        }
+        for a in &mut apps {
+            a.closed = true;
+            a.head.metrics.active_appenders.dec();
+        }
 
+        let finish_all = |apps: &mut Vec<HeadAppender<'_>>| {
+            for a in apps.iter_mut() {
+                a.release_remaining_pending_commits();
+                a.return_scratch();
+            }
+        };
+
+        let mut payloads = Vec::with_capacity(apps.len());
+        for a in &mut apps {
+            match a.prepare_wal_payloads() {
+                Ok(p) => payloads.push(p),
+                Err(err) => {
+                    for app in &mut apps {
+                        app.rollback_series_refs_after_wal_err(&err);
+                    }
+                    finish_all(&mut apps);
+                    return Err(err);
+                }
+            }
+        }
+
+        let same_head = apps.iter().all(|a| std::ptr::eq(a.head, apps[0].head));
+        if same_head {
+            let wal_res: Result<(), HeadError> = (|| {
+                let mut wal_guard = apps[0].head.wal.lock();
+                if let Some(ref mut wal) = *wal_guard {
+                    let series_slices: Vec<(&[u8], bool)> = payloads
+                        .iter()
+                        .filter_map(|p| p.series.as_ref().map(|(b, c)| (b.as_slice(), *c)))
+                        .collect();
+                    if !series_slices.is_empty() {
+                        wal.log_precompressed(&series_slices)?;
+                        for a in &mut apps {
+                            a.series_refs.clear();
+                        }
+                    }
+                    let rec_slices: Vec<(&[u8], bool)> = payloads
+                        .iter()
+                        .flat_map(|p| p.records.iter().map(|(b, c)| (b.as_slice(), *c)))
+                        .collect();
+                    if !rec_slices.is_empty() {
+                        wal.log_precompressed(&rec_slices)?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(err) = wal_res {
+                for a in &mut apps {
+                    a.rollback_series_refs_after_wal_err(&err);
+                }
+                finish_all(&mut apps);
+                return Err(err);
+            }
+        } else {
+            for (idx, p) in payloads.iter().enumerate() {
+                let a = &mut apps[idx];
+                let wal_res: Result<(), HeadError> = (|| {
+                    let mut wal_guard = a.head.wal.lock();
+                    if let Some(ref mut wal) = *wal_guard {
+                        if let Some((ref b, c)) = p.series {
+                            wal.log_precompressed(&[(b.as_slice(), c)])?;
+                            a.series_refs.clear();
+                        }
+                        if !p.records.is_empty() {
+                            let slices: Vec<(&[u8], bool)> =
+                                p.records.iter().map(|(b, c)| (b.as_slice(), *c)).collect();
+                            wal.log_precompressed(&slices)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = wal_res {
+                    for app in &mut apps[idx..] {
+                        app.rollback_series_refs_after_wal_err(&err);
+                    }
+                    finish_all(&mut apps);
+                    return Err(err);
+                }
+            }
+        }
+        drop(payloads);
+
+        let mut first_err: Option<HeadError> = None;
+        for a in &mut apps {
+            if let Err(err) = a.apply_in_memory_inner() {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        finish_all(&mut apps);
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    fn rollback_series_refs_after_wal_err(&mut self, commit_err: &HeadError) {
+        if self.series_refs.is_empty() {
+            return;
+        }
+        if let Some(ref mut wal) = *self.head.wal.lock() {
+            let enc = RecordEncoder::new(self.head.opts.enable_st_storage);
+            let rec = enc.series(&self.series_refs, Vec::new());
+            if let Err(rb_err) = wal.log(&[&rec]) {
+                tracing::error!(
+                    num_series = self.series_refs.len(),
+                    commit_err = %commit_err,
+                    rollback_err = %rb_err,
+                    "failed to persist newly created series' declaration to the WAL on both commit and rollback retry"
+                );
+            }
+        }
+        self.series_refs.clear();
+    }
+
+    fn commit_inner(&mut self) -> Result<(), HeadError> {
+        // 1. Log to WAL (falling back to persisting newly created series_refs on failure,
+        // matching Prometheus headAppender.Commit -> Rollback).
+        if let Err(err) = self.log_wal() {
+            self.rollback_series_refs_after_wal_err(&err);
+            return Err(err);
+        }
+        self.apply_in_memory_inner()
+    }
+
+    fn apply_in_memory_inner(&mut self) -> Result<(), HeadError> {
         // 2. Apply exemplars & metadata & samples to in-memory chunks (collecting OOO records for WBL).
         for ex in self.exemplars.drain(..) {
             if let Err(ExemplarError::OutOfOrderExemplar) =
@@ -11651,6 +11779,7 @@ impl<'a> HeadAppender<'a> {
             if let Some(ref mut wal) = *wal_guard {
                 if let Some((ref b, c)) = prepared_series {
                     wal.log_precompressed(&[(b.as_slice(), c)])?;
+                    self.series_refs.clear();
                 }
                 if !prepared.is_empty() {
                     let slices: Vec<(&[u8], bool)> = prepared
@@ -11662,6 +11791,176 @@ impl<'a> HeadAppender<'a> {
             }
         }
         Ok(())
+    }
+
+    fn prepare_wal_payloads(&mut self) -> Result<PreparedWalPayloads, HeadError> {
+        let wal_compression = self.head.opts.wal_compression;
+        let enc = RecordEncoder::new(self.head.opts.enable_st_storage);
+
+        if self.series_refs.is_empty()
+            && self.metadata.is_empty()
+            && self.histograms.is_empty()
+            && self.float_histograms.is_empty()
+            && self.exemplars.is_empty()
+        {
+            if self.floats.is_empty() {
+                return Ok(PreparedWalPayloads {
+                    series: None,
+                    records: Vec::new(),
+                });
+            }
+            let rec = enc.samples_iter(
+                self.floats.iter().map(|f| RefSample {
+                    ref_id: f.entry.ref_id,
+                    st: f.st,
+                    t: f.t,
+                    v: f.v,
+                }),
+                Vec::with_capacity(self.floats.len() * 14 + 17),
+            );
+            let mut comp_buf = Vec::new();
+            let payload = if crate::wlog::compress_wal_record(&rec, wal_compression, &mut comp_buf)?
+            {
+                (comp_buf, true)
+            } else {
+                (rec, false)
+            };
+            return Ok(PreparedWalPayloads {
+                series: None,
+                records: vec![payload],
+            });
+        }
+
+        let series_rec = if !self.series_refs.is_empty() {
+            Some(enc.series(&self.series_refs, Vec::new()))
+        } else {
+            None
+        };
+
+        let mut recs: Vec<Vec<u8>> = Vec::new();
+        if !self.metadata.is_empty() {
+            let metas: Vec<RefMetadata> = self
+                .metadata
+                .iter()
+                .map(|m| RefMetadata {
+                    ref_id: m.entry.ref_id,
+                    metric_type: m.metric_type as u8,
+                    unit: m.unit.clone(),
+                    help: m.help.clone(),
+                })
+                .collect();
+            recs.push(enc.metadata(&metas, Vec::new()));
+        }
+        let total_batches = self.batch_boundaries.len() + 1;
+        let mut f_start = 0usize;
+        let mut h_start = 0usize;
+        let mut fh_start = 0usize;
+
+        for batch_idx in 0..total_batches {
+            let (f_end, h_end, fh_end) = if batch_idx < self.batch_boundaries.len() {
+                let b = self.batch_boundaries[batch_idx];
+                (b.floats_end, b.hists_end, b.fhists_end)
+            } else {
+                (
+                    self.floats.len(),
+                    self.histograms.len(),
+                    self.float_histograms.len(),
+                )
+            };
+
+            if f_start < f_end {
+                let slice = &self.floats[f_start..f_end];
+                recs.push(enc.samples_iter(
+                    slice.iter().map(|f| RefSample {
+                        ref_id: f.entry.ref_id,
+                        st: f.st,
+                        t: f.t,
+                        v: f.v,
+                    }),
+                    Vec::with_capacity(slice.len() * 14 + 17),
+                ));
+            }
+            if h_start < h_end {
+                let hists: Vec<RefHistogramSample> = self.histograms[h_start..h_end]
+                    .iter()
+                    .map(|h| RefHistogramSample {
+                        ref_id: h.entry.ref_id,
+                        st: h.st,
+                        t: h.t,
+                        h: h.h.clone(),
+                    })
+                    .collect();
+                let (r, cb) = enc.histogram_samples(&hists, Vec::new());
+                if !r.is_empty() {
+                    recs.push(r);
+                }
+                if !cb.is_empty() {
+                    recs.push(enc.custom_buckets_histogram_samples(&cb, Vec::new()));
+                }
+            }
+            if fh_start < fh_end {
+                let fhists: Vec<RefFloatHistogramSample> = self.float_histograms[fh_start..fh_end]
+                    .iter()
+                    .map(|fh| RefFloatHistogramSample {
+                        ref_id: fh.entry.ref_id,
+                        st: fh.st,
+                        t: fh.t,
+                        fh: fh.fh.clone(),
+                    })
+                    .collect();
+                let (r, cb) = enc.float_histogram_samples(&fhists, Vec::new());
+                if !r.is_empty() {
+                    recs.push(r);
+                }
+                if !cb.is_empty() {
+                    recs.push(enc.custom_buckets_float_histogram_samples(&cb, Vec::new()));
+                }
+            }
+
+            f_start = f_end;
+            h_start = h_end;
+            fh_start = fh_end;
+        }
+        if !self.exemplars.is_empty() {
+            let exs: Vec<RefExemplar> = self
+                .exemplars
+                .iter()
+                .map(|e| RefExemplar {
+                    ref_id: e.entry.ref_id,
+                    t: e.exemplar.timestamp_ms,
+                    v: e.exemplar.value,
+                    labels: e.exemplar.labels.clone(),
+                })
+                .collect();
+            recs.push(enc.exemplars(&exs, Vec::new()));
+        }
+
+        let prepared_series = match series_rec {
+            Some(r) => {
+                let mut comp_buf = Vec::new();
+                if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
+                    Some((comp_buf, true))
+                } else {
+                    Some((r, false))
+                }
+            }
+            None => None,
+        };
+
+        let mut prepared: Vec<(Vec<u8>, bool)> = Vec::with_capacity(recs.len());
+        for r in recs {
+            let mut comp_buf = Vec::new();
+            if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
+                prepared.push((comp_buf, true));
+            } else {
+                prepared.push((r, false));
+            }
+        }
+
+        Ok(PreparedWalPayloads {
+            series: prepared_series,
+            records: prepared,
+        })
     }
 }
 
@@ -11786,6 +12085,7 @@ mod tests {
             ..defaults
         };
         let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        head.set_postings_cache_eligibility(true, false);
 
         {
             let mut app = head.appender();
@@ -11917,7 +12217,7 @@ mod tests {
             head.close().unwrap();
         }
 
-        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let head = Head::open(dir.path(), opts.clone(), i64::MIN).unwrap();
         assert_eq!(head.num_series(), 39);
         let e0 = head
             .get_entry_by_sorted_pairs(&[("__name__", "metric_0"), ("job", "worker")])
@@ -11930,13 +12230,35 @@ mod tests {
         for c in chks {
             samples.extend(decode_chunk_samples(&c.chunk.unwrap()).unwrap());
         }
-        assert_eq!(samples.len(), 51);
+        // TSDB-01 + Go resetSeriesWithMMappedChunks: the duplicate RefSeries record clears
+        // pre-duplicate un-mmapped head_chunks (matching sequential replay & Go), leaving the
+        // 34 mmapped samples + the 1 post-duplicate remapped sample (777.0) = 35 samples.
+        assert_eq!(samples.len(), 35);
         assert_eq!(samples.last().unwrap().t, 1_000_000 + 60 * 1000);
         assert_eq!(samples.last().unwrap().value, SampleValue::Float(777.0));
         assert!(head
             .get_entry_by_sorted_pairs(&[("__name__", "metric_1"), ("job", "worker")])
             .is_none());
         head.close().unwrap();
+
+        let seq_opts = HeadOptions {
+            wal_replay_concurrency: 1,
+            ..opts
+        };
+        let seq_head = Head::open(dir.path(), seq_opts, i64::MIN).unwrap();
+        let e0_seq = seq_head
+            .get_entry_by_sorted_pairs(&[("__name__", "metric_0"), ("job", "worker")])
+            .unwrap();
+        let (_, seq_chks, _) = seq_head
+            .series_chunks(e0_seq.ref_id, i64::MIN, i64::MAX)
+            .unwrap()
+            .unwrap();
+        let mut seq_samples = Vec::new();
+        for c in seq_chks {
+            seq_samples.extend(decode_chunk_samples(&c.chunk.unwrap()).unwrap());
+        }
+        assert_eq!(samples, seq_samples);
+        seq_head.close().unwrap();
     }
 
     #[test]
@@ -11952,22 +12274,17 @@ mod tests {
         let mut app = head.appender();
         // First sample in batch (pending_commits == 0 fast path)
         let r = app.append_float(None, &pairs, 1_000_000, 1.0).unwrap();
-        // Exact duplicate in same uncommitted batch (pending_commits > 0 -> no-op)
+        // Exact duplicate in same uncommitted batch -> Ok, dropped at commit
         app.append_float(Some(r), &pairs, 1_000_000, 1.0).unwrap();
-        // Conflicting duplicate in same uncommitted batch -> error
-        assert!(matches!(
-            app.append_float(Some(r), &pairs, 1_000_000, 2.0),
-            Err(HeadError::DuplicateSampleWithDetails(_))
-        ));
+        // Conflicting duplicate in same uncommitted batch -> Ok (Go headAppenderV2 parity),
+        // silently dropped at commit because committed SeriesState already advances to 1_000_000 = 1.0.
+        app.append_float(Some(r), &pairs, 1_000_000, 2.0).unwrap();
         // Newer in-order sample in same uncommitted batch -> succeeds
         app.append_float(Some(r), &pairs, 1_005_000, 5.0).unwrap();
-        // OOO sample within window against batch_last_sample (1_005_000) -> accepted as OOO
+        // OOO sample within window against committed head_maxt (1_000_000) -> accepted as OOO
         app.append_float(Some(r), &pairs, 1_002_000, 2.5).unwrap();
-        // Duplicate against updated batch_last_sample (1_005_000) -> error
-        assert!(matches!(
-            app.append_float(Some(r), &pairs, 1_005_000, 9.0),
-            Err(HeadError::DuplicateSampleWithDetails(_))
-        ));
+        // Conflicting duplicate in same uncommitted batch at 1_005_000 -> Ok, dropped at commit
+        app.append_float(Some(r), &pairs, 1_005_000, 9.0).unwrap();
         app.commit().unwrap();
 
         let (_, chks, _) = head.series_chunks(r, i64::MIN, i64::MAX).unwrap().unwrap();
@@ -13837,6 +14154,414 @@ mod tests {
         drop(guard_in_order);
         t2.join().unwrap();
         assert!(evicted.load(Ordering::SeqCst));
+
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn tsdb_01_parallel_wal_replay_flushes_job_shards_before_duplicate_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let wal_dir = dir.path().join("wal");
+            let mut w = WlogWriter::open(&wal_dir, CompressionType::None).unwrap();
+            let enc = RecordEncoder::new(false);
+            let lbls = Labels::from_sorted_pairs([("__name__", "tsdb01_m"), ("job", "a")]);
+            let r_s1 = enc.series(&[RefSeries { ref_id: 10, labels: lbls.clone() }], Vec::new());
+            let samps1: Vec<RefSample> = (0..10i64)
+                .map(|i| RefSample {
+                    ref_id: 10,
+                    st: 0,
+                    t: 1_000 + i * 100,
+                    v: i as f64,
+                })
+                .collect();
+            let r_samp1 = enc.samples(&samps1, Vec::new());
+            let r_s2 = enc.series(&[RefSeries { ref_id: 99, labels: lbls }], Vec::new());
+            let samps2: Vec<RefSample> = (0..5i64)
+                .map(|i| RefSample {
+                    ref_id: 99,
+                    st: 0,
+                    t: 5_000 + i * 100,
+                    v: (100 + i) as f64,
+                })
+                .collect();
+            let r_samp2 = enc.samples(&samps2, Vec::new());
+            w.log(&[&r_s1, &r_samp1, &r_s2, &r_samp2]).unwrap();
+            w.close().unwrap();
+        }
+
+        let seq_head = Head::open(
+            dir.path(),
+            HeadOptions {
+                wal_replay_concurrency: 1,
+                ..HeadOptions::default()
+            },
+            i64::MIN,
+        )
+        .unwrap();
+        let par_head = Head::open(
+            dir.path(),
+            HeadOptions {
+                wal_replay_concurrency: 4,
+                ..HeadOptions::default()
+            },
+            i64::MIN,
+        )
+        .unwrap();
+
+        let extract = |h: &Head| -> Vec<(i64, f64)> {
+            let e = h
+                .get_entry_by_sorted_pairs(&[("__name__", "tsdb01_m"), ("job", "a")])
+                .unwrap();
+            let (_, chks, _) = h.series_chunks(e.ref_id, i64::MIN, i64::MAX).unwrap().unwrap();
+            let mut out = Vec::new();
+            for c in chks {
+                for s in decode_chunk_samples(&c.chunk.unwrap()).unwrap() {
+                    if let SampleValue::Float(v) = s.value {
+                        out.push((s.t, v));
+                    }
+                }
+            }
+            out
+        };
+        let seq_s = extract(&seq_head);
+        let par_s = extract(&par_head);
+        assert_eq!(seq_s.len(), 5);
+        assert_eq!(par_s, seq_s);
+        assert_eq!(par_head.min_time(), 5_000);
+        seq_head.close().unwrap();
+        par_head.close().unwrap();
+    }
+
+    #[test]
+    fn tsdb_02_head_appender_allows_intra_batch_conflicts_and_drops_at_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 10_000,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let pf = [("__name__", "tsdb02_f"), ("job", "api")];
+        let ph = [("__name__", "tsdb02_h"), ("job", "api")];
+        let pfh = [("__name__", "tsdb02_fh"), ("job", "api")];
+
+        let make_hist = |sum: f64| Histogram {
+            schema: 0,
+            zero_threshold: 0.001,
+            zero_count: 1,
+            count: 1,
+            sum,
+            ..Histogram::default()
+        };
+        let make_fhist = |sum: f64| FloatHistogram {
+            schema: 0,
+            zero_threshold: 0.001,
+            zero_count: 1.0,
+            count: 1.0,
+            sum,
+            ..FloatHistogram::default()
+        };
+
+        let mut app = head.appender();
+        let rf = app.append_float(None, &pf, 1_020_000, 5.0).unwrap();
+        app.append_float(Some(rf), &pf, 1_020_000, 9.0).unwrap();
+        app.append_float(Some(rf), &pf, 1_005_000, 2.5).unwrap();
+        let rh = app.append_histogram(None, &ph, 0, 1_020_000, make_hist(1.0)).unwrap();
+        app.append_histogram(Some(rh), &ph, 0, 1_020_000, make_hist(2.0)).unwrap();
+        let rfh = app.append_float_histogram(None, &pfh, 0, 1_020_000, make_fhist(3.0)).unwrap();
+        app.append_float_histogram(Some(rfh), &pfh, 0, 1_020_000, make_fhist(4.0)).unwrap();
+        app.commit().unwrap();
+
+        let (_, chks, _) = head.series_chunks(rf, i64::MIN, i64::MAX).unwrap().unwrap();
+        let mut got = Vec::new();
+        for c in chks {
+            for s in decode_chunk_samples(&c.chunk.unwrap()).unwrap() {
+                got.push((s.t, s.value));
+            }
+        }
+        assert_eq!(got, vec![(1_020_000, SampleValue::Float(5.0))]);
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn tsdb_03_postings_for_label_value_safe_under_concurrent_symbol_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = Arc::new(Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap());
+
+        for batch in 0..5i64 {
+            let mut app = head.appender();
+            app.append_float(
+                None,
+                &[("__name__", "keep_metric"), ("env", "prod")],
+                1_000 + batch * 10,
+                batch as f64,
+            )
+            .unwrap();
+            for i in 0..200usize {
+                let k = format!("churn_{batch}_{i}");
+                app.append_float(None, &[("__name__", k.as_str()), ("env", "dev")], 1_000, 1.0)
+                    .unwrap();
+            }
+            app.commit().unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let h1 = Arc::clone(&head);
+        let s1 = Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            while !s1.load(Ordering::Relaxed) {
+                let p = h1.postings_for_label_value("__name__", "keep_metric");
+                assert_eq!(p.len(), 1);
+                let cnt = h1.visit_postings_for_label_value("__name__", "keep_metric", |sm, lg| {
+                    sm.len() + lg.len()
+                });
+                assert_eq!(cnt, 1);
+            }
+        });
+
+        for _ in 0..20 {
+            head.maybe_gc_symbols();
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn tsdb_04_parallel_wal_replay_intern_metadata_error_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+            let mut app = head.appender();
+            let pairs = [("__name__", "tsdb04_meta"), ("job", "a")];
+            app.append_float(None, &pairs, 1_000, 1.0).unwrap();
+            app.update_metadata(None, &pairs, "tsdb04_meta", MetricType::Counter, "bytes", "help text")
+                .unwrap();
+            app.commit().unwrap();
+            head.close().unwrap();
+        }
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let dir_path = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let mut opts = HeadOptions {
+                wal_replay_concurrency: 2,
+                ..HeadOptions::default()
+            };
+            let head = Head {
+                dir: dir_path.clone(),
+                opts: opts.clone(),
+                metrics: HeadMetrics::new(None, 0),
+                symbols: RwLock::new(SymbolTable::new()),
+                series: StripeSeries::new(opts.stripe_size),
+                series_creation_mtx: Mutex::new(()),
+                postings: MemPostings::new_unordered(),
+                postings_cache: PostingsForMatchersCache::new(opts.postings_cache.clone()),
+                tombstones: MemTombstones::new(),
+                exemplars: CircularExemplarStorage::new_with_registry(0, 0, None),
+                metadata: UserMetricsMetadata::new(),
+                wal: Mutex::new(None),
+                wbl: Mutex::new(None),
+                chunk_writer: Mutex::new(None),
+                chunk_reader: RwLock::new(None),
+                mmap_mtx: Mutex::new(()),
+                chunk_snapshot_mtx: Mutex::new(()),
+                ooo_wbl_gate: RwLock::new(()),
+                ooo_compact_wbl_cut_seg: Mutex::new(None),
+                min_time: AtomicI64::new(i64::MAX),
+                max_time: AtomicI64::new(i64::MIN),
+                min_valid_time: AtomicI64::new(i64::MIN),
+                min_ooo_time: AtomicI64::new(i64::MAX),
+                max_ooo_time: AtomicI64::new(i64::MIN),
+                ooo_time_window_ms: AtomicI64::new(0),
+                chunk_end_time_variance_bits: AtomicU64::new(0),
+                metadata_limits_max_metrics: AtomicUsize::new(0),
+                metadata_limits_max_per_metric: AtomicUsize::new(0),
+                float_chunk_encoding: AtomicU8::new(opts.float_chunk_encoding.as_u8()),
+                last_series_id: AtomicU64::new(0),
+                num_series: AtomicU64::new(0),
+                last_wal_truncation_time: AtomicI64::new(i64::MIN),
+                closed: AtomicBool::new(false),
+                has_any_metadata: AtomicBool::new(false),
+                deleted_series_since_symbol_gc: AtomicU64::new(0),
+                symbol_arena_baseline_bytes: AtomicU64::new(0),
+                symbol_gc_arena_growth_threshold: AtomicU64::new(DEFAULT_SYMBOL_GC_ARENA_GROWTH_BYTES),
+                wal_expiries: Mutex::new(HashMap::new()),
+                wbl_pinned_refs: Mutex::new(HashSet::new()),
+                appender_pool: Mutex::new(Vec::new()),
+                lifecycle_callback: RwLock::new(None),
+                active_reads: Arc::new(HeadActiveReads::default()),
+                series_gauge: None,
+                series_created_total: None,
+                series_removed_total: None,
+            };
+            {
+                let mut syms = head.symbols.write();
+                syms.intern("__name__");
+                syms.intern("tsdb04_meta");
+                syms.intern("job");
+                syms.intern("a");
+                syms.fail_next_intern_for_test();
+            }
+            opts.wal_replay_concurrency = 2;
+            let mut r = WlogReader::open_wal_with_checkpoint(dir_path.join("wal")).unwrap();
+            let mut multi_ref = HashMap::new();
+            let mut mm = HashMap::new();
+            let mut ooo_mm = HashMap::new();
+            let unknown = UnknownRefs::default();
+            let res = head.replay_wal_reader_parallel(
+                &mut r,
+                &mut multi_ref,
+                &mut mm,
+                &mut ooo_mm,
+                ChunkDiskMapperRef(0),
+                &unknown,
+            );
+            let _ = done_tx.send(res);
+        });
+
+        let res = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("replay_wal_reader_parallel deadlocked on intern_metadata_symbols error");
+        assert!(matches!(
+            res,
+            Err(HeadError::SymbolTable(SymbolTableError::TooManySymbols))
+        ));
+    }
+
+    #[test]
+    fn tsdb_07_commit_series_wal_fallback_and_commit_batch_atomic() {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir1 = tempfile::tempdir().unwrap();
+        {
+            let head = Head::open(dir1.path(), HeadOptions::default(), i64::MIN).unwrap();
+            let call_n = Arc::new(AtomicUsize::new(0));
+            let c_clone = Arc::clone(&call_n);
+            {
+                let mut wal = head.wal.lock();
+                wal.as_mut().unwrap().set_write_fault_hook(Some(Arc::new(move |_| {
+                    if c_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                        crate::head_chunks::WriteFaultAction::Error(io::ErrorKind::Other)
+                    } else {
+                        crate::head_chunks::WriteFaultAction::PassThrough
+                    }
+                })));
+            }
+
+            let mut app = head.appender();
+            let pairs = [("__name__", "tsdb07_fallback"), ("job", "api")];
+            let r = app.append_float(None, &pairs, 1_000, 42.0).unwrap();
+            assert!(app.commit().is_err());
+            assert!(head.series_chunks(r, i64::MIN, i64::MAX).unwrap().is_none());
+
+            {
+                let mut wal = head.wal.lock();
+                wal.as_mut().unwrap().set_write_fault_hook(None);
+            }
+            let mut app2 = head.appender();
+            let r2 = app2.append_float(None, &pairs, 2_000, 99.0).unwrap();
+            assert_eq!(r2, r);
+            app2.commit().unwrap();
+            head.close().unwrap();
+        }
+        let reopened = Head::open(dir1.path(), HeadOptions::default(), i64::MIN).unwrap();
+        let entry = reopened
+            .get_entry_by_sorted_pairs(&[("__name__", "tsdb07_fallback"), ("job", "api")])
+            .expect("series_refs fallback must have persisted series declaration");
+        let (_, chks, _) = reopened
+            .series_chunks(entry.ref_id, i64::MIN, i64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chks.len(), 1);
+        reopened.close().unwrap();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let head2 = Head::open(dir2.path(), HeadOptions::default(), i64::MIN).unwrap();
+        {
+            let mut wal = head2.wal.lock();
+            wal.as_mut().unwrap().set_write_fault_hook(Some(Arc::new(|_| {
+                crate::head_chunks::WriteFaultAction::Error(io::ErrorKind::Other)
+            })));
+        }
+        let mut apps = Vec::new();
+        for s in 0..8usize {
+            let mut app = head2.appender();
+            let j = format!("s{s}");
+            app.append_float(None, &[("__name__", "batch_m"), ("shard", j.as_str())], 1_000, s as f64)
+                .unwrap();
+            apps.push(app);
+        }
+        assert!(HeadAppender::commit_batch(apps).is_err());
+        for s in 0..8usize {
+            let j = format!("s{s}");
+            let e = head2
+                .get_entry_by_sorted_pairs(&[("__name__", "batch_m"), ("shard", j.as_str())])
+                .unwrap();
+            assert_eq!(e.pending_commits_count(), 0);
+            assert!(head2.series_chunks(e.ref_id, i64::MIN, i64::MAX).unwrap().is_none());
+        }
+
+        {
+            let mut wal = head2.wal.lock();
+            wal.as_mut().unwrap().set_write_fault_hook(None);
+        }
+        let mut apps2 = Vec::new();
+        for s in 0..8usize {
+            let mut app = head2.appender();
+            let j = format!("s{s}");
+            app.append_float(None, &[("__name__", "batch_m"), ("shard", j.as_str())], 2_000, (s + 10) as f64)
+                .unwrap();
+            apps2.push(app);
+        }
+        HeadAppender::commit_batch(apps2).unwrap();
+        for s in 0..8usize {
+            let j = format!("s{s}");
+            let e = head2
+                .get_entry_by_sorted_pairs(&[("__name__", "batch_m"), ("shard", j.as_str())])
+                .unwrap();
+            assert_eq!(e.pending_commits_count(), 0);
+            assert!(head2.series_chunks(e.ref_id, i64::MIN, i64::MAX).unwrap().is_some());
+        }
+        head2.close().unwrap();
+    }
+
+    #[test]
+    fn sq_02_head_read_paths_clamp_ino_mint_and_preserve_ooo() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            chunk_range_ms: 10_000,
+            samples_per_chunk: 2,
+            ooo_time_window_ms: 100_000,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let pairs = [("__name__", "sq02_m"), ("job", "api")];
+
+        let mut app = head.appender();
+        let r = app.append_float(None, &pairs, 1_000, 1.0).unwrap();
+        app.append_float(Some(r), &pairs, 2_000, 2.0).unwrap();
+        app.append_float(Some(r), &pairs, 10_000, 10.0).unwrap();
+        app.append_float(Some(r), &pairs, 11_000, 11.0).unwrap();
+        app.append_float(Some(r), &pairs, 500, 0.5).unwrap();
+        app.commit().unwrap();
+        head.mmap_head_chunks().unwrap();
+
+        head.min_time.store(5_000, Ordering::Release);
+
+        assert!(head.series_has_chunks_in_range(r, 0, 4_000).is_some());
+        let (_, chks, _) = head.series_chunks(r, 0, 4_000).unwrap().unwrap();
+        assert_eq!(chks.len(), 1);
+        assert_eq!((chks[0].min_time, chks[0].max_time), (500, 500));
+        let (_, cnt, _) = head.series_lazy_chunk_count_with_snapshot(r, 0, 4_000, None).unwrap().unwrap();
+        assert_eq!(cnt, 1);
+        let (_, ivs, _) = head.series_chunk_metas_no_bytes_with_snapshot(r, 0, 4_000, None).unwrap().unwrap();
+        assert_eq!(ivs.as_slice(), &[(500, 500)]);
+
+        assert!(head.series_has_chunks_in_range(r, 1_000, 4_000).is_none());
+        assert!(head.series_chunks(r, 1_000, 4_000).unwrap().is_none());
+        assert!(head.series_lazy_chunk_count_with_snapshot(r, 1_000, 4_000, None).unwrap().is_none());
+        assert!(head.series_chunk_metas_no_bytes_with_snapshot(r, 1_000, 4_000, None).unwrap().is_none());
 
         head.close().unwrap();
     }
