@@ -489,6 +489,21 @@ impl SimpleRateLimiter {
     }
 }
 
+struct ConsulObserveGuard<'a> {
+    consul: &'a ConsulKv,
+    operation: &'static str,
+    start: Instant,
+    armed: bool,
+}
+
+impl Drop for ConsulObserveGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.consul.observe_op(self.operation, false, self.start);
+        }
+    }
+}
+
 pub struct ConsulKv {
     http: reqwest::Client,
     scheme: String,
@@ -548,32 +563,61 @@ impl ConsulKv {
             "localhost:8500"
         };
 
+        let mut unix_socket: Option<std::path::PathBuf> = None;
         let (host_authority, path_prefix) = match raw_addr.split_once("://") {
             Some((proto, rest)) => {
                 match proto {
                     "http" => {
                         // Never revert to http if TLS was explicitly requested via CONSUL_HTTP_SSL.
+                        match rest.split_once('/') {
+                            Some((h, p)) => {
+                                let p = p.trim_end_matches('/');
+                                let prefix = if p.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("/{p}")
+                                };
+                                (h.to_string(), prefix)
+                            }
+                            None => (rest.to_string(), String::new()),
+                        }
                     }
                     "https" => {
                         scheme = "https".to_string();
+                        match rest.split_once('/') {
+                            Some((h, p)) => {
+                                let p = p.trim_end_matches('/');
+                                let prefix = if p.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("/{p}")
+                                };
+                                (h.to_string(), prefix)
+                            }
+                            None => (rest.to_string(), String::new()),
+                        }
+                    }
+                    "unix" => {
+                        if rest.is_empty() {
+                            return Err(KvError::InvalidConfig(
+                                "consul unix socket path cannot be empty".to_string(),
+                            ));
+                        }
+                        #[cfg(not(unix))]
+                        return Err(KvError::InvalidConfig(
+                            "unix:// sockets are not supported on this platform".to_string(),
+                        ));
+                        #[cfg(unix)]
+                        {
+                            unix_socket = Some(std::path::PathBuf::from(rest));
+                            ("localhost".to_string(), String::new())
+                        }
                     }
                     other => {
                         return Err(KvError::InvalidConfig(format!(
                             "Unknown protocol scheme: {other}"
                         )));
                     }
-                }
-                match rest.split_once('/') {
-                    Some((h, p)) => {
-                        let p = p.trim_end_matches('/');
-                        let prefix = if p.is_empty() {
-                            String::new()
-                        } else {
-                            format!("/{p}")
-                        };
-                        (h.to_string(), prefix)
-                    }
-                    None => (rest.to_string(), String::new()),
                 }
             }
             None => (raw_addr.trim_end_matches('/').to_string(), String::new()),
@@ -599,7 +643,12 @@ impl ConsulKv {
                     go_read_err(&env.token_file, &e)
                 ))
             })?;
-            data.trim().to_string()
+            let trimmed = data.trim();
+            if trimmed.is_empty() {
+                env.token.clone()
+            } else {
+                trimmed.to_string()
+            }
         } else {
             env.token.clone()
         };
@@ -626,7 +675,7 @@ impl ConsulKv {
         let timeout: Duration = cfg.http_client_timeout.as_std().unwrap_or(Duration::ZERO);
         let mut connect_authority = host_authority.clone();
         let mut sni_resolver: Option<Arc<ConsulSniResolver>> = None;
-        if scheme == "https" && !env.tls_server_name.is_empty() {
+        if unix_socket.is_none() && scheme == "https" && !env.tls_server_name.is_empty() {
             let sni_host =
                 extract_tls_server_host(&env.tls_server_name).map_err(KvError::InvalidConfig)?;
             let (target_host, target_port) = split_authority_host_port(&host_authority);
@@ -650,11 +699,20 @@ impl ConsulKv {
             }
         }
 
-        let mut builder = reqwest::Client::builder()
-            .use_preconfigured_tls(tls_config)
-            .default_headers(headers);
-        if let Some(resolver) = sni_resolver {
-            builder = builder.dns_resolver(resolver);
+        let mut builder = reqwest::Client::builder().default_headers(headers);
+        if let Some(sock_path) = &unix_socket {
+            #[cfg(unix)]
+            {
+                builder = builder.unix_socket(sock_path.as_path());
+            }
+            if scheme == "https" {
+                builder = builder.use_preconfigured_tls(tls_config);
+            }
+        } else {
+            builder = builder.use_preconfigured_tls(tls_config);
+            if let Some(resolver) = sni_resolver {
+                builder = builder.dns_resolver(resolver);
+            }
         }
         if !timeout.is_zero() {
             builder = builder.timeout(timeout);
@@ -703,6 +761,15 @@ impl ConsulKv {
         self.request_duration
             .with_label_values(&[operation, status])
             .observe(start.elapsed().as_secs_f64());
+    }
+
+    fn observe_guard(&self, operation: &'static str) -> ConsulObserveGuard<'_> {
+        ConsulObserveGuard {
+            consul: self,
+            operation,
+            start: Instant::now(),
+            armed: true,
+        }
     }
 
     fn build_kv_url(
@@ -764,11 +831,12 @@ impl ConsulKv {
         allow_consistency: bool,
         cancel: Option<&ServiceContext>,
     ) -> Result<(Option<ConsulKvPair>, u64), KvError> {
-        let start = Instant::now();
+        let mut guard = self.observe_guard("Get");
         let res = self
             .get_raw_untracked(key, wait_index, allow_consistency, cancel)
             .await;
-        self.observe_op("Get", res.is_ok(), start);
+        guard.armed = false;
+        self.observe_op("Get", res.is_ok(), guard.start);
         res
     }
 
@@ -834,9 +902,10 @@ impl ConsulKv {
         wait_index: Option<u64>,
         cancel: Option<&ServiceContext>,
     ) -> Result<(Vec<ConsulKvPair>, u64), KvError> {
-        let start = Instant::now();
+        let mut guard = self.observe_guard("List");
         let res = self.list_raw_untracked(prefix, wait_index, cancel).await;
-        self.observe_op("List", res.is_ok(), start);
+        guard.armed = false;
+        self.observe_op("List", res.is_ok(), guard.start);
         res
     }
 
@@ -894,17 +963,19 @@ impl ConsulKv {
     }
 
     async fn put_raw(&self, key: &str, bytes: Vec<u8>) -> Result<(), KvError> {
-        let start = Instant::now();
+        let mut guard = self.observe_guard("Put");
         let res = self.put_with_params_untracked(key, &[], bytes).await.map(|_| ());
-        self.observe_op("Put", res.is_ok(), start);
+        guard.armed = false;
+        self.observe_op("Put", res.is_ok(), guard.start);
         res
     }
 
     async fn cas_raw(&self, key: &str, index: u64, bytes: Vec<u8>) -> Result<bool, KvError> {
-        let start = Instant::now();
+        let mut guard = self.observe_guard("CAS");
         let params = [("cas", index.to_string())];
         let res = self.put_with_params_untracked(key, &params, bytes).await;
-        self.observe_op("CAS", res.is_ok(), start);
+        guard.armed = false;
+        self.observe_op("CAS", res.is_ok(), guard.start);
         res
     }
 
@@ -945,9 +1016,10 @@ impl ConsulKv {
     }
 
     async fn delete_raw(&self, key: &str) -> Result<(), KvError> {
-        let start = Instant::now();
+        let mut guard = self.observe_guard("Delete");
         let res = self.delete_raw_untracked(key).await;
-        self.observe_op("Delete", res.is_ok(), start);
+        guard.armed = false;
+        self.observe_op("Delete", res.is_ok(), guard.start);
         res
     }
 
@@ -1115,9 +1187,10 @@ impl KvClient for ConsulKv {
 
     fn cas<'a>(&'a self, key: &'a str, f: CasFn) -> BoxFuture<'a, Result<(), KvError>> {
         Box::pin(async move {
-            let start = Instant::now();
+            let mut guard = self.observe_guard("CAS loop");
             let res = self.cas_inner(key, f).await;
-            self.observe_op("CAS loop", res.is_ok(), start);
+            guard.armed = false;
+            self.observe_op("CAS loop", res.is_ok(), guard.start);
             res
         })
     }
@@ -1969,7 +2042,6 @@ mod tests {
         for bad in [
             "ftp://127.0.0.1:8500",
             "gopher://127.0.0.1:8500",
-            "unix:///tmp/consul.sock",
         ] {
             let cfg = ConsulConfig {
                 host: bad.to_string(),

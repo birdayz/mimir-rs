@@ -463,6 +463,9 @@ impl Tsdb {
     /// Runs on-disk multi-block and tombstone compaction (`DB.compactBlocks`).
     pub fn compact_blocks(&self) -> Result<Vec<Ulid>, TsdbError> {
         let _guard = self.inner.compact_mtx.lock();
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
         let mut created = Vec::new();
         self.inner.compact_blocks_locked(&mut created)?;
         Ok(created)
@@ -575,12 +578,18 @@ impl Tsdb {
         self.inner.head.exemplars().select(start, end, matcher_sets)
     }
 
-    /// Stops the background reload/mmap loop, flushes & closes Head, and drops all block mmaps.
+    /// Stops the background reload/mmap loop, serializes with in-flight compactions,
+    /// waits for all block readers to close, and flushes & closes Head.
     pub fn close(&self) -> Result<(), TsdbError> {
         self.inner.closed.store(true, Ordering::Release);
         self.stop_background_loop();
+        let _compact_guard = self.inner.compact_mtx.lock();
+        let blocks = std::mem::take(&mut *self.inner.blocks.write());
+        for b in &blocks {
+            b.close_and_wait();
+        }
+        drop(blocks);
         self.inner.head.close()?;
-        self.inner.blocks.write().clear();
         Ok(())
     }
 }
@@ -910,6 +919,9 @@ impl TsdbInner {
     /// compacts the OOO head. Errors count `prometheus_tsdb_compactions_failed_total`.
     fn compact(&self) -> Result<Vec<Ulid>, TsdbError> {
         let _guard = self.compact_mtx.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
         let mut created = Vec::new();
         let mut last_block_maxt = i64::MIN;
 
@@ -956,6 +968,9 @@ impl TsdbInner {
     /// reloading blocks and truncating Head memory & WAL up to `maxt`.
     fn compact_head_range(&self, mint: i64, maxt: i64) -> Result<Option<Ulid>, TsdbError> {
         let _guard = self.compact_mtx.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let uid = self.compact_head_range_locked(mint, maxt, true)?;
         if maxt > mint {
             self.head.truncate_wal(maxt)?;
@@ -1022,6 +1037,9 @@ impl TsdbInner {
     /// `enable_bigger_ooo_block_for_old_samples`, aligned 24h blocks for the days before the
     /// in-order head's max time).
     fn compact_ooo_head_locked(&self) -> Result<Vec<Ulid>, TsdbError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
         let snap = self.head.collect_ooo_compaction_candidates_with_watermark()?;
         if snap.candidates.is_empty() || snap.min_time > snap.max_time {
             self.head
@@ -1196,60 +1214,65 @@ impl TsdbInner {
             return Ok(Vec::new());
         }
         let _guard = self.compact_mtx.lock();
-        let ((candidates, data_mint, data_maxt), fingerprints) =
-            self.head.collect_selected_compaction_candidates_with_fingerprints(refs)?;
-        if candidates.is_empty() || data_mint > data_maxt {
+        if self.closed.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
-        let range = self.head.options().chunk_range_ms;
-        let range128 = range as i128;
+        let ((candidates, data_mint, data_maxt), fingerprints) =
+            self.head.collect_selected_compaction_candidates_with_fingerprints(refs)?;
+        if fingerprints.is_empty() {
+            return Ok(Vec::new());
+        }
         let head_maxt = self.head.max_time();
         let mut created = Vec::new();
-        let mut t = floor_align_i128(self.head.min_time(), range);
-        while t <= head_maxt as i128 {
-            let mint = t.max(i64::MIN as i128) as i64;
-            let maxt = (t + range128).min(i64::MAX as i128) as i64;
-            let maxt_inclusive = if t + range128 > i64::MAX as i128 {
-                i64::MAX
-            } else {
-                maxt.saturating_sub(1)
-            };
-            let mut compaction = BlockMetaCompaction::default();
-            compaction.set_selected_series();
-            compaction.parents.push(BlockDesc {
-                ulid: Ulid::nil(),
-                min_time: 0,
-                max_time: 0,
-            });
-            let meta = self.timed_write(|| {
-                write_head_block_streaming(
-                    &self.dir,
-                    mint,
-                    maxt,
-                    candidates.clone(),
-                    compaction,
-                    false,
-                    self.opts.max_block_chunk_segment_size,
-                    |ref_id, chks, tombs| {
-                        self.head
-                            .load_series_in_order_chunks_into(
-                                ref_id,
-                                mint,
-                                maxt_inclusive,
-                                chks,
-                                tombs,
-                            )
-                            .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
-                    },
-                )
-            })?;
-            t += range128;
-            // No block when the window holds no data for the selected series.
-            let Some(meta) = meta else {
-                continue;
-            };
-            self.reload_after_write(&[meta.ulid])?;
-            created.push(meta.ulid);
+        if !candidates.is_empty() && data_mint <= data_maxt && self.head.initialized() {
+            let range = self.head.options().chunk_range_ms;
+            let range128 = range as i128;
+            let mut t = floor_align_i128(self.head.min_time(), range);
+            while t <= head_maxt as i128 {
+                let mint = t.max(i64::MIN as i128) as i64;
+                let maxt = (t + range128).min(i64::MAX as i128) as i64;
+                let maxt_inclusive = if t + range128 > i64::MAX as i128 {
+                    i64::MAX
+                } else {
+                    maxt.saturating_sub(1)
+                };
+                let mut compaction = BlockMetaCompaction::default();
+                compaction.set_selected_series();
+                compaction.parents.push(BlockDesc {
+                    ulid: Ulid::nil(),
+                    min_time: 0,
+                    max_time: 0,
+                });
+                let meta = self.timed_write(|| {
+                    write_head_block_streaming(
+                        &self.dir,
+                        mint,
+                        maxt,
+                        candidates.clone(),
+                        compaction,
+                        false,
+                        self.opts.max_block_chunk_segment_size,
+                        |ref_id, chks, tombs| {
+                            self.head
+                                .load_series_in_order_chunks_into(
+                                    ref_id,
+                                    mint,
+                                    maxt_inclusive,
+                                    chks,
+                                    tombs,
+                                )
+                                .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
+                        },
+                    )
+                })?;
+                t += range128;
+                // No block when the window holds no data for the selected series.
+                let Some(meta) = meta else {
+                    continue;
+                };
+                self.reload_after_write(&[meta.ulid])?;
+                created.push(meta.ulid);
+            }
         }
         self.head
             .evict_series_refs_with_fingerprints(refs, head_maxt, &fingerprints)?;
