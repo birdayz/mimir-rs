@@ -6,8 +6,9 @@
 //! - github.com/grafana/dskit/tracing/otel_jaeger.go
 //! - go.opentelemetry.io/contrib/propagators/jaeger/jaeger_propagator.go
 
+use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::RngCore;
@@ -24,6 +25,7 @@ pub struct TraceContext {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
     pub sampled: bool,
+    pub trace_flags: u8,
     pub remote: bool,
     pub jaeger_debug_id: Option<String>,
     pub tracestate: Option<String>,
@@ -47,8 +49,13 @@ impl TraceContext {
     }
 
     pub fn to_traceparent(&self) -> String {
-        let flags = if self.sampled { "01" } else { "00" };
-        format!("00-{}-{}-{flags}", self.trace_id_hex(), self.span_id_hex())
+        let mut flags = self.trace_flags & 0x03;
+        if self.sampled {
+            flags |= 0x01;
+        } else {
+            flags &= !0x01;
+        }
+        format!("00-{}-{}-{flags:02x}", self.trace_id_hex(), self.span_id_hex())
     }
 
     pub fn to_uber_trace_id(&self) -> String {
@@ -506,10 +513,15 @@ pub fn parse_traceparent(header: &str) -> Option<TraceContext> {
         return None;
     }
     let flags = u8::from_str_radix(parts[3], 16).ok()?;
+    if version == "00" && flags > 3 {
+        return None;
+    }
+    let trace_flags = flags & 0x03;
     let sc = TraceContext {
         trace_id,
         span_id,
-        sampled: (flags & 0x01) != 0,
+        sampled: (trace_flags & 0x01) != 0,
+        trace_flags,
         remote: true,
         jaeger_debug_id: None,
         tracestate: None,
@@ -557,6 +569,7 @@ pub fn parse_uber_trace_id(header: &str) -> Option<TraceContext> {
         trace_id,
         span_id,
         sampled,
+        trace_flags: if sampled { 0x01 } else { 0x00 },
         remote: true,
         jaeger_debug_id: debug.then(|| "1".to_string()),
         tracestate: None,
@@ -666,12 +679,18 @@ pub fn start_server_span_context(
     };
     let span_id = random_span_id();
     let sampled = sampler.should_sample(&effective_parent, &trace_id);
+    if sampled && rt.is_some_and(|t| t.exporter.is_some()) {
+        if let Some(ref dbg) = effective_parent.jaeger_debug_id {
+            record_jaeger_debug_id(span_id, dbg.clone());
+        }
+    }
 
     (
         TraceContext {
             trace_id,
             span_id,
             sampled,
+            trace_flags: if sampled { 0x01 } else { 0x00 },
             remote: false,
             jaeger_debug_id: effective_parent.jaeger_debug_id,
             tracestate: effective_parent.tracestate,
@@ -803,6 +822,26 @@ pub fn detected_exporter_kind() -> Option<String> {
     None
 }
 
+type JaegerDebugIdQueue = Mutex<VecDeque<([u8; 8], String)>>;
+static JAEGER_DEBUG_IDS: OnceLock<JaegerDebugIdQueue> = OnceLock::new();
+
+fn record_jaeger_debug_id(span_id: [u8; 8], debug_id: String) {
+    let q = JAEGER_DEBUG_IDS.get_or_init(|| Mutex::new(VecDeque::new()));
+    if let Ok(mut g) = q.lock() {
+        if g.len() >= 2048 {
+            g.pop_front();
+        }
+        g.push_back((span_id, debug_id));
+    }
+}
+
+fn take_jaeger_debug_id(span_id: [u8; 8]) -> Option<String> {
+    let q = JAEGER_DEBUG_IDS.get()?;
+    let mut g = q.lock().ok()?;
+    let pos = g.iter().rposition(|(sid, _)| *sid == span_id)?;
+    g.remove(pos).map(|(_, v)| v)
+}
+
 pub fn otlp_traces_endpoint_from_env() -> Option<String> {
     if let Ok(ep) = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") {
         if !ep.is_empty() {
@@ -815,12 +854,28 @@ pub fn otlp_traces_endpoint_from_env() -> Option<String> {
             return Some(format!("{trimmed}/v1/traces"));
         }
     }
+    if std::env::var("OTEL_TRACES_EXPORTER")
+        .ok()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("otlp"))
+    {
+        return Some("http://localhost:4318/v1/traces".to_string());
+    }
     None
 }
 
-pub fn export_span(span: ExportedSpan) {
+pub fn export_span(mut span: ExportedSpan) {
     if let Some(rt) = global_tracing() {
         if let Some(ref exp) = rt.exporter {
+            if !span.attributes.iter().any(|a| a.key == "jaeger-debug-id") {
+                let dbg = take_jaeger_debug_id(span.span_id)
+                    .or_else(|| current_trace_context().and_then(|c| c.jaeger_debug_id));
+                if let Some(dbg) = dbg {
+                    span.attributes.push(SpanAttribute {
+                        key: "jaeger-debug-id".to_string(),
+                        value: SpanAttrValue::String(dbg),
+                    });
+                }
+            }
             exp(span);
         }
     }
@@ -854,7 +909,19 @@ mod tests {
         assert!(j_dbg.jaeger_debug_id.is_some());
 
         assert!(parse_traceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none());
+        assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff").is_none());
+        assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-04").is_none());
         assert!(parse_uber_trace_id("0:70e8b02d28e4337b:0:1").is_none());
+
+        let tp_random_sampled = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03").unwrap();
+        assert!(tp_random_sampled.is_sampled());
+        assert_eq!(tp_random_sampled.trace_flags, 0x03);
+        assert_eq!(tp_random_sampled.to_traceparent(), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03");
+
+        let tp_random_unsampled = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-02").unwrap();
+        assert!(!tp_random_unsampled.is_sampled());
+        assert_eq!(tp_random_unsampled.trace_flags, 0x02);
+        assert_eq!(tp_random_unsampled.to_traceparent(), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-02");
     }
 
     #[test]

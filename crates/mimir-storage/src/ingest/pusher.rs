@@ -529,7 +529,12 @@ impl PushErrorHandler {
         }
     }
 
-    pub fn is_server_error(&self, tenant_id: &str, err: Option<&PusherError>) -> bool {
+    pub fn is_server_error(
+        &self,
+        tenant_id: &str,
+        trace_id: Option<&str>,
+        err: Option<&PusherError>,
+    ) -> bool {
         self.metrics.total_requests.inc();
         let Some(err) = err else {
             return false;
@@ -549,16 +554,31 @@ impl PushErrorHandler {
             } else {
                 format!("{err} ({reason})")
             };
-            warn!(
-                user = tenant_id,
-                insight = true,
-                err = %err_str,
-                "detected a client error while ingesting write request (the request may have been partially ingested)"
-            );
-            if let Some(ref sink) = self.log_sink {
-                sink.lock().push(format!(
-                    "user={tenant_id} level=warn msg=\"detected a client error while ingesting write request (the request may have been partially ingested)\" insight=true err=\"{err_str}\""
-                ));
+            if let Some(tid) = trace_id.filter(|s| !s.is_empty()) {
+                warn!(
+                    user = tenant_id,
+                    trace_id = tid,
+                    insight = true,
+                    err = %err_str,
+                    "detected a client error while ingesting write request (the request may have been partially ingested)"
+                );
+                if let Some(ref sink) = self.log_sink {
+                    sink.lock().push(format!(
+                        "user={tenant_id} trace_id={tid} level=warn msg=\"detected a client error while ingesting write request (the request may have been partially ingested)\" insight=true err=\"{err_str}\""
+                    ));
+                }
+            } else {
+                warn!(
+                    user = tenant_id,
+                    insight = true,
+                    err = %err_str,
+                    "detected a client error while ingesting write request (the request may have been partially ingested)"
+                );
+                if let Some(ref sink) = self.log_sink {
+                    sink.lock().push(format!(
+                        "user={tenant_id} level=warn msg=\"detected a client error while ingesting write request (the request may have been partially ingested)\" insight=true err=\"{err_str}\""
+                    ));
+                }
             }
         }
         false
@@ -927,11 +947,11 @@ impl SequentialStoragePusher {
             .observe(start.elapsed().as_secs_f64());
 
         if let Err(err) = res {
-            if self.error_handler.is_server_error(tenant_id, Some(&err)) {
+            if self.error_handler.is_server_error(tenant_id, None, Some(&err)) {
                 return Err(err);
             }
         } else {
-            self.error_handler.is_server_error(tenant_id, None);
+            self.error_handler.is_server_error(tenant_id, None, None);
         }
         Ok(())
     }
@@ -1114,10 +1134,10 @@ impl ParallelStorageShards {
 
                     match res {
                         Ok(()) => {
-                            eh.is_server_error(&wr.tenant_id, None);
+                            eh.is_server_error(&wr.tenant_id, None, None);
                         }
                         Err(err) => {
-                            if eh.is_server_error(&wr.tenant_id, Some(&err)) {
+                            if eh.is_server_error(&wr.tenant_id, None, Some(&err)) {
                                 err_store.lock().push(err);
                             }
                         }

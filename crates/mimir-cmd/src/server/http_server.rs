@@ -52,14 +52,27 @@ pub struct SharedWriteDeadline {
 }
 
 impl SharedWriteDeadline {
-    pub fn extend_by(&self, extra: Duration) {
-        if !self.base_write_timeout.is_zero() {
-            let mut g = self.deadline.lock();
-            *g = Some(Instant::now() + self.base_write_timeout + extra);
+    pub fn new(base_write_timeout: Duration) -> Self {
+        let initial = (!base_write_timeout.is_zero())
+            .then(|| Instant::now().checked_add(base_write_timeout))
+            .flatten();
+        Self {
+            deadline: Arc::new(Mutex::new(initial)),
+            base_write_timeout,
         }
     }
 
-    fn current(&self) -> Option<Instant> {
+    pub fn extend_by(&self, extra: Duration) {
+        if !self.base_write_timeout.is_zero() {
+            let mut g = self.deadline.lock();
+            *g = self
+                .base_write_timeout
+                .checked_add(extra)
+                .and_then(|d| Instant::now().checked_add(d));
+        }
+    }
+
+    pub fn current(&self) -> Option<Instant> {
         *self.deadline.lock()
     }
 }
@@ -306,7 +319,10 @@ impl<T: AsyncRead + Unpin> AsyncRead for TimedIo<T> {
                     this.sleep = None;
                     return Poll::Pending;
                 }
-                let deadline = since + timeout;
+                let Some(deadline) = since.checked_add(timeout) else {
+                    this.sleep = None;
+                    return Poll::Pending;
+                };
                 match &mut this.sleep {
                     Some((d, s)) if *d == deadline => {
                         if s.as_mut().poll(cx).is_ready() {
@@ -473,8 +489,12 @@ async fn serve_conn<T>(
         let router = router.clone();
         async move {
             let header_start = state.request_started();
-            let read_deadline = (!read_timeout.is_zero()).then(|| header_start + read_timeout);
-            let initial_write_deadline = (!write_timeout.is_zero()).then(|| Instant::now() + write_timeout);
+            let read_deadline = (!read_timeout.is_zero())
+                .then(|| header_start.checked_add(read_timeout))
+                .flatten();
+            let initial_write_deadline = (!write_timeout.is_zero())
+                .then(|| Instant::now().checked_add(write_timeout))
+                .flatten();
             let shared_write_deadline = SharedWriteDeadline {
                 deadline: Arc::new(Mutex::new(initial_write_deadline)),
                 base_write_timeout: write_timeout,
