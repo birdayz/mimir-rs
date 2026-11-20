@@ -586,6 +586,16 @@ fn check_org_id(headers: &http::HeaderMap, method: &str) -> Option<tonic::Status
 /// Per-RPC bookkeeping started when the request arrives and finalized exactly once: when the
 /// response body completes, or on drop (handler future or response body dropped because the
 /// client reset the stream), like the `defer`s of dskit's interceptors and stats handler.
+/// Shared mutable attributes attached to the parent gRPC server span by inner handlers
+/// (e.g. `HttpGrpcBridge` attaching encapsulated HTTP attributes to `httpgrpc.HTTP/Handle`).
+#[derive(Clone, Default)]
+pub struct GrpcSpanAttributes(pub Arc<Mutex<Vec<SpanAttribute>>>);
+
+#[inline]
+fn is_grpc_server_span_error(code: i32) -> bool {
+    matches!(code, 2 | 4 | 12 | 13 | 14 | 15 | 500..=599)
+}
+
 struct RpcGuard {
     known_method: Option<KnownGrpcMethod>,
     method: Cow<'static, str>,
@@ -596,6 +606,10 @@ struct RpcGuard {
     error_log: GrpcErrorLog,
     status_code: Option<i32>,
     status_message: Option<String>,
+    span_ctx: TraceContext,
+    parent_span_id: Option<[u8; 8]>,
+    span_start_unix_nano: u64,
+    span_attributes: GrpcSpanAttributes,
     done: bool,
 }
 
@@ -634,6 +648,29 @@ impl RpcGuard {
         }
         if self.conn.active.fetch_sub(1, Ordering::AcqRel) == 1 {
             *self.conn.idle_since.lock() = Instant::now();
+        }
+        if self.span_ctx.is_sampled() {
+            if let Some(rt) = global_tracing() {
+                if rt.exporter.is_some() {
+                    let mut attributes = vec![SpanAttribute {
+                        key: "rpc.system".to_string(),
+                        value: SpanAttrValue::String("grpc".to_string()),
+                    }];
+                    attributes.extend(self.span_attributes.0.lock().iter().cloned());
+                    export_span(ExportedSpan {
+                        service_name: rt.service_name.clone(),
+                        trace_id: self.span_ctx.trace_id,
+                        span_id: self.span_ctx.span_id,
+                        parent_span_id: self.parent_span_id,
+                        name: self.method.trim_start_matches('/').to_string(),
+                        kind: 2,
+                        start_time_unix_nano: self.span_start_unix_nano,
+                        end_time_unix_nano: now_unix_nanos(),
+                        attributes,
+                        status_error: is_grpc_server_span_error(code),
+                    });
+                }
+            }
         }
         if code != 0 {
             // The handler's view of its error (Go error text, OptionalLogging), or a plain
@@ -789,6 +826,14 @@ where
         (None, None, None)
     };
     let error_log = GrpcErrorLog::default();
+    let extracted_trace = extract_from_http_headers(req.headers());
+    let (span_ctx, parent_span_id) = start_server_span_context(&extracted_trace, false);
+    let span_start_unix_nano = now_unix_nanos();
+    let span_attributes = GrpcSpanAttributes::default();
+    if span_ctx.is_valid() {
+        req.extensions_mut().insert(span_ctx.clone());
+    }
+    req.extensions_mut().insert(span_attributes.clone());
     // From here on every exit path (including this future being dropped when the client
     // resets the stream) finalizes the RPC exactly once.
     let mut guard = RpcGuard {
@@ -801,15 +846,12 @@ where
         error_log: error_log.clone(),
         status_code: None,
         status_message: None,
+        span_ctx: span_ctx.clone(),
+        parent_span_id,
+        span_start_unix_nano,
+        span_attributes,
         done: false,
     };
-
-    let extracted_trace = extract_from_http_headers(req.headers());
-    let (span_ctx, parent_span_id) = start_server_span_context(&extracted_trace, false);
-    let span_start_unix_nano = now_unix_nanos();
-    if span_ctx.is_valid() {
-        req.extensions_mut().insert(span_ctx.clone());
-    }
     req.extensions_mut().insert(tonic::transport::server::TcpConnectInfo {
         local_addr: None,
         remote_addr: Some(remote),
@@ -880,7 +922,6 @@ where
     let resp: GrpcResponse = match rejection {
         Some(status) => status.into_http(),
         None => {
-            let method_for_span = guard.method.clone();
             let call = with_trace_context(span_ctx.clone(), routes.oneshot(req));
             let res = match deadline {
                 // grpc-go: when the transport deadline timer closes the stream before the handler
@@ -896,27 +937,6 @@ where
                 },
                 None => call.await,
             };
-            if span_ctx.is_sampled() {
-                if let Some(rt) = global_tracing() {
-                    if rt.exporter.is_some() {
-                        export_span(ExportedSpan {
-                            service_name: rt.service_name.clone(),
-                            trace_id: span_ctx.trace_id,
-                            span_id: span_ctx.span_id,
-                            parent_span_id,
-                            name: method_for_span.trim_start_matches('/').to_string(),
-                            kind: 2,
-                            start_time_unix_nano: span_start_unix_nano,
-                            end_time_unix_nano: now_unix_nanos(),
-                            attributes: vec![SpanAttribute {
-                                key: "rpc.system".to_string(),
-                                value: SpanAttrValue::String("grpc".to_string()),
-                            }],
-                            status_error: res.is_err(),
-                        });
-                    }
-                }
-            }
             match res {
                 Ok(r) => r,
                 Err(e) => tonic::Status::internal(e.to_string()).into_http(),

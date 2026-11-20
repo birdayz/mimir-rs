@@ -6,10 +6,10 @@
 //! - github.com/grafana/dskit/tracing/otel_jaeger.go
 //! - go.opentelemetry.io/contrib/propagators/jaeger/jaeger_propagator.go
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand::RngCore;
 
@@ -807,6 +807,15 @@ pub fn resolve_service_name(targets: &[String]) -> String {
 }
 
 pub fn detected_exporter_kind() -> Option<String> {
+    for k in [
+        "JAEGER_AGENT_HOST",
+        "JAEGER_ENDPOINT",
+        "JAEGER_SAMPLER_MANAGER_HOST_PORT",
+    ] {
+        if std::env::var(k).ok().is_some_and(|v| !v.is_empty()) {
+            return Some("jaeger".to_string());
+        }
+    }
     if let Ok(exp) = std::env::var("OTEL_TRACES_EXPORTER") {
         if !exp.is_empty() {
             return Some(exp);
@@ -822,6 +831,161 @@ pub fn detected_exporter_kind() -> Option<String> {
         return Some("otlp".to_string());
     }
     None
+}
+
+/// Resolves the Jaeger HTTP collector endpoint from env vars (`JAEGER_ENDPOINT`,
+/// `OTEL_EXPORTER_JAEGER_ENDPOINT`, or default `http://localhost:14268/api/traces` when
+/// `OTEL_TRACES_EXPORTER=jaeger`).
+pub fn jaeger_endpoint_from_env() -> Option<String> {
+    for k in ["JAEGER_ENDPOINT", "OTEL_EXPORTER_JAEGER_ENDPOINT"] {
+        if let Ok(ep) = std::env::var(k) {
+            let trimmed = ep.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    if std::env::var("OTEL_TRACES_EXPORTER")
+        .ok()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("jaeger"))
+    {
+        return Some("http://localhost:14268/api/traces".to_string());
+    }
+    None
+}
+
+/// Returns `(user, password)` for Jaeger collector Basic Auth when both
+/// `OTEL_EXPORTER_JAEGER_USER` and `OTEL_EXPORTER_JAEGER_PASSWORD` are non-empty.
+pub fn jaeger_basic_auth_from_env() -> Option<(String, String)> {
+    let user = std::env::var("OTEL_EXPORTER_JAEGER_USER").ok()?;
+    let pass = std::env::var("OTEL_EXPORTER_JAEGER_PASSWORD").ok()?;
+    if user.is_empty() || pass.is_empty() {
+        return None;
+    }
+    Some((user, pass))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OtlpTlsEnvConfig {
+    pub ca_cert_path: Option<String>,
+    pub client_cert_path: Option<String>,
+    pub client_key_path: Option<String>,
+}
+
+fn non_empty_trimmed_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Resolves OTLP TLS CA & mTLS certificate paths from `OTEL_EXPORTER_OTLP_[TRACES_]*` env vars,
+/// matching `otlptracehttp/internal/otlpconfig/envconfig.go`.
+pub fn otlp_tls_paths_from_env() -> OtlpTlsEnvConfig {
+    let ca_cert_path = non_empty_trimmed_env("OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE")
+        .or_else(|| non_empty_trimmed_env("OTEL_EXPORTER_OTLP_CERTIFICATE"));
+    let (client_cert_path, client_key_path) = match (
+        non_empty_trimmed_env("OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE"),
+        non_empty_trimmed_env("OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY"),
+    ) {
+        (Some(c), Some(k)) => (Some(c), Some(k)),
+        _ => match (
+            non_empty_trimmed_env("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE"),
+            non_empty_trimmed_env("OTEL_EXPORTER_OTLP_CLIENT_KEY"),
+        ) {
+            (Some(c), Some(k)) => (Some(c), Some(k)),
+            _ => (None, None),
+        },
+    };
+    OtlpTlsEnvConfig {
+        ca_cert_path,
+        client_cert_path,
+        client_key_path,
+    }
+}
+
+/// Resolves OTLP HTTP exporter timeout (milliseconds) from `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`
+/// or `OTEL_EXPORTER_OTLP_TIMEOUT`.
+pub fn otlp_timeout_from_env() -> Option<Duration> {
+    for key in [
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+    ] {
+        if let Some(raw) = non_empty_trimmed_env(key) {
+            if let Ok(ms) = raw.parse::<u64>() {
+                if ms > 0 {
+                    return Some(Duration::from_millis(ms));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_http_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        )
+}
+
+fn path_unescape_percent(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_nibble(bytes[i + 1])?;
+            let lo = hex_nibble(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Parses comma-separated `key=value` pairs per OTel OTLP header spec (`url.PathUnescape` on
+/// values, trimmed names and values).
+pub fn parse_otlp_headers_str(raw: &str) -> Vec<(String, String)> {
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    for pair in raw.split(',') {
+        let Some((n, v)) = pair.split_once('=') else {
+            continue;
+        };
+        let name = n.trim();
+        if name.is_empty() || !name.bytes().all(is_http_token_char) {
+            continue;
+        }
+        let Some(decoded) = path_unescape_percent(v) else {
+            continue;
+        };
+        map.insert(name.to_string(), decoded.trim().to_string());
+    }
+    map.into_iter().collect()
+}
+
+/// Reads `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS` (with
+/// `TRACES_HEADERS` taking precedence).
+pub fn otlp_headers_from_env() -> Vec<(String, String)> {
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    for key in [
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    ] {
+        if let Some(raw) = non_empty_trimmed_env(key) {
+            for (k, v) in parse_otlp_headers_str(&raw) {
+                map.insert(k, v);
+            }
+        }
+    }
+    map.into_iter().collect()
 }
 
 type JaegerDebugIdQueue = Mutex<VecDeque<([u8; 8], String)>>;
