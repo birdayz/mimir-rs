@@ -636,7 +636,7 @@ impl NonClientStreamingFrameBody {
                             Vec::with_capacity(compressed.len().min(self.max_recv).min(64 * 1024));
                         match self.algo {
                             FrameDecompressAlgo::Gzip => {
-                                let mut dec = flate2::read::GzDecoder::new(compressed).take(limit);
+                                let mut dec = flate2::read::MultiGzDecoder::new(compressed).take(limit);
                                 dec.read_to_end(&mut decompressed).map_err(|e| {
                                     Status::internal(format!("gzip decompression failed: {e}"))
                                 })?;
@@ -3429,5 +3429,51 @@ mod tests {
         assert!(read_rl.max_inflight() >= 1);
         bp1.finish(std::time::Duration::from_millis(1), true);
         assert_eq!(timeout_count(&read_reg), 1.0);
+    }
+
+    #[tokio::test]
+    async fn w22_deep_03_non_client_streaming_frame_body_decodes_multi_member_gzip() {
+        use std::io::Write as _;
+
+        #[allow(clippy::result_large_err)]
+        async fn collect_body(mut b: NonClientStreamingFrameBody) -> Result<BytesMut, Status> {
+            let mut out = BytesMut::new();
+            while let Some(frame_res) = futures::future::poll_fn(|cx| {
+                hyper::body::Body::poll_frame(Pin::new(&mut b), cx)
+            })
+            .await
+            {
+                if let Ok(data) = frame_res?.into_data() {
+                    out.extend_from_slice(&data);
+                }
+            }
+            Ok(out)
+        }
+
+        let mut e1 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e1.write_all(b"first-member-").unwrap();
+        let mut combined = e1.finish().unwrap();
+
+        let mut e2 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e2.write_all(b"second-member").unwrap();
+        combined.extend_from_slice(&e2.finish().unwrap());
+
+        let mut frame = Vec::with_capacity(5 + combined.len());
+        frame.push(1);
+        frame.extend_from_slice(&(combined.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&combined);
+
+        let body = tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(frame.clone()))));
+        let dec_body = NonClientStreamingFrameBody::new(body, FrameDecompressAlgo::Gzip, 1024);
+        let out = collect_body(dec_body).await.unwrap();
+        assert_eq!(out[0], 0);
+        let len = u32::from_be_bytes([out[1], out[2], out[3], out[4]]) as usize;
+        assert_eq!(&out[5..5 + len], b"first-member-second-member");
+
+        // Bomb across multiple members must still be rejected with ResourceExhausted.
+        let bomb_body = tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(frame))));
+        let bomb_dec = NonClientStreamingFrameBody::new(bomb_body, FrameDecompressAlgo::Gzip, 16);
+        let err = collect_body(bomb_dec).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 }
