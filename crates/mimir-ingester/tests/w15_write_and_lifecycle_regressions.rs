@@ -921,7 +921,7 @@ async fn wll10_tsdb_ingest_exemplar_formats_exemplar_labels_in_sorted_order() {
         .unwrap();
 
     // 2) Push OOO exemplar at ts with UNSORTED exemplar labels: trace_id, a_key, m_key.
-    //    TsdbIngestExemplar must format exemplar={a_key="1", m_key="2", trace_id="t2"}.
+    //    Go's newTSDBIngestExemplarErr formats raw wire-order ex.Labels.
     let wr2 = cortexpb::WriteRequest {
         timeseries: vec![cortexpb::TimeSeries {
             labels: vec![cortexpb::LabelPair::from_strs("__name__", "ex_sorted_err")],
@@ -949,8 +949,8 @@ async fn wll10_tsdb_ingest_exemplar_formats_exemplar_labels_in_sorted_order() {
         .expect_err("OOO exemplar should error");
     let msg = err.to_string();
     assert!(
-        msg.contains(r#"exemplar={a_key="1", m_key="2", trace_id="t2"}"#),
-        "expected sorted exemplar labels in TsdbIngestExemplar error, got: {msg}"
+        msg.contains(r#"exemplar={trace_id="t2", a_key="1", m_key="2"}"#),
+        "expected raw wire-order exemplar labels in TsdbIngestExemplar error, got: {msg}"
     );
 
     // 3) ExemplarTooFarInFuture runs before sorting and must retain wire order.

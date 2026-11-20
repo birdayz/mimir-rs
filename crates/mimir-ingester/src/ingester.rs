@@ -362,7 +362,7 @@ impl Ingester {
             &cfg.push_circuit_breaker,
             &cfg.read_circuit_breaker,
             registry,
-        );
+        )?;
         let reactive_limiter = IngesterReactiveLimiter::new(
             &cfg.rejection_prioritizer,
             &cfg.push_reactive_limiter,
@@ -1358,6 +1358,14 @@ impl Ingester {
 
     /// Flushes WAL & WBL segments for all open tenant TSDBs (`NotifyPreCommit`).
     pub fn notify_pre_commit(&self) -> Result<(), IngesterError> {
+        self.notify_pre_commit_with(|_, db| db.db.head().sync().map_err(|e| e.to_string()))
+    }
+
+    #[doc(hidden)]
+    pub fn notify_pre_commit_with<F>(&self, sync_user: F) -> Result<(), IngesterError>
+    where
+        F: Fn(&str, &Arc<UserTsdb>) -> Result<(), String> + Sync,
+    {
         let users = self.get_tsdb_users();
         if users.is_empty() {
             return Ok(());
@@ -1366,47 +1374,47 @@ impl Ingester {
             .ingest_cfg
             .write_logs_fsync_before_kafka_commit_concurrency
             .max(1) as usize;
-        if concurrency <= 1 || users.len() == 1 {
+        let errs: Vec<String> = if concurrency <= 1 || users.len() == 1 {
+            let mut errs = Vec::new();
             for user_id in users {
                 if let Some(db) = self.get_tsdb(&user_id) {
-                    db.db.head().sync().map_err(|e| IngesterError::Internal {
-                        message: format!("failed to sync TSDB WAL for user {user_id}: {e}"),
-                    })?;
+                    // Go `concurrency.ForEachUser` adds `db.Head().Sync()` errors unwrapped.
+                    if let Err(e) = sync_user(&user_id, &db) {
+                        errs.push(e);
+                    }
                 }
             }
-            return Ok(());
-        }
-        let next_idx = std::sync::atomic::AtomicUsize::new(0);
-        let first_err: Mutex<Option<IngesterError>> = Mutex::new(None);
-        let workers = concurrency.min(users.len());
-        std::thread::scope(|s| {
-            for _ in 0..workers {
-                s.spawn(|| loop {
-                    if first_err.lock().is_some() {
-                        break;
-                    }
-                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                    let Some(user_id) = users.get(idx) else {
-                        break;
-                    };
-                    if let Some(db) = self.get_tsdb(user_id) {
-                        if let Err(e) = db.db.head().sync() {
-                            let mut g = first_err.lock();
-                            if g.is_none() {
-                                *g = Some(IngesterError::Internal {
-                                    message: format!("failed to sync TSDB WAL for user {user_id}: {e}"),
-                                });
-                            }
+            errs
+        } else {
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let errs: Mutex<Vec<String>> = Mutex::new(Vec::new());
+            let workers = concurrency.min(users.len());
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| loop {
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        let Some(user_id) = users.get(idx) else {
                             break;
+                        };
+                        if let Some(db) = self.get_tsdb(user_id) {
+                            if let Err(e) = sync_user(user_id, &db) {
+                                errs.lock().push(e);
+                            }
                         }
-                    }
-                });
-            }
-        });
-        if let Some(err) = first_err.into_inner() {
-            return Err(err);
+                    });
+                }
+            });
+            errs.into_inner()
+        };
+        match errs.len() {
+            0 => Ok(()),
+            1 => Err(IngesterError::Internal {
+                message: errs.into_iter().next().unwrap_or_default(),
+            }),
+            n => Err(IngesterError::Internal {
+                message: format!("{n} errors: {}", errs.join("; ")),
+            }),
         }
-        Ok(())
     }
 
     /// Records the failure of a watched subservice (Go: `subservicesWatcher.Chan()` makes
@@ -1920,7 +1928,12 @@ impl Ingester {
                     *st = State::Stopping;
                     true
                 }
-                State::New | State::Starting | State::Running => {
+                State::New => {
+                    *st = State::Terminated;
+                    self.stop_done_tx.send_replace(Some(Ok(())));
+                    return Ok(());
+                }
+                State::Starting | State::Running => {
                     *st = State::Stopping;
                     true
                 }

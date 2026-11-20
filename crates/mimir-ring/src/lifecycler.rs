@@ -1289,10 +1289,10 @@ impl Lifecycler {
         }
         let since = *ready.ready_since.get_or_insert_with(Instant::now);
         if since.elapsed() < self.cfg.min_ready_duration {
-            return Err(format!(
-                "waiting for {:?} after being ready",
-                self.cfg.min_ready_duration
-            ));
+            let dur_str = mimir_config::format_go_duration(
+                self.cfg.min_ready_duration.as_nanos().min(i64::MAX as u128) as i64,
+            );
+            return Err(format!("waiting for {dur_str} after being ready"));
         }
         ready.ready = true;
         Ok(())
@@ -1367,11 +1367,7 @@ impl Lifecycler {
             "changing instance state from"
         );
         self.state.write().state = target;
-        if let Err(err) = self.update_consul_locked().await {
-            self.state.write().state = curr;
-            return Err(err);
-        }
-        Ok(())
+        self.update_consul_locked().await
     }
 
     pub async fn change_read_only_state(&self, read_only: bool) -> Result<(), LifecyclerError> {
@@ -1382,17 +1378,13 @@ impl Lifecycler {
         if !self.is_running.load(Ordering::Acquire) {
             return Err(LifecyclerError::NotRunning);
         }
-        let (prev, prev_ts) = self.get_read_only_state();
+        let (prev, _) = self.get_read_only_state();
         if prev == read_only {
             return Ok(());
         }
         info!(readOnly = read_only, ring = %self.ring_name, "changing read-only state of instance in the ring");
         self.set_read_only_internal(read_only, Some(SystemTime::now()));
-        if let Err(err) = self.update_consul_locked().await {
-            self.set_read_only_internal(prev, prev_ts);
-            return Err(err);
-        }
-        Ok(())
+        self.update_consul_locked().await
     }
 
     pub async fn claim_tokens_for(&self, source_ingester_id: &str) -> Result<(), LifecyclerError> {

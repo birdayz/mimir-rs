@@ -46,7 +46,7 @@ fn test_circuit_breaker_try_record_failure() {
         ..Default::default()
     };
     let reg = Registry::new();
-    let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap();
+    let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap().unwrap();
 
     // no error
     assert!(!cb.try_record_failure(None));
@@ -111,7 +111,7 @@ fn test_circuit_breaker_is_active() {
         ..Default::default()
     };
     let reg = Registry::new();
-    let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap();
+    let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap().unwrap();
 
     assert_eq!(cb.activation_state(), ActivationState::Inactive);
     assert!(!cb.is_active());
@@ -134,7 +134,7 @@ async fn test_circuit_breaker_is_active_with_delay() {
         ..Default::default()
     };
     let reg = Registry::new();
-    let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap();
+    let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap().unwrap();
 
     assert_eq!(cb.activation_state(), ActivationState::Inactive);
     assert!(!cb.is_active());
@@ -175,7 +175,7 @@ async fn test_circuit_breaker_is_active_with_delay_cancel() {
         ..Default::default()
     };
     let reg = Registry::new();
-    let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap();
+    let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap().unwrap();
 
     cb.activate();
     assert_eq!(cb.activation_state(), ActivationState::Pending);
@@ -210,7 +210,7 @@ async fn test_circuit_breaker_is_active_with_delay_cancel_then_restart() {
         ..Default::default()
     };
     let reg = Registry::new();
-    let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap();
+    let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap().unwrap();
 
     cb.activate();
     assert!(cb.try_acquire_permit().is_ok());
@@ -253,7 +253,7 @@ fn test_circuit_breaker_try_acquire_permit() {
         let reg = Registry::new();
         let mut c = cfg.clone();
         c.initial_delay = GoDuration::from_secs(60);
-        let cb = CircuitBreaker::new(&c, Some(&reg), "test-request-type", true).unwrap();
+        let cb = CircuitBreaker::new(&c, Some(&reg), "test-request-type", true).unwrap().unwrap();
         cb.deactivate();
         let permit = cb.try_acquire_permit().unwrap();
         assert!(permit.is_none());
@@ -262,7 +262,7 @@ fn test_circuit_breaker_try_acquire_permit() {
     // 2) closed
     {
         let reg = Registry::new();
-        let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", true).unwrap();
+        let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", true).unwrap().unwrap();
         cb.activate();
         cb.force_close();
         let permit = cb.try_acquire_permit().unwrap();
@@ -272,7 +272,7 @@ fn test_circuit_breaker_try_acquire_permit() {
     // 3) open
     {
         let reg = Registry::new();
-        let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", true).unwrap();
+        let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", true).unwrap().unwrap();
         cb.activate();
         cb.force_open();
         let err = cb.try_acquire_permit().err().unwrap();
@@ -314,7 +314,7 @@ fn test_circuit_breaker_try_acquire_permit() {
     // 4) half-open
     {
         let reg = Registry::new();
-        let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", true).unwrap();
+        let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", true).unwrap().unwrap();
         cb.activate();
         cb.force_half_open();
         let permit = cb.try_acquire_permit().unwrap();
@@ -362,7 +362,7 @@ fn test_circuit_breaker_record_result() {
 
     for (name, errs, exp_err, exp_success, exp_error, exp_timeouts) in cases {
         let reg = Registry::new();
-        let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap();
+        let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap().unwrap();
         cb.activate();
         let got = cb.record_result(errs);
         assert_eq!(got, *exp_err, "{name}");
@@ -464,7 +464,7 @@ fn test_circuit_breaker_finish_request() {
 
     for (name, dur, is_active, err, exp_err, exp_s, exp_e, exp_to) in cases {
         let reg = Registry::new();
-        let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap();
+        let cb = CircuitBreaker::new(&cfg, Some(&reg), "test-request-type", false).unwrap().unwrap();
         if *is_active {
             cb.activate();
         }
@@ -890,7 +890,7 @@ fn test_pr_circuit_breaker_new_pr_circuit_breaker() {
     };
     let read_cfg = push_cfg.clone();
     let reg = Registry::new();
-    let pr_cb = IngesterCircuitBreaker::new_with_test_mode(&push_cfg, &read_cfg, Some(&reg), true);
+    let pr_cb = IngesterCircuitBreaker::new_with_test_mode(&push_cfg, &read_cfg, Some(&reg), true).unwrap();
     assert!(pr_cb.push.is_some());
     assert!(pr_cb.read.is_some());
 
@@ -954,7 +954,8 @@ fn test_pr_circuit_breaker_try_push_acquire_permit() {
             &Default::default(),
             Some(&reg),
             true,
-        );
+        )
+        .unwrap();
         cb.push.as_ref().unwrap().deactivate();
         let p = cb.try_acquire_push_permit().unwrap();
         assert!(p.is_none());
@@ -968,7 +969,8 @@ fn test_pr_circuit_breaker_try_push_acquire_permit() {
             &Default::default(),
             Some(&reg),
             true,
-        );
+        )
+        .unwrap();
         let push = cb.push.as_ref().unwrap();
         push.activate();
         push.force_close();
@@ -992,7 +994,8 @@ fn test_pr_circuit_breaker_try_push_acquire_permit() {
             &Default::default(),
             Some(&reg),
             true,
-        );
+        )
+        .unwrap();
         let push = cb.push.as_ref().unwrap();
         push.activate();
         push.force_open();
@@ -1016,7 +1019,8 @@ fn test_pr_circuit_breaker_try_push_acquire_permit() {
             &Default::default(),
             Some(&reg),
             true,
-        );
+        )
+        .unwrap();
         let push = cb.push.as_ref().unwrap();
         push.activate();
         push.force_half_open();
@@ -1104,7 +1108,7 @@ fn test_pr_circuit_breaker_try_read_acquire_permit() {
 
     for (read_st, push_st, expect_err) in matrix {
         let reg = Registry::new();
-        let cb = IngesterCircuitBreaker::new_with_test_mode(&push_cfg, &read_cfg, Some(&reg), true);
+        let cb = IngesterCircuitBreaker::new_with_test_mode(&push_cfg, &read_cfg, Some(&reg), true).unwrap();
         apply(cb.read.as_ref().unwrap(), read_st);
         apply(cb.push.as_ref().unwrap(), push_st);
         let res = cb.try_acquire_read_permit();

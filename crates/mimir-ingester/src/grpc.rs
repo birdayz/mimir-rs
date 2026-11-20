@@ -108,9 +108,11 @@ impl Decoder for QueryRequestDecoder {
     type Error = Status;
 
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
-        ingesterpb::QueryRequest::decode(src)
-            .map(Some)
-            .map_err(|e| Status::internal(e.to_string()))
+        ingesterpb::QueryRequest::decode(src).map(Some).map_err(|e| {
+            Status::internal(format!(
+                "grpc: failed to unmarshal the received message: {e}"
+            ))
+        })
     }
 }
 
@@ -155,7 +157,11 @@ impl Decoder for MetricsForLabelMatchersRequestDecoder {
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
         ingesterpb::MetricsForLabelMatchersRequest::decode(src)
             .map(Some)
-            .map_err(|e| Status::internal(e.to_string()))
+            .map_err(|e| {
+                Status::internal(format!(
+                    "grpc: failed to unmarshal the received message: {e}"
+                ))
+            })
     }
 }
 
@@ -300,7 +306,7 @@ where
 }
 
 #[derive(Clone)]
-struct TapDeadlineFlag(Arc<AtomicBool>);
+pub(crate) struct TapDeadlineFlag(pub(crate) Arc<AtomicBool>);
 
 struct ReadTapGuard {
     tap: Option<ReadTapPermit>,
@@ -725,7 +731,7 @@ impl SnappyCompressBody {
             if self.in_buf.len() < frame_end {
                 break;
             }
-            if flag == 0 {
+            if flag == 0 && len > 0 {
                 let hdr_pos = out.len();
                 out.extend_from_slice(&[1, 0, 0, 0, 0]);
                 if mimir_proto::snappy::compress_framed_buf(&self.in_buf[5..frame_end], &mut out)
@@ -1170,9 +1176,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
         let is_query_stream = path == "/cortex.Ingester/QueryStream";
         let is_metrics_for_label_matchers = path == "/cortex.Ingester/MetricsForLabelMatchers";
         let is_ingester_rpc = path.starts_with("/cortex.Ingester/");
-        let qs_echo_encoding = if (is_query_stream || is_metrics_for_label_matchers)
-            && self.send_compression.is_none()
-        {
+        let echo_encoding = if is_ingester_rpc && self.send_compression.is_none() {
             req.headers()
                 .get("grpc-encoding")
                 .and_then(|v| v.to_str().ok())
@@ -1295,34 +1299,43 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         let tap_slot = self.tap_slot.clone();
                         Box::pin(async move {
                             let tap = tap_slot.as_ref().and_then(|s| s.lock().take());
-                            let tenant_res = tenant_from_req(&ingester, &request);
+                            let org_id_res = org_id_from_req(&ingester, &request);
                             let (_, extensions, raw) = request.into_parts();
-                            match tenant_res {
-                                Ok(user_id) => {
-                                    let res = match tap {
-                                        Some(permit) => {
-                                            ingester
-                                                .push_grpc_raw_admitted(&user_id, raw, permit)
-                                                .await
-                                        }
-                                        None => ingester.push_grpc_raw(&user_id, raw).await,
-                                    };
-                                    if let Err(e) = res {
-                                        record_push_error(
-                                            &ingester,
-                                            extensions.get::<GrpcErrorLog>(),
-                                            &e,
-                                        );
-                                        return Err(e.map_push_error_to_grpc_server_status());
-                                    }
-                                    Ok(Response::new(cortexpb::WriteResponse {}))
+                            // Go order: dec(in) -> ServerUserHeaderInterceptor -> PushGrpcMethodEnabled -> tenant.TenantID.
+                            // On the happy path we avoid double-decoding by validating wire bytes early only
+                            // when org_id / push_grpc_method_enabled / tenant_id fails.
+                            if org_id_res.is_err() || !ingester.cfg.push_grpc_method_enabled {
+                                if let Err(e) = ingester.validate_grpc_push_wire(&raw) {
+                                    drop(tap);
+                                    record_push_error(
+                                        &ingester,
+                                        extensions.get::<GrpcErrorLog>(),
+                                        &e,
+                                    );
+                                    return Err(e.map_push_error_to_grpc_server_status());
                                 }
+                            }
+                            let org_id = match org_id_res {
+                                Ok(id) => id,
+                                Err(status) => {
+                                    drop(tap);
+                                    return Err(status);
+                                }
+                            };
+                            if !ingester.cfg.push_grpc_method_enabled {
+                                drop(tap);
+                                let e = IngesterError::PushGrpcDisabled;
+                                record_push_error(
+                                    &ingester,
+                                    extensions.get::<GrpcErrorLog>(),
+                                    &e,
+                                );
+                                return Err(e.map_push_error_to_grpc_server_status());
+                            }
+                            let user_id = match tenant_from_org_id(&org_id, &extensions) {
+                                Ok(uid) => uid,
                                 Err(tenant_status) => {
                                     let wire_err = ingester.validate_grpc_push_wire(&raw).err();
-                                    // Go rejects in `dec(in)` / the tenant interceptor before the
-                                    // limiter's `UnaryServerInterceptor` (`RPCCallProcessing`) and
-                                    // before `PushWithCleanup`: `FinishPushRequest` records a
-                                    // zero-duration success and no reactive-limiter RTT sample.
                                     drop(tap);
                                     if let Some(e) = wire_err {
                                         record_push_error(
@@ -1332,9 +1345,26 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                                         );
                                         return Err(e.map_push_error_to_grpc_server_status());
                                     }
-                                    Err(tenant_status)
+                                    return Err(tenant_status);
                                 }
+                            };
+                            let res = match tap {
+                                Some(permit) => {
+                                    ingester
+                                        .push_grpc_raw_admitted(&user_id, raw, permit)
+                                        .await
+                                }
+                                None => ingester.push_grpc_raw(&user_id, raw).await,
+                            };
+                            if let Err(e) = res {
+                                record_push_error(
+                                    &ingester,
+                                    extensions.get::<GrpcErrorLog>(),
+                                    &e,
+                                );
+                                return Err(e.map_push_error_to_grpc_server_status());
                             }
+                            Ok(Response::new(cortexpb::WriteResponse {}))
                         })
                     }
                 }
@@ -1346,7 +1376,26 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 {
                     push_grpc = push_grpc.accept_compressed(*enc);
                 }
-                if let Some(enc) = send_compression {
+                let effective_tonic_send = send_compression.or_else(|| match echo_encoding {
+                    Some("gzip")
+                        if accept_compression[..accept_compression_len]
+                            .iter()
+                            .flatten()
+                            .any(|e| *e == CompressionEncoding::Gzip) =>
+                    {
+                        Some(CompressionEncoding::Gzip)
+                    }
+                    Some("zstd")
+                        if accept_compression[..accept_compression_len]
+                            .iter()
+                            .flatten()
+                            .any(|e| *e == CompressionEncoding::Zstd) =>
+                    {
+                        Some(CompressionEncoding::Zstd)
+                    }
+                    _ => None,
+                });
+                if let Some(enc) = effective_tonic_send {
                     push_grpc = push_grpc.send_compressed(enc);
                 }
                 push_grpc = push_grpc
@@ -1363,6 +1412,35 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     ),
                 )
                 .await;
+                let resp = if let Some(custom_resp_enc @ ("snappy" | "s2")) = echo_encoding {
+                    if resp.status() == http::StatusCode::OK
+                        && !resp.headers().contains_key("grpc-status")
+                        && resp.headers().get("grpc-encoding").is_none()
+                    {
+                        let (mut parts, body) = resp.into_parts();
+                        parts.headers.insert(
+                            "grpc-encoding",
+                            http::HeaderValue::from_static(custom_resp_enc),
+                        );
+                        let enc = if custom_resp_enc == "s2" {
+                            CustomGrpcEncoding::S2
+                        } else {
+                            CustomGrpcEncoding::Snappy
+                        };
+                        http::Response::from_parts(
+                            parts,
+                            tonic::body::BoxBody::new(SnappyCompressBody::new(
+                                body,
+                                enc,
+                                max_send_len,
+                            )),
+                        )
+                    } else {
+                        resp
+                    }
+                } else {
+                    resp
+                };
                 if let Some(slot) = push_tap_slot {
                     drop(slot.lock().take());
                 }
@@ -1394,8 +1472,9 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                                     ActivityRequest::Query(&inner),
                                 )
                             });
+                            let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);
                             let stream = ingester
-                                .handle_query_stream_raw(&md, &user_id, inner)
+                                .handle_query_stream_raw_with_sink(&md, &user_id, inner, err_sink)
                                 .await
                                 .map_err(|e| read_error_status(&ext, e))?;
                             let wrapped: RawQueryStreamBox = Box::pin(ActivityStream {
@@ -1414,7 +1493,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 {
                     qs_grpc = qs_grpc.accept_compressed(*enc);
                 }
-                let effective_tonic_send = send_compression.or_else(|| match qs_echo_encoding {
+                let effective_tonic_send = send_compression.or_else(|| match echo_encoding {
                     Some("gzip")
                         if accept_compression[..accept_compression_len]
                             .iter()
@@ -1448,7 +1527,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         ),
                     )
                     .await;
-                let qs_resp = if let Some(custom_resp_enc @ ("snappy" | "s2")) = qs_echo_encoding {
+                let qs_resp = if let Some(custom_resp_enc @ ("snappy" | "s2")) = echo_encoding {
                     if qs_resp.status() == http::StatusCode::OK
                         && !qs_resp.headers().contains_key("grpc-status")
                         && qs_resp.headers().get("grpc-encoding").is_none()
@@ -1542,7 +1621,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 {
                     mflm_grpc = mflm_grpc.accept_compressed(*enc);
                 }
-                let effective_tonic_send = send_compression.or_else(|| match qs_echo_encoding {
+                let effective_tonic_send = send_compression.or_else(|| match echo_encoding {
                     Some("gzip")
                         if accept_compression[..accept_compression_len]
                             .iter()
@@ -1576,7 +1655,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         ),
                     )
                     .await;
-                let mflm_resp = if let Some(custom_resp_enc @ ("snappy" | "s2")) = qs_echo_encoding
+                let mflm_resp = if let Some(custom_resp_enc @ ("snappy" | "s2")) = echo_encoding
                 {
                     if mflm_resp.status() == http::StatusCode::OK
                         && !mflm_resp.headers().contains_key("grpc-status")
@@ -1629,13 +1708,63 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     mflm_resp
                 }
             } else if is_ingester_rpc {
+                let effective_tonic_send = send_compression.or_else(|| match echo_encoding {
+                    Some("gzip")
+                        if accept_compression[..accept_compression_len]
+                            .iter()
+                            .flatten()
+                            .any(|e| *e == CompressionEncoding::Gzip) =>
+                    {
+                        Some(CompressionEncoding::Gzip)
+                    }
+                    Some("zstd")
+                        if accept_compression[..accept_compression_len]
+                            .iter()
+                            .flatten()
+                            .any(|e| *e == CompressionEncoding::Zstd) =>
+                    {
+                        Some(CompressionEncoding::Zstd)
+                    }
+                    _ => None,
+                });
+                if let Some(enc) = effective_tonic_send {
+                    if send_compression.is_none() {
+                        inner = inner.send_compressed(enc);
+                    }
+                }
                 let resp = READ_TAP_ADMITTED
                     .scope(
                         true,
                         scope_deadline_ctx(deadline_ctx.clone(), async { inner.call(req).await }),
                     )
                     .await?;
-                let resp = if max_send_len < usize::MAX
+                let resp = if let Some(custom_resp_enc @ ("snappy" | "s2")) = echo_encoding {
+                    if resp.status() == http::StatusCode::OK
+                        && !resp.headers().contains_key("grpc-status")
+                        && resp.headers().get("grpc-encoding").is_none()
+                    {
+                        let (mut parts, body) = resp.into_parts();
+                        parts.headers.insert(
+                            "grpc-encoding",
+                            http::HeaderValue::from_static(custom_resp_enc),
+                        );
+                        let enc = if custom_resp_enc == "s2" {
+                            CustomGrpcEncoding::S2
+                        } else {
+                            CustomGrpcEncoding::Snappy
+                        };
+                        http::Response::from_parts(
+                            parts,
+                            tonic::body::BoxBody::new(SnappyCompressBody::new(
+                                body,
+                                enc,
+                                max_send_len,
+                            )),
+                        )
+                    } else {
+                        resp
+                    }
+                } else if max_send_len < usize::MAX
                     && !resp.headers().contains_key("grpc-status")
                 {
                     resp.map(|b| tonic::body::BoxBody::new(MaxSendFrameBody::new(b, max_send_len)))
@@ -1767,7 +1896,13 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<cortexpb::WriteRequest>,
     ) -> Result<Response<cortexpb::WriteResponse>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        if !self.ingester.cfg.push_grpc_method_enabled {
+            let e = IngesterError::PushGrpcDisabled;
+            record_push_error(&self.ingester, request.extensions().get::<GrpcErrorLog>(), &e);
+            return Err(e.map_push_error_to_grpc_server_status());
+        }
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         if let Err(e) = self.ingester.push_grpc(&user_id, request.get_ref()).await {
             record_push_error(&self.ingester, request.extensions().get::<GrpcErrorLog>(), &e);
             return Err(e.map_push_error_to_grpc_server_status());
@@ -1793,9 +1928,10 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 ActivityRequest::Query(&inner),
             )
         });
+        let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);
         let stream = self
             .ingester
-            .handle_query_stream_bimodal(&md, &user_id, inner)
+            .handle_query_stream_bimodal_with_sink(&md, &user_id, inner, err_sink)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(ActivityStream {
@@ -1831,7 +1967,10 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         &self,
         request: Request<ingesterpb::LabelValuesRequest>,
     ) -> Result<Response<ingesterpb::LabelValuesResponse>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        let matchers = crate::query::validate_label_values_matchers(request.get_ref())
+            .map_err(|e| read_error_status(request.extensions(), e))?;
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
@@ -1844,7 +1983,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         });
         let resp = self
             .ingester
-            .handle_label_values(&md, &user_id, inner)
+            .handle_label_values_with_matchers(&md, &user_id, inner, matchers)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(resp))
@@ -1980,9 +2119,10 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 ActivityRequest::None,
             )
         });
+        let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);
         let stream = self
             .ingester
-            .handle_label_names_and_values_rx(&md, &user_id, inner)
+            .handle_label_names_and_values_rx_with_sink(&md, &user_id, inner, err_sink)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(ActivityStream {
@@ -2014,9 +2154,10 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 ActivityRequest::LabelValuesCardinality(&inner),
             )
         });
+        let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);
         let stream = self
             .ingester
-            .handle_label_values_cardinality_rx(&md, &user_id, inner)
+            .handle_label_values_cardinality_rx_with_sink(&md, &user_id, inner, err_sink)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(ActivityStream {
@@ -2043,9 +2184,10 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 ActivityRequest::None,
             )
         });
+        let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);
         let stream = self
             .ingester
-            .handle_active_series_rx(&md, &user_id, inner)
+            .handle_active_series_rx_with_sink(&md, &user_id, inner, err_sink)
             .await
             .map_err(|e| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(ActivityStream {
@@ -2079,9 +2221,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 ActivityRequest::None,
             )
         });
+        let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);
         let stream = self
             .ingester
-            .handle_search_label_names_with_hints_rx(&md, &user_id, inner, hints, matchers)
+            .handle_search_label_names_with_hints_rx_with_sink(
+                &md, &user_id, inner, hints, matchers, err_sink,
+            )
             .await
             .map_err(|e: IngesterError| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(ActivityStream {
@@ -2115,9 +2260,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 ActivityRequest::None,
             )
         });
+        let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);
         let stream = self
             .ingester
-            .handle_search_label_values_with_hints_rx(&md, &user_id, inner, hints, matchers)
+            .handle_search_label_values_with_hints_rx_with_sink(
+                &md, &user_id, inner, hints, matchers, err_sink,
+            )
             .await
             .map_err(|e: IngesterError| read_error_status(&ext, e))?;
         Ok(Response::new(Box::pin(ActivityStream {
@@ -2768,10 +2916,10 @@ mod tests {
             ..Default::default()
         };
         let push_reg = prometheus::Registry::new();
-        let push_cb = CircuitBreaker::new(&cb_cfg, Some(&push_reg), "push", true).unwrap();
+        let push_cb = CircuitBreaker::new(&cb_cfg, Some(&push_reg), "push", true).unwrap().unwrap();
         push_cb.activate();
         let read_reg = prometheus::Registry::new();
-        let read_cb = CircuitBreaker::new(&cb_cfg, Some(&read_reg), "read", true).unwrap();
+        let read_cb = CircuitBreaker::new(&cb_cfg, Some(&read_reg), "read", true).unwrap().unwrap();
         read_cb.activate();
 
         let rl_cfg = ReactiveLimiterConfig {

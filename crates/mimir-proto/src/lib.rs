@@ -20,6 +20,7 @@ pub use tonic;
 pub mod client;
 pub mod compat;
 pub mod cortexpb;
+pub mod go_strconv;
 pub mod grpcutilpb;
 pub use grpcutilpb::google_rpc;
 pub mod httpgrpcpb;

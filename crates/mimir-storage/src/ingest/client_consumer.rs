@@ -575,17 +575,27 @@ impl Worker {
         let prior = cursor.offset;
         let res = match cursor.last_consumed_ms {
             Some(ts) => {
-                match self
+                let start_fut = self
                     .client
-                    .list_offset_with_timestamp(&self.topic, self.partition_id, ts)
-                    .await
-                {
-                    Ok(l) if l.offset >= 0 => Ok(l.offset.min(prior)),
-                    Ok(_) => self
-                        .client
-                        .list_offset(&self.topic, self.partition_id, KAFKA_OFFSET_END)
-                        .await
-                        .map(|o| o.min(prior)),
+                    .fetch_partition_start_offset(&self.topic, self.partition_id);
+                let end_fut = self.client.list_offset(
+                    &self.topic,
+                    self.partition_id,
+                    KAFKA_OFFSET_END,
+                );
+                let by_time_fut =
+                    self.client
+                        .list_offset_with_timestamp(&self.topic, self.partition_id, ts);
+                match tokio::try_join!(start_fut, end_fut, by_time_fut) {
+                    Ok((start, end, by_time)) => {
+                        let mut offset = if by_time.offset >= 0 && by_time.offset < prior {
+                            by_time.offset
+                        } else {
+                            prior
+                        };
+                        offset = offset.max(start).min(end);
+                        Ok(offset)
+                    }
                     Err(e) => Err(e),
                 }
             }

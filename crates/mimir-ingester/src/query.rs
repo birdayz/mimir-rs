@@ -301,6 +301,51 @@ pub fn remove_shard_from_matchers(
 /// Go `client.FromLabelMatchers`. Its errors are plain errors, which the read RPCs return as
 /// `codes.Internal` (`mapReadErrorToErrorWithStatus`) with the Go text: `invalid matcher type` or
 /// the Prometheus regex error (`error parsing regexp: ...`).
+#[derive(Clone, Default)]
+pub(crate) struct ReadErrorSink {
+    pub(crate) log: Option<mimir_common::grpc_log::GrpcErrorLog>,
+    pub(crate) deadline_flag: Option<Arc<AtomicBool>>,
+}
+
+impl ReadErrorSink {
+    pub(crate) fn from_extensions(ext: &axum::http::Extensions) -> Self {
+        Self {
+            log: ext.get::<mimir_common::grpc_log::GrpcErrorLog>().cloned(),
+            deadline_flag: ext
+                .get::<crate::grpc::TapDeadlineFlag>()
+                .map(|f| Arc::clone(&f.0)),
+        }
+    }
+
+    pub(crate) fn map_read_error(&self, e: IngesterError) -> Status {
+        if let Some(ref log) = self.log {
+            log.set(mimir_common::grpc_log::GrpcErrorLogEntry {
+                err: e.to_string(),
+                keep: true,
+                reason: None,
+            });
+            if e.is_deadline_exceeded() {
+                log.set_instrumentation_code(tonic::Code::Unknown as i32);
+            }
+        }
+        if e.is_deadline_exceeded() {
+            if let Some(ref flag) = self.deadline_flag {
+                flag.store(true, AtomicOrdering::Relaxed);
+            }
+        }
+        e.map_read_error_to_status()
+    }
+}
+
+pub(crate) fn validate_label_values_matchers(
+    req: &ingesterpb::LabelValuesRequest,
+) -> Result<Vec<LabelMatcher>, IngesterError> {
+    match req.matchers {
+        Some(ref m) => from_proto_matchers(&m.matchers),
+        None => Ok(Vec::new()),
+    }
+}
+
 pub fn from_proto_matchers(
     raw: &[ingesterpb::LabelMatcher],
 ) -> Result<Vec<LabelMatcher>, IngesterError> {
@@ -746,7 +791,18 @@ impl Ingester {
         self: &Arc<Self>,
         md: &MetadataMap,
         user_id: &str,
+        req: ingesterpb::QueryRequest,
+    ) -> Result<QueryStreamBox, IngesterError> {
+        self.handle_query_stream_bimodal_with_sink(md, user_id, req, ReadErrorSink::default())
+            .await
+    }
+
+    pub(crate) async fn handle_query_stream_bimodal_with_sink(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
         mut req: ingesterpb::QueryRequest,
+        err_sink: ReadErrorSink,
     ) -> Result<QueryStreamBox, IngesterError> {
         let permit = self.start_read_request(md).await?;
         if req.streaming_chunks_batch_size == 0 {
@@ -841,6 +897,7 @@ impl Ingester {
                     let ingester = Arc::clone(self);
                     let db_c = Arc::clone(&db);
                     let user_c = user_id.to_owned();
+                    let err_sink = err_sink.clone();
                     tokio::task::spawn_blocking(move || {
                         let cq_b = if unordered {
                             db_c.db.unordered_chunk_querier(start_ts, end_ts)
@@ -860,7 +917,7 @@ impl Ingester {
                                     let err = IngesterError::Internal {
                                         message: format!("selecting series from ChunkQuerier: {e}"),
                                     };
-                                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                                    let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                                     permit.finish(false);
                                     return;
                                 }
@@ -995,7 +1052,7 @@ impl Ingester {
                                 let err = IngesterError::Internal {
                                     message: format!("selecting series from ChunkQuerier: {e}"),
                                 };
-                                let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                                let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                             }
                         }
                         permit.finish(false);
@@ -1133,7 +1190,7 @@ impl Ingester {
                 .stream_selected_query_batches(chunk_series, batch_limit, &tx)
                 .await;
             if let Err(e) = res {
-                let _ = tx.send(Err(e.map_read_error_to_status())).await;
+                let _ = tx.send(Err(err_sink.map_read_error(e))).await;
             }
             permit.finish(false);
         });
@@ -1150,7 +1207,18 @@ impl Ingester {
         self: &Arc<Self>,
         md: &MetadataMap,
         user_id: &str,
+        req: ingesterpb::QueryRequest,
+    ) -> Result<RawQueryStreamBox, IngesterError> {
+        self.handle_query_stream_raw_with_sink(md, user_id, req, ReadErrorSink::default())
+            .await
+    }
+
+    pub(crate) async fn handle_query_stream_raw_with_sink(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
         mut req: ingesterpb::QueryRequest,
+        err_sink: ReadErrorSink,
     ) -> Result<RawQueryStreamBox, IngesterError> {
         let permit = self.start_read_request(md).await?;
         if req.streaming_chunks_batch_size == 0 {
@@ -1243,6 +1311,7 @@ impl Ingester {
                     let ingester = Arc::clone(self);
                     let db_c = Arc::clone(&db);
                     let user_c = user_id.to_owned();
+                    let err_sink = err_sink.clone();
                     tokio::task::spawn_blocking(move || {
                         let cq_b = if unordered {
                             db_c.db.unordered_chunk_querier(start_ts, end_ts)
@@ -1262,7 +1331,7 @@ impl Ingester {
                                     let err = IngesterError::Internal {
                                         message: format!("selecting series from ChunkQuerier: {e}"),
                                     };
-                                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                                    let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                                     permit.finish(false);
                                     return;
                                 }
@@ -1384,7 +1453,7 @@ impl Ingester {
                                 let err = IngesterError::Internal {
                                     message: format!("selecting series from ChunkQuerier: {e}"),
                                 };
-                                let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                                let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                             }
                         }
                         permit.finish(false);
@@ -1502,7 +1571,7 @@ impl Ingester {
                 .stream_selected_raw_query_batches(chunk_series, batch_limit, &tx)
                 .await;
             if let Err(e) = res {
-                let _ = tx.send(Err(e.map_read_error_to_status())).await;
+                let _ = tx.send(Err(err_sink.map_read_error(e))).await;
             }
             permit.finish(false);
         });
@@ -1596,7 +1665,19 @@ impl Ingester {
         self: &Arc<Self>,
         md: &MetadataMap,
         user_id: &str,
+        req: ingesterpb::QueryRequest,
+    ) -> Result<ReceiverStream<Result<ingesterpb::QueryStreamResponse, Status>>, IngesterError>
+    {
+        self.handle_query_stream_rx_with_sink(md, user_id, req, ReadErrorSink::default())
+            .await
+    }
+
+    pub(crate) async fn handle_query_stream_rx_with_sink(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
         mut req: ingesterpb::QueryRequest,
+        err_sink: ReadErrorSink,
     ) -> Result<ReceiverStream<Result<ingesterpb::QueryStreamResponse, Status>>, IngesterError>
     {
         let permit = self.start_read_request(md).await?;
@@ -1646,7 +1727,7 @@ impl Ingester {
                 )
                 .await;
             if let Err(e) = res {
-                let _ = tx.send(Err(e.map_read_error_to_status())).await;
+                let _ = tx.send(Err(err_sink.map_read_error(e))).await;
             }
             permit.finish(false);
         });
@@ -2299,16 +2380,39 @@ impl Ingester {
         res
     }
 
+    pub(crate) async fn handle_label_values_with_matchers(
+        &self,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::LabelValuesRequest,
+        matchers: Vec<LabelMatcher>,
+    ) -> Result<ingesterpb::LabelValuesResponse, IngesterError> {
+        let permit = self.start_read_request(md).await?;
+        let res = self
+            .label_values_inner_with_matchers(md, user_id, req, matchers)
+            .await;
+        permit.finish(deadline_exceeded(&res));
+        res
+    }
+
     async fn label_values_inner(
         &self,
         md: &MetadataMap,
         user_id: &str,
         req: ingesterpb::LabelValuesRequest,
     ) -> Result<ingesterpb::LabelValuesResponse, IngesterError> {
-        let matchers = match req.matchers {
-            Some(ref m) => from_proto_matchers(&m.matchers)?,
-            None => Vec::new(),
-        };
+        let matchers = validate_label_values_matchers(&req)?;
+        self.label_values_inner_with_matchers(md, user_id, req, matchers)
+            .await
+    }
+
+    async fn label_values_inner_with_matchers(
+        &self,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::LabelValuesRequest,
+        matchers: Vec<LabelMatcher>,
+    ) -> Result<ingesterpb::LabelValuesResponse, IngesterError> {
         let limit = if req.limit > 0 {
             Some(req.limit as usize)
         } else {
@@ -2621,6 +2725,25 @@ impl Ingester {
         ReceiverStream<Result<ingesterpb::LabelNamesAndValuesResponse, Status>>,
         IngesterError,
     > {
+        self.handle_label_names_and_values_rx_with_sink(
+            md,
+            user_id,
+            req,
+            ReadErrorSink::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn handle_label_names_and_values_rx_with_sink(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::LabelNamesAndValuesRequest,
+        err_sink: ReadErrorSink,
+    ) -> Result<
+        ReceiverStream<Result<ingesterpb::LabelNamesAndValuesResponse, Status>>,
+        IngesterError,
+    > {
         let permit = self.start_read_request(md).await?;
         if let Err(e) = self.enforce_read_consistency(md, user_id).await {
             permit.finish(e.is_deadline_exceeded());
@@ -2669,7 +2792,7 @@ impl Ingester {
                         let err = IngesterError::Internal {
                             message: e.to_string(),
                         };
-                        let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                        let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                         permit.finish(false);
                         return;
                     }
@@ -2683,7 +2806,7 @@ impl Ingester {
                     let err = IngesterError::Internal {
                         message: e.to_string(),
                     };
-                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                    let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                     permit.finish(false);
                     return;
                 }
@@ -2901,6 +3024,25 @@ impl Ingester {
         ReceiverStream<Result<ingesterpb::LabelValuesCardinalityResponse, Status>>,
         IngesterError,
     > {
+        self.handle_label_values_cardinality_rx_with_sink(
+            md,
+            user_id,
+            req,
+            ReadErrorSink::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn handle_label_values_cardinality_rx_with_sink(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::LabelValuesCardinalityRequest,
+        err_sink: ReadErrorSink,
+    ) -> Result<
+        ReceiverStream<Result<ingesterpb::LabelValuesCardinalityResponse, Status>>,
+        IngesterError,
+    > {
         let permit = self.start_read_request(md).await?;
         if let Err(e) = self.enforce_read_consistency(md, user_id).await {
             permit.finish(e.is_deadline_exceeded());
@@ -2962,7 +3104,7 @@ impl Ingester {
                     Ok(r) => r,
                     Err(e) => {
                         let err = IngesterError::Internal { message: e.to_string() };
-                        let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                        let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                         permit.finish(false);
                         return;
                     }
@@ -3017,7 +3159,7 @@ impl Ingester {
                         Ok(v) => v,
                         Err(e) => {
                             let err = IngesterError::Internal { message: e.to_string() };
-                            let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                            let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                             permit.finish(false);
                             return;
                         }
@@ -3057,7 +3199,7 @@ impl Ingester {
                 let mut item: Option<ingesterpb::LabelValueSeriesCount> = None;
                 while let Some(res) = count_rx.blocking_recv() {
                     if let Some(e) = res.err {
-                        let _ = tx.blocking_send(Err(to_err(e).map_read_error_to_status()));
+                        let _ = tx.blocking_send(Err(err_sink.map_read_error(to_err(e))));
                         permit.finish(false);
                         return;
                     }
@@ -3294,6 +3436,18 @@ impl Ingester {
         req: ingesterpb::ActiveSeriesRequest,
     ) -> Result<ReceiverStream<Result<ingesterpb::ActiveSeriesResponse, Status>>, IngesterError>
     {
+        self.handle_active_series_rx_with_sink(md, user_id, req, ReadErrorSink::default())
+            .await
+    }
+
+    pub(crate) async fn handle_active_series_rx_with_sink(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::ActiveSeriesRequest,
+        err_sink: ReadErrorSink,
+    ) -> Result<ReceiverStream<Result<ingesterpb::ActiveSeriesResponse, Status>>, IngesterError>
+    {
         let permit = self.start_read_request(md).await?;
         let matchers = match active_series_matchers(&req.matchers) {
             Ok(m) => m,
@@ -3349,7 +3503,7 @@ impl Ingester {
             let refs = match refs {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(e.map_read_error_to_status()));
+                    let _ = tx.blocking_send(Err(err_sink.map_read_error(e)));
                     permit.finish(false);
                     return;
                 }
@@ -3525,6 +3679,26 @@ impl Ingester {
         hints: SearchHints,
         matchers: Vec<LabelMatcher>,
     ) -> Result<ReceiverStream<Result<ingesterpb::SearchResultBatch, Status>>, IngesterError> {
+        self.handle_search_label_names_with_hints_rx_with_sink(
+            md,
+            user_id,
+            req,
+            hints,
+            matchers,
+            ReadErrorSink::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn handle_search_label_names_with_hints_rx_with_sink(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::SearchLabelNamesRequest,
+        hints: SearchHints,
+        matchers: Vec<LabelMatcher>,
+        err_sink: ReadErrorSink,
+    ) -> Result<ReceiverStream<Result<ingesterpb::SearchResultBatch, Status>>, IngesterError> {
         let permit = self.start_read_request(md).await?;
         if let Err(e) = self.enforce_read_consistency(md, user_id).await {
             permit.finish(e.is_deadline_exceeded());
@@ -3551,7 +3725,7 @@ impl Ingester {
                 Ok(r) => r,
                 Err(e) => {
                     let err = IngesterError::Internal { message: e.to_string() };
-                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                    let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                     permit.finish(false);
                     return;
                 }
@@ -3572,7 +3746,7 @@ impl Ingester {
             if let Err(message) = stream_res {
                 if !receiver_closed {
                     let err = IngesterError::Internal { message };
-                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                    let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                 }
             }
             permit.finish(false);
@@ -3649,6 +3823,26 @@ impl Ingester {
         hints: SearchHints,
         matchers: Vec<LabelMatcher>,
     ) -> Result<ReceiverStream<Result<ingesterpb::SearchResultBatch, Status>>, IngesterError> {
+        self.handle_search_label_values_with_hints_rx_with_sink(
+            md,
+            user_id,
+            req,
+            hints,
+            matchers,
+            ReadErrorSink::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn handle_search_label_values_with_hints_rx_with_sink(
+        self: &Arc<Self>,
+        md: &MetadataMap,
+        user_id: &str,
+        req: ingesterpb::SearchLabelValuesRequest,
+        hints: SearchHints,
+        matchers: Vec<LabelMatcher>,
+        err_sink: ReadErrorSink,
+    ) -> Result<ReceiverStream<Result<ingesterpb::SearchResultBatch, Status>>, IngesterError> {
         let permit = self.start_read_request(md).await?;
         if let Err(e) = self.enforce_read_consistency(md, user_id).await {
             permit.finish(e.is_deadline_exceeded());
@@ -3676,7 +3870,7 @@ impl Ingester {
                 Ok(r) => r,
                 Err(e) => {
                     let err = IngesterError::Internal { message: e.to_string() };
-                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                    let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                     permit.finish(false);
                     return;
                 }
@@ -3697,7 +3891,7 @@ impl Ingester {
             if let Err(message) = stream_res {
                 if !receiver_closed {
                     let err = IngesterError::Internal { message };
-                    let _ = tx.blocking_send(Err(err.map_read_error_to_status()));
+                    let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
                 }
             }
             permit.finish(false);

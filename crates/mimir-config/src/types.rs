@@ -140,58 +140,155 @@ impl<'de> Deserialize<'de> for StringSliceCSVMulti {
     }
 }
 
-/// `flagext.Bytes`: human-readable base-2/base-10 byte counts (e.g. `64KiB`, `1MB`, `65535`).
+/// `flagext.Bytes`: human-readable base-2 byte counts (`alecthomas/units.ParseBase2Bytes`,
+/// e.g. `64KiB`, `1.5MiB`, `1MB`, `0`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HumanBytes(pub u64);
 
-impl HumanBytes {
-    pub fn parse(s: &str) -> Result<u64, ConfigError> {
-        let mut rest = s.trim();
-        if rest.is_empty() {
-            return Err(ConfigError::Flag("empty byte size".to_string()));
+/// Ported 1:1 from `github.com/alecthomas/units/util.go` (`leadingInt`).
+fn units_leading_int(s: &str) -> Result<(i64, &str), ()> {
+    const MAX_LEADING_INT: i64 = (i64::MAX - 9) / 10; // (1<<63 - 10) / 10
+    let bytes = s.as_bytes();
+    let mut x: i64 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if !c.is_ascii_digit() {
+            break;
         }
-        let mut total: u64 = 0;
-        while !rest.is_empty() {
-            let num_end = rest
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(rest.len());
-            if num_end == 0 {
-                return Err(ConfigError::Flag(format!("invalid byte size {s:?}")));
+        if x >= MAX_LEADING_INT {
+            return Err(());
+        }
+        x = x * 10 + i64::from(c - b'0');
+        i += 1;
+    }
+    Ok((x, &s[i..]))
+}
+
+/// Ported 1:1 from `github.com/alecthomas/units/util.go` (`ParseUnit`).
+fn units_parse_unit(mut s: &str, lookup: fn(&str) -> Option<f64>) -> Result<i64, String> {
+    let orig = s;
+    let mut f: f64 = 0.0;
+    let mut neg = false;
+
+    if let Some(first) = s.as_bytes().first().copied() {
+        if first == b'-' || first == b'+' {
+            neg = first == b'-';
+            s = &s[1..];
+        }
+    }
+    if s == "0" {
+        return Ok(0);
+    }
+    if s.is_empty() {
+        return Err(format!("units: invalid {orig}"));
+    }
+
+    while !s.is_empty() {
+        let first = s.as_bytes()[0];
+        if !(first == b'.' || first.is_ascii_digit()) {
+            return Err(format!("units: invalid {orig}"));
+        }
+
+        let pl = s.len();
+        let (x, rem) = units_leading_int(s).map_err(|()| format!("units: invalid {orig}"))?;
+        s = rem;
+        let mut g = x as f64;
+        let pre = pl != s.len();
+
+        let mut post = false;
+        if s.starts_with('.') {
+            s = &s[1..];
+            let pl_frac = s.len();
+            let (frac, rem_frac) =
+                units_leading_int(s).map_err(|()| format!("units: invalid {orig}"))?;
+            s = rem_frac;
+            let mut scale = 1.0_f64;
+            for _ in 0..(pl_frac - s.len()) {
+                scale *= 10.0;
             }
-            let num_str = &rest[..num_end];
-            rest = &rest[num_end..];
-            let val: u64 = num_str.parse().map_err(|e| {
-                ConfigError::Flag(format!("invalid byte size {s:?}: {e}"))
-            })?;
-
-            let unit_end = rest
-                .find(|c: char| c.is_ascii_digit())
-                .unwrap_or(rest.len());
-            let unit_str = rest[..unit_end].trim();
-            rest = &rest[unit_end..];
-
-            let mult: u64 = match unit_str {
-                "" | "B" => 1,
-                "KiB" | "KB" | "K" | "kB" => 1024,
-                "MiB" | "MB" | "M" => 1024 * 1024,
-                "GiB" | "GB" | "G" => 1024 * 1024 * 1024,
-                "TiB" | "TB" | "T" => 1024 * 1024 * 1024 * 1024,
-                "PiB" | "PB" | "P" => 1024 * 1024 * 1024 * 1024 * 1024,
-                "EiB" | "EB" | "E" => 1024 * 1024 * 1024 * 1024 * 1024 * 1024,
-                _ => {
-                    return Err(ConfigError::Flag(format!(
-                        "unknown byte unit {unit_str:?} in {s:?}"
-                    )));
-                }
-            };
-            let part = val
-                .checked_mul(mult)
-                .ok_or_else(|| ConfigError::Flag(format!("byte size overflow in {s:?}")))?;
-            total = total
-                .checked_add(part)
-                .ok_or_else(|| ConfigError::Flag(format!("byte size overflow in {s:?}")))?;
+            g += (frac as f64) / scale;
+            post = pl_frac != s.len();
         }
-        Ok(total)
+        if !pre && !post {
+            return Err(format!("units: invalid {orig}"));
+        }
+
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'.' || c.is_ascii_digit() {
+                break;
+            }
+            i += 1;
+        }
+        let u = &s[..i];
+        s = &s[i..];
+        let unit = lookup(u).ok_or_else(|| format!("units: unknown unit {u} in {orig}"))?;
+        f += g * unit;
+    }
+
+    if neg {
+        f = -f;
+    }
+    if f < (-1_i64 << 63) as f64 || f > i64::MAX as f64 {
+        return Err("units: overflow parsing unit".to_string());
+    }
+    Ok(f as i64)
+}
+
+fn base2_iec_unit(u: &str) -> Option<f64> {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    const PIB: f64 = TIB * 1024.0;
+    const EIB: f64 = PIB * 1024.0;
+    match u {
+        "B" => Some(1.0),
+        "KiB" => Some(KIB),
+        "MiB" => Some(MIB),
+        "GiB" => Some(GIB),
+        "TiB" => Some(TIB),
+        "PiB" => Some(PIB),
+        "EiB" => Some(EIB),
+        _ => None,
+    }
+}
+
+fn base2_old_unit(u: &str) -> Option<f64> {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    const TB: f64 = GB * 1024.0;
+    const PB: f64 = TB * 1024.0;
+    const EB: f64 = PB * 1024.0;
+    match u {
+        "B" => Some(1.0),
+        "KB" => Some(KB),
+        "MB" => Some(MB),
+        "GB" => Some(GB),
+        "TB" => Some(TB),
+        "PB" => Some(PB),
+        "EB" => Some(EB),
+        _ => None,
+    }
+}
+
+impl HumanBytes {
+    /// Parses `s` with Go `alecthomas/units.ParseBase2Bytes` semantics and returns the raw
+    /// Go error message on failure (without `ConfigError::Flag`'s `"invalid flag: "` prefix).
+    pub fn parse_str(s: &str) -> Result<u64, String> {
+        let n = match units_parse_unit(s, base2_iec_unit) {
+            Ok(n) => n,
+            Err(_) => units_parse_unit(s, base2_old_unit)?,
+        };
+        Ok(n as u64)
+    }
+
+    pub fn parse(s: &str) -> Result<u64, ConfigError> {
+        Self::parse_str(s).map_err(ConfigError::Flag)
     }
 }
 
@@ -232,18 +329,25 @@ impl<'de> Deserialize<'de> for HumanBytes {
         impl<'de> Visitor<'de> for BytesVisitor {
             type Value = HumanBytes;
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a byte size string (e.g. '64KiB') or integer")
+                formatter.write_str("a byte size string (e.g. '64KiB')")
             }
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(HumanBytes(v))
+                HumanBytes::parse_str(&v.to_string())
+                    .map(HumanBytes)
+                    .map_err(E::custom)
             }
             fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                u64::try_from(v)
+                HumanBytes::parse_str(&v.to_string())
                     .map(HumanBytes)
-                    .map_err(|_| E::custom(format!("negative byte size: {v}")))
+                    .map_err(E::custom)
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                HumanBytes::parse_str(&v.to_string())
+                    .map(HumanBytes)
+                    .map_err(E::custom)
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                HumanBytes::parse(v).map(HumanBytes).map_err(E::custom)
+                HumanBytes::parse_str(v).map(HumanBytes).map_err(E::custom)
             }
         }
         deserializer.deserialize_any(BytesVisitor)
@@ -748,5 +852,105 @@ mod human_bytes_tests {
             assert_eq!(HumanBytes(n).to_string(), want, "{n}");
             assert_eq!(HumanBytes::parse(want).unwrap(), n, "{want}");
         }
+    }
+
+    #[test]
+    fn parse_matches_alecthomas_units_parse_base2_bytes() {
+        for (input, want) in [
+            ("0", 0u64),
+            ("+0", 0),
+            ("-0", 0),
+            ("0B", 0),
+            ("64KiB", 65_536),
+            ("+64KiB", 65_536),
+            ("64KB", 65_536),
+            ("1.5MiB", 1_572_864),
+            (".5KiB", 512),
+            ("1.KiB", 1_024),
+            ("1KiB512B", 1_536),
+            ("1KB512B", 1_536),
+            ("-1KiB", (-1024_i64) as u64),
+        ] {
+            assert_eq!(HumanBytes::parse(input).unwrap(), want, "input={input:?}");
+        }
+
+        for (bad, want_err) in [
+            ("65536", "units: unknown unit  in 65536"),
+            ("64K", "units: unknown unit K in 64K"),
+            ("1M", "units: unknown unit M in 1M"),
+            ("64kB", "units: unknown unit kB in 64kB"),
+            (" 64KiB", "units: invalid  64KiB"),
+            ("64KiB ", "units: unknown unit KiB  in 64KiB "),
+            ("1KiB1MB", "units: unknown unit KiB in 1KiB1MB"),
+            ("", "units: invalid "),
+            ("+", "units: invalid +"),
+            ("-", "units: invalid -"),
+            (".KiB", "units: invalid .KiB"),
+            ("99999999999999999999B", "units: invalid 99999999999999999999B"),
+            ("10EB", "units: overflow parsing unit"),
+            ("10EiB", "units: unknown unit EiB in 10EiB"),
+        ] {
+            let err = HumanBytes::parse_str(bad).unwrap_err();
+            assert_eq!(err, want_err, "bad={bad:?}");
+        }
+    }
+
+    #[test]
+    fn yaml_deserialization_rejects_non_zero_integers_and_invalid_units() {
+        assert_eq!(serde_yaml::from_str::<HumanBytes>("0").unwrap(), HumanBytes(0));
+        assert_eq!(
+            serde_yaml::from_str::<HumanBytes>(r#""1.5MiB""#).unwrap(),
+            HumanBytes(1_572_864)
+        );
+        let int_err = serde_yaml::from_str::<HumanBytes>("1048576")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            int_err.contains("units: unknown unit  in 1048576"),
+            "unexpected err: {int_err}"
+        );
+
+        let mut bad_cfg = crate::MimirConfig::default();
+        let yaml_int_err = bad_cfg
+            .load_config_from_bytes(
+                b"ingester_client:
+  grpc_client_config:
+    initial_stream_window_size: 1048576
+",
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            yaml_int_err.contains("units: unknown unit  in 1048576"),
+            "unexpected yaml err: {yaml_int_err}"
+        );
+
+        let mut yaml_zero = crate::MimirConfig::default();
+        yaml_zero
+            .load_config_from_bytes(
+                b"ingester_client:
+  grpc_client_config:
+    initial_stream_window_size: 0
+",
+                false,
+            )
+            .unwrap();
+        assert_eq!(yaml_zero.ingester_client.grpc_client_config.initial_stream_window_size.0, 0);
+
+        let mut yaml_frac = crate::MimirConfig::default();
+        yaml_frac
+            .load_config_from_bytes(
+                b"ingester_client:
+  grpc_client_config:
+    initial_stream_window_size: 1.5MiB
+",
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            yaml_frac.ingester_client.grpc_client_config.initial_stream_window_size.0,
+            1_572_864
+        );
     }
 }

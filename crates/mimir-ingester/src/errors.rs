@@ -82,22 +82,14 @@ pub fn format_labels_string<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a st
         }
         out.push_str(k);
         out.push('=');
-        out.push('"');
-        for ch in v.chars() {
-            match ch {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c => out.push(c),
-            }
-        }
-        out.push('"');
+        mimir_proto::compat::append_go_quote_str(&mut out, v);
         count += 1;
     }
     if count > 0 {
         out.push('}');
+    }
+    if out.is_empty() {
+        return "{}".to_string();
     }
     out
 }
@@ -679,8 +671,7 @@ impl IngesterError {
             cortexpb::ErrorCause::InstanceLimit => tonic::Code::Unavailable,
             cortexpb::ErrorCause::TsdbUnavailable => tonic::Code::Internal,
             cortexpb::ErrorCause::MethodNotAllowed => tonic::Code::Unimplemented,
-            cortexpb::ErrorCause::CircuitBreakerOpen
-            | cortexpb::ErrorCause::RequestRateLimited => tonic::Code::Unavailable,
+            cortexpb::ErrorCause::CircuitBreakerOpen => tonic::Code::Unavailable,
             _ => tonic::Code::Internal,
         };
         match self.error_details() {
@@ -716,8 +707,7 @@ impl IngesterError {
         let code = match self.error_cause() {
             cortexpb::ErrorCause::TooBusy => tonic::Code::ResourceExhausted,
             cortexpb::ErrorCause::ServiceUnavailable
-            | cortexpb::ErrorCause::CircuitBreakerOpen
-            | cortexpb::ErrorCause::RequestRateLimited => tonic::Code::Unavailable,
+            | cortexpb::ErrorCause::CircuitBreakerOpen => tonic::Code::Unavailable,
             cortexpb::ErrorCause::MethodNotAllowed => tonic::Code::Unimplemented,
             _ => tonic::Code::Internal,
         };
@@ -729,18 +719,23 @@ impl IngesterError {
         }
     }
 
-    /// Maps an ingester error to its equivalent `httpgrpc` HTTP status code (`400`/`429`/`500`/`501`/`503`).
+    /// Maps an ingester error to its equivalent `httpgrpc` HTTP status code (`202`/`400`/`429`/`500`/`501`/`503`).
     pub fn http_status_code(&self) -> i32 {
         match self.error_cause() {
-            cortexpb::ErrorCause::BadData | cortexpb::ErrorCause::TenantLimit => 400,
-            cortexpb::ErrorCause::RequestRateLimited
-            | cortexpb::ErrorCause::IngestionRateLimited
-            | cortexpb::ErrorCause::TooBusy => 429,
+            cortexpb::ErrorCause::BadData
+            | cortexpb::ErrorCause::TenantLimit
+            | cortexpb::ErrorCause::TooManyClusters => 400,
+            cortexpb::ErrorCause::ReplicasDidNotMatch => 202,
+            cortexpb::ErrorCause::IngestionRateLimited
+            | cortexpb::ErrorCause::RequestRateLimited
+            | cortexpb::ErrorCause::ActiveSeriesLimited => 429,
             cortexpb::ErrorCause::MethodNotAllowed => 501,
-            cortexpb::ErrorCause::ServiceUnavailable
-            | cortexpb::ErrorCause::InstanceLimit
-            | cortexpb::ErrorCause::CircuitBreakerOpen => 503,
-            _ => 500,
+            cortexpb::ErrorCause::TsdbUnavailable
+            | cortexpb::ErrorCause::CircuitBreakerOpen
+            | cortexpb::ErrorCause::InstanceLimit => 503,
+            cortexpb::ErrorCause::Unknown
+            | cortexpb::ErrorCause::ServiceUnavailable
+            | cortexpb::ErrorCause::TooBusy => 500,
         }
     }
 
@@ -844,7 +839,13 @@ impl fmt::Display for IngesterError {
             ),
             Self::Validation {
                 message, series, ..
-            } => write!(f, "{message} This is for series {series}"),
+            } => {
+                if series.is_empty() {
+                    f.write_str(message)
+                } else {
+                    write!(f, "{message} This is for series {series}")
+                }
+            }
             Self::NativeHistogramValidation {
                 err_id,
                 original_err,
@@ -1022,8 +1023,8 @@ mod tests {
         let e6 = IngesterError::ReactiveLimiterExceeded {
             message: "limit exceeded".to_string(),
         };
-        assert_eq!(e6.map_push_error_to_status().code(), tonic::Code::Unavailable);
-        assert_eq!(e6.map_read_error_to_status().code(), tonic::Code::Unavailable);
+        assert_eq!(e6.map_push_error_to_status().code(), tonic::Code::Internal);
+        assert_eq!(e6.map_read_error_to_status().code(), tonic::Code::Internal);
 
         let e7 = IngesterError::tsdb_early_compaction(1_700_000_000_000, 1_700_000_060_000)
             .with_user("t1", 0);

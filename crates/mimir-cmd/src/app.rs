@@ -221,8 +221,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         None
     };
 
+    let ingester_enabled = cfg.is_ingester_enabled();
+
     // 2. RuntimeConfigManager & Overrides.
-    let (runtime_config_mgr, overrides) = if !cfg.runtime_config.file.0.is_empty() {
+    let (runtime_config_mgr, overrides) =
+        if ingester_enabled && !cfg.runtime_config.file.0.is_empty() {
         let sources = mimir_config::runtime_config_source_ids(&cfg.runtime_config)
             .context("initializing runtime config manager")?;
         let observer = Arc::new(
@@ -264,7 +267,6 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let _bound_http_addr = server.http_addr()?;
     let bound_grpc_addr = server.grpc_addr()?;
 
-    let ingester_enabled = cfg.is_ingester_enabled();
     let service_ctx = ServiceContext::background();
 
     // Module services of the configured targets (Go `Mimir.ServiceMap`), used by /ready,
@@ -443,7 +445,13 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                 ..Default::default()
             },
         )
-        .context("creating memberlist KV")?;
+        .map_err(|e| {
+            if cfg.is_module_explicitly_targeted("memberlist-kv") {
+                anyhow::anyhow!("failed to initialise memberlist client instance: {e}")
+            } else {
+                anyhow::anyhow!("creating memberlist KV: {e}")
+            }
+        })?;
         Some(ml)
     } else {
         None
@@ -451,10 +459,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let memberlist_state = StateCell::new(State::New);
     let memberlist_svc = memberlist_kv.as_ref().map(|ml| ml.service());
     if memberlist_module {
-        match memberlist_svc {
-            Some(ref svc) => modules.add("memberlist-kv", service_state_fn(svc)),
-            None => modules.add("memberlist-kv", memberlist_state.state_fn()),
-        }
+        modules.add("memberlist-kv", memberlist_state.state_fn());
     }
     // Go: dskit ring, lifecycler and partition ring metrics and the ingester ring/lifecycler KV
     // clients use `prometheus.WrapRegistererWithPrefix("cortex_", t.Registerer)`; the partition
@@ -854,12 +859,16 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         if let Some(svc) = svc {
             let tx = module_failed_tx.clone();
             let name = name.to_string();
+            let ml_state = (name == "memberlist-kv").then(|| Arc::clone(&memberlist_state));
             listener_handles.push(svc.add_listener(FnListener::new(
                 None,
                 None,
                 None,
                 None,
                 Some(Box::new(move |_, err| {
+                    if let Some(ref ml_state) = ml_state {
+                        ml_state.set(State::Failed);
+                    }
                     let _ = tx.send((name.clone(), err.to_string()));
                 })),
             )));
@@ -870,27 +879,18 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let mut signaled = false;
     {
         let startup_fut = async {
-            // memberlist-kv: starting (transport + fast-join) runs while HTTP/gRPC already serve;
-            // /ready reports "memberlist-kv: Starting" meanwhile. Rings depend on it.
+            // memberlist-kv: mirrors Go KVInitService — transitions to Running immediately while
+            // inner MemberlistKv starts (transport + fast-join) in the background, failing only if
+            // MemberlistKv fails. Rings still await MemberlistKv via await_kv_running_or_stopping().
             if memberlist_module {
                 log_module_starting(&*logger, "memberlist-kv");
+                memberlist_state.set(State::Running);
             }
             if let Some(ref svc) = memberlist_svc {
-                svc.start_async(service_ctx.child())
-                    .await
-                    .map_err(|e| ("memberlist-kv".to_string(), anyhow::anyhow!(e)))?;
-                if let Err(err) = svc.await_running().await {
-                    let cause = svc
-                        .failure_case()
-                        .map(|f| f.to_string())
-                        .unwrap_or_else(|| err.to_string());
-                    return Err((
-                        "memberlist-kv".to_string(),
-                        anyhow::anyhow!("starting module memberlist-kv: {cause}"),
-                    ));
+                if let Err(e) = svc.start_async(service_ctx.child()).await {
+                    memberlist_state.set(State::Failed);
+                    return Err(("memberlist-kv".to_string(), anyhow::anyhow!(e)));
                 }
-            } else {
-                memberlist_state.set(State::Running);
             }
             if let Some(ref rsvc) = ring_svc {
                 log_module_starting(&*logger, "ingester-ring");
@@ -1085,7 +1085,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     }
     service_ctx.cancel();
     runtime_config_state.set(State::Stopping);
-    memberlist_state.set(State::Stopping);
+    // Go KVInitService: a failed inner KV makes `running` return its error, so the module ends
+    // up Failed (never Terminated).
+    if memberlist_state.get() != State::Failed {
+        memberlist_state.set(State::Stopping);
+    }
     server_state.set(State::Stopping);
 
     // `MemberlistKV` depends on `API` -> `Server`: memberlist leaves the cluster and stops
@@ -1097,7 +1101,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     if let Some(ml) = memberlist_kv {
         ml.shutdown().await;
     }
-    memberlist_state.set(State::Terminated);
+    if memberlist_failure.is_some() || memberlist_state.get() == State::Failed {
+        memberlist_state.set(State::Failed);
+    } else {
+        memberlist_state.set(State::Terminated);
+    }
     if memberlist_module && reached_running("memberlist-kv") {
         match memberlist_failure {
             Some(err_s) => logger.log(

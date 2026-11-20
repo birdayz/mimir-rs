@@ -496,18 +496,49 @@ impl KafkaWriterClient {
         }
     }
 
+    const RECORD_BATCH_V2_OVERHEAD: usize = 61;
+
+    fn varint_len(mut v: u64) -> usize {
+        let mut len = 1;
+        while v >= 0x80 {
+            v >>= 7;
+            len += 1;
+        }
+        len
+    }
+
+    fn zigzag_varint_len(v: i64) -> usize {
+        let z = ((v << 1) ^ (v >> 63)) as u64;
+        Self::varint_len(z)
+    }
+
+    fn v2_record_wire_bytes(record: &WriterRecord, offset_delta: i32) -> usize {
+        let key_len = record.key.len();
+        let val_len = record.value.len();
+        let mut headers_bytes = Self::zigzag_varint_len(record.headers.len() as i64);
+        for (hk, hv) in &record.headers {
+            headers_bytes += Self::zigzag_varint_len(hk.len() as i64)
+                + hk.len()
+                + Self::zigzag_varint_len(hv.len() as i64)
+                + hv.len();
+        }
+        let body_len = 1 // attributes
+            + 5 // conservative timestampDelta varlong
+            + Self::zigzag_varint_len(offset_delta as i64)
+            + Self::zigzag_varint_len(key_len as i64)
+            + key_len
+            + Self::zigzag_varint_len(val_len as i64)
+            + val_len
+            + headers_bytes;
+        Self::zigzag_varint_len(body_len as i64) + body_len
+    }
+
     async fn send_partition_batch(
         &self,
         topic: String,
         partition: i32,
         items: Vec<QueuedItem>,
     ) {
-        let earliest_enqueue = items
-            .iter()
-            .map(|i| i.enqueued_at)
-            .min()
-            .unwrap_or_else(Instant::now);
-
         let mut valid_items = Vec::with_capacity(items.len());
         for item in items {
             let rec_bytes = item.record.key.len() + item.record.value.len();
@@ -521,10 +552,48 @@ impl KafkaWriterClient {
                 valid_items.push(item);
             }
         }
-        let mut items = valid_items;
-        if items.is_empty() {
+        if valid_items.is_empty() {
             return;
         }
+
+        // Split into sub-batches that fit within PRODUCER_BATCH_MAX_BYTES (matching kgo ProducerBatchMaxBytes).
+        let mut sub_batches: Vec<Vec<QueuedItem>> = Vec::new();
+        let mut curr_batch: Vec<QueuedItem> = Vec::new();
+        let mut curr_bytes: usize = Self::RECORD_BATCH_V2_OVERHEAD;
+        for item in valid_items {
+            let rec_wire = Self::v2_record_wire_bytes(&item.record, curr_batch.len() as i32);
+            if !curr_batch.is_empty() && curr_bytes + rec_wire > PRODUCER_BATCH_MAX_BYTES {
+                sub_batches.push(curr_batch);
+                curr_batch = Vec::new();
+                curr_bytes = Self::RECORD_BATCH_V2_OVERHEAD
+                    + Self::v2_record_wire_bytes(&item.record, 0);
+                curr_batch.push(item);
+            } else {
+                curr_bytes += rec_wire;
+                curr_batch.push(item);
+            }
+        }
+        if !curr_batch.is_empty() {
+            sub_batches.push(curr_batch);
+        }
+
+        for sub_batch in sub_batches {
+            self.send_single_partition_batch(&topic, partition, sub_batch)
+                .await;
+        }
+    }
+
+    async fn send_single_partition_batch(
+        &self,
+        topic: &str,
+        partition: i32,
+        mut items: Vec<QueuedItem>,
+    ) {
+        let earliest_enqueue = items
+            .iter()
+            .map(|i| i.enqueued_at)
+            .min()
+            .unwrap_or_else(Instant::now);
 
         let mut last_err;
         let mut retry_backoff = Duration::from_millis(25);
@@ -552,7 +621,7 @@ impl KafkaWriterClient {
             let produce_res = tokio::time::timeout(
                 remaining_wait,
                 self.inner
-                    .produce(&topic, partition, self.compression, records),
+                    .produce(topic, partition, self.compression, records),
             )
             .await;
 
@@ -580,11 +649,19 @@ impl KafkaWriterClient {
                     if earliest_enqueue.elapsed() >= unknown_limit {
                         break;
                     }
-                    let _ = self.inner.refresh_metadata(&[topic.as_str()]).await;
+                    let _ = self.inner.refresh_metadata(&[topic]).await;
                     if earliest_enqueue.elapsed() >= unknown_limit {
                         break;
                     }
                     retry_backoff = (retry_backoff * 2).min(Duration::from_millis(250));
+                }
+                Ok(Err(KafkaClientError::Broker(resp_err)))
+                    if !super::kgo_retry::is_retriable_response_error(resp_err) =>
+                {
+                    last_err = Some(ProducerError::Other(
+                        KafkaClientError::Broker(resp_err).to_string(),
+                    ));
+                    break;
                 }
                 Ok(Err(e)) => {
                     last_err = Some(ProducerError::Other(e.to_string()));

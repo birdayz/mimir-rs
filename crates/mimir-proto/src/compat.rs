@@ -307,6 +307,68 @@ pub fn from_label_adapters_to_key_string(ls: &[LabelAdapter]) -> Vec<u8> {
     buf
 }
 
+#[inline]
+fn is_go_print(ch: char) -> bool {
+    crate::go_strconv::is_print(ch)
+}
+
+#[inline]
+fn append_go_escaped_rune(out: &mut String, ch: char) {
+    use std::fmt::Write as _;
+    if ch == '"' || ch == '\\' {
+        out.push('\\');
+        out.push(ch);
+        return;
+    }
+    if is_go_print(ch) {
+        out.push(ch);
+        return;
+    }
+    match ch {
+        '\x07' => out.push_str("\\a"),
+        '\x08' => out.push_str("\\b"),
+        '\x0c' => out.push_str("\\f"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\x0b' => out.push_str("\\v"),
+        _ => {
+            let r = ch as u32;
+            if r < 0x20 || r == 0x7f {
+                let _ = write!(out, "\\x{r:02x}");
+            } else if r < 0x10000 {
+                let _ = write!(out, "\\u{r:04x}");
+            } else {
+                let _ = write!(out, "\\U{r:08x}");
+            }
+        }
+    }
+}
+
+/// Appends a double-quoted string matching Go's `strconv.AppendQuote`.
+pub fn append_go_quote_str(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        append_go_escaped_rune(out, ch);
+    }
+    out.push('"');
+}
+
+/// Appends a double-quoted byte slice matching Go's `strconv.AppendQuote` (escaping invalid UTF-8 bytes as `\xNN`).
+pub fn append_go_quote_bytes(out: &mut String, bytes: &[u8]) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for chunk in bytes.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            append_go_escaped_rune(out, ch);
+        }
+        for &b in chunk.invalid() {
+            let _ = write!(out, "\\x{b:02x}");
+        }
+    }
+    out.push('"');
+}
+
 pub fn from_label_adapters_to_string(ls: &[LabelAdapter]) -> String {
     let mut out = String::new();
     let mut metric_name_idx = None;
@@ -329,9 +391,7 @@ pub fn from_label_adapters_to_string(ls: &[LabelAdapter]) -> String {
         }
         out.push_str(&l.name);
         out.push('=');
-        if let Ok(q) = serde_json::to_string(&l.value) {
-            out.push_str(&q);
-        }
+        append_go_quote_str(&mut out, &l.value);
         count += 1;
     }
     if count > 0 {

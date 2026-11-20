@@ -26,7 +26,7 @@ use mimir_storage::ingest::{
     PusherConsumerMetrics, PusherError, ReaderError, RecordBatchConsumer,
     SingleClusterPartitionReader, READ_COMPARTMENT_ID_PLACEHOLDER,
 };
-use mimir_tsdb::labels::{append_stringlabel_pair, Labels};
+use mimir_tsdb::labels::append_stringlabel_pair;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use tracing::{error, info};
@@ -128,15 +128,14 @@ impl IngestReaderHandle {
 /// Adapts [`Ingester`] into [`PreCommitNotifier`].
 pub struct IngesterStorageAdapter(pub Arc<Ingester>);
 
-fn ingester_err_to_pusher_err(err: IngesterError) -> PusherError {
+pub fn ingester_err_to_pusher_err(err: IngesterError) -> PusherError {
     let cause = err.error_cause();
     let grpc_code = match cause {
         ErrorCause::BadData => "InvalidArgument",
         ErrorCause::TenantLimit => "FailedPrecondition",
         ErrorCause::ServiceUnavailable
         | ErrorCause::InstanceLimit
-        | ErrorCause::CircuitBreakerOpen
-        | ErrorCause::RequestRateLimited => "Unavailable",
+        | ErrorCause::CircuitBreakerOpen => "Unavailable",
         ErrorCause::MethodNotAllowed => "Unimplemented",
         _ => "Internal",
     };
@@ -187,6 +186,8 @@ struct ShardSeriesItem {
     prom_hash: u64,
     label_bytes_start: u32,
     label_bytes_len: u32,
+    raw_label_bytes_start: u32,
+    raw_label_bytes_len: u32,
     samples_start: u32,
     samples_len: u32,
     created_timestamp: i64,
@@ -217,7 +218,7 @@ struct WorkerArena {
     label_bytes_arena: Vec<u8>,
     samples_arena: Vec<cortexpb::Sample>,
     histograms_arena: Vec<ConvertedHistogram>,
-    exemplars_arena: Vec<Result<(i64, f64, Labels, String), crate::errors::IngesterError>>,
+    exemplars_arena: Vec<crate::push::ConvertedExemplarResult>,
     shard_buckets: Vec<Vec<ShardSeriesItem>>,
     metadata: MetadataStash,
     trace_ids: Vec<String>,
@@ -681,7 +682,7 @@ impl IngesterShardedBatchConsumer {
                 jaeger: false,
             };
             let topic_name = &self.kafka_cfg.topic;
-            let mut tmp_ex: Vec<Result<(i64, f64, Labels, String), crate::errors::IngesterError>> =
+            let mut tmp_ex: Vec<crate::push::ConvertedExemplarResult> =
                 Vec::new();
             let mut bucket_bases = [0usize; 16];
             for (local_i, rec) in slice.iter().enumerate() {
@@ -828,6 +829,13 @@ impl IngesterShardedBatchConsumer {
                             let label_bytes_start = ts.label_bytes_range.start as u32;
                             let label_bytes_len =
                                 (ts.label_bytes_range.end - ts.label_bytes_range.start) as u32;
+                            let (raw_label_bytes_start, raw_label_bytes_len) =
+                                match ts.raw_label_bytes_range {
+                                    Some(ref rr) if !ts.bad_utf8 => {
+                                        (rr.start as u32, rr.len() as u32)
+                                    }
+                                    _ => (label_bytes_start, label_bytes_len),
+                                };
                             let prom_hash = if !ts.bad_utf8
                                 && ts.labels_sorted_unique
                                 && label_bytes_len > 0
@@ -879,6 +887,8 @@ impl IngesterShardedBatchConsumer {
                                 prom_hash,
                                 label_bytes_start,
                                 label_bytes_len,
+                                raw_label_bytes_start,
+                                raw_label_bytes_len,
                                 samples_start: ts.samples_range.start as u32,
                                 samples_len: (ts.samples_range.end - ts.samples_range.start)
                                     as u32,
@@ -964,6 +974,7 @@ impl IngesterShardedBatchConsumer {
                     let label_bytes_start = label_bytes_arena.len();
                     let mut labels_sorted_unique = true;
                     let mut bad_utf8 = false;
+                    let mut dropped_empty = false;
                     let mut prev_name: Option<&str> = None;
 
                     if let Some(ts_labels_str) = ts.labels_str() {
@@ -981,6 +992,8 @@ impl IngesterShardedBatchConsumer {
                                     k.as_bytes(),
                                     v.as_bytes(),
                                 );
+                            } else {
+                                dropped_empty = true;
                             }
                         }
                     } else {
@@ -1007,15 +1020,48 @@ impl IngesterShardedBatchConsumer {
                                     k.as_bytes(),
                                     v.as_bytes(),
                                 );
+                            } else {
+                                dropped_empty = true;
                             }
                         }
                     }
 
-                    if bad_utf8 {
+                    let mut raw_range: Option<(u32, u32)> = None;
+                    let label_bytes_end = if bad_utf8 {
                         label_bytes_arena.truncate(label_bytes_start);
-                    }
-                    let label_bytes_end = label_bytes_arena.len();
+                        label_bytes_start
+                    } else if !labels_sorted_unique && dropped_empty {
+                        label_bytes_arena.truncate(label_bytes_start);
+                        if let Some(ts_labels_str) = ts.labels_str() {
+                            for (k, v) in ts_labels_str {
+                                append_stringlabel_pair(label_bytes_arena, k.as_bytes(), v.as_bytes());
+                            }
+                        } else {
+                            for lp in ts.labels() {
+                                append_stringlabel_pair(label_bytes_arena, lp.name, lp.value);
+                            }
+                        }
+                        label_bytes_arena.len()
+                    } else if labels_sorted_unique && dropped_empty {
+                        let enc_end = label_bytes_arena.len();
+                        let raw_start = enc_end;
+                        if let Some(ts_labels_str) = ts.labels_str() {
+                            for (k, v) in ts_labels_str {
+                                append_stringlabel_pair(label_bytes_arena, k.as_bytes(), v.as_bytes());
+                            }
+                        } else {
+                            for lp in ts.labels() {
+                                append_stringlabel_pair(label_bytes_arena, lp.name, lp.value);
+                            }
+                        }
+                        raw_range = Some((raw_start as u32, (label_bytes_arena.len() - raw_start) as u32));
+                        enc_end
+                    } else {
+                        label_bytes_arena.len()
+                    };
                     let label_bytes_len = (label_bytes_end - label_bytes_start) as u32;
+                    let (raw_label_bytes_start, raw_label_bytes_len) =
+                        raw_range.unwrap_or((label_bytes_start as u32, label_bytes_len));
                     let prom_hash = if !bad_utf8 && labels_sorted_unique && label_bytes_len > 0 {
                         xxh64(&label_bytes_arena[label_bytes_start..label_bytes_end], 0)
                     } else {
@@ -1070,6 +1116,8 @@ impl IngesterShardedBatchConsumer {
                         prom_hash,
                         label_bytes_start: label_bytes_start as u32,
                         label_bytes_len,
+                        raw_label_bytes_start,
+                        raw_label_bytes_len,
                         samples_start,
                         samples_len,
                         created_timestamp: ts.created_timestamp(),
@@ -1400,6 +1448,8 @@ impl IngesterShardedBatchConsumer {
                 let wa = &arenas_ref[item.worker_idx as usize];
                 let encoded_labels =
                     wa.label_bytes_slice(item.label_bytes_start, item.label_bytes_len);
+                let raw_encoded_labels =
+                    wa.label_bytes_slice(item.raw_label_bytes_start, item.raw_label_bytes_len);
                 let s_start = item.samples_start as usize;
                 let s_end = s_start + item.samples_len as usize;
                 let samples = &wa.samples_arena[s_start..s_end];
@@ -1419,6 +1469,7 @@ impl IngesterShardedBatchConsumer {
 
                 batch.push(PrehashedSeriesItem {
                     encoded_labels,
+                    raw_encoded_labels,
                     samples,
                     created_timestamp: item.created_timestamp,
                     prom_hash: item.prom_hash,
