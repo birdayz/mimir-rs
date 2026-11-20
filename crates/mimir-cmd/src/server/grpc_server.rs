@@ -69,6 +69,7 @@ pub struct GrpcServerConfig {
     /// `noGRPCAuthOn` methods.
     pub multitenancy_enabled: bool,
     pub no_auth_tenant: String,
+    pub tap_ingester: Option<Arc<mimir_ingester::Ingester>>,
 }
 
 #[derive(Clone)]
@@ -161,6 +162,14 @@ impl KnownGrpcMethod {
             Self::HealthWatch => "/grpc.health.v1.Health/Watch",
             Self::HealthList => "/grpc.health.v1.Health/List",
         }
+    }
+
+    #[inline]
+    const fn is_ingester(self) -> bool {
+        !matches!(
+            self,
+            Self::HttpGrpcHandle | Self::HealthCheck | Self::HealthWatch | Self::HealthList
+        )
     }
 
     #[inline]
@@ -614,12 +623,30 @@ struct RpcGuard {
     parent_span_id: Option<[u8; 8]>,
     span_start_unix_nano: u64,
     span_attributes: GrpcSpanAttributes,
+    suppressed: bool,
     done: bool,
 }
 
 impl RpcGuard {
+    fn suppress(&mut self) {
+        self.suppressed = true;
+    }
+
     fn finish(&mut self, completed: bool) {
         if std::mem::replace(&mut self.done, true) {
+            return;
+        }
+        if self.cache.stats_tracking {
+            self.cache
+                .dec_inflight(self.known_method, self.unknown_inflight.as_ref());
+            if let Some(t) = &self.cache.metrics.stream_tracker {
+                t.close_stream(self.conn.id);
+            }
+        }
+        if self.conn.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            *self.conn.idle_since.lock() = Instant::now();
+        }
+        if self.suppressed {
             return;
         }
         let code = match self.status_code {
@@ -643,16 +670,6 @@ impl RpcGuard {
             label_code,
             elapsed.as_secs_f64(),
         );
-        if self.cache.stats_tracking {
-            self.cache
-                .dec_inflight(self.known_method, self.unknown_inflight.as_ref());
-            if let Some(t) = &self.cache.metrics.stream_tracker {
-                t.close_stream(self.conn.id);
-            }
-        }
-        if self.conn.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            *self.conn.idle_since.lock() = Instant::now();
-        }
         if self.span_ctx.is_sampled() {
             if let Some(rt) = global_tracing() {
                 if rt.exporter.is_some() {
@@ -774,6 +791,30 @@ fn early_abort(status: tonic::Status, http_status: http::StatusCode) -> GrpcResp
     resp
 }
 
+fn parse_tap_message_size_header(headers: &http::HeaderMap) -> i64 {
+    let mut iter = headers.get_all("message-size").iter();
+    let Some(first) = iter.next() else {
+        return 0;
+    };
+    if iter.next().is_some() {
+        return 0;
+    }
+    first
+        .to_str()
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn unavailable_tap_response(err: impl std::fmt::Display) -> GrpcResponse {
+    let mut resp = tonic::Status::unavailable(err.to_string()).into_http();
+    resp.headers_mut().insert(
+        "grpc-accept-encoding",
+        http::HeaderValue::from_static("snappy,s2,gzip,identity"),
+    );
+    resp
+}
+
 async fn handle<B>(
     mut req: hyper::Request<B>,
     remote: SocketAddr,
@@ -813,6 +854,60 @@ where
         }
     };
 
+    let extracted_trace = extract_from_http_headers(req.headers());
+    let (span_ctx, parent_span_id) = start_server_span_context(&extracted_trace, false);
+    let span_start_unix_nano = now_unix_nanos();
+
+    // Interceptor order (dskit server.New): TapHandle admission runs in grpc-go transport
+    // header processing BEFORE grpcStatsHandler (`cortex_request_duration_seconds`), Mimir's
+    // GRPCMiddleware (multitenant auth), and cluster validation.
+    let auth_rejection = (cfg.multitenancy_enabled
+        && known_method != Some(KnownGrpcMethod::IngesterPush))
+        .then(|| check_org_id_known(req.headers(), known_method, &method))
+        .flatten();
+    let rejection = auth_rejection.clone().or_else(|| {
+        cfg.cluster_validation.as_ref().and_then(|cv| {
+            let skip = match known_method {
+                Some(k) => k.is_streaming_or_health(),
+                None => {
+                    STREAMING_METHODS.contains(&method.as_ref())
+                        || method.starts_with("/grpc.health.v1.Health/")
+                }
+            };
+            if skip {
+                return None;
+            }
+            check_cluster(
+                req.headers(),
+                &method,
+                remote,
+                cv,
+                &cache,
+                cfg.multitenancy_enabled,
+                &cfg.no_auth_tenant,
+                &span_ctx,
+            )
+        })
+    });
+
+    // When auth/cluster validation rejects, `routes.oneshot(req)` will not run; enforce the
+    // pre-body `TapHandle` check here ahead of `auth_rejection` / `check_cluster` and before
+    // `RpcGuard` / `stats_tracking`.
+    if rejection.is_some() {
+        if let Some(ref ing) = cfg.tap_ingester {
+            if known_method.is_some_and(KnownGrpcMethod::is_ingester) {
+                if known_method == Some(KnownGrpcMethod::IngesterPush) {
+                    let req_size = parse_tap_message_size_header(req.headers());
+                    if let Err(e) = ing.try_start_push_tap(req_size) {
+                        return Ok(unavailable_tap_response(e));
+                    }
+                } else if let Err(e) = ing.try_start_read_tap(req.headers()) {
+                    return Ok(unavailable_tap_response(e));
+                }
+            }
+        }
+    }
+
     conn.active.fetch_add(1, Ordering::AcqRel);
     // Pre-resolve all labeled metric handles once per stream (`grpcStatsHandler.TagRPC` in
     // `dskit/middleware/grpc_stats.go`), so `cortex_request_message_bytes` and
@@ -830,9 +925,14 @@ where
         (None, None, None)
     };
     let error_log = GrpcErrorLog::default();
-    let extracted_trace = extract_from_http_headers(req.headers());
-    let (span_ctx, parent_span_id) = start_server_span_context(&extracted_trace, false);
-    let span_start_unix_nano = now_unix_nanos();
+    if auth_rejection.is_some() {
+        // `user.ErrNoOrgID` is a plain Go error: logged as its text.
+        error_log.set(GrpcErrorLogEntry {
+            err: "no org id".to_string(),
+            keep: true,
+            reason: None,
+        });
+    }
     let span_attributes = GrpcSpanAttributes::default();
     if span_ctx.is_valid() {
         req.extensions_mut().insert(span_ctx.clone());
@@ -854,6 +954,7 @@ where
         parent_span_id,
         span_start_unix_nano,
         span_attributes,
+        suppressed: false,
         done: false,
     };
     req.extensions_mut().insert(tonic::transport::server::TcpConnectInfo {
@@ -865,49 +966,6 @@ where
         deadline.map(tokio::time::Instant::into_std),
     );
     req.extensions_mut().insert(Arc::clone(&deadline_ctx));
-
-
-    // Interceptor order (dskit server.New): ..., Mimir's GRPCMiddleware (multitenant auth), then
-    // cluster validation (unary RPCs only, never health checks).
-    // For `/cortex.Ingester/Push`, Go's gRPC server runs `dec(in)` before the auth
-    // interceptor (`dec(in) -> org_id`), so `IngesterZeroCopyServer` enforces `tenant_from_req`
-    // right after wire decoding.
-    let auth_rejection = (cfg.multitenancy_enabled
-        && known_method != Some(KnownGrpcMethod::IngesterPush))
-        .then(|| check_org_id_known(req.headers(), known_method, &guard.method))
-        .flatten();
-    if auth_rejection.is_some() {
-        // `user.ErrNoOrgID` is a plain Go error: logged as its text.
-        guard.error_log.set(GrpcErrorLogEntry {
-            err: "no org id".to_string(),
-            keep: true,
-            reason: None,
-        });
-    }
-    let rejection = auth_rejection.or_else(|| {
-        cfg.cluster_validation.as_ref().and_then(|cv| {
-            let skip = match known_method {
-                Some(k) => k.is_streaming_or_health(),
-                None => {
-                    STREAMING_METHODS.contains(&guard.method.as_ref())
-                        || guard.method.starts_with("/grpc.health.v1.Health/")
-                }
-            };
-            if skip {
-                return None;
-            }
-            check_cluster(
-                req.headers(),
-                &guard.method,
-                remote,
-                cv,
-                &cache,
-                cfg.multitenancy_enabled,
-                &cfg.no_auth_tenant,
-                &span_ctx,
-            )
-        })
-    });
 
     let req = if let Some(recv) = recv_size {
         req.map(|b| {
@@ -959,6 +1017,16 @@ where
         .get("grpc-message")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+
+    // Pre-body `TapHandle` rejections from `IngesterZeroCopyServer` carry `grpc-status: 14`
+    // (`Unavailable`) + `grpc-accept-encoding` and must bypass `cortex_request_duration_seconds`
+    // / `grpcStatsHandler` (matching `dskit/server/limits.go:60-63`).
+    if known_method.is_some_and(KnownGrpcMethod::is_ingester)
+        && guard.status_code == Some(14)
+        && resp.headers().contains_key("grpc-accept-encoding")
+    {
+        guard.suppress();
+    }
 
     // grpc-go closes the stream (RST_STREAM CANCEL) when the deadline expires mid-response,
     // unless the handler already returned a completed trailers-only status response.
@@ -1222,6 +1290,7 @@ mod tests {
             cluster_validation: None,
             multitenancy_enabled,
             no_auth_tenant: "anonymous".to_string(),
+            tap_ingester: None,
         };
         let cache = Arc::new(GrpcMetricsCache::new(
             &ctx,
@@ -1531,6 +1600,7 @@ mod tests {
             cluster_validation: None,
             multitenancy_enabled: false,
             no_auth_tenant: "anonymous".to_string(),
+            tap_ingester: None,
         };
         let cache = Arc::new(GrpcMetricsCache::new(
             &ctx,

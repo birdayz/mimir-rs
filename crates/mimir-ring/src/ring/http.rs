@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use axum::extract::{RawQuery, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{on, MethodFilter};
 use axum::Router;
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 use mimir_common::logging::format_rfc3339_nano_utc;
@@ -102,7 +102,12 @@ pub struct RingPageState {
 pub fn ring_router(ring: Arc<Ring>, config: StatusPageConfig) -> Router {
     let state = RingPageState { ring, config };
     Router::new()
-        .route("/ingester/ring", get(handle_ring_get).post(handle_ring_post))
+        .route(
+            "/ingester/ring",
+            on(MethodFilter::GET, handle_ring_get)
+                .head(|| async { StatusCode::METHOD_NOT_ALLOWED })
+                .post(handle_ring_post),
+        )
         .with_state(state)
 }
 
@@ -195,7 +200,7 @@ pub async fn handle_ring_post(State(state): State<RingPageState>, req: Request) 
             state.ring.key(),
             Box::new(move |cur| {
                 let Some(any) = cur else {
-                    return Err(CasCallbackError::fatal(KvError::NotFound(
+                    return Err(CasCallbackError::fatal(KvError::Other(
                         "found empty ring when trying to unregister".to_string(),
                     )));
                 };
@@ -1047,5 +1052,52 @@ mod tests {
             &desc,
         );
         assert!(page.contains("<td>ingester-1</td>") && !page.contains("<a href"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn w21_aps_01_and_07_ring_router_rejects_head_405_and_empty_ring_forget_no_key_not_found() {
+        let kv: Arc<dyn crate::kv::KvClient> =
+            Arc::new(crate::kv::inmemory::InMemoryKv::new(crate::ring::ring_desc_codec()));
+        let mut ring_cfg = mimir_config::ingester::RingConfig::default();
+        ring_cfg.kvstore.store = "inmemory".to_string();
+        ring_cfg.replication_factor = 1;
+        let ring = Ring::with_store_and_strategy(
+            crate::ring::RingSettings::from(&ring_cfg),
+            "ingester",
+            "ring",
+            kv,
+            Arc::new(crate::ring::DefaultReplicationStrategy),
+            None,
+        )
+        .unwrap();
+        let app = ring_router(ring, crate::ring::to_status_page_config(&ring_cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        // W21-APS-01: HEAD /ingester/ring must return 405 Method Not Allowed.
+        let head_resp = client
+            .head(format!("http://{addr}/ingester/ring"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head_resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+
+        // W21-APS-07: POST /ingester/ring on empty ring omits "key not found: ".
+        let post_resp = client
+            .post(format!("http://{addr}/ingester/ring?forget=ing-0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(post_resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        let body = post_resp.text().await.unwrap();
+        assert_eq!(
+            body,
+            "error forgetting instance 'ing-0': found empty ring when trying to unregister\n"
+        );
+        srv.abort();
     }
 }

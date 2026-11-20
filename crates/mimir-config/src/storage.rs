@@ -1627,12 +1627,18 @@ impl TSDBConfig {
             ));
         }
         self.index_lookup_planning.validate()?;
+        Ok(())
+    }
+
+    /// Validates TSDB configuration including mimir-rs ingester-only support gates.
+    pub fn validate_with_mimir_rs_support(&self, active_series_enabled: bool) -> Result<(), ConfigError> {
+        self.validate(active_series_enabled)?;
         self.validate_mimir_rs_support()
     }
 
     /// Settings Go accepts that mimir-rs does not implement yet: rejected explicitly instead
     /// of being silently ignored (tracked in PORT_STATUS.md).
-    fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+    pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
         if self.block_ranges_period.len() > 1 {
             return Err(ConfigError::Validation(
                 "mimir-rs: -blocks-storage.tsdb.block-ranges-period with more than one range (local leveled compaction of TSDB blocks) is not supported yet".to_string(),
@@ -1670,8 +1676,20 @@ impl BlocksStorageConfig {
     }
 
     pub fn validate(&self, active_series_enabled: bool) -> Result<(), ConfigError> {
+        self.validate_for_target(active_series_enabled, true)
+    }
+
+    pub fn validate_for_target(
+        &self,
+        active_series_enabled: bool,
+        check_ingester_support: bool,
+    ) -> Result<(), ConfigError> {
         self.bucket.validate()?;
-        self.tsdb.validate(active_series_enabled)?;
+        if check_ingester_support {
+            self.tsdb.validate_with_mimir_rs_support(active_series_enabled)?;
+        } else {
+            self.tsdb.validate(active_series_enabled)?;
+        }
         self.bucket_store.validate()
     }
 }

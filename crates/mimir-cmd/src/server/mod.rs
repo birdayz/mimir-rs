@@ -251,6 +251,7 @@ impl Server {
             cluster_validation: grpc_cv,
             multitenancy_enabled: false,
             no_auth_tenant: "anonymous".to_string(),
+            tap_ingester: None,
         };
 
         let header_timeout = opt_duration(cfg.http_server_read_header_timeout);
@@ -293,6 +294,13 @@ impl Server {
     pub fn set_grpc_multitenancy(&mut self, enabled: bool, no_auth_tenant: impl Into<String>) {
         self.grpc_cfg.multitenancy_enabled = enabled;
         self.grpc_cfg.no_auth_tenant = no_auth_tenant.into();
+    }
+
+    /// Registers the `Ingester` used for pre-body `TapHandle` admission checks
+    /// (`dskit/server/limits.go`: runs before `grpcStatsHandler`, multitenancy auth, and
+    /// cluster validation).
+    pub fn set_grpc_tap_ingester(&mut self, ingester: Arc<mimir_ingester::Ingester>) {
+        self.grpc_cfg.tap_ingester = Some(ingester);
     }
 
     /// Installs the shutdown flag used on the HTTP listener to emit `Connection: close` once

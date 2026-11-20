@@ -778,18 +778,22 @@ enum BoundedDecompressAlgo {
     Identity,
     Gzip,
     Zstd,
+    Snappy,
+    S2,
 }
 
-/// Pre-Tonic streaming request body wrapper enforcing `max_recv` on wire frame lengths
-/// AND bounding `gzip`/`zstd` decompression with `std::io::Read::take(max_recv + 1)`,
-/// returning grpc-go's `Code::ResourceExhausted` instead of Tonic's `Code::OutOfRange` or OOM.
+/// Pre-Tonic streaming request body wrapper enforcing `max_recv` on wire frame lengths,
+/// bounding `gzip`/`zstd`/`snappy`/`s2` decompression to `max_recv`, and enforcing
+/// non-client-streaming gRPC cardinality (0 frames or 2+ frames -> `Code::Internal`) before
+/// emitting frame 1 so inner handlers never execute on frame 1 when frame 2 is present.
 struct BoundedGrpcDecompressBody {
     inner: tonic::body::BoxBody,
     algo: BoundedDecompressAlgo,
     max_recv: usize,
     in_buf: BytesMut,
     out_buf: BytesMut,
-    out_queue: std::collections::VecDeque<Bytes>,
+    buffered_frame1: Option<Bytes>,
+    frames_seen: usize,
     pending_trailers: Option<http::HeaderMap>,
     done: bool,
 }
@@ -802,7 +806,8 @@ impl BoundedGrpcDecompressBody {
             max_recv,
             in_buf: BytesMut::new(),
             out_buf: BytesMut::new(),
-            out_queue: std::collections::VecDeque::new(),
+            buffered_frame1: None,
+            frames_seen: 0,
             pending_trailers: None,
             done: false,
         }
@@ -827,91 +832,139 @@ impl BoundedGrpcDecompressBody {
         Ok(())
     }
 
-    /// Decompresses at most one complete gRPC frame from `self.in_buf` into `self.out_queue`.
+    /// Decompresses at most one complete gRPC frame from `self.in_buf`, returning its
+    /// uncompressed 5-byte-framed `Bytes` if a complete frame was available.
     #[allow(clippy::result_large_err)]
-    fn drain_one_frame(&mut self) -> Result<bool, Status> {
+    fn drain_one_frame(&mut self) -> Result<Option<Bytes>, Status> {
         use std::io::Read as _;
-        if self.in_buf.len() >= 5 {
-            let flag = self.in_buf[0];
-            let msg_len = u32::from_be_bytes([
-                self.in_buf[1],
-                self.in_buf[2],
-                self.in_buf[3],
-                self.in_buf[4],
-            ]) as usize;
-            if msg_len > self.max_recv {
-                return Err(Status::resource_exhausted(format!(
-                    "grpc: received message larger than max ({msg_len} vs. {})",
-                    self.max_recv
-                )));
+        if self.in_buf.len() < 5 {
+            return Ok(None);
+        }
+        let flag = self.in_buf[0];
+        let msg_len = u32::from_be_bytes([
+            self.in_buf[1],
+            self.in_buf[2],
+            self.in_buf[3],
+            self.in_buf[4],
+        ]) as usize;
+        if msg_len > self.max_recv {
+            return Err(Status::resource_exhausted(format!(
+                "grpc: received message larger than max ({msg_len} vs. {})",
+                self.max_recv
+            )));
+        }
+        let Some(frame_end) = 5usize.checked_add(msg_len) else {
+            return Err(Status::internal("gRPC frame length overflow"));
+        };
+        if self.in_buf.len() < frame_end {
+            return Ok(None);
+        }
+        match self.algo {
+            BoundedDecompressAlgo::Identity => {
+                self.out_buf.extend_from_slice(&self.in_buf[..frame_end]);
             }
-            let Some(frame_end) = 5usize.checked_add(msg_len) else {
-                return Err(Status::internal("gRPC frame length overflow"));
-            };
-            if self.in_buf.len() < frame_end {
-                return Ok(false);
-            }
-            match self.algo {
-                BoundedDecompressAlgo::Identity => {
+            BoundedDecompressAlgo::Gzip
+            | BoundedDecompressAlgo::Zstd
+            | BoundedDecompressAlgo::Snappy
+            | BoundedDecompressAlgo::S2 => match flag {
+                0 => {
                     self.out_buf.extend_from_slice(&self.in_buf[..frame_end]);
                 }
-                BoundedDecompressAlgo::Gzip | BoundedDecompressAlgo::Zstd => match flag {
-                    0 => {
-                        self.out_buf.extend_from_slice(&self.in_buf[..frame_end]);
-                    }
-                    1 => {
-                        let compressed = &self.in_buf[5..frame_end];
-                        let limit = (self.max_recv as u64).saturating_add(1);
-                        let mut decompressed =
-                            Vec::with_capacity(compressed.len().min(self.max_recv).min(64 * 1024));
-                        match self.algo {
-                            BoundedDecompressAlgo::Gzip => {
-                                let mut dec = flate2::read::GzDecoder::new(compressed).take(limit);
-                                dec.read_to_end(&mut decompressed).map_err(|e| {
-                                    Status::internal(format!("gzip decompression failed: {e}"))
-                                })?;
-                            }
-                            BoundedDecompressAlgo::Zstd => {
-                                let dec = zstd::stream::read::Decoder::new(compressed).map_err(
-                                    |e| Status::internal(format!("zstd decompression failed: {e}")),
-                                )?;
-                                dec.take(limit).read_to_end(&mut decompressed).map_err(|e| {
-                                    Status::internal(format!("zstd decompression failed: {e}"))
-                                })?;
-                            }
-                            BoundedDecompressAlgo::Identity => unreachable!(),
-                        }
-                        if decompressed.len() > self.max_recv {
-                            return Err(Status::resource_exhausted(format!(
-                                "grpc: received message after decompression larger than max {}",
-                                self.max_recv
-                            )));
-                        }
-                        let dec_len_u32 = u32::try_from(decompressed.len()).map_err(|_| {
+                1 => {
+                    let compressed = &self.in_buf[5..frame_end];
+                    let limit = (self.max_recv as u64).saturating_add(1);
+                    let mut decompressed =
+                        Vec::with_capacity(compressed.len().min(self.max_recv).min(64 * 1024));
+                    let map_custom_err = |codec: &str, e: std::io::Error| -> Status {
+                        if e.get_ref()
+                            .is_some_and(|r| r.is::<mimir_proto::snappy::DecompressLimitExceeded>())
+                        {
                             Status::resource_exhausted(format!(
                                 "grpc: received message after decompression larger than max {}",
                                 self.max_recv
                             ))
-                        })?;
-                        self.out_buf.put_u8(0);
-                        self.out_buf.extend_from_slice(&dec_len_u32.to_be_bytes());
-                        self.out_buf.extend_from_slice(&decompressed);
+                        } else {
+                            Status::internal(format!("{codec} decompression failed: {e}"))
+                        }
+                    };
+                    match self.algo {
+                        BoundedDecompressAlgo::Gzip => {
+                            let mut dec = flate2::read::GzDecoder::new(compressed).take(limit);
+                            dec.read_to_end(&mut decompressed).map_err(|e| {
+                                Status::internal(format!("gzip decompression failed: {e}"))
+                            })?;
+                        }
+                        BoundedDecompressAlgo::Zstd => {
+                            let dec = zstd::stream::read::Decoder::new(compressed).map_err(|e| {
+                                Status::internal(format!("zstd decompression failed: {e}"))
+                            })?;
+                            dec.take(limit).read_to_end(&mut decompressed).map_err(|e| {
+                                Status::internal(format!("zstd decompression failed: {e}"))
+                            })?;
+                        }
+                        BoundedDecompressAlgo::Snappy => {
+                            mimir_proto::snappy::decompress_framed_bounded_into(
+                                compressed,
+                                &mut decompressed,
+                                self.max_recv,
+                            )
+                            .map_err(|e| map_custom_err("snappy", e))?;
+                        }
+                        BoundedDecompressAlgo::S2 => {
+                            mimir_proto::s2::decompress_framed_into(
+                                compressed,
+                                &mut decompressed,
+                                self.max_recv,
+                            )
+                            .map_err(|e| map_custom_err("s2", e))?;
+                        }
+                        BoundedDecompressAlgo::Identity => unreachable!(),
                     }
-                    other => {
-                        return Err(Status::internal(format!(
-                            "protocol error: received message with invalid compression flag: {other} (valid flags are 0 and 1), while sending request"
+                    if decompressed.len() > self.max_recv {
+                        return Err(Status::resource_exhausted(format!(
+                            "grpc: received message after decompression larger than max {}",
+                            self.max_recv
                         )));
                     }
-                },
-            }
-            self.in_buf.advance(frame_end);
-            if !self.out_buf.is_empty() {
-                self.out_queue.push_back(self.out_buf.split().freeze());
-                return Ok(true);
-            }
-            return Ok(false);
+                    let dec_len_u32 = u32::try_from(decompressed.len()).map_err(|_| {
+                        Status::resource_exhausted(format!(
+                            "grpc: received message after decompression larger than max {}",
+                            self.max_recv
+                        ))
+                    })?;
+                    self.out_buf.put_u8(0);
+                    self.out_buf.extend_from_slice(&dec_len_u32.to_be_bytes());
+                    self.out_buf.extend_from_slice(&decompressed);
+                }
+                other => {
+                    return Err(Status::internal(format!(
+                        "protocol error: received message with invalid compression flag: {other} (valid flags are 0 and 1), while sending request"
+                    )));
+                }
+            },
         }
-        Ok(false)
+        self.in_buf.advance(frame_end);
+        Ok(Some(self.out_buf.split().freeze()))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn process_buffered_frames(&mut self) -> Result<(), Status> {
+        while self.in_buf.len() >= 5 {
+            self.check_incoming_header()?;
+            let Some(frame) = self.drain_one_frame()? else {
+                break;
+            };
+            if self.frames_seen == 0 {
+                self.buffered_frame1 = Some(frame);
+                self.frames_seen = 1;
+            } else {
+                self.buffered_frame1 = None;
+                return Err(Status::internal(
+                    "cardinality violation: received multiple request messages for non-client-streaming RPC",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -924,34 +977,17 @@ impl hyper::body::Body for BoundedGrpcDecompressBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        if let Some(chunk) = self.out_queue.pop_front() {
-            return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
-        }
-        // Drain at most one already-buffered frame before polling the inner stream again.
-        if !self.done && self.in_buf.len() >= 5 {
-            if let Err(st) = self.check_incoming_header() {
-                self.done = true;
-                return Poll::Ready(Some(Err(st)));
-            }
-            match self.drain_one_frame() {
-                Ok(true) => {
-                    if let Some(chunk) = self.out_queue.pop_front() {
-                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
-                    }
-                }
-                Ok(false) => {}
-                Err(st) => {
-                    self.done = true;
-                    return Poll::Ready(Some(Err(st)));
-                }
-            }
-        }
         if let Some(trailers) = self.pending_trailers.take() {
             self.done = true;
             return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
         }
         if self.done {
             return Poll::Ready(None);
+        }
+        if let Err(st) = self.process_buffered_frames() {
+            self.buffered_frame1 = None;
+            self.done = true;
+            return Poll::Ready(Some(Err(st)));
         }
         loop {
             match Pin::new(&mut self.inner).poll_frame(cx) {
@@ -963,6 +999,7 @@ impl hyper::body::Body for BoundedGrpcDecompressBody {
                                     let need = 5 - self.in_buf.len();
                                     self.in_buf.extend_from_slice(&data[..need]);
                                     if let Err(st) = self.check_incoming_header() {
+                                        self.buffered_frame1 = None;
                                         self.done = true;
                                         return Poll::Ready(Some(Err(st)));
                                     }
@@ -970,16 +1007,15 @@ impl hyper::body::Body for BoundedGrpcDecompressBody {
                                 } else {
                                     self.in_buf.extend_from_slice(&data);
                                     if let Err(st) = self.check_incoming_header() {
+                                        self.buffered_frame1 = None;
                                         self.done = true;
                                         return Poll::Ready(Some(Err(st)));
                                     }
                                 }
-                                if let Err(st) = self.drain_one_frame() {
+                                if let Err(st) = self.process_buffered_frames() {
+                                    self.buffered_frame1 = None;
                                     self.done = true;
                                     return Poll::Ready(Some(Err(st)));
-                                }
-                                if let Some(chunk) = self.out_queue.pop_front() {
-                                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
                                 }
                             }
                         }
@@ -987,10 +1023,21 @@ impl hyper::body::Body for BoundedGrpcDecompressBody {
                         match frame.into_trailers() {
                             Ok(trailers) => {
                                 if !self.in_buf.is_empty() {
+                                    self.buffered_frame1 = None;
                                     self.done = true;
                                     return Poll::Ready(Some(Err(Status::internal(
                                         "Unexpected EOF decoding stream.",
                                     ))));
+                                }
+                                if self.frames_seen == 0 {
+                                    self.done = true;
+                                    return Poll::Ready(Some(Err(Status::internal(
+                                        "cardinality violation: received no request message from non-client-streaming RPC",
+                                    ))));
+                                }
+                                if let Some(f1) = self.buffered_frame1.take() {
+                                    self.pending_trailers = Some(trailers);
+                                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(f1))));
                                 }
                                 self.done = true;
                                 return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(
@@ -1003,26 +1050,38 @@ impl hyper::body::Body for BoundedGrpcDecompressBody {
                         }
                     }
                 }
-                Poll::Ready(None) => {
+                Poll::Ready(Some(Err(e))) => {
+                    self.buffered_frame1 = None;
                     self.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(None) => {
                     if !self.in_buf.is_empty() {
+                        self.buffered_frame1 = None;
+                        self.done = true;
                         return Poll::Ready(Some(Err(Status::internal(
                             "Unexpected EOF decoding stream.",
                         ))));
                     }
+                    if self.frames_seen == 0 {
+                        self.done = true;
+                        return Poll::Ready(Some(Err(Status::internal(
+                            "cardinality violation: received no request message from non-client-streaming RPC",
+                        ))));
+                    }
+                    self.done = true;
+                    if let Some(f1) = self.buffered_frame1.take() {
+                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(f1))));
+                    }
                     return Poll::Ready(None);
                 }
-                other => return other,
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
 
     fn is_end_stream(&self) -> bool {
         self.done
-            || (self.out_queue.is_empty()
-                && self.in_buf.is_empty()
-                && self.pending_trailers.is_none()
-                && self.inner.is_end_stream())
     }
 }
 
@@ -1332,11 +1391,29 @@ where
                     ))
                 });
             }
-            Some("snappy") | Some("s2") => {
-                // Handled by SnappyDecompressService / IngesterZeroCopyServer (bounded + ResourceExhausted)
-                // after pre-decompression TapHandle.
+            Some("snappy") => {
+                req.headers_mut().remove("grpc-encoding");
+                req.headers_mut().remove(http::header::CONTENT_LENGTH);
+                req = req.map(|b| {
+                    tonic::body::BoxBody::new(BoundedGrpcDecompressBody::new(
+                        b,
+                        BoundedDecompressAlgo::Snappy,
+                        max_recv,
+                    ))
+                });
             }
-            _ if max_recv < usize::MAX => {
+            Some("s2") => {
+                req.headers_mut().remove("grpc-encoding");
+                req.headers_mut().remove(http::header::CONTENT_LENGTH);
+                req = req.map(|b| {
+                    tonic::body::BoxBody::new(BoundedGrpcDecompressBody::new(
+                        b,
+                        BoundedDecompressAlgo::S2,
+                        max_recv,
+                    ))
+                });
+            }
+            _ => {
                 req = req.map(|b| {
                     tonic::body::BoxBody::new(BoundedGrpcDecompressBody::new(
                         b,
@@ -1345,7 +1422,6 @@ where
                     ))
                 });
             }
-            _ => {}
         }
         let fut = self.inner.call(req);
         Box::pin(async move {
@@ -2110,17 +2186,8 @@ mod tests {
         let body = tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(wire))));
         let mut dec = BoundedGrpcDecompressBody::new(body, BoundedDecompressAlgo::Zstd, 64);
 
-        // First poll_frame yields ONLY frame 1 without decompressing frame 2.
-        let f1 = std::future::poll_fn(|cx| Pin::new(&mut dec).poll_frame(cx))
-            .await
-            .unwrap()
-            .unwrap()
-            .into_data()
-            .unwrap();
-        assert_eq!(f1.len(), 5 + 16);
-        assert_eq!(&f1[5..], p1.as_slice());
-
-        // Second poll_frame attempts frame 2 and rejects it with ResourceExhausted.
+        // Frame 1 is buffered until EOF/trailers or frame 2; frame 2 exceeds max_recv=64
+        // so poll_frame immediately rejects with ResourceExhausted without ever emitting frame 1.
         let err = std::future::poll_fn(|cx| Pin::new(&mut dec).poll_frame(cx))
             .await
             .unwrap()

@@ -56,17 +56,21 @@ fn main() {
     let rest = if args.len() > 1 { &args[1..] } else { &[] };
 
     let outcome = parse_cli_for_run(prog_name, rest);
-    if !outcome.stdout.is_empty() {
-        print!("{}", outcome.stdout);
-    }
-    if !outcome.stderr.is_empty() {
-        eprint!("{}", outcome.stderr);
-    }
-    if outcome.exit_code != 0 {
-        std::process::exit(outcome.exit_code);
-    }
-
-    if !matches!(outcome.action, Some(CliAction::Run)) {
+    if outcome.exit_code != 0
+        || matches!(
+            outcome.action,
+            Some(CliAction::PrintHelp { .. } | CliAction::PrintVersion)
+        )
+    {
+        if !outcome.stdout.is_empty() {
+            print!("{}", outcome.stdout);
+        }
+        if !outcome.stderr.is_empty() {
+            eprint!("{}", outcome.stderr);
+        }
+        if outcome.exit_code != 0 {
+            std::process::exit(outcome.exit_code);
+        }
         return;
     }
 
@@ -74,6 +78,29 @@ fn main() {
     // rendered in go-kit logfmt/json on stderr, honouring -log.level, -log.format and
     // -log.rate-limit-*.
     init_logging(&outcome);
+
+    // Go `mimir.New` rejects empty `-target` before `-print.config` or `-modules` via
+    // `util_log.CheckFatal("initializing application", err)`.
+    if outcome
+        .config
+        .as_ref()
+        .is_some_and(|cfg| cfg.target.0.is_empty())
+    {
+        check_fatal(
+            "initializing application",
+            "no target module specified, the -target flag must be set to a valid module (e.g. \"all\")",
+        );
+    }
+
+    if !outcome.stdout.is_empty() {
+        print!("{}", outcome.stdout);
+    }
+    if !outcome.stderr.is_empty() {
+        eprint!("{}", outcome.stderr);
+    }
+    if !matches!(outcome.action, Some(CliAction::Run)) {
+        return;
+    }
 
     let main_workers = std::env::var("TOKIO_WORKER_THREADS")
         .ok()
