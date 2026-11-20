@@ -470,7 +470,7 @@ async fn w20_sdw_05_oversized_16mib_exemplar_and_series_labels_never_panic() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. [W20-SDW-02] Multi-frame S2/Snappy cumulative decompression & unary frame cap
+// 3. [W20-SDW-02] Multi-frame S2/Snappy decompression is bounded & rejected like grpc-go
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn w20_sdw_02_multi_frame_s2_and_snappy_cumulative_decompression_capped() {
@@ -481,37 +481,61 @@ async fn w20_sdw_02_multi_frame_s2_and_snappy_cumulative_decompression_capped() 
         .into_server()
         .max_decoding_message_size(max_decode);
 
-    // 2 frames of 700 bytes each (<= 1024 individually, 1400 > 1024 cumulatively).
+    // grpc-go v1.85 `serverStream.RecvMsg` (used for every non-client-streaming RPC, unary ones
+    // included) receives and decompresses ONE extra message, each bounded by
+    // `maxReceiveMessageSize` on its own, and then fails the RPC with a cardinality violation.
+    const CARDINALITY: &str =
+        "cardinality violation: received multiple request messages for non-client-streaming RPC";
     // Snappy stream framing is valid for both grpc-encoding: snappy and grpc-encoding: s2.
-    let payload = vec![0u8; 700];
-    let frame = mimir_proto::snappy::encode_grpc_frame(&payload, true).unwrap();
-    assert!(frame.len() * 2 <= max_decode + 5);
-    let mut two_frames = Vec::with_capacity(frame.len() * 2);
-    two_frames.extend_from_slice(&frame);
-    two_frames.extend_from_slice(&frame);
-    let two_frames = Bytes::from(two_frames);
+    let frame_700 = mimir_proto::snappy::encode_grpc_frame(&[0u8; 700], true).unwrap();
+    let frame_small = mimir_proto::snappy::encode_grpc_frame(&[1u8; 32], true).unwrap();
+    let frame_bomb = mimir_proto::snappy::encode_grpc_frame(&[0u8; 2000], true).unwrap();
+    let join = |frames: &[&[u8]]| -> Bytes {
+        let wire = frames.concat();
+        assert!(wire.len() <= max_decode + 5, "test wire must fit max_recv");
+        Bytes::from(wire)
+    };
+    // 2 frames of 700 bytes each: both fit the limit on their own (1400 cumulatively).
+    let two_frames = join(&[&frame_700, &frame_700]);
+    // A valid first frame followed by a second frame decompressing past the limit.
+    let small_then_bomb = join(&[&frame_small, &frame_bomb]);
+    // 3 frames: Go never looks at the third one.
+    let three_frames = join(&[&frame_small, &frame_small, &frame_bomb]);
 
     for enc in ["s2", "snappy"] {
-        let http_req = http::Request::builder()
-            .method("POST")
-            .uri("/cortex.Ingester/Push")
-            .header("content-type", "application/grpc")
-            .header("grpc-encoding", enc)
-            .header("te", "trailers")
-            .header("x-scope-orgid", "tenant-a")
-            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(
-                two_frames.clone(),
-            ))))
-            .unwrap();
-        let resp = svc.clone().oneshot(http_req).await.unwrap();
-        let status = tonic::Status::from_header_map(resp.headers()).expect("grpc-status header");
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted, "enc={enc}");
+        let send = |body: Bytes| {
+            let svc = svc.clone();
+            async move {
+                let http_req = http::Request::builder()
+                    .method("POST")
+                    .uri("/cortex.Ingester/Push")
+                    .header("content-type", "application/grpc")
+                    .header("grpc-encoding", enc)
+                    .header("te", "trailers")
+                    .header("x-scope-orgid", "tenant-a")
+                    .body(tonic::body::BoxBody::new(SingleChunkBody(Some(body))))
+                    .unwrap();
+                let resp = svc.oneshot(http_req).await.unwrap();
+                tonic::Status::from_header_map(resp.headers()).expect("grpc-status header")
+            }
+        };
+
+        let status = send(two_frames.clone()).await;
+        assert_eq!(status.code(), tonic::Code::Internal, "enc={enc}: {status:?}");
+        assert_eq!(status.message(), CARDINALITY, "enc={enc}");
+
+        let status = send(small_then_bomb.clone()).await;
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted, "enc={enc}: {status:?}");
         assert!(
             status
                 .message()
                 .contains("received message after decompression larger than max 1024"),
             "unexpected status for {enc}: {status:?}"
         );
+
+        let status = send(three_frames.clone()).await;
+        assert_eq!(status.code(), tonic::Code::Internal, "enc={enc}: {status:?}");
+        assert_eq!(status.message(), CARDINALITY, "enc={enc}");
     }
 
     // 2 small compressed frames within max_decode must still be rejected as multiple unary frames.
@@ -533,6 +557,7 @@ async fn w20_sdw_02_multi_frame_s2_and_snappy_cumulative_decompression_capped() 
     let resp3 = svc.oneshot(http_req3).await.unwrap();
     let status3 = tonic::Status::from_header_map(resp3.headers()).expect("grpc-status header");
     assert_eq!(status3.code(), tonic::Code::Internal);
+    assert_eq!(status3.message(), CARDINALITY);
 }
 
 // ---------------------------------------------------------------------------

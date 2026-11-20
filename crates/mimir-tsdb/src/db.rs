@@ -132,6 +132,7 @@ struct DbMetrics {
     compactions_total: prometheus::Counter,
     compaction_duration: SingleHistogram,
     compactions_triggered: prometheus::Counter,
+    compactions_skipped: prometheus::Counter,
     compactions_failed: prometheus::Counter,
     reloads: prometheus::Counter,
     reloads_failed: prometheus::Counter,
@@ -162,7 +163,7 @@ impl DbMetrics {
             "The time taken to recompact blocks to remove tombstones.",
             None,
         );
-        let _ = counter(
+        let compactions_skipped = counter(
             reg,
             "prometheus_tsdb_compactions_skipped_total",
             "Total number of skipped compactions due to disabled auto compaction.",
@@ -195,6 +196,14 @@ impl DbMetrics {
             Some(exponential_buckets(1.0, 2.0, 14)),
         );
         let compactor = CompactorMetrics::new(reg);
+        // Go `tsdbutil.NewDirLocker(dir, "tsdb", ...)`: the lock file is never taken (Mimir opens
+        // every TSDB with `NoLockfile`), which Go reports as `lockfileDisabled`.
+        gauge(
+            reg,
+            "prometheus_tsdb_clean_start",
+            "-1: lockfile is disabled. 0: a lockfile from a previous execution was replaced. 1: lockfile creation was clean",
+        )
+        .set(-1.0);
         Self {
             compactions_total: counter(
                 reg,
@@ -207,6 +216,7 @@ impl DbMetrics {
                 "prometheus_tsdb_compactions_triggered_total",
                 "Total number of triggered compactions for the partition.",
             ),
+            compactions_skipped,
             compactions_failed: counter(
                 reg,
                 "prometheus_tsdb_compactions_failed_total",
@@ -467,6 +477,14 @@ impl Tsdb {
                             if let Err(e) = inner_bg.reload_blocks() {
                                 tracing::error!(err = %e, "reloadBlocks");
                             }
+                            // Go `DB.run`: every block reload tick signals `compactc`, which
+                            // counts as a triggered compaction and, as Mimir disables auto
+                            // compactions (`db.DisableCompactions()`, the ingester compacts on
+                            // its own schedule), as a skipped one. `DB.Compact` itself counts
+                            // neither. Not reproduced: the same signal sent by every `Commit`
+                            // while the head is compactable.
+                            inner_bg.metrics.compactions_triggered.inc();
+                            inner_bg.metrics.compactions_skipped.inc();
                             if let Err(e) = inner_bg.head.mmap_head_chunks() {
                                 tracing::error!(err = %e, "mmapHeadChunks");
                             }
@@ -1016,7 +1034,6 @@ impl TsdbInner {
     /// truncates the WAL (also when a later step fails, via the deferred truncation), then
     /// compacts the OOO head. Errors count `prometheus_tsdb_compactions_failed_total`.
     fn compact(&self) -> Result<Vec<Ulid>, TsdbError> {
-        self.metrics.compactions_triggered.inc();
         let _guard = self.compact_mtx.lock();
         if self.closed.load(Ordering::Acquire) {
             return Ok(Vec::new());

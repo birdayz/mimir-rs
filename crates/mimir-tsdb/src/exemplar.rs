@@ -134,7 +134,8 @@ impl ExemplarMetrics {
         .expect("valid gauge");
         let last_exemplars_ts = Gauge::with_opts(Opts::new(
             "prometheus_tsdb_exemplar_last_exemplars_timestamp_seconds",
-            "The timestamp of the oldest exemplar stored in circular storage. Useful to check for what time range the current exemplar buffer limit allows. This usually means the last timestamp for all exemplars for a typical setup. This is not true though if one of the series timestamp is in future compared to rest series.",
+            // Verbatim from Go (`exemplar.go`), string concatenation typos included.
+            "The timestamp of the oldest exemplar stored in circular storage. Useful to check for what timerange the current exemplar buffer limit allows. This usually means the last timestampfor all exemplars for a typical setup. This is not true though if one of the series timestamp is in future compared to rest series.",
         ))
         .expect("valid gauge");
         let out_of_order_exemplars = Counter::with_opts(Opts::new(

@@ -1011,9 +1011,15 @@ fn decompress_frames_slice(
         let out = &mut *guard.0;
 
         let mut pos = 0usize;
-        let mut total_decompressed = 0usize;
         let mut frame_count = 0usize;
         while pos < slice.len() {
+            // Every `cortex.Ingester` RPC is non-client-streaming. grpc-go `serverStream.RecvMsg`
+            // reads (and decompresses, bounded by `maxReceiveMessageSize`) one extra message after
+            // the first and then fails the RPC, so the first message is dropped here: nothing but
+            // an error can come out of this request, and the scratch stays bounded by one message.
+            if frame_count == 1 {
+                out.clear();
+            }
             if slice.len() - pos < 5 {
                 return Err(Status::internal("truncated gRPC compressed frame header"));
             }
@@ -1035,22 +1041,16 @@ fn decompress_frames_slice(
 
             match flag {
                 0 => {
-                    if len > max_decode_len
-                        || total_decompressed
-                            .checked_add(len)
-                            .is_none_or(|t| t > max_decode_len)
-                    {
+                    if len > max_decode_len {
                         return Err(Status::resource_exhausted(format!(
-                            "grpc: received message after decompression larger than max {max_decode_len}"
+                            "grpc: received message larger than max ({len} vs. {max_decode_len})"
                         )));
                     }
-                    total_decompressed += len;
                     out.push(0);
                     out.extend_from_slice(&(len as u32).to_be_bytes());
                     out.extend_from_slice(payload);
                 }
                 1 => {
-                    let remaining = max_decode_len.saturating_sub(total_decompressed);
                     let hdr_pos = out.len();
                     out.extend_from_slice(&[0u8; 5]);
                     let map_decomp_err = |codec: &str, e: std::io::Error| -> Status {
@@ -1069,7 +1069,7 @@ fn decompress_frames_slice(
                             mimir_proto::snappy::decompress_framed_bounded_into(
                                 payload,
                                 out,
-                                remaining,
+                                max_decode_len,
                             )
                             .map_err(|e| map_decomp_err("snappy", e))?;
                         }
@@ -1077,18 +1077,17 @@ fn decompress_frames_slice(
                             mimir_proto::s2::decompress_framed_into(
                                 payload,
                                 out,
-                                remaining,
+                                max_decode_len,
                             )
                             .map_err(|e| map_decomp_err("s2", e))?;
                         }
                     }
                     let dec_len = out.len() - (hdr_pos + 5);
-                    if dec_len > remaining || total_decompressed.saturating_add(dec_len) > max_decode_len {
+                    if dec_len > max_decode_len {
                         return Err(Status::resource_exhausted(format!(
                             "grpc: received message after decompression larger than max {max_decode_len}"
                         )));
                     }
-                    total_decompressed += dec_len;
                     out[hdr_pos + 1..hdr_pos + 5].copy_from_slice(&(dec_len as u32).to_be_bytes());
                 }
                 other => {
@@ -1099,8 +1098,9 @@ fn decompress_frames_slice(
             }
             frame_count += 1;
             if frame_count > 1 {
+                // grpc-go `stream.go` `serverStream.RecvMsg` (v1.85, used for unary RPCs too).
                 return Err(Status::internal(
-                    "unexpected multiple gRPC frames in unary request",
+                    "cardinality violation: received multiple request messages for non-client-streaming RPC",
                 ));
             }
         }

@@ -224,8 +224,24 @@ fn m20_04_and_m20_02_per_tenant_tsdb_metrics_and_native_histograms() {
         app.commit().unwrap();
     }
 
+    // The head counts the series whose last in-order sample is a native histogram (and its
+    // buckets) or a staleness marker.
+    let gauge_value = |name: &str| {
+        metric_family(&reg.gather(), name).unwrap().get_metric()[0]
+            .get_gauge()
+            .get_value()
+    };
+    assert_eq!(gauge_value("prometheus_tsdb_head_native_histogram_series"), 1.0);
+    assert_eq!(gauge_value("prometheus_tsdb_head_native_histogram_buckets"), 2.0);
+    assert_eq!(gauge_value("prometheus_tsdb_head_stale_series"), 1.0);
+
     // Exercise head compaction, OOO compaction, selected series compaction, and overlapping block compaction.
     db.compact_head_range(0, 10_000).unwrap();
+    // Both series only had samples below 10_000: the head truncation deleted them, and Go
+    // `Head.gc` subtracts deleted series from the gauges.
+    assert_eq!(gauge_value("prometheus_tsdb_head_native_histogram_series"), 0.0);
+    assert_eq!(gauge_value("prometheus_tsdb_head_native_histogram_buckets"), 0.0);
+    assert_eq!(gauge_value("prometheus_tsdb_head_stale_series"), 0.0);
     db.compact_ooo_head().unwrap();
     db.compact_selected_series(&[ref_sel]).unwrap();
 
@@ -320,23 +336,6 @@ fn m20_04_and_m20_02_per_tenant_tsdb_metrics_and_native_histograms() {
         assert!(q.get_value().is_finite(), "WAL fsync quantile must be finite");
     }
 
-    // Check active metrics reflect real counts.
-    assert!(
-        metric_family(&families, "prometheus_tsdb_head_native_histogram_series")
-            .unwrap()
-            .get_metric()[0]
-            .get_gauge()
-            .get_value()
-            >= 1.0
-    );
-    assert!(
-        metric_family(&families, "prometheus_tsdb_head_native_histogram_buckets")
-            .unwrap()
-            .get_metric()[0]
-            .get_gauge()
-            .get_value()
-            >= 2.0
-    );
     assert!(
         metric_family(&families, "prometheus_tsdb_selected_series_compactions_triggered_total")
             .unwrap()
@@ -389,6 +388,21 @@ fn w20_sdw_04_regexp_check_limits_and_dfa_size() {
     let deep_ok = format!("{}a{}", "(".repeat(999), ")".repeat(999));
     go_regexp_syntax::check(&deep_ok).unwrap();
 
+    // `parser.collapse` splices nested concatenations / alternations into their parent: 1200
+    // nested non-capturing groups are no deeper than one.
+    let flat_concat = format!("{}{}", "(?:a.".repeat(1200), ")".repeat(1200));
+    go_regexp_syntax::check(&flat_concat).unwrap();
+    let flat_alt = format!("{}b{}", "(?:a|".repeat(1200), ")".repeat(1200));
+    go_regexp_syntax::check(&flat_alt).unwrap();
+    // Capturing groups are not spliced: 2 levels (capture + concat) per group.
+    let cap_concat_ok = format!("{}{}", "(a.".repeat(499), ")".repeat(499));
+    go_regexp_syntax::check(&cap_concat_ok).unwrap();
+    let cap_concat_fail = format!("{}{}", "(a.".repeat(500), ")".repeat(500));
+    assert_eq!(
+        go_regexp_syntax::check(&cap_concat_fail).unwrap_err().code,
+        "expression nests too deeply"
+    );
+
     // 2. Expression size limit (> 3_355_443): rejected in O(1) memory with ErrLarge.
     let huge_concat_repeat = format!("({}){{1000}}", "a".repeat(4000));
     let err_large = go_regexp_syntax::check(&huge_concat_repeat).unwrap_err();
@@ -401,6 +415,63 @@ fn w20_sdw_04_regexp_check_limits_and_dfa_size() {
     let huge_alt = "(a{1000}|b{1000}|c{1000}|d{1000}){1000}";
     let err_huge_alt = go_regexp_syntax::check(huge_alt).unwrap_err();
     assert_eq!(err_huge_alt.code, "expression too large");
+
+    // Go only computes sizes once `numRegexp >= maxSize / repeats` (`checkSize`), where
+    // `repeats` is multiplied by the count of an `OpRepeat` node every time it goes through
+    // `checkLimits`: when it is created and each time it is pushed again as the only item of a
+    // concatenation / alternation / non-capturing group. Every expectation below is the result
+    // of `syntax.Parse(s, syntax.Perl|syntax.DotNL)`.
+    let a = |n: usize| "a".repeat(n);
+    let too_large = |s: &str| {
+        let e = go_regexp_syntax::check(s).expect_err("Go: expression too large");
+        assert_eq!(e.code, "expression too large", "{}", &s[..s.len().min(60)]);
+    };
+    let valid = |s: &str| {
+        if let Err(e) = go_regexp_syntax::check(s) {
+            panic!("Go accepts {}...: {}", &s[..s.len().min(60)], e.code);
+        }
+    };
+    // 1000 * (2 + n) > maxSize from n = 3354 on; the repeat is re-pushed twice (1000^3).
+    valid(&format!("({}){{1000}}", a(3353)));
+    too_large(&format!("({}){{1000}}", a(3354)));
+    too_large(&format!("({}){{999}}", a(3400)));
+    too_large(&format!("(?:{}){{1000}}", a(3400)));
+    too_large(&format!("(?:{}){{1000,}}", a(3400)));
+    too_large(&format!("(?:{}){{0,1000}}", a(4000)));
+    // Next to another item the repeat is never pushed again: repeats == 1000, sizes untracked.
+    valid(&format!("x(?:{}){{1000}}", a(3400)));
+    valid(&format!("x(?:{}){{1000,}}", a(3400)));
+    valid(&format!(".*(?:{}){{1000}}", a(3400)));
+    valid(&format!("x(?:{}){{1000}}y{{4}}", a(3400)));
+    valid(&format!("x(?:{}){{1000}}(y*)(z+)(w?)", a(3400)));
+    // A second large count opens the gate, and the oversized repeat is found.
+    too_large(&format!("x(?:{}){{1000}}y{{1000}}", a(3400)));
+    too_large(&format!("(?:{}){{1000}}(?:{}){{1000}}.*", "ab".repeat(900), "cd".repeat(900)));
+    // Without large repetition counts no literal or alternation is too large, whatever its
+    // length (only `numRunes > maxRunes`, 33_554_432, is).
+    valid(&format!("{}.*", a(3_400_000)));
+    valid(&format!("(?:{})*", a(3_400_000)));
+    let big_alt = (0..100_000)
+        .map(|i| format!("value_number_{i:08}_with_some_long_suffix_x"))
+        .collect::<Vec<_>>()
+        .join("|");
+    assert!(big_alt.len() > 4_000_000);
+    valid(&big_alt);
+    valid(&format!("foo.*({big_alt})"));
+    valid("a{1000}b{1000}c{1000}d{1000}.*");
+    valid("(?:[a-f0-9]{8})-(?:[a-f0-9]{4})-(?:[a-f0-9]{4})-(?:[a-f0-9]{4})-(?:[a-f0-9]{12})");
+    // Once sizes are tracked, a literal run is sized when its first rune is pushed and Go never
+    // updates that cached size, unless the run is pushed again on its own (as a whole group).
+    valid(&format!("x{{1000}}y{{1000}}z{{1000}}{}", a(3_400_000)));
+    valid(&format!("x{{1000}}y{{1000}}z{{1000}}{}.", a(3_400_000)));
+    valid(&format!("(?:(?:a{{20}})){}", "b".repeat(3_400_000)));
+    too_large(&format!("x{{1000}}y{{1000}}z{{1000}}({})", a(3_400_000)));
+    too_large(&format!("x{{1000}}y{{1000}}z{{1000}}(?:{})w", a(3_400_000)));
+    // A literal that was already on the stack when tracking started has its full size.
+    too_large(&format!("{}x{{1000}}y{{1000}}z{{1000}}", a(3_400_000)));
+    // numRunes: each \pL adds 1292 runes.
+    too_large(&format!("{}.*", "\\pL".repeat(27_000)));
+    valid(&format!("{}.*", "\\pL".repeat(20_000)));
 
     // And LabelMatcher::new propagates the exact Go error without compiling NFA.
     let m_err =

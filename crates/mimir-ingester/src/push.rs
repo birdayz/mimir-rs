@@ -1282,11 +1282,12 @@ impl Ingester {
                 ref mut series_metas,
             } = *s;
 
-            let mut decode_opts = mimir_proto::zerocopy::DecodeOptions::classic();
-            decode_opts.skip_unmarshaling_exemplars = max_exemplars == 0;
+            // Exemplars are always unmarshalled (and so validated on the wire), like Go: only the
+            // distributor sets `SkipUnmarshalingExemplars`. With exemplars disabled for the tenant
+            // they are just not converted below.
             let stream_res = mimir_proto::zerocopy::decode_classic_stream(
                 raw_bytes,
-                decode_opts,
+                mimir_proto::zerocopy::DecodeOptions::classic(),
                 wr_scratch,
                 label_bytes_arena,
                 samples_arena,

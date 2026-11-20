@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use mimir_common::native_histogram::Histogram as NativeHistogram;
 use mimir_common::thread_pool::ScopedWorkerPool;
 use mimir_config::KafkaConfig;
 use mimir_proto::cortexpb::{self, ErrorCause};
@@ -466,10 +467,10 @@ pub struct IngesterShardedBatchConsumer {
     ingester: Arc<Ingester>,
     kafka_cfg: KafkaConfig,
     metrics: PusherConsumerMetrics,
-    processing_time_empty: OnceLock<prometheus::Histogram>,
-    processing_time_timeseries: OnceLock<prometheus::Histogram>,
-    processing_time_metadata: OnceLock<prometheus::Histogram>,
-    processing_time_timeseries_and_metadata: OnceLock<prometheus::Histogram>,
+    processing_time_empty: OnceLock<Arc<NativeHistogram>>,
+    processing_time_timeseries: OnceLock<Arc<NativeHistogram>>,
+    processing_time_metadata: OnceLock<Arc<NativeHistogram>>,
+    processing_time_timeseries_and_metadata: OnceLock<Arc<NativeHistogram>>,
     error_handler: Arc<PushErrorHandler>,
     arena_pool: Mutex<Vec<WorkerArena>>,
     worker_pool: ScopedWorkerPool,
@@ -877,11 +878,12 @@ impl IngesterShardedBatchConsumer {
                     let mut rec_metadata: Vec<BorrowedMetadata<'_>> = Vec::new();
                     let mut rec_first_shard: Option<usize> = None;
                     let mut rec_series_count = 0usize;
-                    let mut decode_opts = DecodeOptions::kafka_v2();
-                    decode_opts.skip_unmarshaling_exemplars = max_exemplars == 0;
+                    // Exemplars are always unmarshalled (and so validated on the wire), like Go:
+                    // only the distributor sets `SkipUnmarshalingExemplars`. With exemplars
+                    // disabled for the tenant they are just not converted below.
                     let stream_res = decode_rw2_stream(
                         &rec.value,
-                        decode_opts,
+                        DecodeOptions::kafka_v2(),
                         wr_scratch,
                         rw2_resolved,
                         label_bytes_arena,

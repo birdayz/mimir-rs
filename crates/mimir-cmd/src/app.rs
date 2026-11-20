@@ -59,7 +59,6 @@ use tonic::codec::CompressionEncoding;
 use crate::cli::CliOutcome;
 use crate::grpc::{
     GrpcCompressionEchoService, HealthService, HttpGrpcBridge, HttpGrpcStatusFixService,
-    RefLeaksMiddlewareService,
 };
 use crate::http::{build_http_router, AppHttpState};
 use crate::metrics::{register_global_metrics_with_deprecated, version_info};
@@ -763,6 +762,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         ingester.set_compartments(cfg.compartments.clone());
         ingester.set_partition_ring_watchers(partition_ring_watchers.take());
         ingester.set_activity_tracker(activity_tracker.clone());
+        // mimir.go: `mimirpb.CustomCodecConfig{InstrumentRefLeaksConfig}.RegisterGlobally(reg)`
+        // -> `codecV2.Unmarshal` instruments each unmarshalled `WriteRequest` buffer.
+        if cfg.instrument_ref_leaks.percentage > 0.0 {
+            ingester.set_ref_leaks_tracker(ref_leaks_tracker.clone());
+        }
 
         // Cost attribution service (pkg/mimir/modules.go initCostAttributionService): only enabled
         // when -cost-attribution.registry-path is set.
@@ -855,21 +859,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             .max_encoding_message_size(usize::MAX)
             .accept_compressed(CompressionEncoding::Gzip)
             .accept_compressed(CompressionEncoding::Zstd);
-        if cfg.instrument_ref_leaks.percentage > 0.0 {
-            let ing_svc = GrpcCompressionEchoService::new_with_limits(
-                RefLeaksMiddlewareService::new(ing_inner, ref_leaks_tracker.clone()),
-                max_recv,
-                max_send,
-            );
-            grpc_routes = grpc_routes.add_service(ing_svc);
-        } else {
-            let ing_svc = GrpcCompressionEchoService::new_with_limits(
-                ing_inner,
-                max_recv,
-                max_send,
-            );
-            grpc_routes = grpc_routes.add_service(ing_svc);
-        }
+        let ing_svc =
+            GrpcCompressionEchoService::new_with_limits(ing_inner, max_recv, max_send);
+        grpc_routes = grpc_routes.add_service(ing_svc);
     }
 
     log_module_starting(&*logger, "server");

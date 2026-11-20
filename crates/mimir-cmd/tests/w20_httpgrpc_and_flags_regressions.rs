@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use bytes::Bytes;
 use http_body_util::BodyExt as _;
-use mimir_cmd::grpc::{GrpcCompressionEchoService, HttpGrpcBridge, RefLeaksMiddlewareService};
+use mimir_cmd::grpc::{GrpcCompressionEchoService, HttpGrpcBridge};
 use mimir_cmd::http::{build_http_router, AppHttpState};
 use mimir_cmd::modules::ModuleStates;
 use mimir_cmd::parse_cli_for_run;
@@ -235,28 +235,59 @@ async fn m20_07_instrument_ref_leaks_config_validation_and_push_wiring() {
     );
     ing.set_state_for_test(mimir_common::services::State::Running);
 
-    let svc = GrpcCompressionEchoService::new(RefLeaksMiddlewareService::new(
-        IngesterService::new(Arc::clone(&ing)).into_server(),
-        tracker,
-    ));
+    // app.rs wiring: the tracker is handed to the ingester, which instruments each unmarshalled
+    // `WriteRequest` buffer exactly once (Go `codecV2.Unmarshal` -> `maybeInstrumentRefLeaks`).
+    ing.set_ref_leaks_tracker(tracker.clone());
 
-    let wr = cortexpb::WriteRequest::default();
-    let encoded = wr.encode_to_vec();
-    let mut framed = Vec::with_capacity(5 + encoded.len());
-    framed.push(0);
-    framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-    framed.extend_from_slice(&encoded);
+    let push = |wr: cortexpb::WriteRequest| {
+        let svc = GrpcCompressionEchoService::new(
+            IngesterService::new(Arc::clone(&ing)).into_server(),
+        );
+        async move {
+            let encoded = wr.encode_to_vec();
+            let mut framed = Vec::with_capacity(5 + encoded.len());
+            framed.push(0);
+            framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+            framed.extend_from_slice(&encoded);
+            let req = http::Request::builder()
+                .method(Method::POST)
+                .uri("/cortex.Ingester/Push")
+                .header(header::CONTENT_TYPE, "application/grpc")
+                .header("x-scope-orgid", "tenant-a")
+                .body(tonic::body::BoxBody::new(
+                    http_body_util::Full::new(Bytes::from(framed)).map_err(|never| match never {}),
+                ))
+                .unwrap();
+            let _ = svc.oneshot(req).await.unwrap();
+        }
+    };
 
-    let req = http::Request::builder()
-        .method(Method::POST)
-        .uri("/cortex.Ingester/Push")
-        .header(header::CONTENT_TYPE, "application/grpc")
-        .header("x-scope-orgid", "tenant-a")
-        .body(tonic::body::BoxBody::new(
-            http_body_util::Full::new(Bytes::from(framed)).map_err(|never| match never {}),
-        ))
-        .unwrap();
-    let _ = svc.oneshot(req).await.unwrap();
+    // Go `maybeInstrumentRefLeaks`: `data.Len() > 0` — an empty message is never instrumented.
+    push(cortexpb::WriteRequest::default()).await;
+    assert_eq!(tracker.instrumented_buffers_total(), 0.0);
+
+    // One non-empty Push message == exactly one instrumented buffer at percentage=100, released
+    // (before-reuse-period=0s) once the request completes.
+    push(cortexpb::WriteRequest {
+        timeseries: vec![cortexpb::TimeSeries {
+            labels: vec![cortexpb::LabelPair {
+                name: "__name__".into(),
+                value: "rl_metric".into(),
+            }],
+            samples: vec![cortexpb::Sample {
+                timestamp_ms: 1,
+                value: 1.0,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(tracker.instrumented_buffers_total(), 1.0);
+    assert_eq!(tracker.inflight_instrumented_bytes(), 0.0);
+    let names: Vec<String> = reg.gather().iter().map(|mf| mf.get_name().to_string()).collect();
+    assert!(names.contains(&"mimir_reference_leaks_instrumented_buffers_total".to_string()));
+    assert!(names.contains(&"mimir_reference_leaks_inflight_instrumented_bytes".to_string()));
 
     let families = reg.gather();
     let bufs = families

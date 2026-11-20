@@ -19,8 +19,10 @@ use mimir_proto::cortexpb::{self, is_client_error_cause, ErrorCause};
 use mimir_proto::symbols::V2_COMMON_SYMBOLS_LIST;
 use mimir_proto::zerocopy::{BorrowedWriteRequest, WriteRequestScratch};
 use parking_lot::Mutex as SyncMutex;
-use mimir_common::native_histogram::{HistogramOpts as NativeHistogramOpts, SingleHistogram, DEF_BUCKETS};
-use prometheus::{Counter, CounterVec, HistogramOpts, HistogramVec, Opts, Registry};
+use mimir_common::native_histogram::{
+    HistogramOpts as NativeHistogramOpts, HistogramVec, SingleHistogram, DEF_BUCKETS,
+};
+use prometheus::{Counter, CounterVec, Opts, Registry};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
@@ -417,16 +419,12 @@ impl StoragePusherMetrics {
         )
         .expect("valid metric");
 
-        // NOTE(M20-01): mimir-ingester caches OnceLock<prometheus::Histogram> for this vector;
-        // emit empty classic buckets (le="+Inf" only) until mimir-ingester updates its cache type
-        // to Arc<mimir_common::native_histogram::Histogram> so processing_time can switch to
-        // mimir_common::native_histogram::HistogramVec.
         let processing_time = HistogramVec::new(
-            HistogramOpts::new(
+            NativeHistogramOpts::new(
                 "cortex_ingest_storage_reader_pusher_processing_time_seconds",
                 "Time to ingest a batch of samples for timeseries or metadata by an ingestion shard. The 'batch_contents' label indicates the contents of the batch.",
             )
-            .buckets(vec![f64::INFINITY]),
+            .native(1.1, 0, Duration::ZERO),
             &["content"],
         )
         .expect("valid metric");

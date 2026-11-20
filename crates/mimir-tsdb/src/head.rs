@@ -135,6 +135,17 @@ pub enum HeadError {
     EmptyLabelset,
 }
 
+impl HeadError {
+    /// Go `errors.Is(err, storage.ErrDuplicateSampleForTimestamp)`.
+    #[inline]
+    fn is_duplicate_sample(&self) -> bool {
+        matches!(
+            self,
+            HeadError::DuplicateSampleForTimestamp | HeadError::DuplicateSampleWithDetails(_)
+        )
+    }
+}
+
 /// Lifecycle callback trait matching `prometheus/tsdb.SeriesLifecycleCallback`.
 pub trait SeriesLifecycleCallback: Send + Sync {
     fn pre_creation(&self, pairs: &[(&str, &str)]) -> Result<(), HeadError>;
@@ -3539,8 +3550,19 @@ impl HeadMetrics {
             HeadError::OutOfBounds => self.out_of_bound_samples.with_label_values(&[typ]).inc(),
             HeadError::OutOfOrderSample => self.out_of_order_samples.with_label_values(&[typ]).inc(),
             HeadError::TooOldSample => self.too_old_samples.with_label_values(&[typ]).inc(),
+            // Go `headAppenderV2.Append`: `errors.Is(appErr, errConflictingSample)`.
+            HeadError::DuplicateSampleForTimestamp | HeadError::DuplicateSampleWithDetails(_) => {
+                self.duplicate_samples.with_label_values(&[typ]).inc()
+            }
             _ => {}
         }
+    }
+
+    /// A sample identical (timestamp and value) to the last one of its series. Go queues it and
+    /// drops it in `Commit` (`recordDroppedExactDup`); here it is dropped when it is appended.
+    #[inline]
+    fn exact_duplicate_dropped(&self, typ: &str) {
+        self.duplicate_samples.with_label_values(&[typ]).inc();
     }
 
     /// Go `chunksRemoved.Add(n); chunks.Sub(n)`.
@@ -8153,6 +8175,8 @@ impl Head {
                 self.active_reads.wait_for_range(old_min_ooo, wait_maxt);
             }
             let _mmap_guard = self.mmap_mtx.lock();
+            // Go `truncateSeriesAndChunkDiskMapper("truncateOOO")` times `Head.gc()`.
+            let gc_start = Instant::now();
             let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
             let head_maxt = self.max_time();
             let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
@@ -8250,6 +8274,9 @@ impl Head {
                 self.series.shrink_oversized_stripes();
                 self.maybe_gc_symbols();
             }
+            self.metrics
+                .gc_duration
+                .observe(gc_start.elapsed().as_secs_f64());
 
             self.truncate_chunks_head(min_mmap_seq)?;
         }
@@ -8823,6 +8850,10 @@ impl Head {
                     st.clear_xor2_state();
                     st.clear_hist_state();
                     if st.mmapped().is_empty() {
+                        // The series forgets its last sample here, so this is where it stops
+                        // counting as a stale / native histogram series (Go `stripeSeries.gc`
+                        // subtracts it when the series is deleted, which is the usual outcome).
+                        self.update_metrics_on_series_delete(&st);
                         st.clear_last_sample();
                     }
                 }
@@ -10242,7 +10273,8 @@ impl<'a> HeadAppender<'a> {
                 Ok((is_ooo, is_dup))
             }
             Err(e) => {
-                if v.to_bits() != QUIET_ZERO_NAN_BITS {
+                // Go `memSeries.appendable` returns no delta with a duplicate sample error.
+                if v.to_bits() != QUIET_ZERO_NAN_BITS && !e.is_duplicate_sample() {
                     let delta = self.head_maxt.saturating_sub(t);
                     if delta > 0 {
                         self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
@@ -10579,6 +10611,7 @@ impl<'a> HeadAppender<'a> {
             match res {
                 Ok((is_ooo, is_dup)) => {
                     if is_dup {
+                        self.head.metrics.exact_duplicate_dropped("float");
                         entry.pending_commits.fetch_sub(1, Ordering::Release);
                         if take_entry {
                             *series_entry = Some(entry);
@@ -10626,6 +10659,7 @@ impl<'a> HeadAppender<'a> {
             match res {
                 Ok((is_ooo, is_dup)) => {
                     if is_dup {
+                        self.head.metrics.exact_duplicate_dropped("float");
                         entry.pending_commits.fetch_sub(1, Ordering::Release);
                         if take_entry {
                             *series_entry = Some(entry);
@@ -10767,6 +10801,7 @@ impl<'a> HeadAppender<'a> {
             match res {
                 Ok((is_ooo, is_dup)) => {
                     if is_dup {
+                        self.head.metrics.exact_duplicate_dropped("float");
                         entry.pending_commits.fetch_sub(1, Ordering::Release);
                         return Ok(series_ref);
                     }
@@ -10906,7 +10941,11 @@ impl<'a> HeadAppender<'a> {
                 )
             };
             drop(state);
-            if !matches!(res, Ok((false, _))) {
+            // Go `appendableHistogram` / `appendableFloatHistogram` return no delta for an in-order
+            // sample or with a duplicate sample error.
+            if !matches!(res, Ok((false, _)))
+                && !matches!(&res, Err(e) if e.is_duplicate_sample())
+            {
                 let delta = self.head_maxt.saturating_sub(t);
                 if delta > 0 {
                     self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
@@ -10924,6 +10963,7 @@ impl<'a> HeadAppender<'a> {
                 }
             };
             if is_dup {
+                self.head.metrics.exact_duplicate_dropped("histogram");
                 entry.pending_commits.fetch_sub(1, Ordering::Release);
                 if take_entry {
                     *series_entry = Some(entry);
@@ -11063,7 +11103,11 @@ impl<'a> HeadAppender<'a> {
                 )
             };
             drop(state);
-            if !matches!(res, Ok((false, _))) {
+            // Go `appendableHistogram` / `appendableFloatHistogram` return no delta for an in-order
+            // sample or with a duplicate sample error.
+            if !matches!(res, Ok((false, _)))
+                && !matches!(&res, Err(e) if e.is_duplicate_sample())
+            {
                 let delta = self.head_maxt.saturating_sub(t);
                 if delta > 0 {
                     self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
@@ -11081,6 +11125,7 @@ impl<'a> HeadAppender<'a> {
                 }
             };
             if is_dup {
+                self.head.metrics.exact_duplicate_dropped("histogram");
                 entry.pending_commits.fetch_sub(1, Ordering::Release);
                 if take_entry {
                     *series_entry = Some(entry);
@@ -11655,6 +11700,9 @@ impl<'a> HeadAppender<'a> {
                                             });
                                             ooo_mint = ooo_mint.min(pf.t);
                                             ooo_maxt = ooo_maxt.max(pf.t);
+                                            histograms_appended += 1;
+                                        } else {
+                                            hist_dups += 1;
                                         }
                                     } else {
                                         let (was_stale, was_hist, old_buckets) = state.sample_state();
@@ -11765,6 +11813,9 @@ impl<'a> HeadAppender<'a> {
                                             });
                                             ooo_mint = ooo_mint.min(pf.t);
                                             ooo_maxt = ooo_maxt.max(pf.t);
+                                            histograms_appended += 1;
+                                        } else {
+                                            hist_dups += 1;
                                         }
                                     } else {
                                         let (was_stale, was_hist, old_buckets) = state.sample_state();
@@ -11904,6 +11955,7 @@ impl<'a> HeadAppender<'a> {
                         });
                         ooo_mint = ooo_mint.min(pf.t);
                         ooo_maxt = ooo_maxt.max(pf.t);
+                        floats_appended += 1;
                     } else {
                         float_dups += 1;
                     }
@@ -12037,6 +12089,7 @@ impl<'a> HeadAppender<'a> {
                         });
                         ooo_mint = ooo_mint.min(ph.t);
                         ooo_maxt = ooo_maxt.max(ph.t);
+                        histograms_appended += 1;
                     } else {
                         hist_dups += 1;
                     }
@@ -12167,6 +12220,7 @@ impl<'a> HeadAppender<'a> {
                         });
                         ooo_mint = ooo_mint.min(pfh.t);
                         ooo_maxt = ooo_maxt.max(pfh.t);
+                        histograms_appended += 1;
                     } else {
                         hist_dups += 1;
                     }
@@ -12221,6 +12275,11 @@ impl<'a> HeadAppender<'a> {
         Ok(())
         })();
 
+        // Go `headAppenderBase.Commit` (`head_append.go`): `samplesAppended` covers every sample
+        // of the batch that was neither rejected nor dropped as a duplicate, out-of-order ones
+        // included; histograms rejected at commit time as out of bounds or too old are counted
+        // in the commit context but never exported.
+        let _ = (hist_oob, hist_too_old);
         let m = &self.head.metrics;
         m.out_of_order_samples
             .with_label_values(&["float"])
@@ -12231,19 +12290,9 @@ impl<'a> HeadAppender<'a> {
         m.out_of_bound_samples
             .with_label_values(&["float"])
             .inc_by(float_oob as f64);
-        if hist_oob > 0 {
-            m.out_of_bound_samples
-                .with_label_values(&["histogram"])
-                .inc_by(hist_oob as f64);
-        }
         m.too_old_samples
             .with_label_values(&["float"])
             .inc_by(float_too_old as f64);
-        if hist_too_old > 0 {
-            m.too_old_samples
-                .with_label_values(&["histogram"])
-                .inc_by(hist_too_old as f64);
-        }
         m.samples_appended
             .with_label_values(&["float"])
             .inc_by(floats_appended as f64);
