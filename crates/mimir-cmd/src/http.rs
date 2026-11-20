@@ -210,7 +210,7 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         Router::new()
             .route(
                 &format!("{path_prefix}/"),
-                get_only(index_handler)
+                on(MethodFilter::GET, index_handler)
                     .with_state(state_for_root)
                     .route_layer(axum::middleware::from_fn_with_state(
                         gzip,

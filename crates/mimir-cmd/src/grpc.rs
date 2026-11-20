@@ -860,9 +860,21 @@ impl BoundedGrpcDecompressBody {
             return Ok(None);
         }
         match self.algo {
-            BoundedDecompressAlgo::Identity => {
-                self.out_buf.extend_from_slice(&self.in_buf[..frame_end]);
-            }
+            BoundedDecompressAlgo::Identity => match flag {
+                0 => {
+                    return Ok(Some(self.in_buf.split_to(frame_end).freeze()));
+                }
+                1 => {
+                    return Err(Status::internal(
+                        "grpc: compressed flag set with identity or empty encoding",
+                    ));
+                }
+                other => {
+                    return Err(Status::internal(format!(
+                        "protocol error: received message with invalid compression flag: {other} (valid flags are 0 and 1), while sending request"
+                    )));
+                }
+            },
             BoundedDecompressAlgo::Gzip
             | BoundedDecompressAlgo::Zstd
             | BoundedDecompressAlgo::Snappy
@@ -995,6 +1007,30 @@ impl hyper::body::Body for BoundedGrpcDecompressBody {
                     if frame.is_data() {
                         if let Ok(data) = frame.into_data() {
                             if !data.is_empty() {
+                                if self.frames_seen == 0
+                                    && matches!(self.algo, BoundedDecompressAlgo::Identity)
+                                    && self.in_buf.is_empty()
+                                    && data.len() >= 5
+                                    && data[0] == 0
+                                {
+                                    let msg_len = u32::from_be_bytes([
+                                        data[1], data[2], data[3], data[4],
+                                    ]) as usize;
+                                    if msg_len > self.max_recv {
+                                        self.done = true;
+                                        return Poll::Ready(Some(Err(Status::resource_exhausted(
+                                            format!(
+                                                "grpc: received message larger than max ({msg_len} vs. {})",
+                                                self.max_recv
+                                            ),
+                                        ))));
+                                    }
+                                    if 5usize.checked_add(msg_len) == Some(data.len()) {
+                                        self.buffered_frame1 = Some(data);
+                                        self.frames_seen = 1;
+                                        continue;
+                                    }
+                                }
                                 if self.in_buf.len() < 5 && self.in_buf.len() + data.len() >= 5 {
                                     let need = 5 - self.in_buf.len();
                                     self.in_buf.extend_from_slice(&data[..need]);

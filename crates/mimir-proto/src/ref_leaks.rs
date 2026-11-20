@@ -153,7 +153,7 @@ impl prometheus::core::Collector for RefLeaksInflightBytesCollector {
 pub(crate) fn page_size() -> usize {
     static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PAGE_SIZE.get_or_init(|| {
-        #[cfg(unix)]
+        #[cfg(all(unix, not(miri)))]
         {
             // SAFETY: `sysconf(_SC_PAGESIZE)` is thread-safe and has no preconditions.
             let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };

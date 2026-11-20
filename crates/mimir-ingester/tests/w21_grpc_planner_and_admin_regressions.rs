@@ -443,25 +443,49 @@ async fn w21_df_02_block_planner_cached_and_guards_held_and_ooo_mirrored_outside
     let cache_ulid = cache_db.db.compact_head_all().unwrap().expect("compacted block");
     let cache_blk = Arc::clone(&cache_db.db.blocks()[0]);
     assert_eq!(cache_blk.meta().ulid, cache_ulid);
-    let _ = cache_db.block_lookup_planner(&cache_blk);
-    let _ = cache_db.block_lookup_planner(&cache_blk);
-    let _ = cache_db.block_lookup_planner(&cache_blk);
+    let p1 = cache_db.block_lookup_planner(&cache_blk);
+    let p2 = cache_db.block_lookup_planner(&cache_blk);
+    let p3 = cache_db.block_lookup_planner(&cache_blk);
+    assert!(Arc::ptr_eq(&p1, &p2) && Arc::ptr_eq(&p1, &p3));
+    let weak_planner = Arc::downgrade(&p1);
+    drop((p1, p2, p3));
     assert_eq!(
         factory.calls.load(Ordering::SeqCst),
         1,
         "PlannerFactory::create_planner must execute at most once per opened ULID block"
     );
+    assert!(
+        weak_planner.upgrade().is_some(),
+        "planner lives directly on Block while opened"
+    );
 
-    // Remove cache_ulid on disk and reload_blocks() to trigger on_blocks_reload pruning.
-    std::fs::remove_dir_all(cache_dir.path().join("user-df02-cache").join(cache_ulid.to_string())).unwrap();
+    // Move cache_ulid aside and reload_blocks() to unload it: dropping the last Arc<Block>
+    // frees its cached planner automatically without needing a separate HashMap.
+    let blk_dir = cache_dir
+        .path()
+        .join("user-df02-cache")
+        .join(cache_ulid.to_string());
+    let stash_dir = cache_dir.path().join("stashed-blk");
+    std::fs::rename(&blk_dir, &stash_dir).unwrap();
     cache_db.db.reload_blocks().unwrap();
     assert!(cache_db.db.blocks().iter().all(|b| b.meta().ulid != cache_ulid));
-    // Because cache_ulid was pruned on on_blocks_reload, querying its planner again invokes create_planner.
-    let _ = cache_db.block_lookup_planner(&cache_blk);
+    drop(cache_blk);
+    assert!(
+        weak_planner.upgrade().is_none(),
+        "unloading and dropping Block must free its cached LookupPlanner"
+    );
+
+    // Re-opening the block on reload_blocks() creates a fresh Block whose planner initializes once.
+    std::fs::rename(&stash_dir, &blk_dir).unwrap();
+    cache_db.db.reload_blocks().unwrap();
+    let reopened_blk = Arc::clone(&cache_db.db.blocks()[0]);
+    assert_eq!(reopened_blk.meta().ulid, cache_ulid);
+    let _ = cache_db.block_lookup_planner(&reopened_blk);
+    let _ = cache_db.block_lookup_planner(&reopened_blk);
     assert_eq!(
         factory.calls.load(Ordering::SeqCst),
         2,
-        "on_blocks_reload must prune unloaded ULID blocks from block_planners cache"
+        "re-opened Block must initialize its LookupPlanner once"
     );
 
     let user = "user-df02";

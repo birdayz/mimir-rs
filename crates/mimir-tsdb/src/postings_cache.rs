@@ -149,6 +149,12 @@ impl PostingsForMatchersCacheMetrics {
             evictions_unknown: evictions[3].clone(),
         }
     }
+
+    /// Returns the shared `invalidations_total` counter registered for this cache factory.
+    #[inline]
+    pub fn invalidations(&self) -> &Counter {
+        &self.invalidations
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -448,7 +454,7 @@ impl PostingsForMatchersCache {
     #[inline]
     pub fn invalidate_metric(&self, metric_name: &str) {
         self.invalidate_metric_silent(metric_name);
-        if self.config.report_invalidations {
+        if self.config.report_invalidations && !metric_name.is_empty() {
             if let Some(ref m) = self.metrics {
                 m.invalidations.inc();
             }

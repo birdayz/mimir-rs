@@ -171,9 +171,6 @@ pub struct OwnedSeriesState {
     pub local_series_limit: usize,
 }
 
-type BlockPlannerCell = Arc<std::sync::OnceLock<Arc<dyn LookupPlanner>>>;
-type BlockPlannerCache = Arc<RwLock<HashMap<Ulid, BlockPlannerCell>>>;
-
 pub struct AppendLockGuard<'a> {
     user_tsdb: &'a UserTsdb,
     acquired_state: TsdbState,
@@ -362,8 +359,6 @@ pub struct UserTsdb {
 
     /// `userTSDB.plannerProvider`: set when index lookup planning is enabled.
     planner_provider: std::sync::OnceLock<Arc<PlannerProvider>>,
-    /// Per-ULID-block cached lookup planners, pruned when blocks unload in `on_blocks_reload`.
-    block_planners: BlockPlannerCache,
     ingested_samples_counter: std::sync::OnceLock<prometheus::Counter>,
     ingested_samples_fail_counter: std::sync::OnceLock<prometheus::Counter>,
 }
@@ -405,25 +400,21 @@ impl UserTsdb {
         }
     }
 
-    /// `getIndexLookupPlannerFunc` for a persisted ULID block (cached once per opened block).
+    /// `getIndexLookupPlannerFunc` for a persisted ULID block (cached once directly on `Block`,
+    /// matching Go `index.Reader.lookupPlanner`).
     pub fn block_lookup_planner(&self, block: &mimir_tsdb::block::Block) -> Arc<dyn LookupPlanner> {
         let Some(provider) = self.planner_provider.get() else {
             return Arc::new(NoopPlanner);
         };
-        let ulid = block.meta().ulid;
-        if let Some(cell) = self.block_planners.read().get(&ulid) {
-            if let Some(planner) = cell.get() {
-                return Arc::clone(planner);
-            }
+        let slot = block.get_or_init_lookup_planner(|| {
+            let planner: Arc<dyn LookupPlanner> =
+                provider.get_planner(&block.meta().into(), block.index());
+            Arc::new(planner)
+        });
+        match slot.downcast_ref::<Arc<dyn LookupPlanner>>() {
+            Some(planner) => Arc::clone(planner),
+            None => Arc::new(NoopPlanner),
         }
-        let cell = {
-            let mut map = self.block_planners.write();
-            Arc::clone(
-                map.entry(ulid)
-                    .or_insert_with(|| Arc::new(std::sync::OnceLock::new())),
-            )
-        };
-        Arc::clone(cell.get_or_init(|| provider.get_planner(&block.meta().into(), block.index())))
     }
     #[allow(clippy::too_many_arguments)]
     pub fn open(
@@ -480,7 +471,10 @@ impl UserTsdb {
         let postings_cache_invalidations = if blocks_cfg.tsdb.shared_postings_for_matchers_cache
             && blocks_cfg.tsdb.head_postings_for_matchers_cache_invalidation
         {
-            shared_metrics.head_postings_cache_invalidations.clone()
+            shared_metrics
+                .head_postings_cache
+                .as_ref()
+                .map(|m| m.invalidations().clone())
         } else {
             None
         };
@@ -569,18 +563,12 @@ impl UserTsdb {
             Arc::new(Mutex::new(HashMap::new()));
         let oldest_unshipped_block_ts_ms = Arc::new(AtomicU64::new(0));
         let user_db_ready = Arc::new(AtomicBool::new(false));
-        let block_planners: BlockPlannerCache = Arc::new(RwLock::new(HashMap::new()));
         let on_blocks_reload: BlocksReloadedFn = {
             let shipped_blocks = Arc::clone(&shipped_blocks);
             let oldest_ts = Arc::clone(&oldest_unshipped_block_ts_ms);
-            let block_planners = Arc::clone(&block_planners);
             Arc::new(move |get_blocks| {
                 let shipped = shipped_blocks.lock();
                 let blocks = get_blocks();
-                let live_ulids: HashSet<Ulid> = blocks.iter().map(|b| b.meta().ulid).collect();
-                block_planners
-                    .write()
-                    .retain(|ulid, _| live_ulids.contains(ulid));
                 let oldest = compute_oldest_unshipped_ms(&blocks, &shipped);
                 oldest_ts.store(oldest, Ordering::Release);
             })
@@ -794,7 +782,6 @@ impl UserTsdb {
             lifecycle_adapter,
             current_metadata_limits: Arc::new(Mutex::new(initial_metadata_limits)),
             planner_provider: std::sync::OnceLock::new(),
-            block_planners,
             ingested_samples_counter: std::sync::OnceLock::new(),
             ingested_samples_fail_counter: std::sync::OnceLock::new(),
         });
@@ -1414,27 +1401,17 @@ impl UserTsdb {
 #[derive(Clone)]
 pub struct SharedTsdbMetrics {
     pub head_postings_cache: Option<PostingsForMatchersCacheMetrics>,
-    pub head_postings_cache_invalidations: Option<prometheus::Counter>,
     pub block_postings_cache: Option<PostingsForMatchersCacheMetrics>,
     pub offset_catalogue: OffsetCatalogueMetrics,
 }
 
 impl SharedTsdbMetrics {
     pub fn new(reg: Option<&Registry>) -> Self {
-        let head_postings_cache_invalidations = prometheus::Counter::new(
-            "cortex_ingester_tsdb_head_postings_for_matchers_cache_invalidations_total",
-            "Total number of cache entries that were invalidated.",
-        )
-        .ok();
-        if let (Some(r), Some(ref c)) = (reg, &head_postings_cache_invalidations) {
-            let _ = r.register(Box::new(c.clone()));
-        }
         Self {
             head_postings_cache: Some(PostingsForMatchersCacheMetrics::new(
                 "cortex_ingester_tsdb_head_",
                 reg,
             )),
-            head_postings_cache_invalidations,
             block_postings_cache: Some(PostingsForMatchersCacheMetrics::new(
                 "cortex_ingester_tsdb_block_",
                 reg,
