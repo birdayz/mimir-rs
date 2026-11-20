@@ -75,8 +75,18 @@ pub fn search_token(tokens: &[u32], key: u32) -> usize {
     }
 }
 
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 #[derive(Serialize, Deserialize)]
 struct TokensJson {
+    #[serde(default, alias = "Tokens", deserialize_with = "deserialize_null_default")]
     tokens: Vec<u32>,
 }
 

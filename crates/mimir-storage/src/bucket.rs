@@ -115,9 +115,56 @@ struct TenantSse {
     provider: Arc<dyn TenantConfigProvider>,
 }
 
+#[derive(Debug)]
+struct LazyFilesystem {
+    root: PathBuf,
+    store: parking_lot::Mutex<Option<Arc<LocalFileSystem>>>,
+}
+
+impl LazyFilesystem {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            store: parking_lot::Mutex::new(None),
+        }
+    }
+
+    async fn get_existing(&self) -> Result<Option<Arc<dyn ObjectStore>>, BucketError> {
+        if let Some(store) = self.store.lock().as_ref().cloned() {
+            return Ok(Some(store as Arc<dyn ObjectStore>));
+        }
+        match tokio::fs::metadata(&self.root).await {
+            Ok(_) => {
+                let fs = LocalFileSystem::new_with_prefix(&self.root)?
+                    .with_automatic_cleanup(true);
+                let arc = Arc::new(fs);
+                let mut guard = self.store.lock();
+                let stored = guard.get_or_insert_with(|| Arc::clone(&arc));
+                Ok(Some(Arc::clone(stored) as Arc<dyn ObjectStore>))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(BucketError::Io(e)),
+        }
+    }
+
+    async fn get_or_create(&self) -> Result<Arc<dyn ObjectStore>, BucketError> {
+        tokio::fs::create_dir_all(&self.root).await?;
+        if let Some(store) = self.store.lock().as_ref().cloned() {
+            return Ok(store as Arc<dyn ObjectStore>);
+        }
+        let fs = LocalFileSystem::new_with_prefix(&self.root)?
+            .with_automatic_cleanup(true);
+        let arc = Arc::new(fs);
+        let mut guard = self.store.lock();
+        let stored = guard.get_or_insert_with(|| Arc::clone(&arc));
+        Ok(Arc::clone(stored) as Arc<dyn ObjectStore>)
+    }
+}
+
 #[derive(Clone)]
 enum Backend {
     Store(Arc<dyn ObjectStore>),
+    Filesystem(Arc<LazyFilesystem>),
     S3(Arc<s3::S3Bucket>),
 }
 
@@ -166,14 +213,14 @@ impl BucketClient {
     }
 
     /// Creates a local filesystem bucket client rooted at `dir`.
+    /// Matches Thanos `filesystem.NewBucket`: resolves `dir` to an absolute path
+    /// without eagerly creating directories on disk until an upload/write occurs.
     pub fn new_filesystem(dir: impl AsRef<Path>) -> Result<Self, BucketError> {
         let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)?;
-        let fs = LocalFileSystem::new_with_prefix(dir)?.with_automatic_cleanup(true);
         let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
         // thanos filesystem `Name()`: "fs: <absolute root dir>".
         let mut client = Self::from_backend(
-            Backend::Store(Arc::new(fs)),
+            Backend::Filesystem(Arc::new(LazyFilesystem::new(abs.clone()))),
             format!("fs: {}", abs.to_string_lossy()),
             "FILESYSTEM",
         );
@@ -387,6 +434,11 @@ impl BucketClient {
                     let path = self.object_path(name)?;
                     store_upload(store, &path, source).await
                 }
+                Backend::Filesystem(fs) => {
+                    let path = self.object_path(name)?;
+                    let store = fs.get_or_create().await?;
+                    store_upload(&store, &path, source).await
+                }
             }
         }
         .await;
@@ -449,41 +501,18 @@ impl BucketClient {
                     }
                 })
             }
-            Backend::Store(store) => async {
+            Backend::Store(store) => {
                 let path = self.object_path(name)?;
-                match range {
-                    None => match store.get(&path).await {
-                        Ok(res) => Ok(res.bytes().await?),
-                        Err(object_store::Error::NotFound { .. }) => {
-                            Err(BucketError::NotFound(name.to_string()))
-                        }
-                        Err(e) => Err(BucketError::Store(e)),
-                    },
-                    Some((_, 0)) => match store.head(&path).await {
-                        Ok(_) => Ok(Bytes::new()),
-                        Err(object_store::Error::NotFound { .. }) => {
-                            Err(BucketError::NotFound(name.to_string()))
-                        }
-                        Err(e) => Err(BucketError::Store(e)),
-                    },
-                    Some((off, len)) => {
-                        let opts = GetOptions {
-                            range: Some(GetRange::Bounded(
-                                (off as usize)..(off.saturating_add(len) as usize),
-                            )),
-                            ..Default::default()
-                        };
-                        match store.get_opts(&path, opts).await {
-                            Ok(res) => Ok(res.bytes().await?),
-                            Err(object_store::Error::NotFound { .. }) => {
-                                Err(BucketError::NotFound(name.to_string()))
-                            }
-                            Err(e) => Err(BucketError::Store(e)),
-                        }
-                    }
+                store_read_op(store, &path, name, range).await
+            }
+            Backend::Filesystem(fs) => {
+                let path = self.object_path(name)?;
+                match fs.get_existing().await {
+                    Ok(Some(store)) => store_read_op(&store, &path, name, range).await,
+                    Ok(None) => Err(BucketError::NotFound(name.to_string())),
+                    Err(e) => Err(e),
                 }
             }
-            .await,
         };
         if let Some(t) = timer {
             let expected =
@@ -523,6 +552,18 @@ impl BucketClient {
                 }
             }
             .await,
+            Backend::Filesystem(fs) => async {
+                let path = self.object_path(name)?;
+                let Some(store) = fs.get_existing().await? else {
+                    return Ok(false);
+                };
+                match store.head(&path).await {
+                    Ok(_) => Ok(true),
+                    Err(object_store::Error::NotFound { .. }) => Ok(false),
+                    Err(e) => Err(BucketError::Store(e)),
+                }
+            }
+            .await,
         };
         if let Some(t) = timer {
             let expected =
@@ -539,6 +580,25 @@ impl BucketClient {
             Backend::S3(b) => b.delete(&self.full_name(name)).await.map_err(BucketError::S3),
             Backend::Store(store) => async {
                 let path = self.object_path(name)?;
+                match store.delete(&path).await {
+                    Ok(()) => Ok(()),
+                    Err(object_store::Error::NotFound { .. }) if strict => {
+                        Err(BucketError::NotFound(name.to_string()))
+                    }
+                    Err(object_store::Error::NotFound { .. }) => Ok(()),
+                    Err(e) => Err(BucketError::Store(e)),
+                }
+            }
+            .await,
+            Backend::Filesystem(fs) => async {
+                let path = self.object_path(name)?;
+                let Some(store) = fs.get_existing().await? else {
+                    return if strict {
+                        Err(BucketError::NotFound(name.to_string()))
+                    } else {
+                        Ok(())
+                    };
+                };
                 match store.delete(&path).await {
                     Ok(()) => Ok(()),
                     Err(object_store::Error::NotFound { .. }) if strict => {
@@ -602,6 +662,23 @@ impl BucketClient {
                 }
             }
             .await,
+            Backend::Filesystem(fs) => async {
+                let path = self.object_path(name)?;
+                let Some(store) = fs.get_existing().await? else {
+                    return Err(BucketError::NotFound(name.to_string()));
+                };
+                match store.head(&path).await {
+                    Ok(meta) => Ok(ObjectAttributes {
+                        size: meta.size as u64,
+                        last_modified_unix_secs: meta.last_modified.timestamp(),
+                    }),
+                    Err(object_store::Error::NotFound { .. }) => {
+                        Err(BucketError::NotFound(name.to_string()))
+                    }
+                    Err(e) => Err(BucketError::Store(e)),
+                }
+            }
+            .await,
         };
         if let Some(t) = timer {
             let expected =
@@ -630,9 +707,6 @@ impl BucketClient {
                 .filter(|e| !e.is_empty())
                 .collect());
         }
-        let Backend::Store(store) = &self.backend else {
-            unreachable!()
-        };
         let prefix = if full.is_empty() {
             None
         } else {
@@ -640,6 +714,18 @@ impl BucketClient {
                 ObjectPath::parse(&full)
                     .map_err(|e| BucketError::InvalidPath(full.clone(), e.to_string()))?,
             )
+        };
+        let owned_fs_store: Arc<dyn ObjectStore>;
+        let store: &Arc<dyn ObjectStore> = match &self.backend {
+            Backend::Store(store) => store,
+            Backend::Filesystem(fs) => {
+                let Some(s) = fs.get_existing().await? else {
+                    return Ok(Vec::new());
+                };
+                owned_fs_store = s;
+                &owned_fs_store
+            }
+            Backend::S3(_) => unreachable!(),
         };
         if recursive {
             let mut stream = store.list(prefix.as_ref());
@@ -745,6 +831,45 @@ impl Drop for UploadAbortGuard {
                 handle.spawn(async move {
                     let _ = upload.abort().await;
                 });
+            }
+        }
+    }
+}
+
+async fn store_read_op(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+    name: &str,
+    range: Option<(u64, u64)>,
+) -> Result<Bytes, BucketError> {
+    match range {
+        None => match store.get(path).await {
+            Ok(res) => Ok(res.bytes().await?),
+            Err(object_store::Error::NotFound { .. }) => {
+                Err(BucketError::NotFound(name.to_string()))
+            }
+            Err(e) => Err(BucketError::Store(e)),
+        },
+        Some((_, 0)) => match store.head(path).await {
+            Ok(_) => Ok(Bytes::new()),
+            Err(object_store::Error::NotFound { .. }) => {
+                Err(BucketError::NotFound(name.to_string()))
+            }
+            Err(e) => Err(BucketError::Store(e)),
+        },
+        Some((off, len)) => {
+            let opts = GetOptions {
+                range: Some(GetRange::Bounded(
+                    (off as usize)..(off.saturating_add(len) as usize),
+                )),
+                ..Default::default()
+            };
+            match store.get_opts(path, opts).await {
+                Ok(res) => Ok(res.bytes().await?),
+                Err(object_store::Error::NotFound { .. }) => {
+                    Err(BucketError::NotFound(name.to_string()))
+                }
+                Err(e) => Err(BucketError::Store(e)),
             }
         }
     }

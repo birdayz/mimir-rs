@@ -57,6 +57,36 @@ pub struct ActivityEntry {
     pub activity: String,
 }
 
+/// Validates raw signed `-activity-tracker.max-entries` matching Go's `getMappedFile`
+/// (`MaxEntries < 0` -> `failed to truncate activity file: invalid argument`;
+/// `MaxEntries == 0` -> `failed to mmap activity file: invalid argument`).
+pub fn validate_raw_max_entries(raw: i64) -> io::Result<usize> {
+    if raw < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "failed to truncate activity file: invalid argument",
+        ));
+    }
+    if raw == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "failed to mmap activity file: invalid argument",
+        ));
+    }
+    let entries = raw as usize;
+    if entries
+        .checked_mul(ENTRY_SIZE)
+        .and_then(|bytes| i64::try_from(bytes).ok())
+        .is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "failed to truncate activity file: invalid argument",
+        ));
+    }
+    Ok(entries)
+}
+
 /// Mmap-backed tracker remembering active tasks in fixed 1024-byte slots.
 pub struct ActivityTracker {
     _file: File,
@@ -78,11 +108,26 @@ impl ActivityTracker {
         if cfg.filepath.as_os_str().is_empty() {
             return Ok(None);
         }
+        if cfg.max_entries == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to mmap activity file: invalid argument",
+            ));
+        }
+        let filesize = cfg
+            .max_entries
+            .checked_mul(ENTRY_SIZE)
+            .and_then(|bytes| i64::try_from(bytes).ok().map(|_| bytes))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "failed to truncate activity file: invalid argument",
+                )
+            })?;
 
         // Load unfinished entries from any previous run before truncating.
         let (prev_entries, _) = load_unfinished_entries_partial(&cfg.filepath);
 
-        let filesize = cfg.max_entries * ENTRY_SIZE;
         let file = open_and_truncate(&cfg.filepath, filesize)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
@@ -444,6 +489,52 @@ mod tests {
         .unwrap();
         assert_eq!(tr2.loaded_activities_on_startup_count(), 2.0);
         tr2.close().unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_raw_max_entries_and_zero_or_overflow() {
+        let err_neg = validate_raw_max_entries(-1).unwrap_err();
+        assert!(err_neg.to_string().contains("failed to truncate activity file"));
+        let err_zero = validate_raw_max_entries(0).unwrap_err();
+        assert!(err_zero.to_string().contains("failed to mmap activity file"));
+        let err_ovf = validate_raw_max_entries((i64::MAX / ENTRY_SIZE as i64) + 1).unwrap_err();
+        assert!(err_ovf.to_string().contains("failed to truncate activity file"));
+        assert_eq!(validate_raw_max_entries(16).unwrap(), 16);
+
+        let dir = std::env::temp_dir().join(format!(
+            "mimir-activitytracker-w19-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("activity");
+
+        let zero_res = ActivityTracker::new(
+            ActivityTrackerConfig {
+                filepath: file.clone(),
+                max_entries: 0,
+            },
+            None,
+        );
+        assert!(zero_res
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("failed to mmap activity file"));
+
+        let ovf_res = ActivityTracker::new(
+            ActivityTrackerConfig {
+                filepath: file,
+                max_entries: usize::MAX,
+            },
+            None,
+        );
+        assert!(ovf_res
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("failed to truncate activity file"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

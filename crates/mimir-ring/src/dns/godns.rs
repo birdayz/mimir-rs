@@ -23,6 +23,7 @@ use hickory_resolver::config::{
     LookupIpStrategy, NameServerConfigGroup, ResolveHosts, ResolverConfig,
 };
 use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::ProtoErrorKind;
 use hickory_resolver::{ResolveError, TokioResolver};
 use parking_lot::Mutex;
@@ -64,9 +65,18 @@ impl fmt::Display for GoDnsError {
 
 impl std::error::Error for GoDnsError {}
 
+fn is_not_found_resolve_error(e: &ResolveError) -> bool {
+    match e.proto().map(|p| p.kind()) {
+        Some(ProtoErrorKind::NoRecordsFound { response_code, .. }) => {
+            matches!(response_code, ResponseCode::NoError | ResponseCode::NXDomain)
+        }
+        _ => e.is_no_records_found() || e.is_nx_domain(),
+    }
+}
+
 impl GoDnsError {
     fn from_resolve_error(name: &str, e: &ResolveError) -> Self {
-        if e.is_no_records_found() || e.is_nx_domain() {
+        if is_not_found_resolve_error(e) {
             return GoDnsError {
                 err: ERR_NO_SUCH_HOST.to_string(),
                 name: name.to_string(),
@@ -95,6 +105,7 @@ impl GoDnsError {
 
 struct State {
     resolver: Arc<TokioResolver>,
+    custom_resolver: bool,
     last_checked: Instant,
     resolv_conf_mtime: Option<SystemTime>,
     hosts_mtime: Option<SystemTime>,
@@ -154,6 +165,7 @@ impl Resolver {
         Resolver {
             state: Mutex::new(State {
                 resolver: Arc::new(build_resolver()),
+                custom_resolver: false,
                 last_checked: Instant::now(),
                 resolv_conf_mtime: mtime(RESOLV_CONF_PATH),
                 hosts_mtime: mtime(HOSTS_PATH),
@@ -161,9 +173,23 @@ impl Resolver {
         }
     }
 
+    /// Creates a [`Resolver`] backed by a caller-supplied [`TokioResolver`] (without
+    /// `/etc/resolv.conf` auto-reload).
+    pub fn with_resolver(resolver: TokioResolver) -> Self {
+        Resolver {
+            state: Mutex::new(State {
+                resolver: Arc::new(resolver),
+                custom_resolver: true,
+                last_checked: Instant::now(),
+                resolv_conf_mtime: None,
+                hosts_mtime: None,
+            }),
+        }
+    }
+
     fn current(&self) -> Arc<TokioResolver> {
         let mut st = self.state.lock();
-        if st.last_checked.elapsed() >= RECHECK_INTERVAL {
+        if !st.custom_resolver && st.last_checked.elapsed() >= RECHECK_INTERVAL {
             st.last_checked = Instant::now();
             let rc = mtime(RESOLV_CONF_PATH);
             let hosts = mtime(HOSTS_PATH);
@@ -188,23 +214,53 @@ impl Resolver {
                 is_not_found: true,
             }));
         }
-        let resolver = self.current();
-        match resolver.lookup_ip(host).await {
-            Ok(lookup) => {
-                let ips: Vec<IpAddr> = lookup.iter().collect();
-                if ips.is_empty() {
-                    return Err(Box::new(GoDnsError {
-                        err: ERR_NO_SUCH_HOST.to_string(),
-                        name: host.to_string(),
-                        server: String::new(),
-                        is_timeout: false,
-                        is_not_found: true,
-                    }));
-                }
-                Ok(ips)
-            }
-            Err(e) => Err(Box::new(GoDnsError::from_resolve_error(host, &e))),
+        // Go net.Resolver.lookupIPAddr short-circuits IP literals (including IPv6 %zone) before
+        // sending any DNS queries (avoiding search-domain queries under Kubernetes ndots:5).
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![ip]);
         }
+        if let Some((ip_part, zone)) = host.split_once('%') {
+            if !zone.is_empty() {
+                if let Ok(v6) = ip_part.parse::<Ipv6Addr>() {
+                    return Ok(vec![IpAddr::V6(v6)]);
+                }
+            }
+        }
+        let resolver = self.current();
+        // Issue A and AAAA lookups separately and join both results instead of hickory's
+        // lookup_ip() (future::select), which drops e2 when both fail and can mask
+        // SERVFAIL/Timeout behind a faster NODATA/NXDOMAIN on the other address family.
+        let (v4_res, v6_res) = tokio::join!(resolver.ipv4_lookup(host), resolver.ipv6_lookup(host));
+        let mut ips = Vec::new();
+        let mut errs: Vec<&ResolveError> = Vec::new();
+        match &v4_res {
+            Ok(lookup) => ips.extend(lookup.iter().map(|a| IpAddr::V4(a.0))),
+            Err(e) => errs.push(e),
+        }
+        match &v6_res {
+            Ok(lookup) => ips.extend(lookup.iter().map(|aaaa| IpAddr::V6(aaaa.0))),
+            Err(e) => errs.push(e),
+        }
+        if !ips.is_empty() {
+            return Ok(ips);
+        }
+        if let Some(err) = errs
+            .iter()
+            .copied()
+            .find(|e| !is_not_found_resolve_error(e))
+        {
+            return Err(Box::new(GoDnsError::from_resolve_error(host, err)));
+        }
+        if let Some(err) = errs.first().copied() {
+            return Err(Box::new(GoDnsError::from_resolve_error(host, err)));
+        }
+        Err(Box::new(GoDnsError {
+            err: ERR_NO_SUCH_HOST.to_string(),
+            name: host.to_string(),
+            server: String::new(),
+            is_timeout: false,
+            is_not_found: true,
+        }))
     }
 
     async fn lookup_srv_impl(
