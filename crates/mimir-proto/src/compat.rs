@@ -309,11 +309,7 @@ pub fn from_label_adapters_to_key_string(ls: &[LabelAdapter]) -> Vec<u8> {
 
 #[inline]
 fn is_go_print(ch: char) -> bool {
-    let r = ch as u32;
-    if r <= 0xFF {
-        return (0x20..=0x7E).contains(&r) || ((0xA1..=0xFF).contains(&r) && r != 0xAD);
-    }
-    !ch.is_control() && !ch.is_whitespace()
+    crate::go_strconv::is_print(ch)
 }
 
 #[inline]

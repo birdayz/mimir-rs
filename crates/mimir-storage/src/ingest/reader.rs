@@ -783,7 +783,12 @@ impl PartitionCommitter {
             .observe(start.elapsed().as_secs_f64());
 
         if !errs.is_empty() {
-            let err_msg = errs.join("; ");
+            // dskit `multierror.MultiError.Error()`: "<n> errors: " prefix only when n > 1.
+            let err_msg = if errs.len() > 1 {
+                format!("{} errors: {}", errs.len(), errs.join("; "))
+            } else {
+                errs.join("; ")
+            };
             error!(partition = self.partition_id, offset, err = %err_msg, "failed to commit last consumed offset");
             self.commit_failures_total.inc();
             return Err(err_msg);

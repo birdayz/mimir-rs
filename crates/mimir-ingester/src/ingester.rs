@@ -1378,8 +1378,9 @@ impl Ingester {
             let mut errs = Vec::new();
             for user_id in users {
                 if let Some(db) = self.get_tsdb(&user_id) {
+                    // Go `concurrency.ForEachUser` adds `db.Head().Sync()` errors unwrapped.
                     if let Err(e) = sync_user(&user_id, &db) {
-                        errs.push(format!("failed to sync TSDB WAL for user {user_id}: {e}"));
+                        errs.push(e);
                     }
                 }
             }
@@ -1397,9 +1398,7 @@ impl Ingester {
                         };
                         if let Some(db) = self.get_tsdb(user_id) {
                             if let Err(e) = sync_user(user_id, &db) {
-                                errs.lock().push(format!(
-                                    "failed to sync TSDB WAL for user {user_id}: {e}"
-                                ));
+                                errs.lock().push(e);
                             }
                         }
                     });

@@ -1085,7 +1085,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     }
     service_ctx.cancel();
     runtime_config_state.set(State::Stopping);
-    memberlist_state.set(State::Stopping);
+    // Go KVInitService: a failed inner KV makes `running` return its error, so the module ends
+    // up Failed (never Terminated).
+    if memberlist_state.get() != State::Failed {
+        memberlist_state.set(State::Stopping);
+    }
     server_state.set(State::Stopping);
 
     // `MemberlistKV` depends on `API` -> `Server`: memberlist leaves the cluster and stops
@@ -1097,7 +1101,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     if let Some(ml) = memberlist_kv {
         ml.shutdown().await;
     }
-    memberlist_state.set(State::Terminated);
+    if memberlist_failure.is_some() || memberlist_state.get() == State::Failed {
+        memberlist_state.set(State::Failed);
+    } else {
+        memberlist_state.set(State::Terminated);
+    }
     if memberlist_module && reached_running("memberlist-kv") {
         match memberlist_failure {
             Some(err_s) => logger.log(

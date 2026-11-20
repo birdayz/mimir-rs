@@ -1695,3 +1695,23 @@ fn w18_wpe_03_go_quote_escapes_control_chars_and_empty_labels() {
         r#"m{v="a\ab\bc\fd\ne\rf\tg\vh\x00i\x1fj\x7fk\u0085l\u00adm"}"#
     );
 }
+
+/// `strconv.AppendQuote` escapes every rune for which `strconv.IsPrint` is false: format (Cf),
+/// separator (Z*), private-use (Co) and unassigned (Cn) code points, not only controls.
+/// Expected strings produced by Go `strconv.Quote` (go1.27.3).
+#[test]
+fn w18_wpe_03_go_quote_matches_strconv_is_print_for_non_latin1_runes() {
+    let mut out = String::new();
+    mimir_proto::compat::append_go_quote_str(
+        &mut out,
+        "a\u{200b}b\u{feff}\u{a0}\u{ad}\u{378}\u{e000}\u{1F600}\u{E0001}é\x7f\x01\t\"\\\u{2028}\u{85}",
+    );
+    assert_eq!(
+        out,
+        r#""a\u200bb\ufeff\u00a0\u00ad\u0378\ue000😀\U000e0001é\x7f\x01\t\"\\\u2028\u0085""#
+    );
+
+    let mut out = String::new();
+    mimir_proto::compat::append_go_quote_bytes(&mut out, b"ok\xff\xe2\x80\x8b\xc3\xa9");
+    assert_eq!(out, r#""ok\xff\u200bé""#);
+}

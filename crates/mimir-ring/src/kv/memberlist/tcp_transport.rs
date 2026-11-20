@@ -1131,7 +1131,7 @@ impl TcpTransport {
             None => write_fut.await,
             Some(d) => tokio::time::timeout_at(d, write_fut)
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "i/o timeout"))?,
+                .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "i/o timeout"))),
         };
         if let Err(err) = res {
             self.metrics.outgoing_stream_errors.inc();
