@@ -10,7 +10,7 @@ use mimir_tsdb::block::{write_meta_file, BlockMeta, BlockMetaCompaction, BlockSt
 use mimir_tsdb::chunkenc::{EncodedChunk, XorChunk};
 use mimir_tsdb::head_chunks::{
     head_chunk_file_path, HeadChunksError, HeadChunksReader, HeadChunksWriter, WriteFaultAction,
-    HEAD_CHUNK_FILE_HEADER_SIZE,
+    HEAD_CHUNK_FILE_HEADER_SIZE, HEAD_CHUNK_FILE_PREALLOCATION_SIZE,
 };
 use mimir_tsdb::tombstones::{write_tombstones_file, Interval, MemTombstones, TOMBSTONES_FILENAME};
 use mimir_tsdb::wlog::{
@@ -245,13 +245,14 @@ fn head_chunks_writer_enospc_direct_and_buffered_rollback_preserves_offsets() {
         let err = w.flush().unwrap_err();
         assert!(matches!(err, HeadChunksError::Io(_)));
 
-        // Physical file still only has the 8-byte header (all 23 torn bytes rolled back),
+        // Physical file preserves preallocation (all 23 torn bytes rolled back & zeroed),
         // and unflushed write_buf was discarded so offset == HEAD_CHUNK_FILE_HEADER_SIZE.
         let seq1_path = head_chunk_file_path(dir.path(), 1);
-        assert_eq!(
-            fs::metadata(&seq1_path).unwrap().len(),
-            HEAD_CHUNK_FILE_HEADER_SIZE as u64
-        );
+        #[cfg(unix)]
+        let expected_len = HEAD_CHUNK_FILE_PREALLOCATION_SIZE as u64;
+        #[cfg(not(unix))]
+        let expected_len = HEAD_CHUNK_FILE_HEADER_SIZE as u64;
+        assert_eq!(fs::metadata(&seq1_path).unwrap().len(), expected_len);
 
         // Recover disk space, write 1,000 chunks (starting cleanly at offset 8), close, and verify!
         w.set_write_fault_hook(None);

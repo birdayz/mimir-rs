@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::any::Any;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -416,6 +417,7 @@ pub struct Block {
     total_size: u64,
     postings_cache: PostingsForMatchersCache,
     readers: Arc<BlockReaders>,
+    lookup_planner: OnceLock<Arc<dyn Any + Send + Sync>>,
 }
 
 impl Block {
@@ -454,6 +456,7 @@ impl Block {
             total_size,
             postings_cache: PostingsForMatchersCache::new(postings_cache),
             readers: Arc::new(BlockReaders::default()),
+            lookup_planner: OnceLock::new(),
         })
     }
 
@@ -472,6 +475,18 @@ impl Block {
     /// Marks this block as closing and waits until all active [`BlockReadGuard`]s drop.
     pub fn close_and_wait(&self) {
         self.readers.close_and_wait();
+    }
+
+    /// Returns the cached index lookup planner for this block, initializing it once on first use.
+    #[inline]
+    pub fn get_or_init_lookup_planner<F>(
+        &self,
+        init: F,
+    ) -> &Arc<dyn Any + Send + Sync>
+    where
+        F: FnOnce() -> Arc<dyn Any + Send + Sync>,
+    {
+        self.lookup_planner.get_or_init(init)
     }
 
     #[inline]

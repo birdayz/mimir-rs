@@ -24,6 +24,8 @@ pub const HEAD_CHUNK_FILE_HEADER_SIZE: usize =
     MAGIC_CHUNKS_SIZE + CHUNKS_FORMAT_VERSION_SIZE + SEGMENT_HEADER_PADDING_SIZE;
 
 pub const MAX_HEAD_CHUNK_FILE_SIZE: usize = 128 * 1024 * 1024;
+/// Go `HeadChunkFilePreallocationSize` (`MinWriteBufferSize * 2` = 128 KiB on non-Windows).
+pub const HEAD_CHUNK_FILE_PREALLOCATION_SIZE: usize = 131_072;
 pub const SERIES_REF_SIZE: usize = 8;
 pub const MINT_MAXT_SIZE: usize = 8;
 pub const CHUNK_ENCODING_SIZE: usize = 1;
@@ -251,6 +253,18 @@ impl HeadChunksWriter {
         self.last_flushed_ref
     }
 
+    #[inline]
+    fn prealloc_len_u64(&self) -> u64 {
+        #[cfg(unix)]
+        {
+            HEAD_CHUNK_FILE_PREALLOCATION_SIZE.min(self.max_file_size) as u64
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+
     pub(crate) fn take_snapshot(&self) -> HeadChunksSnapshot {
         HeadChunksSnapshot {
             seq: self.seq,
@@ -276,9 +290,19 @@ impl HeadChunksWriter {
             self.write_buf.truncate(snap.write_buf_len);
             self.offset = snap.offset;
         } else if self.file_offset >= snap.offset {
+            let prealloc_len = self.prealloc_len_u64();
             if let Some(ref mut file) = self.cur_file {
-                let _ = file.set_len(snap.offset as u64);
-                let _ = file.seek(SeekFrom::Start(snap.offset as u64));
+                let saved_pos = snap.offset as u64;
+                let rollback_len = if saved_pos >= HEAD_CHUNK_FILE_HEADER_SIZE as u64 {
+                    saved_pos.max(prealloc_len)
+                } else {
+                    saved_pos
+                };
+                let _ = file.set_len(saved_pos);
+                if rollback_len > saved_pos {
+                    let _ = file.set_len(rollback_len);
+                }
+                let _ = file.seek(SeekFrom::Start(saved_pos));
             }
             self.file_offset = snap.offset;
             self.offset = snap.offset;
@@ -343,12 +367,21 @@ impl HeadChunksWriter {
         if self.write_buf.is_empty() {
             return Ok(());
         }
+        let prealloc_len = self.prealloc_len_u64();
         let Some(ref mut file) = self.cur_file else {
             return Ok(());
         };
         let saved_pos = self.file_offset as u64;
         if let Err(e) = Self::write_all_with_hook(file, self.fault_hook.as_ref(), &self.write_buf) {
+            let rollback_len = if saved_pos >= HEAD_CHUNK_FILE_HEADER_SIZE as u64 {
+                saved_pos.max(prealloc_len)
+            } else {
+                saved_pos
+            };
             let _ = file.set_len(saved_pos);
+            if rollback_len > saved_pos {
+                let _ = file.set_len(rollback_len);
+            }
             let _ = file.seek(SeekFrom::Start(saved_pos));
             self.offset = self.file_offset;
             self.write_buf.clear();
@@ -373,6 +406,15 @@ impl HeadChunksWriter {
             .truncate(true)
             .write(true)
             .open(&path)?;
+
+        let prealloc_len = self.prealloc_len_u64();
+        if prealloc_len > 0 {
+            if let Err(e) = f.set_len(prealloc_len).and_then(|()| f.seek(SeekFrom::Start(0))) {
+                drop(f);
+                let _ = fs::remove_file(&path);
+                return Err(HeadChunksError::Io(e));
+            }
+        }
 
         let mut hdr = [0u8; HEAD_CHUNK_FILE_HEADER_SIZE];
         hdr[..MAGIC_CHUNKS_SIZE].copy_from_slice(&MAGIC_HEAD_CHUNKS.to_be_bytes());
@@ -454,12 +496,21 @@ impl HeadChunksWriter {
         if self.write_buf.len() + needed > self.write_buffer_size {
             self.flush_write_buf()?;
             if needed >= self.write_buffer_size {
+                let prealloc_len = self.prealloc_len_u64();
                 let file = self.cur_file.as_mut().ok_or(HeadChunksError::Closed)?;
                 let saved_pos = self.offset as u64;
                 if let Err(e) =
                     Self::write_all_with_hook(file, self.fault_hook.as_ref(), &self.record_buf)
                 {
+                    let rollback_len = if saved_pos >= HEAD_CHUNK_FILE_HEADER_SIZE as u64 {
+                        saved_pos.max(prealloc_len)
+                    } else {
+                        saved_pos
+                    };
                     let _ = file.set_len(saved_pos);
+                    if rollback_len > saved_pos {
+                        let _ = file.set_len(rollback_len);
+                    }
                     let _ = file.seek(SeekFrom::Start(saved_pos));
                     return Err(HeadChunksError::Io(e));
                 }
@@ -1068,9 +1119,13 @@ mod tests {
         assert!(!reader.has_file(1));
         assert!(!head_chunk_file_path(dir.path(), 1).exists());
         assert!(reader.has_file(2));
+        #[cfg(unix)]
+        let expected_cut_len = HEAD_CHUNK_FILE_PREALLOCATION_SIZE as u64;
+        #[cfg(not(unix))]
+        let expected_cut_len = HEAD_CHUNK_FILE_HEADER_SIZE as u64;
         assert_eq!(
             fs::metadata(head_chunk_file_path(dir.path(), 2)).unwrap().len(),
-            HEAD_CHUNK_FILE_HEADER_SIZE as u64
+            expected_cut_len
         );
         assert!(reader.collect_all_chunks().unwrap().is_empty());
 

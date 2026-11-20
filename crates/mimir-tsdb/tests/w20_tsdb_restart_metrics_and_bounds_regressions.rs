@@ -606,7 +606,7 @@ fn w20_sdw_07_wide_histogram_span_indices_do_not_overflow_i32() {
         ..Histogram::default()
     };
 
-    // Integer histogram chunk: must not overflow/panic; cuts a new chunk when merged span offset > i32::MAX.
+    // Integer histogram chunk: must not overflow/panic; recodes in-place into 1 chunk with Go `int32(offset)` wrap.
     let mut hc = HistogramChunk::new();
     {
         let mut app = hc.appender().unwrap();
@@ -615,10 +615,11 @@ fn w20_sdw_07_wide_histogram_span_indices_do_not_overflow_i32() {
             AppendHistogramOutcome::Appended { .. }
         ));
         let outcome = app.append_histogram(None, 0, 2_000, &h2, false).unwrap();
-        assert!(matches!(outcome, AppendHistogramOutcome::NewChunk(_)));
+        assert!(matches!(outcome, AppendHistogramOutcome::Appended { recoded: true, .. }));
     }
+    assert_eq!(hc.num_samples(), 2);
 
-    // Float histogram chunk: same non-panicking behavior.
+    // Float histogram chunk: same Go 1-chunk in-place `int32(offset)` behavior.
     let fh1 = FloatHistogram {
         counter_reset_hint: CounterResetHint::GaugeType,
         schema: 0,
@@ -646,10 +647,11 @@ fn w20_sdw_07_wide_histogram_span_indices_do_not_overflow_i32() {
         let outcome = app
             .append_float_histogram(None, 0, 2_000, &fh2, false)
             .unwrap();
-        assert!(matches!(outcome, AppendFloatHistogramOutcome::NewChunk(_)));
+        assert!(matches!(outcome, AppendFloatHistogramOutcome::Appended { recoded: true, .. }));
     }
+    assert_eq!(fhc.num_samples(), 2);
 
-    // Head end-to-end: append both gauge histograms and query them back cleanly.
+    // Head end-to-end: append both gauge histograms and verify Go 1-chunk in-place recode.
     let dir = tempfile::tempdir().unwrap();
     let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
     let mut app = head.appender();
@@ -660,15 +662,34 @@ fn w20_sdw_07_wide_histogram_span_indices_do_not_overflow_i32() {
         .unwrap();
     app.commit().unwrap();
     let (_, chks, _) = head.series_chunks(r, i64::MIN, i64::MAX).unwrap().unwrap();
-    assert_eq!(chks.len(), 2);
+    assert_eq!(chks.len(), 1);
+    let wrapped_off = (2_999_999_999_i64) as i32;
     let mut seen = Vec::new();
     for cm in chks {
         for s in mimir_tsdb::compact::decode_chunk_samples(&cm.chunk.unwrap()).unwrap() {
             if let SampleValue::Histogram(h) = s.value {
-                seen.push((s.t, h.positive_spans[0].offset));
+                seen.push((s.t, h.positive_spans.clone()));
             }
         }
     }
-    assert_eq!(seen, vec![(1_000, -1_500_000_000), (2_000, 1_500_000_000)]);
+    assert_eq!(
+        seen,
+        vec![
+            (
+                1_000,
+                vec![
+                    HistogramSpan { offset: -1_500_000_000, length: 1 },
+                    HistogramSpan { offset: wrapped_off, length: 1 },
+                ]
+            ),
+            (
+                2_000,
+                vec![
+                    HistogramSpan { offset: -1_500_000_000, length: 1 },
+                    HistogramSpan { offset: wrapped_off, length: 1 },
+                ]
+            ),
+        ]
+    );
     head.close().unwrap();
 }

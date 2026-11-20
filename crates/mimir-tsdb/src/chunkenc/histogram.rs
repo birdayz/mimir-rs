@@ -401,14 +401,10 @@ impl HistogramAppenderState {
         {
             return AppendableGauge::default();
         }
-        let Some((p_fwd, p_bwd, p_merged)) =
-            super::histogram_meta::expand_spans_both_ways(&self.p_spans, &h.positive_spans) else {
-            return AppendableGauge::default();
-        };
-        let Some((n_fwd, n_bwd, n_merged)) =
-            super::histogram_meta::expand_spans_both_ways(&self.n_spans, &h.negative_spans) else {
-            return AppendableGauge::default();
-        };
+        let (p_fwd, p_bwd, p_merged) =
+            super::histogram_meta::expand_spans_both_ways(&self.p_spans, &h.positive_spans);
+        let (n_fwd, n_bwd, n_merged) =
+            super::histogram_meta::expand_spans_both_ways(&self.n_spans, &h.negative_spans);
         AppendableGauge {
             p_fwd,
             n_fwd,
@@ -708,25 +704,10 @@ impl<'a> HistogramAppender<'a> {
                     h_owned.positive_spans = self.state.p_spans.clone();
                     h_owned.negative_spans = self.state.n_spans.clone();
                 } else {
-                    let (Some(ps), Some(ns)) = (
-                        adjust_for_inserts(&h_owned.positive_spans, &p_bwd),
-                        adjust_for_inserts(&h_owned.negative_spans, &n_bwd),
-                    ) else {
-                        if append_only {
-                            return Err(ChunkError::HistogramLayoutChange);
-                        }
-                        let mut new_chunk = HistogramChunk::new();
-                        let new_state = {
-                            let mut app = new_chunk.appender()?;
-                            app.set_counter_reset_header(cr_hint);
-                            let n = app.append_raw(0, t, h);
-                            app.set_num_samples(n);
-                            return_new_state.then_some(app.state)
-                        };
-                        return Ok((AppendHistogramOutcome::NewChunk(new_chunk), new_state));
-                    };
-                    h_owned.positive_spans = ps;
-                    h_owned.negative_spans = ns;
+                    h_owned.positive_spans =
+                        adjust_for_inserts(&h_owned.positive_spans, &p_bwd);
+                    h_owned.negative_spans =
+                        adjust_for_inserts(&h_owned.negative_spans, &n_bwd);
                 }
                 Self::recode_histogram(&mut h_owned, &p_bwd, &n_bwd);
                 h_ref = &h_owned;
