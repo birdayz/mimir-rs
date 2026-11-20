@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{Request, State as AxumState};
+use axum::extract::{RawQuery, Request, State as AxumState};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -57,6 +57,11 @@ use crate::label_churn::{
     compute_label_churn, LabelChurnError, DEFAULT_LABEL_CHURN_LIMIT,
     DEFAULT_LABEL_CHURN_LOOKBACK,
 };
+
+/// Raw `X-Scope-OrgID` header bytes preserved when `http::HeaderValue` rejects
+/// control/DEL characters (matching Go `http.Header` over `httpgrpc`).
+#[derive(Clone, Debug)]
+pub struct RawScopeOrgId(pub Vec<u8>);
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -691,12 +696,19 @@ async fn shutdown_handler(AxumState(st): AxumState<HttpState>) -> Response {
 /// and the handler's own `tenant.TenantID` (`401 multiple org IDs present` when federation allows
 /// multiple tenants through the middleware). Without multi-tenancy `noauth` injects the no-auth
 /// tenant and ignores the header.
-fn authenticated_tenant(st: &HttpState, headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
+fn authenticated_tenant(
+    st: &HttpState,
+    headers: &HeaderMap,
+    raw_org_id: Option<&RawScopeOrgId>,
+) -> Result<String, (StatusCode, String)> {
     if !st.ingester.is_multitenancy_enabled() {
         return Ok(st.ingester.no_auth_tenant());
     }
-    let org_bytes = extract_org_id_bytes_from_http_headers(headers)
-        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+    let org_bytes = match raw_org_id.filter(|r| !r.0.is_empty()) {
+        Some(raw) => raw.0.as_slice(),
+        None => extract_org_id_bytes_from_http_headers(headers)
+            .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?,
+    };
     let ids =
         parse_tenant_ids_bytes(org_bytes).map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
     let (federation, max_tenants) = st.ingester.tenant_federation();
@@ -721,11 +733,44 @@ fn authenticated_tenant(st: &HttpState, headers: &HeaderMap) -> Result<String, (
     parse_single_tenant_id_bytes(org_bytes).map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))
 }
 
+fn parse_name_filter(raw_query: Option<&str>) -> Option<HashSet<String>> {
+    let q = raw_query?;
+    let mut names = HashSet::new();
+    for part in q.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+        let (raw_k, raw_v) = match part.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (part, ""),
+        };
+        if percent_decode_form(raw_k) == "name[]" {
+            names.insert(percent_decode_form(raw_v));
+        }
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+fn join_accept_headers(headers: &HeaderMap) -> Option<String> {
+    let mut joined = String::new();
+    for v in headers.get_all(header::ACCEPT) {
+        if let Ok(s) = std::str::from_utf8(v.as_bytes()) {
+            if !joined.is_empty() {
+                joined.push(',');
+            }
+            joined.push_str(s);
+        }
+    }
+    (!joined.is_empty()).then_some(joined)
+}
+
 async fn user_registry_handler(
     AxumState(st): AxumState<HttpState>,
+    RawQuery(raw_query): RawQuery,
+    raw_org_id: Option<axum::Extension<RawScopeOrgId>>,
     headers: HeaderMap,
 ) -> Response {
-    let user_id = match authenticated_tenant(&st, &headers) {
+    let user_id = match authenticated_tenant(&st, &headers, raw_org_id.as_ref().map(|e| &e.0)) {
         Ok(id) => id,
         Err((status, msg)) => return go_http_error(status, &msg),
     };
@@ -741,9 +786,12 @@ async fn user_registry_handler(
     let Some(reg) = st.ingester.tsdb_metrics.registry_for_tenant(&user_id) else {
         return go_http_error(StatusCode::NOT_FOUND, "user registry not found");
     };
-    let families = reg.gather();
-    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
-    let format = crate::expfmt::negotiate_with_options(accept, false);
+    let mut families = reg.gather();
+    if let Some(filter) = parse_name_filter(raw_query.as_deref()) {
+        families.retain(|mf| filter.contains(mf.get_name()));
+    }
+    let accept = join_accept_headers(&headers);
+    let format = crate::expfmt::negotiate_with_options(accept.as_deref(), false);
     match crate::expfmt::encode(&families, &format) {
         Ok(body) => {
             let mut resp = Response::new(axum::body::Body::from(body));

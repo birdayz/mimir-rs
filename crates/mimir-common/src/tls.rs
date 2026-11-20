@@ -22,7 +22,7 @@
 //!   TLS 1.0-1.2 suites; TLS 1.3 suites are always enabled.
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -110,6 +110,7 @@ pub enum TlsConfigError {
 pub struct ResolvedClientConfig {
     pub config: Arc<rustls::ClientConfig>,
     pub server_name: Option<ServerName<'static>>,
+    pub insecure_skip_verify: bool,
 }
 
 impl fmt::Debug for ResolvedClientConfig {
@@ -325,7 +326,7 @@ impl ClientConfig {
             })?;
             let mut store = RootCertStore::empty();
             let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem)
-                .map_while(Result::ok)
+                .filter_map(Result::ok)
                 .collect();
             let (_added, _ignored) = store.add_parsable_certificates(certs);
             Some(Arc::new(store))
@@ -369,7 +370,13 @@ impl ClientConfig {
         let server_name = if self.server_name.is_empty() {
             None
         } else {
-            Some(parse_server_name(&self.server_name)?)
+            match parse_server_name(&self.server_name) {
+                Ok(name) => Some(name),
+                Err(_) if self.insecure_skip_verify => {
+                    Some(ServerName::IpAddress(IpAddr::V4(Ipv4Addr::UNSPECIFIED).into()))
+                }
+                Err(err) => return Err(err),
+            }
         };
 
         let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
@@ -414,6 +421,7 @@ impl ClientConfig {
             ResolvedClientConfig {
                 config: Arc::new(config),
                 server_name,
+                insecure_skip_verify: self.insecure_skip_verify,
             },
             client_cert,
         ))
@@ -1213,5 +1221,99 @@ mod tests {
         std::thread::sleep(Duration::from_millis(230));
         let k2 = ResolvesClientCert::resolve(&reloader, &[], &[]).unwrap();
         assert_ne!(k2.cert[0].as_ref(), k1_bytes.as_slice());
+    }
+
+    #[test]
+    fn w19_rkn_06_ca_bundle_keeps_certs_after_header_bearing_pem_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+
+        let other_ca = std::fs::read_to_string(fixture("other-ca.crt")).unwrap();
+        let valid_ca = std::fs::read_to_string(fixture("ca.crt")).unwrap();
+        // OpenSSL / RFC 1421 header-bearing certificate block causes pem_slice_iter to emit
+        // Err(Base64Decode) before continuing to subsequent PEM blocks.
+        let header_bearing_block = "-----BEGIN CERTIFICATE-----
+Subject: CN=ignored
+Issuer: CN=ignored
+AAAA
+-----END CERTIFICATE-----
+";
+        std::fs::write(
+            &bundle_path,
+            format!("{other_ca}{header_bearing_block}{valid_ca}"),
+        )
+        .unwrap();
+
+        let mut c = cfg();
+        c.ca_path = bundle_path.to_string_lossy().into_owned();
+        let resolved = c.get_tls_config().unwrap();
+
+        // Perform a real in-memory TLS handshake against server.crt (signed by ca.crt).
+        let server_certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(fixture("server.crt"))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+        let server_key = PrivateKeyDer::from_pem_file(fixture("server.key")).unwrap();
+        let srv_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(server_certs, server_key)
+        .unwrap();
+
+        let mut server = rustls::ServerConnection::new(Arc::new(srv_cfg)).unwrap();
+        let mut client = rustls::ClientConnection::new(
+            resolved.config,
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        for _ in 0..10 {
+            buf.clear();
+            let _ = client.write_tls(&mut buf);
+            if !buf.is_empty() {
+                let mut slice = buf.as_slice();
+                server.read_tls(&mut slice).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            buf.clear();
+            let _ = server.write_tls(&mut buf);
+            if !buf.is_empty() {
+                let mut slice = buf.as_slice();
+                client.read_tls(&mut slice).unwrap();
+                client.process_new_packets().unwrap();
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+    }
+
+    #[test]
+    fn w19_rkn_09_insecure_skip_verify_allows_non_rfc_dns_server_name() {
+        for bad in ["host:9092", "fe80::1%eth0", "bad host"] {
+            let strict = ClientConfig {
+                server_name: bad.to_string(),
+                insecure_skip_verify: false,
+                ..Default::default()
+            };
+            assert!(
+                matches!(strict.get_tls_config(), Err(TlsConfigError::InvalidServerName { .. })),
+                "strict mode must reject {bad}"
+            );
+
+            let insecure = ClientConfig {
+                server_name: bad.to_string(),
+                insecure_skip_verify: true,
+                ..Default::default()
+            };
+            let resolved = insecure.get_tls_config().unwrap();
+            assert!(resolved.insecure_skip_verify);
+            assert!(matches!(resolved.server_name, Some(ServerName::IpAddress(_))));
+        }
     }
 }

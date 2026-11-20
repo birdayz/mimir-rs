@@ -293,6 +293,10 @@ impl Http for HttpGrpcBridge {
         request: Request<httpgrpcpb::HttpRequest>,
     ) -> Result<Response<httpgrpcpb::HttpResponse>, Status> {
         let error_log = request.extensions().get::<GrpcErrorLog>().cloned();
+        let parent_span_attrs = request
+            .extensions()
+            .get::<crate::server::grpc_server::GrpcSpanAttributes>()
+            .cloned();
         let outer_trace = request
             .extensions()
             .get::<mimir_common::tracing::TraceContext>()
@@ -311,43 +315,36 @@ impl Http for HttpGrpcBridge {
         validate_go_url(&req.url)
             .map_err(|e| Status::unknown(format!("parse {:?}: {e}", req.url)))?;
 
-        // `gorilla/mux` `ServeHTTP` (`cleanPath`): a non-empty relative URL without a leading `/`
-        // (e.g. `"ready"`, `"ingester/ring"`, or `"ready?x=1"`) redirects 301 to `/<path>[?<query>]`
-        // before `http::Uri` parsing (which rejects `/` or `?` without a leading slash).
-        let without_frag = req.url.split('#').next().unwrap_or(&req.url);
-        let (raw_path, raw_query) = match without_frag.split_once('?') {
-            Some((p, q)) => (p, Some(q)),
-            None => (without_frag, None),
+        let (pending_redirect, raw_url_path) = split_go_url_clean_redirect(&req.url);
+        let uri = if pending_redirect.is_some() {
+            Uri::from_static("/__clean_path_redirect__")
+        } else {
+            parse_go_url_to_http_uri(&req.url)
+                .map_err(|e| Status::unknown(format!("parse {:?}: {e}", req.url)))?
         };
-        if !raw_path.is_empty() && !raw_path.contains("://") && !raw_path.starts_with('/') {
-            let location = match raw_query {
-                Some(q) => format!("/{raw_path}?{q}"),
-                None => format!("/{raw_path}"),
-            };
-            return Ok(Response::new(httpgrpcpb::HttpResponse {
-                code: 301,
-                headers: vec![httpgrpcpb::Header {
-                    key: "Location".to_string(),
-                    values: vec![location],
-                }],
-                body: Bytes::new(),
-            }));
-        }
-
-        let uri = parse_go_url_to_http_uri(&req.url)
-            .map_err(|e| Status::unknown(format!("parse {:?}: {e}", req.url)))?;
 
         let mut req_headers = HeaderMap::new();
+        let mut raw_org_id: Option<mimir_ingester::http::RawScopeOrgId> = None;
         for h in req.headers {
             let Ok(name) = HeaderName::from_bytes(h.key.as_bytes()) else {
                 continue;
             };
+            let is_org_id = name.as_str().eq_ignore_ascii_case("x-scope-orgid");
+            if is_org_id {
+                raw_org_id = None;
+            }
             // Go `httpgrpc.ToHeader`: `header[http.CanonicalHeaderKey(h.Key)] = h.Values` overwrites
             // any prior entry for the same canonical header name.
             req_headers.remove(&name);
-            for v in h.values {
-                if let Ok(val) = HeaderValue::from_str(&v) {
-                    req_headers.append(name.clone(), val);
+            for (idx, v) in h.values.into_iter().enumerate() {
+                match HeaderValue::from_bytes(v.as_bytes()) {
+                    Ok(val) => {
+                        req_headers.append(name.clone(), val);
+                    }
+                    Err(_) if is_org_id && idx == 0 => {
+                        raw_org_id = Some(mimir_ingester::http::RawScopeOrgId(v.into_bytes()));
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -361,10 +358,14 @@ impl Http for HttpGrpcBridge {
                 mimir_common::tracing::start_server_span_context(&from_inner, false)
             }
         };
-        let url_path = uri.path().to_string();
+        let url_path = if pending_redirect.is_some() {
+            raw_url_path
+        } else {
+            uri.path().to_string()
+        };
         let user_agent = req_headers
             .get(http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
             .unwrap_or("")
             .to_string();
         let matched_route_cell = Arc::new(parking_lot::Mutex::new(None));
@@ -377,53 +378,74 @@ impl Http for HttpGrpcBridge {
         http_req
             .extensions_mut()
             .insert(CapturedMatchedRoute(Arc::clone(&matched_route_cell)));
+        if let Some(ref loc) = pending_redirect {
+            http_req
+                .extensions_mut()
+                .insert(crate::http::PendingCleanPathRedirect(loc.clone()));
+        }
+        if let Some(raw_org) = raw_org_id {
+            http_req.extensions_mut().insert(raw_org);
+        }
         if effective_trace.is_valid() {
             http_req.extensions_mut().insert(effective_trace.clone());
         }
 
         let span_start = mimir_common::tracing::now_unix_nanos();
-        let resp = mimir_common::tracing::with_trace_context(
+        let mut resp = mimir_common::tracing::with_trace_context(
             effective_trace.clone(),
             self.router.clone().oneshot(http_req),
         )
         .await
         .map_err(|e| Status::internal(format!("router error: {e}")))?;
+        if let Some(ref loc) = pending_redirect {
+            if resp.extensions().get::<crate::http::CleanPathHandled>().is_none() {
+                resp = crate::http::clean_path_redirect_response(loc);
+            }
+        }
+        let route_name = if pending_redirect.is_some() {
+            String::new()
+        } else {
+            matched_route_cell
+                .lock()
+                .take()
+                .unwrap_or_else(|| {
+                    if resp.status() == http::StatusCode::NOT_FOUND {
+                        "notfound".to_string()
+                    } else {
+                        String::new()
+                    }
+                })
+        };
+        let http_span_attrs = vec![
+            mimir_common::tracing::SpanAttribute {
+                key: "http.request.method".to_string(),
+                value: mimir_common::tracing::SpanAttrValue::String(method.to_string()),
+            },
+            mimir_common::tracing::SpanAttribute {
+                key: "http.route".to_string(),
+                value: mimir_common::tracing::SpanAttrValue::String(route_name.clone()),
+            },
+            mimir_common::tracing::SpanAttribute {
+                key: "user_agent.original".to_string(),
+                value: mimir_common::tracing::SpanAttrValue::String(user_agent),
+            },
+            mimir_common::tracing::SpanAttribute {
+                key: "url.path".to_string(),
+                value: mimir_common::tracing::SpanAttrValue::String(url_path),
+            },
+        ];
+        if let Some(ref parent_attrs) = parent_span_attrs {
+            parent_attrs.0.lock().extend(http_span_attrs.clone());
+        }
         if effective_trace.is_sampled() {
             if let Some(rt) = mimir_common::tracing::global_tracing() {
                 if rt.exporter.is_some() {
-                    let route_name = matched_route_cell
-                        .lock()
-                        .take()
-                        .unwrap_or_else(|| {
-                            if resp.status() == http::StatusCode::NOT_FOUND {
-                                "notfound".to_string()
-                            } else {
-                                String::new()
-                            }
-                        });
                     let span_name = if route_name.is_empty() {
                         format!("HTTP {method}")
                     } else {
                         format!("HTTP {method} - {route_name}")
                     };
-                    let mut attributes = vec![
-                        mimir_common::tracing::SpanAttribute {
-                            key: "http.request.method".to_string(),
-                            value: mimir_common::tracing::SpanAttrValue::String(method.to_string()),
-                        },
-                        mimir_common::tracing::SpanAttribute {
-                            key: "http.route".to_string(),
-                            value: mimir_common::tracing::SpanAttrValue::String(route_name),
-                        },
-                        mimir_common::tracing::SpanAttribute {
-                            key: "user_agent.original".to_string(),
-                            value: mimir_common::tracing::SpanAttrValue::String(user_agent),
-                        },
-                        mimir_common::tracing::SpanAttribute {
-                            key: "url.path".to_string(),
-                            value: mimir_common::tracing::SpanAttrValue::String(url_path),
-                        },
-                    ];
+                    let mut attributes = http_span_attrs;
                     if let Some(ref dbg) = effective_trace.jaeger_debug_id {
                         attributes.push(mimir_common::tracing::SpanAttribute {
                             key: "jaeger-debug-id".to_string(),
@@ -451,7 +473,7 @@ impl Http for HttpGrpcBridge {
         let do_not_log_error = resp_headers.remove("x-donotlogerror").is_some();
         let error_msg_override = resp_headers
             .remove("x-errormessage")
-            .and_then(|v| v.to_str().ok().map(str::to_string))
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok().map(str::to_string))
             .filter(|s| !s.is_empty());
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -490,6 +512,45 @@ impl Http for HttpGrpcBridge {
 /// Parses `req.url` with Go `net/url.Parse` tolerance (accepting relative paths without leading
 /// `/` and unescaped `{}`/`[]`/`"`/`|`/`^`/spaces in query strings) and encodes disallowed
 /// RFC 3986 characters so `http::Uri` can pass it into Axum's `Router`.
+/// Splits `raw` per Go `net/url.Parse` and checks whether `gorilla/mux` `cleanPath` requires a
+/// 301 redirect (preserving `scheme://authority`, `?query`, and `#fragment`).
+fn split_go_url_clean_redirect(raw: &str) -> (Option<String>, String) {
+    let (without_frag, frag) = match raw.split_once('#') {
+        Some((a, f)) => (a, Some(f)),
+        None => (raw, None),
+    };
+    let (before_q, query) = match without_frag.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (without_frag, None),
+    };
+    let (scheme_auth, raw_path) = match before_q.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('/') {
+            Some((auth, p)) => (Some(format!("{scheme}://{auth}")), format!("/{p}")),
+            None => (Some(format!("{scheme}://{rest}")), String::new()),
+        },
+        None => (None, before_q.to_string()),
+    };
+    let cleaned = crate::http::gorilla_mux_clean_path(&raw_path);
+    if cleaned != raw_path {
+        let mut loc = String::new();
+        if let Some(sa) = scheme_auth {
+            loc.push_str(&sa);
+        }
+        loc.push_str(&cleaned);
+        if let Some(q) = query {
+            loc.push('?');
+            loc.push_str(q);
+        }
+        if let Some(f) = frag {
+            loc.push('#');
+            loc.push_str(f);
+        }
+        (Some(loc), raw_path)
+    } else {
+        (None, raw_path)
+    }
+}
+
 fn validate_go_url(raw: &str) -> Result<(), String> {
     if raw.is_empty() {
         return Ok(());
@@ -1220,7 +1281,7 @@ pub fn http_canonical_header_key(key: &str) -> String {
 fn header_map_to_httpgrpc(headers: &HeaderMap) -> Vec<httpgrpcpb::Header> {
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for (name, val) in headers {
-        if let Ok(v) = val.to_str() {
+        if let Ok(v) = std::str::from_utf8(val.as_bytes()) {
             grouped
                 .entry(http_canonical_header_key(name.as_str()))
                 .or_default()

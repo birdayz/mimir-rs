@@ -302,6 +302,21 @@ pub(crate) struct Client {
     trace: bool,
 }
 
+fn split_authority_host_port(authority: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some((host, after)) = rest.split_once(']') {
+            let port = after.strip_prefix(':');
+            return (host, port);
+        }
+    }
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if !host.contains(':') {
+            return (host, Some(port));
+        }
+    }
+    (authority, None)
+}
+
 fn header_value(v: &str) -> HeaderValue {
     HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
@@ -836,21 +851,41 @@ impl Client {
             Some(q) => q,
             None => signer::canonical_query(&req.query),
         };
-        let mut url = format!(
-            "{}://{}{}",
-            self.endpoint.scheme,
-            req.host,
-            signer::canonical_uri_path(&req.path)
-        );
+        let canonical_path = signer::canonical_uri_path(&req.path);
+        let mut url = format!("{}://{}{}", self.endpoint.scheme, req.host, canonical_path);
         if !query.is_empty() {
             url.push('?');
             url.push_str(&query);
         }
+        let dial_url = if self.endpoint.scheme == "https" {
+            if let Some(sni) = &self.http.sni {
+                let (target_host, target_port) = split_authority_host_port(&req.host);
+                if !sni.sni_host.eq_ignore_ascii_case(target_host) {
+                    sni.set_target_host(target_host);
+                    let dial_host = match target_port {
+                        Some(p) => format!("{}:{p}", sni.sni_host),
+                        None => sni.sni_host.clone(),
+                    };
+                    let mut u = format!("{}://{}{}", self.endpoint.scheme, dial_host, canonical_path);
+                    if !query.is_empty() {
+                        u.push('?');
+                        u.push_str(&query);
+                    }
+                    u
+                } else {
+                    url.clone()
+                }
+            } else {
+                url.clone()
+            }
+        } else {
+            url.clone()
+        };
         let method = reqwest::Method::from_bytes(req.method.as_bytes()).map_err(|e| SendError {
             message: format!("invalid HTTP method {}: {e}", req.method),
             retryable: false,
         })?;
-        let mut builder = self.http.client.request(method, &url);
+        let mut builder = self.http.client.request(method, &dial_url);
         let mut headers = req.headers.clone();
         if !req.host.is_empty() && !headers.contains_key(reqwest::header::HOST) {
             let host_val = HeaderValue::from_str(&req.host).map_err(|e| SendError {

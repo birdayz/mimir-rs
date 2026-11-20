@@ -12,7 +12,7 @@
 //! - github.com/grafana/mimir/pkg/mimir/modules.go (`initUsageStats`)
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use mimir_common::backoff::{Backoff, BackoffConfig};
 use mimir_ring::kv::memberlist::gofmt::format_go_time_string;
@@ -95,49 +95,9 @@ mod go_time {
 
 /// Parses RFC 3339 timestamps as written by Go (`2006-01-02T15:04:05.999999999Z07:00`).
 pub fn parse_rfc3339(s: &str) -> Option<SystemTime> {
-    let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b't') || b[13] != b':' || b[16] != b':' {
-        return None;
-    }
-    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (hour, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    let mut idx = 19;
-    let mut nanos: i64 = 0;
-    if b.get(idx) == Some(&b'.') {
-        idx += 1;
-        let start = idx;
-        while idx < b.len() && b[idx].is_ascii_digit() {
-            idx += 1;
-        }
-        let frac = &s[start..idx];
-        let digits = frac.len().min(9);
-        nanos = frac[..digits].parse::<i64>().ok()? * 10i64.pow((9 - digits) as u32);
-    }
-    let offset_secs = match s.get(idx..)? {
-        "Z" | "z" => 0,
-        tz if tz.len() == 6 && (tz.starts_with('+') || tz.starts_with('-')) => {
-            let sign = if tz.starts_with('-') { -1 } else { 1 };
-            sign * (tz[1..3].parse::<i64>().ok()? * 3600 + tz[4..6].parse::<i64>().ok()? * 60)
-        }
-        _ => return None,
-    };
-    // days_from_civil (Howard Hinnant).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    let secs = days * 86_400 + hour * 3600 + min * 60 + sec - offset_secs;
-    let d = Duration::new(secs.unsigned_abs(), nanos as u32);
-    if secs >= 0 {
-        UNIX_EPOCH.checked_add(d)
-    } else {
-        UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))?
-            .checked_add(Duration::from_nanos(nanos as u64))
-    }
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(SystemTime::from)
 }
 
 /// `uuid.NewString()` (random, version 4).
@@ -158,7 +118,7 @@ pub fn new_cluster_seed() -> ClusterSeed {
 }
 
 #[derive(Debug)]
-enum SeedError {
+pub enum SeedError {
     NotFound,
     Corrupted(String),
     Other(String),
@@ -176,7 +136,7 @@ impl std::fmt::Display for SeedError {
 }
 
 /// `readSeedFile`.
-async fn read_seed_file(bucket: &BucketClient) -> Result<ClusterSeed, SeedError> {
+pub async fn read_seed_file(bucket: &BucketClient) -> Result<ClusterSeed, SeedError> {
     let data = bucket
         .with_expected_not_found()
         .download(CLUSTER_SEED_FILE_NAME)
@@ -266,7 +226,7 @@ async fn wait_seed_file_stability(
 }
 
 /// `initSeedFile`: waits until a stable seed file exists, creating one if there is none.
-async fn init_seed_file(
+pub async fn init_seed_file(
     ctx: &ServiceContext,
     bucket: &BucketClient,
     min_stability: Duration,
@@ -614,6 +574,7 @@ impl Reporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     // Upstream: pkg/usagestats/reporter_test.go::TestGetNextReportAt
     #[test]

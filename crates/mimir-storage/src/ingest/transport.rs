@@ -790,6 +790,7 @@ impl SaslSession {
 struct TlsDialer {
     connector: TlsConnector,
     server_name: Option<ServerName<'static>>,
+    insecure_skip_verify: bool,
 }
 
 /// Dial + TLS + SASL settings of one Kafka client, built once from [`KafkaConfig`] and shared
@@ -855,6 +856,7 @@ impl KafkaTransport {
         self.tls = Some(TlsDialer {
             connector: TlsConnector::from(tls.config),
             server_name: tls.server_name,
+            insecure_skip_verify: tls.insecure_skip_verify,
         });
         self
     }
@@ -891,7 +893,13 @@ impl KafkaTransport {
                     let (host, _) = split_host_port(addr).map_err(|e| {
                         KafkaClientError::Config(format!("unable to split host:port for dialing: {e}"))
                     })?;
-                    parse_server_name(host).map_err(|e| KafkaClientError::Config(e.to_string()))?
+                    match parse_server_name(host) {
+                        Ok(n) => n,
+                        Err(_) if tls.insecure_skip_verify => ServerName::IpAddress(
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED).into(),
+                        ),
+                        Err(e) => return Err(KafkaClientError::Config(e.to_string())),
+                    }
                 }
             };
             let stream = tls.connector.connect(name, tcp).await.map_err(|e| {

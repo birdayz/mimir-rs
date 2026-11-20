@@ -42,8 +42,47 @@ use tokio::sync::Semaphore;
 /// Go `net.Dialer.Timeout` / `KeepAlive` used by `exthttp.DefaultTransport`.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 const DIAL_KEEP_ALIVE: Duration = Duration::from_secs(30);
-/// Go `http.DefaultMaxIdleConnsPerHost`.
-const GO_DEFAULT_MAX_IDLE_CONNS_PER_HOST: usize = 2;
+/// DNS resolver override so reqwest dials the configured S3 endpoint host/IP while sending
+/// `http.tls_server_name` in TLS `ClientHello` SNI.
+#[derive(Debug)]
+pub(crate) struct SniResolver {
+    pub sni_host: String,
+    target_host: Arc<parking_lot::RwLock<Option<String>>>,
+}
+
+impl SniResolver {
+    pub fn set_target_host(&self, target: &str) {
+        let mut guard = self.target_host.write();
+        if guard.as_deref() != Some(target) {
+            *guard = Some(target.to_string());
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for SniResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let target = self.target_host.read().clone();
+        let lookup_host = if name.as_str().eq_ignore_ascii_case(&self.sni_host) {
+            target.unwrap_or_else(|| name.as_str().to_string())
+        } else {
+            name.as_str().to_string()
+        };
+        Box::pin(async move {
+            if let Ok(ip) = lookup_host.parse::<std::net::IpAddr>() {
+                let addrs: reqwest::dns::Addrs =
+                    Box::new(std::iter::once(std::net::SocketAddr::new(ip, 0)));
+                return Ok(addrs);
+            }
+            let resolved: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((lookup_host.as_str(), 0))
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                    .collect();
+            let addrs: reqwest::dns::Addrs = Box::new(resolved.into_iter());
+            Ok(addrs)
+        })
+    }
+}
 
 /// An HTTP client honouring the bucket `http.*` settings.
 #[derive(Clone, Debug)]
@@ -51,6 +90,7 @@ pub(crate) struct HttpTransport {
     pub client: reqwest::Client,
     pub response_header_timeout: Option<Duration>,
     pub conn_limit: Option<Arc<Semaphore>>,
+    pub sni: Option<Arc<SniResolver>>,
 }
 
 fn go_open_err(path: &str, err: &std::io::Error) -> String {
@@ -242,15 +282,24 @@ impl HttpTransport {
             return Err("http.force_attempt_http2 is not supported by mimir-rs for the s3 backend".to_string());
         }
         let tls = new_tls_config(cfg)?;
-        let tls_handshake = Duration::from_nanos(cfg.tls_handshake_timeout.0.max(0) as u64);
-        let mut max_idle_per_host = if cfg.max_idle_connections_per_host > 0 {
-            cfg.max_idle_connections_per_host as usize
+        let sni = if cfg.tls_server_name.is_empty() {
+            None
         } else {
-            GO_DEFAULT_MAX_IDLE_CONNS_PER_HOST
+            match cfg.tls_server_name.parse::<std::net::IpAddr>() {
+                Ok(_) => None,
+                Err(_) => ServerName::try_from(cfg.tls_server_name.clone())
+                    .ok()
+                    .and_then(|sn| match sn {
+                        ServerName::DnsName(dns) => Some(Arc::new(SniResolver {
+                            sni_host: dns.as_ref().to_string(),
+                            target_host: Arc::new(parking_lot::RwLock::new(None)),
+                        })),
+                        _ => None,
+                    }),
+            }
         };
-        if cfg.max_idle_connections > 0 {
-            max_idle_per_host = max_idle_per_host.min(cfg.max_idle_connections as usize);
-        }
+        let tls_handshake = Duration::from_nanos(cfg.tls_handshake_timeout.0.max(0) as u64);
+        let max_idle_per_host = crate::bucket::exthttp::max_idle_per_host(cfg);
         let mut builder = reqwest::Client::builder()
             .use_preconfigured_tls(tls)
             .redirect(reqwest::redirect::Policy::none())
@@ -260,6 +309,9 @@ impl HttpTransport {
             )))
             .pool_max_idle_per_host(max_idle_per_host)
             .http1_only();
+        if let Some(resolver) = &sni {
+            builder = builder.dns_resolver(Arc::clone(resolver));
+        }
         // Dial timeout (30s) plus TLS handshake timeout; a zero handshake timeout means
         // "no limit" for the handshake, so the combined connect timeout is unbounded too.
         if !tls_handshake.is_zero() {
@@ -275,6 +327,7 @@ impl HttpTransport {
             )),
             conn_limit: (cfg.max_connections_per_host > 0)
                 .then(|| Arc::new(Semaphore::new(cfg.max_connections_per_host as usize))),
+            sni,
         })
     }
 
