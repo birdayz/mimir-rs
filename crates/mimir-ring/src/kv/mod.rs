@@ -173,6 +173,14 @@ where
     }
 
     pub fn decode_msg(&self, bytes: &[u8]) -> Result<M, KvError> {
+        let dec_len = snap::raw::decompress_len(bytes)
+            .map_err(|e| KvError::Codec(format!("snappy decode: {e}")))?;
+        if dec_len > bytes.len().saturating_mul(32).saturating_add(64) {
+            return Err(KvError::Codec(format!(
+                "snappy decode: uncompressed length {dec_len} exceeds max bound for {} compressed bytes",
+                bytes.len()
+            )));
+        }
         let decompressed = snap::raw::Decoder::new()
             .decompress_vec(bytes)
             .map_err(|e| KvError::Codec(format!("snappy decode: {e}")))?;
@@ -489,5 +497,23 @@ fn create_client_with_multi_provider(
     match reg {
         None => Ok(client),
         Some(reg) => metrics::new_metrics_client(backend, client, &reg.wrap_with(role.labels())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w20_sdw_03_proto_snappy_codec_rejects_4gib_length_bomb() {
+        let codec = ProtoSnappyCodec::<mimir_proto::ringpb::Desc>::new("ring");
+        // 5-byte varint declaring 4_294_967_295 uncompressed bytes.
+        let bomb = [0xffu8, 0xff, 0xff, 0xff, 0x0f];
+        let err = codec.decode_msg(&bomb).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds max bound"),
+            "expected bounded length rejection, got: {msg}"
+        );
     }
 }

@@ -4,15 +4,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use mimir_common::errors::DISTRIBUTOR_MAX_WRITE_REQUEST_DATA_ITEM_SIZE;
+use mimir_common::native_histogram::{
+    HistogramOpts as NativeHistogramOpts, HistogramVec as NativeHistogramVec, SingleHistogram,
+    DEF_BUCKETS,
+};
 use mimir_config::KafkaConfig;
 use mimir_proto::cortexpb;
 use mimir_proto::prost::Message;
 use parking_lot::RwLock;
-use prometheus::{Counter, Histogram, HistogramOpts, HistogramVec, Opts, Registry};
+use prometheus::{Counter, Histogram, HistogramOpts, Opts, Registry};
 use thiserror::Error;
 
 use super::compression::KafkaCompression;
@@ -58,20 +62,22 @@ pub enum WriterError {
 
 #[derive(Clone)]
 pub struct WriterMetrics {
-    pub latency: HistogramVec,
+    pub latency: NativeHistogramVec,
     pub sent_bytes_total: Counter,
     pub input_bytes_total: Counter,
     pub records_per_request: Histogram,
-    pub serialize_duration: Histogram,
+    pub serialize_duration: SingleHistogram,
 }
 
 impl WriterMetrics {
     pub fn new(registry: Option<&Registry>) -> Self {
-        let latency = HistogramVec::new(
-            HistogramOpts::new(
+        let latency = NativeHistogramVec::new(
+            NativeHistogramOpts::new(
                 "cortex_ingest_storage_writer_latency_seconds",
                 "Latency to write an incoming request to Kafka partitions.",
-            ),
+            )
+            .buckets(DEF_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
             &["outcome"],
         )
         .expect("valid metric");
@@ -91,10 +97,14 @@ impl WriterMetrics {
         );
         rpr_opts.buckets = prometheus::exponential_buckets(1.0, 2.0, 8).expect("valid buckets");
         let records_per_request = Histogram::with_opts(rpr_opts).expect("valid metric");
-        let serialize_duration = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_writer_serialize_duration_seconds",
-            "Time spent serializing an incoming request to Kafka records.",
-        ))
+        let serialize_duration = SingleHistogram::new(
+            NativeHistogramOpts::new(
+                "cortex_ingest_storage_writer_serialize_duration_seconds",
+                "Time spent serializing an incoming request to Kafka records.",
+            )
+            .buckets(DEF_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
+        )
         .expect("valid metric");
 
         if let Some(reg) = registry {

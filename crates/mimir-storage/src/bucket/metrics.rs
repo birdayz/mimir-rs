@@ -6,12 +6,10 @@
 //! - github.com/thanos-io/objstore/objstore.go (`BucketMetrics`, `wrapWithMetrics`,
 //!   `metricBucket`, `timingReader`)
 //!
-//! Native-histogram settings of the Go histograms are not representable with the `prometheus`
-//! crate; the classic buckets are identical.
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-use prometheus::{CounterVec, Gauge, HistogramOpts, HistogramVec, Opts, Registry};
+use mimir_common::native_histogram::{HistogramOpts, HistogramVec};
+use prometheus::{CounterVec, Gauge, Opts, Registry};
 
 pub const OP_ITER: &str = "iter";
 pub const OP_GET: &str = "get";
@@ -81,7 +79,8 @@ impl BucketMetrics {
                 "Number of bytes transferred from/to bucket per operation.",
             )
             .const_labels(const_labels())
-            .buckets(transferred_bytes_buckets()),
+            .buckets(transferred_bytes_buckets())
+            .native(2.0, 100, Duration::from_secs(3600)),
             &["operation"],
         )?;
         let ops_duration = HistogramVec::new(
@@ -90,7 +89,8 @@ impl BucketMetrics {
                 "Duration of successful operations against the bucket per operation - iter operations include time spent on each callback.",
             )
             .const_labels(const_labels())
-            .buckets(DURATION_BUCKETS.to_vec()),
+            .buckets(DURATION_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
             &["operation"],
         )?;
         let last_successful_upload_time = Gauge::with_opts(

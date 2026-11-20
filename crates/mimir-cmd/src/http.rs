@@ -183,24 +183,11 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     };
 
     // Go `gorilla/mux` `ServeHTTP` (`cleanPath`) redirects non-canonical paths with 301
-    // before routing, inside the `Connection: close` shutdown layer.
-    // Go disables HTTP keep-alives as soon as a shutdown signal is received
-    // (`t.Server.HTTPServer.SetKeepAlivesEnabled(false)`): responses then carry
-    // `Connection: close` and connections are closed after the response.
-    router
-        .layer(axum::middleware::from_fn(clean_path_middleware))
-        .layer(axum::middleware::map_response(move |mut resp: Response| {
-        let shutdown_requested = Arc::clone(&shutdown_requested);
-        async move {
-            if shutdown_requested.load(Ordering::Acquire) {
-                resp.headers_mut().insert(
-                    header::CONNECTION,
-                    header::HeaderValue::from_static("close"),
-                );
-            }
-            resp
-        }
-    }))
+    // before routing. (`Connection: close` on shutdown belongs to the HTTP connection writer
+    // only, not the shared router used by `HttpGrpcBridge`, and Axum's top-level `Allow` on
+    // `MethodMismatch` 405s is stripped after `RouteFuture` in `http_server.rs` and `grpc.rs`.)
+    let _ = shutdown_requested;
+    router.layer(axum::middleware::from_fn(clean_path_middleware))
 }
 
 /// `http.NotFoundHandler()` (`http.Error(w, "404 page not found", 404)`).
@@ -270,6 +257,11 @@ pub(crate) struct PendingCleanPathRedirect(pub String);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CleanPathHandled;
+
+/// Marker extension on responses whose handler explicitly sets `Content-Length`
+/// (e.g. `http.FileServer` for `/static/` files), so `HttpGrpcBridge` preserves it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExplicitContentLength;
 
 /// Matches Go `gorilla/mux` `cleanPath` (POSIX `path.Clean` preserving trailing `/`).
 fn gorilla_mux_clean_path(p: &[u8]) -> Vec<u8> {
@@ -692,7 +684,11 @@ fn decode_query_component(s: &str) -> String {
         if bytes[i] == b'+' {
             out.push(b' ');
             i += 1;
-        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+        } else if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
             if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
                 out.push(v);
                 i += 3;
@@ -1321,6 +1317,7 @@ async fn static_file_handler(AxumPath(path): AxumPath<String>) -> Response {
     *resp.status_mut() = StatusCode::OK;
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(ct));
+    resp.extensions_mut().insert(ExplicitContentLength);
     resp
 }
 

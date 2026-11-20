@@ -16,7 +16,8 @@ use std::time::Duration;
 use mimir_config::{
     is_url, RuntimeConfigHttpObserver, RuntimeConfigLoadEvent, RuntimeConfigObserver,
 };
-use prometheus::{CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry};
+use mimir_common::native_histogram::{HistogramOpts, HistogramVec, DEF_BUCKETS};
+use prometheus::{CounterVec, Gauge, GaugeVec, Opts, Registry};
 
 /// Name Mimir gives its runtime config manager (`config` label value).
 pub const RUNTIME_CONFIG_NAME: &str = "mimir-runtime-config";
@@ -81,12 +82,12 @@ impl RuntimeConfigMetrics {
         let http_duration = if has_url {
             let h = HistogramVec::new(
                 HistogramOpts::new(
-                    "runtime_config_http_request_duration_seconds",
+                    "cortex_runtime_config_http_request_duration_seconds",
                     "Time spent fetching runtime config from HTTP URLs.",
                 )
-                .namespace("cortex")
                 .const_label("config", RUNTIME_CONFIG_NAME)
-                .buckets(prometheus::DEFAULT_BUCKETS.to_vec()),
+                .buckets(DEF_BUCKETS.to_vec())
+                .native(1.1, 100, Duration::from_secs(3600)),
                 &["url", "status_code"],
             )?;
             registry.register(Box::new(h.clone()))?;

@@ -5,10 +5,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use mimir_common::native_histogram::{HistogramOpts, HistogramVec, DEF_BUCKETS};
 use mimir_config::KafkaConfig;
-use prometheus::{CounterVec, HistogramOpts, HistogramVec, Opts, Registry};
+use prometheus::{CounterVec, Opts, Registry};
 
 use super::kafka_client::{KafkaClient, KafkaClientError, KAFKA_OFFSET_END};
 
@@ -44,7 +45,9 @@ impl PartitionOffsetClientMetrics {
             HistogramOpts::new(
                 "cortex_ingest_storage_reader_last_produced_offset_request_duration_seconds",
                 "The duration of requests to fetch the last produced offset of a given partition.",
-            ),
+            )
+            .buckets(DEF_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
             &["topic", "partition"],
         )
         .expect("valid metric");
@@ -68,7 +71,9 @@ impl PartitionOffsetClientMetrics {
             HistogramOpts::new(
                 "cortex_ingest_storage_reader_partition_start_offset_request_duration_seconds",
                 "The duration of requests to fetch the start offset of a given partition.",
-            ),
+            )
+            .buckets(DEF_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
             &["topic", "partition"],
         )
         .expect("valid metric");

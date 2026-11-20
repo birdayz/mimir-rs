@@ -11,12 +11,13 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use mimir_common::native_histogram::{HistogramOpts, HistogramVec, DEF_BUCKETS};
 use mimir_common::services::ServiceContext;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::{LabelPair, MetricFamily};
-use prometheus::{HistogramOpts, HistogramVec, Registry};
+use prometheus::Registry;
 
 use super::{BoxFuture, CasFn, KvClient, KvError, WatchKeyFn, WatchPrefixFn};
 
@@ -255,15 +256,13 @@ pub fn new_metrics_client(
     c: Arc<dyn KvClient>,
     reg: &Registerer,
 ) -> Result<Arc<dyn KvClient>, KvError> {
-    // NativeHistogramBucketFactor 1.1 / MaxBucketNumber 100 /
-    // MinResetDuration 1h are not supported by the Rust prometheus client;
-    // only the classic buckets (prometheus.DefBuckets) are exposed.
     let request_duration = HistogramVec::new(
         HistogramOpts::new(
             "kv_request_duration_seconds",
             "Time spent on kv store requests.",
         )
-        .buckets(prometheus::DEFAULT_BUCKETS.to_vec())
+        .buckets(DEF_BUCKETS.to_vec())
+        .native(1.1, 100, Duration::from_secs(3600))
         .const_label("type", backend),
         &["operation", "status_code"],
     )

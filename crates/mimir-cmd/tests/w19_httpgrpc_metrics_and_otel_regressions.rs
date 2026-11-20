@@ -301,8 +301,12 @@ async fn w19_rkn_04_gorilla_mux_clean_path_redirects_fragment_span_and_shutdown(
         None,
         Arc::clone(&shutdown),
     ));
+    let http_router = mimir_cmd::server::with_shutdown_close_layer(
+        router.clone(),
+        Arc::clone(&shutdown),
+    );
 
-    // Direct HTTP cleanPath 301 redirects with Connection: close.
+    // Direct HTTP cleanPath 301 redirects with Connection: close (HTTP listener layer only).
     for (uri, expected_loc) in [
         ("//ready", "/ready"),
         ("/ingester//ring?a=1", "/ingester/ring?a=1"),
@@ -319,7 +323,7 @@ async fn w19_rkn_04_gorilla_mux_clean_path_redirects_fragment_span_and_shutdown(
             .uri(uri)
             .body(Body::empty())
             .unwrap();
-        let resp = router.clone().oneshot(req).await.unwrap();
+        let resp = http_router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY, "uri={uri}");
         assert_eq!(
             resp.headers()
@@ -337,8 +341,8 @@ async fn w19_rkn_04_gorilla_mux_clean_path_redirects_fragment_span_and_shutdown(
         );
     }
 
-    // HttpGrpcBridge cleanPath 301 redirects preserve #fragment, run inside shutdown Connection: close,
-    // and export child HTTP span.
+    // HttpGrpcBridge cleanPath 301 redirects preserve #fragment, do NOT carry Connection: close
+    // or Content-Length (Go httptest.ResponseRecorder parity), and export child HTTP span.
     let bridge = HttpGrpcBridge::new(router);
     let tid = "4bf92f3577b34da6a3ce929d0e0e4704";
     let sid = "00f067aa0ba902b7";
@@ -379,11 +383,11 @@ async fn w19_rkn_04_gorilla_mux_clean_path_redirects_fragment_span_and_shutdown(
             hresp.headers
         );
         assert!(
-            hresp
+            !hresp
                 .headers
                 .iter()
-                .any(|h| h.key == "Connection" && h.values == vec!["close".to_string()]),
-            "missing Connection: close on 301 redirect for url={url}: {:?}",
+                .any(|h| h.key.eq_ignore_ascii_case("connection") || h.key.eq_ignore_ascii_case("content-length")),
+            "unexpected Connection or Content-Length on httpgrpc 301 redirect for url={url}: {:?}",
             hresp.headers
         );
     }

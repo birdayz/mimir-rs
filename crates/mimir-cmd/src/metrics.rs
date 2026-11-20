@@ -57,6 +57,15 @@ pub fn register_global_metrics(
     registry: &Registry,
     config_hash_sha256: Option<&str>,
 ) -> Result<(), prometheus::Error> {
+    register_global_metrics_with_deprecated(registry, config_hash_sha256, 0)
+}
+
+/// Registers global metrics including `deprecated_flags_inuse_total` set to `deprecated_flags_count`.
+pub fn register_global_metrics_with_deprecated(
+    registry: &Registry,
+    config_hash_sha256: Option<&str>,
+    deprecated_flags_count: usize,
+) -> Result<(), prometheus::Error> {
     let goversion = go_version_str();
 
     for program in ["mimir", "cortex"] {
@@ -90,14 +99,17 @@ pub fn register_global_metrics(
     }
     registry.register(Box::new(config_hash))?;
 
-    register_go_package_init_metrics(registry)?;
+    register_go_package_init_metrics(registry, deprecated_flags_count)?;
 
     Ok(())
 }
 
 /// Registers Go Mimir package-init global metrics that Go's `promauto` / `prometheus.MustRegister`
 /// populate on `prometheus.DefaultRegisterer` regardless of which `-target` is active.
-fn register_go_package_init_metrics(registry: &Registry) -> Result<(), prometheus::Error> {
+fn register_go_package_init_metrics(
+    registry: &Registry,
+    deprecated_flags_count: usize,
+) -> Result<(), prometheus::Error> {
     // .ref/mimir/pkg/distributor/ingester_client_pool.go:21
     let ingester_clients = Gauge::new(
         "cortex_distributor_ingester_clients",
@@ -110,6 +122,9 @@ fn register_go_package_init_metrics(registry: &Registry) -> Result<(), prometheu
         "deprecated_flags_inuse_total",
         "The number of deprecated flags currently set.",
     )?;
+    if deprecated_flags_count > 0 {
+        deprecated_flags.inc_by(deprecated_flags_count as f64);
+    }
     registry.register(Box::new(deprecated_flags))?;
 
     // .ref/mimir/vendor/github.com/prometheus/prometheus/storage/remote/write.go:43,49,55
