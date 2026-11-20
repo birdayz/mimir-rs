@@ -6,7 +6,7 @@
 //! - (b) `MemberlistKv` `LEFT` / `PartitionDeleted` / `OwnerDeleted` merge when incoming gossip
 //!   carries an expired tombstone (P0-1) + `watch_key` deletion notification (P1-7).
 //! - (c) `EtcdKv` watch failover across reconnect + `compact_revision` compaction recovery +
-//!   `DELETE` event (`KeyDeleted`) + auth token + empty-prefix `list("")`/`watch_prefix("")`
+//!   `DELETE` event (`codec.Decode(nil)` parity with `dskit/kv/etcd`) + auth token + empty-prefix `list("")`/`watch_prefix("")`
 //!   (P0-3).
 //! - (d) `ShipperMeta` / `BlockMeta` with Go `"labels": null, "shipped": null` (P1-4) and
 //!   `upload_block_to_bucket` cleanup deleting `meta.json` first (P1-3).
@@ -46,7 +46,7 @@ use mimir_proto::ringpb::{
 };
 use mimir_ring::kv::etcd::EtcdKv;
 use mimir_ring::kv::memberlist::{MemberlistKv, MemberlistKvClient};
-use mimir_ring::kv::{cas_typed, get_typed, is_key_deleted, KvClient, StringCodec};
+use mimir_ring::kv::{cas_typed, get_typed, KvClient, StringCodec};
 use mimir_ring::partition_ring::model::partition_ring_desc_codec;
 use mimir_ring::ring::model::ring_desc_codec;
 use mimir_storage::bucket::BucketClient;
@@ -738,7 +738,7 @@ fn test_w11_p0_3_etcd_watch_failover_auth_empty_prefix_delete_and_compaction() -
         ctx_pref.cancel();
         let _ = h_pref.await;
 
-        let (wk_tx, mut wk_rx) = mpsc::unbounded_channel::<Result<String, ()>>();
+        let (wk_tx, mut wk_rx) = mpsc::unbounded_channel::<String>();
         let ctx_wk = ServiceContext::background();
         let c_wk = Arc::clone(&client);
         let ctx_wk_clone = ctx_wk.clone();
@@ -747,10 +747,8 @@ fn test_w11_p0_3_etcd_watch_failover_auth_empty_prefix_delete_and_compaction() -
                 "watch/k1",
                 ctx_wk_clone,
                 Box::new(move |any| {
-                    if is_key_deleted(any.as_ref()) {
-                        let _ = wk_tx.send(Err(()));
-                    } else if let Ok(s) = any.downcast::<String>() {
-                        let _ = wk_tx.send(Ok(*s));
+                    if let Ok(s) = any.downcast::<String>() {
+                        let _ = wk_tx.send(*s);
                     }
                     true
                 }),
@@ -767,7 +765,7 @@ fn test_w11_p0_3_etcd_watch_failover_auth_empty_prefix_delete_and_compaction() -
             tokio::time::timeout(Duration::from_secs(5), wk_rx.recv())
                 .await?
                 .context("v1")?
-                == Ok("v1".to_string())
+                == "v1"
         );
 
         proxy.pause_and_drop();
@@ -782,15 +780,17 @@ fn test_w11_p0_3_etcd_watch_failover_auth_empty_prefix_delete_and_compaction() -
             tokio::time::timeout(Duration::from_secs(10), wk_rx.recv())
                 .await?
                 .context("v2 after reconnect")?
-                == Ok("v2".to_string())
+                == "v2"
         );
 
+        // Go dskit/kv/etcd/etcd.go:220-231 passes event.Kv.Value (nil on DELETE) through
+        // codec.Decode, which yields "" for StringCodec.
         direct.delete("watch/k1").await?;
         ensure!(
             tokio::time::timeout(Duration::from_secs(5), wk_rx.recv())
                 .await?
                 .context("delete")?
-                == Err(())
+                .is_empty()
         );
         ctx_wk.cancel();
         let _ = h_wk.await;
