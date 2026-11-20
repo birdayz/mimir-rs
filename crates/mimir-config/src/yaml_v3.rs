@@ -1896,6 +1896,89 @@ fn normalize_serde_value(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
 /// Normalizes an already-parsed [`serde_yaml::Value`] (e.g. merged `runtime_config` maps)
 /// according to Go `yaml.v3` scalar coercions for the named Go type (such as
 /// `"mimir.runtimeConfigValues"` or `"mimir.Config"`).
+fn zero_null_fields_walk(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
+    use serde_yaml::{Mapping, Value};
+    let ty_deref = deref_ptr(t, ty);
+    let info = t.get(ty_deref);
+    match val {
+        Value::Sequence(items) => {
+            if let Some(elem_ty) = info.elem {
+                for item in items {
+                    zero_null_fields_walk(t, item, elem_ty);
+                }
+            }
+        }
+        Value::Mapping(map) => {
+            if info.kind == "struct"
+                && !info.name.starts_with("flagext.LimitsMap[")
+                && info.name != "activeseriesmodel.CustomTrackersConfig"
+            {
+                let keys: Vec<Value> = map.keys().cloned().collect();
+                for k in keys {
+                    let field_ty = k
+                        .as_str()
+                        .and_then(|key| info.fields.iter().find(|f| f.key == key).map(|f| f.ty));
+                    let Some(v) = map.get_mut(&k) else {
+                        continue;
+                    };
+                    if v.is_null() {
+                        match field_ty.map(|ft| t.get(ft)) {
+                            Some(fi)
+                                if fi.name == "flagext.StringSliceCSV"
+                                    || fi.name == "flagext.CIDRSliceCSV" =>
+                            {
+                                *v = Value::String(String::new());
+                            }
+                            Some(fi)
+                                if fi.name == "flagext.StringSliceCSVMulti"
+                                    || fi.kind == "slice" =>
+                            {
+                                *v = Value::Sequence(Vec::new());
+                            }
+                            Some(fi)
+                                if fi.kind == "map"
+                                    || fi.name == "activeseriesmodel.CustomTrackersConfig"
+                                    || fi.name.starts_with("flagext.LimitsMap[") =>
+                            {
+                                *v = Value::Mapping(Mapping::new());
+                            }
+                            Some(fi) if fi.kind == "ptr" => {
+                                // Keep explicit YAML null so Option<T> zeroes to None.
+                            }
+                            _ => {
+                                map.remove(&k);
+                            }
+                        }
+                    } else if let Some(ft) = field_ty {
+                        zero_null_fields_walk(t, v, ft);
+                    }
+                }
+            } else {
+                let elem_ty = info
+                    .elem
+                    .or_else(|| limits_map_elem_ty(t, &info.name));
+                if let Some(elem) = elem_ty {
+                    for (_, v) in map.iter_mut() {
+                        if !v.is_null() {
+                            zero_null_fields_walk(t, v, elem);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Applies Go `yaml.v3` `decoder.null` semantics onto a `mimir.Config` YAML value before merging
+/// onto flag defaults: strips `null` on scalars and structs (leaving defaults untouched), zeroes
+/// slices/CSVs (`[]` / `""`), zeroes maps (`{}`), and preserves `null` on pointer fields (`*bool`).
+pub(crate) fn zero_null_fields_like_yaml_v3(core_val: &mut serde_yaml::Value) {
+    if let Ok(t) = types() {
+        zero_null_fields_walk(t, core_val, t.root);
+    }
+}
+
 pub fn normalize_value_for_type(type_name: &str, val: &mut serde_yaml::Value) -> Result<(), String> {
     let t = types()?;
     let ty = t.find(type_name)?;

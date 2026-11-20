@@ -17,7 +17,7 @@ use mimir_ring::ring::{Ring, RingError};
 use mimir_tsdb::labels::Labels;
 use parking_lot::Mutex;
 use prometheus::{Histogram, HistogramOpts, Registry};
-use tracing::{debug, info, warn};
+use tracing::{error, info, warn};
 
 use crate::user_tsdb::UserTsdb;
 
@@ -267,13 +267,18 @@ impl OwnedSeriesService {
         let s_start = Arc::clone(&this);
         let s_run = Arc::clone(&this);
         let basic = basic_service(
-            Some(Box::new(move |_ctx: ServiceContext| {
+            Some(Box::new(move |ctx: ServiceContext| {
                 let s = Arc::clone(&s_start);
                 Box::pin(async move {
                     match s.ring_strategy.check_ring_for_changes() {
                         Ok(_) => {
                             s.initial_ring_check_succeeded.store(true, Ordering::Release);
-                            let _ = s.update_all_tenants(true);
+                            let s_upd = Arc::clone(&s);
+                            let ctx_upd = ctx.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                s_upd.update_all_tenants_with_ctx(true, Some(&ctx_upd))
+                            })
+                            .await;
                         }
                         Err(e) => {
                             if e.contains("empty") {
@@ -305,10 +310,21 @@ impl OwnedSeriesService {
                                         if ticker_interval != s.interval {
                                             ticker_interval = s.interval;
                                         }
-                                        s.update_all_tenants(ring_changed);
+                                        let s_upd = Arc::clone(&s);
+                                        let ctx_upd = ctx.clone();
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            s_upd.update_all_tenants_with_ctx(
+                                                ring_changed,
+                                                Some(&ctx_upd),
+                                            )
+                                        })
+                                        .await;
+                                        if ctx.is_canceled() {
+                                            return Ok(());
+                                        }
                                     }
                                     Err(e) => {
-                                        debug!(err = %e, "can't check ring for updates");
+                                        error!(err = %e, "can't check ring for updates");
                                     }
                                 }
                             }
@@ -346,10 +362,21 @@ impl OwnedSeriesService {
     }
 
     pub fn update_all_tenants(&self, ring_changed: bool) -> usize {
+        self.update_all_tenants_with_ctx(ring_changed, None)
+    }
+
+    pub fn update_all_tenants_with_ctx(
+        &self,
+        ring_changed: bool,
+        ctx: Option<&ServiceContext>,
+    ) -> usize {
         let mut updated = 0usize;
         let mut reasons = Vec::new();
         let start = Instant::now();
         for user_id in (self.get_tsdb_users)() {
+            if ctx.is_some_and(ServiceContext::is_canceled) {
+                return updated;
+            }
             let Some(db) = (self.get_tsdb)(&user_id) else {
                 continue;
             };

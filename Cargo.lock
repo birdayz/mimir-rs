@@ -1958,6 +1958,7 @@ dependencies = [
  "chrono",
  "criterion",
  "dashmap",
+ "flate2",
  "futures",
  "hashbrown 0.15.5",
  "hyper",
@@ -1985,6 +1986,7 @@ dependencies = [
  "tracing",
  "ulid",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]
@@ -1995,6 +1997,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "futures",
+ "libc",
  "parking_lot",
  "prometheus",
  "prost 0.13.5",

@@ -464,75 +464,166 @@ impl hyper::body::Body for SingleChunkBody {
     }
 }
 
-#[derive(Clone, Copy)]
-enum FrameInspectState {
-    Header { buf: [u8; 5], pos: usize },
-    Payload { remaining: usize },
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FrameDecompressAlgo {
+    Identity,
+    Gzip,
+    Zstd,
 }
 
-impl Default for FrameInspectState {
-    fn default() -> Self {
-        Self::Header {
-            buf: [0; 5],
-            pos: 0,
-        }
-    }
-}
-
-struct MaxRecvFrameBody {
+/// Pre-Tonic non-client-streaming request body wrapper enforcing:
+/// - per-frame wire size `msg_len <= max_recv`,
+/// - bounded decompression for `gzip` / `zstd`, and
+/// - grpc-go `serverStream.RecvMsg` request cardinality (0 frames -> Internal,
+///   2+ frames -> validate/decompress frame 2 and fail BEFORE invoking handler).
+struct NonClientStreamingFrameBody {
     inner: tonic::body::BoxBody,
+    algo: FrameDecompressAlgo,
     max_recv: usize,
-    state: FrameInspectState,
+    in_buf: BytesMut,
+    frames_seen: usize,
+    buffered_frame1: Option<Bytes>,
+    pending_trailers: Option<http::HeaderMap>,
+    eof_seen: bool,
+    done: bool,
 }
 
-impl MaxRecvFrameBody {
-    fn new(inner: tonic::body::BoxBody, max_recv: usize) -> Self {
+impl NonClientStreamingFrameBody {
+    fn new(inner: tonic::body::BoxBody, algo: FrameDecompressAlgo, max_recv: usize) -> Self {
         Self {
             inner,
+            algo,
             max_recv,
-            state: FrameInspectState::default(),
+            in_buf: BytesMut::new(),
+            frames_seen: 0,
+            buffered_frame1: None,
+            pending_trailers: None,
+            eof_seen: false,
+            done: false,
         }
     }
 
     #[allow(clippy::result_large_err)]
-    fn check_slice(&mut self, mut data: &[u8]) -> Result<(), Status> {
-        while !data.is_empty() {
-            match &mut self.state {
-                FrameInspectState::Header { buf, pos } => {
-                    let take = (5 - *pos).min(data.len());
-                    buf[*pos..*pos + take].copy_from_slice(&data[..take]);
-                    *pos += take;
-                    data = &data[take..];
-                    if *pos == 5 {
-                        let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-                        if len > self.max_recv {
+    fn check_incoming_header(&self) -> Result<(), Status> {
+        if self.in_buf.len() >= 5 {
+            let msg_len = u32::from_be_bytes([
+                self.in_buf[1],
+                self.in_buf[2],
+                self.in_buf[3],
+                self.in_buf[4],
+            ]) as usize;
+            if msg_len > self.max_recv {
+                return Err(Status::resource_exhausted(format!(
+                    "grpc: received message larger than max ({msg_len} vs. {})",
+                    self.max_recv
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn drain_buffered_frames(&mut self) -> Result<(), Status> {
+        use std::io::Read as _;
+        while self.in_buf.len() >= 5 {
+            let flag = self.in_buf[0];
+            let msg_len = u32::from_be_bytes([
+                self.in_buf[1],
+                self.in_buf[2],
+                self.in_buf[3],
+                self.in_buf[4],
+            ]) as usize;
+            if msg_len > self.max_recv {
+                return Err(Status::resource_exhausted(format!(
+                    "grpc: received message larger than max ({msg_len} vs. {})",
+                    self.max_recv
+                )));
+            }
+            let Some(frame_end) = 5usize.checked_add(msg_len) else {
+                return Err(Status::internal("gRPC frame length overflow"));
+            };
+            if self.in_buf.len() < frame_end {
+                break;
+            }
+            let decoded_frame: Bytes = match self.algo {
+                FrameDecompressAlgo::Identity => match flag {
+                    0 => self.in_buf.split_to(frame_end).freeze(),
+                    1 => {
+                        return Err(Status::internal(
+                            "grpc: compressed flag set with identity or empty encoding",
+                        ));
+                    }
+                    other => {
+                        return Err(Status::internal(format!(
+                            "protocol error: received message with invalid compression flag: {other} (valid flags are 0 and 1), while sending request"
+                        )));
+                    }
+                },
+                FrameDecompressAlgo::Gzip | FrameDecompressAlgo::Zstd => match flag {
+                    0 => self.in_buf.split_to(frame_end).freeze(),
+                    1 => {
+                        let compressed = &self.in_buf[5..frame_end];
+                        let limit = (self.max_recv as u64).saturating_add(1);
+                        let mut decompressed =
+                            Vec::with_capacity(compressed.len().min(self.max_recv).min(64 * 1024));
+                        match self.algo {
+                            FrameDecompressAlgo::Gzip => {
+                                let mut dec = flate2::read::GzDecoder::new(compressed).take(limit);
+                                dec.read_to_end(&mut decompressed).map_err(|e| {
+                                    Status::internal(format!("gzip decompression failed: {e}"))
+                                })?;
+                            }
+                            FrameDecompressAlgo::Zstd => {
+                                let dec = zstd::stream::read::Decoder::new(compressed).map_err(
+                                    |e| Status::internal(format!("zstd decompression failed: {e}")),
+                                )?;
+                                dec.take(limit).read_to_end(&mut decompressed).map_err(|e| {
+                                    Status::internal(format!("zstd decompression failed: {e}"))
+                                })?;
+                            }
+                            FrameDecompressAlgo::Identity => unreachable!(),
+                        }
+                        self.in_buf.advance(frame_end);
+                        if decompressed.len() > self.max_recv {
                             return Err(Status::resource_exhausted(format!(
-                                "grpc: received message larger than max ({len} vs. {})",
+                                "grpc: received message after decompression larger than max {}",
                                 self.max_recv
                             )));
                         }
-                        self.state = if len == 0 {
-                            FrameInspectState::default()
-                        } else {
-                            FrameInspectState::Payload { remaining: len }
-                        };
+                        let dec_len_u32 = u32::try_from(decompressed.len()).map_err(|_| {
+                            Status::resource_exhausted(format!(
+                                "grpc: received message after decompression larger than max {}",
+                                self.max_recv
+                            ))
+                        })?;
+                        let mut out = BytesMut::with_capacity(5 + decompressed.len());
+                        out.put_u8(0);
+                        out.extend_from_slice(&dec_len_u32.to_be_bytes());
+                        out.extend_from_slice(&decompressed);
+                        out.freeze()
                     }
-                }
-                FrameInspectState::Payload { remaining } => {
-                    let skip = (*remaining).min(data.len());
-                    *remaining -= skip;
-                    data = &data[skip..];
-                    if *remaining == 0 {
-                        self.state = FrameInspectState::default();
+                    other => {
+                        return Err(Status::internal(format!(
+                            "protocol error: received message with invalid compression flag: {other} (valid flags are 0 and 1), while sending request"
+                        )));
                     }
-                }
+                },
+            };
+            self.frames_seen += 1;
+            if self.frames_seen == 1 {
+                self.buffered_frame1 = Some(decoded_frame);
+            } else {
+                self.buffered_frame1 = None;
+                return Err(Status::internal(
+                    "cardinality violation: received multiple request messages for non-client-streaming RPC",
+                ));
             }
         }
         Ok(())
     }
 }
 
-impl hyper::body::Body for MaxRecvFrameBody {
+impl hyper::body::Body for NonClientStreamingFrameBody {
     type Data = Bytes;
     type Error = Status;
 
@@ -541,21 +632,119 @@ impl hyper::body::Body for MaxRecvFrameBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        match Pin::new(&mut self.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    if let Err(status) = self.check_slice(data) {
-                        return Poll::Ready(Some(Err(status)));
+        if self.eof_seen {
+            if let Some(frame1) = self.buffered_frame1.take() {
+                return Poll::Ready(Some(Ok(hyper::body::Frame::data(frame1))));
+            }
+            if let Some(trailers) = self.pending_trailers.take() {
+                self.done = true;
+                return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+            }
+            self.done = true;
+            return Poll::Ready(None);
+        }
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match Pin::new(&mut self.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(frame))) => {
+                    if frame.is_data() {
+                        if let Ok(data) = frame.into_data() {
+                            if data.is_empty() {
+                                continue;
+                            }
+                            if self.frames_seen == 0
+                                && self.algo == FrameDecompressAlgo::Identity
+                                && self.in_buf.is_empty()
+                                && data.len() >= 5
+                                && data[0] == 0
+                            {
+                                let msg_len = u32::from_be_bytes([
+                                    data[1], data[2], data[3], data[4],
+                                ]) as usize;
+                                if msg_len > self.max_recv {
+                                    self.done = true;
+                                    return Poll::Ready(Some(Err(Status::resource_exhausted(
+                                        format!(
+                                            "grpc: received message larger than max ({msg_len} vs. {})",
+                                            self.max_recv
+                                        ),
+                                    ))));
+                                }
+                                if 5usize.checked_add(msg_len) == Some(data.len()) {
+                                    self.frames_seen = 1;
+                                    self.buffered_frame1 = Some(data);
+                                    continue;
+                                }
+                            }
+                            self.in_buf.extend_from_slice(&data);
+                            if let Err(st) = self.check_incoming_header() {
+                                self.done = true;
+                                return Poll::Ready(Some(Err(st)));
+                            }
+                            if let Err(st) = self.drain_buffered_frames() {
+                                self.done = true;
+                                return Poll::Ready(Some(Err(st)));
+                            }
+                        }
+                    } else if let Ok(trailers) = frame.into_trailers() {
+                        if !self.in_buf.is_empty() {
+                            self.done = true;
+                            return Poll::Ready(Some(Err(Status::internal(
+                                "Unexpected EOF decoding stream.",
+                            ))));
+                        }
+                        if self.frames_seen == 0 {
+                            self.done = true;
+                            return Poll::Ready(Some(Err(Status::internal(
+                                "cardinality violation: received no request message from non-client-streaming RPC",
+                            ))));
+                        }
+                        self.eof_seen = true;
+                        self.pending_trailers = Some(trailers);
+                        if let Some(frame1) = self.buffered_frame1.take() {
+                            return Poll::Ready(Some(Ok(hyper::body::Frame::data(frame1))));
+                        }
+                        self.done = true;
+                        if let Some(t) = self.pending_trailers.take() {
+                            return Poll::Ready(Some(Ok(hyper::body::Frame::trailers(t))));
+                        }
+                        return Poll::Ready(None);
                     }
                 }
-                Poll::Ready(Some(Ok(frame)))
+                Poll::Ready(None) => {
+                    if !self.in_buf.is_empty() {
+                        self.done = true;
+                        return Poll::Ready(Some(Err(Status::internal(
+                            "Unexpected EOF decoding stream.",
+                        ))));
+                    }
+                    if self.frames_seen == 0 {
+                        self.done = true;
+                        return Poll::Ready(Some(Err(Status::internal(
+                            "cardinality violation: received no request message from non-client-streaming RPC",
+                        ))));
+                    }
+                    self.eof_seen = true;
+                    if let Some(frame1) = self.buffered_frame1.take() {
+                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(frame1))));
+                    }
+                    self.done = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
             }
-            other => other,
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.done
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
@@ -914,199 +1103,153 @@ impl Drop for VecResetGuard<'_> {
 }
 
 #[allow(clippy::result_large_err)]
+fn decode_single_custom_grpc_frame(
+    frame_slice: &[u8],
+    encoding: CustomGrpcEncoding,
+    max_decode_len: usize,
+) -> Result<Bytes, Status> {
+    let flag = frame_slice[0];
+    let len = frame_slice.len() - 5;
+    let payload = &frame_slice[5..];
+    match flag {
+        0 => {
+            if len > max_decode_len {
+                return Err(Status::resource_exhausted(format!(
+                    "grpc: received message larger than max ({len} vs. {max_decode_len})"
+                )));
+            }
+            Ok(Bytes::copy_from_slice(frame_slice))
+        }
+        1 => DECOMP_SCRATCH.with(|cell| {
+            let mut scratch_ref = cell.borrow_mut();
+            let guard = VecResetGuard(&mut scratch_ref);
+            let out = &mut *guard.0;
+            out.extend_from_slice(&[0u8; 5]);
+            let map_decomp_err = |codec: &str, e: std::io::Error| -> Status {
+                if e.get_ref()
+                    .is_some_and(|r| r.is::<mimir_proto::snappy::DecompressLimitExceeded>())
+                {
+                    Status::resource_exhausted(format!(
+                        "grpc: received message after decompression larger than max {max_decode_len}"
+                    ))
+                } else {
+                    Status::internal(format!("{codec} decompression failed: {e}"))
+                }
+            };
+            match encoding {
+                CustomGrpcEncoding::Snappy => {
+                    mimir_proto::snappy::decompress_framed_bounded_into(
+                        payload,
+                        out,
+                        max_decode_len,
+                    )
+                    .map_err(|e| map_decomp_err("snappy", e))?;
+                }
+                CustomGrpcEncoding::S2 => {
+                    mimir_proto::s2::decompress_framed_into(payload, out, max_decode_len)
+                        .map_err(|e| map_decomp_err("s2", e))?;
+                }
+            }
+            let dec_len = out.len() - 5;
+            if dec_len > max_decode_len {
+                return Err(Status::resource_exhausted(format!(
+                    "grpc: received message after decompression larger than max {max_decode_len}"
+                )));
+            }
+            out[1..5].copy_from_slice(&(dec_len as u32).to_be_bytes());
+            Ok(Bytes::copy_from_slice(out))
+        }),
+        other => Err(Status::internal(format!(
+            "invalid gRPC compression flag {other}"
+        ))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
 async fn decompress_custom_grpc_request(
     req: http::Request<tonic::body::BoxBody>,
     encoding: CustomGrpcEncoding,
     max_decode_len: usize,
 ) -> Result<http::Request<tonic::body::BoxBody>, Status> {
     let (mut parts, mut body) = req.into_parts();
-    let max_wire_len = max_decode_len.saturating_add(5);
-    let mut single_chunk: Option<Bytes> = None;
-    let mut multi_buf: Option<PooledBytesMut> = None;
+    let mut pooled = PooledBytesMut::take_or_new(4096);
+    let mut frame1_out: Option<Bytes> = None;
+    let mut frame_count = 0usize;
 
     while let Some(frame_res) =
         futures::future::poll_fn(|cx| hyper::body::Body::poll_frame(Pin::new(&mut body), cx)).await
     {
         let frame = frame_res.map_err(|s| Status::internal(format!("reading gRPC body: {s}")))?;
-        if let Ok(data) = frame.into_data() {
-            if data.is_empty() {
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
+        }
+        let buf = pooled.0.get_or_insert_with(|| BytesMut::with_capacity(4096));
+        if frame_count == 0 && buf.is_empty() && data.len() >= 5 && data[0] == 0 {
+            let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+            if len > max_decode_len {
+                return Err(Status::resource_exhausted(format!(
+                    "grpc: received message larger than max ({len} vs. {max_decode_len})"
+                )));
+            }
+            if 5usize.checked_add(len) == Some(data.len()) {
+                frame1_out = Some(data);
+                frame_count = 1;
                 continue;
             }
-            if let Some(ref mut pooled) = multi_buf {
-                if let Some(buf) = pooled.0.as_mut() {
-                    if buf.len().saturating_add(data.len()) > max_wire_len {
-                        return Err(Status::resource_exhausted(format!(
-                            "grpc: received message larger than max ({} vs. {max_decode_len})",
-                            buf.len().saturating_add(data.len()).saturating_sub(5)
-                        )));
-                    }
-                    buf.extend_from_slice(&data);
-                }
-            } else if let Some(first) = single_chunk.take() {
-                let total = first.len().saturating_add(data.len());
-                if total > max_wire_len {
-                    return Err(Status::resource_exhausted(format!(
-                        "grpc: received message larger than max ({} vs. {max_decode_len})",
-                        total.saturating_sub(5)
-                    )));
-                }
-                let mut pooled = PooledBytesMut::take_or_new(total.max(4096));
-                if let Some(buf) = pooled.0.as_mut() {
-                    buf.extend_from_slice(&first);
-                    buf.extend_from_slice(&data);
-                }
-                multi_buf = Some(pooled);
-            } else {
-                if data.len() > max_wire_len {
-                    return Err(Status::resource_exhausted(format!(
-                        "grpc: received message larger than max ({} vs. {max_decode_len})",
-                        data.len().saturating_sub(5)
-                    )));
-                }
-                single_chunk = Some(data);
-            }
         }
-    }
-
-    let out_bytes: Bytes = if let Some(single) = single_chunk {
-        if single.len() >= 5 && single[0] == 0 {
-            let len = u32::from_be_bytes([single[1], single[2], single[3], single[4]]) as usize;
-            if 5usize.checked_add(len) == Some(single.len()) && len <= max_decode_len {
-                parts.headers.remove("grpc-encoding");
-                parts.headers.remove(http::header::CONTENT_LENGTH);
-                return Ok(http::Request::from_parts(
-                    parts,
-                    tonic::body::BoxBody::new(SingleChunkBody(Some(single))),
-                ));
+        buf.extend_from_slice(&data);
+        while buf.len() >= 5 {
+            let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+            if len > max_decode_len {
+                return Err(Status::resource_exhausted(format!(
+                    "grpc: received message larger than max ({len} vs. {max_decode_len})"
+                )));
             }
-        }
-        decompress_frames_slice(&single, encoding, max_decode_len)?
-    } else if let Some(ref pooled) = multi_buf {
-        let slice = pooled.0.as_deref().unwrap_or(&[]);
-        decompress_frames_slice(slice, encoding, max_decode_len)?
-    } else {
-        Bytes::new()
-    };
-
-    parts.headers.remove("grpc-encoding");
-    parts.headers.remove(http::header::CONTENT_LENGTH);
-    Ok(http::Request::from_parts(
-        parts,
-        tonic::body::BoxBody::new(SingleChunkBody(Some(out_bytes))),
-    ))
-}
-
-#[allow(clippy::result_large_err)]
-fn decompress_frames_slice(
-    slice: &[u8],
-    encoding: CustomGrpcEncoding,
-    max_decode_len: usize,
-) -> Result<Bytes, Status> {
-    if slice.is_empty() {
-        return Ok(Bytes::new());
-    }
-    DECOMP_SCRATCH.with(|cell| {
-        let mut scratch_ref = cell.borrow_mut();
-        let guard = VecResetGuard(&mut scratch_ref);
-        let out = &mut *guard.0;
-
-        let mut pos = 0usize;
-        let mut frame_count = 0usize;
-        while pos < slice.len() {
-            // Every `cortex.Ingester` RPC is non-client-streaming. grpc-go `serverStream.RecvMsg`
-            // reads (and decompresses, bounded by `maxReceiveMessageSize`) one extra message after
-            // the first and then fails the RPC, so the first message is dropped here: nothing but
-            // an error can come out of this request, and the scratch stays bounded by one message.
-            if frame_count == 1 {
-                out.clear();
+            let Some(frame_end) = 5usize.checked_add(len) else {
+                return Err(Status::internal("gRPC compressed frame length overflow"));
+            };
+            if buf.len() < frame_end {
+                break;
             }
-            if slice.len() - pos < 5 {
-                return Err(Status::internal("truncated gRPC compressed frame header"));
-            }
-            let flag = slice[pos];
-            let len = u32::from_be_bytes([
-                slice[pos + 1],
-                slice[pos + 2],
-                slice[pos + 3],
-                slice[pos + 4],
-            ]) as usize;
-            pos += 5;
-            let end = pos
-                .checked_add(len)
-                .ok_or_else(|| Status::internal("gRPC compressed frame length overflow"))?;
-            let payload = slice
-                .get(pos..end)
-                .ok_or_else(|| Status::internal("truncated gRPC compressed frame payload"))?;
-            pos = end;
-
-            match flag {
-                0 => {
-                    if len > max_decode_len {
-                        return Err(Status::resource_exhausted(format!(
-                            "grpc: received message larger than max ({len} vs. {max_decode_len})"
-                        )));
-                    }
-                    out.push(0);
-                    out.extend_from_slice(&(len as u32).to_be_bytes());
-                    out.extend_from_slice(payload);
-                }
-                1 => {
-                    let hdr_pos = out.len();
-                    out.extend_from_slice(&[0u8; 5]);
-                    let map_decomp_err = |codec: &str, e: std::io::Error| -> Status {
-                        if e.get_ref()
-                            .is_some_and(|r| r.is::<mimir_proto::snappy::DecompressLimitExceeded>())
-                        {
-                            Status::resource_exhausted(format!(
-                                "grpc: received message after decompression larger than max {max_decode_len}"
-                            ))
-                        } else {
-                            Status::internal(format!("{codec} decompression failed: {e}"))
-                        }
-                    };
-                    match encoding {
-                        CustomGrpcEncoding::Snappy => {
-                            mimir_proto::snappy::decompress_framed_bounded_into(
-                                payload,
-                                out,
-                                max_decode_len,
-                            )
-                            .map_err(|e| map_decomp_err("snappy", e))?;
-                        }
-                        CustomGrpcEncoding::S2 => {
-                            mimir_proto::s2::decompress_framed_into(
-                                payload,
-                                out,
-                                max_decode_len,
-                            )
-                            .map_err(|e| map_decomp_err("s2", e))?;
-                        }
-                    }
-                    let dec_len = out.len() - (hdr_pos + 5);
-                    if dec_len > max_decode_len {
-                        return Err(Status::resource_exhausted(format!(
-                            "grpc: received message after decompression larger than max {max_decode_len}"
-                        )));
-                    }
-                    out[hdr_pos + 1..hdr_pos + 5].copy_from_slice(&(dec_len as u32).to_be_bytes());
-                }
-                other => {
-                    return Err(Status::internal(format!(
-                        "invalid gRPC compression flag {other}"
-                    )));
-                }
-            }
+            let decoded =
+                decode_single_custom_grpc_frame(&buf[..frame_end], encoding, max_decode_len)?;
+            buf.advance(frame_end);
             frame_count += 1;
-            if frame_count > 1 {
-                // grpc-go `stream.go` `serverStream.RecvMsg` (v1.85, used for unary RPCs too).
+            if frame_count == 1 {
+                frame1_out = Some(decoded);
+            } else {
+                // grpc-go `stream.go` `serverStream.RecvMsg`: validate/decompress frame 2
+                // against `maxReceiveMessageSize`, then fail BEFORE invoking handler.
                 return Err(Status::internal(
                     "cardinality violation: received multiple request messages for non-client-streaming RPC",
                 ));
             }
         }
+    }
 
-        Ok(Bytes::copy_from_slice(out))
-    })
+    if let Some(buf) = pooled.0.as_ref() {
+        if !buf.is_empty() {
+            if buf.len() < 5 {
+                return Err(Status::internal("truncated gRPC compressed frame header"));
+            }
+            return Err(Status::internal("truncated gRPC compressed frame payload"));
+        }
+    }
+    if frame_count == 0 {
+        return Err(Status::internal(
+            "cardinality violation: received no request message from non-client-streaming RPC",
+        ));
+    }
+
+    parts.headers.remove("grpc-encoding");
+    parts.headers.remove(http::header::CONTENT_LENGTH);
+    Ok(http::Request::from_parts(
+        parts,
+        tonic::body::BoxBody::new(SingleChunkBody(Some(frame1_out.unwrap_or_default()))),
+    ))
 }
 
 /// Accepts `grpc-encoding: snappy` and `grpc-encoding: s2` requests for any wrapped gRPC service:
@@ -1257,15 +1400,61 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         return Ok(resp);
                     }
                 }
-            } else if max_decode_len < usize::MAX {
-                req.map(|b| tonic::body::BoxBody::new(MaxRecvFrameBody::new(b, max_decode_len)))
             } else {
-                req
+                let has_gzip = accept_compression[..accept_compression_len]
+                    .iter()
+                    .flatten()
+                    .any(|e| *e == CompressionEncoding::Gzip);
+                let has_zstd = accept_compression[..accept_compression_len]
+                    .iter()
+                    .flatten()
+                    .any(|e| *e == CompressionEncoding::Zstd);
+                let req_enc = req
+                    .headers()
+                    .get("grpc-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase);
+                match req_enc.as_deref() {
+                    Some("gzip") if has_gzip => {
+                        let mut req = req;
+                        req.headers_mut().remove("grpc-encoding");
+                        req.headers_mut().remove(http::header::CONTENT_LENGTH);
+                        req.map(|b| {
+                            tonic::body::BoxBody::new(NonClientStreamingFrameBody::new(
+                                b,
+                                FrameDecompressAlgo::Gzip,
+                                max_decode_len,
+                            ))
+                        })
+                    }
+                    Some("zstd") if has_zstd => {
+                        let mut req = req;
+                        req.headers_mut().remove("grpc-encoding");
+                        req.headers_mut().remove(http::header::CONTENT_LENGTH);
+                        req.map(|b| {
+                            tonic::body::BoxBody::new(NonClientStreamingFrameBody::new(
+                                b,
+                                FrameDecompressAlgo::Zstd,
+                                max_decode_len,
+                            ))
+                        })
+                    }
+                    None | Some("identity") => req.map(|b| {
+                        tonic::body::BoxBody::new(NonClientStreamingFrameBody::new(
+                            b,
+                            FrameDecompressAlgo::Identity,
+                            max_decode_len,
+                        ))
+                    }),
+                    // Unsupported encoding: let Tonic return Unimplemented before reading body.
+                    Some(_) => req,
+                }
             };
 
             // RPCCallProcessing: reactive limiter blocking permit acquisition.
             if let Some(ref slot) = push_tap_slot {
-                match ingester.prepare_push_reactive().await {
+                match ingester.prepare_push_reactive(deadline_ctx.as_deref()).await {
                     Ok(Some(rp)) => {
                         if let Some(ref mut tap) = *slot.lock() {
                             tap.set_reactive_permit(rp);
@@ -1279,7 +1468,10 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 }
             }
             if let Some(ref mut guard) = read_tap {
-                match ingester.prepare_read_reactive(req.headers()).await {
+                match ingester
+                    .prepare_read_reactive(req.headers(), deadline_ctx.as_deref())
+                    .await
+                {
                     Ok(Some(rp)) => {
                         if let Some(ref mut tap) = guard.tap {
                             tap.set_reactive_permit(rp);

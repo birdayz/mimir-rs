@@ -650,7 +650,7 @@ impl MimirConfig {
         // handles omitted fields; for explicit `null` in nested blocks (e.g. `limits: null`),
         // sanitize_null_mappings ensures Go yaml.v3 compatibility.
         let mut core_val = Value::Mapping(core_map);
-        sanitize_null_block_values(&mut core_val);
+        crate::yaml_v3::zero_null_fields_like_yaml_v3(&mut core_val);
         validate_flattened_core_keys(&core_val)?;
 
         // Go unmarshals the YAML on top of the already-populated (flag default) config, so
@@ -850,6 +850,26 @@ impl MimirConfig {
         Ok(lim)
     }
 
+    /// Effective `querier.timeout` from CLI or YAML (default 2m).
+    pub fn querier_timeout(&self) -> GoDuration {
+        if let Some(v) = self.extra_cli_flag_value("querier.timeout") {
+            if let Ok(d) = v.parse::<GoDuration>() {
+                return d;
+            }
+        }
+        if let Some(v) = self
+            .extra_sections
+            .get("querier")
+            .and_then(|q| q.get("timeout"))
+            .and_then(Value::as_str)
+        {
+            if let Ok(d) = v.parse::<GoDuration>() {
+                return d;
+            }
+        }
+        GoDuration::from_secs(120)
+    }
+
     /// Effective `querier.query_store_after` from CLI or YAML (default 12h).
     pub fn querier_query_store_after(&self) -> GoDuration {
         if let Some(v) = self.extra_cli_flag_value("querier.query-store-after") {
@@ -952,7 +972,7 @@ impl MimirConfig {
                 for addr in &self.ingest_storage.kafka.address.0 {
                     if !addr.contains("<write-compartment-id>") {
                         return Err(ConfigError::Validation(
-                            "when compartments are enabled with more than one write compartment, every -ingest-storage.kafka.address must contain the \"<write-compartment-id>\" placeholder".to_string(),
+                            "when compartments are enabled with more than one write compartment, every -ingest-storage.kafka.address must contain the \"<write-compartment-id>\" placeholder for the ingester and query-frontend".to_string(),
                         ));
                     }
                 }
@@ -983,13 +1003,23 @@ impl MimirConfig {
             .validate()
             .map_err(wrap_validation("invalid memberlist config"))?;
         self.blocks_storage
-            .validate(self.ingester.active_series.active_series_metrics_enabled)
+            .validate_for_target(
+                self.ingester.active_series.active_series_metrics_enabled,
+                self.is_ingester_enabled(),
+            )
             .map_err(wrap_validation("invalid TSDB config"))?;
         if self.is_ingester_enabled() {
             self.blocks_storage
                 .bucket
                 .backend_cfg
                 .validate_mimir_rs_support()?;
+        }
+        let querier_timeout = self.querier_timeout();
+        if querier_timeout.0 > self.server.http_server_write_timeout.0 {
+            return Err(ConfigError::Validation(format!(
+                "querier timeout ({querier_timeout}) must be lower than or equal to HTTP server write timeout ({})",
+                self.server.http_server_write_timeout
+            )));
         }
         self.ingester_client
             .validate()
@@ -1154,14 +1184,14 @@ impl MimirConfig {
                     let c = self.extra_storage_str(section_path, &["azure", "container_name"], &format!("{flag_prefix}.azure.container-name"), "");
                     let a = self.extra_storage_str(section_path, &["azure", "account_name"], &format!("{flag_prefix}.azure.account-name"), "");
                     if c == blocks.backend_cfg.azure.container_name && a == blocks.backend_cfg.azure.account_name {
-                        errs.push(format!("{label}: Azure container and account names and storage prefix cannot be the same as the one used in blocks storage config"));
+                        errs.push(format!("{label}: Azure container and account names and storage prefix cannot be the same as the ones used in blocks storage config"));
                     }
                 }
                 "swift" => {
                     let c = self.extra_storage_str(section_path, &["swift", "container_name"], &format!("{flag_prefix}.swift.container-name"), "");
                     let p = self.extra_storage_str(section_path, &["swift", "project_name"], &format!("{flag_prefix}.swift.project-name"), "");
                     if c == blocks.backend_cfg.swift.container_name && p == blocks.backend_cfg.swift.project_name {
-                        errs.push(format!("{label}: Swift container and project names and storage prefix cannot be the same as the one used in blocks storage config"));
+                        errs.push(format!("{label}: Swift container and project names and storage prefix cannot be the same as the ones used in blocks storage config"));
                     }
                 }
                 _ => {}
@@ -1538,22 +1568,7 @@ fn merge_yaml_onto(dst: &mut Value, src: Value) {
     }
 }
 
-fn sanitize_null_block_values(val: &mut Value) {
-    if let Value::Mapping(map) = val {
-        let keys: Vec<Value> = map.keys().cloned().collect();
-        for k in keys {
-            if let Some(v) = map.get_mut(&k) {
-                match v {
-                    Value::Null => {
-                        map.remove(&k);
-                    }
-                    Value::Mapping(_) => sanitize_null_block_values(v),
-                    _ => {}
-                }
-            }
-        }
-    }
-}
+
 
 /// Deep-merges `base` underneath `overlay`: keys in `overlay` win; nested mappings are merged recursively.
 fn merge_yaml_underneath(overlay: &mut Value, base: &Value) {
@@ -1797,19 +1812,11 @@ fn parse_cli_and_load_config_inner(
         Err(err) => return Err(err),
     };
 
-    // Go `mimir.New` fails on empty `-target` before `-print.config` or `-modules`.
-    if state.cfg.target.0.is_empty() && !test_mode {
-        state.cfg.validate_targets()?;
-    }
-
     let action = if state.cfg.print_config {
         CliAction::PrintConfig
     } else if state.main_flags.print_modules {
         CliAction::PrintModules
     } else {
-        if !test_mode {
-            state.cfg.validate_targets()?;
-        }
         CliAction::Run
     };
 
@@ -2021,6 +2028,166 @@ vault:
         assert_eq!(
             err,
             "error validating config: vault integration (-vault.enabled) is not supported by mimir-rs"
+        );
+    }
+
+    #[test]
+    fn w21_aps_04_yaml_null_zeroing_and_scalar_struct_preservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_and_load = |name: &str, yaml: &str, extra_args: &[&str]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, yaml).unwrap();
+            let mut args = vec![format!("-config.file={}", path.display())];
+            args.extend(extra_args.iter().map(|s| (*s).to_string()));
+            parse_cli_and_load_config("mimir", &args)
+        };
+
+        // 1. target: null zeroes StringSliceCSV to [].
+        let loaded = write_and_load("target_null.yaml", "target: null
+", &[]).unwrap();
+        assert!(loaded.config.target.0.is_empty(), "target={:?}", loaded.config.target.0);
+
+        // 2. blocks_storage.tsdb.block_ranges_period: null zeroes DurationList and fails validation.
+        let err = write_and_load(
+            "ranges_null.yaml",
+            "target: ingester
+blocks_storage:
+  tsdb:
+    block_ranges_period: null
+",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("invalid TSDB config: empty block ranges for TSDB"),
+            "unexpected err: {err}"
+        );
+
+        // 3. ingester.ring.instance_interface_names: null zeroes []string to [].
+        // 4. limits.otel_metric_suffixes_enabled: null zeroes *bool to None;
+        //    limits.drop_labels: null zeroes []string to [].
+        // 5. limits.max_label_name_length: null (scalar) keeps default (1024).
+        let loaded = write_and_load(
+            "fields_null.yaml",
+            r#"
+target: ingester
+ingester:
+  ring:
+    instance_interface_names: null
+limits:
+  otel_metric_suffixes_enabled: null
+  drop_labels: null
+  max_label_name_length: null
+"#,
+            &[],
+        )
+        .unwrap();
+        assert!(loaded.config.ingester.ring.instance_interface_names.is_empty());
+        assert_eq!(loaded.config.limits.otel_metric_suffixes_enabled, None);
+        assert!(loaded.config.limits.drop_labels.is_empty());
+        assert_eq!(loaded.config.limits.max_label_name_length, 1024);
+
+        // 6. Struct-level null (limits: null) preserves flag defaults.
+        let loaded = write_and_load(
+            "struct_null.yaml",
+            "target: ingester
+limits: null
+",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(loaded.config.limits.otel_metric_suffixes_enabled, Some(false));
+        assert_eq!(loaded.config.limits.max_label_name_length, 1024);
+    }
+
+    #[test]
+    fn w21_aps_05_querier_write_timeout_tsdb_guard_and_error_texts() {
+        // 1. querier.timeout > server.http_server_write_timeout rejected for all targets.
+        let err = parse_cli_and_load_config(
+            "mimir",
+            &[
+                "-target=ingester".to_string(),
+                "-server.http-write-timeout=30s".to_string(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("querier timeout (2m0s) must be lower than or equal to HTTP server write timeout (30s)"),
+            "unexpected err: {err}"
+        );
+
+        // Equal timeouts pass.
+        assert!(parse_cli_and_load_config(
+            "mimir",
+            &[
+                "-target=ingester".to_string(),
+                "-server.http-write-timeout=30s".to_string(),
+                "-querier.timeout=30s".to_string(),
+            ],
+        )
+        .is_ok());
+
+        // 2. TSDBConfig::validate_mimir_rs_support is gated on is_ingester_enabled().
+        assert!(parse_cli_and_load_config(
+            "mimir",
+            &[
+                "-target=memberlist-kv".to_string(),
+                "-blocks-storage.tsdb.block-ranges-period=2h,12h".to_string(),
+                "-blocks-storage.tsdb.memory-snapshot-on-shutdown=true".to_string(),
+            ],
+        )
+        .is_ok());
+        assert!(parse_cli_and_load_config(
+            "mimir",
+            &[
+                "-target=ingester".to_string(),
+                "-blocks-storage.tsdb.block-ranges-period=2h,12h".to_string(),
+            ],
+        )
+        .is_err());
+
+        // 3. Compartment write-placeholder error matches Go verbatim.
+        let err = parse_cli_and_load_config(
+            "mimir",
+            &[
+                "-target=ingester".to_string(),
+                "-ingest-storage.enabled=true".to_string(),
+                "-compartments.enabled=true".to_string(),
+                "-compartments.read.num-compartments=1".to_string(),
+                "-compartments.write.num-compartments=2".to_string(),
+                "-ingest-storage.kafka.topic=ingest".to_string(),
+                "-ingest-storage.kafka.address=127.0.0.1:9092".to_string(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("for the ingester and query-frontend"),
+            "unexpected err: {err}"
+        );
+
+        // 4. Azure same-bucket/prefix error uses "the ones used in blocks storage config".
+        let err = parse_cli_and_load_config(
+            "mimir",
+            &[
+                "-target=ruler".to_string(),
+                "-blocks-storage.backend=azure".to_string(),
+                "-blocks-storage.azure.container-name=c".to_string(),
+                "-blocks-storage.azure.account-name=a".to_string(),
+                "-blocks-storage.azure.account-key=a2V5".to_string(),
+                "-ruler-storage.backend=azure".to_string(),
+                "-ruler-storage.azure.container-name=c".to_string(),
+                "-ruler-storage.azure.account-name=a".to_string(),
+                "-ruler-storage.azure.account-key=a2V5".to_string(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cannot be the same as the ones used in blocks storage config"),
+            "unexpected err: {err}"
         );
     }
 }

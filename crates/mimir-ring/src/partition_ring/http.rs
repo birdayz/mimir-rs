@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::extract::{RawQuery, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{on, MethodFilter};
 use axum::Router;
 use chrono::{Datelike, Timelike};
 use mimir_proto::ringpb::{PartitionState, PartitionTokenScheme};
@@ -72,7 +72,9 @@ pub fn partition_ring_router(
     Router::new()
         .route(
             "/ingester/partition-ring",
-            get(handle_partition_ring_get).post(handle_partition_ring_post),
+            on(MethodFilter::GET, handle_partition_ring_get)
+                .head(|| async { StatusCode::METHOD_NOT_ALLOWED })
+                .post(handle_partition_ring_post),
         )
         .with_state(state)
 }
@@ -88,7 +90,9 @@ pub fn partition_ring_router_at(
     Router::new()
         .route(
             path,
-            get(handle_partition_ring_get).post(handle_partition_ring_post),
+            on(MethodFilter::GET, handle_partition_ring_get)
+                .head(|| async { StatusCode::METHOD_NOT_ALLOWED })
+                .post(handle_partition_ring_post),
         )
         .with_state(state)
 }
@@ -708,5 +712,48 @@ mod tests {
         assert_eq!(parsed.partitions[1].id, 9);
         assert!(parsed.partitions[1].corrupted);
         assert_eq!(parsed.partitions[1].state_timestamp, "0001-01-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn w21_aps_01_partition_ring_router_rejects_head_405() {
+        let kv = Arc::new(InMemoryKv::new(partition_ring_desc_codec()));
+        let reader = Arc::new(Static(PartitionRing::new(PartitionRingDesc::default()).unwrap()));
+        let editor = Arc::new(PartitionRingEditor::new(
+            "ingester-partitions",
+            Arc::clone(&kv) as Arc<dyn KvClient>,
+        ));
+
+        let client = reqwest::Client::new();
+        for (app, uri) in [
+            (
+                partition_ring_router(Arc::clone(&reader) as Arc<dyn PartitionRingReader>, Arc::clone(&editor)),
+                "/ingester/partition-ring",
+            ),
+            (
+                partition_ring_router_at(
+                    "/ingester/partition-ring/compartment-0",
+                    reader,
+                    editor,
+                ),
+                "/ingester/partition-ring/compartment-0",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let head_resp = client
+                .head(format!("http://{addr}{uri}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                head_resp.status(),
+                reqwest::StatusCode::METHOD_NOT_ALLOWED,
+                "uri={uri}"
+            );
+            srv.abort();
+        }
     }
 }

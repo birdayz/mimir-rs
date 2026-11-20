@@ -27,13 +27,13 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{RawQuery, Request, State as AxumState};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{on, post, MethodFilter};
 use axum::{Json, Router};
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 use mimir_common::services::State;
@@ -47,7 +47,7 @@ use mimir_ring::partition_ring::http::{partition_ring_router, partition_ring_rou
 use mimir_ring::partition_ring::{PartitionRingEditor, PartitionRingError, PartitionRingReader};
 use mimir_ring::kv::memberlist::gofmt::{format_go_time_string, GoJson};
 use mimir_ring::kv::memberlist::http_status::html_escape;
-use mimir_ring::ring::http::{go_http_error, parse_go_form, ring_router};
+use mimir_ring::ring::http::{go_http_error, go_parse_query, parse_go_form, ring_router};
 use mimir_ring::ring::to_status_page_config;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -68,42 +68,53 @@ pub struct HttpState {
     pub ingester: Arc<Ingester>,
 }
 
+/// Exact Gorilla `mux` `Methods("GET", ...)` equivalent: matches `GET` only (NOT `HEAD`),
+/// returning `405 Method Not Allowed` on `HEAD` without triggering handler side effects.
+fn get_only<H, T, S>(handler: H) -> axum::routing::MethodRouter<S>
+where
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    on(MethodFilter::GET, handler).head(|| async { StatusCode::METHOD_NOT_ALLOWED })
+}
+
 pub fn ingester_router(ingester: Arc<Ingester>) -> Router {
     let state = HttpState {
         ingester: Arc::clone(&ingester),
     };
 
     let mut router = Router::new()
-        .route("/ingester/flush", get(flush_handler).post(flush_handler))
+        .route("/ingester/flush", get_only(flush_handler).post(flush_handler))
         .route(
             "/ingester/prepare-shutdown",
-            get(prepare_shutdown_handler)
+            get_only(prepare_shutdown_handler)
                 .post(prepare_shutdown_handler)
                 .delete(prepare_shutdown_handler),
         )
         .route(
             "/ingester/prepare-partition-downscale",
-            get(prepare_partition_downscale_handler)
+            get_only(prepare_partition_downscale_handler)
                 .post(prepare_partition_downscale_handler)
                 .delete(prepare_partition_downscale_handler),
         )
         .route(
             "/ingester/prepare-instance-ring-downscale",
-            get(prepare_instance_ring_downscale_handler)
+            get_only(prepare_instance_ring_downscale_handler)
                 .post(prepare_instance_ring_downscale_handler)
                 .delete(prepare_instance_ring_downscale_handler),
         )
         .route(
             "/ingester/unregister-on-shutdown",
-            get(prepare_unregister_handler)
+            get_only(prepare_unregister_handler)
                 .put(prepare_unregister_handler)
                 .delete(prepare_unregister_handler),
         )
         .route("/ingester/shutdown", post(shutdown_handler))
-        .route("/ingester/tsdb_metrics", get(user_registry_handler))
-        .route("/ingester/tenants", get(tenants_handler))
-        .route("/ingester/tsdb/:tenant", get(tenant_tsdb_handler))
-        .route("/ingester/label_churn/:tenant", get(label_churn_handler))
+        .route("/ingester/tsdb_metrics", get_only(user_registry_handler))
+        .route("/ingester/tenants", get_only(tenants_handler))
+        .route("/ingester/tsdb/:tenant", get_only(tenant_tsdb_handler))
+        .route("/ingester/label_churn/:tenant", get_only(label_churn_handler))
         .with_state(state);
 
     if let Some(ref ring) = ingester.instance_ring {
@@ -128,7 +139,7 @@ pub fn ingester_router(ingester: Arc<Ingester>) -> Router {
         );
         router = router.route(
             "/ingester/partition-ring",
-            get(move || {
+            get_only(move || {
                 let body = index.clone();
                 async move {
                     (
@@ -1310,22 +1321,6 @@ fn percent_decode_form(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn query_first_value(query: &str, target: &str) -> Option<String> {
-    for part in query.split('&') {
-        if part.is_empty() {
-            continue;
-        }
-        let (raw_k, raw_v) = match part.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (part, ""),
-        };
-        if percent_decode_form(raw_k) == target {
-            return Some(percent_decode_form(raw_v));
-        }
-    }
-    None
-}
-
 async fn label_churn_handler(
     AxumState(st): AxumState<HttpState>,
     uri: Uri,
@@ -1346,9 +1341,15 @@ async fn label_churn_handler(
         );
     }
     let query_str = uri.query().unwrap_or_default();
-    let lookback = match query_first_value(query_str, "lookback") {
-        Some(ref lb) if !lb.is_empty() => match parse_model_duration(lb) {
-            Ok(d_ns) if d_ns > 0 => Duration::from_nanos(d_ns as u64),
+    let mut query_map = std::collections::HashMap::new();
+    let _ = go_parse_query(&mut query_map, query_str);
+    let lookback_ms: i128 = match query_map
+        .get("lookback")
+        .and_then(|v| v.first())
+        .map(String::as_str)
+    {
+        Some(lb) if !lb.is_empty() => match parse_model_duration(lb) {
+            Ok(d_ns) if d_ns > 0 => (d_ns as i128) / 1_000_000,
             _ => {
                 return go_http_error(
                     StatusCode::BAD_REQUEST,
@@ -1356,11 +1357,15 @@ async fn label_churn_handler(
                 );
             }
         },
-        _ => DEFAULT_LABEL_CHURN_LOOKBACK,
+        _ => DEFAULT_LABEL_CHURN_LOOKBACK.as_millis() as i128,
     };
 
-    let limit = match query_first_value(query_str, "limit") {
-        Some(ref lim_str) if !lim_str.is_empty() => match lim_str.parse::<i64>() {
+    let limit = match query_map
+        .get("limit")
+        .and_then(|v| v.first())
+        .map(String::as_str)
+    {
+        Some(lim_str) if !lim_str.is_empty() => match lim_str.parse::<isize>() {
             Ok(l) if l >= 0 => l as usize,
             _ => {
                 return go_http_error(
@@ -1384,34 +1389,45 @@ async fn label_churn_handler(
         );
     };
 
-    let since_ms = SystemTime::now()
-        .checked_sub(lookback)
-        .unwrap_or(UNIX_EPOCH)
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let now_ms: i128 = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => i128::try_from(d.as_millis()).unwrap_or(i64::MAX as i128),
+        Err(e) => -(i128::try_from(e.duration().as_millis()).unwrap_or(0)),
+    };
+    let since_ms = (now_ms - lookback_ms).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     let pending = db.pending_series_removals.load(Ordering::Acquire);
     let last_removal = db.last_series_removal_ms.load(Ordering::Acquire);
-    let db_ref = Arc::clone(&db);
-    match compute_label_churn(
-        db.db.head(),
-        &db.series_ref_history,
-        pending,
-        last_removal,
-        since_ms,
-        limit,
-        move || {
-            (
-                db_ref.pending_series_removals.load(Ordering::Acquire),
-                db_ref.last_series_removal_ms.load(Ordering::Acquire),
-            )
-        },
-    ) {
-        Ok(resp) => Json(resp).into_response(),
-        Err(e @ (LabelChurnError::CompactedTooRecently | LabelChurnError::NoRecord)) => {
+    let compute_res = tokio::task::spawn_blocking(move || {
+        let db_ref = Arc::clone(&db);
+        let resp = compute_label_churn(
+            db.db.head(),
+            &db.series_ref_history,
+            pending,
+            last_removal,
+            since_ms,
+            limit,
+            move || {
+                (
+                    db_ref.pending_series_removals.load(Ordering::Acquire),
+                    db_ref.last_series_removal_ms.load(Ordering::Acquire),
+                )
+            },
+        )?;
+        Ok::<Result<Vec<u8>, String>, LabelChurnError>(
+            serde_json::to_vec(&resp).map_err(|e| e.to_string()),
+        )
+    })
+    .await;
+    match compute_res {
+        Ok(Ok(Ok(body))) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
+        Ok(Ok(Err(e))) => go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        Ok(Err(e @ (LabelChurnError::CompactedTooRecently | LabelChurnError::NoRecord))) => {
             go_http_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string())
         }
-        Err(e) => go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Err(e)) => go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => go_http_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("label churn task failed: {e}"),
+        ),
     }
 }
 
