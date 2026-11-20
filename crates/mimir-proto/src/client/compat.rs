@@ -195,12 +195,8 @@ pub fn from_metrics_for_label_matchers_request(
     for m in &req.matchers_set {
         matchers_set.push(from_label_matchers(&m.matchers)?);
     }
-    Ok((
-        SelectHints {
-            limit: req.limit as usize,
-        },
-        matchers_set,
-    ))
+    let limit = if req.limit > 0 { req.limit as usize } else { 0 };
+    Ok((SelectHints { limit }, matchers_set))
 }
 
 pub fn from_metrics_for_label_matchers_response(
@@ -281,7 +277,7 @@ pub fn from_label_names_request(
         Some(m) => from_label_matchers(&m.matchers)?,
         None => Vec::new(),
     };
-    let hints = if req.limit != 0 {
+    let hints = if req.limit > 0 {
         Some(LabelHints {
             limit: req.limit as usize,
         })

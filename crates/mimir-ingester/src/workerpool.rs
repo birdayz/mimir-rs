@@ -16,12 +16,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use mimir_common::native_histogram::{
+    HistogramOpts as NativeHistogramOpts, HistogramVec as NativeHistogramVec, SingleHistogram,
+};
 use parking_lot::{Condvar, Mutex};
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
-use prometheus::{CounterVec, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts, Registry};
+use prometheus::{CounterVec, GaugeVec, Opts, Registry};
 use tracing::error;
 
 /// Go: `workerpool.ErrPoolStopped`.
@@ -238,8 +241,8 @@ struct PoolMetrics {
     queue_length: GaugeVec,
     max_queue_length: Arc<MaxQueueLengthGauge>,
     discarded: CounterVec,
-    enqueue_duration: Histogram,
-    task_duration: HistogramVec,
+    enqueue_duration: SingleHistogram,
+    task_duration: NativeHistogramVec,
 }
 
 /// Go: `workerpool.Pool`.
@@ -293,23 +296,23 @@ impl Pool {
         )
         .map_err(|e| e.to_string())?;
         // Go declares these as native-only histograms (no classic buckets): the classic exposition
-        // only carries the +Inf bucket, sum and count.
-        let enqueue_duration = Histogram::with_opts(
-            HistogramOpts::new(
+        // only carries the +Inf bucket, sum and count, while protobuf exposition carries native buckets.
+        let enqueue_duration = SingleHistogram::new(
+            NativeHistogramOpts::new(
                 "mimir_workerpool_enqueue_duration_seconds",
                 "Time spent enqueueing work items into the worker pool.",
             )
-            .const_labels(const_labels.clone())
-            .buckets(vec![f64::INFINITY]),
+            .const_label("pool", name)
+            .native(1.1, 100, Duration::from_secs(3600)),
         )
         .map_err(|e| e.to_string())?;
-        let task_duration = HistogramVec::new(
-            HistogramOpts::new(
+        let task_duration = NativeHistogramVec::new(
+            NativeHistogramOpts::new(
                 "mimir_workerpool_task_duration_seconds",
                 "Time taken to execute work items in the worker pool, per task dimension.",
             )
-            .const_labels(const_labels)
-            .buckets(vec![f64::INFINITY]),
+            .const_label("pool", name)
+            .native(1.1, 100, Duration::from_secs(3600)),
             &["dimension"],
         )
         .map_err(|e| e.to_string())?;

@@ -223,6 +223,7 @@ pub struct Ingester {
     cost_attribution_mgr: RwLock<Option<Arc<crate::costattribution::Manager>>>,
     active_groups: RwLock<Option<Arc<crate::active_groups::ActiveGroupsCleanupService>>>,
     activity_tracker: RwLock<Option<Arc<ActivityTracker>>>,
+    ref_leaks_tracker: RwLock<Option<mimir_proto::ref_leaks::RefLeaksTracker>>,
 }
 
 pub(crate) struct ActivityGuard {
@@ -566,6 +567,7 @@ impl Ingester {
             cost_attribution_mgr: RwLock::new(None),
             active_groups: RwLock::new(None),
             activity_tracker: RwLock::new(None),
+            ref_leaks_tracker: RwLock::new(None),
         });
 
         let _ = weak_slot.set(Arc::downgrade(&ingester));
@@ -585,6 +587,14 @@ impl Ingester {
             }));
         }
         Ok(ingester)
+    }
+
+    pub fn set_ref_leaks_tracker(&self, tracker: mimir_proto::ref_leaks::RefLeaksTracker) {
+        *self.ref_leaks_tracker.write() = Some(tracker);
+    }
+
+    pub fn ref_leaks_tracker(&self) -> Option<mimir_proto::ref_leaks::RefLeaksTracker> {
+        self.ref_leaks_tracker.read().clone()
     }
 
     pub fn set_compartments(&self, compartments: CompartmentsConfig) {

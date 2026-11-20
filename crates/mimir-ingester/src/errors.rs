@@ -94,11 +94,55 @@ pub fn format_labels_string<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a st
     out
 }
 
+fn civil_from_unix_secs(unix_secs: i64) -> (i128, u32, u32, u32, u32, u32) {
+    let days = unix_secs.div_euclid(86_400) as i128;
+    let secs_of_day = unix_secs.rem_euclid(86_400) as u32;
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32, hour, minute, second)
+}
+
+fn format_extreme_ms_go_utc_string(ts_ms: i64) -> String {
+    use std::fmt::Write as _;
+    let unix_secs = ts_ms.div_euclid(1000);
+    let rem_ms = ts_ms.rem_euclid(1000) as u32;
+    let (y, m, d, hour, minute, second) = civil_from_unix_secs(unix_secs);
+    let mut out = String::with_capacity(44);
+    if y < 0 {
+        let _ = write!(out, "-{:04}", y.unsigned_abs());
+    } else {
+        let _ = write!(out, "{y:04}");
+    }
+    let _ = write!(out, "-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}");
+    if rem_ms != 0 {
+        let mut frac = format!("{rem_ms:03}");
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        out.push('.');
+        out.push_str(&frac);
+    }
+    out.push_str(" +0000 UTC");
+    out
+}
+
 /// Formats `ts_ms` matching Go `time.UnixMilli(ts_ms).String()`.
 pub fn format_timestamp_ms_go_time_string(ts_ms: i64) -> String {
     match DateTime::<Utc>::from_timestamp_millis(ts_ms) {
         Some(dt) => format_go_time_string(&dt.with_timezone(&chrono::Local).fixed_offset()),
-        None => format_timestamp_ms_rfc3339(ts_ms),
+        None => format_extreme_ms_go_utc_string(ts_ms),
     }
 }
 
