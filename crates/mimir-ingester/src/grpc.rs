@@ -1602,7 +1602,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                                     &user_id,
                                     &trace_id,
                                     "Ingester/MetricsForLabelMatchers",
-                                    ActivityRequest::None,
+                                    ActivityRequest::MetricsForLabelMatchers(&inner),
                                 )
                             });
                             let bytes = ingester
@@ -1952,7 +1952,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 &user_id,
                 &trace_id,
                 "Ingester/QueryExemplars",
-                ActivityRequest::None,
+                ActivityRequest::ExemplarQuery(&inner),
             )
         });
         let resp = self
@@ -1978,7 +1978,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 &user_id,
                 &trace_id,
                 "Ingester/LabelValues",
-                ActivityRequest::None,
+                ActivityRequest::LabelValues(&inner),
             )
         });
         let resp = self
@@ -2001,7 +2001,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 &user_id,
                 &trace_id,
                 "Ingester/LabelNames",
-                ActivityRequest::None,
+                ActivityRequest::LabelNames(&inner),
             )
         });
         let resp = self
@@ -2024,7 +2024,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 &user_id,
                 &trace_id,
                 "Ingester/UserStats",
-                ActivityRequest::None,
+                ActivityRequest::UserStats(&inner),
             )
         });
         let resp = self
@@ -2044,7 +2044,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
-            request_activity("", &trace_id, "Ingester/AllUserStats", ActivityRequest::None)
+            request_activity(
+                "",
+                &trace_id,
+                "Ingester/AllUserStats",
+                ActivityRequest::UserStats(&inner),
+            )
         });
         let resp = self
             .ingester
@@ -2066,7 +2071,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 &user_id,
                 &trace_id,
                 "Ingester/MetricsForLabelMatchers",
-                ActivityRequest::None,
+                ActivityRequest::MetricsForLabelMatchers(&inner),
             )
         });
         let resp = self
@@ -2116,7 +2121,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 &user_id,
                 &trace_id,
                 "Ingester/LabelNamesAndValues",
-                ActivityRequest::None,
+                ActivityRequest::LabelNamesAndValues(&inner),
             )
         });
         let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);
@@ -2181,7 +2186,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 &user_id,
                 &trace_id,
                 "Ingester/ActiveSeries",
-                ActivityRequest::None,
+                ActivityRequest::ActiveSeries(&inner),
             )
         });
         let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);
@@ -2218,7 +2223,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 &user_id,
                 &trace_id,
                 "Ingester/SearchLabelNames",
-                ActivityRequest::None,
+                ActivityRequest::SearchLabelNames(&inner),
             )
         });
         let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);
@@ -2257,7 +2262,7 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
                 &user_id,
                 &trace_id,
                 "Ingester/SearchLabelValues",
-                ActivityRequest::None,
+                ActivityRequest::SearchLabelValues(&inner),
             )
         });
         let err_sink = crate::query::ReadErrorSink::from_extensions(&ext);

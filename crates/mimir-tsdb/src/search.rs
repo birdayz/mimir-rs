@@ -15,7 +15,7 @@ const SUBSEQUENCE_NON_EXACT_SCORE_SCALE: f64 = 0.999;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SearchError {
-    #[error("fuzz threshold {0} out of [0, 100]")]
+    #[error("fuzz threshold {0} out of [0,100]")]
     InvalidThreshold(i32),
     #[error("search term {0} is empty")]
     EmptyTerm(usize),

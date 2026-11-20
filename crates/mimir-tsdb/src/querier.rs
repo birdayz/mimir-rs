@@ -186,11 +186,10 @@ enum HeadSnapshotMode {
 impl<'a> TsdbQuerier<'a> {
     pub fn new(head: Option<&'a Head>, blocks: Vec<Arc<Block>>, mint: i64, maxt: i64) -> Self {
         let head = head.filter(|h| {
-            let in_order = h.initialized() && h.min_time() <= maxt && mint <= h.max_time();
             let ooo = h.min_ooo_time() != i64::MAX
                 && h.min_ooo_time() <= maxt
                 && mint <= h.max_ooo_time();
-            in_order || ooo
+            h.min_time() <= maxt || ooo
         });
         let blocks = blocks
             .into_iter()
@@ -409,14 +408,8 @@ impl<'a> TsdbQuerier<'a> {
     }
 
     fn effective_head(&self) -> Option<&'a Head> {
-        self.head.filter(|h| {
-            let in_order =
-                h.initialized() && h.min_time() <= self.maxt && self.mint <= h.max_time();
-            let ooo = h.min_ooo_time() != i64::MAX
-                && h.min_ooo_time() <= self.maxt
-                && self.mint <= h.max_ooo_time();
-            in_order || ooo
-        })
+        self.head
+            .filter(|h| h.min_time() <= self.maxt || self.head_overlaps_ooo(h))
     }
 
     /// Queries samples for all series matching `matchers` in `[mint, maxt]`.
@@ -1365,17 +1358,10 @@ impl<'a> TsdbQuerier<'a> {
                         .iter()
                         .filter(|m| m.name.is_empty())
                         .all(|m| m.matches(""))
+                    && (!matchers.iter().any(|m| !m.name.is_empty())
+                        || !blk.postings_for_matchers_direct(matchers)?.is_empty())
                 {
-                    let other_matchers: Vec<LabelMatcher> = matchers
-                        .iter()
-                        .filter(|m| !m.name.is_empty())
-                        .cloned()
-                        .collect();
-                    if other_matchers.is_empty()
-                        || !blk.postings_for_matchers_direct(&other_matchers)?.is_empty()
-                    {
-                        set.insert(String::new());
-                    }
+                    set.insert(String::new());
                 }
             } else {
                 let refs = blk.postings_for_matchers_direct(matchers)?;

@@ -270,7 +270,11 @@ pub fn remove_shard_from_matchers(
     for (idx, m) in matchers.iter().enumerate() {
         if m.name == "__query_shard__" && m.match_type == MatchType::Equal {
             let parts: Vec<&str> = m.value.split('_').collect();
-            if parts.len() != 3 || parts[1] != "of" {
+            if parts.len() != 3
+                || parts[1] != "of"
+                || parts[0].starts_with('+')
+                || parts[2].starts_with('+')
+            {
                 return Err(IngesterError::BadRequest {
                     message: format!("invalid shard ID: {:?}", m.value),
                 });
@@ -831,7 +835,7 @@ impl Ingester {
 
         let start_ts = req.start_timestamp_ms;
         let end_ts = req.end_timestamp_ms;
-        let batch_limit = (req.streaming_chunks_batch_size as i64).max(0) as usize;
+        let batch_limit = (req.streaming_chunks_batch_size.min(isize::MAX as u64)).max(1) as usize;
         let mut chunk_series = if !self
             .blocks_cfg
             .tsdb
@@ -1247,7 +1251,7 @@ impl Ingester {
 
         let start_ts = req.start_timestamp_ms;
         let end_ts = req.end_timestamp_ms;
-        let batch_limit = (req.streaming_chunks_batch_size as i64).max(0) as usize;
+        let batch_limit = (req.streaming_chunks_batch_size.min(isize::MAX as u64)).max(1) as usize;
         let chunk_series = if !self
             .blocks_cfg
             .tsdb
@@ -1711,7 +1715,7 @@ impl Ingester {
         let user_id_owned = user_id.to_string();
         let start_ts = req.start_timestamp_ms;
         let end_ts = req.end_timestamp_ms;
-        let batch_limit = (req.streaming_chunks_batch_size as i64).max(0) as usize;
+        let batch_limit = (req.streaming_chunks_batch_size.min(isize::MAX as u64)).max(1) as usize;
 
         tokio::spawn(async move {
             let res = ingester
@@ -1870,13 +1874,10 @@ impl Ingester {
                 shard_count,
             });
             let head = db.db.head();
-            let head_in_order = head.initialized()
-                && head.min_time() <= end_timestamp_ms
-                && start_timestamp_ms <= head.max_time();
             let head_ooo = head.min_ooo_time() != i64::MAX
                 && head.min_ooo_time() <= end_timestamp_ms
                 && start_timestamp_ms <= head.max_ooo_time();
-            let head_overlaps = head_in_order || head_ooo;
+            let head_overlaps = head.min_time() <= end_timestamp_ms || head_ooo;
             let blocks: Vec<Arc<Block>> = db
                 .db
                 .blocks()
@@ -1905,13 +1906,14 @@ impl Ingester {
                             });
                         }
                     }
-                    if let Some(e) = ss.err() {
-                        return Err(IngesterError::Internal {
-                            message: format!("selecting series from MirroredChunkQuerier: {e}"),
-                        });
-                    }
+                    let err = ss.err();
                     drop(ss);
                     let _ = mq.close();
+                    if let Some(e) = err {
+                        return Err(IngesterError::Internal {
+                            message: format!("selecting series from ChunkQuerier: {e}"),
+                        });
+                    }
                     Ok(out)
                 } else {
                     let mut ss = planned_cq.select(true, select_hints.as_ref(), matchers);
@@ -1926,7 +1928,7 @@ impl Ingester {
                     }
                     if let Some(e) = ss.err() {
                         return Err(IngesterError::Internal {
-                            message: format!("selecting series from PlannedChunkQuerier: {e}"),
+                            message: format!("selecting series from ChunkQuerier: {e}"),
                         });
                     }
                     Ok(out)
@@ -2191,7 +2193,7 @@ impl Ingester {
         let mut num_samples = 0usize;
 
         // Phase 2: stream QueryStreamSeriesChunks batches respecting streaming_chunks_batch_size & 1MiB cap.
-        let batch_limit = (req.streaming_chunks_batch_size as i64).max(0) as usize;
+        let batch_limit = (req.streaming_chunks_batch_size.min(isize::MAX as u64)).max(1) as usize;
         let mut chunks_batch = Vec::with_capacity(batch_limit.min(1024));
         let mut batch_bytes = 0usize;
 
@@ -3099,6 +3101,9 @@ impl Ingester {
                 message: e.to_string(),
             };
             let head = db.db.head();
+            let is_single_all_postings = matchers.len() == 1
+                && matchers[0].name.is_empty()
+                && matchers[0].value.is_empty();
             let eligible_refs: Option<Arc<[u64]>> = if !matchers.is_empty() {
                 let base_refs = match head.postings_for_matchers_direct_arc(&matchers) {
                     Ok(r) => r,
@@ -3109,6 +3114,29 @@ impl Ingester {
                         return;
                     }
                 };
+                if is_single_all_postings && !base_refs.is_empty() {
+                    for lbl_name in &label_names {
+                        match head.label_values(lbl_name, &matchers) {
+                            Ok(vals) if !vals.is_empty() => {
+                                let err = IngesterError::Internal {
+                                    message: "unexpected all postings".to_string(),
+                                };
+                                let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
+                                permit.finish(false);
+                                return;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                let err = IngesterError::Internal {
+                                    message: e.to_string(),
+                                };
+                                let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
+                                permit.finish(false);
+                                return;
+                            }
+                        }
+                    }
+                }
                 if active_only {
                     let mut filtered = Vec::with_capacity(base_refs.len());
                     for &r in base_refs.iter() {
@@ -3295,12 +3323,29 @@ impl Ingester {
             };
 
             let head = db.db.head();
+            let is_single_all_postings = matchers.len() == 1
+                && matchers[0].name.is_empty()
+                && matchers[0].value.is_empty();
             let eligible_refs: Option<Arc<[u64]>> = if !matchers.is_empty() {
                 let base_refs =
                     head.postings_for_matchers_direct_arc(&matchers)
                         .map_err(|e| IngesterError::Internal {
                             message: e.to_string(),
                         })?;
+                if is_single_all_postings && !base_refs.is_empty() {
+                    for lbl_name in &label_names {
+                        let vals = head.label_values(lbl_name, &matchers).map_err(|e| {
+                            IngesterError::Internal {
+                                message: e.to_string(),
+                            }
+                        })?;
+                        if !vals.is_empty() {
+                            return Err(IngesterError::Internal {
+                                message: "unexpected all postings".to_string(),
+                            });
+                        }
+                    }
+                }
                 if active_only {
                     let mut filtered = Vec::with_capacity(base_refs.len());
                     for &r in base_refs.iter() {
