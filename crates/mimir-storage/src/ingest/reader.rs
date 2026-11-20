@@ -1638,24 +1638,36 @@ impl SingleClusterPartitionReader {
                 return Err(cause);
             }
             // Direct request to Kafka for the partition start offset.
-            let partition_start = match self.offset_reader.fetch_partition_start_offset().await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(partition = self.partition_id, err = %e, "partition reader failed to fetch partition start offset");
-                    cancel.sleep(boff.next_delay()).await;
-                    continue;
+            let partition_start = tokio::select! {
+                biased;
+                _ = cancel.clone().done() => {
+                    return Err(cancel.cause().unwrap_or(ReaderError::Canceled));
                 }
+                res = self.offset_reader.fetch_partition_start_offset() => match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(partition = self.partition_id, err = %e, "partition reader failed to fetch partition start offset");
+                        cancel.sleep(boff.next_delay()).await;
+                        continue;
+                    }
+                },
             };
             // Direct request for the last produced offset (no WaitNextFetchLastProducedOffset,
             // to not introduce further latency).
             let requested_at = Instant::now();
-            let last_produced = match self.offset_reader.fetch_last_produced_offset().await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(partition = self.partition_id, err = %e, "partition reader failed to fetch last produced offset");
-                    cancel.sleep(boff.next_delay()).await;
-                    continue;
+            let last_produced = tokio::select! {
+                biased;
+                _ = cancel.clone().done() => {
+                    return Err(cancel.cause().unwrap_or(ReaderError::Canceled));
                 }
+                res = self.offset_reader.fetch_last_produced_offset() => match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(partition = self.partition_id, err = %e, "partition reader failed to fetch last produced offset");
+                        cancel.sleep(boff.next_delay()).await;
+                        continue;
+                    }
+                },
             };
 
             // Ensure there are some records to consume (e.g. all records deleted by retention).
@@ -2513,12 +2525,14 @@ impl MultiClusterPartitionReader {
         if let Some(ref m) = self.merger {
             m.ensure_started();
         }
-        let mut rxs: Vec<(usize, watch::Receiver<Option<String>>)> = self
+        let rxs: Vec<(usize, watch::Receiver<Option<String>>)> = self
             .readers
             .iter()
             .enumerate()
             .map(|(cid, r)| (cid, r.subscribe_failure()))
             .collect();
+        let merger_rx: Option<watch::Receiver<Option<String>>> =
+            self.merger.as_ref().map(|m| m.subscribe_failure());
         let mut pending = Vec::with_capacity(self.readers.len());
         for r in &self.readers {
             pending.push(r.start_async_with_result().await);
@@ -2541,6 +2555,15 @@ impl MultiClusterPartitionReader {
                 }
             }
         }
+        if first_err.is_none() {
+            if let Some(ref mrx) = merger_rx {
+                if let Some(err) = mrx.borrow().clone() {
+                    first_err = Some(ReaderError::Startup(format!(
+                        "a multi-cluster partition reader subservice failed (heap merger): {err}"
+                    )));
+                }
+            }
+        }
         if let Some(e) = first_err {
             self.state
                 .store(ReaderState::Failed as u8, Ordering::SeqCst);
@@ -2552,13 +2575,22 @@ impl MultiClusterPartitionReader {
         self.state
             .store(ReaderState::Running as u8, Ordering::SeqCst);
 
+        let handle = self.spawn_watcher_task(rxs, merger_rx);
+        *self.watcher_task.lock().await = Some(handle);
+        Ok(())
+    }
+
+    fn spawn_watcher_task(
+        &self,
+        mut rxs: Vec<(usize, watch::Receiver<Option<String>>)>,
+        mut merger_rx: Option<watch::Receiver<Option<String>>>,
+    ) -> JoinHandle<()> {
         let readers = self.readers.clone();
         let merger = self.merger.clone();
         let state = Arc::clone(&self.state);
         let failure_error = Arc::clone(&self.failure_error);
         let mut stop_rx = self.stop_tx.subscribe();
-        let handle = tokio::spawn(async move {
-
+        tokio::spawn(async move {
             loop {
                 if *stop_rx.borrow() {
                     return;
@@ -2579,8 +2611,30 @@ impl MultiClusterPartitionReader {
                         return;
                     }
                 }
+                if let Some(ref mrx) = merger_rx {
+                    let err_opt = mrx.borrow().clone();
+                    if let Some(err) = err_opt {
+                        let msg = format!(
+                            "a multi-cluster partition reader subservice failed (heap merger): {err}"
+                        );
+                        error!(err = %err, "multi-cluster partition reader subservice failed");
+                        *failure_error.lock() = Some(msg);
+                        state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+                        join_all(readers.iter().map(|r| r.stop())).await;
+                        if let Some(ref m) = merger {
+                            m.shutdown_and_drain().await;
+                        }
+                        return;
+                    }
+                }
 
                 let wait_futs = rxs.iter_mut().map(|(_, rx)| Box::pin(rx.changed()));
+                let merger_changed = async {
+                    match merger_rx.as_mut() {
+                        Some(rx) => rx.changed().await,
+                        None => std::future::pending().await,
+                    }
+                };
                 tokio::select! {
                     res = stop_rx.changed() => {
                         if res.is_err() || *stop_rx.borrow() {
@@ -2588,11 +2642,22 @@ impl MultiClusterPartitionReader {
                         }
                     }
                     _ = futures::future::select_all(wait_futs) => {}
+                    res = merger_changed => {
+                        if res.is_err() {
+                            let msg = "a multi-cluster partition reader subservice failed (heap merger): channel closed".to_string();
+                            error!("multi-cluster partition reader heap merger failure channel closed unexpectedly");
+                            *failure_error.lock() = Some(msg);
+                            state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+                            join_all(readers.iter().map(|r| r.stop())).await;
+                            if let Some(ref m) = merger {
+                                m.shutdown_and_drain().await;
+                            }
+                            return;
+                        }
+                    }
                 }
             }
-        });
-        *self.watcher_task.lock().await = Some(handle);
-        Ok(())
+        })
     }
 
     pub async fn stop(&self) {
@@ -3012,5 +3077,317 @@ mod tests {
         assert_eq!(multi.readers[1].state(), ReaderState::Failed);
         multi.stop().await;
         assert_eq!(multi.state(), ReaderState::Failed);
+    }
+
+    #[tokio::test]
+    async fn w22_deep_05_multi_cluster_reader_watches_heap_merger_failure() {
+        struct PanickingConsumer;
+        impl RecordBatchConsumer for PanickingConsumer {
+            fn consume(
+                &self,
+                _records: Vec<FetchedRecord>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async {
+                    panic!("simulated heap merger downstream panic");
+                })
+            }
+        }
+
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "ingest-rt".to_string(),
+            auto_create_topic_enabled: false,
+            consume_from_position_at_startup: "start".to_string(),
+            ..Default::default()
+        };
+        let multi = MultiClusterPartitionReader::new(
+            &[cfg.clone(), cfg],
+            &OrderedConsumptionConfig {
+                enabled: true,
+                max_batch_records: 1,
+                max_batch_wait: mimir_config::GoDuration::from_millis(10),
+                ..Default::default()
+            },
+            0,
+            "ing-0",
+            vec![None, None],
+            Arc::new(PanickingConsumer),
+            None,
+        )
+        .unwrap();
+
+        let merger = multi.merger.as_ref().expect("merger enabled");
+        merger.ensure_started();
+        multi.readers[0]
+            .state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+        multi.readers[1]
+            .state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+        multi
+            .state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+
+        let rxs: Vec<(usize, watch::Receiver<Option<String>>)> = multi
+            .readers
+            .iter()
+            .enumerate()
+            .map(|(cid, r)| (cid, r.subscribe_failure()))
+            .collect();
+        let mrx = multi.merger.as_ref().map(|m| m.subscribe_failure());
+        *multi.watcher_task.lock().await = Some(multi.spawn_watcher_task(rxs, mrx));
+
+        // Submit a record into HeapMerger to trigger the panic in its background task.
+        let _ = merger
+            .submit_and_wait(
+                0,
+                vec![FetchedRecord {
+                    offset: 0,
+                    timestamp_ms: 100,
+                    key: bytes::Bytes::from_static(b"t1"),
+                    value: bytes::Bytes::new(),
+                    headers: Vec::new(),
+                }],
+            )
+            .await;
+
+        let dl = Instant::now() + Duration::from_secs(3);
+        while multi.state() != ReaderState::Failed {
+            assert!(Instant::now() < dl, "timed out waiting for Failed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let err_msg = multi.failure_error().unwrap();
+        assert!(
+            err_msg.contains("heap merger"),
+            "unexpected failure_error: {err_msg}"
+        );
+        assert_eq!(multi.readers[0].state(), ReaderState::Terminated);
+        assert_eq!(multi.readers[1].state(), ReaderState::Terminated);
+        multi.stop().await;
+        assert_eq!(multi.state(), ReaderState::Failed);
+    }
+
+    #[tokio::test]
+    async fn w22_deep_06_lag_catchup_honors_deadline_and_stop_on_stalled_broker() {
+        use bytes::{BufMut, Bytes, BytesMut};
+        use kafka_protocol::messages::api_versions_response::{
+            ApiVersion, ApiVersionsResponse,
+        };
+        use kafka_protocol::messages::list_offsets_response::{
+            ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
+        };
+        use kafka_protocol::messages::metadata_response::{
+            MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
+            MetadataResponseTopic,
+        };
+        use kafka_protocol::messages::{
+            ApiKey, ApiVersionsRequest, BrokerId, ListOffsetsRequest, MetadataRequest,
+            RequestHeader, ResponseHeader, TopicName,
+        };
+        use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        struct NoOpConsumer;
+        impl RecordBatchConsumer for NoOpConsumer {
+            fn consume(
+                &self,
+                _records: Vec<FetchedRecord>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let list_offsets_calls = Arc::new(AtomicUsize::new(0));
+        let lo_calls_srv = Arc::clone(&list_offsets_calls);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let lo_calls = Arc::clone(&lo_calls_srv);
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = stream.into_split();
+                    let mut len_buf = [0u8; 4];
+                    while rd.read_exact(&mut len_buf).await.is_ok() {
+                        let sz = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; sz];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = Bytes::from(payload);
+                        let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let Ok(api_key) = ApiKey::try_from(key_i16) else {
+                            break;
+                        };
+                        let hdr_ver = match api_key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                            ApiKey::Metadata => MetadataRequest::header_version(ver),
+                            ApiKey::ListOffsets => ListOffsetsRequest::header_version(ver),
+                            _ => break,
+                        };
+                        let Ok(req_hdr) = RequestHeader::decode(&mut buf, hdr_ver) else {
+                            break;
+                        };
+                        let mut out = BytesMut::new();
+                        out.put_u32(0);
+                        let resp_hdr_ver = api_key.response_header_version(ver);
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr.encode(&mut out, resp_hdr_ver).unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut resp = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 1, 12),
+                                    (ApiKey::ListOffsets as i16, 1, 7),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    resp.api_keys.push(av);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                let mut resp = MetadataResponse::default();
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = addr.port() as i32;
+                                resp.brokers.push(b);
+                                resp.controller_id = BrokerId(0);
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("ingest-lag")));
+                                let mut p = MetadataResponsePartition::default();
+                                p.partition_index = 0;
+                                p.leader_id = BrokerId(0);
+                                t.partitions.push(p);
+                                resp.topics.push(t);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::ListOffsets => {
+                                let call_n = lo_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                                // Calls 1-2 (attempt 0): start=0, end=0 (takes >1ns, <=60ms).
+                                // Call 3 (attempt 1): stall for 10s so deadline must abort it.
+                                // Calls 4-5 (attempt 2): start=1, end=0 (empty -> finishes cleanly).
+                                if call_n == 3 || call_n >= 6 {
+                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                    return;
+                                }
+                                let mut resp = ListOffsetsResponse::default();
+                                let mut topic = ListOffsetsTopicResponse::default();
+                                topic.name = TopicName(StrBytes::from_static_str("ingest-lag"));
+                                let mut part = ListOffsetsPartitionResponse::default();
+                                part.partition_index = 0;
+                                part.offset = match call_n {
+                                    1 | 2 => 0,
+                                    4 => 1,
+                                    _ => 0,
+                                };
+                                topic.partitions.push(part);
+                                resp.topics.push(topic);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "ingest-lag".to_string(),
+            auto_create_topic_enabled: false,
+            ..Default::default()
+        };
+        let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+        let reader = SingleClusterPartitionReader::with_client(
+            cfg,
+            0,
+            "ing-0",
+            None,
+            client,
+            Arc::new(NoOpConsumer),
+            None,
+        )
+        .unwrap();
+        reader.offset_watcher.notify(0);
+
+        let fetcher = Arc::new(ReaderFetcher::Client(ClientPartitionConsumer::new(
+            Arc::clone(&reader.client),
+            "ingest-lag".to_string(),
+            0,
+            0,
+            Duration::from_millis(50),
+        )));
+        let fetch_loop = FetchLoop {
+            partition_id: 0,
+            topic: "ingest-lag".to_string(),
+            fetcher,
+            consumer: Arc::clone(&reader.consumer),
+            committer: Arc::clone(&reader.committer),
+            offset_watcher: Arc::clone(&reader.offset_watcher),
+            metrics: reader.metrics.clone(),
+            last_seen_offset: Arc::clone(&reader.last_seen_offset),
+            highest_ts: Arc::clone(&reader.highest_consumed_ts_before_end_ms),
+        };
+
+        // Attempt 0 finishes immediately (> 1ns target_lag, <= 60ms max_lag);
+        // Attempt 1 stalls on ListOffsets and MUST abort at 2 * max_lag = 120ms;
+        // Attempt 2 completes cleanly — total elapsed must be << 10s broker stall.
+        let started = Instant::now();
+        reader
+            .process_next_fetches_until_target_or_max_lag_honored(
+                &fetch_loop,
+                Duration::from_nanos(1),
+                Duration::from_millis(60),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "attempt 1 ignored 2*max_lag deadline during stalled ListOffsets: {elapsed:?}"
+        );
+
+        // stop() must also abort stalled ListOffsets immediately with Canceled.
+        let stop_rx = reader.stop_tx.subscribe();
+        let mut cancel = Cancel::new(stop_rx, None);
+        let stop_tx = reader.stop_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = stop_tx.send(true);
+        });
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            reader.process_next_fetches_until_lag_honored(
+                &fetch_loop,
+                Duration::from_secs(5),
+                &mut cancel,
+            ),
+        )
+        .await
+        .expect("stop() must abort stalled ListOffsets")
+        .unwrap_err();
+        assert!(matches!(err, ReaderError::Canceled), "got {err:?}");
+
+        srv.abort();
     }
 }

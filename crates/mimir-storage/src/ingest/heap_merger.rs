@@ -156,8 +156,9 @@ struct HeapMergerPending {
 pub struct HeapMerger {
     input_tx: mpsc::Sender<HeapItem>,
     stop_tx: tokio::sync::watch::Sender<bool>,
+    failure_tx: tokio::sync::watch::Sender<Option<String>>,
     pending: parking_lot::Mutex<Option<HeapMergerPending>>,
-    handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    handle: parking_lot::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl HeapMerger {
@@ -179,10 +180,12 @@ impl HeapMerger {
 
         let (input_tx, input_rx) = mpsc::channel::<HeapItem>(buf_size);
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (failure_tx, _) = tokio::sync::watch::channel(None);
 
         Self {
             input_tx,
             stop_tx,
+            failure_tx,
             pending: parking_lot::Mutex::new(Some(HeapMergerPending {
                 input_rx,
                 stop_rx,
@@ -191,12 +194,23 @@ impl HeapMerger {
                 max_batch_records,
                 max_batch_wait,
             })),
-            handle: tokio::sync::Mutex::new(None),
+            handle: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Subscribes to unexpected task failures or panics in this `HeapMerger`.
+    pub fn subscribe_failure(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.failure_tx.subscribe()
+    }
+
+    /// Returns the recorded failure error, if the background task panicked or exited unexpectedly.
+    pub fn failure_error(&self) -> Option<String> {
+        self.failure_tx.borrow().clone()
     }
 
     /// Spawns the background merger task if it has not been started yet.
     pub fn ensure_started(&self) {
+        let mut handle_guard = self.handle.lock();
         let Some(HeapMergerPending {
             mut input_rx,
             mut stop_rx,
@@ -209,8 +223,37 @@ impl HeapMerger {
             return;
         };
 
+        struct ExitGuard {
+            stop_rx: tokio::sync::watch::Receiver<bool>,
+            failure_tx: tokio::sync::watch::Sender<Option<String>>,
+            clean_exit: bool,
+        }
+        impl Drop for ExitGuard {
+            fn drop(&mut self) {
+                if !self.clean_exit && !*self.stop_rx.borrow() {
+                    let msg = if std::thread::panicking() {
+                        "heap merger task panicked".to_string()
+                    } else {
+                        "heap merger task exited unexpectedly".to_string()
+                    };
+                    let _ = self.failure_tx.send(Some(msg));
+                }
+            }
+        }
+
+        let failure_tx = self.failure_tx.clone();
         let handle = tokio::spawn(async move {
+            let mut exit_guard = ExitGuard {
+                stop_rx: stop_rx.clone(),
+                failure_tx,
+                clean_exit: false,
+            };
             let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(max_batch_records);
+            if *stop_rx.borrow() {
+                Self::drain_heap(&mut heap, &mut input_rx, "heap merger stopped");
+                exit_guard.clean_exit = true;
+                return;
+            }
             let mut batch_start: Option<Instant> = None;
             let mut last_emitted_ts: Option<i64> = None;
             let sleep = tokio::time::sleep(Duration::from_secs(3600));
@@ -223,6 +266,7 @@ impl HeapMerger {
                     res = stop_rx.changed() => {
                         if res.is_err() || *stop_rx.borrow() {
                             Self::drain_heap(&mut heap, &mut input_rx, "heap merger stopped");
+                            exit_guard.clean_exit = true;
                             break;
                         }
                     }
@@ -256,6 +300,7 @@ impl HeapMerger {
                                     &mut batch_start,
                                     &mut last_emitted_ts,
                                 ).await;
+                                exit_guard.clean_exit = true;
                                 break;
                             }
                         }
@@ -274,9 +319,7 @@ impl HeapMerger {
             }
         });
 
-        if let Ok(mut guard) = self.handle.try_lock() {
-            *guard = Some(handle);
-        }
+        *handle_guard = Some(handle);
     }
 
     pub fn start(
@@ -409,7 +452,8 @@ impl HeapMerger {
             let mut heap = BinaryHeap::new();
             Self::drain_heap(&mut heap, &mut pending.input_rx, "heap merger stopped");
         }
-        if let Some(handle) = self.handle.lock().await.take() {
+        let handle = self.handle.lock().take();
+        if let Some(handle) = handle {
             let _ = handle.await;
         }
     }
@@ -417,7 +461,8 @@ impl HeapMerger {
     pub async fn stop(self) {
         drop(self.input_tx);
         drop(self.pending.lock().take());
-        if let Some(handle) = self.handle.lock().await.take() {
+        let handle = self.handle.lock().take();
+        if let Some(handle) = handle {
             let _ = handle.await;
         }
     }
@@ -482,5 +527,31 @@ mod tests {
         merger.stop().await;
 
         assert_eq!(*collected.lock(), vec![10, 20, 30, 50]);
+    }
+
+    #[tokio::test]
+    async fn test_heap_merger_contended_handle_and_panic_notifies_failure() {
+        let consumer: MergedBatchConsumer = Arc::new(|_recs| {
+            Box::pin(async move {
+                panic!("simulated downstream panic");
+            })
+        });
+        let cfg = OrderedConsumptionConfig {
+            enabled: true,
+            max_batch_records: 1,
+            max_batch_wait: mimir_config::GoDuration::from_millis(10),
+            ..Default::default()
+        };
+        let merger = HeapMerger::new(&cfg, consumer, HeapMergerMetrics::new(None));
+        let mut rx = merger.subscribe_failure();
+        // Handle lock is held by ensure_started without dropping JoinHandle.
+        merger.ensure_started();
+        assert!(merger.handle.lock().is_some());
+
+        let res = merger.submit_and_wait(0, vec![mk_rec(0, 10)]).await;
+        assert!(res.is_err());
+        rx.changed().await.unwrap();
+        assert_eq!(rx.borrow().as_deref(), Some("heap merger task panicked"));
+        merger.shutdown_and_drain().await;
     }
 }

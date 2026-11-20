@@ -160,7 +160,7 @@ pub(crate) fn decoded_as_json(name: &str, data: &[u8]) -> bool {
 /// `unmarshalMaybeGzipped`.
 pub(crate) fn unmarshal_maybe_gzipped(name: &str, data: &[u8]) -> Result<Mapping, String> {
     if name.ends_with(".gz") {
-        let mut dec = flate2::read::GzDecoder::new(data);
+        let mut dec = flate2::read::MultiGzDecoder::new(data);
         let mut out = Vec::new();
         dec.read_to_end(&mut out)
             .map_err(|e| format!("read gzipped file: {e}"))?;
@@ -250,6 +250,25 @@ mod tests {
         assert_eq!(unmarshal_maybe_gzipped("x.yaml.gz", &gz).unwrap(), m("a: 1\n"));
         let err = unmarshal_maybe_gzipped("x.yaml", &gz).unwrap_err();
         assert!(err.starts_with("file looks gzipped but doesn't have a .gz extension"), "{err}");
+    }
+
+    #[test]
+    fn multi_member_gzip_source() {
+        use std::io::Write;
+        let mut enc1 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc1.write_all(b"overrides:\n").unwrap();
+        let mut combined = enc1.finish().unwrap();
+
+        let mut enc2 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc2.write_all(b"  t1:\n    max_global_series_per_user: 100\n")
+            .unwrap();
+        combined.extend_from_slice(&enc2.finish().unwrap());
+
+        let got = unmarshal_maybe_gzipped("runtime.yaml.gz", &combined).unwrap();
+        assert_eq!(
+            got,
+            m("overrides:\n  t1:\n    max_global_series_per_user: 100\n")
+        );
     }
 
     #[test]

@@ -2875,8 +2875,7 @@ fn decode_single_batch_slice(
                         "truncated Kafka header key ({hk_len} bytes)"
                     ))
                 })?;
-            let hk_str = std::str::from_utf8(&rec_slice[rp..hk_end])
-                .map_err(|e| KafkaClientError::Protocol(e.into()))?;
+            let hk_range = rp..hk_end;
             rp = hk_end;
 
             let hv_len = read_zigzag_i32(rec_slice, &mut rp)?;
@@ -2885,29 +2884,38 @@ fn decode_single_batch_slice(
                     "Unexpected negative record header value length ({hv_len} bytes)"
                 )));
             }
-            let hv = if hv_len == -1 {
-                Bytes::new()
+            if skip {
+                if hv_len >= 0 {
+                    let hlen = hv_len as usize;
+                    let hv_end = rp
+                        .checked_add(hlen)
+                        .filter(|&e| e <= rec_slice.len())
+                        .ok_or_else(|| {
+                            KafkaClientError::Protocol(anyhow::anyhow!(
+                                "truncated Kafka header value ({hlen} bytes)"
+                            ))
+                        })?;
+                    rp = hv_end;
+                }
             } else {
-                let hlen = hv_len as usize;
-                let hv_end = rp
-                    .checked_add(hlen)
-                    .filter(|&e| e <= rec_slice.len())
-                    .ok_or_else(|| {
-                        KafkaClientError::Protocol(anyhow::anyhow!(
-                            "truncated Kafka header value ({hlen} bytes)"
-                        ))
-                    })?;
-                let bytes = if skip {
+                let hk_str = String::from_utf8_lossy(&rec_slice[hk_range]).into_owned();
+                let hv = if hv_len == -1 {
                     Bytes::new()
                 } else {
-                    records_bytes.slice((rec_base + rp)..(rec_base + hv_end))
+                    let hlen = hv_len as usize;
+                    let hv_end = rp
+                        .checked_add(hlen)
+                        .filter(|&e| e <= rec_slice.len())
+                        .ok_or_else(|| {
+                            KafkaClientError::Protocol(anyhow::anyhow!(
+                                "truncated Kafka header value ({hlen} bytes)"
+                            ))
+                        })?;
+                    let bytes = records_bytes.slice((rec_base + rp)..(rec_base + hv_end));
+                    rp = hv_end;
+                    bytes
                 };
-                rp = hv_end;
-                bytes
-            };
-
-            if !skip {
-                headers.push((hk_str.to_owned(), hv));
+                headers.push((hk_str, hv));
             }
         }
 
@@ -3751,5 +3759,86 @@ mod tests {
         ));
 
         srv.abort();
+    }
+
+    #[test]
+    fn w22_deep_04_non_utf8_record_header_keys_do_not_wedge_partition() {
+        fn encode_with_non_utf8_header(
+            offsets: &[i64],
+            control: bool,
+        ) -> Bytes {
+            let records: Vec<Record> = offsets
+                .iter()
+                .map(|&offset| {
+                    let mut headers = IndexMap::new();
+                    headers.insert(
+                        StrBytes::from_static_str("NK"),
+                        Some(Bytes::from_static(b"nonutf8val")),
+                    );
+                    if !control {
+                        headers.insert(
+                            StrBytes::from_static_str("v"),
+                            Some(Bytes::from_static(b"2")),
+                        );
+                    }
+                    Record {
+                        transactional: control,
+                        control,
+                        partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                        producer_id: if control { 7 } else { NO_PRODUCER_ID },
+                        producer_epoch: if control { 1 } else { NO_PRODUCER_EPOCH },
+                        timestamp_type: TimestampType::Creation,
+                        offset,
+                        sequence: if control { NO_SEQUENCE } else { offset as i32 },
+                        timestamp: 1_700_000_000_000 + offset,
+                        key: Some(Bytes::from(format!("tenant-{offset}"))),
+                        value: Some(Bytes::from(format!("payload-{offset}"))),
+                        headers,
+                    }
+                })
+                .collect();
+            let mut buf = BytesMut::new();
+            let opts = RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            };
+            RecordBatchEncoder::encode_with_custom_compression(
+                &mut buf,
+                records.iter(),
+                &opts,
+                Some(compress_record_batch),
+            )
+            .unwrap();
+            // Replace every "NK" header key marker with raw non-UTF-8 bytes [0xff, 0xfe] and
+            // recompute the RecordBatch CRC32C.
+            let mut replaced = 0usize;
+            for i in 0..buf.len().saturating_sub(1) {
+                if &buf[i..i + 2] == b"NK" {
+                    buf[i] = 0xff;
+                    buf[i + 1] = 0xfe;
+                    replaced += 1;
+                }
+            }
+            assert_eq!(replaced, offsets.len());
+            let crc = crc32c::crc32c(&buf[V2_ATTRIBUTES_OFFSET..]);
+            buf[17..21].copy_from_slice(&crc.to_be_bytes());
+            buf.freeze()
+        }
+
+        // (a) Already-consumed record (offset 0 < fetch_offset 1) + (c) active record (offset 1)
+        // carrying both non-UTF-8 header key [0xff, 0xfe] and "v" -> b"2".
+        let batch = encode_with_non_utf8_header(&[0, 1], false);
+        let (decoded, _metrics) = decode_single_batch_slice(batch, 1).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].offset, 1);
+        assert_eq!(decoded[0].headers[0].0, "\u{fffd}\u{fffd}");
+        assert_eq!(decoded[0].headers[0].1.as_ref(), b"nonutf8val");
+        assert_eq!(decoded[0].headers[1].0, "v");
+        assert_eq!(decoded[0].headers[1].1.as_ref(), b"2");
+
+        // (b) Control record carrying non-UTF-8 header key must be skipped cleanly.
+        let ctrl_batch = encode_with_non_utf8_header(&[5], true);
+        let (ctrl_decoded, _) = decode_single_batch_slice(ctrl_batch, 0).unwrap();
+        assert!(ctrl_decoded.is_empty());
     }
 }

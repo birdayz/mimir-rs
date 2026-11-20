@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
 use mimir_common::thread_pool::ScopedWorkerPool;
@@ -21,7 +21,10 @@ use crate::compact::{
     merge_chunks_with_tombstones_and_float_encoding, merge_head_chunks_with_tombstones,
     reencode_chunk_without_tombstones, DecodedSample,
 };
-use crate::head::{Head, HeadChunkSnapshot, HeadError, HeadReadGuard, SeriesEntry};
+use crate::head::{
+    Head, HeadChunkSnapshot, HeadError, HeadReadGuard, HeadReadIsolation, SeriesEntry,
+};
+use crate::head_chunks::ChunkDiskMapperRef;
 use crate::index::IndexError;
 use crate::labels::{decode_stringlabel_size, Labels};
 use crate::matcher::LabelMatcher;
@@ -103,6 +106,198 @@ pub enum LazyStreamEvent<'a> {
 ///
 /// `'static + Send + Sync` so callers can evaluate postings inline (hitting caches in microseconds)
 /// and decide whether to materialize chunks inline or offload to a blocking worker pool.
+/// Atomic Head snapshot captured under `blocks.read()`.
+#[derive(Clone, Debug)]
+pub struct HeadQuerySnapshot {
+    pub guard: HeadReadGuard,
+    pub isolation: HeadReadIsolation,
+    pub overlaps_in_order: bool,
+    pub overlaps_ooo: bool,
+    pub min_time: i64,
+    pub max_time: i64,
+}
+
+/// Atomic snapshot of overlapping ULID blocks and Head state captured under `blocks.read()`.
+///
+/// Field declaration order ensures `blocks` (`Arc<Block>` mmaps) drop BEFORE `block_guards`
+/// wakes `Block::close_and_wait()`.
+#[derive(Debug)]
+pub struct QuerySourceSnapshot {
+    pub blocks: Vec<Arc<Block>>,
+    pub block_guards: Vec<BlockReadGuard>,
+    pub head: Option<HeadQuerySnapshot>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum HeadSnapshotMode {
+    Effective,
+    InOrderOnly,
+    FullRange,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn snapshot_head_query_source(
+    head: &Head,
+    last_gc_mmap_ref: Option<&AtomicU64>,
+    mint: i64,
+    maxt: i64,
+    mode: HeadSnapshotMode,
+) -> Option<HeadQuerySnapshot> {
+    if head.is_closed() {
+        return None;
+    }
+    let max_ooo_mmap_ref_to_skip = last_gc_mmap_ref
+        .map_or(ChunkDiskMapperRef(0), |a| {
+            ChunkDiskMapperRef(a.load(AtomicOrdering::Acquire))
+        });
+    let evicting = head.evicting_series();
+    let head_min_time = head.min_time();
+    let head_max_time = head.max_time();
+
+    match mode {
+        HeadSnapshotMode::FullRange => {
+            let guard = head.start_read(i64::MIN, i64::MAX);
+            Some(HeadQuerySnapshot {
+                guard,
+                isolation: HeadReadIsolation {
+                    ino_mint: i64::MIN,
+                    max_ooo_mmap_ref_to_skip,
+                    evicting,
+                },
+                overlaps_in_order: true,
+                overlaps_ooo: true,
+                min_time: head_min_time,
+                max_time: head_max_time,
+            })
+        }
+        HeadSnapshotMode::InOrderOnly => {
+            if !(head.initialized() && head_min_time <= maxt && mint <= head_max_time) {
+                return None;
+            }
+            let mut ino_mint = mint.max(head_min_time);
+            let mut guard = head.start_read(mint, maxt);
+            let (should_close, get_new, new_mint) =
+                head.is_querier_colliding_with_truncation(mint, maxt);
+            if should_close {
+                ino_mint = ino_mint.max(new_mint);
+                if get_new {
+                    let new_guard = head.start_read(new_mint, maxt);
+                    guard = new_guard;
+                } else {
+                    drop(guard);
+                    return None;
+                }
+            }
+            let overlaps_in_order = ino_mint <= maxt && mint <= head_max_time;
+            if !overlaps_in_order {
+                drop(guard);
+                return None;
+            }
+            Some(HeadQuerySnapshot {
+                guard,
+                isolation: HeadReadIsolation {
+                    ino_mint,
+                    max_ooo_mmap_ref_to_skip,
+                    evicting,
+                },
+                overlaps_in_order: true,
+                overlaps_ooo: false,
+                min_time: head_min_time,
+                max_time: head_max_time,
+            })
+        }
+        HeadSnapshotMode::Effective => {
+            let min_ooo = head.min_ooo_time();
+            let overlaps_ooo =
+                min_ooo != i64::MAX && min_ooo <= maxt && mint <= head.max_ooo_time();
+            if !(maxt >= head_min_time || overlaps_ooo) {
+                return None;
+            }
+            let mut ino_mint = mint.max(head_min_time);
+            let mut guard = head.start_read(mint, maxt);
+            let mut collided_past_maxt = false;
+            let (should_close, get_new, new_mint) =
+                head.is_querier_colliding_with_truncation(mint, maxt);
+            if should_close {
+                ino_mint = ino_mint.max(new_mint);
+                if get_new {
+                    if !overlaps_ooo {
+                        let new_guard = head.start_read(new_mint, maxt);
+                        guard = new_guard;
+                    }
+                } else {
+                    collided_past_maxt = true;
+                    if !overlaps_ooo {
+                        drop(guard);
+                        return None;
+                    }
+                }
+            }
+            let overlaps_in_order =
+                head.initialized() && !collided_past_maxt && maxt >= head_min_time && ino_mint <= maxt;
+            Some(HeadQuerySnapshot {
+                guard,
+                isolation: HeadReadIsolation {
+                    ino_mint,
+                    max_ooo_mmap_ref_to_skip,
+                    evicting,
+                },
+                overlaps_in_order,
+                overlaps_ooo,
+                min_time: head_min_time,
+                max_time: head_max_time,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn snapshot_query_sources_with_lock(
+    head: Option<&Head>,
+    static_blocks: &[Arc<Block>],
+    blocks_lock: Option<&RwLock<Vec<Arc<Block>>>>,
+    last_gc_mmap_ref: Option<&AtomicU64>,
+    closed: Option<&AtomicBool>,
+    mint: i64,
+    maxt: i64,
+    mode: HeadSnapshotMode,
+) -> QuerySourceSnapshot {
+    let lock_guard = blocks_lock.map(|l| l.read());
+    if closed.is_some_and(|c| c.load(AtomicOrdering::Acquire))
+        || head.is_some_and(Head::is_closed)
+    {
+        drop(lock_guard);
+        return QuerySourceSnapshot {
+            blocks: Vec::new(),
+            block_guards: Vec::new(),
+            head: None,
+        };
+    }
+    let slice: &[Arc<Block>] = match lock_guard.as_ref() {
+        Some(g) => g.as_slice(),
+        None => static_blocks,
+    };
+    let mut blocks = Vec::new();
+    let mut block_guards = Vec::new();
+    for b in slice {
+        if b.overlaps_closed_interval(mint, maxt) {
+            if let Some(bg) = Block::start_read(b) {
+                blocks.push(Arc::clone(b));
+                block_guards.push(bg);
+            }
+        }
+    }
+    let head_snap = head.and_then(|h| {
+        snapshot_head_query_source(h, last_gc_mmap_ref, mint, maxt, mode)
+    });
+    drop(lock_guard);
+    QuerySourceSnapshot {
+        blocks,
+        block_guards,
+        head: head_snap,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedChunkSelect {
     pub head_refs: Option<Arc<[u64]>>,
@@ -112,6 +307,7 @@ pub struct PreparedChunkSelect {
     pub maxt: i64,
     pub unordered: bool,
     head_overlaps_ooo: bool,
+    head_isolation: Option<HeadReadIsolation>,
     _block_guards: Vec<BlockReadGuard>,
     _head_guard: Option<HeadReadGuard>,
 }
@@ -168,19 +364,13 @@ pub struct TsdbQuerier<'a> {
     head: Option<&'a Head>,
     blocks: Vec<Arc<Block>>,
     blocks_lock: Option<&'a RwLock<Vec<Arc<Block>>>>,
+    last_garbage_collected_mmap_ref: Option<&'a AtomicU64>,
     closed: Option<&'a AtomicBool>,
     mint: i64,
     maxt: i64,
     concurrent: bool,
     select_stats: Option<BlockSelectStatsSink>,
     select_stats_filter: Option<SeriesStatsFilter>,
-}
-
-#[derive(Clone, Copy)]
-enum HeadSnapshotMode {
-    Effective,
-    InOrderOnly,
-    FullRange,
 }
 
 impl<'a> TsdbQuerier<'a> {
@@ -199,6 +389,7 @@ impl<'a> TsdbQuerier<'a> {
             head,
             blocks,
             blocks_lock: None,
+            last_garbage_collected_mmap_ref: None,
             closed: None,
             mint,
             maxt,
@@ -218,6 +409,7 @@ impl<'a> TsdbQuerier<'a> {
             head,
             blocks: Vec::new(),
             blocks_lock: Some(blocks_lock),
+            last_garbage_collected_mmap_ref: None,
             closed: None,
             mint,
             maxt,
@@ -238,6 +430,7 @@ impl<'a> TsdbQuerier<'a> {
             head,
             blocks: Vec::new(),
             blocks_lock: Some(blocks_lock),
+            last_garbage_collected_mmap_ref: None,
             closed: Some(closed),
             mint,
             maxt,
@@ -245,6 +438,14 @@ impl<'a> TsdbQuerier<'a> {
             select_stats: None,
             select_stats_filter: None,
         }
+    }
+
+    pub fn with_last_garbage_collected_mmap_ref(
+        mut self,
+        last_garbage_collected_mmap_ref: &'a AtomicU64,
+    ) -> Self {
+        self.last_garbage_collected_mmap_ref = Some(last_garbage_collected_mmap_ref);
+        self
     }
 
     /// Sets Go `sharded` / `hints.ShardCount > 0` (`concurrent` param on
@@ -260,11 +461,7 @@ impl<'a> TsdbQuerier<'a> {
             || self.head.is_some_and(Head::is_closed)
     }
 
-    #[inline]
-    fn head_overlaps_ooo(&self, head: &Head) -> bool {
-        let min_ooo = head.min_ooo_time();
-        min_ooo != i64::MAX && min_ooo <= self.maxt && self.mint <= head.max_ooo_time()
-    }
+
 
     /// Records per block querier [`BlockSelectStats`] of chunk selects into `sink`.
     pub fn set_select_stats(&mut self, sink: BlockSelectStatsSink, filter: Option<SeriesStatsFilter>) {
@@ -325,57 +522,51 @@ impl<'a> TsdbQuerier<'a> {
         (blocks, guards)
     }
 
-    /// Holds `blocks_lock.read()` ONLY long enough to check `check_open()`, clone
-    /// overlapping `Block`s with `BlockReadGuard`s, and register a `HeadReadGuard`, then
-    /// drops `blocks_lock.read()` immediately.
-    ///
-    /// Guards are returned BEFORE `Vec<Arc<Block>>` so LIFO local destructuring drops
-    /// `Arc<Block>` mmaps before `BlockReadGuard` wakes `close_and_wait()`.
-    #[allow(clippy::type_complexity)]
-    fn snapshot_sources(
-        &self,
-        mode: HeadSnapshotMode,
-    ) -> Result<(Vec<BlockReadGuard>, Option<HeadReadGuard>, Vec<Arc<Block>>), QuerierError> {
-        let lock_guard = self.blocks_lock.map(|l| l.read());
-        if self.is_closed() {
-            drop(lock_guard);
-            return Ok((Vec::new(), None, Vec::new()));
-        }
-        let (blocks, block_guards) = self.snapshot_blocks(lock_guard.as_ref());
-        let head_guard = match mode {
-            HeadSnapshotMode::Effective => self
-                .effective_head()
-                .map(|h| h.start_read(self.mint, self.maxt)),
-            HeadSnapshotMode::InOrderOnly => self
-                .effective_in_order_head()
-                .map(|h| h.start_read(self.mint, self.maxt)),
-            HeadSnapshotMode::FullRange => self.head.map(|h| h.start_read(i64::MIN, i64::MAX)),
-        };
-        drop(lock_guard);
-        Ok((block_guards, head_guard, blocks))
+    /// Holds `blocks_lock.read()` ONLY long enough to check `is_closed()`, clone
+    /// overlapping `Block`s with `BlockReadGuard`s, register a `HeadReadGuard`, and capture
+    /// `HeadReadIsolation`, then drops `blocks_lock.read()` immediately.
+    fn snapshot_sources(&self, mode: HeadSnapshotMode) -> QuerySourceSnapshot {
+        snapshot_query_sources_with_lock(
+            self.head,
+            &self.blocks,
+            self.blocks_lock,
+            self.last_garbage_collected_mmap_ref,
+            self.closed,
+            self.mint,
+            self.maxt,
+            mode,
+        )
     }
 
-    #[allow(clippy::type_complexity)]
-    fn try_snapshot_sources(
-        &self,
-    ) -> Result<Option<(Vec<BlockReadGuard>, Option<HeadReadGuard>, Vec<Arc<Block>>)>, QuerierError> {
+    fn try_snapshot_sources(&self) -> Option<QuerySourceSnapshot> {
         let lock_guard = match self.blocks_lock {
-            Some(l) => match l.try_read() {
-                Some(g) => Some(g),
-                None => return Ok(None),
-            },
+            Some(l) => Some(l.try_read()?),
             None => None,
         };
         if self.is_closed() {
             drop(lock_guard);
-            return Ok(Some((Vec::new(), None, Vec::new())));
+            return Some(QuerySourceSnapshot {
+                blocks: Vec::new(),
+                block_guards: Vec::new(),
+                head: None,
+            });
         }
         let (blocks, block_guards) = self.snapshot_blocks(lock_guard.as_ref());
-        let head_guard = self
-            .effective_head()
-            .map(|h| h.start_read(self.mint, self.maxt));
+        let head_snap = self.head.and_then(|h| {
+            snapshot_head_query_source(
+                h,
+                self.last_garbage_collected_mmap_ref,
+                self.mint,
+                self.maxt,
+                HeadSnapshotMode::Effective,
+            )
+        });
         drop(lock_guard);
-        Ok(Some((block_guards, head_guard, blocks)))
+        Some(QuerySourceSnapshot {
+            blocks,
+            block_guards,
+            head: head_snap,
+        })
     }
 
     fn blocks_match_prepared(&self, prepared: &PreparedChunkSelect) -> Result<bool, QuerierError> {
@@ -402,15 +593,7 @@ impl<'a> TsdbQuerier<'a> {
         Ok(all_match && idx == prepared.overlapping_blocks.len())
     }
 
-    fn effective_in_order_head(&self) -> Option<&'a Head> {
-        self.head
-            .filter(|h| h.initialized() && h.min_time() <= self.maxt && self.mint <= h.max_time())
-    }
 
-    fn effective_head(&self) -> Option<&'a Head> {
-        self.head
-            .filter(|h| h.min_time() <= self.maxt || self.head_overlaps_ooo(h))
-    }
 
     /// Queries samples for all series matching `matchers` in `[mint, maxt]`.
     pub fn select(
@@ -461,14 +644,17 @@ impl<'a> TsdbQuerier<'a> {
 
     fn prepare_select_locked(
         &self,
-        block_guards: Vec<BlockReadGuard>,
-        head_guard: Option<HeadReadGuard>,
-        blocks: Vec<Arc<Block>>,
+        snapshot: QuerySourceSnapshot,
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<PreparedChunkSelect, QuerierError> {
+        let block_guards = snapshot.block_guards;
+        let blocks = snapshot.blocks;
+        let (head_guard, head_isolation, head_overlaps_ooo) = match snapshot.head {
+            Some(hs) => (Some(hs.guard), Some(hs.isolation), hs.overlaps_ooo),
+            None => (None, None, false),
+        };
         let head = head_guard.as_ref().and(self.head);
-        let head_overlaps_ooo = head.is_some_and(|h| self.head_overlaps_ooo(h));
         let head_refs = match head {
             Some(h) => Some(h.postings_for_matchers_with_concurrent(matchers, self.concurrent)?),
             None => None,
@@ -486,6 +672,7 @@ impl<'a> TsdbQuerier<'a> {
             overlapping_blocks: blocks,
             _block_guards: block_guards,
             _head_guard: head_guard,
+            head_isolation,
             mint: self.mint,
             maxt: self.maxt,
             unordered,
@@ -501,8 +688,8 @@ impl<'a> TsdbQuerier<'a> {
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<PreparedChunkSelect, QuerierError> {
-        let (block_guards, head_guard, blocks) = self.snapshot_sources(HeadSnapshotMode::Effective)?;
-        self.prepare_select_locked(block_guards, head_guard, blocks, matchers, unordered)
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+        self.prepare_select_locked(snapshot, matchers, unordered)
     }
 
     /// Snapshots blocks & guards under `blocks_lock.read()`, drops the lock immediately, and
@@ -516,9 +703,8 @@ impl<'a> TsdbQuerier<'a> {
         max_source_series: usize,
         max_total_refs: usize,
     ) -> Result<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>, QuerierError> {
-        let (block_guards, head_guard, blocks) = self.snapshot_sources(HeadSnapshotMode::Effective)?;
-        let prepared =
-            self.prepare_select_locked(block_guards, head_guard, blocks, matchers, unordered)?;
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+        let prepared = self.prepare_select_locked(snapshot, matchers, unordered)?;
         if prepared.is_empty() {
             let empty_min_times: Vec<i64> = prepared
                 .overlapping_blocks
@@ -558,11 +744,10 @@ impl<'a> TsdbQuerier<'a> {
         max_source_series: usize,
         max_total_refs: usize,
     ) -> Result<Option<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>>, QuerierError> {
-        let Some((block_guards, head_guard, blocks)) = self.try_snapshot_sources()? else {
+        let Some(snapshot) = self.try_snapshot_sources() else {
             return Ok(None);
         };
-        let prepared =
-            self.prepare_select_locked(block_guards, head_guard, blocks, matchers, unordered)?;
+        let prepared = self.prepare_select_locked(snapshot, matchers, unordered)?;
         if prepared.is_empty() {
             let empty_min_times: Vec<i64> = prepared
                 .overlapping_blocks
@@ -602,15 +787,8 @@ impl<'a> TsdbQuerier<'a> {
         if !self.blocks_match_prepared(&prepared)? {
             let unordered = prepared.unordered;
             drop(prepared);
-            let (block_guards, head_guard, blocks) =
-                self.snapshot_sources(HeadSnapshotMode::Effective)?;
-            prepared = self.prepare_select_locked(
-                block_guards,
-                head_guard,
-                blocks,
-                matchers,
-                unordered,
-            )?;
+            let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+            prepared = self.prepare_select_locked(snapshot, matchers, unordered)?;
         }
         self.execute_prepared_select_locked(prepared, sort_series)
     }
@@ -636,6 +814,7 @@ impl<'a> TsdbQuerier<'a> {
             return Ok(Vec::new());
         }
         let head = prepared._head_guard.as_ref().and(self.head);
+        let head_iso = prepared.head_isolation.as_ref();
         let float_enc = self.head.map_or(Encoding::Xor, Head::float_chunk_encoding);
         let mint = prepared.mint;
         let maxt = prepared.maxt;
@@ -655,7 +834,11 @@ impl<'a> TsdbQuerier<'a> {
             };
             let mut out = Vec::with_capacity(refs.len());
             for &r in refs.iter() {
-                if let Some((labels, chks, tombs)) = head.series_chunks(r, mint, maxt)? {
+                let res = match head_iso {
+                    Some(iso) => head.series_chunks_with_isolation(r, mint, maxt, iso)?,
+                    None => head.series_chunks(r, mint, maxt)?,
+                };
+                if let Some((labels, chks, tombs)) = res {
                     // Go `HeadAndOOOChunkReader` / `populateChunksFromIterable` (`querier.go:1271`)
                     // uses `Xor` for intra-head merges when `st == 0`.
                     let final_chunks = merge_head_chunks_with_tombstones(chks, &tombs)?;
@@ -714,7 +897,11 @@ impl<'a> TsdbQuerier<'a> {
                 block_min_time: 0,
             };
             for &r in refs.iter() {
-                if let Some((labels, chks, tombs)) = head.series_chunks(r, mint, maxt)? {
+                let res = match head_iso {
+                    Some(iso) => head.series_chunks_with_isolation(r, mint, maxt, iso)?,
+                    None => head.series_chunks(r, mint, maxt)?,
+                };
+                if let Some((labels, chks, tombs)) = res {
                     if !chks.is_empty() && self.counts_for_stats(&labels) {
                         stats.series += 1;
                     }
@@ -846,18 +1033,12 @@ impl<'a> TsdbQuerier<'a> {
         if !self.blocks_match_prepared(&prepared)? {
             let unordered = prepared.unordered;
             drop(prepared);
-            let (block_guards, head_guard, blocks) =
-                self.snapshot_sources(HeadSnapshotMode::Effective)?;
-            prepared = self.prepare_select_locked(
-                block_guards,
-                head_guard,
-                blocks,
-                matchers,
-                unordered,
-            )?;
+            let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+            prepared = self.prepare_select_locked(snapshot, matchers, unordered)?;
         }
 
         let head = prepared._head_guard.as_ref().and(self.head);
+        let head_iso = prepared.head_isolation.as_ref();
         let float_enc = self.head.map_or(Encoding::Xor, Head::float_chunk_encoding);
         let mint = prepared.mint;
         let maxt = prepared.maxt;
@@ -886,9 +1067,22 @@ impl<'a> TsdbQuerier<'a> {
                 (Some(h), Some(refs)) => {
                     let mut v = Vec::with_capacity(refs.len());
                     for &r in refs.iter() {
-                        if let Some((entry, chunk_count, head_snapshot)) =
-                            h.series_lazy_chunk_count_with_snapshot(r, mint, maxt, series_filter)?
-                        {
+                        let res = match head_iso {
+                            Some(iso) => h.series_lazy_chunk_count_with_snapshot_and_isolation(
+                                r,
+                                mint,
+                                maxt,
+                                series_filter,
+                                iso,
+                            )?,
+                            None => h.series_lazy_chunk_count_with_snapshot(
+                                r,
+                                mint,
+                                maxt,
+                                series_filter,
+                            )?,
+                        };
+                        if let Some((entry, chunk_count, head_snapshot)) = res {
                             if chunk_count > 0 {
                                 v.push(LazySeriesEntry {
                                     labels: Labels::empty(),
@@ -941,10 +1135,18 @@ impl<'a> TsdbQuerier<'a> {
                             snap,
                         )?,
                         None => match entry.head_entry {
-                            Some(ref head_entry) => {
-                                h.series_final_chunks_for_entry(head_entry, mint, maxt)?
-                            }
-                            None => h.series_final_chunks_only(r, mint, maxt)?,
+                            Some(ref head_entry) => match head_iso {
+                                Some(iso) => h.series_final_chunks_for_entry_with_isolation(
+                                    head_entry, mint, maxt, iso,
+                                )?,
+                                None => h.series_final_chunks_for_entry(head_entry, mint, maxt)?,
+                            },
+                            None => match head_iso {
+                                Some(iso) => {
+                                    h.series_final_chunks_only_with_isolation(r, mint, maxt, iso)?
+                                }
+                                None => h.series_final_chunks_only(r, mint, maxt)?,
+                            },
                         },
                     };
                     if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
@@ -995,9 +1197,22 @@ impl<'a> TsdbQuerier<'a> {
                 block_min_time: 0,
             };
             for &r in refs.iter() {
-                if let Some((labels, ivs, head_snapshot)) =
-                    h.series_chunk_metas_no_bytes_with_snapshot(r, mint, maxt, series_filter)?
-                {
+                let res = match head_iso {
+                    Some(iso) => h.series_chunk_metas_no_bytes_with_snapshot_and_isolation(
+                        r,
+                        mint,
+                        maxt,
+                        series_filter,
+                        iso,
+                    )?,
+                    None => h.series_chunk_metas_no_bytes_with_snapshot(
+                        r,
+                        mint,
+                        maxt,
+                        series_filter,
+                    )?,
+                };
+                if let Some((labels, ivs, head_snapshot)) = res {
                     if !ivs.is_empty() {
                         stats.series += 1;
                     }
@@ -1090,7 +1305,12 @@ impl<'a> TsdbQuerier<'a> {
                     if let Some(h) = head {
                         let chks = match head_snap.take() {
                             Some(snap) => h.series_final_chunks_from_snapshot(None, r, snap)?,
-                            None => h.series_final_chunks_only(r, mint, maxt)?,
+                            None => match head_iso {
+                                Some(iso) => {
+                                    h.series_final_chunks_only_with_isolation(r, mint, maxt, iso)?
+                                }
+                                None => h.series_final_chunks_only(r, mint, maxt)?,
+                            },
                         };
                         for c in chks {
                             head_items.push((c, Vec::new()));
@@ -1231,9 +1451,8 @@ impl<'a> TsdbQuerier<'a> {
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
-        let (block_guards, head_guard, blocks) = self.snapshot_sources(HeadSnapshotMode::Effective)?;
-        let prepared =
-            self.prepare_select_locked(block_guards, head_guard, blocks, matchers, unordered)?;
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+        let prepared = self.prepare_select_locked(snapshot, matchers, unordered)?;
         self.execute_prepared_select_locked(prepared, sort_series)
     }
 
@@ -1243,9 +1462,12 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<Labels>, QuerierError> {
-        let (_block_guards, head_guard, blocks) =
-            self.snapshot_sources(HeadSnapshotMode::Effective)?;
-        let head = head_guard.as_ref().and(self.head);
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+        let _block_guards = snapshot.block_guards;
+        let blocks = snapshot.blocks;
+        let head_snap = snapshot.head;
+        let head = head_snap.as_ref().and(self.head);
+        let head_iso = head_snap.as_ref().map(|hs| &hs.isolation);
 
         if blocks.is_empty() {
             let Some(head) = head else {
@@ -1254,7 +1476,16 @@ impl<'a> TsdbQuerier<'a> {
             let refs = head.postings_for_matchers_with_concurrent(matchers, self.concurrent)?;
             let mut out = Vec::with_capacity(refs.len());
             for &r in refs.iter() {
-                if let Some(labels) = head.series_has_chunks_in_range(r, self.mint, self.maxt) {
+                let labels_opt = match head_iso {
+                    Some(iso) => head.series_has_chunks_in_range_with_isolation(
+                        r,
+                        self.mint,
+                        self.maxt,
+                        iso,
+                    ),
+                    None => head.series_has_chunks_in_range(r, self.mint, self.maxt),
+                };
+                if let Some(labels) = labels_opt {
                     out.push(labels);
                 }
             }
@@ -1268,7 +1499,16 @@ impl<'a> TsdbQuerier<'a> {
         if let Some(head) = head {
             let refs = head.postings_for_matchers_with_concurrent(matchers, self.concurrent)?;
             for &r in refs.iter() {
-                if let Some(labels) = head.series_has_chunks_in_range(r, self.mint, self.maxt) {
+                let labels_opt = match head_iso {
+                    Some(iso) => head.series_has_chunks_in_range_with_isolation(
+                        r,
+                        self.mint,
+                        self.maxt,
+                        iso,
+                    ),
+                    None => head.series_has_chunks_in_range(r, self.mint, self.maxt),
+                };
+                if let Some(labels) = labels_opt {
                     set.insert(labels);
                 }
             }
@@ -1294,9 +1534,11 @@ impl<'a> TsdbQuerier<'a> {
 
     /// Returns sorted unique label names across in-order Head and overlapping Blocks matching `matchers`.
     pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {
-        let (_block_guards, head_guard, blocks) =
-            self.snapshot_sources(HeadSnapshotMode::InOrderOnly)?;
-        let head = head_guard.as_ref().and(self.head);
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::InOrderOnly);
+        let _block_guards = snapshot.block_guards;
+        let blocks = snapshot.blocks;
+        let _head_snap = snapshot.head;
+        let head = _head_snap.as_ref().and(self.head);
         let mut set: BTreeSet<String> = BTreeSet::new();
 
         if let Some(head) = head {
@@ -1328,9 +1570,11 @@ impl<'a> TsdbQuerier<'a> {
         limit: Option<usize>,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<String>, QuerierError> {
-        let (_block_guards, head_guard, blocks) =
-            self.snapshot_sources(HeadSnapshotMode::InOrderOnly)?;
-        let head = head_guard.as_ref().and(self.head);
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::InOrderOnly);
+        let _block_guards = snapshot.block_guards;
+        let blocks = snapshot.blocks;
+        let _head_snap = snapshot.head;
+        let head = _head_snap.as_ref().and(self.head);
 
         if blocks.is_empty() {
             return match head {
@@ -1409,10 +1653,12 @@ impl<'a> TsdbQuerier<'a> {
 
     /// Returns the number of active series in Head (plus series in overlapping blocks if queried).
     pub fn series_count(&self) -> Result<usize, QuerierError> {
-        let (_block_guards, head_guard, blocks) =
-            self.snapshot_sources(HeadSnapshotMode::FullRange)?;
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::FullRange);
+        let _block_guards = snapshot.block_guards;
+        let blocks = snapshot.blocks;
+        let _head_snap = snapshot.head;
         let mut set: BTreeSet<Labels> = BTreeSet::new();
-        if let Some(head) = head_guard.as_ref().and(self.head) {
+        if let Some(head) = _head_snap.as_ref().and(self.head) {
             let all = LabelMatcher::new(crate::matcher::MatchType::RegexMatch, "__name__", ".*")
                 .map_err(PostingsError::from)?;
             for &r in head.postings_for_matchers_direct_arc(&[all])?.iter() {
@@ -1526,6 +1772,16 @@ impl<'a> TsdbChunkQuerier<'a> {
             inner: TsdbQuerier::with_blocks_lock_and_closed(head, blocks_lock, closed, mint, maxt),
             unordered: true,
         }
+    }
+
+    pub fn with_last_garbage_collected_mmap_ref(
+        mut self,
+        last_garbage_collected_mmap_ref: &'a AtomicU64,
+    ) -> Self {
+        self.inner = self
+            .inner
+            .with_last_garbage_collected_mmap_ref(last_garbage_collected_mmap_ref);
+        self
     }
 
     /// Sets Go `sharded` / `hints.ShardCount > 0` (`concurrent` param on

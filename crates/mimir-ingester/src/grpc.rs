@@ -305,6 +305,76 @@ where
     }
 }
 
+/// Response extension inserted ONLY when `TapHandle` (`RPCCallStarting` in
+/// `dskit/server/limits.go`) rejects an RPC before execution, so `grpc_server::RpcGuard`
+/// suppresses metrics/logs/traces for genuine tap rejections without dropping
+/// post-TapHandle `Unavailable` responses (instance limits, reactive limiter timeouts, etc.).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TapRejected;
+
+/// Pre-acquired `TapHandle` permit forwarded from `grpc_server.rs` into
+/// `IngesterZeroCopyServer` via `http::Request::extensions_mut()` so `TapHandle` runs
+/// before `auth` / `cluster_validation` / `RpcGuard` without double-acquiring permits.
+#[derive(Clone)]
+pub enum PreAcquiredTap {
+    Push(Arc<parking_lot::Mutex<Option<crate::push::PushTapPermit>>>),
+    Read(Arc<parking_lot::Mutex<Option<ReadTapPermit>>>),
+}
+
+#[derive(Clone)]
+struct ReadTapSlotContext {
+    slot: Option<Arc<parking_lot::Mutex<Option<ReadTapGuard>>>>,
+    deadline_ctx: Option<Arc<RpcDeadlineContext>>,
+}
+
+static ONLY_REPLICA_HEADERS: std::sync::LazyLock<http::HeaderMap> =
+    std::sync::LazyLock::new(|| {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            crate::query::ONLY_REPLICA_GRPC_MD_KEY,
+            http::HeaderValue::from_static("true"),
+        );
+        h
+    });
+static EMPTY_HEADERS: std::sync::LazyLock<http::HeaderMap> =
+    std::sync::LazyLock::new(http::HeaderMap::new);
+
+#[allow(clippy::result_large_err)]
+async fn prepare_read_reactive_for_slot(
+    ingester: &Ingester,
+    md: &tonic::metadata::MetadataMap,
+    deadline_ctx: Option<&RpcDeadlineContext>,
+    read_tap_slot: Option<&parking_lot::Mutex<Option<ReadTapGuard>>>,
+    ext: &mut http::Extensions,
+) -> Result<(), Status> {
+    let headers: &http::HeaderMap = if crate::query::is_only_replica_metadata(md) {
+        &ONLY_REPLICA_HEADERS
+    } else {
+        &EMPTY_HEADERS
+    };
+    match ingester.prepare_read_reactive(headers, deadline_ctx).await {
+        Ok(Some(rp)) => {
+            if let Some(slot) = read_tap_slot {
+                if let Some(ref mut guard) = *slot.lock() {
+                    if let Some(ref mut tap) = guard.tap {
+                        tap.set_reactive_permit(rp);
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => return Err(Status::unavailable(e.to_string())),
+    }
+    if let Some(slot) = read_tap_slot {
+        if let Some(ref mut guard) = *slot.lock() {
+            if let Some(ref mut tap) = guard.tap {
+                ext.insert(TapDeadlineFlag(tap.deadline_exceeded_flag()));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct TapDeadlineFlag(pub(crate) Arc<AtomicBool>);
 
@@ -446,6 +516,7 @@ fn unavailable_tap_response(e: IngesterError) -> http::Response<tonic::body::Box
         "grpc-accept-encoding",
         http::HeaderValue::from_static(GRPC_ACCEPT_ENCODING_VALUE),
     );
+    resp.extensions_mut().insert(TapRejected);
     resp
 }
 
@@ -568,7 +639,7 @@ impl NonClientStreamingFrameBody {
                             Vec::with_capacity(compressed.len().min(self.max_recv).min(64 * 1024));
                         match self.algo {
                             FrameDecompressAlgo::Gzip => {
-                                let mut dec = flate2::read::GzDecoder::new(compressed).take(limit);
+                                let mut dec = flate2::read::MultiGzDecoder::new(compressed).take(limit);
                                 dec.read_to_end(&mut decompressed).map_err(|e| {
                                     Status::internal(format!("gzip decompression failed: {e}"))
                                 })?;
@@ -1324,7 +1395,8 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
         >>::poll_ready(&mut self.inner, cx)
     }
 
-    fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+    fn call(&mut self, mut req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+        let pre_tap = req.extensions_mut().remove::<PreAcquiredTap>();
         let custom_enc = custom_grpc_encoding(req.headers());
         let max_decode_len = self.max_decoding_message_size.unwrap_or(4 * 1024 * 1024);
         let max_send_len = self.max_encoding_message_size.unwrap_or(usize::MAX);
@@ -1365,33 +1437,59 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
 
         Box::pin(async move {
             // Pre-decompression gRPC TapHandle (`dskit/server/limits.go` + `pkg/mimir/grpc_call_check.go`).
+            // If `grpc_server.rs` already ran TapHandle before `auth` / `check_cluster`, reuse
+            // that permit instead of acquiring a second one.
+            let mut pre_tap = pre_tap;
             let push_tap_slot: Option<
                 Arc<parking_lot::Mutex<Option<crate::push::PushTapPermit>>>,
             > = if is_push {
-                let req_size = parse_message_size_header(req.headers());
-                match ingester.try_start_push_tap(req_size) {
-                    Ok(p) => Some(Arc::new(parking_lot::Mutex::new(Some(p)))),
-                    Err(e) => return Ok(unavailable_tap_response(e)),
+                if let Some(PreAcquiredTap::Push(slot)) = pre_tap.take() {
+                    Some(slot)
+                } else {
+                    let req_size = parse_message_size_header(req.headers());
+                    match ingester.try_start_push_tap(req_size) {
+                        Ok(p) => Some(Arc::new(parking_lot::Mutex::new(Some(p)))),
+                        Err(e) => return Ok(unavailable_tap_response(e)),
+                    }
                 }
             } else {
                 None
             };
-            let mut read_tap = if !is_push && is_ingester_rpc {
-                match ingester.try_start_read_tap(req.headers()) {
-                    Ok(p) => Some(ReadTapGuard {
-                        tap: Some(p),
-                        deadline_ctx: deadline_ctx.clone(),
-                    }),
-                    Err(e) => return Ok(unavailable_tap_response(e)),
-                }
-            } else {
-                None
-            };
+            let read_tap_slot: Option<Arc<parking_lot::Mutex<Option<ReadTapGuard>>>> =
+                if !is_push && is_ingester_rpc {
+                    if let Some(PreAcquiredTap::Read(slot)) = pre_tap.take() {
+                        let permit = slot.lock().take();
+                        permit.map(|p| {
+                            Arc::new(parking_lot::Mutex::new(Some(ReadTapGuard {
+                                tap: Some(p),
+                                deadline_ctx: deadline_ctx.clone(),
+                            })))
+                        })
+                    } else {
+                        match ingester.try_start_read_tap(req.headers()) {
+                            Ok(p) => Some(Arc::new(parking_lot::Mutex::new(Some(ReadTapGuard {
+                                tap: Some(p),
+                                deadline_ctx: deadline_ctx.clone(),
+                            })))),
+                            Err(e) => return Ok(unavailable_tap_response(e)),
+                        }
+                    }
+                } else {
+                    None
+                };
 
             let mut req = if let Some(encoding) = custom_enc {
                 match decompress_custom_grpc_request(req, encoding, max_decode_len).await {
                     Ok(r) => r,
                     Err(status) => {
+                        if let Some(ref slot) = read_tap_slot {
+                            if let Some(mut guard) = slot.lock().take() {
+                                guard.finish(false);
+                            }
+                        }
+                        if let Some(ref slot) = push_tap_slot {
+                            drop(slot.lock().take());
+                        }
                         let mut resp = status.into_http();
                         resp.headers_mut().insert(
                             "grpc-accept-encoding",
@@ -1452,44 +1550,17 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 }
             };
 
-            // RPCCallProcessing: reactive limiter blocking permit acquisition.
-            if let Some(ref slot) = push_tap_slot {
-                match ingester.prepare_push_reactive(deadline_ctx.as_deref()).await {
-                    Ok(Some(rp)) => {
-                        if let Some(ref mut tap) = *slot.lock() {
-                            tap.set_reactive_permit(rp);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        drop(slot.lock().take());
-                        return Ok(unavailable_tap_response(e));
-                    }
-                }
-            }
-            if let Some(ref mut guard) = read_tap {
-                match ingester
-                    .prepare_read_reactive(req.headers(), deadline_ctx.as_deref())
-                    .await
-                {
-                    Ok(Some(rp)) => {
-                        if let Some(ref mut tap) = guard.tap {
-                            tap.set_reactive_permit(rp);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => return Ok(unavailable_tap_response(e)),
-                }
-                if let Some(ref mut tap) = guard.tap {
-                    req.extensions_mut()
-                        .insert(TapDeadlineFlag(tap.deadline_exceeded_flag()));
-                }
-            }
-
+            // RPCCallProcessing (`prepare_push_reactive` / `prepare_read_reactive`) runs INSIDE
+            // each service entrypoint below — AFTER frame decode/decompression (`dec(in)`),
+            // `ServerUserHeaderInterceptor` (`x-scope-orgid`), and `ClusterUnaryServerInterceptor`
+            // — and returns a normal `Status::unavailable` (WITHOUT `TapRejected`) so
+            // `RpcGuard` records `cortex_request_duration_seconds{status_code="Unavailable"}`,
+            // `GRPCServerLog`, and OTel spans.
             let mut resp = if is_push {
                 struct RawPushSvc {
                     ingester: Arc<Ingester>,
                     tap_slot: Option<Arc<parking_lot::Mutex<Option<crate::push::PushTapPermit>>>>,
+                    deadline_ctx: Option<Arc<RpcDeadlineContext>>,
                 }
                 impl tonic::server::UnaryService<Bytes> for RawPushSvc {
                     type Response = cortexpb::WriteResponse;
@@ -1511,8 +1582,9 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
 
                         let ingester = Arc::clone(&self.ingester);
                         let tap_slot = self.tap_slot.clone();
+                        let deadline_ctx = self.deadline_ctx.clone();
                         Box::pin(async move {
-                            let tap = tap_slot.as_ref().and_then(|s| s.lock().take());
+                            let mut tap = tap_slot.as_ref().and_then(|s| s.lock().take());
                             let org_id_res = org_id_from_req(&ingester, &request);
                             let (_, extensions, raw) = request.into_parts();
                             let _tracked_buf = ingester
@@ -1522,10 +1594,10 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                             if let Some(ref g) = _tracked_buf {
                                 let _ = g.0.read_only_data();
                             }
-                            // Go order: dec(in) -> ServerUserHeaderInterceptor -> PushGrpcMethodEnabled -> tenant.TenantID.
+                            // Go order: dec(in) -> ServerUserHeaderInterceptor -> RPCCallProcessing -> PushGrpcMethodEnabled -> tenant.TenantID.
                             // On the happy path we avoid double-decoding by validating wire bytes early only
-                            // when org_id / push_grpc_method_enabled / tenant_id fails.
-                            if org_id_res.is_err() || !ingester.cfg.push_grpc_method_enabled {
+                            // when org_id / reactive / push_grpc_method_enabled / tenant_id fails.
+                            if org_id_res.is_err() {
                                 if let Err(e) = ingester.validate_grpc_push_wire(&raw) {
                                     drop(tap);
                                     record_push_error(
@@ -1543,7 +1615,37 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                                     return Err(status);
                                 }
                             };
+                            match ingester.prepare_push_reactive(deadline_ctx.as_deref()).await {
+                                Ok(Some(rp)) => {
+                                    if let Some(ref mut t) = tap {
+                                        t.set_reactive_permit(rp);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(reactive_err) => {
+                                    if let Err(e) = ingester.validate_grpc_push_wire(&raw) {
+                                        drop(tap);
+                                        record_push_error(
+                                            &ingester,
+                                            extensions.get::<GrpcErrorLog>(),
+                                            &e,
+                                        );
+                                        return Err(e.map_push_error_to_grpc_server_status());
+                                    }
+                                    drop(tap);
+                                    return Err(Status::unavailable(reactive_err.to_string()));
+                                }
+                            }
                             if !ingester.cfg.push_grpc_method_enabled {
+                                if let Err(e) = ingester.validate_grpc_push_wire(&raw) {
+                                    drop(tap);
+                                    record_push_error(
+                                        &ingester,
+                                        extensions.get::<GrpcErrorLog>(),
+                                        &e,
+                                    );
+                                    return Err(e.map_push_error_to_grpc_server_status());
+                                }
                                 drop(tap);
                                 let e = IngesterError::PushGrpcDisabled;
                                 record_push_error(
@@ -1628,6 +1730,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         RawPushSvc {
                             ingester: Arc::clone(&ingester),
                             tap_slot: push_tap_slot.clone(),
+                            deadline_ctx: deadline_ctx.clone(),
                         },
                         req,
                     ),
@@ -1667,7 +1770,11 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 }
                 resp
             } else if is_query_stream {
-                struct RawQueryStreamSvc(Arc<Ingester>);
+                struct RawQueryStreamSvc {
+                    ingester: Arc<Ingester>,
+                    read_tap_slot: Option<Arc<parking_lot::Mutex<Option<ReadTapGuard>>>>,
+                    deadline_ctx: Option<Arc<RpcDeadlineContext>>,
+                }
                 impl tonic::server::ServerStreamingService<ingesterpb::QueryRequest> for RawQueryStreamSvc {
                     type Response = Bytes;
                     type ResponseStream = RawQueryStreamBox;
@@ -1680,10 +1787,21 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     >;
 
                     fn call(&mut self, request: Request<ingesterpb::QueryRequest>) -> Self::Future {
-                        let ingester = Arc::clone(&self.0);
+                        let ingester = Arc::clone(&self.ingester);
+                        let read_tap_slot = self.read_tap_slot.clone();
+                        let deadline_ctx = self.deadline_ctx.clone();
                         Box::pin(async move {
-                            let user_id = tenant_from_req(&ingester, &request)?;
-                            let (md, ext, inner) = request.into_parts();
+                            let org_id = org_id_from_req(&ingester, &request)?;
+                            let (md, mut ext, inner) = request.into_parts();
+                            prepare_read_reactive_for_slot(
+                                &ingester,
+                                &md,
+                                deadline_ctx.as_deref(),
+                                read_tap_slot.as_deref(),
+                                &mut ext,
+                            )
+                            .await?;
+                            let user_id = tenant_from_org_id(&org_id, &ext)?;
                             let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
                             let act = ingester.insert_activity(|| {
                                 request_activity(
@@ -1744,7 +1862,14 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         true,
                         scope_deadline_ctx(
                             deadline_ctx.clone(),
-                            qs_grpc.server_streaming(RawQueryStreamSvc(ingester), req),
+                            qs_grpc.server_streaming(
+                                RawQueryStreamSvc {
+                                    ingester,
+                                    read_tap_slot: read_tap_slot.clone(),
+                                    deadline_ctx: deadline_ctx.clone(),
+                                },
+                                req,
+                            ),
                         ),
                     )
                     .await;
@@ -1781,7 +1906,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 } else {
                     qs_resp
                 };
-                if let Some(mut guard) = read_tap.take() {
+                if let Some(mut guard) = read_tap_slot.as_ref().and_then(|s| s.lock().take()) {
                     if qs_resp.headers().contains_key("grpc-status") {
                         guard.finish(false);
                         qs_resp
@@ -1799,7 +1924,11 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     qs_resp
                 }
             } else if is_metrics_for_label_matchers {
-                struct RawMetricsForLabelMatchersSvc(Arc<Ingester>);
+                struct RawMetricsForLabelMatchersSvc {
+                    ingester: Arc<Ingester>,
+                    read_tap_slot: Option<Arc<parking_lot::Mutex<Option<ReadTapGuard>>>>,
+                    deadline_ctx: Option<Arc<RpcDeadlineContext>>,
+                }
                 impl tonic::server::UnaryService<ingesterpb::MetricsForLabelMatchersRequest>
                     for RawMetricsForLabelMatchersSvc
                 {
@@ -1812,10 +1941,21 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         &mut self,
                         request: Request<ingesterpb::MetricsForLabelMatchersRequest>,
                     ) -> Self::Future {
-                        let ingester = Arc::clone(&self.0);
+                        let ingester = Arc::clone(&self.ingester);
+                        let read_tap_slot = self.read_tap_slot.clone();
+                        let deadline_ctx = self.deadline_ctx.clone();
                         Box::pin(async move {
-                            let user_id = tenant_from_req(&ingester, &request)?;
-                            let (md, ext, inner) = request.into_parts();
+                            let org_id = org_id_from_req(&ingester, &request)?;
+                            let (md, mut ext, inner) = request.into_parts();
+                            prepare_read_reactive_for_slot(
+                                &ingester,
+                                &md,
+                                deadline_ctx.as_deref(),
+                                read_tap_slot.as_deref(),
+                                &mut ext,
+                            )
+                            .await?;
+                            let user_id = tenant_from_org_id(&org_id, &ext)?;
                             let trace_id =
                                 mimir_common::tracing::current_trace_id().unwrap_or_default();
                             let _act = ingester.insert_activity(|| {
@@ -1872,7 +2012,14 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         true,
                         scope_deadline_ctx(
                             deadline_ctx.clone(),
-                            mflm_grpc.unary(RawMetricsForLabelMatchersSvc(ingester), req),
+                            mflm_grpc.unary(
+                                RawMetricsForLabelMatchersSvc {
+                                    ingester,
+                                    read_tap_slot: read_tap_slot.clone(),
+                                    deadline_ctx: deadline_ctx.clone(),
+                                },
+                                req,
+                            ),
                         ),
                     )
                     .await;
@@ -1911,7 +2058,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 } else {
                     mflm_resp
                 };
-                if let Some(mut guard) = read_tap.take() {
+                if let Some(mut guard) = read_tap_slot.as_ref().and_then(|s| s.lock().take()) {
                     if mflm_resp.headers().contains_key("grpc-status") {
                         guard.finish(false);
                         mflm_resp
@@ -1953,6 +2100,10 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                         inner = inner.send_compressed(enc);
                     }
                 }
+                req.extensions_mut().insert(ReadTapSlotContext {
+                    slot: read_tap_slot.clone(),
+                    deadline_ctx: deadline_ctx.clone(),
+                });
                 let resp = READ_TAP_ADMITTED
                     .scope(
                         true,
@@ -1992,7 +2143,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 } else {
                     resp
                 };
-                if let Some(mut guard) = read_tap.take() {
+                if let Some(mut guard) = read_tap_slot.as_ref().and_then(|s| s.lock().take()) {
                     if resp.headers().contains_key("grpc-status") {
                         guard.finish(false);
                         resp
@@ -2104,9 +2255,29 @@ fn tenant_from_org_id(org_id: &str, ext: &http::Extensions) -> Result<String, St
 
 /// [`org_id_from_req`] + [`tenant_from_org_id`].
 #[allow(clippy::result_large_err)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn tenant_from_req<T>(ingester: &Ingester, req: &Request<T>) -> Result<String, Status> {
     let org_id = org_id_from_req(ingester, req)?;
     tenant_from_org_id(&org_id, req.extensions())
+}
+
+#[allow(clippy::result_large_err)]
+async fn prepare_read_reactive_for_request<T>(
+    ingester: &Ingester,
+    req: &mut Request<T>,
+) -> Result<(), Status> {
+    let Some(ctx) = req.extensions_mut().remove::<ReadTapSlotContext>() else {
+        return Ok(());
+    };
+    let md = req.metadata().clone();
+    prepare_read_reactive_for_slot(
+        ingester,
+        &md,
+        ctx.deadline_ctx.as_deref(),
+        ctx.slot.as_deref(),
+        req.extensions_mut(),
+    )
+    .await
 }
 
 
@@ -2136,9 +2307,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn query_stream(
         &self,
-        request: Request<ingesterpb::QueryRequest>,
+        mut request: Request<ingesterpb::QueryRequest>,
     ) -> Result<Response<Self::QueryStreamStream>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let act = self.ingester.insert_activity(|| {
@@ -2163,9 +2336,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn query_exemplars(
         &self,
-        request: Request<ingesterpb::ExemplarQueryRequest>,
+        mut request: Request<ingesterpb::ExemplarQueryRequest>,
     ) -> Result<Response<ingesterpb::ExemplarQueryResponse>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
@@ -2186,9 +2361,10 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn label_values(
         &self,
-        request: Request<ingesterpb::LabelValuesRequest>,
+        mut request: Request<ingesterpb::LabelValuesRequest>,
     ) -> Result<Response<ingesterpb::LabelValuesResponse>, Status> {
         let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
         let matchers = crate::query::validate_label_values_matchers(request.get_ref())
             .map_err(|e| read_error_status(request.extensions(), e))?;
         let user_id = tenant_from_org_id(&org_id, request.extensions())?;
@@ -2212,9 +2388,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn label_names(
         &self,
-        request: Request<ingesterpb::LabelNamesRequest>,
+        mut request: Request<ingesterpb::LabelNamesRequest>,
     ) -> Result<Response<ingesterpb::LabelNamesResponse>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
@@ -2235,9 +2413,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn user_stats(
         &self,
-        request: Request<ingesterpb::UserStatsRequest>,
+        mut request: Request<ingesterpb::UserStatsRequest>,
     ) -> Result<Response<ingesterpb::UserStatsResponse>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
@@ -2258,10 +2438,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn all_user_stats(
         &self,
-        request: Request<ingesterpb::UserStatsRequest>,
+        mut request: Request<ingesterpb::UserStatsRequest>,
     ) -> Result<Response<ingesterpb::UsersStatsResponse>, Status> {
         // Not per-tenant, but still behind the gRPC auth middleware.
         org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
@@ -2282,9 +2463,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn metrics_for_label_matchers(
         &self,
-        request: Request<ingesterpb::MetricsForLabelMatchersRequest>,
+        mut request: Request<ingesterpb::MetricsForLabelMatchersRequest>,
     ) -> Result<Response<ingesterpb::MetricsForLabelMatchersResponse>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
@@ -2305,9 +2488,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn metrics_metadata(
         &self,
-        request: Request<ingesterpb::MetricsMetadataRequest>,
+        mut request: Request<ingesterpb::MetricsMetadataRequest>,
     ) -> Result<Response<ingesterpb::MetricsMetadataResponse>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
@@ -2332,9 +2517,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn label_names_and_values(
         &self,
-        request: Request<ingesterpb::LabelNamesAndValuesRequest>,
+        mut request: Request<ingesterpb::LabelNamesAndValuesRequest>,
     ) -> Result<Response<Self::LabelNamesAndValuesStream>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let act = self.ingester.insert_activity(|| {
@@ -2367,9 +2554,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn label_values_cardinality(
         &self,
-        request: Request<ingesterpb::LabelValuesCardinalityRequest>,
+        mut request: Request<ingesterpb::LabelValuesCardinalityRequest>,
     ) -> Result<Response<Self::LabelValuesCardinalityStream>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let act = self.ingester.insert_activity(|| {
@@ -2397,9 +2586,11 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn active_series(
         &self,
-        request: Request<ingesterpb::ActiveSeriesRequest>,
+        mut request: Request<ingesterpb::ActiveSeriesRequest>,
     ) -> Result<Response<Self::ActiveSeriesStream>, Status> {
-        let user_id = tenant_from_req(&self.ingester, &request)?;
+        let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
+        let user_id = tenant_from_org_id(&org_id, request.extensions())?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let act = self.ingester.insert_activity(|| {
@@ -2427,11 +2618,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn search_label_names(
         &self,
-        request: Request<ingesterpb::SearchLabelNamesRequest>,
+        mut request: Request<ingesterpb::SearchLabelNamesRequest>,
     ) -> Result<Response<Self::SearchLabelNamesStream>, Status> {
-        // dskit's auth interceptor runs first; then Go validates the input ahead of the tenant and
-        // the deferred read error mapping (InvalidArgument).
+        // dskit's auth interceptor runs first, then RPCCallProcessing; then Go validates the
+        // input ahead of the tenant and the deferred read error mapping (InvalidArgument).
         let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
         let r = request.get_ref();
         let (hints, matchers) =
             build_search_hints(r.filter.as_ref(), r.ordering, r.limit, &r.matchers)
@@ -2466,11 +2658,12 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
 
     async fn search_label_values(
         &self,
-        request: Request<ingesterpb::SearchLabelValuesRequest>,
+        mut request: Request<ingesterpb::SearchLabelValuesRequest>,
     ) -> Result<Response<Self::SearchLabelValuesStream>, Status> {
-        // dskit's auth interceptor runs first; then Go validates the input ahead of the tenant and
-        // the deferred read error mapping (InvalidArgument).
+        // dskit's auth interceptor runs first, then RPCCallProcessing; then Go validates the
+        // input ahead of the tenant and the deferred read error mapping (InvalidArgument).
         let org_id = org_id_from_req(&self.ingester, &request)?;
+        prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
         let r = request.get_ref();
         let (hints, matchers) =
             build_search_hints(r.filter.as_ref(), r.ordering, r.limit, &r.matchers)
@@ -3239,5 +3432,216 @@ mod tests {
         assert!(read_rl.max_inflight() >= 1);
         bp1.finish(std::time::Duration::from_millis(1), true);
         assert_eq!(timeout_count(&read_reg), 1.0);
+    }
+
+    #[tokio::test]
+    async fn w22_deep_03_non_client_streaming_frame_body_decodes_multi_member_gzip() {
+        use std::io::Write as _;
+
+        #[allow(clippy::result_large_err)]
+        async fn collect_body(mut b: NonClientStreamingFrameBody) -> Result<BytesMut, Status> {
+            let mut out = BytesMut::new();
+            while let Some(frame_res) = futures::future::poll_fn(|cx| {
+                hyper::body::Body::poll_frame(Pin::new(&mut b), cx)
+            })
+            .await
+            {
+                if let Ok(data) = frame_res?.into_data() {
+                    out.extend_from_slice(&data);
+                }
+            }
+            Ok(out)
+        }
+
+        let mut e1 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e1.write_all(b"first-member-").unwrap();
+        let mut combined = e1.finish().unwrap();
+
+        let mut e2 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e2.write_all(b"second-member").unwrap();
+        combined.extend_from_slice(&e2.finish().unwrap());
+
+        let mut frame = Vec::with_capacity(5 + combined.len());
+        frame.push(1);
+        frame.extend_from_slice(&(combined.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&combined);
+
+        let body = tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(frame.clone()))));
+        let dec_body = NonClientStreamingFrameBody::new(body, FrameDecompressAlgo::Gzip, 1024);
+        let out = collect_body(dec_body).await.unwrap();
+        assert_eq!(out[0], 0);
+        let len = u32::from_be_bytes([out[1], out[2], out[3], out[4]]) as usize;
+        assert_eq!(&out[5..5 + len], b"first-member-second-member");
+
+        // Bomb across multiple members must still be rejected with ResourceExhausted.
+        let bomb_body = tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(frame))));
+        let bomb_dec = NonClientStreamingFrameBody::new(bomb_body, FrameDecompressAlgo::Gzip, 16);
+        let err = collect_body(bomb_dec).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn only_replica_bypasses_saturated_read_reactive_limiter() {
+        use mimir_proto::prost::Message;
+        use tower::ServiceExt;
+
+        fn encode_uncompressed_grpc<M: Message>(msg: &M) -> Bytes {
+            let payload = msg.encode_to_vec();
+            let mut frame = Vec::with_capacity(5 + payload.len());
+            frame.push(0);
+            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&payload);
+            Bytes::from(frame)
+        }
+
+        async fn drain_grpc_status(resp: http::Response<tonic::body::BoxBody>) -> tonic::Code {
+            if let Some(status) = tonic::Status::from_header_map(resp.headers()) {
+                return status.code();
+            }
+            let mut body = resp.into_body();
+            let mut trailer_status = tonic::Code::Ok;
+            while let Some(frame_res) = futures::future::poll_fn(|cx| {
+                hyper::body::Body::poll_frame(Pin::new(&mut body), cx)
+            })
+            .await
+            {
+                let frame = frame_res.unwrap();
+                if let Some(trailers) = frame.trailers_ref() {
+                    if let Some(st) = tonic::Status::from_header_map(trailers) {
+                        trailer_status = st.code();
+                    }
+                }
+            }
+            trailer_status
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-only-replica".to_string();
+        cfg.read_reactive_limiter = mimir_config::ReactiveLimiterConfig {
+            enabled: true,
+            min_limit: 1,
+            max_limit: 1,
+            initial_limit: 1,
+            // Enable a small queue so requests enter `prepare_read_reactive_for_slot`
+            // (after `try_start_read_tap`) and time out on the saturated limiter unless
+            // `__only_replica__` bypasses `prepare_read_reactive`.
+            initial_rejection_factor: 1.0,
+            max_rejection_factor: 2.0,
+            ..Default::default()
+        };
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let _held = ing
+            .reactive_limiter
+            .read
+            .as_ref()
+            .expect("read reactive limiter enabled")
+            .acquire_permit()
+            .await
+            .unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let label_names_frame = encode_uncompressed_grpc(&ingesterpb::LabelNamesRequest {
+            start_timestamp_ms: now - 60_000,
+            end_timestamp_ms: now + 60_000,
+            ..Default::default()
+        });
+        let query_stream_frame = encode_uncompressed_grpc(&ingesterpb::QueryRequest {
+            start_timestamp_ms: now - 60_000,
+            end_timestamp_ms: now + 60_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__name__".into(),
+                value: "up".into(),
+            }],
+            ..Default::default()
+        });
+        let mflm_frame = encode_uncompressed_grpc(&ingesterpb::MetricsForLabelMatchersRequest {
+            start_timestamp_ms: now - 60_000,
+            end_timestamp_ms: now + 60_000,
+            matchers_set: vec![ingesterpb::LabelMatchers {
+                matchers: vec![ingesterpb::LabelMatcher {
+                    r#type: ingesterpb::MatchType::Equal as i32,
+                    name: "__name__".into(),
+                    value: "up".into(),
+                }],
+            }],
+            limit: 0,
+        });
+
+        let cases = [
+            ("/cortex.Ingester/LabelNames", label_names_frame),
+            ("/cortex.Ingester/QueryStream", query_stream_frame),
+            ("/cortex.Ingester/MetricsForLabelMatchers", mflm_frame),
+        ];
+
+        for (uri, payload) in &cases {
+            let svc = IngesterService::new(Arc::clone(&ing)).into_server();
+            let mut req_rejected = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(*uri)
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+                .header("x-scope-orgid", "t-only-replica")
+                .body(tonic::body::BoxBody::new(SingleChunkBody(Some(
+                    payload.clone(),
+                ))))
+                .unwrap();
+            req_rejected.extensions_mut().insert(RpcDeadlineContext::new(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(20),
+            )));
+            let resp_rejected = svc.oneshot(req_rejected).await.unwrap();
+            assert_eq!(
+                drain_grpc_status(resp_rejected).await,
+                tonic::Code::Unavailable,
+                "expected Unavailable without only-replica header on {uri}"
+            );
+
+            for hdr_name in ["__only_replica__", "x-only-replica"] {
+                let svc = IngesterService::new(Arc::clone(&ing)).into_server();
+                let mut req_ok = http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri(*uri)
+                    .header(http::header::CONTENT_TYPE, "application/grpc")
+                    .header("x-scope-orgid", "t-only-replica")
+                    .header(hdr_name, "true")
+                    .body(tonic::body::BoxBody::new(SingleChunkBody(Some(
+                        payload.clone(),
+                    ))))
+                    .unwrap();
+                req_ok.extensions_mut().insert(RpcDeadlineContext::new(Some(
+                    std::time::Instant::now() + std::time::Duration::from_millis(20),
+                )));
+                let resp_ok = svc.oneshot(req_ok).await.unwrap();
+                assert_eq!(
+                    resp_ok.status(),
+                    http::StatusCode::OK,
+                    "expected 200 OK with {hdr_name}: true on {uri}"
+                );
+                assert_eq!(
+                    drain_grpc_status(resp_ok).await,
+                    tonic::Code::Ok,
+                    "expected gRPC Ok with {hdr_name}: true on {uri}"
+                );
+            }
+        }
     }
 }

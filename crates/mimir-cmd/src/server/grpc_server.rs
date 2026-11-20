@@ -812,6 +812,7 @@ fn unavailable_tap_response(err: impl std::fmt::Display) -> GrpcResponse {
         "grpc-accept-encoding",
         http::HeaderValue::from_static("snappy,s2,gzip,identity"),
     );
+    resp.extensions_mut().insert(mimir_ingester::grpc::TapRejected);
     resp
 }
 
@@ -858,14 +859,50 @@ where
     let (span_ctx, parent_span_id) = start_server_span_context(&extracted_trace, false);
     let span_start_unix_nano = now_unix_nanos();
 
-    // Interceptor order (dskit server.New): TapHandle admission runs in grpc-go transport
-    // header processing BEFORE grpcStatsHandler (`cortex_request_duration_seconds`), Mimir's
-    // GRPCMiddleware (multitenant auth), and cluster validation.
+    // Interceptor order (dskit server.New): TapHandle admission (`RPCCallStarting`) runs in
+    // grpc-go transport header processing BEFORE `grpcStatsHandler` (`RpcGuard`), Mimir's
+    // GRPCMiddleware (multitenant auth), and `ClusterUnaryServerInterceptor` (`check_cluster`).
+    // Acquire the tap permit once here (when `tap_ingester` is wired) and forward it via
+    // request extensions so `IngesterZeroCopyServer` does not double-acquire.
+    let pre_tap = if let Some(ref ing) = cfg.tap_ingester {
+        if known_method.is_some_and(KnownGrpcMethod::is_ingester) {
+            if known_method == Some(KnownGrpcMethod::IngesterPush) {
+                let req_size = parse_tap_message_size_header(req.headers());
+                match ing.try_start_push_tap(req_size) {
+                    Ok(p) => Some(mimir_ingester::grpc::PreAcquiredTap::Push(Arc::new(
+                        Mutex::new(Some(p)),
+                    ))),
+                    Err(e) => return Ok(unavailable_tap_response(e)),
+                }
+            } else {
+                match ing.try_start_read_tap(req.headers()) {
+                    Ok(p) => Some(mimir_ingester::grpc::PreAcquiredTap::Read(Arc::new(
+                        Mutex::new(Some(p)),
+                    ))),
+                    Err(e) => return Ok(unavailable_tap_response(e)),
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // For IngesterPush, `RawPushSvc` runs `dec(in)` before `ServerUserHeaderInterceptor` so
+    // malformed protobuf errors beat `no org id`. Still check `check_org_id_known` before
+    // `check_cluster` so missing `x-scope-orgid` does not spuriously trip `check_cluster`.
     let auth_rejection = (cfg.multitenancy_enabled
         && known_method != Some(KnownGrpcMethod::IngesterPush))
         .then(|| check_org_id_known(req.headers(), known_method, &method))
         .flatten();
+    let push_auth_would_reject = cfg.multitenancy_enabled
+        && known_method == Some(KnownGrpcMethod::IngesterPush)
+        && check_org_id_known(req.headers(), known_method, &method).is_some();
     let rejection = auth_rejection.clone().or_else(|| {
+        if push_auth_would_reject {
+            return None;
+        }
         cfg.cluster_validation.as_ref().and_then(|cv| {
             let skip = match known_method {
                 Some(k) => k.is_streaming_or_health(),
@@ -889,24 +926,6 @@ where
             )
         })
     });
-
-    // When auth/cluster validation rejects, `routes.oneshot(req)` will not run; enforce the
-    // pre-body `TapHandle` check here ahead of `auth_rejection` / `check_cluster` and before
-    // `RpcGuard` / `stats_tracking`.
-    if rejection.is_some() {
-        if let Some(ref ing) = cfg.tap_ingester {
-            if known_method.is_some_and(KnownGrpcMethod::is_ingester) {
-                if known_method == Some(KnownGrpcMethod::IngesterPush) {
-                    let req_size = parse_tap_message_size_header(req.headers());
-                    if let Err(e) = ing.try_start_push_tap(req_size) {
-                        return Ok(unavailable_tap_response(e));
-                    }
-                } else if let Err(e) = ing.try_start_read_tap(req.headers()) {
-                    return Ok(unavailable_tap_response(e));
-                }
-            }
-        }
-    }
 
     conn.active.fetch_add(1, Ordering::AcqRel);
     // Pre-resolve all labeled metric handles once per stream (`grpcStatsHandler.TagRPC` in
@@ -967,6 +986,12 @@ where
     );
     req.extensions_mut().insert(Arc::clone(&deadline_ctx));
 
+    if rejection.is_none() {
+        if let Some(tap) = pre_tap.as_ref() {
+            req.extensions_mut().insert(tap.clone());
+        }
+    }
+
     let req = if let Some(recv) = recv_size {
         req.map(|b| {
             tonic::body::boxed(TrackedBody::with_observer(
@@ -982,7 +1007,21 @@ where
     };
 
     let resp: GrpcResponse = match rejection {
-        Some(status) => status.into_http(),
+        Some(status) => {
+            if let Some(tap) = pre_tap {
+                match tap {
+                    mimir_ingester::grpc::PreAcquiredTap::Push(slot) => {
+                        drop(slot.lock().take());
+                    }
+                    mimir_ingester::grpc::PreAcquiredTap::Read(slot) => {
+                        if let Some(p) = slot.lock().take() {
+                            p.finish(false);
+                        }
+                    }
+                }
+            }
+            status.into_http()
+        }
         None => {
             let call = with_trace_context(span_ctx.clone(), routes.oneshot(req));
             let res = match deadline {
@@ -1018,12 +1057,14 @@ where
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    // Pre-body `TapHandle` rejections from `IngesterZeroCopyServer` carry `grpc-status: 14`
-    // (`Unavailable`) + `grpc-accept-encoding` and must bypass `cortex_request_duration_seconds`
-    // / `grpcStatsHandler` (matching `dskit/server/limits.go:60-63`).
-    if known_method.is_some_and(KnownGrpcMethod::is_ingester)
-        && guard.status_code == Some(14)
-        && resp.headers().contains_key("grpc-accept-encoding")
+    // Genuine `TapHandle` rejections (`RPCCallStarting`) carry the internal `TapRejected`
+    // extension and must bypass `cortex_request_duration_seconds` / `GRPCServerLog` / OTel
+    // (matching `dskit/server/limits.go:60-63`). Post-TapHandle `Unavailable` errors
+    // (InstanceLimit, reactive limiter timeouts/rejections, etc.) MUST be recorded.
+    if resp
+        .extensions()
+        .get::<mimir_ingester::grpc::TapRejected>()
+        .is_some()
     {
         guard.suppress();
     }
