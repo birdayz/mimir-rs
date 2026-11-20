@@ -91,28 +91,78 @@ impl InstrumentRefLeaksConfig {
         ))
         .expect("valid counter opts");
 
+        let inner = Arc::new(RefLeaksTrackerInner {
+            instrument_one_in,
+            wait_before_reuse: self.before_reuse_period,
+            max_inflight_instrumented_bytes: max_inflight,
+            unmarshaled_with_buffer_ref_count: AtomicU64::new(0),
+            inflight_instrumented_bytes: AtomicU64::new(0),
+            inflight_instrumented_bytes_metric: inflight_gauge,
+            instrumented_buffers_total_metric: total_counter,
+            delayed_unmap: Mutex::new(Vec::new()),
+        });
+
         if let Some(reg) = registry {
-            let _ = reg.register(Box::new(inflight_gauge.clone()));
-            let _ = reg.register(Box::new(total_counter.clone()));
+            if let Ok(desc) = prometheus::core::Desc::new(
+                "mimir_reference_leaks_inflight_instrumented_bytes".to_string(),
+                "Total bytes of buffers instrumented for reference leak detection.".to_string(),
+                Vec::new(),
+                HashMap::new(),
+            ) {
+                let _ = reg.register(Box::new(RefLeaksInflightBytesCollector {
+                    desc,
+                    inner: Arc::clone(&inner),
+                }));
+            }
+            let _ = reg.register(Box::new(inner.instrumented_buffers_total_metric.clone()));
         }
 
-        RefLeaksTracker {
-            inner: Some(Arc::new(RefLeaksTrackerInner {
-                instrument_one_in,
-                wait_before_reuse: self.before_reuse_period,
-                max_inflight_instrumented_bytes: max_inflight,
-                unmarshaled_with_buffer_ref_count: AtomicU64::new(0),
-                inflight_instrumented_bytes: AtomicU64::new(0),
-                inflight_instrumented_bytes_metric: inflight_gauge,
-                instrumented_buffers_total_metric: total_counter,
-                delayed_unmap: Mutex::new(Vec::new()),
-            })),
-        }
+        RefLeaksTracker { inner: Some(inner) }
+    }
+}
+
+const UNMAP_QUEUE_CAP: usize = 1000;
+
+struct RefLeaksInflightBytesCollector {
+    desc: prometheus::core::Desc,
+    inner: Arc<RefLeaksTrackerInner>,
+}
+
+impl prometheus::core::Collector for RefLeaksInflightBytesCollector {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        vec![&self.desc]
+    }
+
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        self.inner.drain_expired_delayed_unmaps();
+        let val = self.inner.inflight_instrumented_bytes.load(Ordering::SeqCst) as f64;
+        self.inner.inflight_instrumented_bytes_metric.set(val);
+        let mut g = prometheus::proto::Gauge::default();
+        g.set_value(val);
+        let mut m = prometheus::proto::Metric::default();
+        m.set_gauge(g);
+        let mut mf = prometheus::proto::MetricFamily::default();
+        mf.set_name(self.desc.fq_name.clone());
+        mf.set_help(self.desc.help.clone());
+        mf.set_field_type(prometheus::proto::MetricType::GAUGE);
+        mf.set_metric(vec![m].into());
+        vec![mf]
     }
 }
 
 pub(crate) fn page_size() -> usize {
-    4096
+    static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: `sysconf(_SC_PAGESIZE)` is thread-safe and has no preconditions.
+            let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if sz > 0 {
+                return sz as usize;
+            }
+        }
+        4096
+    })
 }
 
 #[inline]
@@ -299,13 +349,22 @@ impl TrackedBuffer {
             self.state.freed.store(true, Ordering::SeqCst);
             if let Some(ref tracker) = self.state.tracker {
                 if !self.state.wait_before_reuse.is_zero() {
-                    if let Ok(mut q) = tracker.delayed_unmap.lock() {
-                        q.push((
-                            Instant::now() + self.state.wait_before_reuse,
-                            self.state.aligned_len,
-                        ));
+                    let queued = if let Ok(mut q) = tracker.delayed_unmap.lock() {
+                        if q.len() < UNMAP_QUEUE_CAP {
+                            q.push((
+                                Instant::now() + self.state.wait_before_reuse,
+                                self.state.aligned_len,
+                            ));
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if queued {
+                        return;
                     }
-                    return;
                 }
                 tracker.unmap(self.state.aligned_len);
             }

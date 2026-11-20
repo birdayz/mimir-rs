@@ -171,6 +171,9 @@ pub struct OwnedSeriesState {
     pub local_series_limit: usize,
 }
 
+type BlockPlannerCell = Arc<std::sync::OnceLock<Arc<dyn LookupPlanner>>>;
+type BlockPlannerCache = Arc<RwLock<HashMap<Ulid, BlockPlannerCell>>>;
+
 pub struct AppendLockGuard<'a> {
     user_tsdb: &'a UserTsdb,
     acquired_state: TsdbState,
@@ -194,6 +197,8 @@ struct LifecycleCallbackAdapter {
     use_owned_series_for_limits: AtomicBool,
     num_series_fn: RwLock<Option<Arc<dyn Fn() -> u64 + Send + Sync>>>,
     pending_series_removals: Arc<AtomicI64>,
+    postings_cache_invalidations: Option<prometheus::Counter>,
+    postings_cache_invalidation_enabled: Arc<AtomicBool>,
 }
 
 impl SeriesLifecycleCallback for LifecycleCallbackAdapter {
@@ -255,6 +260,11 @@ impl SeriesLifecycleCallback for LifecycleCallbackAdapter {
         let metric_name = labels.get("__name__");
         if !metric_name.is_empty() {
             self.series_in_metric.increase_series_for_metric(metric_name);
+            if self.postings_cache_invalidation_enabled.load(Ordering::Acquire) {
+                if let Some(ref c) = self.postings_cache_invalidations {
+                    c.inc();
+                }
+            }
         }
     }
 
@@ -352,6 +362,8 @@ pub struct UserTsdb {
 
     /// `userTSDB.plannerProvider`: set when index lookup planning is enabled.
     planner_provider: std::sync::OnceLock<Arc<PlannerProvider>>,
+    /// Per-ULID-block cached lookup planners, pruned when blocks unload in `on_blocks_reload`.
+    block_planners: BlockPlannerCache,
     ingested_samples_counter: std::sync::OnceLock<prometheus::Counter>,
     ingested_samples_fail_counter: std::sync::OnceLock<prometheus::Counter>,
 }
@@ -393,12 +405,25 @@ impl UserTsdb {
         }
     }
 
-    /// `getIndexLookupPlannerFunc` for a persisted ULID block.
+    /// `getIndexLookupPlannerFunc` for a persisted ULID block (cached once per opened block).
     pub fn block_lookup_planner(&self, block: &mimir_tsdb::block::Block) -> Arc<dyn LookupPlanner> {
-        match self.planner_provider.get() {
-            Some(provider) => provider.get_planner(&block.meta().into(), block.index()),
-            None => Arc::new(NoopPlanner),
+        let Some(provider) = self.planner_provider.get() else {
+            return Arc::new(NoopPlanner);
+        };
+        let ulid = block.meta().ulid;
+        if let Some(cell) = self.block_planners.read().get(&ulid) {
+            if let Some(planner) = cell.get() {
+                return Arc::clone(planner);
+            }
         }
+        let cell = {
+            let mut map = self.block_planners.write();
+            Arc::clone(
+                map.entry(ulid)
+                    .or_insert_with(|| Arc::new(std::sync::OnceLock::new())),
+            )
+        };
+        Arc::clone(cell.get_or_init(|| provider.get_planner(&block.meta().into(), block.index())))
     }
     #[allow(clippy::too_many_arguments)]
     pub fn open(
@@ -451,6 +476,14 @@ impl UserTsdb {
             local_series_limit: initial_local_limit,
         }));
         let pending_series_removals = Arc::new(AtomicI64::new(0));
+        let postings_cache_invalidation_enabled = Arc::new(AtomicBool::new(false));
+        let postings_cache_invalidations = if blocks_cfg.tsdb.shared_postings_for_matchers_cache
+            && blocks_cfg.tsdb.head_postings_for_matchers_cache_invalidation
+        {
+            shared_metrics.head_postings_cache_invalidations.clone()
+        } else {
+            None
+        };
 
         let lifecycle_adapter = Arc::new(LifecycleCallbackAdapter {
             user_id: user_id.clone(),
@@ -466,6 +499,8 @@ impl UserTsdb {
             ),
             num_series_fn: RwLock::new(None),
             pending_series_removals: Arc::clone(&pending_series_removals),
+            postings_cache_invalidations,
+            postings_cache_invalidation_enabled: Arc::clone(&postings_cache_invalidation_enabled),
         });
 
         let block_duration_ms = blocks_cfg
@@ -534,12 +569,18 @@ impl UserTsdb {
             Arc::new(Mutex::new(HashMap::new()));
         let oldest_unshipped_block_ts_ms = Arc::new(AtomicU64::new(0));
         let user_db_ready = Arc::new(AtomicBool::new(false));
+        let block_planners: BlockPlannerCache = Arc::new(RwLock::new(HashMap::new()));
         let on_blocks_reload: BlocksReloadedFn = {
             let shipped_blocks = Arc::clone(&shipped_blocks);
             let oldest_ts = Arc::clone(&oldest_unshipped_block_ts_ms);
+            let block_planners = Arc::clone(&block_planners);
             Arc::new(move |get_blocks| {
                 let shipped = shipped_blocks.lock();
                 let blocks = get_blocks();
+                let live_ulids: HashSet<Ulid> = blocks.iter().map(|b| b.meta().ulid).collect();
+                block_planners
+                    .write()
+                    .retain(|ulid, _| live_ulids.contains(ulid));
                 let oldest = compute_oldest_unshipped_ms(&blocks, &shipped);
                 oldest_ts.store(oldest, Ordering::Release);
             })
@@ -643,6 +684,7 @@ impl UserTsdb {
         // Compact ready blocks after WAL replay
         let _ = db.compact()?;
         pending_series_removals.store(0, Ordering::Release);
+        postings_cache_invalidation_enabled.store(true, Ordering::Release);
 
         // Enable series limits now that WAL replay is complete
         *lifecycle_adapter.limiter_slot.write() = Some(Arc::clone(&limiter));
@@ -752,6 +794,7 @@ impl UserTsdb {
             lifecycle_adapter,
             current_metadata_limits: Arc::new(Mutex::new(initial_metadata_limits)),
             planner_provider: std::sync::OnceLock::new(),
+            block_planners,
             ingested_samples_counter: std::sync::OnceLock::new(),
             ingested_samples_fail_counter: std::sync::OnceLock::new(),
         });
@@ -1371,17 +1414,27 @@ impl UserTsdb {
 #[derive(Clone)]
 pub struct SharedTsdbMetrics {
     pub head_postings_cache: Option<PostingsForMatchersCacheMetrics>,
+    pub head_postings_cache_invalidations: Option<prometheus::Counter>,
     pub block_postings_cache: Option<PostingsForMatchersCacheMetrics>,
     pub offset_catalogue: OffsetCatalogueMetrics,
 }
 
 impl SharedTsdbMetrics {
     pub fn new(reg: Option<&Registry>) -> Self {
+        let head_postings_cache_invalidations = prometheus::Counter::new(
+            "cortex_ingester_tsdb_head_postings_for_matchers_cache_invalidations_total",
+            "Total number of cache entries that were invalidated.",
+        )
+        .ok();
+        if let (Some(r), Some(ref c)) = (reg, &head_postings_cache_invalidations) {
+            let _ = r.register(Box::new(c.clone()));
+        }
         Self {
             head_postings_cache: Some(PostingsForMatchersCacheMetrics::new(
                 "cortex_ingester_tsdb_head_",
                 reg,
             )),
+            head_postings_cache_invalidations,
             block_postings_cache: Some(PostingsForMatchersCacheMetrics::new(
                 "cortex_ingester_tsdb_block_",
                 reg,
@@ -1699,7 +1752,7 @@ pub(crate) fn head_postings_for_matchers_cache_config(
             0
         },
         metrics: shared_metrics.head_postings_cache.clone(),
-        report_invalidations: shared_invalidation,
+        report_invalidations: false,
     }
 }
 
@@ -1919,7 +1972,7 @@ mod tests {
         let pc_shared = head_postings_for_matchers_cache_config(&shared_inv_cfg, &shared);
         assert!(pc_shared.enable_invalidation);
         assert_eq!(pc_shared.num_metric_versions, 4096);
-        assert!(pc_shared.report_invalidations);
+        assert!(!pc_shared.report_invalidations);
     }
 
     #[test]

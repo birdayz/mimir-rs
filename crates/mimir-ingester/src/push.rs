@@ -987,20 +987,41 @@ impl Ingester {
     }
 
     /// Blocking reactive limiter permit acquisition (`Ingester.PreparePushRequest`).
-    pub async fn prepare_push_reactive(&self) -> Result<Option<ReactivePermit>, IngesterError> {
+    pub async fn prepare_push_reactive(
+        &self,
+        deadline_ctx: Option<&crate::grpc::RpcDeadlineContext>,
+    ) -> Result<Option<ReactivePermit>, IngesterError> {
         let Some(ref rl) = self.reactive_limiter.push else {
             return Ok(None);
         };
-        match rl.acquire_permit().await {
+        let res = match deadline_ctx {
+            Some(ctx) if ctx.has_timed_out() => {
+                ctx.mark_expired();
+                Err("context deadline exceeded".to_string())
+            }
+            Some(ctx) => {
+                if let Some(deadline) = ctx.deadline {
+                    tokio::select! {
+                        r = rl.acquire_permit() => r.map_err(|e| e.to_string()),
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                            ctx.mark_expired();
+                            Err("context deadline exceeded".to_string())
+                        }
+                    }
+                } else {
+                    rl.acquire_permit().await.map_err(|e| e.to_string())
+                }
+            }
+            None => rl.acquire_permit().await.map_err(|e| e.to_string()),
+        };
+        match res {
             Ok(p) => Ok(Some(p)),
-            Err(e) => {
+            Err(message) => {
                 self.metrics
                     .rejected
                     .with_label_values(&[REASON_MAX_INFLIGHT_PUSH_REQUESTS])
                     .inc();
-                Err(IngesterError::ReactiveLimiterExceeded {
-                    message: e.to_string(),
-                })
+                Err(IngesterError::ReactiveLimiterExceeded { message })
             }
         }
     }
@@ -2755,9 +2776,6 @@ impl Ingester {
         };
 
         for (idx, item) in items.iter().enumerate() {
-            if let (Some(cast), Some(prev_item)) = (cast.as_deref(), idx.checked_sub(1).map(|i| &items[i])) {
-                attribute_discarded(cast, &mut ca_prev, &stats, iter_stringlabels(prev_item.encoded_labels), start_append);
-            }
             if let Some(ref g) = resolved_guard {
                 if let Some(Some(ref next_entry)) = g.vec.get(idx + 4) {
                     let next_ptr = Arc::as_ptr(next_entry);
@@ -2769,6 +2787,7 @@ impl Ingester {
             let raw_labels = item.raw_encoded_labels;
             let samples = item.samples;
             let hist_count = item.histograms.len();
+            let step_res: Result<(), IngesterError> = (|| -> Result<(), IngesterError> {
             if !samples.is_empty() && hist_count > 0 {
                 stats.series_with_floats_and_histograms += 1;
             }
@@ -2803,7 +2822,7 @@ impl Ingester {
                         None,
                     );
                 }
-                continue;
+                return Ok(());
             }
 
             if ooo_window_ms <= 0 && min_append_time_available && item.exemplars.is_empty() {
@@ -2828,7 +2847,7 @@ impl Ingester {
                             IngesterError::sample_timestamp_too_old(first_ts, s_str),
                             Some(SampleKind::SampleTimestampTooOld),
                         );
-                        continue;
+                        return Ok(());
                     }
                 } else if !samples.is_empty() && all_samples_oob {
                     stats.failed_samples += samples.len();
@@ -2839,7 +2858,7 @@ impl Ingester {
                         IngesterError::sample_timestamp_too_old(first_ts, s_str),
                         Some(SampleKind::SampleTimestampTooOld),
                     );
-                    continue;
+                    return Ok(());
                 }
             }
 
@@ -2855,7 +2874,7 @@ impl Ingester {
                         Some(SampleKind::LabelsNotSorted),
                     );
                 }
-                continue;
+                return Ok(());
             }
 
             let mut series_entry: Option<Arc<SeriesEntry>> = if let Some(ref mut g) = resolved_guard
@@ -2875,8 +2894,6 @@ impl Ingester {
                 && verify_ownership
                 && !self.check_ring_ownership_iter(user_id, iter_stringlabels(encoded_labels))
             {
-                rollback_appender(user_id, app);
-                drop(lock_guard);
                 return Err(IngesterError::Internal {
                     message: format!(
                         "series {} is not owned by this ingester",
@@ -2943,8 +2960,6 @@ impl Ingester {
                                 &mut make_series_str,
                                 &mut record_partial,
                             ) {
-                                rollback_appender(user_id, app);
-                                drop(lock_guard);
                                 return Err(e.with_user(user_id, 0));
                             }
                         }
@@ -2992,8 +3007,6 @@ impl Ingester {
                             &mut make_series_str,
                             &mut record_partial,
                         ) {
-                            rollback_appender(user_id, app);
-                            drop(lock_guard);
                             return Err(e.with_user(user_id, 0));
                         }
                     }
@@ -3079,8 +3092,6 @@ impl Ingester {
                                     &mut make_series_str,
                                     &mut record_partial,
                                 ) {
-                                    rollback_appender(user_id, app);
-                                    drop(lock_guard);
                                     return Err(e.with_user(user_id, 0));
                                 }
                             }
@@ -3124,8 +3135,6 @@ impl Ingester {
                                 &mut make_series_str,
                                 &mut record_partial,
                             ) {
-                                rollback_appender(user_id, app);
-                                drop(lock_guard);
                                 return Err(e.with_user(user_id, 0));
                             }
                         }
@@ -3292,11 +3301,24 @@ impl Ingester {
                     }
                 }
             }
+            Ok(())
+            })();
+            if let Some(cast) = cast.as_deref() {
+                attribute_discarded(
+                    cast,
+                    &mut ca_prev,
+                    &stats,
+                    iter_stringlabels(raw_labels),
+                    start_append,
+                );
+            }
+            if let Err(e) = step_res {
+                rollback_appender(user_id, app);
+                drop(lock_guard);
+                return Err(e);
+            }
         }
 
-        if let (Some(cast), Some(last)) = (cast.as_deref(), items.last()) {
-            attribute_discarded(cast, &mut ca_prev, &stats, iter_stringlabels(last.encoded_labels), start_append);
-        }
         self.metrics
             .appender_add_duration
             .observe(add_timer.elapsed().as_secs_f64());
@@ -3422,10 +3444,9 @@ impl Ingester {
         };
 
         for ts in timeseries {
-            if let Some(cast) = cast.as_deref() {
-                attribute_discarded(cast, &mut ca_prev, &stats, pairs.iter().copied(), start_append);
-            }
             series_str_cache = None;
+            let mut raw_pairs_if_empty: Option<Vec<(&'a str, &'a str)>> = None;
+            let step_res: Result<(), IngesterError> = (|| -> Result<(), IngesterError> {
             let samples = ts.samples();
             let hist_count = ts.histogram_count();
             if !samples.is_empty() && hist_count > 0 {
@@ -3451,7 +3472,7 @@ impl Ingester {
                     );
                 }
                 pairs.clear();
-                continue;
+                return Ok(());
             }
             if first_series {
                 first_series = false;
@@ -3484,7 +3505,7 @@ impl Ingester {
                             IngesterError::sample_timestamp_too_old(first_ts, s_str),
                             Some(SampleKind::SampleTimestampTooOld),
                         );
-                        continue;
+                        return Ok(());
                     }
                 } else if !samples.is_empty() && all_samples_oob {
                     stats.failed_samples += samples.len();
@@ -3495,7 +3516,7 @@ impl Ingester {
                         IngesterError::sample_timestamp_too_old(first_ts, s_str),
                         Some(SampleKind::SampleTimestampTooOld),
                     );
-                    continue;
+                    return Ok(());
                 }
             }
 
@@ -3518,9 +3539,8 @@ impl Ingester {
             // `newLabelsNotSortedError(ts.Labels)` formats the raw wire labels.
             let unsorted_series_str =
                 (!labels_sorted_unique).then(|| format_labels_string(pairs.iter().copied()));
-            let raw_pairs_if_empty: Option<Vec<(&'a str, &'a str)>> =
-                (has_empty_val && labels_sorted_unique).then(|| pairs.clone());
             if has_empty_val {
+                raw_pairs_if_empty = Some(pairs.clone());
                 pairs.retain(|(_, v)| !v.is_empty());
             }
 
@@ -3553,11 +3573,10 @@ impl Ingester {
                         Some(SampleKind::LabelsNotSorted),
                     );
                 }
-                continue;
+                return Ok(());
             }
 
             if series_ref.is_none() && verify_ownership && !self.check_ring_ownership(user_id, pairs) {
-                rollback_appender(user_id, app);
                 return Err(IngesterError::Internal {
                     message: format!(
                         "series {} is not owned by this ingester",
@@ -3625,7 +3644,6 @@ impl Ingester {
                             ) {
                                 Ok(()) => {}
                                 Err(e) => {
-                                    rollback_appender(user_id, app);
                                     return Err(e.with_user(user_id, 0));
                                 }
                             }
@@ -3661,7 +3679,6 @@ impl Ingester {
                         ) {
                             Ok(()) => {}
                             Err(e) => {
-                                rollback_appender(user_id, app);
                                 return Err(e.with_user(user_id, 0));
                             }
                         }
@@ -3740,7 +3757,6 @@ impl Ingester {
                                 ) {
                                 Ok(()) => {}
                                 Err(e) => {
-                                    rollback_appender(user_id, app);
                                     return Err(e.with_user(user_id, 0));
                                 }
                             }
@@ -3787,7 +3803,6 @@ impl Ingester {
                             ) {
                                 Ok(()) => {}
                                 Err(e) => {
-                                    rollback_appender(user_id, app);
                                     return Err(e.with_user(user_id, 0));
                                 }
                             }
@@ -3941,11 +3956,18 @@ impl Ingester {
                     }
                 }
             }
+            Ok(())
+            })();
+            if let Some(cast) = cast.as_deref() {
+                let ca_pairs = raw_pairs_if_empty.as_deref().unwrap_or(pairs.as_slice());
+                attribute_discarded(cast, &mut ca_prev, &stats, ca_pairs.iter().copied(), start_append);
+            }
+            if let Err(e) = step_res {
+                rollback_appender(user_id, app);
+                return Err(e);
+            }
         }
 
-        if let Some(cast) = cast.as_deref() {
-            attribute_discarded(cast, &mut ca_prev, &stats, pairs.iter().copied(), start_append);
-        }
         self.metrics
             .appender_add_duration
             .observe(add_timer.elapsed().as_secs_f64());

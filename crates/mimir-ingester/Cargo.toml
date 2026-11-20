@@ -15,6 +15,7 @@ axum = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
+flate2 = { workspace = true }
 hashbrown = { workspace = true }
 futures = { workspace = true }
 hyper = { workspace = true }
@@ -32,6 +33,7 @@ tower = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 xxhash-rust = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

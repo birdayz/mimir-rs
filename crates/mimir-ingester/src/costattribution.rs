@@ -398,6 +398,26 @@ fn fill_key(labels: &[CostAttributionLabel], get: &dyn Fn(&str) -> Option<String
     key
 }
 
+/// Ported from `sampleTracker.fillKeyFromLabelAdapters` (`pkg/costattribution/sample_tracker.go`):
+/// writes `""` when the label is present on the wire with an empty value, and `"__missing__"`
+/// only when the label is absent.
+fn fill_sample_key(
+    labels: &[CostAttributionLabel],
+    get: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    let mut key = String::new();
+    for (idx, cal) in labels.iter().enumerate() {
+        if idx > 0 {
+            key.push(SEP);
+        }
+        match get(&cal.input) {
+            Some(v) => key.push_str(&v),
+            None => key.push_str(MISSING_VALUE),
+        }
+    }
+    key
+}
+
 impl IndividualActiveTracker {
     fn new(
         user_id: &str,
@@ -1040,7 +1060,7 @@ impl SampleTracker {
         now: SystemTime,
     ) {
         for t in &self.trackers {
-            let key = fill_key(&t.labels, get);
+            let key = fill_sample_key(&t.labels, get);
             t.update_observations(&key, now, 0.0, value, Some(reason));
         }
     }
@@ -1074,7 +1094,7 @@ impl SampleTracker {
                         .find(|(k, _)| *k == n)
                         .map(|(_, v)| v.to_string())
                 };
-                *dict.entry(fill_key(&t.labels, &get)).or_default() += count;
+                *dict.entry(fill_sample_key(&t.labels, &get)).or_default() += count;
             }
             for (k, v) in dict {
                 t.update_observations(&k, now, v as f64, 0.0, None);

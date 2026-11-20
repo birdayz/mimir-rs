@@ -26,12 +26,16 @@ use mimir_proto::query_stream_enc::{
 use mimir_storage::ingest::partition_offset_watcher::OffsetWatcherError;
 use mimir_storage::ingest::reader::ReaderError;
 use mimir_storage::ingest::PartitionOffsets;
-use mimir_tsdb::block::Block;
+use mimir_tsdb::block::{Block, BlockReadGuard};
 use mimir_tsdb::chunkenc::Encoding;
 use mimir_tsdb::chunks_block::ChunkMeta;
-use mimir_tsdb::compact::compact_chunk_series_merge;
+use mimir_tsdb::compact::{
+    compact_chunk_series_merge, merge_chunks_with_tombstones_and_float_encoding,
+    merge_head_chunks_with_tombstones_and_float_encoding, reencode_chunk_without_tombstones,
+};
 use mimir_tsdb::db::Tsdb;
-use mimir_tsdb::querier::TsdbChunkQuerier;
+use mimir_tsdb::head::HeadReadGuard;
+use mimir_tsdb::querier::BlockSelectStats;
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::matcher::{LabelMatcher, MatchType};
 use mimir_tsdb::querier::{
@@ -614,6 +618,7 @@ impl Ingester {
     pub async fn prepare_read_reactive(
         &self,
         headers: &axum::http::HeaderMap,
+        deadline_ctx: Option<&crate::grpc::RpcDeadlineContext>,
     ) -> Result<Option<ReactivePermit>, IngesterError> {
         if is_only_replica_headers(headers) {
             return Ok(None);
@@ -621,16 +626,34 @@ impl Ingester {
         let Some(ref rl) = self.reactive_limiter.read else {
             return Ok(None);
         };
-        match rl.acquire_permit().await {
+        let res = match deadline_ctx {
+            Some(ctx) if ctx.has_timed_out() => {
+                ctx.mark_expired();
+                Err("context deadline exceeded".to_string())
+            }
+            Some(ctx) => {
+                if let Some(deadline) = ctx.deadline {
+                    tokio::select! {
+                        r = rl.acquire_permit() => r.map_err(|e| e.to_string()),
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                            ctx.mark_expired();
+                            Err("context deadline exceeded".to_string())
+                        }
+                    }
+                } else {
+                    rl.acquire_permit().await.map_err(|e| e.to_string())
+                }
+            }
+            None => rl.acquire_permit().await.map_err(|e| e.to_string()),
+        };
+        match res {
             Ok(p) => Ok(Some(p)),
-            Err(e) => {
+            Err(message) => {
                 self.metrics
                     .rejected
                     .with_label_values(&[REASON_MAX_INFLIGHT_READ_REQUESTS])
                     .inc();
-                Err(IngesterError::ReactiveLimiterExceeded {
-                    message: e.to_string(),
-                })
+                Err(IngesterError::ReactiveLimiterExceeded { message })
             }
         }
     }
@@ -1926,7 +1949,10 @@ impl Ingester {
                             });
                         }
                     }
-                    if let Some(e) = ss.err() {
+                    let err = ss.err();
+                    drop(ss);
+                    let _ = planned_cq.close();
+                    if let Some(e) = err {
                         return Err(IngesterError::Internal {
                             message: format!("selecting series from ChunkQuerier: {e}"),
                         });
@@ -1937,6 +1963,8 @@ impl Ingester {
 
             let mut per_source: Vec<Vec<QueryChunkSeries>> = Vec::new();
             if head_overlaps {
+                // Mirror ONLY the in-order Head slice inside MirroredChunkQuerier, merging OOO
+                // Head chunks outside (matching Go `tsdb/db.go:2955, 2985`).
                 let planner = db.head_lookup_planner();
                 let pq = PlannedTsdbChunkQuerier::new_head(
                     Arc::clone(&db.db),
@@ -1956,7 +1984,61 @@ impl Ingester {
                     },
                 )?);
             }
+            if head_ooo {
+                let _ooo_guard = head.start_read(start_timestamp_ms, end_timestamp_ms);
+                let ooo_refs = head
+                    .postings_for_matchers_with_concurrent(matchers, shard.is_some())
+                    .map_err(|e| IngesterError::Internal {
+                        message: format!("selecting OOO series from Head: {e}"),
+                    })?;
+                let mut ooo_series = Vec::new();
+                let mut ooo_chks = Vec::new();
+                let mut ooo_tombs = Vec::new();
+                let float_enc = head.float_chunk_encoding();
+                for &r in ooo_refs.iter() {
+                    let Some(labels) = head.series_labels(r) else {
+                        continue;
+                    };
+                    if let Some((shard_idx, shard_count)) = shard {
+                        if labels_stable_hash(&labels) % shard_count != shard_idx {
+                            continue;
+                        }
+                    }
+                    ooo_chks.clear();
+                    ooo_tombs.clear();
+                    head.load_series_ooo_chunks_into(r, &mut ooo_chks, &mut ooo_tombs)
+                        .map_err(|e| IngesterError::Internal {
+                            message: format!("loading OOO chunks from Head: {e}"),
+                        })?;
+                    ooo_chks.retain(|cm| {
+                        cm.overlaps_closed_interval(start_timestamp_ms, end_timestamp_ms)
+                    });
+                    if ooo_chks.is_empty() {
+                        continue;
+                    }
+                    let final_chunks = merge_head_chunks_with_tombstones_and_float_encoding(
+                        std::mem::take(&mut ooo_chks),
+                        &ooo_tombs,
+                        float_enc,
+                    )
+                    .map_err(|e| IngesterError::Internal {
+                        message: format!("merging OOO chunks from Head: {e}"),
+                    })?;
+                    if !final_chunks.is_empty() {
+                        ooo_series.push(QueryChunkSeries {
+                            labels,
+                            chunks: final_chunks,
+                        });
+                    }
+                }
+                if !ooo_series.is_empty() {
+                    per_source.push(ooo_series);
+                }
+            }
             for blk in blocks {
+                let Some(block_guard) = Block::start_read(&blk) else {
+                    continue;
+                };
                 let planner = db.block_lookup_planner(&blk);
                 let m = blk.meta();
                 let meta = ChunkBlockMeta {
@@ -1964,9 +2046,10 @@ impl Ingester {
                     min_time: m.min_time,
                     max_time: m.max_time,
                 };
-                let pq = PlannedTsdbChunkQuerier::new_block(
+                let pq = PlannedTsdbChunkQuerier::new_block_with_guard(
                     Arc::clone(&db.db),
                     blk,
+                    block_guard,
                     start_timestamp_ms,
                     end_timestamp_ms,
                     planner,
@@ -4131,11 +4214,15 @@ pub(crate) fn merge_per_block_chunk_series(
 
 pub type EstimatesSink = Arc<parking_lot::Mutex<Vec<(u64, u64)>>>;
 
-#[derive(Clone)]
 enum PlannedSource {
     All,
-    HeadOnly,
-    SingleBlock(Arc<Block>),
+    HeadInOrder {
+        guard: Option<HeadReadGuard>,
+    },
+    SingleBlock {
+        block: Arc<Block>,
+        guard: Option<BlockReadGuard>,
+    },
 }
 
 pub struct PlannedTsdbChunkQuerier {
@@ -4180,9 +4267,10 @@ impl PlannedTsdbChunkQuerier {
         planner: Arc<dyn LookupPlanner>,
         unordered: bool,
     ) -> Self {
+        let guard = Some(db.head().start_read(mint, maxt));
         Self {
             db,
-            source: PlannedSource::HeadOnly,
+            source: PlannedSource::HeadInOrder { guard },
             mint,
             maxt,
             planner,
@@ -4200,9 +4288,34 @@ impl PlannedTsdbChunkQuerier {
         planner: Arc<dyn LookupPlanner>,
         unordered: bool,
     ) -> Self {
+        let guard = Block::start_read(&block);
         Self {
             db,
-            source: PlannedSource::SingleBlock(block),
+            source: PlannedSource::SingleBlock { block, guard },
+            mint,
+            maxt,
+            planner,
+            unordered,
+            select_stats: None,
+            estimates_sink: None,
+        }
+    }
+
+    pub fn new_block_with_guard(
+        db: Arc<Tsdb>,
+        block: Arc<Block>,
+        guard: BlockReadGuard,
+        mint: i64,
+        maxt: i64,
+        planner: Arc<dyn LookupPlanner>,
+        unordered: bool,
+    ) -> Self {
+        Self {
+            db,
+            source: PlannedSource::SingleBlock {
+                block,
+                guard: Some(guard),
+            },
             mint,
             maxt,
             planner,
@@ -4228,30 +4341,318 @@ impl PlannedTsdbChunkQuerier {
         self
     }
 
-    fn build_chunk_querier(&self) -> TsdbChunkQuerier<'_> {
-        match &self.source {
-            PlannedSource::All => {
-                if self.unordered {
-                    self.db.unordered_chunk_querier(self.mint, self.maxt)
-                } else {
-                    self.db.chunk_querier(self.mint, self.maxt)
-                }
-            }
-            PlannedSource::HeadOnly => {
-                if self.unordered {
-                    TsdbChunkQuerier::new_unordered(Some(self.db.head()), Vec::new(), self.mint, self.maxt)
-                } else {
-                    TsdbChunkQuerier::new(Some(self.db.head()), Vec::new(), self.mint, self.maxt)
-                }
-            }
-            PlannedSource::SingleBlock(blk) => {
-                if self.unordered {
-                    TsdbChunkQuerier::new_unordered(None, vec![Arc::clone(blk)], self.mint, self.maxt)
-                } else {
-                    TsdbChunkQuerier::new(None, vec![Arc::clone(blk)], self.mint, self.maxt)
-                }
+    fn record_planned_stats(
+        &self,
+        planning_disabled: bool,
+        q_stats: &QueryStats,
+        stat: BlockSelectStats,
+    ) {
+        if planning_disabled {
+            return;
+        }
+        if let Some((sink, _)) = &self.select_stats {
+            sink.lock().push(stat);
+            if let Some(ref est_sink) = self.estimates_sink {
+                let est_p = QueryStats::load_estimated_selected_postings(Some(q_stats));
+                let est_f = QueryStats::load_estimated_final_cardinality(Some(q_stats));
+                est_sink.lock().push((est_p, est_f));
             }
         }
+    }
+
+    fn select_head_in_order(
+        &self,
+        sort_series: bool,
+        shard: Option<(u64, u64)>,
+        plan: &BasicLookupPlan,
+        planning_disabled: bool,
+        q_stats: &QueryStats,
+    ) -> Box<dyn ChunkSeriesSet> {
+        let PlannedSource::HeadInOrder { guard } = &self.source else {
+            return Box::new(VecChunkSeriesSet {
+                items: Vec::new(),
+                pos: 0,
+                err: None,
+            });
+        };
+        if guard.is_none() {
+            return Box::new(VecChunkSeriesSet {
+                items: Vec::new(),
+                pos: 0,
+                err: None,
+            });
+        }
+        let head = self.db.head();
+        let head_ooo = head.min_ooo_time() != i64::MAX
+            && head.min_ooo_time() <= self.maxt
+            && self.mint <= head.max_ooo_time();
+        let ino_mint = self.mint.max(head.min_time());
+        if !head.initialized() || ino_mint > self.maxt || head.is_closed() {
+            self.record_planned_stats(
+                planning_disabled,
+                q_stats,
+                BlockSelectStats {
+                    selected_postings: 0,
+                    series: 0,
+                    head: true,
+                    overlaps_ooo: head_ooo,
+                    block_min_time: 0,
+                },
+            );
+            return Box::new(VecChunkSeriesSet {
+                items: Vec::new(),
+                pos: 0,
+                err: None,
+            });
+        }
+        let refs = match head
+            .postings_for_matchers_with_concurrent(&plan.index_matchers, shard.is_some())
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Box::new(VecChunkSeriesSet {
+                    items: Vec::new(),
+                    pos: 0,
+                    err: Some(QuerierError::Other(e.to_string())),
+                });
+            }
+        };
+        let float_enc = head.float_chunk_encoding();
+        let mut raw_items: Vec<TsdbChunkSeriesItem> = Vec::with_capacity(refs.len());
+        let mut chks_buf = Vec::new();
+        let mut tombs_buf = Vec::new();
+        for &r in refs.iter() {
+            let Some(labels) = head.series_labels(r) else {
+                continue;
+            };
+            if let Some((shard_idx, shard_count)) = shard {
+                if labels_stable_hash(&labels) % shard_count != shard_idx {
+                    continue;
+                }
+            }
+            if !plan
+                .scan_matchers
+                .iter()
+                .all(|m| m.matches(labels.get(&m.name)))
+            {
+                continue;
+            }
+            chks_buf.clear();
+            tombs_buf.clear();
+            if let Err(e) =
+                head.load_series_in_order_chunks_into(r, ino_mint, self.maxt, &mut chks_buf, &mut tombs_buf)
+            {
+                return Box::new(VecChunkSeriesSet {
+                    items: Vec::new(),
+                    pos: 0,
+                    err: Some(QuerierError::Other(e.to_string())),
+                });
+            }
+            if chks_buf.is_empty() {
+                continue;
+            }
+            let final_chunks = match merge_head_chunks_with_tombstones_and_float_encoding(
+                std::mem::take(&mut chks_buf),
+                &tombs_buf,
+                float_enc,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Box::new(VecChunkSeriesSet {
+                        items: Vec::new(),
+                        pos: 0,
+                        err: Some(QuerierError::Other(e.to_string())),
+                    });
+                }
+            };
+            if !final_chunks.is_empty() {
+                raw_items.push(TsdbChunkSeriesItem {
+                    labels,
+                    chunks: final_chunks,
+                });
+            }
+        }
+        if sort_series {
+            raw_items.sort_by(|a, b| a.labels.cmp(&b.labels));
+        }
+        let items: Vec<Arc<dyn ChunkSeries>> = raw_items
+            .into_iter()
+            .map(|it| Arc::new(it) as Arc<dyn ChunkSeries>)
+            .collect();
+        self.record_planned_stats(
+            planning_disabled,
+            q_stats,
+            BlockSelectStats {
+                selected_postings: refs.len() as u64,
+                series: items.len() as u64,
+                head: true,
+                overlaps_ooo: head_ooo,
+                block_min_time: 0,
+            },
+        );
+        Box::new(VecChunkSeriesSet {
+            items,
+            pos: 0,
+            err: None,
+        })
+    }
+
+    fn select_single_block(
+        &self,
+        sort_series: bool,
+        shard: Option<(u64, u64)>,
+        plan: &BasicLookupPlan,
+        planning_disabled: bool,
+        q_stats: &QueryStats,
+    ) -> Box<dyn ChunkSeriesSet> {
+        let PlannedSource::SingleBlock { block, guard } = &self.source else {
+            return Box::new(VecChunkSeriesSet {
+                items: Vec::new(),
+                pos: 0,
+                err: None,
+            });
+        };
+        if guard.is_none() || !block.overlaps_closed_interval(self.mint, self.maxt) {
+            return Box::new(VecChunkSeriesSet {
+                items: Vec::new(),
+                pos: 0,
+                err: None,
+            });
+        }
+        let refs = match block
+            .postings_for_matchers_with_concurrent(&plan.index_matchers, shard.is_some())
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Box::new(VecChunkSeriesSet {
+                    items: Vec::new(),
+                    pos: 0,
+                    err: Some(QuerierError::Other(e.to_string())),
+                });
+            }
+        };
+        let idx = block.index();
+        let chkr = block.chunks();
+        let tombr = block.tombstones();
+        let float_enc = self.db.head().float_chunk_encoding();
+        let mut raw_items: Vec<TsdbChunkSeriesItem> = Vec::with_capacity(refs.len());
+        for &r in refs.iter() {
+            let (labels, chks) = match idx.series(r) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Box::new(VecChunkSeriesSet {
+                        items: Vec::new(),
+                        pos: 0,
+                        err: Some(QuerierError::Other(e.to_string())),
+                    });
+                }
+            };
+            if let Some((shard_idx, shard_count)) = shard {
+                if labels_stable_hash(&labels) % shard_count != shard_idx {
+                    continue;
+                }
+            }
+            if !plan
+                .scan_matchers
+                .iter()
+                .all(|m| m.matches(labels.get(&m.name)))
+            {
+                continue;
+            }
+            let tombs = tombr.get(r);
+            let mut loaded = Vec::new();
+            for mut cm in chks {
+                if !cm.overlaps_closed_interval(self.mint, self.maxt) {
+                    continue;
+                }
+                if tombs
+                    .iter()
+                    .any(|iv| iv.is_subrange(cm.min_time, cm.max_time))
+                {
+                    continue;
+                }
+                match chkr.chunk(cm.ref_id) {
+                    Ok(chk) => cm.chunk = Some(chk),
+                    Err(e) => {
+                        return Box::new(VecChunkSeriesSet {
+                            items: Vec::new(),
+                            pos: 0,
+                            err: Some(QuerierError::Other(e.to_string())),
+                        });
+                    }
+                }
+                loaded.push((cm, tombs.clone()));
+            }
+            if loaded.is_empty() {
+                continue;
+            }
+            let final_chunks = if self.unordered {
+                match merge_chunks_with_tombstones_and_float_encoding(loaded, true, float_enc) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Box::new(VecChunkSeriesSet {
+                            items: Vec::new(),
+                            pos: 0,
+                            err: Some(QuerierError::Other(e.to_string())),
+                        });
+                    }
+                }
+            } else {
+                let mut reencoded = Vec::with_capacity(loaded.len());
+                for (cm, tombs_item) in loaded {
+                    match reencode_chunk_without_tombstones(cm, &tombs_item) {
+                        Ok(Some(c)) => reencoded.push(c),
+                        Ok(None) => {}
+                        Err(e) => {
+                            return Box::new(VecChunkSeriesSet {
+                                items: Vec::new(),
+                                pos: 0,
+                                err: Some(QuerierError::Other(e.to_string())),
+                            });
+                        }
+                    }
+                }
+                match compact_chunk_series_merge(reencoded, float_enc) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Box::new(VecChunkSeriesSet {
+                            items: Vec::new(),
+                            pos: 0,
+                            err: Some(QuerierError::Other(e.to_string())),
+                        });
+                    }
+                }
+            };
+            if !final_chunks.is_empty() {
+                raw_items.push(TsdbChunkSeriesItem {
+                    labels,
+                    chunks: final_chunks,
+                });
+            }
+        }
+        if sort_series {
+            raw_items.sort_by(|a, b| a.labels.cmp(&b.labels));
+        }
+        let items: Vec<Arc<dyn ChunkSeries>> = raw_items
+            .into_iter()
+            .map(|it| Arc::new(it) as Arc<dyn ChunkSeries>)
+            .collect();
+        self.record_planned_stats(
+            planning_disabled,
+            q_stats,
+            BlockSelectStats {
+                selected_postings: refs.len() as u64,
+                series: items.len() as u64,
+                head: false,
+                overlaps_ooo: false,
+                block_min_time: block.min_time(),
+            },
+        );
+        Box::new(VecChunkSeriesSet {
+            items,
+            pos: 0,
+            err: None,
+        })
     }
 }
 
@@ -4283,7 +4684,34 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
             }
         };
 
-        let mut cq = self.build_chunk_querier().with_concurrent(shard.is_some());
+        match &self.source {
+            PlannedSource::HeadInOrder { .. } => {
+                return self.select_head_in_order(
+                    sort_series,
+                    shard,
+                    &plan,
+                    planning_disabled,
+                    &q_stats,
+                );
+            }
+            PlannedSource::SingleBlock { .. } => {
+                return self.select_single_block(
+                    sort_series,
+                    shard,
+                    &plan,
+                    planning_disabled,
+                    &q_stats,
+                );
+            }
+            PlannedSource::All => {}
+        }
+
+        let mut cq = if self.unordered {
+            self.db.unordered_chunk_querier(self.mint, self.maxt)
+        } else {
+            self.db.chunk_querier(self.mint, self.maxt)
+        }
+        .with_concurrent(shard.is_some());
         let stats_len_before = self.select_stats.as_ref().map(|(s, _)| s.lock().len());
         if !planning_disabled {
             if let Some((sink, filter)) = &self.select_stats {
@@ -4364,6 +4792,15 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
     }
 
     fn close(&mut self) -> Result<(), QuerierError> {
+        match &mut self.source {
+            PlannedSource::All => {}
+            PlannedSource::HeadInOrder { guard } => {
+                *guard = None;
+            }
+            PlannedSource::SingleBlock { guard, .. } => {
+                *guard = None;
+            }
+        }
         Ok(())
     }
 }
