@@ -136,10 +136,18 @@ fn format_unix_rfc3339(unix_secs: i64, subsec_nanos: Option<u32>) -> String {
     let y = if m <= 2 { y + 1 } else { y };
 
     let mut out = String::with_capacity(32);
-    let _ = write!(
-        out,
-        "{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}"
-    );
+    if y < 0 {
+        let _ = write!(
+            out,
+            "-{:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}",
+            y.unsigned_abs()
+        );
+    } else {
+        let _ = write!(
+            out,
+            "{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}"
+        );
+    }
     if let Some(ns) = subsec_nanos {
         if ns != 0 {
             let mut frac = format!("{ns:09}");

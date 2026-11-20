@@ -175,8 +175,8 @@ async fn w17_obs_02_large_pprof_seconds_does_not_overflow_instant() {
     assert!(wd.current().is_some());
     wd.extend_by(Duration::from_secs(i64::MAX as u64));
     assert!(
-        wd.current().is_none(),
-        "overflowing deadline extension must disable write deadline (None) instead of panicking"
+        wd.current().is_some(),
+        "overflowing deadline extension must saturate to a bounded finite deadline instead of clearing to None"
     );
 
     let wd_for_req = SharedWriteDeadline::new(Duration::from_secs(120));
@@ -187,12 +187,11 @@ async fn w17_obs_02_large_pprof_seconds_does_not_overflow_instant() {
         .unwrap();
     req.extensions_mut().insert(wd_for_req.clone());
 
-    // profile_handler only needs to get past configureWriteDeadline without panicking;
-    // cancel the long sleep after a short wait.
-    let _ = tokio::time::timeout(Duration::from_millis(20), profile_handler(req)).await;
+    let resp = profile_handler(req).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     assert!(
-        wd_for_req.current().is_none(),
-        "profile_handler should clear write deadline on overflow without panicking"
+        wd_for_req.current().is_some(),
+        "profile_handler must reject huge seconds without clearing write deadline"
     );
 }
 

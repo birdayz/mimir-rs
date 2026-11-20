@@ -15,10 +15,25 @@
 //!
 //! Only what decides *whether and where* Go fails is modelled: the parse stack is reduced to one
 //! frame per open group with the threshold `repeatIsValid` needs for the last item, so the check
-//! is a single allocation-free pass (one `Vec` push per open group). Not modelled: the
-//! `ErrLarge` / `ErrNestingDepth` limits (`checkLimits`, only reached by expressions with more
-//! than 1000 nested or millions of compiled instructions) and `ErrInvalidUTF8` (Rust strings
-//! are always valid UTF-8).
+//! is a single allocation-free pass (one `Vec` push per open group).
+//!
+//! `checkLimits` (`ErrLarge`, `ErrNestingDepth`) is modelled through the compiled size and
+//! height of every node, behind the same gate as Go: sizes only count once
+//! `numRegexp >= maxSize / repeats` (see [`Limits`]), so literals and alternations of any length
+//! stay valid until the repetition counts multiply up. It is an approximation where Go's result
+//! depends on the exact shape of its parse tree:
+//! - `numRegexp` is under-approximated (only repetition and capture nodes are counted), so an
+//!   expression Go rejects with `ErrLarge` because it allocated thousands of nodes next to a
+//!   large repetition can pass here;
+//! - alternations are sized and measured as written, not after `parser.factor`: once sizes are
+//!   tracked, a multi-megabyte alternation whose alternatives share prefixes can be `ErrLarge`
+//!   here and valid in Go, and a long chain of alternatives that are prefixes of each other can
+//!   be `ErrNestingDepth` in Go and valid here;
+//! - `numRunes` of `\p{...}` classes is estimated.
+//!
+//! Not modelled: `ErrInvalidUTF8` (Rust strings are always valid UTF-8), and the errors of the
+//! second parse `labels.NewFastRegexMatcher` runs on `"^(?s:" + parsed.String() + ")$"` (one
+//! more level of nesting, reported with that rewritten expression).
 
 use std::fmt;
 
@@ -50,9 +65,16 @@ const ERR_MISSING_PAREN: &str = "missing closing )";
 const ERR_MISSING_REPEAT_ARGUMENT: &str = "missing argument to repetition operator";
 const ERR_TRAILING_BACKSLASH: &str = "trailing backslash at end of expression";
 const ERR_UNEXPECTED_PAREN: &str = "unexpected )";
+const ERR_NESTING_DEPTH: &str = "expression nests too deeply";
+const ERR_LARGE: &str = "expression too large";
 
 /// Go `maxRepeat` / the `n` of `repeatIsValid(re, 1000)`.
 const MAX_REPEAT: u64 = 1000;
+
+/// Go `syntax/parse.go` `maxHeight`, `maxSize`, `maxRunes` (`checkLimits`).
+const MAX_HEIGHT: u32 = 1000;
+const MAX_SIZE: u64 = (128 << 20) / 40; // 3_355_443
+const MAX_RUNES: u64 = (128 << 20) / 4; // 33_554_432
 
 /// Go `unicode.MaxRune`.
 const MAX_RUNE: i64 = 0x10FFFF;
@@ -125,6 +147,162 @@ pub struct TranslatedRegex {
     pub has_case_insensitive: bool,
 }
 
+/// The Go `Regexp` ops `parser.collapse` flattens into a parent of the same op.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeOp {
+    Other,
+    Concat,
+    Alternate,
+}
+
+/// What Go `checkLimits` looks at in a parsed node.
+#[derive(Clone, Copy)]
+struct Node {
+    /// Go `calcSize`.
+    size: u64,
+    /// Go `calcHeight`.
+    height: u32,
+    /// The count Go `checkSize` multiplies `parser.repeats` by every time this node goes through
+    /// `checkLimits`: `n` for an `OpRepeat` node (`x{min,max}`), 0 otherwise.
+    repeat_n: u64,
+    op: NodeOp,
+}
+
+impl Node {
+    /// A leaf (`^`, `$`, `.`, a character class, ...), or the empty expression.
+    const LEAF: Node = Node {
+        size: 1,
+        height: 1,
+        repeat_n: 0,
+        op: NodeOp::Other,
+    };
+
+    /// Size and height this node contributes to a `parent` concatenation or alternation:
+    /// `parser.collapse` splices the children of a node of the same op into the parent.
+    #[inline]
+    fn as_sub(self, parent: NodeOp) -> (u64, u32) {
+        if self.op == parent {
+            (self.size, self.height.saturating_sub(1))
+        } else {
+            (self.size, self.height)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ItemKind {
+    /// A run of literal runes Go merges into one `OpLiteral` node (`maybeConcat`).
+    ///
+    /// `cached` is the stale size Go keeps for that node once it tracks sizes (`parser.size`):
+    /// the node is sized when its first rune is pushed (or when tracking starts), and the runes
+    /// merged into it afterwards do not update the cached value. 0 means not cached: the size
+    /// is `len`.
+    Literal { len: u64, fold: bool, cached: u64 },
+    Other(Node),
+}
+
+impl ItemKind {
+    /// The node as Go sizes it when it is pushed (again) on its own: a forced `calcSize`.
+    #[inline]
+    fn node(self) -> Node {
+        match self {
+            ItemKind::Literal { len, .. } => Node {
+                size: len.max(1),
+                ..Node::LEAF
+            },
+            ItemKind::Other(node) => Node {
+                size: node.size.max(1),
+                ..node
+            },
+        }
+    }
+
+    /// Size and height contributed to a multi-item concatenation (cached sizes).
+    #[inline]
+    fn as_concat_sub(self) -> (u64, u32) {
+        match self {
+            ItemKind::Literal { len, cached, .. } => {
+                (if cached != 0 { cached } else { len.max(1) }, 1)
+            }
+            ItemKind::Other(node) => node.as_sub(NodeOp::Concat),
+        }
+    }
+}
+
+/// Go `parser.numRunes` plus the state of the `checkSize` gate.
+///
+/// Go only starts computing compiled sizes (`parser.size != nil`) once
+/// `numRegexp >= maxSize / repeats`, where `repeats` is the product of the counts of every
+/// `OpRepeat` node that went through `checkLimits` — including each time such a node is pushed
+/// again as the only item of a concatenation, the only alternative of a group, or the content of
+/// a non-capturing group. Before that, no expression is ever `ErrLarge` because of its size:
+/// multi-megabyte literals and alternations parse fine as long as their repetition counts are
+/// small.
+///
+/// `numRegexp` (the number of `Regexp` nodes Go allocated, free-list reuse excluded) is not
+/// reproduced exactly; [`Limits::num_regexp_lower_bound`] under-approximates it, so this check
+/// starts tracking no earlier than Go does and never rejects an expression through a gate Go
+/// keeps closed.
+#[derive(Default)]
+struct Limits {
+    num_runes: u64,
+    /// Go `parser.repeats` (0 until the first `checkSize`).
+    repeats: u64,
+    /// Go `parser.size != nil`.
+    tracking: bool,
+    /// Repetition and capture nodes currently alive in the parse stack.
+    live_ops: u64,
+    /// Maximum of `live_ops` so far (`numRegexp` never decreases).
+    peak_ops: u64,
+}
+
+impl Limits {
+    /// Every repetition or capture node alive at the same time is a distinct allocation, and so
+    /// is at least one more node (the innermost operand, or the node being checked).
+    #[inline]
+    fn num_regexp_lower_bound(&self) -> u64 {
+        self.peak_ops.saturating_add(1)
+    }
+
+    #[inline]
+    fn add_op(&mut self) {
+        self.live_ops = self.live_ops.saturating_add(1);
+        self.peak_ops = self.peak_ops.max(self.live_ops);
+    }
+
+    /// Go `parser.checkLimits(re)`.
+    fn check(&mut self, s: &str, node: Node) -> Result<(), GoSyntaxError> {
+        let Node { size, height, repeat_n, .. } = node;
+        if self.num_runes > MAX_RUNES {
+            return Err(err(ERR_LARGE, s));
+        }
+        if !self.tracking {
+            if self.repeats == 0 {
+                self.repeats = 1;
+            }
+            if repeat_n > 0 {
+                if repeat_n > MAX_SIZE / self.repeats {
+                    self.repeats = MAX_SIZE;
+                } else {
+                    self.repeats *= repeat_n;
+                }
+            }
+            if self.num_regexp_lower_bound() >= MAX_SIZE / self.repeats {
+                self.tracking = true;
+            }
+        }
+        if self.tracking && size > MAX_SIZE {
+            return Err(err(ERR_LARGE, s));
+        }
+        // Go skips the height check until `numRegexp >= maxHeight`, which a tree higher than
+        // `maxHeight` always satisfies.
+        if height > MAX_HEIGHT {
+            return Err(err(ERR_NESTING_DEPTH, s));
+        }
+        Ok(())
+    }
+}
+
 /// One open group (or the whole expression) of the Go parse stack.
 #[derive(Default)]
 struct Frame {
@@ -135,17 +313,177 @@ struct Frame {
     rest: u64,
     /// Whether `(?i)` (FoldCase) is currently active in this group frame.
     fold_case: bool,
+    /// Whether this frame corresponds to a capturing group (`OpCapture`).
+    is_capturing: bool,
+    /// Topmost AST item in the current concatenation branch.
+    last_item: Option<ItemKind>,
+    /// Concatenation items flushed prior to `last_item`.
+    concat_count: u32,
+    concat_sum_size: u64,
+    concat_max_height: u32,
+    /// Completed alternation branches prior to the current one.
+    alt_count: u32,
+    alt_sum_size: u64,
+    alt_max_height: u32,
+    /// Repetition and capture nodes alive inside this group ([`Limits::live_ops`]).
+    ops: u64,
 }
 
 impl Frame {
-    fn push(&mut self, threshold: u64) {
+    /// Moves the topmost item below a new one: it becomes one more item of a concatenation.
+    fn flush_item(&mut self, prev_item: ItemKind) {
+        let (psz, ph) = prev_item.as_concat_sub();
+        self.concat_count = self.concat_count.saturating_add(1);
+        self.concat_sum_size = self.concat_sum_size.saturating_add(psz);
+        self.concat_max_height = self.concat_max_height.max(ph);
+    }
+
+    fn push_other(
+        &mut self,
+        s: &str,
+        threshold: u64,
+        node: Node,
+        lim: &mut Limits,
+        rune_delta: u64,
+    ) -> Result<(), GoSyntaxError> {
+        lim.num_runes = lim.num_runes.saturating_add(rune_delta);
         if let Some(prev) = self.last.replace(threshold) {
             self.rest = self.rest.max(prev);
+        }
+        if let Some(prev_item) = self.last_item.replace(ItemKind::Other(node)) {
+            self.flush_item(prev_item);
+        }
+        lim.check(s, node)
+    }
+
+    /// Go `parser.literal` for `add_len` runes: each one is pushed (and checked) as a one-rune
+    /// `OpLiteral` and then merged into the literal below it.
+    fn push_literal_run(
+        &mut self,
+        s: &str,
+        add_len: u64,
+        fold: bool,
+        lim: &mut Limits,
+    ) -> Result<(), GoSyntaxError> {
+        lim.num_runes = lim.num_runes.saturating_add(add_len);
+        let was_tracking = lim.tracking;
+        if let Some(ItemKind::Literal { len, fold: prev_fold, cached }) = self.last_item {
+            if prev_fold == fold {
+                self.last = Some(0);
+                let res = lim.check(s, Node::LEAF);
+                // Tracking started on this push: Go sizes the run as it is on the stack.
+                let cached = if cached == 0 && !was_tracking && lim.tracking {
+                    len
+                } else {
+                    cached
+                };
+                self.last_item = Some(ItemKind::Literal {
+                    len: len.saturating_add(add_len),
+                    fold,
+                    cached,
+                });
+                return res;
+            }
+        }
+        if let Some(prev) = self.last.replace(0) {
+            self.rest = self.rest.max(prev);
+        }
+        if let Some(prev_item) = self.last_item.take() {
+            self.flush_item(prev_item);
+        }
+        let res = lim.check(s, Node::LEAF);
+        self.last_item = Some(ItemKind::Literal {
+            len: add_len,
+            fold,
+            cached: u64::from(lim.tracking),
+        });
+        res
+    }
+
+    /// Go `parser.concat`: collapses the items of the current branch and pushes the result,
+    /// which is the item itself (pushed, and checked, once more) when there is only one.
+    fn finalize_branch(&mut self, s: &str, lim: &mut Limits) -> Result<Node, GoSyntaxError> {
+        let total = self.concat_count + u32::from(self.last_item.is_some());
+        let node = match (total, self.last_item) {
+            (0, _) | (_, None) => Node::LEAF,
+            (1, Some(item)) => item.node(),
+            (_, Some(item)) => {
+                let (lsz, lh) = item.as_concat_sub();
+                Node {
+                    size: self.concat_sum_size.saturating_add(lsz).max(1),
+                    height: self.concat_max_height.max(lh).saturating_add(1),
+                    repeat_n: 0,
+                    op: NodeOp::Concat,
+                }
+            }
+        };
+        self.last_item = None;
+        self.concat_count = 0;
+        self.concat_sum_size = 0;
+        self.concat_max_height = 0;
+        lim.check(s, node)?;
+        Ok(node)
+    }
+
+    fn push_alt(&mut self, s: &str, lim: &mut Limits) -> Result<(), GoSyntaxError> {
+        let (bsz, bh) = self.finalize_branch(s, lim)?.as_sub(NodeOp::Alternate);
+        self.alt_count = self.alt_count.saturating_add(1);
+        self.alt_sum_size = self.alt_sum_size.saturating_add(bsz);
+        self.alt_max_height = self.alt_max_height.max(bh);
+        self.rest = self.close_threshold();
+        self.last = None;
+        Ok(())
+    }
+
+    /// Go `parser.concat` + `parser.alternate` at a `)` or at the end of the expression, plus the
+    /// `OpCapture` node of a capturing group. Returns the group's threshold and node; the
+    /// caller pushes it onto the parent frame.
+    fn close_group(&mut self, s: &str, lim: &mut Limits) -> Result<(u64, Node), GoSyntaxError> {
+        let threshold = self.close_threshold();
+        let branch = self.finalize_branch(s, lim)?;
+        let inner = if self.alt_count > 0 {
+            let (bsz, bh) = branch.as_sub(NodeOp::Alternate);
+            let total_alts = self.alt_count.saturating_add(1);
+            let alt = Node {
+                size: self
+                    .alt_sum_size
+                    .saturating_add(bsz)
+                    .saturating_add(u64::from(total_alts - 1))
+                    .max(1),
+                height: self.alt_max_height.max(bh).saturating_add(1),
+                repeat_n: 0,
+                op: NodeOp::Alternate,
+            };
+            // `collapse(subs, OpAlternate)` factors common prefixes and may free any node of
+            // the alternatives: none of them counts as alive any more.
+            lim.live_ops = lim.live_ops.saturating_sub(self.ops);
+            self.ops = 0;
+            lim.check(s, alt)?;
+            alt
+        } else {
+            // `collapse` of a single alternative returns it as is, and `alternate` pushes (and
+            // checks) it again.
+            lim.check(s, branch)?;
+            branch
+        };
+        if self.is_capturing {
+            let capture = Node {
+                size: inner.size.saturating_add(2),
+                height: inner.height.saturating_add(1),
+                repeat_n: 0,
+                op: NodeOp::Other,
+            };
+            self.ops = self.ops.saturating_add(1);
+            lim.add_op();
+            lim.check(s, capture)?;
+            Ok((threshold, capture))
+        } else {
+            Ok((threshold, inner))
         }
     }
 
     /// Threshold of the whole group (`concat` + `alternate`).
-    fn close(&self) -> u64 {
+    fn close_threshold(&self) -> u64 {
         self.rest.max(self.last.unwrap_or(0))
     }
 }
@@ -169,6 +507,7 @@ pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
     let mut frames: Vec<Frame> = vec![Frame::default()];
     let mut out = String::with_capacity(s.len());
     let mut has_case_insensitive = false;
+    let mut lim = Limits::default();
     // Start offset of the previous repetition operator (Go `lastRepeat`).
     let mut last_repeat: Option<usize> = None;
     let mut pos = 0;
@@ -186,6 +525,7 @@ pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
                     let parent_fold = top(&mut frames).fold_case;
                     frames.push(Frame {
                         fold_case: parent_fold,
+                        is_capturing: true,
                         ..Frame::default()
                     });
                     out.push('(');
@@ -193,9 +533,7 @@ pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
                 }
             }
             b'|' => {
-                let cur = top(&mut frames);
-                cur.rest = cur.close();
-                cur.last = None;
+                top(&mut frames).push_alt(s, &mut lim)?;
                 out.push('|');
                 pos += 1;
             }
@@ -203,13 +541,17 @@ pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
                 if frames.len() < 2 {
                     return Err(err(ERR_UNEXPECTED_PAREN, s));
                 }
-                let threshold = frames.pop().map_or(0, |f| f.close());
-                top(&mut frames).push(threshold);
+                let mut popped = frames.pop().unwrap_or_default();
+                let (threshold, group) = popped.close_group(s, &mut lim)?;
+                // Go `parseRightParen` pushes the group content (or its `OpCapture`) back.
+                let parent = top(&mut frames);
+                parent.ops = parent.ops.saturating_add(popped.ops);
+                parent.push_other(s, threshold, group, &mut lim, 0)?;
                 out.push(')');
                 pos += 1;
             }
             b'^' | b'$' | b'.' => {
-                top(&mut frames).push(0);
+                top(&mut frames).push_other(s, 0, Node::LEAF, &mut lim, 0)?;
                 out.push(b[pos] as char);
                 pos += 1;
             }
@@ -218,12 +560,26 @@ pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
                 if fold_case {
                     has_case_insensitive = true;
                 }
-                pos = parse_class_into(s, pos, fold_case, &mut out)?;
-                top(&mut frames).push(0);
+                let (next_pos, class_runes) = parse_class_into(s, pos, fold_case, &mut out)?;
+                pos = next_pos;
+                top(&mut frames).push_other(s, 0, Node::LEAF, &mut lim, class_runes)?;
             }
             b'*' | b'+' | b'?' => {
                 let before = pos;
-                pos = apply_repeat(s, &mut frames, None, before, pos + 1, last_repeat)?;
+                let op = match b[pos] {
+                    b'*' => RepeatKind::Star,
+                    b'+' => RepeatKind::Plus,
+                    _ => RepeatKind::Quest,
+                };
+                pos = apply_repeat(
+                    s,
+                    &mut frames,
+                    op,
+                    before,
+                    pos + 1,
+                    last_repeat,
+                    &mut lim,
+                )?;
                 out.push_str(&s[before..pos]);
                 repeat = Some(before);
             }
@@ -232,7 +588,8 @@ pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
                 match parse_repeat(b, pos) {
                     None => {
                         // Not a repetition: `{` is a literal in Go (e.g. `a{01}`, `a{,2}`, `x{1001`).
-                        top(&mut frames).push(0);
+                        let fold = top(&mut frames).fold_case;
+                        top(&mut frames).push_literal_run(s, 1, fold, &mut lim)?;
                         out.push_str(r"\{");
                         pos += 1;
                     }
@@ -240,7 +597,15 @@ pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
                         if !(0..=1000).contains(&min) || max > 1000 || (max >= 0 && min > max) {
                             return Err(err(ERR_INVALID_REPEAT_SIZE, &s[before..after]));
                         }
-                        pos = apply_repeat(s, &mut frames, Some((min, max)), before, after, last_repeat)?;
+                        pos = apply_repeat(
+                            s,
+                            &mut frames,
+                            RepeatKind::Bounded(min, max),
+                            before,
+                            after,
+                            last_repeat,
+                            &mut lim,
+                        )?;
                         out.push_str(&s[before..pos]);
                         repeat = Some(before);
                     }
@@ -248,7 +613,8 @@ pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
             }
             b'\\' => {
                 let fold = top(&mut frames).fold_case;
-                let (next, used_lit) = parse_top_level_escape_into(s, pos, &mut frames, &mut out)?;
+                let (next, used_lit) =
+                    parse_top_level_escape_into(s, pos, &mut frames, &mut out, &mut lim)?;
                 if fold && used_lit {
                     has_case_insensitive = true;
                 }
@@ -257,12 +623,13 @@ pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
             _ => {
                 let clen = next_char_len(s, pos);
                 let ch_str = &s[pos..pos + clen];
-                if top(&mut frames).fold_case && ch_str.chars().any(char::is_alphabetic) {
+                let fold = top(&mut frames).fold_case;
+                if fold && ch_str.chars().any(char::is_alphabetic) {
                     has_case_insensitive = true;
                 }
                 out.push_str(ch_str);
                 pos += clen;
-                top(&mut frames).push(0);
+                top(&mut frames).push_literal_run(s, 1, fold, &mut lim)?;
             }
         }
         last_repeat = repeat;
@@ -270,6 +637,8 @@ pub fn translate_to_rust(s: &str) -> Result<TranslatedRegex, GoSyntaxError> {
     if frames.len() != 1 {
         return Err(err(ERR_MISSING_PAREN, s));
     }
+    let mut root = frames.pop().unwrap_or_default();
+    root.close_group(s, &mut lim)?;
     Ok(TranslatedRegex {
         pattern: out,
         has_case_insensitive,
@@ -290,15 +659,23 @@ fn is_alnum(c: char) -> bool {
     c.is_ascii_alphanumeric()
 }
 
-/// Go `parser.repeat`: `bounds` is `Some((min, max))` for `{min,max}` (OpRepeat), `None` for
-/// `*`, `+` and `?`.
+#[derive(Clone, Copy)]
+enum RepeatKind {
+    Star,
+    Plus,
+    Quest,
+    Bounded(i64, i64),
+}
+
+/// Go `parser.repeat`.
 fn apply_repeat(
     s: &str,
     frames: &mut [Frame],
-    bounds: Option<(i64, i64)>,
+    kind: RepeatKind,
     before: usize,
     mut after: usize,
     last_repeat: Option<usize>,
+    lim: &mut Limits,
 ) -> Result<usize, GoSyntaxError> {
     let b = s.as_bytes();
     // PerlX: non-greedy suffix, no stacked repetition operators.
@@ -312,9 +689,40 @@ fn apply_repeat(
     let Some(sub) = cur.last else {
         return Err(err(ERR_MISSING_REPEAT_ARGUMENT, &s[before..after]));
     };
-    let threshold = match bounds {
-        None => sub,
-        Some((min, max)) => {
+    // The operator applies to the last rune of a literal run only: the runes before it stay
+    // behind as an item of their own.
+    if let Some(ItemKind::Literal { len, fold, cached }) = cur.last_item {
+        if len > 1 {
+            cur.flush_item(ItemKind::Literal {
+                len: len - 1,
+                fold,
+                cached: cached.min(len - 1),
+            });
+        }
+    }
+    let (sub_sz, sub_h) = match cur.last_item {
+        Some(ItemKind::Other(node)) => (node.size.max(1), node.height),
+        Some(ItemKind::Literal { .. }) | None => (1, 1),
+    };
+    let (new_sz, new_h, threshold) = match kind {
+        RepeatKind::Star => (sub_sz.saturating_add(2), sub_h.saturating_add(1), sub),
+        RepeatKind::Plus | RepeatKind::Quest => {
+            (sub_sz.saturating_add(1), sub_h.saturating_add(1), sub)
+        }
+        RepeatKind::Bounded(min, max) => {
+            let new_sz = if max < 0 {
+                if min == 0 {
+                    sub_sz.saturating_add(2)
+                } else {
+                    1u64.saturating_add((min as u64).saturating_mul(sub_sz))
+                }
+            } else {
+                (max as u64)
+                    .saturating_mul(sub_sz)
+                    .saturating_add((max - min) as u64)
+                    .max(1)
+            };
+            let new_h = sub_h.saturating_add(1);
             let threshold = if max == 0 {
                 0
             } else {
@@ -325,12 +733,29 @@ fn apply_repeat(
                     m.max(m.saturating_mul(sub))
                 }
             };
-            if (min >= 2 || max >= 2) && threshold > MAX_REPEAT {
-                return Err(err(ERR_INVALID_REPEAT_SIZE, &s[before..after]));
-            }
-            threshold
+            (new_sz, new_h, threshold)
         }
     };
+    // Go `checkSize`: `n := re.Max; if n == -1 { n = re.Min }; if n <= 0 { n = 1 }` (OpRepeat only).
+    let repeat_n = match kind {
+        RepeatKind::Bounded(min, max) => (if max < 0 { min } else { max }).max(1) as u64,
+        RepeatKind::Star | RepeatKind::Plus | RepeatKind::Quest => 0,
+    };
+    cur.ops = cur.ops.saturating_add(1);
+    lim.add_op();
+    let node = Node {
+        size: new_sz,
+        height: new_h,
+        repeat_n,
+        op: NodeOp::Other,
+    };
+    lim.check(s, node)?;
+    if let RepeatKind::Bounded(min, max) = kind {
+        if (min >= 2 || max >= 2) && threshold > MAX_REPEAT {
+            return Err(err(ERR_INVALID_REPEAT_SIZE, &s[before..after]));
+        }
+    }
+    cur.last_item = Some(ItemKind::Other(node));
     cur.last = Some(threshold);
     Ok(after)
 }
@@ -417,6 +842,7 @@ fn parse_perl_flags(
         let parent_fold = top(frames).fold_case;
         frames.push(Frame {
             fold_case: parent_fold,
+            is_capturing: true,
             ..Frame::default()
         });
         // FastRegexMatcher never inspects capture names or numbers; emit a non-capturing
@@ -582,29 +1008,37 @@ fn push_class_rune(out: &mut String, r: i64) {
 }
 
 /// The `\` case of Go `parse`; `pos` is at the backslash. Returns `(next_pos, emitted_literal_or_class)`.
+fn unicode_class_rune_estimate(name: &str) -> u64 {
+    match name {
+        "L" | "LC" | "Lo" | "Lu" | "Ll" => 1292,
+        _ => 32,
+    }
+}
+
 fn parse_top_level_escape_into(
     s: &str,
     pos: usize,
     frames: &mut [Frame],
     out: &mut String,
+    lim: &mut Limits,
 ) -> Result<(usize, bool), GoSyntaxError> {
     let b = s.as_bytes();
     if b.len() - pos >= 2 {
         match b[pos + 1] {
             b'A' | b'z' => {
-                top(frames).push(0);
+                top(frames).push_other(s, 0, Node::LEAF, lim, 0)?;
                 out.push('\\');
                 out.push(b[pos + 1] as char);
                 return Ok((pos + 2, false));
             }
             b'b' => {
-                top(frames).push(0);
+                top(frames).push_other(s, 0, Node::LEAF, lim, 0)?;
                 // Go prog.go:IsWordChar is strictly ASCII [0-9A-Za-z_].
                 out.push_str(r"(?-u:\b)");
                 return Ok((pos + 2, false));
             }
             b'B' => {
-                top(frames).push(0);
+                top(frames).push_other(s, 0, Node::LEAF, lim, 0)?;
                 out.push_str(r"(?-u:\B)");
                 return Ok((pos + 2, false));
             }
@@ -619,7 +1053,9 @@ fn parse_top_level_escape_into(
                     None => (rest, s.len()),
                 };
                 if !lit.is_empty() {
-                    top(frames).push(0);
+                    let fold = top(frames).fold_case;
+                    let cnt = lit.chars().count() as u64;
+                    top(frames).push_literal_run(s, cnt, fold, lim)?;
                     for c in lit.chars() {
                         push_outside_char(out, c);
                     }
@@ -631,12 +1067,13 @@ fn parse_top_level_escape_into(
         }
     }
     if let Some((end, negated, name)) = parse_unicode_class(s, pos)? {
-        top(frames).push(0);
+        let est = unicode_class_rune_estimate(name);
+        top(frames).push_other(s, 0, Node::LEAF, lim, est)?;
         push_unicode_class_outside(out, &s[pos..end], negated, name);
         return Ok((end, true));
     }
     if let Some(end) = parse_perl_class_escape(s, pos) {
-        top(frames).push(0);
+        top(frames).push_other(s, 0, Node::LEAF, lim, 6)?;
         // Go `Perl` mode `\d`, `\s`, `\w` are strictly ASCII, whereas Rust `regex`
         // defaults to Unicode mode for `\d`/`\s`/`\w`.
         match &s[pos..end] {
@@ -651,7 +1088,8 @@ fn parse_top_level_escape_into(
         return Ok((end, true));
     }
     let (r, end) = parse_escape(s, pos)?;
-    top(frames).push(0);
+    let fold = top(frames).fold_case;
+    top(frames).push_literal_run(s, 1, fold, lim)?;
     push_outside_rune(out, r);
     Ok((end, true))
 }
@@ -869,7 +1307,7 @@ fn parse_class_into(
     pos: usize,
     fold_case: bool,
     out: &mut String,
-) -> Result<usize, GoSyntaxError> {
+) -> Result<(usize, u64), GoSyntaxError> {
     let b = s.as_bytes();
     let mut t = pos + 1;
     let class_start = out.len();
@@ -881,6 +1319,7 @@ fn parse_class_into(
         t += 1;
     }
     let mut any_item = false;
+    let mut class_runes: u64 = 0;
     // `]` and `-` are okay as first char in class (Perl mode: `-` anywhere).
     let mut first = true;
     while t >= b.len() || b[t] != b']' || first {
@@ -888,6 +1327,7 @@ fn parse_class_into(
         if b.len() - t > 2 && b[t] == b'[' && b[t + 1] == b':' {
             if let Some(nt) = parse_named_class(s, t)? {
                 let name = &s[t..nt];
+                class_runes = class_runes.saturating_add(16);
                 if fold_case {
                     // Under (?i), Go folds POSIX groups before negating (so U+017F 'ſ' and U+212A 'K'
                     // are excluded from negated classes that exclude 's'/'k'), whereas Rust regex folds
@@ -911,6 +1351,7 @@ fn parse_class_into(
             }
         }
         if let Some((nt, u_neg, u_name)) = parse_unicode_class(s, t)? {
+            class_runes = class_runes.saturating_add(unicode_class_rune_estimate(u_name));
             if push_unicode_class_in_class(out, &s[t..nt], u_neg, u_name) {
                 any_item = true;
             }
@@ -918,6 +1359,7 @@ fn parse_class_into(
             continue;
         }
         if let Some(nt) = parse_perl_class_escape(s, t) {
+            class_runes = class_runes.saturating_add(6);
             match &s[t..nt] {
                 r"\d" => out.push_str("0-9"),
                 r"\D" => out.push_str(r"\x{0}-\x{2F}\x{3A}-\x{10FFFF}"),
@@ -949,11 +1391,15 @@ fn parse_class_into(
             if hi < lo {
                 return Err(err(ERR_INVALID_CHAR_RANGE, &s[rng..t]));
             }
+            class_runes = class_runes.saturating_add(2);
             if push_class_range_no_surrogates(out, lo, hi) {
                 any_item = true;
             }
-        } else if push_class_range_no_surrogates(out, lo, lo) {
-            any_item = true;
+        } else {
+            class_runes = class_runes.saturating_add(2);
+            if push_class_range_no_surrogates(out, lo, lo) {
+                any_item = true;
+            }
         }
     }
     if !any_item {
@@ -966,7 +1412,7 @@ fn parse_class_into(
     } else {
         out.push(']');
     }
-    Ok(t + 1)
+    Ok((t + 1, class_runes))
 }
 
 #[cfg(test)]

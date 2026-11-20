@@ -152,7 +152,11 @@ fn decode_query_component(s: &str) -> String {
         if bytes[i] == b'+' {
             out.push(b' ');
             i += 1;
-        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+        } else if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
             if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
                 out.push(v);
                 i += 3;
@@ -183,11 +187,18 @@ pub async fn profile_handler(req: Request) -> Response {
     if !matches!(*req.method(), Method::GET | Method::HEAD) {
         return method_not_allowed_pprof();
     }
+    const MAX_PROFILE_SECONDS: i64 = 86_400;
     let sec = form_value(req.uri().query(), "seconds")
         .and_then(|s| s.parse::<i64>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(30);
-    let duration = Duration::from_secs(sec.unsigned_abs());
+    if sec > MAX_PROFILE_SECONDS {
+        return serve_error(
+            StatusCode::BAD_REQUEST,
+            &format!("profile seconds {sec} exceeds maximum {MAX_PROFILE_SECONDS}"),
+        );
+    }
+    let duration = Duration::from_secs(sec as u64);
     if let Some(wd) = req.extensions().get::<SharedWriteDeadline>() {
         wd.extend_by(duration);
     }

@@ -13,7 +13,8 @@ use mimir_config::KafkaConfig;
 use parking_lot::Mutex as SyncMutex;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::{Metric as ProtoMetric, MetricFamily, MetricType, Quantile, Summary as ProtoSummary};
-use prometheus::{Counter, CounterVec, Gauge, Histogram, HistogramOpts, Opts, Registry};
+use mimir_common::native_histogram::{HistogramOpts, SingleHistogram, DEF_BUCKETS};
+use prometheus::{Counter, CounterVec, Gauge, Opts, Registry};
 use thiserror::Error;
 use tokio::sync::{watch, Notify, Semaphore};
 
@@ -882,8 +883,8 @@ pub struct KafkaProducer {
     buffered_produce_bytes_limit: Gauge,
     produce_records_enqueued_total: Counter,
     produce_records_failed_total: CounterVec,
-    produce_records_enqueue_duration: Histogram,
-    produce_remaining_deadline: Histogram,
+    produce_records_enqueue_duration: SingleHistogram,
+    produce_remaining_deadline: SingleHistogram,
 }
 
 impl KafkaProducer {
@@ -925,15 +926,23 @@ impl KafkaProducer {
             &["reason"],
         )
         .expect("valid metric");
-        let produce_records_enqueue_duration = Histogram::with_opts(HistogramOpts::new(
-            format!("{prefix}produce_records_enqueue_duration_seconds"),
-            "How long it takes to enqueue produced Kafka records in the client, appending them to the batches that will sent to the Kafka backend (in seconds).",
-        ))
+        let produce_records_enqueue_duration = SingleHistogram::new(
+            HistogramOpts::new(
+                format!("{prefix}produce_records_enqueue_duration_seconds"),
+                "How long it takes to enqueue produced Kafka records in the client, appending them to the batches that will sent to the Kafka backend (in seconds).",
+            )
+            .buckets(DEF_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
+        )
         .expect("valid metric");
-        let produce_remaining_deadline = Histogram::with_opts(HistogramOpts::new(
-            format!("{prefix}produce_remaining_deadline_seconds"),
-            "The remaining deadline (in seconds) when records are requested to be produced.",
-        ))
+        let produce_remaining_deadline = SingleHistogram::new(
+            HistogramOpts::new(
+                format!("{prefix}produce_remaining_deadline_seconds"),
+                "The remaining deadline (in seconds) when records are requested to be produced.",
+            )
+            .buckets(DEF_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
+        )
         .expect("valid metric");
 
         if let Some(reg) = registry {

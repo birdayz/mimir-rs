@@ -52,7 +52,7 @@ pub use limits::{
 };
 pub use mimir::{
     parse_cli_and_load_config, parse_cli_and_load_config_test_mode, CommonConfig,
-    LoadedConfig, MimirConfig,
+    InstrumentRefLeaksConfig, LoadedConfig, MimirConfig,
 };
 pub use runtime_config::{
     is_url, parse_runtime_config_yaml, parse_runtime_config_yaml_with_defaults,

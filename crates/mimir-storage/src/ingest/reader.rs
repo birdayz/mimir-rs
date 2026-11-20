@@ -15,7 +15,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::future::{join_all, try_join_all};
 use mimir_config::{KafkaConfig, OrderedConsumptionConfig};
 use parking_lot::Mutex as SyncMutex;
-use prometheus::{Counter, CounterVec, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts, PullingGauge, Registry};
+use mimir_common::native_histogram::{
+    HistogramOpts as NativeHistogramOpts, HistogramVec as NativeHistogramVec, SingleHistogram,
+    DEF_BUCKETS,
+};
+use prometheus::{Counter, CounterVec, GaugeVec, Histogram, HistogramOpts, Opts, PullingGauge, Registry};
 use thiserror::Error;
 use tokio::sync::{oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
@@ -27,8 +31,7 @@ use mimir_common::backoff::{Backoff, BackoffConfig};
 
 use super::client_consumer::ClientPartitionConsumer;
 use super::fetcher::{
-    native_only_buckets, ConcurrentFetchers, FetchResult, FetcherMetrics, OffsetRange,
-    RangeErrorPolicy,
+    ConcurrentFetchers, FetchResult, FetcherMetrics, OffsetRange, RangeErrorPolicy,
 };
 use super::heap_merger::{HeapMerger, HeapMergerMetrics};
 use super::kprom::KpromMetrics;
@@ -183,7 +186,7 @@ impl<H: ZeroCopyRecordHandler> RecordBatchConsumer for ZeroCopyBatchConsumer<H> 
 pub struct StrongReadConsistencyMetrics {
     pub requests: CounterVec,
     pub failures: CounterVec,
-    pub latency: HistogramVec,
+    pub latency: NativeHistogramVec,
 }
 
 impl StrongReadConsistencyMetrics {
@@ -205,12 +208,17 @@ impl StrongReadConsistencyMetrics {
         fail_opts.const_labels = const_labels.clone();
         let failures = CounterVec::new(fail_opts, &["topic"]).expect("valid metric");
 
-        let mut lat_opts = HistogramOpts::new(
-            "cortex_ingest_storage_strong_consistency_wait_duration_seconds",
-            "How long a request spent waiting for strong consistency to be guaranteed.",
-        );
-        lat_opts.common_opts.const_labels = const_labels;
-        let latency = HistogramVec::new(lat_opts, &["topic"]).expect("valid metric");
+        let latency = NativeHistogramVec::new(
+            NativeHistogramOpts::new(
+                "cortex_ingest_storage_strong_consistency_wait_duration_seconds",
+                "How long a request spent waiting for strong consistency to be guaranteed.",
+            )
+            .const_labels(const_labels)
+            .buckets(DEF_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
+            &["topic"],
+        )
+        .expect("valid metric");
 
         for topic in topics {
             for val in ["true", "false"] {
@@ -247,15 +255,15 @@ pub struct ReaderMetrics {
     pub fetches_total: Counter,
     pub fetches_errors: Counter,
     pub records_per_fetch: Histogram,
-    pub consume_latency: Histogram,
+    pub consume_latency: SingleHistogram,
     /// `fetchMaxBytes`, `fetchWaitDuration` and `fetchedDiscardedRecordBytes`
     /// (`ConcurrentFetchers` only).
     pub fetcher: FetcherMetrics,
-    pub estimated_bytes_per_record: Histogram,
+    pub estimated_bytes_per_record: SingleHistogram,
     pub last_consumed_offset: GaugeVec,
     pub missed_records: Counter,
-    pub receive_delay: HistogramVec,
-    pub receive_and_consume_delay: HistogramVec,
+    pub receive_delay: NativeHistogramVec,
+    pub receive_and_consume_delay: NativeHistogramVec,
     pub strong_consistency: StrongReadConsistencyMetrics,
     source: FetcherSlot,
 }
@@ -286,20 +294,20 @@ impl ReaderMetrics {
             .buckets(exponential_buckets(1.0, 2.0, 15)),
         )
         .expect("valid metric");
-        let consume_latency = Histogram::with_opts(
-            HistogramOpts::new(
+        let consume_latency = SingleHistogram::new(
+            NativeHistogramOpts::new(
                 "cortex_ingest_storage_reader_records_batch_process_duration_seconds",
                 "How long a consumer spent processing a batch of records from Kafka. This includes retries on server errors.",
             )
-            .buckets(native_only_buckets()),
+            .native(1.1, 0, Duration::ZERO),
         )
         .expect("valid metric");
-        let estimated_bytes_per_record = Histogram::with_opts(
-            HistogramOpts::new(
+        let estimated_bytes_per_record = SingleHistogram::new(
+            NativeHistogramOpts::new(
                 "cortex_ingest_storage_reader_estimated_bytes_per_record",
                 "Observations with the current size estimation of records fetched from Kafka. Sampled at 10Hz.",
             )
-            .buckets(native_only_buckets()),
+            .native(1.1, 0, Duration::ZERO),
         )
         .expect("valid metric");
         let last_consumed_offset = GaugeVec::new(
@@ -316,21 +324,25 @@ impl ReaderMetrics {
         ))
         .expect("valid metric");
         // Buckets between 125ms and 9h (plus a native histogram upstream).
-        let receive_delay = HistogramVec::new(
-            HistogramOpts::new(
+        let receive_delay = NativeHistogramVec::new(
+            NativeHistogramOpts::new(
                 "cortex_ingest_storage_reader_receive_delay_seconds",
                 "Delay between producing a record and receiving it in the consumer.",
             )
-            .buckets(exponential_buckets(0.125, 2.0, 18)),
+            .buckets(exponential_buckets(0.125, 2.0, 18))
+            .native(1.2, 100, Duration::from_secs(3600))
+            .zero_threshold(2.0_f64.powi(-10)),
             &["phase"],
         )
         .expect("valid metric");
-        let receive_and_consume_delay = HistogramVec::new(
-            HistogramOpts::new(
+        let receive_and_consume_delay = NativeHistogramVec::new(
+            NativeHistogramOpts::new(
                 "cortex_ingest_storage_reader_receive_and_consume_delay_seconds",
                 "Delay between producing a record and consuming it in the consumer.",
             )
-            .buckets(exponential_buckets(0.125, 2.0, 18)),
+            .buckets(exponential_buckets(0.125, 2.0, 18))
+            .native(1.2, 100, Duration::from_secs(3600))
+            .zero_threshold(2.0_f64.powi(-10)),
             &["phase"],
         )
         .expect("valid metric");
@@ -588,7 +600,7 @@ pub struct PartitionCommitter {
     offset_file: Option<Arc<OffsetFile>>,
     commit_requests_total: Counter,
     commit_failures_total: Counter,
-    commit_requests_latency: Histogram,
+    commit_requests_latency: SingleHistogram,
     stop_tx: watch::Sender<bool>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -621,12 +633,16 @@ impl PartitionCommitter {
         fail_opts.const_labels = const_labels.clone();
         let commit_failures_total = Counter::with_opts(fail_opts).expect("valid metric");
 
-        let mut lat_opts = HistogramOpts::new(
-            "cortex_ingest_storage_reader_offset_commit_request_duration_seconds",
-            "The duration of requests to commit the last consumed offset.",
-        );
-        lat_opts.common_opts.const_labels = const_labels.clone();
-        let commit_requests_latency = Histogram::with_opts(lat_opts).expect("valid metric");
+        let commit_requests_latency = SingleHistogram::new(
+            NativeHistogramOpts::new(
+                "cortex_ingest_storage_reader_offset_commit_request_duration_seconds",
+                "The duration of requests to commit the last consumed offset.",
+            )
+            .const_labels(const_labels.clone())
+            .buckets(DEF_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
+        )
+        .expect("valid metric");
 
         let last_committed_offset = Arc::new(AtomicI64::new(-1));
         let lco_clone = Arc::clone(&last_committed_offset);
@@ -992,7 +1008,7 @@ impl SingleClusterPartitionReader {
             start_offset_reader: Mutex::new(None),
             sampler: Mutex::new(None),
             last_seen_offset: Arc::new(AtomicI64::new(-1)),
-            highest_consumed_ts_before_end_ms: Arc::new(AtomicI64::new(0)),
+            highest_consumed_ts_before_end_ms: Arc::new(AtomicI64::new(UNSET_TS_MS)),
             max_replay_period: Duration::ZERO,
             concurrent_fetchers_min_bytes_max_wait_time: fetch_max_wait,
             state: Arc::new(AtomicU8::new(ReaderState::New as u8)),
@@ -1916,20 +1932,30 @@ impl SingleClusterPartitionReader {
             return Ok(());
         }
         let ts_ms = self.highest_consumed_ts_before_end_ms.load(Ordering::SeqCst);
-        if ts_ms <= 0 {
+        if ts_ms == UNSET_TS_MS {
             return Ok(());
         }
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        if now_ms.saturating_sub(ts_ms) > max_delay.as_millis() as i64 {
+        if (now_ms as i128 - ts_ms as i128) > max_delay.as_millis() as i128 {
             return Err(ReaderError::MaxDelayExceeded);
         }
         Ok(())
     }
 }
 
+
+const UNSET_TS_MS: i64 = i64::MIN;
+
+/// Computes `now.Sub(ts).Seconds()` matching Go `time.Time.Sub`, clamping to `[i64::MIN, i64::MAX]` ns.
+#[inline]
+fn elapsed_secs_from_ms(now_ms: i64, ts_ms: i64) -> f64 {
+    let ns = ((now_ms as i128 - ts_ms as i128) * 1_000_000)
+        .clamp(i64::MIN as i128, i64::MAX as i128);
+    (ns as f64) / 1e9
+}
 
 /// dskit `backoff.Config` used by `ConcurrentFetchers` for Fetch errors
 /// (`defaultFetchBackoffConfig` in `config.go`: retry forever).
@@ -2072,7 +2098,7 @@ impl FetchLoop {
         let mut num_records = 0usize;
         for r in fetches.iter().flat_map(|f| f.records.iter()) {
             num_records += 1;
-            observer.observe((now_ms - r.timestamp_ms) as f64 / 1000.0);
+            observer.observe(elapsed_secs_from_ms(now_ms, r.timestamp_ms));
         }
         self.metrics.fetches_total.inc_by(fetches.len() as f64);
         self.metrics.records_per_fetch.observe(num_records as f64);
@@ -2094,7 +2120,7 @@ impl FetchLoop {
 
     /// `updateHighestConsumedTimestampBeforeConsumption`.
     fn update_highest_consumed_timestamp_before_consumption(&self, fetches: &[FetchResult]) {
-        if self.highest_ts.load(Ordering::SeqCst) != 0 {
+        if self.highest_ts.load(Ordering::SeqCst) != UNSET_TS_MS {
             return;
         }
         for f in fetches {
@@ -2117,18 +2143,18 @@ impl FetchLoop {
             .metrics
             .receive_and_consume_delay
             .with_label_values(&[phase]);
-        let mut highest = 0i64;
+        let mut highest = UNSET_TS_MS;
         for f in fetches {
             if f.partition != self.partition_id || f.records.is_empty() {
                 continue;
             }
             for r in &f.records {
-                observer.observe((now_ms - r.timestamp_ms) as f64 / 1000.0);
+                observer.observe(elapsed_secs_from_ms(now_ms, r.timestamp_ms));
                 highest = highest.max(r.timestamp_ms);
             }
             let last = f.records.last().expect("non-empty");
             if last.offset + 1 >= f.high_watermark {
-                self.highest_ts.store(0, Ordering::SeqCst);
+                self.highest_ts.store(UNSET_TS_MS, Ordering::SeqCst);
             } else {
                 self.highest_ts.store(highest, Ordering::SeqCst);
             }

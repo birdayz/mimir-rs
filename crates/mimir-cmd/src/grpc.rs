@@ -405,10 +405,6 @@ impl Http for HttpGrpcBridge {
             if resp.extensions().get::<crate::http::CleanPathHandled>().is_none() {
                 resp = crate::http::clean_path_redirect_response(loc);
             }
-            // gorilla/mux only sets `Location` on the `httptest.ResponseRecorder` that dskit's
-            // `httpgrpc` server reads the headers from. Axum's routing adds `Content-Length: 0`
-            // to the empty redirect body, which Go never reports over `httpgrpc`.
-            resp.headers_mut().remove(http::header::CONTENT_LENGTH);
         }
         let route_name = if pending_redirect.is_some() {
             String::new()
@@ -477,7 +473,24 @@ impl Http for HttpGrpcBridge {
         }
 
         let code = resp.status().as_u16() as i32;
+        let explicit_content_length = resp
+            .extensions()
+            .get::<crate::http::ExplicitContentLength>()
+            .is_some();
         let mut resp_headers = resp.headers().clone();
+        // dskit httpgrpc runs against httptest.ResponseRecorder, which never carries server-added
+        // Content-Length (unless explicitly set by the handler, e.g. /static/ files) or Connection.
+        if !explicit_content_length {
+            resp_headers.remove(http::header::CONTENT_LENGTH);
+        }
+        resp_headers.remove(http::header::CONNECTION);
+        if resp
+            .extensions()
+            .get::<crate::server::http_middleware::MethodMismatch>()
+            .is_some()
+        {
+            resp_headers.remove(http::header::ALLOW);
+        }
         let do_not_log_error = resp_headers.remove("x-donotlogerror").is_some();
         let error_msg_override = resp_headers
             .remove("x-errormessage")
@@ -814,10 +827,11 @@ impl BoundedGrpcDecompressBody {
         Ok(())
     }
 
+    /// Decompresses at most one complete gRPC frame from `self.in_buf` into `self.out_queue`.
     #[allow(clippy::result_large_err)]
-    fn drain_frames(&mut self) -> Result<(), Status> {
+    fn drain_one_frame(&mut self) -> Result<bool, Status> {
         use std::io::Read as _;
-        while self.in_buf.len() >= 5 {
+        if self.in_buf.len() >= 5 {
             let flag = self.in_buf[0];
             let msg_len = u32::from_be_bytes([
                 self.in_buf[1],
@@ -835,7 +849,7 @@ impl BoundedGrpcDecompressBody {
                 return Err(Status::internal("gRPC frame length overflow"));
             };
             if self.in_buf.len() < frame_end {
-                break;
+                return Ok(false);
             }
             match self.algo {
                 BoundedDecompressAlgo::Identity => {
@@ -891,11 +905,13 @@ impl BoundedGrpcDecompressBody {
                 },
             }
             self.in_buf.advance(frame_end);
+            if !self.out_buf.is_empty() {
+                self.out_queue.push_back(self.out_buf.split().freeze());
+                return Ok(true);
+            }
+            return Ok(false);
         }
-        if !self.out_buf.is_empty() {
-            self.out_queue.push_back(self.out_buf.split().freeze());
-        }
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -910,6 +926,25 @@ impl hyper::body::Body for BoundedGrpcDecompressBody {
     ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         if let Some(chunk) = self.out_queue.pop_front() {
             return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
+        }
+        // Drain at most one already-buffered frame before polling the inner stream again.
+        if !self.done && self.in_buf.len() >= 5 {
+            if let Err(st) = self.check_incoming_header() {
+                self.done = true;
+                return Poll::Ready(Some(Err(st)));
+            }
+            match self.drain_one_frame() {
+                Ok(true) => {
+                    if let Some(chunk) = self.out_queue.pop_front() {
+                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
+                    }
+                }
+                Ok(false) => {}
+                Err(st) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(st)));
+                }
+            }
         }
         if let Some(trailers) = self.pending_trailers.take() {
             self.done = true;
@@ -939,7 +974,7 @@ impl hyper::body::Body for BoundedGrpcDecompressBody {
                                         return Poll::Ready(Some(Err(st)));
                                     }
                                 }
-                                if let Err(st) = self.drain_frames() {
+                                if let Err(st) = self.drain_one_frame() {
                                     self.done = true;
                                     return Poll::Ready(Some(Err(st)));
                                 }
@@ -1648,10 +1683,13 @@ mod tests {
                 .headers
                 .iter()
                 .any(|h| h.key.eq_ignore_ascii_case("x-donotlogerror")
-                    || h.key.eq_ignore_ascii_case("x-errormessage")),
-            "expected internal headers stripped: {:?}",
+                    || h.key.eq_ignore_ascii_case("x-errormessage")
+                    || h.key.eq_ignore_ascii_case("content-length")
+                    || h.key.eq_ignore_ascii_case("connection")),
+            "expected internal and server-added headers stripped: {:?}",
             http_resp.headers
         );
+        assert_eq!(http_resp.headers.len(), 1, "expected exact Content-Type only: {:?}", http_resp.headers);
     }
 
     async fn call_bridge(
@@ -2046,5 +2084,47 @@ mod tests {
         let mut plain = Vec::new();
         dec.read_to_end(&mut plain).unwrap();
         assert_eq!(plain, b"abc");
+    }
+
+    #[tokio::test]
+    async fn w20_sdw_02_bounded_decompress_yields_at_most_one_frame_per_poll() {
+        use hyper::body::Body as _;
+
+        // Build two zstd-compressed gRPC frames packed in a single DATA chunk:
+        // frame 1: small valid payload (16 bytes), frame 2: payload decompressing to 256 bytes (> max_recv=64).
+        let p1 = vec![b'a'; 16];
+        let p2 = vec![b'b'; 256];
+        let mut c1 = Vec::new();
+        let mut c2 = Vec::new();
+        zstd::stream::copy_encode(p1.as_slice(), &mut c1, 0).unwrap();
+        zstd::stream::copy_encode(p2.as_slice(), &mut c2, 0).unwrap();
+
+        let mut wire = Vec::new();
+        wire.push(1);
+        wire.extend_from_slice(&(c1.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&c1);
+        wire.push(1);
+        wire.extend_from_slice(&(c2.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&c2);
+
+        let body = tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(wire))));
+        let mut dec = BoundedGrpcDecompressBody::new(body, BoundedDecompressAlgo::Zstd, 64);
+
+        // First poll_frame yields ONLY frame 1 without decompressing frame 2.
+        let f1 = std::future::poll_fn(|cx| Pin::new(&mut dec).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(f1.len(), 5 + 16);
+        assert_eq!(&f1[5..], p1.as_slice());
+
+        // Second poll_frame attempts frame 2 and rejects it with ResourceExhausted.
+        let err = std::future::poll_fn(|cx| Pin::new(&mut dec).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 }

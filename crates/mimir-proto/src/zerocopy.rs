@@ -50,7 +50,13 @@ pub enum DecodeError {
     InvalidHelpRef { index: u32, offset: u32 },
     #[error("proto: Remote Write 2.0 invalid unit reference {index} (offset {offset})")]
     InvalidUnitRef { index: u32, offset: u32 },
+    #[error("proto: Remote Write 2.0 expanded label arena exceeds limit ({limit} bytes)")]
+    LabelArenaLimitExceeded { limit: usize },
 }
+
+/// Default maximum expanded `label_bytes_arena` growth allowed per [`decode_rw2_stream`] call
+/// (512 MiB). Prevents small RW2 symbol-reference payloads from amplifying into multi-GiB arenas.
+pub const DEFAULT_MAX_RW2_LABEL_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum EncodeRw2Error {
@@ -1216,6 +1222,8 @@ fn append_raw_rw2_labels(
     symbol_offset: u32,
     resolved: &[Option<(&[u8], bool)>],
     label_bytes_arena: &mut Vec<u8>,
+    label_base: usize,
+    max_expanded_label_bytes: usize,
 ) -> Result<(), DecodeError> {
     let mut pos = range.start;
     let end = range.end;
@@ -1241,7 +1249,13 @@ fn append_raw_rw2_labels(
                         index: val_idx,
                         offset: symbol_offset,
                     })?;
-                append_stringlabel_pair_proto(label_bytes_arena, k_bytes, v_bytes)?;
+                append_stringlabel_pair_proto_bounded(
+                    label_bytes_arena,
+                    k_bytes,
+                    v_bytes,
+                    label_base,
+                    max_expanded_label_bytes,
+                )?;
             }
         } else {
             skip_field_bounded(input, &mut pos, end, wire_type)?;
@@ -1551,6 +1565,40 @@ impl Drop for ResolvedTableGuard<'_> {
 }
 
 #[inline(always)]
+fn stringlabel_part_encoded_len(len: usize) -> Result<usize, DecodeError> {
+    if len < 255 {
+        Ok(1 + len)
+    } else if len < (1 << 24) {
+        Ok(4 + len)
+    } else {
+        Err(DecodeError::InputTooLarge)
+    }
+}
+
+#[inline(always)]
+fn append_stringlabel_pair_proto_bounded(
+    buf: &mut Vec<u8>,
+    name: &[u8],
+    value: &[u8],
+    label_base: usize,
+    max_expanded_label_bytes: usize,
+) -> Result<(), DecodeError> {
+    let pair_len = stringlabel_part_encoded_len(name.len())?
+        .saturating_add(stringlabel_part_encoded_len(value.len())?);
+    if buf
+        .len()
+        .saturating_sub(label_base)
+        .saturating_add(pair_len)
+        > max_expanded_label_bytes
+    {
+        return Err(DecodeError::LabelArenaLimitExceeded {
+            limit: max_expanded_label_bytes,
+        });
+    }
+    append_stringlabel_pair_proto(buf, name, value)
+}
+
+#[inline(always)]
 fn append_stringlabel_pair_proto(
     buf: &mut Vec<u8>,
     name: &[u8],
@@ -1614,6 +1662,35 @@ pub fn decode_rw2_stream<'r, 'a: 'r, F>(
     label_bytes_arena: &mut Vec<u8>,
     samples_arena: &mut Vec<cortexpb::Sample>,
     meta_out: &mut Vec<BorrowedMetadata<'r>>,
+    on_series: F,
+) -> Result<StreamedRw2Header, DecodeError>
+where
+    F: FnMut(StreamedRw2Series<'_, 'a>),
+{
+    decode_rw2_stream_with_limit(
+        input,
+        opts,
+        scratch,
+        resolved_scratch,
+        label_bytes_arena,
+        samples_arena,
+        meta_out,
+        DEFAULT_MAX_RW2_LABEL_BYTES,
+        on_series,
+    )
+}
+
+/// Like [`decode_rw2_stream`], with an explicit cap on expanded `label_bytes_arena` growth.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_rw2_stream_with_limit<'r, 'a: 'r, F>(
+    input: &'a [u8],
+    opts: DecodeOptions<'a>,
+    scratch: &mut WriteRequestScratch,
+    resolved_scratch: &'r mut Rw2ResolvedScratch,
+    label_bytes_arena: &mut Vec<u8>,
+    samples_arena: &mut Vec<cortexpb::Sample>,
+    meta_out: &mut Vec<BorrowedMetadata<'r>>,
+    max_expanded_label_bytes: usize,
     mut on_series: F,
 ) -> Result<StreamedRw2Header, DecodeError>
 where
@@ -1775,6 +1852,8 @@ where
                         &opts,
                         scratch,
                         label_bytes_arena,
+                        label_base,
+                        max_expanded_label_bytes,
                         samples_arena,
                         meta_out,
                         source,
@@ -1844,6 +1923,8 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
     opts: &DecodeOptions<'a>,
     scratch: &'v mut WriteRequestScratch,
     label_bytes_arena: &'v mut Vec<u8>,
+    label_base: usize,
+    max_expanded_label_bytes: usize,
     samples_arena: &mut Vec<cortexpb::Sample>,
     meta_out: &mut Vec<BorrowedMetadata<'r>>,
     source: i32,
@@ -1911,10 +1992,12 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
                             }
                             prev_name = Some(k_bytes);
                             if !v_bytes.is_empty() {
-                                append_stringlabel_pair_proto(
+                                append_stringlabel_pair_proto_bounded(
                                     label_bytes_arena,
                                     k_bytes,
                                     v_bytes,
+                                    label_base,
+                                    max_expanded_label_bytes,
                                 )?;
                             } else {
                                 dropped_empty = true;
@@ -2012,11 +2095,27 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
         label_bytes_start
     } else if !labels_sorted_unique && dropped_empty {
         label_bytes_arena.truncate(label_bytes_start);
-        append_raw_rw2_labels(input, range, symbol_offset, resolved, label_bytes_arena)?;
+        append_raw_rw2_labels(
+            input,
+            range,
+            symbol_offset,
+            resolved,
+            label_bytes_arena,
+            label_base,
+            max_expanded_label_bytes,
+        )?;
         label_bytes_arena.len()
     } else if labels_sorted_unique && dropped_empty {
         let enc_end = label_bytes_arena.len();
-        append_raw_rw2_labels(input, range, symbol_offset, resolved, label_bytes_arena)?;
+        append_raw_rw2_labels(
+            input,
+            range,
+            symbol_offset,
+            resolved,
+            label_bytes_arena,
+            label_base,
+            max_expanded_label_bytes,
+        )?;
         raw_label_bytes_range = Some(enc_end..label_bytes_arena.len());
         enc_end
     } else {

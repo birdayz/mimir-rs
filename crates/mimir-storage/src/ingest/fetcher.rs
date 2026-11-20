@@ -16,7 +16,8 @@ use kafka_protocol::messages::{BrokerId, FetchRequest, FetchResponse, TopicName}
 use kafka_protocol::protocol::StrBytes;
 use mimir_common::backoff::{Backoff, BackoffConfig};
 use parking_lot::Mutex as SyncMutex;
-use prometheus::{Counter, Histogram, HistogramOpts, Opts, Registry};
+use mimir_common::native_histogram::{HistogramOpts, SingleHistogram};
+use prometheus::{Counter, Opts, Registry};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
@@ -386,34 +387,27 @@ async fn handle_kafka_fetch_err_with_log_start(
 /// (`fetchMaxBytes`, `fetchWaitDuration`, `fetchedDiscardedRecordBytes` in `reader.go`).
 #[derive(Clone)]
 pub struct FetcherMetrics {
-    pub fetch_max_bytes: Histogram,
-    pub fetch_wait_duration: Histogram,
+    pub fetch_max_bytes: SingleHistogram,
+    pub fetch_wait_duration: SingleHistogram,
     pub fetched_discarded_record_bytes: Counter,
-}
-
-/// Classic buckets of a client_golang histogram that only sets `NativeHistogramBucketFactor`
-/// (no `Buckets`): it has no classic bucket, so the text exposition only carries `le="+Inf"`.
-/// The prometheus crate drops a trailing `+Inf` bound and keeps the implicit one.
-pub(crate) fn native_only_buckets() -> Vec<f64> {
-    vec![f64::INFINITY]
 }
 
 impl FetcherMetrics {
     pub fn new(registry: Option<&Registry>) -> Self {
-        let fetch_max_bytes = Histogram::with_opts(
+        let fetch_max_bytes = SingleHistogram::new(
             HistogramOpts::new(
                 "cortex_ingest_storage_reader_records_batch_fetch_max_bytes",
                 "The distribution of MaxBytes specified in the Fetch requests sent to Kafka.",
             )
-            .buckets(native_only_buckets()),
+            .native(1.1, 0, Duration::ZERO),
         )
         .expect("valid metric");
-        let fetch_wait_duration = Histogram::with_opts(
+        let fetch_wait_duration = SingleHistogram::new(
             HistogramOpts::new(
                 "cortex_ingest_storage_reader_records_batch_wait_duration_seconds",
                 "How long a consumer spent waiting for a batch of records from the Kafka client. If fetching is faster than processing, then this will be close to 0.",
             )
-            .buckets(native_only_buckets()),
+            .native(1.1, 0, Duration::ZERO),
         )
         .expect("valid metric");
         let fetched_discarded_record_bytes = Counter::with_opts(Opts::new(

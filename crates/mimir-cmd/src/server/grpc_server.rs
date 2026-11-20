@@ -1014,7 +1014,11 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
             if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
                 out.push(v);
                 i += 3;
@@ -1594,5 +1598,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp_bytes_mf.get_metric()[0].get_histogram().get_sample_count(), 3);
         assert_eq!(resp_bytes_mf.get_metric()[0].get_histogram().get_sample_sum(), 24.0);
+    }
+
+    #[test]
+    fn w20_sdw_11_grpc_percent_decode_rejects_plus_sign() {
+        assert_eq!(percent_decode("foo%20bar"), "foo bar");
+        assert_eq!(percent_decode("foo%+a%-1bar"), "foo%+a%-1bar");
     }
 }

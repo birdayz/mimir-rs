@@ -1328,3 +1328,113 @@ fn regex_matcher_errors_match_go_regexp_syntax() {
         rust_only_rejects.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
     );
 }
+
+/// W20-SDW-04: `regexp/syntax` `checkLimits` (`ErrLarge` / `ErrNestingDepth`) and its gate
+/// (`checkSize` only computes sizes once `numRegexp >= maxSize / repeats`). Every pattern goes
+/// through the vendored `github.com/grafana/regexp` parser via `labels.NewMatcher`: the ones Go
+/// accepts must pass `go_regexp_syntax::check` — a multi-megabyte literal or alternation is a
+/// valid matcher — and the ones Go rejects must fail with the byte-identical error.
+#[test]
+fn regex_check_limits_gate_matches_go_regexp_syntax() {
+    let a = |n: usize| "a".repeat(n);
+    let big_alt = (0..100_000)
+        .map(|i| format!("value_number_{i:08}_with_some_long_suffix_x"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let patterns: Vec<String> = vec![
+        // Nesting depth.
+        format!("{}a{}", "(".repeat(1000), ")".repeat(1000)),
+        format!("{}a{}", "(".repeat(998), ")".repeat(998)),
+        format!("{}{}", "(a.".repeat(499), ")".repeat(499)),
+        format!("{}{}", "(a.".repeat(500), ")".repeat(500)),
+        format!("{}{}", "(?:a.".repeat(1200), ")".repeat(1200)),
+        format!("{}b{}", "(?:a|".repeat(1200), ")".repeat(1200)),
+        format!("{}c{}", "(?:a|b.".repeat(600), ")".repeat(600)),
+        format!("{}a{}", "(?:".repeat(1001), ")*".repeat(1001)),
+        format!("{}a{}", "(?:".repeat(500), ")*".repeat(500)),
+        // A lone repeat is pushed again as the only item of the concatenation and alternation.
+        format!("({}){{1000}}", a(3353)),
+        format!("({}){{1000}}", a(3354)),
+        format!("({}){{999}}", a(3400)),
+        format!("({}){{2}}", a(4000)),
+        format!("(?:{}){{1000}}", a(3354)),
+        format!("(?:{}){{1000}}", a(3400)),
+        format!("(?:{}){{1000,}}", a(3400)),
+        format!("(?:{}){{0,1000}}", a(4000)),
+        "(a{1000}|b{1000}|c{1000}|d{1000}){1000}".to_string(),
+        // Next to another item it is not: the gate stays closed.
+        format!("x(?:{}){{1000}}", a(3400)),
+        format!("x(?:{}){{1000,}}", a(3400)),
+        format!(".*(?:{}){{1000}}", a(3400)),
+        format!("x(?:{}){{1000}}y{{2}}", a(3400)),
+        format!("x(?:{}){{1000}}y{{4}}", a(3400)),
+        format!("x(?:{}){{1000}}(y*)(z+)(w?)", a(3400)),
+        format!("x(?:{}){{1000}}y{{1000}}", a(3400)),
+        format!("(?:{}){{1000}}(?:{}){{1000}}.*", "ab".repeat(900), "cd".repeat(900)),
+        "a{1000}b{1000}c{1000}d{1000}.*".to_string(),
+        "[a-z0-9]{1000}[a-z0-9]{1000}[a-z0-9]{1000}[a-z0-9]{1000}".to_string(),
+        "(?:[0-9]{1,3}\\.){3}[0-9]{1,3}".to_string(),
+        "(?:[a-f0-9]{8})-(?:[a-f0-9]{4})-(?:[a-f0-9]{4})-(?:[a-f0-9]{4})-(?:[a-f0-9]{12})"
+            .to_string(),
+        "(?:(?:a{20}))".to_string(),
+        // No size limit on literals and alternations while repetition counts are small.
+        format!("{}.*", a(3_400_000)),
+        format!("(?:{})*", a(3_400_000)),
+        big_alt.clone(),
+        format!("foo.*({big_alt})"),
+        // Sizes tracked: stale cached size of a literal run vs. a run pushed again on its own.
+        format!("x{{1000}}y{{1000}}z{{1000}}{}", a(3_400_000)),
+        format!("x{{1000}}y{{1000}}z{{1000}}{}.", a(3_400_000)),
+        format!("(?:(?:a{{20}})){}", "b".repeat(3_400_000)),
+        format!("x{{1000}}y{{1000}}z{{1000}}({})", a(3_400_000)),
+        format!("x{{1000}}y{{1000}}z{{1000}}(?:{})w", a(3_400_000)),
+        format!("(?:(?:a{{20}}))({})", "b".repeat(3_400_000)),
+        format!("{}x{{1000}}y{{1000}}z{{1000}}", a(3_400_000)),
+        // numRunes.
+        format!("{}.*", "\\pL".repeat(27_000)),
+        format!("{}.*", "\\pL".repeat(20_000)),
+        format!("{}.*", "\\w".repeat(100_000)),
+    ];
+
+    let resp: RegexMatcherErrorsResponse =
+        invoke_oracle("regex-matcher-errors", &RegexMatcherErrorsRequest { patterns: &patterns })
+            .expect("go-oracle regex-matcher-errors");
+    assert_eq!(resp.errors.len(), patterns.len());
+
+    let head = |s: &str| s.chars().take(70).collect::<String>();
+    let mut mismatches = Vec::new();
+    let (mut go_ok, mut go_large, mut go_deep) = (0usize, 0usize, 0usize);
+    for (p, go) in patterns.iter().zip(&resp.errors) {
+        let rust = match mimir_tsdb::go_regexp_syntax::check(p) {
+            Ok(()) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        if go.is_empty() {
+            go_ok += 1;
+        } else if go.contains("expression too large") {
+            go_large += 1;
+        } else if go.contains("expression nests too deeply") {
+            go_deep += 1;
+        }
+        if &rust != go {
+            mismatches.push(format!(
+                "{}... ({} bytes):\n    go:   {}\n    rust: {}",
+                head(p),
+                p.len(),
+                head(go),
+                head(&rust)
+            ));
+        }
+    }
+    assert!(
+        go_ok >= 20 && go_large >= 12 && go_deep >= 4,
+        "corpus must exercise both sides of every limit (ok={go_ok}, large={go_large}, deep={go_deep})"
+    );
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} patterns differ:\n{}",
+        mismatches.len(),
+        patterns.len(),
+        mismatches.join("\n")
+    );
+}

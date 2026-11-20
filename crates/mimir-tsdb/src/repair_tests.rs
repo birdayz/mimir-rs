@@ -155,7 +155,9 @@ fn out_of_sequence_mmapped_chunk_discards_all_chunk_files() {
     let db = Tsdb::open(dir.path(), opts_with_registry(&reg)).expect("open must repair");
     assert_eq!(counter(&reg, "prometheus_tsdb_mmap_chunk_corruptions_total"), 1.0);
     assert!(chunk_files(dir.path()).is_empty());
-    assert_eq!(db.head().num_series(), 1);
+    // Go Head.Init runs gc(h.MinTime()) after replay; since WAL only had a series record
+    // with no samples and all mmapped chunks were discarded, the chunkless series is GCed.
+    assert_eq!(db.head().num_series(), 0);
     db.close().unwrap();
 }
 

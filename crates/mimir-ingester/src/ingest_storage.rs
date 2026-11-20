@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use mimir_common::native_histogram::Histogram as NativeHistogram;
 use mimir_common::thread_pool::ScopedWorkerPool;
 use mimir_config::KafkaConfig;
 use mimir_proto::cortexpb::{self, ErrorCause};
@@ -184,17 +185,17 @@ struct ShardSeriesItem {
     labels_sorted_unique: bool,
     bad_utf8: bool,
     prom_hash: u64,
-    label_bytes_start: u32,
-    label_bytes_len: u32,
-    raw_label_bytes_start: u32,
-    raw_label_bytes_len: u32,
-    samples_start: u32,
-    samples_len: u32,
+    label_bytes_start: usize,
+    label_bytes_len: usize,
+    raw_label_bytes_start: usize,
+    raw_label_bytes_len: usize,
+    samples_start: usize,
+    samples_len: usize,
     created_timestamp: i64,
-    histograms_start: u32,
-    histograms_len: u32,
-    exemplars_start: u32,
-    exemplars_len: u32,
+    histograms_start: usize,
+    histograms_len: usize,
+    exemplars_start: usize,
+    exemplars_len: usize,
     min_ts: i64,
 }
 
@@ -209,7 +210,7 @@ struct ShardMetadataItem {
     metric_type: i32,
     trace_id_idx: u32,
     /// `[name_start, help_start, unit_start, unit_end)` offsets into `MetadataStash::bytes`.
-    bounds: [u32; 4],
+    bounds: [usize; 4],
 }
 
 struct WorkerArena {
@@ -222,9 +223,26 @@ struct WorkerArena {
     shard_buckets: Vec<Vec<ShardSeriesItem>>,
     metadata: MetadataStash,
     trace_ids: Vec<String>,
-    /// `(rec_seq, record_offset, tenant_idx)` for non-empty records whose tenant key is empty/invalid.
-    tenant_key_errors: Vec<(u32, i64, u32)>,
+    /// `(rec_seq, record_offset, tenant_idx, is_empty)` for records whose tenant key is empty/invalid.
+    tenant_key_errors: Vec<(u32, i64, u32, bool)>,
+    /// `(tenant_idx, norm_source)` pairs for every validly decoded record in Phase A.
+    decoded_pushers: Vec<(u32, i32)>,
+    /// `(rec_seq, worker_idx, record_offset, tenant_idx, norm_source, trace_id_idx)` for valid empty records in sequential mode.
+    seq_empty_records: Vec<(u32, u16, i64, u32, i32, u32)>,
     total_series: usize,
+}
+
+#[inline]
+fn try_append_stringlabel_pair(
+    buf: &mut Vec<u8>,
+    name: &[u8],
+    value: &[u8],
+) -> Result<(), String> {
+    if name.len() >= (1 << 24) || value.len() >= (1 << 24) {
+        return Err("label string exceeds 16 MiB stringlabels limit".to_string());
+    }
+    append_stringlabel_pair(buf, name, value);
+    Ok(())
 }
 
 /// Per-worker metric metadata copied out of the records during Phase A, bucketed by shard.
@@ -252,8 +270,14 @@ impl MetadataStash {
 
     fn clear(&mut self) {
         self.bytes.clear();
+        if self.bytes.capacity() > 4 * 1024 * 1024 {
+            self.bytes.shrink_to(256 * 1024);
+        }
         for b in &mut self.buckets {
             b.clear();
+            if b.capacity() > 16 * 1024 {
+                b.shrink_to(1024);
+            }
         }
         self.total = 0;
     }
@@ -279,13 +303,13 @@ impl MetadataStash {
             .unwrap_or((item.record_offset as u64 % num_shards as u64) as usize);
         for (i, m) in metadata.enumerate() {
             let shard = (start + i % spread) % num_shards;
-            let name_start = self.bytes.len() as u32;
+            let name_start = self.bytes.len();
             self.bytes.extend_from_slice(m.metric_family_name.as_bytes());
-            let help_start = self.bytes.len() as u32;
+            let help_start = self.bytes.len();
             self.bytes.extend_from_slice(m.help.as_bytes());
-            let unit_start = self.bytes.len() as u32;
+            let unit_start = self.bytes.len();
             self.bytes.extend_from_slice(m.unit.as_bytes());
-            let unit_end = self.bytes.len() as u32;
+            let unit_end = self.bytes.len();
             if let Some(bucket) = self.buckets.get_mut(shard) {
                 bucket.push(ShardMetadataItem {
                     metric_type: m.metric_type,
@@ -299,7 +323,7 @@ impl MetadataStash {
 
     #[inline]
     fn view(&self, item: &ShardMetadataItem) -> BorrowedMetadata<'_> {
-        let [n, h, u, end] = item.bounds.map(|b| b as usize);
+        let [n, h, u, end] = item.bounds;
         let s = |a: usize, b: usize| {
             self.bytes
                 .get(a..b)
@@ -328,6 +352,8 @@ impl WorkerArena {
             metadata: MetadataStash::new(num_shards),
             trace_ids: Vec::new(),
             tenant_key_errors: Vec::new(),
+            decoded_pushers: Vec::new(),
+            seq_empty_records: Vec::new(),
             total_series: 0,
         }
     }
@@ -335,27 +361,42 @@ impl WorkerArena {
     fn reset_for(&mut self, num_shards: usize) {
         self.wr_scratch.clear();
         self.label_bytes_arena.clear();
+        if self.label_bytes_arena.capacity() > 4 * 1024 * 1024 {
+            self.label_bytes_arena.shrink_to(256 * 1024);
+        }
         self.samples_arena.clear();
+        if self.samples_arena.capacity() > 256 * 1024 {
+            self.samples_arena.shrink_to(16 * 1024);
+        }
         self.histograms_arena.clear();
+        if self.histograms_arena.capacity() > 16 * 1024 {
+            self.histograms_arena.shrink_to(1024);
+        }
         self.exemplars_arena.clear();
+        if self.exemplars_arena.capacity() > 16 * 1024 {
+            self.exemplars_arena.shrink_to(1024);
+        }
         if self.shard_buckets.len() < num_shards {
             self.shard_buckets
                 .resize_with(num_shards, || Vec::with_capacity(128));
         }
         for b in &mut self.shard_buckets {
             b.clear();
+            if b.capacity() > 16 * 1024 {
+                b.shrink_to(1024);
+            }
         }
         self.metadata.reset_for(num_shards);
         self.trace_ids.clear();
         self.tenant_key_errors.clear();
+        self.decoded_pushers.clear();
+        self.seq_empty_records.clear();
         self.total_series = 0;
     }
 
     #[inline]
-    fn label_bytes_slice(&self, start: u32, len: u32) -> &[u8] {
-        let s = start as usize;
-        let e = s + len as usize;
-        &self.label_bytes_arena[s..e]
+    fn label_bytes_slice(&self, start: usize, len: usize) -> &[u8] {
+        &self.label_bytes_arena[start..start + len]
     }
 }
 
@@ -426,9 +467,10 @@ pub struct IngesterShardedBatchConsumer {
     ingester: Arc<Ingester>,
     kafka_cfg: KafkaConfig,
     metrics: PusherConsumerMetrics,
-    processing_time_timeseries: OnceLock<prometheus::Histogram>,
-    processing_time_metadata: OnceLock<prometheus::Histogram>,
-    processing_time_timeseries_and_metadata: OnceLock<prometheus::Histogram>,
+    processing_time_empty: OnceLock<Arc<NativeHistogram>>,
+    processing_time_timeseries: OnceLock<Arc<NativeHistogram>>,
+    processing_time_metadata: OnceLock<Arc<NativeHistogram>>,
+    processing_time_timeseries_and_metadata: OnceLock<Arc<NativeHistogram>>,
     error_handler: Arc<PushErrorHandler>,
     arena_pool: Mutex<Vec<WorkerArena>>,
     worker_pool: ScopedWorkerPool,
@@ -465,6 +507,7 @@ impl IngesterShardedBatchConsumer {
             ingester,
             kafka_cfg,
             metrics,
+            processing_time_empty: OnceLock::new(),
             processing_time_timeseries: OnceLock::new(),
             processing_time_metadata: OnceLock::new(),
             processing_time_timeseries_and_metadata: OnceLock::new(),
@@ -600,22 +643,11 @@ impl IngesterShardedBatchConsumer {
         };
         let shard_mask = num_shards - 1;
 
-        if self.kafka_cfg.ingestion_concurrency_max > 0 {
-            let bytes_per_sample = self
-                .kafka_cfg
-                .ingestion_concurrency_estimated_bytes_per_sample
-                .max(1) as usize;
-            let mut est_total = 0usize;
-            for &b in &tenant_bytes {
-                est_total += b / bytes_per_sample;
-            }
-            if est_total > 0 {
-                self.metrics
-                    .storage_pusher_metrics
-                    .estimated_timeseries
-                    .inc_by(est_total as f64);
-            }
-        }
+        let norm_source_i32 = |raw: i32| -> i32 {
+            cortexpb::write_request::SourceEnum::try_from(raw)
+                .map(|s| s as i32)
+                .unwrap_or(cortexpb::write_request::SourceEnum::Api as i32)
+        };
 
         // Go `parallelStoragePusher.idealShardsFor`: each tenant's series (and metadata) are
         // spread over at most that many shards, so a small tenant's batch is pushed as one
@@ -674,6 +706,8 @@ impl IngesterShardedBatchConsumer {
                 metadata,
                 trace_ids,
                 tenant_key_errors,
+                decoded_pushers,
+                seq_empty_records,
                 total_series,
             } = arena;
             let propagators = mimir_common::tracing::PropagatorSet {
@@ -714,9 +748,19 @@ impl IngesterShardedBatchConsumer {
                         label_bytes_arena.truncate(label_bytes_base);
                         samples_arena.truncate(samples_base);
                         match stream_res {
-                            Ok(_) => {
-                                if rec_series_count > 0 || !rec_metadata.is_empty() {
-                                    tenant_key_errors.push((rec_seq, rec.offset, tenant_idx));
+                            Ok(hdr) => {
+                                let norm_src = norm_source_i32(hdr.source);
+                                if !decoded_pushers.contains(&(tenant_idx, norm_src)) {
+                                    decoded_pushers.push((tenant_idx, norm_src));
+                                }
+                                let is_empty = rec_series_count == 0 && rec_metadata.is_empty();
+                                if !is_empty || is_sequential {
+                                    tenant_key_errors.push((
+                                        rec_seq,
+                                        rec.offset,
+                                        tenant_idx,
+                                        is_empty,
+                                    ));
                                 }
                             }
                             Err(e) => {
@@ -729,8 +773,19 @@ impl IngesterShardedBatchConsumer {
                     } else {
                         match deserialize_record_content(&rec.value, version, wr_scratch) {
                             Ok(borrowed) => {
-                                if borrowed.timeseries_len() > 0 || borrowed.metadata_len() > 0 {
-                                    tenant_key_errors.push((rec_seq, rec.offset, tenant_idx));
+                                let norm_src = norm_source_i32(borrowed.source);
+                                if !decoded_pushers.contains(&(tenant_idx, norm_src)) {
+                                    decoded_pushers.push((tenant_idx, norm_src));
+                                }
+                                let is_empty =
+                                    borrowed.timeseries_len() == 0 && borrowed.metadata_len() == 0;
+                                if !is_empty || is_sequential {
+                                    tenant_key_errors.push((
+                                        rec_seq,
+                                        rec.offset,
+                                        tenant_idx,
+                                        is_empty,
+                                    ));
                                 }
                             }
                             Err(e) => {
@@ -805,6 +860,11 @@ impl IngesterShardedBatchConsumer {
                     rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
                 );
 
+                let max_exemplars = self
+                    .ingester
+                    .limiter
+                    .max_exemplars_per_user(&tenant_ids[tenant_idx as usize]);
+
                 if version == 2 {
                     let label_bytes_base = label_bytes_arena.len();
                     let samples_base = samples_arena.len();
@@ -817,6 +877,10 @@ impl IngesterShardedBatchConsumer {
 
                     let mut rec_metadata: Vec<BorrowedMetadata<'_>> = Vec::new();
                     let mut rec_first_shard: Option<usize> = None;
+                    let mut rec_series_count = 0usize;
+                    // Exemplars are always unmarshalled (and so validated on the wire), like Go:
+                    // only the distributor sets `SkipUnmarshalingExemplars`. With exemplars
+                    // disabled for the tenant they are just not converted below.
                     let stream_res = decode_rw2_stream(
                         &rec.value,
                         DecodeOptions::kafka_v2(),
@@ -826,14 +890,13 @@ impl IngesterShardedBatchConsumer {
                         samples_arena,
                         &mut rec_metadata,
                         |ts| {
-                            let label_bytes_start = ts.label_bytes_range.start as u32;
+                            rec_series_count += 1;
+                            let label_bytes_start = ts.label_bytes_range.start;
                             let label_bytes_len =
-                                (ts.label_bytes_range.end - ts.label_bytes_range.start) as u32;
+                                ts.label_bytes_range.end - ts.label_bytes_range.start;
                             let (raw_label_bytes_start, raw_label_bytes_len) =
                                 match ts.raw_label_bytes_range {
-                                    Some(ref rr) if !ts.bad_utf8 => {
-                                        (rr.start as u32, rr.len() as u32)
-                                    }
+                                    Some(ref rr) if !ts.bad_utf8 => (rr.start, rr.len()),
                                     _ => (label_bytes_start, label_bytes_len),
                                 };
                             let prom_hash = if !ts.bad_utf8
@@ -846,8 +909,8 @@ impl IngesterShardedBatchConsumer {
                             };
 
                             let mut min_ts = ts.min_sample_ts;
-                            let hist_start = histograms_arena.len() as u32;
-                            let mut hist_len = 0u32;
+                            let hist_start = histograms_arena.len();
+                            let mut hist_len = 0usize;
                             if ts.histograms_len() > 0 {
                                 for h in ts.histograms() {
                                     let conv = convert_borrowed_histogram(&h);
@@ -857,9 +920,9 @@ impl IngesterShardedBatchConsumer {
                                 }
                             }
 
-                            let ex_start = exemplars_arena.len() as u32;
-                            let mut ex_len = 0u32;
-                            if ts.exemplars_len() > 0 {
+                            let ex_start = exemplars_arena.len();
+                            let mut ex_len = 0usize;
+                            if max_exemplars > 0 && ts.exemplars_len() > 0 {
                                 tmp_ex.clear();
                                 for ex in ts.exemplars() {
                                     let res = convert_borrowed_exemplar(&ex);
@@ -889,9 +952,8 @@ impl IngesterShardedBatchConsumer {
                                 label_bytes_len,
                                 raw_label_bytes_start,
                                 raw_label_bytes_len,
-                                samples_start: ts.samples_range.start as u32,
-                                samples_len: (ts.samples_range.end - ts.samples_range.start)
-                                    as u32,
+                                samples_start: ts.samples_range.start,
+                                samples_len: ts.samples_range.end - ts.samples_range.start,
                                 created_timestamp: ts.created_timestamp,
                                 histograms_start: hist_start,
                                 histograms_len: hist_len,
@@ -905,6 +967,20 @@ impl IngesterShardedBatchConsumer {
 
                     match stream_res {
                         Ok(hdr) => {
+                            let norm_src = norm_source_i32(hdr.source);
+                            if !decoded_pushers.contains(&(tenant_idx, norm_src)) {
+                                decoded_pushers.push((tenant_idx, norm_src));
+                            }
+                            if is_sequential && rec_series_count == 0 && rec_metadata.is_empty() {
+                                seq_empty_records.push((
+                                    rec_seq,
+                                    worker_idx as u16,
+                                    rec.offset,
+                                    tenant_idx,
+                                    norm_src,
+                                    rec_trace_idx,
+                                ));
+                            }
                             if hdr.header_changed_after_series {
                                 for s_idx in 0..num_shards {
                                     for item in &mut shard_buckets[s_idx][bucket_bases[s_idx]..] {
@@ -965,10 +1041,20 @@ impl IngesterShardedBatchConsumer {
                         }
                     };
 
+                let label_bytes_base = label_bytes_arena.len();
+                let samples_base = samples_arena.len();
+                let hist_base = histograms_arena.len();
+                let ex_base = exemplars_arena.len();
+                let total_series_base = *total_series;
+                for s_idx in 0..num_shards {
+                    bucket_bases[s_idx] = shard_buckets[s_idx].len();
+                }
+
                 let mut rec_first_shard: Option<usize> = None;
                 let source = borrowed.source;
                 let skip_label_validation = borrowed.skip_label_validation;
                 let ts_count = borrowed.timeseries_len();
+                let mut label_encode_err: Option<String> = None;
 
                 for ts in borrowed.timeseries() {
                     let label_bytes_start = label_bytes_arena.len();
@@ -987,11 +1073,14 @@ impl IngesterShardedBatchConsumer {
                             }
                             prev_name = Some(k);
                             if !v.is_empty() {
-                                append_stringlabel_pair(
+                                if let Err(e) = try_append_stringlabel_pair(
                                     label_bytes_arena,
                                     k.as_bytes(),
                                     v.as_bytes(),
-                                );
+                                ) {
+                                    label_encode_err = Some(e);
+                                    break;
+                                }
                             } else {
                                 dropped_empty = true;
                             }
@@ -1015,18 +1104,24 @@ impl IngesterShardedBatchConsumer {
                             }
                             prev_name = Some(k);
                             if !v.is_empty() {
-                                append_stringlabel_pair(
+                                if let Err(e) = try_append_stringlabel_pair(
                                     label_bytes_arena,
                                     k.as_bytes(),
                                     v.as_bytes(),
-                                );
+                                ) {
+                                    label_encode_err = Some(e);
+                                    break;
+                                }
                             } else {
                                 dropped_empty = true;
                             }
                         }
                     }
+                    if label_encode_err.is_some() {
+                        break;
+                    }
 
-                    let mut raw_range: Option<(u32, u32)> = None;
+                    let mut raw_range: Option<(usize, usize)> = None;
                     let label_bytes_end = if bad_utf8 {
                         label_bytes_arena.truncate(label_bytes_start);
                         label_bytes_start
@@ -1034,12 +1129,29 @@ impl IngesterShardedBatchConsumer {
                         label_bytes_arena.truncate(label_bytes_start);
                         if let Some(ts_labels_str) = ts.labels_str() {
                             for (k, v) in ts_labels_str {
-                                append_stringlabel_pair(label_bytes_arena, k.as_bytes(), v.as_bytes());
+                                if let Err(e) = try_append_stringlabel_pair(
+                                    label_bytes_arena,
+                                    k.as_bytes(),
+                                    v.as_bytes(),
+                                ) {
+                                    label_encode_err = Some(e);
+                                    break;
+                                }
                             }
                         } else {
                             for lp in ts.labels() {
-                                append_stringlabel_pair(label_bytes_arena, lp.name, lp.value);
+                                if let Err(e) = try_append_stringlabel_pair(
+                                    label_bytes_arena,
+                                    lp.name,
+                                    lp.value,
+                                ) {
+                                    label_encode_err = Some(e);
+                                    break;
+                                }
                             }
+                        }
+                        if label_encode_err.is_some() {
+                            break;
                         }
                         label_bytes_arena.len()
                     } else if labels_sorted_unique && dropped_empty {
@@ -1047,21 +1159,38 @@ impl IngesterShardedBatchConsumer {
                         let raw_start = enc_end;
                         if let Some(ts_labels_str) = ts.labels_str() {
                             for (k, v) in ts_labels_str {
-                                append_stringlabel_pair(label_bytes_arena, k.as_bytes(), v.as_bytes());
+                                if let Err(e) = try_append_stringlabel_pair(
+                                    label_bytes_arena,
+                                    k.as_bytes(),
+                                    v.as_bytes(),
+                                ) {
+                                    label_encode_err = Some(e);
+                                    break;
+                                }
                             }
                         } else {
                             for lp in ts.labels() {
-                                append_stringlabel_pair(label_bytes_arena, lp.name, lp.value);
+                                if let Err(e) = try_append_stringlabel_pair(
+                                    label_bytes_arena,
+                                    lp.name,
+                                    lp.value,
+                                ) {
+                                    label_encode_err = Some(e);
+                                    break;
+                                }
                             }
                         }
-                        raw_range = Some((raw_start as u32, (label_bytes_arena.len() - raw_start) as u32));
+                        if label_encode_err.is_some() {
+                            break;
+                        }
+                        raw_range = Some((raw_start, label_bytes_arena.len() - raw_start));
                         enc_end
                     } else {
                         label_bytes_arena.len()
                     };
-                    let label_bytes_len = (label_bytes_end - label_bytes_start) as u32;
+                    let label_bytes_len = label_bytes_end - label_bytes_start;
                     let (raw_label_bytes_start, raw_label_bytes_len) =
-                        raw_range.unwrap_or((label_bytes_start as u32, label_bytes_len));
+                        raw_range.unwrap_or((label_bytes_start, label_bytes_len));
                     let prom_hash = if !bad_utf8 && labels_sorted_unique && label_bytes_len > 0 {
                         xxh64(&label_bytes_arena[label_bytes_start..label_bytes_end], 0)
                     } else {
@@ -1069,16 +1198,16 @@ impl IngesterShardedBatchConsumer {
                     };
 
                     let samples = ts.samples();
-                    let samples_start = samples_arena.len() as u32;
-                    let samples_len = samples.len() as u32;
+                    let samples_start = samples_arena.len();
+                    let samples_len = samples.len();
                     let mut min_ts = i64::MAX;
                     for s in samples {
                         min_ts = min_ts.min(s.timestamp_ms);
                     }
                     samples_arena.extend_from_slice(samples);
 
-                    let hist_start = histograms_arena.len() as u32;
-                    let mut hist_len = 0u32;
+                    let hist_start = histograms_arena.len();
+                    let mut hist_len = 0usize;
                     for h in ts.histograms() {
                         let conv = convert_borrowed_histogram(&h);
                         min_ts = min_ts.min(conv.0);
@@ -1086,9 +1215,9 @@ impl IngesterShardedBatchConsumer {
                         hist_len += 1;
                     }
 
-                    let ex_start = exemplars_arena.len() as u32;
-                    let mut ex_len = 0u32;
-                    if ts.exemplars().len() > 0 {
+                    let ex_start = exemplars_arena.len();
+                    let mut ex_len = 0usize;
+                    if max_exemplars > 0 && ts.exemplars().len() > 0 {
                         tmp_ex.clear();
                         for ex in ts.exemplars() {
                             let res = convert_borrowed_exemplar(&ex);
@@ -1114,7 +1243,7 @@ impl IngesterShardedBatchConsumer {
                         labels_sorted_unique,
                         bad_utf8,
                         prom_hash,
-                        label_bytes_start: label_bytes_start as u32,
+                        label_bytes_start,
                         label_bytes_len,
                         raw_label_bytes_start,
                         raw_label_bytes_len,
@@ -1128,6 +1257,36 @@ impl IngesterShardedBatchConsumer {
                         min_ts,
                     });
                     *total_series += 1;
+                }
+
+                if let Some(e) = label_encode_err {
+                    let err_msg = format!("parsing ingest consumer write request: {e}");
+                    error!(err = %err_msg, "failed to parse write request; skipping");
+                    label_bytes_arena.truncate(label_bytes_base);
+                    samples_arena.truncate(samples_base);
+                    histograms_arena.truncate(hist_base);
+                    exemplars_arena.truncate(ex_base);
+                    for s_idx in 0..num_shards {
+                        shard_buckets[s_idx].truncate(bucket_bases[s_idx]);
+                    }
+                    *total_series = total_series_base;
+                    wr_scratch.clear();
+                    continue;
+                }
+
+                let norm_src = norm_source_i32(source);
+                if !decoded_pushers.contains(&(tenant_idx, norm_src)) {
+                    decoded_pushers.push((tenant_idx, norm_src));
+                }
+                if is_sequential && ts_count == 0 && borrowed.metadata_len() == 0 {
+                    seq_empty_records.push((
+                        rec_seq,
+                        worker_idx as u16,
+                        rec.offset,
+                        tenant_idx,
+                        norm_src,
+                        rec_trace_idx,
+                    ));
                 }
 
                 if borrowed.metadata_len() > 0 {
@@ -1178,9 +1337,56 @@ impl IngesterShardedBatchConsumer {
             });
         }
 
+        struct ParallelPusherMetricsGuard<'a> {
+            metrics: &'a mimir_storage::ingest::pusher::StoragePusherMetrics,
+            active_shards: usize,
+            pushers: usize,
+        }
+        impl Drop for ParallelPusherMetricsGuard<'_> {
+            fn drop(&mut self) {
+                self.metrics
+                    .shards_per_push
+                    .observe(self.active_shards as f64);
+                self.metrics.pushers_per_push.observe(self.pushers as f64);
+            }
+        }
+
+        let _parallel_metrics_guard = if !is_sequential {
+            let mut pushers: HashSet<(u32, i32)> = HashSet::new();
+            for a in &pool_guard.arenas {
+                for &p in &a.decoded_pushers {
+                    pushers.insert(p);
+                }
+            }
+            let bytes_per_sample = self
+                .kafka_cfg
+                .ingestion_concurrency_estimated_bytes_per_sample
+                .max(1) as usize;
+            let mut est_total = 0usize;
+            let mut active_shards = 0usize;
+            for &(t_idx, _) in &pushers {
+                est_total +=
+                    tenant_bytes.get(t_idx as usize).copied().unwrap_or(0) / bytes_per_sample;
+                active_shards += tenant_shard_spread.get(t_idx as usize).copied().unwrap_or(1);
+            }
+            if est_total > 0 {
+                self.metrics
+                    .storage_pusher_metrics
+                    .estimated_timeseries
+                    .inc_by(est_total as f64);
+            }
+            Some(ParallelPusherMetricsGuard {
+                metrics: &self.metrics.storage_pusher_metrics,
+                active_shards,
+                pushers: pushers.len(),
+            })
+        } else {
+            None
+        };
+
         let mut total_series = 0usize;
         let mut total_metadata = 0usize;
-        let mut first_tenant_key_err: Option<(u32, i64, u32)> = None;
+        let mut first_tenant_key_err: Option<(u32, i64, u32, bool)> = None;
         for a in &pool_guard.arenas {
             total_series += a.total_series;
             total_metadata += a.metadata.total;
@@ -1191,7 +1397,7 @@ impl IngesterShardedBatchConsumer {
             }
         }
 
-        if let Some((_, offset, tid_idx)) = first_tenant_key_err {
+        if let Some((_, offset, tid_idx, is_empty)) = first_tenant_key_err {
             let tid = &tenants[tid_idx as usize];
             let msg = if tid.is_empty() {
                 "no org id"
@@ -1207,6 +1413,12 @@ impl IngesterShardedBatchConsumer {
                 log_policy: None,
             };
             let m = &self.metrics.storage_pusher_metrics;
+            if is_sequential && is_empty {
+                m.time_series_per_flush.observe(0.0);
+                self.processing_time_empty
+                    .get_or_init(|| m.processing_time.with_label_values(&["empty"]))
+                    .observe(0.0);
+            }
             if !is_sequential {
                 m.batch_age.observe(batch_started.elapsed().as_secs_f64());
                 m.batching_queue_metrics.flush_total.inc();
@@ -1218,7 +1430,18 @@ impl IngesterShardedBatchConsumer {
             ));
         }
 
-        if total_series == 0 && total_metadata == 0 {
+        let seq_empty_records: Vec<(u32, u16, i64, u32, i32, u32)> = if is_sequential {
+            let mut empty_recs = Vec::new();
+            for a in &pool_guard.arenas {
+                empty_recs.extend_from_slice(&a.seq_empty_records);
+            }
+            empty_recs.sort_by_key(|r| r.0);
+            empty_recs
+        } else {
+            Vec::new()
+        };
+
+        if total_series == 0 && total_metadata == 0 && seq_empty_records.is_empty() {
             return Ok(());
         }
 
@@ -1243,11 +1466,7 @@ impl IngesterShardedBatchConsumer {
                 return Ok(());
             }
 
-            let norm_source_i32 = |raw: i32| -> i32 {
-                cortexpb::write_request::SourceEnum::try_from(raw)
-                    .map(|s| s as i32)
-                    .unwrap_or(cortexpb::write_request::SourceEnum::Api as i32)
-            };
+
             if !is_sequential {
                 items_for_shard.sort_by_key(|it| (it.tenant_idx, norm_source_i32(it.source)));
                 metas_for_shard.sort_by_key(|it| (it.tenant_idx, it.source as i32));
@@ -1450,21 +1669,21 @@ impl IngesterShardedBatchConsumer {
                     wa.label_bytes_slice(item.label_bytes_start, item.label_bytes_len);
                 let raw_encoded_labels =
                     wa.label_bytes_slice(item.raw_label_bytes_start, item.raw_label_bytes_len);
-                let s_start = item.samples_start as usize;
-                let s_end = s_start + item.samples_len as usize;
+                let s_start = item.samples_start;
+                let s_end = s_start + item.samples_len;
                 let samples = &wa.samples_arena[s_start..s_end];
 
                 let histograms = if item.histograms_len == 0 {
                     &[][..]
                 } else {
-                    let h_start = item.histograms_start as usize;
-                    &wa.histograms_arena[h_start..h_start + item.histograms_len as usize]
+                    let h_start = item.histograms_start;
+                    &wa.histograms_arena[h_start..h_start + item.histograms_len]
                 };
                 let exemplars = if item.exemplars_len == 0 {
                     &[][..]
                 } else {
-                    let e_start = item.exemplars_start as usize;
-                    &wa.exemplars_arena[e_start..e_start + item.exemplars_len as usize]
+                    let e_start = item.exemplars_start;
+                    &wa.exemplars_arena[e_start..e_start + item.exemplars_len]
                 };
 
                 batch.push(PrehashedSeriesItem {
@@ -1532,35 +1751,56 @@ impl IngesterShardedBatchConsumer {
             }
         }
 
-        if !is_sequential {
-            let mut pushers: HashSet<(u32, i32)> = HashSet::new();
-            for a in arenas_ref {
-                for b in &a.shard_buckets {
-                    for it in b {
-                        let norm_src = cortexpb::write_request::SourceEnum::try_from(it.source)
-                            .map(|s| s as i32)
-                            .unwrap_or(cortexpb::write_request::SourceEnum::Api as i32);
-                        pushers.insert((it.tenant_idx, norm_src));
+        if first_err.is_none() && !seq_empty_records.is_empty() {
+            let m = &self.metrics.storage_pusher_metrics;
+            let empty_hist = self
+                .processing_time_empty
+                .get_or_init(|| m.processing_time.with_label_values(&["empty"]));
+            for (_, w_idx, offset, tid_idx, norm_src, trace_idx) in seq_empty_records {
+                let tenant_key = &tenants_ref[tid_idx as usize];
+                let tenant_id = &tenant_ids_ref[tid_idx as usize];
+                let norm_source = cortexpb::write_request::SourceEnum::try_from(norm_src)
+                    .unwrap_or(cortexpb::write_request::SourceEnum::Api);
+                let sampled_trace_id = if trace_idx == u32::MAX {
+                    None
+                } else {
+                    arenas_ref
+                        .get(w_idx as usize)
+                        .and_then(|a| a.trace_ids.get(trace_idx as usize))
+                        .map(String::as_str)
+                };
+                m.time_series_per_flush.observe(0.0);
+                let proc_t0 = Instant::now();
+                let res = self
+                    .ingester
+                    .ingest_prehashed_shard_batch_with_trace(
+                        tenant_id,
+                        norm_source,
+                        i64::MAX,
+                        &[],
+                        &[],
+                        sampled_trace_id,
+                    )
+                    .map_err(ingester_err_to_pusher_err);
+                empty_hist.observe(proc_t0.elapsed().as_secs_f64());
+                match res {
+                    Ok(()) => {
+                        self.error_handler
+                            .is_server_error(tenant_id, sampled_trace_id, None);
                     }
-                }
-                for b in &a.metadata.buckets {
-                    for it in b {
-                        pushers.insert((it.tenant_idx, it.source as i32));
+                    Err(err) => {
+                        if self
+                            .error_handler
+                            .is_server_error(tenant_id, sampled_trace_id, Some(&err))
+                        {
+                            first_err = Some(format!(
+                                "consuming record at offset {offset} for tenant {tenant_key}: {err}"
+                            ));
+                            break;
+                        }
                     }
                 }
             }
-            let active_shards: usize = pushers
-                .iter()
-                .map(|(t, _)| tenant_shard_spread.get(*t as usize).copied().unwrap_or(1))
-                .sum();
-            self.metrics
-                .storage_pusher_metrics
-                .shards_per_push
-                .observe(active_shards as f64);
-            self.metrics
-                .storage_pusher_metrics
-                .pushers_per_push
-                .observe(pushers.len() as f64);
         }
 
         match first_err {

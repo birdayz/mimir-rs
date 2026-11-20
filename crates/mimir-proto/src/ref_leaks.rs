@@ -41,13 +41,31 @@ impl Default for InstrumentRefLeaksConfig {
 
 impl InstrumentRefLeaksConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if self.percentage < 0.0 || self.percentage > 100.0 {
+        if !(0.0..=100.0).contains(&self.percentage) {
             return Err(format!(
                 "percentage must be in [0-100], got: {}",
                 self.percentage
             ));
         }
+        Self::validate_before_reuse_period_ns(
+            i64::try_from(self.before_reuse_period.as_nanos()).unwrap_or(i64::MAX),
+        )
+    }
+
+    pub fn validate_before_reuse_period_ns(before_reuse_period_ns: i64) -> Result<(), String> {
+        if before_reuse_period_ns < 0 {
+            return Err(format!(
+                "before-reuse-period must be positive, got: {before_reuse_period_ns}ns"
+            ));
+        }
         Ok(())
+    }
+
+    pub fn validate_raw(percentage: f64, before_reuse_period_ns: i64) -> Result<(), String> {
+        if !(0.0..=100.0).contains(&percentage) {
+            return Err(format!("percentage must be in [0-100], got: {percentage}"));
+        }
+        Self::validate_before_reuse_period_ns(before_reuse_period_ns)
     }
 
     pub fn tracker(&self, registry: Option<&Registry>) -> RefLeaksTracker {
@@ -125,6 +143,28 @@ impl RefLeaksTrackerInner {
         self.inflight_instrumented_bytes_metric
             .set(new_inflight as f64);
     }
+
+    fn drain_expired_delayed_unmaps(&self) {
+        let now = Instant::now();
+        let expired: Vec<usize> = {
+            let Ok(mut q) = self.delayed_unmap.lock() else {
+                return;
+            };
+            let mut due = Vec::new();
+            let mut i = 0;
+            while i < q.len() {
+                if q[i].0 <= now {
+                    due.push(q.swap_remove(i).1);
+                } else {
+                    i += 1;
+                }
+            }
+            due
+        };
+        for aligned_len in expired {
+            self.unmap(aligned_len);
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -144,13 +184,18 @@ impl RefLeaksTracker {
     }
 
     pub fn inflight_instrumented_bytes(&self) -> f64 {
-        self.inner
-            .as_ref()
-            .map_or(0.0, |i| i.inflight_instrumented_bytes_metric.get())
+        match self.inner.as_ref() {
+            Some(i) => {
+                i.drain_expired_delayed_unmaps();
+                i.inflight_instrumented_bytes_metric.get()
+            }
+            None => 0.0,
+        }
     }
 
     pub fn maybe_instrument_ref_leaks(&self, data: &[u8]) -> Option<TrackedBuffer> {
         let inner = self.inner.as_ref()?;
+        inner.drain_expired_delayed_unmaps();
         if data.is_empty() || inner.instrument_one_in == 0 {
             return None;
         }

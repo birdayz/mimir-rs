@@ -410,8 +410,27 @@ impl<'a> FloatHistogramStAppender<'a> {
                     h_owned.positive_spans = self.state.p_spans.clone();
                     h_owned.negative_spans = self.state.n_spans.clone();
                 } else {
-                    h_owned.positive_spans = adjust_for_inserts(&h_owned.positive_spans, &p_bwd);
-                    h_owned.negative_spans = adjust_for_inserts(&h_owned.negative_spans, &n_bwd);
+                    let (Some(ps), Some(ns)) = (
+                        adjust_for_inserts(&h_owned.positive_spans, &p_bwd),
+                        adjust_for_inserts(&h_owned.negative_spans, &n_bwd),
+                    ) else {
+                        if append_only {
+                            return Err(ChunkError::HistogramLayoutChange);
+                        }
+                        let mut new_chunk = FloatHistogramStChunk::new();
+                        let new_cached = {
+                            let mut app = new_chunk.appender()?;
+                            if counter_reset {
+                                app.set_counter_reset_header(CounterResetHeader::CounterReset);
+                            }
+                            let n = app.append_float_histogram_st(0, st, t, h);
+                            app.set_num_samples(n);
+                            return_new_state.then_some((app.state, app.st_enc))
+                        };
+                        return Ok((AppendFloatHistogramStOutcome::NewChunk(new_chunk), new_cached));
+                    };
+                    h_owned.positive_spans = ps;
+                    h_owned.negative_spans = ns;
                 }
                 FloatHistogramAppender::recode_histogram(&mut h_owned, &p_bwd, &n_bwd);
                 h_ref = &h_owned;

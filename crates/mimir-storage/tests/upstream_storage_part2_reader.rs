@@ -847,7 +847,7 @@ async fn test_single_cluster_partition_reader_enforce_read_max_delay() {
         )
         .unwrap();
         reader.start().await.unwrap();
-        assert_eq!(reader.highest_consumed_timestamp_before_partition_end_ms(), 0);
+        assert_eq!(reader.highest_consumed_timestamp_before_partition_end_ms(), i64::MIN);
         reader.enforce_read_max_delay(Duration::from_secs(60)).unwrap();
         reader.stop().await;
         cluster.close();
@@ -906,7 +906,7 @@ async fn test_single_cluster_partition_reader_enforce_read_max_delay() {
             assert!(Instant::now() < dl);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(reader.highest_consumed_timestamp_before_partition_end_ms(), 0);
+        assert_eq!(reader.highest_consumed_timestamp_before_partition_end_ms(), i64::MIN);
         reader.enforce_read_max_delay(Duration::from_secs(60)).unwrap();
 
         reader.stop().await;
@@ -952,7 +952,7 @@ async fn test_single_cluster_partition_reader_enforce_read_max_delay() {
         }
 
         let dl = Instant::now() + Duration::from_secs(5);
-        while reader.highest_consumed_timestamp_before_partition_end_ms() == 0 {
+        while reader.highest_consumed_timestamp_before_partition_end_ms() == i64::MIN {
             assert!(Instant::now() < dl);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

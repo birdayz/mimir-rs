@@ -491,7 +491,7 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
             if let Ok(hex) = std::str::from_utf8(&b[i + 1..i + 3]) {
                 if let Ok(v) = u8::from_str_radix(hex, 16) {
                     out.push(v);
@@ -2330,5 +2330,11 @@ mod tests {
         let auths = blob_auths.lock().unwrap().clone();
         assert!(auths.iter().any(|a| a == "Bearer imds-tok-1"), "{auths:?}");
         assert!(auths.iter().any(|a| a == "Bearer imds-tok-2"), "{auths:?}");
+    }
+
+    #[test]
+    fn w20_sdw_11_percent_decode_rejects_plus_and_minus_signs() {
+        assert_eq!(percent_decode("a%20b%2Fc"), "a b/c");
+        assert_eq!(percent_decode("%+a%-1%zz%2"), "%+a%-1%zz%2");
     }
 }

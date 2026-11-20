@@ -335,10 +335,14 @@ impl FloatHistogramAppenderState {
         {
             return AppendableGauge::default();
         }
-        let (p_fwd, p_bwd, p_merged) =
-            expand_spans_both_ways(&self.p_spans, &h.positive_spans);
-        let (n_fwd, n_bwd, n_merged) =
-            expand_spans_both_ways(&self.n_spans, &h.negative_spans);
+        let Some((p_fwd, p_bwd, p_merged)) =
+            expand_spans_both_ways(&self.p_spans, &h.positive_spans) else {
+            return AppendableGauge::default();
+        };
+        let Some((n_fwd, n_bwd, n_merged)) =
+            expand_spans_both_ways(&self.n_spans, &h.negative_spans) else {
+            return AppendableGauge::default();
+        };
         AppendableGauge {
             p_fwd,
             n_fwd,
@@ -626,8 +630,27 @@ impl<'a> FloatHistogramAppender<'a> {
                     h_owned.positive_spans = self.state.p_spans.clone();
                     h_owned.negative_spans = self.state.n_spans.clone();
                 } else {
-                    h_owned.positive_spans = adjust_for_inserts(&h_owned.positive_spans, &p_bwd);
-                    h_owned.negative_spans = adjust_for_inserts(&h_owned.negative_spans, &n_bwd);
+                    let (Some(ps), Some(ns)) = (
+                        adjust_for_inserts(&h_owned.positive_spans, &p_bwd),
+                        adjust_for_inserts(&h_owned.negative_spans, &n_bwd),
+                    ) else {
+                        if append_only {
+                            return Err(ChunkError::HistogramLayoutChange);
+                        }
+                        let mut new_chunk = FloatHistogramChunk::new();
+                        let new_state = {
+                            let mut app = new_chunk.appender()?;
+                            if counter_reset {
+                                app.set_counter_reset_header(CounterResetHeader::CounterReset);
+                            }
+                            let n = app.append_raw(0, t, h);
+                            app.set_num_samples(n);
+                            return_new_state.then_some(app.state)
+                        };
+                        return Ok((AppendFloatHistogramOutcome::NewChunk(new_chunk), new_state));
+                    };
+                    h_owned.positive_spans = ps;
+                    h_owned.negative_spans = ns;
                 }
                 Self::recode_histogram(&mut h_owned, &p_bwd, &n_bwd);
                 h_ref = &h_owned;
@@ -733,10 +756,10 @@ fn expand_float_spans_and_buckets(
         b_count = *b_buckets.get(b_count_idx)?;
     }
 
-    let add_insert = |inserts: &mut Vec<Insert>, inter: &mut Insert, other_idx: i32| {
+    let add_insert = |inserts: &mut Vec<Insert>, inter: &mut Insert, other_idx: i64| {
         if inter.num == 0 {
             inter.bucket_idx = other_idx;
-        } else if inter.bucket_idx + (inter.num as i32) != other_idx {
+        } else if inter.bucket_idx + (inter.num as i64) != other_idx {
             inserts.push(*inter);
             inter.num = 0;
             inter.bucket_idx = other_idx;
@@ -1137,8 +1160,8 @@ fn reduce_float_side(
     let mut new_spans: Vec<HistogramSpan> = Vec::new();
     let mut new_counts: Vec<f64> = Vec::new();
 
-    let mut prev_new_idx: Option<i32> = None;
-    let mut acc_idx: Option<i32> = None;
+    let mut prev_new_idx: Option<i64> = None;
+    let mut acc_idx: Option<i64> = None;
     let mut acc_count = 0.0f64;
 
     for &val in buckets {
@@ -1148,9 +1171,9 @@ fn reduce_float_side(
         let shifted = if shift >= 64 {
             if orig_idx <= 0 { -1 } else { 0 }
         } else {
-            (i64::from(orig_idx) - 1) >> shift
+            (orig_idx - 1) >> shift
         };
-        let target_idx = (shifted + 1) as i32;
+        let target_idx = shifted + 1;
         match acc_idx {
             Some(idx) if idx == target_idx => {
                 acc_count += val;
@@ -1173,16 +1196,16 @@ fn reduce_float_side(
 }
 
 fn flush_float_bucket(
-    idx: i32,
+    idx: i64,
     val: f64,
-    prev_idx: &mut Option<i32>,
+    prev_idx: &mut Option<i64>,
     spans: &mut Vec<HistogramSpan>,
     counts: &mut Vec<f64>,
 ) {
     match *prev_idx {
         None => {
             spans.push(HistogramSpan {
-                offset: idx,
+                offset: idx as i32,
                 length: 1,
             });
         }
@@ -1192,7 +1215,7 @@ fn flush_float_bucket(
                 spans.last_mut().unwrap().length += 1;
             } else {
                 spans.push(HistogramSpan {
-                    offset: gap,
+                    offset: gap as i32,
                     length: 1,
                 });
             }

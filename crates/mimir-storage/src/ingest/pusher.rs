@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use mimir_config::KafkaConfig;
@@ -19,7 +19,10 @@ use mimir_proto::cortexpb::{self, is_client_error_cause, ErrorCause};
 use mimir_proto::symbols::V2_COMMON_SYMBOLS_LIST;
 use mimir_proto::zerocopy::{BorrowedWriteRequest, WriteRequestScratch};
 use parking_lot::Mutex as SyncMutex;
-use prometheus::{Counter, CounterVec, Histogram, HistogramOpts, HistogramVec, Opts, Registry};
+use mimir_common::native_histogram::{
+    HistogramOpts as NativeHistogramOpts, HistogramVec, SingleHistogram, DEF_BUCKETS,
+};
+use prometheus::{Counter, CounterVec, Opts, Registry};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
@@ -384,11 +387,11 @@ impl BatchingQueueMetrics {
 
 #[derive(Clone)]
 pub struct StoragePusherMetrics {
-    pub batch_age: Histogram,
+    pub batch_age: SingleHistogram,
     pub processing_time: HistogramVec,
-    pub time_series_per_flush: Histogram,
-    pub shards_per_push: Histogram,
-    pub pushers_per_push: Histogram,
+    pub time_series_per_flush: SingleHistogram,
+    pub shards_per_push: SingleHistogram,
+    pub pushers_per_push: SingleHistogram,
     pub batching_queue_metrics: BatchingQueueMetrics,
     pub client_err_requests: Counter,
     pub server_err_requests: Counter,
@@ -407,37 +410,50 @@ impl StoragePusherMetrics {
         )
         .expect("valid metric");
 
-        let batch_age = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_reader_pusher_batch_age_seconds",
-            "Age of the batch of samples that are being ingested by an ingestion shard. This is the time since adding the first sample to the batch. Higher values indicates that the batching queue is not processing fast enough or that the batches are not filling up fast enough.",
-        ))
+        let batch_age = SingleHistogram::new(
+            NativeHistogramOpts::new(
+                "cortex_ingest_storage_reader_pusher_batch_age_seconds",
+                "Age of the batch of samples that are being ingested by an ingestion shard. This is the time since adding the first sample to the batch. Higher values indicates that the batching queue is not processing fast enough or that the batches are not filling up fast enough.",
+            )
+            .native(1.1, 0, Duration::ZERO),
+        )
         .expect("valid metric");
 
         let processing_time = HistogramVec::new(
-            HistogramOpts::new(
+            NativeHistogramOpts::new(
                 "cortex_ingest_storage_reader_pusher_processing_time_seconds",
                 "Time to ingest a batch of samples for timeseries or metadata by an ingestion shard. The 'batch_contents' label indicates the contents of the batch.",
-            ),
+            )
+            .native(1.1, 0, Duration::ZERO),
             &["content"],
         )
         .expect("valid metric");
 
-        let time_series_per_flush = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_reader_pusher_timeseries_per_flush",
-            "Number of time series pushed in each batch to an ingestion shard. A lower number than -ingest-storage.kafka.ingestion-concurrency-batch-size indicates that shards are not filling up and may not be parallelizing ingestion as efficiently.",
-        ))
+        let time_series_per_flush = SingleHistogram::new(
+            NativeHistogramOpts::new(
+                "cortex_ingest_storage_reader_pusher_timeseries_per_flush",
+                "Number of time series pushed in each batch to an ingestion shard. A lower number than -ingest-storage.kafka.ingestion-concurrency-batch-size indicates that shards are not filling up and may not be parallelizing ingestion as efficiently.",
+            )
+            .native(1.1, 0, Duration::ZERO),
+        )
         .expect("valid metric");
 
-        let shards_per_push = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_reader_shards_per_push",
-            "Number of shards that are pushed to in each batch. There are one or more shards for each unique tenant and Source tuple.",
-        ))
+        let shards_per_push = SingleHistogram::new(
+            NativeHistogramOpts::new(
+                "cortex_ingest_storage_reader_shards_per_push",
+                "Number of shards that are pushed to in each batch. There are one or more shards for each unique tenant and Source tuple.",
+            )
+            .native(1.1, 0, Duration::ZERO),
+        )
         .expect("valid metric");
 
-        let pushers_per_push = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_reader_pushers_per_push",
-            "Number of pushers that are pushed to in each batch. There is one pusher for each unique tenant and Source tuple.",
-        ))
+        let pushers_per_push = SingleHistogram::new(
+            NativeHistogramOpts::new(
+                "cortex_ingest_storage_reader_pushers_per_push",
+                "Number of pushers that are pushed to in each batch. There is one pusher for each unique tenant and Source tuple.",
+            )
+            .native(1.1, 0, Duration::ZERO),
+        )
         .expect("valid metric");
 
         let client_err_requests = err_requests_counter.with_label_values(&["client"]);
@@ -483,16 +499,20 @@ impl StoragePusherMetrics {
 
 #[derive(Clone)]
 pub struct PusherConsumerMetrics {
-    pub processing_time_seconds: Histogram,
+    pub processing_time_seconds: SingleHistogram,
     pub storage_pusher_metrics: StoragePusherMetrics,
 }
 
 impl PusherConsumerMetrics {
     pub fn new(reg: Option<&Registry>) -> Self {
-        let processing_time_seconds = Histogram::with_opts(HistogramOpts::new(
-            "cortex_ingest_storage_reader_records_processing_time_seconds",
-            "Time taken to process a batch of fetched records. Fetched records are effectively a set of WriteRequests read from Kafka. This is the latency of a single attempt and does not include retries.",
-        ))
+        let processing_time_seconds = SingleHistogram::new(
+            NativeHistogramOpts::new(
+                "cortex_ingest_storage_reader_records_processing_time_seconds",
+                "Time taken to process a batch of fetched records. Fetched records are effectively a set of WriteRequests read from Kafka. This is the latency of a single attempt and does not include retries.",
+            )
+            .buckets(DEF_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
+        )
         .expect("valid metric");
 
         if let Some(r) = reg {

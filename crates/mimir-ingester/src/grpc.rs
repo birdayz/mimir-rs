@@ -1011,7 +1011,15 @@ fn decompress_frames_slice(
         let out = &mut *guard.0;
 
         let mut pos = 0usize;
+        let mut frame_count = 0usize;
         while pos < slice.len() {
+            // Every `cortex.Ingester` RPC is non-client-streaming. grpc-go `serverStream.RecvMsg`
+            // reads (and decompresses, bounded by `maxReceiveMessageSize`) one extra message after
+            // the first and then fails the RPC, so the first message is dropped here: nothing but
+            // an error can come out of this request, and the scratch stays bounded by one message.
+            if frame_count == 1 {
+                out.clear();
+            }
             if slice.len() - pos < 5 {
                 return Err(Status::internal("truncated gRPC compressed frame header"));
             }
@@ -1087,6 +1095,13 @@ fn decompress_frames_slice(
                         "invalid gRPC compression flag {other}"
                     )));
                 }
+            }
+            frame_count += 1;
+            if frame_count > 1 {
+                // grpc-go `stream.go` `serverStream.RecvMsg` (v1.85, used for unary RPCs too).
+                return Err(Status::internal(
+                    "cardinality violation: received multiple request messages for non-client-streaming RPC",
+                ));
             }
         }
 
@@ -1295,12 +1310,26 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     >;
 
                     fn call(&mut self, request: Request<Bytes>) -> Self::Future {
+                        struct TrackedBufferGuard(mimir_proto::ref_leaks::TrackedBuffer);
+                        impl Drop for TrackedBufferGuard {
+                            fn drop(&mut self) {
+                                self.0.free();
+                            }
+                        }
+
                         let ingester = Arc::clone(&self.ingester);
                         let tap_slot = self.tap_slot.clone();
                         Box::pin(async move {
                             let tap = tap_slot.as_ref().and_then(|s| s.lock().take());
                             let org_id_res = org_id_from_req(&ingester, &request);
                             let (_, extensions, raw) = request.into_parts();
+                            let _tracked_buf = ingester
+                                .ref_leaks_tracker()
+                                .and_then(|t| t.maybe_instrument_ref_leaks(&raw))
+                                .map(TrackedBufferGuard);
+                            if let Some(ref g) = _tracked_buf {
+                                let _ = g.0.read_only_data();
+                            }
                             // Go order: dec(in) -> ServerUserHeaderInterceptor -> PushGrpcMethodEnabled -> tenant.TenantID.
                             // On the happy path we avoid double-decoding by validating wire bytes early only
                             // when org_id / push_grpc_method_enabled / tenant_id fails.

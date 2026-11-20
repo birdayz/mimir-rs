@@ -21,7 +21,7 @@ use mimir_proto::zerocopy::{
 };
 use mimir_ring::ring::replication_strategy::WRITE_NO_EXTEND;
 use mimir_tsdb::chunkenc::{CounterResetHint, FloatHistogram, Histogram, HistogramSpan};
-use mimir_tsdb::exemplar::{Exemplar, ExemplarError};
+use mimir_tsdb::exemplar::{Exemplar, ExemplarError, EXEMPLAR_MAX_LABEL_SET_LENGTH};
 use mimir_tsdb::head::{prefetch_read_data, HeadAppender, HeadError, SeriesEntry};
 use mimir_tsdb::labels::{iter_stringlabels, Labels};
 use parking_lot::Mutex;
@@ -553,6 +553,50 @@ fn format_raw_bytes_labels<'a>(pairs: impl IntoIterator<Item = (&'a [u8], &'a [u
     out
 }
 
+fn convert_exemplar_pairs<'a>(
+    timestamp_ms: i64,
+    value: f64,
+    pairs: Vec<(&'a str, &'a str)>,
+) -> ConvertedExemplarResult {
+    let mut sorted = pairs.clone();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let mut rune_len = 0usize;
+    let mut prev_name: Option<&str> = None;
+    for &(k, v) in &sorted {
+        if prev_name == Some(k) {
+            let ex_str = format_labels_string(pairs.iter().copied());
+            return Err(ConvertedExemplarError {
+                timestamp_ms,
+                message: ExemplarError::DuplicateLabelName(k.to_string()).to_string(),
+                exemplar_labels: ex_str,
+            });
+        }
+        prev_name = Some(k);
+        if k.len() >= (1 << 24) || v.len() >= (1 << 24) {
+            let ex_str = format_labels_string(pairs.iter().copied());
+            return Err(ConvertedExemplarError {
+                timestamp_ms,
+                message: ExemplarError::LabelLengthExceeded.to_string(),
+                exemplar_labels: ex_str,
+            });
+        }
+        for _ in k.chars().chain(v.chars()) {
+            rune_len += 1;
+            if rune_len > EXEMPLAR_MAX_LABEL_SET_LENGTH {
+                let ex_str = format_labels_string(pairs.iter().copied());
+                return Err(ConvertedExemplarError {
+                    timestamp_ms,
+                    message: ExemplarError::LabelLengthExceeded.to_string(),
+                    exemplar_labels: ex_str,
+                });
+            }
+        }
+    }
+    let ex_str = format_labels_string(pairs.iter().copied());
+    let labels = Labels::from_sorted_slice(&sorted);
+    Ok((timestamp_ms, value, labels, ex_str))
+}
+
 pub(crate) fn convert_borrowed_exemplar(
     ex: &BorrowedExemplarView<'_, '_>,
 ) -> ConvertedExemplarResult {
@@ -578,9 +622,7 @@ pub(crate) fn convert_borrowed_exemplar(
             exemplar_labels,
         });
     }
-    let ex_str = format_labels_string(pairs.iter().copied());
-    let labels = Labels::from_pairs(pairs);
-    Ok((ex.timestamp_ms(), ex.value(), labels, ex_str))
+    convert_exemplar_pairs(ex.timestamp_ms(), ex.value(), pairs)
 }
 
 /// Abstract view over a single time series in either owned `cortexpb::TimeSeries` or zero-copy `BorrowedTimeSeriesView`.
@@ -605,6 +647,11 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
             let v = fast_utf8_str(&lp.value).map_err(|_| IngesterError::BadRequest {
                 message: "invalid UTF-8 in label value".to_string(),
             })?;
+            if k.len() >= (1 << 24) || v.len() >= (1 << 24) {
+                return Err(IngesterError::BadRequest {
+                    message: "label string exceeds 16 MiB stringlabels limit".to_string(),
+                });
+            }
             out.push((k, v));
         }
         Ok(())
@@ -738,9 +785,7 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
                 exemplar_labels,
             });
         }
-        let ex_str = format_labels_string(pairs.iter().copied());
-        let labels = Labels::from_pairs(pairs);
-        Ok((ex.timestamp_ms, ex.value, labels, ex_str))
+        convert_exemplar_pairs(ex.timestamp_ms, ex.value, pairs)
     }
 }
 
@@ -748,7 +793,14 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
     fn fill_pairs(&self, out: &mut Vec<(&'a str, &'a str)>) -> Result<(), IngesterError> {
         out.clear();
         if let Some(labels_str) = self.labels_str() {
-            out.extend(labels_str);
+            for (k, v) in labels_str {
+                if k.len() >= (1 << 24) || v.len() >= (1 << 24) {
+                    return Err(IngesterError::BadRequest {
+                        message: "label string exceeds 16 MiB stringlabels limit".to_string(),
+                    });
+                }
+                out.push((k, v));
+            }
             return Ok(());
         }
         for lp in self.labels() {
@@ -758,6 +810,11 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
             let v = fast_utf8_str(lp.value).map_err(|_| IngesterError::BadRequest {
                 message: "invalid UTF-8 in label value".to_string(),
             })?;
+            if k.len() >= (1 << 24) || v.len() >= (1 << 24) {
+                return Err(IngesterError::BadRequest {
+                    message: "label string exceeds 16 MiB stringlabels limit".to_string(),
+                });
+            }
             out.push((k, v));
         }
         Ok(())
@@ -1132,20 +1189,20 @@ impl Ingester {
 
     fn push_grpc_raw_sync(&self, user_id: &str, raw_bytes: &[u8]) -> Result<(), IngesterError> {
         struct ClassicSeriesMeta {
-            label_start: u32,
-            label_len: u32,
-            raw_label_start: u32,
-            raw_label_len: u32,
-            sample_start: u32,
-            sample_len: u32,
+            label_start: usize,
+            label_len: usize,
+            raw_label_start: usize,
+            raw_label_len: usize,
+            sample_start: usize,
+            sample_len: usize,
             created_timestamp: i64,
             prom_hash: u64,
             labels_sorted_unique: bool,
             bad_utf8: bool,
-            hist_start: u32,
-            hist_len: u32,
-            ex_start: u32,
-            ex_len: u32,
+            hist_start: usize,
+            hist_len: usize,
+            ex_start: usize,
+            ex_len: usize,
         }
 
         struct ClassicPushScratch {
@@ -1182,6 +1239,15 @@ impl Ingester {
                 if self.samples_arena.capacity() > 256 * 1024 {
                     self.samples_arena.shrink_to(16 * 1024);
                 }
+                if self.histograms_arena.capacity() > 16 * 1024 {
+                    self.histograms_arena.shrink_to(1024);
+                }
+                if self.exemplars_arena.capacity() > 16 * 1024 {
+                    self.exemplars_arena.shrink_to(1024);
+                }
+                if self.series_metas.capacity() > 64 * 1024 {
+                    self.series_metas.shrink_to(2048);
+                }
             }
         }
 
@@ -1205,6 +1271,7 @@ impl Ingester {
             let mut min_ts = i64::MAX;
             let mut all_sorted_unique = true;
             let mut all_sorted_have_metric_name = true;
+            let max_exemplars = self.limiter.max_exemplars_per_user(user_id);
 
             let ClassicPushScratch {
                 ref mut wr_scratch,
@@ -1215,6 +1282,9 @@ impl Ingester {
                 ref mut series_metas,
             } = *s;
 
+            // Exemplars are always unmarshalled (and so validated on the wire), like Go: only the
+            // distributor sets `SkipUnmarshalingExemplars`. With exemplars disabled for the tenant
+            // they are just not converted below.
             let stream_res = mimir_proto::zerocopy::decode_classic_stream(
                 raw_bytes,
                 mimir_proto::zerocopy::DecodeOptions::classic(),
@@ -1230,8 +1300,8 @@ impl Ingester {
                     }
                     min_ts = min_ts.min(series.min_sample_ts);
 
-                    let hist_start = histograms_arena.len() as u32;
-                    let mut hist_len = 0u32;
+                    let hist_start = histograms_arena.len();
+                    let mut hist_len = 0usize;
                     for h in series.histograms() {
                         let conv = convert_borrowed_histogram(&h);
                         min_ts = min_ts.min(conv.0);
@@ -1239,36 +1309,38 @@ impl Ingester {
                         hist_len += 1;
                     }
 
-                    let ex_start = exemplars_arena.len() as u32;
-                    let mut ex_len = 0u32;
-                    for ex in series.exemplars() {
-                        let res = convert_borrowed_exemplar(&ex);
-                        if let Ok(ref conv) = res {
-                            min_ts = min_ts.min(conv.0);
+                    let ex_start = exemplars_arena.len();
+                    let mut ex_len = 0usize;
+                    if max_exemplars > 0 {
+                        for ex in series.exemplars() {
+                            let res = convert_borrowed_exemplar(&ex);
+                            if let Ok(ref conv) = res {
+                                min_ts = min_ts.min(conv.0);
+                            }
+                            exemplars_arena.push(res);
+                            ex_len += 1;
                         }
-                        exemplars_arena.push(res);
-                        ex_len += 1;
                     }
 
                     let (raw_label_start, raw_label_len) = match series.raw_label_bytes_range {
-                        Some(ref rr) if !series.bad_utf8 => (rr.start as u32, rr.len() as u32),
+                        Some(ref rr) if !series.bad_utf8 => (rr.start, rr.len()),
                         _ if series.bad_utf8 => (0, 0),
                         _ => (
-                            series.label_bytes_range.start as u32,
-                            series.label_bytes_range.len() as u32,
+                            series.label_bytes_range.start,
+                            series.label_bytes_range.len(),
                         ),
                     };
                     series_metas.push(ClassicSeriesMeta {
-                        label_start: series.label_bytes_range.start as u32,
+                        label_start: series.label_bytes_range.start,
                         label_len: if series.bad_utf8 {
                             0
                         } else {
-                            series.label_bytes_range.len() as u32
+                            series.label_bytes_range.len()
                         },
                         raw_label_start,
                         raw_label_len,
-                        sample_start: series.samples_range.start as u32,
-                        sample_len: series.samples_range.len() as u32,
+                        sample_start: series.samples_range.start,
+                        sample_len: series.samples_range.len(),
                         created_timestamp: series.created_timestamp,
                         prom_hash: series.prom_hash,
                         labels_sorted_unique: series.labels_sorted_unique,
@@ -1307,31 +1379,31 @@ impl Ingester {
 
             let mut items: Vec<PrehashedSeriesItem<'_>> = Vec::with_capacity(ts_len);
             for m in series_metas.iter() {
-                let l_start = m.label_start as usize;
+                let l_start = m.label_start;
                 let encoded_labels = if m.bad_utf8 {
                     &[][..]
                 } else {
-                    &label_bytes_arena[l_start..l_start + m.label_len as usize]
+                    &label_bytes_arena[l_start..l_start + m.label_len]
                 };
-                let r_start = m.raw_label_start as usize;
+                let r_start = m.raw_label_start;
                 let raw_encoded_labels = if m.bad_utf8 {
                     &[][..]
                 } else {
-                    &label_bytes_arena[r_start..r_start + m.raw_label_len as usize]
+                    &label_bytes_arena[r_start..r_start + m.raw_label_len]
                 };
-                let s_start = m.sample_start as usize;
-                let samples = &samples_arena[s_start..s_start + m.sample_len as usize];
+                let s_start = m.sample_start;
+                let samples = &samples_arena[s_start..s_start + m.sample_len];
                 let histograms = if m.hist_len == 0 {
                     &[][..]
                 } else {
-                    let h_start = m.hist_start as usize;
-                    &histograms_arena[h_start..h_start + m.hist_len as usize]
+                    let h_start = m.hist_start;
+                    &histograms_arena[h_start..h_start + m.hist_len]
                 };
                 let exemplars = if m.ex_len == 0 {
                     &[][..]
                 } else {
-                    let e_start = m.ex_start as usize;
-                    &exemplars_arena[e_start..e_start + m.ex_len as usize]
+                    let e_start = m.ex_start;
+                    &exemplars_arena[e_start..e_start + m.ex_len]
                 };
                 items.push(PrehashedSeriesItem {
                     encoded_labels,
@@ -2461,10 +2533,6 @@ impl Ingester {
             }
         });
 
-        self.metrics
-            .appender_add_duration
-            .observe(add_timer.elapsed().as_secs_f64());
-
         let mut prepared: Vec<PreparedShard<'_>> = Vec::with_capacity(active_shards.len());
         let mut first_hard_err: Option<IngesterError> = None;
         for slot in shard_slots {
@@ -2494,6 +2562,9 @@ impl Ingester {
             drop(lock_guard);
             return Err(err);
         }
+        self.metrics
+            .appender_add_duration
+            .observe(add_timer.elapsed().as_secs_f64());
 
         let mut stats = PushStats::default();
         let mut best_partial: Option<(usize, IngesterError, Option<SampleKind>)> = None;
@@ -2528,9 +2599,6 @@ impl Ingester {
         let commit_timer = Instant::now();
         let commit_res = HeadAppender::commit_batch(apps);
         drop(lock_guard);
-        self.metrics
-            .appender_commit_duration
-            .observe(commit_timer.elapsed().as_secs_f64());
 
         if let Err(e) = commit_res {
             return Err(IngesterError::Internal {
@@ -2538,6 +2606,9 @@ impl Ingester {
             }
             .with_user(user_id, stats.failed_samples as i64));
         }
+        self.metrics
+            .appender_commit_duration
+            .observe(commit_timer.elapsed().as_secs_f64());
 
         if stats.succeeded_samples > 0 {
             db.set_last_update(SystemTime::now());
@@ -3361,16 +3432,19 @@ impl Ingester {
                 stats.series_with_floats_and_histograms += 1;
             }
 
-            if let Err(_e) = ts.fill_pairs(pairs) {
+            if let Err(e) = ts.fill_pairs(pairs) {
                 let total_bad = samples.len() + hist_count;
                 stats.failed_samples += total_bad;
                 stats.failed_exemplars += ts.exemplar_count();
                 if total_bad > 0 || ts.exemplar_count() > 0 {
+                    let detail = match e {
+                        IngesterError::BadRequest { message } if !message.contains("UTF-8") => message,
+                        _ => "received a series with invalid UTF-8 in label".to_string(),
+                    };
                     record_partial(
                         IngesterError::Validation {
                             err_id: mimir_common::errors::SERIES_INVALID_LABEL,
-                            message: mimir_common::errors::SERIES_INVALID_LABEL
-                                .message("received a series with invalid UTF-8 in label"),
+                            message: mimir_common::errors::SERIES_INVALID_LABEL.message(&detail),
                             series: String::new(),
                         },
                         None,
