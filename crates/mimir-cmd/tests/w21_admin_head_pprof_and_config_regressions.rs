@@ -462,6 +462,20 @@ async fn w21_df_08_tap_handle_runs_before_rpc_guard_auth_and_cluster_validation(
         "pre-body TapHandle rejections must NOT record cortex_request_duration_seconds"
     );
 
+    // Trigger A2/B must also NOT increment invalid_cluster_validation_label_requests_total!
+    let invalid_cluster_count = || -> u64 {
+        reg.gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "cortex_server_invalid_cluster_validation_label_requests_total")
+            .map(|mf| mf.get_metric().iter().map(|m| m.get_counter().get_value() as u64).sum())
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        invalid_cluster_count(),
+        0,
+        "TapHandle rejections must NOT run ClusterUnaryServerInterceptor"
+    );
+
     // Once TapHandle admits (State::Running), auth rejection DOES record duration!
     ing.set_state_for_test(State::Running);
     let err = client
@@ -474,6 +488,280 @@ async fn w21_df_08_tap_handle_runs_before_rpc_guard_auth_and_cluster_validation(
     assert_eq!(duration_count(), 1);
 
     running.shutdown().await;
+    let _ = ing.stop().await;
+}
+
+#[tokio::test]
+async fn w22_res_03_non_tap_unavailable_records_metrics_and_logs_and_reactive_runs_after_auth() {
+    let tmp = tempdir().unwrap();
+    let reg = Registry::new();
+
+    #[derive(Default)]
+    struct CapturingLogger(Mutex<Vec<String>>);
+    impl Logger for CapturingLogger {
+        fn log(&self, level: LogLevel, fields: &[(&str, &str)]) {
+            let line = fields
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.0.lock().unwrap().push(format!("{level:?}:{line}"));
+        }
+    }
+    let logger = Arc::new(CapturingLogger::default());
+
+    let mut ing_cfg = mimir_config::IngesterConfig::default();
+    ing_cfg.ring.instance_id = "w22-res-03".to_string();
+    ing_cfg.push_grpc_method_enabled = true;
+    ing_cfg.instance_limits.max_tenants = 1;
+    ing_cfg.push_reactive_limiter = mimir_config::ReactiveLimiterConfig {
+        enabled: true,
+        min_limit: 1,
+        initial_limit: 1,
+        max_limit: 1,
+        max_limit_factor: 1.0,
+        min_limit_factor: 1.0,
+        recent_window_min_duration: mimir_config::GoDuration(1_000_000_000),
+        recent_window_max_duration: mimir_config::GoDuration(1_000_000_000),
+        recent_window_min_samples: 1,
+        initial_rejection_factor: 1.0,
+        max_rejection_factor: 1.0,
+        ..Default::default()
+    };
+    let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+    blocks_cfg.tsdb.dir = tmp.path().join("tsdb").to_string_lossy().into_owned();
+
+    let ing = Arc::new(
+        Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            Overrides::new(LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&reg),
+        )
+        .unwrap(),
+    );
+    ing.set_state_for_test(State::Running);
+
+    let mut srv_cfg = ServerConfig {
+        http_listen_address: "127.0.0.1".to_string(),
+        http_listen_port: 0,
+        grpc_listen_address: "127.0.0.1".to_string(),
+        grpc_listen_port: 0,
+        ..Default::default()
+    };
+    srv_cfg.cluster_validation.label = "expected-cluster".to_string();
+    srv_cfg.cluster_validation.grpc.enabled = true;
+
+    let mut server = Server::new(&srv_cfg, &reg, logger.clone()).unwrap();
+    server.set_grpc_multitenancy(true, "anonymous");
+    server.set_grpc_tap_ingester(Arc::clone(&ing));
+    let grpc_addr = server.grpc_addr().unwrap();
+
+    let ing_svc = GrpcCompressionEchoService::new(IngesterService::new(Arc::clone(&ing)).into_server());
+    let routes = tonic::service::Routes::new(ing_svc);
+    let running = server.start(Router::new(), routes).unwrap();
+
+    let ep = format!("http://{grpc_addr}");
+    let mut client = ingesterpb::ingester_client::IngesterClient::connect(ep).await.unwrap();
+
+    let duration_unavailable = |route: &str| -> u64 {
+        reg.gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "cortex_request_duration_seconds")
+            .map(|mf| {
+                mf.get_metric()
+                    .iter()
+                    .filter(|m| {
+                        let mut r_ok = false;
+                        let mut s_ok = false;
+                        for lp in m.get_label() {
+                            if lp.get_name() == "route" && lp.get_value() == route {
+                                r_ok = true;
+                            }
+                            if lp.get_name() == "status_code" && lp.get_value() == "Unavailable" {
+                                s_ok = true;
+                            }
+                        }
+                        r_ok && s_ok
+                    })
+                    .map(|m| m.get_histogram().get_sample_count())
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+    let invalid_cluster_count = || -> u64 {
+        reg.gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "cortex_server_invalid_cluster_validation_label_requests_total")
+            .map(|mf| mf.get_metric().iter().map(|m| m.get_counter().get_value() as u64).sum())
+            .unwrap_or(0)
+    };
+
+    // 1) Create tenant 1 so max_tenants=1 is full.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut req1 = tonic::Request::new(cortexpb::WriteRequest {
+        timeseries: vec![cortexpb::TimeSeries {
+            labels: vec![cortexpb::LabelPair {
+                name: Bytes::from_static(b"__name__"),
+                value: Bytes::from_static(b"m1"),
+            }],
+            samples: vec![cortexpb::Sample {
+                timestamp_ms: now_ms,
+                value: 1.0,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    req1.metadata_mut().insert("x-scope-orgid", "t1".parse().unwrap());
+    req1.metadata_mut().insert("x-cluster", "expected-cluster".parse().unwrap());
+    client.push(req1).await.unwrap();
+
+    // 2) Push for tenant 2 -> InstanceLimit (max_tenants=1) returns Code::Unavailable AFTER TapHandle!
+    //    RpcGuard MUST record cortex_request_duration_seconds{status_code="Unavailable"}!
+    let mut req2 = tonic::Request::new(cortexpb::WriteRequest {
+        timeseries: vec![cortexpb::TimeSeries {
+            labels: vec![cortexpb::LabelPair {
+                name: Bytes::from_static(b"__name__"),
+                value: Bytes::from_static(b"m2"),
+            }],
+            samples: vec![cortexpb::Sample {
+                timestamp_ms: now_ms,
+                value: 2.0,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    req2.metadata_mut().insert("x-scope-orgid", "t2".parse().unwrap());
+    req2.metadata_mut().insert("x-cluster", "expected-cluster".parse().unwrap());
+    let err = client.push(req2).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unavailable, "got {err:?}");
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        duration_unavailable("/cortex.Ingester/Push"),
+        1,
+        "post-TapHandle InstanceLimit Unavailable MUST be recorded in cortex_request_duration_seconds"
+    );
+
+    // 3) Hold the reactive limiter permit (capacity=1) so RPCCallProcessing blocks/rejects.
+    let _held = ing
+        .reactive_limiter
+        .push
+        .as_ref()
+        .unwrap()
+        .acquire_permit()
+        .await
+        .unwrap();
+
+    // 3a) Missing x-scope-orgid MUST fail auth (Unknown: no org id) BEFORE RPCCallProcessing!
+    //     And missing x-scope-orgid on Push must NOT trip cluster validation!
+    let mut no_org = tonic::Request::new(cortexpb::WriteRequest::default());
+    no_org.metadata_mut().insert("x-cluster", "wrong-cluster".parse().unwrap());
+    no_org.set_timeout(Duration::from_millis(30));
+    let err = client.push(no_org).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unknown, "auth must beat RPCCallProcessing & cluster: {err:?}");
+    assert_eq!(invalid_cluster_count(), 0);
+
+    // 3b) Deterministic RPCCallProcessing rejection AFTER TapHandle + dec(in):
+    //     Request A passes TapHandle while queued==0 and pauses before sending its body frame.
+    //     Request B then passes TapHandle while queued==0 and blocks inside prepare_push_reactive (queued becomes 1).
+    //     Once Request A sends its body frame, dec(in) finishes and prepare_push_reactive rejects with
+    //     Unavailable ("limit exceeded") WITHOUT TapRejected -> RpcGuard records duration + GRPCServerLog!
+    let logs_before = logger.0.lock().unwrap().len();
+    let (body_tx, body_rx) = tokio::sync::oneshot::channel::<Bytes>();
+    let io = hyper_util::rt::TokioIo::new(
+        tokio::net::TcpStream::connect(grpc_addr).await.unwrap(),
+    );
+    let (mut h2_sender, h2_conn) =
+        hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+            .await
+            .unwrap();
+    let h2_task = tokio::spawn(h2_conn);
+    let req_a_body = Body::from_stream(futures::stream::once(body_rx));
+    let req_a = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("/cortex.Ingester/Push")
+        .header(http::header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .header("x-scope-orgid", "t1")
+        .header("x-cluster", "expected-cluster")
+        .body(req_a_body)
+        .unwrap();
+    let resp_a_fut = tokio::spawn(async move {
+        let resp = h2_sender.send_request(req_a).await.unwrap();
+        let headers = resp.headers().clone();
+        let collected = resp.into_body().collect().await.unwrap();
+        tonic::Status::from_header_map(&headers)
+            .or_else(|| collected.trailers().and_then(tonic::Status::from_header_map))
+    });
+
+    // Wait briefly so Request A has passed TapHandle and is awaiting its body frame.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    // Request B enters while queued==0, passes TapHandle, and queues in prepare_push_reactive.
+    let mut client_b = client.clone();
+    let resp_b_fut = tokio::spawn(async move {
+        let mut req_b = tonic::Request::new(cortexpb::WriteRequest::default());
+        req_b.metadata_mut().insert("x-scope-orgid", "t1".parse().unwrap());
+        req_b.metadata_mut().insert("x-cluster", "expected-cluster".parse().unwrap());
+        client_b.push(req_b).await
+    });
+    let rl_push = ing.reactive_limiter.push.as_ref().unwrap();
+    let wait_q = Instant::now() + Duration::from_secs(2);
+    while rl_push.queued() < 1 {
+        assert!(Instant::now() < wait_q, "Request B never queued in reactive limiter");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // Complete Request A's body (5-byte empty gRPC frame): dec(in) finishes -> prepare_push_reactive rejects!
+    let _ = body_tx.send(Bytes::from_static(&[0, 0, 0, 0, 0]));
+    let st_a = resp_a_fut.await.unwrap().expect("Request A grpc-status");
+    assert_eq!(st_a.code(), tonic::Code::Unavailable, "got {st_a:?}");
+    assert!(st_a.message().contains("limit exceeded"), "got {st_a:?}");
+
+    drop(_held);
+    resp_b_fut.await.unwrap().unwrap();
+    drop(h2_task);
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let dur_after_rl = duration_unavailable("/cortex.Ingester/Push");
+    assert_eq!(
+        dur_after_rl,
+        2,
+        "RPCCallProcessing Unavailable MUST be recorded in cortex_request_duration_seconds (got {dur_after_rl})"
+    );
+    {
+        let logs_after = logger.0.lock().unwrap();
+        assert!(
+            logs_after[logs_before..].iter().any(|l| l.contains("method=/cortex.Ingester/Push") && l.contains("Unavailable")),
+            "expected GRPCServerLog entry for RPCCallProcessing Unavailable, got {:?}",
+            &logs_after[logs_before..]
+        );
+    }
+
+    // 4) TapHandle rejection (State::Stopping) with wrong x-cluster MUST NOT increment
+    //    duration_unavailable or invalid_cluster_count!
+    ing.set_state_for_test(State::Stopping);
+    let mut tap_req = tonic::Request::new(cortexpb::WriteRequest::default());
+    tap_req.metadata_mut().insert("x-scope-orgid", "t1".parse().unwrap());
+    tap_req.metadata_mut().insert("x-cluster", "wrong-cluster".parse().unwrap());
+    let err = client.push(tap_req).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unavailable);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(duration_unavailable("/cortex.Ingester/Push"), dur_after_rl);
+    assert_eq!(invalid_cluster_count(), 0);
+    running.shutdown().await;
+    ing.set_state_for_test(State::Running);
     let _ = ing.stop().await;
 }
 

@@ -2696,9 +2696,10 @@ async fn fresh_install(helm: Arc<Helm>, variant: Variant) -> VariantRun {
     ));
     run.facts.restart = Some(obs);
 
-    // 6. Pod freeze (stalled node / VM pause): SIGSTOP zone-c-1 for 40s, then SIGCONT. Go
-    //    peers declare it dead in memberlist; after the thaw it refutes and the cluster view
-    //    must converge back to the full membership.
+    // 6. Pod freeze (stalled node / VM pause): SIGSTOP zone-c-1 until all peers drop it (up
+    //    to 75s to cover dskit SWIM's 40..55s suspicion tail), then SIGCONT. Peers declare it
+    //    dead in memberlist; after the thaw it refutes and the cluster view must converge back
+    //    to the full membership.
     let frozen_i = cluster.idx(&format!("{RELEASE}-ingester-zone-c-1"));
     let frozen = cluster.pods[frozen_i].spec.host();
     let others: Vec<usize> = all.iter().copied().filter(|i| *i != frozen_i).collect();
@@ -2710,9 +2711,12 @@ async fn fresh_install(helm: Arc<Helm>, variant: Variant) -> VariantRun {
     let ip_to_host = cluster.ip_to_host();
     let freeze_start = Instant::now();
     let mut dropped_by: BTreeSet<String> = BTreeSet::new();
-    while freeze_start.elapsed() < Duration::from_secs(40) {
+    while freeze_start.elapsed() < Duration::from_secs(75) && dropped_by.len() < others.len() {
         for i in &others {
             let p = &cluster.pods[*i];
+            if dropped_by.contains(&p.spec.host()) {
+                continue;
+            }
             if let Ok(v) = fetch_view(&http, &p.ip, helm.http_port, &ip_to_host).await {
                 if !v.view.members.contains(&frozen) {
                     dropped_by.insert(p.spec.host());
@@ -2721,6 +2725,7 @@ async fn fresh_install(helm: Arc<Helm>, variant: Variant) -> VariantRun {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    let freeze_elapsed = freeze_start.elapsed();
     if let Err(e) = docker(&["unpause", &cluster.pods[frozen_i].container]).await {
         run.errors.push(format!("harness: docker unpause: {e:#}"));
     }
@@ -2728,11 +2733,11 @@ async fn fresh_install(helm: Arc<Helm>, variant: Variant) -> VariantRun {
     run.errors.extend(
         convergence_errors(&cluster, &all, &conv3)
             .into_iter()
-            .map(|e| format!("after 40s freeze of {frozen}: {e}")),
+            .map(|e| format!("after {freeze_elapsed:?} freeze of {frozen}: {e}")),
     );
     run.facts.freeze = Some((dropped_by.len() == others.len(), conv3.after));
     details.push(format!(
-        "    freeze of {frozen} for 40s: dropped from memberlist by {dropped_by:?}; reconverged {:?} after thaw",
+        "    freeze of {frozen} for {freeze_elapsed:?}: dropped from memberlist by {dropped_by:?}; reconverged {:?} after thaw",
         conv3.after
     ));
 

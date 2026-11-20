@@ -1006,7 +1006,11 @@ fn twin_process_wave2_canceled_and_timed_out_rpcs() {
                 && delta(&after.1, before_counts)
                     == BTreeMap::from([("Canceled".to_string(), 1.0)])
                 && after.2 == Some(0.0);
-            let deadline = *code == Code::DeadlineExceeded
+            // When grpc-go's 300ms server-side grpc-timeout fires concurrently with the handler
+            // observing context.DeadlineExceeded, the handler records Unknown + 1 read CB timeout
+            // while http2_server.go concurrently sends RST_STREAM(CANCEL), so hyper sees an HTTP/2
+            // stream-reset Err which strong_label_names_server_deadline maps to Code::Cancelled.
+            let deadline = (*code == Code::DeadlineExceeded || *code == Code::Cancelled)
                 && delta(&after.1, before_counts)
                     == BTreeMap::from([("Unknown".to_string(), 1.0)])
                 && after.2 == Some(1.0);

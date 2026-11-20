@@ -1926,10 +1926,59 @@ impl Ingester {
             .cost_attribution_manager()
             .and_then(|m| m.sample_tracker(user_id))
             .is_some();
+        let verify_ownership = self.verify_ring_ownership.load(Ordering::Relaxed);
+        let has_instance_series_limit = self
+            .get_instance_limits()
+            .is_some_and(|il| il.max_series > 0);
+        let min_append_time_available = head.initialized();
+        let min_append_time = head.appendable_min_valid_time();
+        // Wire-order pre-check for pre-append hard errors (empty labelset / missing __name__ /
+        // non-soft native histogram validation errors). When any item can trigger a hard error,
+        // fall back to the sequential wire-order path so processing stops at index k without
+        // creating phantom series or WAL/ActiveSeries entries for k+1..N.
+        let has_pre_hard_error = items.iter().any(|item| {
+            if item.bad_utf8 || !item.labels_sorted_unique {
+                return false;
+            }
+            if item.encoded_labels.is_empty()
+                || !iter_stringlabels(item.encoded_labels).any(|(k, _)| k == "__name__")
+            {
+                return true;
+            }
+            if native_histograms_enabled && !item.histograms.is_empty() {
+                let oob_skip = ooo_window_ms <= 0
+                    && min_append_time_available
+                    && item.exemplars.is_empty()
+                    && item.samples.iter().all(|s| s.timestamp_ms < min_append_time)
+                    && item.histograms.iter().all(|h| h.0 < min_append_time);
+                if !oob_skip {
+                    for (h_ts, is_float, ih_opt, fh_opt, _) in item.histograms {
+                        let h_ts = *h_ts;
+                        if h_ts > max_timestamp_ms || h_ts < min_timestamp_ms {
+                            continue;
+                        }
+                        let valid_res = if *is_float {
+                            fh_opt.as_ref().expect("float histogram").validate()
+                        } else {
+                            ih_opt.as_ref().expect("int histogram").validate()
+                        };
+                        if let Err(err) = valid_res {
+                            if map_native_histogram_err(err.kind).is_none() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        });
         if !head.initialized()
             || may_cross_user_limit
             || may_cross_metric_limit
             || has_cost_attribution
+            || verify_ownership
+            || has_instance_series_limit
+            || has_pre_hard_error
         {
             return self.ingest_prehashed_shard_batch_with_lock(
                 user_id,
@@ -1939,23 +1988,30 @@ impl Ingester {
                 items,
             );
         }
-        let verify_ownership = self.verify_ring_ownership.load(Ordering::Relaxed);
 
-        let min_append_time_available = head.initialized();
-        let min_append_time = head.appendable_min_valid_time();
         let max_exemplars = self.limiter.max_exemplars_per_user(user_id);
         let ignore_ooo_exemplars = limits.ignore_ooo_exemplars;
         let is_otlp = source == cortexpb::write_request::SourceEnum::Otlp;
         let active_series_enabled = self.cfg.active_series.active_series_metrics_enabled;
 
-        struct PreparedShard<'a> {
+        struct ActiveUpdate<'b> {
+            entry: Option<Arc<SeriesEntry>>,
+            encoded_labels: &'b [u8],
+            prom_hash: u64,
+            ref_id: u64,
+            num_native_hist_buckets: i64,
+        }
+
+        struct PreparedShard<'a, 'b> {
             app: HeadAppender<'a>,
             stats: PushStats,
             first_partial: Option<(usize, IngesterError, Option<SampleKind>)>,
+            active_updates: Vec<ActiveUpdate<'b>>,
         }
-        type PreparedShardSlot<'a> = Mutex<Option<Result<PreparedShard<'a>, IngesterError>>>;
+        type PreparedShardSlot<'a, 'b> =
+            Mutex<Option<Result<PreparedShard<'a, 'b>, (usize, IngesterError)>>>;
 
-        let shard_slots: SmallVec<[PreparedShardSlot<'_>; 8]> =
+        let shard_slots: SmallVec<[PreparedShardSlot<'_, '_>; 8]> =
             (0..active_shards.len()).map(|_| Mutex::new(None)).collect();
 
         let pool = classic_push_pool();
@@ -1964,6 +2020,11 @@ impl Ingester {
             let mut app = db.db.appender_with_capacity(shard_items.len());
             let mut stats = PushStats::default();
             let mut first_partial: Option<(usize, IngesterError, Option<SampleKind>)> = None;
+            let mut active_updates: Vec<ActiveUpdate<'_>> = if active_series_enabled {
+                Vec::with_capacity(shard_items.len())
+            } else {
+                Vec::new()
+            };
 
             let use_batch_resolve = shard_items.len() > 2;
             let mut resolved_guard = if use_batch_resolve {
@@ -2002,7 +2063,7 @@ impl Ingester {
                 None
             };
 
-            let mut hard_err: Option<IngesterError> = None;
+            let mut hard_err: Option<(usize, IngesterError)> = None;
             for (local_idx, si) in shard_items.iter().enumerate() {
                 let orig_idx = si.orig_idx;
                 let item = si.item;
@@ -2119,7 +2180,8 @@ impl Ingester {
                     && verify_ownership
                     && !self.check_ring_ownership_iter(user_id, iter_stringlabels(encoded_labels))
                 {
-                    hard_err = Some(
+                    hard_err = Some((
+                        orig_idx,
                         IngesterError::Internal {
                             message: format!(
                                 "series {} is not owned by this ingester",
@@ -2127,7 +2189,7 @@ impl Ingester {
                             ),
                         }
                         .with_user(user_id, 0),
-                    );
+                    ));
                     break;
                 }
 
@@ -2188,7 +2250,7 @@ impl Ingester {
                                     &mut make_series_str,
                                     &mut record_partial,
                                 ) {
-                                    hard_err = Some(e.with_user(user_id, 0));
+                                    hard_err = Some((orig_idx, e.with_user(user_id, 0)));
                                     break;
                                 }
                             }
@@ -2198,7 +2260,7 @@ impl Ingester {
                     }
 
                     let is_last_sample = s_idx + 1 == samples.len() && hist_count == 0;
-                    let append_res = if is_last_sample {
+                    let append_res = if is_last_sample && !active_series_enabled {
                         app.append_float_with_entry_prehashed_encoded_take(
                             &mut series_entry,
                             item.prom_hash,
@@ -2236,7 +2298,7 @@ impl Ingester {
                                 &mut make_series_str,
                                 &mut record_partial,
                             ) {
-                                hard_err = Some(e.with_user(user_id, 0));
+                                hard_err = Some((orig_idx, e.with_user(user_id, 0)));
                                 break;
                             }
                         }
@@ -2326,7 +2388,7 @@ impl Ingester {
                                         &mut make_series_str,
                                         &mut record_partial,
                                     ) {
-                                        hard_err = Some(e.with_user(user_id, 0));
+                                        hard_err = Some((orig_idx, e.with_user(user_id, 0)));
                                         break;
                                     }
                                 }
@@ -2370,7 +2432,7 @@ impl Ingester {
                                     &mut make_series_str,
                                     &mut record_partial,
                                 ) {
-                                    hard_err = Some(e.with_user(user_id, 0));
+                                    hard_err = Some((orig_idx, e.with_user(user_id, 0)));
                                     break;
                                 }
                             }
@@ -2388,18 +2450,14 @@ impl Ingester {
 
                 if active_series_enabled && stats.succeeded_samples > prev_succeeded {
                     if let Some(ref_id) = series_ref {
-                        let entry_ref = series_entry
-                            .as_deref()
-                            .or_else(|| app.last_float_entry().filter(|e| e.ref_id == ref_id));
-                        db.active_series.update_series_with_entry_encoded(
-                            entry_ref,
+                        let entry = series_entry;
+                        active_updates.push(ActiveUpdate {
+                            entry,
                             encoded_labels,
-                            item.prom_hash,
+                            prom_hash: item.prom_hash,
                             ref_id,
-                            start_append,
                             num_native_hist_buckets,
-                            is_otlp,
-                        );
+                        });
                     }
                 }
 
@@ -2542,41 +2600,46 @@ impl Ingester {
                 }
             }
 
-            if let Some(err) = hard_err {
+            if let Some((err_idx, err)) = hard_err {
                 rollback_appender(user_id, app);
-                *shard_slots[s_idx].lock() = Some(Err(err));
+                *shard_slots[s_idx].lock() = Some(Err((err_idx, err)));
             } else {
                 *shard_slots[s_idx].lock() = Some(Ok(PreparedShard {
                     app,
                     stats,
                     first_partial,
+                    active_updates,
                 }));
             }
         });
 
-        let mut prepared: Vec<PreparedShard<'_>> = Vec::with_capacity(active_shards.len());
-        let mut first_hard_err: Option<IngesterError> = None;
+        let mut prepared: Vec<PreparedShard<'_, '_>> = Vec::with_capacity(active_shards.len());
+        let mut first_hard_err: Option<(usize, IngesterError)> = None;
         for slot in shard_slots {
             match slot.into_inner() {
                 Some(Ok(ps)) => prepared.push(ps),
-                Some(Err(e)) => {
-                    if first_hard_err.is_none() {
-                        first_hard_err = Some(e);
+                Some(Err((orig_idx, e))) => {
+                    if first_hard_err
+                        .as_ref()
+                        .is_none_or(|(best_idx, _)| orig_idx < *best_idx)
+                    {
+                        first_hard_err = Some((orig_idx, e));
                     }
                 }
                 None => {
                     if first_hard_err.is_none() {
-                        first_hard_err = Some(
+                        first_hard_err = Some((
+                            usize::MAX,
                             IngesterError::Internal {
                                 message: "classic push shard did not complete".to_string(),
                             }
                             .with_user(user_id, 0),
-                        );
+                        ));
                     }
                 }
             }
         }
-        if let Some(err) = first_hard_err {
+        if let Some((_, err)) = first_hard_err {
             for ps in prepared {
                 rollback_appender(user_id, ps.app);
             }
@@ -2590,7 +2653,15 @@ impl Ingester {
         let mut stats = PushStats::default();
         let mut best_partial: Option<(usize, IngesterError, Option<SampleKind>)> = None;
         let mut apps: Vec<HeadAppender<'_>> = Vec::with_capacity(prepared.len());
+        let mut all_active_updates: Vec<Vec<ActiveUpdate<'_>>> = if active_series_enabled {
+            Vec::with_capacity(prepared.len())
+        } else {
+            Vec::new()
+        };
         for mut ps in prepared {
+            if active_series_enabled && !ps.active_updates.is_empty() {
+                all_active_updates.push(std::mem::take(&mut ps.active_updates));
+            }
             stats.succeeded_samples += ps.stats.succeeded_samples;
             stats.failed_samples += ps.stats.failed_samples;
             stats.succeeded_exemplars += ps.stats.succeeded_exemplars;
@@ -2626,6 +2697,19 @@ impl Ingester {
                 message: format!("failed to commit TSDB appender: {e}"),
             }
             .with_user(user_id, stats.failed_samples as i64));
+        }
+        for shard_updates in all_active_updates {
+            for upd in shard_updates {
+                db.active_series.update_series_with_entry_encoded(
+                    upd.entry.as_deref(),
+                    upd.encoded_labels,
+                    upd.prom_hash,
+                    upd.ref_id,
+                    start_append,
+                    upd.num_native_hist_buckets,
+                    is_otlp,
+                );
+            }
         }
         self.metrics
             .appender_commit_duration
@@ -4796,5 +4880,337 @@ mod wave3_tests {
                     .map(|m| m.get_counter().get_value())
             });
         assert_eq!(val, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn w22_res_04_sharded_push_returns_lowest_wire_index_hard_error_and_zero_phantom_series() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = prometheus::Registry::new();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-w22-res-04".to_string();
+        ing_cfg.active_series.active_series_metrics_enabled = true;
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let limits = mimir_config::LimitsConfig {
+            native_histograms_ingestion_enabled: true,
+            ..Default::default()
+        };
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(limits),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&reg),
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let user = "t-w22-res-04";
+
+        // Initialize Head first so the 4,500-series batch takes the sharded fast-path eligibility branch.
+        let init_req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("__name__", "w22_init_metric"), lp("id", "init")],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: now,
+                    value: 1.0,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ing.push_grpc_raw_sync(user, &mimir_proto::prost::Message::encode_to_vec(&init_req))
+            .unwrap();
+
+        let metric_val = |name: &str| -> f64 {
+            reg.gather()
+                .into_iter()
+                .find(|mf| mf.get_name() == name)
+                .and_then(|mf| mf.get_metric().first().map(|m| m.get_gauge().get_value()))
+                .unwrap_or(0.0)
+        };
+        let init_db = ing.get_tsdb(user).unwrap();
+        assert_eq!(metric_val("cortex_ingester_memory_series"), 1.0);
+        assert_eq!(init_db.active_series.active().0, 1);
+
+        // 4,500 series:
+        // - 0..100: valid brand-new float series
+        // - 100: non-soft hard histogram error (InvalidSchema = 99)
+        // - 101..3000: valid brand-new float series
+        // - 3000: distinct non-soft hard histogram error (ExpSchemaCustomBounds)
+        // - 3001..4500: valid brand-new float series
+        let mut batch = Vec::with_capacity(4500);
+        for i in 0..4500usize {
+            let labels = vec![
+                lp("__name__", "w22_sharded_err_metric"),
+                lp("id", &format!("{i:04}")),
+            ];
+            if i == 100 {
+                batch.push(cortexpb::TimeSeries {
+                    labels,
+                    histograms: vec![cortexpb::Histogram {
+                        timestamp: now,
+                        schema: 99,
+                        count: Some(cortexpb::histogram::Count::CountInt(0)),
+                        zero_count: Some(cortexpb::histogram::ZeroCount::ZeroCountInt(0)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            } else if i == 3000 {
+                batch.push(cortexpb::TimeSeries {
+                    labels,
+                    histograms: vec![cortexpb::Histogram {
+                        timestamp: now,
+                        schema: 3,
+                        custom_values: vec![1.0],
+                        count: Some(cortexpb::histogram::Count::CountInt(0)),
+                        zero_count: Some(cortexpb::histogram::ZeroCount::ZeroCountInt(0)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            } else {
+                batch.push(cortexpb::TimeSeries {
+                    labels,
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: now,
+                        value: i as f64,
+                    }],
+                    ..Default::default()
+                });
+            }
+        }
+        let err = ing
+            .push_grpc_raw_sync(
+                user,
+                &mimir_proto::prost::Message::encode_to_vec(&cortexpb::WriteRequest {
+                    timeseries: batch,
+                    ..Default::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("got schema 99"),
+            "expected index-100 InvalidSchema error, got: {err}"
+        );
+
+        let db = ing.get_tsdb(user).unwrap();
+        // Only init (1) + 0..100 (100) = 101 series may exist; ZERO phantom series from 101..4500!
+        assert_eq!(db.db.head().num_series(), 101);
+        assert_eq!(db.owned_series_state().owned_series_count, 101);
+        assert_eq!(metric_val("cortex_ingester_memory_series"), 101.0);
+        // ActiveSeries only updated for committed series (1 from init + 100 from 0..100 before rollback,
+        // and ZERO from 101..4500!).
+        assert!(
+            db.active_series.active().0 <= 101,
+            "active_series leaked past index 100: {}",
+            db.active_series.active().0
+        );
+
+        // QueryStream for series past index 100 must return ZERO series.
+        let qreq = mimir_proto::ingesterpb::QueryRequest {
+            start_timestamp_ms: now - 60_000,
+            end_timestamp_ms: now + 60_000,
+            matchers: vec![mimir_proto::ingesterpb::LabelMatcher {
+                r#type: mimir_proto::ingesterpb::MatchType::RegexMatch as i32,
+                name: "id".to_string(),
+                value: "^(0101|0500|2999|3001|4499)$".to_string(),
+            }],
+            ..Default::default()
+        };
+        let responses = ing
+            .handle_query_stream(&tonic::metadata::MetadataMap::new(), user, qreq)
+            .await
+            .unwrap();
+        let found: usize = responses.iter().map(|r| r.streaming_series_chunks.len() + r.streaming_series.len()).sum();
+        assert_eq!(found, 0, "QueryStream observed phantom series past index 100");
+    }
+
+    #[test]
+    fn w22_res_04_sharded_push_missing_metric_name_at_100_vs_bad_hist_at_3000_zero_phantoms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = prometheus::Registry::new();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-w22-res-04-mn".to_string();
+        ing_cfg.active_series.active_series_metrics_enabled = true;
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let limits = mimir_config::LimitsConfig {
+            native_histograms_ingestion_enabled: true,
+            ..Default::default()
+        };
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(limits),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&reg),
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let user = "t-w22-res-04-mn";
+        ing.push_grpc_raw_sync(
+            user,
+            &mimir_proto::prost::Message::encode_to_vec(&cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![lp("__name__", "w22_init_metric"), lp("id", "init")],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: now,
+                        value: 1.0,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        let mut batch = Vec::with_capacity(4500);
+        for i in 0..4500usize {
+            if i == 100 {
+                batch.push(cortexpb::TimeSeries {
+                    labels: vec![lp("id", "0100")],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: now,
+                        value: 1.0,
+                    }],
+                    ..Default::default()
+                });
+            } else if i == 3000 {
+                batch.push(cortexpb::TimeSeries {
+                    labels: vec![
+                        lp("__name__", "w22_sharded_err_metric"),
+                        lp("id", "3000"),
+                    ],
+                    histograms: vec![cortexpb::Histogram {
+                        timestamp: now,
+                        schema: 99,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            } else {
+                batch.push(cortexpb::TimeSeries {
+                    labels: vec![
+                        lp("__name__", "w22_sharded_err_metric"),
+                        lp("id", &format!("{i:04}")),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: now,
+                        value: i as f64,
+                    }],
+                    ..Default::default()
+                });
+            }
+        }
+        let err = ing
+            .push_grpc_raw_sync(
+                user,
+                &mimir_proto::prost::Message::encode_to_vec(&cortexpb::WriteRequest {
+                    timeseries: batch,
+                    ..Default::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no metric name label"),
+            "expected index-100 MissingMetricName, got: {err}"
+        );
+        let db = ing.get_tsdb(user).unwrap();
+        assert_eq!(db.db.head().num_series(), 101);
+        assert_eq!(db.owned_series_state().owned_series_count, 101);
+    }
+
+    #[test]
+    fn w22_res_04_sharded_push_valid_4500_series_with_active_series_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = prometheus::Registry::new();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-w22-res-04-ok".to_string();
+        ing_cfg.active_series.active_series_metrics_enabled = true;
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&reg),
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let user = "t-w22-res-04-ok";
+        ing.push_grpc_raw_sync(
+            user,
+            &mimir_proto::prost::Message::encode_to_vec(&cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![lp("__name__", "w22_init_ok"), lp("id", "init")],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: now,
+                        value: 1.0,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        let batch: Vec<_> = (0..4500usize)
+            .map(|i| cortexpb::TimeSeries {
+                labels: vec![
+                    lp("__name__", "w22_valid_sharded"),
+                    lp("id", &format!("{i:04}")),
+                ],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: now,
+                    value: i as f64,
+                }],
+                ..Default::default()
+            })
+            .collect();
+        ing.push_grpc_raw_sync(
+            user,
+            &mimir_proto::prost::Message::encode_to_vec(&cortexpb::WriteRequest {
+                timeseries: batch,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        let db = ing.get_tsdb(user).unwrap();
+        assert_eq!(db.db.head().num_series(), 4501);
+        assert_eq!(db.owned_series_state().owned_series_count, 4501);
+        assert_eq!(db.active_series.active().0, 4501);
     }
 }
