@@ -184,8 +184,59 @@ pub struct HeadChunksWriter {
     discard_epoch: u64,
     last_written_ref: ChunkDiskMapperRef,
     last_flushed_ref: ChunkDiskMapperRef,
+    /// Maximum `ChunkDiskMapperRef` actually flushed to disk during each past `discard_epoch`.
+    /// Indexed by `epoch as usize` for `epoch < self.discard_epoch`.
+    flushed_up_to_by_epoch: smallvec::SmallVec<[ChunkDiskMapperRef; 4]>,
     closed: bool,
     fault_hook: Option<WriteFaultHook>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FlushedRefWatermark {
+    last_flushed_ref: ChunkDiskMapperRef,
+    discard_epoch: u64,
+    flushed_up_to_by_epoch: smallvec::SmallVec<[ChunkDiskMapperRef; 4]>,
+}
+
+impl FlushedRefWatermark {
+    #[inline]
+    pub(crate) fn last_flushed_ref(&self) -> ChunkDiskMapperRef {
+        self.last_flushed_ref
+    }
+
+    #[inline]
+    pub(crate) fn is_flushed(&self, ref_id: ChunkDiskMapperRef, write_epoch: Option<u64>) -> bool {
+        if ref_id.as_u64() == 0 {
+            return false;
+        }
+        let Some(ep) = write_epoch else {
+            return false;
+        };
+        if ep == self.discard_epoch {
+            ref_id <= self.last_flushed_ref
+        } else if let Some(&max_flushed) = self.flushed_up_to_by_epoch.get(ep as usize) {
+            ref_id <= max_flushed
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_discarded(&self, ref_id: ChunkDiskMapperRef, write_epoch: Option<u64>) -> bool {
+        if ref_id.as_u64() == 0 {
+            return true;
+        }
+        let Some(ep) = write_epoch else {
+            return true;
+        };
+        if ep == self.discard_epoch {
+            false
+        } else if let Some(&max_flushed) = self.flushed_up_to_by_epoch.get(ep as usize) {
+            ref_id > max_flushed
+        } else {
+            true
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -195,7 +246,9 @@ pub(crate) struct HeadChunksSnapshot {
     file_offset: usize,
     write_buf_len: usize,
     cut_on_next_chunk: bool,
+    discard_epoch: u64,
     last_written_ref: ChunkDiskMapperRef,
+    last_flushed_ref: ChunkDiskMapperRef,
 }
 
 impl HeadChunksWriter {
@@ -238,6 +291,7 @@ impl HeadChunksWriter {
             discard_epoch: 0,
             last_written_ref: ChunkDiskMapperRef(0),
             last_flushed_ref: ChunkDiskMapperRef(0),
+            flushed_up_to_by_epoch: smallvec::SmallVec::new(),
             closed: false,
             fault_hook: None,
         })
@@ -249,8 +303,12 @@ impl HeadChunksWriter {
     }
 
     #[inline]
-    pub(crate) fn last_flushed_ref(&self) -> ChunkDiskMapperRef {
-        self.last_flushed_ref
+    pub(crate) fn flushed_watermark(&self) -> FlushedRefWatermark {
+        FlushedRefWatermark {
+            last_flushed_ref: self.last_flushed_ref,
+            discard_epoch: self.discard_epoch,
+            flushed_up_to_by_epoch: self.flushed_up_to_by_epoch.clone(),
+        }
     }
 
     #[inline]
@@ -272,7 +330,9 @@ impl HeadChunksWriter {
             file_offset: self.file_offset,
             write_buf_len: self.write_buf.len(),
             cut_on_next_chunk: self.cut_on_next_chunk,
+            discard_epoch: self.discard_epoch,
             last_written_ref: self.last_written_ref,
+            last_flushed_ref: self.last_flushed_ref,
         }
     }
 
@@ -286,9 +346,13 @@ impl HeadChunksWriter {
             self.file_offset = 0;
             self.offset = 0;
             self.write_buf.clear();
-        } else if self.file_offset == snap.file_offset {
+            self.cut_on_next_chunk = snap.cut_on_next_chunk;
+            self.last_written_ref = snap.last_written_ref;
+        } else if self.file_offset == snap.file_offset && self.discard_epoch == snap.discard_epoch {
             self.write_buf.truncate(snap.write_buf_len);
             self.offset = snap.offset;
+            self.cut_on_next_chunk = snap.cut_on_next_chunk;
+            self.last_written_ref = snap.last_written_ref;
         } else if self.file_offset >= snap.offset {
             let prealloc_len = self.prealloc_len_u64();
             if let Some(ref mut file) = self.cur_file {
@@ -307,12 +371,16 @@ impl HeadChunksWriter {
             self.file_offset = snap.offset;
             self.offset = snap.offset;
             self.write_buf.clear();
+            self.cut_on_next_chunk = snap.cut_on_next_chunk;
+            self.last_written_ref = snap.last_written_ref;
+            if self.last_flushed_ref > snap.last_flushed_ref && snap.write_buf_len == 0 {
+                self.last_flushed_ref = snap.last_flushed_ref;
+            }
         } else {
             self.write_buf.clear();
             self.offset = self.file_offset;
+            self.last_written_ref = self.last_flushed_ref;
         }
-        self.cut_on_next_chunk = snap.cut_on_next_chunk;
-        self.last_written_ref = snap.last_written_ref;
     }
 
     /// Installs or clears a write fault-injection hook (used by durability tests).
@@ -385,6 +453,7 @@ impl HeadChunksWriter {
             let _ = file.seek(SeekFrom::Start(saved_pos));
             self.offset = self.file_offset;
             self.write_buf.clear();
+            self.flushed_up_to_by_epoch.push(self.last_flushed_ref);
             self.discard_epoch = self.discard_epoch.wrapping_add(1);
             return Err(HeadChunksError::Io(e));
         }
