@@ -656,7 +656,19 @@ activity_tracker:
                 }
             }
             let _ = slow_h.await;
-            rl_outcomes.push((which, push_disabled_starting, rejects));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (_, _, rl_metrics) = http_req(&http, reqwest::Method::GET, hp, "/metrics").await;
+            let rl_dur_unavail = metric_value(
+                &rl_metrics,
+                "cortex_request_duration_seconds_count",
+                &[
+                    ("method", "gRPC"),
+                    ("route", "/cortex.Ingester/LabelNames"),
+                    ("status_code", "Unavailable"),
+                ],
+            )
+            .unwrap_or(0.0);
+            rl_outcomes.push((which, push_disabled_starting, rejects, rl_dur_unavail));
         }
         if let (Some(gp), Some(rp)) = (&rl_outcomes[0].1, &rl_outcomes[1].1) {
             assert_eq!(rp, gp, "push_grpc_method_enabled=false with ingest_storage Starting mismatch");
@@ -665,6 +677,12 @@ activity_tracker:
         assert!(!rl_outcomes[0].2.is_empty(), "Go did not reject via reactive limiter");
         assert_eq!(rl_outcomes[1].2, rl_outcomes[0].2, "ING-01 reactive limiter mismatch");
         assert!(rl_outcomes[1].2.contains("Unavailable|limit exceeded|details=false"));
+        assert!(
+            rl_outcomes[0].3 > 0.0 && rl_outcomes[1].3 > 0.0,
+            "RPCCallProcessing reactive-limiter Unavailable MUST increment cortex_request_duration_seconds_count: go={} rust={}",
+            rl_outcomes[0].3,
+            rl_outcomes[1].3
+        );
 
         // 2) ING-02: TooBusy via TapHandle returns Code::Unavailable without ErrorDetails
         let mut busy_outcomes = Vec::new();
@@ -718,13 +736,111 @@ activity_tracker:
                 assert!(Instant::now() < deadline, "{}: TooBusy never engaged", which.name());
                 tokio::time::sleep(Duration::from_millis(100)).await;
             };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (_, _, busy_metrics) = http_req(&http, reqwest::Method::GET, hp, "/metrics").await;
+            let busy_dur_unavail = metric_value(
+                &busy_metrics,
+                "cortex_request_duration_seconds_count",
+                &[
+                    ("method", "gRPC"),
+                    ("route", "/cortex.Ingester/LabelNames"),
+                    ("status_code", "Unavailable"),
+                ],
+            )
+            .unwrap_or(0.0);
             busy_outcomes.push((
                 which,
                 format!("{:?}|{}|details={}", st.code(), st.message(), !st.details().is_empty()),
+                busy_dur_unavail,
             ));
         }
         assert_eq!(busy_outcomes[1].1, busy_outcomes[0].1, "ING-02 TooBusy TapHandle mismatch");
         assert!(busy_outcomes[1].1.starts_with("Unavailable|"));
+        assert_eq!(busy_outcomes[0].2, 0.0, "Go TapHandle TooBusy must not record duration");
+        assert_eq!(busy_outcomes[1].2, 0.0, "Rust TapHandle TooBusy must not record duration");
+
+        // 3) W22-RES-03: InstanceLimit (max_tenants=1) Unavailable happens AFTER TapHandle and
+        //    MUST record cortex_request_duration_seconds{status_code="Unavailable"} in both Go and Rust,
+        //    while TapHandle-rejected calls with wrong x-cluster do NOT increment invalid_cluster_requests.
+        let mut limit_outcomes = Vec::new();
+        for which in IMPLS {
+            let (hp, gp) = (free_test_port(), free_test_port());
+            let dir = tmp.path().join(format!("instlimit-{}", which.name()));
+            fs::create_dir_all(dir.join("tsdb")).unwrap();
+            fs::create_dir_all(dir.join("bucket")).unwrap();
+            let yaml = format!(
+                r#"target: ingester
+multitenancy_enabled: true
+server:
+  http_listen_address: 127.0.0.1
+  http_listen_port: {hp}
+  grpc_listen_address: 127.0.0.1
+  grpc_listen_port: {gp}
+ingester:
+  ring:
+    instance_id: ing-0
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+    replication_factor: 1
+    min_ready_duration: 0s
+    final_sleep: 0s
+  instance_limits:
+    max_tenants: 1
+blocks_storage:
+  backend: filesystem
+  filesystem:
+    dir: {bucket}
+  tsdb:
+    dir: {tsdb}
+activity_tracker:
+  filepath: ""
+"#,
+                bucket = dir.join("bucket").display(),
+                tsdb = dir.join("tsdb").display(),
+            );
+            let mut proc = start_mimir(which, "w22-res03-limit", &dir, &yaml, &[]);
+            wait_ready(&http, &mut proc, hp, Duration::from_secs(30)).await;
+            let mut c = connect_grpc(gp).await;
+
+            c.push(with_org(
+                Some("t1"),
+                cortexpb::WriteRequest {
+                    timeseries: vec![float_series(&[("__name__", "m1")], now_ms(), 1.0)],
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap();
+
+            let err = c
+                .push(with_org(
+                    Some("t2"),
+                    cortexpb::WriteRequest {
+                        timeseries: vec![float_series(&[("__name__", "m2")], now_ms(), 2.0)],
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::Unavailable);
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (_, _, m) = http_req(&http, reqwest::Method::GET, hp, "/metrics").await;
+            let dur_unavail = metric_value(
+                &m,
+                "cortex_request_duration_seconds_count",
+                &[
+                    ("method", "gRPC"),
+                    ("route", "/cortex.Ingester/Push"),
+                    ("status_code", "Unavailable"),
+                ],
+            )
+            .unwrap_or(0.0);
+            limit_outcomes.push((which, dur_unavail));
+        }
+        assert_eq!(limit_outcomes[0].1, 1.0, "Go InstanceLimit must record Unavailable duration");
+        assert_eq!(limit_outcomes[1].1, 1.0, "Rust InstanceLimit must record Unavailable duration");
     });
 }
 
