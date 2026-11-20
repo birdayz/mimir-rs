@@ -34,12 +34,12 @@ use mimir_tsdb::compact::{
     merge_head_chunks_with_tombstones_and_float_encoding, reencode_chunk_without_tombstones,
 };
 use mimir_tsdb::db::Tsdb;
-use mimir_tsdb::head::HeadReadGuard;
-use mimir_tsdb::querier::BlockSelectStats;
+use mimir_tsdb::head::{HeadReadGuard, HeadReadIsolation};
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::matcher::{LabelMatcher, MatchType};
 use mimir_tsdb::querier::{
-    BlockSelectStatsSink, LazyStreamEvent, QueryChunkSeries, SeriesStatsFilter,
+    BlockSelectStats, BlockSelectStatsSink, HeadQuerySnapshot, LazyStreamEvent, QueryChunkSeries,
+    SeriesStatsFilter,
 };
 use mimir_tsdb::search::{FuzzAlg, SearchHints, SearchOrdering, SearchResult};
 use tokio::sync::mpsc;
@@ -1896,17 +1896,14 @@ impl Ingester {
                 shard_index,
                 shard_count,
             });
-            let head = db.db.head();
-            let head_ooo = head.min_ooo_time() != i64::MAX
-                && head.min_ooo_time() <= end_timestamp_ms
-                && start_timestamp_ms <= head.max_ooo_time();
-            let head_overlaps = head.min_time() <= end_timestamp_ms || head_ooo;
-            let blocks: Vec<Arc<Block>> = db
+            let snapshot = db
                 .db
-                .blocks()
-                .into_iter()
-                .filter(|b| b.overlaps_closed_interval(start_timestamp_ms, end_timestamp_ms))
-                .collect();
+                .snapshot_query_sources(start_timestamp_ms, end_timestamp_ms);
+            // Keep `block_guards` declared before `blocks` so early returns drop `Arc<Block>`
+            // mmaps before `BlockReadGuard` wakes `close_and_wait()`.
+            let block_guards = snapshot.block_guards;
+            let blocks = snapshot.blocks;
+            let head_snap = snapshot.head;
 
             let run_cq = |cq: &mut dyn ChunkQuerier| -> Result<Vec<QueryChunkSeries>, IngesterError> {
                 let mut ss = cq.select(true, select_hints.as_ref(), matchers);
@@ -1951,38 +1948,39 @@ impl Ingester {
             };
 
             let mut per_source: Vec<Vec<QueryChunkSeries>> = Vec::new();
-            if head_overlaps {
+            if let Some(hs) = head_snap {
                 // Match Go `tsdb/db.go:2955-2986` + `ooo_head_read.go:708-760`:
                 // create the RangeHead ChunkQuerier (optionally mirrored), then when OOO
                 // overlaps wrap it in `HeadAndOOOChunkQuerier`, which runs `Select` once
                 // through `LookupPlanner` over Head+OOO, merges overlapping Head clusters,
                 // and closes the wrapped querier without calling its `select()` (`no_select`).
                 let planner = db.head_lookup_planner();
-                let pq = PlannedTsdbChunkQuerier::new_head(
+                let head_overlaps_ooo = hs.overlaps_ooo;
+                let head_meta = ChunkBlockMeta {
+                    ulid: lookupplan::HEAD_ULID,
+                    min_time: hs.min_time,
+                    max_time: hs.max_time,
+                };
+                let pq = PlannedTsdbChunkQuerier::new_head_with_snapshot(
                     Arc::clone(&db.db),
                     start_timestamp_ms,
                     end_timestamp_ms,
                     Arc::clone(&planner),
                     unordered,
+                    hs.clone(),
                 )
                 .with_select_stats(Arc::clone(&select_stats), shard_stats_filter(shard))
                 .with_estimates_sink(Arc::clone(&est_stats));
-                let mut head_cq = wrap_mirrored(
-                    pq,
-                    ChunkBlockMeta {
-                        ulid: lookupplan::HEAD_ULID,
-                        min_time: head.min_time(),
-                        max_time: head.max_time(),
-                    },
-                );
-                if head_ooo {
+                let mut head_cq = wrap_mirrored(pq, head_meta);
+                if head_overlaps_ooo {
                     head_cq = Box::new(
-                        HeadAndOOOChunkQuerier::new(
+                        HeadAndOOOChunkQuerier::new_with_snapshot(
                             Arc::clone(&db.db),
                             start_timestamp_ms,
                             end_timestamp_ms,
                             planner,
                             Some(head_cq),
+                            hs,
                         )
                         .with_select_stats(Arc::clone(&select_stats), shard_stats_filter(shard))
                         .with_estimates_sink(Arc::clone(&est_stats)),
@@ -1990,10 +1988,7 @@ impl Ingester {
                 }
                 per_source.push(run_cq(head_cq.as_mut())?);
             }
-            for blk in blocks {
-                let Some(block_guard) = Block::start_read(&blk) else {
-                    continue;
-                };
+            for (blk, block_guard) in blocks.into_iter().zip(block_guards) {
                 let planner = db.block_lookup_planner(&blk);
                 let m = blk.meta();
                 let meta = ChunkBlockMeta {
@@ -2014,7 +2009,11 @@ impl Ingester {
                 .with_estimates_sink(Arc::clone(&est_stats));
                 per_source.push(run_planned(pq, meta)?);
             }
-            merge_per_block_chunk_series(per_source, unordered, head.float_chunk_encoding())?
+            merge_per_block_chunk_series(
+                per_source,
+                unordered,
+                db.db.head().float_chunk_encoding(),
+            )?
         } else {
             let cq = if unordered {
                 db.db
@@ -4173,6 +4172,9 @@ enum PlannedSource {
     All,
     HeadInOrder {
         guard: Option<HeadReadGuard>,
+        isolation: HeadReadIsolation,
+        overlaps_in_order: bool,
+        overlaps_ooo: bool,
     },
     SingleBlock {
         block: Arc<Block>,
@@ -4222,10 +4224,42 @@ impl PlannedTsdbChunkQuerier {
         planner: Arc<dyn LookupPlanner>,
         unordered: bool,
     ) -> Self {
-        let guard = Some(db.head().start_read(mint, maxt));
+        match db.snapshot_head_query_source(mint, maxt) {
+            Some(hs) => Self::new_head_with_snapshot(db, mint, maxt, planner, unordered, hs),
+            None => Self {
+                db,
+                source: PlannedSource::HeadInOrder {
+                    guard: None,
+                    isolation: HeadReadIsolation::default(),
+                    overlaps_in_order: false,
+                    overlaps_ooo: false,
+                },
+                mint,
+                maxt,
+                planner,
+                unordered,
+                select_stats: None,
+                estimates_sink: None,
+            },
+        }
+    }
+
+    pub fn new_head_with_snapshot(
+        db: Arc<Tsdb>,
+        mint: i64,
+        maxt: i64,
+        planner: Arc<dyn LookupPlanner>,
+        unordered: bool,
+        snap: HeadQuerySnapshot,
+    ) -> Self {
         Self {
             db,
-            source: PlannedSource::HeadInOrder { guard },
+            source: PlannedSource::HeadInOrder {
+                guard: Some(snap.guard),
+                isolation: snap.isolation,
+                overlaps_in_order: snap.overlaps_in_order,
+                overlaps_ooo: snap.overlaps_ooo,
+            },
             mint,
             maxt,
             planner,
@@ -4323,7 +4357,13 @@ impl PlannedTsdbChunkQuerier {
         planning_disabled: bool,
         q_stats: &QueryStats,
     ) -> Box<dyn ChunkSeriesSet> {
-        let PlannedSource::HeadInOrder { guard } = &self.source else {
+        let PlannedSource::HeadInOrder {
+            guard,
+            isolation,
+            overlaps_in_order,
+            overlaps_ooo,
+        } = &self.source
+        else {
             return Box::new(VecChunkSeriesSet {
                 items: Vec::new(),
                 pos: 0,
@@ -4338,11 +4378,9 @@ impl PlannedTsdbChunkQuerier {
             });
         }
         let head = self.db.head();
-        let head_ooo = head.min_ooo_time() != i64::MAX
-            && head.min_ooo_time() <= self.maxt
-            && self.mint <= head.max_ooo_time();
-        let ino_mint = self.mint.max(head.min_time());
-        if !head.initialized() || ino_mint > self.maxt || head.is_closed() {
+        let head_ooo = *overlaps_ooo;
+        let ino_mint = isolation.ino_mint;
+        if !*overlaps_in_order || !head.initialized() || ino_mint > self.maxt || head.is_closed() {
             self.record_planned_stats(
                 planning_disabled,
                 q_stats,
@@ -4394,9 +4432,14 @@ impl PlannedTsdbChunkQuerier {
             }
             chks_buf.clear();
             tombs_buf.clear();
-            if let Err(e) =
-                head.load_series_in_order_chunks_into(r, ino_mint, self.maxt, &mut chks_buf, &mut tombs_buf)
-            {
+            if let Err(e) = head.load_series_in_order_chunks_into_with_isolation(
+                r,
+                ino_mint,
+                self.maxt,
+                isolation,
+                &mut chks_buf,
+                &mut tombs_buf,
+            ) {
                 return Box::new(VecChunkSeriesSet {
                     items: Vec::new(),
                     pos: 0,
@@ -4749,7 +4792,7 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
     fn close(&mut self) -> Result<(), QuerierError> {
         match &mut self.source {
             PlannedSource::All => {}
-            PlannedSource::HeadInOrder { guard } => {
+            PlannedSource::HeadInOrder { guard, .. } => {
                 *guard = None;
             }
             PlannedSource::SingleBlock { guard, .. } => {
@@ -4760,7 +4803,7 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
     }
 }
 
-struct MirroredChunkQuerierAdapter(MirroredChunkQuerier);
+pub struct MirroredChunkQuerierAdapter(pub MirroredChunkQuerier);
 
 impl ChunkQuerier for MirroredChunkQuerierAdapter {
     fn select(
@@ -4802,6 +4845,9 @@ pub struct HeadAndOOOChunkQuerier {
     maxt: i64,
     planner: Arc<dyn LookupPlanner>,
     guard: Option<HeadReadGuard>,
+    isolation: HeadReadIsolation,
+    overlaps_in_order: bool,
+    overlaps_ooo: bool,
     inner: Option<Box<dyn ChunkQuerier>>,
     select_stats: Option<(BlockSelectStatsSink, Option<SeriesStatsFilter>)>,
     estimates_sink: Option<EstimatesSink>,
@@ -4815,13 +4861,41 @@ impl HeadAndOOOChunkQuerier {
         planner: Arc<dyn LookupPlanner>,
         inner: Option<Box<dyn ChunkQuerier>>,
     ) -> Self {
-        let guard = Some(db.head().start_read(mint, maxt));
+        match db.snapshot_head_query_source(mint, maxt) {
+            Some(hs) => Self::new_with_snapshot(db, mint, maxt, planner, inner, hs),
+            None => Self {
+                db,
+                mint,
+                maxt,
+                planner,
+                guard: None,
+                isolation: HeadReadIsolation::default(),
+                overlaps_in_order: false,
+                overlaps_ooo: false,
+                inner,
+                select_stats: None,
+                estimates_sink: None,
+            },
+        }
+    }
+
+    pub fn new_with_snapshot(
+        db: Arc<Tsdb>,
+        mint: i64,
+        maxt: i64,
+        planner: Arc<dyn LookupPlanner>,
+        inner: Option<Box<dyn ChunkQuerier>>,
+        snap: HeadQuerySnapshot,
+    ) -> Self {
         Self {
             db,
             mint,
             maxt,
             planner,
-            guard,
+            guard: Some(snap.guard),
+            isolation: snap.isolation,
+            overlaps_in_order: snap.overlaps_in_order,
+            overlaps_ooo: snap.overlaps_ooo,
             inner,
             select_stats: None,
             estimates_sink: None,
@@ -4898,11 +4972,11 @@ impl ChunkQuerier for HeadAndOOOChunkQuerier {
         };
 
         let head = self.db.head();
-        let head_ooo = head.min_ooo_time() != i64::MAX
-            && head.min_ooo_time() <= self.maxt
-            && self.mint <= head.max_ooo_time();
-        let ino_mint = self.mint.max(head.min_time());
-        if head.is_closed() || (!head_ooo && (!head.initialized() || ino_mint > self.maxt)) {
+        let head_ooo = self.overlaps_ooo;
+        let ino_mint = self.isolation.ino_mint;
+        if head.is_closed()
+            || (!head_ooo && (!self.overlaps_in_order || !head.initialized() || ino_mint > self.maxt))
+        {
             self.record_planned_stats(
                 planning_disabled,
                 &q_stats,
@@ -4951,7 +5025,12 @@ impl ChunkQuerier for HeadAndOOOChunkQuerier {
             {
                 continue;
             }
-            let final_chunks = match head.series_final_chunks_only(r, self.mint, self.maxt) {
+            let final_chunks = match head.series_final_chunks_only_with_isolation(
+                r,
+                self.mint,
+                self.maxt,
+                &self.isolation,
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     return Box::new(VecChunkSeriesSet {

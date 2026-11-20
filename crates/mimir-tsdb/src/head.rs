@@ -3246,6 +3246,87 @@ impl SeriesFingerprint {
     }
 }
 
+/// Set of series refs currently being evicted by `evict_series_refs_inner` (Go `evictedSeries`).
+#[derive(Debug)]
+pub struct EvictedSeries {
+    /// Sorted, deduplicated series refs.
+    refs: Vec<u64>,
+    maxt_inclusive: i64,
+    fingerprints: Option<Arc<HashMap<u64, SeriesFingerprint>>>,
+}
+
+impl EvictedSeries {
+    pub fn new(
+        mut refs: Vec<u64>,
+        maxt_inclusive: i64,
+        fingerprints: Option<Arc<HashMap<u64, SeriesFingerprint>>>,
+    ) -> Self {
+        refs.sort_unstable();
+        refs.dedup();
+        Self {
+            refs,
+            maxt_inclusive,
+            fingerprints,
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, ref_id: u64) -> bool {
+        self.refs.binary_search(&ref_id).is_ok()
+    }
+
+    #[inline]
+    fn should_skip_in_order(&self, entry: &SeriesEntry, st: &SeriesState) -> bool {
+        if !self.contains(entry.ref_id) {
+            return false;
+        }
+        if entry.pending_commits_count() > 0 || st.max_time() > self.maxt_inclusive {
+            return false;
+        }
+        if self
+            .fingerprints
+            .as_ref()
+            .is_some_and(|fps| SeriesFingerprint::has_mutated(entry, st, fps))
+        {
+            return false;
+        }
+        let has_ooo = st.ooo().is_some_and(|o| {
+            o.ooo_head_chunk.is_some()
+                || !o.ooo_mmapped_chunks.is_empty()
+                || !o.ooo_pending_mmapped.is_empty()
+        });
+        !has_ooo
+    }
+}
+
+/// Snapshot of Head compaction-isolation state captured atomically under `blocks.read()`.
+#[derive(Clone, Debug, Default)]
+pub struct HeadReadIsolation {
+    /// Effective in-order query min time (clamped by `last_memory_truncation_time` when
+    /// `mem_truncation_in_process` was active at snapshot time).
+    pub ino_mint: i64,
+    /// Maximum OOO chunk disk ref already compacted into reloaded blocks at snapshot time
+    /// (Go `db.lastGarbageCollectedMmapRef`); OOO chunks with `ref_id <= max_ooo_mmap_ref_to_skip`
+    /// are skipped in Head so newly opened queriers do not emit duplicate OOO chunks.
+    pub max_ooo_mmap_ref_to_skip: ChunkDiskMapperRef,
+    /// Snapshot of `head.evicting_series` captured at query snapshot time (Go `rh.evicting`).
+    pub evicting: Option<Arc<EvictedSeries>>,
+}
+
+impl HeadReadIsolation {
+    #[inline]
+    fn should_skip_in_order(&self, entry: &SeriesEntry, st: &SeriesState) -> bool {
+        self.evicting
+            .as_ref()
+            .is_some_and(|e| e.should_skip_in_order(entry, st))
+    }
+
+    #[inline]
+    pub(crate) fn evicting_contains(&self, ref_id: u64) -> bool {
+        self.evicting.as_ref().is_some_and(|e| e.contains(ref_id))
+    }
+}
+
 /// Snapshot of OOO compaction candidates bounded by `last_mmap_ref` and `last_wbl_file`
 /// (matching Prometheus `OOOCompactionHead`).
 #[derive(Clone, Debug)]
@@ -3648,6 +3729,10 @@ pub struct Head {
     num_native_histogram_series: Arc<AtomicU64>,
     num_native_histogram_buckets: Arc<AtomicU64>,
     last_wal_truncation_time: AtomicI64,
+    last_memory_truncation_time: AtomicI64,
+    mem_truncation_in_process: AtomicBool,
+    has_evicting_series: AtomicBool,
+    evicting_series: RwLock<Option<Arc<EvictedSeries>>>,
     closed: AtomicBool,
     has_any_metadata: AtomicBool,
     deleted_series_since_symbol_gc: AtomicU64,
@@ -3715,23 +3800,6 @@ impl HeadActiveReads {
             .reads
             .iter()
             .any(|&(id, r_mint, r_maxt)| id < cutoff && r_mint <= maxt_inclusive && mint <= r_maxt)
-        {
-            self.cv.wait(&mut state);
-        }
-    }
-
-    /// Waits until no registered reader overlaps `[mint, maxt_exclusive)`, including readers
-    /// registered while waiting (Go `Head.WaitForPendingReadersInTimeRange`).
-    fn wait_for_range_all(&self, mint: i64, maxt_exclusive: i64) {
-        if mint >= maxt_exclusive {
-            return;
-        }
-        let maxt_inclusive = maxt_exclusive - 1;
-        let mut state = self.state.lock();
-        while state
-            .reads
-            .iter()
-            .any(|&(_, r_mint, r_maxt)| r_mint <= maxt_inclusive && mint <= r_maxt)
         {
             self.cv.wait(&mut state);
         }
@@ -3970,6 +4038,10 @@ impl Head {
             num_native_histogram_series,
             num_native_histogram_buckets,
             last_wal_truncation_time: AtomicI64::new(i64::MIN),
+            last_memory_truncation_time: AtomicI64::new(i64::MIN),
+            mem_truncation_in_process: AtomicBool::new(false),
+            has_evicting_series: AtomicBool::new(false),
+            evicting_series: RwLock::new(None),
             closed: AtomicBool::new(false),
             has_any_metadata: AtomicBool::new(false),
             deleted_series_since_symbol_gc: AtomicU64::new(0),
@@ -7451,12 +7523,61 @@ impl Head {
         out_chunks: &mut Vec<ChunkMeta>,
         out_tombs: &mut Vec<Interval>,
     ) -> Result<(), HeadError> {
+        self.load_series_in_order_chunks_into_inner(
+            ref_id,
+            mint,
+            maxt_inclusive,
+            None,
+            out_chunks,
+            out_tombs,
+        )
+    }
+
+    /// Loads in-order chunks overlapping `[mint, maxt_inclusive]` and tombstones for `ref_id`,
+    /// honoring `iso.evicting` (`skipEvictedSeries`).
+    pub fn load_series_in_order_chunks_into_with_isolation(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt_inclusive: i64,
+        iso: &HeadReadIsolation,
+        out_chunks: &mut Vec<ChunkMeta>,
+        out_tombs: &mut Vec<Interval>,
+    ) -> Result<(), HeadError> {
+        self.load_series_in_order_chunks_into_inner(
+            ref_id,
+            mint,
+            maxt_inclusive,
+            Some(iso),
+            out_chunks,
+            out_tombs,
+        )
+    }
+
+    fn load_series_in_order_chunks_into_inner(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt_inclusive: i64,
+        iso: Option<&HeadReadIsolation>,
+        out_chunks: &mut Vec<ChunkMeta>,
+        out_tombs: &mut Vec<Interval>,
+    ) -> Result<(), HeadError> {
         let Some(entry) = self.series.get_by_id(ref_id) else {
+            if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                self.metrics.chunk_reads_of_removed_series.inc();
+            }
             return Ok(());
         };
         let mut mmapped_refs: SmallVec<[MmappedChunk; 8]> = SmallVec::new();
         {
             let st = entry.inner.lock();
+            if entry.is_gced() || iso.is_some_and(|i| i.should_skip_in_order(&entry, &st)) {
+                if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                    self.metrics.chunk_reads_of_removed_series.inc();
+                }
+                return Ok(());
+            }
             for mc in st.mmapped() {
                 if mc.overlaps_closed_interval(mint, maxt_inclusive) {
                     mmapped_refs.push(*mc);
@@ -8717,7 +8838,7 @@ impl Head {
         refs: &[u64],
         maxt_inclusive: i64,
     ) -> Result<(), HeadError> {
-        self.evict_series_refs_inner(refs, maxt_inclusive, None)
+        self.evict_series_refs_inner(refs, maxt_inclusive, None, false)
     }
 
     /// Evicts `refs` from Head memory ONLY if `pending_commits == 0`, `state.max_time() <= maxt_inclusive`,
@@ -8728,7 +8849,39 @@ impl Head {
         maxt_inclusive: i64,
         fingerprints: &HashMap<u64, SeriesFingerprint>,
     ) -> Result<(), HeadError> {
-        self.evict_series_refs_inner(refs, maxt_inclusive, Some(fingerprints))
+        self.evict_series_refs_inner(refs, maxt_inclusive, Some(fingerprints), false)
+    }
+
+    /// Variant of `evict_series_refs_with_fingerprints` when `evicting_series` was already
+    /// published atomically under `blocks.write()` (the caller clears it via RAII guard).
+    pub fn evict_series_refs_with_fingerprints_prepublished(
+        &self,
+        refs: &[u64],
+        maxt_inclusive: i64,
+        fingerprints: &HashMap<u64, SeriesFingerprint>,
+    ) -> Result<(), HeadError> {
+        self.evict_series_refs_inner(refs, maxt_inclusive, Some(fingerprints), true)
+    }
+
+    pub fn set_evicting_series(&self, evicting: Option<Arc<EvictedSeries>>) {
+        match evicting {
+            Some(ev) => {
+                *self.evicting_series.write() = Some(ev);
+                self.has_evicting_series.store(true, Ordering::Release);
+            }
+            None => {
+                self.has_evicting_series.store(false, Ordering::Release);
+                *self.evicting_series.write() = None;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn evicting_series(&self) -> Option<Arc<EvictedSeries>> {
+        if !self.has_evicting_series.load(Ordering::Acquire) {
+            return None;
+        }
+        self.evicting_series.read().clone()
     }
 
     fn evict_series_refs_inner(
@@ -8736,17 +8889,33 @@ impl Head {
         refs: &[u64],
         maxt_inclusive: i64,
         fingerprints: Option<&HashMap<u64, SeriesFingerprint>>,
+        prepublished_evicting: bool,
     ) -> Result<(), HeadError> {
         let _snap_guard = self.chunk_snapshot_mtx.lock();
+        struct ClearEvictingGuard<'a>(&'a Head);
+        impl Drop for ClearEvictingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set_evicting_series(None);
+            }
+        }
+        let _evict_guard = if !prepublished_evicting && !refs.is_empty() {
+            let ev = Arc::new(EvictedSeries::new(
+                refs.to_vec(),
+                maxt_inclusive,
+                fingerprints.map(|fps| Arc::new(fps.clone())),
+            ));
+            self.set_evicting_series(Some(ev));
+            Some(ClearEvictingGuard(self))
+        } else {
+            None
+        };
         if self.initialized() {
-            // Go `Head.evictSeries` polls until no overlapping reader is open. Nothing tells a
-            // reader registered during the wait that these series are about to lose their
-            // chunks (Go publishes `evictingSeries` for that), so it has to be waited for too:
-            // the chunks it counted for a lazy `QueryStream` must still be there when it
-            // materializes them.
+            // Pre-reload readers registered before blocks.write() saw `evicting_series == None`
+            // and must finish before Head unlinks these series; readers registered after see
+            // `evicting_series` (Go `skipEvictedSeries`) and read them from the new ULID block,
+            // so cutoff-bounded `wait_for_range` cannot be starved by continuous query traffic.
             let wait_maxt = maxt_inclusive.min(i64::MAX - 1) + 1;
-            self.active_reads
-                .wait_for_range_all(self.min_time(), wait_maxt);
+            self.active_reads.wait_for_range(self.min_time(), wait_maxt);
         }
         let min_valid_time = self.min_valid_time.load(Ordering::Acquire);
         let has_wal = self.wal.lock().is_some();
@@ -8850,16 +9019,66 @@ impl Head {
         }
     }
 
+    /// Publishes the pending in-order memory truncation target time before `wait_for_range`
+    /// runs (Go `Head.truncateMemory`: `lastMemoryTruncationTime` stored before
+    /// `memTruncationInProcess`).
+    #[inline]
+    pub fn begin_memory_truncation(&self, mint: i64) {
+        self.last_memory_truncation_time
+            .store(mint, Ordering::Release);
+        self.mem_truncation_in_process
+            .store(true, Ordering::Release);
+    }
+
+    /// Clears `mem_truncation_in_process` after memory truncation completes or aborts.
+    #[inline]
+    pub fn end_memory_truncation(&self) {
+        self.mem_truncation_in_process
+            .store(false, Ordering::Release);
+    }
+
+    /// Port of Go `Head.IsQuerierCollidingWithTruncation` (`head.go:1749-1778`):
+    /// returns `(should_close, get_new, new_mint)`.
+    #[inline]
+    pub fn is_querier_colliding_with_truncation(
+        &self,
+        querier_mint: i64,
+        querier_maxt: i64,
+    ) -> (bool, bool, i64) {
+        if !self.mem_truncation_in_process.load(Ordering::Acquire) {
+            return (false, false, 0);
+        }
+        let mem_trunc_time = self.last_memory_truncation_time.load(Ordering::Acquire);
+        if querier_maxt < mem_trunc_time {
+            return (true, false, mem_trunc_time);
+        }
+        if querier_mint < mem_trunc_time {
+            return (true, true, mem_trunc_time);
+        }
+        (false, false, 0)
+    }
+
     fn truncate_memory_inner(&self, mint: i64) -> Result<(), HeadError> {
         let _snap_guard = self.chunk_snapshot_mtx.lock();
+        struct MemTruncReset<'a>(&'a Head);
+        impl Drop for MemTruncReset<'_> {
+            fn drop(&mut self) {
+                self.0.end_memory_truncation();
+            }
+        }
         let initialized = self.initialized();
         let old_min_time = self.min_time();
         if initialized && old_min_time >= mint {
+            self.end_memory_truncation();
             if self.symbol_arena_grew_past_gc_threshold() {
                 self.maybe_gc_symbols();
             }
             return Ok(());
         }
+        if !self.mem_truncation_in_process.load(Ordering::Acquire) {
+            self.begin_memory_truncation(mint);
+        }
+        let _mem_trunc_reset = MemTruncReset(self);
 
         if initialized {
             // Wait for any active queriers overlapping `[old_min_time, mint)` whose
@@ -9322,13 +9541,46 @@ impl Head {
     /// Returns `Some(entry.labels.clone())` (O(1) refcount bump, zero chunk clone) if `ref_id`
     /// has any non-tombstoned chunks overlapping `[mint, maxt]`.
     pub fn series_has_chunks_in_range(&self, ref_id: u64, mint: i64, maxt: i64) -> Option<Labels> {
+        self.series_has_chunks_in_range_inner(ref_id, mint, maxt, None)
+    }
+
+    pub fn series_has_chunks_in_range_with_isolation(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        iso: &HeadReadIsolation,
+    ) -> Option<Labels> {
+        self.series_has_chunks_in_range_inner(ref_id, mint, maxt, Some(iso))
+    }
+
+    fn series_has_chunks_in_range_inner(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        iso: Option<&HeadReadIsolation>,
+    ) -> Option<Labels> {
         let Some(entry) = self.series.get_by_id(ref_id) else {
-            self.metrics.series_not_found.inc();
+            if !iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                self.metrics.series_not_found.inc();
+            }
             return None;
         };
         let tombs = self.tombstones.get(ref_id);
-        let ino_mint = mint.max(self.min_time());
+        let ino_mint = iso.map_or_else(|| mint.max(self.min_time()), |i| i.ino_mint);
+        let skip_ooo_ref = iso.map_or(ChunkDiskMapperRef(0), |i| i.max_ooo_mmap_ref_to_skip);
         let st = entry.inner.lock();
+        if entry.is_gced() || iso.is_some_and(|i| i.should_skip_in_order(&entry, &st)) {
+            return None;
+        }
+        let wm = if skip_ooo_ref.as_u64() > 0
+            && st.ooo().is_some_and(|o| !o.ooo_pending_mmapped.is_empty())
+        {
+            self.chunk_writer.lock().as_ref().map(|cw| cw.flushed_watermark())
+        } else {
+            None
+        };
         let has_chunk = st.any_head_chunk_bounds(|hc_min, hc_max| {
             hc_min <= maxt
                 && ino_mint <= hc_max
@@ -9339,9 +9591,17 @@ impl Head {
         }) || st.ooo().is_some_and(|ooo| {
             ooo.ooo_mmapped_chunks.iter().any(|mc| {
                 mc.overlaps_closed_interval(mint, maxt)
+                    && !(skip_ooo_ref.as_u64() > 0 && mc.ref_id <= skip_ooo_ref)
                     && !tombs.iter().any(|iv| iv.is_subrange(mc.min_time, mc.max_time))
             }) || ooo.ooo_pending_mmapped.iter().any(|p| {
-                p.mc.overlaps_closed_interval(mint, maxt)
+                let skipped_by_ooo_gc = skip_ooo_ref.as_u64() > 0
+                    && p.mc.ref_id.as_u64() != 0
+                    && p.mc.ref_id <= skip_ooo_ref
+                    && wm
+                        .as_ref()
+                        .is_none_or(|w| w.is_flushed(p.mc.ref_id, p.write_epoch));
+                !skipped_by_ooo_gc
+                    && p.mc.overlaps_closed_interval(mint, maxt)
                     && !tombs
                         .iter()
                         .any(|iv| iv.is_subrange(p.mc.min_time, p.mc.max_time))
@@ -9366,7 +9626,28 @@ impl Head {
         mint: i64,
         maxt: i64,
     ) -> Result<SeriesChunksResult, HeadError> {
-        let Some((labels_opt, chks, tombs)) = self.series_chunks_inner(ref_id, mint, maxt, true)?
+        self.series_chunks_with_isolation_opt(ref_id, mint, maxt, None)
+    }
+
+    pub fn series_chunks_with_isolation(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        iso: &HeadReadIsolation,
+    ) -> Result<SeriesChunksResult, HeadError> {
+        self.series_chunks_with_isolation_opt(ref_id, mint, maxt, Some(iso))
+    }
+
+    fn series_chunks_with_isolation_opt(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        iso: Option<&HeadReadIsolation>,
+    ) -> Result<SeriesChunksResult, HeadError> {
+        let Some((labels_opt, chks, tombs)) =
+            self.series_chunks_inner(ref_id, mint, maxt, true, iso)?
         else {
             return Ok(None);
         };
@@ -9383,13 +9664,18 @@ impl Head {
         mint: i64,
         maxt: i64,
         need_labels: bool,
+        iso: Option<&HeadReadIsolation>,
     ) -> Result<Option<(Option<Labels>, Vec<ChunkMeta>, Vec<Interval>)>, HeadError> {
         let Some(entry) = self.series.get_by_id(ref_id) else {
-            // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
-            self.metrics.series_not_found.inc();
+            if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                self.metrics.chunk_reads_of_removed_series.inc();
+            } else {
+                // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
+                self.metrics.series_not_found.inc();
+            }
             return Ok(None);
         };
-        self.series_chunks_for_entry_inner(&entry, mint, maxt, need_labels)
+        self.series_chunks_for_entry_inner(&entry, mint, maxt, need_labels, iso)
     }
 
     #[allow(clippy::type_complexity)]
@@ -9399,9 +9685,11 @@ impl Head {
         mint: i64,
         maxt: i64,
         need_labels: bool,
+        iso: Option<&HeadReadIsolation>,
     ) -> Result<Option<(Option<Labels>, Vec<ChunkMeta>, Vec<Interval>)>, HeadError> {
         let ref_id = entry.ref_id;
         const OOO_HEAD_CHUNK_REF_BIT: u64 = 1u64 << 31;
+        let skip_ooo_ref = iso.map_or(ChunkDiskMapperRef(0), |i| i.max_ooo_mmap_ref_to_skip);
 
         'retry: loop {
             if self.is_closed() {
@@ -9409,10 +9697,13 @@ impl Head {
             }
             let (mmapped_in_order, head_chks, mmapped_ooo, ooo_head_chks) = {
                 let st = entry.inner.lock();
-                if entry.is_gced() {
+                if entry.is_gced() || iso.is_some_and(|i| i.should_skip_in_order(entry, &st)) {
+                    if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                        self.metrics.chunk_reads_of_removed_series.inc();
+                    }
                     return Ok(None);
                 }
-                let ino_mint = mint.max(self.min_time());
+                let ino_mint = iso.map_or_else(|| mint.max(self.min_time()), |i| i.ino_mint);
                 let mut in_order_pos = 0u64;
                 let (mmapped_in_order, head_chks) = {
                     let mmapped_count = st
@@ -9446,15 +9737,28 @@ impl Head {
                 let mut mmapped_ooo = Vec::new();
                 let mut ooo_head_chks = Vec::new();
                 if let Some(ooo) = st.ooo() {
+                    let wm = if skip_ooo_ref.as_u64() > 0 && !ooo.ooo_pending_mmapped.is_empty() {
+                        self.chunk_writer.lock().as_ref().map(|cw| cw.flushed_watermark())
+                    } else {
+                        None
+                    };
                     let mut ooo_pos = 0u64;
                     for mc in &ooo.ooo_mmapped_chunks {
-                        if mc.overlaps_closed_interval(mint, maxt) {
+                        if mc.overlaps_closed_interval(mint, maxt)
+                            && !(skip_ooo_ref.as_u64() > 0 && mc.ref_id <= skip_ooo_ref)
+                        {
                             mmapped_ooo.push((OOO_HEAD_CHUNK_REF_BIT | ooo_pos, *mc));
                         }
                         ooo_pos += 1;
                     }
                     for p in &ooo.ooo_pending_mmapped {
-                        if p.mc.overlaps_closed_interval(mint, maxt) {
+                        let skipped_by_ooo_gc = skip_ooo_ref.as_u64() > 0
+                            && p.mc.ref_id.as_u64() != 0
+                            && p.mc.ref_id <= skip_ooo_ref
+                            && wm
+                                .as_ref()
+                                .is_none_or(|w| w.is_flushed(p.mc.ref_id, p.write_epoch));
+                        if !skipped_by_ooo_gc && p.mc.overlaps_closed_interval(mint, maxt) {
                             ooo_head_chks.push(ChunkMeta {
                                 ref_id: OOO_HEAD_CHUNK_REF_BIT | ooo_pos,
                                 min_time: p.mc.min_time,
@@ -9587,7 +9891,29 @@ impl Head {
         mint: i64,
         maxt: i64,
     ) -> Result<Option<(Labels, Vec<ChunkMeta>)>, HeadError> {
-        let Some((labels, chks, tombs)) = self.series_chunks(ref_id, mint, maxt)? else {
+        self.series_final_chunks_inner(ref_id, mint, maxt, None)
+    }
+
+    pub fn series_final_chunks_with_isolation(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        iso: &HeadReadIsolation,
+    ) -> Result<Option<(Labels, Vec<ChunkMeta>)>, HeadError> {
+        self.series_final_chunks_inner(ref_id, mint, maxt, Some(iso))
+    }
+
+    fn series_final_chunks_inner(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        iso: Option<&HeadReadIsolation>,
+    ) -> Result<Option<(Labels, Vec<ChunkMeta>)>, HeadError> {
+        let Some((labels, chks, tombs)) =
+            self.series_chunks_with_isolation_opt(ref_id, mint, maxt, iso)?
+        else {
             return Ok(None);
         };
         if chks.is_empty() {
@@ -9611,7 +9937,28 @@ impl Head {
         mint: i64,
         maxt: i64,
     ) -> Result<Vec<ChunkMeta>, HeadError> {
-        let Some((_, chks, tombs)) = self.series_chunks_inner(ref_id, mint, maxt, false)? else {
+        self.series_final_chunks_only_inner(ref_id, mint, maxt, None)
+    }
+
+    pub fn series_final_chunks_only_with_isolation(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        iso: &HeadReadIsolation,
+    ) -> Result<Vec<ChunkMeta>, HeadError> {
+        self.series_final_chunks_only_inner(ref_id, mint, maxt, Some(iso))
+    }
+
+    fn series_final_chunks_only_inner(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        iso: Option<&HeadReadIsolation>,
+    ) -> Result<Vec<ChunkMeta>, HeadError> {
+        let Some((_, chks, tombs)) = self.series_chunks_inner(ref_id, mint, maxt, false, iso)?
+        else {
             return Ok(Vec::new());
         };
         if chks.is_empty() {
@@ -9628,7 +9975,28 @@ impl Head {
         mint: i64,
         maxt: i64,
     ) -> Result<Vec<ChunkMeta>, HeadError> {
-        let Some((_, chks, tombs)) = self.series_chunks_for_entry_inner(entry, mint, maxt, false)?
+        self.series_final_chunks_for_entry_inner(entry, mint, maxt, None)
+    }
+
+    pub fn series_final_chunks_for_entry_with_isolation(
+        &self,
+        entry: &SeriesEntry,
+        mint: i64,
+        maxt: i64,
+        iso: &HeadReadIsolation,
+    ) -> Result<Vec<ChunkMeta>, HeadError> {
+        self.series_final_chunks_for_entry_inner(entry, mint, maxt, Some(iso))
+    }
+
+    fn series_final_chunks_for_entry_inner(
+        &self,
+        entry: &SeriesEntry,
+        mint: i64,
+        maxt: i64,
+        iso: Option<&HeadReadIsolation>,
+    ) -> Result<Vec<ChunkMeta>, HeadError> {
+        let Some((_, chks, tombs)) =
+            self.series_chunks_for_entry_inner(entry, mint, maxt, false, iso)?
         else {
             return Ok(Vec::new());
         };
@@ -9743,6 +10111,38 @@ impl Head {
         }
     }
 
+    fn has_non_skipped_ooo_in_range(
+        &self,
+        st: &SeriesState,
+        mint: i64,
+        maxt: i64,
+        skip_ooo_ref: ChunkDiskMapperRef,
+    ) -> bool {
+        let Some(ooo) = st.ooo() else {
+            return false;
+        };
+        let wm = if skip_ooo_ref.as_u64() > 0 && !ooo.ooo_pending_mmapped.is_empty() {
+            self.chunk_writer.lock().as_ref().map(|cw| cw.flushed_watermark())
+        } else {
+            None
+        };
+        ooo.ooo_mmapped_chunks.iter().any(|mc| {
+            mc.overlaps_closed_interval(mint, maxt)
+                && !(skip_ooo_ref.as_u64() > 0 && mc.ref_id <= skip_ooo_ref)
+        }) || ooo.ooo_pending_mmapped.iter().any(|p| {
+            let skipped_by_ooo_gc = skip_ooo_ref.as_u64() > 0
+                && p.mc.ref_id.as_u64() != 0
+                && p.mc.ref_id <= skip_ooo_ref
+                && wm
+                    .as_ref()
+                    .is_none_or(|w| w.is_flushed(p.mc.ref_id, p.write_epoch));
+            !skipped_by_ooo_gc && p.mc.overlaps_closed_interval(mint, maxt)
+        }) || ooo
+            .ooo_head_chunk
+            .as_ref()
+            .is_some_and(|ohc| ohc.overlaps_closed_interval(mint, maxt))
+    }
+
     /// Computes `(entry, exact_chunk_count, snapshot)` for `ref_id` in `[mint, maxt]` without
     /// cloning `Labels`, chunk bytes, or reading mmap files on the normal in-order disjoint fast path.
     pub fn series_lazy_chunk_count_with_snapshot(
@@ -9752,12 +10152,38 @@ impl Head {
         maxt: i64,
         filter: Option<&dyn Fn(&Labels) -> bool>,
     ) -> Result<Option<(Arc<SeriesEntry>, u32, HeadChunkSnapshot)>, HeadError> {
+        self.series_lazy_chunk_count_with_snapshot_inner(ref_id, mint, maxt, filter, None)
+    }
+
+    pub fn series_lazy_chunk_count_with_snapshot_and_isolation(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+        iso: &HeadReadIsolation,
+    ) -> Result<Option<(Arc<SeriesEntry>, u32, HeadChunkSnapshot)>, HeadError> {
+        self.series_lazy_chunk_count_with_snapshot_inner(ref_id, mint, maxt, filter, Some(iso))
+    }
+
+    fn series_lazy_chunk_count_with_snapshot_inner(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+        iso: Option<&HeadReadIsolation>,
+    ) -> Result<Option<(Arc<SeriesEntry>, u32, HeadChunkSnapshot)>, HeadError> {
         if self.is_closed() {
             return Err(HeadChunksError::Closed.into());
         }
         let Some(entry) = self.series.get_by_id(ref_id) else {
-            // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
-            self.metrics.series_not_found.inc();
+            if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                self.metrics.chunk_reads_of_removed_series.inc();
+            } else {
+                // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
+                self.metrics.series_not_found.inc();
+            }
             return Ok(None);
         };
         if let Some(pred) = filter {
@@ -9767,22 +10193,17 @@ impl Head {
         }
 
         let has_any_tombs = self.tombstones.has_any();
-        let ino_mint = mint.max(self.min_time());
+        let ino_mint = iso.map_or_else(|| mint.max(self.min_time()), |i| i.ino_mint);
+        let skip_ooo_ref = iso.map_or(ChunkDiskMapperRef(0), |i| i.max_ooo_mmap_ref_to_skip);
         let (min_times, needs_slow_resolve) = {
             let st = entry.inner.lock();
-            let has_ooo = st.ooo().is_some_and(|ooo| {
-                ooo.ooo_mmapped_chunks
-                    .iter()
-                    .any(|mc| mc.overlaps_closed_interval(mint, maxt))
-                    || ooo
-                        .ooo_pending_mmapped
-                        .iter()
-                        .any(|p| p.mc.overlaps_closed_interval(mint, maxt))
-                    || ooo
-                        .ooo_head_chunk
-                        .as_ref()
-                        .is_some_and(|ohc| ohc.overlaps_closed_interval(mint, maxt))
-            });
+            if entry.is_gced() || iso.is_some_and(|i| i.should_skip_in_order(&entry, &st)) {
+                if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                    self.metrics.chunk_reads_of_removed_series.inc();
+                }
+                return Ok(None);
+            }
+            let has_ooo = self.has_non_skipped_ooo_in_range(&st, mint, maxt, skip_ooo_ref);
             let mut min_times: SmallVec<[i64; 4]> = SmallVec::new();
             let mut prev_min: i64 = i64::MIN;
             let mut prev_max: i64 = i64::MIN;
@@ -9822,7 +10243,7 @@ impl Head {
             });
         }
 
-        let chks = self.series_final_chunks_for_entry(&entry, mint, maxt)?;
+        let chks = self.series_final_chunks_for_entry_inner(&entry, mint, maxt, iso)?;
         Ok(if chks.is_empty() {
             None
         } else {
@@ -9868,12 +10289,38 @@ impl Head {
         maxt: i64,
         filter: Option<&dyn Fn(&Labels) -> bool>,
     ) -> Result<SeriesChunkMetasWithSnapshot, HeadError> {
+        self.series_chunk_metas_no_bytes_with_snapshot_inner(ref_id, mint, maxt, filter, None)
+    }
+
+    pub fn series_chunk_metas_no_bytes_with_snapshot_and_isolation(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+        iso: &HeadReadIsolation,
+    ) -> Result<SeriesChunkMetasWithSnapshot, HeadError> {
+        self.series_chunk_metas_no_bytes_with_snapshot_inner(ref_id, mint, maxt, filter, Some(iso))
+    }
+
+    fn series_chunk_metas_no_bytes_with_snapshot_inner(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+        iso: Option<&HeadReadIsolation>,
+    ) -> Result<SeriesChunkMetasWithSnapshot, HeadError> {
         if self.is_closed() {
             return Err(HeadChunksError::Closed.into());
         }
         let Some(entry) = self.series.get_by_id(ref_id) else {
-            // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
-            self.metrics.series_not_found.inc();
+            if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                self.metrics.chunk_reads_of_removed_series.inc();
+            } else {
+                // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
+                self.metrics.series_not_found.inc();
+            }
             return Ok(None);
         };
         if let Some(pred) = filter {
@@ -9882,22 +10329,17 @@ impl Head {
             }
         }
         let has_any_tombs = self.tombstones.has_any();
-        let ino_mint = mint.max(self.min_time());
+        let ino_mint = iso.map_or_else(|| mint.max(self.min_time()), |i| i.ino_mint);
+        let skip_ooo_ref = iso.map_or(ChunkDiskMapperRef(0), |i| i.max_ooo_mmap_ref_to_skip);
         let (intervals, needs_slow) = {
             let st = entry.inner.lock();
-            let has_ooo = st.ooo().is_some_and(|ooo| {
-                ooo.ooo_mmapped_chunks
-                    .iter()
-                    .any(|mc| mc.overlaps_closed_interval(mint, maxt))
-                    || ooo
-                        .ooo_pending_mmapped
-                        .iter()
-                        .any(|p| p.mc.overlaps_closed_interval(mint, maxt))
-                    || ooo
-                        .ooo_head_chunk
-                        .as_ref()
-                        .is_some_and(|ohc| ohc.overlaps_closed_interval(mint, maxt))
-            });
+            if entry.is_gced() || iso.is_some_and(|i| i.should_skip_in_order(&entry, &st)) {
+                if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                    self.metrics.chunk_reads_of_removed_series.inc();
+                }
+                return Ok(None);
+            }
+            let has_ooo = self.has_non_skipped_ooo_in_range(&st, mint, maxt, skip_ooo_ref);
             let mut intervals: SmallVec<[(i64, i64); 4]> = SmallVec::new();
             let mut prev_min = i64::MIN;
             let mut prev_max = i64::MIN;
@@ -9938,7 +10380,7 @@ impl Head {
                 HeadChunkSnapshot::InOrderByMinTime(min_times),
             )));
         }
-        let Some((labels, chks)) = self.series_final_chunks(ref_id, mint, maxt)? else {
+        let Some((labels, chks)) = self.series_final_chunks_inner(ref_id, mint, maxt, iso)? else {
             return Ok(None);
         };
         let ivs: SmallVec<[(i64, i64); 4]> =
@@ -15168,6 +15610,107 @@ mod tests {
     }
 
     #[test]
+    fn w22_deep_02_1_flushed_vs_discarded_pending_ooo_mmap_ref_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 500_000,
+            ooo_cap_max: 2,
+            samples_per_chunk: 2,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let s_discarded = [("__name__", "w22_pending_discarded"), ("job", "a")];
+        let s_flushed = [("__name__", "w22_pending_flushed"), ("job", "a")];
+
+        {
+            let mut app = head.appender();
+            app.append_float(None, &s_discarded, 100_000, 100.0)
+                .unwrap();
+            app.append_float(None, &s_flushed, 100_000, 100.0).unwrap();
+            app.commit().unwrap();
+        }
+
+        {
+            let mut app = head.appender();
+            app.append_float(None, &s_flushed, 1_000, 1.0).unwrap();
+            app.append_float(None, &s_flushed, 2_000, 2.0).unwrap();
+            app.commit().unwrap();
+        }
+        {
+            let mut app = head.appender();
+            app.append_float(None, &s_flushed, 3_000, 3.0).unwrap();
+            app.commit().unwrap();
+        }
+        let e_flushed = head.get_entry_by_sorted_pairs(&s_flushed).unwrap();
+        let flushed_ref = {
+            let st = e_flushed.inner.lock();
+            let ooo = st.ooo().unwrap();
+            assert!(
+                !ooo.ooo_mmapped_chunks.is_empty(),
+                "s_flushed must have mmapped OOO chunk"
+            );
+            ooo.ooo_mmapped_chunks.last().unwrap().ref_id
+        };
+
+        {
+            let mut app = head.appender();
+            app.append_float(None, &s_discarded, 1_000, 11.0).unwrap();
+            app.append_float(None, &s_discarded, 2_000, 12.0).unwrap();
+            app.commit().unwrap();
+        }
+        {
+            let mut cw = head.chunk_writer.lock();
+            cw.as_mut()
+                .unwrap()
+                .set_write_fault_hook(Some(Arc::new(|len| {
+                    if len > 8 {
+                        crate::head_chunks::WriteFaultAction::Error(io::ErrorKind::StorageFull)
+                    } else {
+                        crate::head_chunks::WriteFaultAction::PassThrough
+                    }
+                })));
+        }
+        {
+            let mut app = head.appender();
+            app.append_float(None, &s_discarded, 3_000, 13.0).unwrap();
+            assert!(app.commit().is_err());
+        }
+        {
+            let mut cw = head.chunk_writer.lock();
+            cw.as_mut().unwrap().set_write_fault_hook(None);
+        }
+
+        let e_disc = head.get_entry_by_sorted_pairs(&s_discarded).unwrap();
+        let iso = HeadReadIsolation {
+            ino_mint: 0,
+            max_ooo_mmap_ref_to_skip: ChunkDiskMapperRef::new(flushed_ref.unpack().0 + 10, 0),
+            evicting: None,
+        };
+
+        let chks_flushed = head
+            .series_final_chunks_only_with_isolation(e_flushed.ref_id, 0, 10_000, &iso)
+            .unwrap();
+        let ts_flushed: Vec<i64> = chks_flushed
+            .iter()
+            .flat_map(|c| decode_chunk_samples(c.chunk.as_ref().unwrap()).unwrap())
+            .map(|s| s.t)
+            .collect();
+        assert_eq!(ts_flushed, vec![3_000]);
+
+        let chks_disc = head
+            .series_final_chunks_only_with_isolation(e_disc.ref_id, 0, 10_000, &iso)
+            .unwrap();
+        let ts_disc: Vec<i64> = chks_disc
+            .iter()
+            .flat_map(|c| decode_chunk_samples(c.chunk.as_ref().unwrap()).unwrap())
+            .map(|s| s.t)
+            .collect();
+        assert_eq!(ts_disc, vec![1_000, 2_000, 3_000]);
+
+        head.close().unwrap();
+    }
+
+    #[test]
     fn w22_res_01_compact_ooo_head_enospc_flush_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let opts = HeadOptions {
@@ -16016,6 +16559,10 @@ mod tests {
                 num_native_histogram_series: Arc::new(AtomicU64::new(0)),
                 num_native_histogram_buckets: Arc::new(AtomicU64::new(0)),
                 last_wal_truncation_time: AtomicI64::new(i64::MIN),
+                last_memory_truncation_time: AtomicI64::new(i64::MIN),
+                mem_truncation_in_process: AtomicBool::new(false),
+                has_evicting_series: AtomicBool::new(false),
+                evicting_series: RwLock::new(None),
                 closed: AtomicBool::new(false),
                 has_any_metadata: AtomicBool::new(false),
                 deleted_series_since_symbol_gc: AtomicU64::new(0),

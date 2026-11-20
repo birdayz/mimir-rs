@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,11 +26,17 @@ use crate::compact::{
     write_head_block_streaming_with_options, CompactError, CompactorMetrics,
 };
 use crate::exemplar::{CircularExemplarStorage, ExemplarQueryResult};
-use crate::head::{range_for_timestamp, CompactNotifier, Head, HeadAppender, HeadError, HeadOptions};
+use crate::head::{
+    range_for_timestamp, CompactNotifier, EvictedSeries, Head, HeadAppender, HeadError,
+    HeadOptions,
+};
 use crate::matcher::LabelMatcher;
 use crate::metrics::{counter, gauge, native_histogram, FnGaugeCollector};
 use crate::postings_cache::PostingsForMatchersCacheConfig;
-use crate::querier::{TsdbChunkQuerier, TsdbQuerier};
+use crate::querier::{
+    snapshot_head_query_source, snapshot_query_sources_with_lock, HeadQuerySnapshot,
+    HeadSnapshotMode, QuerySourceSnapshot, TsdbChunkQuerier, TsdbQuerier,
+};
 
 /// Go `tmpForDeletionBlockDirSuffix`.
 pub const TMP_FOR_DELETION_BLOCK_DIR_SUFFIX: &str = ".tmp-for-deletion";
@@ -338,6 +344,9 @@ struct TsdbInner {
     opts: TsdbOptions,
     head: Arc<Head>,
     blocks: Arc<RwLock<Vec<Arc<Block>>>>,
+    /// Protected by `blocks.write()` on updates and read under `blocks.read()` when snapshotting
+    /// query sources (Go `DB.lastGarbageCollectedMmapRef`, `tsdb/db.go:441`).
+    last_garbage_collected_mmap_ref: AtomicU64,
     closed: AtomicBool,
     compact_mtx: Mutex<()>,
     compact_pending: AtomicBool,
@@ -462,6 +471,7 @@ impl Tsdb {
             opts,
             head,
             blocks,
+            last_garbage_collected_mmap_ref: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             compact_mtx: Mutex::new(()),
             compact_pending: AtomicBool::new(false),
@@ -673,6 +683,37 @@ impl Tsdb {
         }
     }
 
+    /// Atomically snapshots overlapping ULID blocks (with `BlockReadGuard`s) and Head
+    /// (`HeadReadGuard` + `HeadReadIsolation`) under `blocks.read()`, matching Go
+    /// `DB.blockChunkQuerierForRange` (`tsdb/db.go:2926-2998`).
+    pub fn snapshot_query_sources(&self, mint: i64, maxt: i64) -> QuerySourceSnapshot {
+        snapshot_query_sources_with_lock(
+            Some(&self.inner.head),
+            &[],
+            Some(&self.inner.blocks),
+            Some(&self.inner.last_garbage_collected_mmap_ref),
+            Some(&self.inner.closed),
+            mint,
+            maxt,
+            HeadSnapshotMode::Effective,
+        )
+    }
+
+    /// Atomically snapshots Head (`HeadReadGuard` + `HeadReadIsolation`) under `blocks.read()`.
+    pub fn snapshot_head_query_source(&self, mint: i64, maxt: i64) -> Option<HeadQuerySnapshot> {
+        let _lock = self.inner.blocks.read();
+        if self.inner.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        snapshot_head_query_source(
+            &self.inner.head,
+            Some(&self.inner.last_garbage_collected_mmap_ref),
+            mint,
+            maxt,
+            HeadSnapshotMode::Effective,
+        )
+    }
+
     /// Returns a [`TsdbQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
     pub fn querier(&self, mint: i64, maxt: i64) -> TsdbQuerier<'_> {
         TsdbQuerier::with_blocks_lock_and_closed(
@@ -682,6 +723,7 @@ impl Tsdb {
             mint,
             maxt,
         )
+        .with_last_garbage_collected_mmap_ref(&self.inner.last_garbage_collected_mmap_ref)
     }
 
     /// Returns a [`TsdbChunkQuerier`] over Head + overlapping Blocks for `[mint, maxt]`.
@@ -693,6 +735,7 @@ impl Tsdb {
             mint,
             maxt,
         )
+        .with_last_garbage_collected_mmap_ref(&self.inner.last_garbage_collected_mmap_ref)
     }
 
     /// Returns an unordered [`TsdbChunkQuerier`] (concatenating chunks across Head and Blocks
@@ -705,6 +748,7 @@ impl Tsdb {
             mint,
             maxt,
         )
+        .with_last_garbage_collected_mmap_ref(&self.inner.last_garbage_collected_mmap_ref)
     }
 
     /// Returns the Head's [`CircularExemplarStorage`].
@@ -970,6 +1014,13 @@ impl TsdbInner {
     /// `BlockReadGuard`s on `deletable` blocks outside `blocks.write()`, drops `old_blocks`
     /// so every obsolete mmap is unmapped, and only then unlinks `deletable` directories.
     fn reload_blocks_locked(&self) -> Result<(), TsdbError> {
+        self.reload_blocks_with_hook_locked(|| {})
+    }
+
+    fn reload_blocks_with_hook_locked(
+        &self,
+        mut on_blocks_visible: impl FnMut(),
+    ) -> Result<(), TsdbError> {
         let res = (|| -> Result<(), TsdbError> {
             let (to_load, deletable, unchanged) = {
                 let current = self.blocks.read().clone();
@@ -988,11 +1039,15 @@ impl TsdbInner {
                 (to_load, deletable, unchanged)
             };
             if unchanged {
+                let _guard = self.blocks.write();
+                on_blocks_visible();
                 return Ok(());
             }
             let old_blocks = {
                 let mut guard = self.blocks.write();
-                std::mem::replace(&mut *guard, to_load)
+                let prev = std::mem::replace(&mut *guard, to_load);
+                on_blocks_visible();
+                prev
             };
             if let Some(ref cb) = self.opts.on_blocks_reload {
                 let get_blocks = || self.blocks.read().clone();
@@ -1034,7 +1089,15 @@ impl TsdbInner {
 
     /// Reloads blocks after writing `uids`; on failure removes them (Go `compactHead`).
     fn reload_after_write(&self, uids: &[Ulid]) -> Result<(), TsdbError> {
-        if let Err(e) = self.reload_blocks_locked() {
+        self.reload_after_write_with_hook(uids, || {})
+    }
+
+    fn reload_after_write_with_hook(
+        &self,
+        uids: &[Ulid],
+        on_blocks_visible: impl FnMut(),
+    ) -> Result<(), TsdbError> {
+        if let Err(e) = self.reload_blocks_with_hook_locked(on_blocks_visible) {
             let mut msg = format!("reloadBlocks blocks: {e}");
             for uid in uids {
                 if let Err(re) = fs::remove_dir_all(self.dir.join(uid.to_string())) {
@@ -1178,7 +1241,22 @@ impl TsdbInner {
         })?;
 
         let uids: Vec<Ulid> = meta_opt.iter().map(|m| m.ulid).collect();
-        self.reload_after_write(&uids)?;
+        struct MemTruncGuard<'a>(&'a Head);
+        impl Drop for MemTruncGuard<'_> {
+            fn drop(&mut self) {
+                self.0.end_memory_truncation();
+            }
+        }
+        let _mem_trunc_guard = if truncate_memory {
+            let g = MemTruncGuard(&self.head);
+            self.reload_after_write_with_hook(&uids, || {
+                self.head.begin_memory_truncation(maxt);
+            })?;
+            Some(g)
+        } else {
+            self.reload_after_write(&uids)?;
+            None
+        };
         if truncate_memory {
             self.head.truncate_memory(maxt)?;
         }
@@ -1202,6 +1280,11 @@ impl TsdbInner {
         }
         let snap = self.head.collect_ooo_compaction_candidates_with_watermark()?;
         if snap.candidates.is_empty() || snap.min_time > snap.max_time {
+            if snap.last_mmap_ref.as_u64() > 0 {
+                let _guard = self.blocks.write();
+                self.last_garbage_collected_mmap_ref
+                    .fetch_max(snap.last_mmap_ref.as_u64(), Ordering::Release);
+            }
             self.head
                 .truncate_ooo(snap.last_wbl_file, snap.last_mmap_ref)?;
             return Ok(Vec::new());
@@ -1324,7 +1407,12 @@ impl TsdbInner {
             );
         }
 
-        if let Err(e) = self.reload_blocks_locked() {
+        if let Err(e) = self.reload_blocks_with_hook_locked(|| {
+            if snap.last_mmap_ref.as_u64() > 0 {
+                self.last_garbage_collected_mmap_ref
+                    .fetch_max(snap.last_mmap_ref.as_u64(), Ordering::Release);
+            }
+        }) {
             let mut msg = format!("reloadBlocks blocks after failed compact ooo head: {e}");
             for uid in &ulids {
                 if let Err(re) = fs::remove_dir_all(self.dir.join(uid.to_string())) {
@@ -1426,64 +1514,97 @@ impl TsdbInner {
                     .collect_selected_compaction_intervals(&candidates, range);
                 let range128 = range as i128;
                 let mut t = floor_align_i128(data_mint, range);
-                while t <= data_maxt as i128 {
-                    let mint = t.max(i64::MIN as i128) as i64;
-                    let maxt = (t + range128).min(i64::MAX as i128) as i64;
-                    let maxt_inclusive = if t + range128 > i64::MAX as i128 {
-                        i64::MAX
-                    } else {
-                        maxt.saturating_sub(1)
-                    };
-                    match next_interval_action(&intervals, mint, maxt_inclusive) {
-                        IntervalAction::Done => break,
-                        IntervalAction::SkipTo(next_mint) => {
-                            t = floor_align_i128(next_mint, range);
-                            continue;
+                let write_res = (|| -> Result<(), TsdbError> {
+                    while t <= data_maxt as i128 {
+                        let mint = t.max(i64::MIN as i128) as i64;
+                        let maxt = (t + range128).min(i64::MAX as i128) as i64;
+                        let maxt_inclusive = if t + range128 > i64::MAX as i128 {
+                            i64::MAX
+                        } else {
+                            maxt.saturating_sub(1)
+                        };
+                        match next_interval_action(&intervals, mint, maxt_inclusive) {
+                            IntervalAction::Done => break,
+                            IntervalAction::SkipTo(next_mint) => {
+                                t = floor_align_i128(next_mint, range);
+                                continue;
+                            }
+                            IntervalAction::Overlaps => {}
                         }
-                        IntervalAction::Overlaps => {}
+                        let mut compaction = BlockMetaCompaction::default();
+                        compaction.set_selected_series();
+                        compaction.parents.push(BlockDesc {
+                            ulid: Ulid::nil(),
+                            min_time: 0,
+                            max_time: 0,
+                        });
+                        let meta = self.timed_write(|| {
+                            write_head_block_streaming_with_options(
+                                &self.dir,
+                                mint,
+                                maxt,
+                                maxt_inclusive,
+                                candidates.clone(),
+                                compaction,
+                                false,
+                                self.opts.max_block_chunk_segment_size,
+                                Some(&self.metrics.compactor),
+                                |ref_id, chks, tombs| {
+                                    self.head
+                                        .load_series_in_order_chunks_into(
+                                            ref_id,
+                                            mint,
+                                            maxt_inclusive,
+                                            chks,
+                                            tombs,
+                                        )
+                                        .map_err(|e| {
+                                            CompactError::Io(io::Error::other(e.to_string()))
+                                        })
+                                },
+                            )
+                        })?;
+                        t += range128;
+                        // No block when the window holds no data for the selected series.
+                        if let Some(meta) = meta {
+                            created.push(meta.ulid);
+                        }
                     }
-                    let mut compaction = BlockMetaCompaction::default();
-                    compaction.set_selected_series();
-                    compaction.parents.push(BlockDesc {
-                        ulid: Ulid::nil(),
-                        min_time: 0,
-                        max_time: 0,
-                    });
-                    let meta = self.timed_write(|| {
-                        write_head_block_streaming_with_options(
-                            &self.dir,
-                            mint,
-                            maxt,
-                            maxt_inclusive,
-                            candidates.clone(),
-                            compaction,
-                            false,
-                            self.opts.max_block_chunk_segment_size,
-                            Some(&self.metrics.compactor),
-                            |ref_id, chks, tombs| {
-                                self.head
-                                    .load_series_in_order_chunks_into(
-                                        ref_id,
-                                        mint,
-                                        maxt_inclusive,
-                                        chks,
-                                        tombs,
-                                    )
-                                    .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
-                            },
-                        )
-                    })?;
-                    t += range128;
-                    // No block when the window holds no data for the selected series.
-                    let Some(meta) = meta else {
-                        continue;
-                    };
-                    self.reload_after_write(&[meta.ulid])?;
-                    created.push(meta.ulid);
+                    Ok(())
+                })();
+                if let Err(e) = write_res {
+                    for uid in &created {
+                        let _ = fs::remove_dir_all(self.dir.join(uid.to_string()));
+                    }
+                    return Err(e);
                 }
             }
-            self.head
-                .evict_series_refs_with_fingerprints(refs, head_maxt, &fingerprints)?;
+            if !created.is_empty() {
+                struct ClearEvictingGuard<'a>(&'a Head);
+                impl Drop for ClearEvictingGuard<'_> {
+                    fn drop(&mut self) {
+                        self.0.set_evicting_series(None);
+                    }
+                }
+                let fps_arc = Arc::new(fingerprints);
+                let evicting = Arc::new(EvictedSeries::new(
+                    refs.to_vec(),
+                    head_maxt,
+                    Some(Arc::clone(&fps_arc)),
+                ));
+                let _evict_guard = ClearEvictingGuard(&self.head);
+                self.reload_after_write_with_hook(&created, || {
+                    self.head.set_evicting_series(Some(Arc::clone(&evicting)));
+                })?;
+                self.head.evict_series_refs_with_fingerprints_prepublished(
+                    refs,
+                    head_maxt,
+                    &fps_arc,
+                )?;
+            } else {
+                self.head
+                    .evict_series_refs_with_fingerprints(refs, head_maxt, &fingerprints)?;
+            }
             Ok(created)
         })();
         match &res {
