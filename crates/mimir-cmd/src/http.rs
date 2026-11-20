@@ -272,34 +272,139 @@ pub(crate) struct PendingCleanPathRedirect(pub String);
 pub(crate) struct CleanPathHandled;
 
 /// Matches Go `gorilla/mux` `cleanPath` (POSIX `path.Clean` preserving trailing `/`).
-pub(crate) fn gorilla_mux_clean_path(p: &str) -> String {
+fn gorilla_mux_clean_path(p: &[u8]) -> Vec<u8> {
     if p.is_empty() {
-        return "/".to_string();
+        return b"/".to_vec();
     }
-    let prefixed = if p.starts_with('/') {
+    let prefixed: std::borrow::Cow<'_, [u8]> = if p[0] == b'/' {
         std::borrow::Cow::Borrowed(p)
     } else {
-        std::borrow::Cow::Owned(format!("/{p}"))
+        let mut v = Vec::with_capacity(p.len() + 1);
+        v.push(b'/');
+        v.extend_from_slice(p);
+        std::borrow::Cow::Owned(v)
     };
-    let mut stack: Vec<&str> = Vec::new();
-    for seg in prefixed.split('/') {
+    let mut stack: Vec<&[u8]> = Vec::new();
+    for seg in prefixed.split(|&b| b == b'/') {
         match seg {
-            "" | "." => {}
-            ".." => {
+            b"" | b"." => {}
+            b".." => {
                 stack.pop();
             }
             other => stack.push(other),
         }
     }
-    let mut np = if stack.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", stack.join("/"))
-    };
-    if prefixed.ends_with('/') && np != "/" {
-        np.push('/');
+    let mut np = Vec::with_capacity(prefixed.len());
+    for seg in &stack {
+        np.push(b'/');
+        np.extend_from_slice(seg);
+    }
+    // `path.Clean` drops the trailing slash except for the root: put it back.
+    if np.is_empty() || prefixed.ends_with(b"/") {
+        np.push(b'/');
     }
     np
+}
+
+/// Go `net/url` `unescape(s, encodePath)`: decodes `%XX`, leaving anything else (including `+`
+/// and malformed escapes, which Go rejects before routing) untouched.
+fn go_path_unescape(raw: &str) -> Vec<u8> {
+    let hex = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Go `net/url` `shouldEscape(c, encodePath)`: everything but unreserved characters and
+/// `$&+,/:;=@` is escaped.
+fn go_should_escape_path(b: u8) -> bool {
+    !(b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'_' | b'.' | b'~' | b'$' | b'&' | b'+' | b',' | b'/' | b':' | b';' | b'=' | b'@'
+        ))
+}
+
+/// Go `net/url` `escape(s, encodePath)` (upper-case hex digits).
+fn go_path_escape(path: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(path.len());
+    for &b in path {
+        if go_should_escape_path(b) {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
+/// Go `net/url` `validEncoded(s, encodePath)`.
+fn go_valid_encoded_path(s: &str) -> bool {
+    s.bytes().all(|b| {
+        matches!(
+            b,
+            b'!' | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'['
+                | b']'
+                | b'%'
+        ) || !go_should_escape_path(b)
+    })
+}
+
+/// Go `URL.EscapedPath()` for a URL whose `Path` is `path` and whose `RawPath` is `raw_path`.
+fn go_escaped_path(path: &[u8], raw_path: &str) -> String {
+    if !raw_path.is_empty() && go_valid_encoded_path(raw_path) && go_path_unescape(raw_path) == path
+    {
+        return raw_path.to_string();
+    }
+    if path == b"*" {
+        return "*".to_string();
+    }
+    go_path_escape(path)
+}
+
+/// `gorilla/mux` `Router.ServeHTTP` with `UseEncodedPath()` (pkg/api/api.go): `cleanPath` runs on
+/// `req.URL.EscapedPath()`, and a non-canonical path is answered with a 301 whose `Location` is
+/// `url.Path = p; url.String()`. Because `p` is the cleaned *escaped* path, Go escapes it once
+/// more (`//a%20b` redirects to `/a%2520b`). Returns that `Location` path for `p` (the path as
+/// found in the URL, `URL.setPath(p)`), or `None` when the path is canonical.
+pub(crate) fn gorilla_mux_clean_path_redirect(p: &str) -> Option<String> {
+    let path = go_path_unescape(p);
+    let raw_path = if go_path_escape(&path) == p { "" } else { p };
+    let escaped = go_escaped_path(&path, raw_path);
+    let cleaned = gorilla_mux_clean_path(escaped.as_bytes());
+    (cleaned != escaped.as_bytes()).then(|| go_escaped_path(&cleaned, raw_path))
 }
 
 pub(crate) fn clean_path_redirect_response(loc: &str) -> Response {
@@ -320,9 +425,7 @@ async fn clean_path_middleware(
         return clean_path_redirect_response(loc);
     }
     let uri = req.uri();
-    let path = uri.path();
-    let cleaned = gorilla_mux_clean_path(path);
-    if cleaned != path {
+    if let Some(cleaned) = gorilla_mux_clean_path_redirect(uri.path()) {
         let mut loc = String::new();
         if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
             loc.push_str(scheme);
@@ -1378,6 +1481,51 @@ fn html_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Expected values produced by Go: `url.ParseRequestURI(in)`, `gorilla/mux`
+    /// `cleanPath(u.EscapedPath())` (`UseEncodedPath`) and, when it differs,
+    /// `u.Path = p; u.String()` (`None`: no redirect).
+    #[test]
+    fn gorilla_mux_clean_path_redirect_matches_go() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("/ready", None),
+            ("/ready/", None),
+            ("//ready", Some("/ready")),
+            ("/./ready", Some("/ready")),
+            ("/ready/..", Some("/")),
+            ("/ready/../", Some("/")),
+            ("/foo%2F%2Fbar", None),
+            ("/%2e%2e/ready", None),
+            ("/ingester/%2E/ring", None),
+            ("/ready%2F", None),
+            ("//foo(bar)", Some("/foo%28bar%29")),
+            ("//foo%20bar", Some("/foo%2520bar")),
+            ("/foo//b%41r", Some("/foo/b%2541r")),
+            ("//a%2Fb", Some("/a%252Fb")),
+            ("/%72eady", None),
+            ("//x*y", Some("/x%2Ay")),
+            ("/a//b!c'd", Some("/a/b%21c%27d")),
+            ("//a%ffb", Some("/a%25ffb")),
+            ("/a/./b/", Some("/a/b/")),
+            ("///", Some("/")),
+            ("//a+b", Some("/a+b")),
+            ("//a%2Bb", Some("/a%252Bb")),
+            ("//a%3Fb", Some("/a%253Fb")),
+            ("//a;b,c:d@e&f=g$h", Some("/a;b,c:d@e&f=g$h")),
+            ("//a~b_c-d.e", Some("/a~b_c-d.e")),
+            ("//a%25b", Some("/a%2525b")),
+            ("//a[b]{c}|d^e", Some("/a%255Bb%255D%257Bc%257D%257Cd%255Ee")),
+            ("/", None),
+            ("//", Some("/")),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                super::gorilla_mux_clean_path_redirect(input).as_deref(),
+                *want,
+                "path {input:?}"
+            );
+        }
+    }
+
     use super::*;
     use axum::body::Body;
     use http::{Method, Request};

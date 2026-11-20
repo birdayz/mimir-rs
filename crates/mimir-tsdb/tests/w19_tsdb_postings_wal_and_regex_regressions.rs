@@ -129,6 +129,50 @@ fn w19_dtm_02_decode_labels_non_utf8_wal_and_checkpoint_replay() {
     assert_eq!(decoded.get("__name__"), "a\u{FFFD}\u{FFFD}b");
     assert_eq!(decoded.get("job"), "api");
 
+    // 1b. U+FFFD replacement can reorder names that were sorted as raw bytes: 0x80 < 0xE0, but
+    // 0x80 decodes to U+FFFD (EF BF BD), which sorts after the valid U+0800 (E0 A0 80). The
+    // decoded labels must be re-sorted, never handed to `from_sorted_slice` in raw-byte order.
+    let mut flipped = Encbuf::new();
+    flipped.put_uvarint(2);
+    flipped.put_uvarint(1);
+    flipped.put_bytes(b"\x80");
+    flipped.put_uvarint(1);
+    flipped.put_bytes(b"1");
+    flipped.put_uvarint(3);
+    flipped.put_bytes("\u{0800}".as_bytes());
+    flipped.put_uvarint(1);
+    flipped.put_bytes(b"2");
+    let mut dec = Decbuf::new(flipped.as_slice());
+    let decoded = decode_labels(&mut dec).unwrap();
+    let pairs: Vec<(String, String)> = decoded
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("\u{0800}".to_string(), "2".to_string()),
+            ("\u{FFFD}".to_string(), "1".to_string()),
+        ]
+    );
+    assert_eq!(decoded, Labels::from_pairs([("\u{FFFD}", "1"), ("\u{0800}", "2")]));
+
+    // 1c. Distinct raw names collapsing onto the same replaced name keep one label (last wins).
+    let mut collide = Encbuf::new();
+    collide.put_uvarint(2);
+    collide.put_uvarint(1);
+    collide.put_bytes(b"\x80");
+    collide.put_uvarint(1);
+    collide.put_bytes(b"1");
+    collide.put_uvarint(1);
+    collide.put_bytes(b"\x81");
+    collide.put_uvarint(1);
+    collide.put_bytes(b"2");
+    let mut dec = Decbuf::new(collide.as_slice());
+    let decoded = decode_labels(&mut dec).unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded.get("\u{FFFD}"), "2");
+
     // 2. Live WAL replay: Go-written exemplar record with non-UTF-8 label value followed by valid
     // series + sample records must replay all subsequent records without truncation/corruption.
     {

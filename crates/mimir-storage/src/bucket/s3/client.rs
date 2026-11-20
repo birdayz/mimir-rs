@@ -860,8 +860,11 @@ impl Client {
         let dial_url = if self.endpoint.scheme == "https" {
             if let Some(sni) = &self.http.sni {
                 let (target_host, target_port) = split_authority_host_port(&req.host);
+                // Always record the host of this request, also when it equals the SNI name:
+                // otherwise a target left behind by an earlier request to another host (path-style
+                // vs virtual-host-style) would keep redirecting the SNI name's own lookups.
+                sni.set_target_host(target_host);
                 if !sni.sni_host.eq_ignore_ascii_case(target_host) {
-                    sni.set_target_host(target_host);
                     let dial_host = match target_port {
                         Some(p) => format!("{}:{p}", sni.sni_host),
                         None => sni.sni_host.clone(),

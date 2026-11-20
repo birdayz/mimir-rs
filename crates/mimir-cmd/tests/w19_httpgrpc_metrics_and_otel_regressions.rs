@@ -308,6 +308,10 @@ async fn w19_rkn_04_gorilla_mux_clean_path_redirects_fragment_span_and_shutdown(
         ("/ready/.", "/ready"),
         ("/ingester/../ready", "/ready"),
         ("/ready/./", "/ready/"),
+        // `UseEncodedPath`: `cleanPath` runs on the escaped path, which `URL.String()` escapes
+        // once more; encoded dot segments and slashes are not cleaned.
+        ("//a%20b", "/a%2520b"),
+        ("//foo(bar)", "/foo%28bar%29"),
     ] {
         let req = Request::builder()
             .method(Method::GET)
@@ -337,15 +341,19 @@ async fn w19_rkn_04_gorilla_mux_clean_path_redirects_fragment_span_and_shutdown(
     let bridge = HttpGrpcBridge::new(router);
     let tid = "4bf92f3577b34da6a3ce929d0e0e4704";
     let sid = "00f067aa0ba902b7";
+    // Expected `Location` values are Go's (`url.Parse` + `gorilla/mux` `cleanPath` +
+    // `URL.String()`): a scheme-less `//ready` is the authority `ready` with an empty path.
     for (url, expected_loc) in [
-        ("//ready", "/ready"),
+        ("//ready", "//ready/"),
         ("ready", "/ready"),
         ("/ingester//ring?a=1", "/ingester/ring?a=1"),
         ("/ready/.", "/ready"),
         ("/ingester/../ready", "/ready"),
         ("http://example.com?mode=diff", "http://example.com/?mode=diff"),
         ("ingester//ring#sec", "/ingester/ring#sec"),
-        ("//ready#frag", "/ready#frag"),
+        ("//ready#frag", "//ready/#frag"),
+        ("///ready#frag", "/ready#frag"),
+        ("/ingester//a%20b", "/ingester/a%2520b"),
     ] {
         let hresp = bridge
             .handle(tonic::Request::new(HttpRequest {
@@ -401,7 +409,7 @@ async fn w19_rkn_04_gorilla_mux_clean_path_redirects_fragment_span_and_shutdown(
         .filter(|s| s.trace_id == expected_tid)
         .cloned()
         .collect();
-    assert_eq!(recorded.len(), 8, "expected 8 redirect spans: {recorded:?}");
+    assert_eq!(recorded.len(), 10, "expected 10 redirect spans: {recorded:?}");
     assert_eq!(recorded[6].name, "HTTP GET");
     assert!(recorded[6].attributes.iter().any(|a| {
         a.key == "url.path" && matches!(&a.value, SpanAttrValue::String(v) if v == "ingester//ring")
@@ -614,7 +622,8 @@ async fn w19_rkn_08_grpc_server_span_error_status_and_httpgrpc_parent_attrs() {
     };
     assert_eq!(check_res.into_inner().status, 1);
 
-    // 3. httpgrpc 500 (/boom) => parent span httpgrpc.HTTP/Handle has status_error = true AND HTTP attrs.
+    // 3. httpgrpc 500 (/boom) => parent span httpgrpc.HTTP/Handle carries the HTTP attrs. Its gRPC
+    //    code is the HTTP status (500), which otelgrpc `serverStatus` leaves `Unset`.
     let mut boom_req = tonic::Request::new(HttpRequest {
         method: "GET".to_string(),
         url: "/boom".to_string(),
@@ -683,7 +692,10 @@ async fn w19_rkn_08_grpc_server_span_error_status_and_httpgrpc_parent_attrs() {
     assert!(!check_span.status_error);
 
     let boom_parent = find_span(0xcc, "httpgrpc.HTTP/Handle");
-    assert!(boom_parent.status_error, "5xx httpgrpc parent span must have status_error=true");
+    assert!(
+        !boom_parent.status_error,
+        "httpgrpc 5xx (gRPC code 500) is not an otelgrpc serverStatus error code"
+    );
     assert!(has_attr(&boom_parent, "http.request.method", "GET"));
     assert!(has_attr(&boom_parent, "http.route", "boom"));
     assert!(has_attr(&boom_parent, "url.path", "/boom"));

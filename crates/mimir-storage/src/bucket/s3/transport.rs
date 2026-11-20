@@ -52,10 +52,10 @@ pub(crate) struct SniResolver {
 
 impl SniResolver {
     pub fn set_target_host(&self, target: &str) {
-        let mut guard = self.target_host.write();
-        if guard.as_deref() != Some(target) {
-            *guard = Some(target.to_string());
+        if self.target_host.read().as_deref() == Some(target) {
+            return;
         }
+        *self.target_host.write() = Some(target.to_string());
     }
 }
 

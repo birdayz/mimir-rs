@@ -313,14 +313,18 @@ impl MemPostings {
         if non_empty == 0 {
             return;
         }
-        let _gate = self.add_gate.read();
         if batches.len() <= 1 || non_empty < 256 {
+            // `add_batch_unordered_with_scratch` takes `add_gate` itself. Never hold it here:
+            // a recursive `parking_lot` read deadlocks once a reader has queued its
+            // `add_gate.write()` barrier between the two acquisitions.
             let mut scratch = PostingsBatchScratch::new();
             for b in batches {
                 self.add_batch_unordered_with_scratch(b, &mut scratch);
             }
             return;
         }
+        // Held by this thread only: the pool workers below never touch `add_gate`.
+        let _gate = self.add_gate.read();
 
         let ordered = self.ordered.load(AtomicOrdering::Acquire);
         let mut scratches: Vec<PostingsBatchScratch> =
@@ -3082,5 +3086,55 @@ mod tests {
         let nid = syms.get("__name__").unwrap();
         let vid = syms.get("parallel_req_total").unwrap();
         assert_eq!(p.postings_len(nid, vid), total);
+    }
+
+    /// The small-batch path of `add_batches_unordered_parallel` delegates to
+    /// `add_batch_unordered_with_scratch`, which takes `add_gate` itself. Holding the gate
+    /// across that call is a recursive `parking_lot` read: it deadlocks as soon as a
+    /// `postings_for_matchers` subtracting-matcher barrier (`add_gate.write()`) queues in between.
+    #[test]
+    fn add_batches_unordered_parallel_small_path_does_not_reenter_add_gate() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let mut syms = SymbolTable::new();
+        let lbls = SymbolLabels::from_pairs(&mut syms, [("__name__", "gate_reentry"), ("job", "a")]);
+        let batches: Arc<Vec<Vec<(u64, SymbolLabels)>>> = Arc::new(vec![vec![(1, lbls)]]);
+        let p = Arc::new(MemPostings::new_unordered());
+        let iterations = if cfg!(miri) { 50usize } else { 20_000usize };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = {
+            let (p, stop) = (Arc::clone(&p), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(AtomicOrdering::Acquire) {
+                    drop(p.add_gate.write());
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let adder = {
+            let (p, batches) = (Arc::clone(&p), Arc::clone(&batches));
+            std::thread::spawn(move || {
+                let pool = mimir_common::thread_pool::ScopedWorkerPool::new("gate-reentry", 2);
+                for _ in 0..iterations {
+                    p.add_batches_unordered_parallel(&batches, &pool);
+                }
+                let _ = done_tx.send(());
+            })
+        };
+
+        let finished = done_rx.recv_timeout(Duration::from_secs(120)).is_ok();
+        stop.store(true, AtomicOrdering::Release);
+        assert!(
+            finished,
+            "add_batches_unordered_parallel deadlocked against a queued add_gate.write() barrier"
+        );
+        adder.join().unwrap();
+        barrier.join().unwrap();
+        assert_eq!(p.all_postings.read().len(), iterations);
     }
 }

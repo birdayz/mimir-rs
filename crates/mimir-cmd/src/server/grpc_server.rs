@@ -591,9 +591,13 @@ fn check_org_id(headers: &http::HeaderMap, method: &str) -> Option<tonic::Status
 #[derive(Clone, Default)]
 pub struct GrpcSpanAttributes(pub Arc<Mutex<Vec<SpanAttribute>>>);
 
+/// otelgrpc `serverStatus` (interceptor.go): a server span gets `codes.Error` only for
+/// `Unknown`, `DeadlineExceeded`, `Unimplemented`, `Internal`, `Unavailable` and `DataLoss`.
+/// Every other status stays `Unset`, including the HTTP status codes (`4xx`/`5xx`) that
+/// `httpgrpc` errors carry as their gRPC code.
 #[inline]
 fn is_grpc_server_span_error(code: i32) -> bool {
-    matches!(code, 2 | 4 | 12 | 13 | 14 | 15 | 500..=599)
+    matches!(code, 2 | 4 | 12 | 13 | 14 | 15)
 }
 
 struct RpcGuard {

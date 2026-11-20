@@ -1207,18 +1207,8 @@ async fn stop_module_service(
 }
 
 pub fn validate_activity_tracker_max_entries(max_entries: i64) -> Result<usize> {
-    if max_entries < 0 {
-        bail!("failed to truncate activity file: invalid argument");
-    }
-    if max_entries == 0 {
-        bail!("failed to mmap activity file: invalid argument");
-    }
-    let n = usize::try_from(max_entries)
-        .map_err(|_| anyhow::anyhow!("failed to truncate activity file: invalid argument"))?;
-    if n.checked_mul(mimir_common::activitytracker::ENTRY_SIZE).is_none() {
-        bail!("failed to truncate activity file: invalid argument");
-    }
-    Ok(n)
+    mimir_common::activitytracker::validate_raw_max_entries(max_entries)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn stop_activity_tracker_module(
