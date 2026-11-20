@@ -330,7 +330,10 @@ struct ReadTapSlotContext {
 static ONLY_REPLICA_HEADERS: std::sync::LazyLock<http::HeaderMap> =
     std::sync::LazyLock::new(|| {
         let mut h = http::HeaderMap::new();
-        h.insert("only-replica", http::HeaderValue::from_static("true"));
+        h.insert(
+            crate::query::ONLY_REPLICA_GRPC_MD_KEY,
+            http::HeaderValue::from_static("true"),
+        );
         h
     });
 static EMPTY_HEADERS: std::sync::LazyLock<http::HeaderMap> =
@@ -3475,5 +3478,170 @@ mod tests {
         let bomb_dec = NonClientStreamingFrameBody::new(bomb_body, FrameDecompressAlgo::Gzip, 16);
         let err = collect_body(bomb_dec).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn only_replica_bypasses_saturated_read_reactive_limiter() {
+        use mimir_proto::prost::Message;
+        use tower::ServiceExt;
+
+        fn encode_uncompressed_grpc<M: Message>(msg: &M) -> Bytes {
+            let payload = msg.encode_to_vec();
+            let mut frame = Vec::with_capacity(5 + payload.len());
+            frame.push(0);
+            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&payload);
+            Bytes::from(frame)
+        }
+
+        async fn drain_grpc_status(resp: http::Response<tonic::body::BoxBody>) -> tonic::Code {
+            if let Some(status) = tonic::Status::from_header_map(resp.headers()) {
+                return status.code();
+            }
+            let mut body = resp.into_body();
+            let mut trailer_status = tonic::Code::Ok;
+            while let Some(frame_res) = futures::future::poll_fn(|cx| {
+                hyper::body::Body::poll_frame(Pin::new(&mut body), cx)
+            })
+            .await
+            {
+                let frame = frame_res.unwrap();
+                if let Some(trailers) = frame.trailers_ref() {
+                    if let Some(st) = tonic::Status::from_header_map(trailers) {
+                        trailer_status = st.code();
+                    }
+                }
+            }
+            trailer_status
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-only-replica".to_string();
+        cfg.read_reactive_limiter = mimir_config::ReactiveLimiterConfig {
+            enabled: true,
+            min_limit: 1,
+            max_limit: 1,
+            initial_limit: 1,
+            // Enable a small queue so requests enter `prepare_read_reactive_for_slot`
+            // (after `try_start_read_tap`) and time out on the saturated limiter unless
+            // `__only_replica__` bypasses `prepare_read_reactive`.
+            initial_rejection_factor: 1.0,
+            max_rejection_factor: 2.0,
+            ..Default::default()
+        };
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let _held = ing
+            .reactive_limiter
+            .read
+            .as_ref()
+            .expect("read reactive limiter enabled")
+            .acquire_permit()
+            .await
+            .unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let label_names_frame = encode_uncompressed_grpc(&ingesterpb::LabelNamesRequest {
+            start_timestamp_ms: now - 60_000,
+            end_timestamp_ms: now + 60_000,
+            ..Default::default()
+        });
+        let query_stream_frame = encode_uncompressed_grpc(&ingesterpb::QueryRequest {
+            start_timestamp_ms: now - 60_000,
+            end_timestamp_ms: now + 60_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__name__".into(),
+                value: "up".into(),
+            }],
+            ..Default::default()
+        });
+        let mflm_frame = encode_uncompressed_grpc(&ingesterpb::MetricsForLabelMatchersRequest {
+            start_timestamp_ms: now - 60_000,
+            end_timestamp_ms: now + 60_000,
+            matchers_set: vec![ingesterpb::LabelMatchers {
+                matchers: vec![ingesterpb::LabelMatcher {
+                    r#type: ingesterpb::MatchType::Equal as i32,
+                    name: "__name__".into(),
+                    value: "up".into(),
+                }],
+            }],
+            limit: 0,
+        });
+
+        let cases = [
+            ("/cortex.Ingester/LabelNames", label_names_frame),
+            ("/cortex.Ingester/QueryStream", query_stream_frame),
+            ("/cortex.Ingester/MetricsForLabelMatchers", mflm_frame),
+        ];
+
+        for (uri, payload) in &cases {
+            let svc = IngesterService::new(Arc::clone(&ing)).into_server();
+            let mut req_rejected = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(*uri)
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+                .header("x-scope-orgid", "t-only-replica")
+                .body(tonic::body::BoxBody::new(SingleChunkBody(Some(
+                    payload.clone(),
+                ))))
+                .unwrap();
+            req_rejected.extensions_mut().insert(RpcDeadlineContext::new(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(20),
+            )));
+            let resp_rejected = svc.oneshot(req_rejected).await.unwrap();
+            assert_eq!(
+                drain_grpc_status(resp_rejected).await,
+                tonic::Code::Unavailable,
+                "expected Unavailable without only-replica header on {uri}"
+            );
+
+            for hdr_name in ["__only_replica__", "x-only-replica"] {
+                let svc = IngesterService::new(Arc::clone(&ing)).into_server();
+                let mut req_ok = http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri(*uri)
+                    .header(http::header::CONTENT_TYPE, "application/grpc")
+                    .header("x-scope-orgid", "t-only-replica")
+                    .header(hdr_name, "true")
+                    .body(tonic::body::BoxBody::new(SingleChunkBody(Some(
+                        payload.clone(),
+                    ))))
+                    .unwrap();
+                req_ok.extensions_mut().insert(RpcDeadlineContext::new(Some(
+                    std::time::Instant::now() + std::time::Duration::from_millis(20),
+                )));
+                let resp_ok = svc.oneshot(req_ok).await.unwrap();
+                assert_eq!(
+                    resp_ok.status(),
+                    http::StatusCode::OK,
+                    "expected 200 OK with {hdr_name}: true on {uri}"
+                );
+                assert_eq!(
+                    drain_grpc_status(resp_ok).await,
+                    tonic::Code::Ok,
+                    "expected gRPC Ok with {hdr_name}: true on {uri}"
+                );
+            }
+        }
     }
 }

@@ -7650,8 +7650,13 @@ impl Head {
         // `NewOOOCompactionHead`: `head.wbl.NextSegmentSync()` without writing `MmapMarkers`)
         // and snapshotting `ooo_head_chunk`s so no in-flight `HeadAppender::commit` can log
         // Samples for an already-mmapped chunk into the new WBL segment.
-        let (last_wbl_file, flushed_wm) = {
+        let (last_wbl_file, flushed_wm, discard_epoch_changed) = {
             let _wbl_gate = self.ooo_wbl_gate.write();
+            let initial_discard_epoch = self
+                .chunk_writer
+                .lock()
+                .as_ref()
+                .map(|w| w.discard_epoch());
 
             let last_wbl_file = if ooo_active {
                 let mut wbl_guard = self.wbl.lock();
@@ -7757,21 +7762,23 @@ impl Head {
                 }
             }
 
-            let flushed_wm = if mmapped_any || any_pending {
+            let (flushed_wm, discard_epoch_changed) = if mmapped_any || any_pending {
                 let mut writer_guard = self.chunk_writer.lock();
                 if let Some(ref mut writer) = *writer_guard {
                     writer.flush()?;
-                    Some(writer.flushed_watermark())
+                    let changed = initial_discard_epoch != Some(writer.discard_epoch());
+                    (Some(writer.flushed_watermark()), changed)
                 } else {
-                    None
+                    (None, true)
                 }
             } else {
-                None
+                (None, false)
             };
 
-            (last_wbl_file, flushed_wm)
+            (last_wbl_file, flushed_wm, discard_epoch_changed)
         };
 
+        let mut any_unpromoted = false;
         if !pending_entries.is_empty() {
             if let Some(ref wm) = flushed_wm {
                 self.refresh_chunk_reader()?;
@@ -7780,10 +7787,19 @@ impl Head {
                     if let Some(ref mut ooo) = st.ooo_mut() {
                         if ooo.promote_pending_with_watermark(wm) {
                             self.clear_ooo_unflushed(entry.ref_id);
+                        } else {
+                            any_unpromoted = true;
                         }
                     }
                 }
+            } else {
+                any_unpromoted = true;
             }
+        }
+        if any_unpromoted || discard_epoch_changed {
+            return Err(HeadError::Io(io::Error::other(
+                "pending OOO chunks discarded during OOO compaction scan",
+            )));
         }
 
         let mut out = Vec::new();
@@ -10989,7 +11005,6 @@ impl<'a> CommitContext<'a> {
 
         let need_ooo_flush = !self.pending_ooo_promote.is_empty()
             || self.head.has_ooo_unflushed.load(Ordering::Acquire);
-        let mut re_written_markers: Vec<(RefMmapMarker, u64)> = Vec::new();
         let mut entries_to_promote: Vec<Arc<SeriesEntry>> = Vec::new();
         let mut initial_last_flushed = ChunkDiskMapperRef(0);
         let mut rewrite_err: Option<HeadError> = None;
@@ -11037,32 +11052,13 @@ impl<'a> CommitContext<'a> {
                 let Some(ref mut cw) = *cw_guard else {
                     continue;
                 };
-                match Head::rewrite_discarded_ooo_pending_under_locks(
+                if let Err(e) = Head::rewrite_discarded_ooo_pending_under_locks(
                     entry.ref_id,
                     ooo,
                     cw,
                 ) {
-                    Ok(true) => {
-                        if ooo.ooo_head_chunk.is_none() {
-                            let ep = cw.discard_epoch();
-                            for p in &ooo.ooo_pending_mmapped {
-                                if p.write_epoch == Some(ep) && p.mc.ref_id.as_u64() != 0 {
-                                    re_written_markers.push((
-                                        RefMmapMarker {
-                                            ref_id: entry.ref_id,
-                                            mmap_ref: p.mc.ref_id.as_u64(),
-                                        },
-                                        ep,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        rewrite_err = Some(e.into());
-                        break;
-                    }
+                    rewrite_err = Some(e.into());
+                    break;
                 }
             }
         }
@@ -11085,23 +11081,8 @@ impl<'a> CommitContext<'a> {
             Ok(())
         };
 
-        if !self.ooo_records.is_empty() || !re_written_markers.is_empty() {
-            let mut materialized: Vec<Vec<u8>> = Vec::with_capacity(
-                self.ooo_records.len() + usize::from(!re_written_markers.is_empty()),
-            );
-            if !re_written_markers.is_empty() {
-                let mut kept = Vec::with_capacity(re_written_markers.len());
-                for (m, ep) in re_written_markers {
-                    if post_wm.as_ref().is_some_and(|w| {
-                        w.is_flushed(ChunkDiskMapperRef(m.mmap_ref), Some(ep))
-                    }) {
-                        kept.push(m);
-                    }
-                }
-                if !kept.is_empty() {
-                    materialized.push(self.enc.mmap_markers(&kept, Vec::new()));
-                }
-            }
+        if !self.ooo_records.is_empty() {
+            let mut materialized: Vec<Vec<u8>> = Vec::with_capacity(self.ooo_records.len());
             for rec in self.ooo_records {
                 match rec {
                     PendingOooWblRecord::Encoded(bytes) => materialized.push(bytes),
@@ -16748,5 +16729,340 @@ mod tests {
         assert!(head.series_chunk_metas_no_bytes_with_snapshot(r, 1_000, 4_000, None).unwrap().is_none());
 
         head.close().unwrap();
+    }
+
+    #[test]
+    fn w22_mid_scan_discard_epoch_bump_fails_ooo_compaction_and_preserves_wbl() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 100_000,
+            ooo_cap_max: 8,
+            samples_per_chunk: 4,
+            ..HeadOptions::default()
+        };
+        let head = Arc::new(Head::open(dir.path(), opts.clone(), i64::MIN).unwrap());
+
+        // Pick 3 series whose by_hash stripe indices (used by collect_stripe_into) are strictly ascending.
+        let mut created: Vec<(String, Arc<SeriesEntry>, usize)> = Vec::new();
+        for idx in 0..32usize {
+            let name = format!("w22_mid_scan_s_{idx}");
+            let pairs = [("__name__", name.as_str()), ("job", "api")];
+            let mut app = head.appender();
+            app.append_float(None, &pairs, 100_000, 10.0 + idx as f64)
+                .unwrap();
+            app.commit().unwrap();
+            let entry = head.get_entry_by_sorted_pairs(&pairs).unwrap();
+            let sidx = head.series.stripe_idx(entry.hash);
+            created.push((name, entry, sidx));
+        }
+        created.sort_by_key(|x| x.2);
+        let (name_a, e_a, sidx_a) = created[0].clone();
+        let (_name_mid, e_mid, sidx_mid) = created
+            .iter()
+            .find(|x| x.2 > sidx_a)
+            .unwrap()
+            .clone();
+        let (_name_b, e_b, sidx_b) = created
+            .iter()
+            .find(|x| x.2 > sidx_mid)
+            .unwrap()
+            .clone();
+        assert!(sidx_a < sidx_mid && sidx_mid < sidx_b);
+        let name_b = _name_b;
+
+        {
+            let mut app = head.appender();
+            app.append_float(
+                None,
+                &[("__name__", name_a.as_str()), ("job", "api")],
+                1_000,
+                1.0,
+            )
+            .unwrap();
+            app.append_float(
+                None,
+                &[("__name__", name_a.as_str()), ("job", "api")],
+                2_000,
+                2.0,
+            )
+            .unwrap();
+            app.append_float(
+                None,
+                &[("__name__", name_b.as_str()), ("job", "api")],
+                3_000,
+                3.0,
+            )
+            .unwrap();
+            app.append_float(
+                None,
+                &[("__name__", name_b.as_str()), ("job", "api")],
+                4_000,
+                4.0,
+            )
+            .unwrap();
+            app.commit().unwrap();
+        }
+
+        let wbl_dir = dir.path().join("wbl");
+        let (wbl_first_before, wbl_last_before) =
+            crate::wlog::segments_range(&wbl_dir).unwrap().unwrap();
+
+        let mid_guard = e_mid.inner.lock();
+        let head_bg = Arc::clone(&head);
+        let handle = std::thread::spawn(move || {
+            head_bg.collect_ooo_compaction_candidates_with_watermark()
+        });
+
+        while !head.ooo_unflushed_series.lock().contains(&e_a.ref_id) {
+            std::thread::yield_now();
+        }
+
+        {
+            let mut cw_guard = head.chunk_writer.lock();
+            let cw = cw_guard.as_mut().unwrap();
+            cw.set_write_fault_hook(Some(Arc::new(|len| {
+                if len > 8 {
+                    crate::head_chunks::WriteFaultAction::Error(io::ErrorKind::StorageFull)
+                } else {
+                    crate::head_chunks::WriteFaultAction::PassThrough
+                }
+            })));
+            assert!(cw.flush().is_err());
+            cw.set_write_fault_hook(None);
+        }
+
+        drop(mid_guard);
+
+        let res = handle.join().unwrap();
+        assert!(
+            res.is_err(),
+            "collect_ooo_compaction_candidates_with_watermark must fail when discard_epoch bumps mid-scan"
+        );
+
+        let (wbl_first_after, wbl_last_after) =
+            crate::wlog::segments_range(&wbl_dir).unwrap().unwrap();
+        assert_eq!(wbl_first_after, wbl_first_before);
+        assert!(wbl_last_after >= wbl_last_before);
+
+        let snap = head
+            .collect_ooo_compaction_candidates_with_watermark()
+            .unwrap();
+        assert_eq!(snap.candidates.len(), 2);
+
+        let mut chks_a = Vec::new();
+        let mut tombs_a = Vec::new();
+        head.load_series_ooo_chunks_into_up_to(
+            e_a.ref_id,
+            snap.last_mmap_ref,
+            &mut chks_a,
+            &mut tombs_a,
+        )
+        .unwrap();
+        let mut ts_a: Vec<(i64, f64)> = chks_a
+            .into_iter()
+            .flat_map(|c| decode_chunk_samples(c.chunk.as_ref().unwrap()).unwrap())
+            .map(|s| match s.value {
+                SampleValue::Float(v) => (s.t, v),
+                _ => panic!("expected float"),
+            })
+            .collect();
+        ts_a.sort_by_key(|x| x.0);
+        assert_eq!(ts_a, vec![(1_000, 1.0), (2_000, 2.0)]);
+
+        let mut chks_b = Vec::new();
+        let mut tombs_b = Vec::new();
+        head.load_series_ooo_chunks_into_up_to(
+            e_b.ref_id,
+            snap.last_mmap_ref,
+            &mut chks_b,
+            &mut tombs_b,
+        )
+        .unwrap();
+        let mut ts_b: Vec<(i64, f64)> = chks_b
+            .into_iter()
+            .flat_map(|c| decode_chunk_samples(c.chunk.as_ref().unwrap()).unwrap())
+            .map(|s| match s.value {
+                SampleValue::Float(v) => (s.t, v),
+                _ => panic!("expected float"),
+            })
+            .collect();
+        ts_b.sort_by_key(|x| x.0);
+        assert_eq!(ts_b, vec![(3_000, 3.0), (4_000, 4.0)]);
+
+        Arc::try_unwrap(head)
+            .unwrap_or_else(|_| panic!("unique head arc"))
+            .close()
+            .unwrap();
+    }
+
+    #[test]
+    fn w22_rewrite_discarded_ooo_pending_does_not_emit_retroactive_mmap_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 500_000,
+            ooo_cap_max: 4,
+            samples_per_chunk: 4,
+            ..HeadOptions::default()
+        };
+        let head = Arc::new(Head::open(dir.path(), opts.clone(), i64::MIN).unwrap());
+        let s_a = [("__name__", "w22_no_retro_a"), ("job", "api")];
+        let s_other = [("__name__", "w22_no_retro_other"), ("job", "api")];
+
+        {
+            let mut app = head.appender();
+            app.append_float(None, &s_a, 100_000, 10.0).unwrap();
+            app.append_float(None, &s_other, 100_000, 20.0).unwrap();
+            app.commit().unwrap();
+        }
+        {
+            let mut app = head.appender();
+            app.append_float(None, &s_a, 1_000, 1.0).unwrap();
+            app.append_float(None, &s_a, 2_000, 2.0).unwrap();
+            app.commit().unwrap();
+        }
+
+        {
+            let mut cw = head.chunk_writer.lock();
+            cw.as_mut().unwrap().set_write_fault_hook(Some(Arc::new(|len| {
+                if len > 8 {
+                    crate::head_chunks::WriteFaultAction::Error(io::ErrorKind::StorageFull)
+                } else {
+                    crate::head_chunks::WriteFaultAction::PassThrough
+                }
+            })));
+        }
+        assert!(head
+            .collect_ooo_compaction_candidates_with_watermark()
+            .is_err());
+        {
+            let mut cw = head.chunk_writer.lock();
+            cw.as_mut().unwrap().set_write_fault_hook(None);
+        }
+
+        let e_a = head.get_entry_by_sorted_pairs(&s_a).unwrap();
+        {
+            let st_a = e_a.inner.lock();
+            assert!(st_a.ooo().unwrap().ooo_head_chunk.is_none());
+            assert_eq!(st_a.ooo().unwrap().ooo_pending_mmapped.len(), 1);
+        }
+
+        {
+            let mut app = head.appender();
+            app.append_float(None, &s_other, 101_000, 21.0).unwrap();
+            app.commit().unwrap();
+        }
+        {
+            let mut app = head.appender();
+            app.append_float(None, &s_a, 3_000, 3.0).unwrap();
+            app.commit().unwrap();
+        }
+        {
+            let mut wbl = head.wbl.lock();
+            wbl.as_mut().unwrap().sync().unwrap();
+        }
+
+        let wbl_dir = dir.path().join("wbl");
+        let (first_wbl, last_wbl) = crate::wlog::segments_range(&wbl_dir).unwrap().unwrap();
+        let mut r = crate::wlog::WlogReader::open_ranges(&[crate::wlog::SegmentRange {
+            dir: wbl_dir,
+            first: Some(first_wbl),
+            last: Some(last_wbl),
+        }])
+        .unwrap();
+        let dec = RecordDecoder::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            if let DecodedRecord::MmapMarkers(markers) = dec.decode_record(rec).unwrap() {
+                assert!(
+                    !markers.iter().any(|m| m.ref_id == e_a.ref_id && m.mmap_ref != 0),
+                    "retroactive non-zero MmapMarkers must not be logged to WBL"
+                );
+            }
+        }
+
+        let mut conc_series = Vec::new();
+        for idx in 0..8usize {
+            let name = format!("w22_conc_retro_{idx}");
+            let mut app = head.appender();
+            app.append_float(None, &[("__name__", name.as_str()), ("job", "c")], 100_000, 99.0)
+                .unwrap();
+            app.commit().unwrap();
+            conc_series.push(name);
+        }
+
+        for (idx, name) in conc_series.iter().enumerate() {
+            let pairs = [("__name__", name.as_str()), ("job", "c")];
+            {
+                let mut app = head.appender();
+                app.append_float(None, &pairs, 1_000, 10.0 + idx as f64)
+                    .unwrap();
+                app.append_float(None, &pairs, 2_000, 20.0 + idx as f64)
+                    .unwrap();
+                app.commit().unwrap();
+            }
+            {
+                let mut cw = head.chunk_writer.lock();
+                cw.as_mut().unwrap().set_write_fault_hook(Some(Arc::new(|len| {
+                    if len > 8 {
+                        crate::head_chunks::WriteFaultAction::Error(io::ErrorKind::StorageFull)
+                    } else {
+                        crate::head_chunks::WriteFaultAction::PassThrough
+                    }
+                })));
+            }
+            assert!(head
+                .collect_ooo_compaction_candidates_with_watermark()
+                .is_err());
+            {
+                let mut cw = head.chunk_writer.lock();
+                cw.as_mut().unwrap().set_write_fault_hook(None);
+            }
+
+            let t1_ts = 102_000 + idx as i64 * 1_000;
+            let s_new_val = 30.0 + idx as f64;
+            std::thread::scope(|sc| {
+                let h1 = &head;
+                let h2 = &head;
+                let t1 = sc.spawn(move || {
+                    let mut app = h1.appender();
+                    app.append_float(None, &s_other, t1_ts, 22.0).unwrap();
+                    app.commit().unwrap();
+                });
+                let t2 = sc.spawn(move || {
+                    let mut app = h2.appender();
+                    app.append_float(None, &pairs, 3_000, s_new_val).unwrap();
+                    app.commit().unwrap();
+                });
+                t1.join().unwrap();
+                t2.join().unwrap();
+            });
+        }
+
+        let crash_dir = tempfile::tempdir().unwrap();
+        copy_dir_recursive(dir.path(), crash_dir.path());
+        Arc::try_unwrap(head)
+            .unwrap_or_else(|_| panic!("unique head arc"))
+            .close()
+            .unwrap();
+
+        let reopened = Head::open(crash_dir.path(), opts, i64::MIN).unwrap();
+        let ra = reopened.get_entry_by_sorted_pairs(&s_a).unwrap();
+        assert_eq!(
+            read_head_float_samples(&reopened, ra.ref_id),
+            vec![(1_000, 1.0), (2_000, 2.0), (3_000, 3.0), (100_000, 10.0)]
+        );
+        for (idx, name) in conc_series.iter().enumerate() {
+            let pairs = [("__name__", name.as_str()), ("job", "c")];
+            let entry = reopened.get_entry_by_sorted_pairs(&pairs).unwrap();
+            assert_eq!(
+                read_head_float_samples(&reopened, entry.ref_id),
+                vec![
+                    (1_000, 10.0 + idx as f64),
+                    (2_000, 20.0 + idx as f64),
+                    (3_000, 30.0 + idx as f64),
+                    (100_000, 99.0),
+                ]
+            );
+        }
+        reopened.close().unwrap();
     }
 }

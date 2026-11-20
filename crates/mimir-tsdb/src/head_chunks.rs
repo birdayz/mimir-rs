@@ -337,6 +337,11 @@ impl HeadChunksWriter {
     }
 
     pub(crate) fn rollback_snapshot(&mut self, snap: HeadChunksSnapshot) {
+        let snap_surviving_ref = if snap.seq == 0 || snap.write_buf_len == 0 {
+            snap.last_flushed_ref
+        } else {
+            snap.last_written_ref
+        };
         if self.seq > snap.seq {
             self.cur_file = None;
             for s in (snap.seq + 1)..=self.seq {
@@ -347,7 +352,19 @@ impl HeadChunksWriter {
             self.offset = 0;
             self.write_buf.clear();
             self.cut_on_next_chunk = snap.cut_on_next_chunk;
-            self.last_written_ref = snap.last_written_ref;
+            self.last_written_ref = snap_surviving_ref;
+            if self.last_flushed_ref > snap_surviving_ref {
+                self.last_flushed_ref = snap_surviving_ref;
+            }
+            for entry in self
+                .flushed_up_to_by_epoch
+                .iter_mut()
+                .skip(snap.discard_epoch as usize)
+            {
+                if *entry > snap_surviving_ref {
+                    *entry = snap_surviving_ref;
+                }
+            }
         } else if self.file_offset == snap.file_offset && self.discard_epoch == snap.discard_epoch {
             self.write_buf.truncate(snap.write_buf_len);
             self.offset = snap.offset;
@@ -372,9 +389,18 @@ impl HeadChunksWriter {
             self.offset = snap.offset;
             self.write_buf.clear();
             self.cut_on_next_chunk = snap.cut_on_next_chunk;
-            self.last_written_ref = snap.last_written_ref;
-            if self.last_flushed_ref > snap.last_flushed_ref && snap.write_buf_len == 0 {
-                self.last_flushed_ref = snap.last_flushed_ref;
+            self.last_written_ref = snap_surviving_ref;
+            if self.last_flushed_ref > snap_surviving_ref {
+                self.last_flushed_ref = snap_surviving_ref;
+            }
+            for entry in self
+                .flushed_up_to_by_epoch
+                .iter_mut()
+                .skip(snap.discard_epoch as usize)
+            {
+                if *entry > snap_surviving_ref {
+                    *entry = snap_surviving_ref;
+                }
             }
         } else {
             self.write_buf.clear();
@@ -453,6 +479,7 @@ impl HeadChunksWriter {
             let _ = file.seek(SeekFrom::Start(saved_pos));
             self.offset = self.file_offset;
             self.write_buf.clear();
+            self.last_written_ref = self.last_flushed_ref;
             self.flushed_up_to_by_epoch.push(self.last_flushed_ref);
             self.discard_epoch = self.discard_epoch.wrapping_add(1);
             return Err(HeadChunksError::Io(e));
@@ -1206,5 +1233,150 @@ mod tests {
         let reopened = HeadChunksReader::open(dir.path()).unwrap();
         assert_eq!(reopened.collect_all_chunks().unwrap().len(), 1);
         assert_eq!(reopened.chunk(r2).unwrap(), encoded);
+    }
+
+    #[test]
+    fn rollback_snapshot_branch1_clamps_last_flushed_and_epoch_watermarks_and_reuses_seq() {
+        let mut xc = XorChunk::new();
+        xc.appender().unwrap().append(0, 1000, 1.0).unwrap();
+        let encoded = EncodedChunk::Xor(xc);
+
+        // Subcase A: snap.seq == 0 -> cut_new_file & flush in seq 1..2 -> flush error -> rollback.
+        let dir0 = tempfile::tempdir().unwrap();
+        let mut wb = HeadChunksWriter::with_options(dir0.path(), 80, 128).unwrap();
+        let sb = wb.take_snapshot();
+        assert_eq!(sb.seq, 0);
+        let rb1 = wb.write_chunk(10, 1000, 1000, &encoded, false).unwrap();
+        let rb2 = wb.write_chunk(10, 2000, 2000, &encoded, false).unwrap();
+        assert_eq!(rb1.unpack().0, 1);
+        assert_eq!(rb2.unpack().0, 2);
+        wb.flush().unwrap();
+        assert_eq!(wb.flushed_watermark().last_flushed_ref(), rb2);
+        let _rb3 = wb.write_chunk(10, 3000, 3000, &encoded, false).unwrap();
+        wb.set_write_fault_hook(Some(Arc::new(|len| {
+            if len > 8 {
+                WriteFaultAction::Error(io::ErrorKind::StorageFull)
+            } else {
+                WriteFaultAction::PassThrough
+            }
+        })));
+        assert!(wb.flush().is_err());
+        wb.set_write_fault_hook(None);
+
+        wb.rollback_snapshot(sb);
+        assert_eq!(wb.current_seq(), 0);
+        assert!(!head_chunk_file_path(dir0.path(), 1).exists());
+        assert!(!head_chunk_file_path(dir0.path(), 2).exists());
+        assert!(!head_chunk_file_path(dir0.path(), 3).exists());
+        let wm0 = wb.flushed_watermark();
+        assert_eq!(wm0.last_flushed_ref(), ChunkDiskMapperRef(0));
+        assert!(!wm0.is_flushed(rb1, Some(0)));
+        assert!(!wm0.is_flushed(rb2, Some(0)));
+        assert!(!wm0.is_flushed(rb1, Some(1)));
+
+        let r_reused = wb.write_chunk(10, 4000, 4000, &encoded, false).unwrap();
+        assert_eq!(r_reused.unpack().0, 1);
+        wb.close().unwrap();
+        let reader0 = HeadChunksReader::open(dir0.path()).unwrap();
+        let all0 = reader0.collect_all_chunks().unwrap();
+        assert_eq!(all0.len(), 1);
+        assert_eq!(all0[0].mint, 4000);
+
+        // Subcase B: snap.seq == 1 with snap.write_buf_len > 0 -> cut seq 2 -> flush -> rollback.
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut w1 = HeadChunksWriter::with_options(dir1.path(), 80, 4096).unwrap();
+        let c1 = w1.write_chunk(10, 1000, 1000, &encoded, false).unwrap();
+        assert_eq!(c1.unpack().0, 1);
+        let snap1 = w1.take_snapshot();
+        assert_eq!(snap1.seq, 1);
+        assert!(snap1.write_buf_len > 0);
+
+        let c2 = w1.write_chunk(10, 2000, 2000, &encoded, false).unwrap();
+        assert_eq!(c2.unpack().0, 2);
+        w1.flush().unwrap();
+        assert_eq!(w1.flushed_watermark().last_flushed_ref(), c2);
+
+        let _c3 = w1.write_chunk(10, 3000, 3000, &encoded, false).unwrap();
+        w1.set_write_fault_hook(Some(Arc::new(|len| {
+            if len > 8 {
+                WriteFaultAction::Error(io::ErrorKind::StorageFull)
+            } else {
+                WriteFaultAction::PassThrough
+            }
+        })));
+        assert!(w1.flush().is_err());
+        w1.set_write_fault_hook(None);
+
+        w1.rollback_snapshot(snap1);
+        assert_eq!(w1.current_seq(), 1);
+        assert!(head_chunk_file_path(dir1.path(), 1).exists());
+        assert!(!head_chunk_file_path(dir1.path(), 2).exists());
+        assert!(!head_chunk_file_path(dir1.path(), 3).exists());
+
+        let wm1 = w1.flushed_watermark();
+        assert_eq!(wm1.last_flushed_ref(), c1);
+        assert!(wm1.is_flushed(c1, Some(0)));
+        assert!(!wm1.is_flushed(c2, Some(0)));
+        assert!(!wm1.is_flushed(c2, Some(1)));
+
+        let c_next = w1.write_chunk(10, 5000, 5000, &encoded, false).unwrap();
+        assert_eq!(c_next.unpack().0, 2);
+        w1.close().unwrap();
+
+        let reader1 = HeadChunksReader::open(dir1.path()).unwrap();
+        let all1 = reader1.collect_all_chunks().unwrap();
+        assert_eq!(all1.len(), 2);
+        assert_eq!(reader1.chunk(c1).unwrap(), encoded);
+        assert_eq!(reader1.chunk(c_next).unwrap(), encoded);
+    }
+
+    #[test]
+    fn rollback_snapshot_branch3_with_buffered_snap_rolls_back_truncated_flushed_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut xc = XorChunk::new();
+        xc.appender().unwrap().append(0, 1000, 1.0).unwrap();
+        let encoded = EncodedChunk::Xor(xc);
+
+        let mut w = HeadChunksWriter::with_options(dir.path(), 4096, 64).unwrap();
+        let c1 = w.write_chunk(10, 1000, 1000, &encoded, false).unwrap();
+        let snap = w.take_snapshot();
+        assert_eq!(snap.seq, 1);
+        assert!(snap.write_buf_len > 0);
+        assert_eq!(snap.last_flushed_ref, ChunkDiskMapperRef(0));
+        assert_eq!(snap.last_written_ref, c1);
+
+        let c2 = w.write_chunk(10, 2000, 2000, &encoded, false).unwrap();
+        w.flush().unwrap();
+        assert_eq!(w.flushed_watermark().last_flushed_ref(), c2);
+
+        let _c3 = w.write_chunk(10, 3000, 3000, &encoded, false).unwrap();
+        w.set_write_fault_hook(Some(Arc::new(|len| {
+            if len > 8 {
+                WriteFaultAction::Error(io::ErrorKind::StorageFull)
+            } else {
+                WriteFaultAction::PassThrough
+            }
+        })));
+        assert!(w.flush().is_err());
+        w.set_write_fault_hook(None);
+
+        w.rollback_snapshot(snap);
+        let wm = w.flushed_watermark();
+        assert_eq!(wm.last_flushed_ref(), c1);
+        assert!(wm.is_flushed(c1, Some(0)));
+        assert!(!wm.is_flushed(c2, Some(0)));
+        assert!(!wm.is_flushed(c2, Some(1)));
+
+        let c_after = w.write_chunk(10, 4000, 4000, &encoded, false).unwrap();
+        assert_eq!(c_after.unpack(), (1, snap.offset as u32));
+        w.close().unwrap();
+
+        let reader = HeadChunksReader::open(dir.path()).unwrap();
+        let all = reader.collect_all_chunks().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].mint, 1000);
+        assert_eq!(all[1].mint, 4000);
+        assert_eq!(reader.chunk(c1).unwrap(), encoded);
+        assert_eq!(reader.chunk(c_after).unwrap(), encoded);
     }
 }

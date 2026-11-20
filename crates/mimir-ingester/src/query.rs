@@ -71,7 +71,7 @@ pub const LABEL_VALUES_CARDINALITY_TARGET_SIZE_BYTES: usize = 1024 * 1024;
 pub const ACTIVE_SERIES_MAX_SIZE_BYTES: usize = 1024 * 1024;
 pub const SEARCH_BATCH_SIZE: usize = 256;
 
-const ONLY_REPLICA_GRPC_MD_KEY: &str = "__only_replica__";
+pub(crate) const ONLY_REPLICA_GRPC_MD_KEY: &str = "__only_replica__";
 const X_ONLY_REPLICA_MD_KEY: &str = "x-only-replica";
 const CONSISTENCY_LEVEL_MD_KEY: &str = "__consistency_level__";
 const CONSISTENCY_OFFSETS_MD_KEY: &str = "__consistency_offsets__";
