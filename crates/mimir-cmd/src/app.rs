@@ -1495,7 +1495,7 @@ pub fn try_build_span_exporter() -> Result<Option<SpanExporterFn>, String> {
     }
     let client = builder
         .build()
-        .map_err(|e| format!("building OTLP/Jaeger HTTP client: {e}"))?;
+        .map_err(|e| format!("building OTLP/Jaeger HTTP client: {:#}", anyhow::Error::new(e)))?;
     let jaeger_auth = is_jaeger.then(jaeger_basic_auth_from_env).flatten();
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|e| format!("no active tokio runtime for span exporter: {e}"))?;

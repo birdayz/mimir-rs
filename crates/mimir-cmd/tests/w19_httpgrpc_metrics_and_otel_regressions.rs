@@ -826,7 +826,15 @@ async fn w19_rkn_10_otlp_headers_tls_mtls_timeout_and_jaeger_endpoint_exporter()
     let cli_key = pki_dir.path().join("cli.key");
     let cli_csr = pki_dir.path().join("cli.csr");
     let cli_crt = pki_dir.path().join("cli.crt");
-    std::fs::write(&srv_ext, "subjectAltName=IP:127.0.0.1,DNS:localhost\n").unwrap();
+    let cli_ext = pki_dir.path().join("cli.ext");
+    std::fs::write(
+        &srv_ext,
+        "subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth\n",
+    )
+    .unwrap();
+    // Pass -extfile when signing the client cert so OpenSSL 3.0.x (Ubuntu 24.04) emits
+    // an X.509 v3 certificate; rustls-webpki rejects X.509 v1 end-entity certificates.
+    std::fs::write(&cli_ext, "extendedKeyUsage=clientAuth\n").unwrap();
 
     let run_openssl = |args: &[&str]| {
         let out = Command::new("openssl").args(args).output().unwrap();
@@ -870,6 +878,7 @@ async fn w19_rkn_10_otlp_headers_tls_mtls_timeout_and_jaeger_endpoint_exporter()
         "-CA", ca_crt.to_str().unwrap(),
         "-CAkey", ca_key.to_str().unwrap(),
         "-CAcreateserial",
+        "-extfile", cli_ext.to_str().unwrap(),
         "-out", cli_crt.to_str().unwrap(),
     ]);
 
