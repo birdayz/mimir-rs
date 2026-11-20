@@ -1011,6 +1011,8 @@ fn decompress_frames_slice(
         let out = &mut *guard.0;
 
         let mut pos = 0usize;
+        let mut total_decompressed = 0usize;
+        let mut frame_count = 0usize;
         while pos < slice.len() {
             if slice.len() - pos < 5 {
                 return Err(Status::internal("truncated gRPC compressed frame header"));
@@ -1033,16 +1035,22 @@ fn decompress_frames_slice(
 
             match flag {
                 0 => {
-                    if len > max_decode_len {
+                    if len > max_decode_len
+                        || total_decompressed
+                            .checked_add(len)
+                            .is_none_or(|t| t > max_decode_len)
+                    {
                         return Err(Status::resource_exhausted(format!(
-                            "grpc: received message larger than max ({len} vs. {max_decode_len})"
+                            "grpc: received message after decompression larger than max {max_decode_len}"
                         )));
                     }
+                    total_decompressed += len;
                     out.push(0);
                     out.extend_from_slice(&(len as u32).to_be_bytes());
                     out.extend_from_slice(payload);
                 }
                 1 => {
+                    let remaining = max_decode_len.saturating_sub(total_decompressed);
                     let hdr_pos = out.len();
                     out.extend_from_slice(&[0u8; 5]);
                     let map_decomp_err = |codec: &str, e: std::io::Error| -> Status {
@@ -1061,7 +1069,7 @@ fn decompress_frames_slice(
                             mimir_proto::snappy::decompress_framed_bounded_into(
                                 payload,
                                 out,
-                                max_decode_len,
+                                remaining,
                             )
                             .map_err(|e| map_decomp_err("snappy", e))?;
                         }
@@ -1069,17 +1077,18 @@ fn decompress_frames_slice(
                             mimir_proto::s2::decompress_framed_into(
                                 payload,
                                 out,
-                                max_decode_len,
+                                remaining,
                             )
                             .map_err(|e| map_decomp_err("s2", e))?;
                         }
                     }
                     let dec_len = out.len() - (hdr_pos + 5);
-                    if dec_len > max_decode_len {
+                    if dec_len > remaining || total_decompressed.saturating_add(dec_len) > max_decode_len {
                         return Err(Status::resource_exhausted(format!(
                             "grpc: received message after decompression larger than max {max_decode_len}"
                         )));
                     }
+                    total_decompressed += dec_len;
                     out[hdr_pos + 1..hdr_pos + 5].copy_from_slice(&(dec_len as u32).to_be_bytes());
                 }
                 other => {
@@ -1087,6 +1096,12 @@ fn decompress_frames_slice(
                         "invalid gRPC compression flag {other}"
                     )));
                 }
+            }
+            frame_count += 1;
+            if frame_count > 1 {
+                return Err(Status::internal(
+                    "unexpected multiple gRPC frames in unary request",
+                ));
             }
         }
 
@@ -1295,12 +1310,26 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     >;
 
                     fn call(&mut self, request: Request<Bytes>) -> Self::Future {
+                        struct TrackedBufferGuard(mimir_proto::ref_leaks::TrackedBuffer);
+                        impl Drop for TrackedBufferGuard {
+                            fn drop(&mut self) {
+                                self.0.free();
+                            }
+                        }
+
                         let ingester = Arc::clone(&self.ingester);
                         let tap_slot = self.tap_slot.clone();
                         Box::pin(async move {
                             let tap = tap_slot.as_ref().and_then(|s| s.lock().take());
                             let org_id_res = org_id_from_req(&ingester, &request);
                             let (_, extensions, raw) = request.into_parts();
+                            let _tracked_buf = ingester
+                                .ref_leaks_tracker()
+                                .and_then(|t| t.maybe_instrument_ref_leaks(&raw))
+                                .map(TrackedBufferGuard);
+                            if let Some(ref g) = _tracked_buf {
+                                let _ = g.0.read_only_data();
+                            }
                             // Go order: dec(in) -> ServerUserHeaderInterceptor -> PushGrpcMethodEnabled -> tenant.TenantID.
                             // On the happy path we avoid double-decoding by validating wire bytes early only
                             // when org_id / push_grpc_method_enabled / tenant_id fails.

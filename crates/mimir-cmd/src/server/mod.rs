@@ -24,6 +24,7 @@ pub mod metrics;
 pub mod tls;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,6 +76,25 @@ fn allowed_cluster_labels(cfg: &ServerConfig) -> Vec<String> {
     v
 }
 
+/// Wraps an HTTP router with Go `HTTPServer.SetKeepAlivesEnabled(false)` emulation: emits
+/// `Connection: close` on HTTP responses once `shutdown_requested` is set (HTTP listener only).
+pub fn with_shutdown_close_layer(router: Router, shutdown_requested: Arc<AtomicBool>) -> Router {
+    router.layer(axum::middleware::map_response(
+        move |mut resp: axum::response::Response| {
+            let flag = Arc::clone(&shutdown_requested);
+            async move {
+                if flag.load(Ordering::Acquire) {
+                    resp.headers_mut().insert(
+                        http::header::CONNECTION,
+                        http::header::HeaderValue::from_static("close"),
+                    );
+                }
+                resp
+            }
+        },
+    ))
+}
+
 /// A configured, bound, not yet serving dskit server (Go `server.New`).
 pub struct Server {
     http_listener: std::net::TcpListener,
@@ -85,6 +105,7 @@ pub struct Server {
     grpc_accept: AcceptOptions,
     middleware: Arc<HttpMiddlewareConfig>,
     grpc_ctx: GrpcContext,
+    shutdown_requested: Option<Arc<AtomicBool>>,
 }
 
 impl Server {
@@ -255,6 +276,7 @@ impl Server {
             grpc_accept,
             middleware,
             grpc_ctx: GrpcContext { metrics, logger },
+            shutdown_requested: None,
         })
     }
 
@@ -273,6 +295,13 @@ impl Server {
         self.grpc_cfg.no_auth_tenant = no_auth_tenant.into();
     }
 
+    /// Installs the shutdown flag used on the HTTP listener to emit `Connection: close` once
+    /// shutdown is requested (Go `HTTPServer.SetKeepAlivesEnabled(false)`), without affecting
+    /// `httpgrpc`.
+    pub fn set_shutdown_requested(&mut self, shutdown_requested: Arc<AtomicBool>) {
+        self.shutdown_requested = Some(shutdown_requested);
+    }
+
     /// Go `Server.Run`: serves `router` (wrapped in the dskit HTTP middleware) and the gRPC
     /// `routes` on a dedicated runtime, keeping network I/O apart from TSDB work.
     pub fn start(self, router: Router, grpc_routes: tonic::service::Routes) -> Result<RunningServers> {
@@ -285,9 +314,17 @@ impl Server {
             grpc_accept,
             middleware,
             grpc_ctx,
+            shutdown_requested,
         } = self;
-        let http_router =
-            router.layer(axum::middleware::from_fn_with_state(middleware, http_middleware::dskit_http_middleware));
+        let http_router = if let Some(flag) = shutdown_requested {
+            with_shutdown_close_layer(router, flag)
+        } else {
+            router
+        };
+        let http_router = http_router.layer(axum::middleware::from_fn_with_state(
+            middleware,
+            http_middleware::dskit_http_middleware,
+        ));
 
         let rpc_workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 16));
         let rt = tokio::runtime::Builder::new_multi_thread()

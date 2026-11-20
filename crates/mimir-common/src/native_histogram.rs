@@ -83,8 +83,18 @@ impl HistogramOpts {
         self
     }
 
+    pub fn zero_threshold(mut self, threshold: f64) -> Self {
+        self.native_histogram_zero_threshold = threshold;
+        self
+    }
+
     pub fn const_label(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.const_labels.insert(name.into(), value.into());
+        self
+    }
+
+    pub fn const_labels(mut self, labels: HashMap<String, String>) -> Self {
+        self.const_labels.extend(labels);
         self
     }
 }
@@ -665,6 +675,28 @@ impl Collector for SingleHistogram {
 
     fn collect(&self) -> Vec<proto::MetricFamily> {
         self.vec.collect()
+    }
+}
+
+impl std::fmt::Debug for Histogram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Histogram").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for HistogramVec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistogramVec")
+            .field("name", &self.desc.fq_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for SingleHistogram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleHistogram")
+            .field("name", &self.vec.desc.fq_name)
+            .finish_non_exhaustive()
     }
 }
 

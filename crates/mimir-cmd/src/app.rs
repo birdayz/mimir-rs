@@ -59,9 +59,10 @@ use tonic::codec::CompressionEncoding;
 use crate::cli::CliOutcome;
 use crate::grpc::{
     GrpcCompressionEchoService, HealthService, HttpGrpcBridge, HttpGrpcStatusFixService,
+    RefLeaksMiddlewareService,
 };
 use crate::http::{build_http_router, AppHttpState};
-use crate::metrics::{register_global_metrics, version_info};
+use crate::metrics::{register_global_metrics_with_deprecated, version_info};
 use crate::modules::{ModuleStates, StateCell, StateFn};
 use crate::sanity_check;
 
@@ -150,10 +151,26 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let logger = global_logger().unwrap_or_else(|| Arc::new(build_log_sink(&outcome)));
     logger.register_metrics(&registry);
 
-    register_global_metrics(&registry, outcome.config_hash_sha256.as_deref())
-        .context("registering global Prometheus metrics")?;
+    for flag in cfg.deprecated_flags_used() {
+        logger.log(
+            LogLevel::Warn,
+            &[("msg", "flag disabled"), ("flag", flag)],
+        );
+    }
+
+    register_global_metrics_with_deprecated(
+        &registry,
+        outcome.config_hash_sha256.as_deref(),
+        cfg.deprecated_flags_used().len(),
+    )
+    .context("registering global Prometheus metrics")?;
     crate::metrics::register_process_collector(&registry)
         .context("registering process collector")?;
+
+    let ref_leaks_tracker = cfg
+        .instrument_ref_leaks
+        .to_proto_config()
+        .tracker(Some(&registry));
 
     let tracing_service = resolve_service_name(&cfg.target.0);
     let span_exporter = build_span_exporter();
@@ -290,6 +307,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     // the whole lifetime of the service manager, including module startup.
     let mut shutdown_sig = install_shutdown_signal(Arc::clone(&logger));
     let shutdown_requested = Arc::new(AtomicBool::new(false));
+    server.set_shutdown_requested(Arc::clone(&shutdown_requested));
     let shutdown_delay = Duration::from_nanos(cfg.shutdown_delay.0.max(0) as u64);
 
     // Active groups cleanup service (pkg/mimir/modules.go initActiveGroupsCleanupService): a
@@ -831,17 +849,27 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let mut grpc_routes = tonic::service::Routes::new(health_svc).add_service(http_grpc_svc);
 
     if let Some(ref ing) = ingester_opt {
-        let ing_svc = GrpcCompressionEchoService::new_with_limits(
-            IngesterService::new(Arc::clone(ing))
-                .into_server()
-                .max_decoding_message_size(max_recv)
-                .max_encoding_message_size(usize::MAX)
-                .accept_compressed(CompressionEncoding::Gzip)
-                .accept_compressed(CompressionEncoding::Zstd),
-            max_recv,
-            max_send,
-        );
-        grpc_routes = grpc_routes.add_service(ing_svc);
+        let ing_inner = IngesterService::new(Arc::clone(ing))
+            .into_server()
+            .max_decoding_message_size(max_recv)
+            .max_encoding_message_size(usize::MAX)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd);
+        if cfg.instrument_ref_leaks.percentage > 0.0 {
+            let ing_svc = GrpcCompressionEchoService::new_with_limits(
+                RefLeaksMiddlewareService::new(ing_inner, ref_leaks_tracker.clone()),
+                max_recv,
+                max_send,
+            );
+            grpc_routes = grpc_routes.add_service(ing_svc);
+        } else {
+            let ing_svc = GrpcCompressionEchoService::new_with_limits(
+                ing_inner,
+                max_recv,
+                max_send,
+            );
+            grpc_routes = grpc_routes.add_service(ing_svc);
+        }
     }
 
     log_module_starting(&*logger, "server");

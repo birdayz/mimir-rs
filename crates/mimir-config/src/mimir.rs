@@ -56,6 +56,90 @@ impl CommonConfig {
     }
 }
 
+/// Configuration for reference leak instrumentation (`pkg/mimirpb/ref_leaks.go:InstrumentRefLeaksConfig`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InstrumentRefLeaksConfig {
+    pub percentage: f64,
+    pub before_reuse_period: GoDuration,
+    pub max_inflight_instrumented_bytes: u64,
+}
+
+impl Default for InstrumentRefLeaksConfig {
+    fn default() -> Self {
+        Self {
+            percentage: 0.0,
+            before_reuse_period: GoDuration::from_mins(2),
+            max_inflight_instrumented_bytes: 0,
+        }
+    }
+}
+
+impl InstrumentRefLeaksConfig {
+    pub fn register_flags_into<T: 'static>(
+        &self,
+        f: &mut FlagSet<T>,
+        get: impl Fn(&T) -> &Self + Copy + 'static,
+        get_mut: impl Fn(&mut T) -> &mut Self + Copy + 'static,
+    ) {
+        f.f64_var(
+            "instrument-reference-leaks.percentage",
+            self.percentage,
+            "Percentage [0-100] of request or message buffers to instrument for reference leaks. Set to 0 to disable.",
+            move |t| &get(t).percentage,
+            move |t| &mut get_mut(t).percentage,
+        );
+        f.go_duration_var(
+            "instrument-reference-leaks.before-reuse-period",
+            self.before_reuse_period,
+            "Period after a buffer instrumented for referenced leaks is nominally freed until the buffer is uninstrumented and effectively freed to be reused. After this period, any lingering references to the buffer may potentially be dereferenced again with no detection.",
+            move |t| &get(t).before_reuse_period,
+            move |t| &mut get_mut(t).before_reuse_period,
+        );
+        f.u64_var(
+            "instrument-reference-leaks.max-inflight-instrumented-bytes",
+            self.max_inflight_instrumented_bytes,
+            "Maximum sum of length of buffers instrumented at any given time, in bytes. When surpassed, incoming buffers will not be instrumented, regardless of the configured percentage. Zero means no limit.",
+            move |t| &get(t).max_inflight_instrumented_bytes,
+            move |t| &mut get_mut(t).max_inflight_instrumented_bytes,
+        );
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if self.percentage != 0.0 {
+            return Err(ConfigError::Validation(format!(
+                "reference leaks instrumentation not available in {}",
+                std::env::consts::OS
+            )));
+        }
+        if self.percentage < 0.0 || self.percentage > 100.0 || self.percentage.is_nan() {
+            return Err(ConfigError::Validation(format!(
+                "percentage must be in [0-100], got: {}",
+                self.percentage
+            )));
+        }
+        if self.before_reuse_period.as_nanos() < 0 {
+            return Err(ConfigError::Validation(format!(
+                "before-reuse-period must be positive, got: {}",
+                self.before_reuse_period
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn to_proto_config(&self) -> mimir_proto::ref_leaks::InstrumentRefLeaksConfig {
+        mimir_proto::ref_leaks::InstrumentRefLeaksConfig {
+            percentage: self.percentage,
+            before_reuse_period: self
+                .before_reuse_period
+                .as_std()
+                .unwrap_or(std::time::Duration::ZERO),
+            max_inflight_instrumented_bytes: self.max_inflight_instrumented_bytes,
+        }
+    }
+}
+
 /// Core fields of `mimir.Config` deserialized directly into strongly typed Rust structs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -85,6 +169,7 @@ struct CoreMimirConfig {
     pub runtime_config: RuntimeConfigConfig,
     pub memberlist: MemberlistConfig,
     pub usage_stats: UsageStatsConfig,
+    pub instrument_ref_leaks: InstrumentRefLeaksConfig,
 }
 
 impl Default for CoreMimirConfig {
@@ -123,6 +208,7 @@ impl CoreMimirConfig {
             runtime_config: d.runtime_config,
             memberlist: d.memberlist,
             usage_stats: d.usage_stats,
+            instrument_ref_leaks: d.instrument_ref_leaks,
         }
     }
 }
@@ -159,6 +245,7 @@ pub struct MimirConfig {
     pub runtime_config: RuntimeConfigConfig,
     pub memberlist: MemberlistConfig,
     pub usage_stats: UsageStatsConfig,
+    pub instrument_ref_leaks: InstrumentRefLeaksConfig,
 
     /// Other top-level Mimir sections (`api`, `distributor`, `querier`, `frontend`, `ruler`, etc.)
     /// validated against the upstream schema so full-cluster `mimir.yaml` files load cleanly.
@@ -167,6 +254,8 @@ pub struct MimirConfig {
 
     #[serde(skip)]
     extra_cli_flag_values: BTreeMap<String, String>,
+    #[serde(skip)]
+    deprecated_flags_used: Vec<String>,
 }
 
 impl Default for MimirConfig {
@@ -197,8 +286,10 @@ impl Default for MimirConfig {
             runtime_config: RuntimeConfigConfig::default(),
             memberlist: MemberlistConfig::default(),
             usage_stats: UsageStatsConfig::default(),
+            instrument_ref_leaks: InstrumentRefLeaksConfig::default(),
             extra_sections: BTreeMap::new(),
             extra_cli_flag_values: BTreeMap::new(),
+            deprecated_flags_used: Vec::new(),
         }
     }
 }
@@ -228,6 +319,7 @@ const CORE_TOP_KEYS: &[&str] = &[
     "runtime_config",
     "memberlist",
     "usage_stats",
+    "instrument_ref_leaks",
 ];
 
 const EXTRA_HIDDEN_TOP_KEYS: &[&str] = &[
@@ -415,6 +507,11 @@ impl MimirConfig {
             move |t| &get(t).usage_stats,
             move |t| &mut get_mut(t).usage_stats,
         );
+        self.instrument_ref_leaks.register_flags_into(
+            f,
+            move |t| &get(t).instrument_ref_leaks,
+            move |t| &mut get_mut(t).instrument_ref_leaks,
+        );
         self.common
             .register_flags_into(f, move |t| &get(t).common, move |t| &mut get_mut(t).common);
 
@@ -422,6 +519,20 @@ impl MimirConfig {
             f,
             move |t| &get(t).extra_cli_flag_values,
             move |t| &mut get_mut(t).extra_cli_flag_values,
+        );
+
+        // Deprecated flag registered unconditionally by pkg/usagetracker/tracker.go.
+        f.register_raw(
+            "usage-tracker.use-global-series-limits",
+            false,
+            "value",
+            "deprecated",
+            "",
+            move |t, _s| {
+                get_mut(t).record_deprecated_flag("usage-tracker.use-global-series-limits");
+                Ok(())
+            },
+            move |_t| "deprecated".to_string(),
         );
     }
 
@@ -593,6 +704,7 @@ impl MimirConfig {
         self.runtime_config = core.runtime_config;
         self.memberlist = core.memberlist;
         self.usage_stats = core.usage_stats;
+        self.instrument_ref_leaks = core.instrument_ref_leaks;
     }
 
     pub fn is_module_explicitly_targeted(&self, module: &str) -> bool {
@@ -677,6 +789,16 @@ impl MimirConfig {
         }
 
         Ok(())
+    }
+
+    /// Records invocation of a deprecated CLI flag (matching `dskit/flagext/deprecated.go`).
+    pub fn record_deprecated_flag(&mut self, flag_name: &str) {
+        self.deprecated_flags_used.push(flag_name.to_string());
+    }
+
+    /// Returns the list of deprecated CLI flags invoked during flag parsing.
+    pub fn deprecated_flags_used(&self) -> &[String] {
+        &self.deprecated_flags_used
     }
 
     /// Returns the CLI-set value for a flag belonging to non-ingester sections, if overridden via CLI or common inheritance.
@@ -887,6 +1009,10 @@ impl MimirConfig {
         self.usage_stats
             .validate()
             .map_err(wrap_validation("invalid usage stats config"))?;
+
+        self.instrument_ref_leaks
+            .validate()
+            .map_err(wrap_validation("invalid instrument-ref-leaks config"))?;
 
         // pkg/api/api.go Config.Validate.
         let level = self.api_response_compression_level()?;
@@ -1295,6 +1421,7 @@ fn is_core_block_key(key: &str) -> bool {
             | "runtime_config"
             | "memberlist"
             | "usage_stats"
+            | "instrument_ref_leaks"
     )
 }
 

@@ -636,8 +636,9 @@ pub struct PartitionRingWatcher {
     kv: Arc<InMemoryPartitionKv>,
     token_table: Option<Arc<PartitionTokenTable>>,
     ring: RwLock<Arc<PartitionRingSnapshot>>,
-    _num_partitions: GaugeVec,
-    _max_partition_id: Gauge,
+    num_partitions: GaugeVec,
+    max_partition_id: Gauge,
+    max_derived_partition_id: Gauge,
     stop_tx: watch::Sender<bool>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -667,13 +668,25 @@ impl PartitionRingWatcher {
                 "partition_ring_max_partition_id",
                 "Highest partition ID in the ring, or -1 when empty.",
             )
+            .const_labels(const_labels.clone()),
+        )
+        .expect("valid metric");
+        let max_derived_partition_id = Gauge::with_opts(
+            Opts::new(
+                "partition_ring_max_derived_partition_id",
+                "Highest partition ID using derived tokens in the ring, or -1 when none.",
+            )
             .const_labels(const_labels),
         )
         .expect("valid metric");
 
+        max_partition_id.set(-1.0);
+        max_derived_partition_id.set(-1.0);
+
         if let Some(r) = reg {
             r.register(Box::new(num_partitions.clone())).expect("register partition_ring_partitions without collision");
             r.register(Box::new(max_partition_id.clone())).expect("register partition_ring_max_partition_id without collision");
+            r.register(Box::new(max_derived_partition_id.clone())).expect("register partition_ring_max_derived_partition_id without collision");
         }
 
         let empty = Arc::new(
@@ -687,8 +700,9 @@ impl PartitionRingWatcher {
             kv,
             token_table,
             ring: RwLock::new(empty),
-            _num_partitions: num_partitions,
-            _max_partition_id: max_partition_id,
+            num_partitions,
+            max_partition_id,
+            max_derived_partition_id,
             stop_tx,
             task: tokio::sync::Mutex::new(None),
         })
@@ -698,14 +712,50 @@ impl PartitionRingWatcher {
         self.ring.read().clone()
     }
 
+    fn update_ring(&self, desc: PartitionRingDesc) -> Result<(), String> {
+        let mut max_id = -1i32;
+        let mut max_derived_id = -1i32;
+        let mut counts: HashMap<PartitionState, usize> = HashMap::new();
+        counts.insert(PartitionState::PartitionPending, 0);
+        counts.insert(PartitionState::PartitionActive, 0);
+        counts.insert(PartitionState::PartitionInactive, 0);
+        for (&id, part) in &desc.partitions {
+            if id > max_id {
+                max_id = id;
+            }
+            if part.token_scheme() == PartitionTokenScheme::PartitionTokensSmt512
+                && id > max_derived_id
+            {
+                max_derived_id = id;
+            }
+            *counts.entry(part.state()).or_insert(0) += 1;
+        }
+        let snap = Arc::new(PartitionRingSnapshot::new(desc, self.token_table.clone())?);
+        *self.ring.write() = snap;
+        self.max_partition_id.set(max_id as f64);
+        self.max_derived_partition_id.set(max_derived_id as f64);
+        for (state, count) in counts {
+            let state_name = match state {
+                PartitionState::PartitionUnknown => "Unknown",
+                PartitionState::PartitionPending => "Pending",
+                PartitionState::PartitionActive => "Active",
+                PartitionState::PartitionInactive => "Inactive",
+                PartitionState::PartitionDeleted => "Deleted",
+            };
+            self.num_partitions
+                .with_label_values(&[state_name])
+                .set(count as f64);
+        }
+        Ok(())
+    }
+
     pub async fn start(&self) -> Result<(), String> {
         let guard = self.task.lock().await;
         if guard.is_some() {
             return Ok(());
         }
         if let Some(desc) = self.kv.get(&self.key) {
-            let snap = Arc::new(PartitionRingSnapshot::new(desc, self.token_table.clone())?);
-            *self.ring.write() = snap;
+            self.update_ring(desc)?;
         }
         Ok(())
     }
@@ -716,8 +766,7 @@ impl PartitionRingWatcher {
             return Ok(());
         }
         if let Some(desc) = self.kv.get(&self.key) {
-            let snap = Arc::new(PartitionRingSnapshot::new(desc, self.token_table.clone())?);
-            *self.ring.write() = snap;
+            self.update_ring(desc)?;
         }
         let me = Arc::clone(self);
         let mut sub = self.kv.subscribe(&self.key);
@@ -736,9 +785,7 @@ impl PartitionRingWatcher {
                             break;
                         }
                         if let Some(desc) = me.kv.get(&me.key) {
-                            if let Ok(snap) = PartitionRingSnapshot::new(desc, me.token_table.clone()) {
-                                *me.ring.write() = Arc::new(snap);
-                            }
+                            let _ = me.update_ring(desc);
                         }
                     }
                 }

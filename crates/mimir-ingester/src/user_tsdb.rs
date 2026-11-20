@@ -1017,22 +1017,20 @@ impl UserTsdb {
         let block_duration_ms = self.block_duration_ms;
         let res = tokio::task::spawn_blocking(move || -> Result<(), TsdbError> {
             let head = db.head();
-            if head.initialized() && head.num_series() > 0 {
-                loop {
-                    let h_min = head.min_time();
-                    let h_max = head.max_time();
-                    let Some((mint, maxt_incl, is_last)) = next_forced_head_compaction_range(
-                        block_duration_ms,
-                        h_min,
-                        h_max,
-                        forced_compaction_max_time,
-                    ) else {
-                        break;
-                    };
-                    db.compact_head_range(mint, maxt_incl.saturating_add(1))?;
-                    if is_last || !head.initialized() || head.num_series() == 0 {
-                        break;
-                    }
+            loop {
+                let h_min = head.min_time();
+                let h_max = head.max_time();
+                let Some((mint, maxt_incl, is_last)) = next_forced_head_compaction_range(
+                    block_duration_ms,
+                    h_min,
+                    h_max,
+                    forced_compaction_max_time,
+                ) else {
+                    break;
+                };
+                db.compact_head_range(mint, maxt_incl.saturating_add(1))?;
+                if is_last {
+                    break;
                 }
             }
             let _ = db.compact_ooo_head()?;

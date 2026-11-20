@@ -1838,7 +1838,7 @@ impl SeriesStripe {
                             guard_ref.active_native_histograms.saturating_sub(1);
                         guard_ref.active_native_histogram_buckets = guard_ref
                             .active_native_histogram_buckets
-                            .saturating_sub(old_buckets as u32);
+                            .wrapping_sub(old_buckets as u32);
                         if let Some(cm) = guard_ref.custom_matches.as_ref() {
                             if let Some(matches) = cm.get(matches_handle) {
                                 for idx in matches.iter() {
@@ -1851,14 +1851,16 @@ impl SeriesStripe {
                                         .active_matching_native_histogram_buckets
                                         .get_mut(idx)
                                     {
-                                        *v = v.saturating_sub(old_buckets as u32);
+                                        *v = v.wrapping_sub(old_buckets as u32);
                                     }
                                 }
                             }
                         }
                     } else if old_buckets < 0 && buckets_i32 >= 0 {
                         guard_ref.active_native_histograms += 1;
-                        guard_ref.active_native_histogram_buckets += buckets_i32 as u32;
+                        guard_ref.active_native_histogram_buckets = guard_ref
+                            .active_native_histogram_buckets
+                            .wrapping_add(buckets_i32 as u32);
                         if let Some(cm) = guard_ref.custom_matches.as_ref() {
                             if let Some(matches) = cm.get(matches_handle) {
                                 for idx in matches.iter() {
@@ -1871,7 +1873,7 @@ impl SeriesStripe {
                                         .active_matching_native_histogram_buckets
                                         .get_mut(idx)
                                     {
-                                        *v += buckets_i32 as u32;
+                                        *v = v.wrapping_add(buckets_i32 as u32);
                                     }
                                 }
                             }
@@ -1879,7 +1881,9 @@ impl SeriesStripe {
                     } else if old_buckets >= 0 && buckets_i32 >= 0 {
                         let delta = buckets_i32 - old_buckets;
                         if delta >= 0 {
-                            guard_ref.active_native_histogram_buckets += delta as u32;
+                            guard_ref.active_native_histogram_buckets = guard_ref
+                                .active_native_histogram_buckets
+                                .wrapping_add(delta as u32);
                             if let Some(cm) = guard_ref.custom_matches.as_ref() {
                                 if let Some(matches) = cm.get(matches_handle) {
                                     for idx in matches.iter() {
@@ -1887,7 +1891,7 @@ impl SeriesStripe {
                                             .active_matching_native_histogram_buckets
                                             .get_mut(idx)
                                         {
-                                            *v += delta as u32;
+                                            *v = v.wrapping_add(delta as u32);
                                         }
                                     }
                                 }
@@ -1895,7 +1899,7 @@ impl SeriesStripe {
                         } else {
                             let sub = (-delta) as u32;
                             guard_ref.active_native_histogram_buckets =
-                                guard_ref.active_native_histogram_buckets.saturating_sub(sub);
+                                guard_ref.active_native_histogram_buckets.wrapping_sub(sub);
                             if let Some(cm) = guard_ref.custom_matches.as_ref() {
                                 if let Some(matches) = cm.get(matches_handle) {
                                     for idx in matches.iter() {
@@ -1903,7 +1907,7 @@ impl SeriesStripe {
                                             .active_matching_native_histogram_buckets
                                             .get_mut(idx)
                                         {
-                                            *v = v.saturating_sub(sub);
+                                            *v = v.wrapping_sub(sub);
                                         }
                                     }
                                 }
@@ -1948,14 +1952,16 @@ impl SeriesStripe {
                 }
                 if buckets_i32 >= 0 {
                     guard.active_native_histograms += 1;
-                    guard.active_native_histogram_buckets += buckets_i32 as u32;
+                    guard.active_native_histogram_buckets = guard
+                        .active_native_histogram_buckets
+                        .wrapping_add(buckets_i32 as u32);
                     for idx in matches.iter() {
                         if let Some(v) = guard.active_matching_native_histograms.get_mut(idx) {
                             *v += 1;
                         }
                         if let Some(v) = guard.active_matching_native_histogram_buckets.get_mut(idx)
                         {
-                            *v += buckets_i32 as u32;
+                            *v = v.wrapping_add(buckets_i32 as u32);
                         }
                     }
                 }
@@ -2089,7 +2095,7 @@ impl SeriesStripe {
             guard_ref.active_native_histograms =
                 guard_ref.active_native_histograms.saturating_sub(1);
             guard_ref.active_native_histogram_buckets =
-                guard_ref.active_native_histogram_buckets.saturating_sub(b);
+                guard_ref.active_native_histogram_buckets.wrapping_sub(b);
             if let Some(cm) = guard_ref.custom_matches.as_ref() {
                 if let Some(matches) = cm.get(entry.matches_handle) {
                     for match_idx in matches.iter() {
@@ -2102,7 +2108,7 @@ impl SeriesStripe {
                             .active_matching_native_histogram_buckets
                             .get_mut(match_idx)
                         {
-                            *v = v.saturating_sub(b);
+                            *v = v.wrapping_sub(b);
                         }
                     }
                 }
@@ -2371,7 +2377,8 @@ impl SeriesStripe {
             let buckets = entry.num_native_histogram_buckets;
             if buckets >= 0 {
                 *active_native_histograms += 1;
-                *active_native_histogram_buckets += buckets as u32;
+                *active_native_histogram_buckets =
+                    active_native_histogram_buckets.wrapping_add(buckets as u32);
             }
             if let Some(cm) = custom_matches.as_deref() {
                 if let Some(matches) = cm.get(entry.matches_handle) {
@@ -2386,7 +2393,7 @@ impl SeriesStripe {
                             if let Some(v) =
                                 active_matching_native_histogram_buckets.get_mut(match_idx)
                             {
-                                *v += buckets as u32;
+                                *v = v.wrapping_add(buckets as u32);
                             }
                         }
                     }

@@ -2370,15 +2370,7 @@ static BLOCK_147_BLOCKS: &[SchemaBlock] = &[
     SchemaBlock { name: "ring", fields: BLOCK_146_FIELDS, blocks: BLOCK_146_BLOCKS },
 ];
 
-static BLOCK_148_FIELDS: &[SchemaField] = &[
-    SchemaField { name: "percentage", flag: "instrument-reference-leaks.percentage", kind: FieldKind::Float, default_str: "0", usage: "Percentage [0-100] of request or message buffers to instrument for reference leaks. Set to 0 to disable." },
-    SchemaField { name: "before_reuse_period", flag: "instrument-reference-leaks.before-reuse-period", kind: FieldKind::Duration, default_str: "120000000000", usage: "Period after a buffer instrumented for referenced leaks is nominally freed until the buffer is uninstrumented and effectively freed to be reused. After this period, any lingering references to the buffer may potentially be dereferenced again with no detection." },
-    SchemaField { name: "max_inflight_instrumented_bytes", flag: "instrument-reference-leaks.max-inflight-instrumented-bytes", kind: FieldKind::Int, default_str: "0", usage: "Maximum sum of length of buffers instrumented at any given time, in bytes. When surpassed, incoming buffers will not be instrumented, regardless of the configured percentage. Zero means no limit." },
-];
 
-static BLOCK_148_BLOCKS: &[SchemaBlock] = &[
-
-];
 
 pub static EXTRA_TOP_BLOCKS: &[SchemaBlock] = &[
     SchemaBlock { name: "api", fields: BLOCK_0_FIELDS, blocks: BLOCK_0_BLOCKS },
@@ -2397,7 +2389,6 @@ pub static EXTRA_TOP_BLOCKS: &[SchemaBlock] = &[
     SchemaBlock { name: "alertmanager_storage", fields: BLOCK_132_FIELDS, blocks: BLOCK_132_BLOCKS },
     SchemaBlock { name: "query_scheduler", fields: BLOCK_141_FIELDS, blocks: BLOCK_141_BLOCKS },
     SchemaBlock { name: "overrides_exporter", fields: BLOCK_147_FIELDS, blocks: BLOCK_147_BLOCKS },
-    SchemaBlock { name: "instrument_ref_leaks", fields: BLOCK_148_FIELDS, blocks: BLOCK_148_BLOCKS },
 ];
 
 pub fn find_top_block(name: &str) -> Option<&'static SchemaBlock> {
@@ -2542,16 +2533,7 @@ pub fn register_extra_flags<T: 'static>(
         walk(block, f, get, get_mut);
     }
 
-    // Deprecated flag registered unconditionally by pkg/usagetracker/tracker.go.
-    f.register_raw(
-        "usage-tracker.use-global-series-limits",
-        false,
-        "value",
-        "deprecated",
-        "",
-        move |_t, _s| Ok(()),
-        move |_t| "deprecated".to_string(),
-    );
+
 
     // `continuoustest.Config` (`yaml:"-"`, pkg/continuoustest/{manager,client,*_test}.go): flags
     // are registered for every target in Go and only consumed by `-target=continuous-test`

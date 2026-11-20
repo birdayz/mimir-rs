@@ -64,11 +64,17 @@ impl SharedWriteDeadline {
 
     pub fn extend_by(&self, extra: Duration) {
         if !self.base_write_timeout.is_zero() {
-            let mut g = self.deadline.lock();
-            *g = self
+            // Saturate to a finite future deadline so oversized extensions never clear the write
+            // deadline to `None`.
+            const MAX_WRITE_DEADLINE_OFFSET: Duration = Duration::from_secs(86_400 * 365);
+            let bounded = self
                 .base_write_timeout
-                .checked_add(extra)
-                .and_then(|d| Instant::now().checked_add(d));
+                .saturating_add(extra)
+                .min(MAX_WRITE_DEADLINE_OFFSET);
+            let mut g = self.deadline.lock();
+            *g = Instant::now()
+                .checked_add(bounded)
+                .or_else(|| Instant::now().checked_add(self.base_write_timeout));
         }
     }
 
@@ -517,10 +523,17 @@ async fn serve_conn<T>(
                     ));
                 }
             };
-            let resp: hyper::Response<axum::body::Body> = match resp {
+            let mut resp: hyper::Response<axum::body::Body> = match resp {
                 Ok(r) => r,
                 Err(e) => match e {},
             };
+            if resp
+                .extensions()
+                .get::<crate::server::http_middleware::MethodMismatch>()
+                .is_some()
+            {
+                resp.headers_mut().remove(http::header::ALLOW);
+            }
             let final_write_deadline = shared_write_deadline.current();
             let st = Arc::clone(&state);
             Ok(resp.map(|b| {

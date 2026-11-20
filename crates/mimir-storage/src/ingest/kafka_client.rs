@@ -69,14 +69,32 @@ const KAFKA_FRAME_INITIAL_CAP: usize = 64 * 1024;
 
 /// Reads a single 4-byte length-prefixed Kafka response frame, growing the buffer incrementally as
 /// bytes arrive so a 4-byte corrupt header followed by EOF cannot trigger a huge allocation.
-pub(crate) async fn read_kafka_frame_bounded<R: tokio::io::AsyncRead + Unpin>(
+struct ReadFrame {
+    payload: Bytes,
+    header_at: Instant,
+    done_at: Instant,
+}
+
+struct FrameTiming {
+    enqueued_at: Instant,
+    write_times: parking_lot::Mutex<Option<(Instant, Instant)>>,
+}
+
+struct OutboundFrame {
+    body: Bytes,
+    timing: Option<Arc<FrameTiming>>,
+    track_metrics: bool,
+}
+
+async fn read_kafka_frame_bounded_timed<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     max_frame_bytes: usize,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, Instant, Instant)> {
     let mut len_buf = [0u8; 4];
     if reader.read_exact(&mut len_buf).await.is_err() {
         return None;
     }
+    let header_at = Instant::now();
     let frame_len = u32::from_be_bytes(len_buf) as usize;
     if !(4..=max_frame_bytes).contains(&frame_len) {
         return None;
@@ -97,7 +115,18 @@ pub(crate) async fn read_kafka_frame_bounded<R: tokio::io::AsyncRead + Unpin>(
             Ok(n) => filled += n,
         }
     }
-    Some(payload)
+    let done_at = Instant::now();
+    Some((payload, header_at, done_at))
+}
+
+#[cfg(test)]
+pub(crate) async fn read_kafka_frame_bounded<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    max_frame_bytes: usize,
+) -> Option<Vec<u8>> {
+    read_kafka_frame_bounded_timed(reader, max_frame_bytes)
+        .await
+        .map(|(payload, _, _)| payload)
 }
 
 #[derive(Debug, Error)]
@@ -240,8 +269,8 @@ struct BrokerConn {
     client_id: String,
     transport: Option<Arc<KafkaTransport>>,
     next_corr_id: AtomicI32,
-    write_tx: mpsc::Sender<Bytes>,
-    pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>>,
+    write_tx: mpsc::Sender<OutboundFrame>,
+    pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<ReadFrame>>>>,
     pending_drained: Arc<tokio::sync::Notify>,
     api_versions: RwLock<HashMap<i16, (i16, i16)>>,
     alive: Arc<std::sync::atomic::AtomicBool>,
@@ -270,7 +299,7 @@ impl Drop for BrokerConn {
 }
 
 struct PendingGuard<'a> {
-    pending: &'a parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>,
+    pending: &'a parking_lot::Mutex<HashMap<i32, oneshot::Sender<ReadFrame>>>,
     pending_drained: &'a tokio::sync::Notify,
     corr_id: i32,
     completed: bool,
@@ -320,8 +349,8 @@ impl BrokerConn {
         }
 
         let (mut reader, mut writer) = established.stream.into_split();
-        let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(512);
-        let pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<Bytes>>>> =
+        let (write_tx, mut write_rx) = mpsc::channel::<OutboundFrame>(512);
+        let pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<ReadFrame>>>> =
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let pending_drained = Arc::new(tokio::sync::Notify::new());
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -330,12 +359,26 @@ impl BrokerConn {
         let ext_w = extended_metrics.clone();
         let writer_handle = tokio::spawn(async move {
             while let Some(frame) = write_rx.recv().await {
-                let len = frame.len() as f64;
-                if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
+                let len = frame.body.len() as f64;
+                let write_start = Instant::now();
+                if writer.write_all(&frame.body).await.is_err() || writer.flush().await.is_err() {
                     break;
+                }
+                let write_end = Instant::now();
+                if let Some(ref t) = frame.timing {
+                    *t.write_times.lock() = Some((write_start, write_end));
                 }
                 if let Some(ref m) = ext_w {
                     m.write_bytes_total.inc_by(len);
+                    if frame.track_metrics {
+                        let write_wait = frame
+                            .timing
+                            .as_ref()
+                            .map_or(Duration::ZERO, |t| write_start.saturating_duration_since(t.enqueued_at));
+                        let write_time = write_end.saturating_duration_since(write_start);
+                        m.kafka_write_wait_seconds.observe(write_wait.as_secs_f64());
+                        m.kafka_write_time_seconds.observe(write_time.as_secs_f64());
+                    }
                 }
             }
             let _ = writer.shutdown().await;
@@ -351,8 +394,8 @@ impl BrokerConn {
         let disconnect_hook = kprom.clone().map(|k| (k, node.clone()));
         let ext_r = extended_metrics.clone();
         let reader_handle = tokio::spawn(async move {
-            while let Some(payload) =
-                read_kafka_frame_bounded(&mut reader, MAX_KAFKA_FRAME_BYTES).await
+            while let Some((payload, header_at, done_at)) =
+                read_kafka_frame_bounded_timed(&mut reader, MAX_KAFKA_FRAME_BYTES).await
             {
                 let frame_len = payload.len();
                 if let Some(ref m) = ext_r {
@@ -368,7 +411,11 @@ impl BrokerConn {
                     pending_drained_r.notify_waiters();
                 }
                 if let Some(tx) = tx {
-                    let _ = tx.send(Bytes::from(payload));
+                    let _ = tx.send(ReadFrame {
+                        payload: Bytes::from(payload),
+                        header_at,
+                        done_at,
+                    });
                 }
             }
             alive_r.store(false, Ordering::SeqCst);
@@ -608,10 +655,11 @@ impl BrokerConn {
         if !self.is_alive() {
             return Err(KafkaClientError::ConnectionClosed);
         }
-        let (rx, mut guard, written, e2e_start, read_start) =
-            self.enqueue_frame(api_key, api_version, req).await?;
-        let mut resp_buf = match rx.await {
-            Ok(b) => b,
+        let (rx, mut guard, written, timing, read_fallback) =
+            self.enqueue_frame_with_tracking(api_key, api_version, req, track_success)
+                .await?;
+        let read_frame = match rx.await {
+            Ok(rf) => rf,
             Err(_) => {
                 if let Some(ref k) = self.kprom {
                     k.on_read_error(&self.node, written);
@@ -620,13 +668,18 @@ impl BrokerConn {
             }
         };
         guard.completed = true;
+        let mut resp_buf = read_frame.payload;
         if track_success {
             if let Some(ref m) = self.extended_metrics {
-                m.kafka_read_wait_seconds
-                    .observe(read_start.elapsed().as_secs_f64());
-                m.kafka_read_time_seconds.observe(0.0);
-                m.kafka_request_duration_e2e_seconds
-                    .observe(e2e_start.elapsed().as_secs_f64());
+                let (read_wait, read_time, e2e) = Self::compute_read_and_e2e(
+                    timing.as_deref(),
+                    read_frame.header_at,
+                    read_frame.done_at,
+                    read_fallback,
+                );
+                m.kafka_read_wait_seconds.observe(read_wait.as_secs_f64());
+                m.kafka_read_time_seconds.observe(read_time.as_secs_f64());
+                m.kafka_request_duration_e2e_seconds.observe(e2e.as_secs_f64());
             }
             if let Some(ref k) = self.kprom {
                 k.on_e2e(&self.node, written, resp_buf.len() + 4);
@@ -645,6 +698,25 @@ impl BrokerConn {
         Ok(resp)
     }
 
+    fn compute_read_and_e2e(
+        timing: Option<&FrameTiming>,
+        header_at: Instant,
+        done_at: Instant,
+        fallback: Instant,
+    ) -> (Duration, Duration, Duration) {
+        let read_time = done_at.saturating_duration_since(header_at);
+        if let Some((write_start, write_end)) = timing.and_then(|t| *t.write_times.lock()) {
+            let read_wait = header_at.saturating_duration_since(write_end);
+            let write_time = write_end.saturating_duration_since(write_start);
+            let e2e = write_time + read_wait + read_time;
+            (read_wait, read_time, e2e)
+        } else {
+            let read_wait = header_at.saturating_duration_since(fallback);
+            let e2e = done_at.saturating_duration_since(fallback);
+            (read_wait, read_time, e2e)
+        }
+    }
+
     async fn enqueue_frame<Req: Request + Encodable>(
         &self,
         api_key: ApiKey,
@@ -652,10 +724,30 @@ impl BrokerConn {
         req: &Req,
     ) -> Result<
         (
-            oneshot::Receiver<Bytes>,
+            oneshot::Receiver<ReadFrame>,
             PendingGuard<'_>,
             usize,
+            Option<Arc<FrameTiming>>,
             Instant,
+        ),
+        KafkaClientError,
+    > {
+        self.enqueue_frame_with_tracking(api_key, api_version, req, true)
+            .await
+    }
+
+    async fn enqueue_frame_with_tracking<Req: Request + Encodable>(
+        &self,
+        api_key: ApiKey,
+        api_version: i16,
+        req: &Req,
+        track_metrics: bool,
+    ) -> Result<
+        (
+            oneshot::Receiver<ReadFrame>,
+            PendingGuard<'_>,
+            usize,
+            Option<Arc<FrameTiming>>,
             Instant,
         ),
         KafkaClientError,
@@ -685,22 +777,28 @@ impl BrokerConn {
             completed: false,
         };
 
-        let e2e_start = Instant::now();
+        let enqueued_at = Instant::now();
         let written = body.len();
-        let write_start = Instant::now();
-        if self.write_tx.send(body.freeze()).await.is_err() {
+        let timing = if self.extended_metrics.is_some() && track_metrics {
+            Some(Arc::new(FrameTiming {
+                enqueued_at,
+                write_times: parking_lot::Mutex::new(None),
+            }))
+        } else {
+            None
+        };
+        let outbound = OutboundFrame {
+            body: body.freeze(),
+            timing: timing.clone(),
+            track_metrics,
+        };
+        if self.write_tx.send(outbound).await.is_err() {
             if let Some(ref k) = self.kprom {
                 k.on_write_error(&self.node);
             }
             return Err(KafkaClientError::ConnectionClosed);
         }
-        if let Some(ref m) = self.extended_metrics {
-            m.kafka_write_wait_seconds.observe(0.0);
-            m.kafka_write_time_seconds
-                .observe(write_start.elapsed().as_secs_f64());
-        }
-        let read_start = Instant::now();
-        Ok((rx, guard, written, e2e_start, read_start))
+        Ok((rx, guard, written, timing, enqueued_at))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -708,15 +806,15 @@ impl BrokerConn {
         &self,
         api_key: ApiKey,
         api_version: i16,
-        rx: oneshot::Receiver<Bytes>,
+        rx: oneshot::Receiver<ReadFrame>,
         mut guard: PendingGuard<'_>,
         written: usize,
-        e2e_start: Instant,
-        read_start: Instant,
+        timing: Option<Arc<FrameTiming>>,
+        read_fallback: Instant,
         timeout: Duration,
     ) -> Result<Resp, KafkaClientError> {
-        let mut resp_buf = match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(b)) => b,
+        let read_frame = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(rf)) => rf,
             Ok(Err(_)) => {
                 if let Some(ref k) = self.kprom {
                     k.on_read_error(&self.node, written);
@@ -731,12 +829,17 @@ impl BrokerConn {
             }
         };
         guard.completed = true;
+        let mut resp_buf = read_frame.payload;
         if let Some(ref m) = self.extended_metrics {
-            m.kafka_read_wait_seconds
-                .observe(read_start.elapsed().as_secs_f64());
-            m.kafka_read_time_seconds.observe(0.0);
-            m.kafka_request_duration_e2e_seconds
-                .observe(e2e_start.elapsed().as_secs_f64());
+            let (read_wait, read_time, e2e) = Self::compute_read_and_e2e(
+                timing.as_deref(),
+                read_frame.header_at,
+                read_frame.done_at,
+                read_fallback,
+            );
+            m.kafka_read_wait_seconds.observe(read_wait.as_secs_f64());
+            m.kafka_read_time_seconds.observe(read_time.as_secs_f64());
+            m.kafka_request_duration_e2e_seconds.observe(e2e.as_secs_f64());
         }
         if let Some(ref k) = self.kprom {
             k.on_e2e(&self.node, written, resp_buf.len() + 4);

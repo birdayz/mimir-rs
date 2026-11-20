@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use mimir_common::native_histogram::{HistogramOpts, SingleHistogram, DEF_BUCKETS};
 use kafka_protocol::error::{ParseResponseErrorCode, ResponseError};
 use mimir_config::KafkaConfig;
 use parking_lot::Mutex as SyncMutex;
@@ -331,28 +332,29 @@ pub async fn request_json_from_socket<T: for<'de> Deserialize<'de>>(
             .await
             .map_err(|e| format!("requesting credentials from HTTP socket {socket_path}: {e}"))?;
 
-        let raw = String::from_utf8_lossy(&buf);
-        let Some((head, body)) = raw.split_once("\r\n\r\n") else {
+        let Some(split_pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
             return Err(format!(
                 "parsing credentials from HTTP socket {socket_path}: malformed HTTP response"
             ));
         };
+        let head = String::from_utf8_lossy(&buf[..split_pos]);
+        let body = &buf[split_pos + 4..];
         let status_line = head.lines().next().unwrap_or("");
         if status_line.split_whitespace().nth(1) != Some("200") {
             return Err(format!(
                 "requesting credentials from HTTP socket {socket_path}: unexpected status {status_line}"
             ));
         }
-        // Handle chunked transfer encoding if present
-        let decoded_body = if head
+        // Handle chunked transfer encoding on raw bytes before UTF-8/JSON parsing.
+        let decoded_body: std::borrow::Cow<'_, [u8]> = if head
             .to_ascii_lowercase()
             .contains("transfer-encoding: chunked")
         {
-            decode_http_chunked(body)
+            std::borrow::Cow::Owned(decode_http_chunked(body))
         } else {
-            body.to_string()
+            std::borrow::Cow::Borrowed(body)
         };
-        serde_json::from_str::<T>(&decoded_body).map_err(|e| {
+        serde_json::from_slice::<T>(&decoded_body).map_err(|e| {
             format!("parsing credentials from HTTP socket {socket_path}: {e}")
         })
     };
@@ -362,11 +364,23 @@ pub async fn request_json_from_socket<T: for<'de> Deserialize<'de>>(
         .map_err(|_| format!("requesting credentials from HTTP socket {socket_path}: timeout"))?
 }
 
-fn decode_http_chunked(input: &str) -> String {
-    let mut out = String::new();
+fn decode_http_chunked(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
     let mut rest = input;
-    while let Some((size_line, after_size)) = rest.split_once("\r\n") {
-        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+    while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
+        let size_line = &rest[..pos];
+        let after_size = &rest[pos + 2..];
+        let size_part = size_line
+            .split(|&b| b == b';')
+            .next()
+            .unwrap_or(&[]);
+        let Ok(size_str) = std::str::from_utf8(size_part) else {
+            break;
+        };
+        let size_hex = size_str.trim();
+        if size_hex.is_empty() || !size_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            break;
+        }
         let Ok(sz) = usize::from_str_radix(size_hex, 16) else {
             break;
         };
@@ -374,11 +388,12 @@ fn decode_http_chunked(input: &str) -> String {
             break;
         }
         if after_size.len() < sz {
-            out.push_str(after_size);
+            out.extend_from_slice(after_size);
             break;
         }
-        out.push_str(&after_size[..sz]);
-        rest = after_size[sz..].strip_prefix("\r\n").unwrap_or(&after_size[sz..]);
+        out.extend_from_slice(&after_size[..sz]);
+        let rem = &after_size[sz..];
+        rest = rem.strip_prefix(b"\r\n").unwrap_or(rem);
     }
     out
 }
@@ -661,12 +676,12 @@ impl SampledOnlyTracer {
 
 #[derive(Clone)]
 pub struct KafkaClientExtendedMetrics {
-    pub kafka_write_wait_seconds: prometheus::Histogram,
-    pub kafka_write_time_seconds: prometheus::Histogram,
-    pub kafka_read_wait_seconds: prometheus::Histogram,
-    pub kafka_read_time_seconds: prometheus::Histogram,
-    pub kafka_request_duration_e2e_seconds: prometheus::Histogram,
-    pub kafka_request_throttled_seconds: prometheus::Histogram,
+    pub kafka_write_wait_seconds: SingleHistogram,
+    pub kafka_write_time_seconds: SingleHistogram,
+    pub kafka_read_wait_seconds: SingleHistogram,
+    pub kafka_read_time_seconds: SingleHistogram,
+    pub kafka_request_duration_e2e_seconds: SingleHistogram,
+    pub kafka_request_throttled_seconds: SingleHistogram,
     pub connects_total: prometheus::Counter,
     pub read_bytes_total: prometheus::Counter,
     pub write_bytes_total: prometheus::Counter,
@@ -687,9 +702,11 @@ impl KafkaClientExtendedMetrics {
             const_labels.insert("component".to_string(), c.to_string());
         }
         let reg_hist = |name: &str, help: &str| {
-            let mut opts = prometheus::HistogramOpts::new(format!("{prefix}{name}"), help);
-            opts.common_opts.const_labels = const_labels.clone();
-            let h = prometheus::Histogram::with_opts(opts).expect("valid metric");
+            let opts = HistogramOpts::new(format!("{prefix}{name}"), help)
+                .const_labels(const_labels.clone())
+                .buckets(DEF_BUCKETS.to_vec())
+                .native(1.1, 100, Duration::from_secs(3600));
+            let h = SingleHistogram::new(opts).expect("valid metric");
             if let Some(r) = registry {
                 let _ = r.register(Box::new(h.clone()));
             }
@@ -717,27 +734,27 @@ impl KafkaClientExtendedMetrics {
         Self {
             kafka_write_wait_seconds: reg_hist(
                 "kafka_write_wait_seconds",
-                "Time spent waiting to write a Kafka request.",
+                "Time spent waiting to write to Kafka backend.",
             ),
             kafka_write_time_seconds: reg_hist(
                 "kafka_write_time_seconds",
-                "Time spent writing a Kafka request.",
+                "Time spent writing to Kafka backend.",
             ),
             kafka_read_wait_seconds: reg_hist(
                 "kafka_read_wait_seconds",
-                "Time spent waiting to read a Kafka response.",
+                "Time spent waiting to read from Kafka backend.",
             ),
             kafka_read_time_seconds: reg_hist(
                 "kafka_read_time_seconds",
-                "Time spent reading a Kafka response.",
+                "Time spent reading from Kafka backend.",
             ),
             kafka_request_duration_e2e_seconds: reg_hist(
                 "kafka_request_duration_e2e_seconds",
-                "End-to-end duration of a Kafka request.",
+                "Time from the start of when a Kafka request is written to the end of when the response for that request was fully read from the Kafka backend.",
             ),
             kafka_request_throttled_seconds: reg_hist(
                 "kafka_request_throttled_seconds",
-                "Time a Kafka request was throttled by the broker.",
+                "How long Kafka requests have been throttled by the Kafka client.",
             ),
             connects_total: reg_cnt("connects_total", "Total number of Kafka broker connects."),
             read_bytes_total: reg_cnt("read_bytes_total", "Total bytes read from Kafka."),
