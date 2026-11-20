@@ -180,6 +180,9 @@ impl PostingsBatchScratch {
 pub struct MemPostings {
     stripes: [RwLock<PostingsStripe>; POSTINGS_STRIPES],
     all_postings: RwLock<PostingsList>,
+    /// Shared read lock held across `add` so a reader can barrier on `write()`
+    /// between materialising intersecting base postings and resolving subtracting matchers.
+    add_gate: RwLock<()>,
     ordered: AtomicBool,
 }
 
@@ -204,6 +207,7 @@ impl MemPostings {
         Self {
             stripes: std::array::from_fn(|_| RwLock::new(PostingsStripe::default())),
             all_postings: RwLock::new(PostingsList::default()),
+            add_gate: RwLock::new(()),
             ordered: AtomicBool::new(ordered),
         }
     }
@@ -215,6 +219,7 @@ impl MemPostings {
 
     /// Adds `series_ref` for all `(name_id, value_id)` pairs in `labels`, plus `ALL_POSTINGS_KEY`.
     pub fn add(&self, series_ref: u64, labels: &SymbolLabels) {
+        let _gate = self.add_gate.read();
         let ordered = self.ordered.load(AtomicOrdering::Acquire);
         {
             let mut all = self.all_postings.write();
@@ -267,6 +272,7 @@ impl MemPostings {
         if batch.is_empty() {
             return;
         }
+        let _gate = self.add_gate.read();
         let ordered = self.ordered.load(AtomicOrdering::Acquire);
         {
             let mut all = self.all_postings.write();
@@ -308,12 +314,17 @@ impl MemPostings {
             return;
         }
         if batches.len() <= 1 || non_empty < 256 {
+            // `add_batch_unordered_with_scratch` takes `add_gate` itself. Never hold it here:
+            // a recursive `parking_lot` read deadlocks once a reader has queued its
+            // `add_gate.write()` barrier between the two acquisitions.
             let mut scratch = PostingsBatchScratch::new();
             for b in batches {
                 self.add_batch_unordered_with_scratch(b, &mut scratch);
             }
             return;
         }
+        // Held by this thread only: the pool workers below never touch `add_gate`.
+        let _gate = self.add_gate.read();
 
         let ordered = self.ordered.load(AtomicOrdering::Acquire);
         let mut scratches: Vec<PostingsBatchScratch> =
@@ -987,20 +998,32 @@ impl MemPostings {
         }
 
         let mut its: SmallVec<[MemTerm; 8]> = SmallVec::new();
-        let mut not_its: SmallVec<[MemTerm; 4]> = SmallVec::new();
+        let mut intersecting: SmallVec<[&LabelMatcher; 8]> = SmallVec::new();
+        let mut subtracting: SmallVec<[&LabelMatcher; 4]> = SmallVec::new();
+        for m in matchers {
+            if is_subtracting_matcher(m) {
+                subtracting.push(m);
+            } else {
+                intersecting.push(m);
+            }
+        }
 
         if has_subtracting && !has_intersecting {
             let len = self.all_postings.read().len();
             if len == 0 {
+                for m in &subtracting {
+                    if m.name.is_empty() && m.value.is_empty() {
+                        return Err(PostingsError::UnexpectedAllPostings);
+                    }
+                }
                 return Ok(Vec::new());
             }
             its.push(MemTerm::AllPostings { len_hint: len });
         }
 
-        let mut ordered: SmallVec<[&LabelMatcher; 8]> = matchers.iter().collect();
-        ordered.sort_by_key(|m| is_subtracting_matcher(m));
-
-        for m in ordered {
+        // Phase 1: resolve and materialise all intersecting terms (and all_postings base)
+        // BEFORE resolving any subtracting matcher.
+        for m in intersecting {
             if m.name.is_empty() && m.value.is_empty() {
                 return Err(PostingsError::UnexpectedAllPostings);
             }
@@ -1017,35 +1040,18 @@ impl MemPostings {
                 }
                 continue;
             }
-            if m.match_type == MatchType::RegexNotMatch && m.value == ".+" {
-                if let Some(t) = self.resolve_all_values_term(symbols, &m.name) {
-                    not_its.push(t);
+            let is_not = matches!(m.match_type, MatchType::NotEqual | MatchType::RegexNotMatch);
+            if is_not {
+                let inv = m.inverse()?;
+                match self.resolve_inverse_single_matcher_term(symbols, &inv) {
+                    Some(t) => its.push(t),
+                    None => return Ok(Vec::new()),
                 }
-                continue;
-            }
-
-            if label_must_be_set.contains(m.name.as_str()) {
-                let matches_empty = m.matches_empty();
-                let is_not = matches!(m.match_type, MatchType::NotEqual | MatchType::RegexNotMatch);
-                if is_not && matches_empty {
-                    let inv = m.inverse()?;
-                    if let Some(t) = self.resolve_single_matcher_term(symbols, &inv) {
-                        not_its.push(t);
-                    }
-                } else if is_not && !matches_empty {
-                    let inv = m.inverse()?;
-                    match self.resolve_inverse_single_matcher_term(symbols, &inv) {
-                        Some(t) => its.push(t),
-                        None => return Ok(Vec::new()),
-                    }
-                } else {
-                    match self.resolve_single_matcher_term(symbols, m) {
-                        Some(t) => its.push(t),
-                        None => return Ok(Vec::new()),
-                    }
+            } else {
+                match self.resolve_single_matcher_term(symbols, m) {
+                    Some(t) => its.push(t),
+                    None => return Ok(Vec::new()),
                 }
-            } else if let Some(t) = self.resolve_inverse_single_matcher_term(symbols, m) {
-                not_its.push(t);
             }
         }
 
@@ -1060,15 +1066,58 @@ impl MemPostings {
         let mut acc = PostingsAcc::from_term(self, &its[0]);
         for term in &its[1..] {
             if acc.is_empty() {
-                return Ok(Vec::new());
+                break;
             }
             acc.intersect_term(self, term);
         }
-        for term in &not_its {
-            if acc.is_empty() {
-                return Ok(Vec::new());
+
+        if acc.is_empty() {
+            for m in &subtracting {
+                if m.name.is_empty() && m.value.is_empty() {
+                    return Err(PostingsError::UnexpectedAllPostings);
+                }
             }
-            acc.subtract_term(self, term);
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: wait for any concurrent `add()` that could have contributed a ref to `acc`
+        // to finish all its stripe writes before resolving subtracting matchers.
+        if !subtracting.is_empty() {
+            drop(self.add_gate.write());
+
+            let mut not_its: SmallVec<[MemTerm; 4]> = SmallVec::new();
+            for m in subtracting {
+                if m.name.is_empty() && m.value.is_empty() {
+                    return Err(PostingsError::UnexpectedAllPostings);
+                }
+                if m.match_type == MatchType::RegexMatch && m.value == ".*" {
+                    continue;
+                }
+                if m.match_type == MatchType::RegexNotMatch && m.value == ".*" {
+                    return Ok(Vec::new());
+                }
+                if m.match_type == MatchType::RegexNotMatch && m.value == ".+" {
+                    if let Some(t) = self.resolve_all_values_term(symbols, &m.name) {
+                        not_its.push(t);
+                    }
+                    continue;
+                }
+                if label_must_be_set.contains(m.name.as_str()) {
+                    let inv = m.inverse()?;
+                    if let Some(t) = self.resolve_single_matcher_term(symbols, &inv) {
+                        not_its.push(t);
+                    }
+                } else if let Some(t) = self.resolve_inverse_single_matcher_term(symbols, m) {
+                    not_its.push(t);
+                }
+            }
+
+            for term in &not_its {
+                if acc.is_empty() {
+                    return Ok(Vec::new());
+                }
+                acc.subtract_term(self, term);
+            }
         }
         Ok(acc.into_u64_vec())
     }
@@ -3037,5 +3086,60 @@ mod tests {
         let nid = syms.get("__name__").unwrap();
         let vid = syms.get("parallel_req_total").unwrap();
         assert_eq!(p.postings_len(nid, vid), total);
+    }
+
+    /// The small-batch path of `add_batches_unordered_parallel` delegates to
+    /// `add_batch_unordered_with_scratch`, which takes `add_gate` itself. Holding the gate
+    /// across that call is a recursive `parking_lot` read: it deadlocks as soon as a
+    /// `postings_for_matchers` subtracting-matcher barrier (`add_gate.write()`) queues in between.
+    ///
+    /// Skipped under Miri because contended `parking_lot::RwLock` parks via
+    /// `libc::syscall(SYS_futex, &self.futex, ...)` passing `&AtomicI32` instead of `*mut u32`,
+    /// which triggers Miri's strict C-variadic argument type check.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn add_batches_unordered_parallel_small_path_does_not_reenter_add_gate() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let mut syms = SymbolTable::new();
+        let lbls = SymbolLabels::from_pairs(&mut syms, [("__name__", "gate_reentry"), ("job", "a")]);
+        let batches: Arc<Vec<Vec<(u64, SymbolLabels)>>> = Arc::new(vec![vec![(1, lbls)]]);
+        let p = Arc::new(MemPostings::new_unordered());
+        let iterations = if cfg!(miri) { 50usize } else { 20_000usize };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = {
+            let (p, stop) = (Arc::clone(&p), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(AtomicOrdering::Acquire) {
+                    drop(p.add_gate.write());
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let adder = {
+            let (p, batches) = (Arc::clone(&p), Arc::clone(&batches));
+            std::thread::spawn(move || {
+                let pool = mimir_common::thread_pool::ScopedWorkerPool::new("gate-reentry", 2);
+                for _ in 0..iterations {
+                    p.add_batches_unordered_parallel(&batches, &pool);
+                }
+                let _ = done_tx.send(());
+            })
+        };
+
+        let finished = done_rx.recv_timeout(Duration::from_secs(120)).is_ok();
+        stop.store(true, AtomicOrdering::Release);
+        assert!(
+            finished,
+            "add_batches_unordered_parallel deadlocked against a queued add_gate.write() barrier"
+        );
+        adder.join().unwrap();
+        barrier.join().unwrap();
+        assert_eq!(p.all_postings.read().len(), iterations);
     }
 }

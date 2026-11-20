@@ -561,7 +561,7 @@ fn vault_enabled_is_rejected_explicitly() {
     let file = dir.path().join("mimir.yaml");
     fs::write(
         &file,
-        "target: ingester\nvault:\n  enabled: true\n  url: http://vault:8200\n",
+        "target: ingester\nvault:\n  enabled: true\n  url: http://vault:8200\n  mount_path: secret\n  auth:\n    type: token\n",
     )
     .unwrap();
     let cfg_arg = format!("-config.file={}", file.display());
@@ -577,13 +577,31 @@ fn vault_enabled_is_rejected_explicitly() {
             .unwrap();
     assert!(!loaded.config.vault_enabled().unwrap());
 
-    // Flag only (bool flag without value).
+    // Flags only (bool flag without value) with a config passing `vault.Config.Validate`.
+    let err = parse_cli_and_load_config(
+        "mimir",
+        &[
+            "-target=ingester".to_string(),
+            "-vault.enabled".to_string(),
+            "-vault.url=http://vault:8200".to_string(),
+            "-vault.mount-path=secret".to_string(),
+            "-vault.auth.type=token".to_string(),
+        ],
+    )
+    .expect_err("-vault.enabled must be rejected");
+    assert_eq!(err.to_string(), MSG);
+
+    // pkg/vault/vault.go `Config.Validate` (wrapped with "invalid vault config" by
+    // pkg/mimir/mimir.go) runs first, so an incomplete Vault config reports Go's own error.
     let err = parse_cli_and_load_config(
         "mimir",
         &["-target=ingester".to_string(), "-vault.enabled".to_string()],
     )
     .expect_err("-vault.enabled must be rejected");
-    assert_eq!(err.to_string(), MSG);
+    assert_eq!(
+        err.to_string(),
+        "error validating config: invalid vault config: empty vault URL supplied"
+    );
 
     // Disabled (default) or explicitly false: accepted.
     let mut cfg = MimirConfig::default();

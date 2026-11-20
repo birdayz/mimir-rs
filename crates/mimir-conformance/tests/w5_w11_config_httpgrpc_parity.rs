@@ -570,6 +570,55 @@ async fn p1_6_p1_7_p1_8_p2_2_httpgrpc_urls_headers_compression_and_cost_attribut
     assert_eq!(r_rel.code, g_rel.code);
     assert_eq!(r_rel.headers, g_rel.headers);
 
+    // gorilla/mux `cleanPath` 301 redirects over httpgrpc: code, headers (`Location` only) and
+    // body must match Go for every non-canonical URL shape.
+    for url in [
+        "//ready",
+        "/./ready",
+        "/ready/.",
+        "/ingester/../ready?x=1",
+        "/ingester//ring?tokens=true",
+        "ready?x=1#frag",
+        "//ready#frag",
+        "http://example.com//ready?q=1",
+        "http://example.com",
+        "http:/x//y",
+        "mailto:foo@bar",
+        // `UseEncodedPath`: the cleaned escaped path is escaped once more in `Location`.
+        "/a//b%20c",
+        "/a//b c",
+        "//host//a%41",
+        "/a//b(c)!",
+        "/%2e%2e//ready",
+        "",
+    ] {
+        let mk = || HttpRequest {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: Bytes::new(),
+        };
+        let g = gc.handle(with_org(mk())).await.unwrap().into_inner();
+        let r = rc.handle(with_org(mk())).await.unwrap().into_inner();
+        assert_eq!(g.code, 301, "go url={url:?}");
+        assert_eq!(r.code, g.code, "url={url:?}");
+        assert_eq!(r.headers, g.headers, "url={url:?}");
+        assert_eq!(r.body, g.body, "url={url:?}");
+    }
+    // A scheme-less `//authority` is not part of `url.Path` (`net/url.Parse`): the path after it
+    // is routed.
+    let auth_req = || HttpRequest {
+        method: "GET".to_string(),
+        url: "//host/ready".to_string(),
+        headers: Vec::new(),
+        body: Bytes::new(),
+    };
+    let g_auth = gc.handle(with_org(auth_req())).await.unwrap().into_inner();
+    let r_auth = rc.handle(with_org(auth_req())).await.unwrap().into_inner();
+    assert_eq!(g_auth.code, 200);
+    assert_eq!(r_auth.code, g_auth.code);
+    assert_eq!(r_auth.body, g_auth.body);
+
     let mut raw_client = HttpClient::new(rs_ch)
         .send_compressed(CompressionEncoding::Zstd)
         .accept_compressed(CompressionEncoding::Zstd);

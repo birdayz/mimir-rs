@@ -121,8 +121,8 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         ));
         router = router.route(
             "/metrics",
-            any(move |st: AxumState<AppHttpState>, headers: HeaderMap| {
-                metrics_handler(st, headers, Arc::clone(&cache))
+            any(move |st: AxumState<AppHttpState>, RawQuery(raw_query): RawQuery, headers: HeaderMap| {
+                metrics_handler(st, RawQuery(raw_query), headers, Arc::clone(&cache))
             }),
         );
     }
@@ -135,9 +135,12 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         cost_attribution_path = Some(path.clone());
         router = router.route(
             &path,
-            get(move |headers: HeaderMap| {
+            get(move |RawQuery(raw_query): RawQuery, headers: HeaderMap| {
                 let reg = reg.clone();
-                async move { encode_families(&reg.gather(), &headers, false, None) }
+                async move {
+                    let filter = parse_name_filter(raw_query.as_deref());
+                    encode_families(&reg.gather(), &headers, false, None, filter.as_ref())
+                }
             }),
         );
     }
@@ -179,10 +182,14 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         app
     };
 
+    // Go `gorilla/mux` `ServeHTTP` (`cleanPath`) redirects non-canonical paths with 301
+    // before routing, inside the `Connection: close` shutdown layer.
     // Go disables HTTP keep-alives as soon as a shutdown signal is received
     // (`t.Server.HTTPServer.SetKeepAlivesEnabled(false)`): responses then carry
     // `Connection: close` and connections are closed after the response.
-    router.layer(axum::middleware::map_response(move |mut resp: Response| {
+    router
+        .layer(axum::middleware::from_fn(clean_path_middleware))
+        .layer(axum::middleware::map_response(move |mut resp: Response| {
         let shutdown_requested = Arc::clone(&shutdown_requested);
         async move {
             if shutdown_requested.load(Ordering::Acquire) {
@@ -258,19 +265,263 @@ async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
 /// true})` (wrapped by `metrics.CachedHandlerFor` when `-server.metrics-cache-duration` > 0):
 /// content negotiation (OpenMetrics 1.0.0/0.0.1, delimited protobuf, text 0.0.4), `Vary` headers
 /// and gzip response compression.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingCleanPathRedirect(pub String);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CleanPathHandled;
+
+/// Matches Go `gorilla/mux` `cleanPath` (POSIX `path.Clean` preserving trailing `/`).
+fn gorilla_mux_clean_path(p: &[u8]) -> Vec<u8> {
+    if p.is_empty() {
+        return b"/".to_vec();
+    }
+    let prefixed: std::borrow::Cow<'_, [u8]> = if p[0] == b'/' {
+        std::borrow::Cow::Borrowed(p)
+    } else {
+        let mut v = Vec::with_capacity(p.len() + 1);
+        v.push(b'/');
+        v.extend_from_slice(p);
+        std::borrow::Cow::Owned(v)
+    };
+    let mut stack: Vec<&[u8]> = Vec::new();
+    for seg in prefixed.split(|&b| b == b'/') {
+        match seg {
+            b"" | b"." => {}
+            b".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    let mut np = Vec::with_capacity(prefixed.len());
+    for seg in &stack {
+        np.push(b'/');
+        np.extend_from_slice(seg);
+    }
+    // `path.Clean` drops the trailing slash except for the root: put it back.
+    if np.is_empty() || prefixed.ends_with(b"/") {
+        np.push(b'/');
+    }
+    np
+}
+
+/// Go `net/url` `unescape(s, encodePath)`: decodes `%XX`, leaving anything else (including `+`
+/// and malformed escapes, which Go rejects before routing) untouched.
+fn go_path_unescape(raw: &str) -> Vec<u8> {
+    let hex = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Go `net/url` `shouldEscape(c, encodePath)`: everything but unreserved characters and
+/// `$&+,/:;=@` is escaped.
+fn go_should_escape_path(b: u8) -> bool {
+    !(b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'_' | b'.' | b'~' | b'$' | b'&' | b'+' | b',' | b'/' | b':' | b';' | b'=' | b'@'
+        ))
+}
+
+/// Go `net/url` `escape(s, encodePath)` (upper-case hex digits).
+fn go_path_escape(path: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(path.len());
+    for &b in path {
+        if go_should_escape_path(b) {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
+/// Go `net/url` `validEncoded(s, encodePath)`.
+fn go_valid_encoded_path(s: &str) -> bool {
+    s.bytes().all(|b| {
+        matches!(
+            b,
+            b'!' | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'['
+                | b']'
+                | b'%'
+        ) || !go_should_escape_path(b)
+    })
+}
+
+/// Go `URL.EscapedPath()` for a URL whose `Path` is `path` and whose `RawPath` is `raw_path`.
+fn go_escaped_path(path: &[u8], raw_path: &str) -> String {
+    if !raw_path.is_empty() && go_valid_encoded_path(raw_path) && go_path_unescape(raw_path) == path
+    {
+        return raw_path.to_string();
+    }
+    if path == b"*" {
+        return "*".to_string();
+    }
+    go_path_escape(path)
+}
+
+/// `gorilla/mux` `Router.ServeHTTP` with `UseEncodedPath()` (pkg/api/api.go): `cleanPath` runs on
+/// `req.URL.EscapedPath()`, and a non-canonical path is answered with a 301 whose `Location` is
+/// `url.Path = p; url.String()`. Because `p` is the cleaned *escaped* path, Go escapes it once
+/// more (`//a%20b` redirects to `/a%2520b`). Returns that `Location` path for `p` (the path as
+/// found in the URL, `URL.setPath(p)`), or `None` when the path is canonical.
+pub(crate) fn gorilla_mux_clean_path_redirect(p: &str) -> Option<String> {
+    let path = go_path_unescape(p);
+    let raw_path = if go_path_escape(&path) == p { "" } else { p };
+    let escaped = go_escaped_path(&path, raw_path);
+    let cleaned = gorilla_mux_clean_path(escaped.as_bytes());
+    (cleaned != escaped.as_bytes()).then(|| go_escaped_path(&cleaned, raw_path))
+}
+
+pub(crate) fn clean_path_redirect_response(loc: &str) -> Response {
+    let mut resp = Response::new(axum::body::Body::empty());
+    *resp.status_mut() = StatusCode::MOVED_PERMANENTLY;
+    if let Ok(val) = HeaderValue::from_bytes(loc.as_bytes()) {
+        resp.headers_mut().insert(header::LOCATION, val);
+    }
+    resp.extensions_mut().insert(CleanPathHandled);
+    resp
+}
+
+async fn clean_path_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(PendingCleanPathRedirect(loc)) = req.extensions().get::<PendingCleanPathRedirect>() {
+        return clean_path_redirect_response(loc);
+    }
+    let uri = req.uri();
+    if let Some(cleaned) = gorilla_mux_clean_path_redirect(uri.path()) {
+        let mut loc = String::new();
+        if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
+            loc.push_str(scheme);
+            loc.push_str("://");
+            loc.push_str(authority.as_str());
+        }
+        loc.push_str(&cleaned);
+        if let Some(q) = uri.query() {
+            loc.push('?');
+            loc.push_str(q);
+        }
+        return clean_path_redirect_response(&loc);
+    }
+    next.run(req).await
+}
+
+fn percent_decode_form(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |b: u8| match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                };
+                if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_name_filter(raw_query: Option<&str>) -> Option<std::collections::HashSet<String>> {
+    let q = raw_query?;
+    let mut names = std::collections::HashSet::new();
+    for part in q.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+        let (raw_k, raw_v) = match part.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (part, ""),
+        };
+        if percent_decode_form(raw_k) == "name[]" {
+            names.insert(percent_decode_form(raw_v));
+        }
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+fn join_header_values(headers: &HeaderMap, name: &header::HeaderName) -> Option<String> {
+    let mut joined = String::new();
+    for v in headers.get_all(name) {
+        if let Ok(s) = std::str::from_utf8(v.as_bytes()) {
+            if !joined.is_empty() {
+                joined.push(',');
+            }
+            joined.push_str(s);
+        }
+    }
+    (!joined.is_empty()).then_some(joined)
+}
+
 async fn metrics_handler(
     AxumState(st): AxumState<AppHttpState>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     cache: Arc<MetricsCache>,
 ) -> Response {
     tokio::task::spawn_blocking(move || {
         let families = cache.gather(&st.registry);
+        let filter = parse_name_filter(raw_query.as_deref());
         let created = st
             .config
             .server
             .enable_open_metrics_text_created_samples
             .then_some(cache.as_ref());
-        encode_families(&families, &headers, true, created)
+        encode_families(&families, &headers, true, created, filter.as_ref())
     })
     .await
     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -281,17 +532,28 @@ fn encode_families(
     headers: &HeaderMap,
     enable_open_metrics: bool,
     created_tracker: Option<&MetricsCache>,
+    name_filter: Option<&std::collections::HashSet<String>>,
 ) -> Response {
-    let header_str = |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
-    let format = crate::expfmt::negotiate_with_options(header_str(header::ACCEPT), enable_open_metrics);
+    let filtered: std::borrow::Cow<'_, [prometheus::proto::MetricFamily]> = match name_filter {
+        Some(filter) => std::borrow::Cow::Owned(
+            families
+                .iter()
+                .filter(|mf| filter.contains(mf.get_name()))
+                .cloned()
+                .collect(),
+        ),
+        None => std::borrow::Cow::Borrowed(families),
+    };
+    let accept = join_header_values(headers, &header::ACCEPT);
+    let format = crate::expfmt::negotiate_with_options(accept.as_deref(), enable_open_metrics);
     let encoded = if format.kind == crate::expfmt::FormatType::OpenMetrics {
         if let Some(cache) = created_tracker {
-            Ok(encode_openmetrics_with_created(families, cache, format.escaping_scheme()))
+            Ok(encode_openmetrics_with_created(&filtered, cache, format.escaping_scheme()))
         } else {
-            crate::expfmt::encode(families, &format)
+            crate::expfmt::encode(&filtered, &format)
         }
     } else {
-        crate::expfmt::encode(families, &format)
+        crate::expfmt::encode(&filtered, &format)
     };
     let body = match encoded {
         Ok(b) => b,
@@ -309,7 +571,8 @@ fn encode_families(
         .header(header::VARY, "Accept")
         .header(header::VARY, "Accept-Encoding")
         .header(header::CONTENT_TYPE, format.content_type);
-    let body = match crate::expfmt::negotiate_content_encoding(header_str(header::ACCEPT_ENCODING)) {
+    let accept_encoding = join_header_values(headers, &header::ACCEPT_ENCODING);
+    let body = match crate::expfmt::negotiate_content_encoding(accept_encoding.as_deref()) {
         Some("gzip") => {
             builder = builder.header(header::CONTENT_ENCODING, "gzip");
             gzip_bytes(&body)
@@ -1218,6 +1481,51 @@ fn html_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Expected values produced by Go: `url.ParseRequestURI(in)`, `gorilla/mux`
+    /// `cleanPath(u.EscapedPath())` (`UseEncodedPath`) and, when it differs,
+    /// `u.Path = p; u.String()` (`None`: no redirect).
+    #[test]
+    fn gorilla_mux_clean_path_redirect_matches_go() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("/ready", None),
+            ("/ready/", None),
+            ("//ready", Some("/ready")),
+            ("/./ready", Some("/ready")),
+            ("/ready/..", Some("/")),
+            ("/ready/../", Some("/")),
+            ("/foo%2F%2Fbar", None),
+            ("/%2e%2e/ready", None),
+            ("/ingester/%2E/ring", None),
+            ("/ready%2F", None),
+            ("//foo(bar)", Some("/foo%28bar%29")),
+            ("//foo%20bar", Some("/foo%2520bar")),
+            ("/foo//b%41r", Some("/foo/b%2541r")),
+            ("//a%2Fb", Some("/a%252Fb")),
+            ("/%72eady", None),
+            ("//x*y", Some("/x%2Ay")),
+            ("/a//b!c'd", Some("/a/b%21c%27d")),
+            ("//a%ffb", Some("/a%25ffb")),
+            ("/a/./b/", Some("/a/b/")),
+            ("///", Some("/")),
+            ("//a+b", Some("/a+b")),
+            ("//a%2Bb", Some("/a%252Bb")),
+            ("//a%3Fb", Some("/a%253Fb")),
+            ("//a;b,c:d@e&f=g$h", Some("/a;b,c:d@e&f=g$h")),
+            ("//a~b_c-d.e", Some("/a~b_c-d.e")),
+            ("//a%25b", Some("/a%2525b")),
+            ("//a[b]{c}|d^e", Some("/a%255Bb%255D%257Bc%257D%257Cd%255Ee")),
+            ("/", None),
+            ("//", Some("/")),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                super::gorilla_mux_clean_path_redirect(input).as_deref(),
+                *want,
+                "path {input:?}"
+            );
+        }
+    }
+
     use super::*;
     use axum::body::Body;
     use http::{Method, Request};

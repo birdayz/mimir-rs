@@ -293,6 +293,10 @@ impl Http for HttpGrpcBridge {
         request: Request<httpgrpcpb::HttpRequest>,
     ) -> Result<Response<httpgrpcpb::HttpResponse>, Status> {
         let error_log = request.extensions().get::<GrpcErrorLog>().cloned();
+        let parent_span_attrs = request
+            .extensions()
+            .get::<crate::server::grpc_server::GrpcSpanAttributes>()
+            .cloned();
         let outer_trace = request
             .extensions()
             .get::<mimir_common::tracing::TraceContext>()
@@ -311,43 +315,40 @@ impl Http for HttpGrpcBridge {
         validate_go_url(&req.url)
             .map_err(|e| Status::unknown(format!("parse {:?}: {e}", req.url)))?;
 
-        // `gorilla/mux` `ServeHTTP` (`cleanPath`): a non-empty relative URL without a leading `/`
-        // (e.g. `"ready"`, `"ingester/ring"`, or `"ready?x=1"`) redirects 301 to `/<path>[?<query>]`
-        // before `http::Uri` parsing (which rejects `/` or `?` without a leading slash).
-        let without_frag = req.url.split('#').next().unwrap_or(&req.url);
-        let (raw_path, raw_query) = match without_frag.split_once('?') {
-            Some((p, q)) => (p, Some(q)),
-            None => (without_frag, None),
+        let GoUrlCleanPath {
+            redirect: pending_redirect,
+            path: raw_url_path,
+            route_url,
+        } = split_go_url_clean_redirect(&req.url);
+        let uri = if pending_redirect.is_some() {
+            Uri::from_static("/__clean_path_redirect__")
+        } else {
+            parse_go_url_to_http_uri(route_url.as_deref().unwrap_or(&req.url))
+                .map_err(|e| Status::unknown(format!("parse {:?}: {e}", req.url)))?
         };
-        if !raw_path.is_empty() && !raw_path.contains("://") && !raw_path.starts_with('/') {
-            let location = match raw_query {
-                Some(q) => format!("/{raw_path}?{q}"),
-                None => format!("/{raw_path}"),
-            };
-            return Ok(Response::new(httpgrpcpb::HttpResponse {
-                code: 301,
-                headers: vec![httpgrpcpb::Header {
-                    key: "Location".to_string(),
-                    values: vec![location],
-                }],
-                body: Bytes::new(),
-            }));
-        }
-
-        let uri = parse_go_url_to_http_uri(&req.url)
-            .map_err(|e| Status::unknown(format!("parse {:?}: {e}", req.url)))?;
 
         let mut req_headers = HeaderMap::new();
+        let mut raw_org_id: Option<mimir_ingester::http::RawScopeOrgId> = None;
         for h in req.headers {
             let Ok(name) = HeaderName::from_bytes(h.key.as_bytes()) else {
                 continue;
             };
+            let is_org_id = name.as_str().eq_ignore_ascii_case("x-scope-orgid");
+            if is_org_id {
+                raw_org_id = None;
+            }
             // Go `httpgrpc.ToHeader`: `header[http.CanonicalHeaderKey(h.Key)] = h.Values` overwrites
             // any prior entry for the same canonical header name.
             req_headers.remove(&name);
-            for v in h.values {
-                if let Ok(val) = HeaderValue::from_str(&v) {
-                    req_headers.append(name.clone(), val);
+            for (idx, v) in h.values.into_iter().enumerate() {
+                match HeaderValue::from_bytes(v.as_bytes()) {
+                    Ok(val) => {
+                        req_headers.append(name.clone(), val);
+                    }
+                    Err(_) if is_org_id && idx == 0 => {
+                        raw_org_id = Some(mimir_ingester::http::RawScopeOrgId(v.into_bytes()));
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -361,10 +362,14 @@ impl Http for HttpGrpcBridge {
                 mimir_common::tracing::start_server_span_context(&from_inner, false)
             }
         };
-        let url_path = uri.path().to_string();
+        let url_path = if pending_redirect.is_some() {
+            raw_url_path
+        } else {
+            uri.path().to_string()
+        };
         let user_agent = req_headers
             .get(http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
             .unwrap_or("")
             .to_string();
         let matched_route_cell = Arc::new(parking_lot::Mutex::new(None));
@@ -377,53 +382,78 @@ impl Http for HttpGrpcBridge {
         http_req
             .extensions_mut()
             .insert(CapturedMatchedRoute(Arc::clone(&matched_route_cell)));
+        if let Some(ref loc) = pending_redirect {
+            http_req
+                .extensions_mut()
+                .insert(crate::http::PendingCleanPathRedirect(loc.clone()));
+        }
+        if let Some(raw_org) = raw_org_id {
+            http_req.extensions_mut().insert(raw_org);
+        }
         if effective_trace.is_valid() {
             http_req.extensions_mut().insert(effective_trace.clone());
         }
 
         let span_start = mimir_common::tracing::now_unix_nanos();
-        let resp = mimir_common::tracing::with_trace_context(
+        let mut resp = mimir_common::tracing::with_trace_context(
             effective_trace.clone(),
             self.router.clone().oneshot(http_req),
         )
         .await
         .map_err(|e| Status::internal(format!("router error: {e}")))?;
+        if let Some(ref loc) = pending_redirect {
+            if resp.extensions().get::<crate::http::CleanPathHandled>().is_none() {
+                resp = crate::http::clean_path_redirect_response(loc);
+            }
+            // gorilla/mux only sets `Location` on the `httptest.ResponseRecorder` that dskit's
+            // `httpgrpc` server reads the headers from. Axum's routing adds `Content-Length: 0`
+            // to the empty redirect body, which Go never reports over `httpgrpc`.
+            resp.headers_mut().remove(http::header::CONTENT_LENGTH);
+        }
+        let route_name = if pending_redirect.is_some() {
+            String::new()
+        } else {
+            matched_route_cell
+                .lock()
+                .take()
+                .unwrap_or_else(|| {
+                    if resp.status() == http::StatusCode::NOT_FOUND {
+                        "notfound".to_string()
+                    } else {
+                        String::new()
+                    }
+                })
+        };
+        let http_span_attrs = vec![
+            mimir_common::tracing::SpanAttribute {
+                key: "http.request.method".to_string(),
+                value: mimir_common::tracing::SpanAttrValue::String(method.to_string()),
+            },
+            mimir_common::tracing::SpanAttribute {
+                key: "http.route".to_string(),
+                value: mimir_common::tracing::SpanAttrValue::String(route_name.clone()),
+            },
+            mimir_common::tracing::SpanAttribute {
+                key: "user_agent.original".to_string(),
+                value: mimir_common::tracing::SpanAttrValue::String(user_agent),
+            },
+            mimir_common::tracing::SpanAttribute {
+                key: "url.path".to_string(),
+                value: mimir_common::tracing::SpanAttrValue::String(url_path),
+            },
+        ];
+        if let Some(ref parent_attrs) = parent_span_attrs {
+            parent_attrs.0.lock().extend(http_span_attrs.clone());
+        }
         if effective_trace.is_sampled() {
             if let Some(rt) = mimir_common::tracing::global_tracing() {
                 if rt.exporter.is_some() {
-                    let route_name = matched_route_cell
-                        .lock()
-                        .take()
-                        .unwrap_or_else(|| {
-                            if resp.status() == http::StatusCode::NOT_FOUND {
-                                "notfound".to_string()
-                            } else {
-                                String::new()
-                            }
-                        });
                     let span_name = if route_name.is_empty() {
                         format!("HTTP {method}")
                     } else {
                         format!("HTTP {method} - {route_name}")
                     };
-                    let mut attributes = vec![
-                        mimir_common::tracing::SpanAttribute {
-                            key: "http.request.method".to_string(),
-                            value: mimir_common::tracing::SpanAttrValue::String(method.to_string()),
-                        },
-                        mimir_common::tracing::SpanAttribute {
-                            key: "http.route".to_string(),
-                            value: mimir_common::tracing::SpanAttrValue::String(route_name),
-                        },
-                        mimir_common::tracing::SpanAttribute {
-                            key: "user_agent.original".to_string(),
-                            value: mimir_common::tracing::SpanAttrValue::String(user_agent),
-                        },
-                        mimir_common::tracing::SpanAttribute {
-                            key: "url.path".to_string(),
-                            value: mimir_common::tracing::SpanAttrValue::String(url_path),
-                        },
-                    ];
+                    let mut attributes = http_span_attrs;
                     if let Some(ref dbg) = effective_trace.jaeger_debug_id {
                         attributes.push(mimir_common::tracing::SpanAttribute {
                             key: "jaeger-debug-id".to_string(),
@@ -451,7 +481,7 @@ impl Http for HttpGrpcBridge {
         let do_not_log_error = resp_headers.remove("x-donotlogerror").is_some();
         let error_msg_override = resp_headers
             .remove("x-errormessage")
-            .and_then(|v| v.to_str().ok().map(str::to_string))
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok().map(str::to_string))
             .filter(|s| !s.is_empty());
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -487,9 +517,119 @@ impl Http for HttpGrpcBridge {
     }
 }
 
-/// Parses `req.url` with Go `net/url.Parse` tolerance (accepting relative paths without leading
-/// `/` and unescaped `{}`/`[]`/`"`/`|`/`^`/spaces in query strings) and encodes disallowed
-/// RFC 3986 characters so `http::Uri` can pass it into Axum's `Router`.
+/// `req.url` split the way Go `net/url.Parse` splits it, with the outcome of `gorilla/mux`
+/// `cleanPath` on its path.
+struct GoUrlCleanPath {
+    /// `Location` of the 301 redirect `gorilla/mux` answers with (`url.String()` with the
+    /// cleaned path), when the path is not canonical.
+    redirect: Option<String>,
+    /// `url.Path` as found in `req.url`.
+    path: String,
+    /// `path[?query]` to route instead of `req.url` when Go parsed a scheme-less
+    /// `//authority` out of it (`//host/ready` routes `/ready`).
+    route_url: Option<String>,
+}
+
+/// `net/url` `getScheme`: `(scheme, rest)`, with an empty scheme when there is none.
+fn go_url_scheme(raw: &str) -> (&str, &str) {
+    for (i, &c) in raw.as_bytes().iter().enumerate() {
+        match c {
+            b'a'..=b'z' | b'A'..=b'Z' => {}
+            b'0'..=b'9' | b'+' | b'-' | b'.' if i > 0 => {}
+            b':' if i > 0 => return (&raw[..i], &raw[i + 1..]),
+            _ => return ("", raw),
+        }
+    }
+    ("", raw)
+}
+
+/// Splits `raw` per Go `net/url.Parse` (`parse(rawURL, viaRequest = false)`) and checks whether
+/// `gorilla/mux` `cleanPath` requires a 301 redirect, building its `Location` like
+/// `URL.String()` (scheme, `//authority`, cleaned path, `?query` and `#fragment`).
+fn split_go_url_clean_redirect(raw: &str) -> GoUrlCleanPath {
+    let (without_frag, frag) = raw.split_once('#').unwrap_or((raw, ""));
+    let (scheme, rest) = go_url_scheme(without_frag);
+    let (rest, query, force_query) = if rest.ends_with('?') && rest.matches('?').count() == 1 {
+        (&rest[..rest.len() - 1], "", true)
+    } else {
+        let (r, q) = rest.split_once('?').unwrap_or((rest, ""));
+        (r, q, false)
+    };
+    let push_query_and_fragment = |loc: &mut String| {
+        if force_query || !query.is_empty() {
+            loc.push('?');
+            loc.push_str(query);
+        }
+        if !frag.is_empty() {
+            loc.push('#');
+            loc.push_str(frag);
+        }
+    };
+
+    if !scheme.is_empty() && !rest.starts_with('/') {
+        // Rootless path with a scheme: `url.Opaque`. `url.Path` is empty, so `cleanPath` always
+        // redirects, and `URL.String()` prints the opaque part instead of the path.
+        let mut loc = format!("{}:{rest}", scheme.to_ascii_lowercase());
+        push_query_and_fragment(&mut loc);
+        return GoUrlCleanPath {
+            redirect: Some(loc),
+            path: String::new(),
+            route_url: None,
+        };
+    }
+
+    let mut authority: Option<&str> = None;
+    let mut omit_host = false;
+    let mut path = rest;
+    if (!scheme.is_empty() || !rest.starts_with("///")) && rest.starts_with("//") {
+        let after = &rest[2..];
+        match after.find('/') {
+            Some(i) => {
+                authority = Some(&after[..i]);
+                path = &after[i..];
+            }
+            None => {
+                authority = Some(after);
+                path = "";
+            }
+        }
+    } else if !scheme.is_empty() && rest.starts_with('/') {
+        omit_host = true;
+    }
+
+    let Some(cleaned) = crate::http::gorilla_mux_clean_path_redirect(path) else {
+        let route_url = (scheme.is_empty() && authority.is_some()).then(|| {
+            let mut u = path.to_string();
+            push_query_and_fragment(&mut u);
+            u
+        });
+        return GoUrlCleanPath {
+            redirect: None,
+            path: path.to_string(),
+            route_url,
+        };
+    };
+
+    let mut loc = String::new();
+    if !scheme.is_empty() {
+        loc.push_str(&scheme.to_ascii_lowercase());
+        loc.push(':');
+    }
+    // `cleaned` is never empty, so `URL.String()` writes `//` whenever it writes an authority.
+    let authority = authority.unwrap_or("");
+    if (!scheme.is_empty() || !authority.is_empty()) && !(omit_host && authority.is_empty()) {
+        loc.push_str("//");
+        loc.push_str(authority);
+    }
+    loc.push_str(&cleaned);
+    push_query_and_fragment(&mut loc);
+    GoUrlCleanPath {
+        redirect: Some(loc),
+        path: path.to_string(),
+        route_url: None,
+    }
+}
+
 fn validate_go_url(raw: &str) -> Result<(), String> {
     if raw.is_empty() {
         return Ok(());
@@ -532,6 +672,9 @@ fn validate_go_url(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Parses `req.url` with Go `net/url.Parse` tolerance (accepting relative paths without leading
+/// `/` and unescaped `{}`/`[]`/`"`/`|`/`^`/spaces in query strings) and encodes disallowed
+/// RFC 3986 characters so `http::Uri` can pass it into Axum's `Router`.
 fn parse_go_url_to_http_uri(raw: &str) -> Result<Uri, String> {
     if raw.is_empty() {
         return Ok(Uri::from_static("/"));
@@ -1220,7 +1363,7 @@ pub fn http_canonical_header_key(key: &str) -> String {
 fn header_map_to_httpgrpc(headers: &HeaderMap) -> Vec<httpgrpcpb::Header> {
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for (name, val) in headers {
-        if let Ok(v) = val.to_str() {
+        if let Ok(v) = std::str::from_utf8(val.as_bytes()) {
             grouped
                 .entry(http_canonical_header_key(name.as_str()))
                 .or_default()
@@ -1343,6 +1486,78 @@ mod tests {
     use mimir_proto::grpcutilpb::decode_status_details;
     use mimir_proto::httpgrpcpb::http_server::HttpServer;
     use prost::Message as _;
+
+    /// Expected values produced by Go: `url.Parse(in)`, `gorilla/mux` `cleanPath(u.EscapedPath())`
+    /// (`UseEncodedPath`) and, when it differs, `u.Path = p; u.String()` (`None`: no redirect).
+    #[test]
+    fn split_go_url_clean_redirect_matches_go_url_parse_and_string() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("ready", Some("/ready")),
+            ("ready?x=1", Some("/ready?x=1")),
+            ("ready?x=1#frag", Some("/ready?x=1#frag")),
+            ("ready#", Some("/ready")),
+            ("ready?", Some("/ready?")),
+            ("/ready", None),
+            ("/ready?", None),
+            ("/ready/", None),
+            ("//ready", Some("//ready/")),
+            ("//ready#frag", Some("//ready/#frag")),
+            ("//ready/x", None),
+            ("//ready//x?a=b", Some("//ready/x?a=b")),
+            ("///ready", Some("/ready")),
+            ("////ready", Some("/ready")),
+            ("/./ready", Some("/ready")),
+            ("/ready/.", Some("/ready")),
+            ("/ready/..", Some("/")),
+            ("/ingester/../ready?x=1", Some("/ready?x=1")),
+            ("/ingester//ring?tokens=true", Some("/ingester/ring?tokens=true")),
+            ("/a//b%20c", Some("/a/b%2520c")),
+            ("/a//b c", Some("/a/b%2520c")),
+            ("//foo(bar)?q=(1)", Some("//foo(bar)/?q=(1)")),
+            ("/a//b%2Fc?x=%2F", Some("/a/b%252Fc?x=%2F")),
+            ("http://example.com//a%20b", Some("http://example.com/a%2520b")),
+            ("//host//a%41", Some("//host/a%2541")),
+            ("/a//b{c}", Some("/a/b%257Bc%257D")),
+            ("x//y%2e", Some("/x/y%252e")),
+            ("/%2e%2e//ready", Some("/%252e%252e/ready")),
+            ("", Some("/")),
+            ("http://example.com//ready?q=1", Some("http://example.com/ready?q=1")),
+            ("http://example.com", Some("http://example.com/")),
+            ("http://example.com/", None),
+            ("HTTP://Example.com/a/../b#f", Some("http://Example.com/b#f")),
+            ("http://user:pw@example.com//x", Some("http://user:pw@example.com/x")),
+            ("http:/x//y", Some("http:/x/y")),
+            ("http:///x//y", Some("http:///x/y")),
+            ("mailto:foo@bar", Some("mailto:foo@bar")),
+            ("http:foo/bar?x=1", Some("http:foo/bar?x=1")),
+            ("*", Some("/%2A")),
+            ("/*", None),
+            ("//", Some("/")),
+            ("/", None),
+            ("/..", Some("/")),
+            ("/a/b/../../c/", Some("/c/")),
+            ("//host", Some("//host/")),
+            ("//host?q=1", Some("//host/?q=1")),
+            ("//host/ready", None),
+            ("//host/ready?x=1", None),
+            ("//user@host/a//b", Some("//user@host/a/b")),
+            ("/ready?a=b?c", None),
+            ("/ready??", None),
+            (r#"/config?match[]={job="foo"}&mode=diff"#, None),
+            (r#"//config?match[]={job="foo"}"#, Some(r#"//config/?match[]={job="foo"}"#)),
+        ];
+        for (input, want) in cases {
+            let got = split_go_url_clean_redirect(input);
+            assert_eq!(got.redirect.as_deref(), *want, "url {input:?}");
+        }
+
+        // A scheme-less `//authority` is not part of `url.Path`: Go routes the path after it.
+        let routed = split_go_url_clean_redirect("//host/ready?x=1");
+        assert_eq!(routed.path, "/ready");
+        assert_eq!(routed.route_url.as_deref(), Some("/ready?x=1"));
+        assert_eq!(split_go_url_clean_redirect("/ready?x=1").route_url, None);
+        assert_eq!(split_go_url_clean_redirect("http://h/ready").route_url, None);
+    }
 
     struct SingleChunkBody(Option<Bytes>);
 

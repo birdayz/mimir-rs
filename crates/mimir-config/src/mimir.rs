@@ -903,6 +903,32 @@ impl MimirConfig {
         // target; mimir-rs has no Vault client, so refuse to start instead of silently using the
         // on-disk paths.
         if self.vault_enabled()? {
+            // pkg/vault/vault.go:Config.Validate runs before the CFG-16 unsupported guard.
+            let url = self.extra_storage_str(&["vault"], &["url"], "vault.url", "");
+            if url.is_empty() {
+                return Err(wrap_validation("invalid vault config")(
+                    ConfigError::Validation("empty vault URL supplied".to_string()),
+                ));
+            }
+            let mount_path =
+                self.extra_storage_str(&["vault"], &["mount_path"], "vault.mount-path", "");
+            if mount_path.is_empty() {
+                return Err(wrap_validation("invalid vault config")(
+                    ConfigError::Validation("empty vault mount path supplied".to_string()),
+                ));
+            }
+            let auth_type =
+                self.extra_storage_str(&["vault", "auth"], &["type"], "vault.auth.type", "");
+            if !matches!(
+                auth_type.as_str(),
+                "approle" | "kubernetes" | "userpass" | "token"
+            ) {
+                return Err(wrap_validation("invalid vault config")(
+                    ConfigError::Validation(
+                        "invalid vault auth supplied: unsupported auth method".to_string(),
+                    ),
+                ));
+            }
             return Err(ConfigError::Validation(
                 "vault integration (-vault.enabled) is not supported by mimir-rs".to_string(),
             ));
@@ -1786,5 +1812,88 @@ compactor:
         let mut parsed: MimirConfig = serde_yaml::from_str(yaml).unwrap();
         let err = parsed.validate().unwrap_err().to_string();
         assert!(err.contains("bucket store sync directory"), "got: {err}");
+    }
+
+    #[test]
+    fn w19_mod_05_vault_validate_runs_before_unsupported_guard() {
+        let validate_yaml = |yaml: &str| {
+            let mut cfg = MimirConfig::default();
+            cfg.load_config_from_bytes(yaml.as_bytes(), false).unwrap();
+            cfg.validate().unwrap_err().to_string()
+        };
+
+        assert_eq!(
+            validate_yaml("target: ingester
+vault:
+  enabled: true
+"),
+            "error validating config: invalid vault config: empty vault URL supplied"
+        );
+        assert_eq!(
+            validate_yaml("target: ingester
+vault:
+  enabled: true
+  url: http://vault:8200
+"),
+            "error validating config: invalid vault config: empty vault mount path supplied"
+        );
+        assert_eq!(
+            validate_yaml(
+                "target: ingester
+vault:
+  enabled: true
+  url: http://vault:8200
+  mount_path: secret
+"
+            ),
+            "error validating config: invalid vault config: invalid vault auth supplied: unsupported auth method"
+        );
+        assert_eq!(
+            validate_yaml(
+                "target: ingester
+vault:
+  enabled: true
+  url: http://vault:8200
+  mount_path: secret
+  auth:
+    type: ldap
+"
+            ),
+            "error validating config: invalid vault config: invalid vault auth supplied: unsupported auth method"
+        );
+        for auth in ["approle", "kubernetes", "userpass", "token"] {
+            let yaml = format!(
+                "target: ingester
+vault:
+  enabled: true
+  url: http://vault:8200
+  mount_path: secret
+  auth:
+    type: {auth}
+"
+            );
+            assert_eq!(
+                validate_yaml(&yaml),
+                "error validating config: vault integration (-vault.enabled) is not supported by mimir-rs"
+            );
+        }
+
+        // CLI flags override missing YAML fields cleanly.
+        let err = parse_cli_and_load_config(
+            "mimir",
+            &[
+                "-target=ingester".to_string(),
+                "-vault.enabled".to_string(),
+                "-vault.url=http://vault:8200".to_string(),
+                "-vault.mount-path=secret".to_string(),
+                "-vault.auth.type=token".to_string(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "error validating config: vault integration (-vault.enabled) is not supported by mimir-rs"
+        );
     }
 }

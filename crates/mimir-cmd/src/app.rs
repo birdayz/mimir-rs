@@ -19,8 +19,10 @@ use mimir_common::logging::{
     LogValue, Logger,
 };
 use mimir_common::tracing::{
-    detected_exporter_kind, init_otel_or_jaeger_from_env, otlp_traces_endpoint_from_env,
-    resolve_service_name, ExportedSpan, SpanAttrValue, SpanExporterFn,
+    detected_exporter_kind, init_otel_or_jaeger_from_env, jaeger_basic_auth_from_env,
+    jaeger_endpoint_from_env, otlp_headers_from_env, otlp_timeout_from_env,
+    otlp_tls_paths_from_env, otlp_traces_endpoint_from_env, resolve_service_name,
+    ExportedSpan, SpanAttrValue, SpanExporterFn,
 };
 use mimir_common::services::{FnListener, ManagedBasicService, Service, ServiceContext, State};
 use mimir_config::ingester::KVStoreConfig;
@@ -208,10 +210,12 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             }
         }
 
+        let max_entries = validate_activity_tracker_max_entries(cfg.activity_tracker.max_entries)
+            .context("initializing activity tracker")?;
         let tracker = ActivityTracker::new(
             ActivityTrackerConfig {
                 filepath: PathBuf::from(&cfg.activity_tracker.filepath),
-                max_entries: cfg.activity_tracker.max_entries.max(1) as usize,
+                max_entries,
             },
             Some(&registry),
         )
@@ -276,6 +280,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         .as_ref()
         .map(|_| StateCell::new(State::Running));
     if let Some(ref st) = activity_tracker_state {
+        log_module_starting(&*logger, "activity-tracker");
         modules.add("activity-tracker", st.state_fn());
     }
     let server_state = StateCell::new(State::New);
@@ -315,9 +320,13 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     // Anonymous usage statistics (`initUsageStats`), only for components accessing the blocks
     // storage. `Server` depends on `UsageStats` in Go.
     mimir_common::usagestats::set_target(&cfg.target.0.join(","));
-    if cfg.ingest_storage.enabled && ingester_enabled {
-        mimir_common::usagestats::set_mode(mimir_common::usagestats::MODE_INGEST_STORAGE);
-    }
+    mimir_common::usagestats::set_mode(
+        if cfg.ingest_storage.enabled && ingester_enabled {
+            mimir_common::usagestats::MODE_INGEST_STORAGE
+        } else {
+            mimir_common::usagestats::MODE_CLASSIC
+        },
+    );
     let usage_stats_svc = if cfg.usage_stats.enabled && ingester_enabled {
         // bucket.NewClient(ctx, cfg.BlocksStorage.Bucket, UsageStats, logger, t.Registerer)
         let bucket =
@@ -388,6 +397,12 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             let _ = svc.await_terminated().await;
             log_module_stopped(&*logger, "usage-stats");
         }
+        stop_activity_tracker_module(
+            &*logger,
+            &cfg.activity_tracker.filepath,
+            activity_tracker,
+            activity_tracker_state.as_deref(),
+        );
         logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
         if signaled {
             return Ok(());
@@ -1133,48 +1148,12 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         rt.stop();
     }
     runtime_config_state.set(State::Terminated);
-    if let Some(at) = activity_tracker {
-        if !cfg.activity_tracker.filepath.is_empty() {
-            let (entries, err) = load_unfinished_entries_partial(&cfg.activity_tracker.filepath);
-            if let Some(err) = err {
-                let err_s = err.to_string();
-                logger.log(
-                    LogLevel::Warn,
-                    &[
-                        ("component", "activity-tracker"),
-                        ("msg", "failed to fully read file with unfinished activities during shutdown"),
-                        ("err", &err_s),
-                    ],
-                );
-            }
-            if !entries.is_empty() {
-                let count_s = entries.len().to_string();
-                logger.log(
-                    LogLevel::Warn,
-                    &[
-                        ("component", "activity-tracker"),
-                        ("msg", "found unfinished activities during shutdown"),
-                        ("count", &count_s),
-                    ],
-                );
-                for e in &entries {
-                    let ts = format_rfc3339_nano_utc(e.timestamp);
-                    logger.log(
-                        LogLevel::Warn,
-                        &[
-                            ("component", "activity-tracker"),
-                            ("start", &ts),
-                            ("activity", &e.activity),
-                        ],
-                    );
-                }
-            }
-        }
-        let _ = at.flush();
-    }
-    if let Some(ref st) = activity_tracker_state {
-        st.set(State::Terminated);
-    }
+    stop_activity_tracker_module(
+        &*logger,
+        &cfg.activity_tracker.filepath,
+        activity_tracker,
+        activity_tracker_state.as_deref(),
+    );
 
     logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
     // A shutdown signal received while services are still starting is a requested shutdown,
@@ -1224,6 +1203,65 @@ async fn stop_module_service(
         }
     } else if reached_running {
         log_module_stopped(logger, module);
+    }
+}
+
+pub fn validate_activity_tracker_max_entries(max_entries: i64) -> Result<usize> {
+    mimir_common::activitytracker::validate_raw_max_entries(max_entries)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn stop_activity_tracker_module(
+    logger: &dyn Logger,
+    filepath: &str,
+    activity_tracker: Option<Arc<ActivityTracker>>,
+    state: Option<&StateCell>,
+) {
+    if let Some(at) = activity_tracker {
+        if !filepath.is_empty() {
+            let (entries, err) = load_unfinished_entries_partial(filepath);
+            if let Some(err) = err {
+                let err_s = err.to_string();
+                logger.log(
+                    LogLevel::Warn,
+                    &[
+                        ("component", "activity-tracker"),
+                        (
+                            "msg",
+                            "failed to fully read file with unfinished activities during shutdown",
+                        ),
+                        ("err", &err_s),
+                    ],
+                );
+            }
+            if !entries.is_empty() {
+                let count_s = entries.len().to_string();
+                logger.log(
+                    LogLevel::Warn,
+                    &[
+                        ("component", "activity-tracker"),
+                        ("msg", "found unfinished activities during shutdown"),
+                        ("count", &count_s),
+                    ],
+                );
+                for e in &entries {
+                    let ts = format_rfc3339_nano_utc(e.timestamp);
+                    logger.log(
+                        LogLevel::Warn,
+                        &[
+                            ("component", "activity-tracker"),
+                            ("start", &ts),
+                            ("activity", &e.activity),
+                        ],
+                    );
+                }
+            }
+        }
+        let _ = at.flush();
+        if let Some(st) = state {
+            st.set(State::Terminated);
+        }
+        log_module_stopped(logger, "activity-tracker");
     }
 }
 
@@ -1388,35 +1426,103 @@ pub fn span_to_otlp_json(span: &ExportedSpan) -> serde_json::Value {
     span_to_otlp_json_with_resource(span, extra)
 }
 
-fn build_span_exporter() -> Option<SpanExporterFn> {
-    let kind = detected_exporter_kind()?;
+pub fn try_build_span_exporter() -> Result<Option<SpanExporterFn>, String> {
+    let Some(kind) = detected_exporter_kind() else {
+        return Ok(None);
+    };
     if kind.eq_ignore_ascii_case("none") {
-        return None;
+        return Ok(None);
     }
     if kind.eq_ignore_ascii_case("console") {
-        return Some(Arc::new(|span: ExportedSpan| {
+        return Ok(Some(Arc::new(|span: ExportedSpan| {
             let payload = span_to_otlp_json(&span);
             println!("{payload}");
-        }));
+        })));
     }
-    let endpoint = otlp_traces_endpoint_from_env()?;
+    let is_jaeger = kind.eq_ignore_ascii_case("jaeger");
+    let Some(endpoint) = (if is_jaeger {
+        jaeger_endpoint_from_env()
+    } else {
+        otlp_traces_endpoint_from_env()
+    }) else {
+        return Ok(None);
+    };
     if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
-        return None;
+        return Ok(None);
     }
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ExportedSpan>(4096);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+    let timeout = otlp_timeout_from_env().unwrap_or(Duration::from_secs(10));
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(timeout);
+    if !is_jaeger {
+        let hdrs = otlp_headers_from_env();
+        if !hdrs.is_empty() {
+            let mut header_map = reqwest::header::HeaderMap::new();
+            for (k, v) in hdrs {
+                if let (Ok(name), Ok(val)) = (
+                    reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                    reqwest::header::HeaderValue::from_bytes(v.as_bytes()),
+                ) {
+                    header_map.insert(name, val);
+                }
+            }
+            builder = builder.default_headers(header_map);
+        }
+    }
+    let tls_paths = otlp_tls_paths_from_env();
+    if let Some(ref ca_path) = tls_paths.ca_cert_path {
+        let pem = std::fs::read(ca_path)
+            .map_err(|e| format!("reading OTLP CA certificate {ca_path:?}: {e}"))?;
+        use rustls_pki_types::pem::PemObject as _;
+        for der in rustls_pki_types::CertificateDer::pem_slice_iter(&pem).filter_map(Result::ok) {
+            let cert = reqwest::Certificate::from_der(der.as_ref())
+                .map_err(|e| format!("parsing OTLP CA certificate {ca_path:?}: {e}"))?;
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    if let (Some(ref cert_path), Some(ref key_path)) =
+        (tls_paths.client_cert_path, tls_paths.client_key_path)
+    {
+        let mut combined = std::fs::read(cert_path)
+            .map_err(|e| format!("reading OTLP client certificate {cert_path:?}: {e}"))?;
+        let key_pem = std::fs::read(key_path)
+            .map_err(|e| format!("reading OTLP client key {key_path:?}: {e}"))?;
+        combined.push(b'\n');
+        combined.extend_from_slice(&key_pem);
+        let id = reqwest::Identity::from_pem(&combined)
+            .map_err(|e| format!("parsing OTLP client identity ({cert_path:?}, {key_path:?}): {e}"))?;
+        builder = builder.identity(id);
+    }
+    let client = builder
         .build()
-        .ok()?;
-    tokio::spawn(async move {
+        .map_err(|e| format!("building OTLP/Jaeger HTTP client: {:#}", anyhow::Error::new(e)))?;
+    let jaeger_auth = is_jaeger.then(jaeger_basic_auth_from_env).flatten();
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|e| format!("no active tokio runtime for span exporter: {e}"))?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ExportedSpan>(4096);
+    handle.spawn(async move {
         while let Some(span) = rx.recv().await {
             let body = span_to_otlp_json(&span);
-            let _ = client.post(&endpoint).json(&body).send().await;
+            let mut req = client.post(&endpoint).json(&body);
+            if let Some((ref user, ref pass)) = jaeger_auth {
+                req = req.basic_auth(user, Some(pass));
+            }
+            let _ = req.send().await;
         }
     });
-    Some(Arc::new(move |span: ExportedSpan| {
+    Ok(Some(Arc::new(move |span: ExportedSpan| {
         let _ = tx.try_send(span);
-    }))
+    })))
+}
+
+pub fn build_span_exporter() -> Option<SpanExporterFn> {
+    match try_build_span_exporter() {
+        Ok(exp) => exp,
+        Err(err) => {
+            tracing::warn!(%err, "failed to build span exporter");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

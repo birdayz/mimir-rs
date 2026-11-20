@@ -8675,15 +8675,10 @@ impl Head {
             {
                 return Ok(Vec::new());
             }
-            let other_matchers: Vec<LabelMatcher> = matchers
-                .iter()
-                .filter(|m| !m.name.is_empty())
-                .cloned()
-                .collect();
-            if other_matchers.is_empty() {
+            if !matchers.iter().any(|m| !m.name.is_empty()) {
                 return Ok(vec![String::new()]);
             }
-            let refs = self.postings_for_matchers_direct(&other_matchers)?;
+            let refs = self.postings_for_matchers_direct(matchers)?;
             return Ok(if refs.is_empty() {
                 Vec::new()
             } else {
@@ -8727,27 +8722,26 @@ impl Head {
         let tombs = self.tombstones.get(ref_id);
         let ino_mint = mint.max(self.min_time());
         let st = entry.inner.lock();
-        let has_chunk = (ino_mint <= maxt
-            && (st.any_head_chunk_bounds(|hc_min, hc_max| {
-                hc_min <= maxt
-                    && ino_mint <= hc_max
-                    && !tombs.iter().any(|iv| iv.is_subrange(hc_min, hc_max))
-            }) || st.mmapped().iter().any(|mc| {
-                mc.overlaps_closed_interval(ino_mint, maxt)
+        let has_chunk = st.any_head_chunk_bounds(|hc_min, hc_max| {
+            hc_min <= maxt
+                && ino_mint <= hc_max
+                && !tombs.iter().any(|iv| iv.is_subrange(hc_min, hc_max))
+        }) || st.mmapped().iter().any(|mc| {
+            mc.overlaps_closed_interval(ino_mint, maxt)
+                && !tombs.iter().any(|iv| iv.is_subrange(mc.min_time, mc.max_time))
+        }) || st.ooo().is_some_and(|ooo| {
+            ooo.ooo_mmapped_chunks.iter().any(|mc| {
+                mc.overlaps_closed_interval(mint, maxt)
                     && !tombs.iter().any(|iv| iv.is_subrange(mc.min_time, mc.max_time))
-            })))
-            || st.ooo().is_some_and(|ooo| {
-            ooo.ooo_mmapped_chunks
-                .iter()
-                .any(|mc| mc.overlaps_closed_interval(mint, maxt))
-                || ooo
-                    .ooo_pending_mmapped
-                    .iter()
-                    .any(|(mc, _)| mc.overlaps_closed_interval(mint, maxt))
-                || ooo
-                    .ooo_head_chunk
-                    .as_ref()
-                    .is_some_and(|ohc| ohc.overlaps_closed_interval(mint, maxt))
+            }) || ooo.ooo_pending_mmapped.iter().any(|(mc, _)| {
+                mc.overlaps_closed_interval(mint, maxt)
+                    && !tombs.iter().any(|iv| iv.is_subrange(mc.min_time, mc.max_time))
+            }) || ooo.ooo_head_chunk.as_ref().is_some_and(|ohc| {
+                ohc.overlaps_closed_interval(mint, maxt)
+                    && !tombs
+                        .iter()
+                        .any(|iv| iv.is_subrange(ohc.min_time, ohc.max_time))
+            })
         });
         if has_chunk {
             Some(entry.labels.clone())
@@ -8811,7 +8805,7 @@ impl Head {
                 }
                 let ino_mint = mint.max(self.min_time());
                 let mut in_order_pos = 0u64;
-                let (mmapped_in_order, head_chks) = if ino_mint <= maxt {
+                let (mmapped_in_order, head_chks) = {
                     let mmapped_count = st
                         .mmapped()
                         .iter()
@@ -8839,8 +8833,6 @@ impl Head {
                         }
                     });
                     (mmapped_in_order, head_chks)
-                } else {
-                    (Vec::new(), Vec::new())
                 };
                 let mut mmapped_ooo = Vec::new();
                 let mut ooo_head_chks = Vec::new();
@@ -9184,30 +9176,28 @@ impl Head {
             let mut prev_max: i64 = i64::MIN;
             let mut has_prev = false;
             let mut sorted_disjoint = true;
-            if ino_mint <= maxt {
-                for mc in st.mmapped() {
-                    if mc.overlaps_closed_interval(ino_mint, maxt) {
-                        if has_prev && (mc.min_time < prev_min || mc.min_time <= prev_max) {
-                            sorted_disjoint = false;
-                        }
-                        prev_min = mc.min_time;
-                        prev_max = mc.max_time;
-                        has_prev = true;
-                        min_times.push(mc.min_time);
+            for mc in st.mmapped() {
+                if mc.overlaps_closed_interval(ino_mint, maxt) {
+                    if has_prev && (mc.min_time < prev_min || mc.min_time <= prev_max) {
+                        sorted_disjoint = false;
                     }
+                    prev_min = mc.min_time;
+                    prev_max = mc.max_time;
+                    has_prev = true;
+                    min_times.push(mc.min_time);
                 }
-                st.for_each_head_chunk_bounds(|hc_min, hc_max| {
-                    if hc_min <= maxt && ino_mint <= hc_max {
-                        if has_prev && (hc_min < prev_min || hc_min <= prev_max) {
-                            sorted_disjoint = false;
-                        }
-                        prev_min = hc_min;
-                        prev_max = hc_max;
-                        has_prev = true;
-                        min_times.push(hc_min);
-                    }
-                });
             }
+            st.for_each_head_chunk_bounds(|hc_min, hc_max| {
+                if hc_min <= maxt && ino_mint <= hc_max {
+                    if has_prev && (hc_min < prev_min || hc_min <= prev_max) {
+                        sorted_disjoint = false;
+                    }
+                    prev_min = hc_min;
+                    prev_max = hc_max;
+                    has_prev = true;
+                    min_times.push(hc_min);
+                }
+            });
             (min_times, has_ooo || has_any_tombs || !sorted_disjoint)
         };
 
@@ -9301,30 +9291,28 @@ impl Head {
             let mut prev_max = i64::MIN;
             let mut has_prev = false;
             let mut sorted_disjoint = true;
-            if ino_mint <= maxt {
-                for mc in st.mmapped() {
-                    if mc.overlaps_closed_interval(ino_mint, maxt) {
-                        if has_prev && (mc.min_time < prev_min || mc.min_time <= prev_max) {
-                            sorted_disjoint = false;
-                        }
-                        prev_min = mc.min_time;
-                        prev_max = mc.max_time;
-                        has_prev = true;
-                        intervals.push((mc.min_time, mc.max_time));
+            for mc in st.mmapped() {
+                if mc.overlaps_closed_interval(ino_mint, maxt) {
+                    if has_prev && (mc.min_time < prev_min || mc.min_time <= prev_max) {
+                        sorted_disjoint = false;
                     }
+                    prev_min = mc.min_time;
+                    prev_max = mc.max_time;
+                    has_prev = true;
+                    intervals.push((mc.min_time, mc.max_time));
                 }
-                st.for_each_head_chunk_bounds(|hc_min, hc_max| {
-                    if hc_min <= maxt && ino_mint <= hc_max {
-                        if has_prev && (hc_min < prev_min || hc_min <= prev_max) {
-                            sorted_disjoint = false;
-                        }
-                        prev_min = hc_min;
-                        prev_max = hc_max;
-                        has_prev = true;
-                        intervals.push((hc_min, hc_max));
-                    }
-                });
             }
+            st.for_each_head_chunk_bounds(|hc_min, hc_max| {
+                if hc_min <= maxt && ino_mint <= hc_max {
+                    if has_prev && (hc_min < prev_min || hc_min <= prev_max) {
+                        sorted_disjoint = false;
+                    }
+                    prev_min = hc_min;
+                    prev_max = hc_max;
+                    has_prev = true;
+                    intervals.push((hc_min, hc_max));
+                }
+            });
             (intervals, has_ooo || has_any_tombs || !sorted_disjoint)
         };
         if !needs_slow {

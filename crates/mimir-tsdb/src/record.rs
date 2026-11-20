@@ -675,25 +675,31 @@ fn write_st_marker(buf: &mut Encbuf, st: i64, first_st: i64, prev_st: i64) {
 
 pub fn decode_labels(dec: &mut Decbuf<'_>) -> Result<Labels, EncodingError> {
     let n = dec.uvarint()?;
-    let mut pairs: smallvec::SmallVec<[(&str, &str); 24]> =
+    let mut pairs: smallvec::SmallVec<[(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>); 24]> =
         smallvec::SmallVec::with_capacity(n.min(256));
     for _ in 0..n {
-        let name = dec.uvarint_str()?;
-        let value = dec.uvarint_str()?;
-        if name.len() >= (1 << 24) || value.len() >= (1 << 24) {
+        let name_bytes = dec.uvarint_bytes()?;
+        let value_bytes = dec.uvarint_bytes()?;
+        if name_bytes.len() >= (1 << 24) || value_bytes.len() >= (1 << 24) {
             return Err(EncodingError::InvalidSize);
         }
+        let name = String::from_utf8_lossy(name_bytes);
+        let value = String::from_utf8_lossy(value_bytes);
         pairs.push((name, value));
     }
     if pairs.windows(2).all(|w| w[0].0 < w[1].0) && pairs.iter().all(|(_, v)| !v.is_empty()) {
-        return Ok(Labels::from_sorted_slice(&pairs));
+        let refs: smallvec::SmallVec<[(&str, &str); 24]> =
+            pairs.iter().map(|(k, v)| (k.as_ref(), v.as_ref())).collect();
+        return Ok(Labels::from_sorted_slice(&refs));
     }
     // Canonicalize: sort by label name (stable so last duplicate wins, matching Go
     // labels.Builder), deduplicate keeping last, and drop empty values.
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut deduped: smallvec::SmallVec<[(&str, &str); 24]> =
         smallvec::SmallVec::with_capacity(pairs.len());
-    for (name, value) in pairs {
+    for (name, value) in &pairs {
+        let name = name.as_ref();
+        let value = value.as_ref();
         if let Some(last) = deduped.last_mut() {
             if last.0 == name {
                 last.1 = value;

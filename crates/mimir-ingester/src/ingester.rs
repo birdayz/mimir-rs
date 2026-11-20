@@ -1312,8 +1312,8 @@ impl Ingester {
     /// Computes anonymous usage statistics across all open tenant TSDBs (`updateUsageStats`).
     pub fn update_usage_stats(&self) -> UsageStatsSnapshot {
         let mut snap = UsageStatsSnapshot::default();
-        let mut min_ooo: i64 = 0;
-        let mut max_ooo: i64 = 0;
+        let mut min_ooo_ns: i64 = 0;
+        let mut max_ooo_ns: i64 = 0;
         for user_id in self.get_tsdb_users() {
             let Some(user_db) = self.get_tsdb(&user_id) else {
                 continue;
@@ -1328,18 +1328,17 @@ impl Ingester {
 
             let ooo_ns = self.overrides.out_of_order_time_window_nanos(&user_id);
             if ooo_ns > 0 {
-                let ooo_secs = ooo_ns / 1_000_000_000;
                 snap.tenants_with_out_of_order_enabled += 1;
-                if min_ooo == 0 || ooo_secs < min_ooo {
-                    min_ooo = ooo_secs;
+                if min_ooo_ns == 0 || ooo_ns < min_ooo_ns {
+                    min_ooo_ns = ooo_ns;
                 }
-                if ooo_secs > max_ooo {
-                    max_ooo = ooo_secs;
+                if ooo_ns > max_ooo_ns {
+                    max_ooo_ns = ooo_ns;
                 }
             }
         }
-        snap.min_out_of_order_time_window_seconds = min_ooo;
-        snap.max_out_of_order_time_window_seconds = max_ooo;
+        snap.min_out_of_order_time_window_seconds = min_ooo_ns / 1_000_000_000;
+        snap.max_out_of_order_time_window_seconds = max_ooo_ns / 1_000_000_000;
         snap.appended_samples = self.appended_samples.load(Ordering::Relaxed);
         snap.appended_exemplars = self.appended_exemplars.load(Ordering::Relaxed);
         *self.usage_stats.lock() = snap;

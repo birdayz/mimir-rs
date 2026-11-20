@@ -6,7 +6,7 @@
 use std::fmt;
 
 use hashbrown::HashSet;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 use regex_syntax::ParserBuilder;
 use thiserror::Error;
@@ -316,18 +316,13 @@ impl FastRegexMatcher {
         // Parse translated pattern with DotNL (matching Go `syntax.Perl | syntax.DotNL`).
         let hir = ParserBuilder::new()
             .dot_matches_new_line(true)
+            .nest_limit(1000)
             .build()
             .parse(&translated.pattern)
             .map_err(|e| MatcherError::InvalidRegex {
                 pattern: pattern.to_string(),
                 reason: e.to_string(),
             })?;
-
-        let anchored = format!(r"\A(?s:{})\z", translated.pattern);
-        let re = Regex::new(&anchored).map_err(|e| MatcherError::InvalidRegex {
-            pattern: pattern.to_string(),
-            reason: e.to_string(),
-        })?;
 
         // Go `regexp.go:126` only populates `set_matches` when case-sensitive.
         let set_matches = if translated.has_case_insensitive {
@@ -341,16 +336,33 @@ impl FastRegexMatcher {
             extract_concat_hints(&hir)
         };
 
-        let strategy = if let Some(ref matches) = set_matches {
+        let fast_strategy = if let Some(ref matches) = set_matches {
             if matches.len() == 1 {
-                Strategy::Equal(matches[0].clone())
+                Some(Strategy::Equal(matches[0].clone()))
             } else {
-                build_multi_strategy(matches.clone())
+                Some(build_multi_strategy(matches.clone()))
             }
         } else if !translated.has_case_insensitive {
-            strategy_from_hir(&hir).unwrap_or(Strategy::Regex(re.clone()))
+            strategy_from_hir(&hir)
         } else {
-            Strategy::Regex(re.clone())
+            None
+        };
+
+        let strategy = match fast_strategy {
+            Some(s) => s,
+            None => {
+                let anchored = format!(r"\A(?s:{})\z", translated.pattern);
+                let re = RegexBuilder::new(&anchored)
+                    .nest_limit(1000)
+                    .size_limit(128 << 20)
+                    .dfa_size_limit(64 << 20)
+                    .build()
+                    .map_err(|e| MatcherError::InvalidRegex {
+                        pattern: pattern.to_string(),
+                        reason: e.to_string(),
+                    })?;
+                Strategy::Regex(re)
+            }
         };
 
         // If `strategy` fell back to `Regex`, we can still use `prefix`/`suffix`/`contains`
@@ -652,6 +664,21 @@ fn strip_outer_anchors_directional(mut subs: &[Hir], at_start: bool, at_end: boo
     subs
 }
 
+fn hir_concat_literal_str(hir: &Hir) -> Option<String> {
+    match strip_capture(hir).kind() {
+        HirKind::Empty => Some(String::new()),
+        HirKind::Literal(lit) => std::str::from_utf8(&lit.0).ok().map(str::to_string),
+        HirKind::Concat(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                out.push_str(&hir_concat_literal_str(p)?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 fn strategy_from_hir(hir: &Hir) -> Option<Strategy> {
     strategy_from_hir_inner(hir, true, true)
 }
@@ -663,6 +690,21 @@ fn strategy_from_hir_inner(hir: &Hir, at_start: bool, at_end: bool) -> Option<St
         HirKind::Literal(lit) => {
             let s = std::str::from_utf8(&lit.0).ok()?.to_string();
             Some(Strategy::Equal(s))
+        }
+        HirKind::Alternation(subs) => {
+            let mut seen = HashSet::with_capacity(subs.len());
+            let mut values = Vec::with_capacity(subs.len());
+            for sub in subs {
+                let lit = hir_concat_literal_str(sub)?;
+                if seen.insert(lit.clone()) {
+                    values.push(lit);
+                }
+            }
+            match values.len() {
+                0 => None,
+                1 => values.into_iter().next().map(Strategy::Equal),
+                _ => Some(build_multi_strategy(values)),
+            }
         }
         HirKind::Repetition(rep) => {
             let match_nl = is_any_char_with_nl(&rep.sub)?;
