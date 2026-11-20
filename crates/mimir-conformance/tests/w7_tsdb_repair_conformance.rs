@@ -335,8 +335,32 @@ fn samples_rec(ref_id: u64, ts: &[i64]) -> Vec<u8> {
 // Scenarios
 // ---------------------------------------------------------------------------------------
 
-/// TSDB-1 audit repro: non-zero garbage appended to the last `chunks_head` file (torn
-/// buffered write after an OOMKill).
+fn chunks_head_used_len(path: &Path) -> usize {
+    let data = fs::read(path).unwrap();
+    let mut idx = HEAD_CHUNK_FILE_HEADER_SIZE;
+    while idx + 24 <= data.len() {
+        if data[idx..idx + 24] == [0u8; 24] {
+            break;
+        }
+        idx += 25; // series_ref (8) + mint (8) + maxt (8) + encoding (1)
+        let mut data_len = 0usize;
+        let mut shift = 0u32;
+        loop {
+            let b = data[idx];
+            idx += 1;
+            data_len |= ((b & 0x7f) as usize) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        idx += data_len + 4; // chunk bytes + CRC32C
+    }
+    idx
+}
+
+/// TSDB-1 audit repro: non-zero garbage at the end of the last `chunks_head` file (torn
+/// buffered write after an OOMKill, truncated past preallocation).
 #[test]
 fn torn_tail_of_last_chunks_head_file() {
     if skip() {
@@ -346,11 +370,31 @@ fn torn_tail_of_last_chunks_head_file() {
         build_rust_head(dir);
         let files = chunk_files(dir);
         assert!(files.len() > 2, "fixture must span several chunk files");
-        let mut f = OpenOptions::new()
-            .append(true)
-            .open(dir.join("chunks_head").join(files.last().unwrap()))
-            .unwrap();
-        f.write_all(&[0x5a; 30]).unwrap();
+        let last_path = dir.join("chunks_head").join(files.last().unwrap());
+        let used_len = chunks_head_used_len(&last_path);
+        let mut f = OpenOptions::new().write(true).open(&last_path).unwrap();
+        f.set_len(used_len as u64).unwrap();
+        f.write_all_at(&[0x5a; 30], used_len as u64).unwrap();
+        f.flush().unwrap();
+    });
+    assert!(go.open_error.is_empty());
+    assert_eq!(go.metrics["prometheus_tsdb_mmap_chunk_corruptions_total"], 1.0);
+}
+
+/// Torn buffered write into the zero-preallocated tail of the last `chunks_head` file.
+#[test]
+fn torn_write_in_preallocated_last_chunks_head_file() {
+    if skip() {
+        return;
+    }
+    let (go, _) = differential("torn_tail_prealloc", 0, |dir| {
+        build_rust_head(dir);
+        let files = chunk_files(dir);
+        assert!(files.len() > 2, "fixture must span several chunk files");
+        let last_path = dir.join("chunks_head").join(files.last().unwrap());
+        let used_len = chunks_head_used_len(&last_path);
+        let f = OpenOptions::new().write(true).open(&last_path).unwrap();
+        f.write_all_at(&[0x5a; 30], used_len as u64).unwrap();
     });
     assert!(go.open_error.is_empty());
     assert_eq!(go.metrics["prometheus_tsdb_mmap_chunk_corruptions_total"], 1.0);
