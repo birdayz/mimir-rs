@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use kafka_protocol::records::Compression;
 use lz4_flex::frame::{BlockMode, FrameDecoder, FrameEncoder, FrameInfo};
@@ -156,7 +156,7 @@ pub fn decompress_record_batch_with_limit(
         }
         Compression::Gzip => {
             let mut out = Vec::with_capacity(raw.len().saturating_mul(2).min(max_bytes));
-            read_bounded(GzDecoder::new(&raw[..]), max_bytes, &mut out, "gzip")?;
+            read_bounded(MultiGzDecoder::new(&raw[..]), max_bytes, &mut out, "gzip")?;
             Ok(Bytes::from(out))
         }
         Compression::Snappy => decompress_snappy(&raw, max_bytes),
@@ -393,6 +393,33 @@ mod tests {
             Some(&CompressionError::DecompressedSizeExceeded {
                 limit: MAX_DECOMPRESSED_KAFKA_BATCH_BYTES
             })
+        );
+    }
+
+    #[test]
+    fn test_gzip_multi_member_decode_and_limit() {
+        let mut m1 = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        m1.write_all(b"hello ").unwrap();
+        let b1 = m1.finish().unwrap();
+
+        let mut m2 = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        m2.write_all(b"multi-member gzip").unwrap();
+        let b2 = m2.finish().unwrap();
+
+        let mut combined = Vec::with_capacity(b1.len() + b2.len());
+        combined.extend_from_slice(&b1);
+        combined.extend_from_slice(&b2);
+
+        let mut buf = Bytes::from(combined.clone());
+        let dec = decompress_record_batch(&mut buf, Compression::Gzip).unwrap();
+        assert_eq!(dec.as_ref(), b"hello multi-member gzip");
+
+        let mut limited_buf = Bytes::from(combined);
+        let err = decompress_record_batch_with_limit(&mut limited_buf, Compression::Gzip, 10)
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CompressionError>(),
+            Some(&CompressionError::DecompressedSizeExceeded { limit: 10 })
         );
     }
 }

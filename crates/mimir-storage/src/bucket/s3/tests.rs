@@ -856,3 +856,102 @@ fn list_page_decoding() {
     assert!(page.is_truncated);
     assert_eq!(page.next_continuation_token, "tok");
 }
+
+#[tokio::test]
+async fn w22_deep_07_s3_v1_common_prefixes_pagination_and_delete_200_ok() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let seen_targets: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_c = Arc::clone(&seen_targets);
+
+    let srv = tokio::spawn(async move {
+        let mut list_page = 0usize;
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let seen_req = Arc::clone(&seen_c);
+            let mut buf = Vec::new();
+            let head_end = loop {
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break p;
+                }
+                let mut chunk = [0u8; 4096];
+                match sock.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break 0,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            };
+            if head_end == 0 {
+                continue;
+            }
+            let head = String::from_utf8_lossy(&buf[..head_end]);
+            let first = head.lines().next().unwrap_or("");
+            let mut parts = first.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let target = parts.next().unwrap_or("").to_string();
+            seen_req.lock().unwrap().push(format!("{method} {target}"));
+
+            let (status, body) = if method == "GET" && target.contains("location=") {
+                (
+                    200u16,
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">us-east-1</LocationConstraint>".to_string(),
+                )
+            } else if method == "DELETE" {
+                (200u16, String::new())
+            } else if method == "GET" {
+                list_page += 1;
+                if list_page == 1 {
+                    (
+                        200u16,
+                        "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>test-bucket</Name><Prefix>t1/</Prefix><Delimiter>/</Delimiter><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated><CommonPrefixes><Prefix>t1/01A/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>t1/01B/</Prefix></CommonPrefixes></ListBucketResult>".to_string(),
+                    )
+                } else {
+                    (
+                        200u16,
+                        "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>test-bucket</Name><Prefix>t1/</Prefix><Delimiter>/</Delimiter><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>t1/01C/</Prefix></CommonPrefixes></ListBucketResult>".to_string(),
+                    )
+                }
+            } else {
+                (404u16, String::new())
+            };
+            let hdr = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(hdr.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+        }
+    });
+
+    let mut cfg = s3_cfg(&endpoint, "us-east-1");
+    cfg.list_objects_version = "v1".into();
+    let b = bucket(&cfg);
+
+    let entries = tokio::time::timeout(std::time::Duration::from_secs(3), b.iter("t1", false))
+        .await
+        .expect("v1 CommonPrefixes pagination must not infinite-loop")
+        .unwrap();
+    assert_eq!(entries, vec!["t1/01A/", "t1/01B/", "t1/01C/"]);
+
+    // Page 2 must advance marker to "t1/01B/" (lexicographically greatest entry across page 1).
+    let list_reqs: Vec<String> = seen_targets
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.starts_with("GET ") && !s.contains("location="))
+        .cloned()
+        .collect();
+    assert_eq!(list_reqs.len(), 2);
+    assert!(!list_reqs[0].contains("marker="));
+    assert!(
+        list_reqs[1].contains("marker=t1%2F01B%2F"),
+        "expected marker=t1%2F01B%2F in page 2 request, got {}",
+        list_reqs[1]
+    );
+
+    // S3 DELETE returning 200 OK must succeed.
+    b.delete("t1/obj").await.unwrap();
+
+    srv.abort();
+}

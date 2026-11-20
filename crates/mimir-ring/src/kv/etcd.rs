@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 
-use super::{BoxFuture, CasFn, CasOutcome, Codec, KeyDeleted, KvClient, KvError};
+use super::{BoxFuture, CasFn, CasOutcome, Codec, KvClient, KvError};
 
 /// reqwest's error text plus its source chain (the TLS / connect cause is only in the sources).
 fn format_reqwest_error(err: &reqwest::Error) -> String {
@@ -624,7 +624,7 @@ impl KvClient for EtcdKv {
                 key,
                 key.as_bytes(),
                 None,
-                true,
+                false,
                 cancel,
                 move |_, val| f(val),
             )
@@ -644,7 +644,7 @@ impl KvClient for EtcdKv {
                 prefix,
                 &req_key,
                 Some(range_end),
-                false,
+                true,
                 cancel,
                 move |k, val| f(k, val),
             )
@@ -658,7 +658,7 @@ impl EtcdKv {
         &self,
         key_label: &str,
         trimmed: &[u8],
-        notify_on_delete: bool,
+        ignore_delete: bool,
         start_revision: &mut i64,
         backoff: &mut Backoff,
         on_event: &mut F,
@@ -726,10 +726,7 @@ impl EtcdKv {
                 continue;
             };
 
-            if is_delete {
-                if notify_on_delete && !on_event(&key_str, Box::new(KeyDeleted)) {
-                    return LineAction::StopWatching;
-                }
+            if ignore_delete && is_delete {
                 continue;
             }
 
@@ -747,7 +744,7 @@ impl EtcdKv {
                     }
                 }
                 Err(e) => {
-                    error!(key = %key_str, err = %e, "error decoding etcd watch event");
+                    error!(key = %key_str, err = %e, "error decoding key");
                 }
             }
         }
@@ -760,7 +757,7 @@ impl EtcdKv {
         key_label: &str,
         req_key: &[u8],
         range_end: Option<Vec<u8>>,
-        notify_on_delete: bool,
+        ignore_delete: bool,
         cancel: ServiceContext,
         mut on_event: F,
     ) where
@@ -877,7 +874,7 @@ impl EtcdKv {
                             match self.process_watch_line(
                                 key_label,
                                 trimmed,
-                                notify_on_delete,
+                                ignore_delete,
                                 &mut start_revision,
                                 &mut backoff,
                                 &mut on_event,
@@ -898,7 +895,7 @@ impl EtcdKv {
                             match self.process_watch_line(
                                 key_label,
                                 trimmed,
-                                notify_on_delete,
+                                ignore_delete,
                                 &mut start_revision,
                                 &mut backoff,
                                 &mut on_event,
@@ -929,12 +926,6 @@ impl EtcdKv {
                 };
                 match range_res {
                     Ok(range_resp) => {
-                        if notify_on_delete
-                            && range_resp.kvs.is_empty()
-                            && !on_event(key_label, Box::new(KeyDeleted))
-                        {
-                            return;
-                        }
                         for kv in range_resp.kvs {
                             let Ok(raw_key) = b64_decode(&kv.key) else {
                                 continue;
@@ -996,5 +987,143 @@ mod tests {
     fn prefix_range_empty_matches_clientv3() {
         assert_eq!(prefix_range(""), (vec![0], vec![0]));
         assert_eq!(prefix_range("abc"), (b"abc".to_vec(), b"abd".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn w22_deep_07_watch_key_and_watch_prefix_delete_parity_with_dskit() {
+        use crate::kv::{ProtoSnappyCodec, StringCodec};
+        use mimir_proto::ringpb::Desc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn run_mock_watch(lines: Vec<String>) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = lines.join("\n") + "\n";
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(hdr.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+            format!("http://{addr}")
+        }
+
+        let put_event = |k: &str, v: &[u8], mod_rev: i64| {
+            format!(
+                r#"{{"result":{{"header":{{"revision":"{mod_rev}"}},"events":[{{"kv":{{"key":"{}","value":"{}","version":"1","mod_revision":"{mod_rev}"}}}}]}}}}"#,
+                b64_encode(k.as_bytes()),
+                b64_encode(v)
+            )
+        };
+        let delete_event = |k: &str, mod_rev: i64| {
+            format!(
+                r#"{{"result":{{"header":{{"revision":"{mod_rev}"}},"events":[{{"type":"DELETE","kv":{{"key":"{}","version":"0","mod_revision":"{mod_rev}"}}}}]}}}}"#,
+                b64_encode(k.as_bytes())
+            )
+        };
+
+        // 1. WatchKey with StringCodec: DELETE passes empty bytes through StringCodec -> "".
+        let ep_str = run_mock_watch(vec![
+            put_event("k1", b"hello", 1),
+            delete_event("k1", 2),
+        ])
+        .await;
+        let cfg_str = EtcdConfig {
+            endpoints: vec![ep_str],
+            ..Default::default()
+        };
+        let kv_str = EtcdKv::new(cfg_str, Arc::new(StringCodec)).unwrap();
+        let ctx_str = ServiceContext::background();
+        let got_str = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let got_str_c = Arc::clone(&got_str);
+        let ctx_str_c = ctx_str.clone();
+        kv_str
+            .watch_key(
+                "k1",
+                ctx_str,
+                Box::new(move |any| {
+                    let s = *any.downcast::<String>().expect("StringCodec must yield String on DELETE");
+                    let stop = s.is_empty();
+                    got_str_c.lock().push(s);
+                    if stop {
+                        ctx_str_c.cancel();
+                        false
+                    } else {
+                        true
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(*got_str.lock(), vec!["hello".to_string(), String::new()]);
+
+        // 2. WatchKey with ProtoSnappyCodec: DELETE passes &[] through codec.decode(&[]) which errors
+        // (logged and skipped) rather than emitting KeyDeleted, followed by next valid PUT.
+        let codec_proto = Arc::new(ProtoSnappyCodec::<Desc>::new("ringDesc"));
+        let encoded_desc = codec_proto.encode(&Desc::default()).unwrap();
+        let ep_proto = run_mock_watch(vec![
+            delete_event("ring", 1),
+            put_event("ring", &encoded_desc, 2),
+        ])
+        .await;
+        let cfg_proto = EtcdConfig {
+            endpoints: vec![ep_proto],
+            ..Default::default()
+        };
+        let kv_proto = EtcdKv::new(cfg_proto, codec_proto).unwrap();
+        let ctx_proto = ServiceContext::background();
+        let got_proto = Arc::new(parking_lot::Mutex::new(0usize));
+        let got_proto_c = Arc::clone(&got_proto);
+        let ctx_proto_c = ctx_proto.clone();
+        kv_proto
+            .watch_key(
+                "ring",
+                ctx_proto,
+                Box::new(move |any| {
+                    assert!(any.is::<Desc>(), "expected Desc, never KeyDeleted");
+                    *got_proto_c.lock() += 1;
+                    ctx_proto_c.cancel();
+                    false
+                }),
+            )
+            .await;
+        assert_eq!(*got_proto.lock(), 1);
+
+        // 3. WatchPrefix: DELETE is ignored (matching dskit WatchPrefix), PUT is delivered.
+        let ep_pref = run_mock_watch(vec![
+            delete_event("p/1", 1),
+            put_event("p/2", b"val2", 2),
+        ])
+        .await;
+        let cfg_pref = EtcdConfig {
+            endpoints: vec![ep_pref],
+            ..Default::default()
+        };
+        let kv_pref = EtcdKv::new(cfg_pref, Arc::new(StringCodec)).unwrap();
+        let ctx_pref = ServiceContext::background();
+        let got_pref = Arc::new(parking_lot::Mutex::new(Vec::<(String, String)>::new()));
+        let got_pref_c = Arc::clone(&got_pref);
+        let ctx_pref_c = ctx_pref.clone();
+        kv_pref
+            .watch_prefix(
+                "p/",
+                ctx_pref,
+                Box::new(move |k, any| {
+                    let s = *any.downcast::<String>().unwrap();
+                    got_pref_c.lock().push((k.to_string(), s));
+                    ctx_pref_c.cancel();
+                    false
+                }),
+            )
+            .await;
+        assert_eq!(*got_pref.lock(), vec![("p/2".to_string(), "val2".to_string())]);
     }
 }

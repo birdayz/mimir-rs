@@ -1029,7 +1029,7 @@ impl S3Bucket {
             .execute_method("DELETE", meta)
             .await
             .map_err(S3BucketError::new)?;
-        if resp.status != 204 {
+        if !matches!(resp.status, 200 | 204) {
             return Err(S3BucketError::new(response_error(&resp, &self.name, name)));
         }
         Ok(())
@@ -1091,9 +1091,17 @@ impl S3Bucket {
                     ..Default::default()
                 }))));
             }
-            for key in &page.keys {
-                marker = key.clone();
-            }
+            let v1_last_entry = if use_v1 {
+                page.keys
+                    .last()
+                    .into_iter()
+                    .chain(page.prefixes.last())
+                    .filter(|s| !s.is_empty())
+                    .max()
+                    .cloned()
+            } else {
+                None
+            };
             for key in page.keys.into_iter().chain(page.prefixes) {
                 if key.is_empty() || key == dir {
                     continue;
@@ -1103,6 +1111,8 @@ impl S3Bucket {
             if use_v1 {
                 if !page.next_marker.is_empty() {
                     marker = page.next_marker;
+                } else if let Some(last) = v1_last_entry {
+                    marker = last;
                 }
             } else if !page.next_continuation_token.is_empty() {
                 token = page.next_continuation_token;
