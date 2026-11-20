@@ -3092,7 +3092,12 @@ mod tests {
     /// `add_batch_unordered_with_scratch`, which takes `add_gate` itself. Holding the gate
     /// across that call is a recursive `parking_lot` read: it deadlocks as soon as a
     /// `postings_for_matchers` subtracting-matcher barrier (`add_gate.write()`) queues in between.
+    ///
+    /// Skipped under Miri because contended `parking_lot::RwLock` parks via
+    /// `libc::syscall(SYS_futex, &self.futex, ...)` passing `&AtomicI32` instead of `*mut u32`,
+    /// which triggers Miri's strict C-variadic argument type check.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn add_batches_unordered_parallel_small_path_does_not_reenter_add_gate() {
         use std::sync::atomic::AtomicBool;
         use std::sync::mpsc;

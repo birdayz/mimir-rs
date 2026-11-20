@@ -1426,28 +1426,34 @@ pub fn span_to_otlp_json(span: &ExportedSpan) -> serde_json::Value {
     span_to_otlp_json_with_resource(span, extra)
 }
 
-pub fn build_span_exporter() -> Option<SpanExporterFn> {
-    let kind = detected_exporter_kind()?;
+pub fn try_build_span_exporter() -> Result<Option<SpanExporterFn>, String> {
+    let Some(kind) = detected_exporter_kind() else {
+        return Ok(None);
+    };
     if kind.eq_ignore_ascii_case("none") {
-        return None;
+        return Ok(None);
     }
     if kind.eq_ignore_ascii_case("console") {
-        return Some(Arc::new(|span: ExportedSpan| {
+        return Ok(Some(Arc::new(|span: ExportedSpan| {
             let payload = span_to_otlp_json(&span);
             println!("{payload}");
-        }));
+        })));
     }
     let is_jaeger = kind.eq_ignore_ascii_case("jaeger");
-    let endpoint = if is_jaeger {
-        jaeger_endpoint_from_env()?
+    let Some(endpoint) = (if is_jaeger {
+        jaeger_endpoint_from_env()
     } else {
-        otlp_traces_endpoint_from_env()?
+        otlp_traces_endpoint_from_env()
+    }) else {
+        return Ok(None);
     };
     if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
-        return None;
+        return Ok(None);
     }
     let timeout = otlp_timeout_from_env().unwrap_or(Duration::from_secs(10));
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(timeout);
     if !is_jaeger {
         let hdrs = otlp_headers_from_env();
         if !hdrs.is_empty() {
@@ -1465,31 +1471,34 @@ pub fn build_span_exporter() -> Option<SpanExporterFn> {
     }
     let tls_paths = otlp_tls_paths_from_env();
     if let Some(ref ca_path) = tls_paths.ca_cert_path {
-        if let Ok(pem) = std::fs::read(ca_path) {
-            use rustls_pki_types::pem::PemObject as _;
-            for der in rustls_pki_types::CertificateDer::pem_slice_iter(&pem).filter_map(Result::ok) {
-                if let Ok(cert) = reqwest::Certificate::from_der(der.as_ref()) {
-                    builder = builder.add_root_certificate(cert);
-                }
-            }
+        let pem = std::fs::read(ca_path)
+            .map_err(|e| format!("reading OTLP CA certificate {ca_path:?}: {e}"))?;
+        use rustls_pki_types::pem::PemObject as _;
+        for der in rustls_pki_types::CertificateDer::pem_slice_iter(&pem).filter_map(Result::ok) {
+            let cert = reqwest::Certificate::from_der(der.as_ref())
+                .map_err(|e| format!("parsing OTLP CA certificate {ca_path:?}: {e}"))?;
+            builder = builder.add_root_certificate(cert);
         }
     }
     if let (Some(ref cert_path), Some(ref key_path)) =
         (tls_paths.client_cert_path, tls_paths.client_key_path)
     {
-        if let (Ok(mut combined), Ok(key_pem)) =
-            (std::fs::read(cert_path), std::fs::read(key_path))
-        {
-            combined.push(b'\n');
-            combined.extend_from_slice(&key_pem);
-            if let Ok(id) = reqwest::Identity::from_pem(&combined) {
-                builder = builder.identity(id);
-            }
-        }
+        let mut combined = std::fs::read(cert_path)
+            .map_err(|e| format!("reading OTLP client certificate {cert_path:?}: {e}"))?;
+        let key_pem = std::fs::read(key_path)
+            .map_err(|e| format!("reading OTLP client key {key_path:?}: {e}"))?;
+        combined.push(b'\n');
+        combined.extend_from_slice(&key_pem);
+        let id = reqwest::Identity::from_pem(&combined)
+            .map_err(|e| format!("parsing OTLP client identity ({cert_path:?}, {key_path:?}): {e}"))?;
+        builder = builder.identity(id);
     }
-    let client = builder.build().ok()?;
+    let client = builder
+        .build()
+        .map_err(|e| format!("building OTLP/Jaeger HTTP client: {e}"))?;
     let jaeger_auth = is_jaeger.then(jaeger_basic_auth_from_env).flatten();
-    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|e| format!("no active tokio runtime for span exporter: {e}"))?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ExportedSpan>(4096);
     handle.spawn(async move {
         while let Some(span) = rx.recv().await {
@@ -1501,9 +1510,19 @@ pub fn build_span_exporter() -> Option<SpanExporterFn> {
             let _ = req.send().await;
         }
     });
-    Some(Arc::new(move |span: ExportedSpan| {
+    Ok(Some(Arc::new(move |span: ExportedSpan| {
         let _ = tx.try_send(span);
-    }))
+    })))
+}
+
+pub fn build_span_exporter() -> Option<SpanExporterFn> {
+    match try_build_span_exporter() {
+        Ok(exp) => exp,
+        Err(err) => {
+            tracing::warn!(%err, "failed to build span exporter");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

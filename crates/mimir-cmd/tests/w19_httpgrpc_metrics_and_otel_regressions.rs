@@ -21,7 +21,8 @@ use bytes::Bytes;
 use flate2::read::GzDecoder;
 use http_body_util::BodyExt;
 use mimir_cmd::app::{
-    build_span_exporter, run_mimir, span_to_otlp_json, validate_activity_tracker_max_entries,
+    build_span_exporter, run_mimir, span_to_otlp_json, try_build_span_exporter,
+    validate_activity_tracker_max_entries,
 };
 use mimir_cmd::grpc::{HttpGrpcBridge, HttpGrpcStatusFixService};
 use mimir_cmd::http::{build_http_router, AppHttpState};
@@ -934,7 +935,9 @@ async fn w19_rkn_10_otlp_headers_tls_mtls_timeout_and_jaeger_endpoint_exporter()
         otlp_tls_paths_from_env().ca_cert_path.as_deref(),
         Some(ca_crt.to_str().unwrap())
     );
-    let tls_exp = build_span_exporter().expect("mTLS OTLP exporter");
+    let tls_exp = try_build_span_exporter()
+        .expect("try_build_span_exporter for mTLS OTLP")
+        .expect("mTLS OTLP exporter");
     tls_exp(sample_span.clone());
     let deadline = Instant::now() + Duration::from_secs(5);
     while !tls_received.load(Ordering::Acquire) {

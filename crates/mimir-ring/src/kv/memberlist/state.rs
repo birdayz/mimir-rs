@@ -131,6 +131,54 @@ fn random_stagger(d: Duration) -> Duration {
     Duration::from_nanos(rand::thread_rng().gen_range(0..d.as_nanos().max(1) as u64))
 }
 
+/// Go `time.NewTicker` + `triggerFunc`: starts an interval ticker immediately into a
+/// 1-slot buffered channel (dropping ticks only when a tick is already queued), waits a
+/// random stagger in `[0, interval)`, then invokes `f` on each delivered tick.
+///
+/// Using a 1-slot channel prevents `probe_node` (which sleeps `probe_interval` on failure)
+/// from skipping an entire extra `probe_interval` on every failed probe.
+fn spawn_trigger<F, Fut>(
+    interval: Duration,
+    cancel: mimir_common::services::ServiceContext,
+    mut f: F,
+) where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::channel::<()>(1);
+    let cancel_tick = cancel.clone();
+    tokio::spawn(async move {
+        let start = tokio::time::Instant::now() + interval;
+        let mut ticker = tokio::time::interval_at(start, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel_tick.canceled() => return,
+                _ = ticker.tick() => {
+                    let _ = tx.try_send(());
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = cancel.canceled() => return,
+            _ = tokio::time::sleep(random_stagger(interval)) => {}
+        }
+        loop {
+            tokio::select! {
+                _ = cancel.canceled() => return,
+                tick = rx.recv() => {
+                    if tick.is_none() {
+                        return;
+                    }
+                    f().await;
+                }
+            }
+        }
+    });
+}
+
 fn state_metrics_string(s: NodeStateType) -> &'static str {
     match s {
         NodeStateType::Alive => "alive",
@@ -238,21 +286,9 @@ impl MemberlistKv {
         let t = self.timing.clone();
         if !t.probe_interval.is_zero() {
             let kv = Arc::clone(self);
-            let cancel = self.shutdown_ctx.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = cancel.canceled() => return,
-                    _ = tokio::time::sleep(random_stagger(t.probe_interval)) => {}
-                }
-                let mut ticker = tokio::time::interval(t.probe_interval);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                ticker.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = cancel.canceled() => return,
-                        _ = ticker.tick() => kv.probe().await,
-                    }
-                }
+            spawn_trigger(t.probe_interval, self.shutdown_ctx.clone(), move || {
+                let kv = Arc::clone(&kv);
+                async move { kv.probe().await }
             });
         }
         if !t.push_pull_interval.is_zero() {
@@ -274,21 +310,9 @@ impl MemberlistKv {
         }
         if !t.gossip_interval.is_zero() && t.gossip_nodes > 0 {
             let kv = Arc::clone(self);
-            let cancel = self.shutdown_ctx.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = cancel.canceled() => return,
-                    _ = tokio::time::sleep(random_stagger(t.gossip_interval)) => {}
-                }
-                let mut ticker = tokio::time::interval(t.gossip_interval);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                ticker.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = cancel.canceled() => return,
-                        _ = ticker.tick() => kv.gossip().await,
-                    }
-                }
+            spawn_trigger(t.gossip_interval, self.shutdown_ctx.clone(), move || {
+                let kv = Arc::clone(&kv);
+                async move { kv.gossip().await }
             });
         }
         // Go `checkBroadcastQueueDepth`.
@@ -1119,5 +1143,36 @@ mod tests {
         let table = kv.nodes.read();
         let me = table.map.get(&node_name).expect("local node present");
         assert_eq!(me.state, NodeStateType::Alive);
+    }
+
+    #[tokio::test]
+    async fn spawn_trigger_preserves_one_buffered_tick_like_go_ticker() {
+        use std::sync::atomic::AtomicUsize;
+
+        let cancel = mimir_common::services::ServiceContext::background();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let interval = Duration::from_millis(60);
+        spawn_trigger(interval, cancel.clone(), move || {
+            let calls = Arc::clone(&calls_ref);
+            async move {
+                let n = calls.fetch_add(1, Ordering::AcqRel);
+                if n == 0 {
+                    // Simulate a failed probe finishing slightly after ProbeInterval.
+                    tokio::time::sleep(Duration::from_millis(75)).await;
+                }
+            }
+        });
+        // With 1-slot buffering like Go's time.NewTicker + triggerFunc:
+        // t=60ms fires call 0 (finishes at 135ms), t=120ms tick was buffered so call 1
+        // runs immediately at 135ms, and t=180ms fires call 2.
+        // Under MissedTickBehavior::Skip, call 1 would wait until 180ms and call 2 until 240ms.
+        tokio::time::sleep(Duration::from_millis(215)).await;
+        cancel.cancel();
+        let count = calls.load(Ordering::Acquire);
+        assert!(
+            count >= 3,
+            "expected at least 3 trigger calls in 215ms (1-slot buffered tick), got {count}"
+        );
     }
 }
