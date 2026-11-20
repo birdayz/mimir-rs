@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::extract::{Path as AxumPath, RawQuery, State as AxumState};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, on, MethodFilter, MethodRouter};
 use axum::{Json, Router};
 use mimir_common::services::State;
 use mimir_common::tenant::{
@@ -43,6 +43,44 @@ pub struct AppHttpState {
     pub cost_attribution_registry: Option<(String, Registry)>,
 }
 
+/// Exact `GET`-only route matching Gorilla `mux` `Methods("GET")` (rejecting `HEAD` with 405).
+fn get_only<H, T, S>(handler: H) -> MethodRouter<S>
+where
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    on(MethodFilter::GET, handler).head(crate::server::http_middleware::method_not_allowed)
+}
+
+async fn reject_head_on_gorilla_mux_routes(
+    AxumState(prefix): AxumState<String>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if req.method() == axum::http::Method::HEAD {
+        let matched = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|p| {
+                let s = p.as_str();
+                if prefix.is_empty() {
+                    s
+                } else {
+                    s.strip_prefix(&prefix).unwrap_or(s)
+                }
+            });
+        let allow_head = matches!(
+            matched,
+            Some("/ready" | "/metrics" | "/debug/pprof" | "/debug/pprof/")
+        ) || matched.is_some_and(|p| p.starts_with("/debug/pprof/"));
+        if !allow_head {
+            return crate::server::http_middleware::method_not_allowed().await;
+        }
+    }
+    next.run(req).await
+}
+
 /// Builds the full Axum HTTP router (with `server.http_path_prefix` honored).
 pub fn build_http_router(state: AppHttpState) -> Router {
     let register_instrumentation = state.config.server.register_instrumentation;
@@ -68,25 +106,25 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     // `Server.HTTP.Path("/ready")`, dskit `router.Handle("/metrics", ...)`).
     let mut router = Router::new()
         .route("/ready", any(ready_handler))
-        .route("/services", get(services_handler))
-        .route("/config", get(config_handler))
-        .route("/api/v1/status/buildinfo", get(buildinfo_handler))
-        .route("/api/v1/status/config", get(status_config_handler))
-        .route("/api/v1/status/flags", get(status_flags_handler))
-        .route("/debug/fgprof", get(crate::pprof::fgprof_handler))
-        .route("/static/", get(static_dir_handler))
-        .route("/static/*path", get(static_file_handler));
+        .route("/services", get_only(services_handler))
+        .route("/config", get_only(config_handler))
+        .route("/api/v1/status/buildinfo", get_only(buildinfo_handler))
+        .route("/api/v1/status/config", get_only(status_config_handler))
+        .route("/api/v1/status/flags", get_only(status_flags_handler))
+        .route("/debug/fgprof", get_only(crate::pprof::fgprof_handler))
+        .route("/static/", get_only(static_dir_handler))
+        .route("/static/*path", get_only(static_file_handler));
 
     // Go `initRuntimeConfig` only registers /runtime_config and /api/v1/user_limits when
     // -runtime-config.file is configured (`pkg/mimir/modules.go:460-475`).
     if state.runtime_config.is_some() {
         router = router
-            .route("/runtime_config", get(runtime_config_handler))
-            .route("/api/v1/user_limits", get(user_limits_handler));
+            .route("/runtime_config", get_only(runtime_config_handler))
+            .route("/api/v1/user_limits", get_only(user_limits_handler));
     }
 
     if !has_prefix {
-        router = router.route("/", get(index_handler));
+        router = router.route("/", get_only(index_handler));
     }
 
     if register_instrumentation {
@@ -127,7 +165,7 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         );
     }
     if has_memberlist {
-        router = router.route("/memberlist", get(memberlist_handler));
+        router = router.route("/memberlist", get_only(memberlist_handler));
     }
     let mut cost_attribution_path: Option<String> = None;
     if let Some((path, reg)) = state.cost_attribution_registry.clone() {
@@ -135,7 +173,7 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         cost_attribution_path = Some(path.clone());
         router = router.route(
             &path,
-            get(move |RawQuery(raw_query): RawQuery, headers: HeaderMap| {
+            get_only(move |RawQuery(raw_query): RawQuery, headers: HeaderMap| {
                 let reg = reg.clone();
                 async move {
                     let filter = parse_name_filter(raw_query.as_deref());
@@ -158,6 +196,10 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         cost_attribution_path,
     };
     app = app
+        .route_layer(axum::middleware::from_fn_with_state(
+            path_prefix.clone(),
+            reject_head_on_gorilla_mux_routes,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(gzip.clone(), crate::server::gzip::gzip_handler))
         // gorilla/mux answers a known path with an unsupported method with an empty 405 and
         // reports it as an unmatched route.
@@ -168,7 +210,7 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         Router::new()
             .route(
                 &format!("{path_prefix}/"),
-                get(index_handler)
+                on(MethodFilter::GET, index_handler)
                     .with_state(state_for_root)
                     .route_layer(axum::middleware::from_fn_with_state(
                         gzip,
@@ -918,12 +960,16 @@ fn go_http_error(status: StatusCode, msg: &str) -> Response {
 
 async fn user_limits_handler(
     AxumState(st): AxumState<AppHttpState>,
+    raw_org_id: Option<axum::Extension<mimir_ingester::http::RawScopeOrgId>>,
     headers: HeaderMap,
 ) -> Response {
     let org_bytes: &[u8] = if st.config.multitenancy_enabled {
-        match extract_org_id_bytes_from_http_headers(&headers) {
-            Ok(b) => b,
-            Err(err) => return go_http_error(StatusCode::UNAUTHORIZED, &err.to_string()),
+        match raw_org_id.as_ref().map(|e| &e.0).filter(|r| !r.0.is_empty()) {
+            Some(raw) => raw.0.as_slice(),
+            None => match extract_org_id_bytes_from_http_headers(&headers) {
+                Ok(b) => b,
+                Err(err) => return go_http_error(StatusCode::UNAUTHORIZED, &err.to_string()),
+            },
         }
     } else {
         st.config.no_auth_tenant.as_bytes()

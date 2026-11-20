@@ -194,6 +194,8 @@ struct LifecycleCallbackAdapter {
     use_owned_series_for_limits: AtomicBool,
     num_series_fn: RwLock<Option<Arc<dyn Fn() -> u64 + Send + Sync>>>,
     pending_series_removals: Arc<AtomicI64>,
+    postings_cache_invalidations: Option<prometheus::Counter>,
+    postings_cache_invalidation_enabled: Arc<AtomicBool>,
 }
 
 impl SeriesLifecycleCallback for LifecycleCallbackAdapter {
@@ -255,6 +257,11 @@ impl SeriesLifecycleCallback for LifecycleCallbackAdapter {
         let metric_name = labels.get("__name__");
         if !metric_name.is_empty() {
             self.series_in_metric.increase_series_for_metric(metric_name);
+            if self.postings_cache_invalidation_enabled.load(Ordering::Acquire) {
+                if let Some(ref c) = self.postings_cache_invalidations {
+                    c.inc();
+                }
+            }
         }
     }
 
@@ -393,10 +400,19 @@ impl UserTsdb {
         }
     }
 
-    /// `getIndexLookupPlannerFunc` for a persisted ULID block.
+    /// `getIndexLookupPlannerFunc` for a persisted ULID block (cached once directly on `Block`,
+    /// matching Go `index.Reader.lookupPlanner`).
     pub fn block_lookup_planner(&self, block: &mimir_tsdb::block::Block) -> Arc<dyn LookupPlanner> {
-        match self.planner_provider.get() {
-            Some(provider) => provider.get_planner(&block.meta().into(), block.index()),
+        let Some(provider) = self.planner_provider.get() else {
+            return Arc::new(NoopPlanner);
+        };
+        let slot = block.get_or_init_lookup_planner(|| {
+            let planner: Arc<dyn LookupPlanner> =
+                provider.get_planner(&block.meta().into(), block.index());
+            Arc::new(planner)
+        });
+        match slot.downcast_ref::<Arc<dyn LookupPlanner>>() {
+            Some(planner) => Arc::clone(planner),
             None => Arc::new(NoopPlanner),
         }
     }
@@ -451,6 +467,17 @@ impl UserTsdb {
             local_series_limit: initial_local_limit,
         }));
         let pending_series_removals = Arc::new(AtomicI64::new(0));
+        let postings_cache_invalidation_enabled = Arc::new(AtomicBool::new(false));
+        let postings_cache_invalidations = if blocks_cfg.tsdb.shared_postings_for_matchers_cache
+            && blocks_cfg.tsdb.head_postings_for_matchers_cache_invalidation
+        {
+            shared_metrics
+                .head_postings_cache
+                .as_ref()
+                .map(|m| m.invalidations().clone())
+        } else {
+            None
+        };
 
         let lifecycle_adapter = Arc::new(LifecycleCallbackAdapter {
             user_id: user_id.clone(),
@@ -466,6 +493,8 @@ impl UserTsdb {
             ),
             num_series_fn: RwLock::new(None),
             pending_series_removals: Arc::clone(&pending_series_removals),
+            postings_cache_invalidations,
+            postings_cache_invalidation_enabled: Arc::clone(&postings_cache_invalidation_enabled),
         });
 
         let block_duration_ms = blocks_cfg
@@ -643,6 +672,7 @@ impl UserTsdb {
         // Compact ready blocks after WAL replay
         let _ = db.compact()?;
         pending_series_removals.store(0, Ordering::Release);
+        postings_cache_invalidation_enabled.store(true, Ordering::Release);
 
         // Enable series limits now that WAL replay is complete
         *lifecycle_adapter.limiter_slot.write() = Some(Arc::clone(&limiter));
@@ -1699,7 +1729,7 @@ pub(crate) fn head_postings_for_matchers_cache_config(
             0
         },
         metrics: shared_metrics.head_postings_cache.clone(),
-        report_invalidations: shared_invalidation,
+        report_invalidations: false,
     }
 }
 
@@ -1919,7 +1949,7 @@ mod tests {
         let pc_shared = head_postings_for_matchers_cache_config(&shared_inv_cfg, &shared);
         assert!(pc_shared.enable_invalidation);
         assert_eq!(pc_shared.num_metric_versions, 4096);
-        assert!(pc_shared.report_invalidations);
+        assert!(!pc_shared.report_invalidations);
     }
 
     #[test]

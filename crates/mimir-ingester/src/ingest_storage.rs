@@ -213,6 +213,14 @@ struct ShardMetadataItem {
     bounds: [usize; 4],
 }
 
+struct TrackedBufferGuard(mimir_proto::ref_leaks::TrackedBuffer);
+
+impl Drop for TrackedBufferGuard {
+    fn drop(&mut self) {
+        self.0.free();
+    }
+}
+
 struct WorkerArena {
     wr_scratch: WriteRequestScratch,
     rw2_resolved: Rw2ResolvedScratch,
@@ -229,6 +237,7 @@ struct WorkerArena {
     decoded_pushers: Vec<(u32, i32)>,
     /// `(rec_seq, worker_idx, record_offset, tenant_idx, norm_source, trace_id_idx)` for valid empty records in sequential mode.
     seq_empty_records: Vec<(u32, u16, i64, u32, i32, u32)>,
+    tracked_buffers: Vec<TrackedBufferGuard>,
     total_series: usize,
 }
 
@@ -354,6 +363,7 @@ impl WorkerArena {
             tenant_key_errors: Vec::new(),
             decoded_pushers: Vec::new(),
             seq_empty_records: Vec::new(),
+            tracked_buffers: Vec::new(),
             total_series: 0,
         }
     }
@@ -391,6 +401,7 @@ impl WorkerArena {
         self.tenant_key_errors.clear();
         self.decoded_pushers.clear();
         self.seq_empty_records.clear();
+        self.tracked_buffers.clear();
         self.total_series = 0;
     }
 
@@ -409,6 +420,7 @@ impl Drop for ArenaPoolGuard<'_> {
     fn drop(&mut self) {
         let mut arenas = std::mem::take(&mut self.arenas);
         for a in &mut arenas {
+            a.tracked_buffers.clear();
             a.label_bytes_arena.clear();
             a.samples_arena.clear();
             a.histograms_arena.clear();
@@ -688,6 +700,7 @@ impl IngesterShardedBatchConsumer {
 
         let mut pool_guard = self.take_arenas(num_workers, num_shards);
         let batch_started = Instant::now();
+        let ref_leaks_tracker = self.ingester.ref_leaks_tracker();
 
         // Phase A: parallel decode + metadata + single xxh64 hash + shard bucketing.
         let decode_worker = |worker_idx: usize,
@@ -708,6 +721,7 @@ impl IngesterShardedBatchConsumer {
                 tenant_key_errors,
                 decoded_pushers,
                 seq_empty_records,
+                tracked_buffers,
                 total_series,
             } = arena;
             let propagators = mimir_common::tracing::PropagatorSet {
@@ -728,6 +742,15 @@ impl IngesterShardedBatchConsumer {
                     let version = parse_record_version(
                         rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
                     );
+                    if (0..=2).contains(&version) {
+                        if let Some(tb) = ref_leaks_tracker
+                            .as_ref()
+                            .and_then(|t| t.maybe_instrument_ref_leaks(&rec.value))
+                        {
+                            let _ = tb.read_only_data();
+                            tracked_buffers.push(TrackedBufferGuard(tb));
+                        }
+                    }
                     if version == 2 {
                         let label_bytes_base = label_bytes_arena.len();
                         let samples_base = samples_arena.len();
@@ -859,6 +882,15 @@ impl IngesterShardedBatchConsumer {
                 let version = parse_record_version(
                     rec.headers.iter().map(|(k, v)| (k.as_str(), v.as_ref())),
                 );
+                if (0..=2).contains(&version) {
+                    if let Some(tb) = ref_leaks_tracker
+                        .as_ref()
+                        .and_then(|t| t.maybe_instrument_ref_leaks(&rec.value))
+                    {
+                        let _ = tb.read_only_data();
+                        tracked_buffers.push(TrackedBufferGuard(tb));
+                    }
+                }
 
                 let max_exemplars = self
                     .ingester

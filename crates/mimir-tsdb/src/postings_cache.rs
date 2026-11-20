@@ -149,6 +149,12 @@ impl PostingsForMatchersCacheMetrics {
             evictions_unknown: evictions[3].clone(),
         }
     }
+
+    /// Returns the shared `invalidations_total` counter registered for this cache factory.
+    #[inline]
+    pub fn invalidations(&self) -> &Counter {
+        &self.invalidations
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -432,16 +438,23 @@ impl PostingsForMatchersCache {
         self.shared.load(Ordering::Acquire)
     }
 
-    /// Invalidates cached Head postings affected by creating or deleting a series with `metric_name`.
+    /// Invalidates cached Head postings affected by creating or deleting a series with `metric_name`
+    /// without incrementing `invalidations_total` (used internally during WAL replay and Head GC).
     #[inline]
-    pub fn invalidate_metric(&self, metric_name: &str) {
+    pub fn invalidate_metric_silent(&self, metric_name: &str) {
         self.postings_generation.fetch_add(1, Ordering::Release);
         if self.config.enable_invalidation && !metric_name.is_empty() {
             if let Some(mv) = self.metric_versions.get() {
                 mv.fetch_add(metric_name);
             }
         }
-        if self.config.report_invalidations {
+    }
+
+    /// Invalidates cached Head postings affected by creating or deleting a series with `metric_name`.
+    #[inline]
+    pub fn invalidate_metric(&self, metric_name: &str) {
+        self.invalidate_metric_silent(metric_name);
+        if self.config.report_invalidations && !metric_name.is_empty() {
             if let Some(ref m) = self.metrics {
                 m.invalidations.inc();
             }

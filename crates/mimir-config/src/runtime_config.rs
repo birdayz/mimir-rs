@@ -16,8 +16,7 @@ pub use provider::{
 };
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex as StdMutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -602,8 +601,8 @@ pub struct RuntimeConfigManager {
     last_hash: RwLock<Option<String>>,
     listeners: parking_lot::Mutex<Vec<tokio::sync::mpsc::Sender<Arc<RuntimeConfigValues>>>>,
     http_observer: Arc<RwLock<Option<Arc<dyn RuntimeConfigHttpObserver>>>>,
-    stop_flag: Arc<AtomicBool>,
-    reloader: Option<JoinHandle<()>>,
+    stop_signal: Arc<(StdMutex<bool>, Condvar)>,
+    reloader: parking_lot::Mutex<Option<JoinHandle<()>>>,
     observer: Option<Arc<dyn RuntimeConfigObserver>>,
 }
 
@@ -692,8 +691,8 @@ impl RuntimeConfigManager {
             last_hash: RwLock::new(None),
             listeners: parking_lot::Mutex::new(Vec::new()),
             http_observer,
-            stop_flag: Arc::new(AtomicBool::new(false)),
-            reloader: None,
+            stop_signal: Arc::new((StdMutex::new(false), Condvar::new())),
+            reloader: parking_lot::Mutex::new(None),
             observer,
         });
 
@@ -707,8 +706,22 @@ impl RuntimeConfigManager {
     }
 
     /// Starts a background reloader thread polling every `runtime_config.period`.
-    pub fn start_reloader(self: &Arc<Self>) -> JoinHandle<()> {
-        let mgr = Arc::clone(self);
+    ///
+    /// Holds a `Weak<Self>` and sleeps on a `Condvar` so `stop()` and `Drop` wake and join
+    /// immediately without leaking threads or blocking for `reload_period`.
+    pub fn start_reloader(self: &Arc<Self>) {
+        let mut guard = self.reloader.lock();
+        if guard.is_some() {
+            return;
+        }
+        {
+            let (lock, _) = &*self.stop_signal;
+            if *lock.lock().unwrap_or_else(|e| e.into_inner()) {
+                return;
+            }
+        }
+        let weak: Weak<Self> = Arc::downgrade(self);
+        let stop_signal = Arc::clone(&self.stop_signal);
         let period = self
             .cfg
             .period
@@ -716,22 +729,44 @@ impl RuntimeConfigManager {
             .filter(|d| !d.is_zero())
             .unwrap_or_else(|| Duration::from_secs(10));
 
-        thread::spawn(move || {
-            while !mgr.stop_flag.load(Ordering::Relaxed) {
-                thread::sleep(period);
-                if mgr.stop_flag.load(Ordering::Relaxed) {
+        let handle = thread::spawn(move || {
+            let (lock, cvar) = &*stop_signal;
+            let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while !*stopped {
+                let (next_guard, _) = cvar
+                    .wait_timeout_while(stopped, period, |s| !*s)
+                    .unwrap_or_else(|e| e.into_inner());
+                stopped = next_guard;
+                if *stopped {
                     break;
                 }
+                drop(stopped);
+                let Some(mgr) = weak.upgrade() else {
+                    return;
+                };
                 let _ = mgr.reload();
+                drop(mgr);
+                stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
             }
-        })
+        });
+        *guard = Some(handle);
     }
 
-    /// Signals any background reloader to stop and closes all listener channels
-    /// (`Manager.stopping`).
+    /// Signals any background reloader to stop, wakes it immediately, joins the thread,
+    /// and closes all listener channels (`Manager.stopping`).
     pub fn stop(&self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
+        {
+            let (lock, cvar) = &*self.stop_signal;
+            let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *stopped = true;
+            cvar.notify_all();
+        }
         self.listeners.lock().clear();
+        if let Some(handle) = self.reloader.lock().take() {
+            if handle.thread().id() != thread::current().id() {
+                let _ = handle.join();
+            }
+        }
     }
 
     /// Reloads runtime configuration sources immediately.
@@ -1018,10 +1053,7 @@ fn strip_rc(e: ConfigError) -> String {
 
 impl Drop for RuntimeConfigManager {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.reloader.take() {
-            let _ = handle.join();
-        }
+        self.stop();
     }
 }
 
@@ -1403,6 +1435,50 @@ overrides:
         assert_eq!(
             ov.otel_translation_strategy("t_null_ca").0,
             "UnderscoreEscapingWithoutSuffixes"
+        );
+    }
+
+    #[test]
+    fn w21_aps_03_reloader_stops_and_drops_immediately_despite_long_period() {
+        let cfg = RuntimeConfigConfig {
+            period: GoDuration::from_secs(3600),
+            ..Default::default()
+        };
+        let mgr = RuntimeConfigManager::new(
+            cfg,
+            LimitsConfig::default(),
+            InstanceLimits::default(),
+        )
+        .unwrap();
+        mgr.start_reloader();
+
+        // Explicit stop() must wake the Condvar and join immediately (<< 3600s).
+        let started = std::time::Instant::now();
+        mgr.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stop() blocked for {:?}",
+            started.elapsed()
+        );
+
+        // Dropping the last Arc without calling stop() must also wake & join via Weak + Drop.
+        let cfg2 = RuntimeConfigConfig {
+            period: GoDuration::from_secs(3600),
+            ..Default::default()
+        };
+        let mgr2 = RuntimeConfigManager::new(
+            cfg2,
+            LimitsConfig::default(),
+            InstanceLimits::default(),
+        )
+        .unwrap();
+        mgr2.start_reloader();
+        let started2 = std::time::Instant::now();
+        drop(mgr2);
+        assert!(
+            started2.elapsed() < Duration::from_secs(2),
+            "Drop blocked for {:?}",
+            started2.elapsed()
         );
     }
 }

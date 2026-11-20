@@ -233,6 +233,7 @@ const DETERMINISTIC_VALUES: &[&str] = &[
     "prometheus_tsdb_head_samples_appended_total",
     "prometheus_tsdb_head_out_of_order_samples_appended_total",
     "prometheus_tsdb_duplicate_samples_total",
+    "prometheus_tsdb_sample_ooo_delta_bucket",
     "prometheus_tsdb_sample_ooo_delta_count",
     "prometheus_tsdb_sample_ooo_delta_sum",
     "prometheus_tsdb_head_gc_duration_seconds_count",
@@ -241,7 +242,13 @@ const DETERMINISTIC_VALUES: &[&str] = &[
     "prometheus_tsdb_head_chunks",
     "prometheus_tsdb_head_chunks_created_total",
     "prometheus_tsdb_head_chunks_removed_total",
+    "prometheus_tsdb_head_chunks_storage_size_bytes",
+    "prometheus_tsdb_head_chunks_max_mmapped",
+    "prometheus_tsdb_mmap_chunks_total",
     "prometheus_tsdb_head_active_appenders",
+    "prometheus_tsdb_head_appenders_created_total",
+    "prometheus_tsdb_head_truncations_total",
+    "prometheus_tsdb_head_truncations_failed_total",
     "prometheus_tsdb_out_of_order_samples_total",
     "prometheus_tsdb_out_of_bound_samples_total",
     "prometheus_tsdb_too_old_samples_total",
@@ -255,14 +262,48 @@ const DETERMINISTIC_VALUES: &[&str] = &[
     "prometheus_tsdb_isolation_high_watermark",
     "prometheus_tsdb_wal_corruptions_total",
     "prometheus_tsdb_mmap_chunk_corruptions_total",
+    "prometheus_tsdb_clean_start",
     "prometheus_tsdb_blocks_loaded",
+    "prometheus_tsdb_symbol_table_size_bytes",
     "prometheus_tsdb_compactions_total",
     "prometheus_tsdb_compactions_failed_total",
+    "prometheus_tsdb_compaction_populating_block",
+    "prometheus_tsdb_compaction_duration_seconds_count",
+    "prometheus_tsdb_compaction_chunk_samples_bucket",
+    "prometheus_tsdb_compaction_chunk_samples_count",
+    "prometheus_tsdb_compaction_chunk_samples_sum",
+    "prometheus_tsdb_compaction_chunk_size_bytes_bucket",
+    "prometheus_tsdb_compaction_chunk_size_bytes_count",
+    "prometheus_tsdb_compaction_chunk_size_bytes_sum",
+    "prometheus_tsdb_compaction_chunk_range_seconds_bucket",
+    "prometheus_tsdb_compaction_chunk_range_seconds_count",
+    "prometheus_tsdb_compaction_chunk_range_seconds_sum",
+    "prometheus_tsdb_checkpoint_creations_total",
+    "prometheus_tsdb_checkpoint_creations_failed_total",
+    "prometheus_tsdb_checkpoint_deletions_total",
+    "prometheus_tsdb_checkpoint_deletions_failed_total",
+    "prometheus_tsdb_wal_segment_current",
+    "prometheus_tsdb_wal_completed_pages_total",
+    "prometheus_tsdb_wal_fsync_duration_seconds_count",
+    "prometheus_tsdb_wal_truncations_total",
+    "prometheus_tsdb_wal_truncations_failed_total",
+    "prometheus_tsdb_wal_writes_failed_total",
+    "prometheus_tsdb_out_of_order_wbl_segment_current",
+    "prometheus_tsdb_out_of_order_wbl_storage_size_bytes",
+    "prometheus_tsdb_out_of_order_wbl_completed_pages_total",
+    "prometheus_tsdb_out_of_order_wbl_page_flushes_total",
+    "prometheus_tsdb_out_of_order_wbl_record_part_writes_total",
+    "prometheus_tsdb_out_of_order_wbl_record_parts_bytes_written_total",
+    "prometheus_tsdb_out_of_order_wbl_fsync_duration_seconds_count",
+    "prometheus_tsdb_out_of_order_wbl_truncations_total",
+    "prometheus_tsdb_out_of_order_wbl_truncations_failed_total",
+    "prometheus_tsdb_out_of_order_wbl_writes_failed_total",
     "prometheus_tsdb_retention_limit_bytes",
     "prometheus_tsdb_retention_limit_seconds",
     "prometheus_tsdb_exemplar_exemplars_appended_total",
     "prometheus_tsdb_exemplar_exemplars_in_storage",
     "prometheus_tsdb_exemplar_series_with_exemplars_in_storage",
+    "prometheus_tsdb_exemplar_last_exemplars_timestamp_seconds",
     "prometheus_tsdb_exemplar_max_exemplars",
     "prometheus_tsdb_exemplar_out_of_order_exemplars_total",
 ];
@@ -347,6 +388,37 @@ fn run_scenario(name: &str, limits: &str) {
         let go = tsdb_metrics(&client, &procs[0].0, procs[0].1).await;
         let rust = tsdb_metrics(&client, &procs[1].0, procs[1].1).await;
         assert_same_registry(&format!("{name}: after flush"), &go, &rust);
+
+        if limits.contains("creation_grace_period") {
+            // Exercise commit-triggered `compactions_triggered_total` / `compactions_skipped_total`
+            // when a single post-flush commit stretches the Head span past 1.5 * 2h = 3h.
+            for (_, _, grpc) in &procs {
+                let mut gclient = IngesterClient::connect(format!("http://127.0.0.1:{grpc}"))
+                    .await
+                    .unwrap();
+                push(&mut gclient, float_series("w21_span_total", now_ms + 1_000, 1.0))
+                    .await
+                    .expect("push span start");
+                push(
+                    &mut gclient,
+                    float_series("w21_span_total", now_ms + 4 * 3_600_000, 2.0),
+                )
+                .await
+                .expect("push span > 3h");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let go = tsdb_metrics(&client, &procs[0].0, procs[0].1).await;
+            let rust = tsdb_metrics(&client, &procs[1].0, procs[1].1).await;
+            assert_eq!(
+                go.values.get("prometheus_tsdb_compactions_triggered_total").map(String::as_str),
+                Some("1"),
+            );
+            assert_eq!(
+                rust.values.get("prometheus_tsdb_compactions_triggered_total").map(String::as_str),
+                Some("1"),
+            );
+            assert_same_registry(&format!("{name}: after compactable commit"), &go, &rust);
+        }
     });
 }
 
@@ -359,6 +431,6 @@ fn m20_04_per_tenant_tsdb_registry_matches_go_with_default_limits() {
 fn m20_04_per_tenant_tsdb_registry_matches_go_with_ooo_window_and_exemplars() {
     run_scenario(
         "ooo",
-        "limits:\n  out_of_order_time_window: 10m\n  native_histograms_ingestion_enabled: true\n  max_global_exemplars_per_user: 1000\n",
+        "limits:\n  out_of_order_time_window: 10m\n  creation_grace_period: 5h\n  native_histograms_ingestion_enabled: true\n  max_global_exemplars_per_user: 1000\n",
     );
 }

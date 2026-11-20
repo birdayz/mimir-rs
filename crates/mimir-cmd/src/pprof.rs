@@ -103,7 +103,11 @@ pub async fn index_handler(method: Method) -> Response {
     for (name, _) in PROFILES {
         b.push_str(&format!("<tr><td>0</td><td><a href='{name}?debug=1'>{name}</a></td></tr>\n"));
     }
-    b.push_str("</table>\n<a href=\"goroutine?debug=2\">full goroutine stack dump</a>\n<br>\n<p>\nProfile Descriptions:\n<ul>\n");
+    b.push_str("</table>\n");
+    if PROFILES.iter().any(|(name, _)| *name == "goroutine") {
+        b.push_str("<a href=\"goroutine?debug=2\">full goroutine stack dump</a>\n<br>\n");
+    }
+    b.push_str("<p>\nProfile Descriptions:\n<ul>\n");
     for (name, desc) in PROFILES {
         b.push_str(&format!("<li><div class=profile-name>{name}: </div> {desc}</li>\n"));
     }
@@ -205,11 +209,34 @@ pub async fn profile_handler(req: Request) -> Response {
     sample_pprof_profile(duration, CPU_PROFILE_HZ, "cpu", "cpu", true).await
 }
 
+const MAX_PROFILE_SECONDS: i64 = 86_400;
+
+/// Parses a base-10 signed integer with Go `strconv.Atoi` semantics on 64-bit platforms:
+/// returns `Err((i64::MAX | i64::MIN, "value out of range"))` on signed overflow/underflow of a
+/// well-formed integer literal, or `Err((0, "invalid syntax"))` otherwise.
+fn parse_go_atoi(raw: &str) -> Result<i64, (i64, &'static str)> {
+    let digits = raw.strip_prefix(['+', '-']).unwrap_or(raw);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err((0, "invalid syntax"));
+    }
+    match raw.parse::<i64>() {
+        Ok(n) => Ok(n),
+        Err(_) => {
+            let clamped = if raw.starts_with('-') {
+                i64::MIN
+            } else {
+                i64::MAX
+            };
+            Err((clamped, "value out of range"))
+        }
+    }
+}
+
 /// github.com/felixge/fgprof.Handler() mounted at GET /debug/fgprof.
 pub async fn fgprof_handler(req: Request) -> Response {
     let seconds = match form_value(req.uri().query(), "seconds").filter(|s| !s.is_empty()) {
         None => 30i64,
-        Some(raw) => match raw.parse::<i64>() {
+        Some(raw) => match parse_go_atoi(&raw) {
             Ok(n) if n > 0 => n,
             Ok(n) => {
                 return (
@@ -218,15 +245,22 @@ pub async fn fgprof_handler(req: Request) -> Response {
                 )
                     .into_response();
             }
-            Err(_) => {
+            Err((clamped, reason)) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("bad seconds: 0: strconv.Atoi: parsing {raw:?}: invalid syntax\n"),
+                    format!("bad seconds: {clamped}: strconv.Atoi: parsing {raw:?}: {reason}\n"),
                 )
                     .into_response();
             }
         },
     };
+    if seconds > MAX_PROFILE_SECONDS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("profile seconds {seconds} exceeds maximum {MAX_PROFILE_SECONDS}\n"),
+        )
+            .into_response();
+    }
     let format = form_value(req.uri().query(), "format").unwrap_or_default();
     let duration = Duration::from_secs(seconds as u64);
     match format.as_str() {
@@ -251,6 +285,14 @@ async fn sample_pprof_profile(
         .frequency(hz)
         .blocklist(&["libc", "libgcc", "pthread", "vdso"])
         .build();
+    if let Err(e) = &guard {
+        if pprof_headers {
+            return serve_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Could not enable CPU profiling: {e}"),
+            );
+        }
+    }
     tokio::time::sleep(duration).await;
     let profile = match guard {
         Ok(g) => match g.report().build() {
@@ -262,15 +304,7 @@ async fn sample_pprof_profile(
                 )
             }
         },
-        Err(e) => {
-            if pprof_headers {
-                return serve_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Could not enable CPU profiling: {e}"),
-                );
-            }
-            encode_empty_profile(duration, hz, sample_unit_type, period_type_name)
-        }
+        Err(_) => encode_empty_profile(duration, hz, sample_unit_type, period_type_name),
     };
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let body = match gz.write_all(&profile).and_then(|()| gz.finish()) {

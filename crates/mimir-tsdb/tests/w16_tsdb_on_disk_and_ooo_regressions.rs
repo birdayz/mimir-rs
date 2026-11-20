@@ -901,15 +901,22 @@ fn w16_icw_05_segment_buf_reader_opens_only_one_fd_lazily() {
     }
 
     #[cfg(target_os = "linux")]
+    let dir_canon = fs::canonicalize(dir.path()).unwrap();
+    #[cfg(target_os = "linux")]
     let fd_count = || -> usize {
         fs::read_dir("/proc/self/fd")
             .unwrap()
             .filter_map(Result::ok)
+            .filter(|e| {
+                fs::read_link(e.path())
+                    .map(|target| target.starts_with(&dir_canon))
+                    .unwrap_or(false)
+            })
             .count()
     };
 
     #[cfg(target_os = "linux")]
-    let fds_before = fd_count();
+    assert_eq!(fd_count(), 0);
 
     let sbr = SegmentBufReader::open_dir(dir.path()).unwrap();
 
@@ -917,9 +924,9 @@ fn w16_icw_05_segment_buf_reader_opens_only_one_fd_lazily() {
     {
         let fds_after_open = fd_count();
         // Lazy open: zero segment FDs opened in open_ranges!
-        assert!(
-            fds_after_open <= fds_before + 1,
-            "SegmentBufReader::open_dir opened too many FDs: before={fds_before} after={fds_after_open}"
+        assert_eq!(
+            fds_after_open, 0,
+            "SegmentBufReader::open_dir opened segment FDs eagerly: after={fds_after_open}"
         );
     }
 
@@ -934,8 +941,8 @@ fn w16_icw_05_segment_buf_reader_opens_only_one_fd_lazily() {
         {
             let fds_during = fd_count();
             assert!(
-                fds_during <= fds_before + 2,
-                "SegmentBufReader held >1 segment FD open during streaming: before={fds_before} during={fds_during}"
+                fds_during <= 1,
+                "SegmentBufReader held >1 segment FD open during streaming: during={fds_during}"
             );
         }
     }

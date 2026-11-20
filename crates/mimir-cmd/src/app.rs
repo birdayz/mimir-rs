@@ -136,6 +136,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         .clone()
         .context("missing parsed MimirConfig")?;
 
+    cfg.validate_targets()?;
     validate_supported_targets(&cfg)?;
 
     let _ballast = if outcome.ballast_bytes > 0 {
@@ -272,7 +273,6 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             http_observer: Some(observer as Arc<dyn RuntimeConfigHttpObserver>),
         })
         .context("initializing runtime config manager")?;
-        let _reloader = mgr.start_reloader();
         let ov = mgr.overrides();
         (Some(mgr), ov)
     } else {
@@ -413,6 +413,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             svc.stop_async();
             let _ = svc.await_terminated().await;
             log_module_stopped(&*logger, "usage-stats");
+        }
+        if let Some(rt) = runtime_config_mgr {
+            rt.stop();
         }
         stop_activity_tracker_module(
             &*logger,
@@ -802,7 +805,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         None
     };
 
-    let runtime_config_state = StateCell::new(State::Running);
+    let runtime_config_state = StateCell::new(State::New);
     if runtime_config_mgr.is_some() {
         modules.add("runtime-config", runtime_config_state.state_fn());
     }
@@ -853,6 +856,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let mut grpc_routes = tonic::service::Routes::new(health_svc).add_service(http_grpc_svc);
 
     if let Some(ref ing) = ingester_opt {
+        server.set_grpc_tap_ingester(Arc::clone(ing));
         let ing_inner = IngesterService::new(Arc::clone(ing))
             .into_server()
             .max_decoding_message_size(max_recv)
@@ -867,6 +871,12 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     log_module_starting(&*logger, "server");
     let servers = server.start(http_router, grpc_routes)?;
     server_state.set(State::Running);
+
+    if let Some(ref rt) = runtime_config_mgr {
+        log_module_starting(&*logger, "runtime-config");
+        rt.start_reloader();
+        runtime_config_state.set(State::Running);
+    }
 
     // Cost attribution service (`CostAttributionService` -> `API` -> `Server`): a timer service
     // purging inactive attributions; `IngesterService` depends on it.
@@ -1119,7 +1129,12 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         }
     }
     service_ctx.cancel();
-    runtime_config_state.set(State::Stopping);
+    if let Some(rt) = runtime_config_mgr {
+        runtime_config_state.set(State::Stopping);
+        rt.stop();
+        runtime_config_state.set(State::Terminated);
+        log_module_stopped(&*logger, "runtime-config");
+    }
     // Go KVInitService: a failed inner KV makes `running` return its error, so the module ends
     // up Failed (never Terminated).
     if memberlist_state.get() != State::Failed {
@@ -1164,10 +1179,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         let _ = svc.await_terminated().await;
         log_module_stopped(&*logger, "usage-stats");
     }
-    if let Some(rt) = runtime_config_mgr {
-        rt.stop();
-    }
-    runtime_config_state.set(State::Terminated);
+
     stop_activity_tracker_module(
         &*logger,
         &cfg.activity_tracker.filepath,

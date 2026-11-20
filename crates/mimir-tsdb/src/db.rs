@@ -26,7 +26,7 @@ use crate::compact::{
     write_head_block_streaming_with_options, CompactError, CompactorMetrics,
 };
 use crate::exemplar::{CircularExemplarStorage, ExemplarQueryResult};
-use crate::head::{range_for_timestamp, Head, HeadAppender, HeadError, HeadOptions};
+use crate::head::{range_for_timestamp, CompactNotifier, Head, HeadAppender, HeadError, HeadOptions};
 use crate::matcher::LabelMatcher;
 use crate::metrics::{counter, gauge, native_histogram, FnGaugeCollector};
 use crate::postings_cache::PostingsForMatchersCacheConfig;
@@ -340,6 +340,8 @@ struct TsdbInner {
     blocks: Arc<RwLock<Vec<Arc<Block>>>>,
     closed: AtomicBool,
     compact_mtx: Mutex<()>,
+    compact_pending: AtomicBool,
+    bg_stop: Arc<(Mutex<bool>, Condvar)>,
     block_ranges_ms: RwLock<Vec<i64>>,
     enable_overlapping_compaction: AtomicBool,
     block_postings_cache_force: AtomicBool,
@@ -347,10 +349,19 @@ struct TsdbInner {
     metrics: DbMetrics,
 }
 
+impl CompactNotifier for TsdbInner {
+    #[inline]
+    fn notify_compact(&self) {
+        if !self.compact_pending.swap(true, Ordering::AcqRel) {
+            let _guard = self.bg_stop.0.lock();
+            self.bg_stop.1.notify_all();
+        }
+    }
+}
+
 /// Unified TSDB instance managing an active [`Head`] and immutable on-disk ULID [`Block`]s.
 pub struct Tsdb {
     inner: Arc<TsdbInner>,
-    bg_stop: Arc<(Mutex<bool>, Condvar)>,
     bg_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -445,6 +456,7 @@ impl Tsdb {
             );
         }
 
+        let bg_stop = Arc::new((Mutex::new(false), Condvar::new()));
         let inner = Arc::new(TsdbInner {
             dir,
             opts,
@@ -452,13 +464,14 @@ impl Tsdb {
             blocks,
             closed: AtomicBool::new(false),
             compact_mtx: Mutex::new(()),
+            compact_pending: AtomicBool::new(false),
+            bg_stop: Arc::clone(&bg_stop),
             block_ranges_ms: RwLock::new(initial_ranges),
             enable_overlapping_compaction: AtomicBool::new(false),
             block_postings_cache_force: AtomicBool::new(false),
             block_postings_cache_shared: AtomicBool::new(false),
             metrics,
         });
-        let bg_stop = Arc::new((Mutex::new(false), Condvar::new()));
         let bg_handle = if !block_reload_interval.is_zero() {
             let inner_bg = Arc::clone(&inner);
             let stop_bg = Arc::clone(&bg_stop);
@@ -468,6 +481,19 @@ impl Tsdb {
                     let mut next_tick = Instant::now() + block_reload_interval;
                     let mut stopped = stop_bg.0.lock();
                     while !*stopped {
+                        if inner_bg.compact_pending.swap(false, Ordering::AcqRel) {
+                            drop(stopped);
+                            inner_bg.metrics.compactions_triggered.inc();
+                            inner_bg.metrics.compactions_skipped.inc();
+                            if Instant::now() < next_tick {
+                                stopped = stop_bg.0.lock();
+                                continue;
+                            }
+                            stopped = stop_bg.0.lock();
+                            if *stopped {
+                                break;
+                            }
+                        }
                         let wait_res = stop_bg.1.wait_until(&mut stopped, next_tick);
                         if *stopped {
                             break;
@@ -477,14 +503,11 @@ impl Tsdb {
                             if let Err(e) = inner_bg.reload_blocks() {
                                 tracing::error!(err = %e, "reloadBlocks");
                             }
-                            // Go `DB.run`: every block reload tick signals `compactc`, which
-                            // counts as a triggered compaction and, as Mimir disables auto
-                            // compactions (`db.DisableCompactions()`, the ingester compacts on
-                            // its own schedule), as a skipped one. `DB.Compact` itself counts
-                            // neither. Not reproduced: the same signal sent by every `Commit`
-                            // while the head is compactable.
-                            inner_bg.metrics.compactions_triggered.inc();
-                            inner_bg.metrics.compactions_skipped.inc();
+                            // Go `DB.run`: every block reload tick (and every `Commit` while
+                            // `head.is_compactable()`) signals `compactc`, which counts as a
+                            // triggered compaction and, as Mimir disables auto compactions
+                            // (`db.DisableCompactions()`), as a skipped one.
+                            inner_bg.compact_pending.store(true, Ordering::Release);
                             if let Err(e) = inner_bg.head.mmap_head_chunks() {
                                 tracing::error!(err = %e, "mmapHeadChunks");
                             }
@@ -500,7 +523,6 @@ impl Tsdb {
 
         Ok(Self {
             inner,
-            bg_stop,
             bg_thread: Mutex::new(bg_handle),
         })
     }
@@ -509,9 +531,9 @@ impl Tsdb {
         let mut handle_guard = self.bg_thread.lock();
         if let Some(handle) = handle_guard.take() {
             {
-                let mut stopped = self.bg_stop.0.lock();
+                let mut stopped = self.inner.bg_stop.0.lock();
                 *stopped = true;
-                self.bg_stop.1.notify_all();
+                self.inner.bg_stop.1.notify_all();
             }
             let _ = handle.join();
         }
@@ -542,11 +564,17 @@ impl Tsdb {
 
     /// Returns a new [`HeadAppender`] for writing samples, histograms, exemplars, and metadata.
     pub fn appender(&self) -> HeadAppender<'_> {
-        self.inner.head.appender()
+        self.inner
+            .head
+            .appender()
+            .with_compact_notifier(&*self.inner)
     }
 
     pub fn appender_with_capacity(&self, series_hint: usize) -> HeadAppender<'_> {
-        self.inner.head.appender_with_capacity(series_hint)
+        self.inner
+            .head
+            .appender_with_capacity(series_hint)
+            .with_compact_notifier(&*self.inner)
     }
 
     /// Go `DB.Compact`: compacts every ready `chunk_range` window of the Head into blocks,

@@ -595,7 +595,7 @@ impl BasicLifecycler {
                 &self.ring_key,
                 Box::new(move |in_val| {
                     let Some(any) = in_val else {
-                        return Err(CasCallbackError::fatal(KvError::NotFound(
+                        return Err(CasCallbackError::fatal(KvError::Other(
                             "found empty ring when trying to unregister".to_string(),
                         )));
                     };
@@ -1405,7 +1405,7 @@ impl Lifecycler {
                 &self.ring_key,
                 Box::new(move |in_val| {
                     let Some(any) = in_val else {
-                        return Err(CasCallbackError::fatal(KvError::NotFound(
+                        return Err(CasCallbackError::fatal(KvError::Other(
                             "cannot claim tokens in an empty ring".to_string(),
                         )));
                     };
@@ -1841,7 +1841,7 @@ impl Lifecycler {
                 &self.ring_key,
                 Box::new(move |in_val| {
                     let Some(any) = in_val else {
-                        return Err(CasCallbackError::fatal(KvError::NotFound(
+                        return Err(CasCallbackError::fatal(KvError::Other(
                             "found empty ring when trying to unregister".to_string(),
                         )));
                     };
@@ -2624,5 +2624,34 @@ mod tests {
 
         assert!(del.reg_saw_keep.load(Ordering::Acquire));
         assert!(del.hb_saw_keep.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn w21_aps_07_empty_ring_unregister_and_claim_use_kv_other() {
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(ring_desc_codec()));
+        let cfg = RingConfig {
+            instance_id: "ing-empty".to_string(),
+            instance_addr: "127.0.0.1".to_string(),
+            instance_port: 9095,
+            instance_availability_zone: "zone-a".to_string(),
+            num_tokens: 0,
+            ..Default::default()
+        };
+        let lc_cfg = LifecyclerConfig::from_ring_config(&cfg, 9095).unwrap();
+        let lc = Lifecycler::with_store(
+            lc_cfg,
+            kv,
+            Some(Arc::new(NoopFlushTransferer)),
+            "ingester",
+            "ring",
+            false,
+            None,
+        );
+
+        let err = lc.unregister().await.unwrap_err().to_string();
+        assert!(
+            err.contains("found empty ring when trying to unregister") && !err.contains("key not found"),
+            "unexpected err: {err}"
+        );
     }
 }
