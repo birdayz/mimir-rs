@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mimir_common::native_histogram::{exponential_buckets, SingleHistogram};
 use parking_lot::{Condvar, Mutex, RwLock};
-use prometheus::{Histogram, HistogramOpts, Registry};
+use prometheus::Registry;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -21,13 +22,13 @@ use crate::block::{
     BlockMetaCompaction,
 };
 use crate::compact::{
-    compact_blocks_with_float_encoding, plan_block_compactions, write_head_block_streaming,
-    CompactError,
+    compact_blocks_with_float_encoding_and_metrics, plan_block_compactions,
+    write_head_block_streaming_with_options, CompactError, CompactorMetrics,
 };
 use crate::exemplar::{CircularExemplarStorage, ExemplarQueryResult};
 use crate::head::{range_for_timestamp, Head, HeadAppender, HeadError, HeadOptions};
 use crate::matcher::LabelMatcher;
-use crate::metrics::{counter, gauge};
+use crate::metrics::{counter, gauge, native_histogram, FnGaugeCollector};
 use crate::postings_cache::PostingsForMatchersCacheConfig;
 use crate::querier::{TsdbChunkQuerier, TsdbQuerier};
 
@@ -126,11 +127,11 @@ impl Default for TsdbOptions {
     }
 }
 
-/// Go `dbMetrics` + `CompactorMetrics` (the subset Mimir aggregates, plus
-/// `compactions_failed_total`).
+/// Go `dbMetrics` + `CompactorMetrics`.
 struct DbMetrics {
     compactions_total: prometheus::Counter,
-    compaction_duration: Histogram,
+    compaction_duration: SingleHistogram,
+    compactions_triggered: prometheus::Counter,
     compactions_failed: prometheus::Counter,
     reloads: prometheus::Counter,
     reloads_failed: prometheus::Counter,
@@ -138,21 +139,62 @@ struct DbMetrics {
     blocks_bytes: prometheus::Gauge,
     blocks_loaded: prometheus::Gauge,
     symbol_table_size: prometheus::Gauge,
+    retention_limit_bytes: prometheus::Gauge,
+    retention_limit_percentage: prometheus::Gauge,
+    retention_limit_seconds: prometheus::Gauge,
+    selected_series_compactions_triggered: prometheus::Counter,
+    selected_series_compactions_failed: prometheus::Counter,
+    selected_series_compaction_duration: SingleHistogram,
+    compactor: CompactorMetrics,
 }
 
 impl DbMetrics {
     fn new(reg: Option<&Registry>) -> Self {
-        let compaction_duration = Histogram::with_opts(
-            HistogramOpts::new(
-                "prometheus_tsdb_compaction_duration_seconds",
-                "Duration of compaction runs",
-            )
-            .buckets(prometheus::exponential_buckets(1.0, 2.0, 14).expect("valid buckets")),
-        )
-        .expect("valid compaction duration histogram");
-        if let Some(r) = reg {
-            let _ = r.register(Box::new(compaction_duration.clone()));
-        }
+        let compaction_duration = native_histogram(
+            reg,
+            "prometheus_tsdb_compaction_duration_seconds",
+            "Duration of compaction runs",
+            Some(exponential_buckets(1.0, 2.0, 14)),
+        );
+        let _ = native_histogram(
+            reg,
+            "prometheus_tsdb_tombstone_cleanup_seconds",
+            "The time taken to recompact blocks to remove tombstones.",
+            None,
+        );
+        let _ = counter(
+            reg,
+            "prometheus_tsdb_compactions_skipped_total",
+            "Total number of skipped compactions due to disabled auto compaction.",
+        );
+        let _ = counter(
+            reg,
+            "prometheus_tsdb_size_retentions_total",
+            "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
+        );
+        let _ = counter(
+            reg,
+            "prometheus_tsdb_stale_series_compactions_triggered_total",
+            "Total number of triggered stale series compactions.",
+        );
+        let _ = counter(
+            reg,
+            "prometheus_tsdb_stale_series_compactions_failed_total",
+            "Total number of stale series compactions that failed.",
+        );
+        let _ = native_histogram(
+            reg,
+            "prometheus_tsdb_stale_series_compaction_duration_seconds",
+            "Duration of stale series compaction runs.",
+            Some(exponential_buckets(1.0, 2.0, 14)),
+        );
+        let selected_series_compaction_duration = native_histogram(
+            reg,
+            "prometheus_tsdb_selected_series_compaction_duration_seconds",
+            "Duration of compactions triggered for an explicit caller-provided list of series references.",
+            Some(exponential_buckets(1.0, 2.0, 14)),
+        );
+        let compactor = CompactorMetrics::new(reg);
         Self {
             compactions_total: counter(
                 reg,
@@ -160,6 +202,11 @@ impl DbMetrics {
                 "Total number of compactions that were executed for the partition.",
             ),
             compaction_duration,
+            compactions_triggered: counter(
+                reg,
+                "prometheus_tsdb_compactions_triggered_total",
+                "Total number of triggered compactions for the partition.",
+            ),
             compactions_failed: counter(
                 reg,
                 "prometheus_tsdb_compactions_failed_total",
@@ -195,6 +242,33 @@ impl DbMetrics {
                 "prometheus_tsdb_symbol_table_size_bytes",
                 "Size of symbol table in memory for loaded blocks",
             ),
+            retention_limit_bytes: gauge(
+                reg,
+                "prometheus_tsdb_retention_limit_bytes",
+                "Max number of bytes to be retained in the tsdb blocks, configured 0 means disabled",
+            ),
+            retention_limit_percentage: gauge(
+                reg,
+                "prometheus_tsdb_retention_limit_percentage",
+                "Max percentage of total storage space to be retained in the tsdb blocks, configured 0 means disabled",
+            ),
+            retention_limit_seconds: gauge(
+                reg,
+                "prometheus_tsdb_retention_limit_seconds",
+                "How long to retain samples in storage.",
+            ),
+            selected_series_compactions_triggered: counter(
+                reg,
+                "prometheus_tsdb_selected_series_compactions_triggered_total",
+                "Total number of compactions triggered for an explicit caller-provided list of series references.",
+            ),
+            selected_series_compactions_failed: counter(
+                reg,
+                "prometheus_tsdb_selected_series_compactions_failed_total",
+                "Total number of compactions triggered for an explicit caller-provided list of series references that failed.",
+            ),
+            selected_series_compaction_duration,
+            compactor,
         }
     }
 }
@@ -252,8 +326,8 @@ fn remove_tmp_dirs(dir: &Path) -> Result<(), TsdbError> {
 struct TsdbInner {
     dir: PathBuf,
     opts: TsdbOptions,
-    head: Head,
-    blocks: RwLock<Vec<Arc<Block>>>,
+    head: Arc<Head>,
+    blocks: Arc<RwLock<Vec<Arc<Block>>>>,
     closed: AtomicBool,
     compact_mtx: Mutex<()>,
     block_ranges_ms: RwLock<Vec<i64>>,
@@ -297,9 +371,14 @@ impl Tsdb {
         }
 
         let metrics = DbMetrics::new(opts.head.registry.as_deref());
+        metrics.retention_limit_bytes.set(0.0);
+        metrics.retention_limit_percentage.set(0.0);
+        metrics
+            .retention_limit_seconds
+            .set((opts.retention_duration_ms.max(0) as f64) / 1000.0);
 
         // Go `DB.Open` -> `db.reload()` -> `reloadBlocks()` (before the head is replayed).
-        let blocks = {
+        let blocks_vec = {
             let res = (|| -> Result<Vec<Arc<Block>>, TsdbError> {
                 let (to_load, deletable) =
                     TsdbInner::prepare_reload_blocks(&dir, &opts, &metrics, &[])?;
@@ -312,7 +391,7 @@ impl Tsdb {
             metrics.reloads.inc();
             res?
         };
-        let mut min_valid_time = blocks
+        let in_order_max_time = blocks_vec
             .iter()
             .filter(|b| {
                 !b.meta().out_of_order
@@ -321,8 +400,8 @@ impl Tsdb {
                     && !b.meta().compaction.from_selected_series()
             })
             .map(|b| b.max_time())
-            .max()
-            .unwrap_or(i64::MIN);
+            .max();
+        let mut min_valid_time = in_order_max_time.unwrap_or(i64::MIN);
 
         if let Ok(Some(stored_mvt)) = crate::wlog::read_min_valid_time(&dir.join("wal")) {
             min_valid_time = min_valid_time.max(stored_mvt);
@@ -330,18 +409,37 @@ impl Tsdb {
 
         let initial_ranges = vec![opts.head.chunk_range_ms];
         let variance = opts.head.chunk_end_time_variance();
-        let head = Head::open_with_chunk_end_time_variance(
+        let head = Arc::new(Head::open_with_seed(
             &dir,
             opts.head.clone(),
             min_valid_time,
             variance,
-        )?;
+            in_order_max_time,
+        )?);
+        let blocks = Arc::new(RwLock::new(blocks_vec));
+        {
+            let blks = Arc::clone(&blocks);
+            let hd = Arc::clone(&head);
+            FnGaugeCollector::register(
+                opts.head.registry.as_deref(),
+                "prometheus_tsdb_lowest_timestamp",
+                "Lowest timestamp value stored in the database. The unit is decided by the library consumer.",
+                move || {
+                    let guard = blks.read();
+                    if let Some(first) = guard.first() {
+                        first.min_time() as f64
+                    } else {
+                        hd.min_time() as f64
+                    }
+                },
+            );
+        }
 
         let inner = Arc::new(TsdbInner {
             dir,
             opts,
             head,
-            blocks: RwLock::new(blocks),
+            blocks,
             closed: AtomicBool::new(false),
             compact_mtx: Mutex::new(()),
             block_ranges_ms: RwLock::new(initial_ranges),
@@ -918,6 +1016,7 @@ impl TsdbInner {
     /// truncates the WAL (also when a later step fails, via the deferred truncation), then
     /// compacts the OOO head. Errors count `prometheus_tsdb_compactions_failed_total`.
     fn compact(&self) -> Result<Vec<Ulid>, TsdbError> {
+        self.metrics.compactions_triggered.inc();
         let _guard = self.compact_mtx.lock();
         if self.closed.load(Ordering::Acquire) {
             return Ok(Vec::new());
@@ -929,7 +1028,9 @@ impl TsdbInner {
             while self.head.compactable() {
                 let mint = self.head.min_time();
                 let maxt = range_for_timestamp(mint, self.head.options().chunk_range_ms);
-                if let Some(uid) = self.compact_head_range_locked(mint, maxt, true)? {
+                if let Some(uid) =
+                    self.compact_head_range_locked(mint, maxt, maxt - 1, true)?
+                {
                     created.push(uid);
                 }
                 // Consider only successful compactions for WAL truncation.
@@ -971,7 +1072,10 @@ impl TsdbInner {
         if self.closed.load(Ordering::Acquire) {
             return Ok(None);
         }
-        let uid = self.compact_head_range_locked(mint, maxt, true)?;
+        if maxt <= mint {
+            return Ok(None);
+        }
+        let uid = self.compact_head_range_locked(mint, maxt, maxt - 1, true)?;
         if maxt > mint {
             self.head.truncate_wal(maxt)?;
         }
@@ -983,9 +1087,18 @@ impl TsdbInner {
         if !self.head.initialized() || self.head.num_series() == 0 {
             return Ok(None);
         }
+        let _guard = self.compact_mtx.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let mint = self.head.min_time();
-        let maxt = self.head.max_time().saturating_add(1);
-        self.compact_head_range(mint, maxt)
+        let head_maxt = self.head.max_time();
+        let maxt = head_maxt.saturating_add(1);
+        let uid = self.compact_head_range_locked(mint, maxt, head_maxt, true)?;
+        if maxt > mint {
+            self.head.truncate_wal(maxt)?;
+        }
+        Ok(uid)
     }
 
     /// Go `DB.compactHead`.
@@ -993,22 +1106,24 @@ impl TsdbInner {
         &self,
         mint: i64,
         maxt: i64,
+        maxt_inclusive: i64,
         truncate_memory: bool,
     ) -> Result<Option<Ulid>, TsdbError> {
-        if maxt <= mint {
+        if maxt < mint || maxt_inclusive < mint {
             return Ok(None);
         }
-        let maxt_inclusive = maxt - 1;
         let candidates = self.head.collect_compaction_candidates(mint, maxt_inclusive)?;
         let meta_opt = self.timed_write(|| {
-            write_head_block_streaming(
+            write_head_block_streaming_with_options(
                 &self.dir,
                 mint,
                 maxt,
+                maxt_inclusive,
                 candidates,
                 BlockMetaCompaction::default(),
                 false,
                 self.opts.max_block_chunk_segment_size,
+                Some(&self.metrics.compactor),
                 |ref_id, chks, tombs| {
                     self.head
                         .load_series_in_order_chunks_into(ref_id, mint, maxt_inclusive, chks, tombs)
@@ -1054,8 +1169,11 @@ impl TsdbInner {
         let block_size = self.head.options().chunk_range_ms;
         let mut ulids: Vec<Ulid> = Vec::new();
 
+        let ooo_intervals = self
+            .head
+            .collect_ooo_compaction_intervals(&snap.candidates, max_mmap_ref, block_size);
         let res = (|| -> Result<(), TsdbError> {
-            let mut run = |mint: i64, maxt: i64| -> Result<(), TsdbError> {
+            let mut run = |mint: i64, maxt: i64, maxt_inclusive: i64| -> Result<(), TsdbError> {
                 let mut compaction = BlockMetaCompaction::default();
                 compaction.set_out_of_order();
                 compaction.parents.push(BlockDesc {
@@ -1064,14 +1182,16 @@ impl TsdbInner {
                     max_time: 0,
                 });
                 let meta = self.timed_write(|| {
-                    write_head_block_streaming(
+                    write_head_block_streaming_with_options(
                         &self.dir,
                         mint,
                         maxt,
+                        maxt_inclusive,
                         snap.candidates.clone(),
                         compaction,
                         false,
                         self.opts.max_block_chunk_segment_size,
+                        Some(&self.metrics.compactor),
                         |ref_id, chks, tombs| {
                             self.head
                                 .load_series_ooo_chunks_into_up_to(
@@ -1099,7 +1219,20 @@ impl TsdbInner {
                 while t < maxt_for_24h_block {
                     let mint = t.max(i64::MIN as i128) as i64;
                     let maxt = (t + day128).min(i64::MAX as i128) as i64;
-                    run(mint, maxt)?;
+                    let maxt_inclusive = if t + day128 > i64::MAX as i128 {
+                        i64::MAX
+                    } else {
+                        maxt.saturating_sub(1)
+                    };
+                    match next_interval_action(&ooo_intervals, mint, maxt_inclusive) {
+                        IntervalAction::Done => break,
+                        IntervalAction::SkipTo(next_mint) => {
+                            t = floor_align_i128(next_mint, DAY_MS);
+                            continue;
+                        }
+                        IntervalAction::Overlaps => {}
+                    }
+                    run(mint, maxt, maxt_inclusive)?;
                     t += day128;
                 }
                 if (ooo_start as i128) < maxt_for_24h_block {
@@ -1111,7 +1244,20 @@ impl TsdbInner {
             while t <= ooo_maxt as i128 {
                 let mint = t.max(i64::MIN as i128) as i64;
                 let maxt = (t + block_size128).min(i64::MAX as i128) as i64;
-                run(mint, maxt)?;
+                let maxt_inclusive = if t + block_size128 > i64::MAX as i128 {
+                    i64::MAX
+                } else {
+                    maxt.saturating_sub(1)
+                };
+                match next_interval_action(&ooo_intervals, mint, maxt_inclusive) {
+                    IntervalAction::Done => break,
+                    IntervalAction::SkipTo(next_mint) => {
+                        t = floor_align_i128(next_mint, block_size);
+                        continue;
+                    }
+                    IntervalAction::Overlaps => {}
+                }
+                run(mint, maxt, maxt_inclusive)?;
                 t += block_size128;
             }
             Ok(())
@@ -1180,10 +1326,11 @@ impl TsdbInner {
             }
             let block_refs: Vec<&Block> = plan_blocks.iter().map(|b| b.as_ref()).collect();
             let meta_opt = self.timed_write(|| {
-                compact_blocks_with_float_encoding(
+                compact_blocks_with_float_encoding_and_metrics(
                     &self.dir,
                     &block_refs,
                     self.head.float_chunk_encoding(),
+                    Some(&self.metrics.compactor),
                 )
             })?;
             match meta_opt {
@@ -1217,66 +1364,91 @@ impl TsdbInner {
         if self.closed.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
-        let ((candidates, data_mint, data_maxt), fingerprints) =
-            self.head.collect_selected_compaction_candidates_with_fingerprints(refs)?;
-        if fingerprints.is_empty() {
-            return Ok(Vec::new());
-        }
-        let head_maxt = self.head.max_time();
-        let mut created = Vec::new();
-        if !candidates.is_empty() && data_mint <= data_maxt && self.head.initialized() {
-            let range = self.head.options().chunk_range_ms;
-            let range128 = range as i128;
-            let mut t = floor_align_i128(self.head.min_time(), range);
-            while t <= head_maxt as i128 {
-                let mint = t.max(i64::MIN as i128) as i64;
-                let maxt = (t + range128).min(i64::MAX as i128) as i64;
-                let maxt_inclusive = if t + range128 > i64::MAX as i128 {
-                    i64::MAX
-                } else {
-                    maxt.saturating_sub(1)
-                };
-                let mut compaction = BlockMetaCompaction::default();
-                compaction.set_selected_series();
-                compaction.parents.push(BlockDesc {
-                    ulid: Ulid::nil(),
-                    min_time: 0,
-                    max_time: 0,
-                });
-                let meta = self.timed_write(|| {
-                    write_head_block_streaming(
-                        &self.dir,
-                        mint,
-                        maxt,
-                        candidates.clone(),
-                        compaction,
-                        false,
-                        self.opts.max_block_chunk_segment_size,
-                        |ref_id, chks, tombs| {
-                            self.head
-                                .load_series_in_order_chunks_into(
-                                    ref_id,
-                                    mint,
-                                    maxt_inclusive,
-                                    chks,
-                                    tombs,
-                                )
-                                .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
-                        },
-                    )
-                })?;
-                t += range128;
-                // No block when the window holds no data for the selected series.
-                let Some(meta) = meta else {
-                    continue;
-                };
-                self.reload_after_write(&[meta.ulid])?;
-                created.push(meta.ulid);
+        self.metrics.selected_series_compactions_triggered.inc();
+        let start = Instant::now();
+        let res = (|| -> Result<Vec<Ulid>, TsdbError> {
+            let ((candidates, data_mint, data_maxt), fingerprints) =
+                self.head.collect_selected_compaction_candidates_with_fingerprints(refs)?;
+            if fingerprints.is_empty() {
+                return Ok(Vec::new());
             }
+            let head_maxt = self.head.max_time();
+            let mut created = Vec::new();
+            if !candidates.is_empty() && data_mint <= data_maxt && self.head.initialized() {
+                let range = self.head.options().chunk_range_ms;
+                let intervals = self
+                    .head
+                    .collect_selected_compaction_intervals(&candidates, range);
+                let range128 = range as i128;
+                let mut t = floor_align_i128(data_mint, range);
+                while t <= data_maxt as i128 {
+                    let mint = t.max(i64::MIN as i128) as i64;
+                    let maxt = (t + range128).min(i64::MAX as i128) as i64;
+                    let maxt_inclusive = if t + range128 > i64::MAX as i128 {
+                        i64::MAX
+                    } else {
+                        maxt.saturating_sub(1)
+                    };
+                    match next_interval_action(&intervals, mint, maxt_inclusive) {
+                        IntervalAction::Done => break,
+                        IntervalAction::SkipTo(next_mint) => {
+                            t = floor_align_i128(next_mint, range);
+                            continue;
+                        }
+                        IntervalAction::Overlaps => {}
+                    }
+                    let mut compaction = BlockMetaCompaction::default();
+                    compaction.set_selected_series();
+                    compaction.parents.push(BlockDesc {
+                        ulid: Ulid::nil(),
+                        min_time: 0,
+                        max_time: 0,
+                    });
+                    let meta = self.timed_write(|| {
+                        write_head_block_streaming_with_options(
+                            &self.dir,
+                            mint,
+                            maxt,
+                            maxt_inclusive,
+                            candidates.clone(),
+                            compaction,
+                            false,
+                            self.opts.max_block_chunk_segment_size,
+                            Some(&self.metrics.compactor),
+                            |ref_id, chks, tombs| {
+                                self.head
+                                    .load_series_in_order_chunks_into(
+                                        ref_id,
+                                        mint,
+                                        maxt_inclusive,
+                                        chks,
+                                        tombs,
+                                    )
+                                    .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
+                            },
+                        )
+                    })?;
+                    t += range128;
+                    // No block when the window holds no data for the selected series.
+                    let Some(meta) = meta else {
+                        continue;
+                    };
+                    self.reload_after_write(&[meta.ulid])?;
+                    created.push(meta.ulid);
+                }
+            }
+            self.head
+                .evict_series_refs_with_fingerprints(refs, head_maxt, &fingerprints)?;
+            Ok(created)
+        })();
+        match &res {
+            Ok(_) => self
+                .metrics
+                .selected_series_compaction_duration
+                .observe(start.elapsed().as_secs_f64()),
+            Err(_) => self.metrics.selected_series_compactions_failed.inc(),
         }
-        self.head
-            .evict_series_refs_with_fingerprints(refs, head_maxt, &fingerprints)?;
-        Ok(created)
+        res
     }
 
     /// Truncates Head memory and WAL older than `mint`.
@@ -1291,6 +1463,29 @@ impl TsdbInner {
 fn floor_align_i128(t: i64, range: i64) -> i128 {
     let r = range as i128;
     (t as i128).div_euclid(r) * r
+}
+
+enum IntervalAction {
+    Overlaps,
+    SkipTo(i64),
+    Done,
+}
+
+#[inline]
+fn next_interval_action(
+    intervals: &[(i64, i64)],
+    mint: i64,
+    maxt_inclusive: i64,
+) -> IntervalAction {
+    let idx = intervals.partition_point(|&(_, iv_max)| iv_max < mint);
+    let Some(&(iv_min, _)) = intervals.get(idx) else {
+        return IntervalAction::Done;
+    };
+    if iv_min > maxt_inclusive {
+        IntervalAction::SkipTo(iv_min)
+    } else {
+        IntervalAction::Overlaps
+    }
 }
 
 #[cfg(test)]

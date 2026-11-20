@@ -355,7 +355,6 @@ impl FastRegexMatcher {
                 let re = RegexBuilder::new(&anchored)
                     .nest_limit(1000)
                     .size_limit(128 << 20)
-                    .dfa_size_limit(64 << 20)
                     .build()
                     .map_err(|e| MatcherError::InvalidRegex {
                         pattern: pattern.to_string(),

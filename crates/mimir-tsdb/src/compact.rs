@@ -37,6 +37,77 @@ use crate::tombstones::{write_tombstones_file, Interval, MemTombstones, Tombston
 
 const TMP_BLOCK_DIR_SUFFIX: &str = ".tmp-for-creation";
 
+/// Per-tenant Prometheus TSDB compactor metrics (Go `compact.NewCompactorMetrics`,
+/// excluding `compactions_total` / `compaction_duration_seconds` which live on `DbMetrics`).
+#[derive(Clone)]
+pub struct CompactorMetrics {
+    pub populating_blocks: prometheus::Gauge,
+    pub overlapping_blocks: prometheus::Counter,
+    pub chunk_size: prometheus::Histogram,
+    pub chunk_samples: prometheus::Histogram,
+    pub chunk_range: prometheus::Histogram,
+}
+
+impl CompactorMetrics {
+    pub fn new(reg: Option<&prometheus::Registry>) -> Self {
+        use crate::metrics::{counter, gauge};
+        let hist = |name: &str, help: &str, start: f64, factor: f64, count: usize| {
+            let h = prometheus::Histogram::with_opts(
+                prometheus::HistogramOpts::new(name, help).buckets(
+                    prometheus::exponential_buckets(start, factor, count)
+                        .expect("valid exponential buckets"),
+                ),
+            )
+            .expect("valid histogram");
+            if let Some(r) = reg {
+                let _ = r.register(Box::new(h.clone()));
+            }
+            h
+        };
+        Self {
+            populating_blocks: gauge(
+                reg,
+                "prometheus_tsdb_compaction_populating_block",
+                "Set to 1 when a block is currently being written to the disk.",
+            ),
+            overlapping_blocks: counter(
+                reg,
+                "prometheus_tsdb_vertical_compactions_total",
+                "Total number of compactions done on overlapping blocks.",
+            ),
+            chunk_size: hist(
+                "prometheus_tsdb_compaction_chunk_size_bytes",
+                "Final size of chunks on their first compaction",
+                32.0,
+                1.5,
+                12,
+            ),
+            chunk_samples: hist(
+                "prometheus_tsdb_compaction_chunk_samples",
+                "Final number of samples on their first compaction",
+                4.0,
+                1.5,
+                12,
+            ),
+            chunk_range: hist(
+                "prometheus_tsdb_compaction_chunk_range_seconds",
+                "Final time range of chunks on their first compaction",
+                100.0,
+                4.0,
+                10,
+            ),
+        }
+    }
+}
+
+struct PopulatingBlockGuard<'a>(&'a prometheus::Gauge);
+
+impl Drop for PopulatingBlockGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(0.0);
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CompactError {
     #[error("I/O error: {0}")]
@@ -2064,19 +2135,54 @@ pub fn write_head_block_streaming<F>(
     dest: &Path,
     mint: i64,
     maxt: i64,
+    candidates: Vec<(u64, Labels)>,
+    compaction: BlockMetaCompaction,
+    out_of_order: bool,
+    segment_size: usize,
+    load_series_chunks: F,
+) -> Result<Option<BlockMeta>, CompactError>
+where
+    F: FnMut(u64, &mut Vec<ChunkMeta>, &mut Vec<Interval>) -> Result<(), CompactError>,
+{
+    if maxt <= mint {
+        return Ok(None);
+    }
+    write_head_block_streaming_with_options(
+        dest,
+        mint,
+        maxt,
+        maxt - 1,
+        candidates,
+        compaction,
+        out_of_order,
+        segment_size,
+        None,
+        load_series_chunks,
+    )
+}
+
+/// Like [`write_head_block_streaming`], accepting an explicit `maxt_inclusive` bound (so
+/// `i64::MAX` samples are never dropped) and optional `CompactorMetrics`, and deferring
+/// `.tmp-for-creation` directory creation until the first surviving series with chunks.
+#[allow(clippy::too_many_arguments)]
+pub fn write_head_block_streaming_with_options<F>(
+    dest: &Path,
+    mint: i64,
+    maxt: i64,
+    maxt_inclusive: i64,
     mut candidates: Vec<(u64, Labels)>,
     compaction: BlockMetaCompaction,
     out_of_order: bool,
     segment_size: usize,
+    metrics: Option<&CompactorMetrics>,
     mut load_series_chunks: F,
 ) -> Result<Option<BlockMeta>, CompactError>
 where
     F: FnMut(u64, &mut Vec<ChunkMeta>, &mut Vec<Interval>) -> Result<(), CompactError>,
 {
-    if maxt <= mint || candidates.is_empty() {
+    if maxt < mint || maxt_inclusive < mint || candidates.is_empty() {
         return Ok(None);
     }
-    let maxt_inclusive = maxt - 1;
 
     candidates.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     candidates.dedup_by_key(|a| a.0);
@@ -2084,48 +2190,24 @@ where
     let uid = Ulid::new();
     let final_dir = dest.join(uid.to_string());
     let tmp_dir = dest.join(format!("{uid}{TMP_BLOCK_DIR_SUFFIX}"));
-    if tmp_dir.exists() {
-        fs::remove_dir_all(&tmp_dir)?;
-    }
-    fs::create_dir_all(&tmp_dir)?;
+    let observe_l1_chunks = compaction.level <= 1;
+
+    let _pop_guard = metrics.map(|m| {
+        m.populating_blocks.set(1.0);
+        PopulatingBlockGuard(&m.populating_blocks)
+    });
 
     let write_res = (|| -> Result<Option<BlockMeta>, CompactError> {
-        let seg_sz = if segment_size == 0 {
-            DEFAULT_CHUNK_SEGMENT_SIZE
-        } else {
-            segment_size
-        };
-        let mut chunkw = BlockChunksWriter::with_segment_size(tmp_dir.join("chunks"), seg_sz)?;
-        let mut indexw = IndexWriter::new(tmp_dir.join(INDEX_FILENAME))?;
-
-        // Pass 1: collect unique &str symbols across lightweight candidate Labels (zero chunk allocs).
-        {
-            let mut sym_set: hashbrown::HashSet<&str> =
-                hashbrown::HashSet::with_capacity(candidates.len().min(65536));
-            sym_set.insert("");
-            for (_, labels) in &candidates {
-                for (k, v) in labels.iter() {
-                    sym_set.insert(k);
-                    sym_set.insert(v);
-                }
-            }
-            let mut symbols: Vec<&str> = sym_set.into_iter().collect();
-            symbols.sort_unstable();
-            for sym in symbols {
-                indexw.add_symbol(sym)?;
-            }
-        }
-
-        // Pass 2: stream one series at a time using reused ChunkMeta/Interval scratch Vecs.
+        let mut writers: Option<(BlockChunksWriter, IndexWriter)> = None;
         let mut stats = BlockStats::default();
         let mut chks_buf: Vec<ChunkMeta> = Vec::with_capacity(4);
         let mut tombs_buf: Vec<Interval> = Vec::with_capacity(2);
         let mut series_idx = 0u64;
 
-        for (ref_id, labels) in candidates {
+        for (idx, (ref_id, labels)) in candidates.iter().enumerate() {
             chks_buf.clear();
             tombs_buf.clear();
-            load_series_chunks(ref_id, &mut chks_buf, &mut tombs_buf)?;
+            load_series_chunks(*ref_id, &mut chks_buf, &mut tombs_buf)?;
             if chks_buf.is_empty() {
                 continue;
             }
@@ -2141,8 +2223,41 @@ where
                 continue;
             }
 
+            let (chunkw, indexw) = match writers {
+                Some(ref mut w) => w,
+                None => {
+                    if tmp_dir.exists() {
+                        fs::remove_dir_all(&tmp_dir)?;
+                    }
+                    fs::create_dir_all(&tmp_dir)?;
+                    let seg_sz = if segment_size == 0 {
+                        DEFAULT_CHUNK_SEGMENT_SIZE
+                    } else {
+                        segment_size
+                    };
+                    let cw = BlockChunksWriter::with_segment_size(tmp_dir.join("chunks"), seg_sz)?;
+                    let mut iw = IndexWriter::new(tmp_dir.join(INDEX_FILENAME))?;
+
+                    let mut sym_set: hashbrown::HashSet<&str> =
+                        hashbrown::HashSet::with_capacity((candidates.len() - idx).min(65536));
+                    sym_set.insert("");
+                    for (_, lbls) in &candidates[idx..] {
+                        for (k, v) in lbls.iter() {
+                            sym_set.insert(k);
+                            sym_set.insert(v);
+                        }
+                    }
+                    let mut symbols: Vec<&str> = sym_set.into_iter().collect();
+                    symbols.sort_unstable();
+                    for sym in symbols {
+                        iw.add_symbol(sym)?;
+                    }
+                    writers.insert((cw, iw))
+                }
+            };
+
             chunkw.write_chunks(&mut trimmed)?;
-            indexw.add_series(series_idx, &labels, &trimmed)?;
+            indexw.add_series(series_idx, labels, &trimmed)?;
             series_idx += 1;
 
             stats.num_series += 1;
@@ -2151,6 +2266,13 @@ where
                 if let Some(ref enc) = chk.chunk {
                     let n = enc.num_samples() as u64;
                     stats.num_samples += n;
+                    if observe_l1_chunks {
+                        if let Some(m) = metrics {
+                            m.chunk_size.observe(enc.as_bytes().len() as f64);
+                            m.chunk_samples.observe(n as f64);
+                            m.chunk_range.observe((chk.max_time - chk.min_time) as f64);
+                        }
+                    }
                     match enc.encoding() {
                         Encoding::Xor | Encoding::Xor2 => stats.num_float_samples += n,
                         Encoding::Histogram
@@ -2165,6 +2287,9 @@ where
             chks_buf = trimmed;
         }
 
+        let Some((chunkw, indexw)) = writers else {
+            return Ok(None);
+        };
         chunkw.close()?;
         indexw.close()?;
 
@@ -2293,6 +2418,29 @@ fn write_prepared_block(
     out_of_order: bool,
     segment_size: usize,
 ) -> Result<Option<BlockMeta>, CompactError> {
+    write_prepared_block_with_metrics(
+        dest,
+        mint,
+        maxt,
+        prepared,
+        compaction,
+        out_of_order,
+        segment_size,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_prepared_block_with_metrics(
+    dest: &Path,
+    mint: i64,
+    maxt: i64,
+    prepared: Vec<(Labels, Vec<ChunkMeta>)>,
+    compaction: BlockMetaCompaction,
+    out_of_order: bool,
+    segment_size: usize,
+    metrics: Option<&CompactorMetrics>,
+) -> Result<Option<BlockMeta>, CompactError> {
 
     let uid = Ulid::new();
     let final_dir = dest.join(uid.to_string());
@@ -2329,6 +2477,7 @@ fn write_prepared_block(
             }
         }
 
+        let observe_l1_chunks = compaction.level <= 1;
         let mut stats = BlockStats::default();
         for (series_idx, (labels, mut chks)) in prepared.into_iter().enumerate() {
             chunkw.write_chunks(&mut chks)?;
@@ -2340,6 +2489,13 @@ fn write_prepared_block(
                 if let Some(ref enc) = chk.chunk {
                     let n = enc.num_samples() as u64;
                     stats.num_samples += n;
+                    if observe_l1_chunks {
+                        if let Some(m) = metrics {
+                            m.chunk_size.observe(enc.as_bytes().len() as f64);
+                            m.chunk_samples.observe(n as f64);
+                            m.chunk_range.observe((chk.max_time - chk.min_time) as f64);
+                        }
+                    }
                     match enc.encoding() {
                         Encoding::Xor | Encoding::Xor2 => stats.num_float_samples += n,
                         Encoding::Histogram
@@ -2414,8 +2570,40 @@ pub fn compact_blocks_with_float_encoding(
     blocks: &[&Block],
     float_encoding: Encoding,
 ) -> Result<Option<BlockMeta>, CompactError> {
+    compact_blocks_with_float_encoding_and_metrics(dest, blocks, float_encoding, None)
+}
+
+pub fn compact_blocks_with_float_encoding_and_metrics(
+    dest: &Path,
+    blocks: &[&Block],
+    float_encoding: Encoding,
+    metrics: Option<&CompactorMetrics>,
+) -> Result<Option<BlockMeta>, CompactError> {
     if blocks.is_empty() {
         return Ok(None);
+    }
+
+    let _pop_guard = metrics.map(|m| {
+        m.populating_blocks.set(1.0);
+        PopulatingBlockGuard(&m.populating_blocks)
+    });
+
+    if let Some(m) = metrics {
+        let mut sorted_bounds: Vec<(i64, i64)> = blocks
+            .iter()
+            .map(|b| (b.min_time(), b.max_time()))
+            .collect();
+        sorted_bounds.sort_by_key(|&(min_t, _)| min_t);
+        let mut global_maxt = sorted_bounds[0].1;
+        for &(b_mint, b_maxt) in sorted_bounds.iter().skip(1) {
+            if b_mint < global_maxt {
+                m.overlapping_blocks.inc();
+                break;
+            }
+            if b_maxt > global_maxt {
+                global_maxt = b_maxt;
+            }
+        }
     }
 
     let mut mint = i64::MAX;
@@ -2518,7 +2706,7 @@ pub fn compact_blocks_with_float_encoding(
         comp.set_out_of_order();
     }
 
-    write_prepared_block(dest, mint, maxt, prepared, comp, false, 0)
+    write_prepared_block_with_metrics(dest, mint, maxt, prepared, comp, false, 0, metrics)
 }
 
 #[derive(Clone)]

@@ -22,7 +22,8 @@ use std::time::Instant;
 use bytes::Bytes;
 use hashbrown::HashTable;
 use parking_lot::{Condvar, Mutex, RwLock};
-use prometheus::{CounterVec, Histogram as PromHistogram, HistogramOpts, Opts, Registry};
+use mimir_common::native_histogram::SingleHistogram;
+use prometheus::{CounterVec, Opts, Registry};
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -50,6 +51,7 @@ use crate::head_chunks::{
 };
 use crate::labels::{encode_stringlabel_size, iter_stringlabels, Labels, SymbolLabels, METRIC_NAME};
 use crate::metadata::{MetadataError, MetadataLimits, UserMetricsMetadata};
+use crate::metrics::{native_histogram, FnGaugeCollector};
 use crate::postings::{
     postings_for_matchers, MemPostings, PostingsBatchScratch, PostingsError,
 };
@@ -1363,6 +1365,30 @@ impl SeriesState {
                 _ => LastSample::None,
             },
             _ => LastSample::None,
+        }
+    }
+
+    #[inline]
+    fn sample_state(&self) -> (bool, bool, usize) {
+        match self.last_sample_kind() {
+            1 => (is_stale_nan(f64::from_bits(self.last_float_bits)), false, 0),
+            2 => match self.cold.as_ref().map(|c| &c.last_hist) {
+                Some(LastColdSample::Histogram(h)) => (
+                    is_stale_nan(h.sum),
+                    true,
+                    h.positive_buckets.len() + h.negative_buckets.len(),
+                ),
+                _ => (false, false, 0),
+            },
+            3 => match self.cold.as_ref().map(|c| &c.last_hist) {
+                Some(LastColdSample::FloatHistogram(fh)) => (
+                    is_stale_nan(fh.sum),
+                    true,
+                    fh.positive_buckets.len() + fh.negative_buckets.len(),
+                ),
+                _ => (false, false, 0),
+            },
+            _ => (false, false, 0),
         }
     }
 
@@ -3236,20 +3262,27 @@ struct MmappedLoad {
     last_ref: ChunkDiskMapperRef,
 }
 
-/// Go `headMetrics` (the subset Mimir aggregates in `TSDBMetrics`, plus the related
-/// counters), registered on the per-tenant registry.
+/// Go `headMetrics`, registered on the per-tenant registry.
 struct HeadMetrics {
     mmap_chunk_corruptions_total: prometheus::Counter,
     wal_corruptions_total: prometheus::Counter,
     ooo_samples_appended: CounterVec,
-    ooo_histogram: PromHistogram,
+    ooo_histogram: SingleHistogram,
     active_appenders: prometheus::Gauge,
+    appenders_created: prometheus::Counter,
     chunks: prometheus::Gauge,
     chunks_created: prometheus::Counter,
     chunks_removed: prometheus::Counter,
     series_not_found: prometheus::Counter,
+    chunk_reads_of_removed_series: prometheus::Counter,
     gc_duration: crate::metrics::Summary,
     wal_truncate_duration: crate::metrics::Summary,
+    data_replay_duration: prometheus::Gauge,
+    samples_appended: CounterVec,
+    duplicate_samples: CounterVec,
+    out_of_bound_samples: CounterVec,
+    out_of_order_samples: CounterVec,
+    too_old_samples: CounterVec,
     head_truncate_fail: prometheus::Counter,
     head_truncate_total: prometheus::Counter,
     checkpoint_delete_fail: prometheus::Counter,
@@ -3261,12 +3294,16 @@ struct HeadMetrics {
     wal_replay_unknown_refs: CounterVec,
     wbl_replay_unknown_refs: CounterVec,
     wal: crate::metrics::WlogMetrics,
-    wbl: crate::metrics::WlogMetrics,
+    wbl: Mutex<Option<crate::metrics::WlogMetrics>>,
     chunk_write_queue: Option<crate::metrics::ChunkWriteQueueMetrics>,
 }
 
 impl HeadMetrics {
-    fn new(reg: Option<&Registry>, chunk_write_queue_size: usize) -> Self {
+    fn new_with_dirs(
+        reg: Option<&Registry>,
+        chunk_write_queue_size: usize,
+        wal_dir: Option<&Path>,
+    ) -> Self {
         use crate::metrics::{counter, counter_vec, gauge, summary};
         let ooo_samples_appended = CounterVec::new(
             Opts::new(
@@ -3279,12 +3316,11 @@ impl HeadMetrics {
         let _ = ooo_samples_appended.with_label_values(&["float"]);
         let _ = ooo_samples_appended.with_label_values(&["histogram"]);
 
-        let ooo_histogram = PromHistogram::with_opts(
-            HistogramOpts::new(
-                "prometheus_tsdb_sample_ooo_delta",
-                "Delta in seconds by which a sample is considered out of order (reported regardless of OOO time window and whether sample is accepted or not).",
-            )
-            .buckets(vec![
+        let ooo_histogram = native_histogram(
+            reg,
+            "prometheus_tsdb_sample_ooo_delta",
+            "Delta in seconds by which a sample is considered out of order (reported regardless of OOO time window and whether sample is accepted or not).",
+            Some(vec![
                 600.0,
                 1800.0,
                 3600.0,
@@ -3293,18 +3329,31 @@ impl HeadMetrics {
                 21600.0,
                 43200.0,
             ]),
-        )
-        .expect("valid ooo histogram");
+        );
         if let Some(r) = reg {
             let _ = r.register(Box::new(ooo_samples_appended.clone()));
-            let _ = r.register(Box::new(ooo_histogram.clone()));
         }
+        let _ = counter(
+            reg,
+            "prometheus_tsdb_head_series_pending_commit_underflow_total",
+            "Total number of attempts to release a pending-sample reservation when none was held.",
+        );
+        let _ = counter(
+            reg,
+            "prometheus_tsdb_snapshot_replay_error_total",
+            "Total number snapshot replays that failed.",
+        );
 
         Self {
             active_appenders: gauge(
                 reg,
                 "prometheus_tsdb_head_active_appenders",
-                "Number of currently active appender transactions.",
+                "Number of currently active appender transactions",
+            ),
+            appenders_created: counter(
+                reg,
+                "prometheus_tsdb_head_appenders_created_total",
+                "Total number of appender transactions created.",
             ),
             mmap_chunk_corruptions_total: counter(
                 reg,
@@ -3334,6 +3383,12 @@ impl HeadMetrics {
                 "prometheus_tsdb_head_series_not_found_total",
                 "Total number of requests for series that were not found.",
             ),
+            chunk_reads_of_removed_series: counter(
+                reg,
+                "prometheus_tsdb_head_chunk_reads_of_removed_series_total",
+                "Total number of chunks that queries tried to read from the head after their series or chunks were evicted. The chunks are skipped because their samples are available from blocks.",
+            ),
+            
             gc_duration: summary(
                 reg,
                 "prometheus_tsdb_head_gc_duration_seconds",
@@ -3345,6 +3400,41 @@ impl HeadMetrics {
                 "prometheus_tsdb_wal_truncate_duration_seconds",
                 "Duration of WAL truncation.",
                 &[],
+            ),
+            data_replay_duration: gauge(
+                reg,
+                "prometheus_tsdb_data_replay_duration_seconds",
+                "Time taken to replay the data on disk.",
+            ),
+            samples_appended: counter_vec(
+                reg,
+                "prometheus_tsdb_head_samples_appended_total",
+                "Total number of appended samples.",
+                "type",
+            ),
+            duplicate_samples: counter_vec(
+                reg,
+                "prometheus_tsdb_duplicate_samples_total",
+                "Total number of samples rejected at Append or dropped at Commit because the series already had a sample at the same timestamp.",
+                "type",
+            ),
+            out_of_bound_samples: counter_vec(
+                reg,
+                "prometheus_tsdb_out_of_bound_samples_total",
+                "Total number of out of bound samples ingestion failed attempts with out of order support disabled.",
+                "type",
+            ),
+            out_of_order_samples: counter_vec(
+                reg,
+                "prometheus_tsdb_out_of_order_samples_total",
+                "Total number of out of order samples ingestion failed attempts due to out of order being disabled.",
+                "type",
+            ),
+            too_old_samples: counter_vec(
+                reg,
+                "prometheus_tsdb_too_old_samples_total",
+                "Total number of out of order samples ingestion failed attempts with out of support enabled, but sample outside of time window.",
+                "type",
             ),
             head_truncate_fail: counter(
                 reg,
@@ -3386,6 +3476,7 @@ impl HeadMetrics {
                 "prometheus_tsdb_head_chunks_max_mmapped",
                 "Maximum number of head chunks memory-mapped for any individual series during the last memory-mapping pass.",
             ),
+            
             wal_replay_unknown_refs: counter_vec(
                 reg,
                 "prometheus_tsdb_wal_replay_unknown_refs_total",
@@ -3398,11 +3489,29 @@ impl HeadMetrics {
                 "Total number of unknown series references encountered during WBL replay.",
                 "type",
             ),
-            wal: crate::metrics::WlogMetrics::new(reg, crate::metrics::WAL_METRICS_PREFIX),
-            wbl: crate::metrics::WlogMetrics::new(reg, crate::metrics::WBL_METRICS_PREFIX),
+            wal: crate::metrics::WlogMetrics::new_with_dir(
+                reg,
+                crate::metrics::WAL_METRICS_PREFIX,
+                wal_dir,
+            ),
+            wbl: Mutex::new(None),
             chunk_write_queue: (chunk_write_queue_size > 0)
                 .then(|| crate::metrics::ChunkWriteQueueMetrics::new(reg)),
         }
+    }
+
+    fn ensure_wbl_metrics(&self, reg: Option<&Registry>, wbl_dir: &Path) -> crate::metrics::WlogMetrics {
+        let mut g = self.wbl.lock();
+        if let Some(ref m) = *g {
+            return m.clone();
+        }
+        let m = crate::metrics::WlogMetrics::new_with_dir(
+            reg,
+            crate::metrics::WBL_METRICS_PREFIX,
+            Some(wbl_dir),
+        );
+        *g = Some(m.clone());
+        m
     }
 
     /// Go `onChunkCreated` / `appendChunkAndMmap`: one chunk created in the head.
@@ -3422,6 +3531,16 @@ impl HeadMetrics {
             self.chunks_created(1);
         }
         appended
+    }
+
+    #[inline]
+    fn record_append_err(&self, err: &HeadError, typ: &str) {
+        match err {
+            HeadError::OutOfBounds => self.out_of_bound_samples.with_label_values(&[typ]).inc(),
+            HeadError::OutOfOrderSample => self.out_of_order_samples.with_label_values(&[typ]).inc(),
+            HeadError::TooOldSample => self.too_old_samples.with_label_values(&[typ]).inc(),
+            _ => {}
+        }
     }
 
     /// Go `chunksRemoved.Add(n); chunks.Sub(n)`.
@@ -3464,8 +3583,8 @@ pub struct Head {
     ooo_wbl_gate: RwLock<()>,
     ooo_compact_wbl_cut_seg: Mutex<Option<usize>>,
 
-    min_time: AtomicI64,
-    max_time: AtomicI64,
+    min_time: Arc<AtomicI64>,
+    max_time: Arc<AtomicI64>,
     min_valid_time: AtomicI64,
     min_ooo_time: AtomicI64,
     max_ooo_time: AtomicI64,
@@ -3476,6 +3595,9 @@ pub struct Head {
     float_chunk_encoding: AtomicU8,
     last_series_id: AtomicU64,
     num_series: AtomicU64,
+    num_stale_series: Arc<AtomicU64>,
+    num_native_histogram_series: Arc<AtomicU64>,
+    num_native_histogram_buckets: Arc<AtomicU64>,
     last_wal_truncation_time: AtomicI64,
     closed: AtomicBool,
     has_any_metadata: AtomicBool,
@@ -3608,9 +3730,19 @@ impl Head {
     /// Opens a [`Head`] with Go's `ChunkEndTimeVariance` (0.0 disables jitter).
     pub fn open_with_chunk_end_time_variance(
         dir: impl AsRef<Path>,
+        opts: HeadOptions,
+        min_valid_time: i64,
+        chunk_end_time_variance: f64,
+    ) -> Result<Self, HeadError> {
+        Self::open_with_seed(dir, opts, min_valid_time, chunk_end_time_variance, None)
+    }
+
+    pub(crate) fn open_with_seed(
+        dir: impl AsRef<Path>,
         mut opts: HeadOptions,
         min_valid_time: i64,
         chunk_end_time_variance: f64,
+        in_order_blocks_max_time: Option<i64>,
     ) -> Result<Self, HeadError> {
         if opts.chunk_range_ms < 1 {
             return Err(HeadError::InvalidOption(format!(
@@ -3679,7 +3811,66 @@ impl Head {
         } else {
             Encoding::Xor
         };
-        let metrics = HeadMetrics::new(opts.registry.as_deref(), opts.head_chunks_write_queue_size);
+        let metrics = HeadMetrics::new_with_dirs(
+            opts.registry.as_deref(),
+            opts.head_chunks_write_queue_size,
+            Some(&wal_dir),
+        );
+        let min_time = Arc::new(AtomicI64::new(i64::MAX));
+        let max_time = Arc::new(AtomicI64::new(i64::MIN));
+        let num_stale_series = Arc::new(AtomicU64::new(0));
+        let num_native_histogram_series = Arc::new(AtomicU64::new(0));
+        let num_native_histogram_buckets = Arc::new(AtomicU64::new(0));
+        {
+            let reg = opts.registry.as_deref();
+            let min_t = Arc::clone(&min_time);
+            FnGaugeCollector::register(
+                reg,
+                "prometheus_tsdb_head_min_time",
+                "Minimum time bound of the head block. The unit is decided by the library consumer.",
+                move || min_t.load(Ordering::Acquire) as f64,
+            );
+            let max_t = Arc::clone(&max_time);
+            FnGaugeCollector::register(
+                reg,
+                "prometheus_tsdb_head_max_time",
+                "Maximum timestamp of the head block. The unit is decided by the library consumer.",
+                move || max_t.load(Ordering::Acquire) as f64,
+            );
+            let stale_s = Arc::clone(&num_stale_series);
+            FnGaugeCollector::register(
+                reg,
+                "prometheus_tsdb_head_stale_series",
+                "Total number of stale series in the head block.",
+                move || stale_s.load(Ordering::Acquire) as f64,
+            );
+            let nh_s = Arc::clone(&num_native_histogram_series);
+            FnGaugeCollector::register(
+                reg,
+                "prometheus_tsdb_head_native_histogram_series",
+                "Number of series whose most recent in-order sample is a native histogram.",
+                move || nh_s.load(Ordering::Acquire) as f64,
+            );
+            let nh_b = Arc::clone(&num_native_histogram_buckets);
+            FnGaugeCollector::register(
+                reg,
+                "prometheus_tsdb_head_native_histogram_buckets",
+                "Number of positive and negative bucket entries in the most recent in-order native histogram sample of each series, including entries carried by staleness markers.",
+                move || nh_b.load(Ordering::Acquire) as f64,
+            );
+            FnGaugeCollector::register(
+                reg,
+                "prometheus_tsdb_isolation_low_watermark",
+                "The lowest TSDB append ID that is still referenced.",
+                || 0.0,
+            );
+            FnGaugeCollector::register(
+                reg,
+                "prometheus_tsdb_isolation_high_watermark",
+                "The highest TSDB append ID that has been given out.",
+                || 0.0,
+            );
+        }
         let head = Self {
             dir: dir.clone(),
             opts: opts.clone(),
@@ -3708,8 +3899,8 @@ impl Head {
             chunk_snapshot_mtx: Mutex::new(()),
             ooo_wbl_gate: RwLock::new(()),
             ooo_compact_wbl_cut_seg: Mutex::new(None),
-            min_time: AtomicI64::new(i64::MAX),
-            max_time: AtomicI64::new(i64::MIN),
+            min_time,
+            max_time,
             min_valid_time: AtomicI64::new(min_valid_time),
             min_ooo_time: AtomicI64::new(i64::MAX),
             max_ooo_time: AtomicI64::new(i64::MIN),
@@ -3724,6 +3915,9 @@ impl Head {
             float_chunk_encoding: AtomicU8::new(float_enc.as_u8()),
             last_series_id: AtomicU64::new(0),
             num_series: AtomicU64::new(0),
+            num_stale_series,
+            num_native_histogram_series,
+            num_native_histogram_buckets,
             last_wal_truncation_time: AtomicI64::new(i64::MIN),
             closed: AtomicBool::new(false),
             has_any_metadata: AtomicBool::new(false),
@@ -3753,8 +3947,17 @@ impl Head {
                 opts.wal_segment_size,
                 opts.wal_compression,
             )?;
-            wbl_writer.set_metrics(head.metrics.wbl.clone());
+            let wbl_m = head
+                .metrics
+                .ensure_wbl_metrics(opts.registry.as_deref(), &wbl_dir);
+            wbl_writer.set_metrics(wbl_m);
             *head.wbl.lock() = Some(wbl_writer);
+        }
+
+        // Go `DB.reload()` -> `head.Truncate(inOrderBlocksMaxTime)` BEFORE `Head.Init` / WAL replay.
+        if let Some(seed_maxt) = in_order_blocks_max_time {
+            head.truncate_memory_inner(seed_maxt)?;
+            head.min_valid_time.fetch_max(min_valid_time, Ordering::AcqRel);
         }
 
         head.replay_on_open(&wal_dir, &wbl_dir, &chunks_dir)?;
@@ -3781,6 +3984,7 @@ impl Head {
         wbl_dir: &Path,
         chunks_dir: &Path,
     ) -> Result<(), HeadError> {
+        let replay_start = Instant::now();
         // 1. Load mmapped chunks from chunks_head. Header/sequence errors are fatal (Go
         // `NewChunkDiskMapper` fails `NewHead`); iteration errors are repaired exactly like
         // Go `Head.Init` -> `removeCorruptedMmappedChunks` and the data is recovered from WAL.
@@ -3867,13 +4071,17 @@ impl Head {
         self.postings.ensure_order_parallel();
         self.postings_cache.invalidate_all();
 
-        let effective_mvt = self.min_valid_time.load(Ordering::Relaxed);
-        self.gc(effective_mvt)?;
-
-        // Clamp min_time to min_valid_time if initialized below it.
+        // Go `Head.Init` deferred order (LIFO): clamp `min_time` to `min_valid_time` BEFORE `gc`,
+        // then run `gc(self.min_time())` so sample-less series replayed when uninitialized
+        // (`min_time == i64::MAX`) are removed just like Go.
+        let effective_mvt = self.min_valid_time.load(Ordering::Acquire);
         if self.initialized() && self.min_time() < effective_mvt {
-            self.min_time.store(effective_mvt, Ordering::Relaxed);
+            self.min_time.store(effective_mvt, Ordering::Release);
         }
+        self.gc(self.min_time())?;
+        self.metrics
+            .data_replay_duration
+            .set(replay_start.elapsed().as_secs_f64());
         self.symbol_arena_baseline_bytes
             .store(self.symbols.read().bytes_len() as u64, Ordering::Release);
         Ok(())
@@ -4355,6 +4563,13 @@ impl Head {
             // Port of Go `resetSeriesWithMMappedChunks` (`head_wal.go:664-672`):
             // any un-mmapped samples replayed under an earlier WAL ref belong to the
             // obsolete generation prior to the duplicate Series record's mmappedChunks.
+            let (was_stale, was_hist, old_buckets) = st.sample_state();
+            if was_stale {
+                self.update_stale_series_metric_on_append(true, false);
+            }
+            if was_hist {
+                self.update_native_histogram_metrics_on_append(true, false, old_buckets, 0);
+            }
             st.clear_head_chunks();
             st.set_next_at(0);
             st.invalidate_xor_state();
@@ -4392,6 +4607,7 @@ impl Head {
         if s.t <= state.mm_max_time() {
             return Ok(());
         }
+        let (was_stale, was_hist, old_buckets) = state.sample_state();
         if is_stale_nan(s.v) {
             match state.latest_in_order_encoding() {
                 Some(Encoding::Histogram | Encoding::HistogramSt) => {
@@ -4408,6 +4624,8 @@ impl Head {
                         )?) {
                         *mint = (*mint).min(s.t);
                         *maxt = (*maxt).max(s.t);
+                        self.update_stale_series_metric_on_append(was_stale, true);
+                        self.update_native_histogram_metrics_on_append(was_hist, true, old_buckets, 0);
                     }
                     entry
                         .in_order_max_time
@@ -4428,6 +4646,8 @@ impl Head {
                         )?) {
                         *mint = (*mint).min(s.t);
                         *maxt = (*maxt).max(s.t);
+                        self.update_stale_series_metric_on_append(was_stale, true);
+                        self.update_native_histogram_metrics_on_append(was_hist, true, old_buckets, 0);
                     }
                     entry
                         .in_order_max_time
@@ -4450,6 +4670,10 @@ impl Head {
             )?) {
             *mint = (*mint).min(s.t);
             *maxt = (*maxt).max(s.t);
+            self.update_stale_series_metric_on_append(was_stale, is_stale_nan(s.v));
+            if was_hist {
+                self.update_native_histogram_metrics_on_append(true, false, old_buckets, 0);
+            }
         }
         entry
             .in_order_max_time
@@ -4469,6 +4693,7 @@ impl Head {
         if hs.t <= state.mm_max_time() {
             return Ok(());
         }
+        let (was_stale, was_hist, old_buckets) = state.sample_state();
         if self.metrics.track_append(state.append_histogram_in_order(
                 st,
                 hs.t,
@@ -4478,6 +4703,14 @@ impl Head {
             )?) {
             *mint = (*mint).min(hs.t);
             *maxt = (*maxt).max(hs.t);
+            let new_buckets = hs.h.positive_buckets.len() + hs.h.negative_buckets.len();
+            self.update_stale_series_metric_on_append(was_stale, is_stale_nan(hs.h.sum));
+            self.update_native_histogram_metrics_on_append(
+                was_hist,
+                true,
+                old_buckets,
+                new_buckets,
+            );
         }
         entry
             .in_order_max_time
@@ -4497,6 +4730,7 @@ impl Head {
         if fhs.t <= state.mm_max_time() {
             return Ok(());
         }
+        let (was_stale, was_hist, old_buckets) = state.sample_state();
         if self.metrics.track_append(state.append_float_histogram_in_order(
                 st,
                 fhs.t,
@@ -4506,6 +4740,14 @@ impl Head {
             )?) {
             *mint = (*mint).min(fhs.t);
             *maxt = (*maxt).max(fhs.t);
+            let new_buckets = fhs.fh.positive_buckets.len() + fhs.fh.negative_buckets.len();
+            self.update_stale_series_metric_on_append(was_stale, is_stale_nan(fhs.fh.sum));
+            self.update_native_histogram_metrics_on_append(
+                was_hist,
+                true,
+                old_buckets,
+                new_buckets,
+            );
         }
         entry
             .in_order_max_time
@@ -5822,6 +6064,78 @@ impl Head {
     }
 
     #[inline]
+    pub fn num_stale_series(&self) -> u64 {
+        self.num_stale_series.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn num_native_histogram_series(&self) -> u64 {
+        self.num_native_histogram_series.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn num_native_histogram_buckets(&self) -> u64 {
+        self.num_native_histogram_buckets.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn update_stale_series_metric_on_append(&self, was_stale: bool, is_stale: bool) {
+        match (was_stale, is_stale) {
+            (false, true) => {
+                self.num_stale_series.fetch_add(1, Ordering::Relaxed);
+            }
+            (true, false) => {
+                self.num_stale_series.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
+    fn update_native_histogram_metrics_on_append(
+        &self,
+        was_histogram: bool,
+        is_histogram: bool,
+        old_buckets: usize,
+        new_buckets: usize,
+    ) {
+        match (was_histogram, is_histogram) {
+            (false, true) => {
+                self.num_native_histogram_series
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            (true, false) => {
+                self.num_native_histogram_series
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        if new_buckets > old_buckets {
+            self.num_native_histogram_buckets
+                .fetch_add((new_buckets - old_buckets) as u64, Ordering::Relaxed);
+        } else if old_buckets > new_buckets {
+            self.num_native_histogram_buckets
+                .fetch_sub((old_buckets - new_buckets) as u64, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn update_metrics_on_series_delete(&self, st: &SeriesState) {
+        let (is_stale, is_hist, buckets) = st.sample_state();
+        if is_stale {
+            self.num_stale_series.fetch_sub(1, Ordering::Relaxed);
+        }
+        if is_hist {
+            self.num_native_histogram_series
+                .fetch_sub(1, Ordering::Relaxed);
+            if buckets > 0 {
+                self.num_native_histogram_buckets
+                    .fetch_sub(buckets as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -5915,7 +6229,10 @@ impl Head {
                     self.opts.wal_segment_size,
                     self.opts.wal_compression,
                 )?;
-                wbl_writer.set_metrics(self.metrics.wbl.clone());
+                let wbl_m = self
+                    .metrics
+                    .ensure_wbl_metrics(self.opts.registry.as_deref(), &wbl_dir);
+                wbl_writer.set_metrics(wbl_m);
                 *wbl_guard = Some(wbl_writer);
             }
         }
@@ -6859,6 +7176,7 @@ impl Head {
 
     pub fn appender_with_capacity(&self, series_hint: usize) -> HeadAppender<'_> {
         self.metrics.active_appenders.inc();
+        self.metrics.appenders_created.inc();
         let min_valid = self.appendable_min_valid_time();
         let head_maxt = self.max_time();
         let mut scratch = self.appender_pool.lock().pop().unwrap_or_default();
@@ -7404,6 +7722,107 @@ impl Head {
         Ok(((out, mint, maxt), fingerprints))
     }
 
+    /// Returns sorted, merged closed `[min_time, max_time]` intervals of all in-order chunks
+    /// belonging to `candidates` so selected-series compaction can skip empty gaps in O(1).
+    pub(crate) fn collect_selected_compaction_intervals(
+        &self,
+        candidates: &[(u64, Labels)],
+        range_ms: i64,
+    ) -> Vec<(i64, i64)> {
+        let mut raw = Vec::new();
+        let range128 = range_ms.max(1) as i128;
+        let cr_guard = self.chunk_reader.read();
+        for &(ref_id, _) in candidates {
+            let Some(entry) = self.series.get_by_id(ref_id) else {
+                continue;
+            };
+            let st = entry.inner.lock();
+            for mc in st.mmapped() {
+                if (mc.max_time as i128 - mc.min_time as i128) > range128 {
+                    if let Some(ref cr) = *cr_guard {
+                        if let Ok(enc) = cr.chunk(mc.ref_id) {
+                            if let Ok(samples) = decode_chunk_samples(&enc) {
+                                for s in samples {
+                                    raw.push((s.t, s.t));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                raw.push((mc.min_time, mc.max_time));
+            }
+            st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
+                if (hc_max as i128 - hc_min as i128) > range128 {
+                    if let Ok(samples) = decode_chunk_samples(&hc_chunk) {
+                        for s in samples {
+                            raw.push((s.t, s.t));
+                        }
+                        return;
+                    }
+                }
+                raw.push((hc_min, hc_max));
+            });
+        }
+        merge_time_intervals(raw)
+    }
+
+    /// Returns sorted, merged closed `[min_time, max_time]` intervals of OOO chunks up to
+    /// `max_mmap_ref` belonging to `candidates` so OOO compaction can skip empty gaps in O(1).
+    pub(crate) fn collect_ooo_compaction_intervals(
+        &self,
+        candidates: &[(u64, Labels)],
+        max_mmap_ref: ChunkDiskMapperRef,
+        range_ms: i64,
+    ) -> Vec<(i64, i64)> {
+        let mut raw = Vec::new();
+        if max_mmap_ref.as_u64() == 0 {
+            return raw;
+        }
+        let range128 = range_ms.max(1) as i128;
+        let cr_guard = self.chunk_reader.read();
+        for &(ref_id, _) in candidates {
+            let Some(entry) = self.series.get_by_id(ref_id) else {
+                continue;
+            };
+            let st = entry.inner.lock();
+            let Some(ooo) = st.ooo() else {
+                continue;
+            };
+            for mc in &ooo.ooo_mmapped_chunks {
+                if mc.ref_id <= max_mmap_ref {
+                    if (mc.max_time as i128 - mc.min_time as i128) > range128 {
+                        if let Some(ref cr) = *cr_guard {
+                            if let Ok(enc) = cr.chunk(mc.ref_id) {
+                                if let Ok(samples) = decode_chunk_samples(&enc) {
+                                    for s in samples {
+                                        raw.push((s.t, s.t));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    raw.push((mc.min_time, mc.max_time));
+                }
+            }
+            for (mc, enc) in &ooo.ooo_pending_mmapped {
+                if mc.ref_id <= max_mmap_ref {
+                    if (mc.max_time as i128 - mc.min_time as i128) > range128 {
+                        if let Ok(samples) = decode_chunk_samples(enc) {
+                            for s in samples {
+                                raw.push((s.t, s.t));
+                            }
+                            continue;
+                        }
+                    }
+                    raw.push((mc.min_time, mc.max_time));
+                }
+            }
+        }
+        merge_time_intervals(raw)
+    }
+
     /// Collects all series with chunks overlapping `[mint, maxt_inclusive]` for block compaction.
     pub fn collect_compaction_series(
         &self,
@@ -7772,6 +8191,7 @@ impl Head {
                         && !has_recent_exemplar
                         && self.series.remove_if_gced_under_entry_lock(&entry, &mut st)
                     {
+                        self.update_metrics_on_series_delete(&st);
                         drop(st);
                         to_delete.push(entry);
                         continue;
@@ -7936,6 +8356,7 @@ impl Head {
                 {
                     let keep_until = st.max_time();
                     if self.series.remove_if_gced_under_entry_lock(&entry, &mut st) {
+                        self.update_metrics_on_series_delete(&st);
                         drop(st);
                         to_delete.push((entry, keep_until));
                         continue;
@@ -8186,6 +8607,7 @@ impl Head {
                         };
                         if removed_entry {
                             self.metrics.chunks_removed(removed);
+                            self.update_metrics_on_series_delete(&st);
                             drop(st);
                             to_delete.push((entry, keep_until));
                         }
@@ -8323,7 +8745,7 @@ impl Head {
     pub fn gc(&self, mint: i64) -> Result<(), HeadError> {
         let _snap_guard = self.chunk_snapshot_mtx.lock();
         let _mmap_guard = self.mmap_mtx.lock();
-        let (to_delete, actual_mint, _min_ooo_time, min_mmap_seq) =
+        let (to_delete, _actual_mint, _min_ooo_time, min_mmap_seq) =
             self.gc_collect_and_unlink(mint);
         if !to_delete.is_empty() {
             self.finish_deleted_series_cleanup(to_delete);
@@ -8331,9 +8753,6 @@ impl Head {
             self.maybe_gc_symbols();
         }
         self.tombstones.truncate_before(mint);
-        if actual_mint != i64::MAX && self.initialized() && actual_mint > self.min_time() {
-            self.min_time.store(actual_mint, Ordering::Release);
-        }
         self.truncate_chunks_head(min_mmap_seq)?;
         Ok(())
     }
@@ -8387,7 +8806,6 @@ impl Head {
                     continue;
                 }
 
-                let prev_max_time = st.max_time();
                 let mut removed = 0usize;
                 if !st.mmapped_chunks.is_empty() {
                     let before = st.mmapped_chunks.len();
@@ -8421,9 +8839,9 @@ impl Head {
                     && st.head_chunks_is_empty()
                     && !has_ooo
                     && !has_recent_exemplar
-                    && prev_max_time < mint
                     && self.series.remove_if_gced_under_entry_lock(&entry, &mut st)
                 {
+                    self.update_metrics_on_series_delete(&st);
                     drop(st);
                     to_delete.push((entry, i64::MIN));
                     continue;
@@ -9049,6 +9467,7 @@ impl Head {
             Some(e) => e,
             None => {
                 let Some(e) = self.series.get_by_id(ref_id) else {
+                    self.metrics.chunk_reads_of_removed_series.inc();
                     return Ok(Vec::new());
                 };
                 looked_up = e;
@@ -9063,6 +9482,7 @@ impl Head {
             let (mmapped_in_order, head_chks) = {
                 let st = entry.inner.lock();
                 if entry.is_gced() {
+                    self.metrics.chunk_reads_of_removed_series.inc();
                     return Ok(Vec::new());
                 }
                 let mut pos = 0u64;
@@ -9116,6 +9536,7 @@ impl Head {
                         }
                         let st = entry.inner.lock();
                         if entry.is_gced() {
+                            self.metrics.chunk_reads_of_removed_series.inc();
                             return Ok(Vec::new());
                         }
                         if st.mmapped().iter().any(|m| m.ref_id == mc.ref_id) {
@@ -9471,9 +9892,29 @@ struct AppenderScratch {
     wal_comp_buf: Vec<u8>,
 }
 
+fn merge_time_intervals(mut raw: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    if raw.is_empty() {
+        return raw;
+    }
+    raw.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(raw.len());
+    for (s, e) in raw {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                if e > last.1 {
+                    last.1 = e;
+                }
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    merged
+}
+
 struct PreparedWalPayloads {
-    series: Option<(Vec<u8>, bool)>,
-    records: Vec<(Vec<u8>, bool)>,
+    series: Option<(Vec<u8>, bool, usize)>,
+    records: Vec<(Vec<u8>, bool, usize)>,
 }
 
 /// Transactional write appender for [`Head`] matching `tsdb.headAppender`.
@@ -9807,6 +10248,7 @@ impl<'a> HeadAppender<'a> {
                         self.head.metrics.ooo_histogram.observe(delta as f64 / 1000.0);
                     }
                 }
+                self.head.metrics.record_append_err(&e, "float");
                 Err(e)
             }
         }
@@ -9942,6 +10384,11 @@ impl<'a> HeadAppender<'a> {
         }
         let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
         if effective_ooo == 0 && t < self.min_valid_time {
+            self.head
+                .metrics
+                .out_of_bound_samples
+                .with_label_values(&["float"])
+                .inc();
             return Err(HeadError::OutOfBounds);
         }
 
@@ -10000,6 +10447,11 @@ impl<'a> HeadAppender<'a> {
         }
         let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
         if effective_ooo == 0 && t < self.min_valid_time {
+            self.head
+                .metrics
+                .out_of_bound_samples
+                .with_label_values(&["float"])
+                .inc();
             return Err(HeadError::OutOfBounds);
         }
 
@@ -10229,6 +10681,11 @@ impl<'a> HeadAppender<'a> {
             self.head_maxt = self.head.max_time();
         }
         if self.ooo_time_window == 0 && t < self.min_valid_time {
+            self.head
+                .metrics
+                .out_of_bound_samples
+                .with_label_values(&["float"])
+                .inc();
             return Err(HeadError::OutOfBounds);
         }
         let entry = self
@@ -10317,6 +10774,7 @@ impl<'a> HeadAppender<'a> {
                 }
                 Err(e) => {
                     entry.pending_commits.fetch_sub(1, Ordering::Release);
+                    self.head.metrics.record_append_err(&e, "float");
                     return Err(e);
                 }
             }
@@ -10377,6 +10835,11 @@ impl<'a> HeadAppender<'a> {
         }
         let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
         if effective_ooo == 0 && t < self.min_valid_time {
+            self.head
+                .metrics
+                .out_of_bound_samples
+                .with_label_values(&["histogram"])
+                .inc();
             return Err(HeadError::OutOfBounds);
         }
         h.validate().map_err(HeadError::HistogramValidation)?;
@@ -10456,6 +10919,7 @@ impl<'a> HeadAppender<'a> {
                     if take_entry {
                         *series_entry = Some(entry);
                     }
+                    self.head.metrics.record_append_err(&e, "histogram");
                     return Err(e);
                 }
             };
@@ -10522,6 +10986,11 @@ impl<'a> HeadAppender<'a> {
         }
         let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
         if effective_ooo == 0 && t < self.min_valid_time {
+            self.head
+                .metrics
+                .out_of_bound_samples
+                .with_label_values(&["histogram"])
+                .inc();
             return Err(HeadError::OutOfBounds);
         }
         fh.validate().map_err(HeadError::HistogramValidation)?;
@@ -10607,6 +11076,7 @@ impl<'a> HeadAppender<'a> {
                     if take_entry {
                         *series_entry = Some(entry);
                     }
+                    self.head.metrics.record_append_err(&e, "histogram");
                     return Err(e);
                 }
             };
@@ -10818,22 +11288,22 @@ impl<'a> HeadAppender<'a> {
             let wal_res: Result<(), HeadError> = (|| {
                 let mut wal_guard = apps[0].head.wal.lock();
                 if let Some(ref mut wal) = *wal_guard {
-                    let series_slices: Vec<(&[u8], bool)> = payloads
+                    let series_slices: Vec<(&[u8], bool, usize)> = payloads
                         .iter()
-                        .filter_map(|p| p.series.as_ref().map(|(b, c)| (b.as_slice(), *c)))
+                        .filter_map(|p| p.series.as_ref().map(|(b, c, u)| (b.as_slice(), *c, *u)))
                         .collect();
                     if !series_slices.is_empty() {
-                        wal.log_precompressed(&series_slices)?;
+                        wal.log_precompressed_with_lens(&series_slices)?;
                         for a in &mut apps {
                             a.series_refs.clear();
                         }
                     }
-                    let rec_slices: Vec<(&[u8], bool)> = payloads
+                    let rec_slices: Vec<(&[u8], bool, usize)> = payloads
                         .iter()
-                        .flat_map(|p| p.records.iter().map(|(b, c)| (b.as_slice(), *c)))
+                        .flat_map(|p| p.records.iter().map(|(b, c, u)| (b.as_slice(), *c, *u)))
                         .collect();
                     if !rec_slices.is_empty() {
-                        wal.log_precompressed(&rec_slices)?;
+                        wal.log_precompressed_with_lens(&rec_slices)?;
                     }
                 }
                 Ok(())
@@ -10851,14 +11321,17 @@ impl<'a> HeadAppender<'a> {
                 let wal_res: Result<(), HeadError> = (|| {
                     let mut wal_guard = a.head.wal.lock();
                     if let Some(ref mut wal) = *wal_guard {
-                        if let Some((ref b, c)) = p.series {
-                            wal.log_precompressed(&[(b.as_slice(), c)])?;
+                        if let Some((ref b, c, u)) = p.series {
+                            wal.log_precompressed_with_lens(&[(b.as_slice(), c, u)])?;
                             a.series_refs.clear();
                         }
                         if !p.records.is_empty() {
-                            let slices: Vec<(&[u8], bool)> =
-                                p.records.iter().map(|(b, c)| (b.as_slice(), *c)).collect();
-                            wal.log_precompressed(&slices)?;
+                            let slices: Vec<(&[u8], bool, usize)> = p
+                                .records
+                                .iter()
+                                .map(|(b, c, u)| (b.as_slice(), *c, *u))
+                                .collect();
+                            wal.log_precompressed_with_lens(&slices)?;
                         }
                     }
                     Ok(())
@@ -11025,6 +11498,17 @@ impl<'a> HeadAppender<'a> {
         let samples_per_chunk = self.head.opts.samples_per_chunk;
         let ooo_cap_max = self.head.opts.ooo_cap_max;
 
+        let mut floats_appended = 0u64;
+        let mut histograms_appended = 0u64;
+        let mut float_dups = 0u64;
+        let mut hist_dups = 0u64;
+        let mut float_oob = 0u64;
+        let mut float_ooo = 0u64;
+        let mut float_too_old = 0u64;
+        let mut hist_oob = 0u64;
+        let mut hist_ooo = 0u64;
+        let mut hist_too_old = 0u64;
+
         let ooo_wbl_guard = Some(self.head.ooo_wbl_gate.read());
         let total_batches = self.batch_boundaries.len() + 1;
         let mut f_start = 0usize;
@@ -11065,6 +11549,7 @@ impl<'a> HeadAppender<'a> {
                     if v.to_bits() == QUIET_ZERO_NAN_BITS {
                         v = 0.0;
                     }
+                    let (was_stale, was_hist, old_buckets) = state.sample_state();
                     if self.head.metrics.track_append(state.append_float_in_order(
                         &pf.entry.labels,
                         pf.st,
@@ -11078,6 +11563,15 @@ impl<'a> HeadAppender<'a> {
                     )?) {
                         in_order_mint = in_order_mint.min(pf.t);
                         in_order_maxt = in_order_maxt.max(pf.t);
+                        floats_appended += 1;
+                        self.head
+                            .update_stale_series_metric_on_append(was_stale, is_stale_nan(v));
+                        if was_hist {
+                            self.head
+                                .update_native_histogram_metrics_on_append(true, false, old_buckets, 0);
+                        }
+                    } else {
+                        float_dups += 1;
                     }
                     pf.entry
                         .in_order_max_time
@@ -11162,21 +11656,37 @@ impl<'a> HeadAppender<'a> {
                                             ooo_mint = ooo_mint.min(pf.t);
                                             ooo_maxt = ooo_maxt.max(pf.t);
                                         }
-                                    } else if self.head.metrics.track_append(
-                                        state.append_histogram_in_order(
-                                            pf.st,
-                                            pf.t,
-                                            &h,
-                                            chunk_range_ms,
-                                            use_hist_st,
-                                        )?,
-                                    ) {
-                                        in_order_mint = in_order_mint.min(pf.t);
-                                        in_order_maxt = in_order_maxt.max(pf.t);
-                                        pf.entry
-                                            .in_order_max_time
-                                            .store(state.max_time(), Ordering::Release);
+                                    } else {
+                                        let (was_stale, was_hist, old_buckets) = state.sample_state();
+                                        if self.head.metrics.track_append(
+                                            state.append_histogram_in_order(
+                                                pf.st,
+                                                pf.t,
+                                                &h,
+                                                chunk_range_ms,
+                                                use_hist_st,
+                                            )?,
+                                        ) {
+                                            in_order_mint = in_order_mint.min(pf.t);
+                                            in_order_maxt = in_order_maxt.max(pf.t);
+                                            histograms_appended += 1;
+                                            self.head
+                                                .update_stale_series_metric_on_append(was_stale, true);
+                                            self.head.update_native_histogram_metrics_on_append(
+                                                was_hist,
+                                                true,
+                                                old_buckets,
+                                                0,
+                                            );
+                                            pf.entry
+                                                .in_order_max_time
+                                                .store(state.max_time(), Ordering::Release);
+                                        } else {
+                                            hist_dups += 1;
+                                        }
                                     }
+                                } else {
+                                    hist_dups += 1;
                                 }
                             }
                             continue;
@@ -11256,21 +11766,37 @@ impl<'a> HeadAppender<'a> {
                                             ooo_mint = ooo_mint.min(pf.t);
                                             ooo_maxt = ooo_maxt.max(pf.t);
                                         }
-                                    } else if self.head.metrics.track_append(
-                                        state.append_float_histogram_in_order(
-                                            pf.st,
-                                            pf.t,
-                                            &fh,
-                                            chunk_range_ms,
-                                            use_hist_st,
-                                        )?,
-                                    ) {
-                                        in_order_mint = in_order_mint.min(pf.t);
-                                        in_order_maxt = in_order_maxt.max(pf.t);
-                                        pf.entry
-                                            .in_order_max_time
-                                            .store(state.max_time(), Ordering::Release);
+                                    } else {
+                                        let (was_stale, was_hist, old_buckets) = state.sample_state();
+                                        if self.head.metrics.track_append(
+                                            state.append_float_histogram_in_order(
+                                                pf.st,
+                                                pf.t,
+                                                &fh,
+                                                chunk_range_ms,
+                                                use_hist_st,
+                                            )?,
+                                        ) {
+                                            in_order_mint = in_order_mint.min(pf.t);
+                                            in_order_maxt = in_order_maxt.max(pf.t);
+                                            histograms_appended += 1;
+                                            self.head
+                                                .update_stale_series_metric_on_append(was_stale, true);
+                                            self.head.update_native_histogram_metrics_on_append(
+                                                was_hist,
+                                                true,
+                                                old_buckets,
+                                                0,
+                                            );
+                                            pf.entry
+                                                .in_order_max_time
+                                                .store(state.max_time(), Ordering::Release);
+                                        } else {
+                                            hist_dups += 1;
+                                        }
                                     }
+                                } else {
+                                    hist_dups += 1;
                                 }
                             }
                             continue;
@@ -11299,10 +11825,31 @@ impl<'a> HeadAppender<'a> {
                         None,
                     )
                 };
-                let Ok((is_ooo, is_dup)) = check else {
-                    continue;
+                let (is_ooo, is_dup) = match check {
+                    Ok(v) => v,
+                    Err(HeadError::OutOfBounds) => {
+                        float_oob += 1;
+                        continue;
+                    }
+                    Err(HeadError::OutOfOrderSample) => {
+                        float_ooo += 1;
+                        continue;
+                    }
+                    Err(HeadError::TooOldSample) => {
+                        float_too_old += 1;
+                        continue;
+                    }
+                    Err(
+                        HeadError::DuplicateSampleForTimestamp
+                        | HeadError::DuplicateSampleWithDetails(_),
+                    ) => {
+                        float_dups += 1;
+                        continue;
+                    }
+                    Err(_) => continue,
                 };
                 if is_dup {
+                    float_dups += 1;
                     continue;
                 }
                 if is_ooo {
@@ -11357,11 +11904,14 @@ impl<'a> HeadAppender<'a> {
                         });
                         ooo_mint = ooo_mint.min(pf.t);
                         ooo_maxt = ooo_maxt.max(pf.t);
+                    } else {
+                        float_dups += 1;
                     }
                 } else {
                     if v.to_bits() == QUIET_ZERO_NAN_BITS {
                         v = 0.0;
                     }
+                    let (was_stale, was_hist, old_buckets) = state.sample_state();
                     if self.head.metrics.track_append(state.append_float_in_order(
                         &pf.entry.labels,
                         pf.st,
@@ -11375,6 +11925,15 @@ impl<'a> HeadAppender<'a> {
                     )?) {
                         in_order_mint = in_order_mint.min(pf.t);
                         in_order_maxt = in_order_maxt.max(pf.t);
+                        floats_appended += 1;
+                        self.head
+                            .update_stale_series_metric_on_append(was_stale, is_stale_nan(v));
+                        if was_hist {
+                            self.head
+                                .update_native_histogram_metrics_on_append(true, false, old_buckets, 0);
+                        }
+                    } else {
+                        float_dups += 1;
                     }
                     pf.entry
                         .in_order_max_time
@@ -11399,10 +11958,31 @@ impl<'a> HeadAppender<'a> {
                         cr_guard.as_ref(),
                     )
                 };
-                let Ok((is_ooo, is_dup)) = check else {
-                    continue;
+                let (is_ooo, is_dup) = match check {
+                    Ok(v) => v,
+                    Err(HeadError::OutOfBounds) => {
+                        hist_oob += 1;
+                        continue;
+                    }
+                    Err(HeadError::OutOfOrderSample) => {
+                        hist_ooo += 1;
+                        continue;
+                    }
+                    Err(HeadError::TooOldSample) => {
+                        hist_too_old += 1;
+                        continue;
+                    }
+                    Err(
+                        HeadError::DuplicateSampleForTimestamp
+                        | HeadError::DuplicateSampleWithDetails(_),
+                    ) => {
+                        hist_dups += 1;
+                        continue;
+                    }
+                    Err(_) => continue,
                 };
                 if is_dup {
+                    hist_dups += 1;
                     continue;
                 }
                 if is_ooo {
@@ -11457,19 +12037,37 @@ impl<'a> HeadAppender<'a> {
                         });
                         ooo_mint = ooo_mint.min(ph.t);
                         ooo_maxt = ooo_maxt.max(ph.t);
+                    } else {
+                        hist_dups += 1;
                     }
-                } else if self.head.metrics.track_append(state.append_histogram_in_order(
-                    ph.st,
-                    ph.t,
-                    &ph.h,
-                    chunk_range_ms,
-                    use_hist_st,
-                )?) {
-                    in_order_mint = in_order_mint.min(ph.t);
-                    in_order_maxt = in_order_maxt.max(ph.t);
-                    ph.entry
-                        .in_order_max_time
-                        .store(state.max_time(), Ordering::Release);
+                } else {
+                    let (was_stale, was_hist, old_buckets) = state.sample_state();
+                    if self.head.metrics.track_append(state.append_histogram_in_order(
+                        ph.st,
+                        ph.t,
+                        &ph.h,
+                        chunk_range_ms,
+                        use_hist_st,
+                    )?) {
+                        in_order_mint = in_order_mint.min(ph.t);
+                        in_order_maxt = in_order_maxt.max(ph.t);
+                        histograms_appended += 1;
+                        let new_buckets =
+                            ph.h.positive_buckets.len() + ph.h.negative_buckets.len();
+                        self.head
+                            .update_stale_series_metric_on_append(was_stale, is_stale_nan(ph.h.sum));
+                        self.head.update_native_histogram_metrics_on_append(
+                            was_hist,
+                            true,
+                            old_buckets,
+                            new_buckets,
+                        );
+                        ph.entry
+                            .in_order_max_time
+                            .store(state.max_time(), Ordering::Release);
+                    } else {
+                        hist_dups += 1;
+                    }
                 }
             }
 
@@ -11490,10 +12088,31 @@ impl<'a> HeadAppender<'a> {
                         cr_guard.as_ref(),
                     )
                 };
-                let Ok((is_ooo, is_dup)) = check else {
-                    continue;
+                let (is_ooo, is_dup) = match check {
+                    Ok(v) => v,
+                    Err(HeadError::OutOfBounds) => {
+                        hist_oob += 1;
+                        continue;
+                    }
+                    Err(HeadError::OutOfOrderSample) => {
+                        hist_ooo += 1;
+                        continue;
+                    }
+                    Err(HeadError::TooOldSample) => {
+                        hist_too_old += 1;
+                        continue;
+                    }
+                    Err(
+                        HeadError::DuplicateSampleForTimestamp
+                        | HeadError::DuplicateSampleWithDetails(_),
+                    ) => {
+                        hist_dups += 1;
+                        continue;
+                    }
+                    Err(_) => continue,
                 };
                 if is_dup {
+                    hist_dups += 1;
                     continue;
                 }
                 if is_ooo {
@@ -11548,23 +12167,43 @@ impl<'a> HeadAppender<'a> {
                         });
                         ooo_mint = ooo_mint.min(pfh.t);
                         ooo_maxt = ooo_maxt.max(pfh.t);
+                    } else {
+                        hist_dups += 1;
                     }
-                } else if self
-                    .head
-                    .metrics
-                    .track_append(state.append_float_histogram_in_order(
-                        pfh.st,
-                        pfh.t,
-                        &pfh.fh,
-                        chunk_range_ms,
-                        use_hist_st,
-                    )?)
-                {
-                    in_order_mint = in_order_mint.min(pfh.t);
-                    in_order_maxt = in_order_maxt.max(pfh.t);
-                    pfh.entry
-                        .in_order_max_time
-                        .store(state.max_time(), Ordering::Release);
+                } else {
+                    let (was_stale, was_hist, old_buckets) = state.sample_state();
+                    if self
+                        .head
+                        .metrics
+                        .track_append(state.append_float_histogram_in_order(
+                            pfh.st,
+                            pfh.t,
+                            &pfh.fh,
+                            chunk_range_ms,
+                            use_hist_st,
+                        )?)
+                    {
+                        in_order_mint = in_order_mint.min(pfh.t);
+                        in_order_maxt = in_order_maxt.max(pfh.t);
+                        histograms_appended += 1;
+                        let new_buckets =
+                            pfh.fh.positive_buckets.len() + pfh.fh.negative_buckets.len();
+                        self.head.update_stale_series_metric_on_append(
+                            was_stale,
+                            is_stale_nan(pfh.fh.sum),
+                        );
+                        self.head.update_native_histogram_metrics_on_append(
+                            was_hist,
+                            true,
+                            old_buckets,
+                            new_buckets,
+                        );
+                        pfh.entry
+                            .in_order_max_time
+                            .store(state.max_time(), Ordering::Release);
+                    } else {
+                        hist_dups += 1;
+                    }
                 }
             }
 
@@ -11581,6 +12220,42 @@ impl<'a> HeadAppender<'a> {
         self.fhists_committed = 0;
         Ok(())
         })();
+
+        let m = &self.head.metrics;
+        m.out_of_order_samples
+            .with_label_values(&["float"])
+            .inc_by(float_ooo as f64);
+        m.out_of_order_samples
+            .with_label_values(&["histogram"])
+            .inc_by(hist_ooo as f64);
+        m.out_of_bound_samples
+            .with_label_values(&["float"])
+            .inc_by(float_oob as f64);
+        if hist_oob > 0 {
+            m.out_of_bound_samples
+                .with_label_values(&["histogram"])
+                .inc_by(hist_oob as f64);
+        }
+        m.too_old_samples
+            .with_label_values(&["float"])
+            .inc_by(float_too_old as f64);
+        if hist_too_old > 0 {
+            m.too_old_samples
+                .with_label_values(&["histogram"])
+                .inc_by(hist_too_old as f64);
+        }
+        m.samples_appended
+            .with_label_values(&["float"])
+            .inc_by(floats_appended as f64);
+        m.samples_appended
+            .with_label_values(&["histogram"])
+            .inc_by(histograms_appended as f64);
+        m.duplicate_samples
+            .with_label_values(&["float"])
+            .inc_by(float_dups as f64);
+        m.duplicate_samples
+            .with_label_values(&["histogram"])
+            .inc_by(hist_dups as f64);
 
         if in_order_mint <= in_order_maxt {
             self.head.update_min_max_time(in_order_mint, in_order_maxt);
@@ -11739,7 +12414,7 @@ impl<'a> HeadAppender<'a> {
                     } else {
                         rec.as_slice()
                     };
-                    wal.log_precompressed(&[(payload, is_compressed)])
+                    wal.log_precompressed_with_lens(&[(payload, is_compressed, rec.len())])
                 } else {
                     Ok(())
                 }
@@ -11855,39 +12530,41 @@ impl<'a> HeadAppender<'a> {
 
         let prepared_series = match series_rec {
             Some(r) => {
+                let ulen = r.len();
                 let mut comp_buf = Vec::new();
                 if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
-                    Some((comp_buf, true))
+                    Some((comp_buf, true, ulen))
                 } else {
-                    Some((r, false))
+                    Some((r, false, ulen))
                 }
             }
             None => None,
         };
 
-        let mut prepared: Vec<(Vec<u8>, bool)> = Vec::with_capacity(recs.len());
+        let mut prepared: Vec<(Vec<u8>, bool, usize)> = Vec::with_capacity(recs.len());
         for r in recs {
+            let ulen = r.len();
             let mut comp_buf = Vec::new();
             if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
-                prepared.push((comp_buf, true));
+                prepared.push((comp_buf, true, ulen));
             } else {
-                prepared.push((r, false));
+                prepared.push((r, false, ulen));
             }
         }
 
         if prepared_series.is_some() || !prepared.is_empty() {
             let mut wal_guard = self.head.wal.lock();
             if let Some(ref mut wal) = *wal_guard {
-                if let Some((ref b, c)) = prepared_series {
-                    wal.log_precompressed(&[(b.as_slice(), c)])?;
+                if let Some((ref b, c, ulen)) = prepared_series {
+                    wal.log_precompressed_with_lens(&[(b.as_slice(), c, ulen)])?;
                     self.series_refs.clear();
                 }
                 if !prepared.is_empty() {
-                    let slices: Vec<(&[u8], bool)> = prepared
+                    let slices: Vec<(&[u8], bool, usize)> = prepared
                         .iter()
-                        .map(|(b, c)| (b.as_slice(), *c))
+                        .map(|(b, c, u)| (b.as_slice(), *c, *u))
                         .collect();
-                    wal.log_precompressed(&slices)?;
+                    wal.log_precompressed_with_lens(&slices)?;
                 }
             }
         }
@@ -11919,12 +12596,13 @@ impl<'a> HeadAppender<'a> {
                 }),
                 Vec::with_capacity(self.floats.len() * 14 + 17),
             );
+            let ulen = rec.len();
             let mut comp_buf = Vec::new();
             let payload = if crate::wlog::compress_wal_record(&rec, wal_compression, &mut comp_buf)?
             {
-                (comp_buf, true)
+                (comp_buf, true, ulen)
             } else {
-                (rec, false)
+                (rec, false, ulen)
             };
             return Ok(PreparedWalPayloads {
                 series: None,
@@ -12038,23 +12716,25 @@ impl<'a> HeadAppender<'a> {
 
         let prepared_series = match series_rec {
             Some(r) => {
+                let ulen = r.len();
                 let mut comp_buf = Vec::new();
                 if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
-                    Some((comp_buf, true))
+                    Some((comp_buf, true, ulen))
                 } else {
-                    Some((r, false))
+                    Some((r, false, ulen))
                 }
             }
             None => None,
         };
 
-        let mut prepared: Vec<(Vec<u8>, bool)> = Vec::with_capacity(recs.len());
+        let mut prepared: Vec<(Vec<u8>, bool, usize)> = Vec::with_capacity(recs.len());
         for r in recs {
+            let ulen = r.len();
             let mut comp_buf = Vec::new();
             if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
-                prepared.push((comp_buf, true));
+                prepared.push((comp_buf, true, ulen));
             } else {
-                prepared.push((r, false));
+                prepared.push((r, false, ulen));
             }
         }
 
@@ -14329,7 +15009,10 @@ mod tests {
         let par_s = extract(&par_head);
         assert_eq!(seq_s.len(), 5);
         assert_eq!(par_s, seq_s);
-        assert_eq!(par_head.min_time(), 5_000);
+        // Go Head.Init calls h.gc() without raising h.minTime to actualInOrderMint;
+        // both sequential and parallel replay match Go (min_time == 1_000).
+        assert_eq!(par_head.min_time(), seq_head.min_time());
+        assert_eq!(par_head.min_time(), 1_000);
         seq_head.close().unwrap();
         par_head.close().unwrap();
     }
@@ -14452,7 +15135,7 @@ mod tests {
             let head = Head {
                 dir: dir_path.clone(),
                 opts: opts.clone(),
-                metrics: HeadMetrics::new(None, 0),
+                metrics: HeadMetrics::new_with_dirs(None, 0, None),
                 symbols: RwLock::new(SymbolTable::new()),
                 series: StripeSeries::new(opts.stripe_size),
                 series_creation_mtx: Mutex::new(()),
@@ -14469,8 +15152,8 @@ mod tests {
                 chunk_snapshot_mtx: Mutex::new(()),
                 ooo_wbl_gate: RwLock::new(()),
                 ooo_compact_wbl_cut_seg: Mutex::new(None),
-                min_time: AtomicI64::new(i64::MAX),
-                max_time: AtomicI64::new(i64::MIN),
+                min_time: Arc::new(AtomicI64::new(i64::MAX)),
+                max_time: Arc::new(AtomicI64::new(i64::MIN)),
                 min_valid_time: AtomicI64::new(i64::MIN),
                 min_ooo_time: AtomicI64::new(i64::MAX),
                 max_ooo_time: AtomicI64::new(i64::MIN),
@@ -14481,6 +15164,9 @@ mod tests {
                 float_chunk_encoding: AtomicU8::new(opts.float_chunk_encoding.as_u8()),
                 last_series_id: AtomicU64::new(0),
                 num_series: AtomicU64::new(0),
+                num_stale_series: Arc::new(AtomicU64::new(0)),
+                num_native_histogram_series: Arc::new(AtomicU64::new(0)),
+                num_native_histogram_buckets: Arc::new(AtomicU64::new(0)),
                 last_wal_truncation_time: AtomicI64::new(i64::MIN),
                 closed: AtomicBool::new(false),
                 has_any_metadata: AtomicBool::new(false),

@@ -372,7 +372,7 @@ fn w19_rpc_01_head_reversed_time_range_and_ooo_tombstones() {
         .log(&[&enc.samples(
             &[RefSample {
                 ref_id: 1,
-                t: 5_000,
+                t: 200,
                 st: 0,
                 v: 1.0,
             }],

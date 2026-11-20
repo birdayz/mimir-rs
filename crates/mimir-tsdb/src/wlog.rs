@@ -557,6 +557,60 @@ impl WlogWriter {
         Ok(())
     }
 
+    /// Like [`Self::log_precompressed`], also recording `record_bytes_saved_total` from the
+    /// uncompressed record lengths when compression is enabled.
+    pub(crate) fn log_precompressed_with_lens(
+        &mut self,
+        records: &[(&[u8], bool, usize)],
+    ) -> Result<(), WlogError> {
+        if self.closed {
+            return Err(WlogError::Closed);
+        }
+        if records.is_empty() {
+            return Ok(());
+        }
+        let snap = self.take_snapshot()?;
+        for (i, &(payload, compressed, uncomp_len)) in records.iter().enumerate() {
+            let used_comp = if compressed {
+                self.compress
+            } else {
+                CompressionType::None
+            };
+            self.record_compression_savings(uncomp_len, payload.len(), compressed);
+            if let Err(e) = self.write_record_payload(payload, used_comp, i + 1 == records.len()) {
+                self.rollback_snapshot(snap);
+                if let Some(m) = self.metrics.as_ref() {
+                    m.writes_failed.inc();
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_compression_savings(
+        &self,
+        uncomp_len: usize,
+        payload_len: usize,
+        compressed: bool,
+    ) {
+        let comp_label = match self.compress {
+            CompressionType::None => return,
+            CompressionType::Snappy => "snappy",
+            CompressionType::Zstd => "zstd",
+        };
+        if let Some(m) = self.metrics.as_ref() {
+            let saved = if compressed {
+                uncomp_len.saturating_sub(payload_len)
+            } else {
+                0
+            };
+            m.record_bytes_saved
+                .with_label_values(&[comp_label])
+                .inc_by(saved as f64);
+        }
+    }
+
     fn log_one(&mut self, rec: &[u8], is_final: bool) -> Result<(), WlogError> {
         let mut comp_buf = std::mem::take(&mut self.comp_buf);
         let comp_res = compress_wal_record(rec, self.compress, &mut comp_buf);
@@ -568,8 +622,10 @@ impl WlogWriter {
             }
         };
         let res = if compressed {
+            self.record_compression_savings(rec.len(), comp_buf.len(), true);
             self.write_record_payload(&comp_buf, self.compress, is_final)
         } else {
+            self.record_compression_savings(rec.len(), rec.len(), false);
             self.write_record_payload(rec, CompressionType::None, is_final)
         };
         self.comp_buf = comp_buf;
@@ -631,6 +687,11 @@ impl WlogWriter {
             self.page.buf[hdr_pos + RECORD_HEADER_SIZE..hdr_pos + RECORD_HEADER_SIZE + part_len]
                 .copy_from_slice(part);
             self.page.alloc += RECORD_HEADER_SIZE + part_len;
+            if let Some(m) = self.metrics.as_ref() {
+                m.record_part_writes.inc();
+                m.record_parts_bytes_written
+                    .inc_by((RECORD_HEADER_SIZE + part_len) as f64);
+            }
 
             if self.page.full() {
                 self.flush_page(true)?;

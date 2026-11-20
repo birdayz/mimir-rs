@@ -13,7 +13,7 @@ use super::ChunkError;
 pub(crate) struct Insert {
     pub pos: usize,
     pub num: usize,
-    pub bucket_idx: i32,
+    pub bucket_idx: i64,
 }
 
 #[inline]
@@ -191,14 +191,14 @@ pub(crate) struct BucketIterator<'a> {
     spans: &'a [HistogramSpan],
     span: usize,
     bucket: isize,
-    idx: i32,
+    idx: i64,
 }
 
 impl<'a> BucketIterator<'a> {
     pub fn new(spans: &'a [HistogramSpan]) -> Self {
-        let mut idx = -1i32;
+        let mut idx = -1i64;
         if let Some(first) = spans.first() {
-            idx = idx.wrapping_add(first.offset);
+            idx = idx.wrapping_add(i64::from(first.offset));
         }
         Self {
             spans,
@@ -208,7 +208,7 @@ impl<'a> BucketIterator<'a> {
         }
     }
 
-    pub fn next_idx(&mut self) -> Option<i32> {
+    pub fn next_idx(&mut self) -> Option<i64> {
         if self.span >= self.spans.len() {
             return None;
         }
@@ -221,7 +221,7 @@ impl<'a> BucketIterator<'a> {
             self.span += 1;
             self.idx = self
                 .idx
-                .wrapping_add(self.spans[self.span].offset)
+                .wrapping_add(i64::from(self.spans[self.span].offset))
                 .wrapping_add(1);
             self.bucket = 0;
             if self.spans[self.span].length == 0 {
@@ -237,16 +237,20 @@ impl<'a> BucketIterator<'a> {
 pub(crate) fn expand_spans_both_ways(
     a: &[HistogramSpan],
     b: &[HistogramSpan],
-) -> (Vec<Insert>, Vec<Insert>, Vec<HistogramSpan>) {
+) -> Option<(Vec<Insert>, Vec<Insert>, Vec<HistogramSpan>)> {
     let mut ai = BucketIterator::new(a);
     let mut bi = BucketIterator::new(b);
 
     let mut f_inserts = Vec::new();
     let mut b_inserts = Vec::new();
     let mut merged_spans: Vec<HistogramSpan> = Vec::new();
-    let mut last_bucket = 0i32;
+    let mut last_bucket = 0i64;
+    let mut overflow = false;
 
-    let mut add_bucket = |bucket: i32| {
+    let mut add_bucket = |bucket: i64| {
+        if overflow {
+            return;
+        }
         let mut offset = bucket - last_bucket - 1;
         if offset == 0 && !merged_spans.is_empty() {
             merged_spans.last_mut().unwrap().length += 1;
@@ -254,7 +258,16 @@ pub(crate) fn expand_spans_both_ways(
             if merged_spans.is_empty() {
                 offset += 1;
             }
-            merged_spans.push(HistogramSpan { offset, length: 1 });
+            match i32::try_from(offset) {
+                Ok(off32) => merged_spans.push(HistogramSpan {
+                    offset: off32,
+                    length: 1,
+                }),
+                Err(_) => {
+                    overflow = true;
+                    return;
+                }
+            }
         }
         last_bucket = bucket;
     };
@@ -324,7 +337,10 @@ pub(crate) fn expand_spans_both_ways(
         }
     }
 
-    (f_inserts, b_inserts, merged_spans)
+    if overflow {
+        return None;
+    }
+    Some((f_inserts, b_inserts, merged_spans))
 }
 
 pub(crate) trait BucketNum: Copy + Default + std::ops::AddAssign + std::ops::Neg<Output = Self> + std::ops::Add<Output = Self> {}
@@ -412,19 +428,23 @@ pub(crate) fn counter_reset_hint_from_header(
 pub(crate) fn adjust_for_inserts(
     spans: &[HistogramSpan],
     inserts: &[Insert],
-) -> Vec<HistogramSpan> {
+) -> Option<Vec<HistogramSpan>> {
     if inserts.is_empty() {
-        return spans.to_vec();
+        return Some(spans.to_vec());
     }
     let mut it = BucketIterator::new(spans);
     let mut merged_spans: Vec<HistogramSpan> = Vec::new();
 
-    let mut last_bucket = 0i32;
+    let mut last_bucket = 0i64;
     let mut i = 0usize;
     let mut insert_idx = inserts[0].bucket_idx;
     let mut insert_num = inserts[0].num;
+    let mut overflow = false;
 
-    let mut add_bucket = |b: i32| {
+    let mut add_bucket = |b: i64| {
+        if overflow {
+            return;
+        }
         let mut offset = b - last_bucket - 1;
         if offset == 0 && !merged_spans.is_empty() {
             merged_spans.last_mut().unwrap().length += 1;
@@ -432,7 +452,16 @@ pub(crate) fn adjust_for_inserts(
             if merged_spans.is_empty() {
                 offset += 1;
             }
-            merged_spans.push(HistogramSpan { offset, length: 1 });
+            match i32::try_from(offset) {
+                Ok(off32) => merged_spans.push(HistogramSpan {
+                    offset: off32,
+                    length: 1,
+                }),
+                Err(_) => {
+                    overflow = true;
+                    return;
+                }
+            }
         }
         last_bucket = b;
     };
@@ -469,5 +498,8 @@ pub(crate) fn adjust_for_inserts(
             insert_idx += 1;
         }
     }
-    merged_spans
+    if overflow {
+        return None;
+    }
+    Some(merged_spans)
 }
