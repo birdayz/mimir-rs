@@ -1577,12 +1577,12 @@ mod tests {
         let reg = Registry::new();
         let metrics = PostingsForMatchersCacheMetrics::new("f3d_", Some(&reg));
         let ttl = if cfg!(miri) {
-            Duration::from_millis(250)
+            Duration::from_millis(1500)
         } else {
             Duration::from_millis(30)
         };
         let sleep = if cfg!(miri) {
-            Duration::from_millis(300)
+            Duration::from_millis(1600)
         } else {
             Duration::from_millis(45)
         };
@@ -1594,7 +1594,7 @@ mod tests {
             metrics: Some(metrics),
             ..Default::default()
         });
-        cache.set_eligibility(true, false);
+        cache.set_eligibility(false, false);
 
         let m1 = [LabelMatcher::new(MatchType::Equal, "__name__", "m1").unwrap()];
         let m2 = [LabelMatcher::new(MatchType::Equal, "__name__", "m2").unwrap()];
@@ -1611,8 +1611,9 @@ mod tests {
         assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_skips_total", Some("stale-cached-entry")), 1.0);
         cache.expire_in_progress.store(false, Ordering::Release);
 
-        // Now expire() runs on eligible read and evicts m1.
-        cache.get_or_compute::<_, ()>(&m2, false, || Ok(vec![3])).unwrap(); // skipped ineligible -> no expire
+        // Ineligible read (concurrent=false, force=false) skips cache without running expire().
+        cache.get_or_compute::<_, ()>(&m2, false, || Ok(vec![3])).unwrap();
+        assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_evictions_total", Some("ttl-expired")), 0.0);
         assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_entries_total", None), 1.0);
         cache.get_or_compute::<_, ()>(&m2, true, || Ok(vec![3])).unwrap(); // runs expire(), evicts m1, inserts m2
         assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_evictions_total", Some("ttl-expired")), 1.0);
