@@ -89,16 +89,41 @@ pub struct ReadTapPermit {
     breaker_permit: Option<BreakerPermit>,
     reactive_permit: Option<ReactivePermit>,
     deadline_exceeded: Arc<AtomicBool>,
+    prepared: bool,
     finished: bool,
 }
 
 impl ReadTapPermit {
     pub fn set_reactive_permit(&mut self, rp: ReactivePermit) {
         self.reactive_permit = Some(rp);
+        self.prepared = true;
+    }
+
+    pub fn mark_prepared(&mut self) {
+        self.prepared = true;
+    }
+
+    pub fn is_prepared(&self) -> bool {
+        self.prepared
     }
 
     pub fn deadline_exceeded_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.deadline_exceeded)
+    }
+
+    pub fn abort(mut self) {
+        self.abort_inner();
+    }
+
+    fn abort_inner(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        drop(self.breaker_permit.take());
+        if let Some(rp) = self.reactive_permit.take() {
+            rp.drop_permit();
+        }
     }
 
     pub fn finish(mut self, canceled: bool) {
@@ -127,7 +152,11 @@ impl ReadTapPermit {
 
 impl Drop for ReadTapPermit {
     fn drop(&mut self) {
-        self.finish_inner(true);
+        if self.prepared {
+            self.finish_inner(true);
+        } else {
+            self.abort_inner();
+        }
     }
 }
 
@@ -610,6 +639,7 @@ impl Ingester {
             breaker_permit,
             reactive_permit: None,
             deadline_exceeded: Arc::new(AtomicBool::new(false)),
+            prepared: false,
             finished: false,
         })
     }
@@ -3149,25 +3179,27 @@ impl Ingester {
                         return;
                     }
                 };
-                if is_single_all_postings && !base_refs.is_empty() {
+                if !base_refs.is_empty() {
                     for lbl_name in &label_names {
-                        match head.label_values(lbl_name, &matchers) {
-                            Ok(vals) if !vals.is_empty() => {
-                                let err = IngesterError::Internal {
-                                    message: "unexpected all postings".to_string(),
-                                };
-                                let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
-                                permit.finish(false);
-                                return;
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                let err = IngesterError::Internal {
-                                    message: e.to_string(),
-                                };
-                                let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
-                                permit.finish(false);
-                                return;
+                        if is_single_all_postings || lbl_name.is_empty() {
+                            match head.label_values(lbl_name, &matchers) {
+                                Ok(vals) if !vals.is_empty() => {
+                                    let err = IngesterError::Internal {
+                                        message: "unexpected all postings".to_string(),
+                                    };
+                                    let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
+                                    permit.finish(false);
+                                    return;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let err = IngesterError::Internal {
+                                        message: e.to_string(),
+                                    };
+                                    let _ = tx.blocking_send(Err(err_sink.map_read_error(err)));
+                                    permit.finish(false);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -3367,17 +3399,19 @@ impl Ingester {
                         .map_err(|e| IngesterError::Internal {
                             message: e.to_string(),
                         })?;
-                if is_single_all_postings && !base_refs.is_empty() {
+                if !base_refs.is_empty() {
                     for lbl_name in &label_names {
-                        let vals = head.label_values(lbl_name, &matchers).map_err(|e| {
-                            IngesterError::Internal {
-                                message: e.to_string(),
+                        if is_single_all_postings || lbl_name.is_empty() {
+                            let vals = head.label_values(lbl_name, &matchers).map_err(|e| {
+                                IngesterError::Internal {
+                                    message: e.to_string(),
+                                }
+                            })?;
+                            if !vals.is_empty() {
+                                return Err(IngesterError::Internal {
+                                    message: "unexpected all postings".to_string(),
+                                });
                             }
-                        })?;
-                        if !vals.is_empty() {
-                            return Err(IngesterError::Internal {
-                                message: "unexpected all postings".to_string(),
-                            });
                         }
                     }
                 }
@@ -6492,5 +6526,113 @@ mod tests {
             tsdb_encoding_to_wire(Encoding::Xor),
             "planned Head merge with st==0 must emit wire PrometheusXorChunk (4), not PrometheusXor2Chunk (7)"
         );
+    }
+
+    #[tokio::test]
+    async fn b04_label_values_cardinality_empty_label_name_with_matchers_errors() {
+        use tokio_stream::StreamExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-b04".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.compute_worker_pool.start().unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let user = "t-b04";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        ing.push_to_storage(
+            user,
+            &cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_strs("__name__", "up"),
+                        cortexpb::LabelPair::from_strs("job", "api"),
+                    ],
+                    samples: vec![cortexpb::Sample {
+                        value: 1.0,
+                        timestamp_ms: now,
+                    }],
+                    ..Default::default()
+                }],
+                source: cortexpb::write_request::SourceEnum::Api as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let md = MetadataMap::new();
+        for count_method in [
+            ingesterpb::CountMethod::InMemory as i32,
+            ingesterpb::CountMethod::Active as i32,
+        ] {
+            let req = ingesterpb::LabelValuesCardinalityRequest {
+                label_names: vec![String::new()],
+                matchers: vec![ingesterpb::LabelMatcher {
+                    r#type: ingesterpb::MatchType::Equal as i32,
+                    name: "job".into(),
+                    value: "api".into(),
+                }],
+                count_method,
+            };
+            let err = ing
+                .handle_label_values_cardinality(&md, user, req.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(err.map_read_error_to_status().code(), tonic::Code::Internal);
+            assert!(
+                err.to_string().contains("unexpected all postings"),
+                "unexpected err: {err}"
+            );
+
+            let mut stream = ing
+                .handle_label_values_cardinality_rx_with_sink(
+                    &md,
+                    user,
+                    req,
+                    ReadErrorSink::default(),
+                )
+                .await
+                .unwrap();
+            let first = stream.next().await.unwrap();
+            let st = first.unwrap_err();
+            assert_eq!(st.code(), tonic::Code::Internal);
+            assert!(
+                st.message().contains("unexpected all postings"),
+                "unexpected stream status: {st:?}"
+            );
+        }
+
+        // Empty matchers with label_names: [""] must still succeed (single all-postings fast path).
+        let ok_res = ing
+            .handle_label_values_cardinality(
+                &md,
+                user,
+                ingesterpb::LabelValuesCardinalityRequest {
+                    label_names: vec![String::new()],
+                    matchers: Vec::new(),
+                    count_method: ingesterpb::CountMethod::InMemory as i32,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_res.len(), 1);
     }
 }

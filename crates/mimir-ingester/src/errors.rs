@@ -667,8 +667,8 @@ impl IngesterError {
 
     pub fn is_do_not_log(&self) -> bool {
         match self {
-            Self::InstanceLimitReached { .. } => true,
-            Self::WrappedUser { inner, .. } => inner.is_do_not_log(),
+            Self::InstanceLimitReached { .. } | Self::DoNotLog { .. } => true,
+            Self::WrappedUser { inner, .. } | Self::Sampled { inner, .. } => inner.is_do_not_log(),
             _ => false,
         }
     }
@@ -1081,5 +1081,31 @@ mod tests {
             s7.ends_with(": TSDB Head early compaction in progress and the write request contains samples overlapping with it"),
             "unexpected suffix: {s7}"
         );
+    }
+
+    #[test]
+    fn b03_is_do_not_log_matches_do_not_log_and_sampled_wrappers() {
+        let base = IngesterError::max_in_memory_series_reached()
+            .with_user("t1", 1)
+            .with_do_not_log();
+        assert!(base.is_do_not_log());
+
+        let unavail = IngesterError::Unavailable {
+            state: State::Stopping,
+        }
+        .with_do_not_log();
+        assert!(unavail.is_do_not_log());
+
+        let sampled = IngesterError::Sampled {
+            inner: Box::new(IngesterError::max_tenants_reached()),
+            should_log: false,
+            rate: 10,
+        };
+        assert!(sampled.is_do_not_log());
+
+        let plain_soft = IngesterError::LabelsNotSorted {
+            series: r#"{a="1"}"#.to_string(),
+        };
+        assert!(!plain_soft.is_do_not_log());
     }
 }

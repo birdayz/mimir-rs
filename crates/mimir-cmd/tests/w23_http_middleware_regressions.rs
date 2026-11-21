@@ -382,3 +382,82 @@ async fn w24_f8_f9_compartments_partition_ring_post_and_prefixed_root_head_405()
         }
     }
 }
+
+#[tokio::test]
+async fn d2_01_inflight_requests_drop_guard_decrements_on_write_timeout() {
+    use axum::{routing::get, Router};
+
+    let reg = Registry::new();
+    let metrics = ServerMetrics::new(&reg, false, false).unwrap();
+    let mw_cfg = Arc::new(HttpMiddlewareConfig {
+        metrics,
+        logger: Arc::new(NoopLogger),
+        log_request_headers: false,
+        log_request_at_info_level: false,
+        log_source_ips: None,
+        trace_source_ips: None,
+        exclude_headers: Vec::new(),
+        trace_request_headers: false,
+        trace_exclude_headers: Vec::new(),
+        create_new_traces: false,
+        cluster_validation: None,
+        http_path_prefix: String::new(),
+        cost_attribution_path: None,
+        compartments_enabled: false,
+    });
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let started_tx = Arc::clone(&started);
+    let inner = Router::new().route(
+        "/hang",
+        get(move || {
+            let s = Arc::clone(&started_tx);
+            async move {
+                s.notify_one();
+                std::future::pending::<&'static str>().await
+            }
+        }),
+    );
+
+    let app = inner.layer(axum::middleware::from_fn_with_state(
+        mw_cfg,
+        dskit_http_middleware,
+    ));
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri("/hang")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(ServedOverHttp {
+        remote_addr: "127.0.0.1:9999".parse().unwrap(),
+    });
+
+    {
+        let call = app.oneshot(req);
+        tokio::pin!(call);
+        tokio::select! {
+            _ = &mut call => panic!("hanging handler should not finish"),
+            _ = started.notified() => {
+                let inflight_active: f64 = reg
+                    .gather()
+                    .into_iter()
+                    .find(|mf| mf.get_name() == "cortex_inflight_requests")
+                    .and_then(|mf| mf.get_metric().first().map(|m| m.get_gauge().get_value()))
+                    .unwrap_or(0.0);
+                assert_eq!(inflight_active, 1.0);
+            }
+        }
+    }
+
+    let inflight_after_drop: f64 = reg
+        .gather()
+        .into_iter()
+        .find(|mf| mf.get_name() == "cortex_inflight_requests")
+        .and_then(|mf| mf.get_metric().first().map(|m| m.get_gauge().get_value()))
+        .unwrap_or(-1.0);
+    assert_eq!(
+        inflight_after_drop, 0.0,
+        "cortex_inflight_requests must decrement to 0 when handler future is dropped before headers"
+    );
+}

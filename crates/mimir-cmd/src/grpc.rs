@@ -653,12 +653,16 @@ fn validate_go_url(raw: &str) -> Result<(), String> {
             return Err("net/url: invalid control character in URL".to_string());
         }
     }
+    // Match Go net/url.Parse: validate %XX escapes only before '?' and '#' (raw '%' is allowed
+    // inside ?query and #fragment).
+    let before_qf = raw.split(['?', '#']).next().unwrap_or(raw);
+    let qf_bytes = before_qf.as_bytes();
     let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx] == b'%' {
-            if idx + 2 >= bytes.len()
-                || !bytes[idx + 1].is_ascii_hexdigit()
-                || !bytes[idx + 2].is_ascii_hexdigit()
+    while idx < qf_bytes.len() {
+        if qf_bytes[idx] == b'%' {
+            if idx + 2 >= qf_bytes.len()
+                || !qf_bytes[idx + 1].is_ascii_hexdigit()
+                || !qf_bytes[idx + 2].is_ascii_hexdigit()
             {
                 return Err("invalid URL escape".to_string());
             }
@@ -1704,6 +1708,16 @@ mod tests {
         assert_eq!(routed.route_url.as_deref(), Some("/ready?x=1"));
         assert_eq!(split_go_url_clean_redirect("/ready?x=1").route_url, None);
         assert_eq!(split_go_url_clean_redirect("http://h/ready").route_url, None);
+    }
+
+    #[test]
+    fn d2_09_validate_go_url_allows_raw_percent_in_query_and_fragment() {
+        assert!(validate_go_url("/ready?q=100%").is_ok());
+        assert!(validate_go_url("/ready?q=100%#sec%").is_ok());
+        assert!(validate_go_url("/ready#100%").is_ok());
+        assert!(parse_go_url_to_http_uri("/ready?q=100%").is_ok());
+        assert!(validate_go_url("/ready%zz").is_err());
+        assert!(validate_go_url("/ready%?q=100%").is_err());
     }
 
     struct SingleChunkBody(Option<Bytes>);
