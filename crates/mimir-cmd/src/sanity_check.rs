@@ -246,16 +246,29 @@ fn read_compartment_config(cfg: &BucketConfig, read_compartment_id: i64) -> Buck
 /// `checkObjectStoreConfig`: reads an object we don't expect to exist, just to check that the
 /// object storage replies with the expected "not found" error.
 pub async fn check_object_store_config(cfg: &BucketConfig) -> Result<(), String> {
-    let client = BucketClient::new_client(cfg, "sanity-check", None)
-        .map_err(|e| format!("{ERR_OBJECT_STORAGE}: {e}"))?;
-    match tokio::time::timeout(OBJECT_STORE_CHECK_TIMEOUT, client.download("sanity-check-at-startup"))
+    check_object_store_config_with_timeout(cfg, OBJECT_STORE_CHECK_TIMEOUT).await
+}
+
+async fn check_object_store_config_with_timeout(
+    cfg: &BucketConfig,
+    timeout_dur: Duration,
+) -> Result<(), String> {
+    let cfg = cfg.clone();
+    tokio::time::timeout(timeout_dur, async move {
+        let client = tokio::task::spawn_blocking(move || {
+            BucketClient::new_client(&cfg, "sanity-check", None)
+        })
         .await
-    {
-        Err(_) => Err(format!("{ERR_OBJECT_STORAGE}: context deadline exceeded")),
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) if e.is_not_found() => Ok(()),
-        Ok(Err(e)) => Err(format!("{ERR_OBJECT_STORAGE}: {e}")),
-    }
+        .map_err(|e| format!("{ERR_OBJECT_STORAGE}: {e}"))?
+        .map_err(|e| format!("{ERR_OBJECT_STORAGE}: {e}"))?;
+        match client.download("sanity-check-at-startup").await {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_not_found() => Ok(()),
+            Err(e) => Err(format!("{ERR_OBJECT_STORAGE}: {e}")),
+        }
+    })
+    .await
+    .map_err(|_| format!("{ERR_OBJECT_STORAGE}: context deadline exceeded"))?
 }
 
 #[cfg(test)]
@@ -372,5 +385,42 @@ mod tests {
         cfg.backend_cfg.backend = "s3".to_string();
         cfg.backend_cfg.s3.bucket_name = "blocks-<read-compartment-id>".to_string();
         assert_eq!(read_compartment_config(&cfg, 3).backend_cfg.s3.bucket_name, "blocks-3");
+    }
+
+    #[tokio::test]
+    async fn w23_csc_06_sanity_check_timeout_preempts_slow_store_constructor() {
+        // Bind a TCP listener that accepts and holds the connection silently so an Azure/S3
+        // HTTP client stalls on connect/probe, and verify check_object_store_config_with_timeout
+        // returns context deadline exceeded within the configured budget without blocking Tokio.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _accept_task = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                conns.push(stream);
+            }
+        });
+
+        let mut cfg = BucketConfig::default();
+        cfg.backend_cfg.backend = "s3".to_string();
+        cfg.backend_cfg.s3.endpoint = addr.to_string();
+        cfg.backend_cfg.s3.bucket_name = "blocks".to_string();
+        cfg.backend_cfg.s3.access_key_id = "x".to_string();
+        cfg.backend_cfg.s3.secret_access_key = "y".to_string();
+        cfg.backend_cfg.s3.insecure = true;
+
+        let started = std::time::Instant::now();
+        let err = check_object_store_config_with_timeout(&cfg, Duration::from_millis(80))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("context deadline exceeded"),
+            "expected deadline exceeded, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout took {:?}",
+            started.elapsed()
+        );
     }
 }

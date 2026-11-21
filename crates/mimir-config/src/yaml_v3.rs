@@ -1896,7 +1896,7 @@ fn normalize_serde_value(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
 /// Normalizes an already-parsed [`serde_yaml::Value`] (e.g. merged `runtime_config` maps)
 /// according to Go `yaml.v3` scalar coercions for the named Go type (such as
 /// `"mimir.runtimeConfigValues"` or `"mimir.Config"`).
-fn zero_null_fields_walk(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
+fn zero_null_fields_walk(t: &Types, val: &mut serde_yaml::Value, ty: usize, preserve_cost_tracker_nulls: bool) {
     use serde_yaml::{Mapping, Value};
     let ty_deref = deref_ptr(t, ty);
     let info = t.get(ty_deref);
@@ -1904,7 +1904,7 @@ fn zero_null_fields_walk(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
         Value::Sequence(items) => {
             if let Some(elem_ty) = info.elem {
                 for item in items {
-                    zero_null_fields_walk(t, item, elem_ty);
+                    zero_null_fields_walk(t, item, elem_ty, preserve_cost_tracker_nulls);
                 }
             }
         }
@@ -1936,6 +1936,13 @@ fn zero_null_fields_walk(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
                                 *v = Value::Sequence(Vec::new());
                             }
                             Some(fi)
+                                if preserve_cost_tracker_nulls
+                                    && fi.name == "costattributionmodel.TrackerConfigs" =>
+                            {
+                                // Keep explicit null so runtime_config overlay clears base map
+                                // (distinguishing `null` from `{}` overlay).
+                            }
+                            Some(fi)
                                 if fi.kind == "map"
                                     || fi.name == "activeseriesmodel.CustomTrackersConfig"
                                     || fi.name.starts_with("flagext.LimitsMap[") =>
@@ -1950,7 +1957,7 @@ fn zero_null_fields_walk(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
                             }
                         }
                     } else if let Some(ft) = field_ty {
-                        zero_null_fields_walk(t, v, ft);
+                        zero_null_fields_walk(t, v, ft, preserve_cost_tracker_nulls);
                     }
                 }
             } else {
@@ -1960,7 +1967,7 @@ fn zero_null_fields_walk(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
                 if let Some(elem) = elem_ty {
                     for (_, v) in map.iter_mut() {
                         if !v.is_null() {
-                            zero_null_fields_walk(t, v, elem);
+                            zero_null_fields_walk(t, v, elem, preserve_cost_tracker_nulls);
                         }
                     }
                 }
@@ -1975,7 +1982,7 @@ fn zero_null_fields_walk(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
 /// slices/CSVs (`[]` / `""`), zeroes maps (`{}`), and preserves `null` on pointer fields (`*bool`).
 pub(crate) fn zero_null_fields_like_yaml_v3(core_val: &mut serde_yaml::Value) {
     if let Ok(t) = types() {
-        zero_null_fields_walk(t, core_val, t.root);
+        zero_null_fields_walk(t, core_val, t.root, false);
     }
 }
 
@@ -1983,6 +1990,7 @@ pub fn normalize_value_for_type(type_name: &str, val: &mut serde_yaml::Value) ->
     let t = types()?;
     let ty = t.find(type_name)?;
     normalize_serde_value(t, val, ty);
+    zero_null_fields_walk(t, val, ty, true);
     Ok(())
 }
 

@@ -224,6 +224,15 @@ impl Server {
                 .collect(),
             create_new_traces: cfg.create_new_traces,
             cluster_validation: http_cv,
+            http_path_prefix: {
+                let raw = cfg.http_path_prefix.as_str();
+                if !raw.starts_with('/') {
+                    String::new()
+                } else {
+                    raw.trim_end_matches('/').to_string()
+                }
+            },
+            cost_attribution_path: None,
         });
 
         let http_cfg = HttpServerConfig {
@@ -308,6 +317,17 @@ impl Server {
     /// `httpgrpc`.
     pub fn set_shutdown_requested(&mut self, shutdown_requested: Arc<AtomicBool>) {
         self.shutdown_requested = Some(shutdown_requested);
+    }
+
+    /// Registers the dynamic cost-attribution metrics route path so method-mismatch detection in
+    /// the HTTP middleware knows it is GET-only.
+    pub fn set_cost_attribution_path(&mut self, path: &str) {
+        let normalized = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        Arc::make_mut(&mut self.middleware).cost_attribution_path = Some(normalized);
     }
 
     /// Go `Server.Run`: serves `router` (wrapped in the dskit HTTP middleware) and the gRPC
