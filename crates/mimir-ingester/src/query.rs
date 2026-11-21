@@ -1795,9 +1795,7 @@ impl Ingester {
             return;
         }
         let tsdb_cfg = &self.blocks_cfg.tsdb;
-        let has_metric_name = matchers
-            .iter()
-            .any(|m| m.match_type == MatchType::Equal && m.name == "__name__");
+        let has_metric_name = mimir_tsdb::postings_cache::exact_metric_name_from_matchers(matchers).is_some();
         let postings_tracked = |head: bool| {
             let force = if head {
                 tsdb_cfg.head_postings_for_matchers_cache_force

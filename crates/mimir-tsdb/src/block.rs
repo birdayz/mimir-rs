@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::any::Any;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Condvar, Mutex};
@@ -20,7 +21,9 @@ use crate::chunks_block::{BlockChunksError, BlockChunksReader};
 use crate::index::{IndexError, IndexReader, INDEX_FILENAME};
 use crate::matcher::LabelMatcher;
 use crate::postings::{postings_for_matchers, PostingsError};
-use crate::postings_cache::{PostingsForMatchersCache, PostingsForMatchersCacheConfig};
+use crate::postings_cache::{
+    next_postings_cache_source_id, PostingsForMatchersCache, PostingsForMatchersCacheConfig,
+};
 use crate::tombstones::{read_tombstones_file, MemTombstones, TombstoneError, TOMBSTONES_FILENAME};
 
 pub const META_FILENAME: &str = "meta.json";
@@ -415,7 +418,9 @@ pub struct Block {
     chunks: BlockChunksReader,
     tombstones: MemTombstones,
     total_size: u64,
-    postings_cache: PostingsForMatchersCache,
+    postings_cache: Arc<PostingsForMatchersCache>,
+    postings_cache_source_id: u64,
+    compaction_failed: AtomicBool,
     readers: Arc<BlockReaders>,
     lookup_planner: OnceLock<Arc<dyn Any + Send + Sync>>,
 }
@@ -432,8 +437,22 @@ impl Block {
         dir: impl AsRef<Path>,
         postings_cache: PostingsForMatchersCacheConfig,
     ) -> Result<Self, BlockError> {
+        Self::open_with_shared_postings_cache(
+            dir,
+            Arc::new(PostingsForMatchersCache::new(postings_cache)),
+        )
+    }
+
+    /// Opens a block sharing the supplied `Arc<PostingsForMatchersCache>` (used when
+    /// `shared_postings_for_matchers_cache: true`), assigning a unique `source_id` so
+    /// cache keys never collide across blocks or tenants.
+    pub fn open_with_shared_postings_cache(
+        dir: impl AsRef<Path>,
+        postings_cache: Arc<PostingsForMatchersCache>,
+    ) -> Result<Self, BlockError> {
         let dir = dir.as_ref().to_path_buf();
         let meta = read_meta_file(&dir)?;
+        let compaction_failed = AtomicBool::new(meta.compaction.failed);
         let index = IndexReader::open(dir.join(INDEX_FILENAME))?;
         let chunks = BlockChunksReader::open(dir.join("chunks"))?;
         let tombstones = read_tombstones_file(&dir)?;
@@ -454,10 +473,27 @@ impl Block {
             chunks,
             tombstones,
             total_size,
-            postings_cache: PostingsForMatchersCache::new(postings_cache),
+            postings_cache,
+            postings_cache_source_id: next_postings_cache_source_id(),
+            compaction_failed,
             readers: Arc::new(BlockReaders::default()),
             lookup_planner: OnceLock::new(),
         })
+    }
+
+    /// Persists `compaction.failed = true` to `<dir>/meta.json` and marks this block
+    /// failed in memory (matching Go `Block.setCompactionFailed` in `tsdb/block.go:519`).
+    pub fn set_compaction_failed(&self) -> Result<(), BlockError> {
+        let mut m = self.meta.clone();
+        m.compaction.failed = true;
+        write_meta_file(&self.dir, &mut m)?;
+        self.compaction_failed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn compaction_failed(&self) -> bool {
+        self.meta.compaction.failed || self.compaction_failed.load(Ordering::Acquire)
     }
 
     /// Registers an active reader on this block unless it is already closing.
@@ -513,8 +549,12 @@ impl Block {
         matchers: &[LabelMatcher],
         concurrent: bool,
     ) -> Result<Arc<[u64]>, PostingsError> {
-        self.postings_cache
-            .get_or_compute(matchers, concurrent, || postings_for_matchers(&self.index, matchers))
+        self.postings_cache.get_or_compute_for_source(
+            self.postings_cache_source_id,
+            matchers,
+            concurrent,
+            || postings_for_matchers(&self.index, matchers),
+        )
     }
 
     /// Evaluates `matchers` directly against this block's index, bypassing `PostingsForMatchersCache`.
@@ -579,6 +619,13 @@ impl Block {
     #[inline]
     pub fn overlaps_closed_interval(&self, mint: i64, maxt: i64) -> bool {
         self.meta.overlaps_closed_interval(mint, maxt)
+    }
+}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        self.postings_cache
+            .remove_source(self.postings_cache_source_id);
     }
 }
 

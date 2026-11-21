@@ -188,7 +188,7 @@ pub(crate) fn snapshot_head_query_source(
                     return None;
                 }
             }
-            let overlaps_in_order = ino_mint <= maxt && mint <= head_max_time;
+            let overlaps_in_order = ino_mint <= maxt && ino_mint <= head_max_time;
             if !overlaps_in_order {
                 drop(guard);
                 return None;
@@ -2552,6 +2552,20 @@ mod wave3_tests {
         let all_m = [LabelMatcher::new(crate::matcher::MatchType::RegexMatch, "__name__", ".+").unwrap()];
         assert_eq!(q_ooo.select(true, &all_m).unwrap().len(), 1);
         assert_eq!(q_ooo.select_raw_labels(true, &all_m).unwrap().len(), 1);
+
+        // Trailing window strictly after Head.MaxTime() [2_000_000, 3_000_000] also returns empty
+        // for label discovery (matching Go headIndexReader.{LabelNames,LabelValues} in head_read.go:88-115).
+        let q_after = TsdbQuerier::new(Some(&head), Vec::new(), 2_000_000, 3_000_000);
+        assert!(q_after.label_names(&[]).unwrap().is_empty());
+        assert!(q_after.label_values("head_lbl", None, &[]).unwrap().is_empty());
+        assert!(q_after
+            .search_label_names(&SearchHints::default(), &[])
+            .unwrap()
+            .is_empty());
+        assert!(q_after
+            .search_label_values("head_lbl", &SearchHints::default(), &[])
+            .unwrap()
+            .is_empty());
 
         // Overlapping in-order Head [1_000_000, 1_000_000]:
         let q_ino = TsdbQuerier::new(Some(&head), Vec::new(), 1_000_000, 1_000_000);

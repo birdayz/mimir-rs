@@ -390,7 +390,7 @@ impl Ingester {
                 })?;
 
         let shipper_metrics = ShipperMetrics::new(registry);
-        let shared_tsdb_metrics = crate::user_tsdb::SharedTsdbMetrics::new(registry);
+        let shared_tsdb_metrics = crate::user_tsdb::SharedTsdbMetrics::new_with_blocks_cfg(registry, &blocks_cfg);
         let tsdb_metrics = TSDBMetrics::new("cortex_ingester_", registry);
         let owned_series_metrics =
             OwnedSeriesMetrics::new(owned_series_strategy.as_ref().and(registry));

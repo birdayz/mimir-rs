@@ -30,11 +30,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kafka_protocol::error::{ParseResponseErrorCode, ResponseError};
+use kafka_protocol::messages::fetch_response::NodeEndpoint;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
 use kafka_protocol::messages::{BrokerId, FetchRequest, TopicName};
 use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
+use mimir_common::native_histogram::SingleHistogram;
 use tracing::{debug, info, warn};
 
 use super::fetcher::{kafka_fetch_error_from_client, FetchResult, KafkaFetchError, PartitionMetadataRefresher};
@@ -48,8 +50,8 @@ pub const CLIENT_FETCH_MAX_PARTITION_BYTES: i32 = 50_000_000;
 /// kgo default `RecheckPreferredReplicaInterval`.
 pub const RECHECK_PREFERRED_REPLICA_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Highest Fetch version used: v11 introduced `rack_id` / `preferred_read_replica`, v12
-/// `current_leader` (KIP-951). Topic IDs (v13) are not needed here.
-const CLIENT_FETCH_MAX_VERSION: i16 = 12;
+/// `current_leader`, v13 topic IDs, and v16 KIP-951 `node_endpoints`.
+const CLIENT_FETCH_MAX_VERSION: i16 = 16;
 
 /// The consuming cursor of the single partition (kgo `cursor`).
 struct Cursor {
@@ -78,6 +80,7 @@ pub struct ClientPartitionConsumer {
     buffered_bytes: Arc<AtomicI64>,
     rx: Mutex<mpsc::Receiver<FetchResult>>,
     tx: Mutex<Option<mpsc::Sender<FetchResult>>>,
+    fetch_wait_duration: Option<SingleHistogram>,
     stop_tx: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -109,9 +112,17 @@ impl ClientPartitionConsumer {
             buffered_bytes: Arc::new(AtomicI64::new(0)),
             rx: Mutex::new(rx),
             tx: Mutex::new(Some(tx)),
+            fetch_wait_duration: None,
             stop_tx,
             tasks: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Attaches `cortex_ingest_storage_reader_records_batch_wait_duration_seconds` so
+    /// `poll_fetches_until` observes fetch wait duration like Go `SingleClusterPartitionReader.PollFetches`.
+    pub fn with_fetch_wait_duration(mut self, hist: SingleHistogram) -> Self {
+        self.fetch_wait_duration = Some(hist);
+        self
     }
 
     /// `client.BufferedFetchRecords()`.
@@ -166,12 +177,16 @@ impl ClientPartitionConsumer {
     /// `client.PollFetches(ctx)`: blocks until a fetch with records or an error is buffered.
     /// Returns `None` once `cancel` completes first.
     pub async fn poll_fetches_until<F: Future>(&self, cancel: F) -> Option<FetchResult> {
+        let wait_start = Instant::now();
         let mut rx = self.rx.lock().await;
         let res = tokio::select! {
             biased;
             res = rx.recv() => res,
             _ = cancel => None,
         };
+        if let Some(ref hist) = self.fetch_wait_duration {
+            hist.observe(wait_start.elapsed().as_secs_f64());
+        }
         if res.is_some() {
             self.set_buffered(0, 0);
         }
@@ -392,8 +407,10 @@ impl Worker {
         fp.log_start_offset = -1;
         fp.partition_max_bytes = CLIENT_FETCH_MAX_PARTITION_BYTES;
 
+        let topic_id = self.client.cached_topic_id(&self.topic);
         let mut ft = FetchTopic::default();
         ft.topic = TopicName(StrBytes::from_string(self.topic.clone()));
+        ft.topic_id = uuid::Uuid::from_bytes(topic_id);
         ft.partitions = vec![fp];
 
         let mut req = FetchRequest::default();
@@ -409,11 +426,17 @@ impl Worker {
             req.rack_id = StrBytes::from_string(self.rack.clone());
         }
 
+        // Topic IDs are only usable with v13+; without a known topic ID stay on v12.
+        let max_version = if topic_id == [0u8; 16] {
+            12
+        } else {
+            CLIENT_FETCH_MAX_VERSION
+        };
         let timeout = self.fetch_max_wait + DEFAULT_REQUEST_TIMEOUT_OVERHEAD;
         let source = cursor.source;
         let (resp, version) = match self
             .client
-            .fetch_from_broker(source, &req, 4, CLIENT_FETCH_MAX_VERSION, timeout)
+            .fetch_from_broker(source, &req, 4, max_version, timeout)
             .await
         {
             Ok(v) => v,
@@ -438,7 +461,13 @@ impl Worker {
         let Some(rp) = resp
             .responses
             .iter()
-            .filter(|t| t.topic.0.as_str() == self.topic)
+            .filter(|t| {
+                if version >= 13 {
+                    *t.topic_id.as_bytes() == topic_id
+                } else {
+                    t.topic.0.as_str() == self.topic
+                }
+            })
             .flat_map(|t| t.partitions.iter())
             .find(|p| p.partition_index == self.partition_id)
         else {
@@ -475,10 +504,14 @@ impl Worker {
         }
 
         if let Some(err) = rp.error_code.err() {
-            return self.handle_partition_error(cursor, err, rp).await;
+            return self
+                .handle_partition_error(cursor, err, rp, &resp.node_endpoints)
+                .await;
         }
 
         let raw = rp.records.clone().unwrap_or_default();
+        let raw_non_empty = !raw.is_empty();
+        let prior_offset = cursor.offset;
         let (records, next_offset) = if raw.is_empty() {
             (Vec::new(), cursor.offset)
         } else {
@@ -495,6 +528,12 @@ impl Worker {
         // Keep offset advancements even without records (e.g. only control records).
         cursor.offset = next_offset.max(cursor.offset);
         if records.is_empty() {
+            if raw_non_empty && cursor.offset <= prior_offset {
+                // franz-go source.go:1314-1316 (errFetchNoProgress):
+                // Broker returned batch bytes whose last offsets are all below our requested
+                // offset; back off instead of hot-spinning at 100% CPU.
+                return Step::Backoff;
+            }
             return Step::Continue;
         }
         cursor.last_consumed_ms = records.last().map(|r| r.timestamp_ms);
@@ -513,6 +552,7 @@ impl Worker {
         cursor: &mut Cursor,
         err: ResponseError,
         rp: &kafka_protocol::messages::fetch_response::PartitionData,
+        node_endpoints: &[NodeEndpoint],
     ) -> Step {
         let source = cursor.source;
         if err == ResponseError::OffsetOutOfRange {
@@ -536,18 +576,28 @@ impl Worker {
 
         if is_retriable_response_error(err) {
             // Stripped from the fetch (not returned to the user): update metadata and back off.
-            // KIP-951: a NOT_LEADER / FENCED reply may carry the current leader.
+            // KIP-951 (topics_and_partitions.go:814-844): NOT_LEADER_OR_FOLLOWER may carry a
+            // strictly newer CurrentLeader (+ NodeEndpoints in Fetch v16).
             let cl = &rp.current_leader;
-            if matches!(
-                err,
-                ResponseError::NotLeaderOrFollower | ResponseError::FencedLeaderEpoch
-            ) && cl.leader_id.0 >= 0
-                && cl.leader_epoch >= cursor.leader_epoch
-                && self.client.is_known_broker(cl.leader_id.0)
+            if err == ResponseError::NotLeaderOrFollower
+                && cl.leader_id.0 >= 0
+                && cl.leader_epoch >= 0
+                && cl.leader_epoch > cursor.leader_epoch
+                && self.client.apply_kip951_leader(
+                    &self.topic,
+                    self.partition_id,
+                    cl.leader_id.0,
+                    cl.leader_epoch,
+                    node_endpoints,
+                )
             {
+                cursor.leader = cl.leader_id.0;
+                cursor.leader_epoch = cl.leader_epoch;
                 cursor.source = cl.leader_id.0;
                 cursor.move_at = None;
-            } else if source != cursor.leader {
+                return Step::Backoff;
+            }
+            if source != cursor.leader {
                 cursor.source = cursor.leader;
                 cursor.move_at = None;
             }
@@ -632,5 +682,444 @@ impl Worker {
                 Err(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::{BufMut, Bytes, BytesMut};
+    use kafka_protocol::indexmap::IndexMap;
+    use kafka_protocol::messages::api_versions_response::ApiVersion;
+    use kafka_protocol::messages::fetch_response::{
+        FetchableTopicResponse, LeaderIdAndEpoch, NodeEndpoint, PartitionData,
+    };
+    use kafka_protocol::messages::metadata_response::{
+        MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+    };
+    use kafka_protocol::messages::{
+        ApiKey, ApiVersionsRequest, ApiVersionsResponse, BrokerId, FetchRequest, FetchResponse,
+        MetadataRequest, MetadataResponse, RequestHeader, ResponseHeader, TopicName,
+    };
+    use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+    use kafka_protocol::records::{
+        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+        NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
+    };
+    use mimir_config::{KafkaConfig, StringSliceCSV};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::ingest::fetcher::FetcherMetrics;
+
+    fn encode_msg<R: Encodable>(hv: i16, ver: i16, corr: i32, r: &R) -> Bytes {
+        let mut hdr = ResponseHeader::default();
+        hdr.correlation_id = corr;
+        let mut out = BytesMut::new();
+        out.put_u32(0);
+        hdr.encode(&mut out, hv).unwrap();
+        r.encode(&mut out, ver).unwrap();
+        let len = (out.len() - 4) as u32;
+        out[0..4].copy_from_slice(&len.to_be_bytes());
+        out.freeze()
+    }
+
+    fn encode_batch_range(from: i64, to: i64) -> Bytes {
+        let recs: Vec<Record> = (from..to)
+            .map(|o| Record {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                producer_id: NO_PRODUCER_ID,
+                producer_epoch: NO_PRODUCER_EPOCH,
+                timestamp_type: TimestampType::Creation,
+                offset: o,
+                sequence: NO_SEQUENCE,
+                timestamp: 1_700_000_000_000 + o,
+                key: Some(Bytes::from_static(b"k")),
+                value: Some(Bytes::from(format!("v-{o}"))),
+                headers: IndexMap::new(),
+            })
+            .collect();
+        let mut buf = BytesMut::new();
+        RecordBatchEncoder::encode_with_custom_compression(
+            &mut buf,
+            recs.iter(),
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+            Some(crate::ingest::compression::compress_record_batch),
+        )
+        .unwrap();
+        buf.freeze()
+    }
+
+    #[tokio::test]
+    async fn w24_b02_non_advancing_batch_backs_off_instead_of_hot_spinning() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let fc = Arc::clone(&fetch_count);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let fc = Arc::clone(&fc);
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if s.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if s.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        let mut buf = Bytes::from(buf);
+                        let key = ApiKey::try_from(i16::from_be_bytes([buf[0], buf[1]])).unwrap();
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let hv = match key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                            ApiKey::Metadata => MetadataRequest::header_version(ver),
+                            ApiKey::Fetch => FetchRequest::header_version(ver),
+                            _ => return,
+                        };
+                        let hdr = RequestHeader::decode(&mut buf, hv).unwrap();
+                        let out = match key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut r = ApiVersionsResponse::default();
+                                for (k, max) in [
+                                    (ApiKey::ApiVersions, 3),
+                                    (ApiKey::Metadata, 12),
+                                    (ApiKey::Fetch, 12),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k as i16;
+                                    av.min_version = 0;
+                                    av.max_version = max;
+                                    r.api_keys.push(av);
+                                }
+                                encode_msg(0, ver, hdr.correlation_id, &r)
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = addr.port() as i32;
+                                let mut p = MetadataResponsePartition::default();
+                                p.partition_index = 0;
+                                p.leader_id = BrokerId(0);
+                                p.leader_epoch = 1;
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("no-progress")));
+                                t.partitions = vec![p];
+                                let mut r = MetadataResponse::default();
+                                r.brokers = vec![b];
+                                r.controller_id = BrokerId(0);
+                                r.topics = vec![t];
+                                encode_msg(MetadataResponse::header_version(ver), ver, hdr.correlation_id, &r)
+                            }
+                            ApiKey::Fetch => {
+                                let _ = FetchRequest::decode(&mut buf, ver).unwrap();
+                                let n = fc.fetch_add(1, Ordering::SeqCst);
+                                let mut pd = PartitionData::default();
+                                pd.partition_index = 0;
+                                pd.high_watermark = 11;
+                                pd.log_start_offset = 0;
+                                // First 2 fetches return a non-empty batch strictly below offset 10 (no progress).
+                                if n < 2 {
+                                    pd.records = Some(encode_batch_range(0, 5));
+                                } else {
+                                    pd.records = Some(encode_batch_range(10, 11));
+                                }
+                                let mut ft = FetchableTopicResponse::default();
+                                ft.topic = TopicName(StrBytes::from_static_str("no-progress"));
+                                ft.partitions = vec![pd];
+                                let mut r = FetchResponse::default();
+                                r.responses = vec![ft];
+                                encode_msg(FetchResponse::header_version(ver), ver, hdr.correlation_id, &r)
+                            }
+                            _ => unreachable!(),
+                        };
+                        if s.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "no-progress".to_string(),
+            ..Default::default()
+        };
+        let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+        let reg = prometheus::Registry::new();
+        let fetcher_metrics = FetcherMetrics::new(Some(&reg));
+        let consumer = ClientPartitionConsumer::new(
+            Arc::clone(&client),
+            "no-progress",
+            0,
+            10,
+            Duration::from_millis(50),
+        )
+        .with_fetch_wait_duration(fetcher_metrics.fetch_wait_duration.clone());
+        consumer.start().await;
+
+        // During the first 200ms, the 1st no-progress fetch must back off (>= 250ms retry_backoff)
+        // instead of hot-spinning dozens/hundreds of requests.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let early_fetches = fetch_count.load(Ordering::SeqCst);
+        assert!(
+            early_fetches <= 2,
+            "expected backoff after non-advancing batch, saw {early_fetches} fetches in 200ms"
+        );
+
+        let f = consumer
+            .poll_fetches_until(tokio::time::sleep(Duration::from_secs(5)))
+            .await
+            .expect("expected offset 10 after backoff");
+        assert!(f.err.is_none());
+        assert_eq!(f.records.len(), 1);
+        assert_eq!(f.records[0].offset, 10);
+
+        // W24-B-04: fetch_wait_duration observed on poll_fetches_until.
+        let mfs = reg.gather();
+        let wait_hist = mfs
+            .iter()
+            .find(|mf| mf.get_name() == "cortex_ingest_storage_reader_records_batch_wait_duration_seconds")
+            .expect("fetch_wait_duration metric must be registered");
+        assert!(
+            wait_hist.get_metric()[0].get_histogram().get_sample_count() >= 1,
+            "fetch_wait_duration must be observed on ClientPartitionConsumer poll"
+        );
+
+        consumer.stop().await;
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn w24_b02_kip951_current_leader_requires_strictly_greater_epoch_and_uses_node_endpoints() {
+        let l0 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr0 = l0.local_addr().unwrap();
+        let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = l1.local_addr().unwrap();
+
+        let topic_id = [9u8; 16];
+        let b0_meta_calls = Arc::new(AtomicUsize::new(0));
+        let b0_fetch_calls = Arc::new(AtomicUsize::new(0));
+        let b1_fetch_epochs = Arc::new(parking_lot::Mutex::new(Vec::<i32>::new()));
+
+        let b0_mc = Arc::clone(&b0_meta_calls);
+        let b0_fc = Arc::clone(&b0_fetch_calls);
+        let srv0 = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l0.accept().await else {
+                    break;
+                };
+                let b0_mc = Arc::clone(&b0_mc);
+                let b0_fc = Arc::clone(&b0_fc);
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if s.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if s.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        let mut buf = Bytes::from(buf);
+                        let key = ApiKey::try_from(i16::from_be_bytes([buf[0], buf[1]])).unwrap();
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let hv = match key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                            ApiKey::Metadata => MetadataRequest::header_version(ver),
+                            ApiKey::Fetch => FetchRequest::header_version(ver),
+                            _ => return,
+                        };
+                        let hdr = RequestHeader::decode(&mut buf, hv).unwrap();
+                        let out = match key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut r = ApiVersionsResponse::default();
+                                for (k, max) in [
+                                    (ApiKey::ApiVersions, 3),
+                                    (ApiKey::Metadata, 12),
+                                    (ApiKey::Fetch, 16),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k as i16;
+                                    av.min_version = 0;
+                                    av.max_version = max;
+                                    r.api_keys.push(av);
+                                }
+                                encode_msg(0, ver, hdr.correlation_id, &r)
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                b0_mc.fetch_add(1, Ordering::SeqCst);
+                                // Stale metadata: still claims broker 0 is leader at epoch 5, and does NOT list broker 1!
+                                let mut b0 = MetadataResponseBroker::default();
+                                b0.node_id = BrokerId(0);
+                                b0.host = StrBytes::from_static_str("127.0.0.1");
+                                b0.port = addr0.port() as i32;
+                                let mut p = MetadataResponsePartition::default();
+                                p.partition_index = 0;
+                                p.leader_id = BrokerId(0);
+                                p.leader_epoch = 5;
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("kip951")));
+                                t.topic_id = uuid::Uuid::from_bytes(topic_id);
+                                t.partitions = vec![p];
+                                let mut r = MetadataResponse::default();
+                                r.brokers = vec![b0];
+                                r.controller_id = BrokerId(0);
+                                r.topics = vec![t];
+                                encode_msg(MetadataResponse::header_version(ver), ver, hdr.correlation_id, &r)
+                            }
+                            ApiKey::Fetch => {
+                                let _ = FetchRequest::decode(&mut buf, ver).unwrap();
+                                let n = b0_fc.fetch_add(1, Ordering::SeqCst);
+                                let mut pd = PartitionData::default();
+                                pd.partition_index = 0;
+                                pd.error_code = ResponseError::NotLeaderOrFollower.code();
+                                let mut ep1 = NodeEndpoint::default();
+                                ep1.node_id = BrokerId(1);
+                                ep1.host = StrBytes::from_static_str("127.0.0.1");
+                                ep1.port = addr1.port() as i32;
+                                let mut cl = LeaderIdAndEpoch::default();
+                                cl.leader_id = BrokerId(1);
+                                // Fetch 0: equal epoch 5 -> MUST be ignored (triggers metadata refresh).
+                                // Fetch 1: strictly greater epoch 6 -> MUST move to broker 1 via NodeEndpoints without metadata refresh!
+                                cl.leader_epoch = if n == 0 { 5 } else { 6 };
+                                pd.current_leader = cl;
+                                let mut ft = FetchableTopicResponse::default();
+                                ft.topic_id = uuid::Uuid::from_bytes(topic_id);
+                                ft.partitions = vec![pd];
+                                let mut r = FetchResponse::default();
+                                r.responses = vec![ft];
+                                r.node_endpoints = vec![ep1];
+                                encode_msg(FetchResponse::header_version(ver), ver, hdr.correlation_id, &r)
+                            }
+                            _ => unreachable!(),
+                        };
+                        if s.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let b1_ep = Arc::clone(&b1_fetch_epochs);
+        let srv1 = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l1.accept().await else {
+                    break;
+                };
+                let b1_ep = Arc::clone(&b1_ep);
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if s.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if s.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        let mut buf = Bytes::from(buf);
+                        let key = ApiKey::try_from(i16::from_be_bytes([buf[0], buf[1]])).unwrap();
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let hv = match key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                            ApiKey::Fetch => FetchRequest::header_version(ver),
+                            _ => return,
+                        };
+                        let hdr = RequestHeader::decode(&mut buf, hv).unwrap();
+                        let out = match key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut r = ApiVersionsResponse::default();
+                                for (k, max) in [(ApiKey::ApiVersions, 3), (ApiKey::Fetch, 16)] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k as i16;
+                                    av.min_version = 0;
+                                    av.max_version = max;
+                                    r.api_keys.push(av);
+                                }
+                                encode_msg(0, ver, hdr.correlation_id, &r)
+                            }
+                            ApiKey::Fetch => {
+                                let req = FetchRequest::decode(&mut buf, ver).unwrap();
+                                let epoch = req.topics[0].partitions[0].current_leader_epoch;
+                                b1_ep.lock().push(epoch);
+                                let mut pd = PartitionData::default();
+                                pd.partition_index = 0;
+                                pd.high_watermark = 1;
+                                pd.log_start_offset = 0;
+                                pd.records = Some(encode_batch_range(0, 1));
+                                let mut ft = FetchableTopicResponse::default();
+                                ft.topic_id = uuid::Uuid::from_bytes(topic_id);
+                                ft.partitions = vec![pd];
+                                let mut r = FetchResponse::default();
+                                r.responses = vec![ft];
+                                encode_msg(FetchResponse::header_version(ver), ver, hdr.correlation_id, &r)
+                            }
+                            _ => unreachable!(),
+                        };
+                        if s.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr0.to_string()]),
+            topic: "kip951".to_string(),
+            ..Default::default()
+        };
+        let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+        let consumer = ClientPartitionConsumer::new(
+            Arc::clone(&client),
+            "kip951",
+            0,
+            0,
+            Duration::from_millis(50),
+        );
+        consumer.start().await;
+
+        let f = consumer
+            .poll_fetches_until(tokio::time::sleep(Duration::from_secs(5)))
+            .await
+            .expect("expected record from new leader via KIP-951");
+        assert!(f.err.is_none());
+        assert_eq!(f.records.len(), 1);
+        assert_eq!(f.records[0].offset, 0);
+
+        // Fetch 0 (epoch 5 == cursor.leader_epoch 5) triggered metadata refresh (2 total: initial + after fetch 0);
+        // Fetch 1 (epoch 6 > 5) moved directly via KIP-951 NodeEndpoints WITHOUT a 3rd metadata refresh!
+        assert_eq!(b0_fetch_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(b0_meta_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*b1_fetch_epochs.lock(), vec![6]);
+        assert_eq!(client.cached_partition_leader("kip951", 0), (1, 6));
+        assert!(client.is_known_broker(1));
+
+        consumer.stop().await;
+        srv0.abort();
+        srv1.abort();
     }
 }
