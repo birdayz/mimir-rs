@@ -940,6 +940,28 @@ impl SegmentBufReader {
         })
     }
 
+    /// Opens a single WAL/WBL segment by index (`wlog.OpenReadSegment` + `NewSegmentBufReader`),
+    /// returning `WlogError::Io(NotFound)` immediately if that segment file does not exist.
+    pub fn open_segment(dir: &Path, index: usize) -> Result<Self, WlogError> {
+        let path = segment_name(dir, index);
+        let file = File::open(&path)?;
+        let buf = vec![0u8; 16 * PAGE_SIZE].into_boxed_slice();
+        Ok(Self {
+            segs: vec![SegmentEntry {
+                dir: dir.to_path_buf(),
+                index,
+                path,
+            }],
+            cur: 0,
+            off: 0,
+            cur_file: Some(file),
+            buf,
+            buf_pos: 0,
+            buf_len: 0,
+            eof: false,
+        })
+    }
+
     pub fn current_dir(&self) -> Option<&Path> {
         self.segs.get(self.cur).map(|s| s.dir.as_path())
     }
@@ -1089,6 +1111,12 @@ impl WlogReader<SegmentBufReader> {
 
     pub fn open_ranges(ranges: &[SegmentRange]) -> Result<Self, WlogError> {
         let sbr = SegmentBufReader::open_ranges(ranges)?;
+        Ok(Self::from_reader(sbr))
+    }
+
+    /// Opens a single WAL/WBL segment by index (`wlog.NewReader(NewSegmentBufReader(seg))`).
+    pub fn open_segment(dir: impl AsRef<Path>, index: usize) -> Result<Self, WlogError> {
+        let sbr = SegmentBufReader::open_segment(dir.as_ref(), index)?;
         Ok(Self::from_reader(sbr))
     }
 }

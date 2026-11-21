@@ -68,7 +68,7 @@ use crate::tombstones::{is_completely_deleted, Interval, MemTombstones};
 use crate::wlog::{
     create_checkpoint, decompress_record_into, delete_checkpoints,
     delete_temp_checkpoints, last_checkpoint, read_min_valid_time, segments_range,
-    CompressionType, SegmentRange, SegmentTracker, WlogError, WlogReader, WlogWriter,
+    CompressionType, SegmentTracker, WlogError, WlogReader, WlogWriter,
     DEFAULT_SEGMENT_SIZE, WBL_DIR_NAME,
 };
 
@@ -1586,7 +1586,7 @@ impl SeriesState {
         }
 
         if v.to_bits() == QUIET_ZERO_NAN_BITS {
-            return Ok((true, true));
+            return Ok((true, false));
         }
         if ooo_time_window > 0 && t >= head_maxt.saturating_sub(ooo_time_window) {
             return Ok((true, false));
@@ -4071,6 +4071,10 @@ impl Head {
             series_removed_total,
         };
 
+        // Capture pre-open WAL/WBL segment bounds BEFORE `WlogWriter` cuts a new empty segment,
+        // so replay never reads the freshly cut empty segment (matching Go `Head.Init`).
+        let pre_open_wal_last = segments_range(&wal_dir)?.map(|(_, last)| last);
+
         // Like Go `DB.Open`, the WAL/WBL are opened (cutting a new segment) before the
         // head is initialised, so that a repair operates on the live write log.
         let mut wal_writer =
@@ -4078,7 +4082,8 @@ impl Head {
         wal_writer.set_metrics(head.metrics.wal.clone());
         *head.wal.lock() = Some(wal_writer);
 
-        if opts.ooo_time_window_ms > 0 || wbl_dir.exists() {
+        let pre_open_wbl_range = if opts.ooo_time_window_ms > 0 || wbl_dir.exists() {
+            let range = segments_range(&wbl_dir)?;
             let mut wbl_writer = WlogWriter::with_segment_size(
                 &wbl_dir,
                 opts.wal_segment_size,
@@ -4089,7 +4094,10 @@ impl Head {
                 .ensure_wbl_metrics(opts.registry.as_deref(), &wbl_dir);
             wbl_writer.set_metrics(wbl_m);
             *head.wbl.lock() = Some(wbl_writer);
-        }
+            range
+        } else {
+            None
+        };
 
         // Go `DB.reload()` -> `head.Truncate(inOrderBlocksMaxTime)` BEFORE `Head.Init` / WAL replay.
         if let Some(seed_maxt) = in_order_blocks_max_time {
@@ -4097,13 +4105,20 @@ impl Head {
             head.min_valid_time.fetch_max(min_valid_time, Ordering::AcqRel);
         }
 
-        head.replay_on_open(&wal_dir, &wbl_dir, &chunks_dir)?;
+        let pre_open_chunk_seq = head.replay_on_open(
+            &wal_dir,
+            &wbl_dir,
+            &chunks_dir,
+            pre_open_wal_last,
+            pre_open_wbl_range,
+        )?;
 
         let mut chunk_writer = HeadChunksWriter::with_options(
             &chunks_dir,
             opts.max_head_chunk_file_size,
             opts.head_chunks_write_buffer_size,
         )?;
+        chunk_writer.ensure_min_seq(pre_open_chunk_seq);
         if let Some(m) = head.metrics.chunk_write_queue.clone() {
             chunk_writer.set_queue_metrics(m);
         }
@@ -4120,12 +4135,15 @@ impl Head {
         wal_dir: &Path,
         wbl_dir: &Path,
         chunks_dir: &Path,
-    ) -> Result<(), HeadError> {
+        pre_open_wal_last: Option<usize>,
+        pre_open_wbl_range: Option<(usize, usize)>,
+    ) -> Result<usize, HeadError> {
         let replay_start = Instant::now();
         // 1. Load mmapped chunks from chunks_head. Header/sequence errors are fatal (Go
         // `NewChunkDiskMapper` fails `NewHead`); iteration errors are repaired exactly like
         // Go `Head.Init` -> `removeCorruptedMmappedChunks` and the data is recovered from WAL.
         let mut reader = HeadChunksReader::open(chunks_dir)?;
+        let pre_open_chunk_seq = reader.max_seq();
         let MmappedLoad {
             in_order: mut mmapped_map,
             ooo: mut ooo_mmapped_map,
@@ -4150,6 +4168,7 @@ impl Head {
         let mut multi_ref: HashMap<u64, u64> = HashMap::new();
         let wal_res = self.replay_wal_dir(
             wal_dir,
+            pre_open_wal_last,
             &mut multi_ref,
             &mut mmapped_map,
             &mut ooo_mmapped_map,
@@ -4165,28 +4184,38 @@ impl Head {
                 tracing::info!("Successfully repaired WAL");
             }
             Ok(()) => {
-                // 3. Replay WBL segments if present, passing a chunk_writer so overflowing OOO
-                // head chunks spill to `chunks_head` instead of dropping.
+                // 3. Replay WBL segments one segment at a time (excluding the newly cut empty
+                // writer segment), passing a chunk_writer so overflowing OOO head chunks spill to
+                // `chunks_head` instead of dropping.
                 if wbl_dir.exists() {
-                    if let Some((first_wbl, last_wbl)) = segments_range(wbl_dir)? {
-                        let mut r = WlogReader::open_ranges(&[SegmentRange {
-                            dir: wbl_dir.to_path_buf(),
-                            first: Some(first_wbl),
-                            last: Some(last_wbl),
-                        }])?;
+                    if let Some((first_wbl, last_wbl)) = pre_open_wbl_range {
                         let mut replay_cw = HeadChunksWriter::with_max_file_size(
                             chunks_dir,
                             self.opts.max_head_chunk_file_size,
                         )?;
+                        replay_cw.ensure_min_seq(pre_open_chunk_seq);
                         if let Some(m) = self.metrics.chunk_write_queue.clone() {
                             replay_cw.set_queue_metrics(m);
                         }
-                        let wbl_res = self.replay_wbl_reader(
-                            &mut r,
-                            &multi_ref,
-                            last_mmap_ref,
-                            Some(&mut replay_cw),
-                        );
+                        let mut wbl_res = Ok(());
+                        for seg_idx in first_wbl..=last_wbl {
+                            let mut r = match WlogReader::open_segment(wbl_dir, seg_idx) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    wbl_res = Err(HeadError::from(e));
+                                    break;
+                                }
+                            };
+                            if let Err(e) = self.replay_wbl_reader(
+                                &mut r,
+                                &multi_ref,
+                                last_mmap_ref,
+                                Some(&mut replay_cw),
+                            ) {
+                                wbl_res = Err(e);
+                                break;
+                            }
+                        }
                         let spilled = replay_cw.close().map_err(HeadError::from);
                         spilled?;
                         if let Err(err) = wbl_res {
@@ -4220,20 +4249,22 @@ impl Head {
             .set(replay_start.elapsed().as_secs_f64());
         self.symbol_arena_baseline_bytes
             .store(self.symbols.read().bytes_len() as u64, Ordering::Release);
-        Ok(())
+        Ok(pre_open_chunk_seq)
     }
 
     /// WAL part of Go `Head.Init`: replays the last checkpoint (if any) and then every WAL
-    /// segment after it, stopping at the first error.
+    /// segment `start_from..=end_at` one segment at a time, stopping at the first error.
     fn replay_wal_dir(
         &self,
         wal_dir: &Path,
+        pre_open_wal_last: Option<usize>,
         multi_ref: &mut HashMap<u64, u64>,
         mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
         ooo_mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
         last_mmap_ref: ChunkDiskMapperRef,
     ) -> Result<(), HeadError> {
         let mut start_from = 0usize;
+        let mut global_missing_series_refs: HashSet<u64> = HashSet::new();
         if let Some((cp_dir, cp_idx)) = last_checkpoint(wal_dir)? {
             // A corrupted checkpoint is passed to the WAL repair like any other error
             // (Go: `backfill checkpoint: %w`).
@@ -4241,23 +4272,20 @@ impl Head {
             self.replay_wal_reader(
                 &mut r,
                 multi_ref,
+                &mut global_missing_series_refs,
                 mmapped_map,
                 ooo_mmapped_map,
                 last_mmap_ref,
             )?;
             start_from = cp_idx + 1;
         }
-        if let Some((first_seg, last_seg)) = segments_range(wal_dir)? {
-            let from = start_from.max(first_seg);
-            if from <= last_seg {
-                let mut r = WlogReader::open_ranges(&[SegmentRange {
-                    dir: wal_dir.to_path_buf(),
-                    first: Some(from),
-                    last: Some(last_seg),
-                }])?;
+        if let Some(end_at) = pre_open_wal_last {
+            for seg_idx in start_from..=end_at {
+                let mut r = WlogReader::open_segment(wal_dir, seg_idx)?;
                 self.replay_wal_reader(
                     &mut r,
                     multi_ref,
+                    &mut global_missing_series_refs,
                     mmapped_map,
                     ooo_mmapped_map,
                     last_mmap_ref,
@@ -4895,6 +4923,7 @@ impl Head {
         &self,
         r: &mut WlogReader<R>,
         multi_ref: &mut HashMap<u64, u64>,
+        global_missing_series_refs: &mut HashSet<u64>,
         mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
         ooo_mmapped_map: &mut HashMap<u64, Vec<MmappedChunk>>,
         last_mmap_ref: ChunkDiskMapperRef,
@@ -4919,7 +4948,7 @@ impl Head {
                 &unknown,
             )?;
         }
-        self.report_wal_unknown_refs(&unknown, multi_ref);
+        self.report_wal_unknown_refs(&unknown, multi_ref, global_missing_series_refs);
         Ok(())
     }
 
@@ -6119,9 +6148,36 @@ impl Head {
         HeadMetrics::add_unknown_refs(v, mmap_markers, "mmap_markers");
     }
 
-    /// Go `loadWAL` unknown-reference reporting (`found_series` / `truly_missing_series`
-    /// are the Mimir-specific diagnostics).
-    fn report_wal_unknown_refs(&self, u: &UnknownRefs, multi_ref: &HashMap<u64, u64>) {
+    /// Go `loadWAL` unknown-reference reporting (`found_series_for_prior_segments`,
+    /// `found_series`, `truly_missing_series` are the Mimir-specific diagnostics).
+    fn report_wal_unknown_refs(
+        &self,
+        u: &UnknownRefs,
+        multi_ref: &HashMap<u64, u64>,
+        global_missing_series_refs: &mut HashSet<u64>,
+    ) {
+        let v = &self.metrics.wal_replay_unknown_refs;
+        let mut found_for_prior_segments = 0u64;
+        global_missing_series_refs.retain(|&wal_ref| {
+            let head_ref = multi_ref.get(&wal_ref).copied().unwrap_or(wal_ref);
+            if self.series.get_by_id(head_ref).is_some() {
+                tracing::warn!(
+                    wal_ref = wal_ref,
+                    head_ref = head_ref,
+                    "Series reported as missing in prior segment but was found in this WAL segment"
+                );
+                found_for_prior_segments += 1;
+                false
+            } else {
+                true
+            }
+        });
+        HeadMetrics::add_unknown_refs(
+            v,
+            found_for_prior_segments,
+            "found_series_for_prior_segments",
+        );
+
         let samples = u.samples.load(Ordering::Relaxed);
         let exemplars = u.exemplars.load(Ordering::Relaxed);
         let histograms = u.histograms.load(Ordering::Relaxed);
@@ -6145,10 +6201,11 @@ impl Head {
             let head_ref = multi_ref.get(&wal_ref).copied().unwrap_or(wal_ref);
             if self.series.get_by_id(head_ref).is_some() {
                 found += 1;
+            } else {
+                global_missing_series_refs.insert(wal_ref);
             }
         }
         let truly_missing = missing.len() as u64 - found;
-        let v = &self.metrics.wal_replay_unknown_refs;
         HeadMetrics::add_unknown_refs(v, found, "found_series");
         HeadMetrics::add_unknown_refs(v, truly_missing, "truly_missing_series");
         HeadMetrics::add_unknown_refs(v, truly_missing + found, "series");
@@ -8749,16 +8806,16 @@ impl Head {
         // (lock order: `chunk_writer` -> `chunk_reader`) so a concurrent chunk write cannot
         // cut `active_seq + 1` and refresh `chunk_reader` before truncation runs.
         let mut w = self.chunk_writer.lock();
-        let active_seq = match w.as_mut() {
-            Some(wr) => {
-                let cur = wr.has_active_file().then(|| wr.current_seq());
-                if wr.cur_file_has_chunks() {
-                    wr.cut_file_on_next_chunk();
-                }
-                cur
-            }
-            None => None,
+        let Some(wr) = w.as_mut() else {
+            // Do not truncate `chunks_head` before `chunk_writer` is opened (e.g. during
+            // `replay_on_open`), matching Go `Head.Init` deferring `h.gc()` without
+            // calling `h.chunkDiskMapper.Truncate`.
+            return Ok(());
         };
+        let active_seq = wr.has_active_file().then(|| wr.current_seq());
+        if wr.cur_file_has_chunks() {
+            wr.cut_file_on_next_chunk();
+        }
         if min_mmap_seq > 0 {
             let mut guard = self.chunk_reader.write();
             if let Some(ref mut reader) = *guard {
@@ -9187,7 +9244,7 @@ impl Head {
     pub fn gc(&self, mint: i64) -> Result<(), HeadError> {
         let _snap_guard = self.chunk_snapshot_mtx.lock();
         let _mmap_guard = self.mmap_mtx.lock();
-        let (to_delete, _actual_mint, _min_ooo_time, min_mmap_seq) =
+        let (to_delete, _actual_mint, _min_ooo_time, _min_mmap_seq) =
             self.gc_collect_and_unlink(mint);
         if !to_delete.is_empty() {
             self.finish_deleted_series_cleanup(to_delete);
@@ -9195,7 +9252,6 @@ impl Head {
             self.maybe_gc_symbols();
         }
         self.tombstones.truncate_before(mint);
-        self.truncate_chunks_head(min_mmap_seq)?;
         Ok(())
     }
 
@@ -9266,13 +9322,6 @@ impl Head {
                     st.invalidate_xor_state();
                     st.clear_xor2_state();
                     st.clear_hist_state();
-                    if st.mmapped().is_empty() {
-                        // The series forgets its last sample here, so this is where it stops
-                        // counting as a stale / native histogram series (Go `stripeSeries.gc`
-                        // subtracts it when the series is deleted, which is the usual outcome).
-                        self.update_metrics_on_series_delete(&st);
-                        st.clear_last_sample();
-                    }
                 }
 
                 st.clear_ooo_if_empty();
@@ -9290,6 +9339,7 @@ impl Head {
                     && self.series.remove_if_gced_under_entry_lock(&entry, &mut st)
                 {
                     self.update_metrics_on_series_delete(&st);
+                    st.clear_last_sample();
                     drop(st);
                     to_delete.push((entry, i64::MIN));
                     continue;
@@ -9651,10 +9701,28 @@ impl Head {
                         .iter()
                         .any(|iv| iv.is_subrange(p.mc.min_time, p.mc.max_time))
             }) || ooo.ooo_head_chunk.as_ref().is_some_and(|ohc| {
-                ohc.overlaps_closed_interval(mint, maxt)
-                    && !tombs
+                if !ohc.overlaps_closed_interval(mint, maxt) {
+                    return false;
+                }
+                let use_xor2 = self.float_chunk_encoding() == Encoding::Xor2;
+                let use_hist_st = self.opts.enable_histogram_st_encoding;
+                match ohc.chunk.to_encoded_chunks(
+                    ohc.min_time,
+                    ohc.max_time,
+                    use_xor2,
+                    use_hist_st,
+                ) {
+                    Ok(chunks) => chunks.into_iter().any(|cc| {
+                        cc.min_time <= maxt
+                            && mint <= cc.max_time
+                            && !tombs
+                                .iter()
+                                .any(|iv| iv.is_subrange(cc.min_time, cc.max_time))
+                    }),
+                    Err(_) => !tombs
                         .iter()
-                        .any(|iv| iv.is_subrange(ohc.min_time, ohc.max_time))
+                        .any(|iv| iv.is_subrange(ohc.min_time, ohc.max_time)),
+                }
             })
         });
         if has_chunk {
@@ -9824,12 +9892,14 @@ impl Head {
                                 use_xor2,
                                 use_hist_st,
                             )? {
-                                ooo_head_chks.push(ChunkMeta {
-                                    ref_id: head_ref,
-                                    min_time: cc.min_time,
-                                    max_time: cc.max_time,
-                                    chunk: Some(cc.chunk),
-                                });
+                                if cc.min_time <= maxt && mint <= cc.max_time {
+                                    ooo_head_chks.push(ChunkMeta {
+                                        ref_id: head_ref,
+                                        min_time: cc.min_time,
+                                        max_time: cc.max_time,
+                                        chunk: Some(cc.chunk),
+                                    });
+                                }
                             }
                         }
                     }
@@ -12418,10 +12488,17 @@ impl<'a> HeadAppender<'a> {
         }
 
         let entry = if let Some(r) = series_ref {
-            self.head
-                .series
-                .get_by_id(r)
-                .ok_or(HeadError::UnknownSeriesRef(r))?
+            match self.head.series.get_by_id(r) {
+                Some(e) => e,
+                None => {
+                    let mut sorted: SmallVec<[(&str, &str); 16]> = pairs.iter().copied().collect();
+                    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                    let hash = hash_sorted_pairs(&sorted);
+                    self.head
+                        .get_by_sorted_pairs(hash, &sorted)
+                        .ok_or(HeadError::UnknownSeriesRef(r))?
+                }
+            }
         } else {
             let mut sorted: SmallVec<[(&str, &str); 16]> = pairs.iter().copied().collect();
             sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
@@ -12960,6 +13037,12 @@ impl<'a> HeadAppender<'a> {
                     continue;
                 }
                 if is_ooo {
+                    if v.to_bits() == QUIET_ZERO_NAN_BITS {
+                        // Go `commitFloats` (`head_append.go:1546-1547`): quiet zeros are not
+                        // stored out-of-order, but still count in `samples_appended_total`.
+                        ctx.floats_appended += 1;
+                        continue;
+                    }
                     let mut cw_guard = self.head.chunk_writer.lock();
                     let (ok, chunk_created, mmap_refs, write_epoch) = state.insert_ooo(
                         pf.entry.ref_id,
