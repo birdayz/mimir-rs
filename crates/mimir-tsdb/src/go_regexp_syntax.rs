@@ -1364,7 +1364,7 @@ fn parse_class_into(
                 r"\d" => out.push_str("0-9"),
                 r"\D" => out.push_str(r"\x{0}-\x{2F}\x{3A}-\x{10FFFF}"),
                 r"\s" => out.push_str(r"\t\n\f\r "),
-                r"\S" => out.push_str(r"\x{0}-\x{08}\x{0E}-\x{1F}\x{21}-\x{10FFFF}"),
+                r"\S" => out.push_str(r"\x{0}-\x{08}\x{0B}\x{0E}-\x{1F}\x{21}-\x{10FFFF}"),
                 r"\w" => out.push_str("0-9A-Z_a-z"),
                 r"\W" => {
                     if fold_case {

@@ -287,15 +287,15 @@ impl RecordDecoder {
             let mut unit = String::new();
             let mut help = String::new();
             for _ in 0..num_fields {
-                let field_name = dec.uvarint_str()?;
-                let field_val = dec.uvarint_str()?;
+                let field_name = dec.uvarint_bytes()?;
+                let field_val = dec.uvarint_bytes()?;
                 if field_val.is_empty() {
                     continue;
                 }
-                match field_name {
-                    UNIT_META_NAME => unit = field_val.to_string(),
-                    HELP_META_NAME => help = field_val.to_string(),
-                    _ => {}
+                if field_name == UNIT_META_NAME.as_bytes() {
+                    unit = String::from_utf8_lossy(field_val).into_owned();
+                } else if field_name == HELP_META_NAME.as_bytes() {
+                    help = String::from_utf8_lossy(field_val).into_owned();
                 }
             }
             out.push(RefMetadata {
@@ -1424,5 +1424,26 @@ mod tests {
         let b_mvt = enc_v1.min_valid_time(987654321, Vec::new());
         assert_eq!(b_mvt[0], RecordType::MinValidTime as u8);
         assert_eq!(dec.min_valid_time(&b_mvt).unwrap(), 987654321);
+    }
+
+    #[test]
+    fn metadata_decodes_non_utf8_unit_and_help_lossily() {
+        let mut raw = Encbuf::new();
+        raw.put_byte(RecordType::Metadata as u8);
+        raw.put_uvarint64(7);
+        raw.put_byte(MetricType::Counter as u8);
+        raw.put_uvarint(2);
+        raw.put_uvarint_str(UNIT_META_NAME);
+        raw.put_uvarint_bytes(&[0xff, 0xfe]);
+        raw.put_uvarint_str(HELP_META_NAME);
+        raw.put_uvarint_bytes(b"bad\xffhelp");
+
+        let dec = RecordDecoder::new();
+        let metas = dec.metadata(raw.as_slice()).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].ref_id, 7);
+        assert_eq!(metas[0].metric_type, MetricType::Counter as u8);
+        assert_eq!(metas[0].unit, "\u{FFFD}\u{FFFD}");
+        assert_eq!(metas[0].help, "bad\u{FFFD}help");
     }
 }

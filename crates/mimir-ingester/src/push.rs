@@ -558,13 +558,18 @@ fn convert_exemplar_pairs<'a>(
     value: f64,
     pairs: Vec<(&'a str, &'a str)>,
 ) -> ConvertedExemplarResult {
-    let mut sorted = pairs.clone();
+    let ex_str = format_labels_string(pairs.iter().copied());
+    // Match Go `headAppenderV2.appendExemplars` (`e.Labels = e.Labels.WithoutEmpty()` before
+    // `ValidateExemplar`): strip empty-valued labels prior to duplicate-name and 128-rune checks.
+    let mut sorted: Vec<(&'a str, &'a str)> = pairs
+        .into_iter()
+        .filter(|&(_, v)| !v.is_empty())
+        .collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     let mut rune_len = 0usize;
     let mut prev_name: Option<&str> = None;
     for &(k, v) in &sorted {
         if prev_name == Some(k) {
-            let ex_str = format_labels_string(pairs.iter().copied());
             return Err(ConvertedExemplarError {
                 timestamp_ms,
                 message: ExemplarError::DuplicateLabelName(k.to_string()).to_string(),
@@ -573,7 +578,6 @@ fn convert_exemplar_pairs<'a>(
         }
         prev_name = Some(k);
         if k.len() >= (1 << 24) || v.len() >= (1 << 24) {
-            let ex_str = format_labels_string(pairs.iter().copied());
             return Err(ConvertedExemplarError {
                 timestamp_ms,
                 message: ExemplarError::LabelLengthExceeded.to_string(),
@@ -583,7 +587,6 @@ fn convert_exemplar_pairs<'a>(
         for _ in k.chars().chain(v.chars()) {
             rune_len += 1;
             if rune_len > EXEMPLAR_MAX_LABEL_SET_LENGTH {
-                let ex_str = format_labels_string(pairs.iter().copied());
                 return Err(ConvertedExemplarError {
                     timestamp_ms,
                     message: ExemplarError::LabelLengthExceeded.to_string(),
@@ -592,7 +595,6 @@ fn convert_exemplar_pairs<'a>(
             }
         }
     }
-    let ex_str = format_labels_string(pairs.iter().copied());
     let labels = Labels::from_sorted_slice(&sorted);
     Ok((timestamp_ms, value, labels, ex_str))
 }
@@ -5212,5 +5214,127 @@ mod wave3_tests {
         assert_eq!(db.db.head().num_series(), 4501);
         assert_eq!(db.owned_series_state().owned_series_count, 4501);
         assert_eq!(db.active_series.active().0, 4501);
+    }
+
+    #[test]
+    fn exemplar_validation_strips_empty_labels_before_length_and_duplicate_checks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-ex-without-empty".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let limits = mimir_config::LimitsConfig {
+            max_global_exemplars_per_user: 100,
+            ..Default::default()
+        };
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(limits),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let user = "t-ex-empty";
+        let val_120 = "a".repeat(120);
+
+        // 1) {trace_id="<120 chars>", empty_extra_label=""} -> non-empty is 8 + 120 = 128 runes -> accepted!
+        ing.push_grpc_raw_sync(
+            user,
+            &mimir_proto::prost::Message::encode_to_vec(&cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![lp("__name__", "ex_len_with_empty")],
+                    samples: vec![cortexpb::Sample { timestamp_ms: now, value: 1.0 }],
+                    exemplars: vec![cortexpb::Exemplar {
+                        labels: vec![lp("trace_id", &val_120), lp("unused_empty_label", "")],
+                        value: 1.0,
+                        timestamp_ms: now,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        // 2) {trace_id="", trace_id="abc"} -> empty value stripped before duplicate check -> accepted!
+        ing.push_grpc_raw_sync(
+            user,
+            &mimir_proto::prost::Message::encode_to_vec(&cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![lp("__name__", "ex_dup_empty")],
+                    samples: vec![cortexpb::Sample { timestamp_ms: now, value: 2.0 }],
+                    exemplars: vec![cortexpb::Exemplar {
+                        labels: vec![lp("trace_id", ""), lp("trace_id", "abc")],
+                        value: 2.0,
+                        timestamp_ms: now,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        // 3) {trace_id="1", trace_id="2"} -> duplicate non-empty name -> rejected!
+        let dup_err = ing
+            .push_grpc_raw_sync(
+                user,
+                &mimir_proto::prost::Message::encode_to_vec(&cortexpb::WriteRequest {
+                    timeseries: vec![cortexpb::TimeSeries {
+                        labels: vec![lp("__name__", "ex_dup_nonempty")],
+                        samples: vec![cortexpb::Sample { timestamp_ms: now, value: 3.0 }],
+                        exemplars: vec![cortexpb::Exemplar {
+                            labels: vec![lp("trace_id", "1"), lp("trace_id", "2")],
+                            value: 3.0,
+                            timestamp_ms: now,
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(dup_err.to_string().contains("not unique"));
+
+        // 4) Invalid UTF-8 even on an empty-valued wire exemplar label -> still rejected!
+        let utf8_err = ing
+            .push_grpc_raw_sync(
+                user,
+                &mimir_proto::prost::Message::encode_to_vec(&cortexpb::WriteRequest {
+                    timeseries: vec![cortexpb::TimeSeries {
+                        labels: vec![lp("__name__", "ex_bad_utf8_empty")],
+                        samples: vec![cortexpb::Sample { timestamp_ms: now, value: 4.0 }],
+                        exemplars: vec![cortexpb::Exemplar {
+                            labels: vec![cortexpb::LabelPair {
+                                name: bytes::Bytes::from_static(b"bad\xff"),
+                                value: bytes::Bytes::new(),
+                            }],
+                            value: 4.0,
+                            timestamp_ms: now,
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(utf8_err.to_string().contains("invalid UTF-8"));
+
+        let db = ing.get_tsdb(user).unwrap();
+        let mut ex_count = 0usize;
+        db.db.head().exemplars().iterate_exemplars(|_, _| ex_count += 1);
+        assert_eq!(ex_count, 2);
     }
 }

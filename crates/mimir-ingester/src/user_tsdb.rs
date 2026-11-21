@@ -1056,9 +1056,16 @@ impl UserTsdb {
                     h_max,
                     forced_compaction_max_time,
                 ) else {
+                    if h_min == i64::MAX
+                        && h_max == i64::MAX
+                        && forced_compaction_max_time == i64::MAX
+                        && head.num_series() > 0
+                    {
+                        db.compact_head_range_inclusive(i64::MAX, i64::MAX)?;
+                    }
                     break;
                 };
-                db.compact_head_range(mint, maxt_incl.saturating_add(1))?;
+                db.compact_head_range_inclusive(mint, maxt_incl)?;
                 if is_last {
                     break;
                 }
@@ -2009,5 +2016,123 @@ mod tests {
                 .all(|mf| mf.get_name() != "prometheus_tsdb_head_chunks_storage_size_bytes"),
             "prometheus_tsdb_head_chunks_storage_size_bytes must not be registered on main /metrics"
         );
+    }
+
+    #[tokio::test]
+    async fn user_tsdb_compact_head_preserves_i64_max_samples() {
+        use mimir_tsdb::compact::{decode_chunk_samples, SampleValue};
+
+        // Case 1: sample at (i64::MAX - 100) and i64::MAX in the same block range.
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut blocks_cfg1 = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg1.tsdb.dir = dir1.path().to_string_lossy().into_owned();
+        blocks_cfg1.tsdb.ship_interval = mimir_config::GoDuration::ZERO;
+        let main_reg1 = Registry::new();
+        let shared1 = SharedTsdbMetrics::new(Some(&main_reg1));
+        let shipper1 = ShipperMetrics::new(Some(&main_reg1));
+        let overrides1 = Overrides::new(mimir_config::LimitsConfig::default());
+        let limiter1 = Arc::new(Limiter::new(overrides1.clone(), Arc::new(OneInstanceStrategy)));
+        let rejected1 = CounterVec::new(prometheus::Opts::new("t_rej_max1", "h"), &["reason"]).unwrap();
+
+        let db1 = UserTsdb::open(
+            "t-max-1".to_string(),
+            &mimir_config::IngesterConfig::default(),
+            &blocks_cfg1,
+            overrides1,
+            limiter1,
+            None,
+            shipper1,
+            &shared1,
+            None,
+            1,
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(|| 0),
+            rejected1,
+            HashSet::new(),
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+        {
+            let mut app = db1.db.appender();
+            app.append_float(None, &[("__name__", "m_max")], i64::MAX - 100, 1.0).unwrap();
+            app.append_float(None, &[("__name__", "m_max")], i64::MAX, 2.0).unwrap();
+            app.commit().unwrap();
+        }
+        db1.compact_head(i64::MAX).await.unwrap();
+        {
+            let blocks = db1.db.blocks();
+            assert_eq!(blocks.len(), 1);
+            let idx = blocks[0].index();
+            let chk_r = blocks[0].chunks();
+            let ids = idx.postings("__name__", &["m_max"]).unwrap();
+            let (_, chks) = idx.series(ids[0]).unwrap();
+            let samples: Vec<(i64, SampleValue)> = chks
+                .iter()
+                .flat_map(|c| decode_chunk_samples(&chk_r.chunk(c.ref_id).unwrap()).unwrap())
+                .map(|s| (s.t, s.value))
+                .collect();
+            assert_eq!(
+                samples,
+                vec![
+                    (i64::MAX - 100, SampleValue::Float(1.0)),
+                    (i64::MAX, SampleValue::Float(2.0)),
+                ]
+            );
+        }
+
+        // Case 2: single sample strictly at t == i64::MAX (mint == maxt_incl == i64::MAX).
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut blocks_cfg2 = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg2.tsdb.dir = dir2.path().to_string_lossy().into_owned();
+        blocks_cfg2.tsdb.ship_interval = mimir_config::GoDuration::ZERO;
+        let main_reg2 = Registry::new();
+        let shared2 = SharedTsdbMetrics::new(Some(&main_reg2));
+        let shipper2 = ShipperMetrics::new(Some(&main_reg2));
+        let overrides2 = Overrides::new(mimir_config::LimitsConfig::default());
+        let limiter2 = Arc::new(Limiter::new(overrides2.clone(), Arc::new(OneInstanceStrategy)));
+        let rejected2 = CounterVec::new(prometheus::Opts::new("t_rej_max2", "h"), &["reason"]).unwrap();
+
+        let db2 = UserTsdb::open(
+            "t-max-2".to_string(),
+            &mimir_config::IngesterConfig::default(),
+            &blocks_cfg2,
+            overrides2,
+            limiter2,
+            None,
+            shipper2,
+            &shared2,
+            None,
+            1,
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(|| 0),
+            rejected2,
+            HashSet::new(),
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+        {
+            let mut app = db2.db.appender();
+            app.append_float(None, &[("__name__", "m_only_max")], i64::MAX, 9.5).unwrap();
+            app.commit().unwrap();
+        }
+        db2.compact_head(i64::MAX).await.unwrap();
+        {
+            let blocks = db2.db.blocks();
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].min_time(), i64::MAX);
+            assert_eq!(blocks[0].max_time(), i64::MAX);
+            let idx = blocks[0].index();
+            let chk_r = blocks[0].chunks();
+            let ids = idx.postings("__name__", &["m_only_max"]).unwrap();
+            let (_, chks) = idx.series(ids[0]).unwrap();
+            let samples = decode_chunk_samples(&chk_r.chunk(chks[0].ref_id).unwrap()).unwrap();
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].t, i64::MAX);
+            assert_eq!(samples[0].value, SampleValue::Float(9.5));
+        }
     }
 }

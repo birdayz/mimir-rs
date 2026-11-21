@@ -631,6 +631,16 @@ impl Tsdb {
         self.inner.compact_head_range(mint, maxt)
     }
 
+    /// Compacts the closed time range `[mint, maxt_incl]` of Head into a ULID block on disk
+    /// without truncating away `t == i64::MAX` via `maxt_incl.saturating_add(1) - 1`.
+    pub fn compact_head_range_inclusive(
+        &self,
+        mint: i64,
+        maxt_incl: i64,
+    ) -> Result<Option<Ulid>, TsdbError> {
+        self.inner.compact_head_range_inclusive(mint, maxt_incl)
+    }
+
     /// Compacts the entire active Head `[head.min_time(), head.max_time() + 1)` into a ULID block.
     pub fn compact_head_all(&self) -> Result<Option<Ulid>, TsdbError> {
         self.inner.compact_head_all()
@@ -1184,6 +1194,28 @@ impl TsdbInner {
             return Ok(None);
         }
         let uid = self.compact_head_range_locked(mint, maxt, maxt - 1, true)?;
+        if maxt > mint {
+            self.head.truncate_wal(maxt)?;
+        }
+        Ok(uid)
+    }
+
+    /// Compacts the closed time range `[mint, maxt_incl]` of Head into a ULID block on disk,
+    /// handling `maxt_incl == i64::MAX` (including `mint == i64::MAX`) without losing `t == i64::MAX`.
+    fn compact_head_range_inclusive(
+        &self,
+        mint: i64,
+        maxt_incl: i64,
+    ) -> Result<Option<Ulid>, TsdbError> {
+        let _guard = self.compact_mtx.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if maxt_incl < mint {
+            return Ok(None);
+        }
+        let maxt = maxt_incl.saturating_add(1);
+        let uid = self.compact_head_range_locked(mint, maxt, maxt_incl, true)?;
         if maxt > mint {
             self.head.truncate_wal(maxt)?;
         }
@@ -2137,6 +2169,42 @@ mod tests {
                 (0, 3_000, SampleValue::Float(3.0)),
             ]
         );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn compact_head_range_inclusive_preserves_i64_max_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Tsdb::open_with_reload_interval(dir.path(), TsdbOptions::default(), Duration::ZERO).unwrap();
+
+        let mut app = db.appender();
+        app.append_float(None, &[("__name__", "max_ts_metric")], i64::MAX, 123.5)
+            .unwrap();
+        app.commit().unwrap();
+
+        let uid = db
+            .compact_head_range_inclusive(i64::MAX, i64::MAX)
+            .unwrap()
+            .expect("block must be created for mint == maxt_incl == i64::MAX");
+        {
+            let blocks = db.blocks();
+            let blk = blocks.iter().find(|b| b.ulid() == uid).unwrap();
+            assert_eq!(blk.min_time(), i64::MAX);
+            assert_eq!(blk.max_time(), i64::MAX);
+
+            let idx = blk.index();
+            let chk_r = blk.chunks();
+            let ids = idx.postings("__name__", &["max_ts_metric"]).unwrap();
+            assert_eq!(ids.len(), 1);
+            let (_lbls, chks) = idx.series(ids[0]).unwrap();
+            assert_eq!(chks.len(), 1);
+            let samples =
+                crate::compact::decode_chunk_samples(&chk_r.chunk(chks[0].ref_id).unwrap()).unwrap();
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].t, i64::MAX);
+            assert_eq!(samples[0].value, SampleValue::Float(123.5));
+        }
 
         db.close().unwrap();
     }

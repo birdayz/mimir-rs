@@ -62,6 +62,8 @@ pub const DEFAULT_MAX_RW2_LABEL_BYTES: usize = 512 * 1024 * 1024;
 pub enum EncodeRw2Error {
     #[error("the provided request is already rw2")]
     AlreadyRw2,
+    #[error("invalid UTF-8 in label or exemplar for string-typed WriteRequest.symbols_rw2")]
+    InvalidUtf8,
     #[error("failed to encode protobuf: {0}")]
     Encode(String),
 }
@@ -3725,8 +3727,8 @@ pub fn from_write_request_to_rw2(
         let mut metric_name = "";
         let mut refs = Vec::with_capacity(ts.labels.len() * 2);
         for l in &ts.labels {
-            let name = std::str::from_utf8(&l.name).unwrap_or("");
-            let value = std::str::from_utf8(&l.value).unwrap_or("");
+            let name = std::str::from_utf8(&l.name).map_err(|_| EncodeRw2Error::InvalidUtf8)?;
+            let value = std::str::from_utf8(&l.value).map_err(|_| EncodeRw2Error::InvalidUtf8)?;
             if name == "__name__" {
                 metric_name = value;
             }
@@ -3745,24 +3747,23 @@ pub fn from_write_request_to_rw2(
             }
         }
 
-        let exemplars = ts
-            .exemplars
-            .iter()
-            .map(|ex| {
-                let mut ex_refs = Vec::with_capacity(ex.labels.len() * 2);
-                for l in &ex.labels {
-                    let name = std::str::from_utf8(&l.name).unwrap_or("");
-                    let value = std::str::from_utf8(&l.value).unwrap_or("");
-                    ex_refs.push(symbols.symbolize(name));
-                    ex_refs.push(symbols.symbolize(value));
-                }
-                cortexpb::ExemplarRw2 {
-                    labels_refs: ex_refs,
-                    value: ex.value,
-                    timestamp: ex.timestamp_ms,
-                }
-            })
-            .collect();
+        let mut exemplars = Vec::with_capacity(ts.exemplars.len());
+        for ex in &ts.exemplars {
+            let mut ex_refs = Vec::with_capacity(ex.labels.len() * 2);
+            for l in &ex.labels {
+                let name =
+                    std::str::from_utf8(&l.name).map_err(|_| EncodeRw2Error::InvalidUtf8)?;
+                let value =
+                    std::str::from_utf8(&l.value).map_err(|_| EncodeRw2Error::InvalidUtf8)?;
+                ex_refs.push(symbols.symbolize(name));
+                ex_refs.push(symbols.symbolize(value));
+            }
+            exemplars.push(cortexpb::ExemplarRw2 {
+                labels_refs: ex_refs,
+                value: ex.value,
+                timestamp: ex.timestamp_ms,
+            });
+        }
 
         rw2_timeseries.push(cortexpb::TimeSeriesRw2 {
             labels_refs: refs,
@@ -3826,10 +3827,176 @@ pub fn encode_write_request_rw2_bytes(
     common_symbols: Option<&CommonSymbols>,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeRw2Error> {
-    let rw2 = from_write_request_to_rw2(rw1, offset, common_symbols)?;
+    match from_write_request_to_rw2(rw1, offset, common_symbols) {
+        Ok(rw2) => {
+            out.clear();
+            rw2.encode(out)
+                .map_err(|e| EncodeRw2Error::Encode(e.to_string()))
+        }
+        Err(EncodeRw2Error::InvalidUtf8) => {
+            encode_write_request_rw2_raw_bytes(rw1, offset, common_symbols, out)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Encodes an RW1 `WriteRequest` (which may contain arbitrary non-UTF-8 label or exemplar bytes)
+/// into RW2 protobuf wire bytes, preserving raw byte slices verbatim in `symbols_rw2` (field 4)
+/// just like Go's `FromWriteRequestToRW2Request` + `Marshal()`.
+fn encode_write_request_rw2_raw_bytes(
+    rw1: &cortexpb::WriteRequest,
+    offset: u32,
+    common_symbols: Option<&CommonSymbols>,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeRw2Error> {
+    if !rw1.symbols_rw2.is_empty() || !rw1.timeseries_rw2.is_empty() {
+        return Err(EncodeRw2Error::AlreadyRw2);
+    }
+
+    fn symbolize_bytes<'a>(
+        b: &'a [u8],
+        offset: u32,
+        common_symbols: Option<&CommonSymbols>,
+        syms: &mut Vec<&'a [u8]>,
+        map: &mut HashMap<&'a [u8], u32>,
+    ) -> u32 {
+        if b.is_empty() {
+            return 0;
+        }
+        if let Some(cs) = common_symbols {
+            if let Ok(s) = std::str::from_utf8(b) {
+                if let Some(r) = cs.get_ref(s) {
+                    return r;
+                }
+            }
+        }
+        if let Some(&r) = map.get(b) {
+            return r;
+        }
+        let r = (syms.len() as u32) + offset;
+        syms.push(b);
+        map.insert(b, r);
+        r
+    }
+
+    let mut syms: Vec<&[u8]> = Vec::with_capacity(101);
+    syms.push(b"");
+    let mut map: HashMap<&[u8], u32> = HashMap::with_capacity(100);
+
+    let mut metadata_map: HashMap<&[u8], usize> = HashMap::new();
+    let mut matched_metadata_mask: Vec<bool> = Vec::new();
+    if !rw1.metadata.is_empty() && !rw1.timeseries.is_empty() {
+        metadata_map.reserve(rw1.metadata.len());
+        matched_metadata_mask.resize(rw1.metadata.len(), false);
+        for (i, m) in rw1.metadata.iter().enumerate() {
+            let key = m.metric_family_name.as_bytes();
+            if let Some(&seen_idx) = metadata_map.get(key) {
+                if rw1.metadata[i] == rw1.metadata[seen_idx] {
+                    matched_metadata_mask[i] = true;
+                }
+            } else {
+                metadata_map.insert(key, i);
+            }
+        }
+    }
+
+    let mut rw2_timeseries = Vec::with_capacity(rw1.timeseries.len() + rw1.metadata.len());
+
+    for ts in &rw1.timeseries {
+        let mut metric_name: &[u8] = b"";
+        let mut refs = Vec::with_capacity(ts.labels.len() * 2);
+        for l in &ts.labels {
+            let name = l.name.as_ref();
+            let value = l.value.as_ref();
+            if name == b"__name__" {
+                metric_name = value;
+            }
+            refs.push(symbolize_bytes(name, offset, common_symbols, &mut syms, &mut map));
+            refs.push(symbolize_bytes(value, offset, common_symbols, &mut syms, &mut map));
+        }
+
+        let mut metadata = Some(cortexpb::MetadataRw2::default());
+        if !metadata_map.is_empty() {
+            if let Some(&meta_idx) = metadata_map.get(metric_name) {
+                let m = &rw1.metadata[meta_idx];
+                metadata = Some(cortexpb::MetadataRw2 {
+                    r#type: m.r#type,
+                    help_ref: symbolize_bytes(m.help.as_bytes(), offset, common_symbols, &mut syms, &mut map),
+                    unit_ref: symbolize_bytes(m.unit.as_bytes(), offset, common_symbols, &mut syms, &mut map),
+                });
+                matched_metadata_mask[meta_idx] = true;
+            }
+        }
+
+        let exemplars = ts
+            .exemplars
+            .iter()
+            .map(|ex| {
+                let mut ex_refs = Vec::with_capacity(ex.labels.len() * 2);
+                for l in &ex.labels {
+                    ex_refs.push(symbolize_bytes(l.name.as_ref(), offset, common_symbols, &mut syms, &mut map));
+                    ex_refs.push(symbolize_bytes(l.value.as_ref(), offset, common_symbols, &mut syms, &mut map));
+                }
+                cortexpb::ExemplarRw2 {
+                    labels_refs: ex_refs,
+                    value: ex.value,
+                    timestamp: ex.timestamp_ms,
+                }
+            })
+            .collect();
+
+        rw2_timeseries.push(cortexpb::TimeSeriesRw2 {
+            labels_refs: refs,
+            samples: ts.samples.clone(),
+            histograms: ts.histograms.clone(),
+            exemplars,
+            metadata,
+            created_timestamp: ts.created_timestamp,
+        });
+    }
+
+    for (i, m) in rw1.metadata.iter().enumerate() {
+        if !matched_metadata_mask.is_empty() && matched_metadata_mask[i] {
+            continue;
+        }
+        let labels_refs = vec![
+            symbolize_bytes(b"__name__", offset, common_symbols, &mut syms, &mut map),
+            symbolize_bytes(m.metric_family_name.as_bytes(), offset, common_symbols, &mut syms, &mut map),
+        ];
+        let rw2_meta = cortexpb::MetadataRw2 {
+            r#type: m.r#type,
+            help_ref: symbolize_bytes(m.help.as_bytes(), offset, common_symbols, &mut syms, &mut map),
+            unit_ref: symbolize_bytes(m.unit.as_bytes(), offset, common_symbols, &mut syms, &mut map),
+        };
+        rw2_timeseries.push(cortexpb::TimeSeriesRw2 {
+            labels_refs,
+            samples: Vec::new(),
+            histograms: Vec::new(),
+            exemplars: Vec::new(),
+            metadata: Some(rw2_meta),
+            created_timestamp: 0,
+        });
+    }
+
     out.clear();
-    rw2.encode(out)
-        .map_err(|e| EncodeRw2Error::Encode(e.to_string()))
+    if rw1.source != 0 {
+        prost::encoding::int32::encode(2, &rw1.source, out);
+    }
+    for sym in &syms {
+        prost::encoding::encode_key(4, prost::encoding::WireType::LengthDelimited, out);
+        prost::encoding::encode_varint(sym.len() as u64, out);
+        out.extend_from_slice(sym);
+    }
+    for ts in &rw2_timeseries {
+        prost::encoding::message::encode(5, ts, out);
+    }
+    if rw1.skip_label_validation {
+        prost::encoding::bool::encode(1000, &rw1.skip_label_validation, out);
+    }
+    if rw1.skip_label_count_validation {
+        prost::encoding::bool::encode(1001, &rw1.skip_label_count_validation, out);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5317,5 +5484,73 @@ mod tests {
             .unwrap();
         }
         assert!(saw_sorted);
+    }
+
+    #[test]
+    fn test_rw1_to_rw2_preserves_non_utf8_label_and_exemplar_bytes() {
+        let bad_name: &[u8] = b"bad_\xff_name";
+        let bad_val: &[u8] = b"bad_\xfe_val";
+        let bad_ex_name: &[u8] = b"ex_\x80_k";
+        let bad_ex_val: &[u8] = b"ex_\xff_v";
+
+        let rw1 = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair::from_strs("__name__", "non_utf8_rw2_metric"),
+                    cortexpb::LabelPair {
+                        name: bytes::Bytes::from_static(bad_name),
+                        value: bytes::Bytes::from_static(bad_val),
+                    },
+                ],
+                samples: vec![cortexpb::Sample {
+                    value: 42.0,
+                    timestamp_ms: 1_000,
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![cortexpb::LabelPair {
+                        name: bytes::Bytes::from_static(bad_ex_name),
+                        value: bytes::Bytes::from_static(bad_ex_val),
+                    }],
+                    value: 1.5,
+                    timestamp_ms: 1_000,
+                }],
+                ..Default::default()
+            }],
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            ..Default::default()
+        };
+
+        // Struct-based RW2 conversion rejects non-UTF-8 instead of silently erasing to "".
+        assert_eq!(
+            from_write_request_to_rw2(&rw1, 0, None),
+            Err(EncodeRw2Error::InvalidUtf8)
+        );
+
+        // Wire-level RW2 conversion preserves raw non-UTF-8 bytes in symbols_rw2 (both Rw2 and KafkaV2).
+        for (opts, offset, common) in [
+            (DecodeOptions::rw2(), 0, None),
+            (
+                DecodeOptions::kafka_v2(),
+                V2_RECORD_SYMBOL_OFFSET,
+                Some(v2_common_symbols()),
+            ),
+        ] {
+            let mut wire = Vec::new();
+            encode_write_request_rw2_bytes(&rw1, offset, common, &mut wire).unwrap();
+            let mut scratch = WriteRequestScratch::new();
+            let decoded = decode_write_request(&wire, opts, &mut scratch).unwrap();
+            let ts = decoded.timeseries().next().unwrap();
+            assert!(!ts.is_labels_utf8_validated());
+            let lbls: Vec<(&[u8], &[u8])> =
+                ts.labels().map(|l| (l.name, l.value)).collect();
+            assert_eq!(
+                lbls,
+                vec![(&b"__name__"[..], &b"non_utf8_rw2_metric"[..]), (bad_name, bad_val)]
+            );
+            let ex = ts.exemplars().next().unwrap();
+            let ex_lbls: Vec<(&[u8], &[u8])> =
+                ex.labels().map(|l| (l.name, l.value)).collect();
+            assert_eq!(ex_lbls, vec![(bad_ex_name, bad_ex_val)]);
+        }
     }
 }
