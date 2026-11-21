@@ -721,6 +721,10 @@ async fn w19_rkn_10_otlp_headers_tls_mtls_timeout_and_jaeger_endpoint_exporter()
     let clear_env = || {
         for k in [
             "OTEL_TRACES_EXPORTER",
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_INSECURE",
+            "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
             "OTEL_EXPORTER_OTLP_HEADERS",
@@ -766,8 +770,8 @@ async fn w19_rkn_10_otlp_headers_tls_mtls_timeout_and_jaeger_endpoint_exporter()
     );
     assert_eq!(otlp_timeout_from_env(), Some(Duration::from_millis(2500)));
 
-    // 2. OTLP HTTP exporter sends configured auth headers.
-    let captured: Arc<Mutex<Vec<(HeaderMap, serde_json::Value)>>> =
+    // 2. OTLP HTTP exporter defaults to http/protobuf and sends configured auth headers.
+    let captured: Arc<Mutex<Vec<(HeaderMap, Bytes)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let cap_clone = Arc::clone(&captured);
     let mock_app = Router::new().route(
@@ -775,8 +779,7 @@ async fn w19_rkn_10_otlp_headers_tls_mtls_timeout_and_jaeger_endpoint_exporter()
         axum::routing::post(move |headers: HeaderMap, body: Bytes| {
             let cap = Arc::clone(&cap_clone);
             async move {
-                let json = serde_json::from_slice(&body).unwrap();
-                cap.lock().unwrap_or_else(|e| e.into_inner()).push((headers, json));
+                cap.lock().unwrap_or_else(|e| e.into_inner()).push((headers, body));
                 StatusCode::OK
             }
         }),
@@ -813,9 +816,11 @@ async fn w19_rkn_10_otlp_headers_tls_mtls_timeout_and_jaeger_endpoint_exporter()
         assert!(Instant::now() < deadline, "OTLP span not received");
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
-    let (hdrs, _) = captured.lock().unwrap_or_else(|e| e.into_inner()).remove(0);
+    let (hdrs, body) = captured.lock().unwrap_or_else(|e| e.into_inner()).remove(0);
     assert_eq!(hdrs.get("authorization").unwrap(), "Basic new");
     assert_eq!(hdrs.get("x-base").unwrap(), "1");
+    assert_eq!(hdrs.get("content-type").unwrap(), "application/x-protobuf");
+    assert!(!body.is_empty());
     srv_task.abort();
 
     // 3. OTLP HTTPS mTLS using OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE / CLIENT_CERTIFICATE / CLIENT_KEY.
@@ -999,6 +1004,7 @@ async fn w19_rkn_10_otlp_headers_tls_mtls_timeout_and_jaeger_endpoint_exporter()
     let j_hdrs = j_captured.lock().unwrap_or_else(|e| e.into_inner()).remove(0);
     // base64("alice:secret") == "YWxpY2U6c2VjcmV0"
     assert_eq!(j_hdrs.get("authorization").unwrap(), "Basic YWxpY2U6c2VjcmV0");
+    assert_eq!(j_hdrs.get("content-type").unwrap(), "application/x-thrift");
     j_task.abort();
     clear_env();
 }
