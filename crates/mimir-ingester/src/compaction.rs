@@ -164,7 +164,7 @@ impl Ingester {
         // (matching Go `defer userDB.changeState(activeShipping, active)`) so concurrent
         // close_and_delete_user_tsdb_if_idle or compact_head cannot observe stale shipped blocks
         // or strand the TSDB in ActiveShipping if cancelled.
-        let _state_guard = TsdbStateGuard::new(&user_db, TsdbState::ActiveShipping);
+        let _state_guard = TsdbStateGuard::new(Arc::clone(&user_db), TsdbState::ActiveShipping);
 
         let sync_res = shipper.sync().await;
 
@@ -674,7 +674,7 @@ impl Ingester {
         if !ok {
             return TsdbCloseCheckResult::NotActive;
         }
-        let mut state_guard = TsdbStateGuard::new(&user_db, TsdbState::Closing);
+        let mut state_guard = TsdbStateGuard::new(Arc::clone(&user_db), TsdbState::Closing);
 
         user_db.wait_in_flight_appends().await;
 
@@ -698,13 +698,31 @@ impl Ingester {
             .collect();
 
         let user_db_close = Arc::clone(&user_db);
-        match tokio::task::spawn_blocking(move || user_db_close.close()).await {
+        let close_res = tokio::task::spawn_blocking(move || {
+            let res = user_db_close.close();
+            if (res.is_ok() || user_db_close.db.is_closed())
+                && user_db_close.change_state(TsdbState::Closing, TsdbState::Closed).0
+            {
+                state_guard.disarm();
+            }
+            // Otherwise (close failed before closing db), `state_guard` drops here
+            // and restores `Closing -> Active` only after `close()` finishes.
+            res
+        })
+        .await;
+
+        match close_res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 warn!(user = %user_id, err = %e, "failed to close idle TSDB");
                 return TsdbCloseCheckResult::CloseFailed;
             }
             Err(e) => {
+                if user_db.db.is_closed() {
+                    let _ = user_db.change_state(TsdbState::Closing, TsdbState::Closed);
+                } else {
+                    let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
+                }
                 warn!(user = %user_id, err = %e, "idle TSDB close join error");
                 return TsdbCloseCheckResult::CloseFailed;
             }
@@ -728,11 +746,6 @@ impl Ingester {
                 }
             }
         }
-
-        if user_db.change_state(TsdbState::Closing, TsdbState::Closed).0 {
-            state_guard.disarm();
-        }
-        drop(state_guard);
         // Keep user_id (in Closed state) in self.tsdbs until metric cleanup and
         // remove_dir_all finish so concurrent Push/get_or_create_tsdb cannot reopen
         // a fresh TSDB in the directory while it is being deleted (Go defer parity).

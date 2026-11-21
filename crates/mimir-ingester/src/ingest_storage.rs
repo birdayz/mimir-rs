@@ -837,45 +837,50 @@ impl IngesterShardedBatchConsumer {
                         }),
                         &propagators,
                     );
-                    // Go `sampledOnlyTracer.OnFetchRecordBuffered`: records whose headers carry no
-                    // sampled W3C span context keep the (absent/unsampled) remote context and never
-                    // start a "receive" span, so they must not get a fresh root trace either.
-                    let (span_ctx, parent_span_id) = if extracted.is_sampled() {
-                        mimir_common::tracing::start_server_span_context(&extracted, false)
-                    } else {
-                        (mimir_common::tracing::TraceContext::default(), None)
-                    };
-                    if span_ctx.is_sampled() {
-                        if let Some(rt) = mimir_common::tracing::global_tracing() {
-                            if rt.exporter.is_some() {
-                                let now_ns = mimir_common::tracing::now_unix_nanos();
-                                mimir_common::tracing::export_span(
-                                    mimir_common::tracing::ExportedSpan {
-                                        service_name: rt.service_name.clone(),
-                                        trace_id: span_ctx.trace_id,
-                                        span_id: span_ctx.span_id,
-                                        parent_span_id,
-                                        name: format!("{topic_name} receive"),
-                                        kind: 5,
-                                        start_time_unix_nano: now_ns,
-                                        end_time_unix_nano: now_ns,
-                                        attributes: vec![
-                                            mimir_common::tracing::SpanAttribute {
-                                                key: "messaging.system".to_string(),
-                                                value: mimir_common::tracing::SpanAttrValue::String(
-                                                    "kafka".to_string(),
-                                                ),
-                                            },
-                                            mimir_common::tracing::SpanAttribute {
-                                                key: "messaging.destination.name".to_string(),
-                                                value: mimir_common::tracing::SpanAttrValue::String(
-                                                    topic_name.clone(),
-                                                ),
-                                            },
-                                        ],
-                                        status_error: false,
-                                    },
-                                );
+                    // Go `sampledOnlyTracer.OnFetchRecordBuffered`: uses `recordsPropagator()`
+                    // unconditionally. When `extracted.is_sampled()`, preserve the remote sampled
+                    // context even if global tracing is unset/disabled, and when global tracing is
+                    // enabled mint a sampled child consumer span without demoting via root sampler.
+                    if extracted.is_sampled() {
+                        let rt = mimir_common::tracing::global_tracing();
+                        let (span_ctx, parent_span_id, tracing_enabled) =
+                            mimir_common::tracing::start_kafka_sampled_span_context_with_runtime(
+                                rt,
+                                &extracted,
+                            );
+                        if tracing_enabled {
+                            if let Some(rt) = rt {
+                                if rt.exporter.is_some() {
+                                    let now_ns = mimir_common::tracing::now_unix_nanos();
+                                    mimir_common::tracing::export_span_with_runtime(
+                                        rt,
+                                        mimir_common::tracing::ExportedSpan {
+                                            service_name: rt.service_name.clone(),
+                                            trace_id: span_ctx.trace_id,
+                                            span_id: span_ctx.span_id,
+                                            parent_span_id,
+                                            name: format!("{topic_name} receive"),
+                                            kind: 5,
+                                            start_time_unix_nano: now_ns,
+                                            end_time_unix_nano: now_ns,
+                                            attributes: vec![
+                                                mimir_common::tracing::SpanAttribute {
+                                                    key: "messaging.system".to_string(),
+                                                    value: mimir_common::tracing::SpanAttrValue::String(
+                                                        "kafka".to_string(),
+                                                    ),
+                                                },
+                                                mimir_common::tracing::SpanAttribute {
+                                                    key: "messaging.destination.name".to_string(),
+                                                    value: mimir_common::tracing::SpanAttrValue::String(
+                                                        topic_name.clone(),
+                                                    ),
+                                                },
+                                            ],
+                                            status_error: false,
+                                        },
+                                    );
+                                }
                             }
                         }
                         let idx = trace_ids.len() as u32;

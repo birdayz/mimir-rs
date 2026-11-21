@@ -672,6 +672,10 @@ impl MimirConfig {
         // omitted nested fields keep their context-specific defaults (e.g.
         // `blocks_storage.filesystem.dir: blocks`) instead of the nested type's zero/default.
         // Mirror that by deep-merging the document onto the serialized current values.
+        let yaml_has_name_validation_scheme = core_val
+            .get("limits")
+            .and_then(|l| l.get("name_validation_scheme"))
+            .is_some();
         let mut merged_core = crate::secret::with_secrets_revealed(|| {
             serde_yaml::to_value(CoreMimirConfig::from_config(self))
         })
@@ -681,17 +685,28 @@ impl MimirConfig {
         let prev_name_validation_scheme = self.limits.name_validation_scheme;
         let mut core: CoreMimirConfig = serde_yaml::from_value(merged_core)
             .map_err(|e| ConfigError::Yaml(e.to_string()))?;
-        if core.limits.name_validation_scheme == crate::types::NameValidationScheme::Unset {
-            core.limits.name_validation_scheme = prev_name_validation_scheme;
-        }
         // Go fails in CustomTrackersConfig.UnmarshalYAML & Limits.UnmarshalYAML (while parsing the file,
-        // BEFORE CLI flag overrides are applied).
+        // BEFORE CLI flag overrides are applied), validating YAML `limits:` against the YAML-decoded
+        // `name_validation_scheme` before restoring any pre-existing `prev_name_validation_scheme`
+        // when omitted.
+        if !yaml_has_name_validation_scheme {
+            core.limits.name_validation_scheme = crate::types::NameValidationScheme::Unset;
+        }
         crate::limits::validate_custom_trackers_yaml(&core.limits)?;
+        core.limits
+            .migrate_cost_attribution_labels_structured()
+            .map_err(|e| match e {
+                ConfigError::Validation(msg) | ConfigError::Flag(msg) => ConfigError::Yaml(msg),
+                other => other,
+            })?;
         if has_limits_yaml {
             core.limits.validate().map_err(|e| match e {
                 ConfigError::Validation(msg) | ConfigError::Flag(msg) => ConfigError::Yaml(msg),
                 other => other,
             })?;
+        }
+        if core.limits.name_validation_scheme == crate::types::NameValidationScheme::Unset {
+            core.limits.name_validation_scheme = prev_name_validation_scheme;
         }
 
         self.apply_core(core);
@@ -1207,6 +1222,7 @@ impl MimirConfig {
                 .extra_sections
                 .get(section)
                 .and_then(|v| v.get("s3"))
+                .filter(|v| !v.is_null())
                 .map(|v| serde_yaml::from_value(v.clone()))
                 .transpose()
                 .map_err(|e| ConfigError::Validation(e.to_string()))?
@@ -1257,6 +1273,7 @@ impl MimirConfig {
                     .get(section)
                     .and_then(|v| v.get("cache"))
                     .and_then(|v| v.get("memcached"))
+                    .filter(|v| !v.is_null())
                     .map(|v| serde_yaml::from_value(v.clone()))
                     .transpose()
                     .map_err(|e| ConfigError::Validation(e.to_string()))?

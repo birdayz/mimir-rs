@@ -259,8 +259,14 @@ impl IngestWriter {
     ) -> Result<Vec<(i32, i64)>, WriterError> {
         let start = Instant::now();
         let mut by_partition: HashMap<i32, Vec<ProduceRecord>> = HashMap::new();
+        type PartitionSpanEntries =
+            Vec<(mimir_common::tracing::TraceContext, Option<[u8; 8]>, u64)>;
+        let mut partition_spans: HashMap<i32, PartitionSpanEntries> = HashMap::new();
         let mut input_bytes = 0usize;
         let mut sent_bytes = 0usize;
+        let active_tc = mimir_common::tracing::current_trace_context()
+            .filter(mimir_common::tracing::TraceContext::is_sampled);
+        let rt = mimir_common::tracing::global_tracing();
 
         for pr in partition_requests {
             let (recs, orig_size) = self.serializer.to_records(
@@ -276,9 +282,31 @@ impl IngestWriter {
             self.metrics.records_per_request.observe(recs.len() as f64);
             input_bytes += orig_size;
             let entry = by_partition.entry(pr.partition_id).or_default();
-            let active_tc = mimir_common::tracing::current_trace_context();
+            let start_ns = if active_tc.is_some()
+                && rt.is_some_and(|r| r.enabled && r.exporter.is_some())
+            {
+                mimir_common::tracing::now_unix_nanos()
+            } else {
+                0
+            };
             for mut r in recs {
-                SampledOnlyPropagator.inject_trace_context(active_tc.as_ref(), &mut r.headers);
+                if let Some(ref tc) = active_tc {
+                    r.headers.retain(|(k, _)| {
+                        !k.eq_ignore_ascii_case("traceparent")
+                            && !k.eq_ignore_ascii_case("tracestate")
+                    });
+                    let (prod_ctx, parent_span_id, tracing_enabled) =
+                        mimir_common::tracing::start_kafka_sampled_span_context_with_runtime(
+                            rt, tc,
+                        );
+                    SampledOnlyPropagator.inject_trace_context(Some(&prod_ctx), &mut r.headers);
+                    if tracing_enabled && rt.is_some_and(|r| r.exporter.is_some()) {
+                        partition_spans
+                            .entry(pr.partition_id)
+                            .or_default()
+                            .push((prod_ctx, parent_span_id, start_ns));
+                    }
+                }
                 sent_bytes += r.value.len();
                 entry.push(ProduceRecord {
                     key: Some(r.key),
@@ -300,14 +328,19 @@ impl IngestWriter {
             let client = Arc::clone(&self.client);
             let compression = self.compression;
             let write_timeout = self.write_timeout;
+            let spans = partition_spans.remove(&pid).unwrap_or_default();
             async move {
                 let mut retry_backoff = Duration::from_millis(25);
                 let mut last_err: Option<KafkaClientError> = None;
-                loop {
+                let outcome: Result<(i32, i64), (i32, WriterError)> = loop {
                     let elapsed = start.elapsed();
                     if elapsed >= write_timeout {
-                        return Err(WriterError::Kafka(
-                            last_err.unwrap_or(KafkaClientError::RequestTimeout(write_timeout)),
+                        break Err((
+                            pid,
+                            WriterError::Kafka(
+                                last_err
+                                    .unwrap_or(KafkaClientError::RequestTimeout(write_timeout)),
+                            ),
                         ));
                     }
                     let remaining = write_timeout.saturating_sub(elapsed);
@@ -317,9 +350,9 @@ impl IngestWriter {
                     )
                     .await;
                     match res {
-                        Ok(Ok(base_offset)) => return Ok((pid, base_offset)),
+                        Ok(Ok(base_offset)) => break Ok((pid, base_offset)),
                         Ok(Err(KafkaClientError::Broker(ResponseError::MessageTooLarge))) => {
-                            return Err(WriterError::WriteRequestDataItemTooLarge);
+                            break Err((pid, WriterError::WriteRequestDataItemTooLarge));
                         }
                         Ok(Err(KafkaClientError::Broker(
                             ResponseError::UnknownTopicOrPartition,
@@ -329,17 +362,24 @@ impl IngestWriter {
                             ));
                             let unknown_limit = write_timeout.min(Duration::from_secs(2));
                             if start.elapsed() >= unknown_limit {
-                                return Err(WriterError::Kafka(
-                                    last_err.unwrap_or(KafkaClientError::RequestTimeout(
-                                        write_timeout,
+                                break Err((
+                                    pid,
+                                    WriterError::Kafka(last_err.unwrap_or(
+                                        KafkaClientError::RequestTimeout(write_timeout),
                                     )),
                                 ));
                             }
-                            let _ = client.refresh_metadata(&[topic]).await;
+                            let meta_remaining = unknown_limit.saturating_sub(start.elapsed());
+                            let _ = tokio::time::timeout(
+                                meta_remaining,
+                                client.refresh_metadata(&[topic]),
+                            )
+                            .await;
                             if start.elapsed() >= unknown_limit {
-                                return Err(WriterError::Kafka(
-                                    last_err.unwrap_or(KafkaClientError::RequestTimeout(
-                                        write_timeout,
+                                break Err((
+                                    pid,
+                                    WriterError::Kafka(last_err.unwrap_or(
+                                        KafkaClientError::RequestTimeout(write_timeout),
                                     )),
                                 ));
                             }
@@ -349,35 +389,126 @@ impl IngestWriter {
                             last_err = Some(e);
                             retry_backoff = Duration::from_millis(25);
                         }
-                        Ok(Err(e)) => return Err(WriterError::Kafka(e)),
+                        Ok(Err(e)) => break Err((pid, WriterError::Kafka(e))),
                         Err(_) => {
-                            return Err(WriterError::Kafka(
-                                last_err.unwrap_or(KafkaClientError::RequestTimeout(write_timeout)),
+                            break Err((
+                                pid,
+                                WriterError::Kafka(last_err.unwrap_or(
+                                    KafkaClientError::RequestTimeout(write_timeout),
+                                )),
                             ));
                         }
                     }
 
                     let remaining = write_timeout.saturating_sub(start.elapsed());
                     if remaining.is_zero() {
-                        return Err(WriterError::Kafka(
-                            last_err.unwrap_or(KafkaClientError::RequestTimeout(write_timeout)),
+                        break Err((
+                            pid,
+                            WriterError::Kafka(
+                                last_err
+                                    .unwrap_or(KafkaClientError::RequestTimeout(write_timeout)),
+                            ),
                         ));
                     }
                     tokio::time::sleep(retry_backoff.min(remaining)).await;
+                };
+
+                if !spans.is_empty() {
+                    if let Some(rt) = mimir_common::tracing::global_tracing() {
+                        if rt.exporter.is_some() {
+                            let end_ns = mimir_common::tracing::now_unix_nanos();
+                            let is_err = outcome.is_err();
+                            for (prod_ctx, parent_span_id, start_ns) in spans {
+                                mimir_common::tracing::export_span_with_runtime(
+                                    rt,
+                                    mimir_common::tracing::ExportedSpan {
+                                        service_name: rt.service_name.clone(),
+                                        trace_id: prod_ctx.trace_id,
+                                        span_id: prod_ctx.span_id,
+                                        parent_span_id,
+                                        name: format!("{topic} publish"),
+                                        kind: 4, // OTLP SPAN_KIND_PRODUCER
+                                        start_time_unix_nano: start_ns,
+                                        end_time_unix_nano: end_ns,
+                                        attributes: vec![
+                                            mimir_common::tracing::SpanAttribute {
+                                                key: "messaging.system".to_string(),
+                                                value: mimir_common::tracing::SpanAttrValue::String(
+                                                    "kafka".to_string(),
+                                                ),
+                                            },
+                                            mimir_common::tracing::SpanAttribute {
+                                                key: "messaging.destination.name".to_string(),
+                                                value: mimir_common::tracing::SpanAttrValue::String(
+                                                    topic.to_string(),
+                                                ),
+                                            },
+                                            mimir_common::tracing::SpanAttribute {
+                                                key: "messaging.kafka.destination.partition"
+                                                    .to_string(),
+                                                value: mimir_common::tracing::SpanAttrValue::Int(
+                                                    pid as i64,
+                                                ),
+                                            },
+                                        ],
+                                        status_error: is_err,
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
+                outcome
             }
         });
 
-        let offsets = match futures::future::try_join_all(produce_futs).await {
-            Ok(v) => v,
-            Err(e) => {
-                self.metrics
-                    .latency
-                    .with_label_values(&["failure"])
-                    .observe(start.elapsed().as_secs_f64());
-                return Err(e);
+        let results = futures::future::join_all(produce_futs).await;
+        let mut offsets = Vec::with_capacity(results.len());
+        let mut failed_partitions = Vec::new();
+        let mut first_err: Option<ProducerError> = None;
+        let mut has_too_large = false;
+        for r in results {
+            match r {
+                Ok(pair) => offsets.push(pair),
+                Err((pid, WriterError::WriteRequestDataItemTooLarge)) => {
+                    has_too_large = true;
+                    if !failed_partitions.contains(&pid) {
+                        failed_partitions.push(pid);
+                    }
+                }
+                Err((pid, e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(match e {
+                            WriterError::Kafka(KafkaClientError::RequestTimeout(_)) => {
+                                ProducerError::RecordTimeout
+                            }
+                            WriterError::Kafka(ke) => ProducerError::Other(ke.to_string()),
+                            other => ProducerError::Other(other.to_string()),
+                        });
+                    }
+                    if !failed_partitions.contains(&pid) {
+                        failed_partitions.push(pid);
+                    }
+                }
             }
-        };
+        }
+        if has_too_large {
+            self.metrics
+                .latency
+                .with_label_values(&["failure"])
+                .observe(start.elapsed().as_secs_f64());
+            return Err(WriterError::WriteRequestDataItemTooLarge);
+        }
+        if let Some(source) = first_err {
+            self.metrics
+                .latency
+                .with_label_values(&["failure"])
+                .observe(start.elapsed().as_secs_f64());
+            return Err(WriterError::FailedPartitions {
+                partitions: failed_partitions,
+                source,
+            });
+        }
 
         self.metrics
             .latency

@@ -277,10 +277,12 @@ pub(crate) fn snapshot_query_sources_with_lock(
     let mut block_guards = Vec::new();
     for b in slice {
         if b.overlaps_closed_interval(mint, maxt) {
-            if let Some(bg) = Block::start_read(b) {
-                blocks.push(Arc::clone(b));
-                block_guards.push(bg);
-            }
+            let Some(bg) = Block::start_read(b) else {
+                drop(lock_guard);
+                return Err(QuerierError::Closed);
+            };
+            blocks.push(Arc::clone(b));
+            block_guards.push(bg);
         }
     }
     let head_snap = head.and_then(|h| {
@@ -500,7 +502,7 @@ impl<'a> TsdbQuerier<'a> {
     fn snapshot_blocks(
         &self,
         guard: Option<&parking_lot::RwLockReadGuard<'a, Vec<Arc<Block>>>>,
-    ) -> (Vec<Arc<Block>>, Vec<BlockReadGuard>) {
+    ) -> Result<(Vec<Arc<Block>>, Vec<BlockReadGuard>), QuerierError> {
         let slice: &[Arc<Block>] = match guard {
             Some(g) => g.as_slice(),
             None => self.blocks.as_slice(),
@@ -509,13 +511,14 @@ impl<'a> TsdbQuerier<'a> {
         let mut guards = Vec::new();
         for b in slice {
             if b.overlaps_closed_interval(self.mint, self.maxt) {
-                if let Some(bg) = Block::start_read(b) {
-                    blocks.push(Arc::clone(b));
-                    guards.push(bg);
-                }
+                let Some(bg) = Block::start_read(b) else {
+                    return Err(QuerierError::Closed);
+                };
+                blocks.push(Arc::clone(b));
+                guards.push(bg);
             }
         }
-        (blocks, guards)
+        Ok((blocks, guards))
     }
 
     /// Holds `blocks_lock.read()` ONLY long enough to check `is_closed()`, clone
@@ -546,7 +549,13 @@ impl<'a> TsdbQuerier<'a> {
             drop(lock_guard);
             return Err(QuerierError::Closed);
         }
-        let (blocks, block_guards) = self.snapshot_blocks(lock_guard.as_ref());
+        let (blocks, block_guards) = match self.snapshot_blocks(lock_guard.as_ref()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                drop(lock_guard);
+                return Err(e);
+            }
+        };
         let head_snap = self.head.and_then(|h| {
             snapshot_head_query_source(
                 h,

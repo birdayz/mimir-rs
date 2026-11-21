@@ -1926,7 +1926,10 @@ impl Ingester {
             });
             let snapshot = db
                 .db
-                .snapshot_query_sources(start_timestamp_ms, end_timestamp_ms);
+                .try_snapshot_query_sources(start_timestamp_ms, end_timestamp_ms)
+                .map_err(|e| IngesterError::Internal {
+                    message: format!("selecting series from ChunkQuerier: {e}"),
+                })?;
             // Keep `block_guards` declared before `blocks` so early returns drop `Arc<Block>`
             // mmaps before `BlockReadGuard` wakes `close_and_wait()`.
             let block_guards = snapshot.block_guards;

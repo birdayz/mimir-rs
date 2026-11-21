@@ -20,10 +20,7 @@ use tokio::sync::{watch, Notify, Semaphore};
 
 use super::compression::KafkaCompression;
 use super::kafka_client::{KafkaClientError, ProduceRecord};
-use super::util::{
-    IngestKafkaClient, KafkaClientExtendedMetrics, SampledOnlyTracer, SpanRecorder,
-    TraceSpanContext, TracedKafkaRecord,
-};
+use super::util::{IngestKafkaClient, KafkaClientExtendedMetrics, SampledOnlyPropagator};
 
 pub const DEFAULT_PRODUCER_LINGER: Duration = Duration::from_millis(50);
 pub const DEFAULT_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
@@ -279,8 +276,8 @@ pub struct KafkaWriterClient {
     closed: Arc<AtomicBool>,
     close_tx: watch::Sender<bool>,
     extended_metrics: Option<KafkaClientExtendedMetrics>,
-    span_recorder: Arc<SpanRecorder>,
-    tracer: Arc<SampledOnlyTracer>,
+    #[cfg(test)]
+    test_tracing: SyncMutex<Option<mimir_common::tracing::TracingRuntime>>,
 }
 
 impl KafkaWriterClient {
@@ -327,8 +324,6 @@ impl KafkaWriterClient {
 
         let max_inflight = max_inflight_produce_requests.max(1);
         let (close_tx, close_rx) = watch::channel(false);
-        let span_recorder = SpanRecorder::new();
-        let tracer = Arc::new(SampledOnlyTracer::new(Arc::clone(&span_recorder)));
         let client = Arc::new(Self {
             inner,
             default_topic,
@@ -347,8 +342,8 @@ impl KafkaWriterClient {
             closed: Arc::new(AtomicBool::new(false)),
             close_tx,
             extended_metrics,
-            span_recorder,
-            tracer,
+            #[cfg(test)]
+            test_tracing: SyncMutex::new(None),
         });
 
         let c_bg = Arc::downgrade(&client);
@@ -370,8 +365,20 @@ impl KafkaWriterClient {
         &self.inner
     }
 
-    pub fn span_recorder(&self) -> &Arc<SpanRecorder> {
-        &self.span_recorder
+    #[cfg(test)]
+    fn set_test_tracing(&self, rt: Option<mimir_common::tracing::TracingRuntime>) {
+        *self.test_tracing.lock() = rt;
+    }
+
+    fn with_active_tracing<R>(
+        &self,
+        f: impl FnOnce(Option<&mimir_common::tracing::TracingRuntime>) -> R,
+    ) -> R {
+        #[cfg(test)]
+        if let Some(ref rt) = *self.test_tracing.lock() {
+            return f(Some(rt));
+        }
+        f(mimir_common::tracing::global_tracing())
     }
 
     pub async fn ping(&self) -> Result<(), KafkaClientError> {
@@ -862,76 +869,70 @@ impl KafkaProducerClient for KafkaWriterClient {
         }
 
         // Go `newSampledOnlyTracer()`: on enqueue, if the active trace context is sampled,
-        // start a producer span and inject W3C `traceparent` / `tracestate` into record headers.
+        // propagate W3C `traceparent` / `tracestate` unconditionally in O(1); when global
+        // tracing is enabled, mint a child producer span context and export on completion if
+        // an exporter is configured (no unconditional SpanRecorder retention).
         let active_tc = mimir_common::tracing::current_trace_context();
         let on_done: Box<dyn FnOnce(WriterRecord, Result<i64, ProducerError>) + Send> =
             if let Some(tc) = active_tc.filter(mimir_common::tracing::TraceContext::is_sampled) {
-                let (prod_ctx, parent_span_id) =
-                    mimir_common::tracing::start_server_span_context(&tc, false);
                 record.headers.retain(|(k, _)| {
                     !k.eq_ignore_ascii_case("traceparent") && !k.eq_ignore_ascii_case("tracestate")
                 });
-                let mut traced = TracedKafkaRecord {
-                    topic: record.topic.clone(),
-                    headers: std::mem::take(&mut record.headers),
-                    span_ctx: Some(TraceSpanContext {
-                        trace_id: prod_ctx.trace_id,
-                        span_id: prod_ctx.span_id,
-                        sampled: prod_ctx.sampled,
-                        trace_flags: prod_ctx.trace_flags,
-                        remote: prod_ctx.remote,
-                    }),
-                    tracestate: prod_ctx.tracestate.clone(),
-                    active_span_id: None,
-                };
-                self.tracer.on_produce_record_buffered(&mut traced);
-                record.headers = std::mem::take(&mut traced.headers);
-                let start_ns = mimir_common::tracing::now_unix_nanos();
-                let tracer = Arc::clone(&self.tracer);
-                Box::new(move |rec, res| {
-                    tracer.on_produce_record_unbuffered(&mut traced);
-                    if prod_ctx.is_sampled() {
-                        if let Some(rt) = mimir_common::tracing::global_tracing() {
-                            if rt.exporter.is_some() {
-                                mimir_common::tracing::export_span(
-                                    mimir_common::tracing::ExportedSpan {
-                                        service_name: rt.service_name.clone(),
-                                        trace_id: prod_ctx.trace_id,
-                                        span_id: prod_ctx.span_id,
-                                        parent_span_id,
-                                        name: format!("{} publish", rec.topic),
-                                        kind: 4, // OTLP SPAN_KIND_PRODUCER
-                                        start_time_unix_nano: start_ns,
-                                        end_time_unix_nano: mimir_common::tracing::now_unix_nanos(),
-                                        attributes: vec![
-                                            mimir_common::tracing::SpanAttribute {
-                                                key: "messaging.system".to_string(),
-                                                value: mimir_common::tracing::SpanAttrValue::String(
-                                                    "kafka".to_string(),
-                                                ),
-                                            },
-                                            mimir_common::tracing::SpanAttribute {
-                                                key: "messaging.destination.name".to_string(),
-                                                value: mimir_common::tracing::SpanAttrValue::String(
-                                                    rec.topic.clone(),
-                                                ),
-                                            },
-                                            mimir_common::tracing::SpanAttribute {
-                                                key: "messaging.kafka.destination.partition"
-                                                    .to_string(),
-                                                value: mimir_common::tracing::SpanAttrValue::Int(
-                                                    rec.partition as i64,
-                                                ),
-                                            },
-                                        ],
-                                        status_error: res.is_err(),
+                let (prod_ctx, parent_span_id, export_target) = self.with_active_tracing(|rt| {
+                    let (prod_ctx, parent_span_id, tracing_enabled) =
+                        mimir_common::tracing::start_kafka_sampled_span_context_with_runtime(
+                            rt, &tc,
+                        );
+                    let export_target = if tracing_enabled {
+                        rt.filter(|r| r.exporter.is_some()).cloned()
+                    } else {
+                        None
+                    };
+                    (prod_ctx, parent_span_id, export_target)
+                });
+                SampledOnlyPropagator.inject_trace_context(Some(&prod_ctx), &mut record.headers);
+                if let Some(rt) = export_target {
+                    let start_ns = mimir_common::tracing::now_unix_nanos();
+                    Box::new(move |rec, res| {
+                        mimir_common::tracing::export_span_with_runtime(
+                            &rt,
+                            mimir_common::tracing::ExportedSpan {
+                                service_name: rt.service_name.clone(),
+                                trace_id: prod_ctx.trace_id,
+                                span_id: prod_ctx.span_id,
+                                parent_span_id,
+                                name: format!("{} publish", rec.topic),
+                                kind: 4, // OTLP SPAN_KIND_PRODUCER
+                                start_time_unix_nano: start_ns,
+                                end_time_unix_nano: mimir_common::tracing::now_unix_nanos(),
+                                attributes: vec![
+                                    mimir_common::tracing::SpanAttribute {
+                                        key: "messaging.system".to_string(),
+                                        value: mimir_common::tracing::SpanAttrValue::String(
+                                            "kafka".to_string(),
+                                        ),
                                     },
-                                );
-                            }
-                        }
-                    }
-                    on_done(rec, res);
-                })
+                                    mimir_common::tracing::SpanAttribute {
+                                        key: "messaging.destination.name".to_string(),
+                                        value: mimir_common::tracing::SpanAttrValue::String(
+                                            rec.topic.clone(),
+                                        ),
+                                    },
+                                    mimir_common::tracing::SpanAttribute {
+                                        key: "messaging.kafka.destination.partition".to_string(),
+                                        value: mimir_common::tracing::SpanAttrValue::Int(
+                                            rec.partition as i64,
+                                        ),
+                                    },
+                                ],
+                                status_error: res.is_err(),
+                            },
+                        );
+                        on_done(rec, res);
+                    })
+                } else {
+                    on_done
+                }
             } else {
                 on_done
             };
@@ -2406,8 +2407,9 @@ mod tests {
             .await
             .unwrap();
 
-        let hdrs = captured_headers.lock();
-        assert_eq!(hdrs.len(), 3);
+        {
+            let hdrs = captured_headers.lock();
+            assert_eq!(hdrs.len(), 3);
         let tp = hdrs[0]
             .iter()
             .find(|(k, _)| k == "traceparent")
@@ -2433,10 +2435,60 @@ mod tests {
             "absent trace must not inject headers, got {:?}",
             hdrs[2]
         );
+        }
 
-        let spans = client.span_recorder().ended();
+        // Now enable a tracing runtime (even with AlwaysOff root sampler) and verify a sampled
+        // parent still mints a child producer span (same trace_id, fresh span_id) and exports
+        // "<topic> publish" with kind=4 and parent_span_id=Some(sampled_tc.span_id).
+        let exported_spans: Arc<SyncMutex<Vec<mimir_common::tracing::ExportedSpan>>> =
+            Arc::new(SyncMutex::new(Vec::new()));
+        let exp_cap = Arc::clone(&exported_spans);
+        client.set_test_tracing(Some(mimir_common::tracing::TracingRuntime {
+            enabled: true,
+            service_name: "mimir-test".to_string(),
+            propagators: mimir_common::tracing::PropagatorSet::default(),
+            sampler: mimir_common::tracing::SamplerKind::AlwaysOff,
+            resource_attributes: Vec::new(),
+            exporter: Some(Arc::new(move |s| {
+                exp_cap.lock().push(s);
+            })),
+        }));
+        mimir_common::tracing::with_trace_context(sampled_tc.clone(), async {
+            client
+                .produce_sync(WriterRecord {
+                    topic: "ingest-tr".to_string(),
+                    partition: 0,
+                    key: Bytes::from_static(b"t4"),
+                    value: Bytes::from_static(b"v4"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        })
+        .await;
+        client.set_test_tracing(None);
+
+        let hdrs = captured_headers.lock();
+        assert_eq!(hdrs.len(), 4);
+        let child_tp = hdrs[3]
+            .iter()
+            .find(|(k, _)| k == "traceparent")
+            .map(|(_, v)| String::from_utf8_lossy(v).to_string())
+            .expect("child traceparent must be injected");
+        let parsed_child = mimir_common::tracing::parse_traceparent(&child_tp).unwrap();
+        assert!(parsed_child.is_sampled());
+        assert_eq!(parsed_child.trace_id, sampled_tc.trace_id);
+        assert_ne!(parsed_child.span_id, sampled_tc.span_id);
+        drop(hdrs);
+
+        let spans = exported_spans.lock();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name, "ingest-tr publish");
+        assert_eq!(spans[0].kind, 4);
+        assert_eq!(spans[0].trace_id, sampled_tc.trace_id);
+        assert_eq!(spans[0].span_id, parsed_child.span_id);
+        assert_eq!(spans[0].parent_span_id, Some(sampled_tc.span_id));
+        assert!(!spans[0].status_error);
 
         client.close();
         srv.abort();

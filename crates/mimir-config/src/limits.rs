@@ -833,6 +833,26 @@ impl LimitsConfig {
         f.i64_var("ingest-storage.ingestion-partition-tenant-write-shard-size", self.ingestion_partitions_tenant_write_shard_size, "The maximum number of partitions a tenant's data should be written to when using the ingest storage.", move |t| &get(t).ingestion_partitions_tenant_write_shard_size, move |t| &mut get_mut(t).ingestion_partitions_tenant_write_shard_size);
     }
 
+    /// Migrates legacy `cost_attribution_labels_structured` into `cost_attribution_trackers`,
+    /// matching Go `Limits.migrateCostAttributionLabelsStructured`.
+    pub fn migrate_cost_attribution_labels_structured(&mut self) -> Result<(), ConfigError> {
+        if !self.cost_attribution_labels_structured.is_empty() {
+            if !self.cost_attribution_trackers.is_empty() {
+                return Err(ConfigError::Validation(
+                    "cost_attribution_labels_structured and cost_attribution_trackers are mutually exclusive; use cost_attribution_trackers only".to_string(),
+                ));
+            }
+            self.cost_attribution_trackers.insert(
+                "cost-attribution".to_string(),
+                CostAttributionTrackerConfig {
+                    labels: std::mem::take(&mut self.cost_attribution_labels_structured),
+                    internal: false,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Validates limits matching `pkg/util/validation/limits.go:Limits.Validate()`.
     pub fn validate(&mut self) -> Result<(), ConfigError> {
         let validation_scheme = match self.name_validation_scheme {
@@ -978,20 +998,7 @@ impl LimitsConfig {
             )));
         }
 
-        if !self.cost_attribution_labels_structured.is_empty() {
-            if !self.cost_attribution_trackers.is_empty() {
-                return Err(ConfigError::Validation(
-                    "cost_attribution_labels_structured and cost_attribution_trackers are mutually exclusive; use cost_attribution_trackers only".to_string(),
-                ));
-            }
-            self.cost_attribution_trackers.insert(
-                "cost-attribution".to_string(),
-                CostAttributionTrackerConfig {
-                    labels: std::mem::take(&mut self.cost_attribution_labels_structured),
-                    internal: false,
-                },
-            );
-        }
+        self.migrate_cost_attribution_labels_structured()?;
         for (k, v) in &self.alertmanager_notification_rate_limit_per_integration {
             validate_integration_limit(k, v)?;
         }

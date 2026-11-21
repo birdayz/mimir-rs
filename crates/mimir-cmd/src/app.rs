@@ -299,8 +299,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         (None, Overrides::new(cfg.limits.clone()))
     };
 
-    // 3. Server module (dskit server.New): binds HTTP & gRPC listeners early so port 0 resolves
-    //    before ring registration, builds TLS configs and middleware.
+    // 3. Server module (dskit server.New): validates server config, binds HTTP & gRPC
+    //    listeners early so port 0 resolves before ring registration, builds TLS configs and middleware.
+    cfg.server
+        .validate()
+        .context("error initialising module: server")?;
     let mut server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
         .context("error initialising module: server")?;
     server.set_grpc_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
@@ -1667,7 +1670,8 @@ pub fn try_build_span_exporter_with_handle(
     let Some(kind) = detected_exporter_kind() else {
         return Ok((None, None));
     };
-    let transport = match kind.trim() {
+    let kind_trimmed = kind.trim();
+    let transport = match kind_trimmed.to_ascii_lowercase().as_str() {
         "none" => return Ok((None, None)),
         "console" => {
             return Ok((
@@ -1694,6 +1698,8 @@ pub fn try_build_span_exporter_with_handle(
                 }
                 JaegerTarget::UdpAgent { host, port } => {
                     use std::net::ToSocketAddrs as _;
+                    let _rt_guard = tokio::runtime::Handle::try_current()
+                        .map_err(|e| format!("no active tokio runtime for span exporter: {e}"))?;
                     let port_num: u16 = port
                         .parse()
                         .map_err(|e| format!("invalid JAEGER_AGENT_PORT={port:?}: {e}"))?;
@@ -1747,16 +1753,19 @@ pub fn try_build_span_exporter_with_handle(
                 }
             }
         }
-        other => {
-            return Err(format!("unknown exporter or metrics producer {other:?}"));
+        _ => {
+            return Err(format!(
+                "unknown exporter or metrics producer {kind_trimmed:?}"
+            ));
         }
     };
 
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|e| format!("no active tokio runtime for span exporter: {e}"))?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ExportedSpan>(4096);
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let join = handle.spawn(async move {
+        let mut shutdown_rx = Some(shutdown_rx);
         loop {
             tokio::select! {
                 biased;
@@ -1766,12 +1775,27 @@ pub fn try_build_span_exporter_with_handle(
                         None => break,
                     }
                 }
-                _ = &mut shutdown_rx => {
-                    rx.close();
-                    while let Some(span) = rx.recv().await {
-                        send_exported_span(&transport, &span).await;
+                res = async {
+                    match &mut shutdown_rx {
+                        Some(s_rx) => s_rx.await,
+                        None => std::future::pending().await,
                     }
-                    break;
+                } => {
+                    match res {
+                        Ok(()) => {
+                            rx.close();
+                            while let Some(span) = rx.recv().await {
+                                send_exported_span(&transport, &span).await;
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            // SpanExporterHandle was dropped without calling shutdown()
+                            // (e.g. via try_build_span_exporter / build_span_exporter); keep
+                            // draining spans until all SpanExporterFn senders drop.
+                            shutdown_rx = None;
+                        }
+                    }
                 }
             }
         }
@@ -1918,5 +1942,130 @@ mod tests {
             elapsed < Duration::from_millis(190),
             "must NOT sleep 2 * shutdown_delay ({elapsed:?})"
         );
+    }
+
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn build_span_exporter_stays_alive_across_async_yields() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received_srv = Arc::clone(&received);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let rec = Arc::clone(&received_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        rec.fetch_add(1, Ordering::SeqCst);
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let exp = {
+            let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_exp = std::env::var("OTEL_TRACES_EXPORTER").ok();
+            let prev_proto = std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL").ok();
+            let prev_ep = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").ok();
+
+            std::env::set_var("OTEL_TRACES_EXPORTER", "OTLP");
+            std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf");
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                format!("http://{addr}/v1/traces"),
+            );
+
+            let exp = build_span_exporter().expect("exporter must build");
+
+            match prev_exp {
+                Some(v) => std::env::set_var("OTEL_TRACES_EXPORTER", v),
+                None => std::env::remove_var("OTEL_TRACES_EXPORTER"),
+            }
+            match prev_proto {
+                Some(v) => std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", v),
+                None => std::env::remove_var("OTEL_EXPORTER_OTLP_PROTOCOL"),
+            }
+            match prev_ep {
+                Some(v) => std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", v),
+                None => std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
+            }
+            exp
+        };
+
+        // Yield several times so the dropped SpanExporterHandle oneshot cancellation
+        // is guaranteed to have been polled before we emit spans.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        for i in 0..3u8 {
+            exp(ExportedSpan {
+                service_name: "mimir-test".to_string(),
+                trace_id: [0x11; 16],
+                span_id: [i + 1; 8],
+                parent_span_id: None,
+                name: format!("span-{i}"),
+                kind: 2,
+                start_time_unix_nano: 1_000_000,
+                end_time_unix_nano: 2_000_000,
+                attributes: Vec::new(),
+                status_error: false,
+            });
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        drop(exp);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while received.load(Ordering::SeqCst) < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected 3 exported spans, got {}",
+                received.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        srv.abort();
+    }
+
+    #[test]
+    fn jaeger_udp_agent_without_tokio_runtime_returns_err_instead_of_panicking() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_host = std::env::var("JAEGER_AGENT_HOST").ok();
+        let prev_exp = std::env::var("OTEL_TRACES_EXPORTER").ok();
+        std::env::set_var("JAEGER_AGENT_HOST", "127.0.0.1");
+        std::env::remove_var("OTEL_TRACES_EXPORTER");
+
+        let res = try_build_span_exporter_with_handle();
+
+        match prev_host {
+            Some(v) => std::env::set_var("JAEGER_AGENT_HOST", v),
+            None => std::env::remove_var("JAEGER_AGENT_HOST"),
+        }
+        match prev_exp {
+            Some(v) => std::env::set_var("OTEL_TRACES_EXPORTER", v),
+            None => std::env::remove_var("OTEL_TRACES_EXPORTER"),
+        }
+
+        let err = match res {
+            Ok(_) => panic!("expected Err outside tokio runtime"),
+            Err(e) => e,
+        };
+        assert!(err.contains("no active tokio runtime"), "{err}");
     }
 }

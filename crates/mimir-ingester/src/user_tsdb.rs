@@ -130,17 +130,18 @@ impl TsdbState {
 }
 
 /// RAII guard restoring `TsdbState::Active` from `from` on drop unless disarmed
-/// (e.g. after `Closing -> Closed` succeeds).
-pub struct TsdbStateGuard<'a> {
-    user_db: &'a UserTsdb,
+/// (e.g. after `Closing -> Closed` succeeds). Holds an `Arc<UserTsdb>` so it is
+/// `Send + 'static` and can be moved into `tokio::task::spawn_blocking` closures.
+pub struct TsdbStateGuard {
+    user_db: Option<Arc<UserTsdb>>,
     from: TsdbState,
     armed: bool,
 }
 
-impl<'a> TsdbStateGuard<'a> {
-    pub fn new(user_db: &'a UserTsdb, from: TsdbState) -> Self {
+impl TsdbStateGuard {
+    pub fn new(user_db: Arc<UserTsdb>, from: TsdbState) -> Self {
         Self {
-            user_db,
+            user_db: Some(user_db),
             from,
             armed: true,
         }
@@ -151,10 +152,12 @@ impl<'a> TsdbStateGuard<'a> {
     }
 }
 
-impl Drop for TsdbStateGuard<'_> {
+impl Drop for TsdbStateGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.user_db.change_state(self.from, TsdbState::Active);
+            if let Some(ref user_db) = self.user_db {
+                let _ = user_db.change_state(self.from, TsdbState::Active);
+            }
         }
     }
 }
@@ -1060,7 +1063,10 @@ impl UserTsdb {
     }
 
     /// Force-compact TSDB head up to `forced_compaction_max_time` (or `i64::MAX` for full flush).
-    pub async fn compact_head(&self, forced_compaction_max_time: i64) -> Result<(), String> {
+    pub async fn compact_head(
+        self: &Arc<Self>,
+        forced_compaction_max_time: i64,
+    ) -> Result<(), String> {
         let (ok, s) =
             self.change_state_to_forced_compaction(TsdbState::Active, forced_compaction_max_time);
         if !ok {
@@ -1069,49 +1075,55 @@ impl UserTsdb {
                 s.as_str()
             ));
         }
-        let _state_guard = TsdbStateGuard::new(self, TsdbState::ForceCompacting);
+        let state_guard = TsdbStateGuard::new(Arc::clone(self), TsdbState::ForceCompacting);
 
         self.wait_in_flight_before_forced_compaction().await;
 
         let db = Arc::clone(&self.db);
         let block_duration_ms = self.block_duration_ms;
-        let res = tokio::task::spawn_blocking(move || -> Result<(), TsdbError> {
-            let head = db.head();
-            loop {
-                let h_min = head.min_time();
-                let h_max = head.max_time();
-                let Some((mint, maxt_incl, is_last)) = next_forced_head_compaction_range(
-                    block_duration_ms,
-                    h_min,
-                    h_max,
-                    forced_compaction_max_time,
-                ) else {
-                    if h_min == i64::MAX
-                        && h_max == i64::MAX
-                        && forced_compaction_max_time == i64::MAX
-                        && head.num_series() > 0
-                    {
-                        db.compact_head_range_inclusive(i64::MAX, i64::MAX)?;
+        let (res, state_guard) = tokio::task::spawn_blocking(move || {
+            let inner = || -> Result<(), TsdbError> {
+                let head = db.head();
+                loop {
+                    let h_min = head.min_time();
+                    let h_max = head.max_time();
+                    let Some((mint, maxt_incl, is_last)) = next_forced_head_compaction_range(
+                        block_duration_ms,
+                        h_min,
+                        h_max,
+                        forced_compaction_max_time,
+                    ) else {
+                        if h_min == i64::MAX
+                            && h_max == i64::MAX
+                            && forced_compaction_max_time == i64::MAX
+                            && head.num_series() > 0
+                        {
+                            db.compact_head_range_inclusive(i64::MAX, i64::MAX)?;
+                        }
+                        break;
+                    };
+                    db.compact_head_range_inclusive(mint, maxt_incl)?;
+                    if is_last {
+                        break;
                     }
-                    break;
-                };
-                db.compact_head_range_inclusive(mint, maxt_incl)?;
-                if is_last {
-                    break;
                 }
-            }
-            let _ = db.compact_ooo_head()?;
-            Ok(())
+                let _ = db.compact_ooo_head()?;
+                Ok(())
+            };
+            (inner(), state_guard)
         })
         .await
         .unwrap_or_else(|e| {
-            Err(TsdbError::Io(std::io::Error::other(format!(
-                "compact_head join error: {e}"
-            ))))
+            (
+                Err(TsdbError::Io(std::io::Error::other(format!(
+                    "compact_head join error: {e}"
+                )))),
+                TsdbStateGuard::new(Arc::clone(self), TsdbState::ForceCompacting),
+            )
         });
 
-        drop(_state_guard);
         self.refresh_oldest_unshipped_block_time_ms();
+        drop(state_guard);
         res.map_err(|e| e.to_string())
     }
 
@@ -2360,7 +2372,7 @@ mod tests {
 
         assert!(db.change_state(TsdbState::Active, TsdbState::ActiveShipping).0);
         {
-            let _g = TsdbStateGuard::new(&db, TsdbState::ActiveShipping);
+            let _g = TsdbStateGuard::new(Arc::clone(&db), TsdbState::ActiveShipping);
             assert_eq!(db.state(), TsdbState::ActiveShipping);
         }
         assert_eq!(db.state(), TsdbState::Active);
@@ -2368,7 +2380,7 @@ mod tests {
         // Disarm keeps target state (used on Closing -> Closed).
         assert!(db.change_state(TsdbState::Active, TsdbState::Closing).0);
         {
-            let mut g = TsdbStateGuard::new(&db, TsdbState::Closing);
+            let mut g = TsdbStateGuard::new(Arc::clone(&db), TsdbState::Closing);
             assert!(db.change_state(TsdbState::Closing, TsdbState::Closed).0);
             g.disarm();
         }

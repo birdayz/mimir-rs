@@ -498,13 +498,13 @@ pub fn build_tracing_runtime_from_env(
 fn validate_otel_exporter_env() -> Result<(), String> {
     let raw_exp = std::env::var("OTEL_TRACES_EXPORTER").unwrap_or_default();
     let exp = raw_exp.trim();
-    match exp {
+    match exp.to_ascii_lowercase().as_str() {
         "" | "otlp" => {
             let _ = otlp_protocol_from_env()?;
             Ok(())
         }
         "none" | "console" | "jaeger" => Ok(()),
-        other => Err(format!("unknown exporter or metrics producer {other:?}")),
+        _ => Err(format!("unknown exporter or metrics producer {exp:?}")),
     }
 }
 
@@ -926,6 +926,47 @@ pub fn start_server_span_context(
     start_server_span_context_with_runtime(rt, extracted, create_new_trace)
 }
 
+/// Mints a sampled child `TraceContext` from an already-sampled `parent` without
+/// re-evaluating the root sampler (used by Kafka `sampledOnlyTracer` on produce/consume).
+pub fn mint_sampled_child_context(parent: &TraceContext) -> (TraceContext, Option<[u8; 8]>) {
+    let span_id = random_span_id();
+    let child = TraceContext {
+        trace_id: parent.trace_id,
+        span_id,
+        sampled: true,
+        trace_flags: parent.trace_flags | 0x01,
+        remote: false,
+        jaeger_debug_id: parent.jaeger_debug_id.clone(),
+        tracestate: parent.tracestate.clone(),
+    };
+    (child, Some(parent.span_id))
+}
+
+/// Resolves the span context for a sampled Kafka produce/consume record given `rt`:
+/// - When `rt` is enabled, mints a sampled child `TraceContext` (preserving `sampled = true`
+///   regardless of the root sampler) and returns `(child, Some(parent.span_id), true)`.
+/// - When `rt` is unset or disabled, propagates `parent` unchanged without creating/exporting
+///   a span, returning `(parent.clone(), None, false)` (matching Go `sampledOnlyTracer` +
+///   `recordsPropagator()`).
+pub fn start_kafka_sampled_span_context_with_runtime(
+    rt: Option<&TracingRuntime>,
+    parent: &TraceContext,
+) -> (TraceContext, Option<[u8; 8]>, bool) {
+    if rt.is_some_and(|r| r.enabled) {
+        let (child, parent_span_id) = mint_sampled_child_context(parent);
+        (child, parent_span_id, true)
+    } else {
+        (parent.clone(), None, false)
+    }
+}
+
+/// Process-global variant of [`start_kafka_sampled_span_context_with_runtime`].
+pub fn start_kafka_sampled_span_context(
+    parent: &TraceContext,
+) -> (TraceContext, Option<[u8; 8]>, bool) {
+    start_kafka_sampled_span_context_with_runtime(global_tracing(), parent)
+}
+
 pub fn now_unix_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1120,26 +1161,42 @@ pub enum JaegerTarget {
 }
 
 /// Resolves the Jaeger target (HTTP Thrift collector or UDP Compact Thrift agent) from env vars,
-/// matching `dskit/tracing/otel_jaeger.go`.
+/// matching `dskit/tracing/otel_jaeger.go`: explicit `JAEGER_ENDPOINT` /
+/// `OTEL_EXPORTER_JAEGER_ENDPOINT` takes precedence, then UDP agent env vars
+/// (`JAEGER_AGENT_HOST` / `JAEGER_SAMPLER_MANAGER_HOST_PORT` / `JAEGER_AGENT_PORT`),
+/// and only falls back to `http://localhost:14268/api/traces` when `OTEL_TRACES_EXPORTER=jaeger`
+/// is set with none of those.
 pub fn jaeger_target_from_env() -> Result<Option<JaegerTarget>, String> {
-    if let Some(ep) = jaeger_endpoint_from_env() {
-        if !ep.starts_with("http://") && !ep.starts_with("https://") {
-            return Err(format!("cannot parse env var JAEGER_ENDPOINT={ep}: invalid URI"));
+    for k in ["JAEGER_ENDPOINT", "OTEL_EXPORTER_JAEGER_ENDPOINT"] {
+        if let Some(ep) = non_empty_trimmed_env(k) {
+            if !ep.starts_with("http://") && !ep.starts_with("https://") {
+                return Err(format!("cannot parse env var {k}={ep}: invalid URI"));
+            }
+            return Ok(Some(JaegerTarget::HttpCollector(ep)));
         }
-        return Ok(Some(JaegerTarget::HttpCollector(ep)));
     }
     let has_agent_env = non_empty_trimmed_env("JAEGER_AGENT_HOST").is_some()
         || non_empty_trimmed_env("JAEGER_SAMPLER_MANAGER_HOST_PORT").is_some()
         || non_empty_trimmed_env("JAEGER_AGENT_PORT").is_some();
-    if !has_agent_env {
-        return Ok(None);
+    if has_agent_env {
+        let host =
+            non_empty_trimmed_env("JAEGER_AGENT_HOST").unwrap_or_else(|| "localhost".to_string());
+        let port =
+            non_empty_trimmed_env("JAEGER_AGENT_PORT").unwrap_or_else(|| "6831".to_string());
+        if port.parse::<u16>().is_err() {
+            return Err(format!("invalid JAEGER_AGENT_PORT={port:?}"));
+        }
+        return Ok(Some(JaegerTarget::UdpAgent { host, port }));
     }
-    let host = non_empty_trimmed_env("JAEGER_AGENT_HOST").unwrap_or_else(|| "localhost".to_string());
-    let port = non_empty_trimmed_env("JAEGER_AGENT_PORT").unwrap_or_else(|| "6831".to_string());
-    if port.parse::<u16>().is_err() {
-        return Err(format!("invalid JAEGER_AGENT_PORT={port:?}"));
+    if std::env::var("OTEL_TRACES_EXPORTER")
+        .ok()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("jaeger"))
+    {
+        return Ok(Some(JaegerTarget::HttpCollector(
+            "http://localhost:14268/api/traces".to_string(),
+        )));
     }
-    Ok(Some(JaegerTarget::UdpAgent { host, port }))
+    Ok(None)
 }
 
 /// Parses `OTEL_RESOURCE_ATTRIBUTES` (`k1=v1,k2=v2` with `%XX` URL-unescaping per OTel spec).
@@ -1393,21 +1450,25 @@ pub fn otlp_traces_endpoint_for_protocol(proto: OtlpProtocol) -> Option<String> 
     }
 }
 
-pub fn export_span(mut span: ExportedSpan) {
-    if let Some(rt) = global_tracing() {
-        if let Some(ref exp) = rt.exporter {
-            if !span.attributes.iter().any(|a| a.key == "jaeger-debug-id") {
-                let dbg = take_jaeger_debug_id(span.span_id)
-                    .or_else(|| current_trace_context().and_then(|c| c.jaeger_debug_id));
-                if let Some(dbg) = dbg {
-                    span.attributes.push(SpanAttribute {
-                        key: "jaeger-debug-id".to_string(),
-                        value: SpanAttrValue::String(dbg),
-                    });
-                }
+pub fn export_span_with_runtime(rt: &TracingRuntime, mut span: ExportedSpan) {
+    if let Some(ref exp) = rt.exporter {
+        if !span.attributes.iter().any(|a| a.key == "jaeger-debug-id") {
+            let dbg = take_jaeger_debug_id(span.span_id)
+                .or_else(|| current_trace_context().and_then(|c| c.jaeger_debug_id));
+            if let Some(dbg) = dbg {
+                span.attributes.push(SpanAttribute {
+                    key: "jaeger-debug-id".to_string(),
+                    value: SpanAttrValue::String(dbg),
+                });
             }
-            exp(span);
         }
+        exp(span);
+    }
+}
+
+pub fn export_span(span: ExportedSpan) {
+    if let Some(rt) = global_tracing() {
+        export_span_with_runtime(rt, span);
     }
 }
 
@@ -1940,6 +2001,14 @@ fn write_jaeger_batch<W: ThriftProtoWriter>(
                 key: "span.kind",
                 val: JaegerTagVal::StrRef("server"),
             }),
+            3 => tags.push(JaegerTag {
+                key: "span.kind",
+                val: JaegerTagVal::StrRef("client"),
+            }),
+            4 => tags.push(JaegerTag {
+                key: "span.kind",
+                val: JaegerTagVal::StrRef("producer"),
+            }),
             5 => tags.push(JaegerTag {
                 key: "span.kind",
                 val: JaegerTagVal::StrRef("consumer"),
@@ -2110,5 +2179,65 @@ mod tests {
         let (started, _) = start_server_span_context_with_runtime(&enabled_rt, &extracted, false);
         assert!(started.is_sampled());
         assert_eq!(started.trace_id_hex(), "4bf92f3577b34da6a3ce929d0e0e4736");
+    }
+
+    #[test]
+    fn jaeger_target_agent_beats_otel_exporter_default_and_jaeger_span_kinds_encode() {
+        static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clear = || {
+            for k in [
+                "JAEGER_ENDPOINT",
+                "OTEL_EXPORTER_JAEGER_ENDPOINT",
+                "JAEGER_AGENT_HOST",
+                "JAEGER_AGENT_PORT",
+                "JAEGER_SAMPLER_MANAGER_HOST_PORT",
+                "OTEL_TRACES_EXPORTER",
+            ] {
+                std::env::remove_var(k);
+            }
+        };
+        clear();
+        std::env::set_var("OTEL_TRACES_EXPORTER", "JAEGER");
+        std::env::set_var("JAEGER_AGENT_HOST", "127.0.0.1");
+        assert_eq!(
+            jaeger_target_from_env().unwrap(),
+            Some(JaegerTarget::UdpAgent {
+                host: "127.0.0.1".to_string(),
+                port: "6831".to_string(),
+            })
+        );
+        std::env::remove_var("JAEGER_AGENT_HOST");
+        assert_eq!(
+            jaeger_target_from_env().unwrap(),
+            Some(JaegerTarget::HttpCollector(
+                "http://localhost:14268/api/traces".to_string()
+            ))
+        );
+        assert!(validate_otel_exporter_env().is_ok());
+        std::env::set_var("OTEL_TRACES_EXPORTER", "OTLP");
+        assert!(validate_otel_exporter_env().is_ok());
+        assert_eq!(
+            otlp_traces_endpoint_for_protocol(OtlpProtocol::HttpProtobuf).as_deref(),
+            Some("http://localhost:4318/v1/traces")
+        );
+        clear();
+
+        let mk_span = |kind: u8| ExportedSpan {
+            service_name: "svc".to_string(),
+            trace_id: [0x11; 16],
+            span_id: [0x22; 8],
+            parent_span_id: None,
+            name: "op".to_string(),
+            kind,
+            start_time_unix_nano: 1_000_000,
+            end_time_unix_nano: 2_000_000,
+            attributes: Vec::new(),
+            status_error: false,
+        };
+        let client_bytes = encode_jaeger_thrift_batch_binary(&mk_span(3), &[]);
+        assert!(client_bytes.windows(6).any(|w| w == b"client"));
+        let producer_bytes = encode_jaeger_thrift_batch_binary(&mk_span(4), &[]);
+        assert!(producer_bytes.windows(8).any(|w| w == b"producer"));
     }
 }
