@@ -318,10 +318,11 @@ async fn w24_f8_f9_compartments_partition_ring_post_and_prefixed_root_head_405()
     assert_eq!(resp_f8.status(), StatusCode::METHOD_NOT_ALLOWED);
     let _ = resp_f8.into_body().collect().await.unwrap();
 
-    // F9: HEAD /mimir/ -> 405, empty body, no Allow header, route="other", no http.route span attr.
+    // F9: HEAD /mimir/ -> 404 (matching Go gorilla/mux subrouter), no Allow/Vary headers, route="other", no http.route span attr.
     let mut req_f9 = Request::builder()
         .method(Method::HEAD)
         .uri("/mimir/")
+        .header(http::header::ACCEPT_ENCODING, "gzip")
         .header(
             "traceparent",
             "00-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-5555555555555555-01",
@@ -332,10 +333,25 @@ async fn w24_f8_f9_compartments_partition_ring_post_and_prefixed_root_head_405()
         remote_addr: "127.0.0.1:9999".parse().unwrap(),
     });
     let resp_f9 = app.oneshot(req_f9).await.unwrap();
-    assert_eq!(resp_f9.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp_f9.status(), StatusCode::NOT_FOUND);
     assert!(!resp_f9.headers().contains_key(http::header::ALLOW));
+    assert!(!resp_f9.headers().contains_key(http::header::VARY));
+    assert_eq!(
+        resp_f9
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(
+        resp_f9
+            .headers()
+            .get(http::header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
     let body_f9 = resp_f9.into_body().collect().await.unwrap().to_bytes();
-    assert!(body_f9.is_empty());
+    assert!(body_f9.is_empty(), "HEAD /mimir/ body must be empty, got {body_f9:?}");
 
     let exported = spans.lock().clone();
     let s_f8 = exported

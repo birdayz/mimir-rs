@@ -210,16 +210,13 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         Router::new()
             .route(
                 &format!("{path_prefix}/"),
-                get_only(index_handler)
+                on(MethodFilter::GET, index_handler)
                     .with_state(state_for_root)
-                    .route_layer(axum::middleware::from_fn_with_state(
-                        path_prefix.clone(),
-                        reject_head_on_gorilla_mux_routes,
-                    ))
                     .route_layer(axum::middleware::from_fn_with_state(
                         gzip,
                         crate::server::gzip::gzip_handler,
-                    )),
+                    ))
+                    .head(prefixed_not_found_method_mismatch),
             )
             .nest(&path_prefix, app)
             .method_not_allowed_fallback(prefixed_not_found_method_mismatch)
@@ -1626,18 +1623,41 @@ mod tests {
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // 3. POST /mimir/ -> 404 (not 405).
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/mimir/")
-            .body(Body::empty())
-            .unwrap();
-        let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert!(resp
-            .extensions()
-            .get::<crate::server::http_middleware::MethodMismatch>()
-            .is_some());
+        // 3. POST /mimir/ and HEAD /mimir/ -> 404 (not 405), no Vary header.
+        for method in [Method::POST, Method::HEAD] {
+            let req = Request::builder()
+                .method(method.clone())
+                .uri("/mimir/")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} /mimir/");
+            assert!(
+                !resp.headers().contains_key(header::VARY),
+                "{method} /mimir/ must not include Vary header"
+            );
+            if method == Method::HEAD {
+                assert!(
+                    !resp.headers().contains_key(header::ALLOW),
+                    "{method} /mimir/ must not include Allow header"
+                );
+            }
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                Some("text/plain; charset=utf-8")
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(header::X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff")
+            );
+            assert!(resp
+                .extensions()
+                .get::<crate::server::http_middleware::MethodMismatch>()
+                .is_some());
+        }
 
         // 4. GET /mimir/ with gzip -> 200, gzipped, Vary: Accept-Encoding, relative hrefs.
         let req = Request::builder()

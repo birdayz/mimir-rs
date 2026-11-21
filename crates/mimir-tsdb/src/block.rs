@@ -622,6 +622,13 @@ impl Block {
     }
 }
 
+impl Drop for Block {
+    fn drop(&mut self) {
+        self.postings_cache
+            .remove_source(self.postings_cache_source_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1334,10 +1334,8 @@ impl Ingester {
                     let ex_start = exemplars_arena.len();
                     let mut ex_len = 0usize;
                     for ex in series.exemplars() {
+                        min_ts = min_ts.min(ex.timestamp_ms());
                         let res = convert_borrowed_exemplar(&ex);
-                        if let Ok(ref conv) = res {
-                            min_ts = min_ts.min(conv.0);
-                        }
                         exemplars_arena.push(res);
                         ex_len += 1;
                     }
@@ -5669,5 +5667,68 @@ mod wave3_tests {
             "expected SERIES_INVALID_LABEL, got: {utf8_err}"
         );
         assert_eq!(ing.metrics.ingested_exemplars_fail.get(), fail_before_utf8 + 1.0);
+    }
+
+    #[test]
+    fn w24_min_ts_includes_exemplar_timestamp_even_when_exemplar_labels_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-0".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = dir.path().to_string_lossy().to_string();
+        let limits = mimir_config::LimitsConfig::default();
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(limits),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let db = ing.get_or_create_tsdb("t-ex-mints").unwrap();
+        let (ok, _) = db.change_state_to_forced_compaction(crate::user_tsdb::TsdbState::Active, 100);
+        assert!(ok);
+
+        let lp = |n: &'static str, v: &'static str| cortexpb::LabelPair {
+            name: bytes::Bytes::from_static(n.as_bytes()),
+            value: bytes::Bytes::from_static(v.as_bytes()),
+        };
+
+        // Sample timestamp (200) is > forced compaction watermark (100), but the exemplar
+        // timestamp (50) is <= 100 and its label value has invalid UTF-8. Matching Go
+        // WriteRequest.MinTimestamp(), min_ts must still be 50 and fail acquire_append_lock.
+        let req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("__name__", "ex_min_ts_metric")],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: 200,
+                    value: 1.0,
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![cortexpb::LabelPair {
+                        name: bytes::Bytes::from_static(b"trace_id"),
+                        value: bytes::Bytes::from_static(&[0xff, 0xfe]),
+                    }],
+                    value: 1.0,
+                    timestamp_ms: 50,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = ing
+            .push_grpc_raw_sync("t-ex-mints", &req.encode_to_vec())
+            .unwrap_err();
+        assert_eq!(err.http_status_code(), 503);
+        assert!(
+            err.to_string().contains("TSDB Head early compaction in progress"),
+            "expected early compaction TsdbUnavailable from acquire_append_lock(50), got: {err}"
+        );
     }
 }

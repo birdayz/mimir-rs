@@ -505,6 +505,45 @@ impl PostingsForMatchersCache {
         self.invalidate_metric_for_source(0, metric_name);
     }
 
+    /// Returns `true` if `source_epochs` is non-empty (requiring a read lock on the query path).
+    #[inline]
+    pub fn has_source_epochs(&self) -> bool {
+        self.has_source_epochs.load(Ordering::Acquire)
+    }
+
+    /// Removes `source_id` from `source_epochs` and purges any cached entries belonging to it
+    /// (called when a `Head` or `Block` is dropped). Resets `has_source_epochs` to `false` once
+    /// no per-source epochs remain so the query hot path avoids acquiring `source_epochs.read()`.
+    pub fn remove_source(&self, source_id: u64) {
+        if self.has_source_epochs.load(Ordering::Acquire) {
+            let mut epochs = self.source_epochs.write();
+            if epochs.remove(&source_id).is_some() && epochs.is_empty() {
+                self.has_source_epochs.store(false, Ordering::Release);
+            }
+        }
+        if self.shared() {
+            let mut inner = self.inner.write();
+            let mut removed_entries = 0usize;
+            let mut removed_bytes = 0usize;
+            inner.table.retain(|e| {
+                if e.source_id == source_id {
+                    removed_entries += 1;
+                    removed_bytes += e.size_bytes;
+                    false
+                } else {
+                    true
+                }
+            });
+            inner.total_bytes = inner.total_bytes.saturating_sub(removed_bytes);
+            if removed_entries > 0 {
+                if let Some(ref m) = self.metrics {
+                    m.entries.sub(removed_entries as f64);
+                    m.bytes.sub(removed_bytes as f64);
+                }
+            }
+        }
+    }
+
     /// Invalidates all cached entries belonging to `source_id` (without disturbing other
     /// sources in a shared cache).
     pub fn invalidate_source(&self, source_id: u64) {
@@ -1481,5 +1520,37 @@ mod tests {
         cache.get_or_compute::<_, ()>(&m2, true, || Ok(vec![3])).unwrap(); // runs expire(), evicts m1, inserts m2
         assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_evictions_total", Some("ttl-expired")), 1.0);
         assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_entries_total", None), 1.0);
+    }
+
+    #[test]
+    fn remove_source_prunes_epoch_and_clears_has_source_epochs_when_empty() {
+        let cache = PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            ttl: Duration::from_secs(60),
+            enable_invalidation: true,
+            num_metric_versions: 64,
+            ..Default::default()
+        });
+        cache.set_eligibility(true, true);
+        assert!(!cache.has_source_epochs());
+
+        let s1 = next_postings_cache_source_id();
+        let s2 = next_postings_cache_source_id();
+        let m_up = [LabelMatcher::new(MatchType::Equal, "__name__", "up").unwrap()];
+        cache.get_or_compute_for_source::<_, ()>(s1, &m_up, true, || Ok(vec![1])).unwrap();
+        cache.get_or_compute_for_source::<_, ()>(s2, &m_up, true, || Ok(vec![2])).unwrap();
+
+        cache.invalidate_source(s1);
+        assert!(cache.has_source_epochs());
+        assert_eq!(cache.source_epochs.read().len(), 1);
+
+        // Removing an unrelated source leaves s1's epoch intact.
+        cache.remove_source(s2);
+        assert!(cache.has_source_epochs());
+        assert_eq!(cache.source_epochs.read().len(), 1);
+
+        // Removing s1 clears source_epochs and resets has_source_epochs to false.
+        cache.remove_source(s1);
+        assert!(!cache.has_source_epochs());
+        assert!(cache.source_epochs.read().is_empty());
     }
 }

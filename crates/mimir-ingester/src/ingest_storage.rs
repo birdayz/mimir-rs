@@ -952,10 +952,8 @@ impl IngesterShardedBatchConsumer {
                             if ts.exemplars_len() > 0 {
                                 tmp_ex.clear();
                                 for ex in ts.exemplars() {
+                                    min_ts = min_ts.min(ex.timestamp_ms());
                                     let res = convert_borrowed_exemplar(&ex);
-                                    if let Ok(ref conv) = res {
-                                        min_ts = min_ts.min(conv.0);
-                                    }
                                     tmp_ex.push(res);
                                     ex_len += 1;
                                 }
@@ -1247,10 +1245,8 @@ impl IngesterShardedBatchConsumer {
                     if ts.exemplars().len() > 0 {
                         tmp_ex.clear();
                         for ex in ts.exemplars() {
+                            min_ts = min_ts.min(ex.timestamp_ms());
                             let res = convert_borrowed_exemplar(&ex);
-                            if let Ok(ref conv) = res {
-                                min_ts = min_ts.min(conv.0);
-                            }
                             tmp_ex.push(res);
                             ex_len += 1;
                         }

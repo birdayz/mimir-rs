@@ -4206,8 +4206,6 @@ impl Head {
         }
 
         self.postings.ensure_order_parallel();
-        self.postings_cache
-            .invalidate_source(self.postings_cache_source_id);
 
         // Go `Head.Init` deferred order (LIFO): clamp `min_time` to `min_valid_time` BEFORE `gc`,
         // then run `gc(self.min_time())` so sample-less series replayed when uninitialized
@@ -10479,6 +10477,8 @@ impl Head {
 impl Drop for Head {
     fn drop(&mut self) {
         let _ = self.close();
+        self.postings_cache
+            .remove_source(self.postings_cache_source_id);
     }
 }
 
@@ -17319,5 +17319,36 @@ mod tests {
 
         head0.close().unwrap();
         head1.close().unwrap();
+    }
+
+    #[test]
+    fn shared_postings_cache_skips_source_epochs_on_fresh_head_open_and_prunes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared_cache = Arc::new(PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            enable_invalidation: true,
+            num_metric_versions: 64,
+            ..Default::default()
+        }));
+        shared_cache.set_eligibility(true, true);
+
+        let opts = HeadOptions {
+            shared_postings_cache: Some(Arc::clone(&shared_cache)),
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        assert!(
+            !shared_cache.has_source_epochs(),
+            "fresh Head::open must not populate source_epochs on shared postings_cache"
+        );
+
+        let source_id = head.postings_cache_source_id;
+        shared_cache.invalidate_source(source_id);
+        assert!(shared_cache.has_source_epochs());
+
+        drop(head);
+        assert!(
+            !shared_cache.has_source_epochs(),
+            "Head::drop must prune source_id from shared postings_cache.source_epochs"
+        );
     }
 }
