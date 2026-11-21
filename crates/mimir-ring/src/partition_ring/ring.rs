@@ -559,7 +559,7 @@ impl PartitionRing {
         let non_pending_partitions_count = sub_desc.non_pending_partitions_count();
         let max_partition_id = sub_desc.max_partition_id();
 
-        if partitions.len() == self.desc.partitions.len() {
+        if sub_desc.partitions.len() == self.desc.partitions.len() {
             return Ok(Arc::new(Self {
                 desc: sub_desc,
                 ring_tokens: self.ring_tokens.clone(),
@@ -872,5 +872,47 @@ mod tests {
             }
             CacheStorage::Unbounded(_) => panic!("expected bounded LRU"),
         }
+    }
+
+    #[test]
+    fn w24_b06_with_partitions_unknown_id_same_len_preserves_invariants() {
+        let mut desc = PartitionRingDesc::default();
+        desc.partitions.insert(
+            0,
+            PartitionDesc {
+                state: PartitionState::PartitionActive as i32,
+                tokens: vec![100, 300],
+                ..Default::default()
+            },
+        );
+        desc.partitions.insert(
+            1,
+            PartitionDesc {
+                state: PartitionState::PartitionActive as i32,
+                tokens: vec![200, 400],
+                ..Default::default()
+            },
+        );
+        let ring = PartitionRing::with_options(
+            desc,
+            PartitionRingOptions {
+                token_generator: None,
+                shuffle_shard_cache_size: 0,
+            },
+        )
+        .unwrap();
+
+        // Same cardinality as self.desc.partitions (2), but contains unknown partition 2 instead of 1.
+        let sub = ring.with_partitions(&HashSet::from([0, 2])).unwrap();
+        let pids: Vec<i32> = sub.partition_ids().into_iter().collect();
+        assert_eq!(pids, vec![0]);
+
+        let counts = sub.count_tokens();
+        assert_eq!(counts.get(&0).copied(), Some(u32::MAX as i64 + 1));
+        assert!(!counts.contains_key(&1));
+        assert!(!counts.contains_key(&2));
+
+        let sharded = sub.shuffle_shard("tenant-a", 1).unwrap();
+        assert_eq!(sharded.partition_ids(), vec![0]);
     }
 }

@@ -213,6 +213,7 @@ pub struct HttpMiddlewareConfig {
     pub cluster_validation: Option<HttpClusterValidation>,
     pub http_path_prefix: String,
     pub cost_attribution_path: Option<String>,
+    pub compartments_enabled: bool,
 }
 
 /// Checks BEFORE `inflight`, `check_cluster`, and OTel span creation whether the matched Axum
@@ -239,8 +240,15 @@ fn is_method_mismatch_before_run(req: &Request, cfg: &HttpMiddlewareConfig) -> b
         | "/debug/pprof/*name"
         | "/debug/pprof/profile"
         | "/debug/pprof/symbol" => false,
-        "/ingester/flush" | "/ingester/ring" | "/ingester/partition-ring" => {
+        "/ingester/flush" | "/ingester/ring" => {
             !matches!(*m, http::Method::GET | http::Method::POST)
+        }
+        "/ingester/partition-ring" => {
+            if cfg.compartments_enabled {
+                *m != http::Method::GET
+            } else {
+                !matches!(*m, http::Method::GET | http::Method::POST)
+            }
         }
         p if p.starts_with("/ingester/partition-ring/compartment-") => {
             !matches!(*m, http::Method::GET | http::Method::POST)
@@ -692,6 +700,7 @@ mod tests {
             cluster_validation: Some(cv),
             http_path_prefix: String::new(),
             cost_attribution_path: None,
+            compartments_enabled: false,
         });
 
         let inflight_seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));

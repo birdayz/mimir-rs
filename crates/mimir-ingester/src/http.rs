@@ -341,8 +341,8 @@ async fn prepare_shutdown_handler(
     let marker_path = shutdownmarker::get_path(&st.ingester.blocks_cfg.tsdb.dir);
     match method {
         Method::GET => match shutdownmarker::exists(&marker_path) {
-            Ok(true) => (StatusCode::OK, "set\n").into_response(),
-            Ok(false) => (StatusCode::OK, "unset\n").into_response(),
+            Ok(true) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain")], "set\n").into_response(),
+            Ok(false) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain")], "unset\n").into_response(),
             Err(err) => {
                 tracing::error!(
                     path = %marker_path.display(),

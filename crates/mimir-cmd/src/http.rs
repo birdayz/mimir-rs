@@ -210,8 +210,12 @@ pub fn build_http_router(state: AppHttpState) -> Router {
         Router::new()
             .route(
                 &format!("{path_prefix}/"),
-                on(MethodFilter::GET, index_handler)
+                get_only(index_handler)
                     .with_state(state_for_root)
+                    .route_layer(axum::middleware::from_fn_with_state(
+                        path_prefix.clone(),
+                        reject_head_on_gorilla_mux_routes,
+                    ))
                     .route_layer(axum::middleware::from_fn_with_state(
                         gzip,
                         crate::server::gzip::gzip_handler,
@@ -257,28 +261,25 @@ async fn prefixed_not_found_method_mismatch() -> Response {
 
 async fn ready_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
     if st.shutdown_requested.load(Ordering::Acquire) {
-        return (StatusCode::SERVICE_UNAVAILABLE, "Application is stopping\n").into_response();
+        return go_http_error(StatusCode::SERVICE_UNAVAILABLE, "Application is stopping");
     }
 
     // Go: `if !sm.IsHealthy()` lists every module service that is not Running, one
     // "<module>: <state>" per line (pkg/mimir/mimir.go readyHandler).
     let not_running = st.modules.not_running();
     if !not_running.is_empty() {
-        // http.Error appends a trailing newline.
-        return (
+        return go_http_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("Some services are not Running:\n{}\n", not_running.join("\n")),
-        )
-            .into_response();
+            &format!("Some services are not Running:\n{}", not_running.join("\n")),
+        );
     }
 
     if let Some(ref ing) = st.ingester {
         if let Err(err) = ing.check_ready().await {
-            return (
+            return go_http_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("Ingester not ready: {err}\n"),
-            )
-                .into_response();
+                &format!("Ingester not ready: {err}"),
+            );
         }
     }
 
@@ -1830,5 +1831,84 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
         assert_eq!(body, "too many tenant IDs present in the request. max: 2 actual: 3\n");
+    }
+
+    #[tokio::test]
+    async fn w24_b08_ready_503_nosniff_and_prepare_shutdown_content_type() {
+        // 1. /ready 503 when module not running -> X-Content-Type-Options: nosniff + text/plain; charset=utf-8.
+        let mut st = test_state("", false);
+        let mods = ModuleStates::new();
+        let cell = crate::modules::StateCell::new(State::Starting);
+        mods.add("ingester", cell.state_fn());
+        st.modules = mods;
+        let router = build_http_router(st.clone());
+        let resp = router
+            .oneshot(Request::builder().method(Method::GET).uri("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "text/plain; charset=utf-8");
+
+        // 2. /ready 503 when shutdown_requested -> X-Content-Type-Options: nosniff.
+        let st_shut = test_state("", false);
+        st_shut.shutdown_requested.store(true, Ordering::Release);
+        let router_shut = build_http_router(st_shut);
+        let resp = router_shut
+            .oneshot(Request::builder().method(Method::GET).uri("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "text/plain; charset=utf-8");
+
+        // 3. /ready 503 when ingester not ready + GET /ingester/prepare-shutdown Content-Type: text/plain.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = MimirConfig::default();
+        cfg.ingester.ring.instance_id = "test-0".to_string();
+        cfg.blocks_storage.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = mimir_ingester::Ingester::new(
+            cfg.ingester.clone(),
+            cfg.blocks_storage.clone(),
+            cfg.ingest_storage.clone(),
+            Overrides::new(cfg.limits.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut st_ing = test_state("", false);
+        st_ing.ingester = Some(Arc::clone(&ing));
+        let router_ing = build_http_router(st_ing);
+
+        // Ingester in State::New -> check_ready() fails -> 503 with nosniff.
+        let resp = router_ing
+            .clone()
+            .oneshot(Request::builder().method(Method::GET).uri("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "text/plain; charset=utf-8");
+
+        // Ingester Running -> GET /ingester/prepare-shutdown emits Content-Type: text/plain (matching Go util.WriteTextResponse).
+        ing.set_state_for_test(State::Running);
+        let resp = router_ing
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/ingester/prepare-shutdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "text/plain");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"unset\n");
     }
 }
