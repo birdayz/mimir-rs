@@ -421,7 +421,7 @@ fn shuffle_by_weight(addrs: &mut [Srv], rng: &mut impl Rng) {
     }
 }
 
-/// Port of Go `net.byPriorityWeight.sort` (RFC 2782).
+/// Port of Go `net.dnsConfig.nameList` (`net/dnsclient_unix.go`).
 fn build_go_search_candidates(
     raw_host: &str,
     name: &Name,
@@ -463,6 +463,7 @@ fn build_go_search_candidates(
     out
 }
 
+/// Port of Go `net.byPriorityWeight.sort` (RFC 2782).
 fn sort_by_priority_weight(addrs: &mut [Srv], rng: &mut impl Rng) {
     addrs.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.weight.cmp(&b.weight)));
     let mut i = 0;

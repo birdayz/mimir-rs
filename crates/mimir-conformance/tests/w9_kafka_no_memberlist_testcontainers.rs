@@ -403,22 +403,34 @@ async fn push_via_distributor(
 ) -> Result<()> {
     let raw = req.encode_to_vec();
     let compressed = snap::raw::Encoder::new().compress_vec(&raw)?;
-    let resp = client
-        .post(format!("http://127.0.0.1:{dist_http_port}/api/v1/push"))
-        .header("Content-Type", "application/x-protobuf")
-        .header("Content-Encoding", "snappy")
-        .header("X-Prometheus-Remote-Write-Version", "0.1.0")
-        .header(LOWER_ORG_ID_HEADER_NAME, tenant)
-        .body(compressed)
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await?;
-    ensure!(
-        status.is_success(),
-        "POST /api/v1/push failed ({status}): {body}"
-    );
-    Ok(())
+    // Go Distributor's PartitionRingWatcher runs an independent rate-limited KV watch (e.g.
+    // Consul watch_rate_limit = 1/s) and has no /ingester/partition-ring HTTP endpoint to poll,
+    // so it can observe PartitionActive up to ~1-2s after Go Querier / Ingester does.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let resp = client
+            .post(format!("http://127.0.0.1:{dist_http_port}/api/v1/push"))
+            .header("Content-Type", "application/x-protobuf")
+            .header("Content-Encoding", "snappy")
+            .header("X-Prometheus-Remote-Write-Version", "0.1.0")
+            .header(LOWER_ORG_ID_HEADER_NAME, tenant)
+            .body(compressed.clone())
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        if status.as_u16() == 500
+            && body.contains("no active partition found")
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        anyhow::bail!("POST /api/v1/push failed ({status}): {body}");
+    }
 }
 
 async fn querier_get_json(
