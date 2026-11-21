@@ -1,9 +1,9 @@
-# Hetzner Cloud Mixed Go + Rust Mimir Cluster Stress Report (Pass 4)
+# Hetzner Cloud Mixed Go + Rust Mimir Cluster Stress Report (Pass 5)
 
-**Date:** 2026-11-18
-**Total Active Benchmark Duration:** 71.53 minutes (`4,291.7 s` across Stages 1A, 1B, 2, 3, 4A, 4B, 4C; total written samples: **879,299,053**)
+**Date:** 2026-11-21
+**Total Active Benchmark Duration:** 72.83 minutes (`4,369.6 s` across Stages 1A, 1B, 2, 3, 4A, 4B, 4C; total written samples: **877,824,384**)
 **Images Tested:**
-- **Rust (`mimir-rs`):** `ghcr.io/birdayz/mimir-rs:13b2226abb57422c6241108bebaa8114d9aabd51` (`rustc 1.100.0`, `linux/amd64`)
+- **Rust (`mimir-rs`):** `ghcr.io/birdayz/mimir-rs:0bbd40e212861989813e3e00994a182dac095fd5` (`rustc 1.100.0`, `linux/amd64`, post-Waves 15–23 / 211 bug & parity fixes)
 - **Upstream Go Mimir:** `docker.io/grafana/mimir:latest` (`version=3.2.6`, `revision=634964f9`, `go1.26.11`, `linux/amd64`)
 - **Kafka Broker:** `docker.io/redpandadata/redpanda:latest`
 - **Object Storage (S3):** `docker.io/bitnamilegacy/minio:latest`
@@ -16,157 +16,130 @@ Provisioned on Hetzner Cloud (`fsn1`, `ubuntu-24.04`) on isolated private networ
 
 | Hostname | Role / Zone | Server Type | vCPU / RAM / Kernel | Private IP | Software |
 |---|---|---|---|---|---|
-| `mimir-stress-ing-1` | Ingester 1 (`zone-a`) | `cpx32` | 4 vCPU (AMD EPYC-Genoa) / 7,745 MiB / `6.8.0-138-generic` | `10.88.0.11` | `mimir-rs:13b2226` |
-| `mimir-stress-ing-2` | Ingester 2 (`zone-b`) | `cpx32` | 4 vCPU (AMD EPYC-Genoa) / 7,745 MiB / `6.8.0-138-generic` | `10.88.0.12` | `mimir-rs:13b2226` |
+| `mimir-stress-ing-1` | Ingester 1 (`zone-a`) | `cpx32` | 4 vCPU (AMD EPYC-Genoa) / 7,745 MiB / `6.8.0-138-generic` | `10.88.0.11` | `mimir-rs:0bbd40e` |
+| `mimir-stress-ing-2` | Ingester 2 (`zone-b`) | `cpx32` | 4 vCPU (AMD EPYC-Genoa) / 7,745 MiB / `6.8.0-138-generic` | `10.88.0.12` | `mimir-rs:0bbd40e` |
 | `mimir-stress-ing-3` | Ingester 3 (`zone-c`) | `cpx32` | 4 vCPU (AMD EPYC-Genoa) / 7,745 MiB / `6.8.0-138-generic` | `10.88.0.13` | `grafana/mimir:3.2.6` |
 | `mimir-stress-go-stack` | Go Stack + Redpanda + MinIO | `ccx43` | 16 dedicated vCPU (AMD EPYC-Milan) / 62,784 MiB / `6.8.0-138-generic` | `10.88.0.20` | Go Mimir (`distributor`, `query-frontend`, `query-scheduler`, `querier`, `store-gateway`, `compactor`), Redpanda (`:9092`), MinIO (`:9000`) |
-| `mimir-stress-loadgen` | Loadgen + PromQL + Scraper | `ccx43` | 16 dedicated vCPU (AMD EPYC-Milan) / 62,784 MiB / `6.8.0-138-generic` | `10.88.0.30` | Custom Go `stress-loadgen` + 5s cgroup/proc/metrics scraper |
+| `mimir-stress-loadgen` | Loadgen + PromQL + Deep Scraper | `ccx43` | 16 dedicated vCPU (AMD EPYC-Milan) / 62,784 MiB / `6.8.0-147-generic` | `10.88.0.30` | Custom Go `stress-loadgen` + 5s cgroup/`smaps_rollup`/`/proc/<pid>/io`/`/metrics` scraper + `pprof`/`fgprof` collector |
 
 All Mimir services communicate over `10.88.0.0/24` using `memberlist` TCP gossip (`7941..7947`), with `replication_factor: 3` and `zone_awareness_enabled: true`.
 
 ---
 
-## 2. Summary of Pass 4 Findings
+## 2. Key Deep-Telemetry Discoveries in Pass 5 (`0bbd40e`)
 
-1. **Pass 3 Reliability Fixes Verified in `mimir-rs:13b2226`:**
-   - **Stage 2 Live Flush (0 deadlocks):** Under active `150k samples/s` + `20 req/s` load, both Rust `ing-1` (**58.74 s**, `HTTP 204`, `2,077.3 -> 2,969.4 -> 1,138.3 MB RssAnon`) and `ing-2` (**74.27 s**, `HTTP 204`, `2,298.0 -> 4,700.5 -> 1,131.5 MB RssAnon`) completed compaction/flush and caught up in lockstep to `offset=510,680` with **0 restarts** and **0 deadlocks**. Go `ing-3` was OOM-killed during Stage 2 flush (`7.26 GB RssAnon`, `http_code=0`, `4` restarts).
-   - **Stage 3 Redpanda Restart Recovery (0 unhandled `fetcher.rs` errors):** During `docker restart redpanda` (`1,419.3 ms`), both `ing-1` and `ing-2` logged retryable `fetcher.rs:1132` errors (`connection refused`, `FencedLeaderEpoch`, `NotLeaderOrFollower`), reconnected automatically within 5 s, and advanced in lockstep to `offset=607,084` with **0 unhandled `fetcher.rs:363` errors** and **0 unexpected restarts**.
-   - **`/ingester/prepare-shutdown` Parity in Classic Push Mode:** `POST /ingester/prepare-shutdown` returned `204` (`cortex_ingester_prepare_shutdown_requested = 1`), `GET` returned `200` (`body=set`), and `DELETE /ingester/prepare-shutdown` returned `204` (`cortex_ingester_prepare_shutdown_requested = 0`, `/ready = 200`).
+1. **Zero NVMe Page-Cache Thrashing on Rust vs `152 GiB` Physical Disk Reads & `2.20M` Major Page Faults on Go:**
+   - Collecting `/proc/<pid>/io`, `/proc/<pid>/smaps_rollup`, and cgroup v2 `memory.stat` (`pgmajfault`) across all stages exposed a second-order consequence of Go's `3.1x–3.3x` higher `RssAnon` on 8 GB nodes:
+     - **End of Stage 1B (35m Kafka soak + 1M-series unthrottled scans):** Rust `ing-1` and `ing-2` held `1,969.4 / 1,891.4 MB RssAnon`, leaving `> 5.5 GB` of host RAM for `chunks_head` mmap page cache -> **`0.0 MB` physical disk `read_bytes` and `0` major page faults (`pgmajfault = 0`)**. Go `ing-3` held `6,704.2 MB RssAnon` on the same `7,745 MiB` VM, starving the Linux page cache and forcing **`87,128.1 MB` (`85.1 GiB`) of physical NVMe reads and `1,259,493` major page faults**.
+     - **End of Stage 2 (45m cumulative):** Go `ing-3` reached **`155,733.9 MB` (`152.1 GiB`) physical disk reads and `2,196,405` major page faults**, vs `4.9–10.7 GB` (compaction reads only) and `9k–73k` major faults on Rust `ing-1`/`ing-2`.
+     - **End of Stage 4B (Classic Push 2.5M series):** Go `ing-3` thrashed **`106,635.2 MB` (`104.1 GiB`) of NVMe reads and `1,006,476` major page faults** before kernel `oom-kill` (`anon-rss: 7,555,032 kB`), while Rust `ing-1` and `ing-2` recorded **`2.4 MB` and `13.1 MB` physical disk reads (`29–130` major faults)** all the way through `3,500,000` series in Stage 4C with **0 OOMs and 0 restarts**.
 
-2. **Zero OOM Kills and Zero Unplanned Restarts on Rust vs 35+ Kernel OOM Kills on Go:**
-   - **Stage 1A (25m Kafka `ingest_storage`, 1M series + 300k churn at `200k/s` + `30 req/s`):** Coprime OOO modulo (`503`) produced `count_exact == 1,000,000` from `t=20s` through `t=1515s` (`99` checks, `count_mismatch = 0`). Rust `ing-1`/`ing-2` averaged **2.35-2.82 cores** and **1.57-1.61 GB `RssAnon`** (`3.15-3.16 GB` peak) with **0 write errors** (`300.35M` samples) and **0 query errors** (`37,983` queries), vs Go `ing-3` at **3.32 cores** and **4.87 GB avg / 6.85 GB peak `RssAnon`** (**3.07x** higher average RAM).
-   - **Stage 1B (10m unthrottled 1M-series `count_exact` scan):** Both Rust ingesters completed all 10 minutes with **0 restarts / 0 OOMs** (**2.12-2.40 avg cores**, **1.89-1.97 GB avg / 2.64-2.75 GB peak `RssAnon`**, `count_mismatch = 0`), whereas Go `ing-3` averaged **6.14 GB `RssAnon`** (`7.27 GB` peak) and was **OOM-killed twice** (`7.54-7.55 GB anon-rss`).
-   - **Stage 4A/4B/4C (Classic gRPC `Push`, RF=3, Snappy, 1M -> 2.5M -> 3.5M series at `300k/s`):**
-     - **4A (1.0M series, 5m):** `285.8k/s`, **0 write errors**, **0 query errors** (`4,522` queries, `count_mismatch=0`). Rust `ing-1`/`ing-2` used **1.12-1.18 GB avg / 1.51-1.58 GB peak `RssAnon`** vs Go `ing-3` at **3.87 GB avg / 5.09 GB peak `RssAnon`** (**3.36x** less average RAM).
-     - **4B (2.5M series, 5m):** `292.0k/s`, Rust held **2.41-2.73 GB avg / 3.87-4.05 GB peak `RssAnon`** with **0 restarts**, while Go `ing-3` peaked at **7.18 GB `RssAnon`** and entered a WAL-replay OOM loop (`7.49 GB anon-rss`).
-     - **4C (3.5M series, 5m ceiling test):** Both Rust nodes sustained **300.0k samples/s** (`299,986.5/s`, **0 write errors**, `p50 = 11.91 ms`) with **0 restarts** at **0.56-0.73 avg cores (16% CPU)** and **3.43-3.47 GB avg / 3.81-3.85 GB peak `RssAnon`**, while Go `ing-3` used **1.51 avg cores** and was OOM-killed (`7.49 GB anon-rss`).
+2. **Server-Side `cortex.Ingester/QueryStream` Latency Is `2.7x` Faster in Steady State & `6.3x` Faster Under Scan Storms:**
+   - Directly scraping `cortex_request_duration_seconds_{sum,count}{route="/cortex.Ingester/QueryStream"}` on each ingester isolates per-pod gRPC read execution from querier/frontend fanout:
+     - **Stage 1A (`~81,500` `QueryStream`s/pod):** Rust `ing-1` **`68.15 ms`**, Rust `ing-2` **`60.28 ms`** vs Go `ing-3` **`172.38 ms`** (**`2.69x` faster**; `LabelValuesCardinality`: Rust **`2.51–2.98 ms`** vs Go **`27.95 ms` = `10.2x` faster**).
+     - **Stage 1B delta (`~5,500` heavy `QueryStream`s/pod during unthrottled 1M `count_exact`):** Rust `ing-1` **`404.3 ms`**, Rust `ing-2` **`389.3 ms`** vs Go `ing-3` **`2,505.8 ms`** (**`6.32x` faster**).
+
+3. **Pass 4 -> Pass 5 (`0bbd40e`) Improvements Across Waves 15–23:**
+   - **Stage 1A:** Served **`40,566` PromQL queries (`0` errors)** vs `37,983` in Pass 4; `count_exact` p99 dropped **`4.26x`** (`48,698 ms -> 11,423 ms`, max `12,469 ms`); Rust avg `RssAnon` dropped from `1,567–1,606 MB` to **`1,476–1,526 MB`** (`3.14x` below Go's `4,710 MB`) and avg CPU dropped to **`2.09–2.42` cores** (vs Go `3.39` cores).
+   - **Stage 1B:** Served **`2,311` PromQL queries (`269` full 1M-series `count_exact` scans, `mismatch = 0`)** vs `1,859` (`198` scans) in Pass 4 (**`+24.3%` higher read throughput**); `/api/v1/series` p95 improved **`4.6x`** (`8,808 -> 1,914 ms`) and `cardinality` p99 improved **`8.0x`** (`5,882 -> 732 ms`).
+   - **Stage 2 Live Flush:** Served **`4,514` PromQL queries** vs `1,396` in Pass 4 (**`3.23x` more reads completed during compaction**), `ing-2` live flush completed in **`47.01 s`** (`HTTP 204`, `2,349.5 -> 2,592.9 -> 1,093.1 MB RssAnon`, vs `74.27 s` in Pass 4), `6` ULID blocks uploaded to S3 (`201` Go `compactor` runs, `0` failures; `6` blocks loaded by Go `store-gateway`, `0` load/bucket failures).
+   - **Stage 3 Chaos:** `20s SIGKILL` of `ing-1` caused **`0` write errors**; `ing-1` replayed its 1.09M-series WAL to `/ready = 200` in **`62,023.5 ms` (`62.02 s`, `11.6 s` faster than Pass 4's `73.60 s`)** and hit `0`-lag (`offset = 533,620 / 533,628`) at **`62,038.7 ms`** (`15.2 ms` after `/ready`!). During `docker restart redpanda` (`1,503 ms`), transient write errors dropped **`2x`** (`64` vs `128` in Pass 4, `0` thereafter), and all 3 ingesters converged to exact lockstep `offset = 606,447`.
+   - **Stage 4A/4B/4C Classic gRPC `Push`:** **`0` write errors across all three sub-stages (`270.8M` samples)** — including **`0` write errors at `2.5M` series in Stage 4B** (vs `251` in Pass 4) with `4.5x` lower write p50 (`10.22 ms` vs `46.48 ms`) and `3.7x` lower Stage 4C write p99 (`54.25 ms` vs `199.53 ms` at `3.5M` series / `300.0k samples/s`).
+
+4. **Why End-to-End PromQL Latency Rose in Stage 3 & Stage 4A/4B (`store-gateway` 6-Block S3 Bottleneck):**
+   - Because Go `ing-3` survived Stage 2 in Pass 5, all 3 ingesters uploaded 2 blocks each (`6` un-deduplicated 1.3M-series ULID blocks in MinIO `mimir-blocks/prod/`, vs `4` in Pass 4), `go-stack-push.yaml` sets `querier.query_store_after: 0s`, and `start-push-cluster.sh` stops `compactor` without clearing `mimir-blocks/prod/`. Server-side `store-gateway` metrics confirm every PromQL query fanned out to `/gatewaypb.StoreGateway/Series` across all 6 S3 blocks (`3,090 ms` mean + `47` `Unknown` / `33` `Canceled` on `store-gateway`), while Rust `ing-1`/`ing-2` sat at just `0.53–1.00` cores.
 
 ---
 
-## 3. Stage-by-Stage Results
+## 3. Stage-by-Stage Results (Pass 5)
 
-### Stage 1A: 25 Minutes (1,500 s) Sustained Kafka `ingest_storage` (RF=3, Partition 0)
+### Stage 1A: 25 Minutes (`1,515 s`) Sustained Kafka `ingest_storage` (RF=3, Partition 0)
 
-- **Workload:** `1,000,000` active 10-label series (`container_cpu_usage_seconds_total`), `200,000 samples/s`, `0.2%` OOO (`-5m` within `30m` window, coprime modulo `503`), `200 series/s` churn (`k8s_pod_churn_metric`), `MetricMetadata`, `30 req/s` mixed PromQL across 9 endpoints plus periodic `15s` `count_exact`.
-- **Writes:** `300,346,046` samples (`198,247.2 samples/s` avg), `300,046` batches OK, **`0` write errors**, `596,000` OOO samples, `300,046` churn series, `p50 = 37.00 ms`, `p95 = 60.38 ms`, `p99 = 65.24 ms`.
-- **PromQL Reads:** `37,983` OK, `0` errors, `count_checks = 99`, `last_count = 1,000,000`, `count_mismatch = 0` from `t=20s` onward.
-- **CPU Profile Captured:** 15-second `/debug/pprof/profile?seconds=15` captured mid-Stage-1A (`t~710s`) from `ing-1` (`Duration: 15s, Total samples = 29.32s (195.44%)`).
+- **Writes:** `300,416,116` samples (`198,293.9/s` avg), **`0` write errors**, `p50 = 36.44 ms`, `p95 = 59.80 ms`, `p99 = 64.69 ms`.
+- **PromQL Reads:** `40,566` OK, **`0` errors**, `count_checks = 101`, `last_count = 1,000,000`, **`count_mismatch = 0`**.
 
-| Node (4 vCPU / 8 GB) | Engine | Avg Cores | Max Cores | Avg `RssAnon` | Peak `RssAnon` | Peak `VmRSS` | Restarts | Final Offset | Final `memory_series` |
+| Node (4 vCPU / 7.75 GiB) | Engine | Avg Cores | Max Cores | Avg `RssAnon` | Peak `RssAnon` | `QueryStream` Mean | `io_read` / `pgmajfault` | Restarts | Final Offset |
 |---|---|---|---|---|---|---|---|---|---|
-| `ing-1` (`10.88.0.11`) | Rust `mimir-rs:13b2226` | **2.35** | 3.30 | **1,606.4 MB** | **3,160.8 MB** | 4,030.5 MB | 0 | 299,984 | 1,299,996 |
-| `ing-2` (`10.88.0.12`) | Rust `mimir-rs:13b2226` | **2.82** | 3.94 | **1,566.7 MB** | **3,149.7 MB** | 3,930.9 MB | 0 | 299,996 | 1,300,005 |
-| `ing-3` (`10.88.0.13`) | Go `mimir 3.2.6` | **3.32** | 3.97 | **4,867.2 MB** | **6,846.8 MB** | 7,223.6 MB | 0 | 296,113 | 1,297,754 |
+| `ing-1` (`10.88.0.11`) | Rust `mimir-rs:0bbd40e` | **2.42** | 3.24 | **1,525.9 MB** | **2,850.2 MB** | **68.15 ms** | **0.0 MB / 0** | 0 | 299,999 |
+| `ing-2` (`10.88.0.12`) | Rust `mimir-rs:0bbd40e` | **2.09** | 3.07 | **1,475.9 MB** | **2,662.0 MB** | **60.28 ms** | **0.0 MB / 0** | 0 | 300,033 |
+| `ing-3` (`10.88.0.13`) | Go `mimir 3.2.6` | **3.39** | 3.95 | **4,710.3 MB** | **6,555.9 MB** | **172.38 ms** | 23.4 MB / 351 | 0 | 300,011 |
 
 | PromQL Endpoint (Stage 1A) | OK / Err | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |
 |---|---|---|---|---|---|
-| `instant_rate` | 4,727 / 0 | 1,701.85 | 3,562.63 | 4,470.14 | 33,968.84 |
-| `range_rate` | 4,750 / 0 | 1,797.15 | 3,678.85 | 4,626.29 | 43,789.74 |
-| `count_exact` (15s periodic) | 99 / 0 | 4,964.04 | 12,332.89 | 48,698.05 | 48,698.05 |
-| `regex_pod` | 4,704 / 0 | 1,616.07 | 3,416.97 | 4,051.96 | 30,263.35 |
-| `/api/v1/labels` | 4,773 / 0 | 34.09 | 110.53 | 160.74 | 1,069.71 |
-| `/api/v1/label/namespace/values` | 4,771 / 0 | 30.78 | 107.45 | 167.40 | 2,891.79 |
-| `/api/v1/series` | 4,730 / 0 | 587.44 | 1,154.29 | 1,589.59 | 8,751.28 |
-| `/api/v1/metadata` | 4,703 / 0 | 19.65 | 96.78 | 151.97 | 501.71 |
-| `/api/v1/cardinality/label_values` | 4,726 / 0 | 32.36 | 153.32 | 264.74 | 575.15 |
+| `instant_rate` | 5,058 / 0 | 1,661.72 | 3,320.59 | 3,917.12 | 4,768.10 |
+| `range_rate` | 5,100 / 0 | 1,764.49 | 3,431.77 | 4,039.53 | 4,999.56 |
+| `count_exact` (15s periodic) | 101 / 0 | 4,839.84 | 10,213.77 | 11,422.80 | 12,469.11 |
+| `regex_pod` | 5,027 / 0 | 1,569.95 | 3,138.65 | 3,589.09 | 4,485.53 |
+| `/api/v1/labels` | 5,026 / 0 | 31.28 | 104.06 | 164.96 | 361.20 |
+| `/api/v1/label/namespace/values` | 5,068 / 0 | 25.81 | 108.45 | 175.43 | 328.26 |
+| `/api/v1/series` | 5,040 / 0 | 512.13 | 1,172.19 | 1,640.32 | 2,471.32 |
+| `/api/v1/metadata` | 5,037 / 0 | 16.54 | 102.01 | 159.73 | 341.51 |
+| `/api/v1/cardinality/label_values` | 5,109 / 0 | 28.80 | 146.66 | 234.27 | 625.87 |
+
+#### Go `ing-3` Live CPU & Heap Profile Breakdown (Stage 1A, `1.3M` Series)
+- **CPU (`15s`, `57.03s` = `380%` CPU):** `snappy.encodeBlock` (`9.2%`), Go `maps.ctrlGroup.matchH2` + `mapaccess1_fast64` (`22.1%`), `headIndexReader.ShardedPostings` (`14.1%` cum), `labels.Compare` (`6.2%`), Go GC/allocator `spanClass` + `tryDeferToSpanScan` + `memclrNoHeapPointers` (`15.4%`).
+- **Heap (`inuse_space = 1,824.25 MB` vs `5,915.4 MB RssAnon` = `3.24x` RSS/live multiplier):** `grpc sizedBufferPool` (`205.3 MB`), `tsdb.newMemSeries` (`199.0 MB`), `NewXORChunk` (`165.0 MB`), `stringslite.Clone` (`158.5 MB`), `activeseries` (`159.2 MB`), postings `appendWithExponentialGrowth` (`135.7 MB`), `bytes.Clone` (`118.6 MB`).
 
 ---
 
-### Stage 1B: 10 Minutes (600 s) Unthrottled 1M-Series `count_exact` Scan Workload
+### Stage 1B: 10 Minutes (`615.9 s`) Unthrottled 1M-Series `count_exact` Scan Storm
 
-- **Workload:** `200,000 samples/s` writes plus `30 req/s` PromQL with `count({__name__="container_cpu_usage_seconds_total"})` directly in the 9-endpoint round-robin, stacked immediately onto Stage 1A's 25-minute `1.3M`-series head.
-- **Writes:** `120,746,626` samples (`197,130.1/s` avg), `120,626` batches OK, **`0` write errors**, `p50 = 36.97 ms`, `p95 = 60.66 ms`, `p99 = 64.69 ms`.
-- **PromQL Reads:** `1,859` OK / `25` errors (60s client timeouts during Go `ing-3` OOMs), `count_checks = 198`, `last_count = 1,000,000`, `count_mismatch = 0`.
+- **Writes:** `120,306,186` samples (`195,328.1/s`), **`0` write errors**, `p50 = 36.56 ms`, `p99 = 65.22 ms`.
+- **PromQL Reads:** `2,311` OK / `8` client 60s timeouts (down from `25` in Pass 4), `269` `count_exact` checks, `last_count = 1,000,000`, **`count_mismatch = 0`**.
 
-| Node | Engine | Avg Cores | Max Cores | Avg `RssAnon` | Peak `RssAnon` | Peak `VmRSS` | Restarts / OOMs | End State |
+| Node | Engine | Avg Cores | Avg `RssAnon` | Peak `RssAnon` | Stage-1B `QueryStream` Mean | Cumulative `io_read` | `pgmajfault` | Restarts / OOMs |
 |---|---|---|---|---|---|---|---|---|
-| `ing-1` | Rust `13b2226` | **2.12** | 3.95 | **1,972.7 MB** | **2,636.3 MB** | 5,008.7 MB | **0 / 0** | Healthy, `offset=420,031`, `1,300,046` series |
-| `ing-2` | Rust `13b2226` | **2.40** | 3.98 | **1,890.9 MB** | **2,745.6 MB** | 4,963.1 MB | **0 / 0** | Healthy, `offset=420,031`, `1,300,046` series |
-| `ing-3` | Go `3.2.6` | **3.07** | 3.97 | **6,139.7 MB** | **7,273.3 MB** | 7,282.8 MB | **2 OOMs (7.54-7.55 GB, 15:39:17 & 15:42:55 UTC)** | Lagging at `offset=393,149` |
-
-| PromQL Endpoint (Stage 1B) | OK / Err | p50 (ms) | p95 (ms) | p99 (ms) |
-|---|---|---|---|---|
-| `instant_rate` | 205 / 6 | 10,925.07 | 30,249.81 | 48,242.35 |
-| `range_rate` | 196 / 3 | 10,394.41 | 36,730.11 | 42,639.66 |
-| `count_exact` | 198 / 14 | 15,608.96 | 34,420.28 | 45,128.08 |
-| `regex_pod` | 217 / 2 | 9,986.82 | 20,899.01 | 33,391.95 |
-| `/api/v1/labels` | 212 / 0 | 79.42 | 933.71 | 5,477.09 |
-| `/api/v1/label/namespace/values` | 227 / 0 | 70.05 | 935.97 | 3,327.15 |
-| `/api/v1/series` | 203 / 0 | 809.70 | 8,808.25 | 15,975.25 |
-| `/api/v1/metadata` | 195 / 0 | 95.91 | 961.76 | 2,317.48 |
-| `/api/v1/cardinality/label_values` | 206 / 0 | 75.76 | 1,074.75 | 5,881.93 |
+| `ing-1` | Rust `0bbd40e` | **2.33** | **1,887.2 MB** | **3,049.9 MB** | **404.3 ms** | **0.0 MB** | **0** | **0 / 0** |
+| `ing-2` | Rust `0bbd40e` | **1.88** | **1,864.1 MB** | **2,816.3 MB** | **389.3 ms** | **0.0 MB** | **0** | **0 / 0** |
+| `ing-3` | Go `3.2.6` | **3.53** | **6,065.5 MB** | **6,596.8 MB** | **2,505.8 ms** | **87,128.1 MB (85.1 GiB)** | **1,259,493** | 0 / 0 (lagged ~4.7k offsets) |
 
 ---
 
-### Stage 2: 10 Minutes (600 s) Live Head Compaction, MinIO S3 Shipping, and Go Compactor/Store-Gateway Interop
+### Stage 2: 10 Minutes (`643.8 s`) Live Head Compaction, S3 Block Shipping, & Go Compactor / Store-Gateway Interop
 
-- **Workload:** `150,000 samples/s` writes (`90,107,017` samples, `90,017` batches OK, **`0` write errors**, `p50 = 36.78 ms`, `p99 = 63.40 ms`) plus `20 req/s` PromQL (`1,396` OK / `19` timeouts during Go `ing-3` OOMs, `count_checks = 9`, `last_count = 1,000,000`, `count_mismatch = 0`).
-- **Live Flush (`POST /ingester/flush?wait=true` under active load, 200ms `RssAnon` sawtooth polling):**
-  - `ing-1` (Rust `13b2226`): `HTTP 204` in **58,741.0 ms (58.74 s)**, sawtooth `2,077.3 -> 2,969.4 -> 1,138.3 MB RssAnon`, **0 restarts, 0 deadlocks**, `avg_cores = 1.14`, `avg_RssAnon = 1,700.2 MB`, `peak_RssAnon = 2,713.9 MB`, caught up to `offset = 510,670` (`1,080,911` series).
-  - `ing-2` (Rust `13b2226`): `HTTP 204` in **74,271.9 ms (74.27 s)**, sawtooth `2,298.0 -> 4,700.5 -> 1,131.5 MB RssAnon`, **0 restarts, 0 deadlocks**, `avg_cores = 1.05`, `avg_RssAnon = 1,703.8 MB`, `peak_RssAnon = 4,657.2 MB`, caught up to `offset = 510,680` (`1,067,132` series).
-  - `ing-3` (Go `3.2.6`): OOM-killed during live flush (`http_code = 0` at `155,061.7 ms`, sawtooth `7,164.8 -> 7,256.3 -> 59.1 MB RssAnon`, `delta_restarts = 4`, `oom_kills = 2`, stuck in WAL-replay/catch-up OOM loop at `offset = 424,377`).
-- **MinIO S3, Go `compactor`, and Go `store-gateway` Interop:**
-  - **4 compacted ULID blocks** and `bucket-index.json.gz` verified in MinIO `mimir-blocks/prod/` (`01M7QN9YP0Z8QT3FZDZBMFPNRR`, `01M7QNAQVBJ6FPFC8XJNV3S6NS`, `01M7QNCT03SG6TVDJCD263CC2S`, `01M7QNE8JYFW7559K3PPNGFSNF`).
-  - **Go `compactor`:** `cortex_compactor_runs_completed_total = 200`, `cortex_compactor_runs_failed_total = 0`.
-  - **Go `store-gateway`:** `cortex_bucket_store_blocks_loaded = 4` (`95,164` bytes cached), `cortex_bucket_store_block_load_failures_total = 0`, `0` bucket operation failures across `attributes`, `delete`, `exists`, `get`, `get_range`, `iter`, and `upload`.
-  - Post-Stage-2 PromQL `count_exact` across S3 + head returned `1,000,000`.
-
-*(Before Stage 3, `ing-3`'s `/data/tsdb/*` and Kafka consumer group `ingester-zone-c-0` were reset so Go `ing-3` could exit its Stage 2 WAL-replay OOM loop. Rust `ing-1` and `ing-2` kept running continuously from Stage 1A through Stage 3.)*
+- **Writes:** `90,166,076` samples (`140,057.4/s`), **`0` write errors**, `p50 = 36.14 ms`, `p99 = 63.47 ms`.
+- **PromQL Reads:** `4,514` OK (`3.23x` Pass 4's `1,396`), `count_checks = 17`, `last_count = 1,000,000`, **`count_mismatch = 0`**.
+- **Live Flush Sawtooth:**
+  - `ing-2` (Rust `0bbd40e`): `HTTP 204` in **`47,005.2 ms` (`47.01 s`)**, `2,349.5 -> 2,592.9 -> 1,093.1 MB RssAnon` (`+243.4 MB` sawtooth), `2` ULID blocks shipped, `0` restarts.
+  - `ing-1` (Rust `0bbd40e`): compacted `2,076.1 -> 3,147.7 -> 1,144.4 MB RssAnon`, `2` ULID blocks shipped, caught up to `offset = 510,324`, `0` restarts (client HTTP poll timed out at `120s` while shipping finished cleanly).
+  - `ing-3` (Go `3.2.6`): `4,048.7 -> 4,692.9 -> 4,271.5 MB RssAnon`, `155.7 GB` cumulative NVMe reads.
+- **S3 / Go Compactor / Go Store-Gateway Verification:** `6` ULID blocks + `bucket-index.json.gz` in `mimir-blocks/prod/`; Go `compactor` `runs_completed_total = 201`, `runs_failed_total = 0`; Go `store-gateway` `blocks_loaded = 6`, `block_load_failures_total = 0`, `0` bucket operation failures; post-flush PromQL `count_exact == 1,000,000`.
 
 ---
 
-### Stage 3: 10 Minutes (600 s) Distributed Chaos (`160,000 samples/s` Writes + `25 req/s` PromQL)
+### Stage 3: 10 Minutes (`628.6 s`) Distributed Chaos (`20s SIGKILL ing-1` + `Redpanda` Restart)
 
-- **Workload:** `96,460,364` samples (`156,845.7/s` avg, `96,364` OK, `128` transient write errors during the 1.4 s Redpanda restart, `p50 = 36.76 ms`, `p99 = 64.68 ms`) plus `3,800` PromQL OK / `2` errors, `count_checks = 33`, `last_count = 1,000,000`, `count_mismatch = 0`.
-- **Chaos Event A (`T+60s..T+80s`, `docker kill -s KILL ingester` on `ing-1`):**
-  - **Write Availability:** `0` distributor write errors before kill and throughout the 20 s `ing-1` outage.
-  - **WAL Replay and Kafka Catch-Up (`T+80s` `docker start ingester`):** `ing-1` replayed its 1.09M-series WAL (`547 MB -> 1,943.5 MB -> 1,148.3 MB RssAnon`), reached `/ready == 200` in **73,598.9 ms (73.60 s)**, and reached 0-lag parity with `ing-2` by `t=150.0s` (`<= 70 s` post-start: `ing-1 offset = 534,688` == `ing-2 offset = 534,688`, `1,090,017` series).
-- **Chaos Event B (`T+240s`, `docker restart redpanda` mid-load, `1,419.3 ms`):**
-  - **Transient Write Impact:** `write_err` rose `0 -> 64 -> 128` during the broker restart and remained flat at `128` (`0` new write errors from `T+255s` to `T+600s`).
-  - **Fetcher Recovery:** Both Rust `ing-1` and `ing-2` logged retryable `fetcher.rs:1132` errors (`connection refused`, `FencedLeaderEpoch`, `NotLeaderOrFollower`), reconnected automatically within 5 s (`t=240s: 548,961 -> t=250s: 550,588/550,598`), and consumed in lockstep to `offset = 607,084` (`ing-1 = 607,084`, `ing-2 = 607,084`) with `0` unhandled `fetcher.rs:363` errors.
-  - **Go `ing-3` Under Stage 3 Load:** Go `ing-3` hit repeated OOM kills under the 1M-series `160k/s + 25 req/s` workload (`delta_restarts = 19`, `oom_kills = 10`).
+- **Chaos Event A (`20s SIGKILL` on Rust `ing-1`):** `0` write errors before and during the 20s outage; `ing-1` replayed its 1.09M-series WAL to `/ready = 200` in **`62,023.5 ms` (`62.02 s`)** and reached `0`-lag (`offset = 533,620` vs peer `533,628`) at **`62,038.7 ms`** (`15.2 ms` after `/ready`).
+- **Chaos Event B (`docker restart redpanda`, `1,503.0 ms`):** Only `64` transient distributor write errors during the 1.5s broker restart (`0` errors from `T+20s` through `T+600s`). All 3 ingesters finished in exact lockstep at **`offset = 606,447`** (`1,096,070` series, `count_mismatch = 0`).
 
 ---
 
-### Stage 4: 15 Minutes (900 s: 5m + 5m + 5m) Classic gRPC `Push` Mode (RF=3, Snappy) and 8 GB Ceiling
+### Stage 4: 15 Minutes (`5m + 5m + 5m`) Classic gRPC `Push` Mode (RF=3, Snappy, `1M -> 2.5M -> 3.5M` Series)
 
-Cluster switched to `ingest_storage.enabled: false`, `push_grpc_method_enabled: true`, `replication_factor: 3`, `zone_awareness_enabled: true`, `ingester_client.grpc_client_config.grpc_compression: snappy`, with clean `/data/tsdb` directories (`cortex_distributor_ingest_storage_enabled = 0`).
+- **`/ingester/prepare-shutdown` Parity (`ing-1`):** `POST = 204` (`metric = 1`), `GET = 200` (`set`), `DELETE = 204` (`metric = 0`, `/ready = 200`).
 
-- **`/ingester/prepare-shutdown` Classic Push Parity Check (`ing-1`):**
-  - `POST /ingester/prepare-shutdown` -> `HTTP 204`, `cortex_ingester_prepare_shutdown_requested = 1`
-  - `GET /ingester/prepare-shutdown` -> `HTTP 200` (`body=set`)
-  - `DELETE /ingester/prepare-shutdown` -> `HTTP 204`, `cortex_ingester_prepare_shutdown_requested = 0`, `/ready = 200`
-
-| Sub-Stage | Workload | Throughput and Latency | PromQL | `ing-1` (Rust `13b2226`) | `ing-2` (Rust `13b2226`) | `ing-3` (Go `3.2.6`) |
-|---|---|---|---|---|---|---|
-| **Stage 4A** (315.0s = 5m) | 1,000,000 series at 300k/s + 15 req/s PromQL | 90,039,000 samples (285.8k/s), 0 write err, p50=15.91ms, p99=288.46ms | 4,522 OK / 0 err, count=1,000,000, mismatch=0 | 3.00c avg, 1,184.5 MB avg / 1,584.8 MB peak `RssAnon`, 0 restarts | 1.94c avg, 1,121.2 MB avg / 1,511.1 MB peak `RssAnon`, 0 restarts | 3.49c avg, 3,866.9 MB avg / 5,089.7 MB peak `RssAnon`, 0 restarts |
-| **Stage 4B** (310.6s = 5m) | 2,500,000 series at 300k/s + 15 req/s PromQL | 90,679,000 samples (292.0k/s), 251 write err (during Go OOM), p50=46.48ms, p99=567.36ms | 890 OK / 1 err, count=2,500,000, mismatch=1 (early transient 2,498,000 at t=15s during Go OOM) | 2.86c avg, 2,729.8 MB avg / 4,047.8 MB peak `RssAnon`, 0 restarts | 2.87c avg, 2,408.9 MB avg / 3,874.2 MB peak `RssAnon`, 0 restarts | 2.44c avg, 4,134.8 MB avg / 7,175.1 MB peak `RssAnon`, OOM-killed at 7.49 GB (looped rest of 4B) |
-| **Stage 4C** (303.1s = 5m) | 3,500,000 series at 300k/s ceiling | 90,921,000 samples (300.0k/s), 0 write err, p50=11.91ms, p99=199.53ms | (write ceiling test) | 0.73c avg, 3,468.3 MB avg / 3,847.4 MB peak `RssAnon`, 0 restarts | 0.56c avg, 3,428.9 MB avg / 3,813.0 MB peak `RssAnon`, 0 restarts | 1.51c avg, 5,068.8 MB avg / 7,281.2 MB peak `RssAnon`, OOM-killed at 7.49 GB |
-
-#### Kernel OOM-Kill Summary (`dmesg -T`)
-- **Rust `ing-1` and `ing-2` (`13b2226`):** **0 OOM kills**, **0 unplanned restarts** across all 71.53 minutes (879.3M samples).
-- **Go `ing-3` (`3.2.6`):** **35+ kernel OOM kills** recorded across Stage 1B (`15:39:17`, `15:42:55`, `7.54-7.55 GB anon-rss`), Stage 2 (`15:47:04..15:59:17`, `7.47-7.53 GB anon-rss`), Stage 3 (`16:00:28..16:13:43`, `7.49-7.52 GB anon-rss`), and Stage 4B/4C (`16:21:48`, `16:25:56`, `7.49 GB anon-rss`).
-
----
-
-## 4. Pass 1 -> Pass 2 -> Pass 3 -> Pass 4 (`13b2226`) Progression
-
-| Benchmark | Pass 1 (`f1f680d`) | Pass 2 (`56099c3` / `08370b3`) | Pass 3 (`73b262d`, >1h suite) | Pass 4 (`13b2226`, 71.5m suite) | Go Mimir `3.2.6` (`ing-3`, Pass 4) |
+| Sub-Stage | Workload | Writes & Latency | `ing-1` (Rust `0bbd40e`) | `ing-2` (Rust `0bbd40e`) | `ing-3` (Go `3.2.6`) |
 |---|---|---|---|---|---|
-| **Stage 1A Sustained Kafka** (25m, 1M+300k churn at `200k/s` + `30 req/s`) | (120s only) | (60s only) | 0 err, 2.54-2.56c, 1.46-1.51 GB avg `RssAnon` (`cnt=998k`) | **0 write/query err**, **`cnt=1,000,000` (`mismatch=0`)**, **2.35-2.82c**, **1.57-1.61 GB avg `RssAnon`** | **3.32c**, **4.87 GB avg / 6.85 GB peak `RssAnon`** (3.07x RAM) |
-| **Stage 1B Unthrottled 1M `count_exact`** (10m at `200k/s` + `30 req/s`) | 7.58 GB OOM-kill | 0 OOMs (120s), peak 1.27-1.28 GB | 0 OOMs (600s), 2.22-2.27c, 1.77-1.82 GB avg | **0 OOMs (600s)**, **2.12-2.40c**, **1.89-1.97 GB avg / 2.64-2.75 GB peak `RssAnon`**, `mismatch=0` | **3.07c**, **6.14 GB avg / 7.27 GB peak**, **2 OOM kills at 7.55 GB** |
-| **Stage 2 Live Flush + S3** (10m at `150k/s` + `20 req/s`) | `ing-2` OOM, `ing-1` 26.6s | 0 OOMs, 14.18s / 15.68s | `ing-2` 94.98s OK; `ing-1` post-catch-up deadlock | **Both `HTTP 204` (58.74s and 74.27s), 0 deadlocks**, **1.70 GB avg `RssAnon`**, `200` compactor / `4` store-gw OK | **OOM-killed during flush** (`http_code=0`, `7.26 GB` peak) |
-| **Stage 3 Distributed Chaos** (10m at `160k/s` + `25 req/s`) | `ing-2` early OOM | 0 OOMs, `/ready` 7.76s, 0-lag 11.88s | 0 err on `ing-1` kill; Redpanda restart wedged `fetcher.rs:363` | **0 err on 20s `SIGKILL ing-1`**, `/ready` **73.60s**, 0-lag **<=70s**; **Redpanda restart clean (`0` unhandled `fetcher.rs` errs, lockstep `offset=607,084`)** | **10 OOM kills / 19 restarts** |
-| **Stage 4A Classic Push 1M** (5m at `300k/s` + `15 req/s`) | 134.9k/s, 4.00c, 237 err | 267.4k/s, 75 err, 3.07-3.09c | 281.7k/s, 0 err, 0.95-1.36c, 1.18-1.19 GB avg (`DELETE 405`) | **285.8k/s**, **0 write/query err**, **1.12-1.18 GB avg / 1.51-1.58 GB peak**, `prepare-shutdown` 204/200/204 | **3.49c**, **3.87 GB avg / 5.09 GB peak `RssAnon`** |
-| **Stage 4B Classic Push 2.5M** (5m at `300k/s` + `15 req/s`) | 161.9k/s, 939 err | 205.3k/s, peak 4.05-4.29 GB | 291.5k/s, 0 Rust restarts, 2.60-2.62 GB avg | **292.0k/s**, **0 Rust restarts**, **2.41-2.73 GB avg / 3.87-4.05 GB peak `RssAnon`**, `cnt=2.5M` | **7.18 GB peak**, **OOM-killed at 7.49 GB** |
-| **Stage 4C Classic Push 3.5M** (5m at `300k/s` ceiling) | Go VM OOM lockup | 0.65-0.66c, peak 4.62-4.63 GB | 300.0k/s, 0.52-0.54c, 3.42 GB avg / 3.99 GB peak | **300.0k/s (`0` write err)**, `p50=11.91ms`, **0.56-0.73c**, **3.43-3.47 GB avg / 3.81-3.85 GB peak `RssAnon`**, **0 restarts** | **1.51c**, **7.28 GB peak**, **OOM-killed at 7.49 GB** |
+| **Stage 4A** (`328.3s`) | `1,000,000` series @ `300k/s` + `15 req/s` PromQL | `90,075,000` samp (`274.4k/s`), **`0` write err**, `p50=9.63ms`, `p99=136.48ms` | `1.00c` avg, `1,246.2 MB` avg / `1,708.5 MB` peak `RssAnon`, `0` restarts | `0.53c` avg, `1,400.5 MB` avg / `1,829.8 MB` peak `RssAnon`, `0` restarts | `1.28c` avg, `3,479.1 MB` avg / `4,677.3 MB` peak `RssAnon`, `0` restarts |
+| **Stage 4B** (`335.9s`) | `2,500,000` series @ `300k/s` + `15 req/s` PromQL | `90,138,000` samp (`268.4k/s`), **`0` write err**, `p50=10.22ms`, `p99=207.30ms` | `1.56c` avg, `2,862.6 MB` avg / `3,982.9 MB` peak `RssAnon`, `0` restarts | `0.85c` avg, `2,396.2 MB` avg / `3,794.9 MB` peak `RssAnon`, `0` restarts | `2.02c` avg, `7,356.3 MB` peak `RssAnon`, **OOM-killed at `7.56 GB`** (`104.1 GiB` NVMe thrash) |
+| **Stage 4C** (`302.1s`) | `3,500,000` series @ `300k/s` ceiling | `90,621,000` samp (**`300.0k/s`**), **`0` write err**, `p50=11.76ms`, **`p99=54.25ms`** | `0.77c` avg, `3,832.1 MB` avg / `4,282.8 MB` peak `RssAnon`, `0` restarts | `0.42c` avg, `3,443.2 MB` avg / `3,899.8 MB` peak `RssAnon`, `0` restarts | `1.21c` avg, `7,324.2 MB` peak `RssAnon`, OOM-killed |
+
+---
+
+## 4. Pass 1 -> Pass 2 -> Pass 3 -> Pass 4 -> Pass 5 (`0bbd40e`) Progression
+
+| Stage | Pass 1 (`f1f680d`) | Pass 2 (`08370b3`) | Pass 3 (`73b262d`) | Pass 4 (`13b2226`) | **Pass 5 (`0bbd40e`)** | Go Mimir `3.2.6` (Pass 5) |
+|---|---|---|---|---|---|---|
+| **1A: Sustained Kafka** (25m, 1.3M series) | 120s only | 60s only | 0 err, 2.55c, 1.49 GB | 0 err, 37,983 q, 2.35–2.82c, 1.57–1.61 GB, `cnt_p99=48.7s` | **`0` err, `40,566` q, `2.09–2.42c`, `1.48–1.53 GB`, `cnt_p99=11.4s`, `QS=60–68ms`, `0` majfault** | `3.39c`, `4.71 GB` avg / `6.56 GB` peak, `QS=172ms` |
+| **1B: Unthrottled 1M Scan** (10m) | 7.58 GB OOM | 120s OK | 0 OOMs, 2.25c, 1.80 GB | 0 OOMs, 1,859 q (198 cnt), 2.12–2.40c, 1.89–1.97 GB | **`0` OOMs, `2,311` q (`269` cnt, `+24%`), `1.88–2.33c`, `1.86–1.89 GB`, `QS=389–404ms`, `0` disk read** | `3.53c`, `6.07 GB` avg, `QS=2,506ms`, **`85.1 GiB` NVMe thrash (`1.26M` majfault)** |
+| **2: Live Flush + S3** (10m) | `ing-2` OOM | 14–16s (small) | `ing-1` deadlock | 58.7s / 74.3s, 1,396 q, 4 blocks | **`47.0s` (`ing-2`), `4,514` q (`3.23x`), `6` S3 blocks, `201` compactor / `6` store-gw OK** | `4.85 GB` avg, **`152.1 GiB` NVMe thrash (`2.20M` majfault)** |
+| **3: Chaos** (10m) | `ing-2` OOM | `/ready` 7.8s (small) | Redpanda wedge | `/ready` 73.6s, 128 broker err | **`0` kill err, `/ready` `62.02s`, `0`-lag `62.04s`, `64` broker err, lockstep `606,447`** | Survived (after Stage 2 near-OOM) |
+| **4A: Push 1.0M** (5m) | 134.9k/s, 237 err | 267.4k/s, 75 err | 281.7k/s, 0 err | 285.8k/s, 0 err, 1.94–3.00c | **`274.4k/s`, `0` err, `p50=9.63ms`, `0.53–1.00c`, `1.25–1.40 GB`** | `1.28c`, `3.48 GB` avg / `4.68 GB` peak |
+| **4B: Push 2.5M** (5m) | 161.9k/s, 939 err | 205.3k/s | 291.5k/s, 0 rst | 292.0k/s, 251 w_err, `p50=46.5ms` | **`268.4k/s`, `0` write err, `p50=10.22ms` (`4.5x` faster), `0.85–1.56c`, `2.40–2.86 GB`, `0` rst** | **`7.36 GB` peak, OOM-killed at `7.56 GB` (`104.1 GiB` NVMe thrash)** |
+| **4C: Push 3.5M** (5m) | Go VM lockup | 0.65c, 4.63 GB | 300.0k/s, 0.53c | 300.0k/s, `p99=199.5ms`, 0.56–0.73c | **`300.0k/s`, `0` err, `p50=11.76ms`, `p99=54.25ms` (`3.7x` lower), `0.42–0.77c`, `3.44–3.83 GB`, `0` rst** | `7.32 GB` peak, OOM-killed |
 
 ---
 
 ## 5. Teardown
 
-All temporary Hetzner Cloud resources created for the benchmark carry label `cluster=mimir-stress` and are deleted via:
-
-```bash
-./scripts/hetzner-teardown.sh
-```
+All temporary Hetzner Cloud resources carry label `cluster=mimir-stress` and were torn down automatically via `./scripts/hetzner-teardown.sh` (`0` servers, networks, firewalls, or SSH keys remaining).
