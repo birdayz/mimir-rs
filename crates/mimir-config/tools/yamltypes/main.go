@@ -24,6 +24,7 @@ type field struct {
 	Key       string `json:"key"`
 	Type      int    `json:"type"`
 	OmitEmpty bool   `json:"omitempty,omitempty"`
+	Flow      bool   `json:"flow,omitempty"`
 }
 
 type typeInfo struct {
@@ -106,7 +107,7 @@ func (g *gen) structFields(st reflect.Type, ti *typeInfo) {
 		if tag == "-" {
 			continue
 		}
-		inline, omitEmpty := false, false
+		inline, omitEmpty, flow := false, false, false
 		parts := strings.Split(tag, ",")
 		for _, fl := range parts[1:] {
 			switch fl {
@@ -114,6 +115,8 @@ func (g *gen) structFields(st reflect.Type, ti *typeInfo) {
 				inline = true
 			case "omitempty":
 				omitEmpty = true
+			case "flow":
+				flow = true
 			}
 		}
 		tag = parts[0]
@@ -144,7 +147,7 @@ func (g *gen) structFields(st reflect.Type, ti *typeInfo) {
 		if key == "" {
 			key = strings.ToLower(f.Name)
 		}
-		ti.Fields = append(ti.Fields, field{Key: key, Type: g.id(f.Type), OmitEmpty: omitEmpty})
+		ti.Fields = append(ti.Fields, field{Key: key, Type: g.id(f.Type), OmitEmpty: omitEmpty, Flow: flow})
 	}
 }
 

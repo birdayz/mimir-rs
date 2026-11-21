@@ -532,7 +532,7 @@ impl Http for HttpGrpcBridge {
                 // Status.Message is invalid UTF-8, omitting grpc-status-details-bin while still
                 // sending grpc-status = http_resp.code and grpc-message = encodeGrpcMessage(body)
                 // (google.golang.org/grpc/internal/transport/http_util.go:227-265).
-                let encoded_msg = encode_grpc_message_like_go(&msg);
+                let encoded_msg = encode_grpc_message_like_go(&http_resp.body);
                 let mut st = Status::new(
                     mimir_proto::grpcutilpb::http_code_to_grpc_code(http_resp.code),
                     msg,
@@ -1580,14 +1580,32 @@ fn header_map_to_httpgrpc(headers: &HeaderMap) -> Vec<httpgrpcpb::Header> {
 /// `encodeGrpcMessageUnchecked`): leaves printable ASCII `' '..='~'` except `'%'` unencoded and
 /// percent-encodes all other UTF-8 bytes (including `U+FFFD` replacement bytes `%EF%BF%BD`
 /// produced by `utf8.DecodeRuneInString` on invalid UTF-8) as uppercase `%XX`.
-fn encode_grpc_message_like_go(msg_lossy: &str) -> String {
+fn encode_grpc_message_like_go(raw: &[u8]) -> String {
     use std::fmt::Write as _;
-    let mut out = String::with_capacity(msg_lossy.len());
-    for &b in msg_lossy.as_bytes() {
-        if (b' '..=b'~').contains(&b) && b != b'%' {
-            out.push(b as char);
-        } else {
-            let _ = write!(out, "%{b:02X}");
+    let encode_valid = |slice: &[u8], out: &mut String| {
+        for &b in slice {
+            if (b' '..=b'~').contains(&b) && b != b'%' {
+                out.push(b as char);
+            } else {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    };
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                encode_valid(valid.as_bytes(), &mut out);
+                break;
+            }
+            Err(e) => {
+                let n = e.valid_up_to();
+                encode_valid(&rest[..n], &mut out);
+                // Go unicode/utf8.DecodeRuneInString advances 1 byte per invalid/truncated sequence.
+                out.push_str("%EF%BF%BD");
+                rest = &rest[n + 1..];
+            }
         }
     }
     out
@@ -2515,6 +2533,15 @@ mod tests {
         assert_eq!(
             pct_headers.get("grpc-message").unwrap(),
             "100%25 err:%EF%BF%BD%EF%BF%BD"
+        );
+        // Truncated multi-byte UTF-8 advances 1 byte at a time like Go utf8.DecodeRuneInString.
+        assert_eq!(
+            encode_grpc_message_like_go(b"\xe2\x82bad"),
+            "%EF%BF%BD%EF%BF%BDbad"
+        );
+        assert_eq!(
+            encode_grpc_message_like_go(b"\xf0\x90\x80"),
+            "%EF%BF%BD%EF%BF%BD%EF%BF%BD"
         );
 
         // When X-ErrorMessage IS set (valid UTF-8), grpc-status-details-bin MUST still be emitted.
