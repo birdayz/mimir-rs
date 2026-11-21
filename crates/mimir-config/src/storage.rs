@@ -2050,7 +2050,7 @@ impl KafkaConfig {
             "" | "none" | "gzip" | "snappy" | "lz4" | "zstd"
         ) {
             return Err(ConfigError::Validation(
-                "the configured Kafka producer compression codec is invalid".to_string(),
+                "the configured Kafka producer compression codec is invalid, must be one of: none, gzip, snappy, lz4, zstd".to_string(),
             ));
         }
         if (self.target_consumer_lag_at_startup.0 != 0)
@@ -2066,9 +2066,10 @@ impl KafkaConfig {
             ));
         }
         if !(0..=2).contains(&self.producer_record_version) {
-            return Err(ConfigError::Validation(
-                "invalid record format version".to_string(),
-            ));
+            return Err(ConfigError::Validation(format!(
+                "invalid record format version: unknown record version {}",
+                self.producer_record_version
+            )));
         }
         if self.fetch_max_wait.0 < 5 * 1_000_000_000 || self.fetch_max_wait.0 > 30 * 1_000_000_000
         {
@@ -2100,7 +2101,7 @@ impl KafkaConfig {
                 || self.ingestion_concurrency_target_flushes_per_shard <= 0)
         {
             return Err(ConfigError::Validation(
-                "ingest-storage.kafka.ingestion-concurrency-* params must be greater than 0"
+                "ingest-storage.kafka.ingestion-concurrency-queue-capacity, ingest-storage.kafka.ingestion-concurrency-estimated-bytes-per-sample, ingest-storage.kafka.ingestion-concurrency-batch-size and ingest-storage.kafka.ingestion-concurrency-target-flushes-per-shard must be greater than 0"
                     .to_string(),
             ));
         }
@@ -2109,7 +2110,7 @@ impl KafkaConfig {
             && self.auto_create_topic_default_partitions < 1
         {
             return Err(ConfigError::Validation(
-                "ingest-storage.kafka.auto-create-topic-default-partitions must be -1 or greater than 0".to_string(),
+                "ingest-storage.kafka.auto-create-topic-default-partitions must be -1 or greater than 0 when ingest-storage.kafka.auto-create-topic-default-partitions=true".to_string(),
             ));
         }
         self.validate_sasl()?;
@@ -2126,8 +2127,19 @@ impl KafkaConfig {
         }
         if self.backend == "warpstream" && self.write_timeout.0 < self.write_timeout_overhead.0 * 2
         {
+            return Err(ConfigError::Validation(format!(
+                "ingest-storage.kafka.write-timeout must be greater than or equal to twice ingest-storage.kafka.write-timeout-overhead when ingest-storage.kafka.backend=warpstream (write-timeout={}, write-timeout-overhead={})",
+                self.write_timeout, self.write_timeout_overhead
+            )));
+        }
+        Ok(())
+    }
+
+    /// Rejects Kafka backends not implemented by mimir-rs (warpstream).
+    pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
+        if self.backend == "warpstream" {
             return Err(ConfigError::Validation(
-                "ingest-storage.kafka.write-timeout must be greater than or equal to twice write-timeout-overhead when backend=warpstream".to_string(),
+                r#"ingest-storage.kafka.backend="warpstream" is not supported by mimir-rs (only "kafka" is implemented)"#.to_string(),
             ));
         }
         Ok(())
@@ -2292,5 +2304,62 @@ mod tests {
                 "unexpected error for {unsupported}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn w23_csc_12_kafka_validate_error_strings_and_warpstream_rejection() {
+        let base = || KafkaConfig {
+            address: crate::types::StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "ingest".to_string(),
+            ..Default::default()
+        };
+
+        let mut c1 = base();
+        c1.producer_compression = "brotli".to_string();
+        assert_eq!(
+            c1.validate().unwrap_err().to_string(),
+            "error validating config: the configured Kafka producer compression codec is invalid, must be one of: none, gzip, snappy, lz4, zstd"
+        );
+
+        let mut c2 = base();
+        c2.producer_record_version = 99;
+        assert_eq!(
+            c2.validate().unwrap_err().to_string(),
+            "error validating config: invalid record format version: unknown record version 99"
+        );
+
+        let mut c3 = base();
+        c3.ingestion_concurrency_max = 1;
+        c3.ingestion_concurrency_batch_size = 0;
+        assert_eq!(
+            c3.validate().unwrap_err().to_string(),
+            "error validating config: ingest-storage.kafka.ingestion-concurrency-queue-capacity, ingest-storage.kafka.ingestion-concurrency-estimated-bytes-per-sample, ingest-storage.kafka.ingestion-concurrency-batch-size and ingest-storage.kafka.ingestion-concurrency-target-flushes-per-shard must be greater than 0"
+        );
+
+        let mut c4 = base();
+        c4.auto_create_topic_enabled = true;
+        c4.auto_create_topic_default_partitions = 0;
+        assert_eq!(
+            c4.validate().unwrap_err().to_string(),
+            "error validating config: ingest-storage.kafka.auto-create-topic-default-partitions must be -1 or greater than 0 when ingest-storage.kafka.auto-create-topic-default-partitions=true"
+        );
+
+        let mut c5 = base();
+        c5.backend = "warpstream".to_string();
+        c5.write_timeout = GoDuration::from_secs(1);
+        c5.write_timeout_overhead = GoDuration::from_secs(2);
+        assert_eq!(
+            c5.validate().unwrap_err().to_string(),
+            "error validating config: ingest-storage.kafka.write-timeout must be greater than or equal to twice ingest-storage.kafka.write-timeout-overhead when ingest-storage.kafka.backend=warpstream (write-timeout=1s, write-timeout-overhead=2s)"
+        );
+
+        c5.write_timeout = GoDuration::from_secs(4);
+        assert!(c5.validate().is_ok());
+        assert!(c5
+            .validate_mimir_rs_support()
+            .unwrap_err()
+            .to_string()
+            .contains("warpstream"));
+        assert!(base().validate_mimir_rs_support().is_ok());
     }
 }

@@ -178,7 +178,13 @@ fn build_block_yaml(
                 parse_cli_value_for_yaml(field.kind, cli_val)
             } else if let Some(explicit) = yaml_map.and_then(|m| m.get(&yaml_key)) {
                 if explicit.is_null() {
-                    field_default_yaml_value(field)
+                    match field.kind {
+                        FieldKind::StringList => Value::Sequence(Vec::new()),
+                        FieldKind::Other if field.default_str == "{}" => {
+                            Value::Mapping(Mapping::new())
+                        }
+                        _ => field_default_yaml_value(field),
+                    }
                 } else {
                     explicit.clone()
                 }
@@ -186,7 +192,17 @@ fn build_block_yaml(
                 field_default_yaml_value(field)
             }
         } else if let Some(explicit) = yaml_map.and_then(|m| m.get(&yaml_key)) {
-            explicit.clone()
+            if explicit.is_null() {
+                match field.kind {
+                    FieldKind::StringList => Value::Sequence(Vec::new()),
+                    FieldKind::Other if field.default_str == "{}" => {
+                        Value::Mapping(Mapping::new())
+                    }
+                    _ => field_default_yaml_value(field),
+                }
+            } else {
+                explicit.clone()
+            }
         } else {
             field_default_yaml_value(field)
         };
@@ -462,5 +478,43 @@ usage_tracker:
         let diff = serde_yaml::to_string(&diff).unwrap();
         assert!(!diff.contains("XYZ"), "secret leaked in diff:\n{diff}");
         assert!(diff.contains("sasl_password: '********'"));
+    }
+
+    #[test]
+    fn w23_csc_08_extra_sections_null_slices_zero_to_empty_and_appear_in_diff() {
+        let cfg = load(
+            r#"
+compactor:
+  block_ranges: null
+  enabled_tenants: null
+  compaction_interval: null
+"#,
+        );
+        let eff = effective_config_yaml(&cfg);
+        let comp = eff.get("compactor").and_then(Value::as_mapping).unwrap();
+        assert_eq!(
+            comp.get(Value::String("block_ranges".to_string())),
+            Some(&Value::Sequence(Vec::new()))
+        );
+        assert_eq!(
+            comp.get(Value::String("enabled_tenants".to_string())),
+            Some(&Value::String(String::new()))
+        );
+        assert_eq!(
+            comp.get(Value::String("compaction_interval".to_string())),
+            Some(&Value::String("1h0m0s".to_string()))
+        );
+
+        let diff = diff_yaml_values(&effective_config_yaml(&MimirConfig::default()), &eff)
+            .expect("null compactor.block_ranges must show up in ?mode=diff");
+        let diff_yaml = serde_yaml::to_string(&diff).unwrap();
+        assert!(
+            diff_yaml.contains("block_ranges: []"),
+            "expected block_ranges: [] in diff:\n{diff_yaml}"
+        );
+        assert!(
+            !diff_yaml.contains("compaction_interval"),
+            "scalar null must keep default and stay out of diff:\n{diff_yaml}"
+        );
     }
 }

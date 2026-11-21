@@ -6,11 +6,13 @@
 //! - github.com/grafana/dskit/middleware/http_cluster.go (`ClusterValidationRoundTripper`)
 //! - github.com/grafana/dskit/clusterutil/clusterutil.go (`ClusterValidationLabelHeader`)
 
+use std::io::Read as _;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::merge::MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES;
 use crate::error::ConfigError;
 use crate::server::RuntimeConfigConfig;
 
@@ -80,7 +82,19 @@ pub(crate) enum Provider {
 impl Provider {
     pub(crate) fn read(&self, path: &str, url_for_metrics: &str) -> Result<Vec<u8>, String> {
         match self {
-            Provider::File => std::fs::read(path).map_err(|e| go_file_error(path, &e)),
+            Provider::File => {
+                let file = std::fs::File::open(path).map_err(|e| go_file_error(path, &e))?;
+                let mut out = Vec::new();
+                file.take((MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES + 1) as u64)
+                    .read_to_end(&mut out)
+                    .map_err(|e| go_file_error(path, &e))?;
+                if out.len() > MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES {
+                    return Err(format!(
+                        "runtime config file {path:?} exceeds maximum size of {MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES} bytes"
+                    ));
+                }
+                Ok(out)
+            }
             Provider::Http(f) => f.get(path, url_for_metrics),
         }
     }
@@ -100,6 +114,7 @@ struct FetchRequest {
 /// reloads when `http_client_disable_keep_alives` is false.
 pub(crate) struct HttpFetcher {
     tx: parking_lot::Mutex<Option<std_mpsc::Sender<FetchRequest>>>,
+    timeout: Duration,
 }
 
 impl HttpFetcher {
@@ -163,6 +178,7 @@ impl HttpFetcher {
 
         Ok(Arc::new(Self {
             tx: parking_lot::Mutex::new(Some(tx)),
+            timeout,
         }))
     }
 
@@ -180,9 +196,16 @@ impl HttpFetcher {
             })
             .map_err(|_| format!("Get {url:?}: runtime config HTTP client stopped"))?;
         }
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| Err(format!("Get {url:?}: runtime config HTTP client stopped")))
+        // Bound waiting on the fetcher thread even if reqwest/runtime stalls unexpectedly.
+        match reply_rx.recv_timeout(self.timeout.saturating_add(Duration::from_secs(5))) {
+            Ok(res) => res,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "Get {url:?}: context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+            )),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                Err(format!("Get {url:?}: runtime config HTTP client stopped"))
+            }
+        }
     }
 }
 
@@ -263,11 +286,11 @@ async fn fetch(
             .and_then(|v| v.to_str().ok())
             == Some("application/json")
     {
-        let body = match resp.bytes().await {
+        let body = match read_bounded_body(resp, MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES).await {
             Ok(b) => b,
-            Err(e) => {
+            Err(err_text) => {
                 observe("error");
-                return Err(format!("Get {url:?}: {}", reqwest_error_text(&e)));
+                return Err(format!("Get {url:?}: {err_text}"));
             }
         };
         if let Ok(cv) = serde_json::from_slice::<ClusterValidationError>(&body) {
@@ -286,19 +309,42 @@ async fn fetch(
     }
 
     if status / 100 != 2 {
-        let _ = resp.bytes().await;
+        drop(resp);
         observe(&status.to_string());
         return Err(format!("HTTP {status} from {url}"));
     }
 
-    match resp.bytes().await {
+    match read_bounded_body(resp, MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES).await {
         Ok(b) => {
             observe(&status.to_string());
-            Ok(b.to_vec())
+            Ok(b)
         }
-        Err(e) => {
+        Err(err_text) => {
             observe("error");
-            Err(format!("read response body: {}", reqwest_error_text(&e)))
+            Err(format!("read response body: {err_text}"))
         }
     }
+}
+
+async fn read_bounded_body(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes as u64 {
+            return Err(format!(
+                "runtime config HTTP response body ({len} bytes) exceeds maximum size of {max_bytes} bytes"
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| reqwest_error_text(&e))? {
+        if out.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!(
+                "runtime config HTTP response body exceeds maximum size of {max_bytes} bytes"
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }

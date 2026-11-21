@@ -631,7 +631,7 @@ impl MimirConfig {
 
         // 3. Split out extra_sections vs core sections, converting null block values to empty mappings.
         let mut core_map = Mapping::new();
-        let mut extras = BTreeMap::new();
+        let mut extras_map = Mapping::new();
         for (k, v) in root_map.iter() {
             let key = k.as_str().unwrap_or_default();
             if CORE_TOP_KEYS.contains(&key) {
@@ -642,15 +642,24 @@ impl MimirConfig {
                 };
                 core_map.insert(k.clone(), normalized);
             } else {
-                extras.insert(key.to_string(), v.clone());
+                extras_map.insert(k.clone(), v.clone());
             }
         }
 
-        // Recursively drop Null values on struct-typed nested blocks? Note serde's #[serde(default)]
-        // handles omitted fields; for explicit `null` in nested blocks (e.g. `limits: null`),
-        // sanitize_null_mappings ensures Go yaml.v3 compatibility.
+        // Apply Go yaml.v3 decoder.null semantics to both core sections and extra_sections
+        // (strips null on scalars/structs, zeroes slices/CSVs to []/"", zeroes maps to {}).
         let mut core_val = Value::Mapping(core_map);
         crate::yaml_v3::zero_null_fields_like_yaml_v3(&mut core_val);
+        let mut extras_val = Value::Mapping(extras_map);
+        crate::yaml_v3::zero_null_fields_like_yaml_v3(&mut extras_val);
+        let extras: BTreeMap<String, Value> = extras_val
+            .as_mapping()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| k.as_str().map(|ks| (ks.to_string(), v.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
         validate_flattened_core_keys(&core_val)?;
 
         // Go unmarshals the YAML on top of the already-populated (flag default) config, so
@@ -936,6 +945,12 @@ impl MimirConfig {
         self.ingest_storage
             .validate()
             .map_err(wrap_validation("invalid ingest storage config"))?;
+        if self.ingest_storage.enabled {
+            self.ingest_storage
+                .kafka
+                .validate_mimir_rs_support()
+                .map_err(wrap_validation("invalid ingest storage config"))?;
+        }
         self.compartments
             .validate()
             .map_err(wrap_validation("invalid compartments config"))?;
@@ -2188,6 +2203,24 @@ limits: null
         assert!(
             err.contains("cannot be the same as the ones used in blocks storage config"),
             "unexpected err: {err}"
+        );
+
+        // 5. Reject unsupported ingest_storage.kafka.backend=warpstream at config validation.
+        let err = parse_cli_and_load_config(
+            "mimir",
+            &[
+                "-target=ingester".to_string(),
+                "-ingest-storage.enabled=true".to_string(),
+                "-ingest-storage.kafka.address=127.0.0.1:9092".to_string(),
+                "-ingest-storage.kafka.topic=ingest".to_string(),
+                "-ingest-storage.kafka.backend=warpstream".to_string(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("warpstream") && err.contains("not supported"),
+            "unexpected warpstream err: {err}"
         );
     }
 }
