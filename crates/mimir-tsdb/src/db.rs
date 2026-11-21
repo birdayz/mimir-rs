@@ -788,6 +788,21 @@ impl Tsdb {
     /// (`HeadReadGuard` + `HeadReadIsolation`) under `blocks.read()`, matching Go
     /// `DB.blockChunkQuerierForRange` (`tsdb/db.go:2926-2998`).
     pub fn snapshot_query_sources(&self, mint: i64, maxt: i64) -> QuerySourceSnapshot {
+        self.try_snapshot_query_sources(mint, maxt)
+            .unwrap_or_else(|_| QuerySourceSnapshot {
+                blocks: Vec::new(),
+                block_guards: Vec::new(),
+                head: None,
+            })
+    }
+
+    /// Fallible variant of [`Self::snapshot_query_sources`] returning `Err(QuerierError::Closed)`
+    /// when the TSDB or any overlapping block is closed.
+    pub fn try_snapshot_query_sources(
+        &self,
+        mint: i64,
+        maxt: i64,
+    ) -> Result<QuerySourceSnapshot, crate::querier::QuerierError> {
         snapshot_query_sources_with_lock(
             Some(&self.inner.head),
             &[],
@@ -2195,7 +2210,9 @@ mod tests {
     }
 
     #[test]
-    fn closed_tsdb_returns_empty_results_matching_go() {
+    fn closed_tsdb_rejects_queries_with_closed_error() {
+        use crate::querier::QuerierError;
+
         let dir = tempfile::tempdir().unwrap();
         let db = Tsdb::open_with_reload_interval(dir.path(), TsdbOptions::default(), Duration::ZERO).unwrap();
         let pairs = [("__name__", "closed_tsdb_metric"), ("job", "test")];
@@ -2207,14 +2224,26 @@ mod tests {
         db.compact_head_range(1_000, 2_000).unwrap().unwrap();
         assert_eq!(db.block_ulids().len(), 1);
 
+        let matchers = [LabelMatcher::new(crate::matcher::MatchType::Equal, "__name__", "closed_tsdb_metric").unwrap()];
+
         db.close().unwrap();
         assert!(db.is_closed());
+        assert!(matches!(db.try_snapshot_query_sources(i64::MIN, i64::MAX), Err(QuerierError::Closed)));
 
-        let matchers = [LabelMatcher::new(crate::matcher::MatchType::Equal, "__name__", "closed_tsdb_metric").unwrap()];
         let q = db.querier(i64::MIN, i64::MAX);
-        assert_eq!(q.select(false, &matchers).unwrap(), vec![]);
-        assert_eq!(q.label_names(&[]).unwrap(), Vec::<String>::new());
-        assert_eq!(q.label_values("__name__", None, &[]).unwrap(), Vec::<String>::new());
+        assert!(matches!(q.select(false, &matchers), Err(QuerierError::Closed)));
+        assert!(matches!(q.select_chunks(false, &matchers), Err(QuerierError::Closed)));
+        assert!(matches!(q.select_raw_labels(false, &matchers), Err(QuerierError::Closed)));
+        assert!(matches!(q.label_names(&[]), Err(QuerierError::Closed)));
+        assert!(matches!(q.label_values("__name__", None, &[]), Err(QuerierError::Closed)));
+        assert!(matches!(q.prepare_select_chunks(&matchers, false), Err(QuerierError::Closed)));
+        assert!(matches!(q.select_chunks_adaptive(false, &matchers, false, 10, 10), Err(QuerierError::Closed)));
+        assert!(matches!(q.try_select_chunks_adaptive(false, &matchers, false, 10, 10), Err(QuerierError::Closed)));
+
+        let cq = db.chunk_querier(i64::MIN, i64::MAX);
+        assert!(matches!(cq.select(false, &matchers), Err(QuerierError::Closed)));
+        let ucq = db.unordered_chunk_querier(i64::MIN, i64::MAX);
+        assert!(matches!(ucq.select(false, &matchers), Err(QuerierError::Closed)));
     }
 
     #[test]
