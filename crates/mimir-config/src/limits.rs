@@ -986,7 +986,7 @@ impl LimitsConfig {
         if matches!(
             self.label_value_length_over_limit_strategy,
             LabelValueLengthOverLimitStrategy::Truncate | LabelValueLengthOverLimitStrategy::Drop
-        ) && (self.max_label_value_length as usize) < LABEL_VALUE_HASH_LEN
+        ) && self.max_label_value_length < LABEL_VALUE_HASH_LEN as i64
         {
             return Err(ConfigError::Validation(format!(
                 "cannot set -validation.label-value-length-over-limit-strategy to {:?}: label value hash suffix would exceed max label value length of {}",
@@ -1246,6 +1246,27 @@ mod tests {
                 "active_series_additional_custom_trackers validation failed: invalid max custom trackers limit: -1"
             ),
             other => panic!("expected ConfigError::Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_max_label_value_length_with_truncate_or_drop() {
+        for strategy in [
+            LabelValueLengthOverLimitStrategy::Truncate,
+            LabelValueLengthOverLimitStrategy::Drop,
+        ] {
+            let mut limits = LimitsConfig {
+                max_label_value_length: -1,
+                label_value_length_over_limit_strategy: strategy,
+                ..Default::default()
+            };
+            match limits.validate() {
+                Err(ConfigError::Validation(msg)) => assert!(
+                    msg.contains("label value hash suffix would exceed max label value length of -1"),
+                    "unexpected validation msg for {strategy:?}: {msg}"
+                ),
+                other => panic!("expected ConfigError::Validation for {strategy:?}, got {other:?}"),
+            }
         }
     }
 }

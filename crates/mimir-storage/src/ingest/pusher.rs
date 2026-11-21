@@ -1273,14 +1273,12 @@ impl Default for FlushableWriteRequest {
 
 #[derive(Clone)]
 pub struct BatchingQueueDoneHandle {
-    notify: Arc<tokio::sync::Notify>,
-    flag: Arc<std::sync::atomic::AtomicBool>,
+    done_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl BatchingQueueDoneHandle {
     pub fn done(&self) {
-        self.flag.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        let _ = self.done_tx.send(true);
     }
 }
 
@@ -1288,8 +1286,8 @@ pub struct BatchingQueue {
     metrics: BatchingQueueMetrics,
     tx: Option<mpsc::Sender<FlushableWriteRequest>>,
     errs: Arc<SyncMutex<Vec<PusherError>>>,
-    done: Arc<tokio::sync::Notify>,
-    done_flag: Arc<std::sync::atomic::AtomicBool>,
+    done_tx: tokio::sync::watch::Sender<bool>,
+    done_rx: tokio::sync::watch::Receiver<bool>,
     current_batch: FlushableWriteRequest,
     batch_size: usize,
 }
@@ -1301,6 +1299,7 @@ impl BatchingQueue {
         metrics: BatchingQueueMetrics,
     ) -> (Self, mpsc::Receiver<FlushableWriteRequest>) {
         let (tx, rx) = mpsc::channel(capacity.max(1));
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         let batch_size = batch_size.max(1);
         let mut current_batch = FlushableWriteRequest::default();
         current_batch.write_request.timeseries.reserve(batch_size);
@@ -1308,8 +1307,8 @@ impl BatchingQueue {
             metrics,
             tx: Some(tx),
             errs: Arc::new(SyncMutex::new(Vec::new())),
-            done: Arc::new(tokio::sync::Notify::new()),
-            done_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done_tx,
+            done_rx,
             current_batch,
             batch_size,
         };
@@ -1318,8 +1317,7 @@ impl BatchingQueue {
 
     pub fn done_handle(&self) -> BatchingQueueDoneHandle {
         BatchingQueueDoneHandle {
-            notify: Arc::clone(&self.done),
-            flag: Arc::clone(&self.done_flag),
+            done_tx: self.done_tx.clone(),
         }
     }
 
@@ -1381,8 +1379,7 @@ impl BatchingQueue {
     }
 
     pub fn done(&self) {
-        self.done_flag.store(true, Ordering::SeqCst);
-        self.done.notify_waiters();
+        let _ = self.done_tx.send(true);
     }
 
     async fn push_if_full(&mut self) -> Result<(), String> {
@@ -1436,11 +1433,8 @@ impl BatchingQueue {
                 let _ = tx.send(batch).await;
             }
         }
-        let notified = self.done.notified();
         self.tx.take();
-        if !self.done_flag.load(Ordering::SeqCst) {
-            notified.await;
-        }
+        let _ = self.done_rx.wait_for(|&done| done).await;
         errs.extend(self.collect_errors());
         errs
     }
@@ -1527,5 +1521,24 @@ mod tests {
         assert_eq!(owned.metadata.len(), 1);
         assert_eq!(owned.metadata[0].metric_family_name, "up");
         assert_eq!(owned.metadata[0].help, "Target up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn d1_1_batching_queue_close_stress_500_iterations_no_lost_wakeup() {
+        let reg = Registry::new();
+        let bq_metrics = BatchingQueueMetrics::new(Some(&reg));
+        for iter in 0..500usize {
+            let (mut queue, mut rx) = BatchingQueue::new(4, 1, bq_metrics.clone());
+            let done_handle = queue.done_handle();
+            let worker = tokio::spawn(async move {
+                while rx.recv().await.is_some() {}
+                done_handle.done();
+            });
+            let errs = tokio::time::timeout(Duration::from_secs(5), queue.close())
+                .await
+                .unwrap_or_else(|_| panic!("BatchingQueue::close deadlocked at iteration {iter}"));
+            assert!(errs.is_empty());
+            worker.await.unwrap();
+        }
     }
 }

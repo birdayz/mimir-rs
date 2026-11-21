@@ -311,6 +311,13 @@ impl SeriesChunksStreamReader {
         Ok(())
     }
 
+    async fn wait_cancelled(rx: &mut watch::Receiver<bool>) {
+        if rx.wait_for(|&c| c).await.is_ok() {
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+
     pub fn start_buffering(&mut self) {
         let (msg_tx, msg_rx) = mpsc::channel(1);
         let (err_tx, err_rx) = oneshot::channel();
@@ -405,7 +412,7 @@ impl SeriesChunksStreamReader {
 
                     tokio::select! {
                         biased;
-                        _ = parent_cancel.changed(), if *parent_cancel.borrow() => {
+                        _ = Self::wait_cancelled(parent_cancel) => {
                             return Err(StreamError::Canceled(
                                 "aborted stream because query was cancelled: context canceled".to_string(),
                             ));

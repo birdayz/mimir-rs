@@ -612,8 +612,8 @@ impl tracing::field::Visit for FieldVisitor {
 }
 
 impl tracing::Subscriber for CaptureSubscriber {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::WARN
     }
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)

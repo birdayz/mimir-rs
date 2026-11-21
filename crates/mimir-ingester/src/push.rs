@@ -1802,9 +1802,6 @@ impl Ingester {
         metadata: &[BorrowedMetadata<'_>],
         sampled_trace_id: Option<&str>,
     ) -> Result<(), IngesterError> {
-        if items.is_empty() && metadata.is_empty() {
-            return Ok(());
-        }
         let track_bytes = self
             .get_instance_limits()
             .is_some_and(|il| il.max_inflight_push_requests_bytes > 0);
@@ -1824,7 +1821,9 @@ impl Ingester {
         } else {
             0
         };
-        let permit = self.start_push_request_sync(req_size)?;
+        let permit = self
+            .start_push_request_sync(req_size)
+            .map_err(IngesterError::with_do_not_log)?;
         // Go `PushWithCleanup`: metadata is best-effort and ingested before samples, under the
         // same `startPushRequest`; metadata-only requests return before touching the TSDB.
         let meta_count = self.push_metadata_items_with_trace(user_id, metadata, sampled_trace_id);
@@ -2493,21 +2492,32 @@ impl Ingester {
                             let (ex_ts, ex_val, ex_labels, ex_str) = match ex_res {
                                 Ok(v) => v,
                                 Err(ex_err) => {
-                                    stats.failed_exemplars += 1;
-                                    let s_str = make_series_str(raw_labels);
                                     let err = if ex_err.timestamp_ms > max_timestamp_ms {
+                                        stats.failed_exemplars += 1;
+                                        let s_str = make_series_str(raw_labels);
                                         IngesterError::exemplar_too_far_in_future(
                                             ex_err.timestamp_ms,
                                             s_str,
                                             ex_err.exemplar_labels.clone(),
                                         )
                                     } else if ex_err.timestamp_ms < min_timestamp_ms {
+                                        stats.failed_exemplars += 1;
+                                        let s_str = make_series_str(raw_labels);
                                         IngesterError::exemplar_too_far_in_past(
                                             ex_err.timestamp_ms,
                                             s_str,
                                             ex_err.exemplar_labels.clone(),
                                         )
                                     } else {
+                                        let head = db.db.head();
+                                        if !head.options().enable_exemplar_storage
+                                            || head.exemplars().capacity() == 0
+                                        {
+                                            stats.succeeded_exemplars += 1;
+                                            continue;
+                                        }
+                                        stats.failed_exemplars += 1;
+                                        let s_str = make_series_str(raw_labels);
                                         IngesterError::TsdbIngestExemplar {
                                             original_err: ex_err.message.clone(),
                                             timestamp_ms: ex_err.timestamp_ms,
@@ -3280,21 +3290,32 @@ impl Ingester {
                         let (ex_ts, ex_val, ex_labels, ex_str) = match ex_res {
                             Ok(v) => v,
                             Err(ex_err) => {
-                                stats.failed_exemplars += 1;
-                                let s_str = make_series_str(raw_labels);
                                 let err = if ex_err.timestamp_ms > max_timestamp_ms {
+                                    stats.failed_exemplars += 1;
+                                    let s_str = make_series_str(raw_labels);
                                     IngesterError::exemplar_too_far_in_future(
                                         ex_err.timestamp_ms,
                                         s_str,
                                         ex_err.exemplar_labels.clone(),
                                     )
                                 } else if ex_err.timestamp_ms < min_timestamp_ms {
+                                    stats.failed_exemplars += 1;
+                                    let s_str = make_series_str(raw_labels);
                                     IngesterError::exemplar_too_far_in_past(
                                         ex_err.timestamp_ms,
                                         s_str,
                                         ex_err.exemplar_labels.clone(),
                                     )
                                 } else {
+                                    let head = db.db.head();
+                                    if !head.options().enable_exemplar_storage
+                                        || head.exemplars().capacity() == 0
+                                    {
+                                        stats.succeeded_exemplars += 1;
+                                        continue;
+                                    }
+                                    stats.failed_exemplars += 1;
+                                    let s_str = make_series_str(raw_labels);
                                     IngesterError::TsdbIngestExemplar {
                                         original_err: ex_err.message.clone(),
                                         timestamp_ms: ex_err.timestamp_ms,
@@ -3944,21 +3965,32 @@ impl Ingester {
                         let (ex_ts, ex_val, ex_labels, ex_str) = match ts.exemplar_at(e_idx) {
                             Ok(v) => v,
                             Err(ex_err) => {
-                                stats.failed_exemplars += 1;
-                                let s_str = make_series_str(pairs);
                                 let err = if ex_err.timestamp_ms > max_timestamp_ms {
+                                    stats.failed_exemplars += 1;
+                                    let s_str = make_series_str(pairs);
                                     IngesterError::exemplar_too_far_in_future(
                                         ex_err.timestamp_ms,
                                         s_str,
                                         ex_err.exemplar_labels,
                                     )
                                 } else if ex_err.timestamp_ms < min_timestamp_ms {
+                                    stats.failed_exemplars += 1;
+                                    let s_str = make_series_str(pairs);
                                     IngesterError::exemplar_too_far_in_past(
                                         ex_err.timestamp_ms,
                                         s_str,
                                         ex_err.exemplar_labels,
                                     )
                                 } else {
+                                    let head = db.db.head();
+                                    if !head.options().enable_exemplar_storage
+                                        || head.exemplars().capacity() == 0
+                                    {
+                                        stats.succeeded_exemplars += 1;
+                                        continue;
+                                    }
+                                    stats.failed_exemplars += 1;
+                                    let s_str = make_series_str(pairs);
                                     IngesterError::TsdbIngestExemplar {
                                         original_err: ex_err.message,
                                         timestamp_ms: ex_err.timestamp_ms,
@@ -5730,5 +5762,130 @@ mod wave3_tests {
             err.to_string().contains("TSDB Head early compaction in progress"),
             "expected early compaction TsdbUnavailable from acquire_append_lock(50), got: {err}"
         );
+    }
+
+    #[test]
+    fn b02_b03_empty_shard_batch_runs_start_push_request_sync_and_marks_do_not_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-b02-b03".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // When not Running (State::New), an empty sequential record must NOT bypass
+        // start_push_request_sync; it must fail Unavailable wrapped in DoNotLog.
+        let err = ing
+            .ingest_prehashed_shard_batch_with_trace(
+                "t-empty-unavail",
+                cortexpb::write_request::SourceEnum::Api,
+                i64::MAX,
+                &[],
+                &[],
+                None,
+            )
+            .unwrap_err();
+        assert!(err.is_do_not_log(), "expected is_do_not_log() == true, got {err:?}");
+        assert!(matches!(&err, IngesterError::DoNotLog { .. }));
+        assert_eq!(err.map_push_error_to_status().code(), tonic::Code::Unavailable);
+        assert!(ing.get_user_metadata("t-empty-unavail").is_none());
+
+        // When Running, an empty record still initializes user_metadata.
+        ing.set_state_for_test(mimir_common::services::State::Running);
+        ing.ingest_prehashed_shard_batch_with_trace(
+            "t-empty-ok",
+            cortexpb::write_request::SourceEnum::Api,
+            i64::MAX,
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(ing.get_user_metadata("t-empty-ok").is_some());
+    }
+
+    #[tokio::test]
+    async fn b06_exemplar_validation_skipped_while_head_exemplars_capacity_zero() {
+        use mimir_proto::prost::Message as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-b06".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+
+        // Start with max_global_exemplars_per_user = 0 so head exemplar capacity is 0.
+        let initial_limits = mimir_config::LimitsConfig {
+            max_global_exemplars_per_user: 0,
+            ..Default::default()
+        };
+        let overrides = mimir_config::Overrides::new(initial_limits);
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            overrides.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let db = ing.get_or_create_tsdb("t-b06").unwrap();
+        assert_eq!(db.db.head().exemplars().capacity(), 0);
+
+        // Simulate runtime config raising max_global_exemplars_per_user > 0 before
+        // apply_tsdb_settings updates Head exemplar storage capacity.
+        let mut new_limits = (*overrides.defaults()).clone();
+        new_limits.max_global_exemplars_per_user = 10;
+        overrides.set_defaults(new_limits);
+
+        let lp = |n: &'static str, v: &'static str| cortexpb::LabelPair {
+            name: bytes::Bytes::from_static(n.as_bytes()),
+            value: bytes::Bytes::from_static(v.as_bytes()),
+        };
+
+        // In-range exemplar with duplicate label name must be accepted as no-op across all
+        // push paths while head exemplar capacity is still 0 (matching Go head_append_v2.go:259).
+        let req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("__name__", "b06_metric")],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: now,
+                    value: 1.0,
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![lp("trace_id", "a"), lp("trace_id", "b")],
+                    value: 1.0,
+                    timestamp_ms: now,
+                }],
+                ..Default::default()
+            }],
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            ..Default::default()
+        };
+        ing.push_grpc_raw_sync("t-b06", &req.encode_to_vec())
+            .unwrap();
+        ing.push_grpc("t-b06", &req).await.unwrap();
     }
 }

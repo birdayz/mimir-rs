@@ -10,6 +10,7 @@ pub mod model;
 pub mod replication_strategy;
 pub mod util;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -83,6 +84,23 @@ pub struct RingSettings {
     pub zone_awareness_enabled: bool,
     pub excluded_zones: Vec<String>,
     pub subring_cache_disabled: bool,
+}
+
+impl RingSettings {
+    /// Converts RingConfig to RingSettings, rejecting replication_factor <= 0
+    /// identically to Go dskit/ring.NewWithStoreClientAndStrategy.
+    pub fn try_from_config(cfg: &RingConfig) -> Result<Self, RingError> {
+        if cfg.replication_factor <= 0 {
+            return Err(RingError::InvalidReplicationFactor(cfg.replication_factor));
+        }
+        Ok(Self {
+            heartbeat_timeout: cfg.heartbeat_timeout.as_std().unwrap_or(Duration::ZERO),
+            replication_factor: cfg.replication_factor as usize,
+            zone_awareness_enabled: cfg.zone_awareness_enabled,
+            excluded_zones: cfg.excluded_zones.0.clone(),
+            subring_cache_disabled: false,
+        })
+    }
 }
 
 impl From<&RingConfig> for RingSettings {
@@ -221,6 +239,7 @@ impl RingMetrics {
 
 /// Classic consistent hash ring (`dskit/ring.Ring`).
 pub struct Ring {
+    name: String,
     key: String,
     settings: RingSettings,
     kv_client: Option<Arc<dyn KvClient>>,
@@ -276,6 +295,7 @@ impl Ring {
             return Err(RingError::InvalidReplicationFactor(0));
         }
         Ok(Arc::new(Self {
+            name: name.to_string(),
             key: key.to_string(),
             settings,
             kv_client: Some(store),
@@ -313,6 +333,7 @@ impl Ring {
             return Err(RingError::InvalidReplicationFactor(0));
         }
         let ring = Arc::new(Self {
+            name: String::new(),
             key: String::new(),
             settings,
             kv_client: None,
@@ -399,7 +420,7 @@ impl Ring {
             })),
             None,
         )
-        .with_name("ring client")
+        .with_name(format!("{} ring client", self.name))
     }
 
     pub fn key(&self) -> &str {
@@ -540,26 +561,29 @@ impl Ring {
         let now = SystemTime::now();
 
         let states = ["Unhealthy", "ACTIVE", "LEAVING", "PENDING", "JOINING"];
-        let mut num_by_state: HashMap<&str, usize> = states.iter().map(|&s| (s, 0)).collect();
-        let mut oldest_ts_by_state: HashMap<&str, i64> =
-            states.iter().map(|&s| (s, 0)).collect();
-        let mut num_by_zone_and_state: HashMap<String, HashMap<&str, usize>> = HashMap::new();
+        let mut num_by_state: HashMap<Cow<'static, str>, usize> =
+            states.iter().map(|&s| (Cow::Borrowed(s), 0)).collect();
+        let mut oldest_ts_by_state: HashMap<Cow<'static, str>, i64> =
+            states.iter().map(|&s| (Cow::Borrowed(s), 0)).collect();
+        let mut num_by_zone_and_state: HashMap<String, HashMap<Cow<'static, str>, usize>> =
+            HashMap::new();
 
         if self.settings.zone_awareness_enabled {
             for zone in &inner.tracked_ring_zones {
-                let m = states.iter().map(|&s| (s, 0)).collect();
+                let m = states.iter().map(|&s| (Cow::Borrowed(s), 0)).collect();
                 num_by_zone_and_state.insert(zone.clone(), m);
             }
         }
 
         for inst in inner.ring_desc.ingesters.values() {
-            let st_label = if !inst.is_healthy(REPORTING, self.settings.heartbeat_timeout, now) {
-                "Unhealthy"
-            } else {
-                inst.instance_state().as_str_name()
-            };
-            *num_by_state.entry(st_label).or_insert(0) += 1;
-            let oldest = oldest_ts_by_state.entry(st_label).or_insert(0);
+            let st_label: Cow<'static, str> =
+                if !inst.is_healthy(REPORTING, self.settings.heartbeat_timeout, now) {
+                    Cow::Borrowed("Unhealthy")
+                } else {
+                    inst.state_display()
+                };
+            *num_by_state.entry(st_label.clone()).or_insert(0) += 1;
+            let oldest = oldest_ts_by_state.entry(st_label.clone()).or_insert(0);
             if *oldest == 0 || inst.timestamp < *oldest {
                 *oldest = inst.timestamp;
             }
@@ -571,12 +595,15 @@ impl Ring {
         }
 
         for (st, count) in num_by_state {
-            metrics.num_members.with_label_values(&[st]).set(count as f64);
+            metrics
+                .num_members
+                .with_label_values(&[st.as_ref()])
+                .set(count as f64);
         }
         for (st, ts) in oldest_ts_by_state {
             metrics
                 .oldest_timestamp
-                .with_label_values(&[st])
+                .with_label_values(&[st.as_ref()])
                 .set(ts as f64);
         }
         if self.settings.zone_awareness_enabled {
@@ -584,7 +611,7 @@ impl Ring {
                 for (st, count) in by_st {
                     metrics
                         .num_zone_members
-                        .with_label_values(&[zone.as_str(), st])
+                        .with_label_values(&[zone.as_str(), st.as_ref()])
                         .set(count as f64);
                 }
             }
@@ -738,7 +765,7 @@ impl Ring {
                 .ok_or(RingError::InconsistentTokensInfo)?
                 .clone();
 
-            if op.should_extend_replica_set_on_state(instance.instance_state()) {
+            if op.should_extend_raw_state(instance.state) {
                 replica_set_size += 1;
             } else if zone_awareness_enabled && !info.zone.is_empty() {
                 if let Some(zi) = zone_index {
@@ -856,7 +883,7 @@ impl Ring {
             .ring_desc
             .ingesters
             .iter()
-            .filter(|(_, inst)| op.is_instance_in_state_healthy(inst.instance_state()))
+            .filter(|(_, inst)| op.is_raw_state_healthy(inst.state))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         self.build_ring_for_shard(&inner, shard)
@@ -1063,6 +1090,7 @@ impl Ring {
         let oldest_registered_timestamp = get_oldest_registered_timestamp(&shard_desc);
 
         Arc::new(Ring {
+            name: self.name.clone(),
             key: self.key.clone(),
             settings: self.settings.clone(),
             kv_client: None,
@@ -1222,7 +1250,10 @@ impl Ring {
     }
 
     pub fn get_instance_state(&self, instance_id: &str) -> Result<InstanceState, RingError> {
-        Ok(self.get_instance(instance_id)?.instance_state())
+        let inst = self.get_instance(instance_id)?;
+        InstanceState::try_from(inst.state).map_err(|_| {
+            RingError::InvalidConfig(format!("unknown instance state: {}", inst.state))
+        })
     }
 
     pub fn has_instance(&self, instance_id: &str) -> bool {
@@ -1400,6 +1431,93 @@ mod new_ring_tests {
                 err.to_string(),
                 format!("ReplicationFactor must be greater than zero: {rf}")
             );
+
+            let err2 = RingSettings::try_from_config(&cfg).unwrap_err();
+            assert_eq!(
+                err2.to_string(),
+                format!("ReplicationFactor must be greater than zero: {rf}")
+            );
         }
+    }
+
+    #[test]
+    fn c07_unknown_instance_state_is_not_coerced_to_active() {
+        use super::replication_strategy::{READ, WRITE, WRITE_NO_EXTEND};
+        use mimir_common::services::Service;
+
+        let now = SystemTime::now();
+        let now_s = system_time_to_unix_secs(now);
+        let mut desc = Desc::default();
+        desc.ingesters.insert(
+            "unknown-5".to_string(),
+            InstanceDesc {
+                id: "unknown-5".to_string(),
+                addr: "10.0.0.5:9095".to_string(),
+                state: 5,
+                timestamp: now_s,
+                tokens: vec![100, 200],
+                ..Default::default()
+            },
+        );
+        desc.ingesters.insert(
+            "unknown-neg".to_string(),
+            InstanceDesc {
+                id: "unknown-neg".to_string(),
+                addr: "10.0.0.6:9095".to_string(),
+                state: -1,
+                timestamp: now_s,
+                tokens: vec![300],
+                ..Default::default()
+            },
+        );
+
+        let inst5 = &desc.ingesters["unknown-5"];
+        assert!(!inst5.is_healthy(WRITE, Duration::from_secs(60), now));
+        assert!(!inst5.is_healthy(WRITE_NO_EXTEND, Duration::from_secs(60), now));
+        assert!(!inst5.is_healthy(READ, Duration::from_secs(60), now));
+        assert!(inst5.is_healthy(REPORTING, Duration::from_secs(60), now));
+        let ready_err = inst5.is_ready(now, Duration::from_secs(60)).unwrap_err();
+        assert!(ready_err.contains("in state 5"), "got: {ready_err}");
+
+        let inst_neg = &desc.ingesters["unknown-neg"];
+        assert!(!inst_neg.is_healthy(REPORTING, Duration::from_secs(60), now));
+        let ready_err_neg = inst_neg.is_ready(now, Duration::from_secs(60)).unwrap_err();
+        assert!(ready_err_neg.contains("in state -1"), "got: {ready_err_neg}");
+
+        let ring = Ring::from_desc(
+            RingSettings {
+                heartbeat_timeout: Duration::from_secs(60),
+                replication_factor: 1,
+                zone_awareness_enabled: false,
+                excluded_zones: Vec::new(),
+                subring_cache_disabled: false,
+            },
+            desc,
+            Arc::new(DefaultReplicationStrategy),
+        )
+        .unwrap();
+        assert!(ring.get_subring_for_operation_states(WRITE).instances_count() == 0);
+        assert!(ring.get_subring_for_operation_states(READ).instances_count() == 0);
+        assert!(ring.get(150, WRITE).is_err());
+        assert!(ring.get_instance_state("unknown-5").is_err());
+
+        // C-12: Ring::into_service name includes ring name prefix.
+        let kv = Arc::new(crate::kv::inmemory::InMemoryKv::new(ring_desc_codec()));
+        let named_ring = Ring::with_store_and_strategy(
+            RingSettings {
+                heartbeat_timeout: Duration::from_secs(60),
+                replication_factor: 1,
+                zone_awareness_enabled: false,
+                excluded_zones: Vec::new(),
+                subring_cache_disabled: false,
+            },
+            "ingester",
+            "ring",
+            kv,
+            Arc::new(DefaultReplicationStrategy),
+            None,
+        )
+        .unwrap();
+        assert_eq!(named_ring.into_service().service_name(), "ingester ring client");
     }
 }

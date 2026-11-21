@@ -77,6 +77,19 @@ impl BucketError {
             _ => false,
         }
     }
+
+    /// Matching Thanos `objstore.Bucket.IsAccessDeniedErr`:
+    /// - S3: `AccessDenied`
+    /// - GCS: HTTP 403 / `PermissionDenied`
+    /// - Azure: `AuthorizationPermissionMismatch` or `InsufficientAccountPermissions`
+    /// - Filesystem / InMemory: `false`
+    pub fn is_access_denied(&self) -> bool {
+        match self {
+            BucketError::S3(e) => e.is_access_denied(),
+            BucketError::Store(object_store::Error::PermissionDenied { .. }) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,7 +459,12 @@ impl BucketClient {
                 Backend::Filesystem(fs) => {
                     let path = self.object_path(name)?;
                     let store = fs.get_or_create().await?;
-                    store_upload(&store, &path, source).await
+                    store_upload(&store, &path, source)
+                        .await
+                        .map_err(|e| match e {
+                            BucketError::Store(se) => map_fs_store_error(se),
+                            other => other,
+                        })
                 }
             }
         }
@@ -517,7 +535,7 @@ impl BucketClient {
             Backend::Filesystem(fs) => {
                 let path = self.object_path(name)?;
                 match fs.get_existing().await {
-                    Ok(Some(store)) => store_read_op(&store, &path, name, range).await,
+                    Ok(Some(store)) => fs_read_op(&store, &path, name, range).await,
                     Ok(None) => Err(BucketError::NotFound(name.to_string())),
                     Err(e) => Err(e),
                 }
@@ -569,7 +587,7 @@ impl BucketClient {
                 match store.head(&path).await {
                     Ok(_) => Ok(true),
                     Err(object_store::Error::NotFound { .. }) => Ok(false),
-                    Err(e) => Err(BucketError::Store(e)),
+                    Err(e) => Err(map_fs_store_error(e)),
                 }
             }
             .await,
@@ -587,18 +605,20 @@ impl BucketClient {
         let result = match &self.backend {
             // S3 DeleteObject succeeds for missing objects (minio-go RemoveObject).
             Backend::S3(b) => b.delete(&self.full_name(name)).await.map_err(BucketError::S3),
+            // GCS, Azure, and InMemory Delete return NotFound for missing objects (matching Go Thanos).
             Backend::Store(store) => async {
                 let path = self.object_path(name)?;
                 match store.delete(&path).await {
                     Ok(()) => Ok(()),
-                    Err(object_store::Error::NotFound { .. }) if strict => {
+                    Err(object_store::Error::NotFound { .. }) => {
                         Err(BucketError::NotFound(name.to_string()))
                     }
-                    Err(object_store::Error::NotFound { .. }) => Ok(()),
                     Err(e) => Err(BucketError::Store(e)),
                 }
             }
             .await,
+            // Filesystem Delete succeeds for missing files (os.RemoveAll), while delete_strict()
+            // preserves explicit missing-object checks (e.g. w16_apc_09, w19_mod_01).
             Backend::Filesystem(fs) => async {
                 let path = self.object_path(name)?;
                 let Some(store) = fs.get_existing().await? else {
@@ -614,7 +634,7 @@ impl BucketClient {
                         Err(BucketError::NotFound(name.to_string()))
                     }
                     Err(object_store::Error::NotFound { .. }) => Ok(()),
-                    Err(e) => Err(BucketError::Store(e)),
+                    Err(e) => Err(map_fs_store_error(e)),
                 }
             }
             .await,
@@ -684,7 +704,7 @@ impl BucketClient {
                     Err(object_store::Error::NotFound { .. }) => {
                         Err(BucketError::NotFound(name.to_string()))
                     }
-                    Err(e) => Err(BucketError::Store(e)),
+                    Err(e) => Err(map_fs_store_error(e)),
                 }
             }
             .await,
@@ -724,6 +744,7 @@ impl BucketClient {
                     .map_err(|e| BucketError::InvalidPath(full.clone(), e.to_string()))?,
             )
         };
+        let is_fs = matches!(&self.backend, Backend::Filesystem(_));
         let owned_fs_store: Arc<dyn ObjectStore>;
         let store: &Arc<dyn ObjectStore> = match &self.backend {
             Backend::Store(store) => store,
@@ -743,8 +764,14 @@ impl BucketClient {
                 match stream.try_next().await {
                     Ok(Some(meta)) => keys.push(self.strip_prefix(meta.location.as_ref())),
                     Ok(None) => break,
-                    Err(object_store::Error::NotFound { .. }) => break,
-                    Err(e) => return Err(BucketError::Store(e)),
+                    Err(object_store::Error::NotFound { .. }) if is_fs => break,
+                    Err(e) => {
+                        return Err(if is_fs {
+                            map_fs_store_error(e)
+                        } else {
+                            BucketError::Store(e)
+                        });
+                    }
                 }
             }
             keys.sort();
@@ -752,8 +779,14 @@ impl BucketClient {
         }
         let list_res = match store.list_with_delimiter(prefix.as_ref()).await {
             Ok(res) => res,
-            Err(object_store::Error::NotFound { .. }) => return Ok(Vec::new()),
-            Err(e) => return Err(BucketError::Store(e)),
+            Err(object_store::Error::NotFound { .. }) if is_fs => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(if is_fs {
+                    map_fs_store_error(e)
+                } else {
+                    BucketError::Store(e)
+                });
+            }
         };
 
         let mut entries =
@@ -842,6 +875,42 @@ impl Drop for UploadAbortGuard {
                 });
             }
         }
+    }
+}
+
+fn map_fs_store_error(e: object_store::Error) -> BucketError {
+    match e {
+        object_store::Error::PermissionDenied { source, .. } => {
+            BucketError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, source))
+        }
+        other => BucketError::Store(other),
+    }
+}
+
+async fn fs_read_op(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+    name: &str,
+    range: Option<(u64, u64)>,
+) -> Result<Bytes, BucketError> {
+    match store_read_op(store, path, name, range).await {
+        Ok(b) => Ok(b),
+        Err(BucketError::Store(e @ object_store::Error::Generic { .. })) => {
+            if let Some((off, len)) = range {
+                if len > 0 {
+                    match store.head(path).await {
+                        Ok(meta) if off >= meta.size as u64 => return Ok(Bytes::new()),
+                        Err(object_store::Error::NotFound { .. }) => {
+                            return Err(BucketError::NotFound(name.to_string()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(map_fs_store_error(e))
+        }
+        Err(BucketError::Store(e)) => Err(map_fs_store_error(e)),
+        Err(e) => Err(e),
     }
 }
 
@@ -1210,5 +1279,159 @@ mod tests {
             sum_counters("thanos_objstore_bucket_operation_failures_total"),
             0.0
         );
+    }
+
+    #[tokio::test]
+    async fn d2_03_delete_provider_semantics_match_thanos() {
+        // Filesystem: delete() succeeds on missing objects without incrementing ops_failures.
+        let dir = tempfile::tempdir().unwrap();
+        let reg_fs = prometheus::Registry::new();
+        let mut cfg_fs = BucketConfig::default();
+        cfg_fs.backend_cfg.backend = "filesystem".to_string();
+        cfg_fs.backend_cfg.filesystem.dir = dir.path().to_string_lossy().into_owned();
+        let fs_bkt = BucketClient::new_client(&cfg_fs, "ingester", Some(&reg_fs)).unwrap();
+
+        fs_bkt.delete("missing.bin").await.unwrap();
+        let fs_failures: f64 = reg_fs
+            .gather()
+            .iter()
+            .filter(|mf| mf.get_name() == "thanos_objstore_bucket_operation_failures_total")
+            .flat_map(|mf| mf.get_metric())
+            .map(|m| m.get_counter().get_value())
+            .sum();
+        assert_eq!(fs_failures, 0.0);
+
+        // Backend::Store (GCS / Azure): delete() returns NotFound and increments ops_failures
+        // unless with_expected_not_found() is used.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    loop {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        let hdr_end = loop {
+                            let Ok(n) = sock.read(&mut tmp).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..hdr_end]);
+                        let resp = if head.contains("restype=container") {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                        } else {
+                            "HTTP/1.1 404 Not Found\r\nx-ms-error-code: BlobNotFound\r\nContent-Length: 0\r\n\r\n"
+                        };
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let gcs_sa = format!(
+            r#"{{"type":"service_account","private_key":"unused","private_key_id":"x","client_email":"x@y","gcs_base_url":"http://{addr}","disable_oauth":true}}"#
+        );
+        let mut gcs_cfg = BucketConfig::default();
+        gcs_cfg.backend_cfg.backend = "gcs".to_string();
+        gcs_cfg.backend_cfg.gcs.bucket_name = "bkt".to_string();
+        gcs_cfg.backend_cfg.gcs.service_account = gcs_sa;
+
+        let mut az_cfg = BucketConfig::default();
+        az_cfg.backend_cfg.backend = "azure".to_string();
+        az_cfg.backend_cfg.azure.account_name = "devstoreaccount1".to_string();
+        az_cfg.backend_cfg.azure.container_name = "blocks".to_string();
+        az_cfg.backend_cfg.azure.connection_string = format!(
+            "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://{addr}/devstoreaccount1;"
+        );
+
+        for cfg in [gcs_cfg, az_cfg] {
+            let reg_store = prometheus::Registry::new();
+            let reg_c = reg_store.clone();
+            let bkt = tokio::task::spawn_blocking(move || {
+                BucketClient::new_client(&cfg, "ingester", Some(&reg_c))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+            let err = bkt.delete("missing.bin").await.unwrap_err();
+            assert!(err.is_not_found(), "expected NotFound, got {err:?}");
+            let delete_failures = || -> f64 {
+                reg_store
+                    .gather()
+                    .iter()
+                    .filter(|mf| mf.get_name() == "thanos_objstore_bucket_operation_failures_total")
+                    .flat_map(|mf| mf.get_metric())
+                    .filter(|m| {
+                        m.get_label().iter().any(|lp| {
+                            lp.get_name() == "operation" && lp.get_value() == metrics::OP_DELETE
+                        })
+                    })
+                    .map(|m| m.get_counter().get_value())
+                    .sum()
+            };
+            assert_eq!(delete_failures(), 1.0);
+
+            let err2 = bkt
+                .with_expected_not_found()
+                .delete("missing.bin")
+                .await
+                .unwrap_err();
+            assert!(err2.is_not_found());
+            assert_eq!(delete_failures(), 1.0);
+        }
+        srv.abort();
+    }
+
+    #[test]
+    fn d2_07_bucket_error_is_access_denied() {
+        assert!(BucketError::Store(object_store::Error::PermissionDenied {
+            path: "a".into(),
+            source: "forbidden".into(),
+        })
+        .is_access_denied());
+        assert!(!BucketError::NotFound("a".into()).is_access_denied());
+        assert!(!BucketError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "eacces"
+        ))
+        .is_access_denied());
+    }
+
+    #[tokio::test]
+    async fn d2_10_filesystem_get_range_at_or_past_eof_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let bkt = BucketClient::new_filesystem(dir.path()).unwrap();
+
+        bkt.upload("empty.bin", Bytes::new()).await.unwrap();
+        bkt.upload("hello.bin", Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+
+        assert_eq!(bkt.get_range("empty.bin", 0, 10).await.unwrap(), Bytes::new());
+        assert_eq!(bkt.get_range("empty.bin", 5, 10).await.unwrap(), Bytes::new());
+        assert_eq!(bkt.get_range("hello.bin", 5, 10).await.unwrap(), Bytes::new());
+        assert_eq!(bkt.get_range("hello.bin", 100, 10).await.unwrap(), Bytes::new());
+        assert_eq!(
+            bkt.get_range("hello.bin", 2, 10).await.unwrap(),
+            Bytes::from_static(b"llo")
+        );
+        assert!(matches!(
+            bkt.get_range("missing.bin", 0, 10).await,
+            Err(BucketError::NotFound(_))
+        ));
     }
 }

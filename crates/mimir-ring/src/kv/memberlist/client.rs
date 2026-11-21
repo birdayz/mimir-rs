@@ -372,6 +372,7 @@ pub struct MemberlistKv {
     metrics: KvMetrics,
     go_metrics: Arc<GoMetrics>,
     stream_decryptor: Option<StreamDecryptFn>,
+    propagation_tracker: Mutex<Option<Arc<super::propagation_tracker::PropagationDelayTracker>>>,
 }
 
 /// Process-wide go-metrics sink (Go `metrics.NewGlobal` replaces the global sink).
@@ -394,6 +395,9 @@ impl MemberlistKv {
                 "invalid WatchPrefixBufferSize: must be greater than 0".to_string(),
             ));
         }
+        cfg.propagation_delay_tracker
+            .validate()
+            .map_err(|e| KvError::InvalidConfig(e.to_string()))?;
 
         let mut node_name = if cfg.node_name.is_empty() {
             default_hostname()
@@ -482,12 +486,18 @@ impl MemberlistKv {
                 registry: reg.cloned(),
                 node_name,
                 compression_algo,
-                codecs: RwLock::new(
-                    codecs
+                codecs: RwLock::new({
+                    let mut map: HashMap<String, Arc<dyn Codec>> = codecs
                         .into_iter()
                         .map(|c| (c.codec_id().to_string(), c))
-                        .collect(),
-                ),
+                        .collect();
+                    if cfg.propagation_delay_tracker.enabled {
+                        let pt_codec = super::propagation_tracker::propagation_delay_tracker_codec();
+                        map.entry(pt_codec.codec_id().to_string())
+                            .or_insert(pt_codec);
+                    }
+                    map
+                }),
                 node_meta,
                 dns,
                 discover_backoff: opts.discover_members_backoff,
@@ -525,6 +535,7 @@ impl MemberlistKv {
                 metrics: KvMetrics::new(metrics_namespace),
                 go_metrics: Arc::clone(&go_metrics),
                 stream_decryptor,
+                propagation_tracker: Mutex::new(None),
                 cfg,
             }
         });
@@ -567,7 +578,7 @@ impl MemberlistKv {
                     })
                 })),
             )
-            .with_name("memberlist-kv")
+            .with_name("memberlist_kv")
         };
         let _ = kv.service.set(svc);
         Ok(kv)
@@ -653,12 +664,6 @@ impl MemberlistKv {
 
     /// dskit `starting`: create transport + memberlist, then fast-join.
     async fn starting(self: Arc<Self>, ctx: ServiceContext) -> Result<(), String> {
-        if self.cfg.propagation_delay_tracker.enabled {
-            return Err(
-                "memberlist propagation delay tracker (-memberlist.propagation-delay-tracker.enabled) is not supported by mimir-rs"
-                    .to_string(),
-            );
-        }
         if self.cfg.cluster_label.len() > LABEL_MAX_SIZE {
             return Err(format!(
                 "failed to create memberlist: could not use {:?} as a label: too long",
@@ -723,6 +728,20 @@ impl MemberlistKv {
             return Err(ERR_FAILED_TO_JOIN_CLUSTER.to_string());
         }
 
+        if self.cfg.propagation_delay_tracker.enabled {
+            let tracker = super::propagation_tracker::PropagationDelayTracker::new(
+                self.me.clone(),
+                self.cfg.propagation_delay_tracker.clone(),
+                self.node_name.clone(),
+                self.registry.as_ref(),
+            );
+            if let Err(err) = tracker.service().start_async(ctx.clone()).await {
+                warn!(%err, "failed to start propagation delay tracker");
+            } else {
+                *self.propagation_tracker.lock() = Some(tracker);
+            }
+        }
+
         let rejoin_interval = self.cfg.rejoin_interval.as_std().unwrap_or(Duration::ZERO);
         let rejoin_nodes = self.rejoin_seed_nodes();
         let rejoin_enabled = !rejoin_interval.is_zero() && !rejoin_nodes.is_empty();
@@ -770,8 +789,16 @@ impl MemberlistKv {
         }
     }
 
-    /// dskit `stopping`: flush local broadcasts, leave, shut down.
+    /// dskit stopping: flush local broadcasts, leave, shut down.
     async fn stopping(self: Arc<Self>) {
+        let tracker = self.propagation_tracker.lock().take();
+        if let Some(t) = tracker {
+            let svc = t.service();
+            svc.stop_async();
+            if let Err(err) = svc.await_terminated().await {
+                warn!(%err, "error stopping propagation delay tracker");
+            }
+        }
         info!("leaving memberlist cluster");
         if self.transport.get().is_some() {
             let timeout = self
@@ -2019,22 +2046,20 @@ impl MemberlistKv {
                     if !had_curr {
                         return Ok((None, 0, curr_deleted, curr_update));
                     }
-                    // Store the merged & tombstone-stripped result even when nothing remains to
-                    // gossip, matching Go's in-place mutation of curr.value so LEFT /
-                    // PartitionDeleted / OwnerDeleted transitions are never dropped and local
-                    // watchers are notified.
-                    let new_version = curr_version + 1;
+                    // Persist the merged & tombstone-stripped result without bumping
+                    // curr_version, matching Go's in-place mutation of curr.value while
+                    // returning new_version = 0 (errNoChangeDetected).
                     store.insert(
                         key.to_string(),
                         ValueDesc {
                             value: result,
-                            version: new_version,
+                            version: curr_version,
                             codec_id: codec_id.to_string(),
-                            deleted: new_deleted,
-                            update_time: new_updated,
+                            deleted: curr_deleted,
+                            update_time: curr_update,
                         },
                     );
-                    return Ok((None, new_version, new_deleted, new_updated));
+                    return Ok((None, 0, curr_deleted, curr_update));
                 }
             }
         }
@@ -2059,7 +2084,7 @@ impl MemberlistKv {
         Ok((change, new_version, new_deleted, new_updated))
     }
 
-    fn merge_bytes_value_for_key(
+    pub(crate) fn merge_bytes_value_for_key(
         &self,
         key: &str,
         incoming_data: &[u8],
@@ -2134,7 +2159,7 @@ impl MemberlistKv {
     }
 
     /// dskit `notifyWatchers`.
-    fn notify_watchers(&self, key: &str) {
+    pub(crate) fn notify_watchers(&self, key: &str) {
         let interval = self.cfg.notify_interval.as_std().unwrap_or(Duration::ZERO);
         if interval.is_zero() {
             self.notify_watchers_sync(key);

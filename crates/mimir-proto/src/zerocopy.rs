@@ -3840,48 +3840,47 @@ pub fn encode_write_request_rw2_bytes(
     }
 }
 
-/// Encodes an RW1 `WriteRequest` (which may contain arbitrary non-UTF-8 label or exemplar bytes)
-/// into RW2 protobuf wire bytes, preserving raw byte slices verbatim in `symbols_rw2` (field 4)
-/// just like Go's `FromWriteRequestToRW2Request` + `Marshal()`.
-fn encode_write_request_rw2_raw_bytes(
-    rw1: &cortexpb::WriteRequest,
+fn symbolize_raw_bytes<'a>(
+    b: &'a [u8],
     offset: u32,
     common_symbols: Option<&CommonSymbols>,
-    out: &mut Vec<u8>,
-) -> Result<(), EncodeRw2Error> {
+    syms: &mut Vec<&'a [u8]>,
+    map: &mut HashMap<&'a [u8], u32>,
+    syms_proto_size: &mut usize,
+) -> u32 {
+    if b.is_empty() {
+        return 0;
+    }
+    if let Some(cs) = common_symbols {
+        if let Ok(s) = std::str::from_utf8(b) {
+            if let Some(r) = cs.get_ref(s) {
+                return r;
+            }
+        }
+    }
+    if let Some(&r) = map.get(b) {
+        return r;
+    }
+    let r = (syms.len() as u32) + offset;
+    syms.push(b);
+    map.insert(b, r);
+    *syms_proto_size += 1 + b.len() + prost::encoding::encoded_len_varint(b.len() as u64);
+    r
+}
+
+fn build_rw2_raw_parts<'a>(
+    rw1: &'a cortexpb::WriteRequest,
+    offset: u32,
+    common_symbols: Option<&CommonSymbols>,
+) -> Result<(Vec<&'a [u8]>, Vec<cortexpb::TimeSeriesRw2>), EncodeRw2Error> {
     if !rw1.symbols_rw2.is_empty() || !rw1.timeseries_rw2.is_empty() {
         return Err(EncodeRw2Error::AlreadyRw2);
     }
 
-    fn symbolize_bytes<'a>(
-        b: &'a [u8],
-        offset: u32,
-        common_symbols: Option<&CommonSymbols>,
-        syms: &mut Vec<&'a [u8]>,
-        map: &mut HashMap<&'a [u8], u32>,
-    ) -> u32 {
-        if b.is_empty() {
-            return 0;
-        }
-        if let Some(cs) = common_symbols {
-            if let Ok(s) = std::str::from_utf8(b) {
-                if let Some(r) = cs.get_ref(s) {
-                    return r;
-                }
-            }
-        }
-        if let Some(&r) = map.get(b) {
-            return r;
-        }
-        let r = (syms.len() as u32) + offset;
-        syms.push(b);
-        map.insert(b, r);
-        r
-    }
-
-    let mut syms: Vec<&[u8]> = Vec::with_capacity(101);
+    let mut syms: Vec<&'a [u8]> = Vec::with_capacity(101);
     syms.push(b"");
-    let mut map: HashMap<&[u8], u32> = HashMap::with_capacity(100);
+    let mut map: HashMap<&'a [u8], u32> = HashMap::with_capacity(100);
+    let mut syms_proto_size = 0usize;
 
     let mut metadata_map: HashMap<&[u8], usize> = HashMap::new();
     let mut matched_metadata_mask: Vec<bool> = Vec::new();
@@ -3911,8 +3910,22 @@ fn encode_write_request_rw2_raw_bytes(
             if name == b"__name__" {
                 metric_name = value;
             }
-            refs.push(symbolize_bytes(name, offset, common_symbols, &mut syms, &mut map));
-            refs.push(symbolize_bytes(value, offset, common_symbols, &mut syms, &mut map));
+            refs.push(symbolize_raw_bytes(
+                name,
+                offset,
+                common_symbols,
+                &mut syms,
+                &mut map,
+                &mut syms_proto_size,
+            ));
+            refs.push(symbolize_raw_bytes(
+                value,
+                offset,
+                common_symbols,
+                &mut syms,
+                &mut map,
+                &mut syms_proto_size,
+            ));
         }
 
         let mut metadata = Some(cortexpb::MetadataRw2::default());
@@ -3921,8 +3934,22 @@ fn encode_write_request_rw2_raw_bytes(
                 let m = &rw1.metadata[meta_idx];
                 metadata = Some(cortexpb::MetadataRw2 {
                     r#type: m.r#type,
-                    help_ref: symbolize_bytes(m.help.as_bytes(), offset, common_symbols, &mut syms, &mut map),
-                    unit_ref: symbolize_bytes(m.unit.as_bytes(), offset, common_symbols, &mut syms, &mut map),
+                    help_ref: symbolize_raw_bytes(
+                        m.help.as_bytes(),
+                        offset,
+                        common_symbols,
+                        &mut syms,
+                        &mut map,
+                        &mut syms_proto_size,
+                    ),
+                    unit_ref: symbolize_raw_bytes(
+                        m.unit.as_bytes(),
+                        offset,
+                        common_symbols,
+                        &mut syms,
+                        &mut map,
+                        &mut syms_proto_size,
+                    ),
                 });
                 matched_metadata_mask[meta_idx] = true;
             }
@@ -3934,8 +3961,22 @@ fn encode_write_request_rw2_raw_bytes(
             .map(|ex| {
                 let mut ex_refs = Vec::with_capacity(ex.labels.len() * 2);
                 for l in &ex.labels {
-                    ex_refs.push(symbolize_bytes(l.name.as_ref(), offset, common_symbols, &mut syms, &mut map));
-                    ex_refs.push(symbolize_bytes(l.value.as_ref(), offset, common_symbols, &mut syms, &mut map));
+                    ex_refs.push(symbolize_raw_bytes(
+                        l.name.as_ref(),
+                        offset,
+                        common_symbols,
+                        &mut syms,
+                        &mut map,
+                        &mut syms_proto_size,
+                    ));
+                    ex_refs.push(symbolize_raw_bytes(
+                        l.value.as_ref(),
+                        offset,
+                        common_symbols,
+                        &mut syms,
+                        &mut map,
+                        &mut syms_proto_size,
+                    ));
                 }
                 cortexpb::ExemplarRw2 {
                     labels_refs: ex_refs,
@@ -3960,13 +4001,41 @@ fn encode_write_request_rw2_raw_bytes(
             continue;
         }
         let labels_refs = vec![
-            symbolize_bytes(b"__name__", offset, common_symbols, &mut syms, &mut map),
-            symbolize_bytes(m.metric_family_name.as_bytes(), offset, common_symbols, &mut syms, &mut map),
+            symbolize_raw_bytes(
+                b"__name__",
+                offset,
+                common_symbols,
+                &mut syms,
+                &mut map,
+                &mut syms_proto_size,
+            ),
+            symbolize_raw_bytes(
+                m.metric_family_name.as_bytes(),
+                offset,
+                common_symbols,
+                &mut syms,
+                &mut map,
+                &mut syms_proto_size,
+            ),
         ];
         let rw2_meta = cortexpb::MetadataRw2 {
             r#type: m.r#type,
-            help_ref: symbolize_bytes(m.help.as_bytes(), offset, common_symbols, &mut syms, &mut map),
-            unit_ref: symbolize_bytes(m.unit.as_bytes(), offset, common_symbols, &mut syms, &mut map),
+            help_ref: symbolize_raw_bytes(
+                m.help.as_bytes(),
+                offset,
+                common_symbols,
+                &mut syms,
+                &mut map,
+                &mut syms_proto_size,
+            ),
+            unit_ref: symbolize_raw_bytes(
+                m.unit.as_bytes(),
+                offset,
+                common_symbols,
+                &mut syms,
+                &mut map,
+                &mut syms_proto_size,
+            ),
         };
         rw2_timeseries.push(cortexpb::TimeSeriesRw2 {
             labels_refs,
@@ -3978,16 +4047,54 @@ fn encode_write_request_rw2_raw_bytes(
         });
     }
 
+    Ok((syms, rw2_timeseries))
+}
+
+fn rw2_raw_base_encoded_len(rw1: &cortexpb::WriteRequest) -> usize {
+    let mut n = 0usize;
+    if rw1.source != 0 {
+        n += prost::encoding::int32::encoded_len(2, &rw1.source);
+    }
+    if rw1.skip_label_validation {
+        n += prost::encoding::bool::encoded_len(1000, &rw1.skip_label_validation);
+    }
+    if rw1.skip_label_count_validation {
+        n += prost::encoding::bool::encoded_len(1001, &rw1.skip_label_count_validation);
+    }
+    n
+}
+
+fn rw2_raw_encoded_len(
+    rw1: &cortexpb::WriteRequest,
+    syms: &[&[u8]],
+    rw2_timeseries: &[cortexpb::TimeSeriesRw2],
+) -> usize {
+    let mut n = rw2_raw_base_encoded_len(rw1);
+    for sym in syms {
+        n += 1 + prost::encoding::encoded_len_varint(sym.len() as u64) + sym.len();
+    }
+    for ts in rw2_timeseries {
+        n += prost::encoding::message::encoded_len(5, ts);
+    }
+    n
+}
+
+fn encode_rw2_raw_parts(
+    rw1: &cortexpb::WriteRequest,
+    syms: &[&[u8]],
+    rw2_timeseries: &[cortexpb::TimeSeriesRw2],
+    out: &mut Vec<u8>,
+) {
     out.clear();
     if rw1.source != 0 {
         prost::encoding::int32::encode(2, &rw1.source, out);
     }
-    for sym in &syms {
+    for sym in syms {
         prost::encoding::encode_key(4, prost::encoding::WireType::LengthDelimited, out);
         prost::encoding::encode_varint(sym.len() as u64, out);
         out.extend_from_slice(sym);
     }
-    for ts in &rw2_timeseries {
+    for ts in rw2_timeseries {
         prost::encoding::message::encode(5, ts, out);
     }
     if rw1.skip_label_validation {
@@ -3996,7 +4103,214 @@ fn encode_write_request_rw2_raw_bytes(
     if rw1.skip_label_count_validation {
         prost::encoding::bool::encode(1001, &rw1.skip_label_count_validation, out);
     }
+}
+
+/// Encodes an RW1 `WriteRequest` (which may contain arbitrary non-UTF-8 label or exemplar bytes)
+/// into RW2 protobuf wire bytes, preserving raw byte slices verbatim in `symbols_rw2` (field 4)
+/// just like Go's `FromWriteRequestToRW2Request` + `Marshal()`.
+fn encode_write_request_rw2_raw_bytes(
+    rw1: &cortexpb::WriteRequest,
+    offset: u32,
+    common_symbols: Option<&CommonSymbols>,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeRw2Error> {
+    let (syms, rw2_timeseries) = build_rw2_raw_parts(rw1, offset, common_symbols)?;
+    encode_rw2_raw_parts(rw1, &syms, &rw2_timeseries, out);
     Ok(())
+}
+
+/// Converts an RW1 `WriteRequest` (preserving arbitrary non-UTF-8 label/exemplar bytes verbatim)
+/// into RW2 and splits it into encoded protobuf records each <= `max_size` bytes (best effort),
+/// matching Go's `FromWriteRequestToRW2Request` + `SplitWriteRequestByMaxMarshalSizeRW2`.
+pub fn encode_write_request_rw2_split_raw_bytes(
+    rw1: &cortexpb::WriteRequest,
+    max_size: usize,
+    offset: u32,
+    common_symbols: Option<&CommonSymbols>,
+) -> Result<Vec<Vec<u8>>, EncodeRw2Error> {
+    let (syms, rw2_timeseries) = build_rw2_raw_parts(rw1, offset, common_symbols)?;
+    let req_size = rw2_raw_encoded_len(rw1, &syms, &rw2_timeseries);
+    if max_size == 0 || req_size <= max_size {
+        let mut buf = Vec::with_capacity(req_size);
+        encode_rw2_raw_parts(rw1, &syms, &rw2_timeseries, &mut buf);
+        return Ok(vec![buf]);
+    }
+    if rw2_timeseries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    fn resolve_raw_ref<'a>(
+        r: u32,
+        symbols: &'a [&'a [u8]],
+        common_slice: &'a [String],
+        offset: u32,
+    ) -> &'a [u8] {
+        if r < offset {
+            common_slice
+                .get(r as usize)
+                .map(|s| s.as_bytes())
+                .unwrap_or(b"")
+        } else {
+            symbols
+                .get((r - offset) as usize)
+                .copied()
+                .unwrap_or(b"")
+        }
+    }
+
+    fn resolved_raw_symbol_size(r: u32, symbols: &[&[u8]], offset: u32) -> usize {
+        if r == 0 {
+            return 1 + prost::length_delimiter_len(0);
+        }
+        if r < offset {
+            return 0;
+        }
+        let l = symbols.get((r - offset) as usize).map(|s| s.len()).unwrap_or(0);
+        1 + l + prost::length_delimiter_len(l)
+    }
+
+    fn max_raw_series_size(
+        ts: &cortexpb::TimeSeriesRw2,
+        symbols: &[&[u8]],
+        offset: u32,
+    ) -> (usize, usize) {
+        let highest_possible = symbols.len() as u64 + offset as u64;
+        let sym_upper = 1 + prost::length_delimiter_len(highest_possible as usize);
+        let mut series_size = ts.encoded_len();
+        if ts.metadata.is_none() {
+            series_size += 2;
+        }
+        let mut syms_size = 0usize;
+        for &r in &ts.labels_refs {
+            series_size += sym_upper.saturating_sub(prost::length_delimiter_len(r as usize));
+            syms_size += resolved_raw_symbol_size(r, symbols, offset);
+        }
+        for ex in &ts.exemplars {
+            for &r in &ex.labels_refs {
+                series_size += sym_upper.saturating_sub(prost::length_delimiter_len(r as usize));
+                syms_size += resolved_raw_symbol_size(r, symbols, offset);
+            }
+        }
+        let (help_ref, unit_ref) = ts
+            .metadata
+            .as_ref()
+            .map_or((0, 0), |md| (md.help_ref, md.unit_ref));
+        series_size += sym_upper.saturating_sub(prost::length_delimiter_len(help_ref as usize));
+        syms_size += resolved_raw_symbol_size(help_ref, symbols, offset);
+        series_size += sym_upper.saturating_sub(prost::length_delimiter_len(unit_ref as usize));
+        syms_size += resolved_raw_symbol_size(unit_ref, symbols, offset);
+        (series_size, syms_size)
+    }
+
+    let common_slice: &[String] = common_symbols.map_or(&[], |cs| cs.get_slice());
+    let base_size = rw2_raw_base_encoded_len(rw1);
+    let mut out = Vec::new();
+    let mut next_syms: Vec<&[u8]> = Vec::with_capacity(101);
+    next_syms.push(b"");
+    let mut next_map: HashMap<&[u8], u32> = HashMap::with_capacity(100);
+    let mut next_syms_proto_size = 0usize;
+    let mut next_ts: Vec<cortexpb::TimeSeriesRw2> = Vec::new();
+    let mut next_req_size = base_size;
+    let mut next_req_symbols_size = 0usize;
+
+    for ts in &rw2_timeseries {
+        let (series_size, syms_size) = max_raw_series_size(ts, &syms, offset);
+        let series_field_size = 1 + prost::length_delimiter_len(series_size) + series_size;
+
+        if next_req_size + series_field_size + syms_size > max_size && !next_ts.is_empty() {
+            let mut buf = Vec::with_capacity(next_req_size);
+            encode_rw2_raw_parts(rw1, &next_syms, &next_ts, &mut buf);
+            out.push(buf);
+
+            next_syms.clear();
+            next_syms.push(b"");
+            next_map.clear();
+            next_syms_proto_size = 0;
+            next_ts.clear();
+            next_req_size = base_size;
+            next_req_symbols_size = 0;
+        }
+
+        let labels_refs = ts
+            .labels_refs
+            .iter()
+            .map(|&r| {
+                symbolize_raw_bytes(
+                    resolve_raw_ref(r, &syms, common_slice, offset),
+                    offset,
+                    common_symbols,
+                    &mut next_syms,
+                    &mut next_map,
+                    &mut next_syms_proto_size,
+                )
+            })
+            .collect();
+        let exemplars = ts
+            .exemplars
+            .iter()
+            .map(|ex| {
+                let ex_refs = ex
+                    .labels_refs
+                    .iter()
+                    .map(|&r| {
+                        symbolize_raw_bytes(
+                            resolve_raw_ref(r, &syms, common_slice, offset),
+                            offset,
+                            common_symbols,
+                            &mut next_syms,
+                            &mut next_map,
+                            &mut next_syms_proto_size,
+                        )
+                    })
+                    .collect();
+                cortexpb::ExemplarRw2 {
+                    labels_refs: ex_refs,
+                    value: ex.value,
+                    timestamp: ex.timestamp,
+                }
+            })
+            .collect();
+        let metadata = ts.metadata.map(|md| cortexpb::MetadataRw2 {
+            r#type: md.r#type,
+            help_ref: symbolize_raw_bytes(
+                resolve_raw_ref(md.help_ref, &syms, common_slice, offset),
+                offset,
+                common_symbols,
+                &mut next_syms,
+                &mut next_map,
+                &mut next_syms_proto_size,
+            ),
+            unit_ref: symbolize_raw_bytes(
+                resolve_raw_ref(md.unit_ref, &syms, common_slice, offset),
+                offset,
+                common_symbols,
+                &mut next_syms,
+                &mut next_map,
+                &mut next_syms_proto_size,
+            ),
+        });
+        let new_ts = cortexpb::TimeSeriesRw2 {
+            labels_refs,
+            samples: ts.samples.clone(),
+            histograms: ts.histograms.clone(),
+            exemplars,
+            metadata,
+            created_timestamp: ts.created_timestamp,
+        };
+        let ts_len = new_ts.encoded_len();
+        next_req_size += 1 + prost::length_delimiter_len(ts_len) + ts_len;
+        next_req_size += next_syms_proto_size.saturating_sub(next_req_symbols_size);
+        next_req_symbols_size = next_syms_proto_size;
+        next_ts.push(new_ts);
+    }
+
+    if !next_ts.is_empty() {
+        let mut buf = Vec::with_capacity(next_req_size);
+        encode_rw2_raw_parts(rw1, &next_syms, &next_ts, &mut buf);
+        out.push(buf);
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -5552,5 +5866,72 @@ mod tests {
                 ex.labels().map(|l| (l.name, l.value)).collect();
             assert_eq!(ex_lbls, vec![(bad_ex_name, bad_ex_val)]);
         }
+    }
+
+    #[test]
+    fn test_encode_write_request_rw2_split_raw_bytes_preserves_non_utf8_across_splits() {
+        let mut rw1 = cortexpb::WriteRequest {
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            skip_label_validation: true,
+            ..Default::default()
+        };
+        for i in 0..10u8 {
+            let bad_val = vec![b'v', b'_', 0xff, 0xfe, b'0' + i];
+            let bad_ex_val = vec![b'e', 0x80, b'0' + i];
+            rw1.timeseries.push(cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair::from_static("__name__", "raw_split_metric"),
+                    cortexpb::LabelPair {
+                        name: bytes::Bytes::from_static(b"k\xff"),
+                        value: bytes::Bytes::from(bad_val),
+                    },
+                ],
+                samples: vec![cortexpb::Sample {
+                    value: i as f64,
+                    timestamp_ms: 1000 + i as i64,
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![cortexpb::LabelPair {
+                        name: bytes::Bytes::from_static(b"ex\xfe"),
+                        value: bytes::Bytes::from(bad_ex_val),
+                    }],
+                    value: 1.0,
+                    timestamp_ms: 1000 + i as i64,
+                }],
+                ..Default::default()
+            });
+        }
+
+        let parts = encode_write_request_rw2_split_raw_bytes(
+            &rw1,
+            150,
+            V2_RECORD_SYMBOL_OFFSET,
+            Some(v2_common_symbols()),
+        )
+        .unwrap();
+        assert!(parts.len() > 1, "expected split into >1 parts, got {}", parts.len());
+
+        let mut scratch = WriteRequestScratch::new();
+        let mut decoded_series = 0usize;
+        for (idx, part) in parts.iter().enumerate() {
+            let decoded =
+                decode_write_request(part, DecodeOptions::kafka_v2(), &mut scratch).unwrap();
+            assert!(decoded.skip_label_validation);
+            for ts in decoded.timeseries() {
+                let lbls: Vec<(&[u8], &[u8])> =
+                    ts.labels().map(|l| (l.name, l.value)).collect();
+                assert_eq!(lbls[0], (&b"__name__"[..], &b"raw_split_metric"[..]));
+                assert_eq!(lbls[1].0, &b"k\xff"[..]);
+                assert_eq!(lbls[1].1[0..4], [b'v', b'_', 0xff, 0xfe]);
+                let ex = ts.exemplars().next().unwrap();
+                let ex_lbls: Vec<(&[u8], &[u8])> =
+                    ex.labels().map(|l| (l.name, l.value)).collect();
+                assert_eq!(ex_lbls[0].0, &b"ex\xfe"[..]);
+                assert_eq!(ex_lbls[0].1[0..2], [b'e', 0x80]);
+                decoded_series += 1;
+            }
+            let _ = idx;
+        }
+        assert_eq!(decoded_series, 10);
     }
 }

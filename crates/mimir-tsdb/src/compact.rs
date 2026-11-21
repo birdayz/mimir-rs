@@ -1021,7 +1021,7 @@ pub fn encode_iterable_chunks_with_float_encoding(
                     };
                 if type_mismatch_or_st || size_cut {
                     flush_active(&mut active, &mut out);
-                    has_ts = need_ts;
+                    has_ts = need_ts || prefer_xor2;
                     active = if need_ts || prefer_xor2 {
                         Active::Xor2 {
                             mint: s.t,
@@ -2270,7 +2270,8 @@ where
                         if let Some(m) = metrics {
                             m.chunk_size.observe(enc.as_bytes().len() as f64);
                             m.chunk_samples.observe(n as f64);
-                            m.chunk_range.observe((chk.max_time - chk.min_time) as f64);
+                            m.chunk_range
+                                .observe((chk.max_time as i128 - chk.min_time as i128) as f64);
                         }
                     }
                     match enc.encoding() {
@@ -2298,14 +2299,14 @@ where
         }
 
         let mut comp = compaction;
-        if comp.sources.is_empty() {
+        if comp.level <= 0 {
+            comp.level = 1;
+        }
+        if comp.sources.is_empty() && comp.level <= 1 {
             comp.sources = vec![uid];
         } else {
             comp.sources.sort();
             comp.sources.dedup();
-        }
-        if comp.level <= 0 {
-            comp.level = 1;
         }
         if out_of_order {
             comp.set_out_of_order();
@@ -2493,7 +2494,8 @@ fn write_prepared_block_with_metrics(
                         if let Some(m) = metrics {
                             m.chunk_size.observe(enc.as_bytes().len() as f64);
                             m.chunk_samples.observe(n as f64);
-                            m.chunk_range.observe((chk.max_time - chk.min_time) as f64);
+                            m.chunk_range
+                                .observe((chk.max_time as i128 - chk.min_time as i128) as f64);
                         }
                     }
                     match enc.encoding() {
@@ -2516,14 +2518,14 @@ fn write_prepared_block_with_metrics(
         }
 
         let mut comp = compaction;
-        if comp.sources.is_empty() {
+        if comp.level <= 0 {
+            comp.level = 1;
+        }
+        if comp.sources.is_empty() && comp.level <= 1 {
             comp.sources = vec![uid];
         } else {
             comp.sources.sort();
             comp.sources.dedup();
-        }
-        if comp.level <= 0 {
-            comp.level = 1;
         }
         if out_of_order {
             comp.set_out_of_order();
@@ -2579,6 +2581,22 @@ pub fn compact_blocks_with_float_encoding_and_metrics(
     float_encoding: Encoding,
     metrics: Option<&CompactorMetrics>,
 ) -> Result<Option<BlockMeta>, CompactError> {
+    compact_blocks_with_float_encoding_and_segment_size_and_metrics(
+        dest,
+        blocks,
+        float_encoding,
+        0,
+        metrics,
+    )
+}
+
+pub fn compact_blocks_with_float_encoding_and_segment_size_and_metrics(
+    dest: &Path,
+    blocks: &[&Block],
+    float_encoding: Encoding,
+    segment_size: usize,
+    metrics: Option<&CompactorMetrics>,
+) -> Result<Option<BlockMeta>, CompactError> {
     if blocks.is_empty() {
         return Ok(None);
     }
@@ -2606,107 +2624,161 @@ pub fn compact_blocks_with_float_encoding_and_metrics(
         }
     }
 
-    let mut mint = i64::MAX;
-    let mut maxt = i64::MIN;
-    let mut max_level = 0i32;
-    let mut sources_set = std::collections::BTreeSet::new();
-    let mut parents = Vec::with_capacity(blocks.len());
-    let mut all_ooo = true;
-    let mut any_stale = false;
-    let mut any_selected = false;
+    let res = (|| -> Result<Option<BlockMeta>, CompactError> {
+        let mut mint = i64::MAX;
+        let mut maxt = i64::MIN;
+        let mut max_level = 0i32;
+        let mut sources_set = std::collections::BTreeSet::new();
+        let mut parents = Vec::with_capacity(blocks.len());
+        let mut all_ooo = true;
+        let mut any_stale = false;
+        let mut any_selected = false;
 
-    for b in blocks {
-        let m = b.meta();
-        mint = mint.min(m.min_time);
-        maxt = maxt.max(m.max_time);
-        max_level = max_level.max(m.compaction.level);
-        for &s in &m.compaction.sources {
-            sources_set.insert(s);
-        }
-        if m.compaction.from_stale_series() {
-            any_stale = true;
-        }
-        if m.compaction.from_selected_series() {
-            any_selected = true;
-        }
-        if !m.compaction.from_out_of_order() {
-            all_ooo = false;
-        }
-        parents.push(BlockDesc {
-            ulid: m.ulid,
-            min_time: m.min_time,
-            max_time: m.max_time,
-        });
-    }
-    let sources: Vec<Ulid> = sources_set.into_iter().collect();
-
-    if maxt <= mint {
-        return Ok(None);
-    }
-    let maxt_inclusive = maxt - 1;
-
-    // Collect all series grouped by Labels across all input blocks, keeping each block's
-    // tombstones scoped strictly to chunks from that block (matching Go LeveledCompactor).
-    type SeriesChunkList = Vec<(ChunkMeta, std::sync::Arc<[Interval]>)>;
-    let mut series_map: std::collections::BTreeMap<Labels, SeriesChunkList> =
-        std::collections::BTreeMap::new();
-
-    for b in blocks {
-        let idx = b.index();
-        let chk_r = b.chunks();
-        let tomb_r = b.tombstones();
-        let all_ids = idx
-            .postings("", &[""])
-            .map_err(CompactError::Index)?;
-        for id in all_ids {
-            let (labels, mut chks) = idx.series(id)?;
-            let tombs: std::sync::Arc<[Interval]> = tomb_r.get(id).into();
-            // Skip reading chunk bytes if the chunk is already completely covered by this block's tombstones.
-            chks.retain(|c| !tombs.iter().any(|iv| iv.is_subrange(c.min_time, c.max_time)));
-            if chks.is_empty() {
-                continue;
+        for b in blocks {
+            let m = b.meta();
+            mint = mint.min(m.min_time);
+            maxt = maxt.max(m.max_time);
+            max_level = max_level.max(m.compaction.level);
+            for &s in &m.compaction.sources {
+                sources_set.insert(s);
             }
-            for c in &mut chks {
-                c.chunk = Some(chk_r.chunk(c.ref_id)?);
+            if m.compaction.from_stale_series() {
+                any_stale = true;
             }
-            let entry = series_map.entry(labels).or_default();
-            for c in chks {
-                entry.push((c, std::sync::Arc::clone(&tombs)));
+            if m.compaction.from_selected_series() {
+                any_selected = true;
+            }
+            if !m.compaction.from_out_of_order() {
+                all_ooo = false;
+            }
+            parents.push(BlockDesc {
+                ulid: m.ulid,
+                min_time: m.min_time,
+                max_time: m.max_time,
+            });
+        }
+        let sources: Vec<Ulid> = sources_set.into_iter().collect();
+
+        if maxt <= mint {
+            return Ok(None);
+        }
+        let maxt_inclusive = maxt - 1;
+
+        // Collect all series grouped by Labels across all input blocks, keeping each block's
+        // tombstones scoped strictly to chunks from that block (matching Go LeveledCompactor).
+        type SeriesChunkList = Vec<(ChunkMeta, std::sync::Arc<[Interval]>)>;
+        let mut series_map: std::collections::BTreeMap<Labels, SeriesChunkList> =
+            std::collections::BTreeMap::new();
+
+        for b in blocks {
+            let idx = b.index();
+            let chk_r = b.chunks();
+            let tomb_r = b.tombstones();
+            let all_ids = idx
+                .postings("", &[""])
+                .map_err(CompactError::Index)?;
+            for id in all_ids {
+                let (labels, mut chks) = idx.series(id)?;
+                let tombs: std::sync::Arc<[Interval]> = tomb_r.get(id).into();
+                // Skip reading chunk bytes if the chunk is already completely covered by this block's tombstones.
+                chks.retain(|c| !tombs.iter().any(|iv| iv.is_subrange(c.min_time, c.max_time)));
+                if chks.is_empty() {
+                    continue;
+                }
+                for c in &mut chks {
+                    c.chunk = Some(chk_r.chunk(c.ref_id)?);
+                }
+                let entry = series_map.entry(labels).or_default();
+                for c in chks {
+                    entry.push((c, std::sync::Arc::clone(&tombs)));
+                }
+            }
+        }
+
+        let mut prepared: Vec<(Labels, Vec<ChunkMeta>)> = Vec::with_capacity(series_map.len());
+        for (labels, chks) in series_map {
+            let trimmed =
+                trim_and_merge_chunks_per_chunk(chks, mint, maxt_inclusive, float_encoding)?;
+            if !trimmed.is_empty() {
+                prepared.push((labels, trimmed));
+            }
+        }
+        if prepared.is_empty() {
+            return Ok(None);
+        }
+        // BTreeMap already yields sorted Labels.
+
+        let mut comp = BlockMetaCompaction {
+            level: max_level + 1,
+            sources,
+            deletable: false,
+            parents,
+            failed: false,
+            hints: Vec::new(),
+        };
+        if any_stale {
+            comp.set_stale_series();
+        }
+        if any_selected {
+            comp.set_selected_series();
+        }
+        if all_ooo {
+            comp.set_out_of_order();
+        }
+
+        write_prepared_block_with_metrics(
+            dest,
+            mint,
+            maxt,
+            prepared,
+            comp,
+            false,
+            segment_size,
+            metrics,
+        )
+    })();
+
+    match res {
+        Ok(Some(meta)) => Ok(Some(meta)),
+        Ok(None) => {
+            // Go LeveledCompactor.CompactWithBlockPopulator (compact.go:713-725):
+            // mark source blocks deletable when all output blocks are empty, logging and
+            // continuing if any individual meta.json update fails.
+            for b in blocks {
+                let mut m = b.meta().clone();
+                m.compaction.deletable = true;
+                if let Err(err) = write_meta_file(b.dir(), &mut m) {
+                    tracing::error!(
+                        ulid = %b.ulid(),
+                        err = %err,
+                        "Failed to write 'Deletable' to meta file after compaction"
+                    );
+                }
+            }
+            Ok(None)
+        }
+        Err(err) => {
+            // Go LeveledCompactor.CompactWithBlockPopulator (compact.go:732-738):
+            // mark every source block compaction.failed = true on non-cancellation error.
+            let mut failed_errs = Vec::new();
+            for b in blocks {
+                if let Err(set_err) = b.set_compaction_failed() {
+                    failed_errs.push(format!(
+                        "setting compaction failed for block: {}: {set_err}",
+                        b.dir().display()
+                    ));
+                }
+            }
+            if failed_errs.is_empty() {
+                Err(err)
+            } else {
+                let mut all = vec![err.to_string()];
+                all.extend(failed_errs);
+                Err(CompactError::Io(io::Error::other(all.join("
+"))))
             }
         }
     }
-
-    let mut prepared: Vec<(Labels, Vec<ChunkMeta>)> = Vec::with_capacity(series_map.len());
-    for (labels, chks) in series_map {
-        let trimmed = trim_and_merge_chunks_per_chunk(chks, mint, maxt_inclusive, float_encoding)?;
-        if !trimmed.is_empty() {
-            prepared.push((labels, trimmed));
-        }
-    }
-    if prepared.is_empty() {
-        return Ok(None);
-    }
-    // BTreeMap already yields sorted Labels.
-
-    let mut comp = BlockMetaCompaction {
-        level: max_level + 1,
-        sources,
-        deletable: false,
-        parents,
-        failed: false,
-        hints: Vec::new(),
-    };
-    if any_stale {
-        comp.set_stale_series();
-    }
-    if any_selected {
-        comp.set_selected_series();
-    }
-    if all_ooo {
-        comp.set_out_of_order();
-    }
-
-    write_prepared_block_with_metrics(dest, mint, maxt, prepared, comp, false, 0, metrics)
 }
 
 #[derive(Clone)]
@@ -3235,5 +3307,247 @@ mod tests {
         let parts = split_by_range(&ds, 7_200_000);
         assert_eq!(parts.len(), 2);
         assert!(split_by_range(&ds, 0).is_empty());
+    }
+
+    #[test]
+    fn encode_iterable_xor2_does_not_split_when_st_transitions_from_zero_to_nonzero() {
+        let samples = vec![
+            DecodedSample {
+                st: 0,
+                t: 1_000,
+                value: SampleValue::Float(1.0),
+            },
+            DecodedSample {
+                st: 500,
+                t: 2_000,
+                value: SampleValue::Float(2.0),
+            },
+            DecodedSample {
+                st: 0,
+                t: 3_000,
+                value: SampleValue::Float(3.0),
+            },
+        ];
+        let chks = encode_iterable_chunks_with_float_encoding(&samples, Encoding::Xor2).unwrap();
+        assert_eq!(chks.len(), 1, "Xor2 must not split on st=0 -> st!=0 transition");
+        let enc = chks[0].chunk.as_ref().unwrap();
+        assert_eq!(enc.encoding(), Encoding::Xor2);
+        assert_eq!(decode_chunk_samples(enc).unwrap(), samples);
+    }
+
+    #[test]
+    fn compact_blocks_respects_segment_size_and_empty_l2_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut chunks_a = Vec::new();
+        let mut chunks_b = Vec::new();
+        // Build multiple chunks across both blocks so total chunk bytes exceed a small segment_size.
+        for i in 0..8i64 {
+            let mut xc = XorChunk::new();
+            {
+                let mut app = xc.appender().unwrap();
+                for j in 0..40i64 {
+                    let t = i * 1000 + j * 10;
+                    app.append(0, t, (i * 40 + j) as f64).unwrap();
+                }
+            }
+            chunks_a.push(ChunkMeta {
+                ref_id: 0,
+                min_time: i * 1000,
+                max_time: i * 1000 + 390,
+                chunk: Some(EncodedChunk::Xor(xc)),
+            });
+        }
+        for i in 8..16i64 {
+            let mut xc = XorChunk::new();
+            {
+                let mut app = xc.appender().unwrap();
+                for j in 0..40i64 {
+                    let t = i * 1000 + j * 10;
+                    app.append(0, t, (i * 40 + j) as f64).unwrap();
+                }
+            }
+            chunks_b.push(ChunkMeta {
+                ref_id: 0,
+                min_time: i * 1000,
+                max_time: i * 1000 + 390,
+                chunk: Some(EncodedChunk::Xor(xc)),
+            });
+        }
+
+        let m_a = write_block_from_series(
+            dir.path(),
+            0,
+            8_000,
+            vec![CompactionSeries {
+                labels: Labels::from_pairs([("__name__", "seg_metric")]),
+                chunks: chunks_a,
+                tombstones: Vec::new(),
+            }],
+            BlockMetaCompaction::default(),
+            false,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        let m_b = write_block_from_series(
+            dir.path(),
+            8_000,
+            16_000,
+            vec![CompactionSeries {
+                labels: Labels::from_pairs([("__name__", "seg_metric")]),
+                chunks: chunks_b,
+                tombstones: Vec::new(),
+            }],
+            BlockMetaCompaction::default(),
+            false,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Strip sources on disk from both L1 blocks to verify L2+ preserves empty sources.
+        let dir_a = dir.path().join(m_a.ulid.to_string());
+        let dir_b = dir.path().join(m_b.ulid.to_string());
+        for bdir in [&dir_a, &dir_b] {
+            let mut m = read_meta_file(bdir).unwrap();
+            m.compaction.sources.clear();
+            write_meta_file(bdir, &mut m).unwrap();
+        }
+
+        let blk_a = Block::open(&dir_a).unwrap();
+        let blk_b = Block::open(&dir_b).unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let merged = compact_blocks_with_float_encoding_and_segment_size_and_metrics(
+            out_dir.path(),
+            &[&blk_a, &blk_b],
+            Encoding::Xor,
+            200,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(merged.compaction.level, 2);
+        assert!(
+            merged.compaction.sources.is_empty(),
+            "L2+ block must preserve empty sources when parent sources are empty"
+        );
+        let seg_count = fs::read_dir(out_dir.path().join(merged.ulid.to_string()).join("chunks"))
+            .unwrap()
+            .count();
+        assert!(seg_count >= 2, "expected multiple chunk segments for segment_size=200, got {seg_count}");
+    }
+
+    #[test]
+    fn compact_blocks_persists_deletable_on_empty_and_failed_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut xc = XorChunk::new();
+        {
+            let mut app = xc.appender().unwrap();
+            app.append(0, 1_000, 1.0).unwrap();
+        }
+        let m1 = write_block_from_series(
+            dir.path(),
+            0,
+            2_000,
+            vec![CompactionSeries {
+                labels: Labels::from_pairs([("__name__", "tomb_only")]),
+                chunks: vec![ChunkMeta {
+                    ref_id: 0,
+                    min_time: 1_000,
+                    max_time: 1_000,
+                    chunk: Some(EncodedChunk::Xor(xc)),
+                }],
+                tombstones: Vec::new(),
+            }],
+            BlockMetaCompaction::default(),
+            false,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        let bdir1 = dir.path().join(m1.ulid.to_string());
+        let blk1_pre = Block::open(&bdir1).unwrap();
+        let ref1 = blk1_pre.index().postings("", &[""]).unwrap()[0];
+        drop(blk1_pre);
+        let tombs = MemTombstones::new();
+        tombs.add_interval(ref1, Interval::new(0, 2_000));
+        write_tombstones_file(&bdir1, &tombs).unwrap();
+
+        let blk1 = Block::open(&bdir1).unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let res = compact_blocks(out_dir.path(), &[&blk1]).unwrap();
+        assert!(res.is_none());
+        assert!(
+            read_meta_file(&bdir1).unwrap().compaction.deletable,
+            "direct compact_blocks call must persist compaction.deletable=true when output is empty"
+        );
+
+        // Error case: truncate chunk segment of a second block so reading chunk fails.
+        let mut xc2 = XorChunk::new();
+        {
+            let mut app = xc2.appender().unwrap();
+            app.append(0, 1_000, 2.0).unwrap();
+        }
+        let m2 = write_block_from_series(
+            dir.path(),
+            0,
+            2_000,
+            vec![CompactionSeries {
+                labels: Labels::from_pairs([("__name__", "err_blk")]),
+                chunks: vec![ChunkMeta {
+                    ref_id: 0,
+                    min_time: 1_000,
+                    max_time: 1_000,
+                    chunk: Some(EncodedChunk::Xor(xc2)),
+                }],
+                tombstones: Vec::new(),
+            }],
+            BlockMetaCompaction::default(),
+            false,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        let bdir2 = dir.path().join(m2.ulid.to_string());
+        let blk2 = Block::open(&bdir2).unwrap();
+        let seg = bdir2.join("chunks").join("000001");
+        std::fs::OpenOptions::new().write(true).open(&seg).unwrap().set_len(8).unwrap();
+        assert!(compact_blocks(out_dir.path(), &[&blk2]).is_err());
+        assert!(blk2.compaction_failed());
+        assert!(read_meta_file(&bdir2).unwrap().compaction.failed);
+    }
+
+    #[test]
+    fn write_prepared_block_l1_extreme_chunk_range_no_i64_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = prometheus::Registry::new();
+        let metrics = CompactorMetrics::new(Some(&reg));
+        let mut xc = XorChunk::new();
+        {
+            let mut app = xc.appender().unwrap();
+            app.append(0, i64::MIN, 1.0).unwrap();
+            app.append(0, i64::MAX, 2.0).unwrap();
+        }
+        let res = write_prepared_block_with_metrics(
+            dir.path(),
+            i64::MIN,
+            i64::MAX,
+            vec![(
+                Labels::from_pairs([("__name__", "extreme_span")]),
+                vec![ChunkMeta {
+                    ref_id: 0,
+                    min_time: i64::MIN,
+                    max_time: i64::MAX,
+                    chunk: Some(EncodedChunk::Xor(xc)),
+                }],
+            )],
+            BlockMetaCompaction::default(),
+            false,
+            0,
+            Some(&metrics),
+        )
+        .unwrap();
+        assert!(res.is_some());
     }
 }

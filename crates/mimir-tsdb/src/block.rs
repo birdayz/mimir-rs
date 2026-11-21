@@ -238,7 +238,7 @@ pub struct BlockMeta {
     pub min_time: i64,
     #[serde(rename = "maxTime")]
     pub max_time: i64,
-    #[serde(default, deserialize_with = "deserialize_null_default", skip_serializing_if = "BlockStats::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub stats: BlockStats,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub compaction: BlockMetaCompaction,
@@ -669,5 +669,64 @@ mod tests {
 
         let read_back = read_meta_file(dir.path()).unwrap();
         assert_eq!(read_back, meta);
+    }
+
+    #[test]
+    fn meta_json_serializes_empty_stats_and_deserializes_omitted_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let ulid = Ulid::new();
+        let mut meta = BlockMeta {
+            ulid,
+            min_time: 1000,
+            max_time: 7_201_000,
+            stats: BlockStats::default(),
+            compaction: BlockMetaCompaction {
+                level: 1,
+                sources: vec![ulid],
+                deletable: false,
+                parents: Vec::new(),
+                failed: false,
+                hints: Vec::new(),
+            },
+            version: META_VERSION_1,
+            out_of_order: false,
+            thanos: None,
+        };
+        write_meta_file(dir.path(), &mut meta).unwrap();
+        let text = fs::read_to_string(dir.path().join(META_FILENAME)).unwrap();
+        assert!(text.contains(r#""stats": {}"#), "expected empty stats object in {text}");
+        assert_eq!(read_meta_file(dir.path()).unwrap(), meta);
+
+        // Backward-compatibility: JSON omitting "stats" still deserializes to default BlockStats.
+        let without_stats = format!(
+            "{{\n\t\"ulid\": \"{ulid}\",\n\t\"minTime\": 1000,\n\t\"maxTime\": 7201000,\n\t\"compaction\": {{\n\t\t\"level\": 1,\n\t\t\"sources\": [\"{ulid}\"]\n\t}},\n\t\"version\": 1,\n\t\"out_of_order\": false\n}}\n"
+        );
+        fs::write(dir.path().join(META_FILENAME), without_stats).unwrap();
+        assert_eq!(read_meta_file(dir.path()).unwrap(), meta);
+    }
+
+    #[test]
+    fn block_open_fails_when_chunks_dir_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ulid = Ulid::new();
+        let bdir = dir.path().join(ulid.to_string());
+        fs::create_dir_all(&bdir).unwrap();
+        let mut meta = BlockMeta {
+            ulid,
+            min_time: 0,
+            max_time: 1000,
+            stats: BlockStats::default(),
+            compaction: BlockMetaCompaction::default(),
+            version: META_VERSION_1,
+            out_of_order: false,
+            thanos: None,
+        };
+        write_meta_file(&bdir, &mut meta).unwrap();
+        let iw = crate::index::IndexWriter::new(bdir.join(INDEX_FILENAME)).unwrap();
+        iw.close().unwrap();
+        crate::tombstones::write_tombstones_file(&bdir, &MemTombstones::new()).unwrap();
+        // Deliberately omit chunks/ directory.
+        let err = Block::open(&bdir).expect_err("missing chunks/ must fail Block::open");
+        assert!(matches!(err, BlockError::Chunks(BlockChunksError::Io(_))));
     }
 }

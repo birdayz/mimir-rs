@@ -873,12 +873,7 @@ impl IngestKafkaClient {
         cfg: &KafkaConfig,
         metrics: Option<KafkaClientExtendedMetrics>,
     ) -> Result<Self, KafkaClientError> {
-        let write_timeout = Duration::from_nanos(cfg.write_timeout.as_nanos().max(0) as u64);
-        let overhead =
-            Duration::from_nanos(cfg.write_timeout_overhead.as_nanos().max(0) as u64);
-        let request_timeout = (write_timeout + overhead).max(Duration::from_secs(5));
         let inner = super::kafka_client::KafkaClient::from_config(cfg)?
-            .with_request_timeout(request_timeout)
             .with_extended_metrics(metrics);
         Ok(Self { inner })
     }
