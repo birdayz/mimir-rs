@@ -89,8 +89,7 @@ fn csv_is_empty(v: &StringSliceCSV) -> bool {
     v.0.is_empty()
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MetricRelabelConfig {
     pub source_labels: Vec<String>,
     pub separator: Option<String>,
@@ -99,6 +98,111 @@ pub struct MetricRelabelConfig {
     pub target_label: Option<String>,
     pub replacement: Option<String>,
     pub action: Option<String>,
+}
+
+impl Default for MetricRelabelConfig {
+    /// Upstream Go `relabel.DefaultRelabelConfig` (`model/relabel/relabel.go:40-46`).
+    fn default() -> Self {
+        Self {
+            source_labels: Vec::new(),
+            separator: Some(";".to_string()),
+            regex: Some("(.*)".to_string()),
+            modulus: 0,
+            target_label: None,
+            replacement: Some("$1".to_string()),
+            action: Some("replace".to_string()),
+        }
+    }
+}
+
+fn deserialize_present_opt<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl<'de> Deserialize<'de> for MetricRelabelConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawMetricRelabelConfig {
+            #[serde(default)]
+            source_labels: Option<Vec<String>>,
+            #[serde(default, deserialize_with = "deserialize_present_opt")]
+            separator: Option<Option<String>>,
+            #[serde(default, deserialize_with = "deserialize_present_opt")]
+            regex: Option<Option<String>>,
+            #[serde(default)]
+            modulus: Option<u64>,
+            #[serde(default, deserialize_with = "deserialize_present_opt")]
+            target_label: Option<Option<String>>,
+            #[serde(default, deserialize_with = "deserialize_present_opt")]
+            replacement: Option<Option<String>>,
+            #[serde(default, deserialize_with = "deserialize_present_opt")]
+            action: Option<Option<String>>,
+        }
+
+        let raw = RawMetricRelabelConfig::deserialize(deserializer)?;
+        let mut out = Self::default();
+        if let Some(source_labels) = raw.source_labels {
+            out.source_labels = source_labels;
+        }
+        if let Some(Some(separator)) = raw.separator {
+            out.separator = Some(separator);
+        }
+        match raw.regex {
+            None => {}
+            Some(None) => {
+                // Go `relabel.Config.UnmarshalYAML`: explicit `regex: null` maps to `""`.
+                out.regex = Some(String::new());
+            }
+            Some(Some(re)) => {
+                if let Err(e) = regex::Regex::new(&re) {
+                    return Err(serde::de::Error::custom(format!(
+                        "invalid relabel regex {re:?}: {e}"
+                    )));
+                }
+                out.regex = Some(re);
+            }
+        }
+        if let Some(modulus) = raw.modulus {
+            out.modulus = modulus;
+        }
+        if let Some(Some(target_label)) = raw.target_label {
+            out.target_label = Some(target_label);
+        }
+        if let Some(Some(replacement)) = raw.replacement {
+            out.replacement = Some(replacement);
+        }
+        if let Some(Some(action)) = raw.action {
+            let lower = action.to_ascii_lowercase();
+            if !matches!(
+                lower.as_str(),
+                "replace"
+                    | "keep"
+                    | "drop"
+                    | "hashmod"
+                    | "labelmap"
+                    | "labeldrop"
+                    | "labelkeep"
+                    | "lowercase"
+                    | "uppercase"
+                    | "keepequal"
+                    | "dropequal"
+            ) {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown relabel action {action:?}"
+                )));
+            }
+            out.action = Some(lower);
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1339,25 +1443,6 @@ where
         let Some(cfg) = item else {
             return Err(serde::de::Error::custom("invalid metric_relabel_configs"));
         };
-        if let Some(action) = cfg.action.as_deref() {
-            let lower = action.to_ascii_lowercase();
-            if !matches!(
-                lower.as_str(),
-                "replace" | "keep" | "drop" | "hashmod" | "labelmap" | "labeldrop" | "labelkeep"
-                    | "lowercase" | "uppercase" | "keepequal" | "dropequal"
-            ) {
-                return Err(serde::de::Error::custom(format!(
-                    "unknown relabel action {action:?}"
-                )));
-            }
-        }
-        if let Some(re) = cfg.regex.as_deref() {
-            if let Err(e) = regex::Regex::new(re) {
-                return Err(serde::de::Error::custom(format!(
-                    "invalid relabel regex {re:?}: {e}"
-                )));
-            }
-        }
         out.push(cfg);
     }
     Ok(out)

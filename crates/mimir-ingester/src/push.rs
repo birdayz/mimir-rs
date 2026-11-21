@@ -566,9 +566,10 @@ fn convert_exemplar_pairs<'a>(
         .filter(|&(_, v)| !v.is_empty())
         .collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
-    let mut rune_len = 0usize;
+    // Match Go `CircularExemplarStorage.validateExemplar` (exemplar.go:237-254):
+    // check duplicate label names across the entire label set BEFORE checking the 128-rune limit.
     let mut prev_name: Option<&str> = None;
-    for &(k, v) in &sorted {
+    for &(k, _) in &sorted {
         if prev_name == Some(k) {
             return Err(ConvertedExemplarError {
                 timestamp_ms,
@@ -577,6 +578,9 @@ fn convert_exemplar_pairs<'a>(
             });
         }
         prev_name = Some(k);
+    }
+    let mut rune_len = 0usize;
+    for &(k, v) in &sorted {
         if k.len() >= (1 << 24) || v.len() >= (1 << 24) {
             return Err(ConvertedExemplarError {
                 timestamp_ms,
@@ -1478,7 +1482,13 @@ impl Ingester {
         req: &BorrowedWriteRequest<'_, '_>,
         req_size: i64,
     ) -> Result<(), IngesterError> {
-        let permit = self.start_push_request_sync(req_size)?;
+        let permit = self.start_push_request_sync(req_size).map_err(|err| {
+            if self.ingest_cfg.enabled {
+                err.with_do_not_log()
+            } else {
+                err
+            }
+        })?;
         let res = self.push_borrowed_inner(user_id, req);
         permit.finish(res.as_ref().err());
         res
@@ -1498,7 +1508,13 @@ impl Ingester {
         } else {
             0
         };
-        let permit = self.start_push_request_sync(req_size)?;
+        let permit = self.start_push_request_sync(req_size).map_err(|err| {
+            if self.ingest_cfg.enabled {
+                err.with_do_not_log()
+            } else {
+                err
+            }
+        })?;
         let res = self.push_write_request_sync(user_id, req);
         permit.finish(res.as_ref().err());
         res

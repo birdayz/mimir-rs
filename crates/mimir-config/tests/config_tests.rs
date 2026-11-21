@@ -610,3 +610,130 @@ fn vault_enabled_is_rejected_explicitly() {
     assert!(!cfg.vault_enabled().unwrap());
     cfg.validate().unwrap();
 }
+
+#[test]
+fn w27_a_05_metric_relabel_configs_defaults_action_lowercase_regex_null_and_yaml_emit() {
+    use mimir_config::{
+        parse_runtime_config_yaml, yaml_v3, yaml_v3_emit, InstanceLimits, LimitsConfig,
+        MetricRelabelConfig,
+    };
+
+    // 1. Upstream TestMetricRelabelConfigLimitsLoadingFrom (YAML + map/runtime_config)
+    let yaml_cfg = r#"
+limits:
+  metric_relabel_configs:
+    - action: DROP
+      source_labels: [le]
+      regex: .+
+"#;
+    let mut cfg = MimirConfig::default();
+    cfg.load_config_from_bytes(yaml_cfg.as_bytes(), false)
+        .unwrap();
+    assert_eq!(
+        cfg.limits.metric_relabel_configs,
+        vec![MetricRelabelConfig {
+            source_labels: vec!["le".to_string()],
+            separator: Some(";".to_string()),
+            regex: Some(".+".to_string()),
+            modulus: 0,
+            target_label: None,
+            replacement: Some("$1".to_string()),
+            action: Some("drop".to_string()),
+        }]
+    );
+
+    let rt_yaml = br#"
+overrides:
+  tenant-a:
+    metric_relabel_configs:
+      - action: DROP
+        source_labels: [le]
+        regex: .+
+      - source_labels: [__name__]
+        regex: null
+      - target_label: foo
+"#;
+    let rt = parse_runtime_config_yaml(rt_yaml, &LimitsConfig::default(), &InstanceLimits::default())
+        .unwrap();
+    let ta = rt.overrides["tenant-a"].as_ref().unwrap();
+    assert_eq!(
+        ta.metric_relabel_configs,
+        vec![
+            MetricRelabelConfig {
+                source_labels: vec!["le".to_string()],
+                separator: Some(";".to_string()),
+                regex: Some(".+".to_string()),
+                modulus: 0,
+                target_label: None,
+                replacement: Some("$1".to_string()),
+                action: Some("drop".to_string()),
+            },
+            MetricRelabelConfig {
+                source_labels: vec!["__name__".to_string()],
+                separator: Some(";".to_string()),
+                regex: Some(String::new()),
+                modulus: 0,
+                target_label: None,
+                replacement: Some("$1".to_string()),
+                action: Some("replace".to_string()),
+            },
+            MetricRelabelConfig {
+                source_labels: vec![],
+                separator: Some(";".to_string()),
+                regex: Some("(.*)".to_string()),
+                modulus: 0,
+                target_label: Some("foo".to_string()),
+                replacement: Some("$1".to_string()),
+                action: Some("replace".to_string()),
+            },
+        ]
+    );
+
+    // 2. Main config regex: null maps to "", and YAML marshal emits Go-compatible fields:
+    //    separator: ;, replacement: $1, action: replace, regex: "" when empty,
+    //    and omits regex ONLY when equal to default "(.*)".
+    let main_yaml = r#"
+limits:
+  metric_relabel_configs:
+    - source_labels: [__name__]
+      regex: null
+    - target_label: bar
+      action: KEEP
+"#;
+    let mut cfg2 = MimirConfig::default();
+    cfg2.load_config_from_bytes(main_yaml.as_bytes(), false)
+        .unwrap();
+    assert_eq!(
+        cfg2.limits.metric_relabel_configs[0].regex.as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        cfg2.limits.metric_relabel_configs[1].regex.as_deref(),
+        Some("(.*)")
+    );
+    assert_eq!(
+        cfg2.limits.metric_relabel_configs[1].action.as_deref(),
+        Some("keep")
+    );
+
+    let mut val = serde_yaml::to_value(&cfg2.limits).unwrap();
+    yaml_v3::order_like_go_type("validation.Limits", &mut val).unwrap();
+    let rendered = yaml_v3_emit::marshal_struct(&val).unwrap();
+    assert!(rendered.contains("separator: ;"), "rendered:\n{rendered}");
+    assert!(rendered.contains("replacement: $1"), "rendered:\n{rendered}");
+    assert!(rendered.contains("action: replace"), "rendered:\n{rendered}");
+    assert!(rendered.contains("action: keep"), "rendered:\n{rendered}");
+    assert!(rendered.contains("regex: \"\""), "rendered:\n{rendered}");
+    assert!(!rendered.contains("(.*)"), "default regex must be omitted:\n{rendered}");
+    assert!(!rendered.contains("separator: null"), "rendered:\n{rendered}");
+    assert!(!rendered.contains("replacement: null"), "rendered:\n{rendered}");
+}
+
+#[test]
+fn w27_a_07_label_value_length_over_limit_strategy_error_message() {
+    let err = mimir_config::LabelValueLengthOverLimitStrategy::parse("bogus").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        r#"invalid flag: unrecognized LabelValueLengthOverLimitStrategy: "bogus""#
+    );
+}

@@ -416,7 +416,7 @@ impl LabelValueLengthOverLimitStrategy {
             "truncate" => Ok(Self::Truncate),
             "drop" => Ok(Self::Drop),
             _ => Err(ConfigError::Flag(format!(
-                "unrecognized label_value_length_over_limit_strategy {s:?}"
+                "unrecognized LabelValueLengthOverLimitStrategy: {s:?}"
             ))),
         }
     }
