@@ -6635,4 +6635,28 @@ mod tests {
             .unwrap();
         assert_eq!(ok_res.len(), 1);
     }
+
+    #[test]
+    fn map_strong_read_consistency_wait_err_matches_go_multi_cluster_context_deadline() {
+        let single = map_strong_read_consistency_wait_err(
+            mimir_storage::ingest::ReaderError::ContextDeadlineExceeded,
+        );
+        assert!(single.is_deadline_exceeded());
+        assert_eq!(
+            single.to_string(),
+            "wait for read consistency: context deadline exceeded"
+        );
+
+        let multi = map_strong_read_consistency_wait_err(
+            mimir_storage::ingest::ReaderError::WriteCompartment {
+                id: 0,
+                source: Box::new(mimir_storage::ingest::ReaderError::ContextDeadlineExceeded),
+            },
+        );
+        assert!(multi.is_deadline_exceeded());
+        assert_eq!(
+            multi.to_string(),
+            "wait for read consistency: write compartment 0: context deadline exceeded"
+        );
+    }
 }

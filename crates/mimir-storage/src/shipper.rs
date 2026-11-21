@@ -1027,7 +1027,6 @@ pub(crate) fn atomic_write_file(target: &Path, data: &[u8]) -> std::io::Result<(
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    fs::create_dir_all(parent)?;
     let tmp = target.with_extension(format!(
         "{}.tmp",
         target
@@ -1575,6 +1574,20 @@ mod tests {
         assert!(
             dels[0].ends_with(&format!("{id}/{META_FILENAME}")),
             "meta.json must be deleted first, got {dels:?}"
+        );
+    }
+
+    #[test]
+    fn atomic_write_file_does_not_recreate_missing_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_tenant_dir = dir.path().join("deleted-tenant");
+        let target = missing_tenant_dir.join("mimir.shipper.json");
+
+        let err = atomic_write_file(&target, b"{}").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            !missing_tenant_dir.exists(),
+            "atomic_write_file must not recreate a deleted parent directory"
         );
     }
 }

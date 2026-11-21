@@ -62,6 +62,20 @@ pub enum ReaderState {
     Failed = 5,
 }
 
+impl std::fmt::Display for ReaderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::New => "New",
+            Self::Starting => "Starting",
+            Self::Running => "Running",
+            Self::Stopping => "Stopping",
+            Self::Terminated => "Terminated",
+            Self::Failed => "Failed",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ReaderError {
     #[error("kafka client error: {0}")]
@@ -72,8 +86,10 @@ pub enum ReaderError {
     OffsetReader(String),
     #[error("partition reader is lagging behind more than the allowed max delay")]
     MaxDelayExceeded,
-    #[error("partition reader service is not running")]
-    NotRunning,
+    #[error("partition reader service is not running (state: {0})")]
+    NotRunning(ReaderState),
+    #[error("context deadline exceeded")]
+    ContextDeadlineExceeded,
     /// `errors.Wrap(context.DeadlineExceeded, "wait strong read consistency timeout exceeded")`.
     #[error("wait strong read consistency timeout exceeded: context deadline exceeded")]
     WaitStrongReadConsistencyTimeoutExceeded,
@@ -87,7 +103,7 @@ pub enum ReaderError {
     /// dskit `multierror.MultiError` of per write compartment errors.
     #[error("{}", format_multi_error(.0))]
     Multi(Vec<ReaderError>),
-    #[error("single-cluster partition reader was given read consistency offsets for {0} Kafka clusters")]
+    #[error("a single-cluster partition reader was given read consistency offsets for {0} Kafka clusters")]
     InvalidClusterOffsetCount(usize),
     #[error("startup canceled")]
     Canceled,
@@ -1868,12 +1884,17 @@ impl SingleClusterPartitionReader {
 
         impl Drop for StrongConsistencyGuard<'_> {
             fn drop(&mut self) {
+                // Go `ObserveStrongReadConsistency`: skip latency & failure tracking on
+                // cancellation (including dropped sibling futures in MultiClusterPartitionReader).
+                if !self.finished {
+                    return;
+                }
                 self.metrics
                     .strong_consistency
                     .latency
                     .with_label_values(&[self.topic])
                     .observe(self.start.elapsed().as_secs_f64());
-                if !self.finished || self.failed {
+                if self.failed {
                     self.metrics
                         .strong_consistency
                         .failures
@@ -1914,8 +1935,9 @@ impl SingleClusterPartitionReader {
         };
 
         let res = async {
-            if self.state() != ReaderState::Running {
-                return Err(ReaderError::NotRunning);
+            let cur_state = self.state();
+            if cur_state != ReaderState::Running {
+                return Err(ReaderError::NotRunning(cur_state));
             }
             let target = if effective_timeout.is_zero() {
                 get_offset().await?
@@ -1926,7 +1948,7 @@ impl SingleClusterPartitionReader {
                         if is_configured {
                             ReaderError::WaitStrongReadConsistencyTimeoutExceeded
                         } else {
-                            ReaderError::Watcher(OffsetWatcherError::Timeout(effective_timeout))
+                            ReaderError::ContextDeadlineExceeded
                         }
                     })??
             };
@@ -1940,7 +1962,7 @@ impl SingleClusterPartitionReader {
                 return Err(if is_configured {
                     ReaderError::WaitStrongReadConsistencyTimeoutExceeded
                 } else {
-                    ReaderError::Watcher(OffsetWatcherError::Timeout(effective_timeout))
+                    ReaderError::ContextDeadlineExceeded
                 });
             }
 
@@ -1951,6 +1973,7 @@ impl SingleClusterPartitionReader {
                     OffsetWatcherError::Timeout(_) if is_configured => {
                         ReaderError::WaitStrongReadConsistencyTimeoutExceeded
                     }
+                    OffsetWatcherError::Timeout(_) => ReaderError::ContextDeadlineExceeded,
                     other => ReaderError::Watcher(other),
                 })
         }
@@ -2369,7 +2392,8 @@ impl ReaderError {
     /// Go `errors.Is(err, context.DeadlineExceeded)` (gRPC status `DeadlineExceeded`).
     pub fn is_deadline_exceeded(&self) -> bool {
         match self {
-            Self::WaitStrongReadConsistencyTimeoutExceeded
+            Self::ContextDeadlineExceeded
+            | Self::WaitStrongReadConsistencyTimeoutExceeded
             | Self::WaitTargetLagDeadlineExceeded
             | Self::Watcher(OffsetWatcherError::Timeout(_)) => true,
             Self::WriteCompartment { source, .. } => source.is_deadline_exceeded(),
@@ -2404,7 +2428,7 @@ fn wrap_write_compartment(id: usize, res: Result<(), ReaderError>) -> Result<(),
 /// Builds the downstream consumer of a partition reader, registering its metrics (Go
 /// `NewPusherConsumerMetrics(reg)`) into the given registry.
 pub type RecordBatchConsumerFactory<'a> =
-    dyn Fn(Option<&Registry>) -> Arc<dyn RecordBatchConsumer> + 'a;
+    dyn Fn(&KafkaConfig, Option<&Registry>) -> Arc<dyn RecordBatchConsumer> + 'a;
 
 /// Multi-cluster partition reader consuming the same partition ID across multiple Kafka write
 /// compartments, optionally merging records in timestamp order via [`HeapMerger`].
@@ -2433,7 +2457,7 @@ impl MultiClusterPartitionReader {
             partition_id,
             instance_id,
             offset_file_paths,
-            &|_| Arc::clone(&consumer),
+            &|_, _| Arc::clone(&consumer),
             Arc::new(NoOpPreCommitNotifier),
             Duration::ZERO,
             registry,
@@ -2469,7 +2493,7 @@ impl MultiClusterPartitionReader {
         let merger = if ordered_cfg.enabled && cluster_configs.len() > 1 {
             // The downstream push path is shared across all clusters, so its consumer metrics
             // are registered once on the base registerer rather than per cluster.
-            let downstream = consumer_factory(registry);
+            let downstream = consumer_factory(&cluster_configs[0], registry);
             let cb = Arc::new(move |recs: Vec<FetchedRecord>| {
                 let d = Arc::clone(&downstream);
                 Box::pin(async move { d.consume(recs).await })
@@ -2518,7 +2542,7 @@ impl MultiClusterPartitionReader {
                             cluster_id,
                         })
                     } else {
-                        consumer_factory(cluster_registry.as_ref())
+                        consumer_factory(cfg, cluster_registry.as_ref())
                     };
 
                 let cluster_instance = format!("{instance_id}-wc-{cluster_id}");
@@ -2968,7 +2992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_read_consistency_drop_guard_records_failure_and_latency() {
+    async fn wait_read_consistency_drop_guard_skips_failure_and_latency_on_cancel() {
         struct NoOpConsumer;
         impl RecordBatchConsumer for NoOpConsumer {
             fn consume(
@@ -3000,7 +3024,7 @@ mod tests {
             .store(ReaderState::Running as u8, Ordering::SeqCst);
 
         let offs = PartitionOffsets::new_single_cluster(10);
-        // Simulate gRPC deadline cancellation dropping the future mid-await.
+        // Simulate client cancellation (RST_STREAM) dropping the future mid-await.
         let timed = tokio::time::timeout(
             Duration::from_millis(20),
             reader.wait_read_consistency_until_offsets(&offs, Duration::from_secs(30)),
@@ -3017,23 +3041,123 @@ mod tests {
             .iter()
             .map(|m| m.get_counter().get_value())
             .sum();
-        let fails = mfs
+        let fails: f64 = mfs
             .iter()
             .find(|m| m.get_name() == "cortex_ingest_storage_strong_consistency_failures_total")
-            .unwrap()
-            .get_metric()[0]
-            .get_counter()
-            .get_value();
-        let lat_count = mfs
+            .map(|mf| mf.get_metric().iter().map(|m| m.get_counter().get_value()).sum())
+            .unwrap_or(0.0);
+        let lat_count: u64 = mfs
             .iter()
             .find(|m| m.get_name() == "cortex_ingest_storage_strong_consistency_wait_duration_seconds")
-            .unwrap()
-            .get_metric()[0]
-            .get_histogram()
-            .get_sample_count();
+            .map(|mf| mf.get_metric().iter().map(|m| m.get_histogram().get_sample_count()).sum())
+            .unwrap_or(0);
         assert_eq!(reqs, 1.0);
-        assert_eq!(fails, 1.0);
-        assert_eq!(lat_count, 1);
+        assert_eq!(fails, 0.0, "canceled wait must not record failure");
+        assert_eq!(lat_count, 0, "canceled wait must not observe latency");
+    }
+
+    #[tokio::test]
+    async fn multi_cluster_wait_read_consistency_does_not_blame_healthy_sibling_and_formats_caller_deadline() {
+        struct NoOpConsumer;
+        impl RecordBatchConsumer for NoOpConsumer {
+            fn consume(
+                &self,
+                _records: Vec<FetchedRecord>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let reg = Registry::new();
+        let cfg0 = KafkaConfig {
+            address: StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "ingest-wc0".to_string(),
+            ..Default::default()
+        };
+        let cfg1 = KafkaConfig {
+            address: StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "ingest-wc1".to_string(),
+            ..Default::default()
+        };
+        let multi = MultiClusterPartitionReader::new(
+            &[cfg0, cfg1],
+            &OrderedConsumptionConfig::default(),
+            0,
+            "ing-0",
+            vec![None, None],
+            Arc::new(NoOpConsumer),
+            Some(&reg),
+        )
+        .unwrap();
+
+        // Cluster 0 is Running (healthy sibling), cluster 1 is New (NotRunning).
+        multi.readers[0]
+            .state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+
+        let err = multi
+            .wait_read_consistency_until_offsets(
+                &PartitionOffsets::new_multi_cluster(vec![100, 100]),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "write compartment 1: partition reader service is not running (state: New)"
+        );
+
+        let mfs = reg.gather();
+        let fail_mf = mfs
+            .iter()
+            .find(|m| m.get_name() == "cortex_ingest_storage_strong_consistency_failures_total")
+            .unwrap();
+        let fail_for = |wc: &str| -> f64 {
+            fail_mf
+                .get_metric()
+                .iter()
+                .filter(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|lp| lp.get_name() == "write_compartment" && lp.get_value() == wc)
+                })
+                .map(|m| m.get_counter().get_value())
+                .sum()
+        };
+        assert_eq!(fail_for("1"), 1.0, "failing compartment 1 must record failure");
+        assert_eq!(fail_for("0"), 0.0, "healthy sibling compartment 0 must not record failure");
+
+        // Now mark cluster 1 Running too and test caller timeout error formatting.
+        multi.readers[1]
+            .state
+            .store(ReaderState::Running as u8, Ordering::SeqCst);
+        let err = multi
+            .wait_read_consistency_until_offsets(
+                &PartitionOffsets::new_multi_cluster(vec![100, 100]),
+                Duration::from_millis(15),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is_deadline_exceeded());
+        let msg = err.to_string();
+        assert!(
+            msg == "write compartment 0: context deadline exceeded"
+                || msg == "write compartment 1: context deadline exceeded",
+            "unexpected multi-cluster deadline error: {msg}"
+        );
+
+        // Verify InvalidClusterOffsetCount exact Go message.
+        let single_err = multi.readers[0]
+            .wait_read_consistency_until_offsets(
+                &PartitionOffsets::new_multi_cluster(vec![1, 2]),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            single_err.to_string(),
+            "a single-cluster partition reader was given read consistency offsets for 2 Kafka clusters"
+        );
     }
 
     #[tokio::test]

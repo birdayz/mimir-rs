@@ -600,7 +600,7 @@ async fn test_single_cluster_partition_reader_wait_read_consistency() {
                 .await
                 .unwrap_err()
         };
-        assert!(matches!(err, ReaderError::Watcher(_)));
+        assert!(matches!(err, ReaderError::ContextDeadlineExceeded));
 
         block.store(false, Ordering::SeqCst);
         let recs = tracking
@@ -777,7 +777,7 @@ async fn test_single_cluster_partition_reader_wait_read_consistency() {
                 .await
                 .unwrap_err()
         };
-        assert!(matches!(err, ReaderError::NotRunning));
+        assert!(matches!(err, ReaderError::NotRunning(_)));
         assert_eq!(
             get_counter_value(
                 &reg,

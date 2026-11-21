@@ -19,9 +19,11 @@ use parking_lot::RwLock;
 use prometheus::{Counter, Histogram, HistogramOpts, Opts, Registry};
 use thiserror::Error;
 
+use kafka_protocol::error::ResponseError;
+
 use super::compression::KafkaCompression;
 use super::kafka_client::{KafkaClient, KafkaClientError, ProduceRecord};
-use super::util::create_topics;
+use super::util::{create_topics, IngestKafkaClient, SampledOnlyPropagator};
 use super::version::{
     RecordCodecError, RecordSerializer, RecordVersion, SerializedKafkaRecord,
     MAX_PRODUCER_RECORD_DATA_BYTES_LIMIT,
@@ -138,7 +140,21 @@ pub struct IngestWriter {
     serializer: RecordSerializer,
     compression: KafkaCompression,
     max_record_size_bytes: usize,
+    write_timeout: Duration,
     metrics: WriterMetrics,
+}
+
+fn ingest_writer_retriable_err(err: &KafkaClientError) -> bool {
+    match err {
+        KafkaClientError::Broker(resp) => super::kgo_retry::is_retriable_response_error(*resp),
+        KafkaClientError::Io(_)
+        | KafkaClientError::RequestTimeout(_)
+        | KafkaClientError::ConnectTimeout { .. }
+        | KafkaClientError::ChosenBrokerDead
+        | KafkaClientError::UnknownController(_)
+        | KafkaClientError::UnknownBroker => true,
+        _ => false,
+    }
 }
 
 impl IngestWriter {
@@ -146,21 +162,35 @@ impl IngestWriter {
         cfg: &KafkaConfig,
         registry: Option<&Registry>,
     ) -> Result<Self, WriterError> {
-        let client = Arc::new(KafkaClient::from_config(cfg)?);
+        let client = Arc::new(
+            IngestKafkaClient::from_config_for_producer(cfg, None)?.into_inner(),
+        );
         let version = RecordVersion::from_i64(cfg.producer_record_version)?;
-        let compression: KafkaCompression = cfg.producer_compression.parse()?;
+        let compression: KafkaCompression = if cfg.producer_compression.trim().is_empty() {
+            KafkaCompression::Snappy
+        } else {
+            cfg.producer_compression.parse()?
+        };
         let max_record_size_bytes = if cfg.producer_max_record_size_bytes <= 0 {
             MAX_PRODUCER_RECORD_DATA_BYTES_LIMIT
         } else {
             cfg.producer_max_record_size_bytes as usize
         };
-        Ok(Self::with_client(
+        let raw_wt = Duration::from_nanos(cfg.write_timeout.as_nanos().max(0) as u64);
+        let write_timeout = if raw_wt.is_zero() {
+            Duration::from_secs(10)
+        } else {
+            raw_wt
+        };
+        let mut w = Self::with_client(
             client,
             version,
             compression,
             max_record_size_bytes,
             registry,
-        ))
+        );
+        w.write_timeout = write_timeout;
+        Ok(w)
     }
 
     pub fn with_client(
@@ -170,13 +200,28 @@ impl IngestWriter {
         max_record_size_bytes: usize,
         registry: Option<&Registry>,
     ) -> Self {
+        let pt = client.produce_timeout();
+        let write_timeout = if pt.is_zero() {
+            Duration::from_secs(10)
+        } else {
+            pt
+        };
         Self {
             client,
             serializer: RecordSerializer::new(version),
             compression,
             max_record_size_bytes,
+            write_timeout,
             metrics: WriterMetrics::new(registry),
         }
+    }
+
+    pub fn compression(&self) -> KafkaCompression {
+        self.compression
+    }
+
+    pub fn write_timeout(&self) -> Duration {
+        self.write_timeout
     }
 
     pub fn kafka_client(&self) -> &Arc<KafkaClient> {
@@ -231,7 +276,9 @@ impl IngestWriter {
             self.metrics.records_per_request.observe(recs.len() as f64);
             input_bytes += orig_size;
             let entry = by_partition.entry(pr.partition_id).or_default();
-            for r in recs {
+            let active_tc = mimir_common::tracing::current_trace_context();
+            for mut r in recs {
+                SampledOnlyPropagator.inject_trace_context(active_tc.as_ref(), &mut r.headers);
                 sent_bytes += r.value.len();
                 entry.push(ProduceRecord {
                     key: Some(r.key),
@@ -249,23 +296,88 @@ impl IngestWriter {
             return Ok(Vec::new());
         }
 
-        let mut offsets = Vec::with_capacity(by_partition.len());
-        for (pid, recs) in by_partition {
-            match self
-                .client
-                .produce(topic, pid, self.compression, recs)
-                .await
-            {
-                Ok(base_offset) => offsets.push((pid, base_offset)),
-                Err(e) => {
-                    self.metrics
-                        .latency
-                        .with_label_values(&["failure"])
-                        .observe(start.elapsed().as_secs_f64());
-                    return Err(WriterError::Kafka(e));
+        let produce_futs = by_partition.into_iter().map(|(pid, recs)| {
+            let client = Arc::clone(&self.client);
+            let compression = self.compression;
+            let write_timeout = self.write_timeout;
+            async move {
+                let mut retry_backoff = Duration::from_millis(25);
+                let mut last_err: Option<KafkaClientError> = None;
+                loop {
+                    let elapsed = start.elapsed();
+                    if elapsed >= write_timeout {
+                        return Err(WriterError::Kafka(
+                            last_err.unwrap_or(KafkaClientError::RequestTimeout(write_timeout)),
+                        ));
+                    }
+                    let remaining = write_timeout.saturating_sub(elapsed);
+                    let res = tokio::time::timeout(
+                        remaining,
+                        client.produce(topic, pid, compression, recs.clone()),
+                    )
+                    .await;
+                    match res {
+                        Ok(Ok(base_offset)) => return Ok((pid, base_offset)),
+                        Ok(Err(KafkaClientError::Broker(ResponseError::MessageTooLarge))) => {
+                            return Err(WriterError::WriteRequestDataItemTooLarge);
+                        }
+                        Ok(Err(KafkaClientError::Broker(
+                            ResponseError::UnknownTopicOrPartition,
+                        ))) => {
+                            last_err = Some(KafkaClientError::Broker(
+                                ResponseError::UnknownTopicOrPartition,
+                            ));
+                            let unknown_limit = write_timeout.min(Duration::from_secs(2));
+                            if start.elapsed() >= unknown_limit {
+                                return Err(WriterError::Kafka(
+                                    last_err.unwrap_or(KafkaClientError::RequestTimeout(
+                                        write_timeout,
+                                    )),
+                                ));
+                            }
+                            let _ = client.refresh_metadata(&[topic]).await;
+                            if start.elapsed() >= unknown_limit {
+                                return Err(WriterError::Kafka(
+                                    last_err.unwrap_or(KafkaClientError::RequestTimeout(
+                                        write_timeout,
+                                    )),
+                                ));
+                            }
+                            retry_backoff = (retry_backoff * 2).min(Duration::from_millis(250));
+                        }
+                        Ok(Err(e)) if ingest_writer_retriable_err(&e) => {
+                            last_err = Some(e);
+                            retry_backoff = Duration::from_millis(25);
+                        }
+                        Ok(Err(e)) => return Err(WriterError::Kafka(e)),
+                        Err(_) => {
+                            return Err(WriterError::Kafka(
+                                last_err.unwrap_or(KafkaClientError::RequestTimeout(write_timeout)),
+                            ));
+                        }
+                    }
+
+                    let remaining = write_timeout.saturating_sub(start.elapsed());
+                    if remaining.is_zero() {
+                        return Err(WriterError::Kafka(
+                            last_err.unwrap_or(KafkaClientError::RequestTimeout(write_timeout)),
+                        ));
+                    }
+                    tokio::time::sleep(retry_backoff.min(remaining)).await;
                 }
             }
-        }
+        });
+
+        let offsets = match futures::future::try_join_all(produce_futs).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.metrics
+                    .latency
+                    .with_label_values(&["failure"])
+                    .observe(start.elapsed().as_secs_f64());
+                return Err(e);
+            }
+        };
 
         self.metrics
             .latency
@@ -551,4 +663,221 @@ where
         });
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{BufMut, BytesMut};
+    use kafka_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+    use kafka_protocol::messages::metadata_response::{
+        MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+    };
+    use kafka_protocol::messages::produce_response::{
+        PartitionProduceResponse, TopicProduceResponse,
+    };
+    use kafka_protocol::messages::{
+        ApiKey, BrokerId, MetadataResponse, ProduceRequest, ProduceResponse, RequestHeader,
+        ResponseHeader, TopicName,
+    };
+    use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+    use mimir_config::types::StringSliceCSV;
+    use mimir_config::GoDuration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn ingest_writer_from_config_defaults_compression_to_snappy_and_honors_overhead() {
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "ingest".to_string(),
+            write_timeout: GoDuration::from_millis(250),
+            write_timeout_overhead: GoDuration::from_secs(3),
+            ..Default::default()
+        };
+        let w = IngestWriter::from_config(&cfg, None).unwrap();
+        assert_eq!(w.compression(), KafkaCompression::Snappy);
+        assert_eq!(w.write_timeout(), Duration::from_millis(250));
+        assert_eq!(w.kafka_client().request_timeout(), Duration::from_secs(3));
+
+        let mut none_cfg = cfg.clone();
+        none_cfg.producer_compression = "none".to_string();
+        let w_none = IngestWriter::from_config(&none_cfg, None).unwrap();
+        assert_eq!(w_none.compression(), KafkaCompression::None);
+    }
+
+    #[tokio::test]
+    async fn ingest_writer_retries_and_maps_message_too_large_and_writes_concurrently() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let p0_attempts = Arc::new(AtomicUsize::new(0));
+        let p0_srv = Arc::clone(&p0_attempts);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let p0_c = Arc::clone(&p0_srv);
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = sock.into_split();
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if rd.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; len];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = Bytes::from(payload);
+                        let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let api_key = ApiKey::try_from(key_i16).unwrap();
+                        let req_hdr =
+                            RequestHeader::decode(&mut buf, api_key.request_header_version(ver))
+                                .unwrap();
+                        let mut out = BytesMut::new();
+                        out.put_u32(0);
+                        let resp_hdr_ver = if api_key == ApiKey::ApiVersions {
+                            0
+                        } else {
+                            api_key.response_header_version(ver)
+                        };
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr.encode(&mut out, resp_hdr_ver).unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let mut r = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 0, 12),
+                                    (ApiKey::Produce as i16, 3, 9),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    r.api_keys.push(av);
+                                }
+                                r.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = addr.port() as i32;
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("ingest-w")));
+                                for pid in 0..3 {
+                                    let mut p = MetadataResponsePartition::default();
+                                    p.partition_index = pid;
+                                    p.leader_id = BrokerId(0);
+                                    t.partitions.push(p);
+                                }
+                                let mut r = MetadataResponse::default();
+                                r.brokers = vec![b];
+                                r.topics = vec![t];
+                                r.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Produce => {
+                                let req = ProduceRequest::decode(&mut buf, ver).unwrap();
+                                let mut resp = ProduceResponse::default();
+                                for rt in &req.topic_data {
+                                    let mut tr = TopicProduceResponse::default();
+                                    tr.name = rt.name.clone();
+                                    for rp in &rt.partition_data {
+                                        let mut pr = PartitionProduceResponse::default();
+                                        pr.index = rp.index;
+                                        if rp.index == 0 {
+                                            let n = p0_c.fetch_add(1, Ordering::SeqCst);
+                                            if n == 0 {
+                                                pr.error_code =
+                                                    ResponseError::RequestTimedOut.code();
+                                            } else {
+                                                pr.error_code = 0;
+                                                pr.base_offset = 10;
+                                            }
+                                        } else if rp.index == 1 {
+                                            pr.error_code = 0;
+                                            pr.base_offset = 20;
+                                        } else {
+                                            pr.error_code =
+                                                ResponseError::MessageTooLarge.code();
+                                        }
+                                        tr.partition_responses.push(pr);
+                                    }
+                                    resp.responses.push(tr);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "ingest-w".to_string(),
+            write_timeout: GoDuration::from_secs(2),
+            write_timeout_overhead: GoDuration::from_millis(500),
+            ..Default::default()
+        };
+        cfg.dial_timeout = GoDuration::from_secs(2);
+        let writer = IngestWriter::from_config(&cfg, None).unwrap();
+
+        let sample_req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![cortexpb::LabelPair::from_static("__name__", "m")],
+                samples: vec![cortexpb::Sample {
+                    value: 1.0,
+                    timestamp_ms: 1000,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut res = writer
+            .multi_write_sync(
+                "ingest-w",
+                "user-1",
+                &[
+                    PartitionWriteRequest {
+                        partition_id: 0,
+                        write_request: &sample_req,
+                    },
+                    PartitionWriteRequest {
+                        partition_id: 1,
+                        write_request: &sample_req,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        res.sort_by_key(|(pid, _)| *pid);
+        assert_eq!(res, vec![(0, 10), (1, 20)]);
+        assert_eq!(p0_attempts.load(Ordering::SeqCst), 2);
+
+        let err = writer
+            .write_sync("ingest-w", 2, "user-1", &sample_req)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WriterError::WriteRequestDataItemTooLarge),
+            "expected WriteRequestDataItemTooLarge, got {err:?}"
+        );
+
+        srv.abort();
+    }
 }

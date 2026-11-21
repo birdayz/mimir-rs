@@ -24,7 +24,7 @@ use mimir_storage::ingest::version::{deserialize_record_content, parse_record_ve
 use mimir_storage::ingest::{
     write_compartment_configs, ErrorSampler as StorageErrorSampler, FetchedRecord, LogPolicy,
     MultiClusterPartitionReader, PartitionOffsets, PreCommitNotifier, PushErrorHandler,
-    PusherConsumerMetrics, PusherError, ReaderError, RecordBatchConsumer,
+    PusherConsumerMetrics, PusherError, ReaderError, ReaderState, RecordBatchConsumer,
     SingleClusterPartitionReader, READ_COMPARTMENT_ID_PLACEHOLDER,
 };
 use mimir_tsdb::labels::append_stringlabel_pair;
@@ -101,6 +101,13 @@ impl IngestReaderHandle {
                 r.wait_read_consistency_until_last_produced_offset(timeout)
                     .await
             }
+        }
+    }
+
+    pub fn state(&self) -> ReaderState {
+        match self {
+            Self::Single(r) => r.state(),
+            Self::Multi(r) => r.state(),
         }
     }
 
@@ -1860,14 +1867,15 @@ pub async fn start_ingest_reader(ingester: Arc<Ingester>) -> Result<Arc<IngestRe
     let adapter = Arc::new(IngesterStorageAdapter(Arc::clone(&ingester)));
     let notifier: Arc<dyn PreCommitNotifier> = adapter;
 
-    // Go `NewPusherConsumer(pusher, kafkaCfg, NewPusherConsumerMetrics(reg), ...)`.
-    let consumer_factory = |reg: Option<&prometheus::Registry>| -> Arc<dyn RecordBatchConsumer> {
-        Arc::new(ShardedConsumerHandle(Arc::new(IngesterShardedBatchConsumer::new(
-            Arc::clone(&ingester),
-            ingester.ingest_cfg.kafka.clone(),
-            PusherConsumerMetrics::new(reg),
-        ))))
-    };
+    // Go `NewPusherConsumer(pusher, clusterCfg, NewPusherConsumerMetrics(reg), ...)`.
+    let consumer_factory =
+        |kafka_cfg: &KafkaConfig, reg: Option<&prometheus::Registry>| -> Arc<dyn RecordBatchConsumer> {
+            Arc::new(ShardedConsumerHandle(Arc::new(IngesterShardedBatchConsumer::new(
+                Arc::clone(&ingester),
+                kafka_cfg.clone(),
+                PusherConsumerMetrics::new(reg),
+            ))))
+        };
     let max_replay_period = Duration::from_nanos(
         ingester
             .blocks_cfg
@@ -1910,7 +1918,7 @@ pub async fn start_ingest_reader(ingester: Arc<Ingester>) -> Result<Arc<IngestRe
             ingester.ingest_partition_id,
             &ingester.cfg.ring.instance_id,
             Some(offset_file_path),
-            consumer_factory(ingester.registry.as_ref()),
+            consumer_factory(&ingester.ingest_cfg.kafka, ingester.registry.as_ref()),
             notifier,
             ingester.registry.as_ref(),
         )?;
@@ -2407,5 +2415,80 @@ mod consumer_tests {
                 "version={version:?}: OOB sample + missing __name__ + exemplar must hard-fail as server error"
             );
         }
+    }
+
+    #[test]
+    fn compartment_consumer_factory_receives_divided_concurrency_and_resolved_topic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "ing-0".to_string();
+        ing_cfg.read_compartment_id = 3;
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().to_string();
+        let mut ingest_cfg = mimir_config::IngestStorageConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        ingest_cfg.kafka.address = mimir_config::types::StringSliceCSV(vec!["127.0.0.1:9092".to_string()]);
+        ingest_cfg.kafka.topic = "ingest-<read-compartment-id>".to_string();
+        ingest_cfg.kafka.ingestion_concurrency_max = 8;
+
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            ingest_cfg,
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let topic = ing
+            .ingest_cfg
+            .kafka
+            .topic
+            .replace(READ_COMPARTMENT_ID_PLACEHOLDER, "3");
+        let cluster_configs = write_compartment_configs(&ing.ingest_cfg.kafka, 2, &topic);
+
+        let seen: std::sync::Arc<parking_lot::Mutex<Vec<(String, i64)>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_c = Arc::clone(&seen);
+        let factory = |kafka_cfg: &KafkaConfig, reg: Option<&prometheus::Registry>| -> Arc<dyn RecordBatchConsumer> {
+            let consumer = IngesterShardedBatchConsumer::new(
+                Arc::clone(&ing),
+                kafka_cfg.clone(),
+                PusherConsumerMetrics::new(reg),
+            );
+            seen_c
+                .lock()
+                .push((consumer.kafka_cfg.topic.clone(), consumer.kafka_cfg.ingestion_concurrency_max));
+            Arc::new(ShardedConsumerHandle(Arc::new(consumer)))
+        };
+
+        let _multi = MultiClusterPartitionReader::new_with_notifier(
+            &cluster_configs,
+            &mimir_config::OrderedConsumptionConfig::default(),
+            0,
+            "ing-0",
+            vec![None, None],
+            &factory,
+            Arc::new(IngesterStorageAdapter(Arc::clone(&ing))),
+            Duration::ZERO,
+            None,
+        )
+        .unwrap();
+
+        let captured = seen.lock().clone();
+        assert_eq!(
+            captured,
+            vec![
+                ("ingest-3".to_string(), 4),
+                ("ingest-3".to_string(), 4),
+            ]
+        );
     }
 }
