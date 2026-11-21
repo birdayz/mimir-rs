@@ -179,7 +179,7 @@ fn list_segments(dir: &Path) -> Result<Vec<SegmentRef>, WlogError> {
     }
     refs.sort_by_key(|r| r.index);
     for w in refs.windows(2) {
-        if w[0].index + 1 != w[1].index {
+        if w[0].index.checked_add(1) != Some(w[1].index) {
             return Err(WlogError::NonSequentialSegments);
         }
     }
@@ -282,7 +282,12 @@ impl WlogWriter {
         fs::create_dir_all(&dir)?;
 
         let write_segment_index = match segments_range(&dir)? {
-            Some((_, last)) => last + 1,
+            Some((_, last)) => last.checked_add(1).ok_or_else(|| WlogError::Corruption {
+                dir: Some(dir.clone()),
+                segment: Some(last),
+                offset: 0,
+                message: "segment index overflow".to_string(),
+            })?,
             None => 0,
         };
 
@@ -474,7 +479,12 @@ impl WlogWriter {
         let next_idx = {
             let prev = self.segment.as_ref().ok_or(WlogError::Closed)?;
             Self::fsync_file(self.metrics.as_ref(), &prev.file)?;
-            prev.index + 1
+            prev.index.checked_add(1).ok_or_else(|| WlogError::Corruption {
+                dir: Some(self.dir.clone()),
+                segment: Some(prev.index),
+                offset: 0,
+                message: "segment index overflow".to_string(),
+            })?
         };
 
         let next = Self::create_segment(&self.dir, next_idx)?;
@@ -858,11 +868,17 @@ impl WlogWriter {
         fs::remove_file(&tmp_path)?;
 
         // Always start writing to a new segment rather than the repaired one.
-        let next = Self::create_segment(&self.dir, corrupt_segment + 1)?;
+        let next_segment = corrupt_segment.checked_add(1).ok_or_else(|| WlogError::Corruption {
+            dir: Some(self.dir.clone()),
+            segment: Some(corrupt_segment),
+            offset: corrupt_offset,
+            message: "segment index overflow during repair".to_string(),
+        })?;
+        let next = Self::create_segment(&self.dir, next_segment)?;
         self.done_pages = (next.file.metadata()?.len() as usize) / PAGE_SIZE;
         self.segment = Some(next);
         self.page.reset();
-        self.set_current_segment_metric(corrupt_segment + 1);
+        self.set_current_segment_metric(next_segment);
         crate::block::sync_dir(&self.dir)?;
         Ok(())
     }
@@ -1096,7 +1112,12 @@ impl WlogReader<SegmentBufReader> {
                     first: None,
                     last: None,
                 });
-                Some(cp_idx + 1)
+                Some(cp_idx.checked_add(1).ok_or_else(|| WlogError::Corruption {
+                    dir: Some(dir.to_path_buf()),
+                    segment: Some(cp_idx),
+                    offset: 0,
+                    message: "checkpoint index overflow".to_string(),
+                })?)
             }
             None => None,
         };
@@ -1497,7 +1518,12 @@ where
     let mut effective_from = from;
 
     if let Some((cp_dir, idx)) = last_checkpoint(dir)? {
-        let expected = idx + 1;
+        let expected = idx.checked_add(1).ok_or_else(|| WlogError::Corruption {
+            dir: Some(dir.to_path_buf()),
+            segment: Some(idx),
+            offset: 0,
+            message: "checkpoint index overflow".to_string(),
+        })?;
         if effective_from > expected {
             return Err(WlogError::CheckpointGap {
                 expected,
@@ -2168,5 +2194,32 @@ mod tests {
         assert_eq!(reader.next_record().unwrap().unwrap(), rec0.as_slice());
         assert_eq!(reader.next_record().unwrap().unwrap(), rec1.as_slice());
         assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn usize_max_segment_and_checkpoint_filenames_do_not_overflow_c7() {
+        let dir = tempfile::tempdir().unwrap();
+        let max_s = usize::MAX.to_string();
+        let padded_max_s = format!("0{max_s}");
+        fs::write(dir.path().join(&max_s), b"").unwrap();
+        fs::write(dir.path().join(&padded_max_s), b"").unwrap();
+        assert!(matches!(
+            list_segments(dir.path()),
+            Err(WlogError::NonSequentialSegments)
+        ));
+
+        let cp_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(cp_dir.path().join(format!("{CHECKPOINT_PREFIX}{max_s}"))).unwrap();
+        let cp_err = create_checkpoint(
+            cp_dir.path(),
+            0,
+            1,
+            |_| true,
+            0,
+            false,
+            CompressionType::None,
+        )
+        .unwrap_err();
+        assert!(matches!(cp_err, WlogError::Corruption { .. }), "got {cp_err:?}");
     }
 }

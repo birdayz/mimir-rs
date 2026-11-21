@@ -95,6 +95,12 @@ impl XorChunk {
     }
 
     pub fn appender(&mut self) -> Result<XorAppender<'_>, ChunkError> {
+        if self.b.bytes().len() < CHUNK_HEADER_SIZE {
+            return Err(ChunkError::InvalidHeader {
+                len: self.b.bytes().len(),
+                min: CHUNK_HEADER_SIZE,
+            });
+        }
         if self.b.bytes().len() == CHUNK_HEADER_SIZE {
             return Ok(XorAppender {
                 b: &mut self.b,
@@ -106,7 +112,7 @@ impl XorChunk {
             });
         }
 
-        let (t, v, t_delta, leading, trailing, valid_bits) = {
+        let (t, v, t_delta, leading, trailing, (used_bytes, free_bits)) = {
             let mut it = self.iter();
             while it.next_sample()?.is_some() {}
             (
@@ -115,11 +121,12 @@ impl XorChunk {
                 it.t_delta,
                 it.leading,
                 it.trailing,
-                it.br.valid_bits(),
+                it.br.consumed_bytes_and_free_bits(),
             )
         };
 
-        self.b.set_count(valid_bits);
+        self.b
+            .truncate_and_set_count(CHUNK_HEADER_SIZE + used_bytes, free_bits);
         Ok(XorAppender {
             b: &mut self.b,
             t,
@@ -637,5 +644,31 @@ mod tests {
         assert_eq!(it3.next_sample().unwrap(), Some((100, 1.0)));
         assert_eq!(it3.next_sample().unwrap(), Some((110, 2.5)));
         assert_eq!(it3.next_sample().unwrap(), None);
+    }
+
+    #[test]
+    fn xor_appender_rejects_short_header_and_handles_trailing_padding_c3_c6() {
+        let mut short = XorChunk::from_bytes(vec![0u8; CHUNK_HEADER_SIZE - 1]);
+        assert!(matches!(
+            short.appender(),
+            Err(ChunkError::InvalidHeader { len: 1, min: 2 })
+        ));
+
+        let mut chunk = XorChunk::new();
+        {
+            let mut app = chunk.appender().unwrap();
+            app.append(0, 1_000, 1.5).unwrap();
+        }
+        let mut bytes = chunk.as_bytes().to_vec();
+        bytes.extend_from_slice(&[0xff, 0xaa, 0x55]);
+        let mut padded = XorChunk::from_bytes(bytes);
+        {
+            let mut app = padded.appender().unwrap();
+            app.append(0, 2_000, 3.25).unwrap();
+        }
+        let mut it = padded.iter();
+        assert_eq!(it.next_sample().unwrap(), Some((1_000, 1.5)));
+        assert_eq!(it.next_sample().unwrap(), Some((2_000, 3.25)));
+        assert_eq!(it.next_sample().unwrap(), None);
     }
 }

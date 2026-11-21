@@ -553,6 +553,20 @@ fn check_histogram_spans(spans: &[HistogramSpan], num_buckets: usize) -> Result<
     Ok(())
 }
 
+fn format_go_f(v: f64) -> String {
+    if v.is_infinite() {
+        if v.is_sign_positive() {
+            "+Inf".to_string()
+        } else {
+            "-Inf".to_string()
+        }
+    } else if v.is_nan() {
+        "NaN".to_string()
+    } else {
+        format!("{v:.6}")
+    }
+}
+
 pub(crate) fn format_go_g(v: f64) -> String {
     if v.is_nan() {
         return "NaN".to_string();
@@ -640,7 +654,11 @@ fn check_histogram_custom_bounds(
         if i > 0 && curr <= prev {
             return Err(HistogramValidationError::new(
                 HistogramErrorKind::CustomBucketsInvalid,
-                format!("previous bound is {prev:.6} and current is {curr:.6}"),
+                format!(
+                    "previous bound is {} and current is {}",
+                    format_go_f(prev),
+                    format_go_f(curr)
+                ),
             ));
         }
         prev = curr;
@@ -758,5 +776,28 @@ mod tests {
             err2.to_string().contains("zero bucket has observation count of -1e+06:"),
             "got: {err2}"
         );
+    }
+
+    #[test]
+    fn custom_buckets_invalid_formats_pos_and_neg_inf_like_go() {
+        let fh_pos_inf = FloatHistogram {
+            schema: CUSTOM_BUCKETS_SCHEMA,
+            custom_values: vec![f64::INFINITY, 1.0],
+            ..FloatHistogram::default()
+        };
+        let err1 = fh_pos_inf.validate().unwrap_err();
+        assert_eq!(err1.kind, HistogramErrorKind::CustomBucketsInvalid);
+        let msg1 = err1.to_string();
+        assert!(msg1.contains("previous bound is +Inf"), "got: {msg1}");
+
+        let fh_neg_inf = FloatHistogram {
+            schema: CUSTOM_BUCKETS_SCHEMA,
+            custom_values: vec![f64::NEG_INFINITY, f64::NEG_INFINITY],
+            ..FloatHistogram::default()
+        };
+        let err2 = fh_neg_inf.validate().unwrap_err();
+        assert_eq!(err2.kind, HistogramErrorKind::CustomBucketsInvalid);
+        let msg2 = err2.to_string();
+        assert!(msg2.contains("previous bound is -Inf and current is -Inf"), "got: {msg2}");
     }
 }

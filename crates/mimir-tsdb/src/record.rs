@@ -10,7 +10,8 @@ use crate::chunkenc::histogram_model::{
 };
 use crate::chunkenc::float_histogram::reduce_float_resolution;
 use crate::chunkenc::histogram::reduce_int_resolution;
-use crate::chunkenc::ChunkError;
+use crate::chunkenc::histogram_meta::checked_count_spans;
+use crate::chunkenc::{is_stale_nan, ChunkError};
 use crate::encoding::{Decbuf, Encbuf, EncodingError};
 use crate::labels::Labels;
 
@@ -767,6 +768,13 @@ pub fn decode_histogram(dec: &mut Decbuf<'_>) -> Result<Histogram, EncodingError
         Vec::new()
     };
 
+    if !is_stale_nan(sum)
+        && (checked_count_spans(&positive_spans) != Some(positive_buckets.len())
+            || checked_count_spans(&negative_spans) != Some(negative_buckets.len()))
+    {
+        return Err(EncodingError::InvalidSize);
+    }
+
     Ok(Histogram {
         counter_reset_hint,
         schema,
@@ -866,6 +874,13 @@ pub fn decode_float_histogram(dec: &mut Decbuf<'_>) -> Result<FloatHistogram, En
     } else {
         Vec::new()
     };
+
+    if !is_stale_nan(sum)
+        && (checked_count_spans(&positive_spans) != Some(positive_buckets.len())
+            || checked_count_spans(&negative_spans) != Some(negative_buckets.len()))
+    {
+        return Err(EncodingError::InvalidSize);
+    }
 
     Ok(FloatHistogram {
         counter_reset_hint,
@@ -1445,5 +1460,91 @@ mod tests {
         assert_eq!(metas[0].metric_type, MetricType::Counter as u8);
         assert_eq!(metas[0].unit, "\u{FFFD}\u{FFFD}");
         assert_eq!(metas[0].help, "bad\u{FFFD}help");
+    }
+
+    #[test]
+    fn corrupt_wal_histogram_span_bucket_mismatch_or_u32_max_returns_err_c1() {
+        let enc = RecordEncoder::new(false);
+        let dec = RecordDecoder::new();
+
+        // 1) Integer histogram with length = u32::MAX and empty buckets.
+        let huge_h = RefHistogramSample {
+            ref_id: 1,
+            st: 0,
+            t: 1000,
+            h: Histogram {
+                schema: 0,
+                count: 1,
+                sum: 1.0,
+                positive_spans: vec![HistogramSpan {
+                    offset: 0,
+                    length: u32::MAX,
+                }],
+                positive_buckets: vec![],
+                ..Default::default()
+            },
+        };
+        let (rec_huge, _) = enc.histogram_samples(&[huge_h], Vec::new());
+        assert!(dec.histogram_samples(&rec_huge).is_err());
+
+        // 2) Integer histogram with mismatched span length (5) vs buckets (2).
+        let mismatch_h = RefHistogramSample {
+            ref_id: 1,
+            st: 0,
+            t: 1000,
+            h: Histogram {
+                schema: 0,
+                count: 3,
+                sum: 3.0,
+                positive_spans: vec![HistogramSpan {
+                    offset: 0,
+                    length: 5,
+                }],
+                positive_buckets: vec![1, 2],
+                ..Default::default()
+            },
+        };
+        let (rec_mismatch, _) = enc.histogram_samples(&[mismatch_h], Vec::new());
+        assert!(dec.histogram_samples(&rec_mismatch).is_err());
+
+        // 3) Float histogram with length = u32::MAX and empty buckets.
+        let huge_fh = RefFloatHistogramSample {
+            ref_id: 1,
+            st: 0,
+            t: 1000,
+            fh: FloatHistogram {
+                schema: 0,
+                count: 1.0,
+                sum: 1.0,
+                positive_spans: vec![HistogramSpan {
+                    offset: 0,
+                    length: u32::MAX,
+                }],
+                positive_buckets: vec![],
+                ..Default::default()
+            },
+        };
+        let (rec_fh_huge, _) = enc.float_histogram_samples(&[huge_fh], Vec::new());
+        assert!(dec.float_histogram_samples(&rec_fh_huge).is_err());
+
+        // 4) Float histogram with mismatched span length (5) vs buckets (2).
+        let mismatch_fh = RefFloatHistogramSample {
+            ref_id: 1,
+            st: 0,
+            t: 1000,
+            fh: FloatHistogram {
+                schema: 0,
+                count: 3.0,
+                sum: 3.0,
+                positive_spans: vec![HistogramSpan {
+                    offset: 0,
+                    length: 5,
+                }],
+                positive_buckets: vec![1.0, 2.0],
+                ..Default::default()
+            },
+        };
+        let (rec_fh_mismatch, _) = enc.float_histogram_samples(&[mismatch_fh], Vec::new());
+        assert!(dec.float_histogram_samples(&rec_fh_mismatch).is_err());
     }
 }

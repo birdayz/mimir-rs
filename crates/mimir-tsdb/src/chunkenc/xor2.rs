@@ -114,6 +114,12 @@ impl Xor2Chunk {
     }
 
     pub fn appender(&mut self) -> Result<Xor2Appender<'_>, ChunkError> {
+        if self.b.bytes().len() < XOR2_HEADER_SIZE {
+            return Err(ChunkError::InvalidHeader {
+                len: self.b.bytes().len(),
+                min: XOR2_HEADER_SIZE,
+            });
+        }
         if self.b.bytes().len() == XOR2_HEADER_SIZE {
             return Ok(Xor2Appender {
                 b: &mut self.b,
@@ -141,7 +147,7 @@ impl Xor2Chunk {
             num_total,
             first_st_known,
             first_st_change_on,
-            valid_bits,
+            (used_bytes, free_bits),
         ) = {
             let mut it = self.iter();
             while it.next_sample()?.is_some() {}
@@ -156,11 +162,12 @@ impl Xor2Chunk {
                 it.num_total,
                 it.first_st_known,
                 it.first_st_change_on,
-                it.br.valid_bits(),
+                it.br.consumed_bytes_and_free_bits(),
             )
         };
 
-        self.b.set_count(valid_bits);
+        self.b
+            .truncate_and_set_count(XOR2_HEADER_SIZE + used_bytes, free_bits);
         Ok(Xor2Appender {
             b: &mut self.b,
             st,
@@ -950,5 +957,33 @@ mod tests {
         let mut it = chunk.iter();
         assert!(it.next_sample().is_ok());
         assert!(matches!(it.next_sample(), Err(ChunkError::InvalidChunk)));
+    }
+
+    #[test]
+    fn xor2_appender_rejects_short_header_and_handles_trailing_padding_c3_c6() {
+        let mut short = Xor2Chunk::from_bytes(vec![0u8; XOR2_HEADER_SIZE - 1]);
+        assert!(matches!(
+            short.appender(),
+            Err(ChunkError::InvalidHeader { len: 2, min: 3 })
+        ));
+
+        let mut chunk = Xor2Chunk::new();
+        {
+            let mut app = chunk.appender().unwrap();
+            app.append(100, 1_000, 1.5).unwrap();
+        }
+        let mut bytes = chunk.as_bytes().to_vec();
+        bytes.extend_from_slice(&[0xff, 0xaa, 0x55]);
+        let mut padded = Xor2Chunk::from_bytes(bytes);
+        {
+            let mut app = padded.appender().unwrap();
+            app.append(200, 2_000, 3.25).unwrap();
+        }
+        let mut it = padded.iter();
+        assert_eq!(it.next_sample().unwrap(), Some((1_000, 1.5)));
+        assert_eq!(it.at_st(), 100);
+        assert_eq!(it.next_sample().unwrap(), Some((2_000, 3.25)));
+        assert_eq!(it.at_st(), 200);
+        assert_eq!(it.next_sample().unwrap(), None);
     }
 }
