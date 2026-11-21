@@ -95,6 +95,16 @@ func main() {
 		out, err = cmdGrpcHealthProbe(input)
 	case "grpc-ingester-check":
 		out, err = cmdGrpcIngesterCheck(input)
+	case "validate-config":
+		out, err = cmdValidateConfig(input)
+	case "load-runtime-config":
+		out, err = cmdLoadRuntimeConfig(input)
+	case "write-index-v1-fixture":
+		out, err = cmdWriteIndexV1Fixture(input)
+	case "verify-index-file":
+		out, err = cmdVerifyIndexFile(input)
+	case "serialize-ingest-records":
+		out, err = cmdSerializeIngestRecords(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}
