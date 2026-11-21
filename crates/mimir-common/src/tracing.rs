@@ -113,12 +113,39 @@ pub struct SpanAttribute {
     pub value: SpanAttrValue,
 }
 
-#[derive(Clone, Debug)]
+pub const INTERNAL_SPAN_LINKS_KEY: &str = "__mimir_span_links";
+pub const INTERNAL_SPAN_EVENTS_KEY: &str = "__mimir_span_events";
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpanLink {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub trace_state: Option<String>,
+    pub attributes: Vec<SpanAttribute>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpanEvent {
+    pub name: String,
+    pub time_unix_nano: u64,
+    pub attributes: Vec<SpanAttribute>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum SpanAttrValue {
     String(String),
     StringArray(Vec<String>),
     Bool(bool),
     Int(i64),
+    Float(f64),
+    Links(Vec<SpanLink>),
+    Events(Vec<SpanEvent>),
+}
+
+impl PartialEq for SpanAttribute {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.value == other.value
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +160,69 @@ pub struct ExportedSpan {
     pub end_time_unix_nano: u64,
     pub attributes: Vec<SpanAttribute>,
     pub status_error: bool,
+}
+
+impl ExportedSpan {
+    pub fn push_link(&mut self, link: SpanLink) {
+        if let Some(attr) = self
+            .attributes
+            .iter_mut()
+            .find(|a| matches!(a.value, SpanAttrValue::Links(_)))
+        {
+            if let SpanAttrValue::Links(ref mut links) = attr.value {
+                links.push(link);
+            }
+        } else {
+            self.attributes.push(SpanAttribute {
+                key: INTERNAL_SPAN_LINKS_KEY.to_string(),
+                value: SpanAttrValue::Links(vec![link]),
+            });
+        }
+    }
+
+    pub fn links(&self) -> &[SpanLink] {
+        for attr in &self.attributes {
+            if let SpanAttrValue::Links(ref links) = attr.value {
+                return links.as_slice();
+            }
+        }
+        &[]
+    }
+
+    pub fn push_event(&mut self, event: SpanEvent) {
+        if let Some(attr) = self
+            .attributes
+            .iter_mut()
+            .find(|a| matches!(a.value, SpanAttrValue::Events(_)))
+        {
+            if let SpanAttrValue::Events(ref mut events) = attr.value {
+                events.push(event);
+            }
+        } else {
+            self.attributes.push(SpanAttribute {
+                key: INTERNAL_SPAN_EVENTS_KEY.to_string(),
+                value: SpanAttrValue::Events(vec![event]),
+            });
+        }
+    }
+
+    pub fn events(&self) -> &[SpanEvent] {
+        for attr in &self.attributes {
+            if let SpanAttrValue::Events(ref events) = attr.value {
+                return events.as_slice();
+            }
+        }
+        &[]
+    }
+
+    pub fn regular_attributes(&self) -> impl Iterator<Item = &SpanAttribute> {
+        self.attributes.iter().filter(|a| {
+            !matches!(
+                a.value,
+                SpanAttrValue::Links(_) | SpanAttrValue::Events(_)
+            )
+        })
+    }
 }
 
 pub type SpanExporterFn = Arc<dyn Fn(ExportedSpan) + Send + Sync>;
@@ -220,6 +310,14 @@ impl Default for PropagatorSet {
 }
 
 impl PropagatorSet {
+    pub const fn none() -> Self {
+        Self {
+            tracecontext: false,
+            baggage: false,
+            jaeger: false,
+        }
+    }
+
     pub fn from_env() -> Self {
         let Ok(raw) = std::env::var("OTEL_PROPAGATORS") else {
             return Self::default();
@@ -266,7 +364,7 @@ impl Default for TracingRuntime {
         Self {
             enabled: false,
             service_name: "mimir".to_string(),
-            propagators: PropagatorSet::default(),
+            propagators: PropagatorSet::none(),
             sampler: SamplerKind::ParentBasedAlwaysOn,
             resource_attributes: Vec::new(),
             exporter: None,
@@ -330,8 +428,11 @@ pub fn build_tracing_runtime_from_env(
                 ("detected_env_var", env_key),
             ],
         );
-        let sampler = parse_jaeger_sampler_from_env()?;
+        let (sampler, mut jaeger_attrs) = parse_jaeger_config_from_env()?;
         let tags = parse_jaeger_tags(&std::env::var("JAEGER_TAGS").unwrap_or_default())?;
+        let mut resource_attributes = otel_resource_attributes_from_env();
+        resource_attributes.extend(tags);
+        resource_attributes.append(&mut jaeger_attrs);
         let propagators = PropagatorSet::from_env();
         logger.log(
             LogLevel::Debug,
@@ -345,7 +446,7 @@ pub fn build_tracing_runtime_from_env(
             service_name: service_name.to_string(),
             propagators,
             sampler,
-            resource_attributes: tags,
+            resource_attributes,
             exporter,
         });
     }
@@ -363,7 +464,9 @@ pub fn build_tracing_runtime_from_env(
             ],
         );
         logger.log(LogLevel::Info, &[("msg", "initialising OpenTelemetry tracer")]);
+        validate_otel_exporter_env()?;
         let sampler = parse_otel_sampler_from_env()?;
+        let resource_attributes = otel_resource_attributes_from_env();
         let propagators = PropagatorSet::from_env();
         logger.log(
             LogLevel::Debug,
@@ -377,7 +480,7 @@ pub fn build_tracing_runtime_from_env(
             service_name: service_name.to_string(),
             propagators,
             sampler,
-            resource_attributes: Vec::new(),
+            resource_attributes,
             exporter,
         });
     }
@@ -385,11 +488,24 @@ pub fn build_tracing_runtime_from_env(
     Ok(TracingRuntime {
         enabled: false,
         service_name: service_name.to_string(),
-        propagators: PropagatorSet::default(),
+        propagators: PropagatorSet::none(),
         sampler: SamplerKind::ParentBasedAlwaysOn,
         resource_attributes: Vec::new(),
         exporter: None,
     })
+}
+
+fn validate_otel_exporter_env() -> Result<(), String> {
+    let raw_exp = std::env::var("OTEL_TRACES_EXPORTER").unwrap_or_default();
+    let exp = raw_exp.trim();
+    match exp.to_ascii_lowercase().as_str() {
+        "" | "otlp" => {
+            let _ = otlp_protocol_from_env()?;
+            Ok(())
+        }
+        "none" | "console" | "jaeger" => Ok(()),
+        _ => Err(format!("unknown exporter or metrics producer {exp:?}")),
+    }
 }
 
 fn parse_otel_sampler_from_env() -> Result<SamplerKind, String> {
@@ -397,6 +513,53 @@ fn parse_otel_sampler_from_env() -> Result<SamplerKind, String> {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
+    if name == "jaeger_remote" || name == "parentbased_jaeger_remote" {
+        let parent_based = name == "parentbased_jaeger_remote";
+        let args = std::env::var("OTEL_TRACES_SAMPLER_ARG").unwrap_or_default();
+        if args.is_empty() {
+            return Err(format!(
+                "OTEL_TRACES_SAMPLER_ARG is not set for Jaeger remote sampler {name}"
+            ));
+        }
+        let mut endpoint_set = false;
+        let mut initial_rate = 0.001_f64;
+        for part in args.split(',') {
+            let part = part.trim();
+            if let Some(ep) = part.strip_prefix("endpoint=") {
+                if ep.is_empty() {
+                    return Err(format!(
+                        "endpoint is not set in OTEL_TRACES_SAMPLER_ARG for Jaeger remote sampler {name}"
+                    ));
+                }
+                endpoint_set = true;
+            } else if let Some(ms_str) = part.strip_prefix("pollingIntervalMs=") {
+                ms_str.parse::<i64>().map_err(|e| {
+                    format!("invalid pollingIntervalMs value in OTEL_TRACES_SAMPLER_ARG: {e}")
+                })?;
+            } else if let Some(rate_str) = part.strip_prefix("initialSamplingRate=") {
+                let r = rate_str.parse::<f64>().map_err(|e| {
+                    format!("invalid initialSamplingRate value in OTEL_TRACES_SAMPLER_ARG: {e}")
+                })?;
+                if !(0.0..=1.0).contains(&r) {
+                    return Err(format!(
+                        "initialSamplingRate value set in OTEL_TRACES_SAMPLER_ARG must be between 0 and 1, got {r}"
+                    ));
+                }
+                initial_rate = r;
+            }
+        }
+        if !endpoint_set {
+            return Err(format!(
+                "endpoint is not set in OTEL_TRACES_SAMPLER_ARG for Jaeger remote sampler {name}"
+            ));
+        }
+        let ratio = SamplerKind::ratio_from_f64(initial_rate);
+        return Ok(if parent_based {
+            SamplerKind::ParentBasedTraceIdRatio(ratio)
+        } else {
+            SamplerKind::TraceIdRatio(ratio)
+        });
+    }
     let arg = std::env::var("OTEL_TRACES_SAMPLER_ARG")
         .unwrap_or_default()
         .trim()
@@ -417,19 +580,37 @@ fn parse_otel_sampler_from_env() -> Result<SamplerKind, String> {
     })
 }
 
-fn parse_jaeger_sampler_from_env() -> Result<SamplerKind, String> {
+fn parse_jaeger_config_from_env() -> Result<(SamplerKind, Vec<SpanAttribute>), String> {
     if let Ok(ep) = std::env::var("JAEGER_ENDPOINT") {
         if !ep.is_empty() && !ep.contains("://") {
             return Err(format!("cannot parse env var JAEGER_ENDPOINT={ep}: invalid URI"));
         }
     }
-    let stype = std::env::var("JAEGER_SAMPLER_TYPE").unwrap_or_default();
-    let param = match std::env::var("JAEGER_SAMPLER_PARAM") {
-        Ok(s) if !s.is_empty() => s
+    if let Ok(port_s) = std::env::var("JAEGER_AGENT_PORT") {
+        if !port_s.is_empty() && port_s.trim().parse::<u16>().is_err() {
+            return Err(format!("invalid JAEGER_AGENT_PORT={port_s:?}"));
+        }
+    }
+    let mut stype = std::env::var("JAEGER_SAMPLER_TYPE").unwrap_or_default();
+    let param_set = std::env::var("JAEGER_SAMPLER_PARAM").ok().filter(|s| !s.is_empty());
+    let param = match param_set {
+        Some(ref s) => s
             .parse::<f64>()
             .map_err(|e| format!("cannot parse env var JAEGER_SAMPLER_PARAM={s}: {e}"))?,
-        _ => 1.0,
+        None => 0.0,
     };
+    let sampling_server_url = if let Some(e) = non_empty_env("JAEGER_SAMPLING_ENDPOINT") {
+        e
+    } else if let Some(e) = non_empty_env("JAEGER_SAMPLER_MANAGER_HOST_PORT") {
+        e
+    } else if let Some(host) = non_empty_env("JAEGER_AGENT_HOST") {
+        format!("http://{host}:5778/sampling")
+    } else {
+        String::new()
+    };
+    if !sampling_server_url.is_empty() && stype.is_empty() {
+        stype = "remote".to_string();
+    }
     let not_parent_based = match std::env::var("JAEGER_SAMPLER_NOT_PARENT_BASED") {
         Ok(s) if !s.is_empty() => matches!(s.as_str(), "1" | "t" | "T" | "true" | "TRUE" | "True"),
         _ => false,
@@ -448,16 +629,42 @@ fn parse_jaeger_sampler_from_env() -> Result<SamplerKind, String> {
         }
         other => return Err(format!("unknown sampler type {other:?}")),
     };
-    if not_parent_based {
-        Ok(base)
+    let sampler = if not_parent_based {
+        base
     } else {
-        Ok(match base {
+        match base {
             SamplerKind::AlwaysOn => SamplerKind::ParentBasedAlwaysOn,
             SamplerKind::AlwaysOff => SamplerKind::ParentBasedAlwaysOff,
             SamplerKind::TraceIdRatio(t) => SamplerKind::ParentBasedTraceIdRatio(t),
             other => other,
-        })
+        }
+    };
+    // Exact resource attributes emitted by dskit/tracing/otel_jaeger.go:268-276.
+    let mut attrs = vec![
+        SpanAttribute {
+            key: "samplerType".to_string(),
+            value: SpanAttrValue::String(stype),
+        },
+        SpanAttribute {
+            key: "samplerParam".to_string(),
+            value: SpanAttrValue::Float(param),
+        },
+        SpanAttribute {
+            key: "samplingServerURL".to_string(),
+            value: SpanAttrValue::String(sampling_server_url),
+        },
+    ];
+    if not_parent_based {
+        attrs.push(SpanAttribute {
+            key: "samplerNotParentBased".to_string(),
+            value: SpanAttrValue::Bool(true),
+        });
     }
+    Ok((sampler, attrs))
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 fn parse_jaeger_tags(raw: &str) -> Result<Vec<SpanAttribute>, String> {
@@ -631,38 +838,44 @@ pub fn extract_from_headers<'a>(
     ctx
 }
 
-/// Extracts TraceContext from an http::HeaderMap.
+/// Extracts W3C TraceContext from raw headers regardless of global tracing state
+/// (used by Kafka ingest_storage `recordsPropagator()`).
+pub fn extract_w3c_trace_context<'a>(
+    headers: impl Iterator<Item = (&'a str, &'a str)>,
+) -> TraceContext {
+    let w3c_only = PropagatorSet {
+        tracecontext: true,
+        baggage: false,
+        jaeger: false,
+    };
+    extract_from_headers(headers, &w3c_only)
+}
+
+/// Extracts TraceContext from an http::HeaderMap using the global propagator.
+/// When global tracing is unset or disabled, returns an empty no-op TraceContext
+/// matching Go dskit/tracing (no-op global TextMapPropagator).
 pub fn extract_from_http_headers(headers: &hyper::http::HeaderMap) -> TraceContext {
-    let props = global_tracing()
-        .map(|t| &t.propagators)
-        .cloned()
-        .unwrap_or_default();
+    let Some(rt) = global_tracing().filter(|t| t.enabled) else {
+        return TraceContext::default();
+    };
     let iter = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str(), vs)));
-    extract_from_headers(iter, &props)
+    extract_from_headers(iter, &rt.propagators)
 }
 
-/// Starts a server/consumer span context from an extracted parent context.
-pub fn start_server_span_context(
+/// Starts a server/consumer span context from an extracted parent context using an explicit
+/// `TracingRuntime`. When `!rt.enabled`, returns an empty no-op context.
+pub fn start_server_span_context_with_runtime(
+    rt: &TracingRuntime,
     extracted: &TraceContext,
     create_new_trace: bool,
 ) -> (TraceContext, Option<[u8; 8]>) {
-    let rt = global_tracing();
-    let tracing_active = rt.is_some_and(|t| t.enabled);
-
-    if !tracing_active {
-        if create_new_trace {
-            return (TraceContext::default(), None);
-        }
-        let mut out = extracted.clone();
-        if out.is_valid() && out.jaeger_debug_id.is_some() {
-            out.sampled = true;
-        }
-        return (out, None);
+    if !rt.enabled {
+        return (TraceContext::default(), None);
     }
 
-    let sampler = rt.map(|t| t.sampler).unwrap_or_default();
+    let sampler = rt.sampler;
     let effective_parent = if create_new_trace {
         TraceContext {
             jaeger_debug_id: extracted.jaeger_debug_id.clone(),
@@ -679,7 +892,7 @@ pub fn start_server_span_context(
     };
     let span_id = random_span_id();
     let sampled = sampler.should_sample(&effective_parent, &trace_id);
-    if sampled && rt.is_some_and(|t| t.exporter.is_some()) {
+    if sampled && rt.exporter.is_some() {
         if let Some(ref dbg) = effective_parent.jaeger_debug_id {
             record_jaeger_debug_id(span_id, dbg.clone());
         }
@@ -699,6 +912,59 @@ pub fn start_server_span_context(
         },
         parent_span_id,
     )
+}
+
+/// Starts a server/consumer span context from an extracted parent context.
+/// When global tracing is unset or disabled, returns `(TraceContext::default(), None)`.
+pub fn start_server_span_context(
+    extracted: &TraceContext,
+    create_new_trace: bool,
+) -> (TraceContext, Option<[u8; 8]>) {
+    let Some(rt) = global_tracing().filter(|t| t.enabled) else {
+        return (TraceContext::default(), None);
+    };
+    start_server_span_context_with_runtime(rt, extracted, create_new_trace)
+}
+
+/// Mints a sampled child `TraceContext` from an already-sampled `parent` without
+/// re-evaluating the root sampler (used by Kafka `sampledOnlyTracer` on produce/consume).
+pub fn mint_sampled_child_context(parent: &TraceContext) -> (TraceContext, Option<[u8; 8]>) {
+    let span_id = random_span_id();
+    let child = TraceContext {
+        trace_id: parent.trace_id,
+        span_id,
+        sampled: true,
+        trace_flags: parent.trace_flags | 0x01,
+        remote: false,
+        jaeger_debug_id: parent.jaeger_debug_id.clone(),
+        tracestate: parent.tracestate.clone(),
+    };
+    (child, Some(parent.span_id))
+}
+
+/// Resolves the span context for a sampled Kafka produce/consume record given `rt`:
+/// - When `rt` is enabled, mints a sampled child `TraceContext` (preserving `sampled = true`
+///   regardless of the root sampler) and returns `(child, Some(parent.span_id), true)`.
+/// - When `rt` is unset or disabled, propagates `parent` unchanged without creating/exporting
+///   a span, returning `(parent.clone(), None, false)` (matching Go `sampledOnlyTracer` +
+///   `recordsPropagator()`).
+pub fn start_kafka_sampled_span_context_with_runtime(
+    rt: Option<&TracingRuntime>,
+    parent: &TraceContext,
+) -> (TraceContext, Option<[u8; 8]>, bool) {
+    if rt.is_some_and(|r| r.enabled) {
+        let (child, parent_span_id) = mint_sampled_child_context(parent);
+        (child, parent_span_id, true)
+    } else {
+        (parent.clone(), None, false)
+    }
+}
+
+/// Process-global variant of [`start_kafka_sampled_span_context_with_runtime`].
+pub fn start_kafka_sampled_span_context(
+    parent: &TraceContext,
+) -> (TraceContext, Option<[u8; 8]>, bool) {
+    start_kafka_sampled_span_context_with_runtime(global_tracing(), parent)
 }
 
 pub fn now_unix_nanos() -> u64 {
@@ -865,6 +1131,114 @@ pub fn jaeger_basic_auth_from_env() -> Option<(String, String)> {
     Some((user, pass))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OtlpProtocol {
+    HttpProtobuf,
+    HttpJson,
+    Grpc,
+}
+
+/// Resolves the OTLP transport protocol from `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` or
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`, defaulting to `http/protobuf` per OTel `autoexport`.
+pub fn otlp_protocol_from_env() -> Result<OtlpProtocol, String> {
+    let raw = non_empty_trimmed_env("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+        .or_else(|| non_empty_trimmed_env("OTEL_EXPORTER_OTLP_PROTOCOL"));
+    match raw.as_deref() {
+        None => Ok(OtlpProtocol::HttpProtobuf),
+        Some("http/protobuf") => Ok(OtlpProtocol::HttpProtobuf),
+        Some("http/json") => Ok(OtlpProtocol::HttpJson),
+        Some("grpc") => Ok(OtlpProtocol::Grpc),
+        Some(other) => Err(format!(
+            "invalid OTLP protocol {other:?} - should be one of ['grpc', 'http/protobuf', 'http/json']"
+        )),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JaegerTarget {
+    HttpCollector(String),
+    UdpAgent { host: String, port: String },
+}
+
+/// Resolves the Jaeger target (HTTP Thrift collector or UDP Compact Thrift agent) from env vars,
+/// matching `dskit/tracing/otel_jaeger.go`: explicit `JAEGER_ENDPOINT` /
+/// `OTEL_EXPORTER_JAEGER_ENDPOINT` takes precedence, then UDP agent env vars
+/// (`JAEGER_AGENT_HOST` / `JAEGER_SAMPLER_MANAGER_HOST_PORT` / `JAEGER_AGENT_PORT`),
+/// and only falls back to `http://localhost:14268/api/traces` when `OTEL_TRACES_EXPORTER=jaeger`
+/// is set with none of those.
+pub fn jaeger_target_from_env() -> Result<Option<JaegerTarget>, String> {
+    for k in ["JAEGER_ENDPOINT", "OTEL_EXPORTER_JAEGER_ENDPOINT"] {
+        if let Some(ep) = non_empty_trimmed_env(k) {
+            if !ep.starts_with("http://") && !ep.starts_with("https://") {
+                return Err(format!("cannot parse env var {k}={ep}: invalid URI"));
+            }
+            return Ok(Some(JaegerTarget::HttpCollector(ep)));
+        }
+    }
+    let has_agent_env = non_empty_trimmed_env("JAEGER_AGENT_HOST").is_some()
+        || non_empty_trimmed_env("JAEGER_SAMPLER_MANAGER_HOST_PORT").is_some()
+        || non_empty_trimmed_env("JAEGER_AGENT_PORT").is_some();
+    if has_agent_env {
+        let host =
+            non_empty_trimmed_env("JAEGER_AGENT_HOST").unwrap_or_else(|| "localhost".to_string());
+        let port =
+            non_empty_trimmed_env("JAEGER_AGENT_PORT").unwrap_or_else(|| "6831".to_string());
+        if port.parse::<u16>().is_err() {
+            return Err(format!("invalid JAEGER_AGENT_PORT={port:?}"));
+        }
+        return Ok(Some(JaegerTarget::UdpAgent { host, port }));
+    }
+    if std::env::var("OTEL_TRACES_EXPORTER")
+        .ok()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("jaeger"))
+    {
+        return Ok(Some(JaegerTarget::HttpCollector(
+            "http://localhost:14268/api/traces".to_string(),
+        )));
+    }
+    Ok(None)
+}
+
+/// Parses `OTEL_RESOURCE_ATTRIBUTES` (`k1=v1,k2=v2` with `%XX` URL-unescaping per OTel spec).
+pub fn parse_otel_resource_attributes(raw: &str) -> Vec<SpanAttribute> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut vals: BTreeMap<String, String> = BTreeMap::new();
+    for pair in trimmed.split(',') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let val_trimmed = v.trim();
+        let val = path_unescape_percent(val_trimmed).unwrap_or_else(|| val_trimmed.to_string());
+        if !vals.contains_key(key) {
+            order.push(key.to_string());
+        }
+        vals.insert(key.to_string(), val);
+    }
+    order
+        .into_iter()
+        .filter_map(|k| {
+            vals.remove(&k).map(|v| SpanAttribute {
+                key: k,
+                value: SpanAttrValue::String(v),
+            })
+        })
+        .collect()
+}
+
+pub fn otel_resource_attributes_from_env() -> Vec<SpanAttribute> {
+    non_empty_trimmed_env("OTEL_RESOURCE_ATTRIBUTES")
+        .map(|raw| parse_otel_resource_attributes(&raw))
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OtlpTlsEnvConfig {
     pub ca_cert_path: Option<String>,
@@ -1009,42 +1383,719 @@ fn take_jaeger_debug_id(span_id: [u8; 8]) -> Option<String> {
 }
 
 pub fn otlp_traces_endpoint_from_env() -> Option<String> {
-    if let Ok(ep) = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") {
-        if !ep.is_empty() {
-            return Some(ep);
+    otlp_traces_endpoint_for_protocol(OtlpProtocol::HttpProtobuf)
+}
+
+fn otlp_insecure_from_env() -> Option<bool> {
+    for key in [
+        "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+        "OTEL_EXPORTER_OTLP_INSECURE",
+    ] {
+        if let Some(raw) = non_empty_trimmed_env(key) {
+            if raw.eq_ignore_ascii_case("true") || raw == "1" {
+                return Some(true);
+            }
+            if raw.eq_ignore_ascii_case("false") || raw == "0" {
+                return Some(false);
+            }
         }
-    }
-    if let Ok(ep) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-        if !ep.is_empty() {
-            let trimmed = ep.trim_end_matches('/');
-            return Some(format!("{trimmed}/v1/traces"));
-        }
-    }
-    if std::env::var("OTEL_TRACES_EXPORTER")
-        .ok()
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("otlp"))
-    {
-        return Some("http://localhost:4318/v1/traces".to_string());
     }
     None
 }
 
-pub fn export_span(mut span: ExportedSpan) {
-    if let Some(rt) = global_tracing() {
-        if let Some(ref exp) = rt.exporter {
-            if !span.attributes.iter().any(|a| a.key == "jaeger-debug-id") {
-                let dbg = take_jaeger_debug_id(span.span_id)
-                    .or_else(|| current_trace_context().and_then(|c| c.jaeger_debug_id));
-                if let Some(dbg) = dbg {
-                    span.attributes.push(SpanAttribute {
-                        key: "jaeger-debug-id".to_string(),
-                        value: SpanAttrValue::String(dbg),
-                    });
+pub fn otlp_traces_endpoint_for_protocol(proto: OtlpProtocol) -> Option<String> {
+    match proto {
+        OtlpProtocol::HttpProtobuf | OtlpProtocol::HttpJson => {
+            if let Ok(ep) = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") {
+                if !ep.is_empty() {
+                    return Some(ep);
                 }
             }
-            exp(span);
+            if let Ok(ep) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+                if !ep.is_empty() {
+                    let trimmed = ep.trim_end_matches('/');
+                    return Some(format!("{trimmed}/v1/traces"));
+                }
+            }
+            if std::env::var("OTEL_TRACES_EXPORTER")
+                .ok()
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("otlp"))
+            {
+                return Some("http://localhost:4318/v1/traces".to_string());
+            }
+            None
+        }
+        OtlpProtocol::Grpc => {
+            let raw = non_empty_trimmed_env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+                .or_else(|| non_empty_trimmed_env("OTEL_EXPORTER_OTLP_ENDPOINT"))
+                .or_else(|| {
+                    std::env::var("OTEL_TRACES_EXPORTER")
+                        .ok()
+                        .is_some_and(|v| v.trim().eq_ignore_ascii_case("otlp"))
+                        .then(|| "http://localhost:4317".to_string())
+                })?;
+            if raw.contains("://") {
+                Some(raw)
+            } else {
+                let tls = otlp_tls_paths_from_env();
+                let use_https = match otlp_insecure_from_env() {
+                    Some(true) => false,
+                    Some(false) => true,
+                    None => tls.ca_cert_path.is_some() || tls.client_cert_path.is_some(),
+                };
+                let scheme = if use_https { "https://" } else { "http://" };
+                Some(format!("{scheme}{raw}"))
+            }
         }
     }
+}
+
+pub fn export_span_with_runtime(rt: &TracingRuntime, mut span: ExportedSpan) {
+    if let Some(ref exp) = rt.exporter {
+        if !span.attributes.iter().any(|a| a.key == "jaeger-debug-id") {
+            let dbg = take_jaeger_debug_id(span.span_id)
+                .or_else(|| current_trace_context().and_then(|c| c.jaeger_debug_id));
+            if let Some(dbg) = dbg {
+                span.attributes.push(SpanAttribute {
+                    key: "jaeger-debug-id".to_string(),
+                    value: SpanAttrValue::String(dbg),
+                });
+            }
+        }
+        exp(span);
+    }
+}
+
+pub fn export_span(span: ExportedSpan) {
+    if let Some(rt) = global_tracing() {
+        export_span_with_runtime(rt, span);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OTLP Protobuf & gRPC wire encoders (zero extra crate deps)
+// ---------------------------------------------------------------------------
+
+fn pb_write_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+fn pb_write_tag(buf: &mut Vec<u8>, field_num: u32, wire_type: u8) {
+    pb_write_varint(buf, ((field_num as u64) << 3) | (wire_type as u64));
+}
+
+fn pb_write_bytes(buf: &mut Vec<u8>, field_num: u32, data: &[u8]) {
+    pb_write_tag(buf, field_num, 2);
+    pb_write_varint(buf, data.len() as u64);
+    buf.extend_from_slice(data);
+}
+
+fn pb_write_string(buf: &mut Vec<u8>, field_num: u32, s: &str) {
+    pb_write_bytes(buf, field_num, s.as_bytes());
+}
+
+fn pb_write_fixed64(buf: &mut Vec<u8>, field_num: u32, v: u64) {
+    pb_write_tag(buf, field_num, 1);
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn pb_encode_any_value(val: &SpanAttrValue) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    match val {
+        SpanAttrValue::String(s) => pb_write_string(&mut out, 1, s),
+        SpanAttrValue::Bool(b) => {
+            pb_write_tag(&mut out, 2, 0);
+            pb_write_varint(&mut out, u64::from(*b));
+        }
+        SpanAttrValue::Int(i) => {
+            pb_write_tag(&mut out, 3, 0);
+            pb_write_varint(&mut out, *i as u64);
+        }
+        SpanAttrValue::Float(f) => {
+            pb_write_fixed64(&mut out, 4, f.to_bits());
+        }
+        SpanAttrValue::StringArray(arr) => {
+            let mut arr_buf = Vec::new();
+            for s in arr {
+                let mut elem = Vec::new();
+                pb_write_string(&mut elem, 1, s);
+                pb_write_bytes(&mut arr_buf, 1, &elem);
+            }
+            pb_write_bytes(&mut out, 5, &arr_buf);
+        }
+        SpanAttrValue::Links(_) | SpanAttrValue::Events(_) => return None,
+    }
+    Some(out)
+}
+
+fn pb_encode_key_value(attr: &SpanAttribute) -> Option<Vec<u8>> {
+    let val_bytes = pb_encode_any_value(&attr.value)?;
+    let mut out = Vec::new();
+    pb_write_string(&mut out, 1, &attr.key);
+    pb_write_bytes(&mut out, 2, &val_bytes);
+    Some(out)
+}
+
+/// Encodes an `ExportedSpan` as an OTLP `opentelemetry.proto.collector.trace.v1.ExportTraceServiceRequest`
+/// protobuf message.
+pub fn encode_otlp_trace_request_protobuf(
+    span: &ExportedSpan,
+    extra_resource_attrs: &[SpanAttribute],
+) -> Vec<u8> {
+    // 1. Resource
+    let mut resource_buf = Vec::new();
+    let svc_attr = SpanAttribute {
+        key: "service.name".to_string(),
+        value: SpanAttrValue::String(span.service_name.clone()),
+    };
+    if let Some(kv) = pb_encode_key_value(&svc_attr) {
+        pb_write_bytes(&mut resource_buf, 1, &kv);
+    }
+    for attr in extra_resource_attrs {
+        if attr.key != "service.name" {
+            if let Some(kv) = pb_encode_key_value(attr) {
+                pb_write_bytes(&mut resource_buf, 1, &kv);
+            }
+        }
+    }
+
+    // 2. Span
+    let mut span_buf = Vec::new();
+    pb_write_bytes(&mut span_buf, 1, &span.trace_id);
+    pb_write_bytes(&mut span_buf, 2, &span.span_id);
+    if let Some(pid) = span.parent_span_id {
+        pb_write_bytes(&mut span_buf, 4, &pid);
+    }
+    pb_write_string(&mut span_buf, 5, &span.name);
+    pb_write_tag(&mut span_buf, 6, 0);
+    pb_write_varint(&mut span_buf, u64::from(span.kind));
+    pb_write_fixed64(&mut span_buf, 7, span.start_time_unix_nano);
+    pb_write_fixed64(&mut span_buf, 8, span.end_time_unix_nano);
+    for attr in span.regular_attributes() {
+        if let Some(kv) = pb_encode_key_value(attr) {
+            pb_write_bytes(&mut span_buf, 9, &kv);
+        }
+    }
+    for ev in span.events() {
+        let mut ev_buf = Vec::new();
+        pb_write_fixed64(&mut ev_buf, 1, ev.time_unix_nano);
+        pb_write_string(&mut ev_buf, 2, &ev.name);
+        for attr in &ev.attributes {
+            if let Some(kv) = pb_encode_key_value(attr) {
+                pb_write_bytes(&mut ev_buf, 3, &kv);
+            }
+        }
+        pb_write_bytes(&mut span_buf, 11, &ev_buf);
+    }
+    for link in span.links() {
+        let mut link_buf = Vec::new();
+        pb_write_bytes(&mut link_buf, 1, &link.trace_id);
+        pb_write_bytes(&mut link_buf, 2, &link.span_id);
+        if let Some(ref ts) = link.trace_state {
+            if !ts.is_empty() {
+                pb_write_string(&mut link_buf, 3, ts);
+            }
+        }
+        for attr in &link.attributes {
+            if let Some(kv) = pb_encode_key_value(attr) {
+                pb_write_bytes(&mut link_buf, 4, &kv);
+            }
+        }
+        pb_write_bytes(&mut span_buf, 13, &link_buf);
+    }
+    let mut status_buf = Vec::new();
+    pb_write_tag(&mut status_buf, 3, 0);
+    pb_write_varint(&mut status_buf, if span.status_error { 2 } else { 0 });
+    pb_write_bytes(&mut span_buf, 15, &status_buf);
+
+    // 3. InstrumentationScope & ScopeSpans
+    let mut scope_buf = Vec::new();
+    pb_write_string(&mut scope_buf, 1, "mimir-rs");
+    let mut scope_spans_buf = Vec::new();
+    pb_write_bytes(&mut scope_spans_buf, 1, &scope_buf);
+    pb_write_bytes(&mut scope_spans_buf, 2, &span_buf);
+
+    // 4. ResourceSpans
+    let mut resource_spans_buf = Vec::new();
+    pb_write_bytes(&mut resource_spans_buf, 1, &resource_buf);
+    pb_write_bytes(&mut resource_spans_buf, 2, &scope_spans_buf);
+
+    // 5. ExportTraceServiceRequest
+    let mut req_buf = Vec::new();
+    pb_write_bytes(&mut req_buf, 1, &resource_spans_buf);
+    req_buf
+}
+
+/// Wraps a protobuf payload in a 5-byte gRPC length-prefixed frame.
+pub fn encode_otlp_grpc_frame(protobuf_payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + protobuf_payload.len());
+    out.push(0);
+    out.extend_from_slice(&(protobuf_payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(protobuf_payload);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Jaeger Thrift encoders (Binary for HTTP collector, Compact for UDP agent)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum ThriftType {
+    Stop = 0,
+    Bool = 2,
+    Double = 4,
+    I32 = 8,
+    I64 = 10,
+    String = 11,
+    Struct = 12,
+    List = 15,
+}
+
+enum JaegerTagVal<'a> {
+    String(String),
+    Double(f64),
+    Bool(bool),
+    Long(i64),
+    StrRef(&'a str),
+}
+
+struct JaegerTag<'a> {
+    key: &'a str,
+    val: JaegerTagVal<'a>,
+}
+
+fn attr_to_jaeger_tag<'a>(attr: &'a SpanAttribute) -> Option<JaegerTag<'a>> {
+    let val = match &attr.value {
+        SpanAttrValue::String(s) => JaegerTagVal::StrRef(s.as_str()),
+        SpanAttrValue::Float(f) => JaegerTagVal::Double(*f),
+        SpanAttrValue::Bool(b) => JaegerTagVal::Bool(*b),
+        SpanAttrValue::Int(i) => JaegerTagVal::Long(*i),
+        SpanAttrValue::StringArray(arr) => {
+            let json = serde_json::to_string(arr).unwrap_or_else(|_| "[]".to_string());
+            JaegerTagVal::String(json)
+        }
+        SpanAttrValue::Links(_) | SpanAttrValue::Events(_) => return None,
+    };
+    Some(JaegerTag {
+        key: attr.key.as_str(),
+        val,
+    })
+}
+
+trait ThriftProtoWriter {
+    fn write_struct_begin(&mut self);
+    fn write_struct_end(&mut self);
+    fn write_field_stop(&mut self);
+    fn write_field_begin(&mut self, ttype: ThriftType, id: i16);
+    fn write_bool_field(&mut self, id: i16, v: bool);
+    fn write_i32(&mut self, v: i32);
+    fn write_i64(&mut self, v: i64);
+    fn write_double(&mut self, v: f64);
+    fn write_string(&mut self, s: &str);
+    fn write_list_begin(&mut self, elem_type: ThriftType, len: usize);
+}
+
+struct ThriftBinaryWriter {
+    buf: Vec<u8>,
+}
+
+impl ThriftBinaryWriter {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(256),
+        }
+    }
+}
+
+impl ThriftProtoWriter for ThriftBinaryWriter {
+    fn write_struct_begin(&mut self) {}
+    fn write_struct_end(&mut self) {}
+    fn write_field_stop(&mut self) {
+        self.buf.push(ThriftType::Stop as u8);
+    }
+    fn write_field_begin(&mut self, ttype: ThriftType, id: i16) {
+        self.buf.push(ttype as u8);
+        self.buf.extend_from_slice(&id.to_be_bytes());
+    }
+    fn write_bool_field(&mut self, id: i16, v: bool) {
+        self.write_field_begin(ThriftType::Bool, id);
+        self.buf.push(u8::from(v));
+    }
+    fn write_i32(&mut self, v: i32) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+    fn write_i64(&mut self, v: i64) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+    fn write_double(&mut self, v: f64) {
+        self.buf.extend_from_slice(&v.to_bits().to_be_bytes());
+    }
+    fn write_string(&mut self, s: &str) {
+        self.write_i32(s.len() as i32);
+        self.buf.extend_from_slice(s.as_bytes());
+    }
+    fn write_list_begin(&mut self, elem_type: ThriftType, len: usize) {
+        self.buf.push(elem_type as u8);
+        self.write_i32(len as i32);
+    }
+}
+
+struct ThriftCompactWriter {
+    buf: Vec<u8>,
+    last_field_stack: Vec<i16>,
+    last_field_id: i16,
+}
+
+impl ThriftCompactWriter {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(256),
+            last_field_stack: Vec::new(),
+            last_field_id: 0,
+        }
+    }
+
+    fn compact_type(t: ThriftType) -> u8 {
+        match t {
+            ThriftType::Stop => 0x00,
+            ThriftType::Bool => 0x01,
+            ThriftType::I32 => 0x05,
+            ThriftType::I64 => 0x06,
+            ThriftType::Double => 0x07,
+            ThriftType::String => 0x08,
+            ThriftType::List => 0x09,
+            ThriftType::Struct => 0x0c,
+        }
+    }
+
+    fn write_varint_u32(&mut self, mut v: u32) {
+        loop {
+            if (v & !0x7f) == 0 {
+                self.buf.push(v as u8);
+                break;
+            }
+            self.buf.push(((v & 0x7f) as u8) | 0x80);
+            v >>= 7;
+        }
+    }
+
+    fn write_varint_u64(&mut self, mut v: u64) {
+        loop {
+            if (v & !0x7f) == 0 {
+                self.buf.push(v as u8);
+                break;
+            }
+            self.buf.push(((v & 0x7f) as u8) | 0x80);
+            v >>= 7;
+        }
+    }
+
+    fn write_zigzag_i16(&mut self, n: i16) {
+        let zz = (((n as i32) << 1) ^ ((n as i32) >> 31)) as u32;
+        self.write_varint_u32(zz);
+    }
+
+    fn write_field_header_internal(&mut self, compact_t: u8, id: i16) {
+        let delta = id - self.last_field_id;
+        if delta > 0 && delta <= 15 {
+            self.buf.push((((delta as u8) << 4) & 0xf0) | (compact_t & 0x0f));
+        } else {
+            self.buf.push(compact_t & 0x0f);
+            self.write_zigzag_i16(id);
+        }
+        self.last_field_id = id;
+    }
+
+    fn write_message_begin(&mut self, method: &str, msg_type: u8, seq_id: i32) {
+        self.buf.push(0x82); // COMPACT_PROTOCOL_ID
+        self.buf.push((0x01 & 0x1f) | ((msg_type << 5) & 0xe0));
+        self.write_varint_u32(seq_id as u32);
+        self.write_string(method);
+    }
+}
+
+impl ThriftProtoWriter for ThriftCompactWriter {
+    fn write_struct_begin(&mut self) {
+        self.last_field_stack.push(self.last_field_id);
+        self.last_field_id = 0;
+    }
+    fn write_struct_end(&mut self) {
+        self.last_field_id = self.last_field_stack.pop().unwrap_or(0);
+    }
+    fn write_field_stop(&mut self) {
+        self.buf.push(0x00);
+    }
+    fn write_field_begin(&mut self, ttype: ThriftType, id: i16) {
+        self.write_field_header_internal(Self::compact_type(ttype), id);
+    }
+    fn write_bool_field(&mut self, id: i16, v: bool) {
+        self.write_field_header_internal(if v { 0x01 } else { 0x02 }, id);
+    }
+    fn write_i32(&mut self, v: i32) {
+        let zz = ((v << 1) ^ (v >> 31)) as u32;
+        self.write_varint_u32(zz);
+    }
+    fn write_i64(&mut self, v: i64) {
+        let zz = ((v << 1) ^ (v >> 63)) as u64;
+        self.write_varint_u64(zz);
+    }
+    fn write_double(&mut self, v: f64) {
+        self.buf.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    fn write_string(&mut self, s: &str) {
+        self.write_varint_u32(s.len() as u32);
+        self.buf.extend_from_slice(s.as_bytes());
+    }
+    fn write_list_begin(&mut self, elem_type: ThriftType, len: usize) {
+        let ct = Self::compact_type(elem_type);
+        if len <= 14 {
+            self.buf.push((((len as u8) << 4) & 0xf0) | (ct & 0x0f));
+        } else {
+            self.buf.push(0xf0 | (ct & 0x0f));
+            self.write_varint_u32(len as u32);
+        }
+    }
+}
+
+fn write_jaeger_tag<W: ThriftProtoWriter>(w: &mut W, tag: &JaegerTag<'_>) {
+    w.write_struct_begin();
+    w.write_field_begin(ThriftType::String, 1);
+    w.write_string(tag.key);
+    let vtype = match &tag.val {
+        JaegerTagVal::String(_) | JaegerTagVal::StrRef(_) => 0,
+        JaegerTagVal::Double(_) => 1,
+        JaegerTagVal::Bool(_) => 2,
+        JaegerTagVal::Long(_) => 3,
+    };
+    w.write_field_begin(ThriftType::I32, 2);
+    w.write_i32(vtype);
+    match &tag.val {
+        JaegerTagVal::String(s) => {
+            w.write_field_begin(ThriftType::String, 3);
+            w.write_string(s);
+        }
+        JaegerTagVal::StrRef(s) => {
+            w.write_field_begin(ThriftType::String, 3);
+            w.write_string(s);
+        }
+        JaegerTagVal::Double(d) => {
+            w.write_field_begin(ThriftType::Double, 4);
+            w.write_double(*d);
+        }
+        JaegerTagVal::Bool(b) => {
+            w.write_bool_field(5, *b);
+        }
+        JaegerTagVal::Long(l) => {
+            w.write_field_begin(ThriftType::I64, 6);
+            w.write_i64(*l);
+        }
+    }
+    w.write_field_stop();
+    w.write_struct_end();
+}
+
+fn write_jaeger_batch<W: ThriftProtoWriter>(
+    w: &mut W,
+    span: &ExportedSpan,
+    extra_resource_attrs: &[SpanAttribute],
+) {
+    w.write_struct_begin();
+
+    // field 1: Process
+    w.write_field_begin(ThriftType::Struct, 1);
+    w.write_struct_begin();
+    w.write_field_begin(ThriftType::String, 1);
+    w.write_string(&span.service_name);
+    let proc_tags: Vec<JaegerTag<'_>> = extra_resource_attrs
+        .iter()
+        .filter(|a| a.key != "service.name")
+        .filter_map(attr_to_jaeger_tag)
+        .collect();
+    if !proc_tags.is_empty() {
+        w.write_field_begin(ThriftType::List, 2);
+        w.write_list_begin(ThriftType::Struct, proc_tags.len());
+        for t in &proc_tags {
+            write_jaeger_tag(w, t);
+        }
+    }
+    w.write_field_stop();
+    w.write_struct_end();
+
+    // field 2: Spans
+    w.write_field_begin(ThriftType::List, 2);
+    w.write_list_begin(ThriftType::Struct, 1);
+    {
+        w.write_struct_begin();
+        let tid_hi = i64::from_be_bytes(span.trace_id[0..8].try_into().unwrap_or([0; 8]));
+        let tid_lo = i64::from_be_bytes(span.trace_id[8..16].try_into().unwrap_or([0; 8]));
+        let sid = i64::from_be_bytes(span.span_id);
+        let psid = span.parent_span_id.map(i64::from_be_bytes).unwrap_or(0);
+
+        w.write_field_begin(ThriftType::I64, 1);
+        w.write_i64(tid_lo);
+        w.write_field_begin(ThriftType::I64, 2);
+        w.write_i64(tid_hi);
+        w.write_field_begin(ThriftType::I64, 3);
+        w.write_i64(sid);
+        w.write_field_begin(ThriftType::I64, 4);
+        w.write_i64(psid);
+        w.write_field_begin(ThriftType::String, 5);
+        w.write_string(&span.name);
+
+        let links = span.links();
+        if !links.is_empty() {
+            w.write_field_begin(ThriftType::List, 6);
+            w.write_list_begin(ThriftType::Struct, links.len());
+            for link in links {
+                let l_hi = i64::from_be_bytes(link.trace_id[0..8].try_into().unwrap_or([0; 8]));
+                let l_lo = i64::from_be_bytes(link.trace_id[8..16].try_into().unwrap_or([0; 8]));
+                let l_sid = i64::from_be_bytes(link.span_id);
+                w.write_struct_begin();
+                w.write_field_begin(ThriftType::I32, 1);
+                w.write_i32(1); // SpanRefType_FOLLOWS_FROM
+                w.write_field_begin(ThriftType::I64, 2);
+                w.write_i64(l_lo);
+                w.write_field_begin(ThriftType::I64, 3);
+                w.write_i64(l_hi);
+                w.write_field_begin(ThriftType::I64, 4);
+                w.write_i64(l_sid);
+                w.write_field_stop();
+                w.write_struct_end();
+            }
+        }
+
+        let flags = if span.attributes.iter().any(|a| a.key == "jaeger-debug-id") {
+            3
+        } else {
+            1
+        };
+        w.write_field_begin(ThriftType::I32, 7);
+        w.write_i32(flags);
+
+        let start_us = (span.start_time_unix_nano / 1000) as i64;
+        let dur_us = (span.end_time_unix_nano.saturating_sub(span.start_time_unix_nano) / 1000) as i64;
+        w.write_field_begin(ThriftType::I64, 8);
+        w.write_i64(start_us);
+        w.write_field_begin(ThriftType::I64, 9);
+        w.write_i64(dur_us);
+
+        let mut tags: Vec<JaegerTag<'_>> = span
+            .regular_attributes()
+            .filter_map(attr_to_jaeger_tag)
+            .collect();
+        tags.push(JaegerTag {
+            key: "otel.library.name",
+            val: JaegerTagVal::StrRef("mimir-rs"),
+        });
+        match span.kind {
+            2 => tags.push(JaegerTag {
+                key: "span.kind",
+                val: JaegerTagVal::StrRef("server"),
+            }),
+            3 => tags.push(JaegerTag {
+                key: "span.kind",
+                val: JaegerTagVal::StrRef("client"),
+            }),
+            4 => tags.push(JaegerTag {
+                key: "span.kind",
+                val: JaegerTagVal::StrRef("producer"),
+            }),
+            5 => tags.push(JaegerTag {
+                key: "span.kind",
+                val: JaegerTagVal::StrRef("consumer"),
+            }),
+            _ => {}
+        }
+        if span.status_error {
+            tags.push(JaegerTag {
+                key: "error",
+                val: JaegerTagVal::Bool(true),
+            });
+            tags.push(JaegerTag {
+                key: "otel.status_code",
+                val: JaegerTagVal::StrRef("ERROR"),
+            });
+        }
+        if !tags.is_empty() {
+            w.write_field_begin(ThriftType::List, 10);
+            w.write_list_begin(ThriftType::Struct, tags.len());
+            for t in &tags {
+                write_jaeger_tag(w, t);
+            }
+        }
+
+        let events = span.events();
+        if !events.is_empty() {
+            w.write_field_begin(ThriftType::List, 11);
+            w.write_list_begin(ThriftType::Struct, events.len());
+            for ev in events {
+                w.write_struct_begin();
+                w.write_field_begin(ThriftType::I64, 1);
+                w.write_i64((ev.time_unix_nano / 1000) as i64);
+                let mut fields = Vec::with_capacity(1 + ev.attributes.len());
+                if !ev.name.is_empty() {
+                    fields.push(JaegerTag {
+                        key: "event",
+                        val: JaegerTagVal::StrRef(ev.name.as_str()),
+                    });
+                }
+                for a in &ev.attributes {
+                    if let Some(t) = attr_to_jaeger_tag(a) {
+                        fields.push(t);
+                    }
+                }
+                w.write_field_begin(ThriftType::List, 2);
+                w.write_list_begin(ThriftType::Struct, fields.len());
+                for f in &fields {
+                    write_jaeger_tag(w, f);
+                }
+                w.write_field_stop();
+                w.write_struct_end();
+            }
+        }
+
+        w.write_field_stop();
+        w.write_struct_end();
+    }
+
+    w.write_field_stop();
+    w.write_struct_end();
+}
+
+/// Encodes a `jaeger.thrift` `Batch` using Thrift Binary Protocol (`Content-Type: application/x-thrift`)
+/// matching `go.opentelemetry.io/otel/exporters/jaeger/uploader.go`.
+pub fn encode_jaeger_thrift_batch_binary(
+    span: &ExportedSpan,
+    extra_resource_attrs: &[SpanAttribute],
+) -> Vec<u8> {
+    let mut w = ThriftBinaryWriter::new();
+    write_jaeger_batch(&mut w, span, extra_resource_attrs);
+    w.buf
+}
+
+/// Encodes a Jaeger UDP `agent.thrift` `emitBatch` message using Thrift Compact Protocol
+/// matching `go.opentelemetry.io/otel/exporters/jaeger/agent.go`.
+pub fn encode_jaeger_agent_emit_batch_compact(
+    span: &ExportedSpan,
+    extra_resource_attrs: &[SpanAttribute],
+) -> Vec<u8> {
+    let mut w = ThriftCompactWriter::new();
+    w.write_message_begin("emitBatch", 1 /* CALL */, 0);
+    w.write_struct_begin(); // AgentEmitBatchArgs
+    w.write_field_begin(ThriftType::Struct, 1);
+    write_jaeger_batch(&mut w, span, extra_resource_attrs);
+    w.write_field_stop();
+    w.write_struct_end();
+    w.buf
 }
 
 #[cfg(test)]
@@ -1111,8 +2162,82 @@ mod tests {
         let extracted = extract_from_headers(headers.into_iter(), &PropagatorSet::default());
         assert!(!extracted.is_sampled());
         assert_eq!(extracted.jaeger_debug_id.as_deref(), Some("debug-123"));
-        let (started, _) = start_server_span_context(&extracted, false);
+
+        // When tracing is disabled, start_server_span_context_with_runtime is a no-op.
+        let disabled_rt = TracingRuntime::default();
+        let (disabled_started, disabled_parent) =
+            start_server_span_context_with_runtime(&disabled_rt, &extracted, false);
+        assert!(!disabled_started.is_valid());
+        assert!(disabled_parent.is_none());
+
+        // When tracing is enabled, Jaeger-Debug-Id forces sampling on an unsampled parent.
+        let enabled_rt = TracingRuntime {
+            enabled: true,
+            propagators: PropagatorSet::default(),
+            ..TracingRuntime::default()
+        };
+        let (started, _) = start_server_span_context_with_runtime(&enabled_rt, &extracted, false);
         assert!(started.is_sampled());
         assert_eq!(started.trace_id_hex(), "4bf92f3577b34da6a3ce929d0e0e4736");
+    }
+
+    #[test]
+    fn jaeger_target_agent_beats_otel_exporter_default_and_jaeger_span_kinds_encode() {
+        static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clear = || {
+            for k in [
+                "JAEGER_ENDPOINT",
+                "OTEL_EXPORTER_JAEGER_ENDPOINT",
+                "JAEGER_AGENT_HOST",
+                "JAEGER_AGENT_PORT",
+                "JAEGER_SAMPLER_MANAGER_HOST_PORT",
+                "OTEL_TRACES_EXPORTER",
+            ] {
+                std::env::remove_var(k);
+            }
+        };
+        clear();
+        std::env::set_var("OTEL_TRACES_EXPORTER", "JAEGER");
+        std::env::set_var("JAEGER_AGENT_HOST", "127.0.0.1");
+        assert_eq!(
+            jaeger_target_from_env().unwrap(),
+            Some(JaegerTarget::UdpAgent {
+                host: "127.0.0.1".to_string(),
+                port: "6831".to_string(),
+            })
+        );
+        std::env::remove_var("JAEGER_AGENT_HOST");
+        assert_eq!(
+            jaeger_target_from_env().unwrap(),
+            Some(JaegerTarget::HttpCollector(
+                "http://localhost:14268/api/traces".to_string()
+            ))
+        );
+        assert!(validate_otel_exporter_env().is_ok());
+        std::env::set_var("OTEL_TRACES_EXPORTER", "OTLP");
+        assert!(validate_otel_exporter_env().is_ok());
+        assert_eq!(
+            otlp_traces_endpoint_for_protocol(OtlpProtocol::HttpProtobuf).as_deref(),
+            Some("http://localhost:4318/v1/traces")
+        );
+        clear();
+
+        let mk_span = |kind: u8| ExportedSpan {
+            service_name: "svc".to_string(),
+            trace_id: [0x11; 16],
+            span_id: [0x22; 8],
+            parent_span_id: None,
+            name: "op".to_string(),
+            kind,
+            start_time_unix_nano: 1_000_000,
+            end_time_unix_nano: 2_000_000,
+            attributes: Vec::new(),
+            status_error: false,
+        };
+        let client_bytes = encode_jaeger_thrift_batch_binary(&mk_span(3), &[]);
+        assert!(client_bytes.windows(6).any(|w| w == b"client"));
+        let producer_bytes = encode_jaeger_thrift_batch_binary(&mk_span(4), &[]);
+        assert!(producer_bytes.windows(8).any(|w| w == b"producer"));
     }
 }

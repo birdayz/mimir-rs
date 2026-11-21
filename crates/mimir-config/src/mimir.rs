@@ -629,6 +629,12 @@ impl MimirConfig {
             }
         }
 
+        // Track whether `limits:` was provided as a non-null YAML value so `load_yaml` runs
+        // `LimitsConfig::validate()` during YAML decode matching Go `Limits.UnmarshalYAML`.
+        let has_limits_yaml = root_map
+            .get(Value::String("limits".to_string()))
+            .is_some_and(|v| !v.is_null());
+
         // 3. Split out extra_sections vs core sections, converting null block values to empty mappings.
         let mut core_map = Mapping::new();
         let mut extras_map = Mapping::new();
@@ -666,6 +672,10 @@ impl MimirConfig {
         // omitted nested fields keep their context-specific defaults (e.g.
         // `blocks_storage.filesystem.dir: blocks`) instead of the nested type's zero/default.
         // Mirror that by deep-merging the document onto the serialized current values.
+        let yaml_has_name_validation_scheme = core_val
+            .get("limits")
+            .and_then(|l| l.get("name_validation_scheme"))
+            .is_some();
         let mut merged_core = crate::secret::with_secrets_revealed(|| {
             serde_yaml::to_value(CoreMimirConfig::from_config(self))
         })
@@ -675,11 +685,29 @@ impl MimirConfig {
         let prev_name_validation_scheme = self.limits.name_validation_scheme;
         let mut core: CoreMimirConfig = serde_yaml::from_value(merged_core)
             .map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        // Go fails in CustomTrackersConfig.UnmarshalYAML & Limits.UnmarshalYAML (while parsing the file,
+        // BEFORE CLI flag overrides are applied), validating YAML `limits:` against the YAML-decoded
+        // `name_validation_scheme` before restoring any pre-existing `prev_name_validation_scheme`
+        // when omitted.
+        if !yaml_has_name_validation_scheme {
+            core.limits.name_validation_scheme = crate::types::NameValidationScheme::Unset;
+        }
+        crate::limits::validate_custom_trackers_yaml(&core.limits)?;
+        core.limits
+            .migrate_cost_attribution_labels_structured()
+            .map_err(|e| match e {
+                ConfigError::Validation(msg) | ConfigError::Flag(msg) => ConfigError::Yaml(msg),
+                other => other,
+            })?;
+        if has_limits_yaml {
+            core.limits.validate().map_err(|e| match e {
+                ConfigError::Validation(msg) | ConfigError::Flag(msg) => ConfigError::Yaml(msg),
+                other => other,
+            })?;
+        }
         if core.limits.name_validation_scheme == crate::types::NameValidationScheme::Unset {
             core.limits.name_validation_scheme = prev_name_validation_scheme;
         }
-        // Go fails in CustomTrackersConfig.UnmarshalYAML (i.e. while parsing the file).
-        crate::limits::validate_custom_trackers_yaml(&core.limits)?;
 
         self.apply_core(core);
         self.extra_sections = extras;
@@ -938,10 +966,20 @@ impl MimirConfig {
 
     /// Validates the full configuration, matching `pkg/mimir/mimir.go:Config.Validate`.
     pub fn validate(&mut self) -> Result<(), ConfigError> {
-
-        self.server.validate()?;
+        if self.server.throughput_latency_cutoff.0 > 0 {
+            return Err(ConfigError::Validation(
+                "-server.throughput.latency-cutoff > 0 (request throughput metric) is not supported by mimir-rs yet".to_string(),
+            ));
+        }
+        if self.server.enable_open_metrics_text_created_samples && !self.server.register_instrumentation {
+            return Err(ConfigError::Validation(
+                "server.enable-open-metrics-text-created-samples can only be used if server.register-instrumentation is set to true".to_string(),
+            ));
+        }
         self.validate_bucket_configs()?;
         self.validate_filesystem_paths()?;
+        self.validate_extra_bucket_storage("ruler_storage", "ruler-storage", true)
+            .map_err(wrap_validation("invalid rulestore config"))?;
         self.ingest_storage
             .validate()
             .map_err(wrap_validation("invalid ingest storage config"))?;
@@ -1023,6 +1061,10 @@ impl MimirConfig {
                 self.is_ingester_enabled(),
             )
             .map_err(wrap_validation("invalid TSDB config"))?;
+        self.validate_distributor_reactive_limiter()
+            .map_err(wrap_validation("invalid distributor config"))?;
+        self.validate_querier_config()
+            .map_err(wrap_validation("invalid querier config"))?;
         if self.is_ingester_enabled() {
             self.blocks_storage
                 .bucket
@@ -1055,6 +1097,10 @@ impl MimirConfig {
             .validate()
             .map_err(wrap_validation("invalid usage stats config"))?;
 
+        self.validate_extra_bucket_storage("alertmanager_storage", "alertmanager-storage", false)
+            .map_err(wrap_validation("invalid alertmanager storage config"))?;
+        self.validate_overrides_exporter_config()
+            .map_err(wrap_validation("invalid overrides-exporter config"))?;
         self.instrument_ref_leaks
             .validate()
             .map_err(wrap_validation("invalid instrument-ref-leaks config"))?;
@@ -1136,6 +1182,207 @@ impl MimirConfig {
             .and_then(|api| api.get("response_compression_level"))
             .and_then(Value::as_i64)
             .unwrap_or(-1))
+    }
+
+    fn validate_extra_bucket_storage(
+        &self,
+        section: &str,
+        flag_prefix: &str,
+        has_cache: bool,
+    ) -> Result<(), ConfigError> {
+        let backend = self.extra_storage_str(
+            &[section],
+            &["backend"],
+            &format!("{flag_prefix}.backend"),
+            "filesystem",
+        );
+        if !matches!(
+            backend.as_str(),
+            "s3" | "gcs" | "azure" | "swift" | "filesystem" | "local"
+        ) {
+            return Err(ConfigError::Validation(
+                "unsupported storage backend".to_string(),
+            ));
+        }
+        let storage_prefix = self.extra_storage_str(
+            &[section],
+            &["storage_prefix"],
+            &format!("{flag_prefix}.storage-prefix"),
+            "",
+        );
+        if !storage_prefix.is_empty()
+            && !storage_prefix.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return Err(ConfigError::Validation(
+                "storage prefix contains invalid characters, it may only contain digits and English alphabet letters".to_string(),
+            ));
+        }
+        if backend == "s3" {
+            let mut s3: crate::storage::S3Config = self
+                .extra_sections
+                .get(section)
+                .and_then(|v| v.get("s3"))
+                .filter(|v| !v.is_null())
+                .map(|v| serde_yaml::from_value(v.clone()))
+                .transpose()
+                .map_err(|e| ConfigError::Validation(e.to_string()))?
+                .unwrap_or_default();
+            if let Some(v) = self.extra_cli_flag_value(&format!("{flag_prefix}.s3.bucket-name")) {
+                s3.bucket_name = v.to_string();
+            }
+            if let Some(v) = self.extra_cli_flag_value(&format!("{flag_prefix}.s3.endpoint")) {
+                s3.endpoint = v.to_string();
+            }
+            if let Some(v) =
+                self.extra_cli_flag_value(&format!("{flag_prefix}.s3.signature-version"))
+            {
+                s3.signature_version = v.to_string();
+            }
+            if let Some(v) = self.extra_cli_flag_value(&format!("{flag_prefix}.s3.sts-endpoint")) {
+                s3.sts_endpoint = v.to_string();
+            }
+            if let Some(v) = self.extra_cli_flag_value(&format!("{flag_prefix}.s3.storage-class"))
+            {
+                s3.storage_class = v.to_string();
+            }
+            if let Some(v) = self.extra_cli_flag_value(&format!("{flag_prefix}.s3.sse.type")) {
+                s3.sse.sse_type = v.to_string();
+            }
+            if let Some(v) =
+                self.extra_cli_flag_value(&format!("{flag_prefix}.s3.sse.kms-encryption-context"))
+            {
+                s3.sse.kms_encryption_context = v.to_string();
+            }
+            s3.validate()?;
+        }
+        if has_cache {
+            let cache_backend = self.extra_storage_str(
+                &[section, "cache"],
+                &["backend"],
+                &format!("{flag_prefix}.cache.backend"),
+                "",
+            );
+            if !cache_backend.is_empty() && cache_backend != "memcached" {
+                return Err(ConfigError::Validation(format!(
+                    "unsupported cache backend: {cache_backend}"
+                )));
+            }
+            if cache_backend == "memcached" {
+                let mut mc: crate::storage::MemcachedClientConfig = self
+                    .extra_sections
+                    .get(section)
+                    .and_then(|v| v.get("cache"))
+                    .and_then(|v| v.get("memcached"))
+                    .filter(|v| !v.is_null())
+                    .map(|v| serde_yaml::from_value(v.clone()))
+                    .transpose()
+                    .map_err(|e| ConfigError::Validation(e.to_string()))?
+                    .unwrap_or_default();
+                if let Some(v) =
+                    self.extra_cli_flag_value(&format!("{flag_prefix}.cache.memcached.addresses"))
+                {
+                    mc.addresses = v.to_string();
+                }
+                if let Some(v) = self.extra_cli_flag_value(&format!(
+                    "{flag_prefix}.cache.memcached.max-async-concurrency"
+                )) {
+                    mc.max_async_concurrency = crate::flags::go_parse_int(v)?;
+                }
+                if let Some(v) = self.extra_cli_flag_value(&format!(
+                    "{flag_prefix}.cache.memcached.addresses-lookup-period"
+                )) {
+                    mc.addresses_lookup_period = v.parse::<GoDuration>()?;
+                }
+                if let Some(v) = self.extra_cli_flag_value(&format!(
+                    "{flag_prefix}.cache.memcached.free-list-shards"
+                )) {
+                    mc.free_list_shards = crate::flags::go_parse_int(v)?;
+                }
+                mc.validate()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_distributor_reactive_limiter(&self) -> Result<(), ConfigError> {
+        let min_limit_factor = if let Some(v) =
+            self.extra_cli_flag_value("distributor.reactive-limiter.min-limit-factor")
+        {
+            v.parse::<f64>().map_err(|e| ConfigError::Validation(e.to_string()))?
+        } else {
+            self.extra_sections
+                .get("distributor")
+                .and_then(|d| d.get("reactive_limiter"))
+                .and_then(|rl| rl.get("min_limit_factor"))
+                .and_then(Value::as_f64)
+                .unwrap_or(1.2)
+        };
+        if min_limit_factor < 1.0 {
+            return Err(ConfigError::Validation(
+                "min_limit_factor must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_querier_config(&self) -> Result<(), ConfigError> {
+        let query_engine =
+            self.extra_storage_str(&["querier"], &["query_engine"], "querier.query-engine", "mimir");
+        if query_engine != "prometheus" && query_engine != "mimir" {
+            return Err(ConfigError::Validation(format!(
+                "unknown PromQL engine '{query_engine}'"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_overrides_exporter_config(&self) -> Result<(), ConfigError> {
+        let metrics: Vec<String> = if let Some(v) =
+            self.extra_cli_flag_value("overrides-exporter.enabled-metrics")
+        {
+            if v.is_empty() {
+                Vec::new()
+            } else {
+                v.split(',').map(str::to_string).collect()
+            }
+        } else if let Some(val) = self
+            .extra_sections
+            .get("overrides_exporter")
+            .and_then(|o| o.get("enabled_metrics"))
+        {
+            match val {
+                Value::String(s) => {
+                    if s.is_empty() {
+                        Vec::new()
+                    } else {
+                        s.split(',').map(str::to_string).collect()
+                    }
+                }
+                Value::Sequence(seq) => seq
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                _ => return Ok(()),
+            }
+        } else {
+            return Ok(());
+        };
+        for name in &metrics {
+            match limits_field_exportability(name) {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(ConfigError::Validation(format!(
+                        "enabled-metrics: metric '{name}' has unsupported type"
+                    )));
+                }
+                None => {
+                    return Err(ConfigError::Validation(format!(
+                        "enabled-metrics: unknown metric name '{name}' - must match a yaml tag in the Limits struct"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn extra_storage_str(
@@ -1845,6 +2092,174 @@ fn parse_cli_and_load_config_inner(
     })
 }
 
+/// Returns `Some(true)` if the `validation.Limits` YAML tag exists and is exportable by
+/// `overrides-exporter`, `Some(false)` if it exists with an unsupported type, or `None` if unknown.
+fn limits_field_exportability(name: &str) -> Option<bool> {
+    match name {
+        "max_active_series_per_user"
+        | "active_series_limit_response_code"
+        | "request_rate"
+        | "request_burst_size"
+        | "ingestion_rate"
+        | "ingestion_burst_size"
+        | "ingestion_burst_factor"
+        | "accept_ha_samples"
+        | "ha_tracker_per_sample_dedupe"
+        | "merge_duplicate_timeseries"
+        | "ha_max_clusters"
+        | "ha_tracker_update_timeout"
+        | "ha_tracker_update_timeout_jitter_max"
+        | "ha_tracker_failover_timeout"
+        | "ha_tracker_sample_failover_timeout"
+        | "max_label_name_length"
+        | "max_label_value_length"
+        | "max_label_names_per_series"
+        | "max_label_names_per_info_series"
+        | "max_metadata_length"
+        | "max_native_histogram_buckets"
+        | "max_exemplars_per_series_per_request"
+        | "reduce_native_histogram_over_max_buckets"
+        | "creation_grace_period"
+        | "past_grace_period"
+        | "enforce_out_of_order_window_on_distributor"
+        | "enforce_metadata_metric_name"
+        | "ingestion_tenant_shard_size"
+        | "ingestion_artificial_delay"
+        | "max_global_series_per_user"
+        | "max_global_series_per_metric"
+        | "label_value_bytes_metric_threshold"
+        | "max_global_metadata_per_user"
+        | "max_global_metadata_per_metric"
+        | "max_global_exemplars_per_user"
+        | "ignore_ooo_exemplars"
+        | "early_head_compaction_owned_series_threshold"
+        | "early_head_compaction_min_estimated_series_reduction_percentage"
+        | "native_histograms_ingestion_enabled"
+        | "float_chunk_encoding"
+        | "histogram_chunk_encoding"
+        | "max_active_series_additional_custom_trackers"
+        | "out_of_order_time_window"
+        | "out_of_order_blocks_external_label_enabled"
+        | "max_fetched_chunks_per_query"
+        | "max_estimated_fetched_chunks_per_query_multiplier"
+        | "max_fetched_series_per_query"
+        | "max_fetched_chunk_bytes_per_query"
+        | "max_estimated_memory_consumption_per_query"
+        | "max_blocks_per_store_request"
+        | "max_query_lookback"
+        | "max_partial_query_length"
+        | "max_query_parallelism"
+        | "max_labels_query_length"
+        | "max_series_query_limit"
+        | "max_label_names_limit"
+        | "max_label_values_limit"
+        | "max_cache_freshness"
+        | "max_queriers_per_tenant"
+        | "query_sharding_total_shards"
+        | "query_sharding_max_sharded_queries"
+        | "query_sharding_max_regexp_size_bytes"
+        | "cardinality_sharding_max_sharded_queries"
+        | "query_ingesters_within"
+        | "enable_delayed_name_removal"
+        | "max_total_query_length"
+        | "results_cache_ttl"
+        | "results_cache_ttl_for_out_of_order_time_window"
+        | "results_cache_ttl_for_cardinality_query"
+        | "results_cache_ttl_for_labels_query"
+        | "results_cache_ttl_for_errors"
+        | "cache_unaligned_requests"
+        | "max_query_expression_size_bytes"
+        | "align_queries_with_step"
+        | "prom2_range_compat"
+        | "subquery_spin_off_enabled"
+        | "labels_query_optimizer_enabled"
+        | "cardinality_analysis_enabled"
+        | "label_names_and_values_results_max_size_bytes"
+        | "label_values_max_cardinality_label_names_per_request"
+        | "cardinality_analysis_max_results"
+        | "active_series_results_max_size_bytes"
+        | "cost_attribution_cooldown"
+        | "max_cost_attribution_cardinality"
+        | "ruler_evaluation_delay_duration"
+        | "ruler_evaluation_consistency_max_delay"
+        | "ruler_tenant_shard_size"
+        | "ruler_max_rules_per_rule_group"
+        | "ruler_max_rule_groups_per_tenant"
+        | "ruler_recording_rules_evaluation_enabled"
+        | "ruler_alerting_rules_evaluation_enabled"
+        | "ruler_sync_rules_on_changes_enabled"
+        | "ruler_max_independent_rule_evaluation_concurrency_per_tenant"
+        | "ruler_min_rule_evaluation_interval"
+        | "ruler_max_rule_evaluation_results"
+        | "store_gateway_tenant_shard_size"
+        | "store_gateway_tenant_shard_size_per_zone"
+        | "compactor_blocks_retention_period"
+        | "compactor_split_and_merge_shards"
+        | "compactor_ooo_split_and_merge_shards"
+        | "compactor_split_groups"
+        | "compactor_tenant_shard_size"
+        | "compactor_partial_block_deletion_delay"
+        | "compactor_block_upload_enabled"
+        | "compactor_block_upload_validation_enabled"
+        | "compactor_block_upload_verify_chunks"
+        | "compactor_block_upload_max_block_size_bytes"
+        | "compactor_max_lookback"
+        | "compactor_max_per_block_upload_concurrency"
+        | "alertmanager_receivers_firewall_block_private_addresses"
+        | "alertmanager_notification_rate_limit"
+        | "alertmanager_max_config_size_bytes"
+        | "alertmanager_max_silences_count"
+        | "alertmanager_max_silence_size_bytes"
+        | "alertmanager_max_templates_count"
+        | "alertmanager_max_template_size_bytes"
+        | "alertmanager_max_dispatcher_aggregation_groups"
+        | "alertmanager_max_alerts_count"
+        | "alertmanager_max_alerts_size_bytes"
+        | "otel_created_timestamp_zero_ingestion_enabled"
+        | "otel_keep_identifying_resource_attributes"
+        | "otel_convert_histograms_to_nhcb"
+        | "otel_promote_scope_metadata"
+        | "otel_native_delta_ingestion"
+        | "otel_label_name_underscore_sanitization"
+        | "otel_label_name_preserve_multiple_underscores"
+        | "ingestion_partitions_tenant_shard_size"
+        | "ingestion_partitions_tenant_write_shard_size" => Some(true),
+        "ha_cluster_label"
+        | "ha_replica_label"
+        | "drop_labels"
+        | "label_value_length_over_limit_strategy"
+        | "blocked_label_names_for_label_value_bytes"
+        | "metric_relabel_configs"
+        | "active_series_custom_trackers"
+        | "active_series_additional_custom_trackers"
+        | "separate_metrics_group_label"
+        | "blocked_queries"
+        | "limited_queries"
+        | "blocked_requests"
+        | "enabled_promql_experimental_functions"
+        | "enabled_promql_extended_range_selectors"
+        | "enabled_promql_binop_fill_modifiers"
+        | "cost_attribution_labels_structured"
+        | "cost_attribution_trackers"
+        | "additional_cost_attribution_trackers"
+        | "ruler_max_rules_per_rule_group_by_namespace"
+        | "ruler_max_rule_groups_per_tenant_by_namespace"
+        | "ruler_protected_namespaces"
+        | "ruler_alertmanager_client_config"
+        | "s3_sse_type"
+        | "s3_sse_kms_key_id"
+        | "s3_sse_kms_encryption_context"
+        | "alertmanager_receivers_firewall_block_cidr_networks"
+        | "alertmanager_notification_rate_limit_per_integration"
+        | "otel_metric_suffixes_enabled"
+        | "promote_otel_resource_attributes"
+        | "otel_translation_strategy"
+        | "ingest_storage_read_consistency"
+        | "name_validation_scheme" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod yaml_defaults_tests {
     use super::*;
@@ -2221,6 +2636,178 @@ limits: null
         assert!(
             err.contains("warpstream") && err.contains("not supported"),
             "unexpected warpstream err: {err}"
+        );
+    }
+
+    #[test]
+    fn w26_s4_05_s4_06_s4_10_yaml_limits_server_and_extra_sections_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_and_load = |name: &str, yaml: &str, extra_args: &[&str]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, yaml).unwrap();
+            let mut args = vec![
+                "-target=ingester".to_string(),
+                format!("-config.file={}", path.display()),
+            ];
+            args.extend(extra_args.iter().map(|s| (*s).to_string()));
+            parse_cli_and_load_config("mimir", &args)
+        };
+
+        // S4-05: Invalid YAML limits rejected during YAML decode BEFORE CLI flags fix them.
+        let err = write_and_load(
+            "bad_otel.yaml",
+            "limits:\n  otel_translation_strategy: NoUTF8EscapingWithSuffixes\n",
+            &[
+                "-validation.name-validation-scheme=utf8",
+                "-distributor.otel-metric-suffixes-enabled=true",
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(
+            err.to_string()
+                .contains("OTLP translation strategy NoUTF8EscapingWithSuffixes is not allowed"),
+            "unexpected err: {err}"
+        );
+
+        let err2 = write_and_load(
+            "bad_mult.yaml",
+            "limits:\n  max_estimated_fetched_chunks_per_query_multiplier: -1\n",
+            &["-querier.max-estimated-fetched-chunks-per-query-multiplier=0"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err2.contains("error parsing config file:")
+                && err2.contains("max-estimated-fetched-chunks-per-query-multiplier"),
+            "unexpected err2: {err2}"
+        );
+
+        // S4-08 end-to-end via parse_cli_and_load_config: disabled ingest_storage accepts
+        // empty/invalid sasl_mechanism in YAML, and CLI override fixes it when enabled.
+        let loaded_dis = write_and_load(
+            "kafka_sasl_dis.yaml",
+            "ingest_storage:\n  enabled: false\n  kafka:\n    sasl_mechanism: \"\"\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded_dis.config.ingest_storage.kafka.sasl_mechanism_raw.as_deref(),
+            Some("")
+        );
+
+        write_and_load(
+            "kafka_sasl_fix.yaml",
+            "ingest_storage:\n  enabled: true\n  kafka:\n    address: 127.0.0.1:9092\n    topic: ingest\n    sasl_mechanism: \"INVALID\"\n",
+            &["-ingest-storage.kafka.sasl-mechanism=PLAIN"],
+        )
+        .unwrap();
+
+        // S4-06: MimirConfig::validate() accepts server.cluster_validation without label and
+        // negative metrics_cache_duration (matching Go mimir.Config.Validate).
+        write_and_load(
+            "cluster_val.yaml",
+            "server:\n  metrics_cache_duration: -1s\n  cluster_validation:\n    grpc:\n      enabled: true\n",
+            &[],
+        )
+        .unwrap();
+
+        // S4-10: Unconditional non-ingester extra_sections validated even on -target=ingester.
+        let e_q = write_and_load(
+            "bad_querier.yaml",
+            "querier:\n  query_engine: invalid\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e_q.contains("invalid querier config: unknown PromQL engine 'invalid'"),
+            "unexpected querier err: {e_q}"
+        );
+
+        let e_rs_bkt = write_and_load(
+            "bad_rulestore.yaml",
+            "ruler_storage:\n  backend: invalid\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e_rs_bkt.contains("invalid rulestore config: unsupported storage backend"),
+            "unexpected rulestore err: {e_rs_bkt}"
+        );
+
+        let e_rs_mc = write_and_load(
+            "bad_rulestore_mc.yaml",
+            "ruler_storage:\n  cache:\n    backend: memcached\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e_rs_mc.contains("invalid rulestore config: no memcached addresses provided"),
+            "unexpected rulestore memcached err: {e_rs_mc}"
+        );
+
+        let e_am = write_and_load(
+            "bad_am_storage.yaml",
+            "alertmanager_storage:\n  backend: invalid\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e_am.contains("invalid alertmanager storage config: unsupported storage backend"),
+            "unexpected am storage err: {e_am}"
+        );
+
+        let e_oe = write_and_load(
+            "bad_oe.yaml",
+            "overrides_exporter:\n  enabled_metrics: not_a_limit\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e_oe.contains("invalid overrides-exporter config: enabled-metrics: unknown metric name 'not_a_limit'"),
+            "unexpected oe err: {e_oe}"
+        );
+
+        let e_oe_type = write_and_load(
+            "bad_oe_type.yaml",
+            "overrides_exporter:\n  enabled_metrics: ha_cluster_label\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e_oe_type.contains("invalid overrides-exporter config: enabled-metrics: metric 'ha_cluster_label' has unsupported type"),
+            "unexpected oe type err: {e_oe_type}"
+        );
+
+        let e_dist = write_and_load(
+            "bad_dist.yaml",
+            "distributor:\n  reactive_limiter:\n    min_limit_factor: 0.5\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e_dist.contains("invalid distributor config: min_limit_factor must be >= 1"),
+            "unexpected dist err: {e_dist}"
+        );
+
+        // S4-10 library-mode custom trackers validator runs without mimir-cmd hook.
+        let e_ct = write_and_load(
+            "bad_ct.yaml",
+            "limits:\n  active_series_custom_trackers:\n    t1: \"invalid matcher\"\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e_ct.contains("can't build active series matcher t1"),
+            "unexpected custom trackers err: {e_ct}"
         );
     }
 }

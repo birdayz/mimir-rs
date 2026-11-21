@@ -1,4 +1,4 @@
-//! Bit-exact Prometheus TSDB Index v2 writer & memory-mapped reader.
+//! Bit-exact Prometheus TSDB Index v2 writer & memory-mapped v1/v2/v3 reader.
 //!
 //! Ported from github.com/prometheus/prometheus/tsdb/index/index.go.
 
@@ -723,7 +723,7 @@ struct PostingOffsetEntry {
     table_rel_off: usize,
 }
 
-/// Memory-mapped reader for Prometheus TSDB Index v2/v3 files.
+/// Memory-mapped reader for Prometheus TSDB Index v1/v2/v3 files.
 #[derive(Debug)]
 pub struct IndexReader {
     mmap: Mmap,
@@ -733,6 +733,7 @@ pub struct IndexReader {
     num_symbols: usize,
     name_cache: HashMap<u32, (u32, u32)>,
     postings_index: Vec<Box<[PostingOffsetEntry]>>,
+    postings_v1: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 impl IndexReader {
@@ -748,7 +749,7 @@ impl IndexReader {
             return Err(IndexError::InvalidMagic(magic));
         }
         let version = mmap[4];
-        if version != INDEX_FORMAT_V2 && version != INDEX_FORMAT_V3 {
+        if version != INDEX_FORMAT_V1 && version != INDEX_FORMAT_V2 && version != INDEX_FORMAT_V3 {
             return Err(IndexError::UnsupportedVersion(version));
         }
 
@@ -759,23 +760,38 @@ impl IndexReader {
         let postings_payload_start = postings_table_off
             .checked_add(4)
             .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
-        let postings_index = parse_postings_offset_table(&mmap, postings_table_off)?;
 
-        let mut name_cache = HashMap::with_capacity(postings_index.len());
-        for entries in &postings_index {
-            let Some(first) = entries.first() else {
-                continue;
-            };
-            if first.name_len == 0 {
-                continue;
+        let (postings_index, postings_v1, name_cache) = if version == INDEX_FORMAT_V1 {
+            let (postings_v1, name_offsets) =
+                parse_postings_offset_table_v1(&mmap, postings_table_off)?;
+            let mut name_cache = HashMap::with_capacity(name_offsets.len());
+            for (name, (name_off, name_len)) in name_offsets {
+                let sid = reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, &name, version)?;
+                name_cache.insert(sid, (name_off, name_len));
             }
-            let (start, end) =
-                resolve_posting_str_range(postings_payload_start, first.name_off, first.name_len);
-            // SAFETY: `parse_postings_offset_table` validated UTF-8 and slice bounds on `mmap`.
-            let name = unsafe { std::str::from_utf8_unchecked(&mmap[start..end]) };
-            let sid = reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name)?;
-            name_cache.insert(sid, (first.name_off, first.name_len));
-        }
+            (Vec::new(), postings_v1, name_cache)
+        } else {
+            let postings_index = parse_postings_offset_table(&mmap, postings_table_off)?;
+            let mut name_cache = HashMap::with_capacity(postings_index.len());
+            for entries in &postings_index {
+                let Some(first) = entries.first() else {
+                    continue;
+                };
+                if first.name_len == 0 {
+                    continue;
+                }
+                let (start, end) = resolve_posting_str_range(
+                    postings_payload_start,
+                    first.name_off,
+                    first.name_len,
+                );
+                // SAFETY: `parse_postings_offset_table` validated UTF-8 and slice bounds on `mmap`.
+                let name = unsafe { std::str::from_utf8_unchecked(&mmap[start..end]) };
+                let sid = reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name, version)?;
+                name_cache.insert(sid, (first.name_off, first.name_len));
+            }
+            (postings_index, BTreeMap::new(), name_cache)
+        };
 
         Ok(Self {
             mmap,
@@ -785,6 +801,7 @@ impl IndexReader {
             num_symbols,
             name_cache,
             postings_index,
+            postings_v1,
         })
     }
 
@@ -830,6 +847,14 @@ impl IndexReader {
     /// pre-validated UTF-8 from `IndexReader::open`, matching Go `tsdb/index`).
     #[inline]
     pub fn lookup_symbol(&self, o: u32) -> Result<&str, IndexError> {
+        if self.version == INDEX_FORMAT_V1 {
+            let slice = self
+                .mmap
+                .get(o as usize..)
+                .ok_or(IndexError::UnknownSymbolOffset(o))?;
+            let mut dec = Decbuf::new(slice);
+            return Ok(dec.uvarint_str()?);
+        }
         if (o as usize) >= self.num_symbols {
             return Err(IndexError::UnknownSymbolOffset(o));
         }
@@ -874,6 +899,14 @@ impl IndexReader {
 
     /// Returns all unique label names present in the index (sorted, excluding `""`).
     pub fn label_names(&self) -> Vec<String> {
+        if self.version == INDEX_FORMAT_V1 {
+            return self
+                .postings_v1
+                .keys()
+                .filter(|k| !k.is_empty())
+                .cloned()
+                .collect();
+        }
         self.postings_index
             .iter()
             .filter_map(|entries| {
@@ -889,6 +922,12 @@ impl IndexReader {
 
     /// Returns all sorted label values for `name`.
     pub fn label_values(&self, name: &str) -> Result<Vec<String>, IndexError> {
+        if self.version == INDEX_FORMAT_V1 {
+            return Ok(self
+                .postings_v1
+                .get(name)
+                .map_or_else(Vec::new, |m| m.keys().cloned().collect()));
+        }
         let Some(entries) = self.postings_entries(name) else {
             return Ok(Vec::new());
         };
@@ -961,12 +1000,21 @@ impl IndexReader {
         Ok(unsafe { Labels::from_valid_stringlabels_bytes_unchecked(bytes) })
     }
 
-    /// Decodes the series entry at `ref_id` (`series_id = file_offset / 16`).
+    #[inline]
+    fn series_offset(&self, ref_id: u64) -> Result<usize, IndexError> {
+        let r = usize::try_from(ref_id).map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+        if self.version == INDEX_FORMAT_V1 {
+            Ok(r)
+        } else {
+            r.checked_mul(SERIES_BYTE_ALIGN)
+                .ok_or(IndexError::Encoding(EncodingError::InvalidSize))
+        }
+    }
+
+    /// Decodes the series entry at `ref_id` (`series_id = file_offset` in v1,
+    /// `file_offset / 16` in v2/v3).
     pub fn series(&self, ref_id: u64) -> Result<(Labels, Vec<ChunkMeta>), IndexError> {
-        let offset = usize::try_from(ref_id)
-            .ok()
-            .and_then(|r| r.checked_mul(SERIES_BYTE_ALIGN))
-            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+        let offset = self.series_offset(ref_id)?;
         let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
         let mut dec = Decbuf::new(payload);
         let labels = self.decode_series_labels(&mut dec)?;
@@ -1005,10 +1053,7 @@ impl IndexReader {
 
     /// Decodes only the labels for `ref_id`.
     pub fn series_labels(&self, ref_id: u64) -> Result<Labels, IndexError> {
-        let offset = usize::try_from(ref_id)
-            .ok()
-            .and_then(|r| r.checked_mul(SERIES_BYTE_ALIGN))
-            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+        let offset = self.series_offset(ref_id)?;
         let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
         let mut dec = Decbuf::new(payload);
         self.decode_series_labels(&mut dec)
@@ -1085,6 +1130,25 @@ impl IndexReader {
     }
 
     pub fn postings(&self, name: &str, values: &[&str]) -> Result<Vec<u64>, IndexError> {
+        if self.version == INDEX_FORMAT_V1 {
+            let Some(vals) = self.postings_v1.get(name) else {
+                return Ok(Vec::new());
+            };
+            if values.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut sorted_vals: Vec<&str> = values.to_vec();
+            sorted_vals.sort_unstable();
+            sorted_vals.dedup();
+            let mut lists = Vec::with_capacity(sorted_vals.len());
+            for v in sorted_vals {
+                if let Some(&off) = vals.get(v) {
+                    lists.push(self.decode_postings_at(off)?);
+                }
+            }
+            let slices: Vec<&[u64]> = lists.iter().map(|v| v.as_slice()).collect();
+            return Ok(merge_postings(&slices));
+        }
         let Some(entries) = self.postings_entries(name) else {
             return Ok(Vec::new());
         };
@@ -1140,6 +1204,17 @@ impl IndexReader {
     }
 
     pub fn postings_for_all_values(&self, name: &str) -> Result<Vec<u64>, IndexError> {
+        if self.version == INDEX_FORMAT_V1 {
+            let Some(vals) = self.postings_v1.get(name) else {
+                return Ok(Vec::new());
+            };
+            let mut lists = Vec::with_capacity(vals.len());
+            for &off in vals.values() {
+                lists.push(self.decode_postings_at(off)?);
+            }
+            let slices: Vec<&[u64]> = lists.iter().map(|v| v.as_slice()).collect();
+            return Ok(merge_postings(&slices));
+        }
         let Some(entries) = self.postings_entries(name) else {
             return Ok(Vec::new());
         };
@@ -1161,6 +1236,19 @@ impl IndexReader {
         name: &str,
         pred: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Vec<u64>, IndexError> {
+        if self.version == INDEX_FORMAT_V1 {
+            let Some(vals) = self.postings_v1.get(name) else {
+                return Ok(Vec::new());
+            };
+            let mut lists = Vec::new();
+            for (val, &off) in vals {
+                if pred(val) {
+                    lists.push(self.decode_postings_at(off)?);
+                }
+            }
+            let slices: Vec<&[u64]> = lists.iter().map(|v| v.as_slice()).collect();
+            return Ok(merge_postings(&slices));
+        }
         let Some(entries) = self.postings_entries(name) else {
             return Ok(Vec::new());
         };
@@ -1183,10 +1271,7 @@ impl IndexReader {
     pub fn label_names_for(&self, postings: &[u64]) -> Result<Vec<String>, IndexError> {
         let mut name_ids: HashSet<u32> = HashSet::new();
         for &id in postings {
-            let offset = usize::try_from(id)
-                .ok()
-                .and_then(|u| u.checked_mul(SERIES_BYTE_ALIGN))
-                .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+            let offset = self.series_offset(id)?;
             let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
             let mut dec = Decbuf::new(payload);
             let k = dec.uvarint()?;
@@ -1343,6 +1428,7 @@ fn reverse_lookup_symbol(
     offsets: &[usize],
     num_symbols: usize,
     sym: &str,
+    version: u8,
 ) -> Result<u32, IndexError> {
     if offsets.is_empty() {
         return Err(IndexError::UnknownSymbol(sym.to_string()));
@@ -1355,8 +1441,14 @@ fn reverse_lookup_symbol(
     let mut dec = Decbuf::new(&buf[offsets[idx]..]);
     let mut res = idx * SYMBOL_FACTOR;
     while res < num_symbols {
+        let sym_off = buf.len() - dec.len();
         let s = dec.uvarint_str()?;
         if s == sym {
+            if version == INDEX_FORMAT_V1 {
+                let off = u32::try_from(sym_off)
+                    .map_err(|_| IndexError::SymbolTableTooLarge(sym_off as u64))?;
+                return Ok(off);
+            }
             return Ok(res as u32);
         }
         if s > sym {
@@ -1372,6 +1464,49 @@ fn resolve_posting_str_range(payload_start: usize, off: u32, len: u32) -> (usize
     let start = payload_start + (off as usize);
     let end = start + (len as usize);
     (start, end)
+}
+
+type V1PostingsMap = BTreeMap<String, BTreeMap<String, u64>>;
+type V1NameOffsets = Vec<(String, (u32, u32))>;
+
+fn parse_postings_offset_table_v1(
+    buf: &[u8],
+    table_off: usize,
+) -> Result<(V1PostingsMap, V1NameOffsets), IndexError> {
+    let payload = checked_decbuf_at(buf, table_off)?;
+    let mut dec = Decbuf::new(payload);
+    let orig_len = dec.len();
+    let cnt = dec.be32()? as usize;
+
+    let mut map: V1PostingsMap = BTreeMap::new();
+    let mut name_offsets: V1NameOffsets = Vec::new();
+
+    for _ in 0..cnt {
+        let key_cnt = dec.uvarint()?;
+        if key_cnt != 2 {
+            return Err(IndexError::Corrupt(format!(
+                "unexpected postings offset table key_count {key_cnt}"
+            )));
+        }
+        let name = dec.uvarint_str()?;
+        let name_end = orig_len - dec.len();
+        let name_off = u32::try_from(name_end - name.len())
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+        let name_len = u32::try_from(name.len())
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+
+        let value = dec.uvarint_str()?;
+        let postings_off = dec.uvarint64()?;
+
+        if !name.is_empty() && !map.contains_key(name) {
+            name_offsets.push((name.to_string(), (name_off, name_len)));
+        }
+        map.entry(name.to_string())
+            .or_default()
+            .insert(value.to_string(), postings_off);
+    }
+
+    Ok((map, name_offsets))
 }
 
 fn parse_postings_offset_table(
@@ -1814,5 +1949,320 @@ mod tests {
             std::str::from_utf8(&payload_bytes[vs2 - sim_payload_start..ve2 - sim_payload_start]).unwrap(),
             "api"
         );
+    }
+
+    struct FormatV1TestInput {
+        symbols: Vec<String>,
+        series: Vec<(Labels, Vec<ChunkMeta>)>,
+        unsorted_postings: bool,
+    }
+
+    fn build_format_v1_index_bytes(input: &FormatV1TestInput) -> (Vec<u8>, Vec<u64>, HashMap<String, u32>) {
+        let mut syms = input.symbols.clone();
+        syms.sort();
+        syms.dedup();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC_INDEX.to_be_bytes());
+        buf.push(INDEX_FORMAT_V1);
+
+        // Symbols section: 4B len + [4B cnt + uvarint_str...] + 4B CRC32C.
+        let toc_symbols = buf.len() as u64;
+        let mut sym_payload = Encbuf::new();
+        sym_payload.put_be32(syms.len() as u32);
+        let mut sym_rel_offsets = Vec::with_capacity(syms.len());
+        for s in &syms {
+            sym_rel_offsets.push(sym_payload.len());
+            sym_payload.put_uvarint_str(s);
+        }
+        let sym_crc = crc32c::crc32c(sym_payload.as_slice());
+        let sym_payload_start = buf.len() + 4;
+        buf.extend_from_slice(&(sym_payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(sym_payload.as_slice());
+        buf.extend_from_slice(&sym_crc.to_be_bytes());
+
+        let mut sym_file_offsets = HashMap::with_capacity(syms.len());
+        for (s, rel) in syms.iter().zip(sym_rel_offsets) {
+            sym_file_offsets.insert(s.clone(), (sym_payload_start + rel) as u32);
+        }
+
+        // Deliberately write a 3-byte filler so series offsets are NOT 16-byte aligned.
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let toc_series = buf.len() as u64;
+
+        let mut series_refs = Vec::with_capacity(input.series.len());
+        let mut postings_map: Vec<((String, String), Vec<u32>)> = Vec::new();
+        let mut postings_acc: BTreeMap<(String, String), Vec<u32>> = BTreeMap::new();
+
+        for (lbls, chks) in &input.series {
+            // In FormatV1, SeriesRef is the exact byte offset (unaligned).
+            let series_off = buf.len() as u64;
+            assert!(
+                !series_off.is_multiple_of(SERIES_BYTE_ALIGN as u64),
+                "expected non-16-aligned V1 series offset, got {series_off}"
+            );
+            series_refs.push(series_off);
+
+            let mut sbuf = Encbuf::new();
+            sbuf.put_uvarint(lbls.len());
+            for (k, v) in lbls.iter() {
+                let ko = *sym_file_offsets.get(k).expect("missing label name symbol");
+                let vo = *sym_file_offsets.get(v).expect("missing label value symbol");
+                sbuf.put_uvarint(ko as usize);
+                sbuf.put_uvarint(vo as usize);
+            }
+            sbuf.put_uvarint(chks.len());
+            if !chks.is_empty() {
+                sbuf.put_varint64(chks[0].min_time);
+                sbuf.put_uvarint64((chks[0].max_time - chks[0].min_time) as u64);
+                sbuf.put_uvarint64(chks[0].ref_id);
+                let mut prev_maxt = chks[0].max_time;
+                let mut prev_ref = chks[0].ref_id as i64;
+                for c in &chks[1..] {
+                    sbuf.put_uvarint64((c.min_time - prev_maxt) as u64);
+                    sbuf.put_uvarint64((c.max_time - c.min_time) as u64);
+                    sbuf.put_varint64((c.ref_id as i64) - prev_ref);
+                    prev_maxt = c.max_time;
+                    prev_ref = c.ref_id as i64;
+                }
+            }
+            let mut len_hdr = Encbuf::new();
+            len_hdr.put_uvarint(sbuf.len());
+            let scrc = crc32c::crc32c(sbuf.as_slice());
+            buf.extend_from_slice(len_hdr.as_slice());
+            buf.extend_from_slice(sbuf.as_slice());
+            buf.extend_from_slice(&scrc.to_be_bytes());
+            // Deliberately add 1 byte padding between series so subsequent series also stay unaligned if needed.
+            buf.push(0x00);
+
+            let sid = series_off as u32;
+            postings_acc
+                .entry((String::new(), String::new()))
+                .or_default()
+                .push(sid);
+            for (k, v) in lbls.iter() {
+                postings_acc
+                    .entry((k.to_string(), v.to_string()))
+                    .or_default()
+                    .push(sid);
+            }
+        }
+
+        for (kv, sids) in postings_acc {
+            postings_map.push((kv, sids));
+        }
+        if input.unsorted_postings {
+            postings_map.reverse();
+        }
+
+        let toc_label_indices = buf.len() as u64;
+        let toc_postings = buf.len() as u64;
+        let mut postings_offsets = Vec::with_capacity(postings_map.len());
+        for ((k, v), sids) in postings_map {
+            let p_off = buf.len() as u64;
+            let mut pbuf = Encbuf::new();
+            pbuf.put_be32(sids.len() as u32);
+            for sid in sids {
+                pbuf.put_be32(sid);
+            }
+            let pcrc = crc32c::crc32c(pbuf.as_slice());
+            buf.extend_from_slice(&(pbuf.len() as u32).to_be_bytes());
+            buf.extend_from_slice(pbuf.as_slice());
+            buf.extend_from_slice(&pcrc.to_be_bytes());
+            postings_offsets.push((k, v, p_off));
+        }
+
+        let toc_label_indices_table = buf.len() as u64;
+        let toc_postings_table = buf.len() as u64;
+        let mut pt_buf = Encbuf::new();
+        pt_buf.put_be32(postings_offsets.len() as u32);
+        for (k, v, off) in &postings_offsets {
+            pt_buf.put_uvarint(2);
+            pt_buf.put_uvarint_str(k);
+            pt_buf.put_uvarint_str(v);
+            pt_buf.put_uvarint64(*off);
+        }
+        let pt_crc = crc32c::crc32c(pt_buf.as_slice());
+        buf.extend_from_slice(&(pt_buf.len() as u32).to_be_bytes());
+        buf.extend_from_slice(pt_buf.as_slice());
+        buf.extend_from_slice(&pt_crc.to_be_bytes());
+
+        let mut toc = Encbuf::new();
+        toc.put_be64(toc_symbols);
+        toc.put_be64(toc_series);
+        toc.put_be64(toc_label_indices);
+        toc.put_be64(toc_label_indices_table);
+        toc.put_be64(toc_postings);
+        toc.put_be64(toc_postings_table);
+        toc.put_crc32c();
+        buf.extend_from_slice(toc.as_slice());
+
+        (buf, series_refs, sym_file_offsets)
+    }
+
+    #[test]
+    fn index_v1_read_symbols_unaligned_series_and_unsorted_postings() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx_path = dir.path().join(INDEX_FILENAME);
+
+        // > 32 symbols so checkpointing & ReverseLookup across multiple 32-symbol blocks are exercised.
+        let mut syms: Vec<String> = (0..45).map(|i| format!("sym_{i:02}")).collect();
+        syms.extend(
+            [
+                "",
+                "__name__",
+                "env",
+                "http_requests",
+                "job",
+                "prod",
+                "staging",
+                "web_api",
+                "worker",
+                "z_metric",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+
+        let l1 = Labels::from_pairs([
+            ("__name__", "http_requests"),
+            ("env", "prod"),
+            ("job", "web_api"),
+        ]);
+        let l2 = Labels::from_pairs([
+            ("__name__", "z_metric"),
+            ("env", "staging"),
+            ("job", "worker"),
+        ]);
+        let l3 = Labels::from_pairs([
+            ("__name__", "http_requests"),
+            ("env", "prod"),
+            ("job", "worker"),
+        ]);
+
+        let (bytes, expected_refs, sym_offsets) = build_format_v1_index_bytes(&FormatV1TestInput {
+            symbols: syms.clone(),
+            series: vec![
+                (
+                    l1.clone(),
+                    vec![ChunkMeta {
+                        ref_id: 11,
+                        min_time: 1_000,
+                        max_time: 2_000,
+                        chunk: None,
+                    }],
+                ),
+                (
+                    l2.clone(),
+                    vec![
+                        ChunkMeta {
+                            ref_id: 22,
+                            min_time: 1_000,
+                            max_time: 2_000,
+                            chunk: None,
+                        },
+                        ChunkMeta {
+                            ref_id: 33,
+                            min_time: 2_001,
+                            max_time: 3_000,
+                            chunk: None,
+                        },
+                    ],
+                ),
+                (
+                    l3.clone(),
+                    vec![ChunkMeta {
+                        ref_id: 44,
+                        min_time: 3_001,
+                        max_time: 4_000,
+                        chunk: None,
+                    }],
+                ),
+            ],
+            unsorted_postings: true,
+        });
+        fs::write(&idx_path, &bytes).unwrap();
+
+        let r = IndexReader::open(&idx_path).unwrap();
+        assert_eq!(r.version(), INDEX_FORMAT_V1);
+        // 55 unique symbols -> ceil(55 / 32) = 2 checkpoints * 8 bytes = 16.
+        assert_eq!(r.symbol_table_size(), 16);
+        assert_eq!(r.symbols().unwrap().len(), 55);
+
+        // V1 lookup_symbol takes direct byte offsets (including symbols in the second 32-symbol chunk).
+        for s in ["", "__name__", "sym_00", "sym_35", "sym_44", "z_metric"] {
+            let off = sym_offsets[s];
+            assert_eq!(r.lookup_symbol(off).unwrap(), s);
+        }
+
+        // Unsorted postings table must still yield sorted label_names and label_values.
+        assert_eq!(r.label_names(), vec!["__name__", "env", "job"]);
+        assert_eq!(r.label_values("job").unwrap(), vec!["web_api", "worker"]);
+        assert_eq!(r.label_values("env").unwrap(), vec!["prod", "staging"]);
+        assert_eq!(r.label_values("").unwrap(), vec![""]);
+        assert!(r.label_values("nonexistent").unwrap().is_empty());
+
+        let all = r.all_postings().unwrap();
+        assert_eq!(all, expected_refs);
+
+        // Series lookup using direct unaligned byte-offset SeriesRefs.
+        let (d1, c1) = r.series(all[0]).unwrap();
+        assert_eq!(d1, l1);
+        assert_eq!(c1.len(), 1);
+        assert_eq!(c1[0].ref_id, 11);
+
+        let (d2, c2) = r.series(all[1]).unwrap();
+        assert_eq!(d2, l2);
+        assert_eq!(c2.len(), 2);
+        assert_eq!(c2[0].ref_id, 22);
+        assert_eq!(c2[1].ref_id, 33);
+
+        assert_eq!(r.series_labels(all[2]).unwrap(), l3);
+        assert_eq!(
+            r.label_names_for(&[all[0]]).unwrap(),
+            vec!["__name__", "env", "job"]
+        );
+
+        assert_eq!(r.postings("job", &["worker"]).unwrap(), vec![all[1], all[2]]);
+        assert_eq!(r.postings("job", &["worker", "web_api"]).unwrap(), all);
+        assert_eq!(r.postings_for_all_values("env").unwrap(), all);
+        assert_eq!(
+            r.postings_for_label_matching("job", &mut |v| v.starts_with("web"))
+                .unwrap(),
+            vec![all[0]]
+        );
+
+        let m = LabelMatcher::new(MatchType::Equal, "env", "prod").unwrap();
+        assert_eq!(postings_for_matchers(&r, &[m]).unwrap(), vec![all[0], all[2]]);
+    }
+
+    #[test]
+    fn index_v1_invalid_offsets_return_err_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx_path = dir.path().join(INDEX_FILENAME);
+
+        let l1 = Labels::from_pairs([("__name__", "m1")]);
+        let (bytes, refs, _) = build_format_v1_index_bytes(&FormatV1TestInput {
+            symbols: vec!["".into(), "__name__".into(), "m1".into()],
+            series: vec![(
+                l1,
+                vec![ChunkMeta {
+                    ref_id: 1,
+                    min_time: 100,
+                    max_time: 200,
+                    chunk: None,
+                }],
+            )],
+            unsorted_postings: false,
+        });
+        fs::write(&idx_path, &bytes).unwrap();
+
+        let r = IndexReader::open(&idx_path).unwrap();
+        assert!(matches!(
+            r.lookup_symbol(u32::MAX),
+            Err(IndexError::UnknownSymbolOffset(u32::MAX))
+        ));
+        assert!(r.series(refs[0] + 1).is_err());
+        assert!(r.series(u64::MAX).is_err());
     }
 }

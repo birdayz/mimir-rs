@@ -30,6 +30,7 @@ use mimir_ring::partition_ring::{
 };
 use mimir_ring::ring::Ring;
 use mimir_storage::bucket::BucketClient;
+use mimir_storage::ingest::ReaderState;
 use mimir_storage::shipper::ShipperMetrics;
 use mimir_storage::TSDBMetrics;
 use parking_lot::{Mutex, RwLock};
@@ -848,14 +849,18 @@ impl Ingester {
         Err(IngesterError::Unavailable { state: s })
     }
 
-    /// Checks if the ingester is available for pushes (`Running` or `Starting` with active Kafka reader).
+    /// Checks if the ingester is available for pushes (`Running` or `Starting` with Starting/Running Kafka reader).
     pub fn check_available_for_push(&self) -> Result<(), IngesterError> {
         let s = self.state();
         if s == State::Running {
             return Ok(());
         }
-        if s == State::Starting && self.ingest_reader.read().is_some() {
-            return Ok(());
+        if s == State::Starting {
+            if let Some(reader) = self.ingest_reader.read().as_ref() {
+                if matches!(reader.state(), ReaderState::Starting | ReaderState::Running) {
+                    return Ok(());
+                }
+            }
         }
         Err(IngesterError::Unavailable { state: s })
     }
@@ -1298,7 +1303,6 @@ impl Ingester {
                     if removed.is_some() {
                         let tracker_names = db.active_series.current_matcher_names();
                         self.metrics.mem_users.dec();
-                        self.tsdb_metrics.remove_registry_for_tenant(&k);
                         self.metrics
                             .delete_per_user_custom_tracker_metrics(&k, &tracker_names);
                     }
@@ -1575,26 +1579,28 @@ impl Ingester {
     async fn run_starting(self: &Arc<Self>, ctx: ServiceContext) -> Result<(), IngesterError> {
         let res = self.run_starting_inner(&ctx).await;
         if let Err(ref _e) = res {
-            ctx.cancel();
             let reader_opt = self.ingest_reader.write().take();
             if let Some(r) = reader_opt {
                 r.stop().await;
             }
-            let lc_svc_opt = self.lifecycler_svc.lock().clone();
-            if let Some(svc) = lc_svc_opt {
-                svc.stop_async();
-                let _ = svc.await_terminated().await;
-            }
-            let plc_svc_opt = self.partition_lifecycler_svc.lock().clone();
-            if let Some(svc) = plc_svc_opt {
-                svc.stop_async();
-                let _ = svc.await_terminated().await;
-            }
+            ctx.cancel();
             let tasks = std::mem::take(&mut *self.background_tasks.lock());
             for t in tasks {
                 let _ = t.await;
             }
-            self.close_all_tsdbs().await;
+            let plc_svc_opt = self.partition_lifecycler_svc.lock().take();
+            if let Some(svc) = plc_svc_opt {
+                svc.stop_async();
+                let _ = svc.await_terminated().await;
+            }
+            let lc_svc_opt = self.lifecycler_svc.lock().take();
+            if let Some(svc) = lc_svc_opt {
+                svc.stop_async();
+                let _ = svc.await_terminated().await;
+            }
+            if !self.blocks_cfg.tsdb.keep_user_tsdb_open_on_shutdown {
+                self.close_all_tsdbs().await;
+            }
             let mut st = self.state.write();
             if *st == State::Starting {
                 *st = State::Failed;
@@ -1628,7 +1634,10 @@ impl Ingester {
             }
         }
 
-        self.open_existing_tsdbs_with_context(Some(ctx)).await?;
+        if let Err(e) = self.open_existing_tsdbs_with_context(Some(ctx)).await {
+            self.close_all_tsdbs().await;
+            return Err(e);
+        }
 
         // Start owned series loop before partition replay and lifecycler.
         if self.owned_series_strategy.is_some() {
@@ -2221,5 +2230,117 @@ mod tests {
 
         w_svc.stop_async();
         let _ = w_svc.await_terminated().await;
+    }
+
+    #[tokio::test]
+    async fn check_available_for_push_requires_starting_or_running_reader_and_close_all_keeps_tsdb_metrics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = IngesterConfig::default();
+        ing_cfg.ring.instance_id = "inst-avail".to_string();
+        let mut blocks_cfg = BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().to_string();
+        let reg = Registry::new();
+
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            IngestStorageConfig::default(),
+            Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&reg),
+        )
+        .unwrap();
+
+        struct NoOpConsumer;
+        impl mimir_storage::ingest::RecordBatchConsumer for NoOpConsumer {
+            fn consume(
+                &self,
+                _records: Vec<mimir_storage::ingest::FetchedRecord>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>
+            {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let reader = Arc::new(
+            mimir_storage::ingest::SingleClusterPartitionReader::new(
+                mimir_config::KafkaConfig {
+                    address: mimir_config::types::StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+                    topic: "ingest".to_string(),
+                    ..Default::default()
+                },
+                0,
+                "inst-avail",
+                None,
+                Arc::new(NoOpConsumer),
+                None,
+            )
+            .unwrap(),
+        );
+        ing.set_state_for_test(State::Starting);
+        *ing.ingest_reader.write() = Some(Arc::new(crate::ingest_storage::IngestReaderHandle::Single(
+            Arc::clone(&reader),
+        )));
+
+        // ReaderState::New must be rejected during State::Starting.
+        assert!(ing.check_available_for_push().is_err());
+
+        // ReaderState::Starting and Running must be accepted.
+        reader.set_state_for_test(ReaderState::Starting);
+        assert!(ing.check_available_for_push().is_ok());
+        reader.set_state_for_test(ReaderState::Running);
+        assert!(ing.check_available_for_push().is_ok());
+
+        // ReaderState::Failed must be rejected.
+        reader.set_state_for_test(ReaderState::Failed);
+        assert!(ing.check_available_for_push().is_err());
+
+        // close_all_tsdbs must NOT remove tenant registry from tsdb_metrics (Go closeAllTSDBs parity).
+        let db = ing.get_or_create_tsdb("u-keep-reg").unwrap();
+        assert!(ing.tsdb_metrics.registry_for_tenant("u-keep-reg").is_some());
+        drop(db);
+        ing.close_all_tsdbs().await;
+        assert!(
+            ing.tsdb_metrics.registry_for_tenant("u-keep-reg").is_some(),
+            "close_all_tsdbs must retain tenant registry in tsdb_metrics"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_starting_failure_respects_keep_user_tsdb_open_on_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = IngesterConfig::default();
+        ing_cfg.ring.instance_id = "inst-keep".to_string();
+        let mut blocks_cfg = BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().to_string();
+        blocks_cfg.tsdb.keep_user_tsdb_open_on_shutdown = true;
+
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            IngestStorageConfig::default(),
+            Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let _db = ing.get_or_create_tsdb("u-open").unwrap();
+        let ctx = ServiceContext::background();
+        ctx.cancel();
+        let err = ing.run_starting(ctx).await;
+        assert!(err.is_err());
+        assert!(
+            ing.get_tsdb("u-open").is_some(),
+            "keep_user_tsdb_open_on_shutdown=true must keep TSDBs open on startup cancellation"
+        );
     }
 }

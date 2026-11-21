@@ -261,17 +261,13 @@ pub(crate) fn snapshot_query_sources_with_lock(
     mint: i64,
     maxt: i64,
     mode: HeadSnapshotMode,
-) -> QuerySourceSnapshot {
+) -> Result<QuerySourceSnapshot, QuerierError> {
     let lock_guard = blocks_lock.map(|l| l.read());
     if closed.is_some_and(|c| c.load(AtomicOrdering::Acquire))
         || head.is_some_and(Head::is_closed)
     {
         drop(lock_guard);
-        return QuerySourceSnapshot {
-            blocks: Vec::new(),
-            block_guards: Vec::new(),
-            head: None,
-        };
+        return Err(QuerierError::Closed);
     }
     let slice: &[Arc<Block>] = match lock_guard.as_ref() {
         Some(g) => g.as_slice(),
@@ -281,21 +277,23 @@ pub(crate) fn snapshot_query_sources_with_lock(
     let mut block_guards = Vec::new();
     for b in slice {
         if b.overlaps_closed_interval(mint, maxt) {
-            if let Some(bg) = Block::start_read(b) {
-                blocks.push(Arc::clone(b));
-                block_guards.push(bg);
-            }
+            let Some(bg) = Block::start_read(b) else {
+                drop(lock_guard);
+                return Err(QuerierError::Closed);
+            };
+            blocks.push(Arc::clone(b));
+            block_guards.push(bg);
         }
     }
     let head_snap = head.and_then(|h| {
         snapshot_head_query_source(h, last_gc_mmap_ref, mint, maxt, mode)
     });
     drop(lock_guard);
-    QuerySourceSnapshot {
+    Ok(QuerySourceSnapshot {
         blocks,
         block_guards,
         head: head_snap,
-    }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -504,7 +502,7 @@ impl<'a> TsdbQuerier<'a> {
     fn snapshot_blocks(
         &self,
         guard: Option<&parking_lot::RwLockReadGuard<'a, Vec<Arc<Block>>>>,
-    ) -> (Vec<Arc<Block>>, Vec<BlockReadGuard>) {
+    ) -> Result<(Vec<Arc<Block>>, Vec<BlockReadGuard>), QuerierError> {
         let slice: &[Arc<Block>] = match guard {
             Some(g) => g.as_slice(),
             None => self.blocks.as_slice(),
@@ -513,19 +511,20 @@ impl<'a> TsdbQuerier<'a> {
         let mut guards = Vec::new();
         for b in slice {
             if b.overlaps_closed_interval(self.mint, self.maxt) {
-                if let Some(bg) = Block::start_read(b) {
-                    blocks.push(Arc::clone(b));
-                    guards.push(bg);
-                }
+                let Some(bg) = Block::start_read(b) else {
+                    return Err(QuerierError::Closed);
+                };
+                blocks.push(Arc::clone(b));
+                guards.push(bg);
             }
         }
-        (blocks, guards)
+        Ok((blocks, guards))
     }
 
     /// Holds `blocks_lock.read()` ONLY long enough to check `is_closed()`, clone
     /// overlapping `Block`s with `BlockReadGuard`s, register a `HeadReadGuard`, and capture
     /// `HeadReadIsolation`, then drops `blocks_lock.read()` immediately.
-    fn snapshot_sources(&self, mode: HeadSnapshotMode) -> QuerySourceSnapshot {
+    fn snapshot_sources(&self, mode: HeadSnapshotMode) -> Result<QuerySourceSnapshot, QuerierError> {
         snapshot_query_sources_with_lock(
             self.head,
             &self.blocks,
@@ -538,20 +537,25 @@ impl<'a> TsdbQuerier<'a> {
         )
     }
 
-    fn try_snapshot_sources(&self) -> Option<QuerySourceSnapshot> {
+    fn try_snapshot_sources(&self) -> Result<Option<QuerySourceSnapshot>, QuerierError> {
         let lock_guard = match self.blocks_lock {
-            Some(l) => Some(l.try_read()?),
+            Some(l) => match l.try_read() {
+                Some(g) => Some(g),
+                None => return Ok(None),
+            },
             None => None,
         };
         if self.is_closed() {
             drop(lock_guard);
-            return Some(QuerySourceSnapshot {
-                blocks: Vec::new(),
-                block_guards: Vec::new(),
-                head: None,
-            });
+            return Err(QuerierError::Closed);
         }
-        let (blocks, block_guards) = self.snapshot_blocks(lock_guard.as_ref());
+        let (blocks, block_guards) = match self.snapshot_blocks(lock_guard.as_ref()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                drop(lock_guard);
+                return Err(e);
+            }
+        };
         let head_snap = self.head.and_then(|h| {
             snapshot_head_query_source(
                 h,
@@ -562,20 +566,23 @@ impl<'a> TsdbQuerier<'a> {
             )
         });
         drop(lock_guard);
-        Some(QuerySourceSnapshot {
+        Ok(Some(QuerySourceSnapshot {
             blocks,
             block_guards,
             head: head_snap,
-        })
+        }))
     }
 
     fn blocks_match_prepared(&self, prepared: &PreparedChunkSelect) -> Result<bool, QuerierError> {
         let Some(lock) = self.blocks_lock else {
-            return Ok(!self.is_closed());
+            if self.is_closed() {
+                return Err(QuerierError::Closed);
+            }
+            return Ok(true);
         };
         let lock_guard = lock.read();
         if self.is_closed() {
-            return Ok(false);
+            return Err(QuerierError::Closed);
         }
         let mut idx = 0usize;
         let mut all_match = true;
@@ -688,7 +695,7 @@ impl<'a> TsdbQuerier<'a> {
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<PreparedChunkSelect, QuerierError> {
-        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective)?;
         self.prepare_select_locked(snapshot, matchers, unordered)
     }
 
@@ -703,7 +710,7 @@ impl<'a> TsdbQuerier<'a> {
         max_source_series: usize,
         max_total_refs: usize,
     ) -> Result<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>, QuerierError> {
-        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective)?;
         let prepared = self.prepare_select_locked(snapshot, matchers, unordered)?;
         if prepared.is_empty() {
             let empty_min_times: Vec<i64> = prepared
@@ -744,7 +751,7 @@ impl<'a> TsdbQuerier<'a> {
         max_source_series: usize,
         max_total_refs: usize,
     ) -> Result<Option<Result<Vec<QueryChunkSeries>, PreparedChunkSelect>>, QuerierError> {
-        let Some(snapshot) = self.try_snapshot_sources() else {
+        let Some(snapshot) = self.try_snapshot_sources()? else {
             return Ok(None);
         };
         let prepared = self.prepare_select_locked(snapshot, matchers, unordered)?;
@@ -787,7 +794,7 @@ impl<'a> TsdbQuerier<'a> {
         if !self.blocks_match_prepared(&prepared)? {
             let unordered = prepared.unordered;
             drop(prepared);
-            let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+            let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective)?;
             prepared = self.prepare_select_locked(snapshot, matchers, unordered)?;
         }
         self.execute_prepared_select_locked(prepared, sort_series)
@@ -800,7 +807,7 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
         if self.is_closed() {
-            return Ok(Vec::new());
+            return Err(QuerierError::Closed);
         }
         self.execute_prepared_select_locked(prepared, sort_series)
     }
@@ -811,7 +818,7 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
         if self.is_closed() {
-            return Ok(Vec::new());
+            return Err(QuerierError::Closed);
         }
         let head = prepared._head_guard.as_ref().and(self.head);
         let head_iso = prepared.head_isolation.as_ref();
@@ -1033,7 +1040,7 @@ impl<'a> TsdbQuerier<'a> {
         if !self.blocks_match_prepared(&prepared)? {
             let unordered = prepared.unordered;
             drop(prepared);
-            let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+            let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective)?;
             prepared = self.prepare_select_locked(snapshot, matchers, unordered)?;
         }
 
@@ -1451,7 +1458,7 @@ impl<'a> TsdbQuerier<'a> {
         matchers: &[LabelMatcher],
         unordered: bool,
     ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
-        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective)?;
         let prepared = self.prepare_select_locked(snapshot, matchers, unordered)?;
         self.execute_prepared_select_locked(prepared, sort_series)
     }
@@ -1462,7 +1469,7 @@ impl<'a> TsdbQuerier<'a> {
         sort_series: bool,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<Labels>, QuerierError> {
-        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective);
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::Effective)?;
         let _block_guards = snapshot.block_guards;
         let blocks = snapshot.blocks;
         let head_snap = snapshot.head;
@@ -1534,7 +1541,7 @@ impl<'a> TsdbQuerier<'a> {
 
     /// Returns sorted unique label names across in-order Head and overlapping Blocks matching `matchers`.
     pub fn label_names(&self, matchers: &[LabelMatcher]) -> Result<Vec<String>, QuerierError> {
-        let snapshot = self.snapshot_sources(HeadSnapshotMode::InOrderOnly);
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::InOrderOnly)?;
         let _block_guards = snapshot.block_guards;
         let blocks = snapshot.blocks;
         let _head_snap = snapshot.head;
@@ -1570,7 +1577,7 @@ impl<'a> TsdbQuerier<'a> {
         limit: Option<usize>,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<String>, QuerierError> {
-        let snapshot = self.snapshot_sources(HeadSnapshotMode::InOrderOnly);
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::InOrderOnly)?;
         let _block_guards = snapshot.block_guards;
         let blocks = snapshot.blocks;
         let _head_snap = snapshot.head;
@@ -1653,7 +1660,7 @@ impl<'a> TsdbQuerier<'a> {
 
     /// Returns the number of active series in Head (plus series in overlapping blocks if queried).
     pub fn series_count(&self) -> Result<usize, QuerierError> {
-        let snapshot = self.snapshot_sources(HeadSnapshotMode::FullRange);
+        let snapshot = self.snapshot_sources(HeadSnapshotMode::FullRange)?;
         let _block_guards = snapshot.block_guards;
         let blocks = snapshot.blocks;
         let _head_snap = snapshot.head;

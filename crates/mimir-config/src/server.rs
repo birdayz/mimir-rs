@@ -346,6 +346,11 @@ impl ServerConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.metrics_cache_duration.0 < 0 {
+            return Err(ConfigError::Validation(
+                "server.metrics-cache-duration must not be negative".to_string(),
+            ));
+        }
         if self.throughput_latency_cutoff.0 > 0 {
             // dskit middleware.Instrument throughput observation (request_throughput_<unit>)
             // is not ported yet; fail explicitly instead of silently ignoring the flag.
@@ -838,5 +843,21 @@ impl CompartmentsConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w26_s4_06_server_validate_rejects_negative_metrics_cache_duration() {
+        let mut cfg = ServerConfig::default();
+        cfg.validate().unwrap();
+        cfg.metrics_cache_duration = GoDuration::from_secs(-1);
+        assert_eq!(
+            cfg.validate().unwrap_err().to_string(),
+            "error validating config: server.metrics-cache-duration must not be negative"
+        );
     }
 }

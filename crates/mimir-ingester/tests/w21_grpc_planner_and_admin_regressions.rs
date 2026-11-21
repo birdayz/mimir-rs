@@ -568,10 +568,36 @@ async fn w21_df_02_block_planner_cached_and_guards_held_and_ooo_mirrored_outside
         0
     );
 
+    // Querying `user` after its overlapping block was closed must return an error rather than
+    // silently skipping the closed block (Go `block.go:ErrClosing` parity).
+    let closed_blk_err = ing
+        .handle_query_stream(
+            &tonic::metadata::MetadataMap::new(),
+            user,
+            ingesterpb::QueryRequest {
+                start_timestamp_ms: 0,
+                end_timestamp_ms: 10_000,
+                matchers: vec![ingesterpb::LabelMatcher {
+                    r#type: ingesterpb::MatchType::Equal as i32,
+                    name: "__name__".to_string(),
+                    value: "m_blk".to_string(),
+                }],
+                streaming_chunks_batch_size: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        closed_blk_err.to_string().contains("closed"),
+        "expected closed error when overlapping block is closed, got: {closed_blk_err}"
+    );
+
     // Part C: Head in-order mirrored inside MirroredChunkQuerier while OOO Head chunks are merged outside.
     // Push in-order sample at 100_000 (inside [0, 120_000]) and m_head_ooo_new at 180_000 (outside [0, 120_000]).
+    let head_user = "user-df02-head";
+    let head_db = ing.get_or_create_tsdb(head_user).unwrap();
     {
-        let mut app = db.db.appender();
+        let mut app = head_db.db.appender();
         app.append_float(None, &[("__name__", "m_head_ino")], 100_000, 10.0)
             .unwrap();
         app.append_float(None, &[("__name__", "m_head_ooo_new")], 180_000, 1.0)
@@ -580,14 +606,14 @@ async fn w21_df_02_block_planner_cached_and_guards_held_and_ooo_mirrored_outside
     }
     // Directly test concurrent OOO Head write into [0, 120_000] between mq.select() and mq.close()!
     let head_pq = PlannedTsdbChunkQuerier::new_head(
-        Arc::clone(&db.db),
+        Arc::clone(&head_db.db),
         0,
         120_000,
-        db.head_lookup_planner(),
+        head_db.head_lookup_planner(),
         false,
     );
     let mut head_mq = MirroredChunkQuerier::new_with_meta(
-        user,
+        head_user,
         outcomes.clone(),
         0,
         120_000,
@@ -604,7 +630,7 @@ async fn w21_df_02_block_planner_cached_and_guards_held_and_ooo_mirrored_outside
 
     // Now write an OOO sample on m_head_ooo_new at t=50_000 (inside [0, 120_000], <= finished_at_ms)!
     {
-        let mut app = db.db.appender();
+        let mut app = head_db.db.appender();
         app.append_float(None, &[("__name__", "m_head_ooo_new")], 50_000, 99.0)
             .unwrap();
         app.commit().unwrap();
@@ -621,7 +647,7 @@ async fn w21_df_02_block_planner_cached_and_guards_held_and_ooo_mirrored_outside
     let qs = ing
         .handle_query_stream(
             &tonic::metadata::MetadataMap::new(),
-            user,
+            head_user,
             ingesterpb::QueryRequest {
                 start_timestamp_ms: 0,
                 end_timestamp_ms: 120_000,

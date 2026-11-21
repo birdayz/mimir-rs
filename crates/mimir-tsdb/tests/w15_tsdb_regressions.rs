@@ -353,7 +353,10 @@ fn tsdb_06_tsdb_open_applies_chunk_end_time_variance_before_wal_replay() {
 }
 
 #[test]
-fn wll_01_closed_tsdb_querier_all_methods_return_empty_ok() {
+fn wll_01_closed_tsdb_querier_all_methods_return_closed_err() {
+    use mimir_tsdb::querier::QuerierError;
+    use mimir_tsdb::search::SearchHints;
+
     let dir = tempfile::tempdir().unwrap();
     let db = Tsdb::open_with_reload_interval(dir.path(), TsdbOptions::default(), Duration::ZERO)
         .unwrap();
@@ -367,12 +370,14 @@ fn wll_01_closed_tsdb_querier_all_methods_return_empty_ok() {
 
     let q = db.querier(i64::MIN, i64::MAX);
     let m = [LabelMatcher::new(MatchType::Equal, "__name__", "wll01").unwrap()];
-    assert!(q.select(true, &m).unwrap().is_empty());
-    assert!(q.select_chunks(true, &m).unwrap().is_empty());
-    assert!(q.select_raw_labels(true, &m).unwrap().is_empty());
-    assert!(q.label_names(&m).unwrap().is_empty());
-    assert!(q.label_values("job", None, &m).unwrap().is_empty());
-    assert!(q.label_names_and_values(&m).unwrap().is_empty());
-    assert_eq!(q.label_values_cardinality("job", &m).unwrap(), 0);
-    assert_eq!(q.series_count().unwrap(), 0);
+    assert!(matches!(q.select(true, &m), Err(QuerierError::Closed)));
+    assert!(matches!(q.select_chunks(true, &m), Err(QuerierError::Closed)));
+    assert!(matches!(q.select_raw_labels(true, &m), Err(QuerierError::Closed)));
+    assert!(matches!(q.label_names(&m), Err(QuerierError::Closed)));
+    assert!(matches!(q.label_values("job", None, &m), Err(QuerierError::Closed)));
+    assert!(matches!(q.label_names_and_values(&m), Err(QuerierError::Closed)));
+    assert!(matches!(q.label_values_cardinality("job", &m), Err(QuerierError::Closed)));
+    assert!(matches!(q.series_count(), Err(QuerierError::Closed)));
+    assert!(matches!(q.search_label_names(&SearchHints::default(), &m), Err(QuerierError::Closed)));
+    assert!(matches!(q.search_label_values("job", &SearchHints::default(), &m), Err(QuerierError::Closed)));
 }

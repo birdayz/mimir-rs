@@ -569,6 +569,8 @@ pub enum SASLMechanism {
     MskIam,
 }
 
+pub const INVALID_SASL_MECHANISM_ERR: &str = "the configured SASL mechanism is invalid, must be one of: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER, AWS_MSK_IAM";
+
 impl SASLMechanism {
     pub fn parse(s: &str) -> Result<Self, ConfigError> {
         match s {
@@ -577,9 +579,7 @@ impl SASLMechanism {
             "SCRAM-SHA-512" => Ok(Self::ScramSha512),
             "OAUTHBEARER" => Ok(Self::Oauthbearer),
             "AWS_MSK_IAM" => Ok(Self::MskIam),
-            _ => Err(ConfigError::Flag(
-                "the configured SASL mechanism is invalid, must be one of: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER, AWS_MSK_IAM".to_string(),
-            )),
+            _ => Err(ConfigError::Flag(INVALID_SASL_MECHANISM_ERR.to_string())),
         }
     }
 

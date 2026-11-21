@@ -19,10 +19,13 @@ use mimir_common::logging::{
     LogValue, Logger,
 };
 use mimir_common::tracing::{
-    detected_exporter_kind, init_otel_or_jaeger_from_env, jaeger_basic_auth_from_env,
-    jaeger_endpoint_from_env, otlp_headers_from_env, otlp_timeout_from_env,
-    otlp_tls_paths_from_env, otlp_traces_endpoint_from_env, resolve_service_name,
-    ExportedSpan, SpanAttrValue, SpanExporterFn,
+    detected_exporter_kind, encode_jaeger_agent_emit_batch_compact,
+    encode_jaeger_thrift_batch_binary, encode_otlp_grpc_frame, encode_otlp_trace_request_protobuf,
+    global_tracing, init_otel_or_jaeger_from_env, jaeger_basic_auth_from_env,
+    jaeger_target_from_env, otlp_headers_from_env, otlp_protocol_from_env,
+    otlp_timeout_from_env, otlp_tls_paths_from_env, otlp_traces_endpoint_for_protocol,
+    resolve_service_name, ExportedSpan, JaegerTarget, OtlpProtocol, SpanAttrValue,
+    SpanExporterFn,
 };
 use mimir_common::services::{FnListener, ManagedBasicService, Service, ServiceContext, State};
 use mimir_config::ingester::KVStoreConfig;
@@ -173,12 +176,29 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         .tracker(Some(&registry));
 
     let tracing_service = resolve_service_name(&cfg.target.0);
-    let span_exporter = build_span_exporter();
-    if let Err(err) = init_otel_or_jaeger_from_env(&tracing_service, logger.as_ref(), span_exporter) {
-        logger.log(
-            LogLevel::Error,
-            &[("msg", "Failed to setup tracing"), ("err", &err)],
-        );
+    let mut span_exporter_handle: Option<SpanExporterHandle> = None;
+    match try_build_span_exporter_with_handle() {
+        Ok((span_exporter, handle)) => {
+            if let Err(err) =
+                init_otel_or_jaeger_from_env(&tracing_service, logger.as_ref(), span_exporter)
+            {
+                if let Some(h) = handle {
+                    h.shutdown(Duration::from_secs(5), logger.as_ref()).await;
+                }
+                logger.log(
+                    LogLevel::Error,
+                    &[("msg", "Failed to setup tracing"), ("err", &err)],
+                );
+            } else {
+                span_exporter_handle = handle;
+            }
+        }
+        Err(err) => {
+            logger.log(
+                LogLevel::Error,
+                &[("msg", "Failed to setup tracing"), ("err", &err)],
+            );
+        }
     }
 
     let version = version_info();
@@ -279,8 +299,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         (None, Overrides::new(cfg.limits.clone()))
     };
 
-    // 3. Server module (dskit server.New): binds HTTP & gRPC listeners early so port 0 resolves
-    //    before ring registration, builds TLS configs and middleware.
+    // 3. Server module (dskit server.New): validates server config, binds HTTP & gRPC
+    //    listeners early so port 0 resolves before ring registration, builds TLS configs and middleware.
+    cfg.server
+        .validate()
+        .context("error initialising module: server")?;
     let mut server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
         .context("error initialising module: server")?;
     server.set_grpc_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
@@ -424,6 +447,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             activity_tracker,
             activity_tracker_state.as_deref(),
         );
+        if let Some(h) = span_exporter_handle.take() {
+            h.shutdown(Duration::from_secs(5), logger.as_ref()).await;
+        }
         logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
         if signaled {
             return Ok(());
@@ -1154,6 +1180,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         activity_tracker,
         activity_tracker_state.as_deref(),
     );
+    if let Some(h) = span_exporter_handle.take() {
+        h.shutdown(Duration::from_secs(5), logger.as_ref()).await;
+    }
 
     logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
     // A shutdown signal received while services are still starting is a requested shutdown,
@@ -1354,11 +1383,13 @@ fn span_attr_to_otlp_json(a: &mimir_common::tracing::SpanAttribute) -> serde_jso
         SpanAttrValue::String(s) => serde_json::json!({ "stringValue": s }),
         SpanAttrValue::Bool(b) => serde_json::json!({ "boolValue": b }),
         SpanAttrValue::Int(i) => serde_json::json!({ "intValue": i.to_string() }),
+        SpanAttrValue::Float(f) => serde_json::json!({ "doubleValue": f }),
         SpanAttrValue::StringArray(arr) => serde_json::json!({
             "arrayValue": {
                 "values": arr.iter().map(|s| serde_json::json!({ "stringValue": s })).collect::<Vec<_>>()
             }
         }),
+        SpanAttrValue::Links(_) | SpanAttrValue::Events(_) => serde_json::json!({}),
     };
     serde_json::json!({ "key": a.key, "value": v })
 }
@@ -1377,8 +1408,7 @@ pub fn span_to_otlp_json_with_resource(
         s
     };
     let attrs: Vec<serde_json::Value> = span
-        .attributes
-        .iter()
+        .regular_attributes()
         .map(span_attr_to_otlp_json)
         .collect();
     let mut span_obj = serde_json::json!({
@@ -1394,6 +1424,57 @@ pub fn span_to_otlp_json_with_resource(
     if let Some(pid) = span.parent_span_id {
         if let Some(obj) = span_obj.as_object_mut() {
             obj.insert("parentSpanId".to_string(), serde_json::json!(hex_bytes(&pid)));
+        }
+    }
+    let links = span.links();
+    if !links.is_empty() {
+        let json_links: Vec<serde_json::Value> = links
+            .iter()
+            .map(|l| {
+                let mut lo = serde_json::json!({
+                    "traceId": hex_bytes(&l.trace_id),
+                    "spanId": hex_bytes(&l.span_id),
+                });
+                if let Some(ref ts) = l.trace_state {
+                    if !ts.is_empty() {
+                        if let Some(obj) = lo.as_object_mut() {
+                            obj.insert("traceState".to_string(), serde_json::json!(ts));
+                        }
+                    }
+                }
+                if !l.attributes.is_empty() {
+                    if let Some(obj) = lo.as_object_mut() {
+                        obj.insert(
+                            "attributes".to_string(),
+                            serde_json::Value::Array(
+                                l.attributes.iter().map(span_attr_to_otlp_json).collect(),
+                            ),
+                        );
+                    }
+                }
+                lo
+            })
+            .collect();
+        if let Some(obj) = span_obj.as_object_mut() {
+            obj.insert("links".to_string(), serde_json::Value::Array(json_links));
+        }
+    }
+    let events = span.events();
+    if !events.is_empty() {
+        let json_events: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| {
+                let ev_attrs: Vec<serde_json::Value> =
+                    e.attributes.iter().map(span_attr_to_otlp_json).collect();
+                serde_json::json!({
+                    "timeUnixNano": e.time_unix_nano.to_string(),
+                    "name": e.name,
+                    "attributes": ev_attrs,
+                })
+            })
+            .collect();
+        if let Some(obj) = span_obj.as_object_mut() {
+            obj.insert("events".to_string(), serde_json::Value::Array(json_events));
         }
     }
     let mut resource_attrs = Vec::with_capacity(1 + extra_resource_attrs.len());
@@ -1426,34 +1507,119 @@ pub fn span_to_otlp_json(span: &ExportedSpan) -> serde_json::Value {
     span_to_otlp_json_with_resource(span, extra)
 }
 
-pub fn try_build_span_exporter() -> Result<Option<SpanExporterFn>, String> {
-    let Some(kind) = detected_exporter_kind() else {
-        return Ok(None);
-    };
-    if kind.eq_ignore_ascii_case("none") {
-        return Ok(None);
+pub struct SpanExporterHandle {
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SpanExporterHandle {
+    pub async fn shutdown(mut self, timeout: Duration, logger: &dyn Logger) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.join.take() {
+            if tokio::time::timeout(timeout, join).await.is_err() {
+                logger.log(
+                    LogLevel::Error,
+                    &[
+                        ("msg", "OpenTelemetry trace provider failed to shutdown"),
+                        ("err", "context deadline exceeded"),
+                    ],
+                );
+            }
+        }
     }
-    if kind.eq_ignore_ascii_case("console") {
-        return Ok(Some(Arc::new(|span: ExportedSpan| {
-            let payload = span_to_otlp_json(&span);
-            println!("{payload}");
-        })));
+}
+
+#[derive(Clone)]
+enum SpanTransport {
+    OtlpHttpProtobuf {
+        client: reqwest::Client,
+        endpoint: String,
+    },
+    OtlpHttpJson {
+        client: reqwest::Client,
+        endpoint: String,
+    },
+    OtlpGrpc {
+        client: reqwest::Client,
+        export_url: String,
+    },
+    JaegerHttpThrift {
+        client: reqwest::Client,
+        endpoint: String,
+        auth: Option<(String, String)>,
+    },
+    JaegerUdpAgent {
+        socket: Arc<tokio::net::UdpSocket>,
+        addr: std::net::SocketAddr,
+    },
+}
+
+async fn send_exported_span(transport: &SpanTransport, span: &ExportedSpan) {
+    let extra = global_tracing()
+        .map(|rt| rt.resource_attributes.as_slice())
+        .unwrap_or(&[]);
+    match transport {
+        SpanTransport::OtlpHttpProtobuf { client, endpoint } => {
+            let body = encode_otlp_trace_request_protobuf(span, extra);
+            let _ = client
+                .post(endpoint)
+                .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
+                .body(body)
+                .send()
+                .await;
+        }
+        SpanTransport::OtlpHttpJson { client, endpoint } => {
+            let body = span_to_otlp_json_with_resource(span, extra);
+            let _ = client.post(endpoint).json(&body).send().await;
+        }
+        SpanTransport::OtlpGrpc { client, export_url } => {
+            let pb = encode_otlp_trace_request_protobuf(span, extra);
+            let framed = encode_otlp_grpc_frame(&pb);
+            let _ = client
+                .post(export_url)
+                .header(reqwest::header::CONTENT_TYPE, "application/grpc")
+                .header("te", "trailers")
+                .body(framed)
+                .send()
+                .await;
+        }
+        SpanTransport::JaegerHttpThrift {
+            client,
+            endpoint,
+            auth,
+        } => {
+            let body = encode_jaeger_thrift_batch_binary(span, extra);
+            let mut req = client
+                .post(endpoint)
+                .header(reqwest::header::CONTENT_TYPE, "application/x-thrift")
+                .body(body);
+            if let Some((ref user, ref pass)) = auth {
+                req = req.basic_auth(user, Some(pass));
+            }
+            let _ = req.send().await;
+        }
+        SpanTransport::JaegerUdpAgent { socket, addr } => {
+            let pkt = encode_jaeger_agent_emit_batch_compact(span, extra);
+            if pkt.len() <= 65000 {
+                let _ = socket.send_to(&pkt, *addr).await;
+            }
+        }
     }
-    let is_jaeger = kind.eq_ignore_ascii_case("jaeger");
-    let Some(endpoint) = (if is_jaeger {
-        jaeger_endpoint_from_env()
-    } else {
-        otlp_traces_endpoint_from_env()
-    }) else {
-        return Ok(None);
-    };
-    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
-        return Ok(None);
-    }
+}
+
+fn build_otlp_http_client(
+    is_jaeger: bool,
+    http2_prior_knowledge: bool,
+) -> Result<reqwest::Client, String> {
     let timeout = otlp_timeout_from_env().unwrap_or(Duration::from_secs(10));
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .timeout(timeout);
+    if http2_prior_knowledge {
+        builder = builder.http2_prior_knowledge();
+    }
     if !is_jaeger {
         let hdrs = otlp_headers_from_env();
         if !hdrs.is_empty() {
@@ -1489,30 +1655,164 @@ pub fn try_build_span_exporter() -> Result<Option<SpanExporterFn>, String> {
             .map_err(|e| format!("reading OTLP client key {key_path:?}: {e}"))?;
         combined.push(b'\n');
         combined.extend_from_slice(&key_pem);
-        let id = reqwest::Identity::from_pem(&combined)
-            .map_err(|e| format!("parsing OTLP client identity ({cert_path:?}, {key_path:?}): {e}"))?;
+        let id = reqwest::Identity::from_pem(&combined).map_err(|e| {
+            format!("parsing OTLP client identity ({cert_path:?}, {key_path:?}): {e}")
+        })?;
         builder = builder.identity(id);
     }
-    let client = builder
+    builder
         .build()
-        .map_err(|e| format!("building OTLP/Jaeger HTTP client: {:#}", anyhow::Error::new(e)))?;
-    let jaeger_auth = is_jaeger.then(jaeger_basic_auth_from_env).flatten();
+        .map_err(|e| format!("building OTLP/Jaeger HTTP client: {:#}", anyhow::Error::new(e)))
+}
+
+pub fn try_build_span_exporter_with_handle(
+) -> Result<(Option<SpanExporterFn>, Option<SpanExporterHandle>), String> {
+    let Some(kind) = detected_exporter_kind() else {
+        return Ok((None, None));
+    };
+    let kind_trimmed = kind.trim();
+    let transport = match kind_trimmed.to_ascii_lowercase().as_str() {
+        "none" => return Ok((None, None)),
+        "console" => {
+            return Ok((
+                Some(Arc::new(|span: ExportedSpan| {
+                    let payload = span_to_otlp_json(&span);
+                    println!("{payload}");
+                })),
+                None,
+            ));
+        }
+        "jaeger" => {
+            let Some(target) = jaeger_target_from_env()? else {
+                return Ok((None, None));
+            };
+            match target {
+                JaegerTarget::HttpCollector(endpoint) => {
+                    let client = build_otlp_http_client(true, false)?;
+                    let auth = jaeger_basic_auth_from_env();
+                    SpanTransport::JaegerHttpThrift {
+                        client,
+                        endpoint,
+                        auth,
+                    }
+                }
+                JaegerTarget::UdpAgent { host, port } => {
+                    use std::net::ToSocketAddrs as _;
+                    let _rt_guard = tokio::runtime::Handle::try_current()
+                        .map_err(|e| format!("no active tokio runtime for span exporter: {e}"))?;
+                    let port_num: u16 = port
+                        .parse()
+                        .map_err(|e| format!("invalid JAEGER_AGENT_PORT={port:?}: {e}"))?;
+                    let addr = (host.as_str(), port_num)
+                        .to_socket_addrs()
+                        .map_err(|e| format!("resolving Jaeger agent {host}:{port}: {e}"))?
+                        .next()
+                        .ok_or_else(|| {
+                            format!("no address resolved for Jaeger agent {host}:{port}")
+                        })?;
+                    let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+                    let std_sock = std::net::UdpSocket::bind(bind_addr)
+                        .map_err(|e| format!("binding Jaeger UDP socket: {e}"))?;
+                    std_sock
+                        .set_nonblocking(true)
+                        .map_err(|e| format!("configuring Jaeger UDP socket: {e}"))?;
+                    let socket = tokio::net::UdpSocket::from_std(std_sock)
+                        .map_err(|e| format!("wrapping Jaeger UDP socket: {e}"))?;
+                    SpanTransport::JaegerUdpAgent {
+                        socket: Arc::new(socket),
+                        addr,
+                    }
+                }
+            }
+        }
+        "otlp" => {
+            let proto = otlp_protocol_from_env()?;
+            let Some(endpoint) = otlp_traces_endpoint_for_protocol(proto) else {
+                return Ok((None, None));
+            };
+            if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+                return Err(format!("invalid OTLP endpoint {endpoint:?}"));
+            }
+            match proto {
+                OtlpProtocol::HttpProtobuf => {
+                    let client = build_otlp_http_client(false, false)?;
+                    SpanTransport::OtlpHttpProtobuf { client, endpoint }
+                }
+                OtlpProtocol::HttpJson => {
+                    let client = build_otlp_http_client(false, false)?;
+                    SpanTransport::OtlpHttpJson { client, endpoint }
+                }
+                OtlpProtocol::Grpc => {
+                    let h2_prior = endpoint.starts_with("http://");
+                    let client = build_otlp_http_client(false, h2_prior)?;
+                    let base = endpoint.trim_end_matches('/');
+                    let export_url = format!(
+                        "{base}/opentelemetry.proto.collector.trace.v1.TraceService/Export"
+                    );
+                    SpanTransport::OtlpGrpc { client, export_url }
+                }
+            }
+        }
+        _ => {
+            return Err(format!(
+                "unknown exporter or metrics producer {kind_trimmed:?}"
+            ));
+        }
+    };
+
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|e| format!("no active tokio runtime for span exporter: {e}"))?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ExportedSpan>(4096);
-    handle.spawn(async move {
-        while let Some(span) = rx.recv().await {
-            let body = span_to_otlp_json(&span);
-            let mut req = client.post(&endpoint).json(&body);
-            if let Some((ref user, ref pass)) = jaeger_auth {
-                req = req.basic_auth(user, Some(pass));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let join = handle.spawn(async move {
+        let mut shutdown_rx = Some(shutdown_rx);
+        loop {
+            tokio::select! {
+                biased;
+                maybe_span = rx.recv() => {
+                    match maybe_span {
+                        Some(span) => send_exported_span(&transport, &span).await,
+                        None => break,
+                    }
+                }
+                res = async {
+                    match &mut shutdown_rx {
+                        Some(s_rx) => s_rx.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match res {
+                        Ok(()) => {
+                            rx.close();
+                            while let Some(span) = rx.recv().await {
+                                send_exported_span(&transport, &span).await;
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            // SpanExporterHandle was dropped without calling shutdown()
+                            // (e.g. via try_build_span_exporter / build_span_exporter); keep
+                            // draining spans until all SpanExporterFn senders drop.
+                            shutdown_rx = None;
+                        }
+                    }
+                }
             }
-            let _ = req.send().await;
         }
     });
-    Ok(Some(Arc::new(move |span: ExportedSpan| {
-        let _ = tx.try_send(span);
-    })))
+    Ok((
+        Some(Arc::new(move |span: ExportedSpan| {
+            let _ = tx.try_send(span);
+        })),
+        Some(SpanExporterHandle {
+            shutdown_tx: Some(shutdown_tx),
+            join: Some(join),
+        }),
+    ))
+}
+
+pub fn try_build_span_exporter() -> Result<Option<SpanExporterFn>, String> {
+    try_build_span_exporter_with_handle().map(|(exp, _)| exp)
 }
 
 async fn await_startup_with_shutdown<F, S>(
@@ -1642,5 +1942,130 @@ mod tests {
             elapsed < Duration::from_millis(190),
             "must NOT sleep 2 * shutdown_delay ({elapsed:?})"
         );
+    }
+
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn build_span_exporter_stays_alive_across_async_yields() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received_srv = Arc::clone(&received);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let rec = Arc::clone(&received_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        rec.fetch_add(1, Ordering::SeqCst);
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let exp = {
+            let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_exp = std::env::var("OTEL_TRACES_EXPORTER").ok();
+            let prev_proto = std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL").ok();
+            let prev_ep = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").ok();
+
+            std::env::set_var("OTEL_TRACES_EXPORTER", "OTLP");
+            std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf");
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                format!("http://{addr}/v1/traces"),
+            );
+
+            let exp = build_span_exporter().expect("exporter must build");
+
+            match prev_exp {
+                Some(v) => std::env::set_var("OTEL_TRACES_EXPORTER", v),
+                None => std::env::remove_var("OTEL_TRACES_EXPORTER"),
+            }
+            match prev_proto {
+                Some(v) => std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", v),
+                None => std::env::remove_var("OTEL_EXPORTER_OTLP_PROTOCOL"),
+            }
+            match prev_ep {
+                Some(v) => std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", v),
+                None => std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
+            }
+            exp
+        };
+
+        // Yield several times so the dropped SpanExporterHandle oneshot cancellation
+        // is guaranteed to have been polled before we emit spans.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        for i in 0..3u8 {
+            exp(ExportedSpan {
+                service_name: "mimir-test".to_string(),
+                trace_id: [0x11; 16],
+                span_id: [i + 1; 8],
+                parent_span_id: None,
+                name: format!("span-{i}"),
+                kind: 2,
+                start_time_unix_nano: 1_000_000,
+                end_time_unix_nano: 2_000_000,
+                attributes: Vec::new(),
+                status_error: false,
+            });
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        drop(exp);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while received.load(Ordering::SeqCst) < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected 3 exported spans, got {}",
+                received.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        srv.abort();
+    }
+
+    #[test]
+    fn jaeger_udp_agent_without_tokio_runtime_returns_err_instead_of_panicking() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_host = std::env::var("JAEGER_AGENT_HOST").ok();
+        let prev_exp = std::env::var("OTEL_TRACES_EXPORTER").ok();
+        std::env::set_var("JAEGER_AGENT_HOST", "127.0.0.1");
+        std::env::remove_var("OTEL_TRACES_EXPORTER");
+
+        let res = try_build_span_exporter_with_handle();
+
+        match prev_host {
+            Some(v) => std::env::set_var("JAEGER_AGENT_HOST", v),
+            None => std::env::remove_var("JAEGER_AGENT_HOST"),
+        }
+        match prev_exp {
+            Some(v) => std::env::set_var("OTEL_TRACES_EXPORTER", v),
+            None => std::env::remove_var("OTEL_TRACES_EXPORTER"),
+        }
+
+        let err = match res {
+            Ok(_) => panic!("expected Err outside tokio runtime"),
+            Err(e) => e,
+        };
+        assert!(err.contains("no active tokio runtime"), "{err}");
     }
 }
