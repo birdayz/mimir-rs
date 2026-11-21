@@ -1064,6 +1064,54 @@ impl KafkaClient {
         self.metadata.read().brokers.contains_key(&node_id)
     }
 
+    /// Cached topic ID for `topic`, or all-zero if unknown.
+    pub fn cached_topic_id(&self, topic: &str) -> [u8; 16] {
+        self.metadata
+            .read()
+            .topic_ids
+            .get(topic)
+            .copied()
+            .unwrap_or([0u8; 16])
+    }
+
+    /// Applies a KIP-951 `CurrentLeader` hint (and any `NodeEndpoints` from Fetch v16) to the
+    /// cached metadata when the leader/epoch is valid and the broker is known (or supplied in
+    /// `node_endpoints`). Returns `true` if the target leader broker is now known.
+    pub fn apply_kip951_leader(
+        &self,
+        topic: &str,
+        partition: i32,
+        leader_id: i32,
+        leader_epoch: i32,
+        node_endpoints: &[kafka_protocol::messages::fetch_response::NodeEndpoint],
+    ) -> bool {
+        if leader_id < 0 || leader_epoch < 0 {
+            return false;
+        }
+        let mut md = self.metadata.write();
+        if !node_endpoints.is_empty() {
+            let mut known = self.known_node_ids.write();
+            for ep in node_endpoints {
+                if ep.node_id.0 >= 0 && !ep.host.is_empty() && ep.port > 0 {
+                    let addr = join_host_port(ep.host.as_str(), ep.port);
+                    md.brokers.insert(ep.node_id.0, BrokerInfo { addr: addr.clone() });
+                    known.insert(addr, ep.node_id.0);
+                }
+            }
+        }
+        if !md.brokers.contains_key(&leader_id) {
+            return false;
+        }
+        let key = (topic.to_string(), partition);
+        let cached_epoch = md.partition_leader_epochs.get(&key).copied().unwrap_or(-1);
+        if leader_epoch > cached_epoch {
+            md.partition_leaders.insert(key.clone(), leader_id);
+            md.partition_leader_epochs.insert(key.clone(), leader_epoch);
+            md.partition_load_errors.remove(&key);
+        }
+        true
+    }
+
     /// kadm `ListTopics(topic)` + `topics[topic].ID`: loads the topic metadata and returns its ID.
     pub async fn topic_id(&self, topic: &str) -> Result<[u8; 16], KafkaClientError> {
         self.refresh_metadata(&[topic]).await?;

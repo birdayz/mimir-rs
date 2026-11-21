@@ -93,6 +93,7 @@ async fn w23_csc_11_otel_span_511_and_metrics_on_method_mismatch() {
         cluster_validation: Some(cv),
         http_path_prefix: "/mimir".to_string(),
         cost_attribution_path: None,
+        compartments_enabled: false,
     });
 
     let app = router.layer(axum::middleware::from_fn_with_state(
@@ -207,6 +208,160 @@ async fn w23_csc_11_otel_span_511_and_metrics_on_method_mismatch() {
                 if method == "DELETE" || method == "POST" {
                     assert_eq!(route, "other", "unexpected route in {}", mf.get_name());
                 }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn w24_f8_f9_compartments_partition_ring_post_and_prefixed_root_head_405() {
+    use mimir_ingester::Ingester;
+    use mimir_ring::kv::inmemory::InMemoryKv;
+    use mimir_ring::kv::{KvClient, ProtoSnappyCodec};
+    use mimir_ring::partition_ring::{
+        PartitionRingOptions, PartitionRingWatcher, PartitionRingWatchers,
+    };
+
+    let spans = init_test_tracing();
+    spans.lock().clear();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = MimirConfig::default();
+    cfg.server.http_path_prefix = "/mimir".to_string();
+    cfg.compartments.enabled = true;
+    cfg.ingester.ring.instance_id = "test-0".to_string();
+    cfg.blocks_storage.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+    let cfg_arc = Arc::new(cfg);
+
+    let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(Arc::new(
+        ProtoSnappyCodec::<mimir_proto::ringpb::PartitionRingDesc>::new("partitionRingDesc"),
+    )));
+    let watcher = PartitionRingWatcher::new(
+        "ingester-partitions-rc-0",
+        "ingester-partitions-rc-0",
+        kv,
+        PartitionRingOptions::default(),
+        None,
+    );
+    let watchers = PartitionRingWatchers::new(vec![Arc::clone(&watcher)]).unwrap();
+
+    let ing = Ingester::new(
+        cfg_arc.ingester.clone(),
+        cfg_arc.blocks_storage.clone(),
+        cfg_arc.ingest_storage.clone(),
+        Overrides::new(cfg_arc.limits.clone()),
+        None,
+        None,
+        Some(watcher),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    ing.set_compartments(cfg_arc.compartments.clone());
+    ing.set_partition_ring_watchers(Some(watchers));
+
+    let modules = ModuleStates::new();
+    let cell = StateCell::new(State::Running);
+    modules.add("server", cell.state_fn());
+
+    let router = build_http_router(AppHttpState {
+        config: Arc::clone(&cfg_arc),
+        default_config: Arc::new(MimirConfig::default()),
+        registry: Registry::new(),
+        shutdown_requested: Arc::new(AtomicBool::new(false)),
+        ingester: Some(ing),
+        runtime_config: None,
+        overrides: Overrides::new(cfg_arc.limits.clone()),
+        memberlist_kv: None,
+        modules,
+        cost_attribution_registry: None,
+    });
+
+    let reg = Registry::new();
+    let metrics = ServerMetrics::new(&reg, false, false).unwrap();
+    let mw_cfg = Arc::new(HttpMiddlewareConfig {
+        metrics,
+        logger: Arc::new(NoopLogger),
+        log_request_headers: false,
+        log_request_at_info_level: false,
+        log_source_ips: None,
+        trace_source_ips: None,
+        exclude_headers: Vec::new(),
+        trace_request_headers: false,
+        trace_exclude_headers: Vec::new(),
+        create_new_traces: false,
+        cluster_validation: None,
+        http_path_prefix: "/mimir".to_string(),
+        cost_attribution_path: None,
+        compartments_enabled: true,
+    });
+    let app = router.layer(axum::middleware::from_fn_with_state(
+        mw_cfg,
+        dskit_http_middleware,
+    ));
+
+    // F8: POST /mimir/ingester/partition-ring when compartments.enabled == true -> 405, route="other", no http.route span attr.
+    let mut req_f8 = Request::builder()
+        .method(Method::POST)
+        .uri("/mimir/ingester/partition-ring")
+        .header(
+            "traceparent",
+            "00-dddddddddddddddddddddddddddddddd-4444444444444444-01",
+        )
+        .body(Body::empty())
+        .unwrap();
+    req_f8.extensions_mut().insert(ServedOverHttp {
+        remote_addr: "127.0.0.1:9999".parse().unwrap(),
+    });
+    let resp_f8 = app.clone().oneshot(req_f8).await.unwrap();
+    assert_eq!(resp_f8.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let _ = resp_f8.into_body().collect().await.unwrap();
+
+    // F9: HEAD /mimir/ -> 405, empty body, no Allow header, route="other", no http.route span attr.
+    let mut req_f9 = Request::builder()
+        .method(Method::HEAD)
+        .uri("/mimir/")
+        .header(
+            "traceparent",
+            "00-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-5555555555555555-01",
+        )
+        .body(Body::empty())
+        .unwrap();
+    req_f9.extensions_mut().insert(ServedOverHttp {
+        remote_addr: "127.0.0.1:9999".parse().unwrap(),
+    });
+    let resp_f9 = app.oneshot(req_f9).await.unwrap();
+    assert_eq!(resp_f9.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(!resp_f9.headers().contains_key(http::header::ALLOW));
+    let body_f9 = resp_f9.into_body().collect().await.unwrap().to_bytes();
+    assert!(body_f9.is_empty());
+
+    let exported = spans.lock().clone();
+    let s_f8 = exported
+        .iter()
+        .find(|s| s.trace_id[0] == 0xdd)
+        .expect("F8 span");
+    assert_eq!(s_f8.name, "HTTP POST");
+    assert!(!s_f8.attributes.iter().any(|a| a.key == "http.route"));
+
+    let s_f9 = exported
+        .iter()
+        .find(|s| s.trace_id[0] == 0xee)
+        .expect("F9 span");
+    assert_eq!(s_f9.name, "HTTP HEAD");
+    assert!(!s_f9.attributes.iter().any(|a| a.key == "http.route"));
+
+    for mf in reg.gather() {
+        if mf.get_name() == "cortex_request_duration_seconds" {
+            for m in mf.get_metric() {
+                let route = m
+                    .get_label()
+                    .iter()
+                    .find(|l| l.get_name() == "route")
+                    .map(|l| l.get_value())
+                    .unwrap_or("");
+                assert_eq!(route, "other", "unexpected route label in {}", mf.get_name());
             }
         }
     }

@@ -221,6 +221,13 @@ enum LineAction {
     StopWatching,
 }
 
+enum AuthError {
+    /// Server responded at HTTP level rejecting authentication (e.g. 400/401/missing token).
+    Rejected(KvError),
+    /// Transport / connect / timeout failure while reaching auth endpoint (retryable under WaitForReady).
+    Transport(KvError),
+}
+
 pub struct EtcdKv {
     http: reqwest::Client,
     endpoints: Vec<String>,
@@ -304,7 +311,7 @@ impl EtcdKv {
         *self.auth_token.write().await = None;
     }
 
-    async fn ensure_auth(&self) -> Result<Option<String>, KvError> {
+    async fn ensure_auth(&self) -> Result<Option<String>, AuthError> {
         if self.cfg.username.is_empty() {
             return Ok(None);
         }
@@ -318,10 +325,12 @@ impl EtcdKv {
         }
         #[derive(Deserialize)]
         struct AuthResp {
+            #[serde(default)]
             token: String,
         }
 
         let mut last_err = None;
+        let mut responded = false;
         let req_timeout = self.unary_request_timeout();
         for idx in 0..self.endpoints.len() {
             let url = format!("{}/v3/auth/authenticate", self.endpoint(idx));
@@ -337,30 +346,46 @@ impl EtcdKv {
                 .await
             {
                 Ok(resp) if resp.status().is_success() => {
-                    let parsed: AuthResp = resp
-                        .json()
-                        .await
-                        .map_err(|e| KvError::Http(format!("decode etcd auth: {e}")))?;
+                    let parsed: AuthResp = resp.json().await.map_err(|e| {
+                        AuthError::Rejected(KvError::Http(format!("decode etcd auth: {e}")))
+                    })?;
+                    if parsed.token.is_empty() {
+                        return Err(AuthError::Rejected(KvError::Http(
+                            "etcd auth failed: missing token in response".to_string(),
+                        )));
+                    }
                     *self.auth_token.write().await = Some(parsed.token.clone());
                     return Ok(Some(parsed.token));
                 }
                 Ok(resp) => {
-                    last_err = Some(KvError::Http(format!("etcd auth failed: {}", resp.status())));
+                    let status = resp.status();
+                    let err = KvError::Http(format!("etcd auth failed: {status}"));
+                    if status.is_client_error() {
+                        return Err(AuthError::Rejected(err));
+                    }
+                    responded = true;
+                    last_err = Some(err);
                 }
                 Err(e) => {
                     last_err = Some(KvError::Http(format_reqwest_error(&e)));
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| KvError::Http("no etcd endpoints".to_string())))
+        let err = last_err.unwrap_or_else(|| KvError::Http("no etcd endpoints".to_string()));
+        if responded {
+            Err(AuthError::Rejected(err))
+        } else {
+            Err(AuthError::Transport(err))
+        }
     }
 
-    async fn auth_headers(&self) -> Result<HeaderMap, KvError> {
+    async fn auth_headers(&self) -> Result<HeaderMap, AuthError> {
         let mut headers = HeaderMap::new();
         if let Some(tok) = self.ensure_auth().await? {
-            if let Ok(val) = HeaderValue::from_str(&tok) {
-                headers.insert("Authorization", val);
-            }
+            let val = HeaderValue::from_str(&tok).map_err(|e| {
+                AuthError::Rejected(KvError::Http(format!("invalid etcd auth token header: {e}")))
+            })?;
+            headers.insert("Authorization", val);
         }
         Ok(headers)
     }
@@ -384,7 +409,8 @@ impl EtcdKv {
         loop {
             let headers = match self.auth_headers().await {
                 Ok(h) => h,
-                Err(e) => {
+                Err(AuthError::Rejected(e)) => return Err(e),
+                Err(AuthError::Transport(e)) => {
                     warn!(path, err = %e, "etcd auth failed while connecting, retrying");
                     reconnect.wait().await;
                     continue;
@@ -779,7 +805,11 @@ impl EtcdKv {
                 r = self.auth_headers() => r,
             } {
                 Ok(h) => h,
-                Err(e) => {
+                Err(AuthError::Rejected(e)) => {
+                    error!(key = key_label, err = %e, "etcd watch auth rejected");
+                    return;
+                }
+                Err(AuthError::Transport(e)) => {
                     error!(key = key_label, err = %e, "etcd watch auth error");
                     tokio::select! {
                         _ = cancel.canceled() => return,
@@ -1125,5 +1155,169 @@ mod tests {
             )
             .await;
         assert_eq!(*got_pref.lock(), vec![("p/2".to_string(), "val2".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn w24_b03_auth_400_and_401_fail_fast_instead_of_looping() {
+        use crate::kv::StringCodec;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn spawn_auth_reject_server(status_line: &'static str, body: &'static str) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        let resp = format!(
+                            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.shutdown().await;
+                    });
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        for (status_line, body, expected_status) in [
+            (
+                "400 Bad Request",
+                r#"{"error":"etcdserver: authentication is not enabled","code":9}"#,
+                "400",
+            ),
+            (
+                "401 Unauthorized",
+                r#"{"error":"etcdserver: authentication failed, invalid user ID or password","code":16}"#,
+                "401",
+            ),
+        ] {
+            let ep = spawn_auth_reject_server(status_line, body).await;
+            let cfg = EtcdConfig {
+                endpoints: vec![ep],
+                username: "root".to_string(),
+                password: "wrong".to_string(),
+                max_retries: 3,
+                ..Default::default()
+            };
+            let kv = EtcdKv::new(cfg, Arc::new(StringCodec)).unwrap();
+
+            let err_get = tokio::time::timeout(Duration::from_secs(1), kv.get("k"))
+                .await
+                .expect("get must fail fast on auth rejection")
+                .unwrap_err();
+            assert!(
+                err_get.to_string().contains(expected_status),
+                "unexpected get error: {err_get}"
+            );
+
+            let err_list = tokio::time::timeout(Duration::from_secs(1), kv.list("p/"))
+                .await
+                .expect("list must fail fast on auth rejection")
+                .unwrap_err();
+            assert!(
+                err_list.to_string().contains(expected_status),
+                "unexpected list error: {err_list}"
+            );
+
+            let err_cas = tokio::time::timeout(
+                Duration::from_secs(1),
+                kv.cas("k", Box::new(|_| Ok(CasOutcome::Update(Box::new("v".to_string()))))),
+            )
+            .await
+            .expect("cas must fail fast on auth rejection")
+            .unwrap_err();
+            assert!(
+                err_cas.to_string().contains(expected_status),
+                "unexpected cas error: {err_cas}"
+            );
+
+            let ctx = ServiceContext::background();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                kv.watch_key("k", ctx, Box::new(|_| true)),
+            )
+            .await
+            .expect("watch_key must return immediately on auth rejection");
+        }
+    }
+
+    #[tokio::test]
+    async fn w24_b03_expired_token_reauths_once_and_fails_if_reauth_rejected() {
+        use crate::kv::StringCodec;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let range_calls = Arc::new(AtomicUsize::new(0));
+        let ac = Arc::clone(&auth_calls);
+        let rc = Arc::clone(&range_calls);
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let ac = Arc::clone(&ac);
+                let rc = Arc::clone(&rc);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req_str.lines().next().unwrap_or("");
+                    let (status_line, body) = if first_line.contains("/v3/auth/authenticate") {
+                        let c = ac.fetch_add(1, Ordering::SeqCst);
+                        if c == 0 {
+                            ("200 OK", r#"{"token":"tok-1"}"#.to_string())
+                        } else if c == 1 {
+                            ("200 OK", r#"{"token":"tok-2"}"#.to_string())
+                        } else {
+                            ("401 Unauthorized", r#"{"error":"invalid credentials"}"#.to_string())
+                        }
+                    } else {
+                        let c = rc.fetch_add(1, Ordering::SeqCst);
+                        if c == 0 {
+                            ("401 Unauthorized", r#"{"error":"invalid auth token"}"#.to_string())
+                        } else if c == 1 {
+                            ("200 OK", r#"{"kvs":[]}"#.to_string())
+                        } else {
+                            ("401 Unauthorized", r#"{"error":"invalid auth token"}"#.to_string())
+                        }
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let cfg = EtcdConfig {
+            endpoints: vec![format!("http://{addr}")],
+            username: "root".to_string(),
+            password: "secret".to_string(),
+            ..Default::default()
+        };
+        let kv = EtcdKv::new(cfg, Arc::new(StringCodec)).unwrap();
+
+        // First get: tok-1 gets 401 -> re-auths tok-2 -> succeeds.
+        let res = tokio::time::timeout(Duration::from_secs(1), kv.get("k"))
+            .await
+            .expect("re-auth must succeed")
+            .unwrap();
+        assert!(res.is_none());
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 2);
+
+        // Second get: tok-2 gets 401 -> re-auth gets 401 -> fails fast.
+        let err = tokio::time::timeout(Duration::from_secs(1), kv.get("k"))
+            .await
+            .expect("rejected re-auth must fail fast")
+            .unwrap_err();
+        assert!(err.to_string().contains("401"), "unexpected error: {err}");
     }
 }

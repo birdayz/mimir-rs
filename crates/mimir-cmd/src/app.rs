@@ -284,6 +284,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let mut server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
         .context("error initialising module: server")?;
     server.set_grpc_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
+    server.set_compartments_enabled(cfg.compartments.enabled);
     let _bound_http_addr = server.http_addr()?;
     let bound_grpc_addr = server.grpc_addr()?;
 

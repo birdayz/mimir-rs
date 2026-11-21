@@ -425,13 +425,15 @@ impl BucketClient {
     }
 
     async fn upload_source(&self, name: &str, source: s3::UploadSource) -> Result<(), BucketError> {
+        // Validate per-tenant SSE before starting OpTimer, matching Go SSEBucketClient wrapping
+        // InstrumentedBucket from the outside.
+        let sse = self.tenant_sse_override()?;
         let timer = self.timer(metrics::OP_UPLOAD);
         let size = match &source {
             s3::UploadSource::Bytes(b) => b.len() as u64,
             s3::UploadSource::File { len, .. } => *len,
         };
         let result = async {
-            let sse = self.tenant_sse_override()?;
             match &self.backend {
                 Backend::S3(b) => {
                     b.upload(&self.full_name(name), source, sse).await?;
@@ -1163,5 +1165,50 @@ mod tests {
             .map(|m| m.get_counter().get_value())
             .sum();
         assert_eq!(failures, 0.0);
+    }
+
+    #[tokio::test]
+    async fn w24_b07_invalid_tenant_sse_does_not_increment_bucket_metrics() {
+        struct BadSseProvider;
+        impl TenantConfigProvider for BadSseProvider {
+            fn s3_sse_type(&self, _user_id: &str) -> String {
+                "INVALID-SSE-TYPE".to_string()
+            }
+            fn s3_sse_kms_key_id(&self, _user_id: &str) -> String {
+                String::new()
+            }
+            fn s3_sse_kms_encryption_context(&self, _user_id: &str) -> String {
+                String::new()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let reg = prometheus::Registry::new();
+        let mut cfg = BucketConfig::default();
+        cfg.backend_cfg.backend = "filesystem".to_string();
+        cfg.backend_cfg.filesystem.dir = dir.path().to_string_lossy().into_owned();
+        let bkt = BucketClient::new_client(&cfg, "blocks", Some(&reg))
+            .unwrap()
+            .for_user_with_config("tenant-bad", Arc::new(BadSseProvider));
+
+        let err = bkt
+            .upload("01ABCDEF/meta.json", Bytes::from_static(b"{}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BucketError::TenantSse { .. }), "got {err:?}");
+
+        let mfs = reg.gather();
+        let sum_counters = |name: &str| -> f64 {
+            mfs.iter()
+                .filter(|mf| mf.get_name() == name)
+                .flat_map(|mf| mf.get_metric())
+                .map(|m| m.get_counter().get_value())
+                .sum()
+        };
+        assert_eq!(sum_counters("thanos_objstore_bucket_operations_total"), 0.0);
+        assert_eq!(
+            sum_counters("thanos_objstore_bucket_operation_failures_total"),
+            0.0
+        );
     }
 }
