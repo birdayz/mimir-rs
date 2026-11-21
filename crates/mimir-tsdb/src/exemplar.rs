@@ -587,11 +587,13 @@ impl CircularExemplarInner {
         }
 
         let mut seen = HashSet::with_capacity(e.labels.len());
-        let mut rune_len = 0usize;
-        for (name, value) in e.labels.iter() {
+        for (name, _) in e.labels.iter() {
             if !seen.insert(name) {
                 return Err(ExemplarError::DuplicateLabelName(name.to_string()));
             }
+        }
+        let mut rune_len = 0usize;
+        for (name, value) in e.labels.iter() {
             rune_len += name.chars().count() + value.chars().count();
             if rune_len > EXEMPLAR_MAX_LABEL_SET_LENGTH {
                 return Err(ExemplarError::LabelLengthExceeded);
@@ -821,5 +823,21 @@ mod tests {
         let inner = store.inner.read();
         assert_eq!(inner.exemplars.len(), max);
         assert_eq!(inner.exemplars.capacity(), max);
+    }
+
+    #[test]
+    fn duplicate_label_name_checked_before_128_rune_length_limit() {
+        let store = CircularExemplarStorage::new(10, 0);
+        let s = Labels::from_pairs([("__name__", "m")]);
+        let long_val = "x".repeat(130);
+        let ex_lbls = Labels::from_sorted_slice(&[
+            ("a", long_val.as_str()),
+            ("b", "1"),
+            ("b", "2"),
+        ]);
+        assert_eq!(
+            store.add_exemplar(&s, Exemplar::new(ex_lbls, 1.0, 100)),
+            Err(ExemplarError::DuplicateLabelName("b".to_string()))
+        );
     }
 }

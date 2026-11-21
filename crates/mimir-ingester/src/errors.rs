@@ -705,18 +705,19 @@ impl IngesterError {
     }
 
     fn map_push_error_to_status_with_message(&self, message: String) -> tonic::Status {
-        if let Self::BadRequest { message } = self {
-            return tonic::Status::invalid_argument(message.clone());
-        }
-        let code = match self.error_cause() {
-            cortexpb::ErrorCause::BadData => tonic::Code::InvalidArgument,
-            cortexpb::ErrorCause::TenantLimit => tonic::Code::FailedPrecondition,
-            cortexpb::ErrorCause::ServiceUnavailable => tonic::Code::Unavailable,
-            cortexpb::ErrorCause::InstanceLimit => tonic::Code::Unavailable,
-            cortexpb::ErrorCause::TsdbUnavailable => tonic::Code::Internal,
-            cortexpb::ErrorCause::MethodNotAllowed => tonic::Code::Unimplemented,
-            cortexpb::ErrorCause::CircuitBreakerOpen => tonic::Code::Unavailable,
-            _ => tonic::Code::Internal,
+        let code = if self.has_ingester_error_details() {
+            match self.error_cause() {
+                cortexpb::ErrorCause::BadData => tonic::Code::InvalidArgument,
+                cortexpb::ErrorCause::TenantLimit => tonic::Code::FailedPrecondition,
+                cortexpb::ErrorCause::ServiceUnavailable => tonic::Code::Unavailable,
+                cortexpb::ErrorCause::InstanceLimit => tonic::Code::Unavailable,
+                cortexpb::ErrorCause::TsdbUnavailable => tonic::Code::Internal,
+                cortexpb::ErrorCause::MethodNotAllowed => tonic::Code::Unimplemented,
+                cortexpb::ErrorCause::CircuitBreakerOpen => tonic::Code::Unavailable,
+                _ => tonic::Code::Internal,
+            }
+        } else {
+            tonic::Code::Internal
         };
         match self.error_details() {
             Some(details) => {

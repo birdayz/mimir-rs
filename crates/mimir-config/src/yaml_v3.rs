@@ -1414,6 +1414,15 @@ fn is_zero(t: &Types, ty: usize, value: &serde_yaml::Value) -> bool {
         // A non-nil pointer is never zero.
         return value.is_null();
     }
+    if info.name == "relabel.Regexp" {
+        // Go `relabel.Regexp.IsZero()`: `re.Regexp == DefaultRelabelConfig.Regex.Regexp`,
+        // so only the default `"(.*)"` is omitted on marshal; explicit `""` is emitted.
+        return match value {
+            Value::String(s) => s == "(.*)",
+            Value::Tagged(tagged) => is_zero(t, ty, &tagged.value),
+            _ => false,
+        };
+    }
     match value {
         Value::Null => true,
         Value::Bool(b) => !*b,
@@ -1948,6 +1957,10 @@ fn zero_null_fields_walk(t: &Types, val: &mut serde_yaml::Value, ty: usize, pres
                                     || fi.name.starts_with("flagext.LimitsMap[") =>
                             {
                                 *v = Value::Mapping(Mapping::new());
+                            }
+                            Some(fi) if fi.name == "relabel.Regexp" => {
+                                // Go `relabel.Config.UnmarshalYAML`: explicit `regex: null` maps to `""`.
+                                *v = Value::String(String::new());
                             }
                             Some(fi) if fi.kind == "ptr" => {
                                 // Keep explicit YAML null so Option<T> zeroes to None.

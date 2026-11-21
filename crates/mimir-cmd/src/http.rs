@@ -716,42 +716,14 @@ async fn services_handler(AxumState(st): AxumState<AppHttpState>, headers: Heade
     Html(html).into_response()
 }
 
-fn decode_query_component(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'+' {
-            out.push(b' ');
-            i += 1;
-        } else if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && bytes[i + 1].is_ascii_hexdigit()
-            && bytes[i + 2].is_ascii_hexdigit()
-        {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-            out.push(bytes[i]);
-            i += 1;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// First `mode` query parameter (`r.URL.Query().Get("mode")`), tolerating duplicates.
+/// First `mode` query parameter (`r.URL.Query().Get("mode")`), matching Go 1.17+
+/// `net/url.ParseQuery`: splits only on `&` and discards pairs containing `;` or invalid `%`
+/// escapes.
 fn extract_mode_query(raw: Option<&str>) -> Option<String> {
-    raw?
-        .split(['&', ';'])
-        .filter(|p| !p.is_empty())
-        .filter_map(|kv| kv.split_once('=').or(Some((kv, ""))))
-        .find(|(k, _)| decode_query_component(k) == "mode")
-        .map(|(_, v)| decode_query_component(v))
+    let raw = raw?;
+    let mut values = std::collections::HashMap::new();
+    let _ = mimir_ring::ring::http::go_parse_query(&mut values, raw);
+    values.remove("mode").and_then(|mut v| v.drain(..).next())
 }
 
 async fn config_handler(
@@ -784,7 +756,7 @@ async fn config_handler(
             yaml,
         )
             .into_response(),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+        Err(err) => go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &err),
     }
 }
 
@@ -850,7 +822,7 @@ async fn runtime_config_handler(
             yaml,
         )
             .into_response(),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+        Err(err) => go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &err),
     }
 }
 
@@ -1930,5 +1902,175 @@ mod tests {
         assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "text/plain");
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"unset\n");
+    }
+
+    #[tokio::test]
+    async fn d_admin_01_config_and_runtime_config_follow_go_parse_query_and_500_headers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rc_path = tmp.path().join("runtime.yaml");
+        std::fs::write(&rc_path, "overrides:\n  tenant-a:\n    max_global_series_per_user: 42\n").unwrap();
+        let mut st = test_state("", false);
+        let mut rc_cfg = st.config.runtime_config.clone();
+        rc_cfg.file.0 = vec![rc_path.to_string_lossy().into_owned()];
+        let rc_mgr = RuntimeConfigManager::new(
+            rc_cfg,
+            st.config.limits.clone(),
+            st.config.ingester.instance_limits.clone(),
+        )
+        .unwrap();
+        Arc::make_mut(&mut st.config).no_auth_tenant = "custom-tenant".to_string();
+        st.runtime_config = Some(rc_mgr);
+        let router = build_http_router(st);
+
+        let full_cfg = router
+            .clone()
+            .oneshot(Request::builder().uri("/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let full_cfg_str = String::from_utf8(full_cfg.to_vec()).unwrap();
+
+        let defaults_cfg = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/config?mode=defaults")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let defaults_cfg_str = String::from_utf8(defaults_cfg.to_vec()).unwrap();
+        assert_ne!(full_cfg_str, defaults_cfg_str);
+
+        // Semicolon in pair must cause Go 1.17+ ParseQuery to discard that pair -> full config.
+        for uri in ["/config?mode=diff;foo=1", "/config?a=1;mode=diff"] {
+            let body = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(
+                String::from_utf8(body.to_vec()).unwrap(),
+                full_cfg_str,
+                "uri {uri} should discard semicolon-contaminated pair"
+            );
+        }
+
+        // Invalid % escape skips the bad first pair and uses the subsequent valid mode=defaults pair.
+        let bad_pct = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/config?mode=diff%2&mode=defaults")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(String::from_utf8(bad_pct.to_vec()).unwrap(), defaults_cfg_str);
+
+        // Same Go ParseQuery semantics on /runtime_config.
+        let full_rc = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime_config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let full_rc_str = String::from_utf8(full_rc.to_vec()).unwrap();
+
+        let diff_rc = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime_config?mode=diff")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let diff_rc_str = String::from_utf8(diff_rc.to_vec()).unwrap();
+        assert_ne!(full_rc_str, diff_rc_str);
+
+        let semi_rc = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime_config?mode=diff;foo=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(String::from_utf8(semi_rc.to_vec()).unwrap(), full_rc_str);
+
+        let bad_pct_rc = router
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime_config?mode=defaults%2&mode=diff")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(String::from_utf8(bad_pct_rc.to_vec()).unwrap(), diff_rc_str);
+
+        // 500 error helper emits Go http.Error headers + trailing newline.
+        let err_resp = go_http_error(StatusCode::INTERNAL_SERVER_ERROR, "marshal failed");
+        assert_eq!(err_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            err_resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        let err_body = err_resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(err_body.as_ref(), b"marshal failed
+");
     }
 }

@@ -110,14 +110,21 @@ impl HistogramChunk {
     }
 
     pub fn appender(&mut self) -> Result<HistogramAppender<'_>, ChunkError> {
-        if self.b.bytes().len() == HISTOGRAM_HEADER_SIZE {
+        if self.b.bytes().len() < HISTOGRAM_HEADER_SIZE {
+            return Err(ChunkError::InvalidHeader {
+                len: self.b.bytes().len(),
+                min: HISTOGRAM_HEADER_SIZE,
+            });
+        }
+        if self.num_samples() == 0 {
+            self.b.truncate_and_set_count(HISTOGRAM_HEADER_SIZE, 0);
             return Ok(HistogramAppender {
                 chunk: self,
                 state: HistogramAppenderState::empty(),
             });
         }
 
-        let (state, valid_bits) = {
+        let (state, (used_bytes, free_bits)) = {
             let mut it = self.iter();
             while it.next_sample()?.is_some() {}
             (
@@ -143,11 +150,12 @@ impl HistogramChunk {
                     leading: it.leading,
                     trailing: it.trailing,
                 },
-                it.br.valid_bits(),
+                it.br.consumed_bytes_and_free_bits(),
             )
         };
 
-        self.b.set_count(valid_bits);
+        self.b
+            .truncate_and_set_count(HISTOGRAM_HEADER_SIZE + used_bytes, free_bits);
         Ok(HistogramAppender { chunk: self, state })
     }
 
@@ -450,7 +458,7 @@ impl<'a> HistogramAppender<'a> {
         bytes[1] = be[1];
     }
 
-    fn append_raw(&mut self, num: usize, t: i64, h: &Histogram) -> usize {
+    fn append_raw(&mut self, num: usize, t: i64, h: &Histogram) -> Result<usize, ChunkError> {
         Self::append_raw_to_stream(&mut self.chunk.b, &mut self.state, num, t, h)
     }
 
@@ -460,7 +468,7 @@ impl<'a> HistogramAppender<'a> {
         num: usize,
         t: i64,
         h: &Histogram,
-    ) -> usize {
+    ) -> Result<usize, ChunkError> {
         let mut stale_holder;
         let h = if is_stale_nan(h.sum) {
             stale_holder = Histogram::default();
@@ -475,6 +483,12 @@ impl<'a> HistogramAppender<'a> {
         let mut z_cnt_delta = 0i64;
 
         if num == 0 {
+            let num_p = checked_count_spans(&h.positive_spans).ok_or(ChunkError::InvalidChunk)?;
+            let num_n = checked_count_spans(&h.negative_spans).ok_or(ChunkError::InvalidChunk)?;
+            if num_p != h.positive_buckets.len() || num_n != h.negative_buckets.len() {
+                return Err(ChunkError::InvalidChunk);
+            }
+
             write_histogram_chunk_layout(
                 b,
                 h.schema,
@@ -489,8 +503,6 @@ impl<'a> HistogramAppender<'a> {
             state.n_spans = h.negative_spans.clone();
             state.custom_values = h.custom_values.clone();
 
-            let num_p = count_spans(&h.positive_spans);
-            let num_n = count_spans(&h.negative_spans);
             state.p_buckets = vec![0; num_p];
             state.p_buckets_delta = vec![0; num_p];
             state.n_buckets = vec![0; num_n];
@@ -507,6 +519,12 @@ impl<'a> HistogramAppender<'a> {
                 put_varbit_int(b, bkt);
             }
         } else {
+            if !is_stale_nan(h.sum)
+                && (h.positive_buckets.len() != state.p_buckets.len()
+                    || h.negative_buckets.len() != state.n_buckets.len())
+            {
+                return Err(ChunkError::InvalidChunk);
+            }
             t_delta = t.wrapping_sub(state.t);
             cnt_delta = (h.count as i64).wrapping_sub(state.cnt as i64);
             z_cnt_delta = (h.zero_count as i64).wrapping_sub(state.z_cnt as i64);
@@ -558,7 +576,7 @@ impl<'a> HistogramAppender<'a> {
         }
         state.sum = h.sum;
 
-        num + 1
+        Ok(num + 1)
     }
 
     fn recode_in_place(
@@ -569,8 +587,8 @@ impl<'a> HistogramAppender<'a> {
         negative_spans: &[HistogramSpan],
     ) -> Result<(), ChunkError> {
         let crh = self.chunk.counter_reset_header();
-        let num_p = count_spans(positive_spans);
-        let num_n = count_spans(negative_spans);
+        let num_p = checked_count_spans(positive_spans).ok_or(ChunkError::InvalidChunk)?;
+        let num_n = checked_count_spans(negative_spans).ok_or(ChunkError::InvalidChunk)?;
 
         let mut new_chunk = HistogramChunk::new();
         {
@@ -588,7 +606,7 @@ impl<'a> HistogramAppender<'a> {
                     h_old.negative_buckets =
                         insert_buckets(&h_old.negative_buckets, num_n, negative_inserts, true);
                 }
-                num = new_app.append_raw(num, t_old, &h_old);
+                num = new_app.append_raw(num, t_old, &h_old)?;
             }
             new_app.set_num_samples(num);
             new_app.set_counter_reset_header(crh);
@@ -659,7 +677,7 @@ impl<'a> HistogramAppender<'a> {
         }
 
         if num_samples == 0 {
-            let new_num = self.append_raw(0, t, h);
+            let new_num = self.append_raw(0, t, h)?;
             self.set_num_samples(new_num);
             if h.counter_reset_hint == CounterResetHint::GaugeType {
                 self.set_counter_reset_header(CounterResetHeader::GaugeType);
@@ -691,7 +709,7 @@ impl<'a> HistogramAppender<'a> {
                 let new_state = {
                     let mut app = new_chunk.appender()?;
                     app.set_counter_reset_header(cr_hint);
-                    let n = app.append_raw(0, t, h);
+                    let n = app.append_raw(0, t, h)?;
                     app.set_num_samples(n);
                     return_new_state.then_some(app.state)
                 };
@@ -720,12 +738,12 @@ impl<'a> HistogramAppender<'a> {
                     return Err(ChunkError::HistogramLayoutChange);
                 }
                 self.recode_in_place(&p_fwd, &n_fwd, &h_ref.positive_spans, &h_ref.negative_spans)?;
-                let n = self.append_raw(self.chunk.num_samples(), t, h_ref);
+                let n = self.append_raw(self.chunk.num_samples(), t, h_ref)?;
                 self.set_num_samples(n);
                 return Ok((AppendHistogramOutcome::Appended { recoded: true }, None));
             }
 
-            let n = self.append_raw(num_samples, t, h_ref);
+            let n = self.append_raw(num_samples, t, h_ref)?;
             self.set_num_samples(n);
             return Ok((AppendHistogramOutcome::Appended { recoded: false }, None));
         }
@@ -748,7 +766,7 @@ impl<'a> HistogramAppender<'a> {
             let new_state = {
                 let mut app = new_chunk.appender()?;
                 app.set_counter_reset_header(CounterResetHeader::GaugeType);
-                let n = app.append_raw(0, t, h);
+                let n = app.append_raw(0, t, h)?;
                 app.set_num_samples(n);
                 return_new_state.then_some(app.state)
             };
@@ -773,12 +791,12 @@ impl<'a> HistogramAppender<'a> {
                 return Err(ChunkError::HistogramLayoutChange);
             }
             self.recode_in_place(&p_fwd, &n_fwd, &h_ref.positive_spans, &h_ref.negative_spans)?;
-            let n = self.append_raw(self.chunk.num_samples(), t, h_ref);
+            let n = self.append_raw(self.chunk.num_samples(), t, h_ref)?;
             self.set_num_samples(n);
             return Ok((AppendHistogramOutcome::Appended { recoded: true }, None));
         }
 
-        let n = self.append_raw(num_samples, t, h_ref);
+        let n = self.append_raw(num_samples, t, h_ref)?;
         self.set_num_samples(n);
         Ok((AppendHistogramOutcome::Appended { recoded: false }, None))
     }
@@ -816,7 +834,7 @@ fn expand_int_spans_and_buckets(
     let add_insert = |inserts: &mut Vec<Insert>, inter: &mut Insert, other_idx: i64| {
         if inter.num == 0 {
             inter.bucket_idx = other_idx;
-        } else if inter.bucket_idx + (inter.num as i64) != other_idx {
+        } else if inter.bucket_idx.wrapping_add(inter.num as i64) != other_idx {
             inserts.push(*inter);
             inter.num = 0;
             inter.bucket_idx = other_idx;
@@ -839,7 +857,7 @@ fn expand_int_spans_and_buckets(
                     a_inter.pos += 1;
                     a_count_idx += 1;
                     if a_idx.is_some() {
-                        a_count += *a_buckets.get(a_count_idx)?;
+                        a_count = a_count.wrapping_add(*a_buckets.get(a_count_idx)?);
                     }
 
                     if b_inter.num > 0 {
@@ -850,7 +868,7 @@ fn expand_int_spans_and_buckets(
                     b_inter.pos += 1;
                     b_count_idx += 1;
                     if b_idx.is_some() {
-                        b_count += *b_buckets.get(b_count_idx)?;
+                        b_count = b_count.wrapping_add(*b_buckets.get(b_count_idx)?);
                     }
                 } else if av < bv {
                     if a_count == 0 {
@@ -863,7 +881,7 @@ fn expand_int_spans_and_buckets(
                         a_inter.pos += 1;
                         a_count_idx += 1;
                         if a_idx.is_some() {
-                            a_count += *a_buckets.get(a_count_idx)?;
+                            a_count = a_count.wrapping_add(*a_buckets.get(a_count_idx)?);
                         }
                         continue;
                     }
@@ -878,7 +896,7 @@ fn expand_int_spans_and_buckets(
                     b_inter.pos += 1;
                     b_count_idx += 1;
                     if b_idx.is_some() {
-                        b_count += *b_buckets.get(b_count_idx)?;
+                        b_count = b_count.wrapping_add(*b_buckets.get(b_count_idx)?);
                     }
                 }
             }
@@ -893,7 +911,7 @@ fn expand_int_spans_and_buckets(
                     a_inter.pos += 1;
                     a_count_idx += 1;
                     if a_idx.is_some() {
-                        a_count += *a_buckets.get(a_count_idx)?;
+                        a_count = a_count.wrapping_add(*a_buckets.get(a_count_idx)?);
                     }
                     continue;
                 }
@@ -909,7 +927,7 @@ fn expand_int_spans_and_buckets(
                 b_inter.pos += 1;
                 b_count_idx += 1;
                 if b_idx.is_some() {
-                    b_count += *b_buckets.get(b_count_idx)?;
+                    b_count = b_count.wrapping_add(*b_buckets.get(b_count_idx)?);
                 }
             }
             (None, None) => {
@@ -1202,8 +1220,18 @@ pub(crate) fn validate_spans_for_reduce(
     spans: &[HistogramSpan],
     num_buckets: usize,
 ) -> Result<(), ChunkError> {
+    let mut end_idx: i64 = 0;
     for (n, span) in spans.iter().enumerate() {
         if n > 0 && span.offset < 0 {
+            return Err(ChunkError::InvalidChunk);
+        }
+        if n == 0 && span.offset == i32::MIN {
+            return Err(ChunkError::InvalidChunk);
+        }
+        end_idx = end_idx
+            .saturating_add(i64::from(span.offset))
+            .saturating_add(i64::from(span.length));
+        if end_idx.saturating_sub(1) > i64::from(i32::MAX) {
             return Err(ChunkError::InvalidChunk);
         }
     }
@@ -1362,10 +1390,40 @@ mod tests {
 
     #[test]
     fn corrupt_reserved_schema_and_extreme_deltas_do_not_overflow() {
-        let mut h = Histogram {
+        // C-8: offset == i32::MIN at n == 0 and end_idx - 1 > i32::MAX are rejected.
+        let mut h_min = Histogram {
             schema: 52,
             positive_spans: vec![HistogramSpan {
                 offset: i32::MIN,
+                length: 2,
+            }],
+            positive_buckets: vec![1, 1],
+            ..Default::default()
+        };
+        assert!(matches!(
+            reduce_int_resolution(&mut h_min, super::super::EXPONENTIAL_SCHEMA_MAX),
+            Err(ChunkError::InvalidChunk)
+        ));
+
+        let mut h_over_max = Histogram {
+            schema: 52,
+            positive_spans: vec![HistogramSpan {
+                offset: i32::MAX,
+                length: 2,
+            }],
+            positive_buckets: vec![1, 1],
+            ..Default::default()
+        };
+        assert!(matches!(
+            reduce_int_resolution(&mut h_over_max, super::super::EXPONENTIAL_SCHEMA_MAX),
+            Err(ChunkError::InvalidChunk)
+        ));
+
+        // Valid i32 range with extreme i64::MAX bucket deltas wraps without panic.
+        let mut h = Histogram {
+            schema: 52,
+            positive_spans: vec![HistogramSpan {
+                offset: i32::MIN + 1,
                 length: 2,
             }],
             positive_buckets: vec![i64::MAX, i64::MAX],
@@ -1373,5 +1431,87 @@ mod tests {
         };
         reduce_int_resolution(&mut h, super::super::EXPONENTIAL_SCHEMA_MAX).unwrap();
         assert_eq!(h.schema, super::super::EXPONENTIAL_SCHEMA_MAX);
+    }
+
+    #[test]
+    fn histogram_appender_rejects_short_header_padded_bytes_and_mismatched_raw_c1_c3_c5_c6() {
+        let mut short = HistogramChunk::from_bytes(vec![0u8; HISTOGRAM_HEADER_SIZE - 1]);
+        assert!(matches!(
+            short.appender(),
+            Err(ChunkError::InvalidHeader { len: 2, min: 3 })
+        ));
+
+        let h1 = Histogram {
+            schema: 0,
+            count: 2,
+            sum: 3.0,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![2],
+            ..Default::default()
+        };
+        let h2 = Histogram {
+            schema: 0,
+            count: 5,
+            sum: 7.0,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![5],
+            ..Default::default()
+        };
+
+        let mut chunk = HistogramChunk::new();
+        {
+            let mut app = chunk.appender().unwrap();
+            app.append_histogram(None, 0, 1_000, &h1, false).unwrap();
+        }
+        let mut bytes = chunk.as_bytes().to_vec();
+        bytes.extend_from_slice(&[0xff, 0xaa, 0x55]);
+        let mut padded = HistogramChunk::from_bytes(bytes);
+        {
+            let mut app = padded.appender().unwrap();
+            app.append_histogram(None, 0, 2_000, &h2, false).unwrap();
+        }
+        let mut it = padded.iter();
+        assert_eq!(it.next_histogram().unwrap().unwrap().1.count, 2);
+        assert_eq!(it.next_histogram().unwrap().unwrap().1.count, 5);
+        assert!(it.next_histogram().unwrap().is_none());
+
+        // C-1: Direct append_raw_to_stream with u32::MAX span or mismatched buckets returns Err without panic/OOM.
+        let mut bs = BitStream::with_header(HISTOGRAM_HEADER_SIZE, 32);
+        let mut st = HistogramAppenderState::empty();
+        let corrupt_huge = Histogram {
+            positive_spans: vec![HistogramSpan { offset: 0, length: u32::MAX }],
+            positive_buckets: vec![],
+            ..Default::default()
+        };
+        assert!(matches!(
+            HistogramAppender::append_raw_to_stream(&mut bs, &mut st, 0, 100, &corrupt_huge),
+            Err(ChunkError::InvalidChunk)
+        ));
+        let corrupt_mismatch = Histogram {
+            positive_spans: vec![HistogramSpan { offset: 0, length: 5 }],
+            positive_buckets: vec![1, 2],
+            ..Default::default()
+        };
+        assert!(matches!(
+            HistogramAppender::append_raw_to_stream(&mut bs, &mut st, 0, 100, &corrupt_mismatch),
+            Err(ChunkError::InvalidChunk)
+        ));
+
+        // C-5: expand_int_spans_and_buckets wraps i64::MAX deltas cleanly.
+        let spans = [HistogramSpan { offset: 0, length: 2 }];
+        let expanded = expand_int_spans_and_buckets(&spans, &spans, &[i64::MAX, 1], &[i64::MAX, 1]);
+        assert!(expanded.is_some());
+
+        // GateA-2: 0-sample chunk with trailing padding bytes truncates to header before sample 0.
+        let mut zero_padded = HistogramChunk::from_bytes(vec![0, 0, 0, 0xff, 0xaa]);
+        {
+            let _ = zero_padded.appender().unwrap();
+            assert_eq!(zero_padded.as_bytes(), &[0, 0, 0]);
+            let mut app = zero_padded.appender().unwrap();
+            app.append_histogram(None, 0, 1_000, &h1, false).unwrap();
+        }
+        let mut it = zero_padded.iter();
+        assert_eq!(it.next_histogram().unwrap().unwrap().1.count, 2);
+        assert!(it.next_histogram().unwrap().is_none());
     }
 }

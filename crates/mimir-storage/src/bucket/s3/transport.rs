@@ -42,39 +42,42 @@ use tokio::sync::Semaphore;
 /// Go `net.Dialer.Timeout` / `KeepAlive` used by `exthttp.DefaultTransport`.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 const DIAL_KEEP_ALIVE: Duration = Duration::from_secs(30);
-/// DNS resolver override so reqwest dials the configured S3 endpoint host/IP while sending
-/// `http.tls_server_name` in TLS `ClientHello` SNI.
-#[derive(Debug)]
-pub(crate) struct SniResolver {
-    pub sni_host: String,
-    target_host: Arc<parking_lot::RwLock<Option<String>>>,
+/// Maximum number of per-target-host `reqwest::Client` instances retained in `SniClientPool`.
+const MAX_SNI_CLIENTS: usize = 64;
+
+#[inline]
+fn strip_ipv6_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
-impl SniResolver {
-    pub fn set_target_host(&self, target: &str) {
-        if self.target_host.read().as_deref() == Some(target) {
-            return;
-        }
-        *self.target_host.write() = Some(target.to_string());
-    }
+/// Immutable per-target-host DNS resolver override so reqwest dials `target_host` while
+/// sending `sni_host` in TLS `ClientHello` SNI. Each distinct target host gets its own
+/// `reqwest::Client` (and thus its own keep-alive pool and resolver), eliminating both
+/// pooled-connection misrouting and concurrent target-host races.
+#[derive(Debug)]
+struct SniResolver {
+    sni_host: String,
+    target_host: String,
 }
 
 impl reqwest::dns::Resolve for SniResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let target = self.target_host.read().clone();
         let lookup_host = if name.as_str().eq_ignore_ascii_case(&self.sni_host) {
-            target.unwrap_or_else(|| name.as_str().to_string())
+            self.target_host.clone()
         } else {
             name.as_str().to_string()
         };
         Box::pin(async move {
-            if let Ok(ip) = lookup_host.parse::<std::net::IpAddr>() {
+            let bare_host = strip_ipv6_brackets(&lookup_host);
+            if let Ok(ip) = bare_host.parse::<std::net::IpAddr>() {
                 let addrs: reqwest::dns::Addrs =
                     Box::new(std::iter::once(std::net::SocketAddr::new(ip, 0)));
                 return Ok(addrs);
             }
             let resolved: Vec<std::net::SocketAddr> =
-                tokio::net::lookup_host((lookup_host.as_str(), 0))
+                tokio::net::lookup_host((bare_host, 0))
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
                     .collect();
@@ -84,13 +87,66 @@ impl reqwest::dns::Resolve for SniResolver {
     }
 }
 
+/// Per-target-host `reqwest::Client` pool used when `http.tls_server_name` is a DNS name.
+#[derive(Clone, Debug)]
+pub(crate) struct SniClientPool {
+    pub sni_host: String,
+    tls: rustls::ClientConfig,
+    idle_conn_timeout: Option<Duration>,
+    max_idle_per_host: usize,
+    connect_timeout: Option<Duration>,
+    clients: Arc<parking_lot::RwLock<std::collections::HashMap<String, reqwest::Client>>>,
+}
+
+impl SniClientPool {
+    fn build_client(&self, target_host: &str) -> Result<reqwest::Client, String> {
+        let bare_target = strip_ipv6_brackets(target_host);
+        let resolver = Arc::new(SniResolver {
+            sni_host: self.sni_host.clone(),
+            target_host: bare_target.to_string(),
+        });
+        let mut builder = reqwest::Client::builder()
+            .use_preconfigured_tls(self.tls.clone())
+            .redirect(reqwest::redirect::Policy::none())
+            .tcp_keepalive(DIAL_KEEP_ALIVE)
+            .pool_idle_timeout(self.idle_conn_timeout)
+            .pool_max_idle_per_host(self.max_idle_per_host)
+            .http1_only()
+            .dns_resolver(resolver);
+        if let Some(t) = self.connect_timeout {
+            builder = builder.connect_timeout(t);
+        }
+        builder
+            .build()
+            .map_err(|e| format!("unable to build HTTP client: {e}"))
+    }
+
+    pub fn client_for_host(&self, target_host: &str) -> Result<reqwest::Client, String> {
+        let bare_target = strip_ipv6_brackets(target_host);
+        let key = bare_target.to_ascii_lowercase();
+        if let Some(c) = self.clients.read().get(&key) {
+            return Ok(c.clone());
+        }
+        let client = self.build_client(bare_target)?;
+        let mut guard = self.clients.write();
+        if let Some(c) = guard.get(&key) {
+            return Ok(c.clone());
+        }
+        if guard.len() >= MAX_SNI_CLIENTS {
+            guard.clear();
+        }
+        guard.insert(key, client.clone());
+        Ok(client)
+    }
+}
+
 /// An HTTP client honouring the bucket `http.*` settings.
 #[derive(Clone, Debug)]
 pub(crate) struct HttpTransport {
     pub client: reqwest::Client,
     pub response_header_timeout: Option<Duration>,
     pub conn_limit: Option<Arc<Semaphore>>,
-    pub sni: Option<Arc<SniResolver>>,
+    pub sni: Option<SniClientPool>,
 }
 
 fn go_open_err(path: &str, err: &std::io::Error) -> String {
@@ -125,10 +181,18 @@ fn system_roots() -> RootCertStore {
 
 
 
-/// Server certificate verifier implementing Go's `InsecureSkipVerify` and `ServerName` override.
+#[derive(Debug)]
+enum VerifyMode {
+    InsecureSkip,
+    RejectAll,
+    WebPki(Arc<WebPkiServerVerifier>),
+}
+
+/// Server certificate verifier implementing Go's `InsecureSkipVerify`, empty-CA reject-all,
+/// and `ServerName` override.
 #[derive(Debug)]
 struct GoVerifier {
-    inner: Option<Arc<WebPkiServerVerifier>>,
+    mode: VerifyMode,
     server_name: Option<ServerName<'static>>,
     algorithms: WebPkiSupportedAlgorithms,
 }
@@ -142,9 +206,12 @@ impl ServerCertVerifier for GoVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        match &self.inner {
-            None => Ok(ServerCertVerified::assertion()),
-            Some(inner) => inner.verify_server_cert(
+        match &self.mode {
+            VerifyMode::InsecureSkip => Ok(ServerCertVerified::assertion()),
+            VerifyMode::RejectAll => Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            )),
+            VerifyMode::WebPki(inner) => inner.verify_server_cert(
                 end_entity,
                 intermediates,
                 self.server_name.as_ref().unwrap_or(server_name),
@@ -204,11 +271,14 @@ pub(crate) fn new_tls_config(cfg: &BucketHTTPConfig) -> Result<rustls::ClientCon
         None
     } else {
         let name = &cfg.tls_server_name;
-        Some(match name.parse::<std::net::IpAddr>() {
-            Ok(ip) => ServerName::IpAddress(ip.into()),
-            Err(_) => ServerName::try_from(name.clone())
-                .map_err(|e| format!("invalid TLS server name {name:?}: {e}"))?,
-        })
+        match name.parse::<std::net::IpAddr>() {
+            Ok(ip) => Some(ServerName::IpAddress(ip.into())),
+            Err(_) => match ServerName::try_from(name.clone()) {
+                Ok(sn) => Some(sn),
+                Err(_) if cfg.insecure_skip_verify => None,
+                Err(e) => return Err(format!("invalid TLS server name {name:?}: {e}")),
+            },
+        }
     };
     let client_cert = match (cfg.tls_cert_path.is_empty(), cfg.tls_key_path.is_empty()) {
         (true, true) => None,
@@ -241,17 +311,20 @@ pub(crate) fn new_tls_config(cfg: &BucketHTTPConfig) -> Result<rustls::ClientCon
             Some(Arc::new(r) as Arc<dyn ResolvesClientCert>)
         }
     };
-    let inner = if cfg.insecure_skip_verify {
-        None
+    let mode = if cfg.insecure_skip_verify {
+        VerifyMode::InsecureSkip
+    } else if roots.is_empty() {
+        // Go: empty root pool succeeds at startup and rejects all server certificates at handshake.
+        VerifyMode::RejectAll
     } else {
-        Some(
+        VerifyMode::WebPki(
             WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
                 .build()
                 .map_err(|e| format!("unable to build TLS verifier: {e}"))?,
         )
     };
     let verifier = GoVerifier {
-        inner,
+        mode,
         server_name,
         algorithms: provider.signature_verification_algorithms,
     };
@@ -282,6 +355,14 @@ impl HttpTransport {
             return Err("http.force_attempt_http2 is not supported by mimir-rs for the s3 backend".to_string());
         }
         let tls = new_tls_config(cfg)?;
+        let idle_conn_timeout = duration_opt(Duration::from_nanos(
+            cfg.idle_conn_timeout.0.max(0) as u64,
+        ));
+        let tls_handshake = Duration::from_nanos(cfg.tls_handshake_timeout.0.max(0) as u64);
+        let max_idle_per_host = crate::bucket::exthttp::max_idle_per_host(cfg);
+        // Dial timeout (30s) plus TLS handshake timeout; a zero handshake timeout means
+        // "no limit" for the handshake, so the combined connect timeout is unbounded too.
+        let connect_timeout = (!tls_handshake.is_zero()).then(|| DIAL_TIMEOUT + tls_handshake);
         let sni = if cfg.tls_server_name.is_empty() {
             None
         } else {
@@ -290,32 +371,29 @@ impl HttpTransport {
                 Err(_) => ServerName::try_from(cfg.tls_server_name.clone())
                     .ok()
                     .and_then(|sn| match sn {
-                        ServerName::DnsName(dns) => Some(Arc::new(SniResolver {
+                        ServerName::DnsName(dns) => Some(SniClientPool {
                             sni_host: dns.as_ref().to_string(),
-                            target_host: Arc::new(parking_lot::RwLock::new(None)),
-                        })),
+                            tls: tls.clone(),
+                            idle_conn_timeout,
+                            max_idle_per_host,
+                            connect_timeout,
+                            clients: Arc::new(parking_lot::RwLock::new(
+                                std::collections::HashMap::new(),
+                            )),
+                        }),
                         _ => None,
                     }),
             }
         };
-        let tls_handshake = Duration::from_nanos(cfg.tls_handshake_timeout.0.max(0) as u64);
-        let max_idle_per_host = crate::bucket::exthttp::max_idle_per_host(cfg);
         let mut builder = reqwest::Client::builder()
             .use_preconfigured_tls(tls)
             .redirect(reqwest::redirect::Policy::none())
             .tcp_keepalive(DIAL_KEEP_ALIVE)
-            .pool_idle_timeout(duration_opt(Duration::from_nanos(
-                cfg.idle_conn_timeout.0.max(0) as u64,
-            )))
+            .pool_idle_timeout(idle_conn_timeout)
             .pool_max_idle_per_host(max_idle_per_host)
             .http1_only();
-        if let Some(resolver) = &sni {
-            builder = builder.dns_resolver(Arc::clone(resolver));
-        }
-        // Dial timeout (30s) plus TLS handshake timeout; a zero handshake timeout means
-        // "no limit" for the handshake, so the combined connect timeout is unbounded too.
-        if !tls_handshake.is_zero() {
-            builder = builder.connect_timeout(DIAL_TIMEOUT + tls_handshake);
+        if let Some(t) = connect_timeout {
+            builder = builder.connect_timeout(t);
         }
         let client = builder
             .build()
@@ -421,5 +499,82 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+    }
+
+    #[test]
+    fn d_tls_01_and_03_empty_roots_reject_all_and_insecure_non_rfc_server_name() {
+        let provider = provider();
+        let verifier = GoVerifier {
+            mode: VerifyMode::RejectAll,
+            server_name: None,
+            algorithms: provider.signature_verification_algorithms,
+        };
+        let cert = CertificateDer::pem_file_iter(fixture("server.crt"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let err = verifier
+            .verify_server_cert(
+                &cert,
+                &[],
+                &ServerName::try_from("localhost").unwrap(),
+                &[],
+                UnixTime::now(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+        );
+
+        // Non-RFC-1035 tls_server_name must fail when insecure_skip_verify is false,
+        // and succeed when insecure_skip_verify is true.
+        let strict = new_tls_config(&BucketHTTPConfig {
+            tls_server_name: "bad_host:9092".into(),
+            insecure_skip_verify: false,
+            ..Default::default()
+        });
+        assert!(strict.is_err());
+
+        let insecure_cfg = BucketHTTPConfig {
+            tls_server_name: "bad_host:9092".into(),
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        assert!(new_tls_config(&insecure_cfg).is_ok());
+        assert!(HttpTransport::new(&insecure_cfg).is_ok());
+    }
+
+    #[tokio::test]
+    async fn gate_b1_sni_pool_strips_ipv6_brackets_and_caps_entries() {
+        use reqwest::dns::Resolve;
+
+        let tr = HttpTransport::new(&BucketHTTPConfig {
+            tls_ca_path: fixture("ca.crt"),
+            tls_server_name: "kafka.mimir-rs.test".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let pool = tr.sni.expect("expected SniClientPool");
+
+        // "[::1]" and "::1" normalize to the same pooled key and resolve to ::1.
+        let _c1 = pool.client_for_host("[::1]").unwrap();
+        let _c2 = pool.client_for_host("::1").unwrap();
+        assert_eq!(pool.clients.read().len(), 1);
+
+        let resolver = SniResolver {
+            sni_host: "kafka.mimir-rs.test".to_string(),
+            target_host: "[::1]".to_string(),
+        };
+        let name: reqwest::dns::Name = "kafka.mimir-rs.test".parse().unwrap();
+        let addrs: Vec<_> = resolver.resolve(name).await.unwrap().collect();
+        assert_eq!(addrs, vec![std::net::SocketAddr::new("::1".parse().unwrap(), 0)]);
+
+        // Inserting more than MAX_SNI_CLIENTS clears and keeps map bounded.
+        for i in 0..(MAX_SNI_CLIENTS + 10) {
+            pool.client_for_host(&format!("127.0.1.{i}")).unwrap();
+        }
+        assert!(pool.clients.read().len() <= MAX_SNI_CLIENTS);
     }
 }

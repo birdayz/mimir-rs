@@ -118,9 +118,31 @@ async fn start_sni_s3_server(
     Arc<Mutex<Vec<String>>>,
     tokio::task::JoinHandle<()>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    start_sni_s3_server_on("127.0.0.1", expected_sni).await
+}
+
+async fn start_sni_s3_server_on(
+    bind_ip: &str,
+    expected_sni: &'static str,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<Option<String>>>>,
+    Arc<Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let bind_addr = if bind_ip.contains(':') {
+        format!("[{bind_ip}]:0")
+    } else {
+        format!("{bind_ip}:0")
+    };
+    let listener = TcpListener::bind(&bind_addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let endpoint = format!("127.0.0.1:{}", addr.port());
+    let endpoint = if addr.ip().is_ipv6() {
+        format!("[{}]:{}", addr.ip(), addr.port())
+    } else {
+        format!("{}:{}", addr.ip(), addr.port())
+    };
 
     let tcp_accepts = Arc::new(AtomicUsize::new(0));
     let seen_snis = Arc::new(Mutex::new(Vec::new()));
@@ -288,5 +310,70 @@ async fn w19_rkn_09_kafka_transport_dial_allows_non_dns_server_name_when_insecur
     let stream = transport.dial(&addr).await.unwrap();
     drop(stream);
 
+    srv.abort();
+}
+
+#[tokio::test]
+async fn d_tls_03_s3_bucket_accepts_non_rfc_server_name_when_insecure_skip_verify() {
+    let s3_cfg = S3Config {
+        endpoint: "127.0.0.1:9000".to_string(),
+        bucket_name: "test-bkt".to_string(),
+        region: "us-east-1".to_string(),
+        access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+        secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+        insecure: true,
+        http: BucketHTTPConfig {
+            tls_server_name: "bad_host:9092".to_string(),
+            insecure_skip_verify: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(S3Bucket::new(&s3_cfg, "ingester").is_ok());
+
+    let strict_cfg = S3Config {
+        http: BucketHTTPConfig {
+            tls_server_name: "bad_host:9092".to_string(),
+            insecure_skip_verify: false,
+            ..Default::default()
+        },
+        ..s3_cfg
+    };
+    assert!(S3Bucket::new(&strict_cfg, "ingester").is_err());
+}
+
+#[tokio::test]
+async fn gate_b1_s3_bucket_ipv6_loopback_with_tls_server_name() {
+    if TcpListener::bind("[::1]:0").await.is_err() {
+        return;
+    }
+    let (endpoint, tcp_accepts, seen_snis, seen_hosts, srv) =
+        start_sni_s3_server_on("::1", "kafka.mimir-rs.test").await;
+    let s3_cfg = S3Config {
+        endpoint: endpoint.clone(),
+        bucket_name: "test-bkt".to_string(),
+        region: "us-east-1".to_string(),
+        access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+        secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+        insecure: false,
+        http: BucketHTTPConfig {
+            tls_ca_path: fixture("ca.crt"),
+            tls_server_name: "kafka.mimir-rs.test".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let bkt = S3Bucket::new(&s3_cfg, "ingester").unwrap();
+    assert!(bkt.exists("key1").await.unwrap());
+    assert_eq!(bkt.get("key1").await.unwrap().as_ref(), b"hello");
+    assert!(tcp_accepts.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        seen_snis.lock().unwrap().as_slice(),
+        &[Some("kafka.mimir-rs.test".to_string())]
+    );
+    assert_eq!(
+        seen_hosts.lock().unwrap().as_slice(),
+        &[endpoint.clone(), endpoint]
+    );
     srv.abort();
 }

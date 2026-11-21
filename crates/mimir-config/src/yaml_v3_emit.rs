@@ -112,7 +112,7 @@ enum Event<'a> {
     StreamEnd,
     DocumentStart,
     DocumentEnd,
-    SequenceStart,
+    SequenceStart { flow: bool },
     SequenceEnd,
     MappingStart,
     MappingEnd,
@@ -133,8 +133,84 @@ fn scalar<'a>(value: impl Into<Cow<'a, str>>, style: ScalarStyle) -> Event<'a> {
     }
 }
 
+fn flow_field_pairs() -> &'static [(String, String)] {
+    use serde::Deserialize;
+    use std::sync::OnceLock;
+
+    #[derive(Deserialize)]
+    struct Field {
+        key: String,
+        #[serde(rename = "type")]
+        ty: usize,
+        #[serde(default)]
+        flow: bool,
+    }
+    #[derive(Deserialize)]
+    struct Type {
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        elem: Option<usize>,
+        #[serde(default)]
+        fields: Vec<Field>,
+    }
+    #[derive(Deserialize)]
+    struct Db {
+        types: Vec<Type>,
+    }
+
+    static FLOW_PAIRS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    FLOW_PAIRS.get_or_init(|| {
+        let db: Db = serde_json::from_str(include_str!("yaml_types.json"))
+            .expect("valid embedded yaml_types.json");
+        let mut pairs = Vec::new();
+        for t in &db.types {
+            if t.kind != "struct" {
+                continue;
+            }
+            for parent in &t.fields {
+                let mut cur = parent.ty;
+                while let Some(info) = db.types.get(cur) {
+                    match (info.kind.as_str(), info.elem) {
+                        ("slice" | "ptr", Some(next)) => cur = next,
+                        ("struct", _) => {
+                            for child in &info.fields {
+                                if child.flow {
+                                    pairs.push((parent.key.clone(), child.key.clone()));
+                                }
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        pairs
+    })
+}
+
+fn is_flow_sequence_field(parent_key: Option<&str>, field_key: Option<&str>) -> bool {
+    let (Some(p), Some(f)) = (parent_key, field_key) else {
+        return false;
+    };
+    flow_field_pairs()
+        .iter()
+        .any(|(parent, field)| parent == p && field == f)
+}
+
 /// encode.go `marshal`.
 fn marshal<'a>(value: &'a Value, order: KeyOrder, events: &mut Vec<Event<'a>>) -> Result<(), String> {
+    marshal_with_parent(value, order, None, false, events)
+}
+
+fn marshal_with_parent<'a>(
+    value: &'a Value,
+    order: KeyOrder,
+    parent_key: Option<&'a str>,
+    flow_seq: bool,
+    events: &mut Vec<Event<'a>>,
+) -> Result<(), String> {
     match value {
         // nilv
         Value::Null => events.push(scalar("null", ScalarStyle::Plain)),
@@ -161,9 +237,9 @@ fn marshal<'a>(value: &'a Value, order: KeyOrder, events: &mut Vec<Event<'a>>) -
         Value::String(s) => events.push(stringv(Cow::Borrowed(s))),
         Value::Sequence(seq) => {
             // slicev
-            events.push(Event::SequenceStart);
+            events.push(Event::SequenceStart { flow: flow_seq });
             for item in seq {
-                marshal(item, order, events)?;
+                marshal_with_parent(item, order, parent_key, false, events)?;
             }
             events.push(Event::SequenceEnd);
         }
@@ -171,8 +247,10 @@ fn marshal<'a>(value: &'a Value, order: KeyOrder, events: &mut Vec<Event<'a>>) -
             // structv: fields in declaration order.
             events.push(Event::MappingStart);
             for (k, v) in mapping {
-                marshal(k, order, events)?;
-                marshal(v, order, events)?;
+                marshal_with_parent(k, order, None, false, events)?;
+                let key_str = k.as_str();
+                let child_flow = is_flow_sequence_field(parent_key, key_str);
+                marshal_with_parent(v, order, key_str, child_flow, events)?;
             }
             events.push(Event::MappingEnd);
         }
@@ -1645,8 +1723,8 @@ impl Emitter {
         self.simple_key_context = simple_key;
         match &events[head] {
             Event::Scalar { value, style } => self.emit_scalar(value.as_bytes(), *style),
-            Event::SequenceStart => {
-                self.state = if self.flow_level > 0 || self.check_empty_sequence(events, head) {
+            Event::SequenceStart { flow } => {
+                self.state = if *flow || self.flow_level > 0 || self.check_empty_sequence(events, head) {
                     State::FlowSequenceFirstItem
                 } else {
                     State::BlockSequenceFirstItem
@@ -1676,7 +1754,7 @@ impl Emitter {
     }
 
     fn check_empty_sequence(&self, events: &[Event<'_>], head: usize) -> bool {
-        matches!(events.get(head), Some(Event::SequenceStart))
+        matches!(events.get(head), Some(Event::SequenceStart { .. }))
             && matches!(events.get(head + 1), Some(Event::SequenceEnd))
     }
 
@@ -1693,7 +1771,7 @@ impl Emitter {
                 }
                 value.len()
             }
-            Event::SequenceStart => {
+            Event::SequenceStart { .. } => {
                 if !self.check_empty_sequence(events, head) {
                     return false;
                 }
@@ -4233,6 +4311,26 @@ r#""1": x
         assert_eq!(
             keys,
             ["_x", "1", "01", "2", "10", "B", "a1", "a9", "a10", "b"]
+        );
+    }
+
+    #[test]
+    fn marshal_struct_emits_relabel_source_labels_in_flow_style() {
+        let doc: Value = serde_yaml::from_str(
+            r#"
+metric_relabel_configs:
+  - source_labels: [__name__, job]
+    separator: ;
+    target_label: out
+    replacement: $1
+    action: replace
+"#,
+        )
+        .unwrap();
+        let out = marshal_struct(&doc).unwrap();
+        assert!(
+            out.contains("source_labels: [__name__, job]"),
+            "expected flow sequence in marshal_struct output:\n{out}"
         );
     }
 }

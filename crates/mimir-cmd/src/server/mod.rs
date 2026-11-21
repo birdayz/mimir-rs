@@ -138,8 +138,12 @@ impl Server {
             min_version: cfg.tls_min_version.clone(),
             curve_preferences: cfg.tls_curve_preferences.clone(),
         };
-        tls_opts.validate()?;
-        let http_tls = if tls_enabled(&cfg.http_tls_config) {
+        let http_tls_on = tls_enabled(&cfg.http_tls_config);
+        let grpc_tls_on = tls_enabled(&cfg.grpc_tls_config);
+        if http_tls_on || grpc_tls_on {
+            tls_opts.validate()?;
+        }
+        let http_tls = if http_tls_on {
             Some(
                 server_config(&cfg.http_tls_config, &tls_opts, &[b"h2", b"http/1.1"])
                     .map_err(|e| anyhow!("error generating http tls config: {e}"))?,
@@ -147,7 +151,7 @@ impl Server {
         } else {
             None
         };
-        let grpc_tls = if tls_enabled(&cfg.grpc_tls_config) {
+        let grpc_tls = if grpc_tls_on {
             Some(
                 server_config(&cfg.grpc_tls_config, &tls_opts, &[b"h2"])
                     .map_err(|e| anyhow!("error generating grpc tls config: {e}"))?,
@@ -428,4 +432,31 @@ impl RunningServers {
 /// Resolves once the shutdown flag is set (never holds the watch guard across an await).
 pub(crate) async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|v| *v).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopLogger;
+    impl Logger for NoopLogger {
+        fn log(&self, _level: LogLevel, _kvs: &[(&str, &str)]) {}
+    }
+
+    #[test]
+    fn d_tls_06_plaintext_server_ignores_go_tls_options_when_tls_disabled() {
+        let cfg = ServerConfig {
+            http_listen_address: "127.0.0.1".into(),
+            http_listen_port: 0,
+            grpc_listen_address: "127.0.0.1".into(),
+            grpc_listen_port: 0,
+            tls_curve_preferences: "X25519MLKEM768".into(),
+            tls_min_version: "VersionTLS10".into(),
+            tls_cipher_suites: "TLS_RSA_WITH_AES_128_CBC_SHA".into(),
+            ..Default::default()
+        };
+
+        let srv = Server::new(&cfg, &Registry::new(), Arc::new(NoopLogger));
+        assert!(srv.is_ok(), "plaintext server should not fail on Go TLS options: {:?}", srv.err());
+    }
 }

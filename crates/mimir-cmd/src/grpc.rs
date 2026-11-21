@@ -510,9 +510,13 @@ impl Http for HttpGrpcBridge {
 
         let class = code / 100;
         if class == 5 || (self.return_4xx_errors && class == 4) {
-            let msg = error_msg_override.unwrap_or_else(|| {
-                String::from_utf8_lossy(&http_resp.body).into_owned()
-            });
+            let (msg, non_utf8_body) = match error_msg_override {
+                Some(override_msg) => (override_msg, false),
+                None => match std::str::from_utf8(&http_resp.body) {
+                    Ok(s) => (s.to_string(), false),
+                    Err(_) => (String::from_utf8_lossy(&http_resp.body).into_owned(), true),
+                },
+            };
             if do_not_log_error {
                 // `middleware.DoNotLogError{Err: err}`: the gRPC log interceptor drops it.
                 if let Some(log) = &error_log {
@@ -522,6 +526,25 @@ impl Http for HttpGrpcBridge {
                         reason: None,
                     });
                 }
+            }
+            if non_utf8_body {
+                // Go grpc-go: proto.Marshal(google.rpc.Status) fails with errInvalidUTF8 when
+                // Status.Message is invalid UTF-8, omitting grpc-status-details-bin while still
+                // sending grpc-status = http_resp.code and grpc-message = encodeGrpcMessage(body)
+                // (google.golang.org/grpc/internal/transport/http_util.go:227-265).
+                let encoded_msg = encode_grpc_message_like_go(&http_resp.body);
+                let mut st = Status::new(
+                    mimir_proto::grpcutilpb::http_code_to_grpc_code(http_resp.code),
+                    msg,
+                );
+                if let Ok(val) = tonic::metadata::MetadataValue::try_from(http_resp.code.to_string())
+                {
+                    st.metadata_mut().insert("x-mimir-httpgrpc-raw-code", val);
+                }
+                if let Ok(val) = tonic::metadata::MetadataValue::try_from(encoded_msg) {
+                    st.metadata_mut().insert("x-mimir-httpgrpc-raw-msg", val);
+                }
+                return Err(st);
             }
             return Err(status_with_http_response(&http_resp, msg));
         }
@@ -611,7 +634,9 @@ fn split_go_url_clean_redirect(raw: &str) -> GoUrlCleanPath {
     }
 
     let Some(cleaned) = crate::http::gorilla_mux_clean_path_redirect(path) else {
-        let route_url = (scheme.is_empty() && authority.is_some()).then(|| {
+        let route_url = ((scheme.is_empty() && authority.is_some())
+            || (!scheme.is_empty() && (omit_host || authority == Some(""))))
+        .then(|| {
             let mut u = path.to_string();
             push_query_and_fragment(&mut u);
             u
@@ -728,17 +753,29 @@ fn parse_go_url_to_http_uri(raw: &str) -> Result<Uri, String> {
 
     let mut encoded = String::with_capacity(without_frag.len());
     if let Some((scheme, rest)) = path_part.split_once("://") {
-        encoded.push_str(scheme);
-        encoded.push_str("://");
-        if let Some((authority, path)) = rest.split_once('/') {
-            encoded.push_str(authority);
+        if let Some(after_empty_auth) = rest.strip_prefix('/') {
+            // Valid Go URL with scheme + empty authority (e.g. `http:///ready`): route `/ready`.
             encoded.push('/');
-            encode_ascii_unsafe(path, &mut encoded);
+            encode_ascii_unsafe(after_empty_auth, &mut encoded);
         } else {
-            encoded.push_str(rest);
+            encoded.push_str(scheme);
+            encoded.push_str("://");
+            if let Some((authority, path)) = rest.split_once('/') {
+                encoded.push_str(authority);
+                encoded.push('/');
+                encode_ascii_unsafe(path, &mut encoded);
+            } else {
+                encoded.push_str(rest);
+            }
         }
     } else {
-        encode_ascii_unsafe(path_part, &mut encoded);
+        let (scheme, rest) = go_url_scheme(path_part);
+        if !scheme.is_empty() && rest.starts_with('/') {
+            // Valid Go URL with scheme + OmitHost (e.g. `http:/ready`): route `/ready`.
+            encode_ascii_unsafe(rest, &mut encoded);
+        } else {
+            encode_ascii_unsafe(path_part, &mut encoded);
+        }
     }
     if let Some(q) = query_part {
         encoded.push('?');
@@ -1539,7 +1576,53 @@ fn header_map_to_httpgrpc(headers: &HeaderMap) -> Vec<httpgrpcpb::Header> {
     out
 }
 
+/// Go `google.golang.org/grpc/internal/transport/http_util.go:227-265` (`encodeGrpcMessage` /
+/// `encodeGrpcMessageUnchecked`): leaves printable ASCII `' '..='~'` except `'%'` unencoded and
+/// percent-encodes all other UTF-8 bytes (including `U+FFFD` replacement bytes `%EF%BF%BD`
+/// produced by `utf8.DecodeRuneInString` on invalid UTF-8) as uppercase `%XX`.
+fn encode_grpc_message_like_go(raw: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let encode_valid = |slice: &[u8], out: &mut String| {
+        for &b in slice {
+            if (b' '..=b'~').contains(&b) && b != b'%' {
+                out.push(b as char);
+            } else {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    };
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                encode_valid(valid.as_bytes(), &mut out);
+                break;
+            }
+            Err(e) => {
+                let n = e.valid_up_to();
+                encode_valid(&rest[..n], &mut out);
+                // Go unicode/utf8.DecodeRuneInString advances 1 byte per invalid/truncated sequence.
+                out.push_str("%EF%BF%BD");
+                rest = &rest[n + 1..];
+            }
+        }
+    }
+    out
+}
+
 fn rewrite_httpgrpc_status_header(headers: &mut HeaderMap) {
+    let raw_msg = headers.remove("x-mimir-httpgrpc-raw-msg");
+    if let Some(raw_code) = headers.remove("x-mimir-httpgrpc-raw-code") {
+        headers.insert(Status::GRPC_STATUS, raw_code);
+        if let Some(msg) = raw_msg {
+            headers.insert(Status::GRPC_MESSAGE, msg);
+        }
+        return;
+    }
+    if let Some(msg) = raw_msg {
+        headers.insert(Status::GRPC_MESSAGE, msg);
+    }
     if !headers.contains_key("grpc-status-details-bin") {
         return;
     }
@@ -2292,5 +2375,187 @@ mod tests {
             BoundedGrpcDecompressBody::new(bomb_body, BoundedDecompressAlgo::Gzip, 10);
         let err = bomb_dec.collect().await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn d_httpgrpc_01_routes_scheme_urls_with_empty_or_omitted_host() {
+        use mimir_proto::httpgrpcpb::http_server::Http;
+
+        let router = Router::new().route("/ready", get(|| async { (StatusCode::OK, "ready") }));
+        let bridge = HttpGrpcBridge::new(router);
+
+        for url in [
+            "http:///ready",
+            "http:/ready",
+            "https:///ready",
+            "https:/ready",
+            "http:///ready?x=1",
+            "http:/ready?x=1#frag",
+        ] {
+            let req = tonic::Request::new(httpgrpcpb::HttpRequest {
+                method: "GET".to_string(),
+                url: url.to_string(),
+                headers: vec![],
+                body: Bytes::new(),
+            });
+            let resp = bridge
+                .handle(req)
+                .await
+                .unwrap_or_else(|e| panic!("url {url:?} failed: {e}"))
+                .into_inner();
+            assert_eq!(resp.code, 200, "url {url:?}");
+            assert_eq!(resp.body.as_ref(), b"ready", "url {url:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn d_httpgrpc_02_non_utf8_error_body_omits_details_bin_and_preserves_raw_status() {
+        use http_body_util::BodyExt as _;
+        use mimir_proto::httpgrpcpb::http_server::Http;
+        use tower::ServiceExt as _;
+
+        let raw_non_utf8: &[u8] = &[0x1f, 0x8b, 0x08, b'b', b'a', b'd'];
+        let router = Router::new()
+            .route(
+                "/bin-err",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Bytes::from_static(&[0x1f, 0x8b, 0x08, b'b', b'a', b'd']),
+                    )
+                }),
+            )
+            .route(
+                "/bin-err-pct",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Bytes::from_static(b"100% err:\xff\x80"),
+                    )
+                }),
+            )
+            .route(
+                "/bin-err-override",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        [("x-errormessage", "utf8 override")],
+                        Bytes::from_static(&[0x1f, 0x8b, 0x08, b'b', b'a', b'd']),
+                    )
+                }),
+            );
+
+        let bridge = HttpGrpcBridge::new(router.clone());
+        let status = bridge
+            .handle(tonic::Request::new(httpgrpcpb::HttpRequest {
+                method: "GET".to_string(),
+                url: "/bin-err".to_string(),
+                headers: vec![],
+                body: Bytes::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            status.details().is_empty(),
+            "non-UTF-8 body without X-ErrorMessage must omit grpc-status-details-bin"
+        );
+        assert!(extract_http_response(&status).is_none());
+
+        // Through HttpGrpcStatusFixService (wire trailers/headers):
+        // grpc-status == "500", grpc-status-details-bin absent, x-mimir-httpgrpc-raw-code absent,
+        // grpc-message == "%1F%EF%BF%BD%08bad" (matching Go grpc-go encodeGrpcMessage).
+        let svc = HttpGrpcStatusFixService::new(HttpServer::new(HttpGrpcBridge::new(router)));
+        let req_msg = httpgrpcpb::HttpRequest {
+            method: "GET".to_string(),
+            url: "/bin-err".to_string(),
+            headers: vec![],
+            body: Bytes::new(),
+        };
+        let payload = req_msg.encode_to_vec();
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(0);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+
+        let http_req = http::Request::builder()
+            .method("POST")
+            .uri("/httpgrpc.HTTP/Handle")
+            .header("content-type", "application/grpc")
+            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(frame)))))
+            .unwrap();
+        let resp = svc.clone().oneshot(http_req).await.unwrap();
+        let mut merged_headers = resp.headers().clone();
+        let collected = resp.into_body().collect().await.unwrap();
+        if let Some(trailers) = collected.trailers() {
+            merged_headers.extend(trailers.clone());
+        }
+        assert_eq!(merged_headers.get("grpc-status").unwrap(), "500");
+        assert!(
+            !merged_headers.contains_key("grpc-status-details-bin"),
+            "grpc-status-details-bin must be omitted on non-UTF-8 Status.Message"
+        );
+        assert!(!merged_headers.contains_key("x-mimir-httpgrpc-raw-code"));
+        assert!(!merged_headers.contains_key("x-mimir-httpgrpc-raw-msg"));
+        assert_eq!(
+            merged_headers.get("grpc-message").unwrap(),
+            "%1F%EF%BF%BD%08bad"
+        );
+
+        // Verify Go grpc-go encodeGrpcMessage parity on '%', ' ', and invalid UTF-8 bytes:
+        // b"100% err:\xff\x80" -> "100%25 err:%EF%BF%BD%EF%BF%BD" (grpc-go v1.85.0 http_util.go:241-265).
+        let pct_req = httpgrpcpb::HttpRequest {
+            method: "GET".to_string(),
+            url: "/bin-err-pct".to_string(),
+            headers: vec![],
+            body: Bytes::new(),
+        };
+        let pct_payload = pct_req.encode_to_vec();
+        let mut pct_frame = Vec::with_capacity(5 + pct_payload.len());
+        pct_frame.push(0);
+        pct_frame.extend_from_slice(&(pct_payload.len() as u32).to_be_bytes());
+        pct_frame.extend_from_slice(&pct_payload);
+        let pct_http_req = http::Request::builder()
+            .method("POST")
+            .uri("/httpgrpc.HTTP/Handle")
+            .header("content-type", "application/grpc")
+            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(pct_frame)))))
+            .unwrap();
+        let pct_resp = svc.clone().oneshot(pct_http_req).await.unwrap();
+        let mut pct_headers = pct_resp.headers().clone();
+        let pct_collected = pct_resp.into_body().collect().await.unwrap();
+        if let Some(trailers) = pct_collected.trailers() {
+            pct_headers.extend(trailers.clone());
+        }
+        assert_eq!(pct_headers.get("grpc-status").unwrap(), "500");
+        assert!(!pct_headers.contains_key("grpc-status-details-bin"));
+        assert!(!pct_headers.contains_key("x-mimir-httpgrpc-raw-code"));
+        assert!(!pct_headers.contains_key("x-mimir-httpgrpc-raw-msg"));
+        assert_eq!(
+            pct_headers.get("grpc-message").unwrap(),
+            "100%25 err:%EF%BF%BD%EF%BF%BD"
+        );
+        // Truncated multi-byte UTF-8 advances 1 byte at a time like Go utf8.DecodeRuneInString.
+        assert_eq!(
+            encode_grpc_message_like_go(b"\xe2\x82bad"),
+            "%EF%BF%BD%EF%BF%BDbad"
+        );
+        assert_eq!(
+            encode_grpc_message_like_go(b"\xf0\x90\x80"),
+            "%EF%BF%BD%EF%BF%BD%EF%BF%BD"
+        );
+
+        // When X-ErrorMessage IS set (valid UTF-8), grpc-status-details-bin MUST still be emitted.
+        let status_override = bridge
+            .handle(tonic::Request::new(httpgrpcpb::HttpRequest {
+                method: "GET".to_string(),
+                url: "/bin-err-override".to_string(),
+                headers: vec![],
+                body: Bytes::new(),
+            }))
+            .await
+            .unwrap_err();
+        let extracted = extract_http_response(&status_override).unwrap();
+        assert_eq!(extracted.code, 400);
+        assert_eq!(extracted.body.as_ref(), raw_non_utf8);
     }
 }

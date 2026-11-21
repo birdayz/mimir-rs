@@ -195,9 +195,20 @@ impl BitStream {
         }
     }
 
-    #[inline(always)]
-    pub(crate) fn set_count(&mut self, count: u8) {
-        self.count = BitCount::from_u8(count);
+    /// Truncates the stream to `new_len` bytes and sets the trailing free bit count (`0..=7`),
+    /// masking off any garbage bits in the unused low bits of the final byte.
+    #[inline]
+    pub(crate) fn truncate_and_set_count(&mut self, new_len: usize, free_bits: u8) {
+        debug_assert!(free_bits < 8, "BitStream::truncate_and_set_count called with free_bits={free_bits}");
+        let clamped_len = new_len.min(self.len as usize);
+        self.len = clamped_len as u32;
+        let free = free_bits.min(7);
+        if free > 0 {
+            if let Some(last) = self.bytes_mut().last_mut() {
+                *last &= !((1u8 << free) - 1);
+            }
+        }
+        self.count = BitCount::from_u8(free);
     }
 
     #[inline]
@@ -301,6 +312,12 @@ impl BitStream {
     pub fn write_byte(&mut self, byt: u8) {
         let c = self.count.as_u8();
         if c == 0 {
+            self.push_byte(byt);
+            return;
+        }
+        if c >= 8 {
+            debug_assert!(false, "BitStream::write_byte called with invalid count={c}");
+            self.count = BitCount::C0;
             self.push_byte(byt);
             return;
         }
@@ -408,6 +425,15 @@ impl<'a> BitReader<'a> {
     #[inline]
     pub fn valid_bits(&self) -> u8 {
         self.valid
+    }
+
+    /// Returns `(consumed_bytes, free_bits)` where `consumed_bytes` is the exact byte prefix
+    /// of `stream` containing all bits read so far and `free_bits` is in `0..=7`.
+    #[inline]
+    pub fn consumed_bytes_and_free_bits(&self) -> (usize, u8) {
+        let unread_bytes = (self.valid as usize) / 8;
+        let free_bits = self.valid % 8;
+        (self.stream_offset.saturating_sub(unread_bytes), free_bits)
     }
 
     #[inline]

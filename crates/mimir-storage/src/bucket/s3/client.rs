@@ -857,14 +857,20 @@ impl Client {
             url.push('?');
             url.push_str(&query);
         }
-        let dial_url = if self.endpoint.scheme == "https" {
+        let (client, dial_url) = if self.endpoint.scheme == "https" {
             if let Some(sni) = &self.http.sni {
-                let (target_host, target_port) = split_authority_host_port(&req.host);
-                // Always record the host of this request, also when it equals the SNI name:
-                // otherwise a target left behind by an earlier request to another host (path-style
-                // vs virtual-host-style) would keep redirecting the SNI name's own lookups.
-                sni.set_target_host(target_host);
-                if !sni.sni_host.eq_ignore_ascii_case(target_host) {
+                let (raw_target_host, target_port) = split_authority_host_port(&req.host);
+                let target_host = raw_target_host
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(raw_target_host);
+                let client = sni
+                    .client_for_host(target_host)
+                    .map_err(|message| SendError {
+                        message,
+                        retryable: false,
+                    })?;
+                let dial_url = if !sni.sni_host.eq_ignore_ascii_case(target_host) {
                     let dial_host = match target_port {
                         Some(p) => format!("{}:{p}", sni.sni_host),
                         None => sni.sni_host.clone(),
@@ -877,18 +883,19 @@ impl Client {
                     u
                 } else {
                     url.clone()
-                }
+                };
+                (client, dial_url)
             } else {
-                url.clone()
+                (self.http.client.clone(), url.clone())
             }
         } else {
-            url.clone()
+            (self.http.client.clone(), url.clone())
         };
         let method = reqwest::Method::from_bytes(req.method.as_bytes()).map_err(|e| SendError {
             message: format!("invalid HTTP method {}: {e}", req.method),
             retryable: false,
         })?;
-        let mut builder = self.http.client.request(method, &dial_url);
+        let mut builder = client.request(method, &dial_url);
         let mut headers = req.headers.clone();
         if !req.host.is_empty() && !headers.contains_key(reqwest::header::HOST) {
             let host_val = HeaderValue::from_str(&req.host).map_err(|e| SendError {
@@ -1225,6 +1232,188 @@ impl WireBody {
             }))
             .boxed();
         (stream, len)
+    }
+}
+
+#[cfg(test)]
+mod d_tls_03_tests {
+    use super::*;
+    use std::sync::Arc;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::LazyConfigAcceptor;
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/tests/fixtures/kafka_tls/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    #[tokio::test]
+    async fn d_tls_03_s3_sni_isolates_pools_across_distinct_target_hosts() {
+        async fn spawn_labeled_sni_server(
+            bind_ip: &str,
+            expected_sni: &'static str,
+            body: &'static str,
+        ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+            let listener = TcpListener::bind(format!("{bind_ip}:0")).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let endpoint = format!("{bind_ip}:{}", addr.port());
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_srv = Arc::clone(&hits);
+
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let certs: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_file_iter(fixture("sni.crt"))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+            let key = PrivateKeyDer::from_pem_file(fixture("sni.key")).unwrap();
+            let sni_cfg = Arc::new(
+                rustls::ServerConfig::builder_with_provider(provider)
+                    .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .unwrap(),
+            );
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let hits_conn = Arc::clone(&hits_srv);
+                    let sni_cfg = Arc::clone(&sni_cfg);
+                    tokio::spawn(async move {
+                        let acceptor =
+                            LazyConfigAcceptor::new(rustls::server::Acceptor::default(), sock);
+                        let Ok(start) = acceptor.await else {
+                            return;
+                        };
+                        if start.client_hello().server_name() != Some(expected_sni) {
+                            return;
+                        }
+                        let Ok(mut tls_stream) = start.into_stream(sni_cfg).await else {
+                            return;
+                        };
+                        let mut buf = Vec::new();
+                        loop {
+                            buf.clear();
+                            let mut tmp = [0u8; 4096];
+                            loop {
+                                match tls_stream.read(&mut tmp).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                                }
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            hits_conn.fetch_add(1, Ordering::SeqCst);
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            if tls_stream.write_all(resp.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            (endpoint, hits, handle)
+        }
+
+        let (ep_a, hits_a, srv_a) =
+            spawn_labeled_sni_server("127.0.0.1", "kafka.mimir-rs.test", "from-a").await;
+        let (ep_b, hits_b, srv_b) =
+            spawn_labeled_sni_server("127.0.0.2", "kafka.mimir-rs.test", "from-b").await;
+
+        let http_cfg = mimir_config::BucketHTTPConfig {
+            tls_ca_path: fixture("ca.crt"),
+            tls_server_name: "kafka.mimir-rs.test".to_string(),
+            max_idle_connections_per_host: 2,
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&http_cfg).unwrap();
+        let endpoint = crate::bucket::s3utils::get_endpoint_url(&ep_a, true).unwrap();
+        let creds = crate::bucket::s3::credentials::new_credentials(
+            &crate::bucket::s3::credentials::CredentialsConfig {
+                aws_sdk_auth: false,
+                access_key: "AKIA".into(),
+                secret_key: "SECRET".into(),
+                session_token: String::new(),
+                region: "us-east-1".into(),
+                sts_endpoint: String::new(),
+            },
+            Arc::new(|_| String::new()),
+        );
+        let client = Client::new(ClientOptions {
+            endpoint,
+            secure: true,
+            region: "us-east-1".to_string(),
+            lookup: S3BucketLookupType::Path,
+            dualstack_enabled: false,
+            credentials: creds,
+            http: transport,
+            component: "test".to_string(),
+            trace: false,
+        });
+
+        let req_a = SignableRequest {
+            method: "GET",
+            host: ep_a.clone(),
+            path: "/bkt/obj".to_string(),
+            query: Vec::new(),
+            headers: HeaderMap::new(),
+        };
+        let req_b = SignableRequest {
+            method: "GET",
+            host: ep_b.clone(),
+            path: "/bkt/obj".to_string(),
+            query: Vec::new(),
+            headers: HeaderMap::new(),
+        };
+
+        // Request 1 hits host A and leaves an idle keep-alive connection open in A's pool.
+        let r1 = tokio::time::timeout(std::time::Duration::from_secs(3), client.send(&req_a, None, None))
+            .await
+            .expect("r1 timed out")
+            .unwrap();
+        assert_eq!(r1.body.as_ref(), b"from-a");
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+
+        // Request 2 targets host B through the SAME S3 client with pooling enabled: must NOT
+        // reuse host A's idle connection.
+        let r2 = tokio::time::timeout(std::time::Duration::from_secs(3), client.send(&req_b, None, None))
+            .await
+            .expect("r2 timed out")
+            .unwrap();
+        assert_eq!(r2.body.as_ref(), b"from-b");
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+
+        // Concurrent requests to host A and host B must never race or cross-route.
+        for _ in 0..8 {
+            let (ra, rb) = tokio::join!(
+                client.send(&req_a, None, None),
+                client.send(&req_b, None, None),
+            );
+            assert_eq!(ra.unwrap().body.as_ref(), b"from-a");
+            assert_eq!(rb.unwrap().body.as_ref(), b"from-b");
+        }
+        assert_eq!(hits_a.load(Ordering::SeqCst), 9);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 9);
+
+        srv_a.abort();
+        srv_b.abort();
     }
 }
 

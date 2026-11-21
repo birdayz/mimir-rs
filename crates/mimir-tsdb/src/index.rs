@@ -1168,6 +1168,7 @@ impl IndexReader {
 
         let mut lists: Vec<Vec<u64>> = Vec::new();
         while vi < sorted_vals.len() {
+            let prev_vi = vi;
             let target = sorted_vals[vi];
             let mut idx = entries.partition_point(|e| self.mmap_str(e.val_off, e.val_len) < target);
             if idx == entries.len() {
@@ -1197,6 +1198,11 @@ impl IndexReader {
                 }
                 Ok(true)
             })?;
+            if vi == prev_vi {
+                return Err(IndexError::Corrupt(format!(
+                    "postings offset table traversal made no progress for label {name:?}"
+                )));
+            }
         }
 
         let slices: Vec<&[u64]> = lists.iter().map(|v| v.as_slice()).collect();
@@ -1525,6 +1531,8 @@ fn parse_postings_offset_table_payload(
     let cnt = dec.be32()? as usize;
 
     let mut result: BTreeMap<&str, Vec<PostingOffsetEntry>> = BTreeMap::new();
+    let mut current_group_name: Option<&str> = None;
+    let mut last_val: Option<&str> = None;
     let mut last_name: Option<&str> = None;
     let mut last_entry: Option<PostingOffsetEntry> = None;
     let mut value_count = 0usize;
@@ -1561,7 +1569,12 @@ fn parse_postings_offset_table_payload(
             table_rel_off: rel_off,
         };
 
-        if !result.contains_key(name) {
+        if current_group_name != Some(name) {
+            if result.contains_key(name) {
+                return Err(IndexError::Corrupt(format!(
+                    "non-contiguous label name {name:?} in postings offset table"
+                )));
+            }
             result.insert(name, Vec::new());
             if let Some(prev_name) = last_name.take() {
                 if let (Some(prev_vec), Some(pending)) =
@@ -1570,7 +1583,16 @@ fn parse_postings_offset_table_payload(
                     prev_vec.push(pending);
                 }
             }
+            current_group_name = Some(name);
+            last_val = Some(value);
             value_count = 0;
+        } else if let Some(prev_val) = last_val {
+            if value <= prev_val {
+                return Err(IndexError::Corrupt(format!(
+                    "non-increasing label value {value:?} after {prev_val:?} for label {name:?} in postings offset table"
+                )));
+            }
+            last_val = Some(value);
         }
         if value_count.is_multiple_of(SYMBOL_FACTOR) {
             if let Some(vec) = result.get_mut(name) {
@@ -2264,5 +2286,52 @@ mod tests {
         ));
         assert!(r.series(refs[0] + 1).is_err());
         assert!(r.series(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn corrupt_interleaved_postings_offset_table_rejected_without_loop_c4() {
+        // Exact 26-byte corrupt payload PoC from Scope C (C-4):
+        // cnt = 3: ("aa", "a", 0), ("bb\t", "b", 0), ("aa", "z", 0).
+        let payload: [u8; 26] = [
+            0x00, 0x00, 0x00, 0x03, // cnt = 3
+            0x02, 0x02, b'a', b'a', 0x01, b'a', 0x00, // ("aa", "a", 0)
+            0x02, 0x03, b'b', b'b', 0x09, 0x01, b'b', 0x00, // ("bb\t", "b", 0)
+            0x02, 0x02, b'a', b'a', 0x01, b'z', 0x00, // ("aa", "z", 0)
+        ];
+        assert!(matches!(
+            parse_postings_offset_table_payload(&payload),
+            Err(IndexError::Corrupt(_))
+        ));
+
+        // Non-strictly-increasing label values for the same label name must also be rejected.
+        let mut non_mono = Encbuf::new();
+        non_mono.put_be32(2);
+        non_mono.put_uvarint(2);
+        non_mono.put_uvarint_str("job");
+        non_mono.put_uvarint_str("z");
+        non_mono.put_uvarint64(0);
+        non_mono.put_uvarint(2);
+        non_mono.put_uvarint_str("job");
+        non_mono.put_uvarint_str("a");
+        non_mono.put_uvarint64(0);
+        assert!(matches!(
+            parse_postings_offset_table_payload(non_mono.as_slice()),
+            Err(IndexError::Corrupt(_))
+        ));
+
+        let mut dup_val = Encbuf::new();
+        dup_val.put_be32(2);
+        dup_val.put_uvarint(2);
+        dup_val.put_uvarint_str("job");
+        dup_val.put_uvarint_str("a");
+        dup_val.put_uvarint64(0);
+        dup_val.put_uvarint(2);
+        dup_val.put_uvarint_str("job");
+        dup_val.put_uvarint_str("a");
+        dup_val.put_uvarint64(0);
+        assert!(matches!(
+            parse_postings_offset_table_payload(dup_val.as_slice()),
+            Err(IndexError::Corrupt(_))
+        ));
     }
 }

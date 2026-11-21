@@ -87,7 +87,7 @@ fn read_histogram_chunk_layout_spans(
     b: &mut BitReader<'_>,
 ) -> Result<Vec<HistogramSpan>, ChunkError> {
     let num_u64 = read_varbit_uint(b)?;
-    if num_u64 > (b.remaining_bits() / 4) as u64 {
+    if num_u64 > (b.remaining_bits() / 2) as u64 {
         return Err(ChunkError::UnexpectedEof);
     }
     let num = usize::try_from(num_u64).map_err(|_| ChunkError::InvalidChunk)?;
@@ -246,12 +246,13 @@ pub(crate) fn expand_spans_both_ways(
     let mut last_bucket = 0i64;
 
     let mut add_bucket = |bucket: i64| {
-        let mut offset = bucket - last_bucket - 1;
+        let mut offset = bucket.wrapping_sub(last_bucket).wrapping_sub(1);
         if offset == 0 && !merged_spans.is_empty() {
-            merged_spans.last_mut().unwrap().length += 1;
+            let last = merged_spans.last_mut().unwrap();
+            last.length = last.length.wrapping_add(1);
         } else {
             if merged_spans.is_empty() {
-                offset += 1;
+                offset = offset.wrapping_add(1);
             }
             merged_spans.push(HistogramSpan {
                 offset: offset as i32,
@@ -329,9 +330,34 @@ pub(crate) fn expand_spans_both_ways(
     (f_inserts, b_inserts, merged_spans)
 }
 
-pub(crate) trait BucketNum: Copy + Default + std::ops::AddAssign + std::ops::Neg<Output = Self> + std::ops::Add<Output = Self> {}
-impl BucketNum for i64 {}
-impl BucketNum for f64 {}
+pub(crate) trait BucketNum: Copy + Default {
+    fn wrapping_add(self, rhs: Self) -> Self;
+    fn wrapping_neg(self) -> Self;
+}
+
+impl BucketNum for i64 {
+    #[inline]
+    fn wrapping_add(self, rhs: Self) -> Self {
+        i64::wrapping_add(self, rhs)
+    }
+
+    #[inline]
+    fn wrapping_neg(self) -> Self {
+        i64::wrapping_neg(self)
+    }
+}
+
+impl BucketNum for f64 {
+    #[inline]
+    fn wrapping_add(self, rhs: Self) -> Self {
+        self + rhs
+    }
+
+    #[inline]
+    fn wrapping_neg(self) -> Self {
+        -self
+    }
+}
 
 pub(crate) fn insert_buckets<BV: BucketNum>(
     in_vals: &[BV],
@@ -348,13 +374,13 @@ pub(crate) fn insert_buckets<BV: BucketNum>(
         if ii >= inserts.len() || i != inserts[ii].pos {
             out[oi] = d;
             oi += 1;
-            v += d;
+            v = v.wrapping_add(d);
             continue;
         }
         let mut first_insert = true;
         while ii < inserts.len() && i == inserts[ii].pos {
             if deltas && first_insert {
-                out[oi] = -v;
+                out[oi] = v.wrapping_neg();
                 first_insert = false;
             } else {
                 out[oi] = BV::default();
@@ -367,12 +393,12 @@ pub(crate) fn insert_buckets<BV: BucketNum>(
             ii += 1;
         }
         if deltas {
-            out[oi] = d + v;
+            out[oi] = d.wrapping_add(v);
         } else {
             out[oi] = d;
         }
         oi += 1;
-        v += d;
+        v = v.wrapping_add(d);
     }
 
     while ii < inserts.len() {
@@ -381,7 +407,7 @@ pub(crate) fn insert_buckets<BV: BucketNum>(
             "leftover inserts must be after current buckets"
         );
         if deltas {
-            out[oi] = -v;
+            out[oi] = v.wrapping_neg();
         } else {
             out[oi] = BV::default();
         }
@@ -427,12 +453,13 @@ pub(crate) fn adjust_for_inserts(
     let mut insert_num = inserts[0].num;
 
     let mut add_bucket = |b: i64| {
-        let mut offset = b - last_bucket - 1;
+        let mut offset = b.wrapping_sub(last_bucket).wrapping_sub(1);
         if offset == 0 && !merged_spans.is_empty() {
-            merged_spans.last_mut().unwrap().length += 1;
+            let last = merged_spans.last_mut().unwrap();
+            last.length = last.length.wrapping_add(1);
         } else {
             if merged_spans.is_empty() {
-                offset += 1;
+                offset = offset.wrapping_add(1);
             }
             merged_spans.push(HistogramSpan {
                 offset: offset as i32,
@@ -454,7 +481,7 @@ pub(crate) fn adjust_for_inserts(
                     insert_num = inserts[i].num;
                 }
             } else {
-                insert_idx += 1;
+                insert_idx = insert_idx.wrapping_add(1);
             }
         } else {
             add_bucket(b_val);
@@ -471,8 +498,54 @@ pub(crate) fn adjust_for_inserts(
                 insert_num = inserts[i].num;
             }
         } else {
-            insert_idx += 1;
+            insert_idx = insert_idx.wrapping_add(1);
         }
     }
     merged_spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_length_spans_decode_above_quarter_bit_budget_c2() {
+        // 60 zero-length spans encode at 2 bits/span (120 bits), which would fail
+        // an overly tight remaining_bits() / 4 precheck.
+        let spans = vec![HistogramSpan { offset: 0, length: 0 }; 60];
+        let mut bs = BitStream::new();
+        write_histogram_chunk_layout(&mut bs, 0, 0.0, &[], &spans, &[]);
+        put_varbit_int(&mut bs, 0); // t
+        put_varbit_uint(&mut bs, 0); // cnt
+        put_varbit_uint(&mut bs, 0); // z_cnt
+        bs.write_bits(0.0f64.to_bits(), 64); // sum
+
+        let mut br = BitReader::new(bs.bytes());
+        let layout = read_histogram_chunk_layout(&mut br).unwrap();
+        assert_eq!(layout.negative_spans.len(), 60);
+        assert!(layout.negative_spans.iter().all(|s| s.offset == 0 && s.length == 0));
+    }
+
+    #[test]
+    fn wrapping_arithmetic_in_insert_buckets_and_span_helpers_c5() {
+        let inserts = [Insert {
+            pos: 0,
+            num: 1,
+            bucket_idx: -1,
+        }];
+        // Should wrap without panicking on i64::MIN negation or i64::MAX + i64::MIN.
+        let out_min = insert_buckets(&[i64::MIN], 2, &inserts, true);
+        assert_eq!(out_min, vec![0, i64::MIN]);
+
+        let out_add = insert_buckets(&[i64::MAX, 10], 3, &[Insert { pos: 1, num: 1, bucket_idx: 2 }], true);
+        assert_eq!(out_add, vec![i64::MAX, i64::MAX.wrapping_neg(), 10i64.wrapping_add(i64::MAX)]);
+
+        let a = [HistogramSpan { offset: i32::MAX, length: 1 }];
+        let b = [HistogramSpan { offset: i32::MIN + 1, length: 1 }];
+        let (_pf, _pb, merged) = expand_spans_both_ways(&a, &b);
+        assert_eq!(merged.len(), 2);
+
+        let adj = adjust_for_inserts(&[HistogramSpan { offset: i32::MAX, length: 1 }], &[Insert { pos: 0, num: 1, bucket_idx: i64::MAX }]);
+        assert!(!adj.is_empty());
+    }
 }
