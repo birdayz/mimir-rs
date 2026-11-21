@@ -165,6 +165,8 @@ pub fn reqwest_client(
         if certs.is_empty() {
             return Err(unusable_ca(cfg));
         }
+        // Replace the OS root store (matching Go exthttp.updateRootCA setting cfg.RootCAs).
+        b = b.tls_built_in_root_certs(false);
         for c in certs {
             b = b.add_root_certificate(c);
         }
@@ -490,5 +492,75 @@ mod tests {
         );
         let err = reqwest_client(&cfg, None, false).unwrap_err().to_string();
         assert!(err.contains("unable to use specified CA cert"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn d2_04_tls_ca_path_replaces_root_store_in_reqwest_client() {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/kafka_tls");
+        let certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(dir.join("server.crt"))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+        let key = PrivateKeyDer::from_pem_file(dir.join("server.key")).unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let server_cfg = std::sync::Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        );
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acc = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acc.accept(sock).await {
+                        let mut buf = [0u8; 1024];
+                        let _ = tls.read(&mut buf).await;
+                        let _ = tls
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let ok_cfg = BucketHTTPConfig {
+            tls_ca_path: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let ok_client = reqwest_client(&ok_cfg, Some(Duration::from_secs(5)), false).unwrap();
+        let resp = ok_client
+            .get(format!("https://localhost:{}/", addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let wrong_cfg = BucketHTTPConfig {
+            tls_ca_path: dir.join("other-ca.crt").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let wrong_client =
+            reqwest_client(&wrong_cfg, Some(Duration::from_secs(5)), false).unwrap();
+        let err = wrong_client
+            .get(format!("https://localhost:{}/", addr.port()))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_connect() || err.is_request(), "expected TLS verify error, got {err:?}");
+
+        srv.abort();
     }
 }

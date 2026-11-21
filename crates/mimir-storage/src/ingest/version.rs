@@ -12,8 +12,8 @@ use mimir_proto::symbols::{
     MIN_PREALLOCATED_SYMBOLS_PER_REQUEST, RECORD_VERSION_HEADER_KEY, V2_RECORD_SYMBOL_OFFSET,
 };
 use mimir_proto::zerocopy::{
-    decode_write_request, from_write_request_to_rw2, BorrowedWriteRequest, DecodeError,
-    DecodeOptions, EncodeRw2Error, WriteRequestScratch,
+    decode_write_request, encode_write_request_rw2_split_raw_bytes, from_write_request_to_rw2,
+    BorrowedWriteRequest, DecodeError, DecodeOptions, EncodeRw2Error, WriteRequestScratch,
 };
 use thiserror::Error;
 
@@ -116,6 +116,9 @@ impl RecordSerializer {
     ) -> Result<(Vec<SerializedKafkaRecord>, usize), RecordCodecError> {
         let input_size = req.encoded_len();
         if req.timeseries.is_empty() && req.metadata.is_empty() && req.timeseries_rw2.is_empty() {
+            if !req.symbols_rw2.is_empty() && self.version == RecordVersion::V2 {
+                return Err(RecordCodecError::EncodeRw2(EncodeRw2Error::AlreadyRw2));
+            }
             return Ok((Vec::new(), input_size));
         }
 
@@ -489,22 +492,35 @@ fn serialize_rw2_split(
     req: &cortexpb::WriteRequest,
     max_size: usize,
 ) -> Result<Vec<Bytes>, RecordCodecError> {
-    let rw2 = from_write_request_to_rw2(req, V2_RECORD_SYMBOL_OFFSET, Some(v2_common_symbols()))?;
-    let rw2_size = rw2.encoded_len();
-    let parts = split_write_request_by_max_marshal_size_rw2(
-        &rw2,
-        rw2_size,
-        max_size,
-        V2_RECORD_SYMBOL_OFFSET,
-        v2_common_symbols(),
-    );
-    let mut out = Vec::with_capacity(parts.len());
-    for part in parts {
-        let mut buf = Vec::with_capacity(part.encoded_len());
-        part.encode(&mut buf)?;
-        out.push(Bytes::from(buf));
+    match from_write_request_to_rw2(req, V2_RECORD_SYMBOL_OFFSET, Some(v2_common_symbols())) {
+        Ok(rw2) => {
+            let rw2_size = rw2.encoded_len();
+            let parts = split_write_request_by_max_marshal_size_rw2(
+                &rw2,
+                rw2_size,
+                max_size,
+                V2_RECORD_SYMBOL_OFFSET,
+                v2_common_symbols(),
+            );
+            let mut out = Vec::with_capacity(parts.len());
+            for part in parts {
+                let mut buf = Vec::with_capacity(part.encoded_len());
+                part.encode(&mut buf)?;
+                out.push(Bytes::from(buf));
+            }
+            Ok(out)
+        }
+        Err(EncodeRw2Error::InvalidUtf8) => {
+            let raw_parts = encode_write_request_rw2_split_raw_bytes(
+                req,
+                max_size,
+                V2_RECORD_SYMBOL_OFFSET,
+                Some(v2_common_symbols()),
+            )?;
+            Ok(raw_parts.into_iter().map(Bytes::from).collect())
+        }
+        Err(e) => Err(RecordCodecError::EncodeRw2(e)),
     }
-    Ok(out)
 }
 
 /// Zero-copy deserializes a Kafka record payload of version 0, 1, or 2 directly into `scratch`.
@@ -640,5 +656,66 @@ mod tests {
         table.symbolize("foo");
         // Tag 4 (1) + len varint (1) + "foo" (3) = 5 bytes, excluding "".
         assert_eq!(table.symbols_size_proto(), 5);
+    }
+
+    #[test]
+    fn d1_6_v2_serializer_preserves_non_utf8_bytes_and_rejects_symbols_rw2() {
+        // Non-empty symbols_rw2 with empty timeseries_rw2 must still be rejected as AlreadyRw2.
+        let rw2_symbols_only = cortexpb::WriteRequest {
+            symbols_rw2: vec!["".to_string(), "sym".to_string()],
+            ..Default::default()
+        };
+        let err = RecordSerializer::new(RecordVersion::V2)
+            .to_records("ingest", 0, "t1", &rw2_symbols_only, 1024)
+            .unwrap_err();
+        assert!(
+            matches!(err, RecordCodecError::EncodeRw2(EncodeRw2Error::AlreadyRw2)),
+            "expected AlreadyRw2, got {err:?}"
+        );
+
+        // Non-UTF-8 label and exemplar bytes in RW1 must be preserved verbatim through V2 encoding/decoding.
+        let bad_val = &[b'v', b'a', b'l', b'_', 0xff, 0xfe];
+        let bad_ex_val = &[b'e', b'x', b'_', 0x80, 0x81];
+        let req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair::from_static("__name__", "non_utf8_metric"),
+                    cortexpb::LabelPair {
+                        name: Bytes::from_static(b"lbl\xfe"),
+                        value: Bytes::from_static(bad_val),
+                    },
+                ],
+                samples: vec![cortexpb::Sample {
+                    value: 3.25,
+                    timestamp_ms: 42_000,
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![cortexpb::LabelPair {
+                        name: Bytes::from_static(b"trace\xff"),
+                        value: Bytes::from_static(bad_ex_val),
+                    }],
+                    value: 1.0,
+                    timestamp_ms: 42_000,
+                }],
+                ..Default::default()
+            }],
+            skip_label_validation: true,
+            ..Default::default()
+        };
+        let (recs, _) = RecordSerializer::new(RecordVersion::V2)
+            .to_records("ingest", 0, "t1", &req, 1024 * 1024)
+            .unwrap();
+        assert_eq!(recs.len(), 1);
+        let mut scratch = WriteRequestScratch::new();
+        let dec = deserialize_record_content(&recs[0].value, 2, &mut scratch).unwrap();
+        let ts = dec.timeseries().next().unwrap();
+        let lbls: Vec<(&[u8], &[u8])> = ts.labels().map(|l| (l.name, l.value)).collect();
+        assert_eq!(
+            lbls,
+            vec![(&b"__name__"[..], &b"non_utf8_metric"[..]), (&b"lbl\xfe"[..], &bad_val[..])]
+        );
+        let ex = ts.exemplars().next().unwrap();
+        let ex_lbls: Vec<(&[u8], &[u8])> = ex.labels().map(|l| (l.name, l.value)).collect();
+        assert_eq!(ex_lbls, vec![(&b"trace\xff"[..], &bad_ex_val[..])]);
     }
 }

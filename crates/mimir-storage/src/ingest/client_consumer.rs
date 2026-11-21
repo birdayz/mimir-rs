@@ -151,6 +151,7 @@ impl ClientPartitionConsumer {
             buffered_records: Arc::clone(&self.buffered_records),
             buffered_bytes: Arc::clone(&self.buffered_bytes),
             stop_rx: self.stop_tx.subscribe(),
+            unknown_id_fails: 0,
         };
         let start_offset = self.start_offset;
         tasks.push(tokio::spawn(async move { worker.run(start_offset, tx).await }));
@@ -204,6 +205,7 @@ struct Worker {
     buffered_records: Arc<AtomicI64>,
     buffered_bytes: Arc<AtomicI64>,
     stop_rx: watch::Receiver<bool>,
+    unknown_id_fails: u32,
 }
 
 enum Step {
@@ -504,10 +506,14 @@ impl Worker {
         }
 
         if let Some(err) = rp.error_code.err() {
+            if err != ResponseError::UnknownTopicId {
+                self.unknown_id_fails = 0;
+            }
             return self
                 .handle_partition_error(cursor, err, rp, &resp.node_endpoints)
                 .await;
         }
+        self.unknown_id_fails = 0;
 
         let raw = rp.records.clone().unwrap_or_default();
         let raw_non_empty = !raw.is_empty();
@@ -571,6 +577,29 @@ impl Worker {
                 return Step::Continue;
             }
             // KIP-392 case 4: the follower has not caught up yet; retry it.
+            return Step::Backoff;
+        }
+
+        if err == ResponseError::UnknownTopicId {
+            // franz-go source.go:1343-1363: strip UnknownTopicID for the first 5 consecutive
+            // occurrences (allowing newly-created topics to propagate), then surface it.
+            self.unknown_id_fails += 1;
+            if self.unknown_id_fails > 5 {
+                self.unknown_id_fails -= 1;
+                return Step::Buffer(FetchResult::error(
+                    self.partition_id,
+                    Some(kafka_fetch_error_from_client(
+                        super::kafka_client::KafkaClientError::Broker(err),
+                    )),
+                ));
+            }
+            if source != cursor.leader {
+                cursor.source = cursor.leader;
+                cursor.move_at = None;
+            }
+            if let Err(e) = self.client.refresh_metadata(&[self.topic.as_str()]).await {
+                debug!(topic = %self.topic, err = %e, "metadata refresh failed");
+            }
             return Step::Backoff;
         }
 
@@ -1121,5 +1150,168 @@ mod tests {
         consumer.stop().await;
         srv0.abort();
         srv1.abort();
+    }
+
+    #[tokio::test]
+    async fn d1_8_unknown_topic_id_surfaces_after_five_consecutive_failures_and_resets() {
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let fetch_calls_srv = Arc::clone(&fetch_calls);
+        let return_ok_on_call = Arc::new(AtomicUsize::new(usize::MAX));
+        let return_ok_srv = Arc::clone(&return_ok_on_call);
+        let topic_id = [7u8; 16];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port() as i32;
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let fc = Arc::clone(&fetch_calls_srv);
+                let ok_at = Arc::clone(&return_ok_srv);
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if s.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if s.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        let mut buf = Bytes::from(buf);
+                        let key = ApiKey::try_from(i16::from_be_bytes([buf[0], buf[1]])).unwrap();
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let hv = match key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                            ApiKey::Metadata => MetadataRequest::header_version(ver),
+                            ApiKey::Fetch => FetchRequest::header_version(ver),
+                            _ => return,
+                        };
+                        let hdr = RequestHeader::decode(&mut buf, hv).unwrap();
+                        let out = match key {
+                            ApiKey::ApiVersions => {
+                                let mut r = ApiVersionsResponse::default();
+                                for (k, min, max) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 0, 12),
+                                    (ApiKey::Fetch as i16, 4, 15),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = min;
+                                    av.max_version = max;
+                                    r.api_keys.push(av);
+                                }
+                                encode_msg(0, ver, hdr.correlation_id, &r)
+                            }
+                            ApiKey::Metadata => {
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = port;
+                                let mut p = MetadataResponsePartition::default();
+                                p.partition_index = 0;
+                                p.leader_id = BrokerId(0);
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("utid")));
+                                t.topic_id = uuid::Uuid::from_bytes(topic_id);
+                                t.partitions = vec![p];
+                                let mut r = MetadataResponse::default();
+                                r.brokers = vec![b];
+                                r.topics = vec![t];
+                                encode_msg(MetadataResponse::header_version(ver), ver, hdr.correlation_id, &r)
+                            }
+                            ApiKey::Fetch => {
+                                let call_idx = fc.fetch_add(1, Ordering::SeqCst) + 1;
+                                let mut pd = PartitionData::default();
+                                pd.partition_index = 0;
+                                if call_idx == ok_at.load(Ordering::SeqCst) {
+                                    pd.high_watermark = 1;
+                                    pd.log_start_offset = 0;
+                                    pd.records = Some(encode_batch_range(0, 1));
+                                } else {
+                                    pd.error_code = ResponseError::UnknownTopicId.code();
+                                }
+                                let mut ft = FetchableTopicResponse::default();
+                                ft.topic_id = uuid::Uuid::from_bytes(topic_id);
+                                ft.partitions = vec![pd];
+                                let mut r = FetchResponse::default();
+                                r.responses = vec![ft];
+                                encode_msg(FetchResponse::header_version(ver), ver, hdr.correlation_id, &r)
+                            }
+                            _ => unreachable!(),
+                        };
+                        if s.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        // Case 1: 5 consecutive UnknownTopicId responses are stripped, then the 6th surfaces!
+        let cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "utid".to_string(),
+            ..Default::default()
+        };
+        let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+        let consumer = ClientPartitionConsumer::new(
+            Arc::clone(&client),
+            "utid",
+            0,
+            0,
+            Duration::from_millis(20),
+        );
+        consumer.start().await;
+
+        let f = consumer
+            .poll_fetches_until(tokio::time::sleep(Duration::from_secs(15)))
+            .await
+            .expect("expected surfaced UnknownTopicId after >5 consecutive failures");
+        assert!(f.err.is_some(), "expected fetch error on 6th UnknownTopicId");
+        assert!(
+            fetch_calls.load(Ordering::SeqCst) >= 6,
+            "expected at least 6 fetch calls (5 stripped + 1 surfaced), got {}",
+            fetch_calls.load(Ordering::SeqCst)
+        );
+        consumer.stop().await;
+
+        // Case 2: 3 UnknownTopicId failures followed by a healthy response resets the counter,
+        // so it takes another >5 consecutive failures before surfacing.
+        fetch_calls.store(0, Ordering::SeqCst);
+        return_ok_on_call.store(4, Ordering::SeqCst);
+        let consumer2 = ClientPartitionConsumer::new(
+            Arc::clone(&client),
+            "utid",
+            0,
+            0,
+            Duration::from_millis(20),
+        );
+        consumer2.start().await;
+        let ok_fetch = consumer2
+            .poll_fetches_until(tokio::time::sleep(Duration::from_secs(15)))
+            .await
+            .expect("expected healthy fetch at call 4");
+        assert!(ok_fetch.err.is_none());
+        assert_eq!(ok_fetch.records.len(), 1);
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 4);
+
+        let err_fetch = consumer2
+            .poll_fetches_until(tokio::time::sleep(Duration::from_secs(15)))
+            .await
+            .expect("expected UnknownTopicId after reset + >5 failures");
+        assert!(err_fetch.err.is_some());
+        // 4 calls up to success + 6 more UnknownTopicId calls = 10 calls total.
+        assert!(
+            fetch_calls.load(Ordering::SeqCst) >= 10,
+            "counter must reset after non-UnknownTopicId response (calls={})",
+            fetch_calls.load(Ordering::SeqCst)
+        );
+
+        consumer2.stop().await;
+        srv.abort();
     }
 }
