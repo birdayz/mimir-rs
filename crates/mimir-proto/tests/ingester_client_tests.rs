@@ -1447,3 +1447,82 @@ async fn w18_wpe_11_final_series_limit_error_is_wrapped() {
     );
     assert!(msg.contains("the query hit the max number of chunks limit"), "{msg}");
 }
+
+#[tokio::test]
+async fn d1_3_read_stream_aborts_immediately_when_parent_cancel_fires_on_full_channel() {
+    struct TwoBatchStream {
+        step: usize,
+        closed_send: Arc<AtomicBool>,
+    }
+
+    #[tonic::async_trait]
+    impl QueryStreamClient for TwoBatchStream {
+        async fn recv(&mut self) -> Result<Option<ingesterpb::QueryStreamResponse>, StreamError> {
+            let cur = self.step;
+            self.step += 1;
+            if cur < 2 {
+                Ok(Some(ingesterpb::QueryStreamResponse {
+                    streaming_series_chunks: vec![ingesterpb::QueryStreamSeriesChunks {
+                        series_index: cur as u64,
+                        chunks: vec![create_test_chunk(1000 + cur as i64, cur as f64)],
+                    }],
+                    ..Default::default()
+                }))
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        fn close_send(&mut self) {
+            self.closed_send.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let closed_send = Arc::new(AtomicBool::new(false));
+    let cleaned_up = Arc::new(AtomicBool::new(false));
+    let cleaned_up_cb = Arc::clone(&cleaned_up);
+
+    let mut reader = SeriesChunksStreamReader::new(
+        cancel_rx,
+        Box::new(TwoBatchStream {
+            step: 0,
+            closed_send: Arc::clone(&closed_send),
+        }),
+        "ingester",
+        2,
+        Arc::new(QueryLimiter::new(0, 0, 0, 0)),
+        Arc::new(MemoryConsumptionTracker::unlimited()),
+        Arc::new(move || {
+            cleaned_up_cb.store(true, Ordering::SeqCst);
+        }),
+    );
+
+    reader.start_buffering();
+    // Let the background task fill the capacity-1 msg_tx with batch 0 and block sending batch 1.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!cleaned_up.load(Ordering::SeqCst));
+
+    // Flip parent_cancel to true while msg_tx is full and nobody is reading from msg_rx.
+    cancel_tx.send(true).unwrap();
+
+    // Background task must abort promptly, call close_send(), and run cleanup.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !cleaned_up.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "read_stream hung on full channel after parent_cancel became true"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(closed_send.load(Ordering::SeqCst));
+
+    // Drain batch 0 (already buffered before cancel), then batch 1 sees the cancellation error.
+    let c0 = reader.get_chunks(0).await.unwrap();
+    assert_eq!(c0.len(), 1);
+    let err = reader.get_chunks(1).await.unwrap_err();
+    assert!(
+        err.is_canceled(),
+        "expected StreamError::Canceled after abort, got: {err:?}"
+    );
+}

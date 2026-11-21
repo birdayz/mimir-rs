@@ -1051,19 +1051,53 @@ impl AzureHttpClient {
                         tokio::time::sleep(delay).await;
                         continue;
                     }
+                    let make_source = |code: Option<&str>| -> Box<dyn std::error::Error + Send + Sync> {
+                        if body.is_empty() {
+                            match code {
+                                Some(c) => format!("Azure error code {c} with status {status}").into(),
+                                None => format!("Client/Server error with status {status}").into(),
+                            }
+                        } else {
+                            format!("HTTP error with status {status}: {body}").into()
+                        }
+                    };
                     if let Some(code) = extract_azure_error_code(&headers, &body) {
                         if code == "BlobNotFound" || code == "InvalidUri" {
-                            let source: Box<dyn std::error::Error + Send + Sync> = if body.is_empty()
-                            {
-                                format!("Azure error code {code} with status {status}").into()
-                            } else {
-                                format!("HTTP error with status {status}: {body}").into()
-                            };
                             return Err(object_store::Error::NotFound {
                                 path: path_label.to_string(),
-                                source,
+                                source: make_source(Some(&code)),
                             });
                         }
+                        if status == StatusCode::NOT_FOUND {
+                            // Non-blob 404 (e.g. ContainerNotFound) must not be classified as IsObjNotFoundErr.
+                            return Err(object_store::Error::Generic {
+                                store: STORE,
+                                source: make_source(Some(&code)),
+                            });
+                        }
+                        if status == StatusCode::FORBIDDEN {
+                            // Only AuthorizationPermissionMismatch and InsufficientAccountPermissions
+                            // map to PermissionDenied (Thanos azure.IsAccessDeniedErr).
+                            if code == "AuthorizationPermissionMismatch"
+                                || code == "InsufficientAccountPermissions"
+                            {
+                                return Err(object_store::Error::PermissionDenied {
+                                    path: path_label.to_string(),
+                                    source: make_source(Some(&code)),
+                                });
+                            }
+                            return Err(object_store::Error::Generic {
+                                store: STORE,
+                                source: make_source(Some(&code)),
+                            });
+                        }
+                    } else if status == StatusCode::FORBIDDEN
+                        || (status == StatusCode::NOT_FOUND && path_label.is_empty())
+                    {
+                        return Err(object_store::Error::Generic {
+                            store: STORE,
+                            source: make_source(None),
+                        });
                     }
                     return Err(exthttp::map_http_error(STORE, path_label, status, body));
                 }
@@ -2473,6 +2507,123 @@ mod tests {
         .to_string();
         assert!(err2.contains("context deadline exceeded"), "{err2}");
         assert!(t1.elapsed() < Duration::from_secs(2), "elapsed={:?}", t1.elapsed());
+
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn d2_02_and_d2_07_azure_container_not_found_and_403_access_denied() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    loop {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        let hdr_end = loop {
+                            let Ok(n) = sock.read(&mut tmp).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..hdr_end]);
+                        let target = head
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("");
+                        let resp = if target.contains("restype=container") && !target.contains("comp=list") {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+                        } else if target.contains("missing-container") || target.contains("comp=list") {
+                            let body = "<Error><Code>ContainerNotFound</Code></Error>";
+                            format!(
+                                "HTTP/1.1 404 Not Found\r\nx-ms-error-code: ContainerNotFound\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                        } else if target.contains("perm-mismatch") {
+                            "HTTP/1.1 403 Forbidden\r\nx-ms-error-code: AuthorizationPermissionMismatch\r\nContent-Length: 0\r\n\r\n".to_string()
+                        } else if target.contains("insufficient-perm") {
+                            "HTTP/1.1 403 Forbidden\r\nx-ms-error-code: InsufficientAccountPermissions\r\nContent-Length: 0\r\n\r\n".to_string()
+                        } else if target.contains("auth-failure") {
+                            "HTTP/1.1 403 Forbidden\r\nx-ms-error-code: AuthorizationFailure\r\nContent-Length: 0\r\n\r\n".to_string()
+                        } else {
+                            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_string()
+                        };
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let reg = prometheus::Registry::new();
+        let cfg = mimir_config::BucketConfig {
+            backend_cfg: mimir_config::StorageBackendConfig {
+                backend: "azure".to_string(),
+                azure: AzureConfig {
+                    account_name: "devstoreaccount1".into(),
+                    container_name: "blocks".into(),
+                    max_retries: 0,
+                    connection_string: format!(
+                        "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://{addr}/devstoreaccount1;"
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let reg_c = reg.clone();
+        let bkt = tokio::task::spawn_blocking(move || {
+            crate::bucket::BucketClient::new_client(&cfg, "ingester", Some(&reg_c))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        // D2-02: ContainerNotFound (404) must NOT be classified as NotFound and iter_dir/list_all must error!
+        let ex_err = bkt.exists("missing-container/obj").await.unwrap_err();
+        assert!(!ex_err.is_not_found(), "ContainerNotFound must not be NotFound: {ex_err:?}");
+        let dl_err = bkt.download("missing-container/obj").await.unwrap_err();
+        assert!(!dl_err.is_not_found());
+        assert!(bkt.iter_dir("").await.is_err());
+        assert!(bkt.list_all("").await.is_err());
+        let iter_failures: f64 = reg
+            .gather()
+            .iter()
+            .filter(|mf| mf.get_name() == "thanos_objstore_bucket_operation_failures_total")
+            .flat_map(|mf| mf.get_metric())
+            .filter(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|lp| lp.get_name() == "operation" && lp.get_value() == "iter")
+            })
+            .map(|m| m.get_counter().get_value())
+            .sum();
+        assert_eq!(iter_failures, 2.0);
+
+        // D2-07: Only AuthorizationPermissionMismatch & InsufficientAccountPermissions are is_access_denied().
+        let err_pm = bkt.download("perm-mismatch").await.unwrap_err();
+        assert!(err_pm.is_access_denied(), "got {err_pm:?}");
+        let err_ip = bkt.download("insufficient-perm").await.unwrap_err();
+        assert!(err_ip.is_access_denied(), "got {err_ip:?}");
+        let err_af = bkt.download("auth-failure").await.unwrap_err();
+        assert!(!err_af.is_access_denied(), "AuthorizationFailure must not be access denied: {err_af:?}");
+        assert!(err_af.to_string().contains("AuthorizationFailure"), "{err_af}");
+        let err_plain = bkt.download("plain-403").await.unwrap_err();
+        assert!(!err_plain.is_access_denied());
 
         srv.abort();
     }

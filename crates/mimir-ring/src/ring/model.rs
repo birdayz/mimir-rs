@@ -3,6 +3,7 @@
 //! Ported from github.com/grafana/dskit/ring/model.go
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -65,6 +66,8 @@ pub fn system_time_to_unix_secs(t: SystemTime) -> i64 {
 
 pub trait InstanceDescExt {
     fn instance_state(&self) -> InstanceState;
+    fn try_instance_state(&self) -> Option<InstanceState>;
+    fn state_display(&self) -> Cow<'static, str>;
     fn is_heartbeat_healthy(&self, heartbeat_timeout: Duration, now: SystemTime) -> bool;
     fn is_healthy(
         &self,
@@ -80,6 +83,17 @@ pub trait InstanceDescExt {
 impl InstanceDescExt for InstanceDesc {
     fn instance_state(&self) -> InstanceState {
         InstanceState::try_from(self.state).unwrap_or(InstanceState::Active)
+    }
+
+    fn try_instance_state(&self) -> Option<InstanceState> {
+        InstanceState::try_from(self.state).ok()
+    }
+
+    fn state_display(&self) -> Cow<'static, str> {
+        match InstanceState::try_from(self.state) {
+            Ok(s) => Cow::Borrowed(s.as_str_name()),
+            Err(_) => Cow::Owned(self.state.to_string()),
+        }
     }
 
     fn is_heartbeat_healthy(&self, heartbeat_timeout: Duration, now: SystemTime) -> bool {
@@ -103,7 +117,7 @@ impl InstanceDescExt for InstanceDesc {
         heartbeat_timeout: Duration,
         now: SystemTime,
     ) -> bool {
-        op.is_instance_in_state_healthy(self.instance_state())
+        op.is_raw_state_healthy(self.state)
             && self.is_heartbeat_healthy(heartbeat_timeout, now)
     }
 
@@ -111,11 +125,11 @@ impl InstanceDescExt for InstanceDesc {
         if !self.is_heartbeat_healthy(heartbeat_timeout, now) {
             return Err(format!("instance {} past heartbeat timeout", self.addr));
         }
-        if self.instance_state() != InstanceState::Active {
+        if self.try_instance_state() != Some(InstanceState::Active) {
             return Err(format!(
                 "instance {} in state {}",
                 self.addr,
-                self.instance_state().as_str_name()
+                self.state_display()
             ));
         }
         Ok(())
@@ -342,9 +356,9 @@ impl DescExt for Desc {
 
             let ting = self.ingesters.get(name);
             let ting_ts = ting.map(|t| t.timestamp).unwrap_or(0);
-            let ting_state = ting
-                .map(|t| t.instance_state())
-                .unwrap_or(InstanceState::Active);
+            let ting_left = ting
+                .and_then(|t| t.try_instance_state())
+                == Some(InstanceState::Left);
             let this_timestamp = local_merge_timestamp(ting_ts, timestamp_limit);
 
             if oing.timestamp > this_timestamp {
@@ -355,8 +369,8 @@ impl DescExt for Desc {
                 self.ingesters.insert(name.clone(), oing.clone());
                 updated.push(name.clone());
             } else if oing.timestamp == this_timestamp
-                && ting_state != InstanceState::Left
-                && oing.instance_state() == InstanceState::Left
+                && !ting_left
+                && oing.try_instance_state() == Some(InstanceState::Left)
             {
                 self.ingesters.insert(name.clone(), oing.clone());
                 updated.push(name.clone());
@@ -366,7 +380,7 @@ impl DescExt for Desc {
         if local_cas {
             for (name, ting) in &mut self.ingesters {
                 if !other.ingesters.contains_key(name)
-                    && ting.instance_state() != InstanceState::Left
+                    && ting.try_instance_state() != Some(InstanceState::Left)
                 {
                     ting.state = InstanceState::Left as i32;
                     ting.tokens.clear();
@@ -396,7 +410,7 @@ impl DescExt for Desc {
 
 pub fn normalize_ingesters_map(input: &mut Desc) {
     for ing in input.ingesters.values_mut() {
-        if ing.instance_state() == InstanceState::Left {
+        if ing.try_instance_state() == Some(InstanceState::Left) {
             ing.tokens.clear();
             continue;
         }
@@ -430,10 +444,10 @@ pub fn resolve_conflicts(ingesters: &mut HashMap<String, InstanceDesc>) {
     let mut token_to_ingester: BTreeMap<u32, String> = BTreeMap::new();
 
     for (ing_key, ing) in ingesters.iter() {
-        if ing.instance_state() == InstanceState::Left {
+        if ing.try_instance_state() == Some(InstanceState::Left) {
             continue;
         }
-        let ing_leaving = ing.instance_state() == InstanceState::Leaving;
+        let ing_leaving = ing.try_instance_state() == Some(InstanceState::Leaving);
         for &token in &ing.tokens {
             match token_to_ingester.get(&token) {
                 None => {
@@ -441,7 +455,7 @@ pub fn resolve_conflicts(ingesters: &mut HashMap<String, InstanceDesc>) {
                 }
                 Some(prev_key) => {
                     let prev_leaving =
-                        ingesters[prev_key].instance_state() == InstanceState::Leaving;
+                        ingesters[prev_key].try_instance_state() == Some(InstanceState::Leaving);
                     let winner = if ing_leaving && !prev_leaving {
                         prev_key.clone()
                     } else if (prev_leaving && !ing_leaving) || (ing_key < prev_key) {
@@ -651,13 +665,12 @@ impl Mergeable for Desc {
     fn remove_tombstones(&mut self, limit: Option<SystemTime>) -> (usize, usize) {
         let mut total = 0usize;
         let mut removed = 0usize;
-        let limit_secs = limit.map(system_time_to_unix_secs);
 
         self.ingesters.retain(|_, ing| {
-            if ing.instance_state() == InstanceState::Left {
-                let expired = match limit_secs {
+            if ing.try_instance_state() == Some(InstanceState::Left) {
+                let expired = match limit {
                     None => true,
-                    Some(lim) => ing.timestamp < lim,
+                    Some(lim) => unix_secs_before(ing.timestamp, lim),
                 };
                 if expired {
                     removed += 1;
@@ -674,6 +687,10 @@ impl Mergeable for Desc {
 
     fn clone_mergeable(&self) -> Box<dyn Mergeable> {
         Box::new(self.clone())
+    }
+
+    fn eq_mergeable(&self, other: &dyn Mergeable) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
     }
 
     fn to_go_json(&self) -> GoJson {
@@ -694,5 +711,19 @@ impl Mergeable for Desc {
 
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> {
         self
+    }
+}
+
+pub(crate) fn unix_secs_before(ts_secs: i64, limit: SystemTime) -> bool {
+    if ts_secs >= 0 {
+        match UNIX_EPOCH.checked_add(Duration::from_secs(ts_secs as u64)) {
+            Some(t) => t < limit,
+            None => false,
+        }
+    } else {
+        match UNIX_EPOCH.checked_sub(Duration::from_secs(ts_secs.unsigned_abs())) {
+            Some(t) => t < limit,
+            None => true,
+        }
     }
 }

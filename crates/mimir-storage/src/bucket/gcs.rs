@@ -1742,15 +1742,42 @@ fn auth_from_json(json: &str) -> Result<(Arc<dyn GcpAuth>, Option<String>), Stri
     }
 }
 
+fn parse_storage_emulator_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let parsed = reqwest::Url::parse(&candidate)
+        .map_err(|e| format!("invalid STORAGE_EMULATOR_HOST {trimmed:?}: {e}"))?;
+    if parsed.host_str().is_none() {
+        return Err(format!("invalid STORAGE_EMULATOR_HOST {trimmed:?}: missing host"));
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
 /// Builds the GCS object store for `cfg` (Go `gcs.NewBucketClient`).
 pub fn new_store(cfg: &GCSConfig) -> Result<Arc<dyn ObjectStore>, BucketError> {
+    let env = |k: &str| std::env::var(k).ok();
+    new_store_with_env(cfg, &env)
+}
+
+fn new_store_with_env(
+    cfg: &GCSConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Arc<dyn ObjectStore>, BucketError> {
     let wrap = |e: String| BucketError::Config(format!("NewBucketClient: create bucket: {e}"));
     if cfg.bucket_name.is_empty() {
         return Err(wrap(
             "missing Google Cloud Storage bucket name for stored blocks".to_string(),
         ));
     }
-    let env = |k: &str| std::env::var(k).ok();
+    let emulator_url = match env("STORAGE_EMULATOR_HOST").filter(|s| !s.trim().is_empty()) {
+        Some(raw) => Some(parse_storage_emulator_url(&raw).map_err(wrap)?),
+        None => None,
+    };
+
     let read = |p: &str| {
         if std::path::Path::new(p).exists() {
             Some(std::fs::read_to_string(p))
@@ -1758,7 +1785,6 @@ pub fn new_store(cfg: &GCSConfig) -> Result<Arc<dyn ObjectStore>, BucketError> {
             None
         }
     };
-    let source = credential_source(cfg, &env, &read).map_err(wrap)?;
 
     let total_timeout = if cfg.http.idle_conn_timeout.0 > 0 {
         cfg.http.idle_conn_timeout.as_std()
@@ -1767,27 +1793,38 @@ pub fn new_store(cfg: &GCSConfig) -> Result<Arc<dyn ObjectStore>, BucketError> {
     };
     let client = exthttp::reqwest_client(&cfg.http, total_timeout, true)?;
 
-    let mut base_url = DEFAULT_GCS_BASE_URL.to_string();
-    let auth: Arc<dyn GcpAuth> = match source {
-        CredentialSource::ServiceAccountKey(json)
-        | CredentialSource::AuthorizedUserJson(json)
-        | CredentialSource::ExternalAccountJson(json)
-        | CredentialSource::ImpersonatedServiceAccountJson(json) => {
-            let (auth, override_url) = auth_from_json(&json).map_err(wrap)?;
-            if let Some(u) = override_url {
-                base_url = u;
+    let mut base_url = emulator_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_GCS_BASE_URL.to_string());
+    let auth: Arc<dyn GcpAuth> = if emulator_url.is_some() && cfg.service_account.is_empty() {
+        Arc::new(NoOauthAuth)
+    } else {
+        let source = credential_source(cfg, env, &read).map_err(wrap)?;
+        match source {
+            CredentialSource::ServiceAccountKey(json)
+            | CredentialSource::AuthorizedUserJson(json)
+            | CredentialSource::ExternalAccountJson(json)
+            | CredentialSource::ImpersonatedServiceAccountJson(json) => {
+                let (auth, override_url) = auth_from_json(&json).map_err(wrap)?;
+                if emulator_url.is_none() {
+                    if let Some(u) = override_url {
+                        base_url = u;
+                    }
+                }
+                auth
             }
-            auth
-        }
-        CredentialSource::ApplicationCredentialsFile(path) => {
-            let content = std::fs::read_to_string(&path).map_err(|e| wrap(e.to_string()))?;
-            let (auth, override_url) = auth_from_json(&content).map_err(wrap)?;
-            if let Some(u) = override_url {
-                base_url = u;
+            CredentialSource::ApplicationCredentialsFile(path) => {
+                let content = std::fs::read_to_string(&path).map_err(|e| wrap(e.to_string()))?;
+                let (auth, override_url) = auth_from_json(&content).map_err(wrap)?;
+                if emulator_url.is_none() {
+                    if let Some(u) = override_url {
+                        base_url = u;
+                    }
+                }
+                auth
             }
-            auth
+            CredentialSource::Metadata => Arc::new(GceMetadataProvider::new()),
         }
-        CredentialSource::Metadata => Arc::new(GceMetadataProvider::new()),
     };
 
     let bucket_name_encoded = exthttp::percent_encode_non_alnum(&cfg.bucket_name);
@@ -1918,6 +1955,22 @@ impl GcsClient {
                         retries += 1;
                         tokio::time::sleep(delay).await;
                         continue;
+                    }
+                    if status == StatusCode::NOT_FOUND
+                        && (path_label.is_empty()
+                            || xml_text_tag(body.as_bytes(), "Code").as_deref()
+                                == Some("NoSuchBucket")
+                            || body.contains("specified bucket does not exist"))
+                    {
+                        let source: Box<dyn std::error::Error + Send + Sync> = if body.is_empty() {
+                            format!("GCS bucket not found with status {status}").into()
+                        } else {
+                            format!("HTTP error with status {status}: {body}").into()
+                        };
+                        return Err(object_store::Error::Generic {
+                            store: STORE,
+                            source,
+                        });
                     }
                     return Err(exthttp::map_http_error(STORE, path_label, status, body));
                 }
@@ -3188,5 +3241,180 @@ mod tests {
             .await;
         assert!(res.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn d2_02_gcs_no_such_bucket_is_not_obj_not_found_and_errors_on_iter() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    loop {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        let hdr_end = loop {
+                            let Ok(n) = sock.read(&mut tmp).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos;
+                            }
+                        };
+                        let _ = hdr_end;
+                        let body = "<?xml version='1.0' encoding='UTF-8'?><Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message></Error>";
+                        let resp = format!(
+                            "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let sa = format!(
+            r#"{{"type":"service_account","private_key":"unused","private_key_id":"x","client_email":"x@y","gcs_base_url":"http://{addr}","disable_oauth":true}}"#
+        );
+        let store = new_store(&GCSConfig {
+            bucket_name: "missing-bkt".into(),
+            service_account: sa,
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let reg = prometheus::Registry::new();
+        let mut bkt = crate::bucket::BucketClient::from_object_store(store, "missing-bkt", "GCS");
+        bkt.metrics = Some(Arc::new(
+            crate::bucket::metrics::BucketMetrics::register(&reg, "ingester", "missing-bkt").unwrap(),
+        ));
+
+        let dl_err = bkt.download("obj.bin").await.unwrap_err();
+        assert!(!dl_err.is_not_found(), "NoSuchBucket must not be NotFound: {dl_err:?}");
+        assert!(bkt.iter_dir("").await.is_err());
+        assert!(bkt.list_all("").await.is_err());
+
+        let iter_failures: f64 = reg
+            .gather()
+            .iter()
+            .filter(|mf| mf.get_name() == "thanos_objstore_bucket_operation_failures_total")
+            .flat_map(|mf| mf.get_metric())
+            .filter(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|lp| lp.get_name() == "operation" && lp.get_value() == "iter")
+            })
+            .map(|m| m.get_counter().get_value())
+            .sum();
+        assert_eq!(iter_failures, 2.0);
+
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn d2_11_storage_emulator_host_skips_oauth_without_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_auth = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let seen_auth_srv = Arc::clone(&seen_auth);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let sa_log = Arc::clone(&seen_auth_srv);
+                tokio::spawn(async move {
+                    loop {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        let hdr_end = loop {
+                            let Ok(n) = sock.read(&mut tmp).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..hdr_end]);
+                        let has_auth = head
+                            .lines()
+                            .any(|l| l.to_ascii_lowercase().starts_with("authorization:"));
+                        sa_log.lock().unwrap().push(has_auth);
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        // Empty service_account + STORAGE_EMULATOR_HOST without scheme ("127.0.0.1:port").
+        let cfg = GCSConfig {
+            bucket_name: "emu-bkt".into(),
+            ..Default::default()
+        };
+        let host_str = addr.to_string();
+        let store = new_store_with_env(&cfg, &|k| {
+            if k == "STORAGE_EMULATOR_HOST" {
+                Some(host_str.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+
+        let data = store.get(&Path::from("k1")).await.unwrap().bytes().await.unwrap();
+        assert_eq!(data.as_ref(), b"hello");
+        assert_eq!(*seen_auth.lock().unwrap(), vec![false]);
+
+        // Also accepts explicit http:// scheme and rejects invalid URLs.
+        let http_str = format!("http://{addr}/");
+        assert!(new_store_with_env(&cfg, &|k| {
+            (k == "STORAGE_EMULATOR_HOST").then(|| http_str.clone())
+        })
+        .is_ok());
+        assert!(new_store_with_env(&cfg, &|k| {
+            (k == "STORAGE_EMULATOR_HOST").then(|| "http://[::1".to_string())
+        })
+        .is_err());
+
+        // STORAGE_EMULATOR_HOST must NOT be clobbered when service_account JSON provides a base URL / universe override.
+        let cfg_with_sa = GCSConfig {
+            bucket_name: "emu-bkt".into(),
+            service_account: r#"{"type":"service_account","private_key":"unused","private_key_id":"x","client_email":"x@y","gcs_base_url":"https://storage.custom.universe.example","disable_oauth":true}"#.into(),
+            ..Default::default()
+        };
+        let store_with_sa = new_store_with_env(&cfg_with_sa, &|k| {
+            (k == "STORAGE_EMULATOR_HOST").then(|| host_str.clone())
+        })
+        .unwrap();
+        let data2 = store_with_sa
+            .get(&Path::from("k2"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(data2.as_ref(), b"hello");
+
+        srv.abort();
     }
 }

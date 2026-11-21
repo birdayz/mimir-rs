@@ -606,15 +606,15 @@ impl Mergeable for PartitionRingDesc {
     }
 
     fn remove_tombstones(&mut self, limit: Option<SystemTime>) -> (usize, usize) {
+        use crate::ring::model::unix_secs_before;
         let mut total = 0usize;
         let mut removed = 0usize;
-        let limit_secs = limit.map(system_time_to_unix_secs);
 
         self.partitions.retain(|_, part| {
             if part.is_deleted() {
-                let expired = match limit_secs {
+                let expired = match limit {
                     None => true,
-                    Some(lim) => part.state_timestamp < lim,
+                    Some(lim) => unix_secs_before(part.state_timestamp, lim),
                 };
                 if expired {
                     removed += 1;
@@ -628,9 +628,9 @@ impl Mergeable for PartitionRingDesc {
 
         self.owners.retain(|_, owner| {
             if owner.state == OwnerState::OwnerDeleted as i32 {
-                let expired = match limit_secs {
+                let expired = match limit {
                     None => true,
-                    Some(lim) => owner.updated_timestamp < lim,
+                    Some(lim) => unix_secs_before(owner.updated_timestamp, lim),
                 };
                 if expired {
                     removed += 1;
@@ -647,6 +647,10 @@ impl Mergeable for PartitionRingDesc {
 
     fn clone_mergeable(&self) -> Box<dyn Mergeable> {
         Box::new(self.clone())
+    }
+
+    fn eq_mergeable(&self, other: &dyn Mergeable) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
     }
 
     fn to_go_json(&self) -> GoJson {

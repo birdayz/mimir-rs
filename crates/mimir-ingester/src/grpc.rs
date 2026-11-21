@@ -353,26 +353,29 @@ async fn prepare_read_reactive_for_slot(
         &EMPTY_HEADERS
     };
     match ingester.prepare_read_reactive(headers, deadline_ctx).await {
-        Ok(Some(rp)) => {
+        Ok(rp_opt) => {
             if let Some(slot) = read_tap_slot {
                 if let Some(ref mut guard) = *slot.lock() {
                     if let Some(ref mut tap) = guard.tap {
-                        tap.set_reactive_permit(rp);
+                        if let Some(rp) = rp_opt {
+                            tap.set_reactive_permit(rp);
+                        }
+                        tap.mark_prepared();
+                        ext.insert(TapDeadlineFlag(tap.deadline_exceeded_flag()));
                     }
                 }
             }
+            Ok(())
         }
-        Ok(None) => {}
-        Err(e) => return Err(Status::unavailable(e.to_string())),
-    }
-    if let Some(slot) = read_tap_slot {
-        if let Some(ref mut guard) = *slot.lock() {
-            if let Some(ref mut tap) = guard.tap {
-                ext.insert(TapDeadlineFlag(tap.deadline_exceeded_flag()));
+        Err(e) => {
+            if let Some(slot) = read_tap_slot {
+                if let Some(mut guard) = slot.lock().take() {
+                    guard.abort();
+                }
             }
+            Err(Status::unavailable(e.to_string()))
         }
     }
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -384,9 +387,19 @@ struct ReadTapGuard {
 }
 
 impl ReadTapGuard {
-    fn finish(&mut self, canceled: bool) {
+    fn abort(&mut self) {
         if let Some(tap) = self.tap.take() {
-            tap.finish(canceled);
+            tap.abort();
+        }
+    }
+
+    fn finish_or_abort(&mut self, canceled: bool) {
+        if let Some(tap) = self.tap.take() {
+            if tap.is_prepared() {
+                tap.finish(canceled);
+            } else {
+                tap.abort();
+            }
         }
     }
 
@@ -398,6 +411,10 @@ impl ReadTapGuard {
 impl Drop for ReadTapGuard {
     fn drop(&mut self) {
         if let Some(tap) = self.tap.take() {
+            if !tap.is_prepared() {
+                tap.abort();
+                return;
+            }
             let timed_out = self
                 .deadline_ctx
                 .as_ref()
@@ -447,10 +464,14 @@ impl hyper::body::Body for ReadTapDropBody {
         };
         if done {
             if let Some(permit) = self.permit.take() {
-                if deadline_exceeded {
-                    permit.deadline_exceeded_flag().store(true, Ordering::Release);
+                if !permit.is_prepared() {
+                    permit.abort();
+                } else {
+                    if deadline_exceeded {
+                        permit.deadline_exceeded_flag().store(true, Ordering::Release);
+                    }
+                    permit.finish(false);
                 }
-                permit.finish(false);
             }
         }
         poll
@@ -468,6 +489,10 @@ impl hyper::body::Body for ReadTapDropBody {
 impl Drop for ReadTapDropBody {
     fn drop(&mut self) {
         if let Some(permit) = self.permit.take() {
+            if !permit.is_prepared() {
+                permit.abort();
+                return;
+            }
             let timed_out = self
                 .deadline_ctx
                 .as_ref()
@@ -1484,7 +1509,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                     Err(status) => {
                         if let Some(ref slot) = read_tap_slot {
                             if let Some(mut guard) = slot.lock().take() {
-                                guard.finish(false);
+                                guard.abort();
                             }
                         }
                         if let Some(ref slot) = push_tap_slot {
@@ -1908,7 +1933,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 };
                 if let Some(mut guard) = read_tap_slot.as_ref().and_then(|s| s.lock().take()) {
                     if qs_resp.headers().contains_key("grpc-status") {
-                        guard.finish(false);
+                        guard.finish_or_abort(false);
                         qs_resp
                     } else {
                         let permit = guard.take_for_body();
@@ -2060,7 +2085,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 };
                 if let Some(mut guard) = read_tap_slot.as_ref().and_then(|s| s.lock().take()) {
                     if mflm_resp.headers().contains_key("grpc-status") {
-                        guard.finish(false);
+                        guard.finish_or_abort(false);
                         mflm_resp
                     } else {
                         let permit = guard.take_for_body();
@@ -2145,7 +2170,7 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for IngesterZeroCopySer
                 };
                 if let Some(mut guard) = read_tap_slot.as_ref().and_then(|s| s.lock().take()) {
                     if resp.headers().contains_key("grpc-status") {
-                        guard.finish(false);
+                        guard.finish_or_abort(false);
                         resp
                     } else {
                         let permit = guard.take_for_body();
@@ -3213,6 +3238,27 @@ mod tests {
             1,
             "normal completion on Frame::trailers must call rp.record()"
         );
+
+        // 3) Unprepared permit must call abort() (not finish()) on both poll_frame completion and drop.
+        let tap_unprep1 = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+        assert!(!tap_unprep1.is_prepared());
+        let body_unprep_drop = ReadTapDropBody {
+            inner: tonic::body::BoxBody::new(VecFramesBody(VecDeque::new())),
+            permit: Some(tap_unprep1),
+            deadline_ctx: None,
+        };
+        drop(body_unprep_drop);
+
+        let tap_unprep2 = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+        assert!(!tap_unprep2.is_prepared());
+        let mut body_unprep_poll = ReadTapDropBody {
+            inner: tonic::body::BoxBody::new(VecFramesBody(VecDeque::new())),
+            permit: Some(tap_unprep2),
+            deadline_ctx: None,
+        };
+        let end = std::future::poll_fn(|cx| Pin::new(&mut body_unprep_poll).poll_frame(cx)).await;
+        assert!(end.is_none());
+        assert!(body_unprep_poll.permit.is_none());
     }
 
     #[tokio::test]
@@ -3643,5 +3689,205 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn b01_read_cb_half_open_not_closed_by_auth_or_reactive_rejection_or_queue_timeout() {
+        use crate::circuit_breaker::BreakerState;
+        use tower::ServiceExt as _;
+
+        #[derive(Clone)]
+        struct SingleChunkBody(Option<Bytes>);
+        impl hyper::body::Body for SingleChunkBody {
+            type Data = Bytes;
+            type Error = tonic::Status;
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+                match self.0.take() {
+                    Some(b) => Poll::Ready(Some(Ok(hyper::body::Frame::data(b)))),
+                    None => Poll::Ready(None),
+                }
+            }
+        }
+
+        fn encode_frame<M: Message>(m: &M) -> Bytes {
+            let raw = m.encode_to_vec();
+            let mut out = Vec::with_capacity(5 + raw.len());
+            out.push(0);
+            out.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+            out.extend_from_slice(&raw);
+            Bytes::from(out)
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = prometheus::Registry::new();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "test-b01-grpc".to_string();
+        cfg.read_circuit_breaker = mimir_config::CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold_percentage: 50,
+            failure_execution_threshold: 2,
+            thresholding_period: mimir_config::GoDuration::from_secs(0),
+            cooldown_period: mimir_config::GoDuration::from_millis(20),
+            request_timeout: mimir_config::GoDuration::from_millis(10),
+            ..Default::default()
+        };
+        cfg.read_reactive_limiter = mimir_config::ReactiveLimiterConfig {
+            enabled: true,
+            min_limit: 1,
+            max_limit: 1,
+            initial_limit: 1,
+            initial_rejection_factor: 1.0,
+            max_rejection_factor: 2.0,
+            ..Default::default()
+        };
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&reg),
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let read_cb = ing.circuit_breaker.read.as_ref().unwrap();
+        read_cb.activate();
+        for _ in 0..2 {
+            let p = read_cb.try_acquire_permit().unwrap().unwrap();
+            p.finish(std::time::Duration::from_millis(25), true);
+        }
+        assert_eq!(read_cb.state(), BreakerState::Open);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let ln_payload = encode_frame(&ingesterpb::LabelNamesRequest {
+            start_timestamp_ms: now - 60_000,
+            end_timestamp_ms: now + 60_000,
+            ..Default::default()
+        });
+        let qs_payload = encode_frame(&ingesterpb::QueryRequest {
+            start_timestamp_ms: now - 60_000,
+            end_timestamp_ms: now + 60_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__name__".into(),
+                value: "up".into(),
+            }],
+            ..Default::default()
+        });
+
+        // 1. Missing x-scope-orgid (auth rejection inside IngesterZeroCopyServer) must abort
+        //    ReadTapPermit and NOT close HalfOpen read CB or record CB success.
+        for (uri, payload) in [
+            ("/cortex.Ingester/LabelNames", ln_payload.clone()),
+            ("/cortex.Ingester/QueryStream", qs_payload.clone()),
+        ] {
+            let svc = IngesterService::new(Arc::clone(&ing)).into_server();
+            let req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(uri)
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+                .body(tonic::body::BoxBody::new(SingleChunkBody(Some(payload))))
+                .unwrap();
+            let resp = svc.oneshot(req).await.unwrap();
+            assert_eq!(
+                tonic::Status::from_header_map(resp.headers()).unwrap().code(),
+                tonic::Code::Unknown
+            );
+            assert_eq!(read_cb.state(), BreakerState::HalfOpen);
+            assert_eq!(read_cb.recorded_successes(), 0);
+        }
+
+        // 2. Reactive-limiter queue timeout exceeding CB request_timeout (10ms) before
+        //    PrepareReadRequest completes must abort ReadTapPermit (no CB timeout, no HalfOpen close).
+        let held = ing
+            .reactive_limiter
+            .read
+            .as_ref()
+            .unwrap()
+            .acquire_permit()
+            .await
+            .unwrap();
+        for (uri, payload) in [
+            ("/cortex.Ingester/LabelNames", ln_payload.clone()),
+            ("/cortex.Ingester/QueryStream", qs_payload),
+        ] {
+            let svc = IngesterService::new(Arc::clone(&ing)).into_server();
+            let mut req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(uri)
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+                .header("x-scope-orgid", "t-b01")
+                .body(tonic::body::BoxBody::new(SingleChunkBody(Some(payload))))
+                .unwrap();
+            req.extensions_mut().insert(RpcDeadlineContext::new(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(25),
+            )));
+            let resp = svc.oneshot(req).await.unwrap();
+            assert_eq!(
+                tonic::Status::from_header_map(resp.headers()).unwrap().code(),
+                tonic::Code::Unavailable
+            );
+            assert_eq!(read_cb.state(), BreakerState::HalfOpen);
+            assert_eq!(read_cb.recorded_successes(), 0);
+        }
+        drop(held);
+
+        let timeout_metric = reg
+            .gather()
+            .into_iter()
+            .find(|f| f.get_name() == "cortex_ingester_circuit_breaker_request_timeouts_total")
+            .and_then(|f| {
+                f.get_metric()
+                    .iter()
+                    .find(|m| {
+                        m.get_label()
+                            .iter()
+                            .any(|l| l.get_name() == "request_type" && l.get_value() == "read")
+                    })
+                    .map(|m| m.get_counter().get_value())
+            })
+            .unwrap_or(0.0);
+        assert_eq!(
+            timeout_metric, 2.0,
+            "only the 2 initial open-inducing timeouts should be recorded, not reactive queue timeouts"
+        );
+
+        // 3. Genuinely admitted & completed read RPCs (failure_execution_threshold = 2) close the HalfOpen read CB.
+        for _ in 0..2 {
+            let svc = IngesterService::new(Arc::clone(&ing)).into_server();
+            let req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("/cortex.Ingester/LabelNames")
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+                .header("x-scope-orgid", "t-b01")
+                .body(tonic::body::BoxBody::new(SingleChunkBody(Some(ln_payload.clone()))))
+                .unwrap();
+            let resp = svc.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK);
+            let mut body = resp.into_body();
+            while let Some(frame_res) = futures::future::poll_fn(|cx| {
+                hyper::body::Body::poll_frame(Pin::new(&mut body), cx)
+            })
+            .await
+            {
+                let _ = frame_res.unwrap();
+            }
+        }
+        assert_eq!(read_cb.state(), BreakerState::Closed);
+        assert_eq!(read_cb.recorded_successes(), 2);
     }
 }

@@ -929,8 +929,10 @@ impl KafkaTransport {
             client_id: Some(StrBytes::from_string(client_id.to_string())),
             timeout: request_timeout.max(Duration::from_secs(2)),
             addr,
+            eof_kind: super::kgo_retry::FirstReadEofKind::Tls,
         };
         let api_versions = io.request_api_versions().await?;
+        io.eof_kind = super::kgo_retry::FirstReadEofKind::Sasl;
         let sasl_expiry = self.authenticate(&mut io, &api_versions).await?;
         Ok(EstablishedConn {
             next_correlation_id: io.next_corr_id,
@@ -1182,6 +1184,7 @@ struct HandshakeIo<'a> {
     client_id: Option<StrBytes>,
     timeout: Duration,
     addr: &'a str,
+    eof_kind: super::kgo_retry::FirstReadEofKind,
 }
 
 impl HandshakeIo<'_> {
@@ -1205,22 +1208,14 @@ impl HandshakeIo<'_> {
     /// vice versa).
     async fn read_frame(&mut self) -> Result<Bytes, KafkaClientError> {
         let addr = self.addr;
-        let tls = self.stream.is_tls();
+        let eof_kind = self.eof_kind;
         let timeout = self.timeout;
         let stream = &mut self.stream;
         let fut = async {
             let mut size_buf = [0u8; 4];
             if let Err(e) = stream.read_exact(&mut size_buf).await {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
-                    let hint = if tls {
-                        "is the broker listener expecting plaintext (is TLS misconfigured?)"
-                    } else {
-                        "this often happens when the broker requires TLS and the client is not using it (is TLS misconfigured?)"
-                    };
-                    return Err(KafkaClientError::Io(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!("broker {addr} closed the connection during connection setup (EOF); {hint}"),
-                    )));
+                    return Err(KafkaClientError::FirstReadEof(eof_kind.to_string()));
                 }
                 return Err(e.into());
             }
@@ -1511,5 +1506,32 @@ mod tests {
         let sasl = SaslAuthConfig::from_kafka_config(&cfg).unwrap();
         assert_eq!(sasl.mechanism_name(), Some("SCRAM-SHA-256"));
         assert!(!format!("{sasl:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn d1_5_immediate_eof_on_api_versions_returns_non_retryable_first_read_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let srv = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // Read the client's ApiVersions request then close cleanly (FIN -> UnexpectedEof).
+                let mut tmp = [0u8; 256];
+                let _ = sock.read(&mut tmp).await;
+                let _ = sock.shutdown().await;
+                drop(sock);
+            }
+        });
+
+        let transport = KafkaTransport::plaintext(Duration::from_secs(2));
+        let err = match transport.connect(&addr, "test", Duration::from_secs(2)).await {
+            Ok(_) => panic!("expected FirstReadEof error"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, KafkaClientError::FirstReadEof(ref m) if m == &super::super::kgo_retry::FirstReadEofKind::Tls.to_string()),
+            "expected FirstReadEof(Tls), got {err:?}"
+        );
+        assert!(!super::super::kgo_retry::is_retryable_broker_err(&err));
+        srv.abort();
     }
 }

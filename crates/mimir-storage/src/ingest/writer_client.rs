@@ -268,7 +268,6 @@ pub struct KafkaWriterClient {
     compression: KafkaCompression,
     linger: Duration,
     write_timeout: Duration,
-    write_timeout_overhead: Duration,
     buffered_bytes: Arc<AtomicI64>,
     buffered_records: Arc<AtomicI64>,
     queue: Arc<SyncMutex<VecDeque<QueuedItem>>>,
@@ -301,7 +300,10 @@ impl KafkaWriterClient {
         } else {
             None
         };
-        let inner = Arc::new(IngestKafkaClient::from_config(cfg, extended_metrics.clone())?);
+        let inner = Arc::new(IngestKafkaClient::from_config_for_producer(
+            cfg,
+            extended_metrics.clone(),
+        )?);
         let compression =
             kafka_producer_compression_from_config(&cfg.producer_compression)
                 .unwrap_or(KafkaCompression::Snappy);
@@ -312,8 +314,6 @@ impl KafkaWriterClient {
         };
         let write_timeout =
             Duration::from_nanos(cfg.write_timeout.as_nanos().max(0) as u64);
-        let write_timeout_overhead =
-            Duration::from_nanos(cfg.write_timeout_overhead.as_nanos().max(0) as u64);
         let default_topic = if opts.disable_default_topic || cfg.topic.is_empty() {
             None
         } else {
@@ -332,7 +332,6 @@ impl KafkaWriterClient {
             } else {
                 write_timeout
             },
-            write_timeout_overhead,
             buffered_bytes: Arc::new(AtomicI64::new(0)),
             buffered_records: Arc::new(AtomicI64::new(0)),
             queue: Arc::new(SyncMutex::new(VecDeque::new())),
@@ -355,7 +354,7 @@ impl KafkaWriterClient {
     }
 
     pub fn request_timeout_overhead(&self) -> Duration {
-        self.write_timeout_overhead
+        self.inner.request_timeout()
     }
 
     pub fn inner(&self) -> &Arc<IngestKafkaClient> {
@@ -704,6 +703,7 @@ impl KafkaWriterClient {
             let elapsed = earliest_enqueue.elapsed();
             if elapsed >= self.write_timeout {
                 last_err = Some(ProducerError::RecordTimeout);
+                self.drain_partition_with_err(topic, partition, ProducerError::RecordTimeout);
                 break;
             }
 
@@ -717,9 +717,7 @@ impl KafkaWriterClient {
                 })
                 .collect();
 
-            let remaining_wait = (self.write_timeout + self.write_timeout_overhead)
-                .saturating_sub(elapsed)
-                .max(Duration::from_millis(50));
+            let remaining_wait = self.write_timeout.saturating_sub(elapsed);
 
             let produce_res = tokio::time::timeout(
                 remaining_wait,
@@ -772,22 +770,7 @@ impl KafkaWriterClient {
                 }
                 Err(_) => {
                     last_err = Some(ProducerError::RecordTimeout);
-                    // Fail only queued records belonging to this (topic, partition), matching
-                    // franz-go per-partition recBuf isolation.
-                    let mut same_partition_items = Vec::new();
-                    {
-                        let mut q = self.queue.lock();
-                        let mut remaining = VecDeque::with_capacity(q.len());
-                        for item in q.drain(..) {
-                            if item.record.topic == topic && item.record.partition == partition {
-                                same_partition_items.push(item);
-                            } else {
-                                remaining.push_back(item);
-                            }
-                        }
-                        *q = remaining;
-                    }
-                    self.fail_items_with_err(same_partition_items, ProducerError::RecordTimeout);
+                    self.drain_partition_with_err(topic, partition, ProducerError::RecordTimeout);
                     break;
                 }
             }
@@ -799,6 +782,7 @@ impl KafkaWriterClient {
                     && !matches!(last_err, Some(ProducerError::Other(ref m)) if m == "unknown topic or partition")
                 {
                     last_err = Some(ProducerError::RecordTimeout);
+                    self.drain_partition_with_err(topic, partition, ProducerError::RecordTimeout);
                 }
                 break;
             }
@@ -806,6 +790,7 @@ impl KafkaWriterClient {
             if remaining.is_zero() {
                 if !matches!(last_err, Some(ProducerError::Other(ref m)) if m == "unknown topic or partition") {
                     last_err = Some(ProducerError::RecordTimeout);
+                    self.drain_partition_with_err(topic, partition, ProducerError::RecordTimeout);
                 }
                 break;
             }
@@ -820,6 +805,25 @@ impl KafkaWriterClient {
             self.update_buffered_gauges();
             (item.on_done)(item.record, Err(err.clone()));
         }
+    }
+
+    /// Drains and fails all queued buffered records belonging to `(topic, partition)`,
+    /// matching franz-go per-partition `recBuf` timeout draining.
+    fn drain_partition_with_err(&self, topic: &str, partition: i32, err: ProducerError) {
+        let mut same_partition_items = Vec::new();
+        {
+            let mut q = self.queue.lock();
+            let mut remaining = VecDeque::with_capacity(q.len());
+            for item in q.drain(..) {
+                if item.record.topic == topic && item.record.partition == partition {
+                    same_partition_items.push(item);
+                } else {
+                    remaining.push_back(item);
+                }
+            }
+            *q = remaining;
+        }
+        self.fail_items_with_err(same_partition_items, err);
     }
 
     fn update_buffered_gauges(&self) {
@@ -1709,7 +1713,7 @@ mod tests {
         let mut cfg = KafkaConfig {
             address: StringSliceCSV(vec![addr.to_string()]),
             topic: "ingest".to_string(),
-            write_timeout: GoDuration::from_millis(160),
+            write_timeout: GoDuration::from_millis(200),
             write_timeout_overhead: GoDuration::from_millis(40),
             ..Default::default()
         };
@@ -1900,6 +1904,209 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("warpstream"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn d1_4b_retry_loop_timeout_bounds_by_write_timeout_and_drains_same_partition() {
+        // Server returns retriable RequestTimedOut on Produce for partition 0 and succeeds on p1.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port() as i32;
+        let p0_attempts = Arc::new(AtomicUsize::new(0));
+        let p0_attempts_srv = Arc::clone(&p0_attempts);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let p0_c = Arc::clone(&p0_attempts_srv);
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = sock.into_split();
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if rd.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; len];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = Bytes::from(payload);
+                        let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let api_key = ApiKey::try_from(key_i16).unwrap();
+                        let req_hdr = RequestHeader::decode(&mut buf, api_key.request_header_version(ver)).unwrap();
+                        let mut out = BytesMut::new();
+                        out.put_u32(0);
+                        let resp_hdr_ver = if api_key == ApiKey::ApiVersions {
+                            0
+                        } else {
+                            api_key.response_header_version(ver)
+                        };
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr.encode(&mut out, resp_hdr_ver).unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let mut r = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 0, 12),
+                                    (ApiKey::Produce as i16, 3, 9),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    r.api_keys.push(av);
+                                }
+                                r.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = port;
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("ingest")));
+                                for pid in 0..2 {
+                                    let mut p = MetadataResponsePartition::default();
+                                    p.partition_index = pid;
+                                    p.leader_id = BrokerId(0);
+                                    t.partitions.push(p);
+                                }
+                                let mut r = MetadataResponse::default();
+                                r.brokers = vec![b];
+                                r.topics = vec![t];
+                                r.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Produce => {
+                                let req = ProduceRequest::decode(&mut buf, ver).unwrap();
+                                let mut resp = ProduceResponse::default();
+                                for rt in &req.topic_data {
+                                    let mut tr = TopicProduceResponse::default();
+                                    tr.name = rt.name.clone();
+                                    for rp in &rt.partition_data {
+                                        let mut pr = PartitionProduceResponse::default();
+                                        pr.index = rp.index;
+                                        if rp.index == 0 {
+                                            p0_c.fetch_add(1, Ordering::SeqCst);
+                                            pr.error_code = ResponseError::RequestTimedOut.code();
+                                        } else {
+                                            pr.error_code = 0;
+                                            pr.base_offset = 100;
+                                        }
+                                        tr.partition_responses.push(pr);
+                                    }
+                                    resp.responses.push(tr);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        // Large write_timeout_overhead (5s) must NOT extend RecordDeliveryTimeout past write_timeout (150ms)!
+        let mut cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "ingest".to_string(),
+            write_timeout: GoDuration::from_millis(150),
+            write_timeout_overhead: GoDuration::from_secs(5),
+            ..Default::default()
+        };
+        cfg.dial_timeout = GoDuration::from_secs(2);
+
+        let client = KafkaWriterClient::new(
+            &cfg,
+            2,
+            None,
+            KafkaWriterClientOptions {
+                disable_default_topic: false,
+                disable_linger: false,
+            },
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let (tx0_a, rx0_a) = tokio::sync::oneshot::channel();
+        client.produce(
+            WriterRecord {
+                topic: "ingest".to_string(),
+                partition: 0,
+                key: Bytes::from_static(b"k0a"),
+                value: Bytes::from_static(b"v0a"),
+                ..Default::default()
+            },
+            Box::new(move |_r, res| {
+                let _ = tx0_a.send(res);
+            }),
+        );
+
+        // Wait for at least one retriable Produce attempt on p0 (after 50ms linger), then wait
+        // until ~110ms total so p0_b remains in self.queue (linger 50ms -> 160ms) when p0_a hits
+        // write_timeout at 150ms.
+        while p0_attempts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Enqueue a second p0 record and a healthy p1 record while p0 is retrying.
+        let (tx0_b, rx0_b) = tokio::sync::oneshot::channel();
+        let p0_b_enqueued = Instant::now();
+        client.produce(
+            WriterRecord {
+                topic: "ingest".to_string(),
+                partition: 0,
+                key: Bytes::from_static(b"k0b"),
+                value: Bytes::from_static(b"v0b"),
+                ..Default::default()
+            },
+            Box::new(move |_r, res| {
+                let _ = tx0_b.send((res, p0_b_enqueued.elapsed()));
+            }),
+        );
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        client.produce(
+            WriterRecord {
+                topic: "ingest".to_string(),
+                partition: 1,
+                key: Bytes::from_static(b"k1"),
+                value: Bytes::from_static(b"v1"),
+                ..Default::default()
+            },
+            Box::new(move |_r, res| {
+                let _ = tx1.send(res);
+            }),
+        );
+
+        assert_eq!(rx0_a.await.unwrap(), Err(ProducerError::RecordTimeout));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "RecordDeliveryTimeout must NOT include 5s write_timeout_overhead, took {elapsed:?}"
+        );
+        let (res0_b, p0_b_elapsed) = rx0_b.await.unwrap();
+        assert_eq!(res0_b, Err(ProducerError::RecordTimeout));
+        assert!(
+            p0_b_elapsed < Duration::from_millis(140),
+            "queued p0_b must be drained immediately on retry-loop timeout, took {p0_b_elapsed:?}"
+        );
+        assert_eq!(rx1.await.unwrap(), Ok(100));
+        assert_eq!(client.buffered_produce_bytes(), 0);
+        assert_eq!(client.buffered_produce_records(), 0);
+
+        client.close();
+        srv.abort();
     }
 }
 

@@ -873,14 +873,39 @@ impl IngestKafkaClient {
         cfg: &KafkaConfig,
         metrics: Option<KafkaClientExtendedMetrics>,
     ) -> Result<Self, KafkaClientError> {
-        let write_timeout = Duration::from_nanos(cfg.write_timeout.as_nanos().max(0) as u64);
-        let overhead =
-            Duration::from_nanos(cfg.write_timeout_overhead.as_nanos().max(0) as u64);
-        let request_timeout = (write_timeout + overhead).max(Duration::from_secs(5));
         let inner = super::kafka_client::KafkaClient::from_config(cfg)?
-            .with_request_timeout(request_timeout)
             .with_extended_metrics(metrics);
         Ok(Self { inner })
+    }
+
+    pub fn from_config_for_producer(
+        cfg: &KafkaConfig,
+        metrics: Option<KafkaClientExtendedMetrics>,
+    ) -> Result<Self, KafkaClientError> {
+        let raw_overhead =
+            Duration::from_nanos(cfg.write_timeout_overhead.as_nanos().max(0) as u64);
+        let overhead = if raw_overhead.is_zero() {
+            super::kgo_retry::DEFAULT_REQUEST_TIMEOUT_OVERHEAD
+        } else {
+            raw_overhead.max(Duration::from_millis(100))
+        };
+        let inner = super::kafka_client::KafkaClient::from_config(cfg)?
+            .with_request_timeout(overhead)
+            .with_extended_metrics(metrics);
+        Ok(Self { inner })
+    }
+
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.inner = self.inner.with_request_timeout(timeout);
+        self
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        self.inner.request_timeout()
+    }
+
+    pub fn produce_timeout(&self) -> Duration {
+        self.inner.produce_timeout()
     }
 
     pub fn extended_metrics(&self) -> Option<&KafkaClientExtendedMetrics> {

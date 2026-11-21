@@ -3,6 +3,7 @@
 //! Ported from github.com/grafana/dskit/kv/etcd/etcd.go (TLS: see [`super::etcd_tls`]).
 
 use std::any::Any;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -231,12 +232,20 @@ enum AuthError {
     Transport(KvError),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AuthState {
+    Unknown,
+    Token(String),
+    NotEnabled,
+}
+
 pub struct EtcdKv {
     http: reqwest::Client,
     endpoints: Vec<String>,
     cfg: EtcdConfig,
     codec: Arc<dyn Codec>,
-    auth_token: RwLock<Option<String>>,
+    auth_state: RwLock<AuthState>,
+    next_endpoint: AtomicUsize,
 }
 
 impl EtcdKv {
@@ -293,7 +302,8 @@ impl EtcdKv {
             endpoints,
             cfg,
             codec,
-            auth_token: RwLock::new(None),
+            auth_state: RwLock::new(AuthState::Unknown),
+            next_endpoint: AtomicUsize::new(0),
         })
     }
 
@@ -310,16 +320,37 @@ impl EtcdKv {
         }
     }
 
+    fn auth_enabled(&self) -> bool {
+        !self.cfg.username.is_empty() && !self.cfg.password.is_empty()
+    }
+
+    fn should_refresh_token(status: StatusCode, body: &str, auth_enabled: bool) -> bool {
+        if !auth_enabled {
+            return false;
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            return true;
+        }
+        if status == StatusCode::BAD_REQUEST {
+            return body.contains("invalid auth token")
+                || body.contains("revision of auth store is old")
+                || body.contains("user name is empty");
+        }
+        false
+    }
+
     async fn invalidate_auth(&self) {
-        *self.auth_token.write().await = None;
+        *self.auth_state.write().await = AuthState::Unknown;
     }
 
     async fn ensure_auth(&self) -> Result<Option<String>, AuthError> {
-        if self.cfg.username.is_empty() {
+        if !self.auth_enabled() {
             return Ok(None);
         }
-        if let Some(tok) = self.auth_token.read().await.as_ref() {
-            return Ok(Some(tok.clone()));
+        match &*self.auth_state.read().await {
+            AuthState::Token(tok) => return Ok(Some(tok.clone())),
+            AuthState::NotEnabled => return Ok(None),
+            AuthState::Unknown => {}
         }
         #[derive(Serialize)]
         struct AuthReq<'a> {
@@ -335,7 +366,9 @@ impl EtcdKv {
         let mut last_err = None;
         let mut responded_server = false;
         let req_timeout = self.unary_request_timeout();
-        for idx in 0..self.endpoints.len() {
+        let start_idx = self.next_endpoint.load(Ordering::Relaxed);
+        for attempt in 0..self.endpoints.len() {
+            let idx = (start_idx + attempt) % self.endpoints.len();
             let url = format!("{}/v3/auth/authenticate", self.endpoint(idx));
             match self
                 .http
@@ -349,6 +382,7 @@ impl EtcdKv {
                 .await
             {
                 Ok(resp) if resp.status().is_success() => {
+                    self.next_endpoint.store(idx, Ordering::Relaxed);
                     let body_bytes = match resp.bytes().await {
                         Ok(b) => b,
                         Err(e) => {
@@ -365,11 +399,24 @@ impl EtcdKv {
                             "etcd auth failed: missing token in response".to_string(),
                         )));
                     }
-                    *self.auth_token.write().await = Some(parsed.token.clone());
+                    *self.auth_state.write().await = AuthState::Token(parsed.token.clone());
                     return Ok(Some(parsed.token));
                 }
                 Ok(resp) => {
                     let status = resp.status();
+                    if !status.is_server_error() {
+                        self.next_endpoint.store(idx, Ordering::Relaxed);
+                    }
+                    if status == StatusCode::BAD_REQUEST {
+                        let body = resp.text().await.unwrap_or_default();
+                        if body.contains("authentication is not enabled") {
+                            *self.auth_state.write().await = AuthState::NotEnabled;
+                            return Ok(None);
+                        }
+                        return Err(AuthError::Rejected(KvError::Http(format!(
+                            "etcd auth failed: {status}"
+                        ))));
+                    }
                     let err = KvError::Http(format!("etcd auth failed: {status}"));
                     if status.is_client_error() {
                         return Err(AuthError::Rejected(err));
@@ -385,6 +432,10 @@ impl EtcdKv {
                     last_err = Some(KvError::Http(format_reqwest_error(&e)));
                 }
             }
+        }
+        if !responded_server && !self.endpoints.is_empty() {
+            self.next_endpoint
+                .store((start_idx + 1) % self.endpoints.len(), Ordering::Relaxed);
         }
         let err = last_err.unwrap_or_else(|| KvError::Http("no etcd endpoints".to_string()));
         if responded_server {
@@ -435,7 +486,9 @@ impl EtcdKv {
             let mut responded = false;
             let mut need_auth_retry = false;
             let req_timeout = self.unary_request_timeout();
-            for idx in 0..self.endpoints.len() {
+            let start_idx = self.next_endpoint.load(Ordering::Relaxed);
+            for attempt in 0..self.endpoints.len() {
+                let idx = (start_idx + attempt) % self.endpoints.len();
                 let url = format!("{}{path}", self.endpoint(idx));
                 match self
                     .http
@@ -447,32 +500,46 @@ impl EtcdKv {
                     .await
                 {
                     Ok(resp) if resp.status().is_success() => {
+                        self.next_endpoint.store(idx, Ordering::Relaxed);
                         return resp
                             .json::<Resp>()
                             .await
                             .map_err(|e| KvError::Http(format!("decode etcd {path}: {e}")));
                     }
                     Ok(resp)
-                        if resp.status() == StatusCode::UNAUTHORIZED
-                            && !self.cfg.username.is_empty()
+                        if (resp.status() == StatusCode::UNAUTHORIZED
+                            || resp.status() == StatusCode::BAD_REQUEST)
+                            && self.auth_enabled()
                             && !refreshed_auth =>
                     {
-                        refreshed_auth = true;
-                        need_auth_retry = true;
-                        self.invalidate_auth().await;
-                        break;
+                        self.next_endpoint.store(idx, Ordering::Relaxed);
+                        let status = resp.status();
+                        let resp_body = resp.text().await.unwrap_or_default();
+                        if Self::should_refresh_token(status, &resp_body, true) {
+                            refreshed_auth = true;
+                            need_auth_retry = true;
+                            self.invalidate_auth().await;
+                            break;
+                        }
+                        responded = true;
+                        last_err = Some(KvError::Http(format!("etcd {path} returned {status}")));
                     }
                     Ok(resp) => {
+                        let status = resp.status();
+                        if !status.is_server_error() {
+                            self.next_endpoint.store(idx, Ordering::Relaxed);
+                        }
                         responded = true;
-                        last_err = Some(KvError::Http(format!(
-                            "etcd {path} returned {}",
-                            resp.status()
-                        )));
+                        last_err = Some(KvError::Http(format!("etcd {path} returned {status}")));
                     }
                     Err(e) => {
                         last_err = Some(KvError::Http(format_reqwest_error(&e)));
                     }
                 }
+            }
+            if !responded && !need_auth_retry && !self.endpoints.is_empty() {
+                self.next_endpoint
+                    .store((start_idx + 1) % self.endpoints.len(), Ordering::Relaxed);
             }
             if need_auth_retry {
                 continue;
@@ -811,7 +878,7 @@ impl EtcdKv {
         });
 
         let mut start_revision: i64 = 0;
-        let mut ep_idx: usize = 0;
+        let mut ep_idx: usize = self.next_endpoint.load(Ordering::Relaxed) % self.endpoints.len();
         let mut refreshed_auth = false;
 
         while backoff.ongoing() && !cancel.is_canceled() {
@@ -868,15 +935,21 @@ impl EtcdKv {
                         break;
                     }
                     Ok(r)
-                        if r.status() == StatusCode::UNAUTHORIZED
-                            && !self.cfg.username.is_empty()
+                        if (r.status() == StatusCode::UNAUTHORIZED
+                            || r.status() == StatusCode::BAD_REQUEST)
+                            && self.auth_enabled()
                             && !refreshed_auth =>
                     {
-                        warn!(key = key_label, endpoint = %self.endpoint(idx), "etcd watch unauthorized, refreshing auth token");
-                        refreshed_auth = true;
-                        self.invalidate_auth().await;
-                        unauthorized = true;
-                        break;
+                        let status = r.status();
+                        let resp_body = r.text().await.unwrap_or_default();
+                        if Self::should_refresh_token(status, &resp_body, true) {
+                            warn!(key = key_label, endpoint = %self.endpoint(idx), %status, "etcd watch auth token stale/rejected, refreshing auth token");
+                            refreshed_auth = true;
+                            self.invalidate_auth().await;
+                            unauthorized = true;
+                            break;
+                        }
+                        error!(key = key_label, endpoint = %self.endpoint(idx), %status, "etcd watch HTTP error");
                     }
                     Ok(r) => {
                         error!(key = key_label, endpoint = %self.endpoint(idx), status = %r.status(), "etcd watch HTTP error");
@@ -1201,7 +1274,7 @@ mod tests {
         for (status_line, body, expected_status) in [
             (
                 "400 Bad Request",
-                r#"{"error":"etcdserver: authentication is not enabled","code":9}"#,
+                r#"{"error":"etcdserver: authentication failed, invalid user ID or password","code":3}"#,
                 "400",
             ),
             (
@@ -1541,5 +1614,441 @@ mod tests {
             .unwrap();
         assert!(got.is_none());
         assert_eq!(good_auth_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn c02_err_auth_old_revision_auto_reauths_unary_and_watch() {
+        use crate::kv::StringCodec;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let range_calls = Arc::new(AtomicUsize::new(0));
+        let watch_calls = Arc::new(AtomicUsize::new(0));
+        let ac = Arc::clone(&auth_calls);
+        let rc = Arc::clone(&range_calls);
+        let wc = Arc::clone(&watch_calls);
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let ac = Arc::clone(&ac);
+                let rc = Arc::clone(&rc);
+                let wc = Arc::clone(&wc);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req_str.lines().next().unwrap_or("");
+                    if first_line.contains("/v3/auth/authenticate") {
+                        let c = ac.fetch_add(1, Ordering::SeqCst);
+                        let body = format!(r#"{{"token":"tok-{}"}}"#, c + 1);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else if first_line.contains("/v3/kv/range") {
+                        let c = rc.fetch_add(1, Ordering::SeqCst);
+                        let (status_line, body) = if c == 0 {
+                            (
+                                "400 Bad Request",
+                                r#"{"error":"etcdserver: revision of auth store is old","code":3}"#,
+                            )
+                        } else {
+                            ("200 OK", r#"{"kvs":[]}"#)
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else if first_line.contains("/v3/watch") {
+                        let c = wc.fetch_add(1, Ordering::SeqCst);
+                        if c == 0 {
+                            let body = r#"{"error":"etcdserver: revision of auth store is old","code":3}"#;
+                            let resp = format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        } else {
+                            let val_b64 = b64_encode(b"v-ok");
+                            let key_b64 = b64_encode(b"k");
+                            let event_line = format!(
+                                r#"{{"result":{{"header":{{"revision":"11"}},"events":[{{"type":"PUT","kv":{{"key":"{key_b64}","value":"{val_b64}","mod_revision":"11"}}}}]}}}}"#
+                            );
+                            let chunk = format!("{:x}\r\n{event_line}\n\r\n", event_line.len() + 1);
+                            let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                            let _ = sock.write_all(headers.as_bytes()).await;
+                            let _ = sock.write_all(chunk.as_bytes()).await;
+                            let _ = sock.write_all(b"0\r\n\r\n").await;
+                        }
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let kv = EtcdKv::new(
+            EtcdConfig {
+                endpoints: vec![format!("http://{addr}")],
+                username: "root".to_string(),
+                password: "secret".to_string(),
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+        )
+        .unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(2), kv.get("k"))
+            .await
+            .expect("get must recover from ErrAuthOldRevision")
+            .unwrap();
+        assert!(got.is_none());
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 2);
+
+        // Also test watch_key recovering from ErrAuthOldRevision.
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+        let ctx = ServiceContext::background();
+        let cancel = ctx.clone();
+        let h = tokio::spawn(async move {
+            kv.watch_key(
+                "k",
+                ctx,
+                Box::new(move |val| {
+                    if let Some(s) = val.downcast_ref::<String>() {
+                        if let Some(sender) = tx.lock().unwrap().take() {
+                            let _ = sender.send(s.clone());
+                        }
+                    }
+                    false
+                }),
+            )
+            .await;
+        });
+        let wgot = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("watch_key must recover from ErrAuthOldRevision")
+            .unwrap();
+        assert_eq!(wgot, "v-ok");
+        cancel.cancel();
+        let _ = h.await;
+    }
+
+    #[tokio::test]
+    async fn c02_err_auth_not_enabled_falls_back_unauthenticated_and_empty_password_skips_auth() {
+        use crate::kv::StringCodec;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let saw_auth_header = Arc::new(AtomicUsize::new(0));
+        let ac = Arc::clone(&auth_calls);
+        let sh = Arc::clone(&saw_auth_header);
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let ac = Arc::clone(&ac);
+                let sh = Arc::clone(&sh);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req_str.lines().next().unwrap_or("");
+                    if req_str.to_ascii_lowercase().contains("authorization:") {
+                        sh.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if first_line.contains("/v3/auth/authenticate") {
+                        ac.fetch_add(1, Ordering::SeqCst);
+                        let body = r#"{"error":"etcdserver: authentication is not enabled","code":9}"#;
+                        let resp = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else if first_line.contains("/v3/kv/range") {
+                        let body = r#"{"kvs":[]}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else if first_line.contains("/v3/watch") {
+                        let val_b64 = b64_encode(b"unauth-ok");
+                        let key_b64 = b64_encode(b"k");
+                        let event_line = format!(
+                            r#"{{"result":{{"header":{{"revision":"1"}},"events":[{{"type":"PUT","kv":{{"key":"{key_b64}","value":"{val_b64}","mod_revision":"1"}}}}]}}}}"#
+                        );
+                        let chunk = format!("{:x}\r\n{event_line}\n\r\n", event_line.len() + 1);
+                        let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                        let _ = sock.write_all(headers.as_bytes()).await;
+                        let _ = sock.write_all(chunk.as_bytes()).await;
+                        let _ = sock.write_all(b"0\r\n\r\n").await;
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        // 1. Empty password skips auth entirely.
+        let kv_no_pw = EtcdKv::new(
+            EtcdConfig {
+                endpoints: vec![format!("http://{addr}")],
+                username: "root".to_string(),
+                password: String::new(),
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+        )
+        .unwrap();
+        assert!(kv_no_pw.get("k").await.unwrap().is_none());
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 0);
+
+        // 2. Non-empty username+password caches ErrAuthNotEnabled and skips redundant auth POSTs.
+        let kv = EtcdKv::new(
+            EtcdConfig {
+                endpoints: vec![format!("http://{addr}")],
+                username: "root".to_string(),
+                password: "secret".to_string(),
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+        )
+        .unwrap();
+        assert!(kv.get("k").await.unwrap().is_none());
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+        assert!(kv.get("k").await.unwrap().is_none());
+        assert_eq!(
+            auth_calls.load(Ordering::SeqCst),
+            1,
+            "subsequent KV RPC must NOT re-post /v3/auth/authenticate once AuthNotEnabled is cached"
+        );
+        assert_eq!(saw_auth_header.load(Ordering::SeqCst), 0);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+        let ctx = ServiceContext::background();
+        let cancel = ctx.clone();
+        let h = tokio::spawn(async move {
+            kv.watch_key(
+                "k",
+                ctx,
+                Box::new(move |val| {
+                    if let Some(s) = val.downcast_ref::<String>() {
+                        if let Some(sender) = tx.lock().unwrap().take() {
+                            let _ = sender.send(s.clone());
+                        }
+                    }
+                    false
+                }),
+            )
+            .await;
+        });
+        let got = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("watch_key must succeed unauthenticated on ErrAuthNotEnabled")
+            .unwrap();
+        assert_eq!(got, "unauth-ok");
+        cancel.cancel();
+        let _ = h.await;
+    }
+
+    #[tokio::test]
+    async fn c03_sticky_rotating_unary_endpoint_failover() {
+        use crate::kv::StringCodec;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Endpoint 0: accepts and immediately resets/closes without HTTP response.
+        let l0 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr0 = l0.local_addr().unwrap();
+        let hits0 = Arc::new(AtomicUsize::new(0));
+        let h0 = Arc::clone(&hits0);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = l0.accept().await {
+                h0.fetch_add(1, Ordering::SeqCst);
+                drop(sock);
+            }
+        });
+
+        // Endpoint 1: healthy.
+        let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = l1.local_addr().unwrap();
+        let hits1 = Arc::new(AtomicUsize::new(0));
+        let h1 = Arc::clone(&hits1);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l1.accept().await {
+                h1.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"kvs":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let kv = EtcdKv::new(
+            EtcdConfig {
+                endpoints: vec![format!("http://{addr0}"), format!("http://{addr1}")],
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+        )
+        .unwrap();
+
+        // First call tries endpoint 0 (hits0=1), fails over to endpoint 1 (hits1=1) and remembers idx=1.
+        assert!(kv.get("k").await.unwrap().is_none());
+        assert_eq!(hits0.load(Ordering::SeqCst), 1);
+        assert_eq!(hits1.load(Ordering::SeqCst), 1);
+
+        // Second & third calls start directly at endpoint 1 without hitting dead endpoint 0!
+        assert!(kv.get("k").await.unwrap().is_none());
+        assert!(kv.get("k").await.unwrap().is_none());
+        assert_eq!(hits0.load(Ordering::SeqCst), 1);
+        assert_eq!(hits1.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gate_b3_auth_not_enabled_cleared_on_401_and_5xx_does_not_stick_endpoint() {
+        use crate::kv::StringCodec;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Part A: AuthNotEnabled is cleared when a subsequent KV call receives 401.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let auth_enabled = Arc::new(AtomicBool::new(false));
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let ae = Arc::clone(&auth_enabled);
+        let ac = Arc::clone(&auth_calls);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l.accept().await {
+                let ae = Arc::clone(&ae);
+                let ac = Arc::clone(&ac);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let has_auth = req.to_ascii_lowercase().contains("authorization: tok-live");
+                    let (status, body) = if first_line.contains("/v3/auth/authenticate") {
+                        ac.fetch_add(1, Ordering::SeqCst);
+                        if ae.load(Ordering::SeqCst) {
+                            ("200 OK", r#"{"token":"tok-live"}"#)
+                        } else {
+                            ("400 Bad Request", r#"{"error":"etcdserver: authentication is not enabled","code":9}"#)
+                        }
+                    } else if ae.load(Ordering::SeqCst) && !has_auth {
+                        ("401 Unauthorized", r#"{"error":"etcdserver: user name is empty"}"#)
+                    } else {
+                        ("200 OK", r#"{"kvs":[]}"#)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let kv = EtcdKv::new(
+            EtcdConfig {
+                endpoints: vec![format!("http://{addr}")],
+                username: "root".to_string(),
+                password: "secret".to_string(),
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+        )
+        .unwrap();
+        assert!(kv.get("k").await.unwrap().is_none());
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+
+        // Auth is later enabled on etcd; 401 clears AuthNotEnabled and triggers re-auth.
+        auth_enabled.store(true, Ordering::SeqCst);
+        assert!(kv.get("k").await.unwrap().is_none());
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 2);
+
+        // Part B: 5xx on endpoint 0 must NOT overwrite next_endpoint back to 0.
+        let l503 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a503 = l503.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l503.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"error":"unavailable"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let l200 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a200 = l200.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l200.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"kvs":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let kv_ep = EtcdKv::new(
+            EtcdConfig {
+                endpoints: vec![format!("http://{a503}"), format!("http://{a200}")],
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+        )
+        .unwrap();
+        // Start next_endpoint at 1 (healthy); if we force a 503 on 0 alone, next_endpoint stays at 1.
+        kv_ep.next_endpoint.store(1, Ordering::Relaxed);
+        assert!(kv_ep.get("k").await.unwrap().is_none());
+        assert_eq!(kv_ep.next_endpoint.load(Ordering::Relaxed), 1);
+
+        let kv_503_first = EtcdKv::new(
+            EtcdConfig {
+                endpoints: vec![format!("http://{a503}"), format!("http://{a503}")],
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+        )
+        .unwrap();
+        kv_503_first.next_endpoint.store(1, Ordering::Relaxed);
+        assert!(kv_503_first.get("k").await.is_err());
+        assert_eq!(
+            kv_503_first.next_endpoint.load(Ordering::Relaxed),
+            1,
+            "5xx response must not update next_endpoint"
+        );
     }
 }

@@ -658,6 +658,14 @@ impl HeadChunksWriter {
         self.seq
     }
 
+    /// Ensures sequence numbering never regresses below `min_seq` across startup/truncation
+    /// (matching Go `ChunkDiskMapper` monotonic `evtlPos.seq`).
+    pub fn ensure_min_seq(&mut self, min_seq: usize) {
+        if min_seq > self.seq {
+            self.seq = min_seq;
+        }
+    }
+
     pub fn close(mut self) -> Result<(), HeadChunksError> {
         self.close_inner()
     }
@@ -806,6 +814,10 @@ impl HeadChunksReader {
     #[inline]
     pub fn has_file(&self, seq: usize) -> bool {
         self.files.contains_key(&seq)
+    }
+
+    pub fn max_seq(&self) -> usize {
+        self.files.keys().next_back().copied().unwrap_or(0)
     }
 
     /// Reads and CRC-validates the chunk referenced by `chunk_ref`.

@@ -653,21 +653,35 @@ fn validate_go_url(raw: &str) -> Result<(), String> {
             return Err("net/url: invalid control character in URL".to_string());
         }
     }
-    let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx] == b'%' {
-            if idx + 2 >= bytes.len()
-                || !bytes[idx + 1].is_ascii_hexdigit()
-                || !bytes[idx + 2].is_ascii_hexdigit()
-            {
-                return Err("invalid URL escape".to_string());
+    // Match Go net/url.Parse: split off '#fragment' first (url.setFragment unescapes and rejects
+    // invalid '%' in fragments), while leaving '?query' (RawQuery) unescaped.
+    let (without_frag, frag_opt) = match raw.split_once('#') {
+        Some((before, frag)) => (before, Some(frag)),
+        None => (raw, None),
+    };
+    let check_escapes = |s: &str| -> Result<(), String> {
+        let bytes = s.as_bytes();
+        let mut idx = 0;
+        while idx < bytes.len() {
+            if bytes[idx] == b'%' {
+                if idx + 2 >= bytes.len()
+                    || !bytes[idx + 1].is_ascii_hexdigit()
+                    || !bytes[idx + 2].is_ascii_hexdigit()
+                {
+                    return Err("invalid URL escape".to_string());
+                }
+                idx += 3;
+            } else {
+                idx += 1;
             }
-            idx += 3;
-        } else {
-            idx += 1;
         }
+        Ok(())
+    };
+    let before_query = without_frag.split('?').next().unwrap_or("");
+    check_escapes(before_query)?;
+    if let Some(frag) = frag_opt {
+        check_escapes(frag)?;
     }
-    let without_frag = raw.split('#').next().unwrap_or(raw);
     let before_pq = without_frag.split(['/', '?']).next().unwrap_or("");
     if let Some((scheme, _)) = before_pq.split_once(':') {
         if scheme.is_empty() {
@@ -1704,6 +1718,22 @@ mod tests {
         assert_eq!(routed.route_url.as_deref(), Some("/ready?x=1"));
         assert_eq!(split_go_url_clean_redirect("/ready?x=1").route_url, None);
         assert_eq!(split_go_url_clean_redirect("http://h/ready").route_url, None);
+    }
+
+    #[test]
+    fn d2_09_validate_go_url_allows_raw_percent_in_query_and_validates_fragment() {
+        assert!(validate_go_url("/ready?q=100%").is_ok());
+        assert!(validate_go_url("/ready?q=100%#sec").is_ok());
+        assert!(validate_go_url("/ready#100%25").is_ok());
+        assert!(parse_go_url_to_http_uri("/ready?q=100%").is_ok());
+
+        let err_frag = validate_go_url("/ready#100%").unwrap_err();
+        assert!(err_frag.contains("invalid URL escape"), "got: {err_frag}");
+        let err_qfrag = validate_go_url("/ready?q=100%#sec%").unwrap_err();
+        assert!(err_qfrag.contains("invalid URL escape"), "got: {err_qfrag}");
+        assert!(parse_go_url_to_http_uri("/ready#100%").is_err());
+        assert!(validate_go_url("/ready%zz").is_err());
+        assert!(validate_go_url("/ready%?q=100%").is_err());
     }
 
     struct SingleChunkBody(Option<Bytes>);

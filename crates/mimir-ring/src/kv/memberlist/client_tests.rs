@@ -187,7 +187,7 @@
             .merge_bytes_value_for_key("ring", &encoded, codec.as_ref(), false, None)
             .unwrap();
         assert!(ch.is_none(), "expired tombstone should not be re-gossiped");
-        assert!(new_ver > 0, "local store & version must update");
+        assert!(new_ver > 0, "deleting a live entry via expired tombstone must bump version so watchers are notified");
         kv.notify_watchers("ring");
 
         let updated = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -412,6 +412,142 @@
             super::super::wire::MessageType::HasLabel as u8,
             "server reply must NOT prepend HasLabel (244)"
         );
+
+        kv.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn c11_expired_tombstone_cas_returns_no_change_without_bumping_version_and_subsecond_limit() {
+        use crate::kv::memberlist::mergeable::Mergeable;
+        use crate::ring::model::ring_desc_codec;
+        use mimir_config::GoDuration;
+        use mimir_proto::ringpb::{OwnerDesc, OwnerState, PartitionDesc, PartitionRingDesc, PartitionState};
+        use mimir_proto::ringpb::{Desc, InstanceDesc, InstanceState};
+
+        // 1. Sub-second limit comparison in Desc & PartitionRingDesc remove_tombstones.
+        let mut ring_desc = Desc::default();
+        ring_desc.ingesters.insert(
+            "left-100".into(),
+            InstanceDesc {
+                id: "left-100".into(),
+                state: InstanceState::Left as i32,
+                timestamp: 100,
+                ..Default::default()
+            },
+        );
+        let limit_half = UNIX_EPOCH + Duration::from_secs(100) + Duration::from_millis(500);
+        assert_eq!(ring_desc.remove_tombstones(Some(limit_half)), (0, 1));
+        assert!(ring_desc.ingesters.is_empty());
+
+        let mut pr_desc = PartitionRingDesc::default();
+        pr_desc.partitions.insert(
+            1,
+            PartitionDesc {
+                state: PartitionState::PartitionDeleted as i32,
+                state_timestamp: 100,
+                ..Default::default()
+            },
+        );
+        pr_desc.owners.insert(
+            "o1".into(),
+            OwnerDesc {
+                state: OwnerState::OwnerDeleted as i32,
+                updated_timestamp: 100,
+                ..Default::default()
+            },
+        );
+        assert_eq!(pr_desc.remove_tombstones(Some(limit_half)), (0, 2));
+        assert!(pr_desc.partitions.is_empty());
+        assert!(pr_desc.owners.is_empty());
+
+        // 2a. CAS that produces only expired tombstones with NO net state change to curr does not
+        // bump version and reports errNoChangeDetected ("no change detected").
+        let mut cfg = local_cfg("c11-node");
+        cfg.left_ingesters_timeout = GoDuration::from_secs(60);
+        let codec = ring_desc_codec();
+        let kv = MemberlistKv::start(cfg, vec![Arc::clone(&codec)], "test", None)
+            .await
+            .unwrap();
+        let client = Arc::new(MemberlistKvClient::new(Arc::clone(&kv), Arc::clone(&codec)).unwrap());
+
+        let old_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 120;
+        client
+            .cas(
+                "ring",
+                Box::new(move |_| {
+                    let mut d = Desc::default();
+                    d.ingesters.insert(
+                        "ing-1".into(),
+                        InstanceDesc {
+                            id: "ing-1".into(),
+                            addr: "127.0.0.1:9095".into(),
+                            timestamp: old_ts,
+                            state: InstanceState::Active as i32,
+                            tokens: vec![10],
+                            ..Default::default()
+                        },
+                    );
+                    Ok(CasOutcome::Update(Box::new(d)))
+                }),
+            )
+            .await
+            .unwrap();
+        let (_, ver_before) = kv.get_value("ring").unwrap();
+
+        let err = client
+            .cas(
+                "ring",
+                Box::new(move |cur| {
+                    let mut d = cur.unwrap().downcast_ref::<Desc>().unwrap().clone();
+                    d.ingesters.insert(
+                        "expired-ghost".into(),
+                        InstanceDesc {
+                            id: "expired-ghost".into(),
+                            addr: "127.0.0.1:9096".into(),
+                            timestamp: old_ts + 1,
+                            state: InstanceState::Left as i32,
+                            ..Default::default()
+                        },
+                    );
+                    Ok(CasOutcome::UpdateOnce(Box::new(d)))
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no change detected"),
+            "expected no change detected, got: {err}"
+        );
+        let (val_after, ver_after) = kv.get_value("ring").unwrap();
+        assert_eq!(ver_after, ver_before, "version must NOT be incremented when curr is unchanged");
+        let desc_after = val_after.downcast::<Desc>().unwrap();
+        assert!(desc_after.ingesters.contains_key("ing-1"));
+        assert!(!desc_after.ingesters.contains_key("expired-ghost"));
+
+        // 2b. CAS that deletes an existing live entry via expired tombstone DOES change curr,
+        // so it strips the entry and bumps version (without re-gossiping expired tombstones).
+        client
+            .cas(
+                "ring",
+                Box::new(move |cur| {
+                    let mut d = cur.unwrap().downcast_ref::<Desc>().unwrap().clone();
+                    if let Some(i) = d.ingesters.get_mut("ing-1") {
+                        i.state = InstanceState::Left as i32;
+                        i.timestamp = old_ts + 1;
+                    }
+                    Ok(CasOutcome::UpdateOnce(Box::new(d)))
+                }),
+            )
+            .await
+            .unwrap();
+        let (val_deleted, ver_deleted) = kv.get_value("ring").unwrap();
+        assert!(ver_deleted > ver_before, "version must bump when live entry is removed");
+        let desc_deleted = val_deleted.downcast::<Desc>().unwrap();
+        assert!(desc_deleted.ingesters.is_empty(), "expired tombstone must be stripped locally");
 
         kv.shutdown().await;
     }

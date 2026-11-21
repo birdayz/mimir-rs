@@ -490,7 +490,8 @@ impl BrokerConn {
             let drain_budget = timeout.saturating_sub(start.elapsed());
             let drain_res = tokio::time::timeout(drain_budget, async {
                 loop {
-                    let notified = self.pending_drained.notified();
+                    let mut notified = std::pin::pin!(self.pending_drained.notified());
+                    notified.as_mut().enable();
                     if self.pending.lock().is_empty() {
                         return Ok(());
                     }
@@ -886,6 +887,9 @@ fn is_transport_error(err: &KafkaClientError) -> bool {
 }
 
 fn is_leader_or_io_error(err: &KafkaClientError) -> bool {
+    if matches!(err, KafkaClientError::FirstReadEof(_)) {
+        return false;
+    }
     is_transport_error(err)
         || matches!(
             err,
@@ -914,6 +918,7 @@ pub struct KafkaClient {
     client_id: String,
     client_rack: String,
     request_timeout: Duration,
+    produce_timeout: Duration,
     transport: Arc<KafkaTransport>,
     conns_by_addr: Mutex<HashMap<(String, ConnKind), Arc<BrokerConn>>>,
     connect_locks: ConnectLocks,
@@ -947,6 +952,11 @@ impl KafkaClient {
             client_id: client_id.into(),
             client_rack: client_rack.into(),
             request_timeout: if request_timeout.is_zero() {
+                Duration::from_secs(10)
+            } else {
+                request_timeout
+            },
+            produce_timeout: if request_timeout.is_zero() {
                 Duration::from_secs(10)
             } else {
                 request_timeout
@@ -1177,6 +1187,24 @@ impl KafkaClient {
         self
     }
 
+    /// Returns the configured request timeout overhead (`kgo.RequestTimeoutOverhead`).
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Sets the wire `ProduceRequest.timeout_ms` (`kgo.ProduceRequestTimeout`).
+    pub fn with_produce_timeout(mut self, timeout: Duration) -> Self {
+        if !timeout.is_zero() {
+            self.produce_timeout = timeout;
+        }
+        self
+    }
+
+    /// Returns the configured wire `ProduceRequest` timeout (`kgo.ProduceRequestTimeout`).
+    pub fn produce_timeout(&self) -> Duration {
+        self.produce_timeout
+    }
+
     /// Sets the `ListOffsets` retry timeout (`last_produced_offset_retry_timeout`; zero = no limit).
     pub fn with_last_produced_offset_retry_timeout(mut self, timeout: Duration) -> Self {
         self.last_produced_offset_retry_timeout = timeout;
@@ -1225,14 +1253,20 @@ impl KafkaClient {
                 }
             }
         }
+        let write_timeout = Duration::from_nanos(cfg.write_timeout.as_nanos().max(0) as u64);
+        let write_timeout = if write_timeout.is_zero() {
+            Duration::from_secs(10)
+        } else {
+            write_timeout
+        };
         let client = Self::new(
             addrs,
             cfg.client_id.clone(),
             cfg.client_rack.clone(),
             Duration::from_nanos(cfg.dial_timeout.as_nanos().max(0) as u64),
-            Duration::from_nanos(cfg.write_timeout.as_nanos().max(0) as u64)
-                .max(Duration::from_secs(10)),
+            kgo_retry::DEFAULT_REQUEST_TIMEOUT_OVERHEAD,
         )?
+        .with_produce_timeout(write_timeout)
         .with_transport(Arc::new(KafkaTransport::from_kafka_config(cfg)?))
         .with_last_produced_offset_retry_timeout(Duration::from_nanos(
             cfg.last_produced_offset_retry_timeout.as_nanos().max(0) as u64,
@@ -1599,9 +1633,7 @@ impl KafkaClient {
             md.brokers.get(&node_id).map(|b| b.addr.clone())
         };
         if let Some(addr) = addr {
-            if let Ok(conn) = self.load_conn_kind(&addr, kind).await {
-                return Ok(conn);
-            }
+            return self.load_conn_kind(&addr, kind).await;
         }
         self.any_conn_kind(kind).await
     }
@@ -2346,12 +2378,13 @@ impl KafkaClient {
             let mut req = ProduceRequest::default();
             req.transactional_id = None;
             req.acks = -1;
-            req.timeout_ms = self.request_timeout.as_millis().min(i32::MAX as u128) as i32;
+            req.timeout_ms = self.produce_timeout.as_millis().min(i32::MAX as u128) as i32;
             req.topic_data = vec![tp];
 
+            let read_timeout = self.produce_timeout + self.request_timeout;
             let res: Result<i64, KafkaClientError> = async {
                 let resp: ProduceResponse = self
-                    .send_on(&conn, ApiKey::Produce, ver, &req, self.request_timeout)
+                    .send_on(&conn, ApiKey::Produce, ver, &req, read_timeout)
                     .await?;
 
                 if let Some(ref m) = self.extended_metrics {
@@ -4112,5 +4145,392 @@ mod tests {
         );
         client2.close().await;
         same_srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn d1_2_reauth_drain_does_not_lose_wakeup_when_pending_drains() {
+        for iter in 0..200usize {
+            let (write_tx, write_rx) = mpsc::channel::<OutboundFrame>(4);
+            let pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let pending_drained = Arc::new(tokio::sync::Notify::new());
+            let (tx_pending, _rx_pending) = oneshot::channel();
+            pending.lock().insert(99, tx_pending);
+
+            let conn = Arc::new(BrokerConn {
+                addr: "127.0.0.1:9092".to_string(),
+                kind: ConnKind::Normal,
+                client_id: "test".to_string(),
+                transport: None,
+                next_corr_id: AtomicI32::new(1),
+                write_tx,
+                pending: Arc::clone(&pending),
+                pending_drained: Arc::clone(&pending_drained),
+                api_versions: RwLock::new(HashMap::new()),
+                alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                reader_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                writer_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                // Expired SASL session triggers KIP-368 drain branch in send_raw_timeout_outcome.
+                sasl_expiry: parking_lot::Mutex::new(Some(
+                    std::time::Instant::now() - Duration::from_secs(1),
+                )),
+                requests_since_auth: std::sync::atomic::AtomicU64::new(1),
+                reauth_lock: tokio::sync::Mutex::new(()),
+                successes: std::sync::atomic::AtomicU64::new(0),
+                node: Arc::new(parking_lot::RwLock::new("0".to_string())),
+                kprom: None,
+                extended_metrics: None,
+            });
+
+            // Concurrently drain pending and notify_waiters (racing with send_raw_timeout_outcome).
+            let drain_task = tokio::spawn(async move {
+                let _keep_rx = write_rx;
+                tokio::task::yield_now().await;
+                pending.lock().remove(&99);
+                pending_drained.notify_waiters();
+            });
+
+            let meta_req = kafka_protocol::messages::MetadataRequest::default();
+            let outcome: SendOutcome<kafka_protocol::messages::MetadataResponse> = tokio::time::timeout(
+                Duration::from_secs(2),
+                conn.send_raw_timeout_outcome(ApiKey::Metadata, 1, &meta_req, Duration::from_secs(5)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("reauth drain lost wakeup at iter {iter}"));
+            // Because transport is None, perform_kip368_reauth returns Err(Sasl(...)) immediately
+            // AFTER pending drained — crucially it did NOT stall for 5s RequestTimeout!
+            assert!(
+                matches!(outcome, SendOutcome::ReauthFailed(KafkaClientError::Sasl(_))),
+                "unexpected outcome at iter {iter}"
+            );
+            drain_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn d1_4a_produce_separates_wire_timeout_from_socket_read_overhead() {
+        use kafka_protocol::messages::{
+            ApiVersionsResponse, MetadataResponse, ProduceRequest, ProduceResponse,
+        };
+        use kafka_protocol::messages::api_versions_response::ApiVersion;
+        use kafka_protocol::messages::metadata_response::{
+            MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+        };
+        use kafka_protocol::messages::produce_response::{
+            PartitionProduceResponse, TopicProduceResponse,
+        };
+        use kafka_protocol::messages::{BrokerId, TopicName};
+
+        let seen_timeout_ms = Arc::new(parking_lot::Mutex::new(Vec::<i32>::new()));
+        let seen_c = Arc::clone(&seen_timeout_ms);
+        let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(120));
+        let delay_c = Arc::clone(&delay_ms);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port() as i32;
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_c = Arc::clone(&seen_c);
+                let delay_c = Arc::clone(&delay_c);
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = sock.into_split();
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if rd.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; len];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = Bytes::from(payload);
+                        let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let api_key = ApiKey::try_from(key_i16).unwrap();
+                        let req_hdr_ver = api_key.request_header_version(ver);
+                        let req_hdr = RequestHeader::decode(&mut buf, req_hdr_ver).unwrap();
+
+                        let mut out = BytesMut::new();
+                        out.put_u32(0);
+                        let resp_hdr_ver = if api_key == ApiKey::ApiVersions {
+                            0
+                        } else {
+                            api_key.response_header_version(ver)
+                        };
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr.encode(&mut out, resp_hdr_ver).unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let mut r = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 0, 12),
+                                    (ApiKey::Produce as i16, 3, 9),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    r.api_keys.push(av);
+                                }
+                                r.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = port;
+                                let mut p = MetadataResponsePartition::default();
+                                p.partition_index = 0;
+                                p.leader_id = BrokerId(0);
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("t")));
+                                t.partitions = vec![p];
+                                let mut r = MetadataResponse::default();
+                                r.brokers = vec![b];
+                                r.topics = vec![t];
+                                r.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Produce => {
+                                let req = ProduceRequest::decode(&mut buf, ver).unwrap();
+                                seen_c.lock().push(req.timeout_ms);
+                                let d = delay_c.load(Ordering::SeqCst);
+                                if d > 0 {
+                                    tokio::time::sleep(Duration::from_millis(d)).await;
+                                }
+                                let mut pr = PartitionProduceResponse::default();
+                                pr.index = 0;
+                                pr.base_offset = 7;
+                                let mut tr = TopicProduceResponse::default();
+                                tr.name = TopicName(StrBytes::from_static_str("t"));
+                                tr.partition_responses = vec![pr];
+                                let mut r = ProduceResponse::default();
+                                r.responses = vec![tr];
+                                r.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let cfg = KafkaConfig {
+            address: mimir_config::StringSliceCSV(vec![addr.to_string()]),
+            topic: "t".to_string(),
+            write_timeout: mimir_config::GoDuration::from_millis(80),
+            write_timeout_overhead: mimir_config::GoDuration::from_millis(150),
+            ..Default::default()
+        };
+        let reader_kc = KafkaClient::from_config(&cfg).unwrap();
+        assert_eq!(
+            reader_kc.request_timeout(),
+            kgo_retry::DEFAULT_REQUEST_TIMEOUT_OVERHEAD,
+            "reader KafkaClient::from_config must keep 10s request_timeout"
+        );
+        let reader_ikc = super::super::util::IngestKafkaClient::from_config(&cfg, None).unwrap();
+        assert_eq!(
+            reader_ikc.request_timeout(),
+            kgo_retry::DEFAULT_REQUEST_TIMEOUT_OVERHEAD,
+            "reader IngestKafkaClient::from_config must keep 10s request_timeout"
+        );
+
+        let client =
+            super::super::util::IngestKafkaClient::from_config_for_producer(&cfg, None).unwrap();
+        assert_eq!(client.produce_timeout(), Duration::from_millis(80));
+        assert_eq!(client.request_timeout(), Duration::from_millis(150));
+
+        // 120ms server delay > 80ms write_timeout, < 230ms (write_timeout + overhead): MUST succeed
+        // and send timeout_ms = 80 on the wire!
+        let rec = ProduceRecord {
+            key: Some(Bytes::from_static(b"k")),
+            value: Some(Bytes::from_static(b"v")),
+            headers: Vec::new(),
+            timestamp_ms: Some(1000),
+        };
+        let off = client
+            .produce("t", 0, KafkaCompression::None, vec![rec.clone()])
+            .await
+            .unwrap();
+        assert_eq!(off, 7);
+        assert_eq!(*seen_timeout_ms.lock(), vec![80]);
+
+        // 350ms server delay > 230ms (write_timeout + overhead): socket read timeout fires!
+        delay_ms.store(350, Ordering::SeqCst);
+        let err = client
+            .produce("t", 0, KafkaCompression::None, vec![rec])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, KafkaClientError::RequestTimeout(_)),
+            "expected RequestTimeout at write_timeout + overhead, got {err:?}"
+        );
+
+        client.close().await;
+        srv.abort();
+    }
+
+    #[test]
+    fn d1_5_is_leader_or_io_error_rejects_first_read_eof() {
+        let e = KafkaClientError::FirstReadEof(kgo_retry::FirstReadEofKind::Tls.to_string());
+        assert!(is_transport_error(&e));
+        assert!(!is_leader_or_io_error(&e));
+    }
+
+    #[tokio::test]
+    async fn d1_8_conn_for_node_propagates_leader_dial_error_without_fallback() {
+        use kafka_protocol::messages::{ApiVersionsResponse, MetadataResponse};
+        use kafka_protocol::messages::api_versions_response::ApiVersion;
+        use kafka_protocol::messages::metadata_response::{
+            MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+        };
+        use kafka_protocol::messages::{BrokerId, TopicName};
+
+        // Pick an unused port that refuses TCP connections immediately for dead leader node 1.
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        let dead_port = dead_addr.port() as i32;
+        drop(dead_listener);
+
+        use std::sync::atomic::AtomicUsize;
+        let b0_produce_calls = Arc::new(AtomicUsize::new(0));
+        let b0_produce_srv = Arc::clone(&b0_produce_calls);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr0 = listener.local_addr().unwrap();
+        let port0 = addr0.port() as i32;
+        let srv0 = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let pc = Arc::clone(&b0_produce_srv);
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = sock.into_split();
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if rd.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; len];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = Bytes::from(payload);
+                        let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let api_key = ApiKey::try_from(key_i16).unwrap();
+                        let req_hdr = RequestHeader::decode(&mut buf, api_key.request_header_version(ver)).unwrap();
+
+                        let mut out = BytesMut::new();
+                        out.put_u32(0);
+                        let resp_hdr_ver = if api_key == ApiKey::ApiVersions {
+                            0
+                        } else {
+                            api_key.response_header_version(ver)
+                        };
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr.encode(&mut out, resp_hdr_ver).unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let mut r = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 0, 12),
+                                    (ApiKey::Produce as i16, 3, 9),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    r.api_keys.push(av);
+                                }
+                                r.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let mut b0 = MetadataResponseBroker::default();
+                                b0.node_id = BrokerId(0);
+                                b0.host = StrBytes::from_static_str("127.0.0.1");
+                                b0.port = port0;
+                                let mut b1 = MetadataResponseBroker::default();
+                                b1.node_id = BrokerId(1);
+                                b1.host = StrBytes::from_static_str("127.0.0.1");
+                                b1.port = dead_port;
+                                let mut p = MetadataResponsePartition::default();
+                                p.partition_index = 0;
+                                p.leader_id = BrokerId(1); // Partition 0 leader is node 1!
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("t")));
+                                t.partitions = vec![p];
+                                let mut r = MetadataResponse::default();
+                                r.brokers = vec![b0, b1];
+                                r.topics = vec![t];
+                                r.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Produce => {
+                                pc.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = KafkaClient::new(
+            vec![addr0.to_string()],
+            "test-client",
+            "",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        let err = client
+            .produce(
+                "t",
+                0,
+                KafkaCompression::None,
+                vec![ProduceRecord {
+                    key: Some(Bytes::from_static(b"k")),
+                    value: Some(Bytes::from_static(b"v")),
+                    headers: Vec::new(),
+                    timestamp_ms: Some(1000),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, KafkaClientError::Dial(_)),
+            "expected Dial error from unreachable leader node 1, got {err:?}"
+        );
+        assert_eq!(
+            b0_produce_calls.load(Ordering::SeqCst),
+            0,
+            "must NOT fall back to non-leader broker 0 when leader dial fails"
+        );
+
+        client.close().await;
+        srv0.abort();
     }
 }

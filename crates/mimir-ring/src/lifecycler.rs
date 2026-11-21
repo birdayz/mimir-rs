@@ -375,9 +375,13 @@ impl BasicLifecycler {
             Some(Box::new(move |ctx| {
                 let l = l_start.clone();
                 Box::pin(async move {
-                    l.register_instance()
-                        .await
-                        .map_err(|e| ServiceError::failure(format!("register instance in the ring: {e}")))?;
+                    tokio::select! {
+                        biased;
+                        _ = ctx.canceled() => return Err(ServiceError::Canceled),
+                        res = l.register_instance() => {
+                            res.map_err(|e| ServiceError::failure(format!("register instance in the ring: {e}")))?;
+                        }
+                    }
 
                     if !l.get_tokens().is_empty() && !l.cfg.tokens_observe_period.is_zero() {
                         l.wait_stable_tokens(ctx, l.cfg.tokens_observe_period)
@@ -405,9 +409,14 @@ impl BasicLifecycler {
                             break;
                         } else {
                             tokio::select! {
+                                biased;
                                 _ = ctx.canceled() => break,
                                 _ = tokio::time::sleep(hb_period) => {
-                                    l.heartbeat().await;
+                                    tokio::select! {
+                                        biased;
+                                        _ = ctx.canceled() => break,
+                                        _ = l.heartbeat() => {}
+                                    }
                                 }
                             }
                         }
@@ -542,18 +551,30 @@ impl BasicLifecycler {
         period: Duration,
     ) -> Result<(), LifecyclerError> {
         let mut observe_deadline = tokio::time::Instant::now() + period;
+        let hb = self.cfg.heartbeat_period;
+        let mut next_hb = tokio::time::Instant::now() + hb;
         loop {
-            let hb = self.cfg.heartbeat_period;
             tokio::select! {
+                biased;
                 _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
                 _ = tokio::time::sleep_until(observe_deadline) => {
-                    if self.verify_tokens().await {
+                    let verified = tokio::select! {
+                        biased;
+                        _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
+                        v = self.verify_tokens() => v,
+                    };
+                    if verified {
                         return Ok(());
                     }
                     observe_deadline = tokio::time::Instant::now() + period;
                 }
-                _ = tokio::time::sleep(hb), if !hb.is_zero() => {
-                    self.heartbeat().await;
+                _ = tokio::time::sleep_until(next_hb), if !hb.is_zero() => {
+                    tokio::select! {
+                        biased;
+                        _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
+                        _ = self.heartbeat() => {}
+                    }
+                    next_hb = tokio::time::Instant::now() + hb;
                 }
             }
         }
@@ -829,11 +850,17 @@ impl BasicLifecyclerDelegate for AutoForgetDelegate {
             .ingesters
             .iter()
             .filter_map(|(id, inst)| {
-                if inst.timestamp <= 0 {
-                    return None;
-                }
-                let hb = UNIX_EPOCH + Duration::from_secs(inst.timestamp as u64);
-                let elapsed = now.duration_since(hb).unwrap_or(Duration::ZERO);
+                let elapsed = if inst.timestamp >= 0 {
+                    UNIX_EPOCH
+                        .checked_add(Duration::from_secs(inst.timestamp as u64))
+                        .and_then(|hb| now.duration_since(hb).ok())
+                        .unwrap_or(Duration::ZERO)
+                } else {
+                    let before_epoch = Duration::from_secs(inst.timestamp.unsigned_abs());
+                    now.duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .saturating_add(before_epoch)
+                };
                 if elapsed > self.forget_period {
                     Some(id.clone())
                 } else {
@@ -1647,7 +1674,13 @@ impl Lifecycler {
                 if ctx.is_canceled() {
                     return Err(LifecyclerError::NotRunning);
                 }
-                if let Ok(Some(any)) = self.kv_store.get(&self.ring_key).await {
+                let get_res = tokio::select! {
+                    biased;
+                    _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    res = self.kv_store.get(&self.ring_key) => res,
+                };
+                if let Ok(Some(any)) = get_res {
                     if let Ok(desc) = any.downcast::<Desc>() {
                         if self.token_generator.can_join(&desc.ingesters).is_ok() {
                             break;
@@ -1658,13 +1691,19 @@ impl Lifecycler {
                     break;
                 }
                 tokio::select! {
+                    biased;
                     _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
+                    _ = tokio::time::sleep_until(deadline) => break,
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
             }
         }
 
-        let _op = self.op_lock.lock().await;
+        let _op = tokio::select! {
+            biased;
+            _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
+            g = self.op_lock.lock() => g,
+        };
         if ctx.is_canceled() || !self.is_running.load(Ordering::Acquire) {
             return Err(LifecyclerError::NotRunning);
         }
@@ -1683,8 +1722,10 @@ impl Lifecycler {
         let final_tokens = Arc::new(Mutex::new(Vec::new()));
         let final_tokens_cb = final_tokens.clone();
 
-        self.kv_store
-            .cas(
+        tokio::select! {
+            biased;
+            _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
+            res = self.kv_store.cas(
                 &self.ring_key,
                 Box::new(move |cur| {
                     let mut ring_desc = cur
@@ -1713,8 +1754,8 @@ impl Lifecycler {
                     *last_desc_cb.lock() = Some(ring_desc.clone());
                     Ok(CasOutcome::Update(Box::new(ring_desc)))
                 }),
-            )
-            .await?;
+            ) => res?,
+        }
 
         self.state.write().state = target_state;
         let toks = std::mem::take(&mut *final_tokens.lock());
@@ -1964,9 +2005,18 @@ impl Lifecycler {
             Some(Box::new(move |ctx: ServiceContext| {
                 let l = l_run.clone();
                 Box::pin(async move {
-                    l.init_ring()
-                        .await
-                        .map_err(|e| ServiceError::failure(format!("failed to join the ring {}: {e}", l.ring_name)))?;
+                    tokio::select! {
+                        biased;
+                        _ = ctx.canceled() => {
+                            return Err(ServiceError::failure(format!(
+                                "failed to join the ring {}: context canceled",
+                                l.ring_name
+                            )));
+                        }
+                        res = l.init_ring() => {
+                            res.map_err(|e| ServiceError::failure(format!("failed to join the ring {}: {e}", l.ring_name)))?;
+                        }
+                    }
                     l.is_running.store(true, Ordering::Release);
 
                     let join_deadline = tokio::time::Instant::now() + l.cfg.join_after;
@@ -2029,9 +2079,27 @@ impl Lifecycler {
                                 if s != InstanceState::Joining {
                                     error!(state = s.as_str_name(), ring = %l.ring_name, "unexpected state while observing tokens");
                                 }
-                                if l.verify_tokens().await {
+                                let verified = tokio::select! {
+                                    biased;
+                                    _ = ctx.canceled() => {
+                                        info!(ring = %l.ring_name, "lifecycler loop() exited gracefully");
+                                        l.is_running.store(false, Ordering::Release);
+                                        break;
+                                    }
+                                    v = l.verify_tokens() => v,
+                                };
+                                if verified {
                                     info!(ring = %l.ring_name, "token verification successful");
-                                    if let Err(err) = l.change_state_inner(InstanceState::Active).await {
+                                    let res = tokio::select! {
+                                        biased;
+                                        _ = ctx.canceled() => {
+                                            info!(ring = %l.ring_name, "lifecycler loop() exited gracefully");
+                                            l.is_running.store(false, Ordering::Release);
+                                            break;
+                                        }
+                                        r = l.change_state_inner(InstanceState::Active) => r,
+                                    };
+                                    if let Err(err) = res {
                                         error!(ring = %l.ring_name, %err, "failed to set state to ACTIVE");
                                     }
                                 } else {
@@ -2041,7 +2109,16 @@ impl Lifecycler {
                             }
                             _ = hb_interval.tick(), if !hb_period.is_zero() => {
                                 l.metrics.consul_heartbeats.inc();
-                                if let Err(err) = l.update_consul().await {
+                                let res = tokio::select! {
+                                    biased;
+                                    _ = ctx.canceled() => {
+                                        info!(ring = %l.ring_name, "lifecycler loop() exited gracefully");
+                                        l.is_running.store(false, Ordering::Release);
+                                        break;
+                                    }
+                                    r = l.update_consul() => r,
+                                };
+                                if let Err(err) = res {
                                     error!(ring = %l.ring_name, %err, "failed to write to the KV store, sleeping");
                                 }
                             }
@@ -3224,5 +3301,496 @@ mod tests {
             lc2.change_state(InstanceState::Active).await,
             Err(LifecyclerError::NotRunning)
         ));
+    }
+
+    #[tokio::test]
+    async fn c01_lifecycler_and_basic_lifecycler_cancel_promptly_on_hanging_kv() {
+        use mimir_common::services::Service;
+        use std::sync::atomic::AtomicUsize;
+
+        struct TestNoopBasicDelegate;
+        impl BasicLifecyclerDelegate for TestNoopBasicDelegate {
+            fn on_ring_instance_register(
+                &self,
+                _lifecycler: &BasicLifecycler,
+                _ring_desc: &Desc,
+                _instance_exists: bool,
+                _instance_id: &str,
+                _instance_desc: Option<&InstanceDesc>,
+            ) -> (InstanceState, Vec<u32>) {
+                (InstanceState::Active, Vec::new())
+            }
+            fn on_ring_instance_tokens(&self, _lifecycler: &BasicLifecycler, _tokens: &[u32]) {}
+            fn on_ring_instance_stopping<'a>(
+                &'a self,
+                _lifecycler: &'a BasicLifecycler,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async {})
+            }
+            fn on_ring_instance_heartbeat(
+                &self,
+                _lifecycler: &BasicLifecycler,
+                _ring_desc: &mut Desc,
+                _instance_desc: &mut InstanceDesc,
+            ) {
+            }
+        }
+
+        struct HangingCasKv {
+            hang_after_calls: usize,
+            cas_calls: AtomicUsize,
+            get_calls: AtomicUsize,
+            hang_get: bool,
+        }
+
+        impl KvClient for HangingCasKv {
+            fn list<'a>(&'a self, _p: &'a str) -> BoxFuture<'a, Result<Vec<String>, KvError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn get<'a>(
+                &'a self,
+                _k: &'a str,
+            ) -> BoxFuture<'a, Result<Option<Box<dyn std::any::Any + Send + Sync>>, KvError>> {
+                Box::pin(async move {
+                    self.get_calls.fetch_add(1, Ordering::SeqCst);
+                    if self.hang_get {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(None)
+                })
+            }
+            fn delete<'a>(&'a self, _k: &'a str) -> BoxFuture<'a, Result<(), KvError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn cas<'a>(
+                &'a self,
+                _k: &'a str,
+                mut f: crate::kv::CasFn,
+            ) -> BoxFuture<'a, Result<(), KvError>> {
+                Box::pin(async move {
+                    let n = self.cas_calls.fetch_add(1, Ordering::SeqCst);
+                    if n >= self.hang_after_calls {
+                        std::future::pending::<()>().await;
+                    }
+                    let _ = f(None);
+                    Ok(())
+                })
+            }
+            fn watch_key<'a>(
+                &'a self,
+                _k: &'a str,
+                ctx: ServiceContext,
+                _f: Box<dyn FnMut(Box<dyn std::any::Any + Send + Sync>) -> bool + Send>,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    ctx.canceled().await;
+                })
+            }
+            fn watch_prefix<'a>(
+                &'a self,
+                _p: &'a str,
+                ctx: ServiceContext,
+                _f: Box<dyn FnMut(&str, Box<dyn std::any::Any + Send + Sync>) -> bool + Send>,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    ctx.canceled().await;
+                })
+            }
+        }
+
+        // 1. Lifecycler blocked in init_ring CAS cancels promptly on stop_async.
+        let cfg = RingConfig {
+            instance_id: "c01-lc-init".into(),
+            instance_addr: "127.0.0.1".into(),
+            num_tokens: 2,
+            ..Default::default()
+        };
+        let mut lc_cfg = LifecyclerConfig::from_ring_config(&cfg, 9095).unwrap();
+        lc_cfg.heartbeat_period = Duration::from_secs(60);
+        let lc1 = Lifecycler::with_store(
+            lc_cfg,
+            Arc::new(HangingCasKv {
+                hang_after_calls: 0,
+                cas_calls: AtomicUsize::new(0),
+                get_calls: AtomicUsize::new(0),
+                hang_get: false,
+            }),
+            None,
+            "ingester",
+            "ring",
+            false,
+            None,
+        );
+        let svc1 = lc1.clone().into_service();
+        svc1.start_async(ServiceContext::background()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        svc1.stop_async();
+        let res1 = tokio::time::timeout(Duration::from_millis(500), svc1.await_terminated())
+            .await
+            .expect("Lifecycler blocked in init_ring must cancel promptly");
+        assert!(res1.is_err());
+
+        // 2. Lifecycler blocked in update_consul heartbeat cancels promptly and enters stopping.
+        let mut lc2_cfg = LifecyclerConfig::from_ring_config(&cfg, 9095).unwrap();
+        lc2_cfg.join_after = Duration::from_secs(60);
+        lc2_cfg.heartbeat_period = Duration::from_millis(15);
+        let kv2 = Arc::new(HangingCasKv {
+            hang_after_calls: 1, // init_ring (call 0) succeeds, first heartbeat (call 1) hangs
+            cas_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
+            hang_get: false,
+        });
+        let lc2 = Lifecycler::with_store(
+            lc2_cfg,
+            kv2,
+            None,
+            "ingester",
+            "ring",
+            false,
+            None,
+        );
+        let svc2 = lc2.clone().into_service();
+        svc2.start_async(ServiceContext::background()).await.unwrap();
+        svc2.await_running().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        svc2.stop_async();
+        for _ in 0..30 {
+            if !lc2.is_running.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !lc2.is_running.load(Ordering::Acquire),
+            "Lifecycler running loop must exit promptly even while update_consul hangs"
+        );
+
+        // 3. BasicLifecycler blocked in register_instance cancels promptly on stop_async.
+        let bcfg = BasicLifecyclerConfig {
+            id: "c01-blc".into(),
+            addr: "127.0.0.1:9095".into(),
+            zone: String::new(),
+            heartbeat_period: Duration::from_millis(50),
+            heartbeat_timeout: Duration::from_secs(5),
+            num_tokens: 2,
+            tokens_observe_period: Duration::ZERO,
+            keep_instance_in_the_ring_on_shutdown: false,
+            token_generator: None,
+            versions: HashMap::new(),
+        };
+        let blc = BasicLifecycler::new(
+            bcfg,
+            "ingester",
+            "ring",
+            Arc::new(HangingCasKv {
+                hang_after_calls: 0,
+                cas_calls: AtomicUsize::new(0),
+                get_calls: AtomicUsize::new(0),
+                hang_get: false,
+            }),
+            Arc::new(TestNoopBasicDelegate),
+            None,
+        );
+        let bsvc = blc.into_service();
+        bsvc.start_async(ServiceContext::background()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        bsvc.stop_async();
+        let bres = tokio::time::timeout(Duration::from_millis(500), bsvc.await_terminated())
+            .await
+            .expect("BasicLifecycler blocked in register_instance must cancel promptly");
+        assert!(bres.is_err());
+
+        // 4. auto_join respects can_join_timeout when kv_store.get hangs.
+        struct CanJoinTokenGen;
+        impl crate::token_gen::TokenGenerator for CanJoinTokenGen {
+            fn generate_tokens(&self, count: usize, _taken: &[u32]) -> Vec<u32> {
+                (0..count as u32).collect()
+            }
+            fn can_join_enabled(&self) -> bool {
+                true
+            }
+            fn can_join(
+                &self,
+                _ingesters: &HashMap<String, InstanceDesc>,
+            ) -> Result<(), crate::token_gen::TokenGenError> {
+                Err(crate::token_gen::TokenGenError::SpreadMinimizing("wait".to_string()))
+            }
+        }
+        let mut lc3_cfg = LifecyclerConfig::from_ring_config(&cfg, 9095).unwrap();
+        lc3_cfg.heartbeat_period = Duration::from_secs(60);
+        lc3_cfg.token_generator = Some(Arc::new(CanJoinTokenGen));
+        let mut lc3 = Lifecycler::with_store(
+            lc3_cfg,
+            Arc::new(HangingCasKv {
+                hang_after_calls: 99,
+                cas_calls: AtomicUsize::new(0),
+                get_calls: AtomicUsize::new(0),
+                hang_get: true,
+            }),
+            None,
+            "ingester",
+            "ring",
+            false,
+            None,
+        );
+        Arc::get_mut(&mut lc3).unwrap().can_join_timeout = Duration::from_millis(60);
+        lc3.is_running.store(true, Ordering::Release);
+        let ctx3 = ServiceContext::background();
+        let aj_res = tokio::time::timeout(
+            Duration::from_millis(500),
+            lc3.auto_join(&ctx3, InstanceState::Active),
+        )
+        .await
+        .expect("auto_join must respect can_join_timeout even if kv_store.get hangs");
+        assert!(aj_res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn c05_wait_stable_tokens_heartbeats_while_observe_period_shorter_than_heartbeat() {
+        struct StealingKv {
+            inner: InMemoryKv,
+            stealing: AtomicBool,
+            hb: Arc<std::sync::atomic::AtomicUsize>,
+            next_tok: std::sync::atomic::AtomicU32,
+        }
+        impl KvClient for StealingKv {
+            fn list<'a>(&'a self, p: &'a str) -> BoxFuture<'a, Result<Vec<String>, KvError>> {
+                self.inner.list(p)
+            }
+            fn get<'a>(
+                &'a self,
+                k: &'a str,
+            ) -> BoxFuture<'a, Result<Option<Box<dyn std::any::Any + Send + Sync>>, KvError>> {
+                self.inner.get(k)
+            }
+            fn delete<'a>(&'a self, k: &'a str) -> BoxFuture<'a, Result<(), KvError>> {
+                self.inner.delete(k)
+            }
+            fn cas<'a>(
+                &'a self,
+                k: &'a str,
+                f: crate::kv::CasFn,
+            ) -> BoxFuture<'a, Result<(), KvError>> {
+                Box::pin(async move {
+                    self.inner.cas(k, f).await?;
+                    if self.stealing.load(Ordering::Acquire) && self.hb.load(Ordering::SeqCst) < 3 {
+                        let tok = self.next_tok.fetch_add(1, Ordering::SeqCst);
+                        let _ = self
+                            .inner
+                            .cas(
+                                k,
+                                Box::new(move |cur| {
+                                    let mut d =
+                                        cur.unwrap().downcast_ref::<Desc>().unwrap().clone();
+                                    if let Some(inst) = d.ingesters.get_mut("c05-blc") {
+                                        inst.tokens = vec![tok];
+                                        return Ok(CasOutcome::Update(Box::new(d)));
+                                    }
+                                    Ok(CasOutcome::NoChange)
+                                }),
+                            )
+                            .await;
+                    }
+                    Ok(())
+                })
+            }
+            fn watch_key<'a>(
+                &'a self,
+                k: &'a str,
+                ctx: ServiceContext,
+                f: Box<dyn FnMut(Box<dyn std::any::Any + Send + Sync>) -> bool + Send>,
+            ) -> BoxFuture<'a, ()> {
+                self.inner.watch_key(k, ctx, f)
+            }
+            fn watch_prefix<'a>(
+                &'a self,
+                p: &'a str,
+                ctx: ServiceContext,
+                f: Box<dyn FnMut(&str, Box<dyn std::any::Any + Send + Sync>) -> bool + Send>,
+            ) -> BoxFuture<'a, ()> {
+                self.inner.watch_prefix(p, ctx, f)
+            }
+        }
+        let cfg = BasicLifecyclerConfig {
+            id: "c05-blc".into(),
+            addr: "127.0.0.1:9095".into(),
+            zone: String::new(),
+            heartbeat_period: Duration::from_millis(60),
+            heartbeat_timeout: Duration::from_secs(5),
+            num_tokens: 2,
+            tokens_observe_period: Duration::from_millis(20),
+            keep_instance_in_the_ring_on_shutdown: false,
+            token_generator: None,
+            versions: HashMap::new(),
+        };
+
+        let hb_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CountingDelegate {
+            hb: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl BasicLifecyclerDelegate for CountingDelegate {
+            fn on_ring_instance_register(
+                &self,
+                _lifecycler: &BasicLifecycler,
+                _ring_desc: &Desc,
+                _instance_exists: bool,
+                _instance_id: &str,
+                _instance_desc: Option<&InstanceDesc>,
+            ) -> (InstanceState, Vec<u32>) {
+                (InstanceState::Active, vec![10, 20])
+            }
+            fn on_ring_instance_tokens(&self, _lifecycler: &BasicLifecycler, _tokens: &[u32]) {}
+            fn on_ring_instance_stopping<'a>(
+                &'a self,
+                _lifecycler: &'a BasicLifecycler,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async {})
+            }
+            fn on_ring_instance_heartbeat(
+                &self,
+                _lifecycler: &BasicLifecycler,
+                _ring_desc: &mut Desc,
+                _instance_desc: &mut InstanceDesc,
+            ) {
+                self.hb.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let kv = Arc::new(StealingKv {
+            inner: InMemoryKv::new(ring_desc_codec()),
+            stealing: AtomicBool::new(false),
+            hb: hb_count.clone(),
+            next_tok: std::sync::atomic::AtomicU32::new(100),
+        });
+        let blc = BasicLifecycler::new(
+            cfg,
+            "ingester",
+            "ring",
+            kv.clone(),
+            Arc::new(CountingDelegate {
+                hb: hb_count.clone(),
+            }),
+            None,
+        );
+        blc.register_instance().await.unwrap();
+        kv.stealing.store(true, Ordering::Release);
+        kv.cas(
+            "ring",
+            Box::new(|cur| {
+                let mut d = cur.unwrap().downcast_ref::<Desc>().unwrap().clone();
+                if let Some(inst) = d.ingesters.get_mut("c05-blc") {
+                    inst.tokens = vec![99];
+                }
+                Ok(CasOutcome::Update(Box::new(d)))
+            }),
+        )
+        .await
+        .unwrap();
+
+        let ctx = ServiceContext::background();
+        let res = tokio::time::timeout(
+            Duration::from_secs(3),
+            blc.wait_stable_tokens(ctx, Duration::from_millis(20)),
+        )
+        .await;
+        res.expect("wait_stable_tokens must complete once 3 heartbeats pass")
+            .unwrap();
+        assert!(
+            hb_count.load(Ordering::SeqCst) >= 3,
+            "expected >= 3 heartbeats during observe retries, got {}",
+            hb_count.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn c09_auto_forget_delegate_removes_zero_and_negative_timestamps() {
+        struct TestNoopBasicDelegate;
+        impl BasicLifecyclerDelegate for TestNoopBasicDelegate {
+            fn on_ring_instance_register(
+                &self,
+                _lifecycler: &BasicLifecycler,
+                _ring_desc: &Desc,
+                _instance_exists: bool,
+                _instance_id: &str,
+                _instance_desc: Option<&InstanceDesc>,
+            ) -> (InstanceState, Vec<u32>) {
+                (InstanceState::Active, Vec::new())
+            }
+            fn on_ring_instance_tokens(&self, _lifecycler: &BasicLifecycler, _tokens: &[u32]) {}
+            fn on_ring_instance_stopping<'a>(
+                &'a self,
+                _lifecycler: &'a BasicLifecycler,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async {})
+            }
+            fn on_ring_instance_heartbeat(
+                &self,
+                _lifecycler: &BasicLifecycler,
+                _ring_desc: &mut Desc,
+                _instance_desc: &mut InstanceDesc,
+            ) {
+            }
+        }
+        let cfg = BasicLifecyclerConfig {
+            id: "self".into(),
+            addr: "127.0.0.1:9095".into(),
+            zone: String::new(),
+            heartbeat_period: Duration::from_secs(5),
+            heartbeat_timeout: Duration::from_secs(60),
+            tokens_observe_period: Duration::ZERO,
+            num_tokens: 0,
+            keep_instance_in_the_ring_on_shutdown: false,
+            token_generator: None,
+            versions: HashMap::new(),
+        };
+        let kv = Arc::new(InMemoryKv::new(ring_desc_codec()));
+        let blc = BasicLifecycler::new(
+            cfg,
+            "ingester",
+            "ring",
+            kv,
+            Arc::new(TestNoopBasicDelegate),
+            None,
+        );
+
+        let delegate = AutoForgetDelegate::new(Duration::from_secs(60), Arc::new(TestNoopBasicDelegate));
+        let mut ring_desc = Desc::default();
+        let now_s = system_time_to_unix_secs(SystemTime::now());
+        ring_desc.ingesters.insert(
+            "zero-ts".into(),
+            InstanceDesc {
+                id: "zero-ts".into(),
+                timestamp: 0,
+                state: InstanceState::Active as i32,
+                ..Default::default()
+            },
+        );
+        ring_desc.ingesters.insert(
+            "neg-ts".into(),
+            InstanceDesc {
+                id: "neg-ts".into(),
+                timestamp: -10,
+                state: InstanceState::Active as i32,
+                ..Default::default()
+            },
+        );
+        ring_desc.ingesters.insert(
+            "fresh".into(),
+            InstanceDesc {
+                id: "fresh".into(),
+                timestamp: now_s,
+                state: InstanceState::Active as i32,
+                ..Default::default()
+            },
+        );
+        let mut self_inst = InstanceDesc {
+            id: "self".into(),
+            timestamp: now_s,
+            ..Default::default()
+        };
+        delegate.on_ring_instance_heartbeat(&blc, &mut ring_desc, &mut self_inst);
+        assert!(!ring_desc.ingesters.contains_key("zero-ts"));
+        assert!(!ring_desc.ingesters.contains_key("neg-ts"));
+        assert!(ring_desc.ingesters.contains_key("fresh"));
     }
 }

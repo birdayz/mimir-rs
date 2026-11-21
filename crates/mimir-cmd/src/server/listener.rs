@@ -300,6 +300,20 @@ fn proxy_err(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("proxyproto: {msg}"))
 }
 
+fn parse_v1_port(port_str: &str) -> io::Result<u16> {
+    // Matches pires/go-proxyproto parseV1PortNumber (v1.go:270-282): digits only,
+    // no leading zero when len > 1, and 0..=65535.
+    if port_str.is_empty()
+        || !port_str.bytes().all(|b| b.is_ascii_digit())
+        || (port_str.len() > 1 && port_str.starts_with('0'))
+    {
+        return Err(proxy_err("invalid port number"));
+    }
+    port_str
+        .parse::<u16>()
+        .map_err(|_| proxy_err("invalid port number"))
+}
+
 async fn read_v1(stream: &mut TcpStream, mut buf: Vec<u8>) -> io::Result<(Vec<u8>, Option<SocketAddr>)> {
     // The v1 header is at most 107 bytes including CRLF.
     while !buf.ends_with(b"\r\n") {
@@ -316,16 +330,34 @@ async fn read_v1(stream: &mut TcpStream, mut buf: Vec<u8>) -> io::Result<(Vec<u8
     let parts: Vec<&str> = line.split(' ').collect();
     match parts.get(1).copied() {
         Some("UNKNOWN") => Ok((Vec::new(), None)),
-        Some("TCP4") | Some("TCP6") if parts.len() == 6 => {
-            let ip: IpAddr = parts[2].parse().map_err(|_| proxy_err("invalid source address"))?;
-            let port: u16 = parts[4].parse().map_err(|_| proxy_err("invalid source port"))?;
-            Ok((Vec::new(), Some(SocketAddr::new(ip, port))))
+        Some("TCP4") if parts.len() == 6 => {
+            let src_ip: std::net::Ipv4Addr = parts[2]
+                .parse()
+                .map_err(|_| proxy_err("invalid source address"))?;
+            let _dst_ip: std::net::Ipv4Addr = parts[3]
+                .parse()
+                .map_err(|_| proxy_err("invalid destination address"))?;
+            let src_port = parse_v1_port(parts[4])?;
+            let _dst_port = parse_v1_port(parts[5])?;
+            Ok((Vec::new(), Some(SocketAddr::new(IpAddr::V4(src_ip), src_port))))
+        }
+        Some("TCP6") if parts.len() == 6 => {
+            let src_ip: std::net::Ipv6Addr = parts[2]
+                .parse()
+                .map_err(|_| proxy_err("invalid source address"))?;
+            let _dst_ip: std::net::Ipv6Addr = parts[3]
+                .parse()
+                .map_err(|_| proxy_err("invalid destination address"))?;
+            let src_port = parse_v1_port(parts[4])?;
+            let _dst_port = parse_v1_port(parts[5])?;
+            Ok((Vec::new(), Some(SocketAddr::new(IpAddr::V6(src_ip), src_port))))
         }
         _ => Err(proxy_err("invalid version 1 header")),
     }
 }
 
 async fn read_v2(stream: &mut TcpStream, mut buf: Vec<u8>) -> io::Result<(Vec<u8>, Option<SocketAddr>)> {
+    const MAX_V2_HEADER_SIZE: usize = 4096;
     while buf.len() < 16 {
         let mut b = [0u8; 1];
         if stream.read(&mut b).await? == 0 {
@@ -334,23 +366,48 @@ async fn read_v2(stream: &mut TcpStream, mut buf: Vec<u8>) -> io::Result<(Vec<u8
         buf.push(b[0]);
     }
     let ver_cmd = buf[12];
-    if ver_cmd >> 4 != 2 {
-        return Err(proxy_err("invalid version 2 header"));
+    // Matches pires/go-proxyproto v2.go:98: only LOCAL (0x20) and PROXY (0x21) are valid.
+    if ver_cmd != 0x20 && ver_cmd != 0x21 {
+        return Err(proxy_err("unsupported version 2 command"));
     }
     let fam = buf[13];
+    // Matches pires/go-proxyproto addr_proto.go:24: only defined v2 family/protocol bytes.
+    let min_len = match fam {
+        0x00 => 0usize,        // UNSPEC
+        0x11 | 0x12 => 12,     // TCPv4 | UDPv4
+        0x21 | 0x22 => 36,     // TCPv6 | UDPv6
+        0x31 | 0x32 => 216,    // UnixStream | UnixDatagram
+        _ => return Err(proxy_err("unsupported version 2 address family and protocol")),
+    };
+    if fam == 0x00 && ver_cmd != 0x20 {
+        return Err(proxy_err("version 2 PROXY command cannot use UNSPEC family"));
+    }
     let len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
+    if len > MAX_V2_HEADER_SIZE {
+        return Err(proxy_err("version 2 header length exceeds maximum"));
+    }
+    if len < min_len {
+        if ver_cmd == 0x20 {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                stream.read_exact(&mut discard).await?;
+            }
+            return Ok((Vec::new(), None));
+        }
+        return Err(proxy_err("invalid version 2 payload length"));
+    }
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).await?;
     // LOCAL command: keep the real connection address.
-    if ver_cmd & 0x0f == 0 {
+    if ver_cmd == 0x20 {
         return Ok((Vec::new(), None));
     }
-    let src = match fam >> 4 {
-        1 if payload.len() >= 12 => Some(SocketAddr::new(
+    let src = match fam {
+        0x11 | 0x12 => Some(SocketAddr::new(
             IpAddr::from([payload[0], payload[1], payload[2], payload[3]]),
             u16::from_be_bytes([payload[8], payload[9]]),
         )),
-        2 if payload.len() >= 36 => {
+        0x21 | 0x22 => {
             let mut a = [0u8; 16];
             a.copy_from_slice(&payload[..16]);
             Some(SocketAddr::new(
@@ -358,7 +415,8 @@ async fn read_v2(stream: &mut TcpStream, mut buf: Vec<u8>) -> io::Result<(Vec<u8
                 u16::from_be_bytes([payload[32], payload[33]]),
             ))
         }
-        _ => None,
+        0x31 | 0x32 => None,
+        _ => unreachable!(),
     };
     Ok((Vec::new(), src))
 }
@@ -503,5 +561,64 @@ mod tests {
         let (mut a, _) = l.accept().await.unwrap();
         let (_, src) = read_proxy_header(&mut a).await.unwrap();
         assert_eq!(src.unwrap(), "192.168.1.7:8080".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn d2_08_proxy_v1_and_v2_reject_invalid_commands_families_and_truncated_payloads() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+
+        let bad_headers: Vec<Vec<u8>> = vec![
+            // v1: TCP4 with IPv6 source
+            b"PROXY TCP4 ::1 10.0.0.1 5555 80\r\n".to_vec(),
+            // v1: TCP6 with IPv4 source
+            b"PROXY TCP6 10.1.2.3 ::1 5555 80\r\n".to_vec(),
+            // v1: TCP4 with invalid destination IP
+            b"PROXY TCP4 10.1.2.3 notanip 5555 80\r\n".to_vec(),
+            // v1: TCP4 with invalid destination port
+            b"PROXY TCP4 10.1.2.3 10.0.0.1 5555 notaport\r\n".to_vec(),
+            // v1: TCP4 with leading zero port (forbidden by spec / go-proxyproto)
+            b"PROXY TCP4 10.1.2.3 10.0.0.1 5555 080\r\n".to_vec(),
+            // v2: invalid command nibble (0x22)
+            [V2_SIG.as_slice(), &[0x22, 0x11, 0, 12], &[0u8; 12]].concat(),
+            // v2: undefined family/protocol byte (0x13)
+            [V2_SIG.as_slice(), &[0x21, 0x13, 0, 12], &[0u8; 12]].concat(),
+            // v2: undefined family/protocol byte even with LOCAL (0x20, 0xFF)
+            [V2_SIG.as_slice(), &[0x20, 0xFF, 0, 0]].concat(),
+            // v2: UNSPEC (0x00) with PROXY (0x21)
+            [V2_SIG.as_slice(), &[0x21, 0x00, 0, 0]].concat(),
+            // v2: truncated IPv4 payload (len=4 < 12) with PROXY
+            [V2_SIG.as_slice(), &[0x21, 0x11, 0, 4], &[1, 2, 3, 4]].concat(),
+            // v2: truncated IPv6 payload (len=16 < 36) with PROXY
+            [V2_SIG.as_slice(), &[0x21, 0x21, 0, 16], &[0u8; 16]].concat(),
+        ];
+
+        for hdr in bad_headers {
+            let hdr_c = hdr.clone();
+            let cli = tokio::spawn(async move {
+                let mut s = TcpStream::connect(addr).await.unwrap();
+                s.write_all(&hdr_c).await.unwrap();
+                s
+            });
+            let (mut srv, _) = l.accept().await.unwrap();
+            let err = read_proxy_header(&mut srv)
+                .await
+                .expect_err(&format!("expected error for bad header: {hdr:?}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            let _ = cli.await;
+        }
+
+        // v2: LOCAL (0x20) + TCPv4 (0x11) + len=0 is valid per go-proxyproto v2.go:149 and yields None.
+        let local_hdr = [V2_SIG.as_slice(), &[0x20, 0x11, 0, 0]].concat();
+        let cli = tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(&local_hdr).await.unwrap();
+            s
+        });
+        let (mut srv, _) = l.accept().await.unwrap();
+        let (prefix, src) = read_proxy_header(&mut srv).await.unwrap();
+        assert!(prefix.is_empty());
+        assert!(src.is_none());
+        let _ = cli.await;
     }
 }

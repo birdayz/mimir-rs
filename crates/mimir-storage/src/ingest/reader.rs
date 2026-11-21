@@ -843,10 +843,10 @@ pub struct SingleClusterPartitionReader {
     offset_client: PartitionOffsetClient,
     metrics: ReaderMetrics,
     /// Set once started: the fetcher records are polled from.
-    fetcher: Mutex<Option<Arc<ReaderFetcher>>>,
+    fetcher: Arc<Mutex<Option<Arc<ReaderFetcher>>>>,
     /// Partition start offset reader refreshed every 10s (`startOffsetReader`).
-    start_offset_reader: Mutex<Option<Arc<GenericOffsetReader<i64>>>>,
-    sampler: Mutex<Option<JoinHandle<()>>>,
+    start_offset_reader: Arc<Mutex<Option<Arc<GenericOffsetReader<i64>>>>>,
+    sampler: Arc<Mutex<Option<JoinHandle<()>>>>,
     last_seen_offset: Arc<AtomicI64>,
     highest_consumed_ts_before_end_ms: Arc<AtomicI64>,
     max_replay_period: Duration,
@@ -1009,9 +1009,9 @@ impl SingleClusterPartitionReader {
             committer,
             offset_client,
             metrics,
-            fetcher: Mutex::new(None),
-            start_offset_reader: Mutex::new(None),
-            sampler: Mutex::new(None),
+            fetcher: Arc::new(Mutex::new(None)),
+            start_offset_reader: Arc::new(Mutex::new(None)),
+            sampler: Arc::new(Mutex::new(None)),
             last_seen_offset: Arc::new(AtomicI64::new(-1)),
             highest_consumed_ts_before_end_ms: Arc::new(AtomicI64::new(UNSET_TS_MS)),
             max_replay_period: Duration::ZERO,
@@ -1354,24 +1354,24 @@ impl SingleClusterPartitionReader {
         self.state
             .store(ReaderState::Running as u8, Ordering::SeqCst);
         let cancel = Cancel::new(self.stop_tx.subscribe(), None);
-        let state = Arc::clone(&self.state);
-        let offset_watcher = Arc::clone(&self.offset_watcher);
-        let committer = Arc::clone(&self.committer);
-        let offset_reader = Arc::clone(&self.offset_reader);
-        let stop_tx = self.stop_tx.clone();
-        let failure_tx = self.failure_tx.clone();
-        let partition = self.partition_id;
+        let ctx = RuntimeFailureCtx {
+            partition: self.partition_id,
+            state: Arc::clone(&self.state),
+            offset_watcher: Arc::clone(&self.offset_watcher),
+            committer: Arc::clone(&self.committer),
+            offset_reader: Arc::clone(&self.offset_reader),
+            start_offset_reader: Arc::clone(&self.start_offset_reader),
+            sampler: Arc::clone(&self.sampler),
+            fetcher: Arc::clone(&self.fetcher),
+            fallback_fetcher: Arc::clone(&fetch_loop.fetcher),
+            stop_tx: self.stop_tx.clone(),
+            failure_tx: self.failure_tx.clone(),
+        };
         *guard = Some(tokio::spawn(async move {
             if let Err(e) = fetch_loop.run(cancel).await {
                 // Fail the whole service in case of a non-recoverable error.
-                error!(partition, err = %e, "partition reader failed");
-                let err_msg = e.to_string();
-                state.store(ReaderState::Failed as u8, Ordering::SeqCst);
-                offset_watcher.stop();
-                let _ = stop_tx.send(true);
-                committer.stop().await;
-                offset_reader.stop().await;
-                let _ = failure_tx.send(Some(err_msg));
+                error!(partition = ctx.partition, err = %e, "partition reader failed");
+                ctx.fail_and_stop(e.to_string()).await;
             }
         }));
         info!(partition = self.partition_id, "started partition reader");
@@ -1766,19 +1766,44 @@ impl SingleClusterPartitionReader {
         }
     }
 
+    #[cfg(test)]
+    async fn simulate_runtime_failure_for_test(&self, err_msg: String) {
+        let fallback_fetcher = self.fetcher.lock().await.clone();
+        if let Some(fallback_fetcher) = fallback_fetcher {
+            RuntimeFailureCtx {
+                partition: self.partition_id,
+                state: Arc::clone(&self.state),
+                offset_watcher: Arc::clone(&self.offset_watcher),
+                committer: Arc::clone(&self.committer),
+                offset_reader: Arc::clone(&self.offset_reader),
+                start_offset_reader: Arc::clone(&self.start_offset_reader),
+                sampler: Arc::clone(&self.sampler),
+                fetcher: Arc::clone(&self.fetcher),
+                fallback_fetcher,
+                stop_tx: self.stop_tx.clone(),
+                failure_tx: self.failure_tx.clone(),
+            }
+            .fail_and_stop(err_msg)
+            .await;
+        }
+    }
+
     /// `stopDependencies`: stops the committer (final commit), the offset readers, the metrics
     /// sampler, then the fetcher (buffered records are dropped).
     async fn stop_dependencies(&self) {
         let _ = self.stop_tx.send(true);
         self.committer.stop().await;
         self.offset_reader.stop().await;
-        if let Some(r) = self.start_offset_reader.lock().await.take() {
+        let start_offset_reader = self.start_offset_reader.lock().await.take();
+        if let Some(r) = start_offset_reader {
             r.stop().await;
         }
-        if let Some(h) = self.sampler.lock().await.take() {
+        let sampler = self.sampler.lock().await.take();
+        if let Some(h) = sampler {
             let _ = h.await;
         }
-        if let Some(f) = self.fetcher.lock().await.take() {
+        let fetcher = self.fetcher.lock().await.take();
+        if let Some(f) = fetcher {
             f.stop().await;
         }
     }
@@ -2033,6 +2058,45 @@ impl Cancel {
 }
 
 /// The fetch / consume loop shared by the startup catch-up and the running phase.
+struct RuntimeFailureCtx {
+    partition: i32,
+    state: Arc<AtomicU8>,
+    offset_watcher: Arc<PartitionOffsetWatcher>,
+    committer: Arc<PartitionCommitter>,
+    offset_reader: Arc<SingleClusterPartitionOffsetReader>,
+    start_offset_reader: Arc<Mutex<Option<Arc<GenericOffsetReader<i64>>>>>,
+    sampler: Arc<Mutex<Option<JoinHandle<()>>>>,
+    fetcher: Arc<Mutex<Option<Arc<ReaderFetcher>>>>,
+    fallback_fetcher: Arc<ReaderFetcher>,
+    stop_tx: watch::Sender<bool>,
+    failure_tx: watch::Sender<Option<String>>,
+}
+
+impl RuntimeFailureCtx {
+    async fn fail_and_stop(self, err_msg: String) {
+        self.state.store(ReaderState::Failed as u8, Ordering::SeqCst);
+        self.offset_watcher.stop();
+        let _ = self.stop_tx.send(true);
+        self.committer.stop().await;
+        self.offset_reader.stop().await;
+        let start_offset_reader = self.start_offset_reader.lock().await.take();
+        if let Some(r) = start_offset_reader {
+            r.stop().await;
+        }
+        let sampler = self.sampler.lock().await.take();
+        if let Some(h) = sampler {
+            let _ = h.await;
+        }
+        let fetcher = self.fetcher.lock().await.take();
+        if let Some(f) = fetcher {
+            f.stop().await;
+        } else {
+            self.fallback_fetcher.stop().await;
+        }
+        let _ = self.failure_tx.send(Some(err_msg));
+    }
+}
+
 struct FetchLoop {
     partition_id: i32,
     topic: String,
@@ -3468,5 +3532,239 @@ mod tests {
                 .get_value(),
             42.0
         );
+    }
+
+    #[tokio::test]
+    async fn d1_7_runtime_failure_stops_fetcher_and_start_offset_reader() {
+        use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
+        use kafka_protocol::messages::list_offsets_response::{
+            ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
+        };
+        use kafka_protocol::messages::{
+            ApiVersionsRequest, ApiVersionsResponse, FetchRequest, FetchResponse,
+            ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
+            RequestHeader, ResponseHeader,
+        };
+        use kafka_protocol::messages::api_versions_response::ApiVersion;
+        use kafka_protocol::messages::metadata_response::{
+            MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+        };
+        use std::sync::atomic::AtomicUsize;
+        use kafka_protocol::messages::{ApiKey, BrokerId, TopicName};
+        use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use bytes::BufMut;
+        use tokio::net::TcpListener;
+
+        struct FailOnRecordConsumer;
+        impl RecordBatchConsumer for FailOnRecordConsumer {
+            fn consume(
+                &self,
+                records: Vec<FetchedRecord>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async move {
+                    if !records.is_empty() {
+                        Err("non-recoverable consumer failure".to_string())
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let fetch_calls_srv = Arc::clone(&fetch_calls);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let fc = Arc::clone(&fetch_calls_srv);
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = sock.into_split();
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if rd.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; len];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = bytes::Bytes::from(payload);
+                        let req_hdr_ver = if i16::from_be_bytes([buf[0], buf[1]]) == ApiKey::ApiVersions as i16 {
+                            let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                            ApiVersionsRequest::header_version(ver)
+                        } else {
+                            let key = ApiKey::try_from(i16::from_be_bytes([buf[0], buf[1]])).unwrap();
+                            let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                            match key {
+                                ApiKey::Metadata => MetadataRequest::header_version(ver),
+                                ApiKey::ListOffsets => ListOffsetsRequest::header_version(ver),
+                                ApiKey::Fetch => FetchRequest::header_version(ver),
+                                _ => 1,
+                            }
+                        };
+                        let req_hdr = RequestHeader::decode(&mut buf, req_hdr_ver).unwrap();
+                        let api_key = ApiKey::try_from(req_hdr.request_api_key).unwrap();
+                        let ver = req_hdr.request_api_version;
+
+                        let mut out = bytes::BytesMut::new();
+                        out.put_u32(0);
+                        let resp_hdr_ver = if api_key == ApiKey::ApiVersions {
+                            0
+                        } else {
+                            api_key.response_header_version(ver)
+                        };
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr.encode(&mut out, resp_hdr_ver).unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut resp = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 1, 12),
+                                    (ApiKey::ListOffsets as i16, 1, 7),
+                                    (ApiKey::Fetch as i16, 4, 12),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    resp.api_keys.push(av);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                let mut resp = MetadataResponse::default();
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = addr.port() as i32;
+                                resp.brokers.push(b);
+                                resp.controller_id = BrokerId(0);
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("fail-clean")));
+                                let mut p = MetadataResponsePartition::default();
+                                p.partition_index = 0;
+                                p.leader_id = BrokerId(0);
+                                t.partitions.push(p);
+                                resp.topics.push(t);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::ListOffsets => {
+                                let _ = ListOffsetsRequest::decode(&mut buf, ver);
+                                let mut resp = ListOffsetsResponse::default();
+                                let mut topic = ListOffsetsTopicResponse::default();
+                                topic.name = TopicName(StrBytes::from_static_str("fail-clean"));
+                                let mut part = ListOffsetsPartitionResponse::default();
+                                part.partition_index = 0;
+                                part.offset = 0;
+                                topic.partitions.push(part);
+                                resp.topics.push(topic);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Fetch => {
+                                let _ = FetchRequest::decode(&mut buf, ver);
+                                fc.fetch_add(1, Ordering::SeqCst);
+                                let mut resp = FetchResponse::default();
+                                let mut ft = FetchableTopicResponse::default();
+                                ft.topic = TopicName(StrBytes::from_static_str("fail-clean"));
+                                let mut pd = PartitionData::default();
+                                pd.partition_index = 0;
+                                pd.error_code = kafka_protocol::error::ResponseError::TopicAuthorizationFailed.code();
+                                ft.partitions.push(pd);
+                                resp.responses.push(ft);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "fail-clean".to_string(),
+            auto_create_topic_enabled: false,
+            fetch_concurrency_max: 0,
+            ..Default::default()
+        };
+        cfg.target_consumer_lag_at_startup = mimir_config::GoDuration::ZERO;
+        cfg.max_consumer_lag_at_startup = mimir_config::GoDuration::ZERO;
+
+        let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+        let reader = SingleClusterPartitionReader::with_client(
+            cfg,
+            0,
+            "",
+            None,
+            client,
+            Arc::new(FailOnRecordConsumer),
+            None,
+        )
+        .unwrap();
+
+        let mut failure_rx = reader.subscribe_failure();
+        reader.start().await.unwrap();
+        assert_eq!(reader.state(), ReaderState::Running);
+        assert!(reader.fetcher.lock().await.is_some());
+        assert!(reader.start_offset_reader.lock().await.is_some());
+
+        // Wait until fetcher has issued at least one Fetch while Running.
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while fetch_calls.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < wait_deadline, "fetcher never issued Fetch");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Trigger the exact runtime failure path used when fetch_loop.run() returns Err(e).
+        reader
+            .simulate_runtime_failure_for_test("simulated runtime error".to_string())
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(2), failure_rx.wait_for(|v| v.is_some()))
+            .await
+            .expect("failure_tx must be notified")
+            .unwrap();
+
+        assert_eq!(reader.state(), ReaderState::Failed);
+        assert!(
+            reader.fetcher.lock().await.is_none(),
+            "fetcher must be stopped and cleared on runtime failure"
+        );
+        assert!(
+            reader.start_offset_reader.lock().await.is_none(),
+            "start_offset_reader must be stopped and cleared on runtime failure"
+        );
+        assert!(
+            reader.sampler.lock().await.is_none(),
+            "sampler must be stopped and cleared on runtime failure"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let calls_at_fail = fetch_calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fetch_calls.load(Ordering::SeqCst),
+            calls_at_fail,
+            "fetcher must not keep issuing Fetch requests after runtime failure"
+        );
+
+        reader.stop().await;
+        srv.abort();
     }
 }

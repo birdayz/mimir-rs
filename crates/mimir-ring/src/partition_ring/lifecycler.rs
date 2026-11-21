@@ -542,18 +542,34 @@ impl PartitionInstanceLifecycler {
             Some(Box::new(move |ctx: ServiceContext| {
                 let l = l_run.clone();
                 Box::pin(async move {
-                    l.reconcile_owned_partition(SystemTime::now()).await;
-                    l.reconcile_other_partitions(SystemTime::now()).await;
+                    tokio::select! {
+                        biased;
+                        _ = ctx.canceled() => {
+                            l.running.store(false, Ordering::Release);
+                            return Ok(());
+                        }
+                        _ = async {
+                            l.reconcile_owned_partition(SystemTime::now()).await;
+                            l.reconcile_other_partitions(SystemTime::now()).await;
+                        } => {}
+                    }
 
                     let mut ticker = tokio::time::interval(l.cfg.polling_interval);
                     ticker.tick().await;
                     loop {
                         tokio::select! {
+                            biased;
                             _ = ctx.canceled() => break,
                             _ = ticker.tick() => {
                                 let now = SystemTime::now();
-                                l.reconcile_owned_partition(now).await;
-                                l.reconcile_other_partitions(now).await;
+                                tokio::select! {
+                                    biased;
+                                    _ = ctx.canceled() => break,
+                                    _ = async {
+                                        l.reconcile_owned_partition(now).await;
+                                        l.reconcile_other_partitions(now).await;
+                                    } => {}
+                                }
                             }
                         }
                     }
@@ -767,5 +783,93 @@ mod tests {
             desc.partitions.contains_key(&1),
             "negative delete_inactive_partition_after must disable deletion"
         );
+    }
+
+    #[tokio::test]
+    async fn c01_partition_lifecycler_cancels_promptly_on_hanging_reconcile() {
+        use crate::kv::BoxFuture;
+        use mimir_common::services::Service;
+        use std::sync::atomic::AtomicUsize;
+
+        struct HangOnReconcileKv {
+            cas_calls: AtomicUsize,
+        }
+
+        impl KvClient for HangOnReconcileKv {
+            fn list<'a>(&'a self, _p: &'a str) -> BoxFuture<'a, Result<Vec<String>, KvError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn get<'a>(
+                &'a self,
+                _k: &'a str,
+            ) -> BoxFuture<'a, Result<Option<Box<dyn std::any::Any + Send + Sync>>, KvError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn delete<'a>(&'a self, _k: &'a str) -> BoxFuture<'a, Result<(), KvError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn cas<'a>(
+                &'a self,
+                _k: &'a str,
+                mut f: crate::kv::CasFn,
+            ) -> BoxFuture<'a, Result<(), KvError>> {
+                Box::pin(async move {
+                    let n = self.cas_calls.fetch_add(1, Ordering::SeqCst);
+                    if n >= 1 {
+                        std::future::pending::<()>().await;
+                    }
+                    let _ = f(None);
+                    Ok(())
+                })
+            }
+            fn watch_key<'a>(
+                &'a self,
+                _k: &'a str,
+                ctx: ServiceContext,
+                _f: Box<dyn FnMut(Box<dyn std::any::Any + Send + Sync>) -> bool + Send>,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    ctx.canceled().await;
+                })
+            }
+            fn watch_prefix<'a>(
+                &'a self,
+                _p: &'a str,
+                ctx: ServiceContext,
+                _f: Box<dyn FnMut(&str, Box<dyn std::any::Any + Send + Sync>) -> bool + Send>,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    ctx.canceled().await;
+                })
+            }
+        }
+
+        let cfg = PartitionInstanceLifecyclerConfig {
+            partition_id: 0,
+            instance_id: "ing-0".into(),
+            polling_interval: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let plc = PartitionInstanceLifecycler::new(
+            cfg,
+            "ingester-partitions",
+            "ingester-partitions",
+            Arc::new(HangOnReconcileKv {
+                cas_calls: AtomicUsize::new(0),
+            }),
+            None,
+        )
+        .unwrap();
+        plc.set_create_partition_on_startup(true);
+        plc.set_remove_owner_on_shutdown(false);
+        let svc = plc.into_service();
+        svc.start_async(ServiceContext::background()).await.unwrap();
+        svc.await_running().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        svc.stop_async();
+        tokio::time::timeout(Duration::from_millis(500), svc.await_terminated())
+            .await
+            .expect("PartitionInstanceLifecycler must abort hanging reconcile on ctx cancellation")
+            .unwrap();
     }
 }

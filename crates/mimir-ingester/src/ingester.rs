@@ -1632,33 +1632,7 @@ impl Ingester {
 
         // Start owned series loop before partition replay and lifecycler.
         if self.owned_series_strategy.is_some() {
-            if let Some(ref strategy) = self.owned_series_strategy {
-                match strategy.check_ring_for_changes() {
-                    Ok(changed) => {
-                        self.owned_series_initial_ring_check_succeeded
-                            .store(true, Ordering::Release);
-                        let start = Instant::now();
-                        for user_id in self.get_tsdb_users() {
-                            if let Some(db) = self.get_tsdb(&user_id) {
-                                db.update_owned_series_if_needed(strategy.as_ref(), changed);
-                            }
-                        }
-                        self.owned_series_metrics
-                            .check_duration
-                            .observe(start.elapsed().as_secs_f64());
-                    }
-                    Err(e) if e.contains("empty") => {
-                        warn!("skipped initial owned series computation, ring is empty");
-                        self.owned_series_initial_ring_check_succeeded
-                            .store(false, Ordering::Release);
-                    }
-                    Err(e) => {
-                        return Err(IngesterError::Internal {
-                            message: format!("can't read ring: {e}"),
-                        });
-                    }
-                }
-            }
+            self.run_initial_owned_series_check()?;
             let h = self.watch_subservice_task(
                 "ingester-owned-series",
                 spawn_owned_series_loop(Arc::clone(self), ctx.child()),
@@ -2090,6 +2064,39 @@ impl Ingester {
     }
 }
 
+impl Ingester {
+    fn run_initial_owned_series_check(&self) -> Result<(), IngesterError> {
+        if let Some(ref strategy) = self.owned_series_strategy {
+            match strategy.check_ring_for_changes() {
+                Ok(_) => {
+                    self.owned_series_initial_ring_check_succeeded
+                        .store(true, Ordering::Release);
+                    let start = Instant::now();
+                    for user_id in self.get_tsdb_users() {
+                        if let Some(db) = self.get_tsdb(&user_id) {
+                            db.update_owned_series_if_needed(strategy.as_ref(), true);
+                        }
+                    }
+                    self.owned_series_metrics
+                        .check_duration
+                        .observe(start.elapsed().as_secs_f64());
+                }
+                Err(e) if e.contains("empty") => {
+                    warn!("skipped initial owned series computation, ring is empty");
+                    self.owned_series_initial_ring_check_succeeded
+                        .store(false, Ordering::Release);
+                }
+                Err(e) => {
+                    return Err(IngesterError::Internal {
+                        message: format!("can't read ring: {e}"),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Ported from `pkg/ingester/ingester.go:Config.getIgnoreSeriesLimitForMetricNamesMap`.
 pub fn get_ignore_series_limit_for_metric_names_map(raw: &str) -> Option<HashSet<String>> {
     let set: HashSet<String> = raw
@@ -2124,5 +2131,95 @@ pub fn block_generation_calculator(
         "100+".to_string()
     } else {
         gen.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mimir_common::services::start_and_await_running;
+    use mimir_proto::ringpb::{PartitionRingDesc, PartitionState};
+    use mimir_ring::kv::inmemory::InMemoryKv;
+    use mimir_ring::kv::{cas_typed, KvClient};
+    use mimir_ring::partition_ring::{
+        partition_ring_desc_codec, PartitionRingDescExt, PartitionRingOptions, PartitionRingWatcher,
+    };
+
+    #[tokio::test]
+    async fn b05_initial_owned_series_reconciles_even_when_check_ring_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = prometheus::Registry::new();
+
+        // Populate partition ring with 1 PENDING partition (0 ACTIVE partitions), so
+        // OwnedSeriesPartitionRingStrategy::check_ring_for_changes() returns Ok(false).
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(partition_ring_desc_codec()));
+        cas_typed::<PartitionRingDesc, _>(kv.as_ref(), "ingester-partitions", |cur| {
+            let mut d = cur.cloned().unwrap_or_default();
+            d.add_partition(
+                0,
+                PartitionState::PartitionPending,
+                std::time::SystemTime::now(),
+            );
+            Ok(Some((d, true)))
+        })
+        .await
+        .unwrap();
+
+        let watcher = PartitionRingWatcher::new(
+            "ingester-partitions",
+            "ingester-partitions",
+            Arc::clone(&kv),
+            PartitionRingOptions::default(),
+            None,
+        );
+        let w_svc = Arc::clone(&watcher).into_service();
+        start_and_await_running(ServiceContext::background(), w_svc.as_ref())
+            .await
+            .unwrap();
+
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "ingester-zone-a-0".to_string();
+        ing_cfg.track_ingester_owned_series = true;
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ingest_cfg = mimir_config::IngestStorageConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            ingest_cfg,
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            Some(Arc::clone(&watcher)),
+            None,
+            None,
+            Some(&reg),
+        )
+        .unwrap();
+
+        let db = ing.get_or_create_tsdb("t-b05").unwrap();
+        // Give the tenant non-empty token ranges and clear any pending recompute reason.
+        let strat = ing.owned_series_strategy.as_ref().unwrap();
+        assert!(db.update_owned_series_if_needed(strat.as_ref(), true));
+        assert!(db.update_token_ranges(vec![0, u32::MAX]));
+
+        // With ring_changed=false, stale ranges are NOT updated.
+        assert!(!db.update_owned_series_if_needed(strat.as_ref(), false));
+
+        // Now run_initial_owned_series_check: check_ring_for_changes() returns Ok(false)
+        // because there are 0 ACTIVE partitions, yet update_owned_series_if_needed(..., true)
+        // still reconciles the stale [0, u32::MAX] ranges back to [].
+        ing.run_initial_owned_series_check().unwrap();
+        assert!(
+            !db.update_token_ranges(vec![]),
+            "run_initial_owned_series_check must pass ring_changed=true and reconcile token_ranges to [] even when check_ring_for_changes returns Ok(false)"
+        );
+
+        w_svc.stop_async();
+        let _ = w_svc.await_terminated().await;
     }
 }

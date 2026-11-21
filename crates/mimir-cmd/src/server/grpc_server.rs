@@ -1015,7 +1015,7 @@ where
                     }
                     mimir_ingester::grpc::PreAcquiredTap::Read(slot) => {
                         if let Some(p) = slot.lock().take() {
-                            p.finish(false);
+                            p.abort();
                         }
                     }
                 }
@@ -1715,5 +1715,86 @@ mod tests {
     fn w20_sdw_11_grpc_percent_decode_rejects_plus_sign() {
         assert_eq!(percent_decode("foo%20bar"), "foo bar");
         assert_eq!(percent_decode("foo%+a%-1bar"), "foo%+a%-1bar");
+    }
+
+    #[tokio::test]
+    async fn b01_pre_handler_auth_and_cluster_rejection_abort_half_open_read_cb() {
+        let mut fx = fixture(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-b01-cmd".to_string();
+        ing_cfg.read_circuit_breaker = mimir_config::CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold_percentage: 50,
+            failure_execution_threshold: 2,
+            thresholding_period: mimir_config::GoDuration::from_secs(0),
+            cooldown_period: mimir_config::GoDuration::from_millis(20),
+            request_timeout: mimir_config::GoDuration::from_millis(10),
+            ..Default::default()
+        };
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = mimir_ingester::Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let read_cb = ing.circuit_breaker.read.as_ref().unwrap();
+        read_cb.activate();
+        for _ in 0..2 {
+            let p = read_cb.try_acquire_permit().unwrap().unwrap();
+            p.finish(Duration::from_millis(25), true);
+        }
+        assert_eq!(read_cb.state(), mimir_ingester::circuit_breaker::BreakerState::Open);
+        std::thread::sleep(Duration::from_millis(30));
+
+        fx.cfg.tap_ingester = Some(Arc::clone(&ing));
+        fx.cfg.cluster_validation = Some(GrpcClusterValidation {
+            allowed: vec!["prod".to_string()],
+            soft: false,
+        });
+
+        // 1) Pre-handler auth rejection (missing x-scope-orgid) -> Unknown, HalfOpen unchanged.
+        let resp = fx.call("/cortex.Ingester/LabelNames", &[]).await.unwrap();
+        assert_eq!(
+            tonic::Status::from_header_map(resp.headers()).unwrap().code(),
+            tonic::Code::Unknown
+        );
+        assert_eq!(
+            read_cb.state(),
+            mimir_ingester::circuit_breaker::BreakerState::HalfOpen
+        );
+        assert_eq!(read_cb.recorded_successes(), 0);
+
+        // 2) Pre-handler cluster validation rejection -> FailedPrecondition, HalfOpen unchanged.
+        let resp = fx
+            .call(
+                "/cortex.Ingester/LabelNames",
+                &[
+                    ("x-scope-orgid", "t1"),
+                    ("x-cortex-cluster", "wrong-cluster"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tonic::Status::from_header_map(resp.headers()).unwrap().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            read_cb.state(),
+            mimir_ingester::circuit_breaker::BreakerState::HalfOpen
+        );
+        assert_eq!(read_cb.recorded_successes(), 0);
     }
 }

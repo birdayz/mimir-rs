@@ -419,8 +419,28 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
         req.extensions_mut().insert(span_ctx.clone());
     }
 
-    let inflight = cfg.metrics.inflight_requests.with_label_values(&[&method, &route]);
-    inflight.inc();
+    struct InflightGuard(Option<prometheus::Gauge>);
+    impl InflightGuard {
+        fn new(gauge: prometheus::Gauge) -> Self {
+            gauge.inc();
+            Self(Some(gauge))
+        }
+        fn take(&mut self) -> Option<prometheus::Gauge> {
+            self.0.take()
+        }
+    }
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            if let Some(g) = self.0.take() {
+                g.dec();
+            }
+        }
+    }
+    let mut inflight_guard = InflightGuard::new(
+        cfg.metrics
+            .inflight_requests
+            .with_label_values(&[&method, &route]),
+    );
 
     let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (parts, body) = req.into_parts();
@@ -471,6 +491,7 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
         Some(r) if !r.is_empty() => format!("HTTP {method} - {r}"),
         _ => format!("HTTP {method}"),
     };
+    let inflight = inflight_guard.take();
     let on_done = Box::new(move |_completed: bool| {
         let elapsed = begin.elapsed();
         if should_export {
@@ -498,7 +519,9 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
         m.request_duration
             .with_label_values(&[&method, &route, &code.to_string(), &ws.to_string()])
             .observe(elapsed.as_secs_f64());
-        inflight.dec();
+        if let Some(g) = inflight {
+            g.dec();
+        }
         log_request(&cfg2, &method, &uri, code, elapsed, ws, &captured.lock(), source_ips.as_deref(), headers_dump.as_deref(), &span_ctx);
     });
     let (parts, body) = resp.into_parts();
